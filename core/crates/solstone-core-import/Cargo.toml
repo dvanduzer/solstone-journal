@@ -26,8 +26,9 @@ path = "tests/import_sync.rs"
 name = "import_text"
 path = "tests/import_text.rs"
 
-[lints]
-workspace = true
+# The host-zone test sets TZ and restores it. That is the only unsafe in this package.
+[lints.rust]
+unsafe_code = "deny"
 
 [dependencies]
 chrono.workspace = true

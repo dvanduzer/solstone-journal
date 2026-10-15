@@ -6,10 +6,11 @@
 //! Times, speakers and words come from the file, never from a model. A transcript in a
 //! recognized layout keeps every turn at the import's start plus its heading offset, on
 //! the ~300-second segments the conversation spans, with the speaker its label names and
-//! its words exactly as written. Any other file is untimed: it lands whole in the one
-//! ~300-second segment at its start, with no duration estimated and no turn time invented.
-//! A model may add each segment's topics and setting, and nothing else; when it refuses or
-//! fails, the segment is written without them.
+//! its words exactly as written. The tile clock is the owner-zone local time of the anchor
+//! plus real elapsed seconds, and one inline `23:xx` → `00:xx` crossing is the next local day.
+//! Any other file is untimed: it lands whole in the one ~300-second segment at its start, with
+//! no duration estimated and no turn time invented. A model may add each segment's topics and
+//! setting, and nothing else; when it refuses or fails, the segment is written without them.
 //!
 //! Recognized layouts (v1), each after an optional preamble such as a date or title:
 //! - relative `## HH:MM:SS` headings counted from the start of the conversation, each
@@ -27,7 +28,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::{Days, NaiveDate};
+use chrono::{DateTime, Days, NaiveDate, NaiveTime, TimeDelta, TimeZone, Utc};
 use serde_json::{Map, Value};
 use solstone_core_generate::{
     ClientError, ContentPart, GenerateRequest, GenerateResponse, GenerateSessionAdapter,
@@ -107,6 +108,10 @@ const TOPICS_SCHEMA: &str = include_str!("text_assets/detect_transcript_topics.s
 /// Failure while importing a generic transcript.
 #[derive(Debug)]
 pub enum TextImportError {
+    LocalTimeMissing {
+        day: String,
+        time: String,
+    },
     UnsupportedFormat {
         path: PathBuf,
     },
@@ -147,6 +152,9 @@ pub enum TextImportError {
 impl fmt::Display for TextImportError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::LocalTimeMissing { day, time } => {
+                write!(formatter, "no such local time {time} on {day}")
+            }
             Self::UnsupportedFormat { .. } => formatter.write_str("unsupported transcript format"),
             Self::SourceRead { path, source } => write!(formatter, "{}: {source}", path.display()),
             Self::RawFilename { path } => {
@@ -184,7 +192,8 @@ impl Error for TextImportError {
             Self::Write { source, .. } => Some(source),
             Self::StreamMarker { source, .. } => Some(source),
             Self::RawCopy { source, .. } => Some(source),
-            Self::UnsupportedFormat { .. }
+            Self::LocalTimeMissing { .. }
+            | Self::UnsupportedFormat { .. }
             | Self::RawFilename { .. }
             | Self::InvalidTime { .. }
             | Self::NextDay { .. }
@@ -324,6 +333,7 @@ fn import(
             turns,
             day: tile_day,
             segment: segment_key,
+            origin,
         } = tile_plan;
         let parent = day_dir
             .parent()
@@ -377,6 +387,7 @@ fn import(
         let rows = jsonl_rows(
             &turns,
             tile * TILE_SECONDS,
+            origin,
             import_id,
             raw_filename,
             facet,
@@ -488,6 +499,7 @@ struct PlannedTile {
     turns: Vec<Turn>,
     day: String,
     segment: String,
+    origin: DateTime<Utc>,
 }
 
 fn plan_tiles(
@@ -496,30 +508,90 @@ fn plan_tiles(
     start_time: &str,
     stream: &str,
 ) -> Result<(Vec<Result<PlannedTile, TextImportError>>, bool), TextImportError> {
-    let (_, day) = journal_marker_context(day_dir)?;
+    let (journal_root, day) = journal_marker_context(day_dir)?;
+    let zone = solstone_core_journal_config::owner_zone(journal_root);
     let start_seconds = clock_seconds(start_time).ok_or_else(|| TextImportError::InvalidTime {
         value: start_time.to_owned(),
     })?;
+    let parsed_date = NaiveDate::parse_from_str(day, "%Y%m%d");
+    let is_literal_day = parsed_date.is_err();
+    let day_date = parsed_date.unwrap_or_else(|_| NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
     let chronicle = day_dir.parent().unwrap_or(day_dir);
     let reading = read_turns(text);
     let untimed = reading.untimed;
-    let base = reading.clock_start.unwrap_or(start_seconds);
+
+    let (anchor, turns) = if let Some(first) = reading.clock_start {
+        let naive_time = NaiveTime::from_num_seconds_from_midnight_opt(first as u32, 0).unwrap();
+        let naive = day_date.and_time(naive_time);
+        let anchor = zone
+            .from_local_datetime(&naive)
+            .earliest()
+            .ok_or_else(|| TextImportError::LocalTimeMissing {
+                day: day.to_owned(),
+                time: clock_text(first),
+            })?
+            .with_timezone(&Utc);
+        let mut resolved_turns = Vec::with_capacity(reading.turns.len());
+        for mut turn in reading.turns {
+            if let Some(stated) = turn.stated {
+                let turn_date = day_date
+                    .checked_add_days(Days::new(stated.day_shift as u64))
+                    .ok_or_else(|| TextImportError::NextDay {
+                        day: day.to_owned(),
+                    })?;
+                let turn_time =
+                    NaiveTime::from_num_seconds_from_midnight_opt(stated.seconds as u32, 0)
+                        .unwrap();
+                let turn_naive = turn_date.and_time(turn_time);
+                let turn_utc = zone
+                    .from_local_datetime(&turn_naive)
+                    .earliest()
+                    .ok_or_else(|| TextImportError::LocalTimeMissing {
+                        day: if is_literal_day {
+                            day.to_owned()
+                        } else {
+                            turn_date.format("%Y%m%d").to_string()
+                        },
+                        time: clock_text(stated.seconds),
+                    })?
+                    .with_timezone(&Utc);
+                turn.offset = (turn_utc - anchor).num_seconds().max(0) as u64;
+            }
+            resolved_turns.push(turn);
+        }
+        (anchor, resolved_turns)
+    } else {
+        let naive_time =
+            NaiveTime::from_num_seconds_from_midnight_opt(start_seconds as u32, 0).unwrap();
+        let naive = day_date.and_time(naive_time);
+        let anchor = zone
+            .from_local_datetime(&naive)
+            .earliest()
+            .ok_or_else(|| TextImportError::LocalTimeMissing {
+                day: day.to_owned(),
+                time: start_time.to_owned(),
+            })?
+            .with_timezone(&Utc);
+        (anchor, reading.turns)
+    };
+
     let mut occupied: HashMap<String, HashSet<String>> = HashMap::new();
     let mut planned = Vec::new();
-    for (tile, turns) in tiles(reading.turns) {
+    for (tile, turns) in tiles(turns) {
         let result = (|| {
-            let tile_start = base + tile * TILE_SECONDS;
-            let tile_day = if tile_start / DAY_SECONDS == 0 {
+            let tile_instant = anchor + TimeDelta::seconds((tile * TILE_SECONDS) as i64);
+            let tile_local = tile_instant.with_timezone(&zone).naive_local();
+            let tile_day = if is_literal_day && tile_local.date() == day_date {
                 day.to_owned()
             } else {
-                next_day(day, tile_start / DAY_SECONDS).ok_or_else(|| TextImportError::NextDay {
-                    day: day.to_owned(),
-                })?
+                tile_local.format("%Y%m%d").to_string()
             };
+            let tile_seconds = (tile_local.time() - NaiveTime::from_hms_opt(0, 0, 0).unwrap())
+                .num_seconds() as u64;
             let parent = chronicle.join(&tile_day).join(stream);
-            let candidate = format!("{}_{TILE_SECONDS}", clock_key(tile_start % DAY_SECONDS));
+            let candidate = format!("{}_{TILE_SECONDS}", clock_key(tile_seconds));
             let day_occupied = occupied.entry(tile_day.clone()).or_default();
-            let segment = text_segment_key(&parent, tile_start % DAY_SECONDS, day_occupied)?
+            let segment = text_segment_key(&parent, tile_seconds, day_occupied)?
                 .ok_or(TextImportError::SegmentKeyUnavailable { candidate })?;
             day_occupied.insert(segment.clone());
             Ok(PlannedTile {
@@ -527,6 +599,7 @@ fn plan_tiles(
                 turns,
                 day: tile_day,
                 segment,
+                origin: anchor,
             })
         })();
         let failed = result.is_err();
@@ -575,6 +648,12 @@ fn text_segment_key(
     Ok(None)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StatedClock {
+    day_shift: u32,
+    seconds: u64,
+}
+
 /// One entry of the transcript as the file gives it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Turn {
@@ -582,6 +661,7 @@ struct Turn {
     offset: u64,
     speaker: Option<String>,
     text: String,
+    stated: Option<StatedClock>,
 }
 
 /// Read the file's turns: timed when the layout is recognized, otherwise every line at
@@ -630,28 +710,54 @@ enum InlineLayout {
 /// heading, which starts an entry with no speaker. No text is dropped.
 fn inline_turns(text: &str) -> Option<Reading> {
     let mut layout = None;
-    let mut turns: Vec<(Option<u64>, Turn)> = Vec::new();
+    let mut turns: Vec<(Option<StatedClock>, Turn)> = Vec::new();
     let mut last_time: Option<u64> = None;
     let mut spoken = 0_usize;
     let mut continues = false;
+    let mut first_time: Option<u64> = None;
+    let mut crossed = false;
+    let mut day_shift: u32 = 0;
     for line in text.lines() {
         if line.trim().is_empty() {
             continue;
         }
         if let Some((kind, time, speaker, said)) = inline_turn(line) {
-            if layout.is_some_and(|known| known != kind)
-                || last_time.is_some_and(|last| time < last)
-            {
+            if layout.is_some_and(|known| known != kind) {
                 return None;
+            }
+            if let Some(last) = last_time {
+                if time < last {
+                    let first = first_time.unwrap();
+                    if first >= FIRST_HEADING_LIMIT_SECONDS
+                        && !crossed
+                        && last >= 23 * 3600
+                        && time < 3600
+                        && time < DAY_SECONDS
+                    {
+                        crossed = true;
+                        day_shift = 1;
+                    } else {
+                        return None;
+                    }
+                } else if first_time.unwrap() >= FIRST_HEADING_LIMIT_SECONDS && time >= DAY_SECONDS
+                {
+                    return None;
+                }
+            } else {
+                first_time = Some(time);
             }
             layout = Some(kind);
             last_time = Some(time);
             turns.push((
-                Some(time),
+                Some(StatedClock {
+                    day_shift,
+                    seconds: time,
+                }),
                 Turn {
                     offset: 0,
                     speaker: Some(speaker.to_owned()),
                     text: said.to_owned(),
+                    stated: None,
                 },
             ));
             spoken += 1;
@@ -670,11 +776,15 @@ fn inline_turns(text: &str) -> Option<Reading> {
             }
             _ => {
                 turns.push((
-                    last_time,
+                    last_time.map(|time| StatedClock {
+                        day_shift,
+                        seconds: time,
+                    }),
                     Turn {
                         offset: 0,
                         speaker: None,
                         text: line.to_owned(),
+                        stated: None,
                     },
                 ));
                 continues = true;
@@ -684,7 +794,7 @@ fn inline_turns(text: &str) -> Option<Reading> {
     if spoken < 2 {
         return None;
     }
-    let first = turns.iter().find_map(|(time, _)| *time)?;
+    let first = first_time?;
     let clock_start = if first < FIRST_HEADING_LIMIT_SECONDS {
         None
     } else if last_time? < DAY_SECONDS {
@@ -698,9 +808,23 @@ fn inline_turns(text: &str) -> Option<Reading> {
         untimed: false,
         turns: turns
             .into_iter()
-            .map(|(time, turn)| Turn {
-                offset: time.unwrap_or(base) - base,
-                ..turn
+            .map(|(clock, turn)| {
+                let (offset, stated) = if clock_start.is_some() {
+                    if let Some(sc) = clock {
+                        let off = (sc.day_shift as u64 * DAY_SECONDS + sc.seconds) - base;
+                        (off, Some(sc))
+                    } else {
+                        (0, None)
+                    }
+                } else {
+                    let off = clock.map(|sc| sc.seconds).unwrap_or(0);
+                    (off, None)
+                };
+                Turn {
+                    offset,
+                    stated,
+                    ..turn
+                }
             })
             .collect(),
     })
@@ -749,6 +873,7 @@ fn untimed_turns(text: &str) -> Vec<Turn> {
             offset: 0,
             speaker: None,
             text: line.to_owned(),
+            stated: None,
         })
         .collect()
 }
@@ -786,6 +911,7 @@ fn timed_turns(text: &str) -> Option<Vec<Turn>> {
                     offset: at,
                     speaker: Some(speaker.to_owned()),
                     text: said.to_owned(),
+                    stated: None,
                 });
                 spoken = true;
                 continues = true;
@@ -807,6 +933,7 @@ fn timed_turns(text: &str) -> Option<Vec<Turn>> {
                     offset: at,
                     speaker: None,
                     text: line.to_owned(),
+                    stated: None,
                 });
                 continues = true;
             }
@@ -871,13 +998,6 @@ fn tiles(turns: Vec<Turn>) -> BTreeMap<u64, Vec<Turn>> {
             .push(turn);
     }
     tiles
-}
-
-fn next_day(day: &str, days: u64) -> Option<String> {
-    NaiveDate::parse_from_str(day, "%Y%m%d")
-        .ok()?
-        .checked_add_days(Days::new(days))
-        .map(|next| next.format("%Y%m%d").to_string())
 }
 
 fn clock_key(seconds: u64) -> String {
@@ -1054,6 +1174,7 @@ fn stage_raw_source(
 fn jsonl_rows(
     turns: &[Turn],
     tile_offset: u64,
+    origin: DateTime<Utc>,
     import_id: &str,
     raw_filename: &str,
     facet: Option<&str>,
@@ -1098,6 +1219,8 @@ fn jsonl_rows(
             "start".to_owned(),
             Value::String(clock_text(turn.offset - tile_offset)),
         );
+        let source_ms = (origin + TimeDelta::seconds(turn.offset as i64)).timestamp_millis();
+        entry.insert("source_ms".to_owned(), Value::Number(source_ms.into()));
         if let Some(speaker) = &turn.speaker {
             entry.insert("speaker".to_owned(), Value::String(speaker.clone()));
         }
@@ -1117,6 +1240,22 @@ mod tests {
             offset,
             speaker: speaker.map(str::to_owned),
             text: text.to_owned(),
+            stated: None,
+        }
+    }
+
+    fn turn_stated(
+        offset: u64,
+        speaker: Option<&str>,
+        text: &str,
+        day_shift: u32,
+        seconds: u64,
+    ) -> Turn {
+        Turn {
+            offset,
+            speaker: speaker.map(str::to_owned),
+            text: text.to_owned(),
+            stated: Some(StatedClock { day_shift, seconds }),
         }
     }
 
@@ -1189,11 +1328,62 @@ mod tests {
             reading.turns,
             vec![
                 turn(0, None, "# Granola notes"),
-                turn(0, Some("Ana Lima"), "We should start."),
-                turn(55, Some("Ben Okafor"), "Agreed."),
-                turn(55, None, "## Summary\nStarted."),
+                turn_stated(
+                    0,
+                    Some("Ana Lima"),
+                    "We should start.",
+                    0,
+                    14 * 3600 + 30 * 60 + 5,
+                ),
+                turn_stated(55, Some("Ben Okafor"), "Agreed.", 0, 14 * 3600 + 31 * 60),
+                turn_stated(55, None, "## Summary\nStarted.", 0, 14 * 3600 + 31 * 60),
             ]
         );
+    }
+
+    #[test]
+    fn inline_midnight_crossing_is_recognized_in_bracketed_and_parenthesized() {
+        let bracketed = "[23:50:00] Alice: night\n[00:10:00] Bob: morning\n## Note\n";
+        let reading = read_turns(bracketed);
+        assert_eq!(reading.clock_start, Some(23 * 3600 + 50 * 60));
+        assert!(!reading.untimed);
+        assert_eq!(
+            reading.turns,
+            vec![
+                turn_stated(0, Some("Alice"), "night", 0, 85800),
+                turn_stated(1200, Some("Bob"), "morning", 1, 600),
+                turn_stated(1200, None, "## Note", 1, 600),
+            ]
+        );
+
+        let parenthesized = "Alice (23:50:00)\nnight\nBob (00:10:00): morning\n## Note\n";
+        let reading = read_turns(parenthesized);
+        assert_eq!(reading.clock_start, Some(23 * 3600 + 50 * 60));
+        assert!(!reading.untimed);
+        assert_eq!(
+            reading.turns,
+            vec![
+                turn_stated(0, Some("Alice"), "night", 0, 85800),
+                turn_stated(1200, Some("Bob"), "morning", 1, 600),
+                turn_stated(1200, None, "## Note", 1, 600),
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_midnight_steps_stay_untimed() {
+        for file in [
+            "[22:59:00] Alice: too early to cross\n[00:01:00] Bob: morning\n",
+            "[23:50:00] Alice: night\n[01:00:00] Bob: skipped 00:xx\n",
+            "[23:50:00] Alice: night\n[00:05:00] Bob: morning\n[00:04:00] Carol: backwards again\n",
+            "[00:10:00] Alice: relative layout\n[00:05:00] Bob: backwards in relative\n",
+            "[15:00:00] Alice: afternoon\n[14:00:00] Bob: earlier\n",
+            "[10:00:00] Alice: morning\n[09:00:00] Bob: earlier\n",
+        ] {
+            let reading = read_turns(file);
+            assert_eq!(reading.clock_start, None, "{file}");
+            assert!(reading.untimed, "{file}");
+        }
     }
 
     #[test]

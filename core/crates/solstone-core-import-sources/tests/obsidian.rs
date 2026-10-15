@@ -8,7 +8,8 @@ use std::time::SystemTime;
 
 use chrono::{DateTime, Local, TimeZone, Utc};
 use serde_json::Value;
-use solstone_core_import_sources::{ics, obsidian};
+use solstone_core_format::content::{Family, produce_chunks};
+use solstone_core_import_sources::{ics, obsidian, save};
 
 static NEXT_TREE: AtomicUsize = AtomicUsize::new(0);
 const ORACLE: &str = include_str!("../../../fixtures/import_source_preview_oracle.json");
@@ -242,4 +243,78 @@ impl Drop for Tree {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(self.path());
     }
+}
+
+#[test]
+fn obsidian_fall_back_notes_render_distinct_windows_and_preserve_markdown_bodies() {
+    let tree = Tree::new();
+    let journal = tree.path().join("journal");
+    fs::create_dir_all(journal.join("config")).unwrap();
+    fs::write(
+        journal.join("config/journal.json"),
+        serde_json::json!({"identity": {"timezone": "America/Denver"}}).to_string(),
+    )
+    .unwrap();
+    let zone = solstone_core_journal_config::owner_zone(&journal);
+
+    let t1 = Utc.with_ymd_and_hms(2026, 11, 1, 7, 58, 0).unwrap();
+    let t2 = Utc.with_ymd_and_hms(2026, 11, 1, 8, 58, 0).unwrap();
+
+    let note1 = obsidian::NoteEntry {
+        title: "First Note".to_string(),
+        source_path: PathBuf::from("First.md"),
+        content: "First note body content".to_string(),
+        tags: Vec::new(),
+        wikilinks: Vec::new(),
+        is_daily: false,
+        daily_note_day: None,
+        modified: t1,
+    };
+    let note2 = obsidian::NoteEntry {
+        title: "Second Note".to_string(),
+        source_path: PathBuf::from("Second.md"),
+        content: "Second note body content".to_string(),
+        tags: Vec::new(),
+        wikilinks: Vec::new(),
+        is_daily: false,
+        daily_note_day: None,
+        modified: t2,
+    };
+
+    let rendered = obsidian::render_notes(vec![note1, note2], &zone);
+    assert_eq!(rendered.files.len(), 2);
+    assert_eq!(rendered.files[0].day, "20261101");
+    assert_eq!(rendered.files[0].segment, "015800_300");
+    assert_eq!(rendered.files[1].day, "20261101");
+    assert_eq!(rendered.files[1].segment, "015800_301");
+
+    let outcome = save::write_rendered(&journal, Some("imp-obsidian"), &rendered);
+    assert!(outcome.error.is_none());
+    assert_eq!(outcome.created.len(), 2);
+    assert_eq!(outcome.created[0].day, "20261101");
+    assert_eq!(outcome.created[0].segment, "015800_300");
+    assert_eq!(outcome.created[1].day, "20261101");
+    assert_eq!(outcome.created[1].segment, "015800_301");
+
+    let text0 = fs::read_to_string(&outcome.created[0].path).unwrap();
+    assert!(text0.contains("First Note"));
+    assert!(text0.contains("First note body content"));
+    let rel0 = format!(
+        "20261101/import.obsidian/{}/{}",
+        outcome.created[0].segment,
+        obsidian::TRANSCRIPT_FILE
+    );
+    let prod0 = produce_chunks(Family::Markdown, &rel0, &text0);
+    assert_eq!(prod0.chunks[0].occurrence_time_ms, None);
+
+    let text1 = fs::read_to_string(&outcome.created[1].path).unwrap();
+    assert!(text1.contains("Second Note"));
+    assert!(text1.contains("Second note body content"));
+    let rel1 = format!(
+        "20261101/import.obsidian/{}/{}",
+        outcome.created[1].segment,
+        obsidian::TRANSCRIPT_FILE
+    );
+    let prod1 = produce_chunks(Family::Markdown, &rel1, &text1);
+    assert_eq!(prod1.chunks[0].occurrence_time_ms, None);
 }

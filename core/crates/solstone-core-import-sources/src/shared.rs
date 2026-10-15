@@ -3,6 +3,7 @@
 
 //! Shared read-only import planning types and local-day windowing.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
@@ -41,6 +42,7 @@ pub struct PlannedEntry {
     pub text: String,
     /// The conversation this entry came from.
     pub thread: usize,
+    pub source_ms: i64,
 }
 
 /// A source-local locator for an entry that was not planned.
@@ -252,6 +254,7 @@ pub(crate) fn plan_entries(
                         speaker: entry.speaker,
                         text: entry.text,
                         thread: entry.thread,
+                        source_ms: timestamp.timestamp_millis(),
                     })
                     .collect(),
                 day: window.day,
@@ -289,7 +292,11 @@ pub(crate) const WINDOW_SECONDS: i64 = 300;
 /// Group timestamped items into five-minute segments of the owner's local days.
 ///
 /// A window opens at its first item and closes when an item falls on another
-/// local day or five minutes or more after that first item.
+/// local day or five minutes or more after that first item. A repeated owner
+/// wall clock in the same render keeps its HHMMSS and steps the segment length.
+/// Length is not an occurrence: readers use explicit source_ms when present,
+/// and otherwise hour/minute/second plus start, while clamped_segment_end_seconds
+/// only bounds the segment end.
 pub(crate) fn window<T>(
     mut items: Vec<(DateTime<Utc>, T)>,
     zone: &impl TimeZone<Offset: fmt::Display>,
@@ -313,6 +320,20 @@ pub(crate) fn window<T>(
                 items: vec![(timestamp, item)],
             }),
         }
+    }
+    let mut counts: HashMap<(String, String), usize> = HashMap::new();
+    for window in &mut windows {
+        let wall_hhmmss = window
+            .start
+            .with_timezone(zone)
+            .format("%H%M%S")
+            .to_string();
+        let key = (window.day.clone(), wall_hhmmss.clone());
+        let count = counts.entry(key).or_insert(0);
+        if *count > 0 {
+            window.segment_key = format!("{wall_hhmmss}_{}", WINDOW_SECONDS + *count as i64);
+        }
+        *count += 1;
     }
     windows
 }

@@ -39,6 +39,7 @@ pub fn render(source: RegistrySource, plan: ImportPlan, import_id: &str) -> Rend
                 "speaker": speaker,
                 "text": entry.text,
                 "source": "import",
+                "source_ms": entry.source_ms,
             });
             contents.push_str(&row.to_string());
             contents.push('\n');

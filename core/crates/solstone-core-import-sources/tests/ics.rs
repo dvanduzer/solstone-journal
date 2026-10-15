@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::Value;
-use solstone_core_import_sources::ics;
+use solstone_core_format::content::{Family, produce_chunks};
+use solstone_core_import::RegistrySource;
+use solstone_core_import_sources::{ics, save};
 use zip::ZipWriter;
 
 static NEXT_TREE: AtomicUsize = AtomicUsize::new(0);
@@ -214,4 +216,103 @@ fn floating_and_all_day_times_are_read_in_the_owner_zone_not_utc() {
             .to_string(),
         "09:00"
     );
+}
+
+#[test]
+fn ics_fall_back_events_render_distinct_windows_and_preserve_markdown_bodies() {
+    let tree = Tree::new();
+    let journal = tree.path().join("journal");
+    fs::create_dir_all(journal.join("config")).unwrap();
+    fs::write(
+        journal.join("config/journal.json"),
+        serde_json::json!({"identity": {"timezone": "America/Denver"}}).to_string(),
+    )
+    .unwrap();
+    let zone = solstone_core_journal_config::owner_zone(&journal);
+
+    let cal_text = "BEGIN:VCALENDAR\r\n\
+BEGIN:VEVENT\r\n\
+SUMMARY:Morning hold\r\n\
+DTSTART:20261102T170000Z\r\n\
+DTEND:20261102T180000Z\r\n\
+LAST-MODIFIED:20261101T075800Z\r\n\
+END:VEVENT\r\n\
+BEGIN:VEVENT\r\n\
+SUMMARY:Second hold\r\n\
+DTSTART:20261102T180000Z\r\n\
+DTEND:20261102T190000Z\r\n\
+LAST-MODIFIED:20261101T085800Z\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+
+    let calendar = tree.file("fallback.ics", cal_text);
+    let rendered = save::render(RegistrySource::Ics, &calendar, "imp-ics", zone)
+        .unwrap()
+        .unwrap();
+
+    let preview = save::preview_size(&journal, &rendered).unwrap();
+    let preview_segments: Vec<_> = preview
+        .recordings
+        .iter()
+        .map(|r| (&r.day, &r.segment))
+        .collect();
+    assert_eq!(
+        preview_segments,
+        vec![
+            (&"20261101".to_string(), &"015800_300".to_string()),
+            (&"20261101".to_string(), &"015800_301".to_string()),
+        ]
+    );
+
+    let outcome = save::write_rendered(&journal, Some("imp-ics"), &rendered);
+    assert!(outcome.error.is_none());
+    assert_eq!(outcome.created.len(), 2);
+    assert_eq!(outcome.created[0].day, "20261101");
+    assert_eq!(outcome.created[0].segment, "015800_300");
+    assert_eq!(outcome.created[1].day, "20261101");
+    assert_eq!(outcome.created[1].segment, "015800_301");
+
+    let manifest_path = journal.join("imports/imp-ics/content_manifest.jsonl");
+    let manifest_text = fs::read_to_string(&manifest_path).unwrap();
+    let mut manifest_segments = Vec::new();
+    for line in manifest_text.lines() {
+        let item: Value = serde_json::from_str(line).unwrap();
+        if let Some(segs) = item.get("segments").and_then(Value::as_array) {
+            for seg in segs {
+                let day = seg["day"].as_str().unwrap().to_string();
+                let key = seg["key"].as_str().unwrap().to_string();
+                manifest_segments.push((day, key));
+            }
+        }
+    }
+    assert_eq!(
+        manifest_segments,
+        vec![
+            ("20261101".to_string(), "015800_300".to_string()),
+            ("20261101".to_string(), "015800_301".to_string()),
+        ]
+    );
+
+    let text0 = fs::read_to_string(&outcome.created[0].path).unwrap();
+    let rel0 = format!(
+        "20261101/import.ics/{}/{}",
+        outcome.created[0].segment,
+        ics::TRANSCRIPT_FILE
+    );
+    let prod0 = produce_chunks(Family::Markdown, &rel0, &text0);
+    assert_eq!(prod0.chunks[0].occurrence_time_ms, None);
+
+    let text1 = fs::read_to_string(&outcome.created[1].path).unwrap();
+    let rel1 = format!(
+        "20261101/import.ics/{}/{}",
+        outcome.created[1].segment,
+        ics::TRANSCRIPT_FILE
+    );
+    let prod1 = produce_chunks(Family::Markdown, &rel1, &text1);
+    assert_eq!(prod1.chunks[0].occurrence_time_ms, None);
+
+    assert!(text0.contains("Morning hold"));
+    assert!(text0.contains("2026-11-02 10:00 AM"));
+    assert!(text1.contains("Second hold"));
+    assert!(text1.contains("2026-11-02 11:00 AM"));
 }

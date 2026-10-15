@@ -2,11 +2,12 @@
 // Copyright (c) 2026 sol pbc
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
+use solstone_core_format::content::{Family, OccurrenceTimeMs, produce_chunks};
 use solstone_core_generate::{
     ClientError, ContentPart, GenerateRequest, GenerateResponse, GeneratedResponse, RefusalReason,
     RefusedResponse,
@@ -502,11 +503,10 @@ fn an_untimed_transcript_is_one_segment_at_its_start_with_no_time_invented() {
     let lines: Vec<&str> = untimed.lines().filter(|line| !line.is_empty()).collect();
     assert_eq!(written.len(), lines.len() + 1);
     for (row, line) in written[1..].iter().zip(lines) {
-        assert_eq!(
-            row,
-            &json!({"start": "00:00:00", "text": line, "source": "import"}),
-            "every line, as written, at the start"
-        );
+        assert_eq!(row["start"], "00:00:00");
+        assert_eq!(row["text"], line);
+        assert_eq!(row["source"], "import");
+        assert!(row["source_ms"].is_i64());
     }
     assert_eq!(written[0]["topics"], "roadmap, imports");
     assert_eq!(
@@ -688,4 +688,588 @@ fn text_created_identity_carries_complete_metadata() {
     );
     assert_eq!(item.created_segment().day, "20260311");
     assert_eq!(item.created_segment().segment, "120000_300");
+}
+
+fn setup_in_zone(
+    name: &str,
+    text: &str,
+    day_str: &str,
+    zone: &str,
+) -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let temporary = tempfile::tempdir().unwrap();
+    let journal = temporary.path().join("journal");
+    fs::create_dir_all(journal.join("config")).unwrap();
+    fs::write(
+        journal.join("config/journal.json"),
+        json!({"identity": {"timezone": zone}}).to_string(),
+    )
+    .unwrap();
+    let source = temporary.path().join(name);
+    fs::write(&source, text).unwrap();
+    let day = journal.join("chronicle").join(day_str);
+    fs::create_dir_all(&day).unwrap();
+    (temporary, source, day)
+}
+
+fn has_any_transcript(root: &Path) -> bool {
+    if !root.exists() {
+        return false;
+    }
+    if root.is_file() {
+        return root.file_name().and_then(|n| n.to_str()) == Some("conversation_transcript.jsonl");
+    }
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            if has_any_transcript(&entry.path()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(feature = "full-tests")]
+fn setup_day(name: &str, text: &str, day_str: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join(name);
+    fs::write(&source, text).unwrap();
+    let day = temporary.path().join("journal/chronicle").join(day_str);
+    fs::create_dir_all(&day).unwrap();
+    (temporary, source, day)
+}
+
+#[test]
+fn spring_tile_keeps_real_instants_through_the_reader() {
+    let text =
+        "## 00:00:00\n**Ana:** First\n## 00:03:00\n**Ben:** Second\n## 00:05:00\n**Ana:** Third\n";
+    let (_temporary, source, day) = setup_in_zone("spring.txt", text, "20260308", "America/Denver");
+    let preview_size =
+        solstone_core_import::text::preview(&source, &day, "01:58:00", "import.text").unwrap();
+    let created = run_ok(&source, &day, "01:58:00", &RecordingWire::always(no_engine));
+    assert_eq!(created.len(), 2);
+    assert_eq!(created[0].day, "20260308");
+    assert_eq!(created[0].segment, "015800_300");
+    assert_eq!(created[1].day, "20260308");
+    assert_eq!(created[1].segment, "030300_300");
+
+    let preview_keys: BTreeSet<(&str, &str)> = preview_size
+        .recordings
+        .iter()
+        .map(|r| (r.day.as_str(), r.segment.as_str()))
+        .collect();
+    let created_keys: BTreeSet<(&str, &str)> = created
+        .iter()
+        .map(|c| (c.day.as_str(), c.segment.as_str()))
+        .collect();
+    assert_eq!(preview_keys, created_keys);
+
+    let rows0 = rows(&created[0].path);
+    assert_eq!(
+        rows0[1].get("start").and_then(Value::as_str),
+        Some("00:00:00")
+    );
+    assert_eq!(
+        rows0[2].get("start").and_then(Value::as_str),
+        Some("00:03:00")
+    );
+
+    let rows1 = rows(&created[1].path);
+    assert_eq!(
+        rows1[1].get("start").and_then(Value::as_str),
+        Some("00:00:00")
+    );
+
+    let expected_ms0 = chrono::NaiveDate::from_ymd_opt(2026, 3, 8)
+        .unwrap()
+        .and_hms_opt(8, 58, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+    let text0 = fs::read_to_string(&created[0].path).unwrap();
+    let rel0 = format!(
+        "20260308/import.text/{}/conversation_transcript.jsonl",
+        created[0].segment
+    );
+    let produced0 = produce_chunks(Family::AiChat, &rel0, &text0);
+    assert_eq!(
+        produced0.chunks[0].occurrence_time_ms,
+        Some(OccurrenceTimeMs(expected_ms0)),
+    );
+    assert_eq!(
+        produced0.chunks[1].occurrence_time_ms,
+        Some(OccurrenceTimeMs(expected_ms0 + 180 * 1000)),
+    );
+
+    let text1 = fs::read_to_string(&created[1].path).unwrap();
+    let rel1 = format!(
+        "20260308/import.text/{}/conversation_transcript.jsonl",
+        created[1].segment
+    );
+    let produced1 = produce_chunks(Family::AiChat, &rel1, &text1);
+    assert_eq!(
+        produced1.chunks[0].occurrence_time_ms,
+        Some(OccurrenceTimeMs(expected_ms0 + 300 * 1000)),
+    );
+}
+
+#[test]
+fn fall_back_tile_keeps_both_one_fifty_eight_instants() {
+    let text = "## 00:00:00\n**Ana:** First\n## 00:05:00\n**Ben:** Second\n## 01:00:00\n**Ana:** Third\n## 01:05:00\n**Ben:** Fourth\n";
+    let (_temporary, source, day) = setup_in_zone("fall.txt", text, "20261101", "America/Denver");
+    let preview_size =
+        solstone_core_import::text::preview(&source, &day, "01:58:00", "import.text").unwrap();
+    let created = run_ok(&source, &day, "01:58:00", &RecordingWire::always(no_engine));
+    assert_eq!(created.len(), 4);
+    assert_eq!(created[0].day, "20261101");
+    assert_eq!(created[0].segment, "015800_300");
+    assert_eq!(created[1].day, "20261101");
+    assert_eq!(created[1].segment, "010300_300");
+    assert_eq!(created[2].day, "20261101");
+    assert_eq!(created[2].segment, "015801_300");
+    assert_eq!(created[3].day, "20261101");
+    assert_eq!(created[3].segment, "020300_300");
+
+    let preview_keys: BTreeSet<(&str, &str)> = preview_size
+        .recordings
+        .iter()
+        .map(|r| (r.day.as_str(), r.segment.as_str()))
+        .collect();
+    let created_keys: BTreeSet<(&str, &str)> = created
+        .iter()
+        .map(|c| (c.day.as_str(), c.segment.as_str()))
+        .collect();
+    assert_eq!(preview_keys, created_keys);
+
+    let rows0 = rows(&created[0].path);
+    assert_eq!(
+        rows0[1].get("start").and_then(Value::as_str),
+        Some("00:00:00")
+    );
+    let rows1 = rows(&created[1].path);
+    assert_eq!(
+        rows1[1].get("start").and_then(Value::as_str),
+        Some("00:00:00")
+    );
+    let rows2 = rows(&created[2].path);
+    assert_eq!(
+        rows2[1].get("start").and_then(Value::as_str),
+        Some("00:00:00")
+    );
+    let rows3 = rows(&created[3].path);
+    assert_eq!(
+        rows3[1].get("start").and_then(Value::as_str),
+        Some("00:00:00")
+    );
+
+    let expected_ms0 = chrono::NaiveDate::from_ymd_opt(2026, 11, 1)
+        .unwrap()
+        .and_hms_opt(7, 58, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+
+    let text0 = fs::read_to_string(&created[0].path).unwrap();
+    let rel0 = format!(
+        "20261101/import.text/{}/conversation_transcript.jsonl",
+        created[0].segment
+    );
+    let produced0 = produce_chunks(Family::AiChat, &rel0, &text0);
+    assert_eq!(
+        produced0.chunks[0].occurrence_time_ms,
+        Some(OccurrenceTimeMs(expected_ms0)),
+    );
+
+    let text1 = fs::read_to_string(&created[1].path).unwrap();
+    let rel1 = format!(
+        "20261101/import.text/{}/conversation_transcript.jsonl",
+        created[1].segment
+    );
+    let produced1 = produce_chunks(Family::AiChat, &rel1, &text1);
+    assert_eq!(
+        produced1.chunks[0].occurrence_time_ms,
+        Some(OccurrenceTimeMs(expected_ms0 + 300 * 1000)),
+    );
+
+    let text2 = fs::read_to_string(&created[2].path).unwrap();
+    let rel2 = format!(
+        "20261101/import.text/{}/conversation_transcript.jsonl",
+        created[2].segment
+    );
+    let produced2 = produce_chunks(Family::AiChat, &rel2, &text2);
+    assert_eq!(
+        produced2.chunks[0].occurrence_time_ms,
+        Some(OccurrenceTimeMs(expected_ms0 + 3600 * 1000)),
+    );
+
+    let text3 = fs::read_to_string(&created[3].path).unwrap();
+    let rel3 = format!(
+        "20261101/import.text/{}/conversation_transcript.jsonl",
+        created[3].segment
+    );
+    let produced3 = produce_chunks(Family::AiChat, &rel3, &text3);
+    assert_eq!(
+        produced3.chunks[0].occurrence_time_ms,
+        Some(OccurrenceTimeMs(expected_ms0 + 3900 * 1000)),
+    );
+}
+
+#[test]
+fn ordinary_day_clocks_stay_on_the_wall_time() {
+    let text =
+        "## 00:00:00\n**Ana:** First\n## 00:03:00\n**Ben:** Second\n## 00:05:00\n**Ana:** Third\n";
+    let (_temporary, source, day) =
+        setup_in_zone("ordinary.txt", text, "20260311", "America/Denver");
+    let preview_size =
+        solstone_core_import::text::preview(&source, &day, "01:58:00", "import.text").unwrap();
+    let created = run_ok(&source, &day, "01:58:00", &RecordingWire::always(no_engine));
+    assert_eq!(created.len(), 2);
+    assert_eq!(created[0].day, "20260311");
+    assert_eq!(created[0].segment, "015800_300");
+    assert_eq!(created[1].day, "20260311");
+    assert_eq!(created[1].segment, "020300_300");
+
+    let preview_keys: BTreeSet<(&str, &str)> = preview_size
+        .recordings
+        .iter()
+        .map(|r| (r.day.as_str(), r.segment.as_str()))
+        .collect();
+    let created_keys: BTreeSet<(&str, &str)> = created
+        .iter()
+        .map(|c| (c.day.as_str(), c.segment.as_str()))
+        .collect();
+    assert_eq!(preview_keys, created_keys);
+
+    let rows0 = rows(&created[0].path);
+    assert_eq!(
+        rows0[1].get("start").and_then(Value::as_str),
+        Some("00:00:00")
+    );
+    assert_eq!(
+        rows0[2].get("start").and_then(Value::as_str),
+        Some("00:03:00")
+    );
+    let rows1 = rows(&created[1].path);
+    assert_eq!(
+        rows1[1].get("start").and_then(Value::as_str),
+        Some("00:00:00")
+    );
+
+    let expected_ms0 = chrono::NaiveDate::from_ymd_opt(2026, 3, 11)
+        .unwrap()
+        .and_hms_opt(7, 58, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+    let text0 = fs::read_to_string(&created[0].path).unwrap();
+    let rel0 = format!(
+        "20260311/import.text/{}/conversation_transcript.jsonl",
+        created[0].segment
+    );
+    let produced0 = produce_chunks(Family::AiChat, &rel0, &text0);
+    assert_eq!(
+        produced0.chunks[0].occurrence_time_ms,
+        Some(OccurrenceTimeMs(expected_ms0)),
+    );
+    assert_eq!(
+        produced0.chunks[1].occurrence_time_ms,
+        Some(OccurrenceTimeMs(expected_ms0 + 180 * 1000)),
+    );
+
+    let text1 = fs::read_to_string(&created[1].path).unwrap();
+    let rel1 = format!(
+        "20260311/import.text/{}/conversation_transcript.jsonl",
+        created[1].segment
+    );
+    let produced1 = produce_chunks(Family::AiChat, &rel1, &text1);
+    assert_eq!(
+        produced1.chunks[0].occurrence_time_ms,
+        Some(OccurrenceTimeMs(expected_ms0 + 300 * 1000)),
+    );
+}
+
+#[test]
+fn kolkata_midnight_rolls_to_the_next_local_day() {
+    let text = "# 2026-03-11\n## 00:00:00\n**Ana:** late\n## 00:05:00\n**Ben:** next day\n";
+    let (_temporary, source, day) = setup_in_zone("kolkata.txt", text, "20260311", "Asia/Kolkata");
+    let preview_size =
+        solstone_core_import::text::preview(&source, &day, "23:58:00", "import.text").unwrap();
+    let created = run_ok(&source, &day, "23:58:00", &RecordingWire::always(no_engine));
+    assert_eq!(created.len(), 2);
+    assert_eq!(created[0].day, "20260311");
+    assert_eq!(created[0].segment, "235800_300");
+    assert_eq!(created[1].day, "20260312");
+    assert_eq!(created[1].segment, "000300_300");
+
+    let preview_keys: BTreeSet<(&str, &str)> = preview_size
+        .recordings
+        .iter()
+        .map(|r| (r.day.as_str(), r.segment.as_str()))
+        .collect();
+    let created_keys: BTreeSet<(&str, &str)> = created
+        .iter()
+        .map(|c| (c.day.as_str(), c.segment.as_str()))
+        .collect();
+    assert_eq!(preview_keys, created_keys);
+
+    let text0 = fs::read_to_string(&created[0].path).unwrap();
+    let rel0 = format!(
+        "20260311/import.text/{}/conversation_transcript.jsonl",
+        created[0].segment
+    );
+    let produced0 = produce_chunks(Family::AiChat, &rel0, &text0);
+    let expected0 = chrono::NaiveDate::from_ymd_opt(2026, 3, 11)
+        .unwrap()
+        .and_hms_opt(18, 28, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+    assert_eq!(
+        produced0.chunks[0].occurrence_time_ms,
+        Some(OccurrenceTimeMs(expected0)),
+    );
+
+    let text1 = fs::read_to_string(&created[1].path).unwrap();
+    let rel1 = format!(
+        "20260312/import.text/{}/conversation_transcript.jsonl",
+        created[1].segment
+    );
+    let produced1 = produce_chunks(Family::AiChat, &rel1, &text1);
+    assert_eq!(
+        produced1.chunks[0].occurrence_time_ms,
+        Some(OccurrenceTimeMs(expected0 + 300_000)),
+    );
+}
+
+#[test]
+fn missing_spring_start_writes_no_chronicle_segment() {
+    let text = "# 2026-03-08\n## 00:00:00\n**Ana:** hello\n";
+    let (temporary, source, day) = setup_in_zone("missing.txt", text, "20260308", "America/Denver");
+    let preview_err =
+        solstone_core_import::text::preview(&source, &day, "02:30:00", "import.text").unwrap_err();
+    match preview_err {
+        TextImportError::LocalTimeMissing {
+            day: failed_day,
+            time,
+        } => {
+            assert_eq!(failed_day, "20260308");
+            assert_eq!(time, "02:30:00");
+        }
+        other => panic!("expected LocalTimeMissing from preview, got {other:?}"),
+    }
+
+    let wire = RecordingWire::always(no_engine);
+    let outcome = process_transcript_with_wire(
+        &source,
+        &day,
+        "02:30:00",
+        "20260308_023000",
+        "import.text",
+        None,
+        None,
+        &wire,
+    );
+    match outcome {
+        TextImportOutcome::Failed {
+            error:
+                TextImportError::LocalTimeMissing {
+                    day: failed_day,
+                    time,
+                },
+            created,
+        } => {
+            assert_eq!(failed_day, "20260308");
+            assert_eq!(time, "02:30:00");
+            assert!(created.created.is_empty());
+        }
+        other => panic!("expected LocalTimeMissing, got {other:?}"),
+    }
+    let chronicle = temporary.path().join("journal/chronicle");
+    assert!(
+        !has_any_transcript(&chronicle),
+        "no conversation_transcript.jsonl anywhere under chronicle/"
+    );
+}
+
+#[test]
+fn inline_clocks_cross_midnight_onto_the_next_local_day() {
+    let text = "[23:58:00] A: before\n[00:03:00] B: after\n";
+    let (_temporary, source, day) =
+        setup_in_zone("midnight.txt", text, "20260311", "America/Denver");
+    let preview_size =
+        solstone_core_import::text::preview(&source, &day, "12:00:00", "import.text").unwrap();
+    let created = run_ok(&source, &day, "12:00:00", &RecordingWire::always(no_engine));
+    assert_eq!(created.len(), 2);
+    assert_eq!(created[0].day, "20260311");
+    assert_eq!(created[0].segment, "235800_300");
+    assert_eq!(created[1].day, "20260312");
+    assert_eq!(created[1].segment, "000300_300");
+
+    let preview_keys: BTreeSet<(&str, &str)> = preview_size
+        .recordings
+        .iter()
+        .map(|r| (r.day.as_str(), r.segment.as_str()))
+        .collect();
+    let created_keys: BTreeSet<(&str, &str)> = created
+        .iter()
+        .map(|c| (c.day.as_str(), c.segment.as_str()))
+        .collect();
+    assert_eq!(preview_keys, created_keys);
+
+    let rows0 = rows(&created[0].path);
+    assert!(rows0[0].get("untimed").is_none());
+    assert_eq!(
+        rows0[1].get("start").and_then(Value::as_str),
+        Some("00:00:00")
+    );
+    assert_eq!(rows0[1].get("text").and_then(Value::as_str), Some("before"));
+
+    let rows1 = rows(&created[1].path);
+    assert!(rows1[0].get("untimed").is_none());
+    assert_eq!(
+        rows1[1].get("start").and_then(Value::as_str),
+        Some("00:00:00")
+    );
+    assert_eq!(rows1[1].get("text").and_then(Value::as_str), Some("after"));
+
+    let text0 = fs::read_to_string(&created[0].path).unwrap();
+    let rel0 = format!(
+        "20260311/import.text/{}/conversation_transcript.jsonl",
+        created[0].segment
+    );
+    let produced0 = produce_chunks(Family::AiChat, &rel0, &text0);
+    // 2026-03-11 23:58:00 Denver MDT (UTC-6) -> 2026-03-12 05:58:00Z
+    let expected0 = chrono::NaiveDate::from_ymd_opt(2026, 3, 12)
+        .unwrap()
+        .and_hms_opt(5, 58, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+    assert_eq!(
+        produced0.chunks[0].occurrence_time_ms,
+        Some(OccurrenceTimeMs(expected0)),
+    );
+
+    let text1 = fs::read_to_string(&created[1].path).unwrap();
+    let rel1 = format!(
+        "20260312/import.text/{}/conversation_transcript.jsonl",
+        created[1].segment
+    );
+    let produced1 = produce_chunks(Family::AiChat, &rel1, &text1);
+    // 2026-03-12 00:03:00 Denver MDT (UTC-6) -> 2026-03-12 06:03:00Z
+    let expected1 = chrono::NaiveDate::from_ymd_opt(2026, 3, 12)
+        .unwrap()
+        .and_hms_opt(6, 3, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+    assert_eq!(
+        produced1.chunks[0].occurrence_time_ms,
+        Some(OccurrenceTimeMs(expected1)),
+    );
+}
+
+#[cfg(feature = "full-tests")]
+#[test]
+#[allow(unsafe_code)]
+fn owner_zone_beats_the_host_zone() {
+    struct TzGuard(Option<String>);
+    impl Drop for TzGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(val) => unsafe { std::env::set_var("TZ", val) },
+                None => unsafe { std::env::remove_var("TZ") },
+            }
+        }
+    }
+    let _guard = TzGuard(std::env::var("TZ").ok());
+    unsafe { std::env::set_var("TZ", "UTC") };
+
+    // With TZ=UTC and identity.timezone America/Denver:
+    let text = "## 00:00:00\n**Ana:** hi\n## 01:00:00\n**Ben:** later\n";
+    let (_temp, source, day) = setup_in_zone("t.txt", text, "20261101", "America/Denver");
+    let created = run_ok(&source, &day, "01:58:00", &RecordingWire::always(no_engine));
+    assert_eq!(created.len(), 2);
+    assert_eq!(created[0].segment, "015800_300");
+    assert_eq!(created[1].segment, "015801_300");
+
+    let expected_ms0 = chrono::NaiveDate::from_ymd_opt(2026, 11, 1)
+        .unwrap()
+        .and_hms_opt(7, 58, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+    let text0 = fs::read_to_string(&created[0].path).unwrap();
+    let rel0 = format!(
+        "20261101/import.text/{}/conversation_transcript.jsonl",
+        created[0].segment
+    );
+    let produced0 = produce_chunks(Family::AiChat, &rel0, &text0);
+    assert_eq!(
+        produced0.chunks[0].occurrence_time_ms,
+        Some(OccurrenceTimeMs(expected_ms0)),
+    );
+    let text1 = fs::read_to_string(&created[1].path).unwrap();
+    let rel1 = format!(
+        "20261101/import.text/{}/conversation_transcript.jsonl",
+        created[1].segment
+    );
+    let produced1 = produce_chunks(Family::AiChat, &rel1, &text1);
+    assert_eq!(
+        produced1.chunks[0].occurrence_time_ms,
+        Some(OccurrenceTimeMs(expected_ms0 + 3600 * 1000)),
+    );
+
+    // With TZ=UTC and no config/journal.json:
+    let (_temp2, source2, day2) = setup_day("t2.txt", text, "20261101");
+    let created2 = run_ok(
+        &source2,
+        &day2,
+        "01:58:00",
+        &RecordingWire::always(no_engine),
+    );
+    let text_no_cfg = fs::read_to_string(&created2[0].path).unwrap();
+    let rel_no_cfg = format!(
+        "20261101/import.text/{}/conversation_transcript.jsonl",
+        created2[0].segment
+    );
+    let produced_no_cfg = produce_chunks(Family::AiChat, &rel_no_cfg, &text_no_cfg);
+    let expected_utc = chrono::NaiveDate::from_ymd_opt(2026, 11, 1)
+        .unwrap()
+        .and_hms_opt(1, 58, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+    assert_eq!(
+        produced_no_cfg.chunks[0].occurrence_time_ms,
+        Some(OccurrenceTimeMs(expected_utc)),
+    );
+
+    // Keep the 02:30 LocalTimeMissing case under Denver even when TZ=UTC:
+    let (_temp3, source3, day3) = setup_in_zone(
+        "t3.txt",
+        "# 2026-03-08\n## 00:00:00\n**Ana:** hi\n",
+        "20260308",
+        "America/Denver",
+    );
+    let wire = RecordingWire::always(no_engine);
+    let outcome = process_transcript_with_wire(
+        &source3,
+        &day3,
+        "02:30:00",
+        "20260308_023000",
+        "import.text",
+        None,
+        None,
+        &wire,
+    );
+    match outcome {
+        TextImportOutcome::Failed {
+            error: TextImportError::LocalTimeMissing { day, time },
+            ..
+        } => {
+            assert_eq!(day, "20260308");
+            assert_eq!(time, "02:30:00");
+        }
+        other => panic!("expected LocalTimeMissing, got {other:?}"),
+    }
 }

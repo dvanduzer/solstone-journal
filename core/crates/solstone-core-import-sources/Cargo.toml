@@ -26,8 +26,9 @@ path = "tests/source_format_contracts.rs"
 name = "source_planning_contracts"
 path = "tests/source_planning_contracts.rs"
 
-[lints]
-workspace = true
+# The host-zone test sets TZ and restores it. That is the only unsafe in this package.
+[lints.rust]
+unsafe_code = "deny"
 
 [dependencies]
 base64 = "0.22.1"

@@ -94,7 +94,12 @@ fn capitalize_source(source: &str) -> String {
     }
 }
 
+/// Turn timestamp in Unix milliseconds. Explicit `source_ms` wins; otherwise
+/// falls back to local day and segment start time treated as UTC, plus elapsed `start`.
 fn ai_chat_timestamp(rel: &str, record: &JsonObject) -> i64 {
+    if let Some(millis) = record.get("source_ms").and_then(Value::as_i64) {
+        return millis;
+    }
     let mut timestamp = ai_chat_base_timestamp(rel);
     if let Some(start) = record.get("start").and_then(Value::as_str) {
         let parts: Vec<_> = start.split(':').collect();
@@ -133,7 +138,7 @@ fn ai_chat_base_timestamp(rel: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::content::parse_jsonl_objects;
+    use crate::content::{OccurrenceTimeMs, parse_jsonl_objects};
 
     #[test]
     fn renders_only_start_bearing_non_empty_turns() {
@@ -152,5 +157,57 @@ mod tests {
         assert_eq!(produced.agent_override.as_deref(), Some("import.claude"));
         assert_eq!(produced.chunks.len(), 1);
         assert_eq!(produced.chunks[0].content, "**User:** Hello");
+    }
+
+    #[test]
+    fn source_ms_wins_over_path_and_start() {
+        let records = parse_jsonl_objects(
+            r#"{"start":"00:00:00","speaker":"User","text":"Hello","source_ms":1793523480000}
+"#,
+        );
+        let produced = render(
+            "20261101/import.chatgpt/015800_301/conversation_transcript.jsonl",
+            &records,
+        );
+        assert_eq!(
+            produced.chunks[0].occurrence_time_ms,
+            Some(OccurrenceTimeMs(1793523480000))
+        );
+    }
+
+    #[test]
+    fn absent_source_ms_stepped_length_produces_same_timestamp() {
+        let records = parse_jsonl_objects(
+            r#"{"start":"00:00:00","speaker":"User","text":"Hello"}
+"#,
+        );
+        let produced_300 = render(
+            "20261101/import.chatgpt/015800_300/conversation_transcript.jsonl",
+            &records,
+        );
+        let produced_301 = render(
+            "20261101/import.chatgpt/015800_301/conversation_transcript.jsonl",
+            &records,
+        );
+        assert_eq!(
+            produced_300.chunks[0].occurrence_time_ms,
+            produced_301.chunks[0].occurrence_time_ms
+        );
+    }
+
+    #[test]
+    fn absent_source_ms_on_unparseable_path_uses_base_zero_plus_start() {
+        let records = parse_jsonl_objects(
+            r#"{"start":"00:00:01","speaker":"User","text":"Hello"}
+"#,
+        );
+        let produced = render(
+            "20260101/import.claude/thread_a/conversation_transcript.jsonl",
+            &records,
+        );
+        assert_eq!(
+            produced.chunks[0].occurrence_time_ms,
+            Some(OccurrenceTimeMs(1000))
+        );
     }
 }
