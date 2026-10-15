@@ -117,7 +117,7 @@ async fn ac3_all_captured_get_cases_match_status_and_digest() {
             assert_eq!(
                 digest(&normalized),
                 expected["digest"].as_str().expect("digest"),
-                "{phase_name} {name}"
+                "{phase_name} {name}; actual normalized body: {normalized}"
             );
         }
     }
@@ -138,6 +138,27 @@ pub(crate) fn normalize(value: Value, path: &str, root: &str) -> (Value, Vec<Str
     if let Value::String(value) = value {
         if value.contains(root) {
             hits.push(format!("{path}#journal_root"));
+            if path == "/config/path"
+                && let Ok(relative) = std::path::Path::new(&value).strip_prefix(root)
+                && relative
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+            {
+                let relative = relative
+                    .components()
+                    .map(|part| part.as_os_str().to_str())
+                    .collect::<Option<Vec<_>>>()
+                    .expect("JSON path components are UTF-8")
+                    .join("/");
+                return (
+                    Value::String(if relative.is_empty() {
+                        "<JOURNAL_ROOT>".to_owned()
+                    } else {
+                        format!("<JOURNAL_ROOT>/{relative}")
+                    }),
+                    hits,
+                );
+            }
             return (Value::String(value.replace(root, "<JOURNAL_ROOT>")), hits);
         }
         if let Some((_, replacement)) = NORMALIZE

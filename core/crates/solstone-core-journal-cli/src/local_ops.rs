@@ -2672,9 +2672,10 @@ mod facet_merge_tests {
             stdout.starts_with("Dry run, nothing was changed."),
             "{stdout}"
         );
+        let nested_note = Path::new("notes").join("today.md").display().to_string();
         assert_eq!(
             listed_after(&stdout, "Files both facets have that"),
-            ["collision.md", "notes/today.md"]
+            ["collision.md", nested_note.as_str()]
         );
         assert_eq!(
             // id 1 loses to the destination; the destination's own second id 4 loses to its first.
@@ -2683,7 +2684,13 @@ mod facet_merge_tests {
         );
         assert_eq!(
             listed_after(&stdout, "Entity fields"),
-            ["entities/ada/entity.json: 1"]
+            [format!(
+                "{}: 1",
+                Path::new("entities")
+                    .join("ada")
+                    .join("entity.json")
+                    .display()
+            )]
         );
         assert!(
             stdout.contains("The settings in the facet.json of 'source'"),

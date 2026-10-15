@@ -442,6 +442,7 @@ runtime = "none"
 features = ["full-tests"]
 
 [[package_suites]]
+# The library harness has no test cases; zero execution cannot qualify as a whole-library pass.
 id = "package::solstone-core-ced-sys"
 package = "solstone-core-ced-sys"
 set = "native"
@@ -680,7 +681,7 @@ id = "package::solstone-core-facets"
 package = "solstone-core-facets"
 set = "component"
 areas = ["facets"]
-platforms = ["linux", "macos"]
+platforms = ["linux", "macos", "windows"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
 default_full = true
@@ -829,7 +830,7 @@ id = "package::solstone-core-import-host"
 package = "solstone-core-import-host"
 set = "component"
 areas = ["import"]
-platforms = ["linux", "macos"]
+platforms = ["linux", "macos", "windows"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
 default_full = true
@@ -837,6 +838,7 @@ runtime = "none"
 features = ["full-tests"]
 
 [[package_suites]]
+# Windows archive publication retains child claims across a directory rename; whole-library qualification is blocked.
 id = "package::solstone-core-import-sources"
 package = "solstone-core-import-sources"
 set = "component"
@@ -853,7 +855,7 @@ id = "package::solstone-core-import-web"
 package = "solstone-core-import-web"
 set = "component"
 areas = ["import"]
-platforms = ["linux", "macos"]
+platforms = ["linux", "macos", "windows"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
 default_full = true
@@ -1012,7 +1014,7 @@ id = "package::solstone-core-journal-cli"
 package = "solstone-core-journal-cli"
 set = "component"
 areas = ["journal"]
-platforms = ["linux", "macos"]
+platforms = ["linux", "macos", "windows"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
 default_full = true
@@ -1275,7 +1277,7 @@ id = "package::solstone-core-segment"
 package = "solstone-core-segment"
 set = "component"
 areas = ["ingest"]
-platforms = ["linux", "macos"]
+platforms = ["linux", "macos", "windows"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
 default_full = true
@@ -1287,7 +1289,7 @@ id = "package::solstone-core-segment-cli"
 package = "solstone-core-segment-cli"
 set = "component"
 areas = ["ingest"]
-platforms = ["linux", "macos"]
+platforms = ["linux", "macos", "windows"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
 default_full = false
@@ -1332,7 +1334,7 @@ id = "package::solstone-core-settings-web"
 package = "solstone-core-settings-web"
 set = "component"
 areas = ["home"]
-platforms = ["linux", "macos"]
+platforms = ["linux", "macos", "windows"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
 default_full = true
@@ -1340,6 +1342,7 @@ runtime = "none"
 features = ["full-tests"]
 
 [[package_suites]]
+# Whole-library qualification needs isolated Windows owner fixtures; Unix homes and POSIX wrappers do not provide them.
 id = "package::solstone-core-setup"
 package = "solstone-core-setup"
 set = "component"
@@ -1421,6 +1424,7 @@ runtime = "none"
 features = ["full-tests", "test-hooks"]
 
 [[package_suites]]
+# The library harness has no cases; its test cases live in the tag_audio integration target.
 id = "package::solstone-core-sound-tags"
 package = "solstone-core-sound-tags"
 set = "component"
@@ -1447,7 +1451,7 @@ id = "package::solstone-core-speaker-resolve"
 package = "solstone-core-speaker-resolve"
 set = "component"
 areas = ["audio"]
-platforms = ["linux", "macos"]
+platforms = ["linux", "macos", "windows"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
 default_full = true
@@ -1573,7 +1577,7 @@ id = "package::solstone-core-system-health"
 package = "solstone-core-system-health"
 set = "component"
 areas = ["system"]
-platforms = ["linux", "macos"]
+platforms = ["linux", "macos", "windows"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
 default_full = true
@@ -1641,7 +1645,7 @@ id = "package::solstone-core-think-cli"
 package = "solstone-core-think-cli"
 set = "component"
 areas = ["commands"]
-platforms = ["linux", "macos"]
+platforms = ["linux", "macos", "windows"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
 default_full = true
@@ -1661,6 +1665,7 @@ runtime = "none"
 features = ["full-tests"]
 
 [[package_suites]]
+# This data/copy library has no library test cases; zero execution cannot qualify.
 id = "package::solstone-core-thinking-copy"
 package = "solstone-core-thinking-copy"
 set = "component"
@@ -1687,7 +1692,7 @@ id = "package::solstone-core-transcribe"
 package = "solstone-core-transcribe"
 set = "component"
 areas = ["audio"]
-platforms = ["linux", "macos"]
+platforms = ["linux", "macos", "windows"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
 default_full = true
@@ -1744,7 +1749,7 @@ id = "package::solstone-core-transcripts-web"
 package = "solstone-core-transcripts-web"
 set = "component"
 areas = ["audio"]
-platforms = ["linux", "macos"]
+platforms = ["linux", "macos", "windows"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
 default_full = true

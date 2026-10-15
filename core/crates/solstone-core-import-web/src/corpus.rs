@@ -149,6 +149,25 @@ pub(crate) mod tests {
         value
     }
 
+    fn normalize_journal_root(value: Value, root: &str) -> Value {
+        match value {
+            Value::String(value) => Value::String(value.replace(root, "<JOURNAL_ROOT>")),
+            Value::Array(items) => Value::Array(
+                items
+                    .into_iter()
+                    .map(|value| normalize_journal_root(value, root))
+                    .collect(),
+            ),
+            Value::Object(items) => Value::Object(
+                items
+                    .into_iter()
+                    .map(|(key, value)| (key, normalize_journal_root(value, root)))
+                    .collect(),
+            ),
+            value => value,
+        }
+    }
+
     fn canonical_json(value: &Value) -> String {
         match value {
             Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
@@ -192,7 +211,7 @@ pub(crate) mod tests {
                 let path = case["path"].as_str().expect("path");
                 let (status, content_type, location, mut actual_body) =
                     request(root.path(), method, path, case.get("request_json")).await;
-                if case.get("body_normalized").is_some() {
+                if case.get("body_normalized").is_some() && case.get("json").is_none() {
                     actual_body = String::from_utf8_lossy(&actual_body)
                         .replace(&*root.path().to_string_lossy(), "<JOURNAL_ROOT>")
                         .into_bytes();
@@ -210,6 +229,13 @@ pub(crate) mod tests {
                         };
                     }
                     serde_json::from_slice::<Value>(&actual_body)
+                        .map(|value| {
+                            if case.get("body_normalized").is_some() {
+                                normalize_journal_root(value, &root.path().to_string_lossy())
+                            } else {
+                                value
+                            }
+                        })
                         .map(|value| normalize(value, CTIME_PATHS))
                         .ok()
                         .as_ref()
@@ -230,7 +256,11 @@ pub(crate) mod tests {
                 if matches {
                     passed += 1;
                 } else {
-                    unexpected.push(format!("{phase} {method} {path}"));
+                    let body_prefix = String::from_utf8_lossy(&actual_body)
+                        .chars()
+                        .take(2000)
+                        .collect::<String>();
+                    unexpected.push(format!("{phase} {method} {path}: status={status}, content_type={content_type}, location={location:?}, body_prefix={body_prefix}"));
                 }
             }
         }

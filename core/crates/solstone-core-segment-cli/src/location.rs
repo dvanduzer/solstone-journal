@@ -79,11 +79,18 @@ impl SegmentLocation {
         } else {
             format!("{day}/{}/{}", identity.stream, identity.key)
         };
+        #[cfg(windows)]
+        let path = std::fs::canonicalize(segment.path()).map_err(|source| SegmentError::Io {
+            path: segment.path().to_path_buf(),
+            source,
+        })?;
+        #[cfg(not(windows))]
+        let path = segment.path().to_path_buf();
         Ok(Self {
             day: day.to_owned(),
             stream: identity.stream.to_owned(),
             segment: identity.key.to_owned(),
-            path: segment.path().to_path_buf(),
+            path,
             disk_rel,
             parent_rel,
             index_rel,

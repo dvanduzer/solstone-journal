@@ -21,6 +21,23 @@ pub(crate) struct Cooperation {
 impl Cooperation {
     pub(crate) fn admit(journal: &Path) -> Result<Self, String> {
         let root = JournalRoot::open(journal).map_err(|_| binding_hold())?;
+        #[cfg(windows)]
+        let root = {
+            // Admit the original spelling before canonicalizing coordinates.
+            // Both retained bindings must still identify that admitted object.
+            let canonical_path =
+                std::fs::canonicalize(root.canonical_path()).map_err(|_| binding_hold())?;
+            let canonical = JournalRoot::open(&canonical_path).map_err(|_| binding_hold())?;
+            if canonical.identity() != root.identity() {
+                return Err(binding_hold());
+            }
+            root.revalidate_canonical_binding()
+                .map_err(|_| binding_hold())?;
+            canonical
+                .revalidate_canonical_binding()
+                .map_err(|_| binding_hold())?;
+            canonical
+        };
         let activity = ActivityLease::try_acquire(Arc::new(root)).map_err(|error| match error {
             ActivityAdmissionError::Busy => activity_hold(),
             ActivityAdmissionError::Unavailable(_) => binding_hold(),
@@ -131,38 +148,58 @@ mod path_tests {
     #[test]
     fn native_targets_keep_the_admitted_binding_and_reserved_names() {
         let root = TempDir::new();
-        let guard = Cooperation::admit(root.path()).unwrap();
-        let target = guard
-            .journal()
-            .join("chronicle")
-            .join("20261014")
-            .join("work")
-            .join("120000_60");
+        let plain = root.path().to_path_buf();
+        let canonical = std::fs::canonicalize(&plain).unwrap();
         #[cfg(windows)]
         {
-            let native = target
-                .strip_prefix(guard.journal())
-                .unwrap()
-                .to_str()
-                .unwrap();
-            assert!(native.contains('\\'));
-            assert!(contained_path(guard.journal(), native).is_err());
+            use std::path::Prefix;
+            assert!(
+                matches!(plain.components().next(), Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::Disk(_)))
+            );
+            assert!(
+                matches!(canonical.components().next(), Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::VerbatimDisk(_)))
+            );
+            assert_ne!(plain, canonical);
+            let alias = std::path::PathBuf::from(plain.to_str().unwrap().replace('\\', "/"));
+            assert_eq!(std::fs::canonicalize(&alias).unwrap(), canonical);
+            assert!(JournalRoot::open(&alias).is_err());
+            assert!(Cooperation::admit(&alias).is_err());
         }
-        guard.target(&target).unwrap();
-        assert!(guard.target(root.path().parent().unwrap()).is_err());
-        assert!(guard.target(&guard.journal().join("../outside")).is_err());
-        for reserved in [
-            ".tmp-offload-owned",
-            ".removing_.tmp-offload-owned",
-            ".removing_.removing_.tmp-offload-owned",
-        ] {
-            assert!(guard.target(&guard.journal().join(reserved)).is_err());
+        for journal in [plain, canonical.clone()] {
+            let guard = Cooperation::admit(&journal).unwrap();
+            assert_eq!(guard.journal(), canonical);
+            let target = guard
+                .journal()
+                .join("chronicle")
+                .join("20261014")
+                .join("work")
+                .join("120000_60");
+            #[cfg(windows)]
+            {
+                let native = target
+                    .strip_prefix(guard.journal())
+                    .unwrap()
+                    .to_str()
+                    .unwrap();
+                assert!(native.contains('\\'));
+                assert!(contained_path(guard.journal(), native).is_err());
+            }
+            guard.target(&target).unwrap();
+            assert!(guard.target(guard.journal().parent().unwrap()).is_err());
+            assert!(guard.target(&guard.journal().join("../outside")).is_err());
+            for reserved in [
+                ".tmp-offload-owned",
+                ".removing_.tmp-offload-owned",
+                ".removing_.removing_.tmp-offload-owned",
+            ] {
+                assert!(guard.target(&guard.journal().join(reserved)).is_err());
+            }
+            #[cfg(unix)]
+            assert!(
+                guard
+                    .target(&guard.journal().join("literal\\name"))
+                    .is_err()
+            );
         }
-        #[cfg(unix)]
-        assert!(
-            guard
-                .target(&guard.journal().join("literal\\name"))
-                .is_err()
-        );
     }
 }
