@@ -9,11 +9,6 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use serde_json::Value;
-use solstone_core_assets::catalog;
-use solstone_core_journal_config::parakeet_coreml::{
-    default_parakeet_coreml_cache_dir, parakeet_coreml_model_root,
-    read_valid_parakeet_coreml_sentinel,
-};
 use solstone_core_local::install::pins;
 
 use crate::process::{Disposition, LaunchError, launch};
@@ -167,31 +162,15 @@ pub fn check_parakeet_coreml_cache(
     os_name: &str,
     arch: &str,
 ) -> Result<PathBuf, String> {
-    let cache = default_parakeet_coreml_cache_dir(home_dir);
-    let sentinel = read_valid_parakeet_coreml_sentinel(home_dir, os_name, arch);
-    let Some(sentinel) = sentinel else {
-        return Err(format!(
-            "parakeet check failed: sentinel not ready at {}",
-            cache.join(".install-complete").display()
-        ));
-    };
-    let configured = sentinel.cache_dir();
-    let model_root = parakeet_coreml_model_root(configured);
-    let complete = catalog()
-        .iter()
-        .filter(|artifact| artifact.unit == "parakeet-coreml")
-        .all(|artifact| model_root.join(artifact.filename).is_file());
-    complete.then_some(configured.to_path_buf()).ok_or_else(|| {
-        format!(
-            "parakeet check failed: cache verification failed at {}",
-            configured.display()
-        )
-    })
+    solstone_core_local::install::coreml_install::check_parakeet_coreml_cache_doctor(
+        home_dir, os_name, arch,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solstone_core_assets::catalog;
     use solstone_core_journal_config::parakeet_coreml::{
         default_parakeet_coreml_cache_dir, parakeet_coreml_model_root,
     };
@@ -241,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn coreml_override_uses_default_sentinel_and_configured_complete_tree() {
+    fn coreml_readiness_rejects_unverified_files_with_configured_complete_tree() {
         let home = tempdir().unwrap();
         let cache = home.path().join("configured/cache");
         let model_root = parakeet_coreml_model_root(&cache);
@@ -281,10 +260,7 @@ mod tests {
             cache.parent().unwrap().join("parakeet-tdt-0.6b-v3")
         );
 
-        assert_eq!(
-            check_parakeet_coreml_cache(home.path(), "darwin", "arm64").unwrap(),
-            cache
-        );
+        assert!(check_parakeet_coreml_cache(home.path(), "darwin", "arm64").is_err());
     }
 
     #[test]

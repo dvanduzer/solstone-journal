@@ -69,6 +69,8 @@ pub struct ParakeetCoremlSentinel {
     fluidaudio_version: Value,
     platform: ParakeetCoremlSentinelPlatform,
     cache_dir: PathBuf,
+    #[serde(default)]
+    catalog_version: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,7 +80,13 @@ struct ParakeetCoremlSentinelPlatform {
 }
 
 impl ParakeetCoremlSentinel {
-    pub fn new(cache_dir: PathBuf, os_name: &str, arch: &str, fluidaudio_version: &str) -> Self {
+    pub fn new(
+        cache_dir: PathBuf,
+        os_name: &str,
+        arch: &str,
+        fluidaudio_version: &str,
+        catalog_version: &str,
+    ) -> Self {
         Self {
             schema_version: 1,
             backend: "parakeet".to_owned(),
@@ -91,11 +99,16 @@ impl ParakeetCoremlSentinel {
                 arch: arch.to_owned(),
             },
             cache_dir,
+            catalog_version: catalog_version.to_owned(),
         }
     }
 
     pub fn cache_dir(&self) -> &Path {
         &self.cache_dir
+    }
+
+    pub fn catalog_version(&self) -> &str {
+        &self.catalog_version
     }
 
     fn is_valid_for(&self, os_name: &str, arch: &str) -> bool {

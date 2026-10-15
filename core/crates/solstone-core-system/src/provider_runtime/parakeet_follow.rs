@@ -875,4 +875,82 @@ mod tests {
         assert_eq!(res_b, ParakeetFollowDecision::Hold("backoff".into()));
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
+
+    #[test]
+    fn boot_version_record_does_not_affect_parakeet_follow_decisions() {
+        let journal = tempfile::tempdir().unwrap();
+        let health = journal.path().join("health");
+        std::fs::create_dir_all(&health).unwrap();
+        let boot_path = health.join("boot-version.json");
+
+        let launches = Arc::new(AtomicU32::new(0));
+        let launches_clone = launches.clone();
+        let launcher: LocalInstallerLauncher = Arc::new(move |_| {
+            launches_clone.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+
+        let cpu = proof_missing();
+        let vulkan = proof_ready();
+        let model = proof_ready();
+        let record = record_installed("2026-09-01T12:00:00Z");
+        let moved_input = ParakeetFollowInput {
+            cpu_proof: &cpu,
+            vulkan_proof: &vulkan,
+            model_proof: &model,
+            desired: true,
+            blocked: false,
+            model_installed_before: true,
+            record: Some(&record),
+            now: dummy_now(),
+        };
+
+        std::fs::write(
+            &boot_path,
+            serde_json::json!({ "schema": 1, "product_version": env!("CARGO_PKG_VERSION") })
+                .to_string(),
+        )
+        .unwrap();
+        let follow1 = ParakeetFollow::new(Arc::clone(&launcher));
+        assert_eq!(
+            follow1.observe_at(journal.path(), &moved_input, || Ok(false), Instant::now()),
+            ParakeetFollowDecision::Launch
+        );
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+
+        std::fs::write(
+            &boot_path,
+            serde_json::json!({ "schema": 1, "product_version": "0.0.0-older" }).to_string(),
+        )
+        .unwrap();
+        let follow2 = ParakeetFollow::new(Arc::clone(&launcher));
+        assert_eq!(
+            follow2.observe_at(journal.path(), &moved_input, || Ok(false), Instant::now()),
+            ParakeetFollowDecision::Launch
+        );
+        assert_eq!(launches.load(Ordering::SeqCst), 2);
+
+        let ready = proof_ready();
+        let ready_input = ParakeetFollowInput {
+            cpu_proof: &ready,
+            vulkan_proof: &ready,
+            model_proof: &ready,
+            desired: true,
+            blocked: false,
+            model_installed_before: true,
+            record: Some(&record),
+            now: dummy_now(),
+        };
+        let follow3 = ParakeetFollow::new(Arc::clone(&launcher));
+        assert_eq!(
+            follow3.observe_at(journal.path(), &ready_input, || Ok(false), Instant::now()),
+            ParakeetFollowDecision::Hold("ready".to_owned())
+        );
+        let follow4 = ParakeetFollow::new(Arc::clone(&launcher));
+        assert_eq!(
+            follow4.observe_at(journal.path(), &ready_input, || Ok(false), Instant::now()),
+            ParakeetFollowDecision::Hold("ready".to_owned())
+        );
+        assert_eq!(launches.load(Ordering::SeqCst), 2);
+    }
 }
