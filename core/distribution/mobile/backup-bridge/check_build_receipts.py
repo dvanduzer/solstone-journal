@@ -18,7 +18,7 @@ import backup_bridge_build as bridge_build
 
 class TestBackupBridgeBuild(unittest.TestCase):
     def test_native_http_closure_refuses_selected_or_linked_qualification_authority(self):
-        selection = {"CgoFiles": ["native_http_apple.go"], "MFiles": ["native_http_darwin.m"]}
+        selection = {"CgoFiles": ["native_http_apple.go", "s3_owner_policy_apple.go"], "MFiles": ["native_http_darwin.m", "s3_owner_policy_darwin.m"]}
         bridge_build.check_native_http_closure(selection, "ios", "public ABI", "fixed native symbols")
         for field, bad in (("CgoFiles", "native_http_testhooks_apple.go"), ("MFiles", "native_http_testhooks_darwin.m")):
             changed = {key: list(value) for key, value in selection.items()}
@@ -29,6 +29,13 @@ class TestBackupBridgeBuild(unittest.TestCase):
             bridge_build.check_native_http_closure(selection, "ios", "public ABI", "_sb_http_test_install")
         with self.assertRaisesRegex(ValueError, "private HTTP authority"):
             bridge_build.check_native_http_closure(selection, "ios", "void sb_http_cancel();", "fixed native symbols")
+        with self.assertRaisesRegex(ValueError, "private HTTP authority"):
+            bridge_build.check_native_http_closure(selection, "ios", "int sb_s3_owner_file_policy();", "fixed native symbols")
+        for missing in ("native_http_darwin.m", "s3_owner_policy_darwin.m"):
+            changed = {key: list(value) for key, value in selection.items()}
+            changed["MFiles"].remove(missing)
+            with self.assertRaisesRegex(ValueError, "closure is missing or widened"):
+                bridge_build.check_native_http_closure(changed, "ios", "public ABI", "fixed native symbols")
 
     def staged_build(self, root, target="linux"):
         work = root / "build"

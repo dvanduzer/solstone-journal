@@ -65,14 +65,15 @@ const (
 
 // Internal Go representation of caller request parameters.
 type bridgeRequest struct {
-	operation        int32
-	password         []byte
-	recoveryPassword []byte
-	repoPath         string
-	sourcePath       string
-	sourceName       string
-	restorePath      string
-	snapshotID       string
+	operation         int32
+	password          []byte
+	recoveryPassword  []byte
+	repoPath          string
+	sourcePath        string
+	sourceName        string
+	restorePath       string
+	snapshotID        string
+	snapshotSelection *snapshotSelection
 	// pathFiles pin caller-authorized directories for the complete asynchronous
 	// operation.
 	pathFiles            []*os.File
@@ -91,6 +92,7 @@ type bridgeRequest struct {
 	restoreStageName     string
 	restorePublished     bool
 	pathsPinned          bool
+	remote               *s3RemoteRequest
 }
 
 // Internal Go representation of call results.
@@ -101,4 +103,8 @@ type bridgeResult struct {
 	snapshotCount uint32
 	snapshotIDs   []string
 	diagnostic    string
+	// Optional read metadata has its own bounded-output outcome. Failure to
+	// encode metadata never changes an existing operation's legacy result.
+	metadata       []byte
+	metadataStatus int32
 }

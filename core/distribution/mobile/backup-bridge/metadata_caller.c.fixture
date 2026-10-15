@@ -1,0 +1,48 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 sol pbc
+#include "librestic_bridge.h"
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int inspect(char *repo, int operation) {
+    restic_request req = {0};
+    req.operation = operation;
+    req.password = "host-abi-fixture-password";
+    req.password_len = (uint32_t)strlen(req.password);
+    req.repo_path = repo; req.repo_path_len = (uint32_t)strlen(repo);
+    restic_result *result = calloc(1,sizeof(*result));
+    uint64_t id = 0;
+    if (!result || restic_bridge_start(&req,&id) || !id || restic_bridge_wait(id,result) || result->status) return 1;
+    uint32_t required = 123;
+    if (restic_bridge_result_metadata(id,NULL,0,&required) != 5 || !required || required > 4*1024*1024) return 2;
+    char *payload = malloc((size_t)required+1);
+    if (!payload) return 3;
+    memset(payload,0x5a,(size_t)required+1);
+    uint32_t size = 0;
+    if (restic_bridge_result_metadata(id,payload,required-1,&size) != 5 || size != required) return 4;
+    for (uint32_t n=0;n<=required;n++) if ((unsigned char)payload[n] != 0x5a) return 5;
+    if (restic_bridge_result_metadata(id,payload,required,&size) || size != required || (unsigned char)payload[required] != 0x5a) return 6;
+    payload[required] = 0;
+    if (!strstr(payload,"\"schema\":\"solstone.backup-metadata.v1\"")) return 7;
+    if (operation == 2 && (!strstr(payload,"\"kind\":\"repository-config\"") || !strstr(payload,"\"repository\":{"))) return 8;
+    if (operation == 5 && (!strstr(payload,"\"kind\":\"snapshot-catalog\"") || result->snapshot_count != 1 || !strstr(payload,result->snapshot_ids[0]))) return 9;
+    if (restic_bridge_free(id)) return 10;
+    size = 123;
+    if (restic_bridge_result_metadata(id,payload,required,&size) != 7 || size) return 11;
+    free(payload); free(result);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc != 2) return 20;
+    uint32_t required = 123;
+    if (restic_bridge_result_metadata(0,NULL,0,&required) != 7 || required) return 21;
+    if (restic_bridge_result_metadata(0,(char *)(uintptr_t)1,4*1024*1024+1,&required) != 1 || required) return 22;
+    if (restic_bridge_result_metadata(0,NULL,1,&required) != 1 || required) return 23;
+    if (restic_bridge_result_metadata(0,NULL,0,NULL) != 1) return 24;
+    int code = inspect(argv[1],2);
+    if (code) return 30+code;
+    code = inspect(argv[1],5);
+    return code ? 50+code : 0;
+}

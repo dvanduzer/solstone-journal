@@ -30,7 +30,7 @@ func isMetadataNonce(name string) bool {
 }
 
 func pinMetadataWorkspace(req *bridgeRequest, path string) (resultErr error) {
-	if req.operation != OpSnapshot || req.metadataRoot != nil || req.sourceRoot == nil || req.repoRoot == nil {
+	if req.operation != OpSnapshot || req.metadataRoot != nil || req.sourceRoot == nil || req.repoRoot == nil && req.remote == nil {
 		return errors.New("invalid metadata workspace operation")
 	}
 	if err := sanitizePath(path); err != nil {
@@ -58,7 +58,11 @@ func pinMetadataWorkspace(req *bridgeRequest, path string) (resultErr error) {
 	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		return err
 	}
-	for _, root := range []*os.Root{req.sourceRoot, req.repoRoot} {
+	protectedRoot := req.repoRoot
+	if req.remote != nil {
+		protectedRoot = req.remote.owner.root
+	}
+	for _, root := range []*os.Root{req.sourceRoot, protectedRoot} {
 		other, err := root.OpenFile(".", os.O_RDONLY, 0)
 		if err != nil {
 			return err

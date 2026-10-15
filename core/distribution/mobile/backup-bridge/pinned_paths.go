@@ -96,7 +96,12 @@ func pinRequestPaths(req *bridgeRequest) (err error) {
 		return err
 	}
 	req.repoRoot = repoRoot
+	return pinDataPaths(req, []*os.File{repo})
+}
 
+// Each protected directory is real local custody (repository or private remote
+// state), not a fabricated local repository for a remote operation.
+func pinDataPaths(req *bridgeRequest, protected []*os.File) (err error) {
 	var source *os.File
 	if req.operation == OpSnapshot || req.operation == OpRestore {
 		originalSource := req.sourcePath
@@ -105,11 +110,13 @@ func pinRequestPaths(req *bridgeRequest) (err error) {
 			return err
 		}
 		req.pathFiles = append(req.pathFiles, source)
-		if overlap, overlapErr := pinnedDirectoriesOverlap(repo, source); overlapErr != nil || overlap {
-			if overlapErr != nil {
-				return overlapErr
+		for _, other := range protected {
+			if overlap, overlapErr := pinnedDirectoriesOverlap(other, source); overlapErr != nil || overlap {
+				if overlapErr != nil {
+					return overlapErr
+				}
+				return errPathOverlap
 			}
-			return errPathOverlap
 		}
 		sourceRoot, err := adoptRoot(originalSource, source)
 		if err != nil {
@@ -139,7 +146,7 @@ func pinRequestPaths(req *bridgeRequest) (err error) {
 		} else if !errors.Is(statErr, unix.ENOENT) {
 			return statErr
 		}
-		for _, other := range []*os.File{repo, source} {
+		for _, other := range append(append([]*os.File(nil), protected...), source) {
 			if other == nil {
 				continue
 			}

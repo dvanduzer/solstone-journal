@@ -181,7 +181,7 @@ func executeInit(ctx context.Context, req bridgeRequest, setWrote func()) (bridg
 		return bridgeResult{status: StatusCancelled, diagnostic: DiagCancelled}, ctx.Err()
 	}
 
-	be, err := createRootBackend(req.repoRoot)
+	be, err := operationBackend(ctx, req, true)
 	if err != nil {
 		return bridgeResult{status: StatusFailed, diagnostic: DiagIoFailed}, err
 	}
@@ -208,7 +208,7 @@ func executeInit(ctx context.Context, req bridgeRequest, setWrote func()) (bridg
 
 	if err != nil {
 		keyID := repo.KeyID()
-		if !keyID.IsNull() {
+		if req.remote == nil && !keyID.IsNull() {
 			// If Init returned an error, repo.KeyID() is set, and the config file is absent,
 			// remove that one key file through the *local.Local backend so a later init is not wedged.
 			_, statErr := be.Stat(ctx, backend.Handle{Type: restic.ConfigFile})
@@ -220,7 +220,11 @@ func executeInit(ctx context.Context, req bridgeRequest, setWrote func()) (bridg
 		if ctx.Err() != nil {
 			return bridgeResult{status: StatusCancelledUncertain, diagnostic: DiagCancelledUncertain}, ctx.Err()
 		}
-		return bridgeResult{status: StatusFailed, diagnostic: DiagRepoExists}, err
+		diagnostic := DiagRepoExists
+		if req.remote != nil {
+			diagnostic = s3InitFailureDiagnostic(err)
+		}
+		return bridgeResult{status: StatusFailed, diagnostic: diagnostic}, err
 	}
 
 	return bridgeResult{status: StatusOk, keyID: repo.KeyID().String()}, nil
@@ -238,7 +242,7 @@ func executeOpen(ctx context.Context, req bridgeRequest) (bridgeResult, error) {
 	pw, clearPw := passwordString(req.password)
 	defer clearPw()
 
-	be, err := newRootBackend(req.repoRoot)
+	be, err := operationBackend(ctx, req, false)
 	if err != nil {
 		return bridgeResult{status: StatusFailed, diagnostic: DiagRepoMissing}, err
 	}
@@ -263,7 +267,8 @@ func executeOpen(ctx context.Context, req bridgeRequest) (bridgeResult, error) {
 	defer unlock()
 	_ = lockCtx
 
-	return bridgeResult{status: StatusOk, keyID: keyID.String()}, nil
+	metadata, metadataStatus := repositoryMetadata(repo.Config())
+	return bridgeResult{status: StatusOk, keyID: keyID.String(), metadata: metadata, metadataStatus: metadataStatus}, nil
 }
 
 // executeAddRecoveryKey adds a recovery key wrapping the existing master key.
@@ -285,7 +290,7 @@ func executeAddRecoveryKey(ctx context.Context, req bridgeRequest, setWrote func
 	recPw, clearRec := passwordString(req.recoveryPassword)
 	defer clearRec()
 
-	be, err := newRootBackend(req.repoRoot)
+	be, err := operationBackend(ctx, req, false)
 	if err != nil {
 		return bridgeResult{status: StatusFailed, diagnostic: DiagRepoMissing}, err
 	}
@@ -340,7 +345,7 @@ func executeAddRecoveryKey(ctx context.Context, req bridgeRequest, setWrote func
 
 	// Verification is a separate backend open and safe scan with only the recovery password.
 	verified := false
-	beVerify, err := newRootBackend(req.repoRoot)
+	beVerify, err := operationBackend(lockCtx, req, false)
 	if err == nil {
 		repoVerify, err := repository.New(guardedBackend{beVerify}, repository.Options{})
 		if err == nil {
@@ -355,7 +360,9 @@ func executeAddRecoveryKey(ctx context.Context, req bridgeRequest, setWrote func
 	if !verified {
 		// (*Local).Remove discards its context.
 		// RemoveKey refuses when id == repo.KeyID(), which is why it must be the daily-opened repo.
-		_ = repository.RemoveKey(lockCtx, repo, newID)
+		if req.remote == nil {
+			_ = repository.RemoveKey(lockCtx, repo, newID)
+		}
 		if lockCtx.Err() != nil {
 			return bridgeResult{status: StatusCancelledUncertain, diagnostic: DiagCancelledUncertain}, lockCtx.Err()
 		}
@@ -381,7 +388,7 @@ func executeSnapshot(ctx context.Context, req bridgeRequest, setWrote func()) (b
 	pw, clearPw := passwordString(req.password)
 	defer clearPw()
 
-	be, err := newRootBackend(req.repoRoot)
+	be, err := operationBackend(ctx, req, false)
 	if err != nil {
 		return bridgeResult{status: StatusFailed, diagnostic: DiagRepoMissing}, err
 	}
@@ -426,6 +433,9 @@ func executeSnapshot(ctx context.Context, req bridgeRequest, setWrote func()) (b
 	}
 	rootFS := newRootFS(req.sourceRoot, sourceName, req.metadataRoot)
 	arch := archiver.New(repo, rootFS, archiver.Options{})
+	if req.snapshotSelection != nil {
+		arch.SelectByName = func(item string) bool { return req.snapshotSelection.permits(lockCtx, rootFS, item) }
+	}
 	// Upstream worker paths call Error for non-context failures. Returning the
 	// original error both aborts on first item failure and avoids a nil callback
 	// if cancellation races an in-flight filesystem operation.
@@ -437,6 +447,9 @@ func executeSnapshot(ctx context.Context, req bridgeRequest, setWrote func()) (b
 	}
 
 	_, snID, _, err := arch.Snapshot(lockCtx, []string{sourceName}, opts)
+	if req.snapshotSelection != nil {
+		err = errors.Join(err, req.snapshotSelection.failure())
+	}
 	if err != nil {
 		if strings.Contains(err.Error(), "snapshot is empty") {
 			return bridgeResult{status: StatusFailed, diagnostic: DiagSnapshotEmpty}, err
@@ -462,7 +475,7 @@ func executeListSnapshots(ctx context.Context, req bridgeRequest) (bridgeResult,
 	pw, clearPw := passwordString(req.password)
 	defer clearPw()
 
-	be, err := newRootBackend(req.repoRoot)
+	be, err := operationBackend(ctx, req, false)
 	if err != nil {
 		return bridgeResult{status: StatusFailed, diagnostic: DiagRepoMissing}, err
 	}
@@ -489,8 +502,9 @@ func executeListSnapshots(ctx context.Context, req bridgeRequest) (bridgeResult,
 
 	var ids []string
 	var idsMu sync.Mutex
+	var metadata snapshotMetadataCollector
 	overflow := false
-	err = data.ForAllSnapshots(lockCtx, repo, repo, nil, func(id restic.ID, _ *data.Snapshot, err error) error {
+	err = data.ForAllSnapshots(lockCtx, repo, repo, nil, func(id restic.ID, snapshot *data.Snapshot, err error) error {
 		idsMu.Lock()
 		defer idsMu.Unlock()
 		if err != nil {
@@ -501,6 +515,7 @@ func executeListSnapshots(ctx context.Context, req bridgeRequest) (bridgeResult,
 			return errResourceLimit
 		}
 		ids = append(ids, id.String())
+		metadata.add(id, snapshot)
 		return nil
 	})
 	if overflow {
@@ -513,7 +528,9 @@ func executeListSnapshots(ctx context.Context, req bridgeRequest) (bridgeResult,
 		return refusalResult(err, scrubError(err, req)), err
 	}
 	sort.Strings(ids)
-	return clipSnapshotIDs(ids), nil
+	result := clipSnapshotIDs(ids)
+	result.metadata, result.metadataStatus = metadata.finish()
+	return result, nil
 }
 
 // silentRestoreProgressPrinter implements restore.ProgressPrinter without output.
@@ -542,7 +559,7 @@ func executeRestoreWithPublisher(ctx context.Context, req *bridgeRequest, setWro
 	pw, clearPw := passwordString(req.password)
 	defer clearPw()
 
-	be, err := newRootBackend(req.repoRoot)
+	be, err := operationBackend(ctx, *req, false)
 	if err != nil {
 		return bridgeResult{status: StatusFailed, diagnostic: DiagRepoMissing}, err
 	}
@@ -644,7 +661,7 @@ func executeCheck(ctx context.Context, req bridgeRequest) (bridgeResult, error) 
 	pw, clearPw := passwordString(req.password)
 	defer clearPw()
 
-	be, err := newRootBackend(req.repoRoot)
+	be, err := operationBackend(ctx, req, false)
 	if err != nil {
 		return bridgeResult{status: StatusFailed, diagnostic: DiagRepoMissing}, err
 	}

@@ -75,13 +75,16 @@ def check_native_http_closure(selection, target, header, symbols):
     if any("testhooks" in name or "_probe" in name for name in names):
         raise ValueError("qualification hooks selected in production archive")
     if target == "ios":
-        if "native_http_apple.go" not in selected["CgoFiles"] or selected["MFiles"] != ["native_http_darwin.m"]:
-            raise ValueError("fixed Apple HTTP closure is missing or widened")
+        if (
+            not {"native_http_apple.go", "s3_owner_policy_apple.go"}.issubset(selected["CgoFiles"])
+            or sorted(selected["MFiles"]) != ["native_http_darwin.m", "s3_owner_policy_darwin.m"]
+        ):
+            raise ValueError("fixed Apple HTTP/state-policy closure is missing or widened")
     elif selected["MFiles"] or "native_http_other.go" not in selected["GoFiles"]:
         raise ValueError("non-Apple HTTP platform boundary changed")
     if any(token in symbols for token in ("sb_http_test_", "SBHTTPFixtureProtocol", "restic_bridge_http_probe")):
         raise ValueError("qualification symbols present in production archive")
-    if any(token in header for token in ("sb_http_", "native_http_internal", "restic_bridge_http_probe")):
+    if any(token in header for token in ("sb_http_", "sb_s3_owner_", "native_http_internal", "restic_bridge_http_probe")):
         raise ValueError("private HTTP authority escaped into public header")
     return selected
 
@@ -404,12 +407,33 @@ int main(void) {{
         self.run_step("host-c-link", host_link, cwd=host_artifacts, env=env)
         self.run_step("host-c-run", [host_caller_bin], cwd=host_artifacts, env=env)
 
+        metadata_caller = host_artifacts / "metadata-caller.c"
+        shutil.copy2(BRIDGE_SRC_PATH / "metadata_caller.c.fixture", metadata_caller)
+        metadata_bin = host_artifacts / "metadata-caller"
+        metadata_link = [str(item) if item not in (host_caller, host_caller_bin) else str(metadata_caller if item == host_caller else metadata_bin) for item in host_link]
+        self.run_step("metadata-c-link", metadata_link, cwd=host_artifacts, env=env)
+        self.run_step("metadata-c-run", [metadata_bin, abi_repo], cwd=host_artifacts, env=env)
+
+        selection_caller = host_artifacts / "selection-caller.c"
+        shutil.copy2(BRIDGE_SRC_PATH / "snapshot_selection_caller.c.fixture", selection_caller)
+        selection_bin = host_artifacts / "selection-caller"
+        selection_link = [str(item) if item not in (host_caller, host_caller_bin) else str(selection_caller if item == host_caller else selection_bin) for item in host_link]
+        self.run_step("selection-c-link", selection_link, cwd=host_artifacts, env=env)
+        self.run_step("selection-c-run", [selection_bin, host_artifacts], cwd=host_artifacts, env=env)
+
         workspace_caller = host_artifacts / "workspace-caller.c"
         shutil.copy2(BRIDGE_SRC_PATH / "workspace_caller.c.fixture", workspace_caller)
         workspace_bin = host_artifacts / "workspace-caller"
         workspace_link = [str(item) if item not in (host_caller, host_caller_bin) else str(workspace_caller if item == host_caller else workspace_bin) for item in host_link]
         self.run_step("workspace-c-link", workspace_link, cwd=host_artifacts, env=env)
         self.run_step("workspace-c-run", [workspace_bin, host_artifacts], cwd=host_artifacts, env=env)
+
+        s3_caller = host_artifacts / "s3-caller.c"
+        shutil.copy2(BRIDGE_SRC_PATH / "s3_caller.c.fixture", s3_caller)
+        s3_bin = host_artifacts / "s3-caller"
+        s3_link = [str(item) if item not in (host_caller, host_caller_bin) else str(s3_caller if item == host_caller else s3_bin) for item in host_link]
+        self.run_step("s3-c-link", s3_link, cwd=host_artifacts, env=env)
+        self.run_step("s3-c-run", [s3_bin, host_artifacts], cwd=host_artifacts, env=env)
 
         # Host behavioral execution above is independent of the device target.
         env.update(GOOS=goos, GOARCH=goarch)
@@ -476,7 +500,11 @@ int main(void) {{
             '    int32_t cancelled = restic_bridge_cancel(0);\n'
             '    int32_t waited = restic_bridge_wait(0, 0);\n'
             '    int32_t freed = restic_bridge_free(0);\n'
-            '    return rc == 0 || cancelled == 0 || waited == 0 || freed == 0 ? 1 : 0;\n'
+            '    uint32_t required = 0;\n'
+            '    int32_t metadata = restic_bridge_result_metadata(0, 0, 0, &required);\n'
+            '    int32_t selected = restic_bridge_snapshot_v1_start(0, 0, 0, 0, 0, &id);\n'
+            '    int32_t remote_selected = restic_bridge_s3_snapshot_v1_start(0, 0, 0, &id);\n'
+            '    return rc == 0 || cancelled == 0 || waited == 0 || freed == 0 || metadata == 0 || selected == 0 || remote_selected == 0 ? 1 : 0;\n'
             '}\n'
         )
         caller_bin = artifacts_dir / "caller-link"

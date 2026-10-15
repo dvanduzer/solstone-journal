@@ -1,0 +1,158 @@
+//go:build darwin || ios || linux
+
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 sol pbc
+
+// Qualification-only addition to an exact production module. This file is not
+// selected by the maintained production archive recipe.
+package main
+
+/*
+#include <stdint.h>
+*/
+import "C"
+
+import (
+	"encoding/json"
+	"errors"
+	"io"
+	"os"
+	"strings"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
+)
+
+type policyProbeCommit struct {
+	BeforeDevice   uint64 `json:"before_device"`
+	BeforeInode    uint64 `json:"before_inode"`
+	BeforeSize     int64  `json:"before_size"`
+	AfterDevice    uint64 `json:"after_device"`
+	AfterInode     uint64 `json:"after_inode"`
+	AfterSize      int64  `json:"after_size"`
+	PolicyReadOnly bool   `json:"policy_read_only"`
+}
+
+type policyProbeResult struct {
+	Passed  bool                `json:"passed"`
+	Reason  string              `json:"reason"`
+	Commits []policyProbeCommit `json:"commits"`
+}
+
+func runOwnerPolicyProbe(path string) (policyProbeResult, int32) {
+	result := policyProbeResult{Reason: "OWNER_POLICY_PROBE_FAILED", Commits: []policyProbeCommit{}}
+	// Invalid synthetic destination: this entry never constructs a backend.
+	cfg := s3Config{endpoint: "https://invalid.example", region: "local-only", bucket: "synthetic-owner-policy", prefix: "local-only",
+		access: "qualification-only-access", secret: "qualification-only-secret"}
+	owner, err := newS3Owner(path, cfg)
+	if err != nil {
+		if errors.Is(err, errS3OwnerPolicy) {
+			result.Reason = "OWNER_POLICY_REFUSED"
+			return result, 2
+		}
+		result.Reason = "OWNER_ADMISSION_REFUSED"
+		return result, 1
+	}
+	defer func() {
+		_ = owner.drainPrimary()
+		_ = owner.Close()
+	}()
+	if owner.exists {
+		result.Reason = "OWNER_NOT_FRESH"
+		return result, 1
+	}
+	var before *policyProbeCommit
+	owner.fault = func(stage string) error {
+		switch stage {
+		case "before-secret-write":
+			if before != nil {
+				return errS3OwnerInvalid
+			}
+			fd, err := unix.Openat(int(owner.directory.Fd()), ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+			if err != nil {
+				return err
+			}
+			listing := os.NewFile(uintptr(fd), "policy probe directory")
+			names, readErr := listing.Readdirnames(4)
+			closeErr := listing.Close()
+			if readErr != nil && !errors.Is(readErr, io.EOF) || closeErr != nil {
+				return errS3OwnerIO
+			}
+			var temporary string
+			for _, name := range names {
+				if strings.HasPrefix(name, s3OwnerTempPrefix) && strings.HasSuffix(name, ".tmp") {
+					if temporary != "" {
+						return errS3OwnerInvalid
+					}
+					temporary = name
+				} else if name != s3OwnerStateName {
+					return errS3OwnerInvalid
+				}
+			}
+			if temporary == "" {
+				return errS3OwnerInvalid
+			}
+			fd, err = unix.Openat(int(owner.directory.Fd()), temporary, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+			if err != nil {
+				return err
+			}
+			file := os.NewFile(uintptr(fd), "actual owner temporary before payload")
+			var info unix.Stat_t
+			valid := privateS3StateFile(file) && unix.Fstat(fd, &info) == nil && info.Size == 0 && s3StateFilePolicy(fd, false) == nil
+			matches, matchErr := pinnedEntryMatches(int(owner.directory.Fd()), temporary, file)
+			closed := file.Close()
+			if !valid || !matches || matchErr != nil || closed != nil {
+				return errS3OwnerPolicy
+			}
+			before = &policyProbeCommit{BeforeDevice: uint64(info.Dev), BeforeInode: info.Ino, BeforeSize: info.Size, PolicyReadOnly: true}
+		case "directory-sync":
+			if before == nil || owner.stateFile == nil {
+				return errS3OwnerInvalid
+			}
+			fd := int(owner.stateFile.Fd())
+			var info unix.Stat_t
+			if !privateS3StateFile(owner.stateFile) || unix.Fstat(fd, &info) != nil || info.Size <= 0 || s3StateFilePolicy(fd, false) != nil {
+				return errS3OwnerPolicy
+			}
+			matches, err := pinnedEntryMatches(int(owner.directory.Fd()), s3OwnerStateName, owner.stateFile)
+			if err != nil || !matches || uint64(info.Dev) != before.BeforeDevice || info.Ino != before.BeforeInode {
+				return errS3OwnerInvalid
+			}
+			before.AfterDevice, before.AfterInode, before.AfterSize = uint64(info.Dev), info.Ino, info.Size
+			result.Commits = append(result.Commits, *before)
+			before = nil
+		}
+		return nil
+	}
+	// Both writes use the unchanged actual owner persistence implementation.
+	for range 2 {
+		if owner.begin(OpOpen, cfg, []byte("qualification-only-password")) != nil {
+			return result, 1
+		}
+	}
+	if before != nil || len(result.Commits) != 2 || owner.drainPrimary() != nil || owner.Close() != nil {
+		return result, 1
+	}
+	result.Passed, result.Reason = true, ""
+	return result, 0
+}
+
+//export restic_bridge_probe_s3_owner_policy
+func restic_bridge_probe_s3_owner_policy(path *C.char, pathLen C.uint32_t, output *C.char, outputCap C.uint32_t) C.int32_t {
+	if path == nil || pathLen == 0 || pathLen > maxPathLen || output == nil || outputCap < 4096 || outputCap > 16384 {
+		return 1
+	}
+	name := string(copyCBytes(path, pathLen))
+	if sanitizePath(name) != nil {
+		return 1
+	}
+	result, status := runOwnerPolicyProbe(name)
+	encoded, err := json.Marshal(result)
+	if err != nil || len(encoded)+1 > int(outputCap) {
+		return 1
+	}
+	buffer := unsafe.Slice((*byte)(unsafe.Pointer(output)), int(outputCap))
+	copy(buffer, encoded)
+	buffer[len(encoded)] = 0
+	return C.int32_t(status)
+}

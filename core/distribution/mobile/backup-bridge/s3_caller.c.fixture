@@ -1,0 +1,105 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 sol pbc
+#include "librestic_bridge.h"
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#if defined(__APPLE__)
+#include <CoreFoundation/CoreFoundation.h>
+#endif
+
+_Static_assert(offsetof(restic_s3_request, version) == 0, "version layout changed");
+_Static_assert(offsetof(restic_s3_request, operation) == 4, "operation layout changed");
+_Static_assert(offsetof(restic_s3_request, endpoint) == 8, "field layout changed");
+_Static_assert(sizeof(restic_s3_request) == 232, "64-bit S3 request layout changed");
+
+static int refused(restic_s3_request *req, int32_t expected) {
+    uint64_t id = 123;
+    int32_t got = restic_bridge_s3_start(req, &id);
+    return got == expected && id == 0 ? 0 : 1;
+}
+
+int main(int argc, char **argv) {
+    if (argc != 2) return 1;
+    char state[4096];
+    int count = snprintf(state, sizeof(state), "%s/s3-abi-state", argv[1]);
+    if (count <= 0 || (size_t)count >= sizeof(state) || mkdir(state, 0700)) return 2;
+#if defined(__APPLE__)
+    CFURLRef root = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)state, strlen(state), true);
+    CFErrorRef error = NULL;
+    if (!root || !CFURLSetResourcePropertyForKey(root, kCFURLIsExcludedFromBackupKey, kCFBooleanTrue, &error)) return 3;
+    CFRelease(root);
+#endif
+    restic_s3_request req = {0};
+    req.version = 1; req.operation = 8;
+#define FIELD(name, value) req.name = value; req.name##_len = (uint32_t)strlen(value)
+    FIELD(endpoint, "https://storage.example");
+    FIELD(region, "fixture-region");
+    FIELD(bucket, "fixture-bucket");
+    FIELD(prefix, "fixture-prefix");
+    FIELD(access_key, "fixture-access");
+    FIELD(secret_key, "fixture-secret");
+    FIELD(state_path, state);
+#undef FIELD
+    if (refused(NULL, 1) || restic_bridge_s3_start(&req, NULL) != 1) return 4;
+    restic_s3_request bad = req;
+    bad.version = 2;
+    if (refused(&bad, 1)) return 5;
+    bad = req; bad.operation = 9;
+    if (refused(&bad, 1)) return 6;
+    // A non-dereferenceable pointer in each field is rejected by its length cap
+    // before *any* foreign payload copy. NULL/nonzero pairs refuse separately.
+#define BAD_FIELD(name, cap) \
+    bad = req; bad.name = (char *)(uintptr_t)1; bad.name##_len = (cap) + 1; \
+    if (refused(&bad, 5)) return 10; \
+    bad = req; bad.name = NULL; bad.name##_len = 1; \
+    if (refused(&bad, 1)) return 11
+    BAD_FIELD(endpoint, 8192); BAD_FIELD(region, 64); BAD_FIELD(bucket, 63);
+    BAD_FIELD(prefix, 512); BAD_FIELD(access_key, 256); BAD_FIELD(secret_key, 1024);
+    BAD_FIELD(session_token, 16384); BAD_FIELD(password, 256); BAD_FIELD(recovery_password, 256);
+    BAD_FIELD(state_path, 4096); BAD_FIELD(source_path, 4096); BAD_FIELD(restore_path, 4096);
+    BAD_FIELD(snapshot_id, 64); BAD_FIELD(workspace_path, 4096);
+#undef BAD_FIELD
+    bad = req; bad.password = "unexpected"; bad.password_len = 10;
+    if (refused(&bad, 1)) return 12;
+    bad = req; bad.operation = 1;
+    if (refused(&bad, 1)) return 13;
+    restic_result *result = calloc(1, sizeof(*result));
+    if (!result) return 14;
+    uint64_t id = 0;
+    char original_state[4096]; memcpy(original_state, state, strlen(state) + 1);
+    if (restic_bridge_s3_start(&req, &id) || !id) return 15;
+    // Entry has copied and pinned state; later mutation of the C buffer cannot
+    // redirect inspection. This operation constructs no transport on any host.
+    memset(state, 'x', strlen(state));
+    if (restic_bridge_wait(id, result) || result->status || strcmp(result->diagnostic, "S3_STATE_NEW") || restic_bridge_free(id)) return 16;
+    if (restic_bridge_cancel(id) != 7 || restic_bridge_free(id) != 7) return 17;
+#if !defined(__APPLE__)
+    // Linux has no production native transport. The real C operation must fail
+    // closed rather than using Go's default HTTP implementation. Its explicit
+    // input bytes are retained before that refusal and survive C-buffer reuse.
+    char password[] = "abcd", secret[] = "fixture-secret";
+    req.operation = 2;
+    req.state_path = original_state; req.state_path_len = (uint32_t)strlen(original_state);
+    req.password = password; req.password_len = 4;
+    req.secret_key = secret; req.secret_key_len = (uint32_t)strlen(secret);
+    if (restic_bridge_s3_start(&req, &id) || !id) return 18;
+    memset(password, 'x', 4); memset(secret, 'x', strlen(secret));
+    if (restic_bridge_wait(id, result) || result->status != 2 || restic_bridge_free(id)) return 19;
+    char state_file[4096];
+    count = snprintf(state_file, sizeof(state_file), "%s/state.json", original_state);
+    if (count <= 0 || (size_t)count >= sizeof(state_file)) return 20;
+    FILE *file = fopen(state_file, "rb");
+    char contents[131073];
+    if (!file) return 21;
+    size_t length = fread(contents, 1, sizeof(contents) - 1, file);
+    if (ferror(file) || fclose(file)) return 22;
+    contents[length] = 0;
+    if (!strstr(contents, "fixture-secret") || !strstr(contents, "YWJjZA==")) return 23;
+#endif
+    free(result);
+    return 0;
+}

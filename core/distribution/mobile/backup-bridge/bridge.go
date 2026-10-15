@@ -60,6 +60,7 @@ type callHandle struct {
 	state                int32
 	cancelRequested      bool
 	publicationCommitted bool
+	retainedS3Request    *bridgeRequest
 	mu                   sync.Mutex
 }
 
@@ -215,6 +216,9 @@ func allocateID(counter *atomic.Uint64) (uint64, int32) {
 // rejectBridgeCall cleans admitted resources without masking retained scratch.
 func rejectBridgeCall(req *bridgeRequest, status int32) int32 {
 	err := closeRequestPaths(req)
+	if req.remote != nil {
+		err = errors.Join(err, req.remote.owner.Close())
+	}
 	zeroBytes(req.password)
 	zeroBytes(req.recoveryPassword)
 	if errors.Is(err, errMetadataCleanup) {
@@ -302,6 +306,10 @@ func publishRestoreForHandle(h *callHandle, req *bridgeRequest) error {
 }
 
 func runWorker(h *callHandle, req bridgeRequest) {
+	if req.remote != nil {
+		runS3Worker(h, req)
+		return
+	}
 	wrote := false
 	result := bridgeResult{status: StatusInternal, diagnostic: DiagInternal}
 	defer func() {
@@ -387,6 +395,36 @@ func restic_bridge_start(req *C.restic_request, outID *C.uint64_t) C.int32_t {
 //
 //export restic_bridge_start_with_workspace
 func restic_bridge_start_with_workspace(req *C.restic_request, workspace *C.char, workspaceLen C.uint32_t, outID *C.uint64_t) C.int32_t {
+	return startWithWorkspace(req, workspace, workspaceLen, nil, outID)
+}
+
+func parseCSnapshotSelection(pointer *C.char, length C.uint32_t) (*snapshotSelection, int32) {
+	if length > C.uint32_t(maxSnapshotSelectionBytes) {
+		return nil, StatusCapExceeded
+	}
+	if pointer == nil || length == 0 {
+		return nil, StatusInvalidArgument
+	}
+	return parseSnapshotSelection(copyCBytes(pointer, length))
+}
+
+//export restic_bridge_snapshot_v1_start
+func restic_bridge_snapshot_v1_start(req *C.restic_request, workspace *C.char, workspaceLen C.uint32_t, policy *C.char, policyLen C.uint32_t, outID *C.uint64_t) C.int32_t {
+	if outID == nil {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	*outID = 0
+	if req == nil || req.operation != C.int32_t(OpSnapshot) {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	selection, status := parseCSnapshotSelection(policy, policyLen)
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	return startWithWorkspace(req, workspace, workspaceLen, selection, outID)
+}
+
+func startWithWorkspace(req *C.restic_request, workspace *C.char, workspaceLen C.uint32_t, selection *snapshotSelection, outID *C.uint64_t) C.int32_t {
 	if outID == nil {
 		return C.int32_t(StatusInvalidArgument)
 	}
@@ -414,6 +452,7 @@ func restic_bridge_start_with_workspace(req *C.restic_request, workspace *C.char
 		}
 		return C.int32_t(StatusInvalidArgument)
 	}
+	breq.snapshotSelection = selection
 	id, status := startBridgeCall(breq)
 	if status == StatusOk {
 		*outID = C.uint64_t(id)
@@ -519,6 +558,8 @@ func freeCall(id uint64) int32 {
 	for _, b := range h.passwords {
 		zeroBytes(b)
 	}
+	zeroBytes(h.result.metadata)
+	h.result.metadata = nil
 	delete(handles, id)
 	h.mu.Unlock()
 	handlesMu.Unlock()
@@ -528,5 +569,31 @@ func freeCall(id uint64) int32 {
 
 //export restic_bridge_free
 func restic_bridge_free(id C.uint64_t) C.int32_t { return C.int32_t(freeCall(uint64(id))) }
+
+// restic_bridge_result_metadata copies optional repository-config or snapshot-
+// catalog JSON into caller-owned bytes, without a trailing NUL. Existing C
+// request/result layouts and operation results are unchanged. A NULL buffer
+// with capacity0 queries the required size and returns CAP_EXCEEDED; callers
+// must still inspect the actual terminal operation result before using metadata.
+// No partial document is copied on refusal. Free remains the handle owner.
+//
+//export restic_bridge_result_metadata
+func restic_bridge_result_metadata(id C.uint64_t, buffer *C.char, capacity C.uint32_t, required *C.uint32_t) C.int32_t {
+	if required == nil {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	*required = 0
+	if uint64(capacity) > maxResultMetadata || buffer == nil && capacity != 0 {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	return C.int32_t(withResultMetadata(uint64(id), func(payload []byte) int32 {
+		*required = C.uint32_t(len(payload))
+		if uint64(capacity) < uint64(len(payload)) {
+			return StatusCapExceeded
+		}
+		copy(unsafe.Slice((*byte)(unsafe.Pointer(buffer)), int(capacity)), payload)
+		return StatusOk
+	}))
+}
 
 func main() {}
