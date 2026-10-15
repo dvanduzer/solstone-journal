@@ -31,9 +31,14 @@ import (
 	"errors"
 	"golang.org/x/sys/unix"
 	"os"
+	"unicode/utf8"
 )
 
 func validateS3Shape(version uint32, operation int32, fields [14]requestField) int32 {
+	return validateS3ShapeForRoot(version, operation, fields, false)
+}
+
+func validateS3ShapeForRoot(version uint32, operation int32, fields [14]requestField, rooted bool) int32 {
 	if version != 1 || operation < OpInit || operation > OpS3Inspect {
 		return StatusInvalidArgument
 	}
@@ -63,7 +68,7 @@ func validateS3Shape(version uint32, operation int32, fields [14]requestField) i
 	if operation != OpInit && operation != OpAddRecoveryKey && fields[8].length != 0 {
 		return StatusInvalidArgument
 	}
-	if operation == OpSnapshot || operation == OpRestore {
+	if operation == OpSnapshot || (operation == OpRestore && !rooted) {
 		if fields[10].length == 0 {
 			return StatusInvalidArgument
 		}
@@ -88,6 +93,10 @@ func validateS3Shape(version uint32, operation int32, fields [14]requestField) i
 }
 
 func validateS3Request(request *C.restic_s3_request) (result bridgeRequest, status int32) {
+	return validateS3RequestForRoot(request, nil)
+}
+
+func validateS3RequestForRoot(request *C.restic_s3_request, rooted *rootedRestore) (result bridgeRequest, status int32) {
 	if request == nil {
 		return bridgeRequest{}, StatusInvalidArgument
 	}
@@ -101,7 +110,10 @@ func validateS3Request(request *C.restic_s3_request) (result bridgeRequest, stat
 		{uint32(request.snapshot_id_len), request.snapshot_id != nil}, {uint32(request.workspace_path_len), request.workspace_path != nil},
 	}
 	operation := int32(request.operation)
-	if status := validateS3Shape(uint32(request.version), operation, fields); status != StatusOk {
+	if rooted != nil && operation != OpRestore {
+		return bridgeRequest{}, StatusInvalidArgument
+	}
+	if status := validateS3ShapeForRoot(uint32(request.version), operation, fields, rooted != nil); status != StatusOk {
 		return bridgeRequest{}, status
 	}
 	readString := func(pointer *C.char, length C.uint32_t) string {
@@ -116,7 +128,7 @@ func validateS3Request(request *C.restic_s3_request) (result bridgeRequest, stat
 		return bridgeRequest{}, StatusInvalidArgument
 	}
 	result = bridgeRequest{operation: operation, password: copyCBytes(request.password, request.password_len), recoveryPassword: copyCBytes(request.recovery_password, request.recovery_password_len),
-		sourcePath: readString(request.source_path, request.source_path_len), restorePath: readString(request.restore_path, request.restore_path_len), snapshotID: readString(request.snapshot_id, request.snapshot_id_len)}
+		sourcePath: readString(request.source_path, request.source_path_len), restorePath: readString(request.restore_path, request.restore_path_len), snapshotID: readString(request.snapshot_id, request.snapshot_id_len), rootedRestore: rooted}
 	defer func() {
 		if status != StatusOk {
 			zeroBytes(result.password)
@@ -126,13 +138,24 @@ func validateS3Request(request *C.restic_s3_request) (result bridgeRequest, stat
 	if len(result.recoveryPassword) != 0 && len(result.password) == len(result.recoveryPassword) && subtle.ConstantTimeCompare(result.password, result.recoveryPassword) == 1 {
 		return result, StatusInvalidArgument
 	}
-	if operation == OpRestore && (!validS3ID(result.snapshotID) || validateRestoreDest(result.restorePath) != nil) {
-		return result, StatusInvalidArgument
+	if operation == OpRestore {
+		if !validS3ID(result.snapshotID) {
+			return result, StatusInvalidArgument
+		}
+		if rooted == nil && validateRestoreDest(result.restorePath) != nil {
+			return result, StatusInvalidArgument
+		}
+		if rooted != nil && validateExistingDir(result.restorePath) != nil {
+			return result, StatusInvalidArgument
+		}
 	}
 	if result.sourcePath != "" && validateExistingDir(result.sourcePath) != nil {
 		return result, StatusInvalidArgument
 	}
 	statePath := readString(request.state_path, request.state_path_len)
+	if rooted != nil && (!utf8.ValidString(statePath) || !utf8.ValidString(result.restorePath)) {
+		return result, StatusInvalidArgument
+	}
 	owner, err := newS3Owner(statePath, cfg)
 	if err != nil {
 		if errors.Is(err, errS3OwnerBusy) {
@@ -145,6 +168,9 @@ func validateS3Request(request *C.restic_s3_request) (result bridgeRequest, stat
 	}
 	result.remote = &s3RemoteRequest{cfg: cfg, owner: owner}
 	if err := pinDataPaths(&result, []*os.File{owner.directory}); err != nil {
+		if rooted != nil && (errors.Is(err, errS3OwnerBusy) || errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN)) {
+			return result, rejectBridgeCall(&result, StatusBusy)
+		}
 		return result, rejectBridgeCall(&result, StatusInvalidArgument)
 	}
 	if operation == OpSnapshot {
@@ -157,6 +183,34 @@ func validateS3Request(request *C.restic_s3_request) (result bridgeRequest, stat
 		}
 	}
 	return result, StatusOk
+}
+
+//export restic_bridge_s3_restore_root_v1_start
+func restic_bridge_s3_restore_root_v1_start(request *C.restic_s3_request, targetFD C.int32_t, selector *C.char, selectorLen C.uint32_t, outID *C.uint64_t) C.int32_t {
+	if outID == nil {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	*outID = 0
+	if request == nil || request.operation != C.int32_t(OpRestore) || request.version != 1 || selector == nil || selectorLen == 0 {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	if selectorLen > maxPathLen {
+		return C.int32_t(StatusCapExceeded)
+	}
+	rooted, status := newRootedRestore(int(targetFD), string(copyCBytes(selector, selectorLen)))
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	req, status := validateS3RequestForRoot(request, rooted)
+	if status != StatusOk {
+		_ = rooted.close()
+		return C.int32_t(status)
+	}
+	id, status := startBridgeCall(req)
+	if status == StatusOk {
+		*outID = C.uint64_t(id)
+	}
+	return C.int32_t(status)
 }
 
 //export restic_bridge_s3_start

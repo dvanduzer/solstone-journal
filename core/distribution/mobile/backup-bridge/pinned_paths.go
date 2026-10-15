@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"unicode/utf8"
 
 	"golang.org/x/sys/unix"
 )
@@ -78,6 +79,9 @@ func pinRequestPaths(req *bridgeRequest) (err error) {
 			_ = closeRequestPaths(req)
 		}
 	}()
+	if req.rootedRestore != nil && !utf8.ValidString(req.repoPath) {
+		return errPinnedIdentity
+	}
 	repo, err := openPinnedDirectory(req.repoPath)
 	if err != nil {
 		if req.operation == OpInit && (errors.Is(err, unix.ENOENT) || os.IsNotExist(err)) {
@@ -91,6 +95,9 @@ func pinRequestPaths(req *bridgeRequest) (err error) {
 		}
 	}
 	req.pathFiles = append(req.pathFiles, repo)
+	if err := reserveRootedPrivateDirectory(repo); err != nil {
+		return err
+	}
 	repoRoot, err := adoptRoot(req.repoPath, repo)
 	if err != nil {
 		return err
@@ -102,6 +109,9 @@ func pinRequestPaths(req *bridgeRequest) (err error) {
 // Each protected directory is real local custody (repository or private remote
 // state), not a fabricated local repository for a remote operation.
 func pinDataPaths(req *bridgeRequest, protected []*os.File) (err error) {
+	if req.rootedRestore != nil {
+		return pinRootedRestore(req, protected)
+	}
 	var source *os.File
 	if req.operation == OpSnapshot || req.operation == OpRestore {
 		originalSource := req.sourcePath
@@ -368,8 +378,10 @@ func clearDirectoryContents(fd int) error {
 	return nil
 }
 
-func closeRequestPaths(req *bridgeRequest) error {
-	var cleanupErr error
+func closeRequestPaths(req *bridgeRequest) (cleanupErr error) {
+	if req.rootedRestore != nil {
+		defer func() { cleanupErr = errors.Join(cleanupErr, req.rootedRestore.close()) }()
+	}
 	if req.metadataRoot != nil {
 		cleanupErr = cleanupMetadataWorkspace(req)
 	}
@@ -415,11 +427,11 @@ func closeRequestPaths(req *bridgeRequest) error {
 	if req.metadataFile != nil {
 		// Closing this retained flock descriptor releases custody only after the
 		// worker has stopped using the workspace and cleanup has been attempted.
-		cleanupErr = errors.Join(cleanupErr, req.metadataFile.Close())
+		cleanupErr = errors.Join(cleanupErr, closeRootedPrivateDirectory(req.metadataFile))
 		req.metadataFile = nil
 	}
 	for _, file := range req.pathFiles {
-		_ = file.Close()
+		_ = closeRootedPrivateDirectory(file)
 	}
 	req.pathFiles = nil
 	if req.repoRoot != nil {

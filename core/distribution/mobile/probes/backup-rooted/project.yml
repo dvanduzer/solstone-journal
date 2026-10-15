@@ -1,0 +1,31 @@
+name: BackupRootedProbe
+options:
+  deploymentTarget:
+    iOS: '26.0'
+settings:
+  base:
+    SWIFT_VERSION: '5.0'
+    IPHONEOS_DEPLOYMENT_TARGET: '26.0'
+    GENERATE_INFOPLIST_FILE: false
+    INFOPLIST_FILE: Shared/Info.plist
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_OBJC_BRIDGING_HEADER: Shared/Bridge.h
+    HEADER_SEARCH_PATHS: $(BACKUP_HEADERS)
+    OTHER_LDFLAGS: $(BACKUP_ARCHIVE) -framework CoreFoundation -framework Foundation -framework Security -lresolv
+    ENABLE_DEBUG_DYLIB: false
+    CURRENT_PROJECT_VERSION: 1
+    MARKETING_VERSION: 0.0.1
+    TARGETED_DEVICE_FAMILY: 1,2
+targets:
+  BackupRootedProbe:
+    type: application
+    platform: iOS
+    sources: [Host, Native]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.solstone.journal.backup.rooted.dev
+schemes:
+  BackupRootedProbe:
+    build:
+      targets:
+        BackupRootedProbe: all

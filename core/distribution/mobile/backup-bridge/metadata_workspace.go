@@ -43,7 +43,7 @@ func pinMetadataWorkspace(req *bridgeRequest, path string) (resultErr error) {
 	retained := false
 	defer func() {
 		if !retained {
-			_ = file.Close()
+			_ = closeRootedPrivateDirectory(file)
 		}
 	}()
 	var stat unix.Stat_t
@@ -52,6 +52,9 @@ func pinMetadataWorkspace(req *bridgeRequest, path string) (resultErr error) {
 	}
 	if stat.Uid != uint32(os.Geteuid()) || stat.Mode&0777 != 0700 {
 		return errors.New("metadata workspace must be privately owned")
+	}
+	if err := reserveRootedPrivateDirectory(file); err != nil {
+		return err
 	}
 	// flock is tied to this open directory description, not to a removable lock
 	// file or process-associated fcntl lock. Rejected opens cannot unlock it.

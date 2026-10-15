@@ -158,7 +158,11 @@ func executeS3Operation(h *callHandle, req *bridgeRequest, wrote *bool) (result 
 	case OpListSnapshots:
 		result, _ = executeListSnapshots(h.ctx, *req)
 	case OpRestore:
-		result, _ = executeRestoreWithPublisher(h.ctx, req, markWrite, func(_ context.Context, req *bridgeRequest) error { return publishRestoreForHandle(h, req) })
+		if req.rootedRestore != nil {
+			result, _ = executeRootedRestore(h.ctx, req, markWrite)
+		} else {
+			result, _ = executeRestoreWithPublisher(h.ctx, req, markWrite, func(_ context.Context, req *bridgeRequest) error { return publishRestoreForHandle(h, req) })
+		}
 	case OpCheck:
 		result, _ = executeCheck(h.ctx, *req)
 	default:
@@ -246,10 +250,10 @@ func closeS3RequestPaths(req *bridgeRequest) (resultErr error) {
 			}
 		}
 		if req.metadataFile != nil {
-			resultErr = errors.Join(resultErr, req.metadataFile.Close())
+			resultErr = errors.Join(resultErr, closeRootedPrivateDirectory(req.metadataFile))
 		}
 		for _, file := range req.pathFiles {
-			resultErr = errors.Join(resultErr, file.Close())
+			resultErr = errors.Join(resultErr, closeRootedPrivateDirectory(file))
 		}
 		req.metadataRoot, req.repoRoot, req.sourceRoot, req.restoreRoot = nil, nil, nil, nil
 		req.metadataFile, req.pathFiles = nil, nil

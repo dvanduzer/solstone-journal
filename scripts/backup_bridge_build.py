@@ -241,6 +241,12 @@ class BridgeBuild:
         self.run_step("rooted-restorer-overlay", ["patch", "--batch", "--forward", "--fuzz=0", "-p1", "-i", rooted_patch], cwd=restic_dir)
         self.receipt["rooted_restorer_patch_sha256"] = sha256(rooted_patch)
 
+        # Opt-in existing-root semantics; the prior restorer overlay and all
+        # external/common producer inputs remain independently pinned.
+        existing_patch = BRIDGE_SRC_PATH / "restic-existing-root.patch"
+        self.run_step("existing-root-overlay", ["patch", "--batch", "--forward", "--fuzz=0", "-p1", "-i", existing_patch], cwd=restic_dir)
+        self.receipt["existing_root_patch_sha256"] = sha256(existing_patch)
+
         # Copy bridge files into restic/mobilebackup/
         pkg_dir = restic_dir / "mobilebackup"
         pkg_dir.mkdir(parents=True, exist_ok=True)
@@ -317,6 +323,7 @@ class BridgeBuild:
         # Step: Run unit tests (no tags)
         self.run_step("go-test", [go_bin, "test", "-buildvcs=false", "./mobilebackup"], cwd=restic_dir, env=env)
         self.run_step("rooted-metadata-tests", [go_bin, "test", "-buildvcs=false", "-run", "^TestRootRestoreMetadata", "./internal/restorer"], cwd=restic_dir, env=env)
+        self.run_step("existing-root-tests", [go_bin, "test", "-buildvcs=false", "-run", "^TestExistingRoot", "./internal/restorer"], cwd=restic_dir, env=env)
         self.run_step(
             "receipt-control-tests",
             [sys.executable, BRIDGE_SRC_PATH / "check_build_receipts.py"],
@@ -420,6 +427,13 @@ int main(void) {{
         selection_link = [str(item) if item not in (host_caller, host_caller_bin) else str(selection_caller if item == host_caller else selection_bin) for item in host_link]
         self.run_step("selection-c-link", selection_link, cwd=host_artifacts, env=env)
         self.run_step("selection-c-run", [selection_bin, host_artifacts], cwd=host_artifacts, env=env)
+
+        rooted_caller = host_artifacts / "rooted-caller.c"
+        shutil.copy2(BRIDGE_SRC_PATH / "rooted_restore_caller.c.fixture", rooted_caller)
+        rooted_bin = host_artifacts / "rooted-caller"
+        rooted_link = [str(item) if item not in (host_caller, host_caller_bin) else str(rooted_caller if item == host_caller else rooted_bin) for item in host_link]
+        self.run_step("existing-root-c-link", rooted_link, cwd=host_artifacts, env=env)
+        self.run_step("existing-root-c-run", [rooted_bin, host_artifacts], cwd=host_artifacts, env=env)
 
         workspace_caller = host_artifacts / "workspace-caller.c"
         shutil.copy2(BRIDGE_SRC_PATH / "workspace_caller.c.fixture", workspace_caller)

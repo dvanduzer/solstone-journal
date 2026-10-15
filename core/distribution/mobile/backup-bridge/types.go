@@ -93,6 +93,7 @@ type bridgeRequest struct {
 	restorePublished     bool
 	pathsPinned          bool
 	remote               *s3RemoteRequest
+	rootedRestore        *rootedRestore
 }
 
 // Internal Go representation of call results.

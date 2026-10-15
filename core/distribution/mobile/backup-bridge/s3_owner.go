@@ -151,6 +151,9 @@ func newS3Owner(path string, cfg s3Config) (_ *s3Owner, resultErr error) {
 	if unix.Fstat(int(file.Fd()), &stat) != nil || stat.Uid != uint32(os.Geteuid()) || stat.Mode&07777 != 0700 {
 		return nil, errS3OwnerInvalid
 	}
+	if err := reserveRootedPrivateDirectory(file); err != nil {
+		return nil, err
+	}
 	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
 			return nil, errS3OwnerBusy
@@ -707,7 +710,7 @@ func (owner *s3Owner) Close() error {
 		owner.root = nil
 	}
 	if owner.directory != nil {
-		closeErr = errors.Join(closeErr, owner.directory.Close())
+		closeErr = errors.Join(closeErr, closeRootedPrivateDirectory(owner.directory))
 		owner.directory = nil
 	}
 	for _, password := range owner.record.Passwords {

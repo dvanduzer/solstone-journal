@@ -30,6 +30,12 @@ typedef struct {
     char snapshot_ids[4096][65];
     char diagnostic[256];
 } restic_result;
+
+typedef struct {
+    uint32_t version;
+    uint32_t target_admitted;
+    uint32_t target_may_have_mutated;
+} restic_restore_root_outcome_v1;
 */
 import "C"
 
@@ -39,6 +45,7 @@ import (
 	"golang.org/x/sys/unix"
 	"sync"
 	"sync/atomic"
+	"unicode/utf8"
 	"unsafe"
 )
 
@@ -61,6 +68,7 @@ type callHandle struct {
 	cancelRequested      bool
 	publicationCommitted bool
 	retainedS3Request    *bridgeRequest
+	rootedRestore        *rootedRestore
 	mu                   sync.Mutex
 }
 
@@ -239,12 +247,13 @@ func startBridgeCall(req bridgeRequest) (uint64, int32) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	h := &callHandle{
-		id:        id,
-		ctx:       ctx,
-		cancel:    cancel,
-		doneCh:    make(chan struct{}),
-		state:     handleRunning,
-		passwords: [][]byte{req.password, req.recoveryPassword},
+		id:            id,
+		ctx:           ctx,
+		cancel:        cancel,
+		doneCh:        make(chan struct{}),
+		state:         handleRunning,
+		passwords:     [][]byte{req.password, req.recoveryPassword},
+		rootedRestore: req.rootedRestore,
 	}
 
 	handlesMu.Lock()
@@ -359,9 +368,13 @@ func runWorker(h *callHandle, req bridgeRequest) {
 	case OpListSnapshots:
 		result, _ = executeListSnapshots(h.ctx, req)
 	case OpRestore:
-		result, _ = executeRestoreWithPublisher(h.ctx, &req, markWrite, func(_ context.Context, req *bridgeRequest) error {
-			return publishRestoreForHandle(h, req)
-		})
+		if req.rootedRestore != nil {
+			result, _ = executeRootedRestore(h.ctx, &req, markWrite)
+		} else {
+			result, _ = executeRestoreWithPublisher(h.ctx, &req, markWrite, func(_ context.Context, req *bridgeRequest) error {
+				return publishRestoreForHandle(h, req)
+			})
+		}
 	case OpCheck:
 		result, _ = executeCheck(h.ctx, req)
 	default:
@@ -389,6 +402,71 @@ func restic_bridge_start(req *C.restic_request, outID *C.uint64_t) C.int32_t {
 		*outID = C.uint64_t(id)
 	}
 	return C.int32_t(status)
+}
+
+// New entrypoint: existing root, exact authenticated subtree, no old source.
+// The target descriptor is borrowed only for synchronous duplication.
+//
+//export restic_bridge_restore_root_v1_start
+func restic_bridge_restore_root_v1_start(version C.uint32_t, request *C.restic_request, targetFD C.int32_t, selector *C.char, selectorLen C.uint32_t, outID *C.uint64_t) C.int32_t {
+	if outID == nil {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	*outID = 0
+	if version != 1 || request == nil || request.operation != C.int32_t(OpRestore) ||
+		request.source_path_len != 0 || request.recovery_password_len != 0 {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	if request.password_len == 0 || request.password == nil || request.repo_path_len == 0 || request.repo_path == nil ||
+		request.restore_path_len == 0 || request.restore_path == nil || request.snapshot_id_len != idHexLen || request.snapshot_id == nil || selectorLen == 0 || selector == nil {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	if request.password_len > maxPasswordLen || request.repo_path_len > maxPathLen || request.restore_path_len > maxPathLen || selectorLen > maxPathLen {
+		return C.int32_t(StatusCapExceeded)
+	}
+	r, status := newRootedRestore(int(targetFD), string(copyCBytes(selector, selectorLen)))
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	req := bridgeRequest{operation: OpRestore, password: copyCBytes(request.password, request.password_len),
+		repoPath: string(copyCBytes(request.repo_path, request.repo_path_len)), restorePath: string(copyCBytes(request.restore_path, request.restore_path_len)),
+		snapshotID: string(copyCBytes(request.snapshot_id, request.snapshot_id_len)), rootedRestore: r}
+	if !lowerHexID(req.snapshotID) || !utf8.ValidString(req.repoPath) || !utf8.ValidString(req.restorePath) || validateExistingDir(req.repoPath) != nil || validateExistingDir(req.restorePath) != nil {
+		return C.int32_t(rejectBridgeCall(&req, StatusInvalidArgument))
+	}
+	if err := pinRequestPaths(&req); err != nil {
+		status := StatusInvalidArgument
+		if errors.Is(err, errS3OwnerBusy) || errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
+			status = StatusBusy
+		}
+		return C.int32_t(rejectBridgeCall(&req, status))
+	}
+	id, status := startBridgeCall(req)
+	if status == StatusOk {
+		*outID = C.uint64_t(id)
+	}
+	return C.int32_t(status)
+}
+
+//export restic_bridge_restore_root_v1_outcome
+func restic_bridge_restore_root_v1_outcome(id C.uint64_t, version C.uint32_t, out *C.restic_restore_root_outcome_v1) C.int32_t {
+	if out == nil {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	*out = C.restic_restore_root_outcome_v1{}
+	if version != 1 {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	return C.int32_t(withRootedRestoreOutcome(uint64(id), func(admitted, mutated bool) int32 {
+		out.version = 1
+		if admitted {
+			out.target_admitted = 1
+		}
+		if mutated {
+			out.target_may_have_mutated = 1
+		}
+		return StatusOk
+	}))
 }
 
 // A synchronous return of 10 means admitted scratch cleanup requires a retry.

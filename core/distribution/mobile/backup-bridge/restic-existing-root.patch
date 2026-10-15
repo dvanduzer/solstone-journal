@@ -1,0 +1,852 @@
+diff --git a/internal/restorer/restorer.go b/internal/restorer/restorer.go
+--- a/internal/restorer/restorer.go
++++ b/internal/restorer/restorer.go
+@@ -37,8 +37,9 @@
+ 
+ 	XattrSelectFilter func(xattrName string) (xattrSelectedForRestore bool)
+ 
+-	root        *os.Root
+-	BeforeWrite func() error
++	root         *os.Root
++	BeforeWrite  func() error
++	existingRoot *existingRootState
+ }
+ 
+ var restorerAbortOnAllErrors = func(_ string, err error) error { return err }
+@@ -50,6 +51,9 @@
+ 	Overwrite       OverwriteBehavior
+ 	Delete          bool
+ 	OwnershipByName bool
++	// ExistingRoot opts in to the mobile existing-destination safeguards.
++	// Legacy RestoreToRoot and CLI behavior remain unchanged by default.
++	ExistingRoot bool
+ }
+ 
+ type OverwriteBehavior int
+@@ -491,6 +495,9 @@
+ // RestoreToRoot restores snapshot contents into the given root directory.
+ func (res *Restorer) RestoreToRoot(ctx context.Context, root *os.Root) (uint64, error) {
+ 	res.root = root
++	if res.opts.ExistingRoot {
++		res.existingRoot = newExistingRootState()
++	}
+ 	restoredFileCount := uint64(0)
+ 
+ 	rootInfo, err := root.Stat(".")
+@@ -506,6 +513,7 @@
+ 		res.repo.Connections(), res.opts.Sparse, res.opts.Delete, res.repo.StartWarmup, res.opts.Progress)
+ 	filerestorer.Error = res.Error
+ 	filerestorer.Info = res.Info
++	filerestorer.filesWriter.existingRoot = res.existingRoot
+ 
+ 	var buf []byte
+ 
+@@ -605,11 +613,21 @@
+ 						}
+ 						_ = rootRemove(res.root, targetRel)
+ 						linkTarget := filerestorer.targetPath(idx.Value(node.Inode, node.DeviceID))
++						if res.existingRoot != nil {
++							if err := checkExistingHardlinkSource(res, linkTarget); err != nil {
++								return err
++							}
++						}
+ 						if err := rootRestoreHardlink(res, node, linkTarget, targetRel); err != nil {
+ 							return err
+ 						}
+ 					}
+ 					res.opts.Progress.AddProgress(location, restoreui.ActionOtherRestored, 0, 0)
++					if res.existingRoot != nil {
++						// The canonical inode already received metadata before its
++						// secondary links. Never mutate metadata through a link.
++						return nil
++					}
+ 					return rootRestoreMetadata(res, node, targetRel, res.Warn, res.XattrSelectFilter, res.opts.OwnershipByName)
+ 				})
+ 				return err
+@@ -693,7 +711,11 @@
+ }
+ 
+ func (res *Restorer) verifyFileRoot(ctx context.Context, root *os.Root, rel string, node *data.Node, failFast bool, trustMtime bool, buf []byte) (*fileState, []byte, error) {
+-	f, err := openRootFileRead(root, rel)
++	readFile := openRootFileRead
++	if res.existingRoot != nil {
++		readFile = openExistingRootRead
++	}
++	f, err := readFile(root, rel)
+ 	if err != nil {
+ 		return nil, buf, err
+ 	}
+@@ -702,6 +724,14 @@
+ 	}()
+ 
+ 	fi, err := f.Stat()
++	if err == nil && res.existingRoot != nil {
++		res.existingRoot.remember(rel, fi)
++		if mustReplaceExistingFile(fi) {
++			// No content/metadata reuse through an outside-linked or read-only
++			// inode. A full content restore will safely replace this entry.
++			return nil, buf, nil
++		}
++	}
+ 	sizeMatches := true
+ 	switch {
+ 	case err != nil:
+diff --git a/internal/restorer/fileswriter.go b/internal/restorer/fileswriter.go
+--- a/internal/restorer/fileswriter.go
++++ b/internal/restorer/fileswriter.go
+@@ -25,6 +25,7 @@
+ 	cache                *simplelru.LRU[string, *partialFile]
+ 	root                 *os.Root
+ 	beforeWrite          func() error
++	existingRoot         *existingRootState
+ }
+ 
+ type filesWriterBucket struct {
+@@ -262,6 +263,18 @@
+ 	if err != nil {
+ 		return err
+ 	}
++	if w.existingRoot != nil {
++		if w.beforeWrite != nil {
++			if err := w.beforeWrite(); err != nil {
++				_ = releaseWriter(wr)
++				return err
++			}
++		}
++		if err := w.existingRoot.checkFile(path, wr.File); err != nil {
++			_ = releaseWriter(wr)
++			return err
++		}
++	}
+ 
+ 	_, err = wr.WriteAt(blob, offset)
+ 
+@@ -287,9 +300,15 @@
+ 			return nil, err
+ 		}
+ 	}
++	if w.existingRoot != nil {
++		return w.createExistingRootFile(path, createSize, sparse)
++	}
+ 	return openRootFileCreate(w.root, path, createSize, sparse, w.allowRecursiveDelete)
+ }
+ 
+ func (w *filesWriter) openFileRoot(path string) (*os.File, error) {
++	if w.existingRoot != nil {
++		return w.reopenExistingRootFile(path)
++	}
+ 	return openRootFileRead(w.root, path)
+ }
+diff --git a/internal/restorer/root_io.go b/internal/restorer/root_io.go
+--- a/internal/restorer/root_io.go
++++ b/internal/restorer/root_io.go
+@@ -227,6 +227,9 @@
+ }
+ 
+ func rootRestoreMetadata(res *Restorer, node *data.Node, target string, warn func(msg string), xattrSelectFilter func(xattrName string) bool, ownershipByName bool) error {
++	if res.existingRoot != nil {
++		return restoreExistingRootMetadata(res, node, target, xattrSelectFilter)
++	}
+ 	rootFile, err := res.root.OpenFile(".", os.O_RDONLY, 0)
+ 	if err != nil {
+ 		return err
+diff --git a/internal/restorer/existing_root.go b/internal/restorer/existing_root.go
+--- /dev/null
++++ b/internal/restorer/existing_root.go
+@@ -0,0 +1,268 @@
++//go:build darwin || ios || linux
++
++package restorer
++
++import (
++	"errors"
++	"os"
++	"sync"
++	"syscall"
++
++	"github.com/restic/restic/internal/data"
++	"golang.org/x/sys/unix"
++)
++
++var errExistingIdentity = errors.New("existing restore entry identity changed")
++
++// Retained stat identities carry no open-file ownership. The writer and metadata
++// passes share this map; cache eviction cannot grant authority to another inode.
++type existingRootState struct {
++	mu    sync.Mutex
++	files map[string]os.FileInfo
++}
++
++func newExistingRootState() *existingRootState {
++	return &existingRootState{files: make(map[string]os.FileInfo)}
++}
++
++func (s *existingRootState) remember(name string, info os.FileInfo) {
++	s.mu.Lock()
++	s.files[name] = info
++	s.mu.Unlock()
++}
++
++func (s *existingRootState) same(name string, info os.FileInfo) bool {
++	want, _ := s.lookup(name)
++	return want != nil && os.SameFile(want, info)
++}
++
++func (s *existingRootState) lookup(name string) (os.FileInfo, bool) {
++	s.mu.Lock()
++	want, known := s.files[name]
++	s.mu.Unlock()
++	return want, known
++}
++
++func mustReplaceExistingFile(info os.FileInfo) bool {
++	stat, ok := info.Sys().(*syscall.Stat_t)
++	return !ok || stat.Nlink != 1 || info.Mode().Perm()&0200 == 0
++}
++
++func (s *existingRootState) checkFile(name string, file *os.File) error {
++	info, err := file.Stat()
++	if err != nil {
++		return err
++	}
++	if !info.Mode().IsRegular() || mustReplaceExistingFile(info) || !s.same(name, info) {
++		return errExistingIdentity
++	}
++	return nil
++}
++
++func (w *filesWriter) createExistingRootFile(name string, size int64, sparse bool) (*os.File, error) {
++	root, err := w.root.OpenFile(".", os.O_RDONLY, 0)
++	if err != nil {
++		return nil, err
++	}
++	defer root.Close()
++	parent, leaf, closeParent, err := openatParent(int(root.Fd()), name)
++	if err != nil {
++		return nil, err
++	}
++	defer closeParent()
++	var before unix.Stat_t
++	statErr := unix.Fstatat(parent, leaf, &before, unix.AT_SYMLINK_NOFOLLOW)
++	if statErr != nil && !errors.Is(statErr, unix.ENOENT) {
++		return nil, statErr
++	}
++	want, known := w.existingRoot.lookup(name)
++	if known {
++		stat, ok := want.Sys().(*syscall.Stat_t)
++		if !ok || statErr != nil || uint64(stat.Dev) != uint64(before.Dev) || stat.Ino != before.Ino || before.Mode&unix.S_IFMT != unix.S_IFREG {
++			return nil, errExistingIdentity
++		}
++	} else if statErr == nil {
++		// Verification observed absence. Do not inherit an entry that appeared
++		// before initial creation, even when its contents might look reusable.
++		return nil, errExistingIdentity
++	}
++	replace := known && mustReplaceExistingFile(want)
++	if statErr == nil && !replace && (before.Nlink != 1 || before.Mode&0200 == 0) {
++		// Matching-blob state belongs to the original single-link writable
++		// inode. A later change cannot turn that state into a partial copy of
++		// a newly created inode.
++		return nil, errExistingIdentity
++	}
++	if replace {
++		flags := 0
++		if before.Mode&unix.S_IFMT == unix.S_IFDIR {
++			flags = unix.AT_REMOVEDIR
++		}
++		// No permission fallback ever touches an old multi-link inode.
++		if err := unix.Unlinkat(parent, leaf, flags); err != nil {
++			return nil, err
++		}
++	}
++	flags := unix.O_WRONLY | unix.O_NOFOLLOW | unix.O_CLOEXEC | unix.O_NONBLOCK
++	if replace || errors.Is(statErr, unix.ENOENT) {
++		flags |= unix.O_CREAT | unix.O_EXCL
++	}
++	fd, err := unix.Openat(parent, leaf, flags, 0600)
++	if err != nil {
++		return nil, err
++	}
++	file := os.NewFile(uintptr(fd), name)
++	info, err := file.Stat()
++	if err != nil {
++		_ = file.Close()
++		return nil, err
++	}
++	stat, ok := info.Sys().(*syscall.Stat_t)
++	if !ok || !info.Mode().IsRegular() || stat.Nlink != 1 ||
++		(!replace && statErr == nil && (uint64(stat.Dev) != uint64(before.Dev) || stat.Ino != before.Ino)) {
++		_ = file.Close()
++		return nil, errExistingIdentity
++	}
++	if known && !replace && (!os.SameFile(want, info) || info.Size() != want.Size() || !info.ModTime().Equal(want.ModTime()) || info.Mode() != want.Mode()) {
++		_ = file.Close()
++		return nil, errExistingIdentity
++	}
++	w.existingRoot.remember(name, info)
++	return ensureSize(file, info, size, sparse)
++}
++
++func (w *filesWriter) reopenExistingRootFile(name string) (*os.File, error) {
++	root, err := w.root.OpenFile(".", os.O_RDONLY, 0)
++	if err != nil {
++		return nil, err
++	}
++	defer root.Close()
++	parent, leaf, closeParent, err := openatParent(int(root.Fd()), name)
++	if err != nil {
++		return nil, err
++	}
++	defer closeParent()
++	fd, err := unix.Openat(parent, leaf, unix.O_WRONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
++	if err != nil {
++		return nil, err
++	}
++	file := os.NewFile(uintptr(fd), name)
++	if err := w.existingRoot.checkFile(name, file); err != nil {
++		_ = file.Close()
++		return nil, err
++	}
++	return file, nil
++}
++
++func checkExistingHardlinkSource(res *Restorer, name string) error {
++	file, err := openExistingRootRead(res.root, name)
++	if err != nil {
++		return err
++	}
++	defer file.Close()
++	info, err := file.Stat()
++	if err != nil {
++		return err
++	}
++	if !res.existingRoot.same(name, info) {
++		return errExistingIdentity
++	}
++	return nil
++}
++
++func openExistingRootRead(root *os.Root, name string) (*os.File, error) {
++	directory, err := root.OpenFile(".", os.O_RDONLY, 0)
++	if err != nil {
++		return nil, err
++	}
++	defer directory.Close()
++	parent, leaf, closeParent, err := openatParent(int(directory.Fd()), name)
++	if err != nil {
++		return nil, err
++	}
++	defer closeParent()
++	fd, err := unix.Openat(parent, leaf, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
++	if err != nil {
++		return nil, err
++	}
++	file := os.NewFile(uintptr(fd), name)
++	info, err := file.Stat()
++	if err != nil || !info.Mode().IsRegular() {
++		_ = file.Close()
++		if err != nil {
++			return nil, err
++		}
++		return nil, errExistingIdentity
++	}
++	return file, nil
++}
++
++func restoreExistingRootMetadata(res *Restorer, node *data.Node, name string, selectXattr func(string) bool) error {
++	if res.BeforeWrite != nil {
++		if err := res.BeforeWrite(); err != nil {
++			return err
++		}
++	}
++	if node.Type != data.NodeTypeFile && node.Type != data.NodeTypeDir && node.Type != data.NodeTypeSymlink {
++		return unix.ENOTSUP
++	}
++	root, err := res.root.OpenFile(".", os.O_RDONLY, 0)
++	if err != nil {
++		return err
++	}
++	defer root.Close()
++	parent, leaf, closeParent, err := openatParent(int(root.Fd()), name)
++	if err != nil {
++		return err
++	}
++	defer closeParent()
++	isLink := node.Type == data.NodeTypeSymlink
++	fd, err := openExistingMetadata(parent, leaf, isLink)
++	if err != nil {
++		return err
++	}
++	file := os.NewFile(uintptr(fd), name)
++	defer file.Close()
++	info, err := file.Stat()
++	if err != nil {
++		return err
++	}
++	stat, ok := info.Sys().(*syscall.Stat_t)
++	if !ok || (node.Type == data.NodeTypeFile && (!info.Mode().IsRegular() || stat.Nlink != 1 || !res.existingRoot.same(name, info))) ||
++		(node.Type == data.NodeTypeDir && !info.IsDir()) ||
++		(isLink && (info.Mode()&os.ModeSymlink == 0 || stat.Nlink != 1)) {
++		return errExistingIdentity
++	}
++	if err := chownExistingMetadata(fd, int(node.UID), int(node.GID), isLink); err != nil {
++		if !(os.Geteuid() != 0 && errors.Is(err, unix.EPERM)) && !errors.Is(err, unix.ENOTSUP) && !errors.Is(err, unix.EOPNOTSUPP) {
++			return err
++		}
++	}
++	for _, attr := range node.ExtendedAttributes {
++		if selectXattr != nil && !selectXattr(attr.Name) {
++			continue
++		}
++		if err := xattrExistingMetadata(fd, attr.Name, attr.Value, isLink); err != nil {
++			return err
++		}
++	}
++	if err := timesExistingMetadata(fd, node.AccessTime.UnixNano(), node.ModTime.UnixNano(), isLink); err != nil {
++		return err
++	}
++	if !isLink {
++		mode := uint32(node.Mode.Perm())
++		if node.Mode&os.ModeSetuid != 0 {
++			mode |= unix.S_ISUID
++		}
++		if node.Mode&os.ModeSetgid != 0 {
++			mode |= unix.S_ISGID
++		}
++		if node.Mode&os.ModeSticky != 0 {
++			mode |= unix.S_ISVTX
++		}
++		if err := unix.Fchmod(fd, mode); err != nil {
++			return err
++		}
++	}
++	return nil
++}
+diff --git a/internal/restorer/existing_root_linux.go b/internal/restorer/existing_root_linux.go
+--- /dev/null
++++ b/internal/restorer/existing_root_linux.go
+@@ -0,0 +1,32 @@
++//go:build linux
++
++package restorer
++
++import "golang.org/x/sys/unix"
++
++func openExistingMetadata(parent int, leaf string, link bool) (int, error) {
++	flags := unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_CLOEXEC | unix.O_NONBLOCK
++	if link {
++		flags = unix.O_PATH | unix.O_NOFOLLOW | unix.O_CLOEXEC
++	}
++	return unix.Openat(parent, leaf, flags, 0)
++}
++
++func chownExistingMetadata(fd, uid, gid int, link bool) error {
++	if link {
++		return unix.Fchownat(fd, "", uid, gid, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
++	}
++	return unix.Fchown(fd, uid, gid)
++}
++
++func xattrExistingMetadata(fd int, name string, value []byte, link bool) error {
++	if link {
++		return unix.ENOTSUP
++	}
++	return unix.Fsetxattr(fd, name, value, 0)
++}
++
++func timesExistingMetadata(fd int, access, modified int64, link bool) error {
++	times := []unix.Timespec{unix.NsecToTimespec(access), unix.NsecToTimespec(modified)}
++	return unix.UtimesNanoAt(fd, "", times, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
++}
+diff --git a/internal/restorer/existing_root_darwin.go b/internal/restorer/existing_root_darwin.go
+--- /dev/null
++++ b/internal/restorer/existing_root_darwin.go
+@@ -0,0 +1,41 @@
++//go:build darwin || ios
++
++package restorer
++
++/*
++#include <sys/stat.h>
++#include <errno.h>
++#include <stdint.h>
++static int existing_root_times(int fd, int64_t access, int64_t modified) {
++    struct timespec times[2];
++    times[0].tv_sec = access / 1000000000;
++    times[0].tv_nsec = access % 1000000000;
++    if (times[0].tv_nsec < 0) { times[0].tv_sec--; times[0].tv_nsec += 1000000000; }
++    times[1].tv_sec = modified / 1000000000;
++    times[1].tv_nsec = modified % 1000000000;
++    if (times[1].tv_nsec < 0) { times[1].tv_sec--; times[1].tv_nsec += 1000000000; }
++    return futimens(fd, times) == 0 ? 0 : errno;
++}
++*/
++import "C"
++
++import "golang.org/x/sys/unix"
++
++func openExistingMetadata(parent int, leaf string, link bool) (int, error) {
++	flags := unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_CLOEXEC | unix.O_NONBLOCK
++	if link {
++		flags = unix.O_SYMLINK | unix.O_CLOEXEC | unix.O_NONBLOCK
++	}
++	return unix.Openat(parent, leaf, flags, 0)
++}
++
++func chownExistingMetadata(fd, uid, gid int, link bool) error { return unix.Fchown(fd, uid, gid) }
++func xattrExistingMetadata(fd int, name string, value []byte, link bool) error {
++	return unix.Fsetxattr(fd, name, value, 0)
++}
++func timesExistingMetadata(fd int, access, modified int64, link bool) error {
++	if code := C.existing_root_times(C.int(fd), C.int64_t(access), C.int64_t(modified)); code != 0 {
++		return unix.Errno(code)
++	}
++	return nil
++}
+diff --git a/internal/restorer/existing_root_test.go b/internal/restorer/existing_root_test.go
+--- /dev/null
++++ b/internal/restorer/existing_root_test.go
+@@ -0,0 +1,343 @@
++//go:build darwin || ios || linux
++
++package restorer
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"runtime"
++	"testing"
++	"time"
++
++	"github.com/restic/restic/internal/data"
++	"github.com/restic/restic/internal/repository"
++	"golang.org/x/sys/unix"
++)
++
++// Regression derived from the independent actual-Restorer reproduction: blob
++// matches belong to the inode that was authenticated, never its replacement.
++func TestExistingRootFirstOpenRetainsVerifiedIdentity(t *testing.T) {
++	repo := repository.TestRepository(t)
++	snapshot, _ := saveSnapshot(t, repo, Snapshot{Nodes: map[string]Node{
++		"file": File{DataParts: []string{"left", "tail"}, Mode: 0600, ModTime: time.Unix(1700000000, 0)},
++	}}, noopGetGenericAttributes)
++	dir := t.TempDir()
++	named := filepath.Join(dir, "file")
++	if err := os.WriteFile(named, []byte("leftbad!"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	root, err := os.OpenRoot(dir)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer root.Close()
++	res := NewRestorer(repo, snapshot, Options{ExistingRoot: true, Overwrite: OverwriteAlways})
++	substituted := false
++	res.BeforeWrite = func() error {
++		if !substituted {
++			substituted = true
++			if err := os.Rename(named, filepath.Join(dir, "verified-old-inode")); err != nil {
++				return err
++			}
++			return os.WriteFile(named, []byte("oops????"), 0600)
++		}
++		return nil
++	}
++	_, err = res.RestoreToRoot(context.Background(), root)
++	actual, readErr := os.ReadFile(named)
++	if readErr != nil {
++		t.Fatal(readErr)
++	}
++	if !substituted {
++		t.Fatal("actual first-open replacement checkpoint did not run")
++	}
++	if err == nil {
++		if string(actual) != "lefttail" {
++			t.Fatalf("false success on replaced inode: %q", actual)
++		}
++	} else if !errors.Is(err, errExistingIdentity) || string(actual) != "oops????" {
++		t.Fatalf("initial refusal touched replacement: %q %v", actual, err)
++	}
++}
++
++func existingRootTestWriter(t *testing.T) (string, *filesWriter) {
++	t.Helper()
++	path := t.TempDir()
++	root, err := os.OpenRoot(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	w := newFilesWriterRoot(1, false, root, func() error { return nil })
++	w.existingRoot = newExistingRootState()
++	t.Cleanup(func() { w.flush(); _ = root.Close() })
++	return path, w
++}
++
++func TestExistingRootWriterEvictionReopensWritableAndRetainsBytes(t *testing.T) {
++	path, writer := existingRootTestWriter(t)
++	// More files than the actual LRU capacity, interleaved across two writes.
++	for i := 0; i < 80; i++ {
++		if err := writer.writeToFile(fmt.Sprintf("file-%03d", i), []byte("left"), 0, 8, false); err != nil {
++			t.Fatal(err)
++		}
++	}
++	for i := 0; i < 80; i++ {
++		name := fmt.Sprintf("file-%03d", i)
++		if err := writer.writeToFile(name, []byte("tail"), 4, -1, false); err != nil {
++			t.Fatalf("actual reopen %s: %v", name, err)
++		}
++		value, err := os.ReadFile(filepath.Join(path, name))
++		if err != nil || string(value) != "lefttail" {
++			t.Fatalf("actual reopened bytes %s: %q %v", name, value, err)
++		}
++	}
++}
++
++func TestExistingRootWriterReopenRefusesReplacementAndCachedGuard(t *testing.T) {
++	path, writer := existingRootTestWriter(t)
++	if err := writer.writeToFile("file", []byte("old!"), 0, 8, false); err != nil {
++		t.Fatal(err)
++	}
++	writer.flush()
++	if err := os.Rename(filepath.Join(path, "file"), filepath.Join(path, "retained")); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(path, "file"), []byte("outside!"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if err := writer.writeToFile("file", []byte("bad!"), 4, -1, false); !errors.Is(err, errExistingIdentity) {
++		t.Fatalf("replacement admitted: %v", err)
++	}
++	if data, _ := os.ReadFile(filepath.Join(path, "file")); string(data) != "outside!" {
++		t.Fatal("replacement changed")
++	}
++	if err := writer.writeToFile("cached", []byte("left"), 0, 8, false); err != nil {
++		t.Fatal(err)
++	}
++	refusal := errors.New("actual guard refusal")
++	writer.beforeWrite = func() error { return refusal }
++	if err := writer.writeToFile("cached", []byte("bad!"), 4, -1, false); !errors.Is(err, refusal) {
++		t.Fatalf("cached write bypassed guard: %v", err)
++	}
++	if value, _ := os.ReadFile(filepath.Join(path, "cached")); string(value[:4]) != "left" || string(value[4:]) == "bad!" {
++		t.Fatal("refused cached write changed bytes")
++	}
++}
++
++func existingMetadataNode(name string, mode os.FileMode) *data.Node {
++	return &data.Node{Name: name, Type: data.NodeTypeFile, Mode: mode, UID: uint32(os.Geteuid()), GID: uint32(os.Getegid()),
++		AccessTime: time.Unix(1700000000, 123456789), ModTime: time.Unix(1700000001, 987654321)}
++}
++
++func TestExistingRootMetadataUsesHeldInodeAndRefusesOutsideHardlink(t *testing.T) {
++	path, writer := existingRootTestWriter(t)
++	outside := filepath.Join(t.TempDir(), "outside")
++	if err := os.WriteFile(outside, []byte("outside bytes"), 0444); err != nil {
++		t.Fatal(err)
++	}
++	stamp := time.Unix(1600000000, 222000000)
++	if err := os.Chtimes(outside, stamp, stamp); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Link(outside, filepath.Join(path, "file")); err != nil {
++		t.Fatal(err)
++	}
++	before, err := os.Stat(outside)
++	if err != nil {
++		t.Fatal(err)
++	}
++	writer.existingRoot.remember("file", before)
++	res := &Restorer{root: writer.root, existingRoot: writer.existingRoot, BeforeWrite: func() error { return nil }}
++	node := existingMetadataNode("file", 0600)
++	if err := rootRestoreMetadata(res, node, "file", nil, nil, false); !errors.Is(err, errExistingIdentity) {
++		t.Fatalf("outside hardlink metadata admitted: %v", err)
++	}
++	after, err := os.Stat(outside)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !after.ModTime().Equal(before.ModTime()) || after.Mode() != before.Mode() {
++		t.Fatal("outside metadata changed")
++	}
++	value, _ := os.ReadFile(outside)
++	if string(value) != "outside bytes" {
++		t.Fatal("outside bytes changed")
++	}
++	// A full write detaches safely without chmodding the outside readonly inode.
++	if err := writer.writeToFile("file", []byte("new bytes"), 0, 9, false); err != nil {
++		t.Fatal(err)
++	}
++	if err := rootRestoreMetadata(res, node, "file", nil, nil, false); err != nil {
++		t.Fatal(err)
++	}
++	after, _ = os.Stat(outside)
++	if !after.ModTime().Equal(before.ModTime()) || after.Mode() != before.Mode() {
++		t.Fatal("detachment changed outside metadata")
++	}
++	value, _ = os.ReadFile(outside)
++	if string(value) != "outside bytes" {
++		t.Fatal("detachment changed outside bytes")
++	}
++	inside, _ := os.Stat(filepath.Join(path, "file"))
++	if os.SameFile(inside, after) || inside.Mode().Perm() != 0600 || !inside.ModTime().Equal(node.ModTime) {
++		t.Fatal("new inode metadata incorrect")
++	}
++}
++
++func TestExistingRootMetadataGuardAndSymlinkDoNotFollowOutsideTarget(t *testing.T) {
++	path, writer := existingRootTestWriter(t)
++	if err := os.WriteFile(filepath.Join(path, "file"), []byte("data"), 0640); err != nil {
++		t.Fatal(err)
++	}
++	info, _ := os.Stat(filepath.Join(path, "file"))
++	writer.existingRoot.remember("file", info)
++	refusal := errors.New("metadata guard refused")
++	res := &Restorer{root: writer.root, existingRoot: writer.existingRoot, BeforeWrite: func() error { return refusal }}
++	if err := rootRestoreMetadata(res, existingMetadataNode("file", 0600), "file", nil, nil, false); !errors.Is(err, refusal) {
++		t.Fatalf("metadata skipped guard: %v", err)
++	}
++	after, _ := os.Stat(filepath.Join(path, "file"))
++	if after.Mode() != info.Mode() || !after.ModTime().Equal(info.ModTime()) {
++		t.Fatal("refused metadata changed")
++	}
++	outside := filepath.Join(t.TempDir(), "outside")
++	if err := os.WriteFile(outside, []byte("outside"), 0644); err != nil {
++		t.Fatal(err)
++	}
++	outsideInfo, _ := os.Stat(outside)
++	if err := os.Symlink(outside, filepath.Join(path, "link")); err != nil {
++		t.Fatal(err)
++	}
++	res.BeforeWrite = func() error { return nil }
++	node := existingMetadataNode("link", 0777)
++	node.Type = data.NodeTypeSymlink
++	if err := rootRestoreMetadata(res, node, "link", nil, nil, false); err != nil {
++		t.Fatal(err)
++	}
++	outsideAfter, _ := os.Stat(outside)
++	if !outsideAfter.ModTime().Equal(outsideInfo.ModTime()) || outsideAfter.Mode() != outsideInfo.Mode() {
++		t.Fatal("symlink metadata followed outside target")
++	}
++	linkInfo, _ := os.Lstat(filepath.Join(path, "link"))
++	if !linkInfo.ModTime().Equal(node.ModTime) {
++		t.Fatal("symlink timestamp not restored")
++	}
++	// Exercise descriptor xattrs on an ordinary target independently of times.
++	name := "user.solstone.rooted"
++	if runtime.GOOS == "darwin" {
++		name = "com.solstone.rooted"
++	}
++	res.BeforeWrite = func() error { return nil }
++	fileNode := existingMetadataNode("file", 0600)
++	fileNode.ExtendedAttributes = []data.ExtendedAttribute{{Name: name, Value: []byte("owned")}}
++	if err := rootRestoreMetadata(res, fileNode, "file", nil, nil, false); err != nil {
++		t.Fatal(err)
++	}
++	buffer := make([]byte, 16)
++	n, err := unix.Getxattr(filepath.Join(path, "file"), name, buffer)
++	if err != nil || string(buffer[:n]) != "owned" {
++		t.Fatal("held descriptor xattr failed", err)
++	}
++}
++
++// Every case is a finite local entry substitution. The external go test
++// timeout bounds a regression that blocks in open(2); no competing process,
++// load generator or retry loop is used.
++func TestExistingRootClosedTypesRefuseWithoutBlocking(t *testing.T) {
++	operations := []string{"verify", "hardlink-source", "create", "reopen", "metadata-file", "metadata-directory", "metadata-symlink"}
++	for _, operation := range operations {
++		for _, kind := range []string{"fifo", "directory", "symlink"} {
++			if operation == "metadata-directory" && kind == "directory" || operation == "metadata-symlink" && kind == "symlink" {
++				continue
++			}
++			t.Run(operation+"/"+kind, func(t *testing.T) {
++				dir := t.TempDir()
++				outside := filepath.Join(t.TempDir(), "outside")
++				if err := os.WriteFile(outside, []byte("outside sentinel"), 0600); err != nil {
++					t.Fatal(err)
++				}
++				beforeOutside, err := os.Stat(outside)
++				if err != nil {
++					t.Fatal(err)
++				}
++				path := filepath.Join(dir, "entry")
++				if err := os.WriteFile(path, []byte("old data"), 0600); err != nil {
++					t.Fatal(err)
++				}
++				before, err := os.Stat(path)
++				if err != nil {
++					t.Fatal(err)
++				}
++				root, err := os.OpenRoot(dir)
++				if err != nil {
++					t.Fatal(err)
++				}
++				defer root.Close()
++				state := newExistingRootState()
++				state.remember("entry", before)
++				if err := os.Remove(path); err != nil {
++					t.Fatal(err)
++				}
++				switch kind {
++				case "fifo":
++					err = unix.Mkfifo(path, 0600)
++				case "directory":
++					err = os.Mkdir(path, 0700)
++				case "symlink":
++					err = os.Symlink(outside, path)
++				}
++				if err != nil {
++					t.Fatal(err)
++				}
++				substituted, err := os.Lstat(path)
++				if err != nil {
++					t.Fatal(err)
++				}
++				nodeType := data.NodeTypeFile
++				if operation == "metadata-directory" {
++					nodeType = data.NodeTypeDir
++				}
++				if operation == "metadata-symlink" {
++					nodeType = data.NodeTypeSymlink
++				}
++				node := &data.Node{Name: "entry", Type: nodeType, Mode: 0600, UID: uint32(os.Geteuid()), GID: uint32(os.Getegid()), AccessTime: time.Unix(1700000000, 0), ModTime: time.Unix(1700000000, 0)}
++				res := &Restorer{root: root, existingRoot: state, BeforeWrite: func() error { return nil }}
++				writer := newFilesWriterRoot(1, false, root, func() error { return nil })
++				writer.existingRoot = state
++				var file *os.File
++				switch operation {
++				case "verify":
++					_, _, err = res.verifyFileRoot(context.Background(), root, "entry", node, false, false, nil)
++				case "hardlink-source":
++					err = checkExistingHardlinkSource(res, "entry")
++				case "create":
++					file, err = writer.createFileRoot("entry", 8, false)
++				case "reopen":
++					file, err = writer.openFileRoot("entry")
++				default:
++					err = rootRestoreMetadata(res, node, "entry", nil, nil, false)
++				}
++				if file != nil {
++					_ = file.Close()
++				}
++				writer.flush()
++				if err == nil {
++					t.Fatal("closed type was admitted")
++				}
++				after, statErr := os.Lstat(path)
++				if statErr != nil || !os.SameFile(substituted, after) || after.Mode() != substituted.Mode() {
++					t.Fatalf("refusal changed substituted entry: %v", statErr)
++				}
++				content, readErr := os.ReadFile(outside)
++				afterOutside, statErr := os.Stat(outside)
++				if readErr != nil || statErr != nil || string(content) != "outside sentinel" || afterOutside.Mode() != beforeOutside.Mode() || !afterOutside.ModTime().Equal(beforeOutside.ModTime()) {
++					t.Fatal("refusal changed outside sentinel")
++				}
++				t.Logf("refused %s as %s: %v", kind, operation, err)
++			})
++		}
++	}
++}
