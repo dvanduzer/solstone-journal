@@ -4716,6 +4716,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "full-tests")]
     fn selection(today: chrono::NaiveDate, spending: WorkPolicy) -> Selection {
         Selection {
             allowed: true,
@@ -5358,6 +5359,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "full-tests")]
     fn confidential_spending(rest: Duration) -> WorkPolicy {
         WorkPolicy {
             lane: ThinkingLane::Confidential,
@@ -5367,6 +5369,7 @@ mod tests {
     }
 
     /// Selects with the confidential lane and the background slot as given.
+    #[cfg(feature = "full-tests")]
     fn select_confidential(state: &mut QueueState, rest: Duration, slot_open: bool) -> Vec<String> {
         take_ready(
             state,
@@ -5382,6 +5385,7 @@ mod tests {
         .collect()
     }
 
+    #[cfg(feature = "full-tests")]
     fn ready_state(queue: &TaskQueue) -> std::sync::MutexGuard<'_, QueueState> {
         let mut state = queue.inner.state.lock().unwrap();
         state.ready = true;
@@ -5390,6 +5394,7 @@ mod tests {
 
     /// Each reference is its own work, daily included: unlike `ranked_request`,
     /// the reference stays in the command so same-day daily work does not merge.
+    #[cfg(feature = "full-tests")]
     fn enqueue_ranked(queue: &TaskQueue, state: &mut QueueState, work: &[(&str, &str, &str)]) {
         for &(reference, mode, priority) in work {
             let mut command = vec!["journal", "think", "--day", "20260101"];
