@@ -366,3 +366,118 @@ fn owner_embedding_inventory(root: &Path) -> Result<(usize, usize), CatalogBuild
     }
     Ok((segments_available, embeddings_available))
 }
+
+#[cfg(all(test, feature = "full-tests"))]
+mod tests {
+    use std::fs;
+
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn confirmed_owner_cache_reflects_voiceprint_mutations() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let principal_id = "owner_person";
+
+        let manual_stats = ManualOwnerTagStats {
+            manual_tags_count: 5,
+            streams_represented: 1,
+            lookup_error_count: 0,
+        };
+
+        // 1. centroid: None -> intra_cosine_p25 is null and streams is empty
+        let res_no_centroid = confirmed_status(root, principal_id, &manual_stats, None);
+        assert_eq!(res_no_centroid["status"], "confirmed");
+        assert!(res_no_centroid["centroid_metadata"]["intra_cosine_p25"].is_null());
+        assert_eq!(res_no_centroid["centroid_metadata"]["streams"], json!([]));
+
+        // Create entity and voiceprints
+        let entity_dir = root.join("entities").join(principal_id);
+        fs::create_dir_all(&entity_dir).expect("entity dir");
+        fs::write(
+            entity_dir.join("entity.json"),
+            serde_json::to_vec(&json!({"id": principal_id, "name": "The Owner", "type": "Person"}))
+                .unwrap(),
+        )
+        .unwrap();
+
+        let encoder = solstone_core_entity::EncoderIdentity {
+            id: "test".to_owned(),
+            sha256: "0".repeat(64),
+            width: 256,
+        };
+        solstone_core_entity::save_voiceprints_batch(
+            root,
+            principal_id,
+            &[
+                solstone_core_entity::VoiceprintItem {
+                    embedding: vec![1.0; 256],
+                    metadata: json!({"day":"20261015","stream":"mic","segment_key":"120000_1","source":"audio","sentence_id":1}),
+                },
+                solstone_core_entity::VoiceprintItem {
+                    embedding: vec![0.5; 256],
+                    metadata: json!({"day":"20261015","stream":"mic","segment_key":"120000_1","source":"audio","sentence_id":2}),
+                },
+            ],
+            &encoder,
+        )
+        .unwrap();
+
+        let centroid_summary = OwnerCentroidSummary {
+            cluster_size: 2,
+            threshold: 0.5,
+            margin: Some(0.1),
+            last_refreshed_at: "2026-10-15T12:00:00Z".to_owned(),
+            created_at: Some("2026-10-15T12:00:00Z".to_owned()),
+            evidence_tier: "standard".to_owned(),
+            evidence_hash: Some("abc".to_owned()),
+            evidence_intra_cosine_p25: Some(0.4),
+        };
+
+        // 2. centroid: Some(...) with real voiceprint -> number and streams from file
+        let res_with_centroid =
+            confirmed_status(root, principal_id, &manual_stats, Some(centroid_summary));
+        assert_eq!(res_with_centroid["status"], "confirmed");
+        assert!(res_with_centroid["centroid_metadata"]["intra_cosine_p25"].is_number());
+        assert_eq!(
+            res_with_centroid["centroid_metadata"]["streams"],
+            json!(["mic"])
+        );
+
+        // 3. Corrupt voiceprint file -> null p25 and empty streams
+        fs::write(entity_dir.join("voiceprints.npz"), b"corrupted bytes").unwrap();
+        let centroid_summary2 = OwnerCentroidSummary {
+            cluster_size: 2,
+            threshold: 0.5,
+            margin: Some(0.1),
+            last_refreshed_at: "2026-10-15T12:00:00Z".to_owned(),
+            created_at: Some("2026-10-15T12:00:00Z".to_owned()),
+            evidence_tier: "standard".to_owned(),
+            evidence_hash: Some("abc".to_owned()),
+            evidence_intra_cosine_p25: Some(0.4),
+        };
+        let res_corrupted =
+            confirmed_status(root, principal_id, &manual_stats, Some(centroid_summary2));
+        assert!(res_corrupted["centroid_metadata"]["intra_cosine_p25"].is_null());
+        assert_eq!(res_corrupted["centroid_metadata"]["streams"], json!([]));
+
+        // 4. Delete voiceprint file -> null p25 and empty streams
+        fs::remove_file(entity_dir.join("voiceprints.npz")).unwrap();
+        let centroid_summary3 = OwnerCentroidSummary {
+            cluster_size: 2,
+            threshold: 0.5,
+            margin: Some(0.1),
+            last_refreshed_at: "2026-10-15T12:00:00Z".to_owned(),
+            created_at: Some("2026-10-15T12:00:00Z".to_owned()),
+            evidence_tier: "standard".to_owned(),
+            evidence_hash: Some("abc".to_owned()),
+            evidence_intra_cosine_p25: Some(0.4),
+        };
+        let res_deleted =
+            confirmed_status(root, principal_id, &manual_stats, Some(centroid_summary3));
+        assert!(res_deleted["centroid_metadata"]["intra_cosine_p25"].is_null());
+        assert_eq!(res_deleted["centroid_metadata"]["streams"], json!([]));
+    }
+}

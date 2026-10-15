@@ -284,4 +284,121 @@ mod tests {
         );
         let _ = fs::remove_dir_all(root);
     }
+
+    #[test]
+    #[cfg(all(test, feature = "full-tests"))]
+    fn known_voice_cache_live_reads_reflect_entity_and_voiceprint_mutations() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+
+        let encoder = solstone_core_entity::EncoderIdentity {
+            id: "test".to_owned(),
+            sha256: "0".repeat(64),
+            width: 256,
+        };
+
+        for (id, name) in [("alice", "Alice"), ("bob", "Bob")] {
+            let entity_dir = root.join("entities").join(id);
+            fs::create_dir_all(&entity_dir).expect("entity dir");
+            fs::write(
+                entity_dir.join("entity.json"),
+                serde_json::to_vec(&json!({"id": id, "name": name, "type": "Person"})).unwrap(),
+            )
+            .unwrap();
+            solstone_core_entity::save_voiceprints_batch(
+                root,
+                id,
+                &[
+                    solstone_core_entity::VoiceprintItem {
+                        embedding: vec![1.0; 256],
+                        metadata: json!({"day":"20261015","stream":"main","segment_key":"120000_1","source":"audio","sentence_id":1}),
+                    },
+                    solstone_core_entity::VoiceprintItem {
+                        embedding: vec![0.5; 256],
+                        metadata: json!({"day":"20261015","stream":"main","segment_key":"120000_1","source":"audio","sentence_id":2}),
+                    },
+                ],
+                &encoder,
+            )
+            .unwrap();
+        }
+
+        // 1. Initial read: both present
+        let initial = known_speakers(root);
+        assert_eq!(initial.len(), 2);
+        let alice_p25 = initial
+            .iter()
+            .find(|s| s.entity_id == "alice")
+            .unwrap()
+            .intra_cosine_p25;
+        assert!(alice_p25.is_some());
+
+        // 2. Name-only edit of entity.json shows new name, same p25
+        let alice_dir = root.join("entities").join("alice");
+        fs::write(
+            alice_dir.join("entity.json"),
+            serde_json::to_vec(&json!({"id": "alice", "name": "Alice Wonder", "type": "Person"}))
+                .unwrap(),
+        )
+        .unwrap();
+        let after_rename = known_speakers(root);
+        let alice_after = after_rename
+            .iter()
+            .find(|s| s.entity_id == "alice")
+            .unwrap();
+        assert_eq!(alice_after.name, "Alice Wonder");
+        assert_eq!(alice_after.intra_cosine_p25, alice_p25);
+
+        // 3. Block bob
+        let bob_dir = root.join("entities").join("bob");
+        fs::write(
+            bob_dir.join("entity.json"),
+            serde_json::to_vec(
+                &json!({"id": "bob", "name": "Bob", "type": "Person", "blocked": true}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let after_block = known_speakers(root);
+        assert_eq!(after_block.len(), 1);
+        assert_eq!(after_block[0].entity_id, "alice");
+
+        // Unblock bob
+        fs::write(
+            bob_dir.join("entity.json"),
+            serde_json::to_vec(&json!({"id": "bob", "name": "Bob", "type": "Person"})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(known_speakers(root).len(), 2);
+
+        // 4. Change bob to non-person
+        fs::write(
+            bob_dir.join("entity.json"),
+            serde_json::to_vec(&json!({"id": "bob", "name": "Bob", "type": "Tool"})).unwrap(),
+        )
+        .unwrap();
+        let after_type = known_speakers(root);
+        assert_eq!(after_type.len(), 1);
+        assert_eq!(after_type[0].entity_id, "alice");
+
+        // Restore bob type
+        fs::write(
+            bob_dir.join("entity.json"),
+            serde_json::to_vec(&json!({"id": "bob", "name": "Bob", "type": "Person"})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(known_speakers(root).len(), 2);
+
+        // 5. Corrupt bob's voiceprint file
+        fs::write(bob_dir.join("voiceprints.npz"), b"not an npz file").unwrap();
+        let after_corrupt = known_speakers(root);
+        assert_eq!(after_corrupt.len(), 1);
+        assert_eq!(after_corrupt[0].entity_id, "alice");
+
+        // 6. Delete bob entity directory entirely
+        let _ = fs::remove_dir_all(&bob_dir);
+        let after_delete = known_speakers(root);
+        assert_eq!(after_delete.len(), 1);
+        assert_eq!(after_delete[0].entity_id, "alice");
+    }
 }

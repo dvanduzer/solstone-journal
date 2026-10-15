@@ -9,9 +9,10 @@
 //! pool catch-up both run it.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use chrono::Utc;
 use ndarray::Array2;
@@ -644,9 +645,83 @@ pub fn segment_overlap_fraction(path: &Path) -> f64 {
         .unwrap_or(0.0)
 }
 
+const P25_CACHE_CAP: usize = 128;
+
+type P25CacheQueue = VecDeque<([u8; 32], Option<f64>)>;
+
+fn p25_cache() -> &'static Mutex<P25CacheQueue> {
+    static CACHE: OnceLock<Mutex<P25CacheQueue>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(VecDeque::with_capacity(P25_CACHE_CAP)))
+}
+
+fn hash_raw_embeddings(embeddings: &[Vec<f32>]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update((embeddings.len() as u64).to_le_bytes());
+    for row in embeddings {
+        hasher.update((row.len() as u64).to_le_bytes());
+        for val in row {
+            hasher.update(val.to_le_bytes());
+        }
+    }
+    hasher.finalize().into()
+}
+
+#[cfg(test)]
+thread_local! {
+    static P25_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static P25_MISSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_p25_hit() {
+    P25_HITS.with(|c| c.set(c.get() + 1));
+}
+#[cfg(not(test))]
+fn record_p25_hit() {}
+
+#[cfg(test)]
+fn record_p25_miss() {
+    P25_MISSES.with(|c| c.set(c.get() + 1));
+}
+#[cfg(not(test))]
+fn record_p25_miss() {}
+
 /// The 25th-percentile pairwise cosine between embeddings: how consistent a
 /// voice is.
 pub fn intra_cosine_p25(embeddings: &[Vec<f32>]) -> Option<f64> {
+    let digest = hash_raw_embeddings(embeddings);
+    {
+        let cache = p25_cache().lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, cached_val)) = cache.iter().find(|(k, _)| *k == digest) {
+            record_p25_hit();
+            return *cached_val;
+        }
+    }
+    record_p25_miss();
+
+    let computed = if embeddings
+        .iter()
+        .any(|embedding| embedding.iter().any(|val| !val.is_finite()))
+    {
+        None
+    } else {
+        compute_intra_cosine_p25(embeddings)
+    };
+
+    {
+        let mut cache = p25_cache().lock().unwrap_or_else(PoisonError::into_inner);
+        if !cache.iter().any(|(k, _)| *k == digest) {
+            if cache.len() >= P25_CACHE_CAP {
+                cache.pop_front();
+            }
+            cache.push_back((digest, computed));
+        }
+    }
+
+    computed
+}
+
+fn compute_intra_cosine_p25(embeddings: &[Vec<f32>]) -> Option<f64> {
     if embeddings.len() < 2 {
         return None;
     }
@@ -676,19 +751,36 @@ pub fn intra_cosine_p25(embeddings: &[Vec<f32>]) -> Option<f64> {
     let rows = normalized.len();
     let values = normalized.into_iter().flatten().collect::<Vec<_>>();
     let matrix = Array2::from_shape_vec((rows, columns), values).ok()?;
-    // NumPy uses a float32 matrix multiply (`e_norm @ e_norm.T`) before
-    // percentile interpolation, so use a GEMM rather than a scalar dot loop.
     let similarities = matrix.dot(&matrix.t());
-    let mut cosines = Vec::new();
+    let mut cosines = Vec::with_capacity(rows.checked_mul(rows - 1)? / 2);
     for row in 0..rows {
-        cosines.extend((row + 1..rows).map(|column| similarities[(row, column)]));
+        for column in (row + 1)..rows {
+            cosines.push(similarities[(row, column)]);
+        }
     }
-    cosines.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+    if cosines.is_empty() {
+        return None;
+    }
+    let comparator = |left: &f32, right: &f32| left.partial_cmp(right).unwrap_or(Ordering::Equal);
     let rank = (cosines.len() - 1) as f64 * 0.25;
     let lower = rank.floor() as usize;
     let upper = rank.ceil() as usize;
     let fraction = rank - lower as f64;
-    Some(f64::from(cosines[lower]) + fraction * f64::from(cosines[upper] - cosines[lower]))
+
+    let (lower_v, upper_v) = if lower == upper {
+        cosines.select_nth_unstable_by(lower, comparator);
+        let val = cosines[lower];
+        (val, val)
+    } else {
+        cosines.select_nth_unstable_by(upper, comparator);
+        let upper_v = cosines[upper];
+        let lower_v = *cosines[..upper]
+            .iter()
+            .max_by(|a, b| comparator(a, b))
+            .expect("upper > 0 so prefix is non-empty");
+        (lower_v, upper_v)
+    };
+    Some(f64::from(lower_v) + fraction * f64::from(upper_v - lower_v))
 }
 
 #[cfg(test)]
@@ -1048,5 +1140,273 @@ mod tests {
                 "{name}: {actual} vs {expected}"
             );
         }
+    }
+
+    fn reference_p25(embeddings: &[Vec<f32>]) -> Option<f64> {
+        if embeddings.len() < 2 {
+            return None;
+        }
+        let normalized = embeddings
+            .iter()
+            .map(|embedding| {
+                let norm = embedding
+                    .iter()
+                    .map(|value| value * value)
+                    .sum::<f32>()
+                    .sqrt();
+                let norm = if norm < 1e-9 { 1.0 } else { norm };
+                embedding
+                    .iter()
+                    .map(|value| value / norm)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let columns = normalized.first()?.len();
+        if columns == 0
+            || normalized
+                .iter()
+                .any(|embedding| embedding.len() != columns)
+        {
+            return None;
+        }
+        let rows = normalized.len();
+        let values = normalized.into_iter().flatten().collect::<Vec<_>>();
+        let matrix = Array2::from_shape_vec((rows, columns), values).ok()?;
+        let similarities = matrix.dot(&matrix.t());
+        let mut cosines = Vec::new();
+        for row in 0..rows {
+            cosines.extend((row + 1..rows).map(|column| similarities[(row, column)]));
+        }
+        cosines.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+        let rank = (cosines.len() - 1) as f64 * 0.25;
+        let lower = rank.floor() as usize;
+        let upper = rank.ceil() as usize;
+        let fraction = rank - lower as f64;
+        Some(f64::from(cosines[lower]) + fraction * f64::from(cosines[upper] - cosines[lower]))
+    }
+
+    #[test]
+    fn reference_equality_across_sizes_duplicates_zeros_and_ranks() {
+        assert_eq!(intra_cosine_p25(&[]), None);
+        assert_eq!(intra_cosine_p25(&[vec![1.0, 2.0]]), None);
+        assert_eq!(intra_cosine_p25(&[vec![1.0, 2.0], vec![1.0]]), None);
+        assert_eq!(intra_cosine_p25(&[vec![], vec![]]), None);
+
+        // n=2: integral rank (0.0)
+        let v2 = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
+        assert_eq!(intra_cosine_p25(&v2), reference_p25(&v2));
+
+        // n=3: fractional rank (0.5)
+        let v3 = vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 1.0]];
+        assert_eq!(intra_cosine_p25(&v3), reference_p25(&v3));
+
+        // n=10: integral rank (11.0)
+        let v10 = (0..10)
+            .map(|i| vec![i as f32 + 1.0, (10 - i) as f32 + 1.0, (i * 2) as f32])
+            .collect::<Vec<_>>();
+        assert_eq!(intra_cosine_p25(&v10), reference_p25(&v10));
+
+        // Duplicate rows and zeros
+        let with_dups = vec![
+            vec![1.0, 0.0],
+            vec![1.0, 0.0],
+            vec![0.0, 0.0],
+            vec![0.5, 0.5],
+            vec![1.0, 0.0],
+        ];
+        assert_eq!(intra_cosine_p25(&with_dups), reference_p25(&with_dups));
+
+        // Finite subnormals
+        let with_subnormals = vec![vec![1e-40_f32, 1.0], vec![2.0, 1e-40_f32], vec![1.0, 1.0]];
+        assert_eq!(
+            intra_cosine_p25(&with_subnormals),
+            reference_p25(&with_subnormals)
+        );
+    }
+
+    #[test]
+    fn nonfinite_returns_none_and_finite_twin_matches_reference() {
+        let nan_in = vec![vec![1.0, f32::NAN], vec![1.0, 2.0]];
+        assert_eq!(intra_cosine_p25(&nan_in), None);
+
+        let inf_in = vec![vec![f32::INFINITY, 0.0], vec![1.0, 2.0]];
+        assert_eq!(intra_cosine_p25(&inf_in), None);
+
+        let neg_inf_in = vec![vec![1.0, 0.0], vec![1.0, f32::NEG_INFINITY]];
+        assert_eq!(intra_cosine_p25(&neg_inf_in), None);
+
+        let finite_twin = vec![vec![1.0, 0.0], vec![1.0, 2.0]];
+        assert_eq!(intra_cosine_p25(&finite_twin), reference_p25(&finite_twin));
+    }
+
+    #[test]
+    fn evidence_quality_gates_cohesion_tiers_and_early_rejections() {
+        // Standard tier pass
+        let std_pass_emb = vec![vec![1.0, 0.0]; 30];
+        let q_std = evidence_quality(&std_pass_emb, vec![2.0; 30]);
+        assert_eq!(q_std.tier, "standard");
+        assert_eq!(q_std.bound, STANDARD_P25);
+        assert_eq!(q_std.reason, None);
+
+        // Standard tier fail
+        let mut std_fail_emb = vec![vec![1.0, 0.0]; 15];
+        std_fail_emb.extend(vec![vec![-1.0, 0.0]; 15]);
+        let q = evidence_quality(&std_fail_emb, vec![2.0; 30]);
+        assert_eq!(q.tier, "standard");
+        assert_eq!(q.reason, Some("cluster_too_diffuse"));
+
+        // Strong tier pass
+        let strong_pass_emb = vec![vec![1.0, 0.0]; 100];
+        let q = evidence_quality(&strong_pass_emb, vec![2.0; 100]);
+        assert_eq!(q.tier, "strong");
+        assert_eq!(q.bound, STRONG_P25);
+        assert_eq!(q.reason, None);
+
+        // Strong tier fail
+        let mut strong_fail_emb = vec![vec![1.0, 0.0]; 50];
+        strong_fail_emb.extend(vec![vec![-1.0, 0.0]; 50]);
+        let q = evidence_quality(&strong_fail_emb, vec![2.0; 100]);
+        assert_eq!(q.tier, "strong");
+        assert_eq!(q.reason, Some("cluster_too_diffuse"));
+
+        // Early rejection: too few statements (< 30)
+        let too_few = vec![vec![1.0, 0.0]; 20];
+        let q = evidence_quality(&too_few, vec![2.0; 20]);
+        assert_eq!(q.reason, Some("too_few_stmts"));
+
+        // Early rejection: median duration too short (< 1.5)
+        let short_dur = vec![vec![1.0, 0.0]; 30];
+        let q = evidence_quality(&short_dur, vec![1.0; 30]);
+        assert_eq!(q.reason, Some("median_duration_too_short"));
+
+        // Cached call matches cold call
+        let q2 = evidence_quality(&std_pass_emb, vec![2.0; 30]);
+        assert_eq!(q_std.p25, q2.p25);
+        assert_eq!(q_std.reason, q2.reason);
+    }
+
+    #[test]
+    fn finite_decisions_match_full_sort_on_both_sides_of_each_bound() {
+        fn reference_quality(embeddings: &[Vec<f32>], mut durations: Vec<f64>) -> Quality {
+            let tier = if embeddings.len() >= STRONG_STATEMENTS {
+                "strong"
+            } else {
+                "standard"
+            };
+            let bound = if tier == "strong" {
+                STRONG_P25
+            } else {
+                STANDARD_P25
+            };
+            durations.sort_by(f64::total_cmp);
+            let median = durations
+                .get((durations.len().saturating_sub(1)) / 2)
+                .copied()
+                .unwrap_or(0.0);
+            let p25 = reference_p25(embeddings).unwrap_or(0.0);
+            let reason = if embeddings.len() < MIN_STATEMENTS {
+                Some("too_few_stmts")
+            } else if median < MIN_MEDIAN_DURATION {
+                Some("median_duration_too_short")
+            } else if p25 < bound {
+                Some("cluster_too_diffuse")
+            } else {
+                None
+            };
+            Quality {
+                reason,
+                median,
+                p25,
+                tier,
+                bound,
+            }
+        }
+        for (n, bound) in [
+            (MIN_STATEMENTS, STANDARD_P25),
+            (STRONG_STATEMENTS, STRONG_P25),
+        ] {
+            for delta in [-0.00001, 0.00001] {
+                let cosine = (bound + delta) as f32;
+                let other = vec![cosine, (1.0 - cosine * cosine).sqrt()];
+                let mut rows = vec![vec![1.0, 0.0]; n / 2];
+                rows.extend(vec![other; n - n / 2]);
+                let expected = reference_quality(&rows, vec![2.0; n]);
+                assert_eq!(expected.reason.is_none(), delta > 0.0);
+                let misses = P25_MISSES.with(|c| c.get());
+                let hits = P25_HITS.with(|c| c.get());
+                for _ in 0..2 {
+                    let actual = evidence_quality(&rows, vec![2.0; n]);
+                    assert!((actual.p25 - expected.p25).abs() <= 1e-4);
+                    assert_eq!(actual.reason, expected.reason);
+                    assert_eq!(actual.reason.is_none(), expected.reason.is_none());
+                    assert_eq!(actual.median, expected.median);
+                    assert_eq!(actual.tier, expected.tier);
+                    assert_eq!(actual.bound, expected.bound);
+                }
+                assert_eq!(P25_MISSES.with(|c| c.get()) - misses, 1);
+                assert_eq!(P25_HITS.with(|c| c.get()) - hits, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn cache_hits_on_identical_bits_misses_on_mutation_and_sweep() {
+        let a = vec![vec![0.3_f32, 0.7_f32], vec![0.1_f32, 0.9_f32]];
+        let b = vec![vec![0.3_f32, 0.7_f32], vec![0.1_f32, 0.9_f32]];
+
+        let h0 = P25_HITS.with(|c| c.get());
+        let m0 = P25_MISSES.with(|c| c.get());
+
+        let res_a = intra_cosine_p25(&a);
+        assert_eq!(P25_MISSES.with(|c| c.get()) - m0, 1);
+        assert_eq!(P25_HITS.with(|c| c.get()) - h0, 0);
+
+        let res_b = intra_cosine_p25(&b);
+        assert_eq!(res_a, res_b);
+        assert_eq!(P25_MISSES.with(|c| c.get()) - m0, 1);
+        assert_eq!(P25_HITS.with(|c| c.get()) - h0, 1);
+
+        // One-bit flip misses and recomputes
+        let mut flipped = a.clone();
+        flipped[0][0] = f32::from_bits(flipped[0][0].to_bits() ^ 1);
+        let _ = intra_cosine_p25(&flipped);
+        assert_eq!(P25_MISSES.with(|c| c.get()) - m0, 2);
+
+        // Nonfinite inputs also hit on second call
+        let nan_in = vec![vec![f32::NAN, 1.0], vec![1.0, 2.0]];
+        let m_before_nan = P25_MISSES.with(|c| c.get());
+        let h_before_nan = P25_HITS.with(|c| c.get());
+        assert_eq!(intra_cosine_p25(&nan_in), None);
+        assert_eq!(P25_MISSES.with(|c| c.get()) - m_before_nan, 1);
+        assert_eq!(P25_HITS.with(|c| c.get()) - h_before_nan, 0);
+
+        assert_eq!(intra_cosine_p25(&nan_in), None);
+        assert_eq!(P25_MISSES.with(|c| c.get()) - m_before_nan, 1);
+        assert_eq!(P25_HITS.with(|c| c.get()) - h_before_nan, 1);
+
+        // 45-distinct width-2 sweep
+        let sweep: Vec<Vec<Vec<f32>>> = (0..45)
+            .map(|i| {
+                vec![
+                    vec![17.125 + (i as f32) * 0.01, 23.125 + (i as f32) * 0.01],
+                    vec![31.125 + (i as f32) * 0.01, 47.125 + (i as f32) * 0.01],
+                ]
+            })
+            .collect();
+
+        let m_sweep0 = P25_MISSES.with(|c| c.get());
+        let h_sweep0 = P25_HITS.with(|c| c.get());
+
+        for item in &sweep {
+            intra_cosine_p25(item);
+        }
+        assert_eq!(P25_MISSES.with(|c| c.get()) - m_sweep0, 45);
+        assert_eq!(P25_HITS.with(|c| c.get()) - h_sweep0, 0);
+
+        for item in &sweep {
+            intra_cosine_p25(item);
+        }
+        assert_eq!(P25_MISSES.with(|c| c.get()) - m_sweep0, 45);
+        assert_eq!(P25_HITS.with(|c| c.get()) - h_sweep0, 45);
     }
 }
