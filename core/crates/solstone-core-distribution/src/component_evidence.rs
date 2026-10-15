@@ -180,23 +180,32 @@ pub fn check_member_path(path: &str) -> Result<(), EvidenceError> {
     Ok(())
 }
 
-fn read_llama_cpp_revision(checkout: &Path) -> Result<String, EvidenceError> {
+fn read_llama_cpp_revision(checkout: &Path, release_tag: &str) -> Result<String, EvidenceError> {
     let pins_path = checkout.join("core/crates/solstone-core-local/src/install/pins.rs");
     let content = std::fs::read_to_string(&pins_path)
         .map_err(|e| EvidenceError::new(format!("failed to read {}: {e}", pins_path.display())))?;
-    for line in content.lines() {
-        if line.contains("\"llama_cpp_revision\"")
-            && let Some(start) = line.find(':')
+    // Read the bounded release/source table, rather than taking the first
+    // architecture's revision when selected runtime releases differ.
+    let table = content
+        .split_once("pub const CUDA_RELEASE_REVISIONS:")
+        .and_then(|(_, rest)| rest.split_once("= &["))
+        .and_then(|(_, rest)| rest.split_once("];"))
+        .map(|(table, _)| table)
+        .ok_or_else(|| EvidenceError::new("missing CUDA release/source table"))?;
+    let values: Vec<_> = table.split('"').skip(1).step_by(2).collect();
+    if values.len() % 2 != 0 {
+        return Err(EvidenceError::new("malformed CUDA release/source table"));
+    }
+    for pair in values.chunks_exact(2) {
+        if pair[0] == release_tag
+            && pair[1].len() == 40
+            && pair[1].bytes().all(|b| b.is_ascii_hexdigit())
         {
-            let rest = line[start + 1..].trim();
-            let unquoted = rest.trim_matches(|c| c == '"' || c == ',' || c == ' ');
-            if !unquoted.is_empty() {
-                return Ok(unquoted.to_string());
-            }
+            return Ok(pair[1].to_owned());
         }
     }
     Err(EvidenceError::new(format!(
-        "could not find llama_cpp_revision in {}",
+        "no CUDA source revision for {release_tag} in {}",
         pins_path.display()
     )))
 }
@@ -289,7 +298,7 @@ fn catalog_source(
 ) -> Result<String, EvidenceError> {
     if artifact.upstream_url.contains("updates.solstone.app") {
         if id == "llama-server-cuda" {
-            let rev = read_llama_cpp_revision(checkout)?;
+            let rev = read_llama_cpp_revision(checkout, artifact.version)?;
             return Ok(rev);
         }
         return Err(EvidenceError::new(format!("owner-origin-source: {id}")));
@@ -2066,9 +2075,34 @@ mod tests {
     }
 
     #[test]
+    fn cuda_source_revision_follows_the_requested_release() {
+        let root = tempfile::tempdir().unwrap();
+        let pins = root
+            .path()
+            .join("core/crates/solstone-core-local/src/install/pins.rs");
+        std::fs::create_dir_all(pins.parent().unwrap()).unwrap();
+        std::fs::write(
+            &pins,
+            r#"pub const CUDA_RELEASE_REVISIONS: &[(&str, &str)] = &[
+            ("b11669", "620d2225cc436ab0b001e3200e590e3b286ef9ab"),
+            ("b11429", "d81235049384534c167caea52b85a694f6103d14"),
+        ];"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_llama_cpp_revision(root.path(), "b11429").unwrap(),
+            "d81235049384534c167caea52b85a694f6103d14"
+        );
+        assert_eq!(
+            read_llama_cpp_revision(root.path(), "b11669").unwrap(),
+            "620d2225cc436ab0b001e3200e590e3b286ef9ab"
+        );
+        assert!(read_llama_cpp_revision(root.path(), "unknown").is_err());
+    }
+
+    #[test]
     fn render_runtime_rows_posix_properties() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
-        let expected_llama_rev = read_llama_cpp_revision(&repo_root).unwrap();
 
         for target in ["linux-x86_64", "linux-aarch64", "macos-arm64"] {
             let rows1 = render_runtime_rows(target, &[]).unwrap();
@@ -2097,7 +2131,10 @@ mod tests {
             let cat = solstone_core_assets::catalog();
             for r in &rows1 {
                 if r.id == "llama-server-cuda" {
-                    assert_eq!(r.source, expected_llama_rev);
+                    assert_eq!(
+                        r.source,
+                        read_llama_cpp_revision(&repo_root, &r.version).unwrap()
+                    );
                     assert!(!r.source.contains("updates.solstone.app"));
                 }
                 if r.id != "nvattest" {

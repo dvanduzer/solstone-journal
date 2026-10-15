@@ -2585,7 +2585,7 @@ fn registry_preserves_prechange_identity_literals() {
         fingerprint::canonical(pins::vulkan_identity("aarch64-apple-darwin").unwrap()).unwrap();
     assert_eq!(
         current_metal,
-        "{\"artifact_key\":\"aarch64-apple-darwin\",\"binary_name\":\"llama-server\",\"filename\":\"llama-b11429-bin-macos-arm64.tar.gz\",\"release_tag\":\"b11429\",\"sha256\":\"740288ec6887be94280a5dfa25b5e23a78285cab104519e6c7e218904ee82459\",\"unit\":\"llama-server-vulkan\"}"
+        "{\"artifact_key\":\"aarch64-apple-darwin\",\"binary_name\":\"llama-server\",\"filename\":\"llama-b11669-bin-macos-arm64.tar.gz\",\"release_tag\":\"b11669\",\"sha256\":\"dbed55493d72bc1ba2babc8770d669c2289b5bc4ee9fb2a4dfc158d45b7d13fd\",\"unit\":\"llama-server-vulkan\"}"
     );
 
     let current_cuda =
@@ -3543,11 +3543,13 @@ fn cancellation_does_not_overwrite_a_replacement_attempt() {
 }
 
 #[test]
-fn cuda_b11429_identity_pins_toolkit_inputs_and_not_publisher_attestation() {
+fn cuda_selected_identity_pins_toolkit_and_upstream_inputs() {
     let cases = [
         (
             "x86_64-unknown-linux-gnu",
             "amd64",
+            "b11429",
+            "d81235049384534c167caea52b85a694f6103d14",
             "https://updates.solstone.app/runtimes/llama-cuda13/b11429/llama-b11429-bin-linux-cuda13-amd64-sol1.tar.gz",
             "a9d8c0a4ece9f9dce7d8e634dd55f943ba39b93b339462dd645202db34aafbbd",
             591752886u64,
@@ -3571,29 +3573,31 @@ fn cuda_b11429_identity_pins_toolkit_inputs_and_not_publisher_attestation() {
         (
             "aarch64-unknown-linux-gnu",
             "arm64",
-            "https://updates.solstone.app/runtimes/llama-cuda13/b11429/llama-b11429-bin-linux-cuda13-arm64-sol1.tar.gz",
-            "de73a4cae3cb750170cfce090d752af95a67d97afd681154646547a7d6ddc72f",
-            699234360u64,
+            "b11669",
+            "620d2225cc436ab0b001e3200e590e3b286ef9ab",
+            "https://updates.solstone.app/runtimes/llama-cuda13/b11669/llama-b11669-bin-linux-cuda13-arm64-sol1.tar.gz",
+            "e7cee5a124adb5d93f2ada5bb26ddab123f07ae0d4cef5ec8fb922d63e939509",
+            700854480u64,
             json!([
                 {
                     "role": "engine",
-                    "filename": "llama-b11429-bin-ubuntu-cuda-13.4-arm64.tar.gz",
-                    "sha256": "9c76d072276c0faa7fc1b5cbf715b4186dd2e8d7f16acd20b67daab24c82bd22",
-                    "size_bytes": 147639003,
-                    "url_prefix": "https://github.com/ggml-org/llama.cpp/releases/download/b11429/"
+                    "filename": "llama-b11669-bin-ubuntu-cuda-13.4-arm64.tar.gz",
+                    "sha256": "19902edd0c02942ac736c2dea5e104ff219a196a5cd07f125a7adcd44c103e6b",
+                    "size_bytes": 149286186,
+                    "url_prefix": "https://github.com/ggml-org/llama.cpp/releases/download/b11669/"
                 },
                 {
                     "role": "cudart",
-                    "filename": "cudart-llama-b11429-bin-ubuntu-cuda-13.4-arm64.tar.gz",
-                    "sha256": "ad62e46cdc2e8636fa91e883b9e9ad779516f61cc478ece1c90e5dbc905a7d29",
-                    "size_bytes": 552521413,
-                    "url_prefix": "https://github.com/ggml-org/llama.cpp/releases/download/b11429/"
+                    "filename": "cudart-llama-b11669-bin-ubuntu-cuda-13.4-arm64.tar.gz",
+                    "sha256": "6c81453d16a574eef3273662a7a8ceafa3537699a5b2ffec3fc853eb1a08f67c",
+                    "size_bytes": 552521396,
+                    "url_prefix": "https://github.com/ggml-org/llama.cpp/releases/download/b11669/"
                 }
             ]),
         ),
     ];
 
-    for (key, arch, url, sha256, size, inputs) in cases {
+    for (key, arch, release, revision, url, sha256, size, inputs) in cases {
         let (pin_url, pin_sha256, pin_size) = pins::cuda_pin(key).expect("cuda_pin exists");
         assert_eq!(pin_url, url);
         assert_eq!(pin_sha256, sha256);
@@ -3605,15 +3609,8 @@ fn cuda_b11429_identity_pins_toolkit_inputs_and_not_publisher_attestation() {
         assert_eq!(identity["url"], url);
         assert_eq!(identity["sha256"], sha256);
         assert_eq!(identity["size_bytes"], size);
-        assert_eq!(identity["release_tag"], "b11429");
-        assert_eq!(
-            identity["llama_cpp_revision"],
-            "d81235049384534c167caea52b85a694f6103d14"
-        );
-        assert_ne!(
-            identity["llama_cpp_revision"],
-            "8345f333951c661d166b00e6f9362e553768f292"
-        );
+        assert_eq!(identity["release_tag"], release);
+        assert_eq!(identity["llama_cpp_revision"], revision);
         assert_eq!(identity["cuda_toolkit"], "13.4.1");
         assert_eq!(identity["repack_revision"], "sol1");
         assert_eq!(identity["arch"], arch);
