@@ -192,7 +192,6 @@ mod tests {
     #[cfg(all(test, feature = "full-tests"))]
     mod replacement_proof_tests {
         use std::fs;
-        use std::path::Path;
 
         use axum::body::{Body, to_bytes};
         use axum::http::{Request, StatusCode, header};
@@ -529,7 +528,7 @@ mod tests {
             assert_eq!(stream_files_after.len(), 1);
 
             let record_after: Value =
-                serde_json::from_str(&fs::read_to_string(&stream_files_after[0].path()).unwrap())
+                serde_json::from_str(&fs::read_to_string(stream_files_after[0].path()).unwrap())
                     .unwrap();
             assert_eq!(record_after["seq"], record_seq_before);
 
