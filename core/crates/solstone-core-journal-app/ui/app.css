@@ -214,6 +214,10 @@ details.detail p { margin-top: var(--space-2); user-select: text; overflow-wrap:
 /* --- the mark ------------------------------------------------------------ */
 
 .mark-card {
+  /* Fixed-light mark card: neutral roles keep their light-appearance values. */
+  --mark-neutral-border: #ECE3D0;
+  --mark-neutral-fill: #FEFCF8;
+  --mark-neutral-ink: #6E6453;
   display: inline-flex;
   flex-direction: column;
   align-items: center;
@@ -247,7 +251,7 @@ details.detail p { margin-top: var(--space-2); user-select: text; overflow-wrap:
   font-size: 19px;
   color: #1A1A1A;
 }
-.mark-sep { color: #6E6453; margin: 0 0.3em; }
+.mark-sep { color: var(--mark-neutral-ink); margin: 0 0.3em; }
 .mark-confirmed { font-size: 13px; font-weight: 600; color: #333333; }
 
 /* The card stays warm-bright in a dark window too, so its inks never switch. */

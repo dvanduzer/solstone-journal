@@ -74,12 +74,12 @@ export function renderMarkCard(container, mark, confirmedLine, unavailable = fal
     for (let i = 0; i < 2; i++) {
       const chip = document.createElement('div');
       chip.className = 'mark-chip unavailable';
-      chip.style.borderColor = '#d1c7b7';
-      chip.style.background = '#eae5dc';
+      chip.style.borderColor = 'var(--mark-neutral-border)';
+      chip.style.background = 'var(--mark-neutral-fill)';
       const q = document.createElement('span');
       q.style.fontSize = '24px';
       q.style.fontWeight = '700';
-      q.style.color = '#6E6453';
+      q.style.color = 'var(--mark-neutral-ink)';
       q.textContent = '?';
       chip.appendChild(q);
       chips.appendChild(chip);

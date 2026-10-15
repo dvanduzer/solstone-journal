@@ -28,7 +28,7 @@
     .init-section { margin-bottom: 2rem; }
     .init-section h3 { font-size: 1.25rem; font-weight: 600; border-bottom: 1px solid var(--hairline); padding-bottom: 0.5rem; margin-bottom: 0.75rem; }
     .section-hint { font-size: 0.85rem; color: var(--ink-soft-paper); margin: 0 0 0.75rem; }
-    .section-hint a { color: var(--orange-ink); }
+    .section-hint a { color: var(--orange-text-aa); }
     .machine-card {
       margin-bottom: 2rem;
       padding: 1rem;
@@ -108,7 +108,7 @@
     .lane.greyed { background: var(--cream); border-color: var(--hairline); cursor: default; }
     .lane.greyed .lanename { color: var(--ink-faint); }
     .lane .laneverdict { font-size: .82rem; color: var(--ink-faint); margin-top: 7px; line-height: 1.45; }
-    .lane .reqlink { color: var(--orange-ink); font-weight: 600; text-decoration: none; }
+    .lane .reqlink { color: var(--orange-text-aa); font-weight: 600; text-decoration: none; }
     .lane .lanetag {
       border: 1px solid var(--hairline);
       color: var(--ink-faint);
@@ -127,7 +127,7 @@
       font: inherit;
       font-size: .84rem;
       font-weight: 600;
-      color: var(--orange-ink);
+      color: var(--orange-text-aa);
       margin: 7px 0 0 17px;
     }
     .lanedetail {
@@ -162,14 +162,14 @@
     }
     .routenote b { color: var(--ink-soft); }
     .deferlink { font-size: .86rem; color: var(--ink-faint); margin-top: 16px; }
-    .deferlink a { color: var(--orange-ink); font-weight: 600; text-decoration: none; }
+    .deferlink a { color: var(--orange-text-aa); font-weight: 600; text-decoration: none; }
     .footer-note { font-size: 0.8rem; color: var(--ink-faint-paper); margin-top: 1.5rem; text-align: center; }
     .settings-preset-btn {
       padding: 0.5em 0.9em; border: 1px solid var(--hairline-2); border-radius: 4px;
       background: var(--paper); color: var(--ink-soft-paper); cursor: pointer; font-size: 0.85rem;
     }
     .settings-preset-btn:hover { border-color: var(--ink-faint-paper); }
-    .settings-preset-btn.active { border-color: var(--orange); color: var(--orange-ink); }
+    .settings-preset-btn.active { border-color: var(--orange); color: var(--orange-text-aa); }
     .retention-options { display: flex; flex-direction: column; gap: 0.5rem; }
     .retention-option { display: flex; flex-direction: column; gap: 0.4rem; cursor: pointer; }
     .retention-option-label { font-size: 0.95rem; }
@@ -622,8 +622,8 @@
       if (!display) return;
       display.innerHTML = '<div class="mark-card unavailable" role="img" aria-label="your journal\'s mark, unavailable right now">' +
         '<div class="mark-chips">' +
-        '<div class="mark-chip-unavailable" style="width: 48px; height: 48px; display: flex; align-items: center; justify-content: center; border: 2px solid #d1c7b7; background: #eae5dc; border-radius: 12px; box-sizing: border-box;"><span style="font-size: 24px; font-weight: 700; color: #6E6453;">?</span></div>' +
-        '<div class="mark-chip-unavailable" style="width: 48px; height: 48px; display: flex; align-items: center; justify-content: center; border: 2px solid #d1c7b7; background: #eae5dc; border-radius: 12px; box-sizing: border-box;"><span style="font-size: 24px; font-weight: 700; color: #6E6453;">?</span></div>' +
+        '<div class="mark-chip-unavailable" style="width: 48px; height: 48px; display: flex; align-items: center; justify-content: center; border: 2px solid var(--hairline); background: var(--cream-bright); border-radius: 12px; box-sizing: border-box;"><span style="font-size: 24px; font-weight: 700; color: var(--ink-faint);">?</span></div>' +
+        '<div class="mark-chip-unavailable" style="width: 48px; height: 48px; display: flex; align-items: center; justify-content: center; border: 2px solid var(--hairline); background: var(--cream-bright); border-radius: 12px; box-sizing: border-box;"><span style="font-size: 24px; font-weight: 700; color: var(--ink-faint);">?</span></div>' +
         '</div>' +
         '<div class="mark-words"><span>mark</span><span class="mark-sep">·</span><span>unavailable</span></div>' +
         '</div>';
