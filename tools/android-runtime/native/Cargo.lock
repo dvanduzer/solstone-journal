@@ -3199,7 +3199,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-about"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "libc",
  "log",
@@ -3213,7 +3213,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-artifact-download"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "sha2",
  "solstone-core-assets",
@@ -3223,7 +3223,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-assets"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "serde",
  "serde_json",
@@ -3232,7 +3232,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-auth-flow"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "getrandom 0.3.4",
  "sha2",
@@ -3240,7 +3240,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-backup"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "getrandom 0.3.4",
  "hmac",
@@ -3257,7 +3257,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-backup-runtime"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
@@ -3289,7 +3289,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-backup-web"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "axum",
  "chrono",
@@ -3315,7 +3315,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-body-ingest"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -3336,7 +3336,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-body-rebuild"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "nix",
  "rusqlite",
@@ -3349,7 +3349,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-body-source"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "ryu",
  "sha2",
@@ -3357,14 +3357,14 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-body-store"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "solstone-core-body-source",
 ]
 
 [[package]]
 name = "solstone-core-brain"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
@@ -3383,7 +3383,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-brain-owner"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "serde_json",
@@ -3397,7 +3397,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-callosum"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "getrandom 0.3.4",
  "hmac",
@@ -3417,7 +3417,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-chatgpt-auth"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "getrandom 0.3.4",
  "serde",
@@ -3431,7 +3431,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-check"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "log",
  "nix",
@@ -3445,11 +3445,11 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-cli-boundary"
-version = "2.0.46"
+version = "2.0.47"
 
 [[package]]
 name = "solstone-core-convey-body"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "axum",
  "chrono",
@@ -3465,7 +3465,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-convey-http"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "axum",
  "hyper",
@@ -3478,7 +3478,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-convey-shell"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "axum",
  "chrono",
@@ -3546,7 +3546,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-cortex"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -3570,7 +3570,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-depict"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -3591,7 +3591,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-describe-categories"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "serde",
  "serde_json",
@@ -3599,7 +3599,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-distribution"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "bzip2-rs",
  "flate2",
@@ -3624,7 +3624,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-entities"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "axum",
  "chrono",
@@ -3647,7 +3647,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-entity"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "caseless",
  "chrono",
@@ -3668,7 +3668,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-entity-matching"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "caseless",
  "md5",
@@ -3679,7 +3679,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-facets"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "caseless",
  "chrono",
@@ -3695,7 +3695,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-facets-web"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "axum",
  "chrono",
@@ -3716,14 +3716,14 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-ffmpeg-build-support"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "sha2",
 ]
 
 [[package]]
 name = "solstone-core-format"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "glob",
@@ -3737,7 +3737,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-generate"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "log",
  "serde",
@@ -3746,7 +3746,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-generate-wire"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -3769,14 +3769,14 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-handoff-nonce"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "getrandom 0.3.4",
 ]
 
 [[package]]
 name = "solstone-core-health-web"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "axum",
  "chrono",
@@ -3801,7 +3801,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-home"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -3826,7 +3826,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-home-web"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "axum",
  "chrono",
@@ -3846,7 +3846,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-import"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -3870,7 +3870,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-import-sources"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -3902,7 +3902,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-import-web"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "axum",
  "chrono",
@@ -3929,7 +3929,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-indexer"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -3948,7 +3948,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-indexer-query"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -3964,7 +3964,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-indexer-store"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "log",
  "rusqlite",
@@ -3979,7 +3979,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-ingest"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "axum",
  "log",
@@ -3998,7 +3998,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-ingest-contract"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "jsonschema",
  "serde_json",
@@ -4007,7 +4007,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-ingest-resolve"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "serde",
@@ -4020,7 +4020,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-installation-identity"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "getrandom 0.3.4",
  "nix",
@@ -4030,7 +4030,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-installed-payload"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "minisign",
  "serde",
@@ -4041,14 +4041,14 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-journal"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "toml_edit",
 ]
 
 [[package]]
 name = "solstone-core-journal-archive"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "nix",
  "solstone-core-journal-io",
@@ -4057,7 +4057,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-journal-cli"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "serde_json",
@@ -4081,7 +4081,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-journal-config"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -4096,7 +4096,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-journal-config-write"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "serde_json",
  "solstone-core-journal-config",
@@ -4105,7 +4105,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-journal-io"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
@@ -4121,7 +4121,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-journal-stats-cli"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "serde",
@@ -4138,7 +4138,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-local"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "flate2",
@@ -4164,7 +4164,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-location"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -4184,7 +4184,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-maintenance"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -4202,7 +4202,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-map-web"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "axum",
  "chrono",
@@ -4214,7 +4214,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-mcp-audit"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "serde",
@@ -4224,7 +4224,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-mcp-endpoint"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -4275,7 +4275,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-memory-original"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "serde",
  "serde_json",
@@ -4286,11 +4286,11 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-npy"
-version = "2.0.46"
+version = "2.0.47"
 
 [[package]]
 name = "solstone-core-nvattest-authority"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "serde",
  "serde_json",
@@ -4298,7 +4298,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-observe-audio"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "ffmpeg-next",
  "ffmpeg-sys-next",
@@ -4307,7 +4307,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-offload"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
@@ -4328,7 +4328,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-processing-record"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "serde",
  "serde_json",
@@ -4336,7 +4336,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-profile-web"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "axum",
  "chrono",
@@ -4352,7 +4352,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-push"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -4376,7 +4376,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-records-web"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "axum",
  "chrono",
@@ -4396,7 +4396,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-reprocess-cli"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -4412,7 +4412,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-retention"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
@@ -4430,7 +4430,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-retention-client"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "serde",
  "serde_json",
@@ -4439,7 +4439,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-segment"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "caseless",
  "serde",
@@ -4452,7 +4452,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-sense"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "serde",
@@ -4471,7 +4471,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-service-unit"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "plist",
  "quick-xml",
@@ -4481,7 +4481,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-serving"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "serde",
@@ -4494,7 +4494,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-settings-web"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "axum",
  "chrono",
@@ -4519,7 +4519,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-sol-client"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -4533,7 +4533,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-sol-link"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "argon2",
  "axum",
@@ -4569,7 +4569,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-sound-tags"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "log",
  "serde_json",
@@ -4581,7 +4581,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-speaker-id"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "serde",
  "serde_json",
@@ -4593,7 +4593,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-speaker-resolve"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -4623,14 +4623,14 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-speakers"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "hdbscan",
 ]
 
 [[package]]
 name = "solstone-core-speakers-analyze"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "env_logger",
  "log",
@@ -4642,7 +4642,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-speakers-onnx"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "ort",
  "solstone-core-local",
@@ -4652,7 +4652,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-spl"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "bytes",
  "futures-util",
@@ -4675,7 +4675,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-spp-attest"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "base64 0.22.1",
  "plist",
@@ -4692,7 +4692,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-spp-ratls"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "nix",
  "ring",
@@ -4707,7 +4707,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-stats-web"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "axum",
  "chrono",
@@ -4724,7 +4724,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-support-web"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "axum",
  "nix",
@@ -4734,7 +4734,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-system"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -4768,7 +4768,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-system-health"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "log",
@@ -4791,7 +4791,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-talent-cli"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "jsonschema",
@@ -4806,14 +4806,14 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-talent-config"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "solstone-core-talent-runtime"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "caseless",
  "chrono",
@@ -4851,7 +4851,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-thinking"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -4877,14 +4877,14 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-thinking-copy"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "solstone-core-transcribe"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
@@ -4917,7 +4917,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-transcripts"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "chrono",
  "log",
@@ -4930,7 +4930,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-transcripts-web"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "axum",
  "chrono",
@@ -4962,7 +4962,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-vad-analyze"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "ort",
  "serde_json",
@@ -4972,7 +4972,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-win-dll-load"
-version = "2.0.46"
+version = "2.0.47"
 dependencies = [
  "libloading 0.8.9",
  "windows-sys 0.61.2",

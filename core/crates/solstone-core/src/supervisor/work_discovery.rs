@@ -46,6 +46,8 @@ fn rest_after(pass: Duration) -> Duration {
 /// While it watches the queue, a resting worker checks it this often: for
 /// the end of an owner's requested work, and for discovered work that has left.
 const QUEUE_POLL: Duration = Duration::from_secs(1);
+/// A resting worker tells readers a later next pass at most this often.
+const REPROMISE: Duration = Duration::from_secs(60);
 
 /// Days the owner asked to redo whose discovered work is still in the queue.
 fn owner_days_in_queue(journal: &Path, queue: &TaskQueue) -> BTreeSet<String> {
@@ -75,13 +77,21 @@ fn owner_work_in_queue(queue: &TaskQueue, day: &str) -> bool {
 /// leaves the queue, until it returns false. Each top-up then rests nine times
 /// as long as it ran and moves the next pass back by ten times as long, so
 /// discovery as a whole still holds at most a tenth of one core.
+///
+/// `promise` carries the time readers were told the next pass is due. When
+/// that time arrives and top-ups have moved the next pass back, it tells them
+/// the new time. Only a live worker does this, so if it stops, its snapshot
+/// goes stale on the time last promised.
 fn rest(
     receiver: &mpsc::Receiver<()>,
     mut next_pass: Option<Instant>,
     owner: Option<(Instant, &dyn Fn() -> bool)>,
     mut top_up: Option<&mut dyn FnMut() -> bool>,
+    mut promise: Option<(Instant, &mut dyn FnMut(Instant))>,
 ) -> bool {
     let mut top_up_at = Instant::now();
+    let mut told = promise.as_ref().map(|(told, _)| *told);
+    let mut check_at = told;
     loop {
         let now = Instant::now();
         if next_pass.is_some_and(|due| now >= due)
@@ -89,11 +99,22 @@ fn rest(
         {
             return true;
         }
+        if let (Some(due), Some(at), Some(was)) = (next_pass, check_at, told)
+            && now >= at
+            && let Some((_, tell)) = promise.as_mut()
+        {
+            if due > was + QUEUE_POLL {
+                tell(due);
+                told = Some(due);
+            }
+            check_at = Some(due.max(now + REPROMISE));
+        }
         if now >= top_up_at
             && let Some(admit_next) = top_up.as_mut()
         {
+            let began = Instant::now();
             let more = admit_next();
-            let spent = now.elapsed();
+            let spent = began.elapsed();
             top_up_at = Instant::now() + spent * REST_PER_PASS;
             next_pass = next_pass.map(|due| due + spent * (REST_PER_PASS + 1));
             if !more {
@@ -109,6 +130,7 @@ fn rest(
                     .is_some()
                     .then(|| top_up_at.saturating_duration_since(now).max(QUEUE_POLL)),
             )
+            .chain(check_at.map(|at| at.saturating_duration_since(now)))
             .min();
         let timeout = match (
             next_pass.map(|due| due.saturating_duration_since(now)),
@@ -205,6 +227,19 @@ impl WorkDiscovery {
                             .iter()
                             .any(|day| !owner_work_in_queue(&queue, day))
                     };
+                    let mut published = backlog.published.take();
+                    let told = published
+                        .as_ref()
+                        .and_then(|report| report.next_pass_ms)
+                        .map(|due| {
+                            let left = due - chrono::Utc::now().timestamp_millis();
+                            Instant::now() + Duration::from_millis(left.max(0) as u64)
+                        });
+                    let mut promise = |due: Instant| {
+                        if let Some(report) = published.as_mut() {
+                            repromise(&journal, report, due);
+                        }
+                    };
                     let mut top_up = || backlog.top_up(&journal, &queue, &worker_stop);
                     if !rest(
                         &receiver,
@@ -212,6 +247,7 @@ impl WorkDiscovery {
                         (!owner_days.is_empty())
                             .then_some((ended + pass, &owner_done as &dyn Fn() -> bool)),
                         automatic.then_some(&mut top_up as &mut dyn FnMut() -> bool),
+                        told.map(|told| (told, &mut promise as &mut dyn FnMut(Instant))),
                     ) {
                         return;
                     }
@@ -239,11 +275,25 @@ impl Drop for WorkDiscovery {
     }
 }
 
-/// What the last pass handed the queue, and the rest of its ranking in order.
+/// Republish a resting pass's snapshot with a later next pass. It is still the
+/// snapshot as of its pass; only the promise moves.
+fn repromise(journal: &Path, report: &mut WorkInventory, due: Instant) {
+    report.next_pass_ms = Some(
+        chrono::Utc::now().timestamp_millis()
+            + due.saturating_duration_since(Instant::now()).as_millis() as i64,
+    );
+    if let Err(error) = report.publish(journal) {
+        log::warn!("work discovery: {error}");
+    }
+}
+
+/// What the last pass handed the queue, the rest of its ranking in order, and
+/// the snapshot it published.
 #[derive(Default)]
 struct Backlog {
     admitted: Vec<DiscoveredTask>,
     ranked: VecDeque<DiscoveredTask>,
+    published: Option<WorkInventory>,
 }
 
 impl Backlog {
@@ -919,7 +969,9 @@ fn inspect_day(
             if permanently_blocked || permanently_held_daily.contains(&id) {
                 work.history.set_aside += 1;
                 work.history.daily_units_set_aside += u64::from(p.band >= WorkBand::Completing);
-            } else {
+            } else if p.band != WorkBand::Remake {
+                // Updating an older day's outputs (band 6) is still counted as
+                // left, but it runs after history and must not hold the range.
                 work.history.owed += 1;
             }
         }
@@ -1305,7 +1357,8 @@ fn held_thinking(
     Ok(Some(held))
 }
 
-/// All historical days after the newest owed day are caught up. Today and
+/// All historical days after the newest day still owed its recordings or its
+/// first daily outputs are caught up. Today and
 /// yesterday are outside this range; unreadable days and permanent holds are
 /// counted separately. This folds only evidence already read by the pass.
 fn history_progress(
@@ -1424,13 +1477,18 @@ fn reconcile_pass(
     let pass_started = Instant::now();
     // One small reporting snapshot, before this pass publishes its progress.
     // No day or segment is read again to obtain the rate baseline.
-    let previous = match solstone_core_system::work_inventory::read(journal) {
-        Ok(inventory) => inventory
-            .and_then(|inventory| inventory.history)
-            .and_then(|history| history.sample),
+    let (last_history, last_current) = match solstone_core_system::work_inventory::read(journal) {
+        Ok(inventory) => (
+            inventory
+                .as_ref()
+                .and_then(|inventory| inventory.history.clone()),
+            inventory.is_some_and(|inventory| {
+                inventory.current_at(chrono::Utc::now().timestamp_millis())
+            }),
+        ),
         Err(error) => {
             log::warn!("previous history progress unreadable: {error}");
-            None
+            (None, false)
         }
     };
     let policy = WorkPolicy::read(journal)?;
@@ -1480,6 +1538,12 @@ fn reconcile_pass(
     report.unreadable.extend(activity_errors);
     report.unreadable.extend(held_errors);
     report.unreadable.extend(retry_errors);
+    // Until this pass can say more, its progress carries the last finished
+    // pass's history line: only while that line was still current, and not
+    // when this pass could not have produced one.
+    if last_current && report.unreadable.is_empty() {
+        report.history = last_history.clone();
+    }
     report.publish(journal)?;
     let mut last_publish = Instant::now();
     let mut candidates = Vec::new();
@@ -1743,6 +1807,7 @@ fn reconcile_pass(
     report.next_pass_ms =
         automatic.then(|| report.as_of_ms + rest_after(pass_started.elapsed()).as_millis() as i64);
     let ended = chrono::Utc::now();
+    // A pass that crossed midnight keeps the last line until the next pass.
     if import_errors.is_empty() && daily_coverage::local_day(journal, ended) == pass_day {
         let today = chrono::NaiveDate::parse_from_str(&pass_day, "%Y%m%d")
             .map_err(|error| error.to_string())?;
@@ -1750,11 +1815,17 @@ fn reconcile_pass(
             &report,
             &history_days,
             today,
-            previous.as_ref(),
+            last_history
+                .as_ref()
+                .and_then(|history| history.sample.as_ref()),
         ));
     }
     report.publish(journal)?;
-    Ok(Backlog { admitted, ranked })
+    Ok(Backlog {
+        admitted,
+        ranked,
+        published: Some(report),
+    })
 }
 
 #[cfg(test)]
@@ -3198,5 +3269,163 @@ mod tests {
         let queue = queue(root.path());
         reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
         assert!(queue.contains_reference("supervisor-work-19990101-notes-120000_60"));
+    }
+
+    /// History is walking older days while a newer older day only waits to
+    /// have its finished outputs updated. The range follows the walk, the
+    /// update is still counted as left, and a pass in progress keeps showing
+    /// the last finished line.
+    #[test]
+    fn updating_older_days_does_not_hold_the_range_behind_the_walk() {
+        let root = fixture("local");
+        let journal = root.path();
+        segment(journal, "19990101", "120000_60");
+        let updated = "19990105";
+        std::fs::create_dir_all(journal.join("chronicle").join(updated)).unwrap();
+        let coverage = daily_coverage::read_daily_coverage(journal, updated).unwrap();
+        let mut made = 0;
+        for unit in &coverage.units {
+            if unit.evidence_revision.is_empty() || unit.contract_digest.is_empty() {
+                continue;
+            }
+            let stale = "0".repeat(64);
+            let mut record = solstone_core_journal_io::DailyUnitRecord::new(
+                unit.identity.clone(),
+                &stale,
+                &unit.contract_digest,
+            );
+            record.status = solstone_core_journal_io::DailyUnitStatus::CommittedNoOutput;
+            record.accepted = Some(solstone_core_journal_io::AcceptedDailyResult {
+                evidence_revision: stale,
+                contract_digest: unit.contract_digest.clone(),
+                status: solstone_core_journal_io::DailyUnitStatus::CommittedNoOutput,
+                packet_digest: Some("a".repeat(64)),
+                generated_result: Some(serde_json::json!({"response":"[]","output":"[]"})),
+                receipts: Vec::new(),
+                committed_at_ms: 1,
+            });
+            solstone_core_journal_io::save_daily_unit_record(journal, &record).unwrap();
+            made += 1;
+        }
+        assert!(made > 0);
+        let queue = queue(journal);
+        reconcile(journal, &queue, &AtomicBool::new(false)).unwrap();
+        let inventory = solstone_core_system::work_inventory::read(journal)
+            .unwrap()
+            .unwrap();
+        assert!(inventory.bands[5].daily_units_owed > 0);
+        let history = inventory.history.unwrap();
+        assert_eq!(history.caught_up_since.as_deref(), Some("19990102"));
+        assert_eq!(history.segments_owed, 1);
+        assert!(history.daily_units_owed > inventory.bands[4].daily_units_owed);
+        // A stopped pass publishes only its first progress, which keeps the line.
+        reconcile(journal, &queue, &AtomicBool::new(true)).unwrap();
+        let progress = solstone_core_system::work_inventory::read(journal)
+            .unwrap()
+            .unwrap();
+        assert_eq!(progress.days_inspected, 0);
+        assert_eq!(
+            serde_json::to_value(&progress.history).unwrap(),
+            serde_json::to_value(Some(history)).unwrap()
+        );
+        // A line from before a long stop is not shown as current.
+        let mut old = progress;
+        old.as_of_ms = 1;
+        old.next_pass_ms = None;
+        old.publish(journal).unwrap();
+        reconcile(journal, &queue, &AtomicBool::new(true)).unwrap();
+        let progress = solstone_core_system::work_inventory::read(journal)
+            .unwrap()
+            .unwrap();
+        assert!(progress.history.is_none());
+        // A daily output never made on that newer day still holds the range.
+        let unmade = coverage
+            .units
+            .iter()
+            .find(|unit| !unit.evidence_revision.is_empty() && !unit.contract_digest.is_empty())
+            .unwrap();
+        solstone_core_journal_io::save_daily_unit_record(
+            journal,
+            &solstone_core_journal_io::DailyUnitRecord::new(
+                unmade.identity.clone(),
+                &unmade.evidence_revision,
+                &unmade.contract_digest,
+            ),
+        )
+        .unwrap();
+        reconcile(journal, &queue, &AtomicBool::new(false)).unwrap();
+        let history = solstone_core_system::work_inventory::read(journal)
+            .unwrap()
+            .unwrap()
+            .history
+            .unwrap();
+        assert_eq!(history.caught_up_since.as_deref(), Some("19990106"));
+        queue.shutdown();
+    }
+
+    /// Top-ups move the next pass back. Readers hear the new time when the
+    /// promised one arrives, once; with nothing moved, they hear nothing.
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn a_resting_worker_tells_readers_when_top_ups_move_the_next_pass_back() {
+        let (_wake, receiver) = mpsc::sync_channel(1);
+        let promised = Instant::now() + Duration::from_millis(200);
+        let mut told = Vec::new();
+        let mut tell = |due: Instant| told.push(due);
+        let mut calls = 0;
+        let mut top_up = || {
+            calls += 1;
+            if calls == 1 {
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            true
+        };
+        assert!(rest(
+            &receiver,
+            Some(promised),
+            None,
+            Some(&mut top_up as &mut dyn FnMut() -> bool),
+            Some((promised, &mut tell as &mut dyn FnMut(Instant))),
+        ));
+        let returned = Instant::now();
+        assert_eq!(told.len(), 1);
+        assert!(told[0] >= promised + Duration::from_millis(1_400));
+        assert!(returned >= told[0]);
+        let mut told = Vec::new();
+        let mut tell = |due: Instant| told.push(due);
+        let due = Instant::now() + Duration::from_millis(200);
+        assert!(rest(
+            &receiver,
+            Some(due),
+            None,
+            None,
+            Some((due, &mut tell as &mut dyn FnMut(Instant))),
+        ));
+        assert!(told.is_empty());
+    }
+
+    #[test]
+    fn a_later_next_pass_is_published_without_refreshing_the_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("health")).unwrap();
+        let mut report = WorkInventory {
+            as_of_ms: 1_000,
+            next_pass_ms: Some(2_000),
+            ..WorkInventory::default()
+        };
+        report.publish(root.path()).unwrap();
+        let before = chrono::Utc::now().timestamp_millis();
+        repromise(
+            root.path(),
+            &mut report,
+            Instant::now() + Duration::from_secs(600),
+        );
+        let after = chrono::Utc::now().timestamp_millis();
+        let read = solstone_core_system::work_inventory::read(root.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.as_of_ms, 1_000);
+        let due = read.next_pass_ms.unwrap();
+        assert!(due >= before + 599_000 && due <= after + 600_000, "{due}");
     }
 }

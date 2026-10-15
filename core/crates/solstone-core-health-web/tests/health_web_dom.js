@@ -1010,6 +1010,17 @@ test('work progress keeps unknown and stale reach honest and only confirms after
   context.work.inventory.as_of_ms = now - 200000;
   vm.runInContext('renderWorkProgress(work)', context);
   assert(!history.textContent.includes((0.25).toLocaleString()));
+  // A rest whose next pass was moved back reads current until the new time;
+  // once a stopped worker misses its last promised time, it reads as checked.
+  context.work.inventory.next_pass_ms = now + 600000;
+  vm.runInContext('renderWorkProgress(work)', context);
+  assert(history.textContent.includes((0.25).toLocaleString()));
+  assert(!history.textContent.startsWith('last checked: '));
+  context.work.inventory.next_pass_ms = now - 180000;
+  vm.runInContext('renderWorkProgress(work)', context);
+  assert(history.textContent.startsWith('last checked: '));
+  assert(!history.textContent.includes((0.25).toLocaleString()));
+  delete context.work.inventory.next_pass_ms;
   context.work.inventory.history = null;
   vm.runInContext('renderWorkProgress(work)', context);
   assert.strictEqual(history.hidden, true);
