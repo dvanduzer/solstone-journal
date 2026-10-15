@@ -1207,7 +1207,11 @@ pub(crate) fn command(
 }
 
 pub(crate) async fn start(State(state): State<AppState>, Json(data): Json<Value>) -> Response {
-    let data = match crate::preview::validate_start(&state.root, data).await {
+    let validated = match crate::preview::planner() {
+        Ok(program) => crate::preview::validate_start(&state.root, data, &program).await,
+        Err(error) => Err(error),
+    };
+    let data = match validated {
         Ok(data) => data,
         Err(error) => {
             return json_response(
@@ -1526,7 +1530,7 @@ where
     json_response(StatusCode::OK, json!({"status":"ok","task_id":task_id}))
 }
 
-fn detect_inprocess_source(
+pub(crate) fn detect_inprocess_source(
     metadata: &ImportMetadata,
     command_path: &str,
 ) -> Option<solstone_core_import::RegistrySource> {
@@ -3533,5 +3537,105 @@ mod tests {
         assert_eq!(json["status"], "staged");
         let ts = json["timestamp"].as_str().unwrap();
         assert!(root.path().join("imports").join(ts).is_dir());
+    }
+
+    /// The phone's share sheet saves an item, then starts it with `{path, timestamp}` alone: it
+    /// has no size step and sends no preview token. The journal previews that start itself and
+    /// admits it, for an image (imported in process) and an audio file (queued for the importer),
+    /// and either way the import reads the private copy the preview is bound to.
+    #[cfg(all(unix, feature = "full-tests"))]
+    #[tokio::test]
+    async fn a_phone_share_starts_without_a_preview_token() {
+        let root = crate::test_support::phase_root("empty");
+        let tools = TempDir::new().unwrap();
+        let planner = tools.path().join("solstone-core");
+        fs::write(
+            &planner,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\nprintf '%s\\n' '{\"schema\":\"solstone.import.size.v1\",\"recordings\":1,\"days\":1,\"skipped\":0,\"other_units\":null}'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&planner, fs::Permissions::from_mode(0o700)).unwrap();
+        for (filename, content_type, item) in [
+            (
+                "IMG_4821.png",
+                "image/png",
+                "6f1c2a52-0d8e-4c55-9d38-2f3b8a1e0001",
+            ),
+            (
+                "Voice Memo 12.m4a",
+                "audio/mp4",
+                "6f1c2a52-0d8e-4c55-9d38-2f3b8a1e0002",
+            ),
+        ] {
+            let boundary = "phone-share";
+            let body = format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"imported_via\"\r\n\r\nmobile_share\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"client_item_id\"\r\n\r\n{item}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n{filename} bytes\r\n--{boundary}--\r\n"
+            );
+            let response = crate::routes(root.path().to_path_buf())
+                .oneshot(multipart_save(body, boundary))
+                .await
+                .unwrap();
+            let (status, saved) = response_json(response).await;
+            assert_eq!(status, StatusCode::OK, "{filename}: {saved}");
+            let path = saved["path"].as_str().unwrap().to_owned();
+            let timestamp = saved["timestamp"].as_str().unwrap().to_owned();
+
+            // What `start` runs, with the planner, the queue and the in-process importer stood in.
+            let data = crate::preview::validate_start(
+                root.path(),
+                json!({"path": path, "timestamp": timestamp}),
+                &planner,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{filename}: {error}"));
+            let planned = fs::read_to_string(tools.path().join("solstone-core.args")).unwrap();
+            let planned_as = planned.lines().skip_while(|arg| *arg != "--source").nth(1);
+            let expected = (content_type == "image/png").then_some("image");
+            assert_eq!(planned_as, expected, "{filename}: {planned}");
+            let queued = Rc::new(RefCell::new(Vec::new()));
+            let produced = Rc::new(RefCell::new(None));
+            let (queue, producer) = (Rc::clone(&queued), Rc::clone(&produced));
+            let response = start_with(
+                root.path(),
+                &data,
+                move |_, _, cmd| {
+                    *queue.borrow_mut() = cmd.to_vec();
+                    Ok(())
+                },
+                write_import_metadata,
+                move |_, source, _, kind, _, _| *producer.borrow_mut() = Some((source, kind)),
+                |_, _| {},
+            );
+            assert_eq!(response.status(), StatusCode::OK, "{filename}");
+
+            let preview = read_import_metadata(root.path(), &timestamp).unwrap()["preview"].clone();
+            let snapshot = root
+                .path()
+                .join("imports")
+                .join(&timestamp)
+                .join(preview["relative"].as_str().unwrap());
+            assert_ne!(snapshot, Path::new(&path));
+            assert_eq!(
+                fs::read_to_string(&snapshot).unwrap(),
+                format!("{filename} bytes")
+            );
+            if content_type == "image/png" {
+                assert_eq!(
+                    *produced.borrow(),
+                    Some((snapshot, solstone_core_import::RegistrySource::Image))
+                );
+                assert!(queued.borrow().is_empty());
+            } else {
+                let cmd = queued.borrow().clone();
+                assert_eq!(cmd[3], snapshot.display().to_string());
+                let token = preview["token"].as_str().unwrap();
+                assert!(
+                    cmd.windows(2)
+                        .any(|pair| pair[0] == "--preview-token" && pair[1] == token)
+                );
+                assert!(produced.borrow().is_none());
+            }
+        }
+        assert!(!root.path().join("chronicle").exists());
     }
 }

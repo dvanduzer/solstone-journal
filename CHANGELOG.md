@@ -12,6 +12,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - on windows, links to saved output from a thinking run open again.
 - on windows, `solstone link join` can finish pairing and save connection settings.
 - on windows, you can preview an import again.
+- sharing to your journal from your iphone or ipad works again. since 2.0.42, your journal turned away every photo, voice memo, pdf and piece of text you shared from your phone, saying to preview the import first, which the phone has no way to do. anything your phone is still holding goes into your journal on its own once your journal is updated and your phone connects to it again.
+- on the import page, dropping a photo or a pdf into quick import works again. since 2.0.42, its preview stopped with an error instead.
 
 ## [2.0.47] - 2026-10-15
 

@@ -7,7 +7,7 @@
 use crate::{
     AppState,
     http::json as json_response,
-    lifecycle::{command, contained_import_file, source_hint},
+    lifecycle::{command, contained_import_file, detect_inprocess_source, source_hint},
 };
 use axum::{
     extract::{Json, State},
@@ -72,17 +72,26 @@ fn input(root: &Path, data: &Value) -> Result<Input, String> {
     })
 }
 
-async fn plan(path: &Path, options: &Value, metadata: &ImportMetadata) -> Result<Value, String> {
+/// The native importer beside this executable, which plans every preview.
+pub(crate) fn planner() -> Result<PathBuf, String> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    let program = executable
+    Ok(executable
         .parent()
         .ok_or("cannot locate the importer")?
         .join(if cfg!(windows) {
             "solstone-core.exe"
         } else {
             "solstone-core"
-        });
-    plan_using(&program, path, options, metadata, Duration::from_secs(600)).await
+        }))
+}
+
+async fn plan(
+    program: &Path,
+    path: &Path,
+    options: &Value,
+    metadata: &ImportMetadata,
+) -> Result<Value, String> {
+    plan_using(program, path, options, metadata, Duration::from_secs(600)).await
 }
 
 async fn plan_using(
@@ -94,8 +103,16 @@ async fn plan_using(
 ) -> Result<Value, String> {
     let mut metadata = metadata.clone();
     metadata.remove("preview");
+    let path = path.to_str().ok_or("the source path is not UTF-8")?;
+    // Start imports an image or document by the kind it was saved as, with or without a source
+    // hint. The planner only recognizes those kinds when told, so it is told the same kind.
+    if source_hint(&metadata).is_none()
+        && let Some(source) = detect_inprocess_source(&metadata, path)
+    {
+        metadata.insert("source_hint".to_owned(), json!(source.name()));
+    }
     let args = command(
-        path.to_str().ok_or("the source path is not UTF-8")?,
+        path,
         options["timestamp"].as_str().ok_or("missing timestamp")?,
         &metadata,
         options["force"].as_bool().unwrap_or(false),
@@ -129,7 +146,11 @@ async fn plan_using(
 }
 
 pub(crate) async fn preview(State(state): State<AppState>, Json(data): Json<Value>) -> Response {
-    match create_preview(state.root, data).await {
+    let previewed = match planner() {
+        Ok(program) => create_preview(state.root, data, &program).await,
+        Err(error) => Err(error),
+    };
+    match previewed {
         Ok(preview) => json_response(StatusCode::OK, preview),
         Err(error) => json_response(
             StatusCode::BAD_REQUEST,
@@ -138,7 +159,7 @@ pub(crate) async fn preview(State(state): State<AppState>, Json(data): Json<Valu
     }
 }
 
-async fn create_preview(root: PathBuf, data: Value) -> Result<Value, String> {
+async fn create_preview(root: PathBuf, data: Value, program: &Path) -> Result<Value, String> {
     let snapshot_root = root.clone();
     let (input, snapshot) = tokio::task::spawn_blocking(move || {
         let input = input(&snapshot_root, &data)?;
@@ -159,7 +180,7 @@ async fn create_preview(root: PathBuf, data: Value) -> Result<Value, String> {
         snapshot.relative.to_str().ok_or("invalid snapshot path")?,
     )
     .map_err(|error| error.to_string())?;
-    let size = plan(&source, &input.options, &input.metadata).await?;
+    let size = plan(program, &source, &input.options, &input.metadata).await?;
     let record = json!({"source": input.source, "relative": snapshot.relative, "digest": snapshot.digest, "options": input.options, "size": size});
     let token = format!("{:x}", Sha256::digest(record.to_string().as_bytes()));
     let mut record = record;
@@ -184,10 +205,22 @@ async fn create_preview(root: PathBuf, data: Value) -> Result<Value, String> {
     Ok(response)
 }
 
-pub(crate) async fn validate_start(root: &Path, mut data: Value) -> Result<Value, String> {
+pub(crate) async fn validate_start(
+    root: &Path,
+    mut data: Value,
+    program: &Path,
+) -> Result<Value, String> {
     // No client can supply the private, already-validated start fields.
     if let Some(object) = data.as_object_mut() {
         object.remove("_preview_source");
+    }
+    // A start without a token is the owner's start instruction from a client with no size
+    // step, such as a share from the phone. It is previewed here, under the same snapshot,
+    // settings and size binding as a preview the owner saw.
+    let previewed_here = data.get("preview_token").and_then(Value::as_str).is_none();
+    if previewed_here {
+        let preview = create_preview(root.to_path_buf(), data.clone(), program).await?;
+        data["preview_token"] = preview["preview_token"].clone();
     }
     let checked_root = root.to_path_buf();
     let checked_data = data.clone();
@@ -222,7 +255,11 @@ pub(crate) async fn validate_start(root: &Path, mut data: Value) -> Result<Value
     })
     .await
     .map_err(|error| error.to_string())??;
-    let current = plan(&snapshot, &input.options, &input.metadata).await?;
+    let current = if previewed_here {
+        record["size"].clone()
+    } else {
+        plan(program, &snapshot, &input.options, &input.metadata).await?
+    };
     if current != record["size"] {
         return Err("the import size changed as your journal changed; preview it again".to_owned());
     }
@@ -284,15 +321,22 @@ mod tests {
         assert_eq!(fs::read_to_string(source).unwrap(), "owner material");
     }
     #[tokio::test]
-    async fn start_without_preview_refuses_without_admission_or_outputs() {
+    async fn a_start_that_cannot_be_previewed_is_refused_without_admission_or_outputs() {
         let (root, data) = fixture();
+        let error = validate_start(root.path(), data, &root.path().join("no-importer"))
+            .await
+            .unwrap_err();
         assert!(
-            validate_start(root.path(), data)
-                .await
-                .unwrap_err()
-                .contains("preview the import")
+            error.contains("could not prepare the import preview"),
+            "{error}"
         );
         assert!(!root.path().join("chronicle").exists());
+        assert!(
+            read_import_metadata(root.path(), ID)
+                .unwrap()
+                .get("preview")
+                .is_none()
+        );
         assert_eq!(
             solstone_core_import::project_import_result(root.path(), ID).status,
             solstone_core_import::ProjectionStatus::Pending
@@ -312,7 +356,7 @@ mod tests {
         let mut changed = data.clone();
         changed["timestamp"] = json!("20261012_120000");
         assert!(
-            validate_start(root.path(), changed)
+            validate_start(root.path(), changed, Path::new("unused"))
                 .await
                 .unwrap_err()
                 .contains("settings changed")
@@ -320,7 +364,7 @@ mod tests {
         metadata.insert("setting".into(), json!("home"));
         write_import_metadata(root.path(), ID, &metadata).unwrap();
         assert!(
-            validate_start(root.path(), data.clone())
+            validate_start(root.path(), data.clone(), Path::new("unused"))
                 .await
                 .unwrap_err()
                 .contains("settings changed")
@@ -329,7 +373,7 @@ mod tests {
         write_import_metadata(root.path(), ID, &metadata).unwrap();
         fs::write(input.source, "a changed note").unwrap();
         assert!(
-            validate_start(root.path(), data)
+            validate_start(root.path(), data, Path::new("unused"))
                 .await
                 .unwrap_err()
                 .contains("source changed")
