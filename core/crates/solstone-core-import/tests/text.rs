@@ -402,7 +402,7 @@ fn a_meeting_that_crosses_midnight_continues_into_the_next_day() {
             ("20260311".to_owned(), "235800_300".to_owned(), 86_280),
             ("20260311".to_owned(), "235800_300".to_owned(), 86_280),
             ("20260311".to_owned(), "235800_300".to_owned(), 86_280),
-            ("20260311".to_owned(), "235800_300".to_owned(), 86_579),
+            ("20260312".to_owned(), "000259_300".to_owned(), 179),
             ("20260312".to_owned(), "000300_300".to_owned(), 180),
             ("20260312".to_owned(), "002800_300".to_owned(), 1_755),
             ("20260312".to_owned(), "005800_300".to_owned(), 3_603),
@@ -414,7 +414,7 @@ fn a_meeting_that_crosses_midnight_continues_into_the_next_day() {
             .is_file()
     );
     assert_stream_generation(&day, 1);
-    assert_stream_generation(&next, 3);
+    assert_stream_generation(&next, 4);
 }
 
 #[test]
@@ -1166,6 +1166,56 @@ fn inline_clocks_cross_midnight_onto_the_next_local_day() {
         produced1.chunks[0].occurrence_time_ms,
         Some(OccurrenceTimeMs(expected1)),
     );
+}
+
+#[test]
+fn a_single_elapsed_tile_splits_at_the_owner_day_boundary() {
+    for (name, text, start) in [
+        (
+            "clock-midnight.txt",
+            "[23:59:00] Alex: before\n[00:01:00] Blair: after\n",
+            "12:00:00",
+        ),
+        (
+            "elapsed-midnight.txt",
+            "## 00:00:00\n**Alex:** before\n## 00:02:00\n**Blair:** after\n",
+            "23:59:00",
+        ),
+    ] {
+        let (_temporary, source, day) = setup_in_zone(name, text, "20260311", "America/Denver");
+        let preview =
+            solstone_core_import::text::preview(&source, &day, start, "import.text").unwrap();
+        let created = run_ok(&source, &day, start, &RecordingWire::always(no_engine));
+        assert_eq!(created.len(), 2, "{name}");
+        assert_eq!(preview.recordings.len(), 2, "{name}");
+        for (item, expected_day, expected_text, hour, minute) in [
+            (&created[0], "20260311", "before", 5, 59),
+            (&created[1], "20260312", "after", 6, 1),
+        ] {
+            assert_eq!(item.day, expected_day, "{name}");
+            assert!(preview.recordings.iter().any(|recording|
+                recording.day == item.day && recording.segment == item.segment));
+            let bytes = fs::read_to_string(&item.path).unwrap();
+            let rel = format!(
+                "{expected_day}/import.text/{}/conversation_transcript.jsonl",
+                item.segment
+            );
+            let produced = produce_chunks(Family::AiChat, &rel, &bytes);
+            assert_eq!(produced.chunks.len(), 1, "{name}");
+            assert!(produced.chunks[0].content.contains(expected_text));
+            let expected = chrono::NaiveDate::from_ymd_opt(2026, 3, 12)
+                .unwrap()
+                .and_hms_opt(hour, minute, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp_millis();
+            assert_eq!(
+                produced.chunks[0].occurrence_time_ms,
+                Some(OccurrenceTimeMs(expected)),
+                "{name}"
+            );
+        }
+    }
 }
 
 #[cfg(feature = "full-tests")]
