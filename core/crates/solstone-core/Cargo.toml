@@ -172,6 +172,7 @@ solstone-core-journal-config.workspace = true
 solstone-core-journal-config-write.workspace = true
 solstone-core-mcp-endpoint = { workspace = true, optional = true }
 solstone-core-local.workspace = true
+solstone-core-location.workspace = true
 solstone-core-assets.workspace = true
 solstone-core-generate.workspace = true
 solstone-core-generate-wire.workspace = true

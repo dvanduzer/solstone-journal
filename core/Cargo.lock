@@ -3522,6 +3522,7 @@ dependencies = [
  "solstone-core-journal-stats-cli",
  "solstone-core-linked-share",
  "solstone-core-local",
+ "solstone-core-location",
  "solstone-core-maintenance",
  "solstone-core-mcp-endpoint",
  "solstone-core-npy",
@@ -4902,6 +4903,7 @@ version = "2.0.47"
 dependencies = [
  "chrono",
  "chrono-tz",
+ "log",
  "lzma-rs",
  "nix",
  "serde",

@@ -547,4 +547,69 @@ mod tests {
         memory.reset();
         assert!(memory.backoff_elapsed(at));
     }
+
+    #[test]
+    fn boot_version_record_does_not_affect_local_follow_decisions() {
+        let journal = tempfile::tempdir().unwrap();
+        let health = journal.path().join("health");
+        std::fs::create_dir_all(&health).unwrap();
+        let boot_path = health.join("boot-version.json");
+
+        let model_dir = pins::cache_root(journal.path()).join("models/default");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(manifest::artifact_manifest_path(&model_dir), b"{}").unwrap();
+
+        let mut config = serde_json::Map::new();
+        config.insert(
+            "providers".to_owned(),
+            serde_json::json!({ "active": { "provider": "local" } }),
+        );
+
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let launches_clone = Arc::clone(&launches);
+        let launcher: LocalInstallerLauncher = Arc::new(move |_| {
+            launches_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        });
+
+        let readiness = moved_runtime();
+
+        std::fs::write(
+            &boot_path,
+            serde_json::json!({ "schema": 1, "product_version": env!("CARGO_PKG_VERSION") })
+                .to_string(),
+        )
+        .unwrap();
+        let follow1 = LocalFollow::new(Arc::clone(&launcher));
+        assert_eq!(
+            follow1.observe(journal.path(), Some(&config), &readiness),
+            FollowDecision::Launch
+        );
+        assert_eq!(launches.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        std::fs::write(
+            &boot_path,
+            serde_json::json!({ "schema": 1, "product_version": "0.0.0-older" }).to_string(),
+        )
+        .unwrap();
+        let follow2 = LocalFollow::new(Arc::clone(&launcher));
+        assert_eq!(
+            follow2.observe(journal.path(), Some(&config), &readiness),
+            FollowDecision::Launch
+        );
+        assert_eq!(launches.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+        let ready_readiness = serde_json::json!({ "ready": true });
+        let follow3 = LocalFollow::new(Arc::clone(&launcher));
+        assert_eq!(
+            follow3.observe(journal.path(), Some(&config), &ready_readiness),
+            FollowDecision::Hold("ready")
+        );
+        let follow4 = LocalFollow::new(Arc::clone(&launcher));
+        assert_eq!(
+            follow4.observe(journal.path(), Some(&config), &ready_readiness),
+            FollowDecision::Hold("ready")
+        );
+        assert_eq!(launches.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
 }
