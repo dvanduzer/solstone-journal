@@ -1,0 +1,152 @@
+//go:build backup_http_probe && (darwin || ios)
+
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 sol pbc
+
+// Isolated qualification entry point. The production recipe never selects this
+// file or tag; this is not a remote backup API or product admission authority.
+package main
+
+/*
+#include <stdint.h>
+#include <stdlib.h>
+*/
+import "C"
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+	"unsafe"
+
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
+)
+
+type httpProbeConfig struct {
+	Endpoint   string `json:"endpoint"`
+	Region     string `json:"region"`
+	Bucket     string `json:"bucket"`
+	BucketID   string `json:"bucket_id"`
+	Prefix     string `json:"prefix"`
+	Access     string `json:"access_key_id"`
+	Secret     string `json:"secret_access_key"`
+	Token      string `json:"session_token"`
+	InvalidTLS string `json:"invalid_tls_endpoint"`
+}
+
+func runHTTPProbe(encoded []byte) map[string]any {
+	result := map[string]any{"passed": false, "boundary": "signed protocol canary; no remote backup or product admission"}
+	fail := func(stage string) map[string]any { result["failed_stage"] = stage; return result }
+	var cfg httpProbeConfig
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&cfg) != nil || decoder.Decode(new(any)) != io.EOF || cfg.Endpoint == "" || cfg.Region == "" || cfg.Bucket == "" || cfg.Prefix == "" || cfg.Access == "" || cfg.Secret == "" || cfg.InvalidTLS == "" {
+		return fail("fixture_config")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	transport, err := newNativeHTTPTransport(ctx, cfg.Endpoint)
+	if err != nil {
+		return fail("authority")
+	}
+	endpoint, _ := url.Parse(cfg.Endpoint)
+	makeClient := func(secret string) (*minio.Core, error) {
+		return minio.NewCore(endpoint.Host, &minio.Options{
+			Creds: credentials.NewStaticV4(cfg.Access, secret, cfg.Token), Secure: true, Region: cfg.Region,
+			BucketLookup: minio.BucketLookupPath, Transport: transport, MaxRetries: 1,
+		})
+	}
+	client, err := makeClient(cfg.Secret)
+	if err != nil {
+		return fail("scoped_client")
+	}
+	nonce := make([]byte, 16)
+	data := make([]byte, 64*1024)
+	if _, err = rand.Read(nonce); err != nil {
+		return fail("entropy")
+	}
+	if _, err = rand.Read(data); err != nil {
+		return fail("entropy")
+	}
+	defer zeroBytes(data)
+	name := strings.TrimSuffix(cfg.Prefix, "/") + "/native-phone-" + hex.EncodeToString(nonce) + "/signed space+percent%/sample"
+	digest := sha256.Sum256(data)
+	result["key"] = name
+	result["bytes"] = len(data)
+	result["sha256"] = hex.EncodeToString(digest[:])
+	result["owned_canary_cleanup_pending"] = true
+	if _, err = client.PutObject(ctx, cfg.Bucket, name, bytes.NewReader(data), int64(len(data)), "", "", minio.PutObjectOptions{ContentType: "application/octet-stream"}); err != nil {
+		return fail("signed_put")
+	}
+	reader, _, _, err := client.GetObject(ctx, cfg.Bucket, name, minio.GetObjectOptions{})
+	if err != nil {
+		return fail("signed_get")
+	}
+	stored, readErr := io.ReadAll(io.LimitReader(reader, int64(len(data))+1))
+	closeErr := reader.Close()
+	defer zeroBytes(stored)
+	if readErr != nil || closeErr != nil || !bytes.Equal(stored, data) {
+		return fail("readback_bytes")
+	}
+	info, err := client.StatObject(ctx, cfg.Bucket, name, minio.StatObjectOptions{})
+	if err != nil || info.Size != int64(len(data)) {
+		return fail("head_metadata")
+	}
+	result["signed_put_get_head"] = true
+	invalid, err := makeClient(cfg.Secret + "-deliberately-invalid")
+	if err != nil {
+		return fail("invalid_client")
+	}
+	_, err = invalid.StatObject(ctx, cfg.Bucket, name, minio.StatObjectOptions{})
+	refusal := minio.ToErrorResponse(err)
+	if err == nil || refusal.StatusCode != http.StatusForbidden {
+		return fail("invalid_credential_refusal")
+	}
+	result["invalid_credential_status"] = refusal.StatusCode
+	badTransport, err := newNativeHTTPTransport(ctx, cfg.InvalidTLS)
+	if err != nil {
+		return fail("invalid_tls_authority")
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodHead, cfg.InvalidTLS, nil)
+	if err != nil {
+		return fail("invalid_tls_request")
+	}
+	response, err := badTransport.RoundTrip(request)
+	if response != nil {
+		_ = response.Body.Close()
+	}
+	if !errors.Is(err, errHTTPTLS) || response != nil {
+		return fail("invalid_tls_refusal")
+	}
+	result["invalid_tls_refused"] = true
+	result["passed"] = true
+	return result
+}
+
+//export restic_bridge_http_probe
+func restic_bridge_http_probe(pointer *C.char, size C.uint32_t) *C.char {
+	result := map[string]any{"passed": false, "failed_stage": "fixture_bounds"}
+	if pointer != nil && size > 0 && size <= 32*1024 {
+		encoded := C.GoBytes(unsafe.Pointer(pointer), C.int(size))
+		result = runHTTPProbe(encoded)
+		zeroBytes(encoded)
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return nil
+	}
+	return C.CString(string(encoded))
+}
+
+//export restic_bridge_http_probe_free
+func restic_bridge_http_probe_free(pointer *C.char) { C.free(unsafe.Pointer(pointer)) }

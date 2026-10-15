@@ -17,6 +17,19 @@ import backup_bridge_build as bridge_build
 
 
 class TestBackupBridgeBuild(unittest.TestCase):
+    def test_native_http_closure_refuses_selected_or_linked_qualification_authority(self):
+        selection = {"CgoFiles": ["native_http_apple.go"], "MFiles": ["native_http_darwin.m"]}
+        bridge_build.check_native_http_closure(selection, "ios", "public ABI", "fixed native symbols")
+        for field, bad in (("CgoFiles", "native_http_testhooks_apple.go"), ("MFiles", "native_http_testhooks_darwin.m")):
+            changed = {key: list(value) for key, value in selection.items()}
+            changed[field].append(bad)
+            with self.assertRaisesRegex(ValueError, "qualification hooks"):
+                bridge_build.check_native_http_closure(changed, "ios", "public ABI", "fixed native symbols")
+        with self.assertRaisesRegex(ValueError, "qualification symbols"):
+            bridge_build.check_native_http_closure(selection, "ios", "public ABI", "_sb_http_test_install")
+        with self.assertRaisesRegex(ValueError, "private HTTP authority"):
+            bridge_build.check_native_http_closure(selection, "ios", "void sb_http_cancel();", "fixed native symbols")
+
     def staged_build(self, root, target="linux"):
         work = root / "build"
         stage = work / "immutable-input"

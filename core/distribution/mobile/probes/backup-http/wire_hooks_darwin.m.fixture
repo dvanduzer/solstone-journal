@@ -1,0 +1,56 @@
+//go:build backup_http_wire && (darwin || ios)
+
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 sol pbc
+// Isolated loopback TLS harness only. Never selected by either app archive.
+#import <Foundation/Foundation.h>
+#import <Security/Security.h>
+#import <objc/runtime.h>
+#include <stdint.h>
+
+static IMP SBWireOriginal;
+static NSData *SBWireLeaf;
+static NSString *SBWireHost;
+static NSInteger SBWirePort;
+
+static void SBWireChallenge(id self, SEL selector, NSURLAuthenticationChallenge *challenge,
+    void (^completion)(NSURLSessionAuthChallengeDisposition, NSURLCredential *)) {
+    NSURLProtectionSpace *space = challenge.protectionSpace;
+    BOOL match = [space.authenticationMethod isEqualToString:NSURLAuthenticationMethodServerTrust] &&
+        [space.host isEqualToString:SBWireHost] && space.port == SBWirePort && space.serverTrust;
+    if (match) {
+        CFArrayRef chain = SecTrustCopyCertificateChain(space.serverTrust);
+        match = chain && CFArrayGetCount(chain) > 0;
+        if (match) {
+            CFDataRef leaf = SecCertificateCopyData((SecCertificateRef)CFArrayGetValueAtIndex(chain, 0));
+            match = leaf && [SBWireLeaf isEqualToData:(NSData *)leaf];
+            if (leaf) CFRelease(leaf);
+        }
+        if (chain) CFRelease(chain);
+    }
+    if (match) completion(NSURLSessionAuthChallengeUseCredential, [NSURLCredential credentialForTrust:space.serverTrust]);
+    else ((void (*)(id, SEL, id, id))SBWireOriginal)(self, selector, challenge, completion);
+}
+
+int32_t sb_http_wire_install(const void *der, uint32_t length, const char *host, uint32_t port) {
+    @autoreleasepool {
+        if (SBWireOriginal || !der || !length || length > 65536 || !host || !port || port > 65535) return 1;
+        NSString *name = [NSString stringWithUTF8String:host];
+        if (![name isEqualToString:@"127.0.0.1"]) return 1;
+        Method method = class_getInstanceMethod(objc_getClass("SBHTTPCall"), @selector(handleChallenge:completionHandler:));
+        if (!method) return 1;
+        SBWireLeaf = [[NSData alloc] initWithBytes:der length:length];
+        SBWireHost = [name copy]; SBWirePort = port;
+        SBWireOriginal = method_setImplementation(method, (IMP)SBWireChallenge);
+        return 0;
+    }
+}
+
+void sb_http_wire_uninstall(void) {
+    @autoreleasepool {
+        method_setImplementation(class_getInstanceMethod(objc_getClass("SBHTTPCall"), @selector(handleChallenge:completionHandler:)), SBWireOriginal);
+        SBWireOriginal = NULL;
+        [SBWireLeaf release]; SBWireLeaf = nil;
+        [SBWireHost release]; SBWireHost = nil;
+    }
+}

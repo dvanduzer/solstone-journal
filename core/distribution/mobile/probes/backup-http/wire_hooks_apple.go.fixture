@@ -1,0 +1,25 @@
+//go:build backup_http_wire && (darwin || ios)
+
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 sol pbc
+package main
+
+/*
+#include <stdint.h>
+#include <stdlib.h>
+int32_t sb_http_wire_install(const void*,uint32_t,const char*,uint32_t);
+void sb_http_wire_uninstall(void);
+*/
+import "C"
+
+import "unsafe"
+
+func installWirePin(der []byte, host string, port uint32) bool {
+	certificate := C.CBytes(der)
+	defer C.free(certificate)
+	name := C.CString(host)
+	defer C.free(unsafe.Pointer(name))
+	return C.sb_http_wire_install(certificate, C.uint32_t(len(der)), name, C.uint32_t(port)) == 0
+}
+
+func uninstallWirePin() { C.sb_http_wire_uninstall() }
