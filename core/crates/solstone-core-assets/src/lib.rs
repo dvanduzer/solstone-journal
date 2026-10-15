@@ -252,12 +252,12 @@ static ARTIFACTS: &[Artifact] = &[
     // archive launches with the Vulkan backend.
     Artifact {
         unit: "llama-server-vulkan",
-        version: "b11429",
-        filename: "llama-b11429-bin-macos-arm64.tar.gz",
-        sha256: "740288ec6887be94280a5dfa25b5e23a78285cab104519e6c7e218904ee82459",
-        size_bytes: 11971406,
-        upstream_url: "https://github.com/ggml-org/llama.cpp/releases/download/b11429/llama-b11429-bin-macos-arm64.tar.gz",
-        origin_key: "assets/llama-server-vulkan/b11429/llama-b11429-bin-macos-arm64.tar.gz",
+        version: "b11669",
+        filename: "llama-b11669-bin-macos-arm64.tar.gz",
+        sha256: "dbed55493d72bc1ba2babc8770d669c2289b5bc4ee9fb2a4dfc158d45b7d13fd",
+        size_bytes: 12191582,
+        upstream_url: "https://github.com/ggml-org/llama.cpp/releases/download/b11669/llama-b11669-bin-macos-arm64.tar.gz",
+        origin_key: "assets/llama-server-vulkan/b11669/llama-b11669-bin-macos-arm64.tar.gz",
         artifact_key: Some("aarch64-apple-darwin"),
         platform: Some(Platform::MacosArm64),
         backend: None,
