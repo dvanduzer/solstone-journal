@@ -199,6 +199,7 @@ mod tests {
         use sha2::{Digest, Sha256};
         use solstone_core_callosum::CallosumSocketServer;
         use solstone_core_convey_http::identity::{AccessBasis, Carrier, LinkedDeviceCid};
+        use solstone_core_segment::list_stream_records_tolerant;
         use solstone_core_sol_link::device_migration::{Choice, DecisionRequest, ReplacesCid};
         use solstone_core_sol_link::ledger::{AuthorizationLedger, ClientEntry, ClientRole};
         use tower::ServiceExt;
@@ -496,16 +497,11 @@ mod tests {
             let marker_seq_before = b_marker_before["seq"].as_u64().unwrap();
             assert_eq!(marker_seq_before, 2);
 
-            let streams_dir = root.join("streams");
-            let stream_files_before: Vec<_> = fs::read_dir(&streams_dir)
-                .unwrap()
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
-                .collect();
-            assert_eq!(stream_files_before.len(), 1);
-            let stream_record_path = stream_files_before[0].path();
-            let record_before: Value =
-                serde_json::from_str(&fs::read_to_string(&stream_record_path).unwrap()).unwrap();
+            let records_before = list_stream_records_tolerant(root).unwrap();
+            assert!(records_before.anomalies.is_empty());
+            assert_eq!(records_before.records.len(), 1);
+            assert_eq!(records_before.records[0].0, a_stream_name);
+            let record_before = &records_before.records[0].1;
             let record_seq_before = record_before["seq"].as_u64().unwrap();
             assert_eq!(record_seq_before, 2);
 
@@ -520,16 +516,11 @@ mod tests {
             assert_eq!(b_marker_after["seq"], marker_seq_before);
             assert_eq!(b_marker_after["stream"], a_stream_name);
 
-            let stream_files_after: Vec<_> = fs::read_dir(&streams_dir)
-                .unwrap()
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
-                .collect();
-            assert_eq!(stream_files_after.len(), 1);
-
-            let record_after: Value =
-                serde_json::from_str(&fs::read_to_string(stream_files_after[0].path()).unwrap())
-                    .unwrap();
+            let records_after = list_stream_records_tolerant(root).unwrap();
+            assert!(records_after.anomalies.is_empty());
+            assert_eq!(records_after.records.len(), 1);
+            assert_eq!(records_after.records[0].0, a_stream_name);
+            let record_after = &records_after.records[0].1;
             assert_eq!(record_after["seq"], record_seq_before);
 
             let seg_b2 = "160000_60";
@@ -554,7 +545,7 @@ mod tests {
                 &app,
                 "GET",
                 &format!("/app/devices/ingest/segments/{day}?source={source}"),
-                CID_A,
+                CID_B,
                 Vec::new(),
                 None,
             )
@@ -568,6 +559,15 @@ mod tests {
                 .find(|f| f["name"] == "screen.mp4")
                 .unwrap();
             assert_eq!(screen_150000["status"], "processed");
+            assert_eq!(screen_150000["size"], screen_bytes.len());
+            assert_eq!(screen_150000["sha256"], digest(screen_bytes));
+            let audio_150000 = files_150000
+                .iter()
+                .find(|f| f["name"] == "audio.flac")
+                .unwrap();
+            assert_eq!(audio_150000["status"], "present");
+            assert_eq!(audio_150000["size"], audio_bytes.len());
+            assert_eq!(audio_150000["sha256"], digest(audio_bytes));
         }
 
         #[tokio::test]
@@ -642,7 +642,7 @@ mod tests {
             let (ct_b, body_b) = multipart_one(
                 json!({
                     "day": day,
-                    "segment": "130000_60",
+                    "segment": "120000_60",
                     "source": source,
                     "files": [{"submitted": "audio.flac"}],
                 }),
@@ -660,13 +660,20 @@ mod tests {
             .await;
             assert_eq!(status, StatusCode::OK, "{upload_b}");
 
-            let streams_dir = root.join("streams");
-            let stream_files: Vec<_> = fs::read_dir(&streams_dir)
-                .unwrap()
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
-                .collect();
-            assert_eq!(stream_files.len(), 2);
+            let records = list_stream_records_tolerant(root).unwrap();
+            assert!(records.anomalies.is_empty());
+            assert_eq!(records.records.len(), 2);
+            let mut physical_paths = Vec::new();
+            for (name, _) in &records.records {
+                let path = root
+                    .join("chronicle")
+                    .join(day)
+                    .join(name)
+                    .join("120000_60");
+                assert_eq!(fs::read(path.join("audio.flac")).unwrap(), identical_bytes);
+                physical_paths.push(path);
+            }
+            assert_ne!(physical_paths[0], physical_paths[1]);
 
             let (status, listing_a) = request(
                 &app,
@@ -681,6 +688,12 @@ mod tests {
             let items_a = listing_a["items"].as_array().expect("items array");
             assert_eq!(items_a.len(), 1);
             assert_eq!(items_a[0]["key"], "120000_60");
+            let files_a = items_a[0]["files"].as_array().unwrap();
+            assert_eq!(files_a.len(), 1);
+            assert_eq!(files_a[0]["name"], "audio.flac");
+            assert_eq!(files_a[0]["size"], identical_bytes.len());
+            assert_eq!(files_a[0]["sha256"], digest(identical_bytes));
+            assert_eq!(files_a[0]["status"], "present");
 
             let (status, listing_b) = request(
                 &app,
@@ -694,7 +707,13 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             let items_b = listing_b["items"].as_array().expect("items array");
             assert_eq!(items_b.len(), 1);
-            assert_eq!(items_b[0]["key"], "130000_60");
+            assert_eq!(items_b[0]["key"], "120000_60");
+            let files_b = items_b[0]["files"].as_array().unwrap();
+            assert_eq!(files_b.len(), 1);
+            assert_eq!(files_b[0]["name"], "audio.flac");
+            assert_eq!(files_b[0]["size"], identical_bytes.len());
+            assert_eq!(files_b[0]["sha256"], digest(identical_bytes));
+            assert_eq!(files_b[0]["status"], "present");
         }
     }
 }

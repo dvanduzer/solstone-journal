@@ -4655,6 +4655,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(marker["seq"], 2);
+        assert_eq!(marker["prev_day"], "20260804");
+        assert_eq!(marker["prev_segment"], "120000_1");
         let (_, segments) = call(
             &app,
             "GET",

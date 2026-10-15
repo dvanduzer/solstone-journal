@@ -5,7 +5,7 @@ use std::path::Path;
 
 use chrono::{Duration, NaiveDate, NaiveTime};
 use serde_json::{Value, json};
-use solstone_core_format::segment::segment_parse;
+use solstone_core_format::segment::{is_date_key, segment_parse};
 use solstone_core_segment::{
     DEFAULT_STREAM, DirEntryKind, Segment, SegmentIdentityError, StreamLocation, list_days,
     list_dir_entries, list_segments, list_segments_in, read_stream_record, read_text,
@@ -283,6 +283,14 @@ enum ForwardResolution {
     Missing,
 }
 
+fn capture_key<'a>(day: &'a str, segment: &str) -> Option<(&'a str, u8, u8, u8)> {
+    if !is_date_key(day) {
+        return None;
+    }
+    let time = segment_parse(segment)?;
+    Some((day, time.hour, time.minute, time.second))
+}
+
 fn resolve_forward(
     journal: &Path,
     location: &SegmentLocation,
@@ -294,6 +302,27 @@ fn resolve_forward(
     }
     if is_tail(journal, &location.day, stream, &location.segment) {
         return Ok(ForwardResolution::Tail);
+    }
+    // Only bound observed ingest deliberately starts a new capture-time chain.
+    // A missing pointer in another writer, or on a forward/equal-time pair,
+    // remains damage rather than evidence of a deliberate boundary.
+    let bound_observed = read_stream_record(journal, stream)
+        .ok()
+        .flatten()
+        .is_some_and(|record| {
+            record
+                .get("kind")
+                .or_else(|| record.get("type"))
+                .and_then(Value::as_str)
+                == Some("observer")
+                && record
+                    .get("cid")
+                    .and_then(Value::as_str)
+                    .is_some_and(|cid| !cid.is_empty())
+                && record.get("source").is_some_and(Value::is_string)
+        });
+    if !bound_observed {
+        return Ok(ForwardResolution::Missing);
     }
     if let Some(target_seq) = marker
         .and_then(|m| m.get("seq"))
@@ -318,7 +347,14 @@ fn resolve_forward(
                     candidate_marker.get("prev_segment"),
                     None | Some(Value::Null)
                 );
-                if prev_day_null_or_absent && prev_segment_null_or_absent {
+                let capture_boundary = match (
+                    capture_key(&location.day, &location.segment),
+                    capture_key(&scan_day, candidate.key()),
+                ) {
+                    (Some(prior), Some(next)) => next < prior,
+                    _ => true,
+                };
+                if prev_day_null_or_absent && prev_segment_null_or_absent && capture_boundary {
                     candidates.push(require_discovered(&scan_day, &candidate)?);
                 }
             }

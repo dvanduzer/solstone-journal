@@ -8,6 +8,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- when older recordings arrive late, your journal no longer links them as if they were recorded after newer ones.
 - security fix: exports from older journals could include private keys for connections to other journals, giving a copy of those keys to anyone you shared the export with. exports now leave out those keys.
 - changing your backup recovery key now saves and checks the replacement before removing the old key. if removal is interrupted, trying again finishes the same change.
 - small orange links and labels in your journal dashboard are easier to read in light appearance. if your journal's mark cannot be read, its placeholder now follows the dashboard's appearance. opening support keeps the navigation in place.

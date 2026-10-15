@@ -1605,7 +1605,7 @@ mod tests {
     fn null_predecessor_boundary_passes_and_a_missing_link_fails() {
         use crate::read::{Check, describe_next};
         use solstone_core_segment::{
-            PairedStreamBase, StreamAllocationBase, StreamHints, advance_bound_stream,
+            Kind, PairedStreamBase, StreamAllocationBase, StreamHints, advance_bound_stream,
             bind_paired_stream,
         };
 
@@ -1613,7 +1613,10 @@ mod tests {
             chks.iter().find(|c| c.name == name).unwrap().passed
         };
         let cid = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let hints = StreamHints::default();
+        let hints = StreamHints {
+            kind: Some(Kind::Observed),
+            ..StreamHints::default()
+        };
         let base = PairedStreamBase {
             origin: StreamAllocationBase::ClientLabel,
             input: "phone",
@@ -1683,6 +1686,28 @@ mod tests {
         assert!(next_desc.contains("140000_60"));
         assert_ne!(next_desc, "(none)");
 
+        // Only the bound observed writer creates capture-time boundaries.
+        let record_path = pass_root
+            .join("streams")
+            .join(format!("{}.json", bound1.stream));
+        let record_bytes = fs::read(&record_path).unwrap();
+        let record: Value = serde_json::from_slice(&record_bytes).unwrap();
+        for (kind, cid_value) in [
+            ("import", Value::Null),
+            ("agent-memory", Value::Null),
+            ("observer", Value::Null),
+        ] {
+            let mut unrelated = record.clone();
+            unrelated["kind"] = json!(kind);
+            unrelated["cid"] = cid_value;
+            fs::write(&record_path, serde_json::to_vec(&unrelated).unwrap()).unwrap();
+            assert!(
+                !check_passed(&checks(pass_root, &loc1), "forward chain"),
+                "{kind}"
+            );
+        }
+        fs::write(&record_path, record_bytes).unwrap();
+
         // Failing case 1: Forward pair 120000_60 then 120100_60. Delete earlier directory. Later segment backward chain fails.
         let fail1_temp = TempDir::new().unwrap();
         let fail1_root = fail1_temp.path();
@@ -1726,6 +1751,22 @@ mod tests {
             "mic",
         )
         .unwrap();
+
+        // A null pointer on a forward-time pair is damage, not a boundary.
+        let f1_marker_path = f1_bound2.segment.path().join("stream.json");
+        let f1_marker_bytes = fs::read(&f1_marker_path).unwrap();
+        let mut f1_marker: Value = serde_json::from_slice(&f1_marker_bytes).unwrap();
+        f1_marker["prev_day"] = Value::Null;
+        f1_marker["prev_segment"] = Value::Null;
+        fs::write(&f1_marker_path, serde_json::to_vec(&f1_marker).unwrap()).unwrap();
+        let f1_loc1 =
+            SegmentLocation::resolve(fail1_root, "20260805", &f1_bound1.stream, "120000_60")
+                .unwrap();
+        assert!(!check_passed(
+            &checks(fail1_root, &f1_loc1),
+            "forward chain"
+        ));
+        fs::write(&f1_marker_path, f1_marker_bytes).unwrap();
 
         fs::remove_dir_all(f1_bound1.segment.path()).unwrap();
         let f1_loc2 =
