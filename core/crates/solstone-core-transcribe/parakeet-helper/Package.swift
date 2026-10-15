@@ -14,11 +14,20 @@ let package = Package(
         )
     ],
     targets: [
+        .target(
+            name: "InstalledModels",
+            dependencies: [.product(name: "FluidAudio", package: "FluidAudio")]
+        ),
         .executableTarget(
             name: "parakeet-helper",
             dependencies: [
-                .product(name: "FluidAudio", package: "FluidAudio")
+                .product(name: "FluidAudio", package: "FluidAudio"),
+                "InstalledModels"
             ]
+        ),
+        .testTarget(
+            name: "parakeet-helperTests",
+            dependencies: ["InstalledModels"]
         )
     ]
 )

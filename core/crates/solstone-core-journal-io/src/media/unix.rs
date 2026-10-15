@@ -186,6 +186,21 @@ pub(super) fn entries(
     directory: &Directory,
     maximum: usize,
 ) -> io::Result<Option<Vec<MediaEntry>>> {
+    list(directory, maximum, true)
+}
+
+pub(super) fn entries_keeping_any_name(
+    directory: &Directory,
+    maximum: usize,
+) -> io::Result<Option<Vec<MediaEntry>>> {
+    list(directory, maximum, false)
+}
+
+fn list(
+    directory: &Directory,
+    maximum: usize,
+    portable_only: bool,
+) -> io::Result<Option<Vec<MediaEntry>>> {
     let mut cursor = nix::dir::Dir::openat(directory, ".", DIRECTORY, Mode::empty())?;
     let mut result = Vec::new();
     for record in cursor.iter() {
@@ -198,7 +213,11 @@ pub(super) fn entries(
             return Ok(None);
         }
         let name = OsString::from_vec(bytes.to_vec());
-        super::plain_name(&name)?;
+        if portable_only {
+            super::plain_name(&name)?;
+        } else {
+            super::utf8_name(&name)?;
+        }
         step(MediaPrimitive::BeforeEntryObservation)?;
         let observed = entry(directory, &name)?.ok_or_else(changed)?;
         let MediaIdentity::Unix { inode, device } = observed.identity else {

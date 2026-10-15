@@ -166,13 +166,15 @@ mod tests {
             cleanup_journal_from_toml("journal = \"relative\""),
             Err(CleanupConfigError::JournalNotAbsolute)
         ));
-        assert_eq!(
-            cleanup_journal_from_toml("journal = \"/journal\"").unwrap(),
-            PathBuf::from("/journal")
+        let journal = std::env::temp_dir().join("journal");
+        let config = format!(
+            "journal = {}",
+            serde_json::to_string(&journal.to_string_lossy()).unwrap()
         );
+        assert_eq!(cleanup_journal_from_toml(&config).unwrap(), journal);
         assert_eq!(
-            cleanup_journal_from_toml("journal = \"/journal\"\nextra = true").unwrap(),
-            PathBuf::from("/journal")
+            cleanup_journal_from_toml(&format!("{config}\nextra = true")).unwrap(),
+            journal
         );
     }
 

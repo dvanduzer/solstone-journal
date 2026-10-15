@@ -1137,10 +1137,13 @@ fn components(relative: &Path) -> io::Result<Vec<OsString>> {
         .collect()
 }
 
+fn utf8_name(name: &OsStr) -> io::Result<&str> {
+    name.to_str()
+        .ok_or_else(|| invalid("media name must be portable UTF-8"))
+}
+
 fn plain_name(name: &OsStr) -> io::Result<()> {
-    let text = name
-        .to_str()
-        .ok_or_else(|| invalid("media name must be portable UTF-8"))?;
+    let text = utf8_name(name)?;
     crate::name_admission::check_portable_component(text)
         .map_err(|_| invalid("invalid media basename"))
 }

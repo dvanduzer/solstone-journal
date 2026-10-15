@@ -3,20 +3,24 @@
 
 //! Read-only classification of managed wrapper and service guard artifacts.
 
+#[cfg(any(not(windows), test))]
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use solstone_core_installation_identity::{
     ArtifactBindingEvidence, GuardFields, InstallationBinding, NamespaceName,
-    parse_service_guard_environment,
 };
+
+#[cfg(any(not(windows), test))]
+use solstone_core_installation_identity::parse_service_guard_environment;
 
 use crate::events::StepName;
 use crate::legacy_launcher;
 use crate::steps::service_artifact_path;
 use crate::wrapper::{WrapperCommand, parse_wrapper, wrapper_paths};
 
+#[cfg(any(not(windows), test))]
 const SERVICE_GUARD_KEYS: [&str; 4] = [
     "SOLSTONE_INSTALLATION_NAMESPACE",
     "SOLSTONE_INSTALLATION_ID",
@@ -335,7 +339,7 @@ fn read_service(path: &Path) -> Result<Option<PresentArtifact>, ()> {
         let xml = solstone_core_service_unit::decode_windows_task_xml(&bytes).map_err(|_| ())?;
         let definition =
             solstone_core_service_unit::parse_windows_task_xml(&xml).map_err(|_| ())?;
-        return Ok(Some(PresentArtifact::Guarded(definition.action.guard)));
+        Ok(Some(PresentArtifact::Guarded(definition.action.guard)))
     }
     #[cfg(not(windows))]
     read_unix_service(path)
@@ -485,6 +489,7 @@ fn classify_slots(
     ArtifactBindingEvidence::Guarded(first.clone())
 }
 
+#[cfg(any(not(windows), test))]
 fn extract_service_guards(content: &str) -> Result<BTreeMap<String, String>, ()> {
     let mut values = BTreeMap::new();
     if content
@@ -529,6 +534,7 @@ fn extract_service_guards(content: &str) -> Result<BTreeMap<String, String>, ()>
     Ok(values)
 }
 
+#[cfg(any(not(windows), test))]
 fn insert_service_guard(values: &mut BTreeMap<String, String>, entry: &str) -> Result<(), ()> {
     let Some((key, value)) = entry.split_once('=') else {
         return Ok(());
@@ -638,6 +644,8 @@ mod tests {
     /// the one signal that catches it: without it, `journal setup` would
     /// report success after a respin while silently leaving the wrapper
     /// pointed at the build it just replaced.
+    // Managed POSIX shell wrappers are not published on Windows.
+    #[cfg(unix)]
     #[test]
     fn wrapper_targets_drifted_detects_a_version_swap_the_guard_cannot_see() {
         let root = std::env::temp_dir().join(format!(
@@ -800,6 +808,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    // Managed POSIX shell wrappers are not published on Windows.
+    #[cfg(unix)]
     #[test]
     fn legacy_classify_error_refuses_before_valid_wrapper_fallback() {
         let root = std::env::temp_dir().join(format!(
@@ -886,6 +896,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    // Managed POSIX shell wrappers are not published on Windows.
+    #[cfg(unix)]
     #[test]
     fn named_slot_accessors_preserve_each_artifact_before_the_aggregate_fold() {
         let root =

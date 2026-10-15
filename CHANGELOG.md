@@ -11,6 +11,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - new imports use creation dates in common filenames, photos, audio and video files instead of the date a file was copied. when no creation date is found, you can choose one. this works from the import page and the command line without installing an extra tool.
 - new conversations imported across midnight and daylight saving changes keep their source times. conversations in the repeated hour are kept separately, and timed text that crosses midnight continues on the next day. existing recordings stay where they are.
 
+- security fix: on mac, a redirected speech-model download could tell another website that you were using transcription. missing or damaged models now ask you to repair them with the journal's installer.
 - when older recordings arrive late, your journal no longer links them as if they were recorded after newer ones.
 - security fix: exports from older journals could include private keys for connections to other journals, giving a copy of those keys to anyone you shared the export with. exports now leave out those keys.
 - changing your backup recovery key now saves and checks the replacement before removing the old key. if removal is interrupted, trying again finishes the same change.
@@ -24,6 +25,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - on windows, you can preview an import again.
 - sharing to your journal from your iphone or ipad works again. since 2.0.42, your journal turned away every photo, voice memo, pdf and piece of text you shared from your phone, saying to preview the import first, which the phone has no way to do. anything your phone is still holding goes into your journal on its own once your journal is updated and your phone connects to it again.
 - on the import page, dropping a photo or a pdf into quick import works again. since 2.0.42, its preview stopped with an error instead.
+- media offload runs again on some journals that go back to before version 2.0. 2.0.47 said offload ran again on a large journal, but on these journals the check it runs first still stopped it before it began. nothing was removed, and your media stayed on this computer.
 
 ## [2.0.47] - 2026-10-15
 
