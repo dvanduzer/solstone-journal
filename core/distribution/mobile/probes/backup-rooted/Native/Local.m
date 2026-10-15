@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 #include "librestic_bridge.h"
+#include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <unistd.h>
 
 static int join(char *out, size_t cap, const char *base, const char *name) {
@@ -25,6 +27,15 @@ static int call(restic_request *request, restic_result *result) {
     if (restic_bridge_start(request, &id) || !id) return 1;
     if (restic_bridge_wait(id, result) || restic_bridge_free(id)) return 1;
     return result->status != 0;
+}
+static int lease_is_held(const char *target) {
+    char path[4096];
+    if (join(path,sizeof(path),target,"backup-activity.lock")) return 0;
+    int fd=open(path,O_RDWR|O_NOFOLLOW);if (fd<0) return 0;
+    int rc=flock(fd,LOCK_EX|LOCK_NB),saved=errno;
+    if (!rc) (void)flock(fd,LOCK_UN);
+    if (close(fd)) return 0;
+    return rc==-1 && (saved==EWOULDBLOCK || saved==EAGAIN);
 }
 int rooted_local_fixture_run(int argc, char **argv) {
     if (argc != 2) return 1;
@@ -82,5 +93,49 @@ int rooted_local_fixture_run(int argc, char **argv) {
     file=fopen(path,"rb");if (!file) return 37;
     memset(bytes,0,sizeof(bytes));count=fread(bytes,1,sizeof(bytes),file);
     if (fclose(file) || count!=14 || memcmp(bytes,"retained lease",14)) return 38;
+
+    char admitted[4096];
+    if (join(admitted,sizeof(admitted),argv[1],"rooted-abi-admitted-target") || mkdir(admitted,0700)) return 39;
+    if (join(path,sizeof(path),admitted,"backup-activity.lock") || write_fixture(path,"whole restore lease")) return 40;
+    struct stat lock_before,lock_after;if (stat(path,&lock_before)) return 41;
+    fd=open(admitted,O_RDONLY|O_DIRECTORY);if (fd<0) return 42;
+    uint64_t owner=123;
+    if (restic_bridge_target_admit_v1(2,fd,admitted,(uint32_t)strlen(admitted),&owner)!=1 || owner) return 43;
+    owner=123;if (restic_bridge_target_admit_v1(1,fd,(char *)(uintptr_t)1,4097,&owner)!=5 || owner) return 44;
+    owner=123;if (restic_bridge_target_admit_v1(1,fd,target,(uint32_t)strlen(target),&owner)!=1 || owner) return 45;
+    if (restic_bridge_target_admit_v1(1,fd,admitted,(uint32_t)strlen(admitted),&owner) || !owner || close(fd)) return 46;
+    if (!lease_is_held(admitted) || restic_bridge_free(owner)!=7 || restic_bridge_target_revalidate_v1(1,id)!=7) return 47;
+    if (restic_bridge_target_release_v1(1,id)!=7 || restic_bridge_target_revalidate_v1(2,owner)!=1) return 48;
+    request.restore_path=admitted;request.restore_path_len=(uint32_t)strlen(admitted);
+    memcpy(selector,"rooted-abi-source",sizeof(selector));
+    id=123;if (restic_bridge_restore_admitted_v1_start(2,&request,owner,selector,size,&id)!=1 || id) return 49;
+    id=123;if (restic_bridge_restore_admitted_v1_start(1,&request,0,selector,size,&id)!=7 || id) return 50;
+    id=123;if (restic_bridge_s3_restore_admitted_v1_start(&remote,owner,selector,size,&id)!=1 || id) return 51;
+    if (restic_bridge_target_revalidate_v1(1,owner)) return 52;
+    if (restic_bridge_restore_admitted_v1_start(1,&request,owner,selector,size,&id) || !id) return 53;
+    uint64_t second=123;
+    if (restic_bridge_target_release_v1(1,owner)!=6 ||
+        restic_bridge_restore_admitted_v1_start(1,&request,owner,selector,size,&second)!=6 || second) return 54;
+    if (restic_bridge_wait(id,result) || result->status || !lease_is_held(admitted)) return 55;
+    if (restic_bridge_restore_root_v1_outcome(id,1,&outcome) || outcome.target_admitted!=1 || outcome.target_may_have_mutated!=1) return 56;
+    if (restic_bridge_target_release_v1(1,owner)!=6 || restic_bridge_free(id) || restic_bridge_target_revalidate_v1(1,owner)) return 57;
+    if (!lease_is_held(admitted) || join(path,sizeof(path),admitted,"owner")) return 58;
+    file=fopen(path,"rb");if (!file) return 59;
+    memset(bytes,0,sizeof(bytes));count=fread(bytes,1,sizeof(bytes),file);
+    if (fclose(file) || count!=20 || memcmp(bytes,"selected owner bytes",20)) return 60;
+    if (join(path,sizeof(path),admitted,"post-work") || write_fixture(path,"held repair work")) return 61;
+    fd=open(admitted,O_RDONLY|O_DIRECTORY);if (fd<0) return 62;
+    second=123;if (restic_bridge_target_admit_v1(1,fd,admitted,(uint32_t)strlen(admitted),&second)!=6 || second) return 63;
+    request.password=wrong;request.password_len=(uint32_t)strlen(wrong);
+    if (restic_bridge_restore_admitted_v1_start(1,&request,owner,selector,size,&id) || !id || restic_bridge_wait(id,result) || !result->status) return 64;
+    if (restic_bridge_restore_root_v1_outcome(id,1,&outcome) || outcome.target_admitted!=1 || outcome.target_may_have_mutated) return 65;
+    if (restic_bridge_free(id) || !lease_is_held(admitted)) return 66;
+    if (join(path,sizeof(path),admitted,"backup-activity.lock") || stat(path,&lock_after) ||
+        lock_before.st_dev!=lock_after.st_dev || lock_before.st_ino!=lock_after.st_ino) return 67;
+    file=fopen(path,"rb");if (!file) return 68;
+    memset(bytes,0,sizeof(bytes));count=fread(bytes,1,sizeof(bytes),file);
+    if (fclose(file) || count!=19 || memcmp(bytes,"whole restore lease",19)) return 69;
+    if (restic_bridge_target_release_v1(1,owner) || restic_bridge_target_revalidate_v1(1,owner)!=7 || restic_bridge_target_release_v1(1,owner)!=7) return 70;
+    if (restic_bridge_target_admit_v1(1,fd,admitted,(uint32_t)strlen(admitted),&second) || !second || close(fd) || restic_bridge_target_release_v1(1,second)) return 71;
     free(result);return 0;
 }

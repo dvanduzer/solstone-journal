@@ -443,7 +443,23 @@ func closeRequestPaths(req *bridgeRequest) (cleanupErr error) {
 		req.sourceRoot = nil
 	}
 	if req.restoreRoot != nil {
-		_ = req.restoreRoot.Close()
+		var err error
+		if req.rootedRestore != nil {
+			err = closeTargetAdmissionResource("worker-root", req.restoreRoot)
+		} else {
+			err = req.restoreRoot.Close()
+		}
+		if err != nil {
+			cleanupErr = errors.Join(cleanupErr, err)
+			if r := req.rootedRestore; r != nil {
+				rootedTargets.Lock()
+				if r.borrowed != nil {
+					r = r.borrowed.rooted
+				}
+				r.failCloseLocked(err)
+				rootedTargets.Unlock()
+			}
+		}
 		req.restoreRoot = nil
 	}
 	req.pathsPinned = false
