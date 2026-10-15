@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use solstone_core_backup::archive_admission::ArchiveCancellation;
 use solstone_core_backup_runtime::{
     Clock, HttpRequest, HttpResponse, HttpTransport, JournalMaintenance, JournalMaintenanceError,
     NativeRestoreRecorder, ToolOutput, ToolRequest, ToolRunner,
@@ -56,6 +57,14 @@ impl ToolRunner for NoSpawnRunner {
             .unwrap()
             .push(PathBuf::from(request.program.clone()));
         panic!("must not spawn tool: {:?}", request.program);
+    }
+
+    fn run_cancellable(
+        &self,
+        request: &ToolRequest<'_>,
+        _cancellation: &ArchiveCancellation,
+    ) -> std::io::Result<ToolOutput> {
+        self.run(request)
     }
 }
 

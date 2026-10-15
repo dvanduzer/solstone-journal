@@ -8,7 +8,7 @@ publish = false
 [workspace]
 
 [features]
-full-tests = []
+full-tests = ["solstone-core-backup-web/full-tests"]
 audio-native = ["audio", "journal-mobile-audio/native"]
 audio = ["dep:journal-mobile-audio", "dep:solstone-core-transcribe", "dep:sha2"]
 
@@ -16,6 +16,10 @@ audio = ["dep:journal-mobile-audio", "dep:solstone-core-transcribe", "dep:sha2"]
 axum = { version = "0.8.9", default-features = false }
 serde_json = "1"
 log = "0.4"
+solstone-core-backup-web = { path = "../../core/crates/solstone-core-backup-web" }
+solstone-core-backup-runtime = { path = "../../core/crates/solstone-core-backup-runtime" }
+solstone-core-backup = { path = "../../core/crates/solstone-core-backup" }
+solstone-core-maintenance = { path = "../../core/crates/solstone-core-maintenance" }
 solstone-core-spl = { path = "../../core/crates/solstone-core-spl" }
 solstone-core-mcp-endpoint = { path = "../../core/crates/solstone-core-mcp-endpoint" }
 solstone-core-convey-shell = { path = "../../core/crates/solstone-core-convey-shell" }

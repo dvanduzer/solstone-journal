@@ -22,6 +22,90 @@ use crate::observation::{
     FileObservation, FlatDirectoryEntry, same_entry_metadata, same_observation,
 };
 
+#[cfg(target_os = "android")]
+mod android_teardown;
+#[cfg(target_os = "android")]
+pub use android_teardown::claim_and_remove_android_teardown_observed_bounded;
+
+enum RenamePolicy {
+    Platform,
+    #[cfg(target_os = "android")]
+    AndroidTeardown(android_teardown::Authority),
+}
+
+impl RenamePolicy {
+    fn revalidate(&self, _directory: &FlatDirectory) -> io::Result<()> {
+        match self {
+            Self::Platform => Ok(()),
+            #[cfg(target_os = "android")]
+            Self::AndroidTeardown(authority) => authority.revalidate(_directory),
+        }
+    }
+
+    fn rename(&self, directory: &FlatDirectory, from: &OsStr, to: &OsStr) -> io::Result<()> {
+        match self {
+            Self::Platform => rename_no_replace(directory, from, to),
+            #[cfg(target_os = "android")]
+            Self::AndroidTeardown(_) => android_teardown::rename_no_replace(directory, from, to),
+        }
+    }
+
+    fn primitive(&self) -> NoReplacePrimitive {
+        match self {
+            Self::Platform => no_replace_primitive(),
+            #[cfg(target_os = "android")]
+            Self::AndroidTeardown(_) => NoReplacePrimitive::LinuxRenameAt2,
+        }
+    }
+
+    fn verify_claim(
+        &self,
+        _directory: &FlatDirectory,
+        _claim: &ClaimName,
+        _prior: &FileObservation,
+        _maximum: usize,
+    ) -> io::Result<()> {
+        match self {
+            Self::Platform => Ok(()),
+            #[cfg(target_os = "android")]
+            Self::AndroidTeardown(authority) => {
+                authority.revalidate(_directory)?;
+                match read_observed_file_unchecked_bounded(_directory, _claim.as_os_str(), _maximum)
+                    .map_err(io::Error::other)?
+                {
+                    Some(current) if same_observation(&current, _prior) => {}
+                    _ => return Err(io::Error::other("teardown claim changed before unlink")),
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn verify_restoration(
+        &self,
+        _directory: &FlatDirectory,
+        _claim: &ClaimName,
+        _claimed: &ClaimedObject,
+        _maximum: usize,
+    ) -> io::Result<()> {
+        match self {
+            Self::Platform => Ok(()),
+            #[cfg(target_os = "android")]
+            Self::AndroidTeardown(authority) => {
+                authority.revalidate(_directory)?;
+                match claimed_object_state(_directory, _claim.as_os_str(), _claimed, _maximum)
+                    .map_err(io::Error::other)?
+                {
+                    ObservationState::Matches => Ok(()),
+                    _ => Err(io::Error::other(
+                        "teardown claim changed before restoration",
+                    )),
+                }
+            }
+        }
+    }
+}
+
 /// Ordered checkpoints used by claim/removal fault and pause tests.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClaimRemovalPrimitive {
@@ -241,6 +325,24 @@ pub fn claim_and_remove_observed_bounded(
     claim: &ClaimName,
     maximum: usize,
 ) -> Result<ClaimRemovalOutcome, ClaimRemovalError> {
+    claim_and_remove_with_policy(
+        directory,
+        original,
+        prior,
+        claim,
+        maximum,
+        &RenamePolicy::Platform,
+    )
+}
+
+fn claim_and_remove_with_policy(
+    directory: &FlatDirectory,
+    original: &OsStr,
+    prior: &FileObservation,
+    claim: &ClaimName,
+    maximum: usize,
+    policy: &RenamePolicy,
+) -> Result<ClaimRemovalOutcome, ClaimRemovalError> {
     validate_original_name(original)?;
     if original != prior.entry.name.as_os_str() {
         return Err(ClaimRemovalError::ObservationNameMismatch {
@@ -281,8 +383,10 @@ pub fn claim_and_remove_observed_bounded(
         path: directory.diagnostic_entry(claim.as_os_str()),
         source,
     })?;
-    let claim_result = checkpoint(ClaimRemovalPrimitive::ClaimRename)
-        .and_then(|()| rename_no_replace(directory, original, claim.as_os_str()));
+    let claim_result = checkpoint(ClaimRemovalPrimitive::ClaimRename).and_then(|()| {
+        policy.revalidate(directory)?;
+        policy.rename(directory, original, claim.as_os_str())
+    });
     match claim_result {
         Ok(()) => {
             checkpoint(ClaimRemovalPrimitive::AfterClaim).map_err(|source| {
@@ -299,7 +403,7 @@ pub fn claim_and_remove_observed_bounded(
             }
             RenameErrorClass::Unsupported => {
                 return Ok(unchanged(ClaimUnchangedReason::UnsupportedNoReplace {
-                    primitive: no_replace_primitive(),
+                    primitive: policy.primitive(),
                 }));
             }
             RenameErrorClass::SourceAbsent => return Ok(unknown_location()),
@@ -352,9 +456,9 @@ pub fn claim_and_remove_observed_bounded(
     };
     if matches!(&claimed, ClaimedObject::Observed(observation) if same_observation(observation, prior))
     {
-        return unlink_matching_claim(directory, claim);
+        return unlink_matching_claim(directory, claim, prior, maximum, policy);
     }
-    restore_changed_claim(directory, original, &claimed, claim, maximum)
+    restore_changed_claim(directory, original, &claimed, claim, maximum, policy)
 }
 
 fn validate_original_name(original: &OsStr) -> Result<(), ClaimRemovalError> {
@@ -469,6 +573,9 @@ fn reconcile_claim_rename(
 fn unlink_matching_claim(
     directory: &FlatDirectory,
     claim: &ClaimName,
+    prior: &FileObservation,
+    maximum: usize,
+    policy: &RenamePolicy,
 ) -> Result<ClaimRemovalOutcome, ClaimRemovalError> {
     checkpoint(ClaimRemovalPrimitive::BeforeUnlink).map_err(|source| {
         ClaimRemovalError::UnlinkFailure {
@@ -478,6 +585,7 @@ fn unlink_matching_claim(
     })?;
     checkpoint(ClaimRemovalPrimitive::Unlink)
         .and_then(|()| {
+            policy.verify_claim(directory, claim, prior, maximum)?;
             unlinkat(directory, claim.as_os_str(), UnlinkatFlags::NoRemoveDir).map_err(errno_io)
         })
         .map_err(|source| ClaimRemovalError::UnlinkFailure {
@@ -499,6 +607,7 @@ fn restore_changed_claim(
     claimed: &ClaimedObject,
     claim: &ClaimName,
     maximum: usize,
+    policy: &RenamePolicy,
 ) -> Result<ClaimRemovalOutcome, ClaimRemovalError> {
     checkpoint(ClaimRemovalPrimitive::BeforeRestore).map_err(|source| {
         ClaimRemovalError::RestoreFailure {
@@ -506,8 +615,18 @@ fn restore_changed_claim(
             source,
         }
     })?;
-    let restore_result = checkpoint(ClaimRemovalPrimitive::RestoreRename)
-        .and_then(|()| rename_no_replace(directory, claim.as_os_str(), original));
+    let restore_result = match checkpoint(ClaimRemovalPrimitive::RestoreRename) {
+        Ok(()) => {
+            policy
+                .verify_restoration(directory, claim, claimed, maximum)
+                .map_err(|source| ClaimRemovalError::RestoreFailure {
+                    claim: claim.clone(),
+                    source,
+                })?;
+            policy.rename(directory, claim.as_os_str(), original)
+        }
+        Err(source) => Err(source),
+    };
     match restore_result {
         Ok(()) => Ok(identity_changed(
             IdentityChangeDisposition::Restored,

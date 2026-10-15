@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use serde_json::Value;
+use solstone_core_backup::archive_admission::ArchiveCancellation;
 use solstone_core_backup_runtime::{
     AdmittedDestination, BackupServices, ToolOutput, ToolRequest, ToolRunner, restore_journal,
     run_restic, test_support::RestoreRecorderSpy, windows_cleanup::RetainingToolRunner,
@@ -302,6 +303,21 @@ fn archive_query_cleanup_releases_original_page_owner() {
         )
         .is_err()
     );
+    #[cfg(feature = "full-tests")]
+    let lifetime = deps.lifetime();
+    #[cfg(feature = "full-tests")]
+    {
+        lifetime.request_stop();
+        assert_eq!(
+            lifetime.drain(crate::test_support::join_executor(), Instant::now()),
+            crate::route_lifetime::BackupRouteDrain::Pending
+        );
+        assert_eq!(
+            deps.lifetime()
+                .drain(crate::test_support::join_executor(), Instant::now()),
+            crate::route_lifetime::BackupRouteDrain::Pending
+        );
+    }
 
     fault.0.release();
     assert!(matches!(
@@ -318,14 +334,20 @@ fn archive_query_cleanup_releases_original_page_owner() {
         carrier.upgrade().is_none(),
         "the original carrier must be released"
     );
-    let next = archive_worker::begin_owned(
-        &deps.operations,
-        "offload_restore",
-        Arc::new(JournalRoot::open(directory.path()).unwrap()),
-        deps.clock.clone(),
-    )
-    .unwrap();
-    next.cancel_before_preparation(&deps.operations);
+    #[cfg(feature = "full-tests")]
+    assert_eq!(
+        lifetime.drain(crate::test_support::join_executor(), Instant::now() + WAIT),
+        crate::route_lifetime::BackupRouteDrain::Drained
+    );
+    assert!(
+        archive_worker::begin_owned(
+            &deps.operations,
+            "offload_restore",
+            Arc::new(JournalRoot::open(directory.path()).unwrap()),
+            deps.clock.clone(),
+        )
+        .is_err()
+    );
     println!("BACKUP_CLEANUP_ARCHIVE_QUERY_RELEASE_PASS");
 }
 
@@ -361,6 +383,14 @@ impl ToolRunner for FaultRunner {
         self.publish.lock().unwrap().recv_timeout(WAIT).unwrap();
         Err(io::Error::other(failure))
     }
+
+    fn run_cancellable(
+        &self,
+        request: &ToolRequest<'_>,
+        _cancellation: &ArchiveCancellation,
+    ) -> io::Result<ToolOutput> {
+        self.run(request)
+    }
 }
 
 struct RestoreWriterFault {
@@ -384,6 +414,14 @@ impl ToolRunner for RestoreWriterFault {
             Some("restore") => self.writer.run(request),
             other => panic!("unexpected engine helper: {other:?}"),
         }
+    }
+
+    fn run_cancellable(
+        &self,
+        request: &ToolRequest<'_>,
+        _cancellation: &ArchiveCancellation,
+    ) -> io::Result<ToolOutput> {
+        self.run(request)
     }
 }
 
@@ -484,6 +522,14 @@ impl ToolRunner for HeldSelectiveRunner {
         Err(io::Error::other(
             "held selective restore must not issue a tool",
         ))
+    }
+
+    fn run_cancellable(
+        &self,
+        request: &ToolRequest<'_>,
+        _cancellation: &ArchiveCancellation,
+    ) -> io::Result<ToolOutput> {
+        self.run(request)
     }
 }
 
@@ -806,4 +852,49 @@ async fn backup_native_cleanup_ownership() {
     drop(fault);
     restore_engines_preserve_configuration_while_writer_cleanup_is_pending();
     archive_query_cleanup_releases_original_page_owner();
+}
+
+#[cfg(feature = "full-tests")]
+#[test]
+fn windows_pending_cleanup_holds_drain_until_quiescent() {
+    let root = tempfile::tempdir().unwrap();
+    let deps = BackupWebDeps::new(root.path().to_path_buf());
+    let lifetime = deps.lifetime();
+    let began = operation::begin(&deps.operations, "restore", None, None, None).unwrap();
+    assert!(operation::start_worker(&deps.operations, began.generation));
+
+    let fault = FaultGuard(HelperCleanupObservationFault::new());
+    let failure = run_bounded_helper_with_observation_fault_for_test(
+        child_request(BoundedHelperResources::new()),
+        &fault.0,
+    )
+    .unwrap_err();
+    let owner = failure.cleanup().expect("cleanup owner").clone();
+
+    operation::finish_worker(
+        &deps.operations,
+        began.generation,
+        operation::Terminal::done(),
+        vec![owner.clone()],
+    );
+
+    lifetime.request_stop();
+    assert_eq!(
+        lifetime.drain(crate::test_support::join_executor(), Instant::now()),
+        crate::route_lifetime::BackupRouteDrain::Pending
+    );
+
+    fault.0.release();
+    assert_eq!(
+        owner.retry_until(Instant::now() + WAIT),
+        HelperCleanupStatus::Quiescent
+    );
+
+    assert_eq!(
+        lifetime.drain(
+            crate::test_support::join_executor(),
+            Instant::now() + Duration::from_secs(5)
+        ),
+        crate::route_lifetime::BackupRouteDrain::Drained
+    );
 }

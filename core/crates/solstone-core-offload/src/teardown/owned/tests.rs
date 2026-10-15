@@ -356,14 +356,23 @@ fn owned_teardown_boundaries_on_windows() {
     }
 }
 
+/// Android's permanent in-process resolver uses the same owning coordinator.
+#[test]
+#[cfg(target_os = "android")]
+fn owned_teardown_boundaries_on_android() {
+    for case in BOUNDARY_CASES {
+        owned_teardown_boundaries(case);
+    }
+}
+
 #[cfg(all(test, feature = "full-tests"))]
 fn owned_teardown_boundaries(case: &str) {
     let case = case.to_owned();
     assert!(BOUNDARY_CASES.contains(&case.as_str()));
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     let parent = fs::canonicalize("/var/tmp").unwrap();
-    #[cfg(windows)]
-    let parent = std::env::temp_dir();
+    #[cfg(any(windows, target_os = "android"))]
+    let parent = fs::canonicalize(std::env::temp_dir()).unwrap();
     let temp = tempfile::Builder::new()
         .prefix("owned-teardown-journal-")
         // macOS links /var to /private/var; the journal root binds its real path.
@@ -582,3 +591,7 @@ fn owned_teardown_boundaries(case: &str) {
     drop(ActivityLease::try_acquire(root).unwrap());
     println!("owned_teardown_{case}_ok requests={expected}");
 }
+
+#[cfg(target_os = "android")]
+#[path = "android_tests.rs"]
+mod android_tests;

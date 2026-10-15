@@ -125,6 +125,8 @@ pub use atomic::{write_bytes_exclusive, write_reader_exclusive};
 #[cfg(any(unix, windows))]
 pub use atomic::{write_jsonl, write_text};
 pub use bounded_read::{JournalReadError, MAX_BYTES, resolve_read_path};
+#[cfg(target_os = "android")]
+pub use claim_remove::claim_and_remove_android_teardown_observed_bounded;
 #[cfg(all(unix, feature = "test-hooks"))]
 pub use claim_remove::{
     ClaimRemovalPrimitive, run_with_claim_removal_barrier, run_with_claim_removal_fault,

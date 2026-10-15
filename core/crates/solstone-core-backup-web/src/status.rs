@@ -65,10 +65,16 @@ pub(crate) fn status_with_operation(
             backup_setup_fingerprint(&backup, binding.as_ref()).map(|current| stored == current)
         });
     let destination = backup.get("destination").and_then(Value::as_object);
+    let pending_val = backup.get("pending_key_revocation");
+    let revocation_unresolved = pending_val.is_some();
+    let revocation_pending = pending_val
+        .and_then(solstone_core_backup::PendingKeyRevocation::parse)
+        .is_some();
     Ok(with_cleanup_admission(json!({
         "success": true, "enabled": backup.get("enabled").cloned().unwrap_or(Value::Null), "mode": backup.get("mode").cloned().unwrap_or(Value::Null),
         "destination": {"repository": destination.and_then(|d| d.get("repository")).cloned().unwrap_or(Value::Null), "backend": destination.and_then(|d| d.get("backend")).cloned().unwrap_or(Value::Null), "credentials_set": destination.and_then(|d| d.get("credentials")).is_some_and(|value| value.as_object().is_some_and(|value| !value.is_empty()))},
         "daily_key_set": backup.get("daily_key").is_some_and(|value| !value.is_null()), "recovery_key_set": backup.get("recovery_key").is_some_and(|value| !value.is_null()), "recovery_key_confirmed": backup.get("confirmed_recovery_key").and_then(Value::as_bool).unwrap_or(false),
+        "recovery_key_revocation_pending": revocation_pending, "recovery_key_revocation_unresolved": revocation_unresolved,
         "retention": backup.get("retention").cloned().unwrap_or(Value::Null), "offload": backup.get("offload").cloned().unwrap_or(Value::Null), "schedule": solstone_core_backup_runtime::effective_backup_schedule(root),
         "last_backup": backup.get("last_backup").cloned().unwrap_or(Value::Null), "last_backup_current_setup": current_setup, "last_prune": backup.get("last_prune").cloned().unwrap_or(Value::Null), "last_offload": backup.get("last_offload").cloned().unwrap_or(Value::Null), "last_verification": backup.get("last_verification").cloned().unwrap_or(Value::Null), "last_restore": backup.get("last_restore").cloned().unwrap_or(Value::Null), "hosted": hosted_view(binding.as_ref(), operation), "operation": operation_value(operation)
     })))

@@ -114,7 +114,7 @@ fn begin_owned_locked(
     root: Arc<JournalRoot>,
     clock: OwnedClock,
 ) -> Result<OwnedArchiveBegin, ArchiveBeginRefusal> {
-    let cancellation = ArchiveCancellation::new();
+    let cancellation = ArchiveCancellation::new_child(&state.cancellation);
     let budget = ArchiveBudget::new_cancellable(clock.as_ref(), cancellation.clone())
         .map_err(ArchiveBeginRefusal::Admission)?;
     let generation = operation::install_slot(
@@ -152,6 +152,7 @@ pub enum ArchivePayload {
     },
     Prepared(Box<OwnedPreparedArchiveHold>),
     PreparationFailure(Box<OwnedArchivePreparationFailure>),
+    UnusedRetirement(Box<solstone_core_backup::archive_activity::OwnedUnusedArchiveRetirement>),
     AdmissionFailure(OwnedArchiveAdmissionFailure),
     ReadHeld {
         read: Box<OwnedDirectReadHold>,
@@ -208,35 +209,48 @@ impl ArchivePayload {
     fn release(self) -> Result<(), Self> {
         match self {
             Self::Released | Self::BeginHeld(_) => Ok(()),
-            Self::Prepared(owner) => {
-                owner.release_unused();
-                Ok(())
-            }
-            Self::PreparationFailure(failure) => {
-                failure.release();
-                Ok(())
-            }
+            Self::Prepared(owner) => owner
+                .retire_unused()
+                .map_err(|retirement| Self::UnusedRetirement(Box::new(retirement))),
+            Self::PreparationFailure(failure) => failure
+                .retire_unused()
+                .map_err(|retirement| Self::UnusedRetirement(Box::new(retirement))),
             Self::AdmissionFailure(failure) => failure
                 .release()
                 .map_err(|failure| Self::AdmissionFailure(*failure)),
-            Self::ReadHeld { read, outside } => match (*read).release_unused() {
-                Ok(()) => {
-                    outside.release_unused();
-                    Ok(())
+            Self::ReadHeld { read, outside } => match (*read).release_refused() {
+                Ok(read) => {
+                    let runtime = outside.finish_refused(read);
+                    if runtime.released() {
+                        Ok(())
+                    } else {
+                        Err(Self::Unknown {
+                            runtime,
+                            report: None,
+                        })
+                    }
                 }
                 Err(read) => Err(Self::ReadHeld { read, outside }),
             },
             Self::NativeHeld { native, outside } => match (*native).release_refused() {
-                Ok((read, _report)) => {
-                    drop(outside.finish_refused(read));
-                    Ok(())
+                Ok((read, report)) => {
+                    let runtime = outside.finish_refused(read);
+                    if runtime.released() {
+                        Ok(())
+                    } else {
+                        Err(Self::NativeFinished { report, runtime })
+                    }
                 }
                 Err(native) => Err(Self::NativeHeld { native, outside }),
             },
             Self::ProofHeld { proof, outside } => match (*proof).release_refused() {
-                Ok((read, _report)) => {
-                    drop(outside.finish_refused(read));
-                    Ok(())
+                Ok((read, report)) => {
+                    let runtime = outside.finish_refused(read);
+                    if runtime.released() {
+                        Ok(())
+                    } else {
+                        Err(Self::ProofFinished { report, runtime })
+                    }
                 }
                 Err(proof) => Err(Self::ProofHeld { proof, outside }),
             },
@@ -287,6 +301,7 @@ impl ArchivePayload {
             }
             Self::Prepared(owner) => (owner.journal_root(), Some(owner.owned_clock())),
             Self::PreparationFailure(owner) => (owner.journal_root(), Some(owner.owned_clock())),
+            Self::UnusedRetirement(owner) => (owner.journal_root(), Some(owner.owned_clock())),
             Self::AdmissionFailure(owner) => (owner.journal_root(), owner.owned_clock()),
             Self::ReadHeld { read, outside } => {
                 if !Arc::ptr_eq(read.carrier(), outside.carrier())
@@ -377,6 +392,15 @@ pub(crate) struct ArchiveCustody {
 }
 
 impl ArchiveCustody {
+    pub(crate) fn needs_settlement(&self) -> bool {
+        !self.retained.is_empty()
+            || self.teardown.needs_settlement()
+            || self.approval.needs_settlement()
+            || self.restore.needs_settlement()
+    }
+    pub(crate) fn workers_running(&self) -> bool {
+        !self.approval.settled() || self.restore.worker_running()
+    }
     pub(crate) fn is_busy(&self) -> bool {
         self.reservation.is_some()
             || !self.retained.is_empty()
@@ -394,6 +418,17 @@ impl ArchiveCustody {
             .as_ref()
             .is_some_and(|original| Arc::ptr_eq(original, &ticket.0))
     }
+
+    pub(crate) fn take_finished_workers(&mut self) -> Vec<std::thread::JoinHandle<()>> {
+        let mut workers = Vec::new();
+        if let Some(worker) = self.approval.take_finished_worker() {
+            workers.push(worker);
+        }
+        if let Some(worker) = self.restore.take_finished_worker() {
+            workers.push(worker);
+        }
+        workers
+    }
 }
 
 /// Start only the worker owning this private admission ticket.
@@ -401,7 +436,7 @@ pub fn start_owned_worker(slot: &SharedOperationSlot, ticket: &ArchiveTicket) ->
     let Ok(mut state) = slot.lock() else {
         return false;
     };
-    if !state.archive.matches(ticket) || !state.archive.retained.is_empty() {
+    if state.closed || !state.archive.matches(ticket) || !state.archive.retained.is_empty() {
         return false;
     }
     let Some(current) = state.current.as_mut() else {
@@ -573,6 +608,63 @@ pub(crate) fn observe_retained(state: &mut operation::OperationState) {
         }
         state.archive.retained.push(returned);
     }
+}
+
+/// A closed lifetime's actual settlement worker. Custody stays in the shared
+/// state until this registered worker takes it, then release runs outside its mutex.
+pub(crate) fn settle_closed(slot: &SharedOperationSlot) {
+    let returned = {
+        let mut state = match slot.lock() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        if !state.closed {
+            return;
+        }
+        let mut eligible = Vec::new();
+        for returned in std::mem::take(&mut state.archive.retained) {
+            if returned.reason.is_none() && state.archive.matches(&returned.ticket) {
+                eligible.push(returned);
+            } else {
+                state.archive.retained.push(returned);
+            }
+        }
+        eligible
+    };
+    for mut returned in returned {
+        let payload = std::mem::replace(&mut returned.payload, ArchivePayload::Released);
+        let released = match payload.release() {
+            Ok(()) => true,
+            Err(payload) => {
+                returned.payload = payload;
+                false
+            }
+        };
+        let mut state = match slot.lock() {
+            Ok(state) => state,
+            Err(error) => {
+                error.into_inner().archive.retained.push(returned);
+                continue;
+            }
+        };
+        if released && state.archive.matches(&returned.ticket) {
+            discharge_released(&mut state, &returned);
+        } else {
+            state.archive.retained.push(returned);
+        }
+    }
+    let mut state = match slot.lock() {
+        Ok(state) => state,
+        Err(_) => return,
+    };
+    #[cfg(windows)]
+    if let Some(current) = state.current.as_mut() {
+        operation::observe_cleanup(current);
+    }
+    teardown::settle_closed(&mut state);
+    removal::settle_closed(&mut state);
+    restore::settle_closed(&mut state);
+    slot.notify_waiters();
 }
 
 /// Retention alone may recover a poisoned mutex. It never applies success.

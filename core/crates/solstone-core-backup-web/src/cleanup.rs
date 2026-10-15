@@ -66,38 +66,52 @@ pub(crate) async fn admit_mutation(
     next.run(request).await
 }
 
+#[cfg(windows)]
 pub(crate) fn spawn_worker<F>(mut deps: BackupWebDeps, generation: u64, work: F)
 where
     F: FnOnce(BackupWebDeps) -> Terminal + Send + 'static,
 {
-    if !operation::start_worker(&deps.operations, generation) {
-        operation::finish(
-            &deps.operations,
-            generation,
-            "error",
-            Some("failed".into()),
-            None,
-        );
-        return;
-    }
     let operations = deps.operations.clone();
-    let failed_spawn = operations.clone();
     let (runner, cleanup) =
         solstone_core_backup_runtime::windows_cleanup::track_cleanup(deps.runner.clone());
     deps.runner = runner;
+    let mut guard = match operations.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if !operation::start_worker_locked(&mut guard, generation) {
+        if let Some(current) = guard.current.as_mut()
+            && current.generation == generation
+        {
+            current.worker_active = false;
+            operation::finish_or_defer(current, Terminal::error("failed"));
+        }
+        drop(guard);
+        operations.notify_waiters();
+        return;
+    }
+    let worker_ops = operations.clone();
     let started = spawn_thread(move || {
         let terminal = panic::catch_unwind(AssertUnwindSafe(|| work(deps)))
             .unwrap_or_else(|_| Terminal::error("failed"));
         let owners = cleanup.try_iter().collect();
-        operation::finish_worker(&operations, generation, terminal, owners);
+        operation::finish_worker(&worker_ops, generation, terminal, owners);
     });
-    if started.is_err() {
-        operation::finish_worker(
-            &failed_spawn,
-            generation,
-            Terminal::error("failed"),
-            Vec::new(),
-        );
+    match started {
+        Ok(handle) => {
+            guard.threads.push(handle);
+            drop(guard);
+        }
+        Err(_) => {
+            if let Some(current) = guard.current.as_mut()
+                && current.generation == generation
+            {
+                current.worker_active = false;
+                operation::finish_or_defer(current, Terminal::error("failed"));
+            }
+            drop(guard);
+            operations.notify_waiters();
+        }
     }
 }
 

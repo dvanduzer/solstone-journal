@@ -23,6 +23,7 @@ pub mod owned_creator;
 pub mod owned_dns;
 #[cfg(target_os = "macos")]
 mod parent_watch;
+mod rotation_binding;
 mod state;
 pub mod teardown_configuration;
 
@@ -35,12 +36,15 @@ pub use keys::{
     generate_daily_key, generate_recovery_key, parse_recovery_key,
 };
 pub use merge::merge_backup_config;
+pub use rotation_binding::{RotationBindingExclusion, hold_rotation_binding_at_root};
 pub use state::{
-    backup_setup_fingerprint, clear_backup_config, clear_backup_config_at_root,
-    clear_backup_config_if_unchanged, generate_and_store_keys, get_backup_config, get_destination,
-    get_keys, record_backup_result, record_offload_result, record_prune_result,
-    record_restore_result, record_verification_result, set_destination, set_enabled, set_mode,
-    set_offload, set_recovery_key, set_recovery_key_confirmed, set_retention, status_view,
+    PendingExecution, PendingKeyRevocation, backup_setup_fingerprint, candidate_binding,
+    clear_backup_config, clear_backup_config_at_root, clear_backup_config_if_unchanged,
+    clear_pending_key_revocation_at_root, credential_binding, destination_from_config,
+    generate_and_store_keys, get_backup_config, get_destination, get_keys, record_backup_result,
+    record_offload_result, record_prune_result, record_restore_result, record_verification_result,
+    set_destination, set_enabled, set_mode, set_offload, set_recovery_key,
+    set_recovery_key_confirmed, set_retention, stage_pending_key_revocation_at_root, status_view,
 };
 
 pub(crate) const OFFLOAD_STATUSES: [&str; 4] = ["ok", "skipped", "stalled", "error"];

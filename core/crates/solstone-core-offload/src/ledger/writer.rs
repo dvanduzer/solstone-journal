@@ -617,7 +617,8 @@ mod unix {
     impl Hooks for NoHooks {
         #[cfg(all(test, feature = "full-tests"))]
         fn sync(&mut self, file: &impl AsFd, point: SyncPoint) -> io::Result<()> {
-            let injected = FILE_SYNC_FAULT.with_borrow(|state| {
+            let injected = FILE_SYNC_FAULT.with(|slot| {
+                let state = slot.borrow();
                 state.as_ref().is_some_and(|state| {
                     if point != SyncPoint::File {
                         return false;
@@ -638,6 +639,9 @@ mod unix {
 
     #[cfg(all(test, feature = "full-tests"))]
     std::thread_local! {
+        #[cfg(target_os = "android")]
+        static FILE_SYNC_FAULT: Box<std::cell::RefCell<Option<std::rc::Rc<FileSyncState>>>> = Box::new(std::cell::RefCell::new(None));
+        #[cfg(not(target_os = "android"))]
         static FILE_SYNC_FAULT: std::cell::RefCell<Option<std::rc::Rc<FileSyncState>>> = const {
             std::cell::RefCell::new(None)
         };
@@ -656,7 +660,8 @@ mod unix {
     #[cfg(all(test, feature = "full-tests"))]
     impl FileSyncUncertainty {
         pub(super) fn arm() -> io::Result<Self> {
-            FILE_SYNC_FAULT.with_borrow_mut(|slot| {
+            FILE_SYNC_FAULT.with(|cell| {
+                let mut slot = cell.borrow_mut();
                 if slot.is_some() {
                     return Err(io::Error::other("FileSync fixture already armed"));
                 }
@@ -676,7 +681,7 @@ mod unix {
     #[cfg(all(test, feature = "full-tests"))]
     impl Drop for FileSyncUncertainty {
         fn drop(&mut self) {
-            FILE_SYNC_FAULT.with_borrow_mut(|slot| *slot = None);
+            FILE_SYNC_FAULT.with(|slot| *slot.borrow_mut() = None);
         }
     }
 

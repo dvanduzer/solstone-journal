@@ -305,7 +305,87 @@ fn dispatch_approval(
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 mod approval_tests;
 
+#[cfg(all(test, feature = "full-tests"))]
+static DECLINE_PAUSE_HOOK: std::sync::Mutex<
+    Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(all(test, feature = "full-tests"))]
+pub(crate) fn arm_decline_pause() -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    *DECLINE_PAUSE_HOOK.lock().unwrap() = Some((entered_tx, release_rx));
+    (entered_rx, release_tx)
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+fn pause_decline() {
+    let pair = {
+        let mut guard = DECLINE_PAUSE_HOOK.lock().unwrap();
+        guard.take()
+    };
+    if let Some((entered_tx, release_rx)) = pair {
+        let _ = entered_tx.send(());
+        let _ = release_rx.recv();
+    }
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+static RECOVER_PAUSE_HOOK: std::sync::Mutex<
+    Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(all(test, feature = "full-tests"))]
+pub(crate) fn arm_recover_pause() -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    *RECOVER_PAUSE_HOOK.lock().unwrap() = Some((entered_tx, release_rx));
+    (entered_rx, release_tx)
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+fn pause_recover() {
+    let pair = {
+        let mut guard = RECOVER_PAUSE_HOOK.lock().unwrap();
+        guard.take()
+    };
+    if let Some((entered_tx, release_rx)) = pair {
+        let _ = entered_tx.send(());
+        let _ = release_rx.recv();
+    }
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+static RECOVER_APPEND_PAUSE_HOOK: std::sync::Mutex<
+    Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(all(test, feature = "full-tests"))]
+pub(crate) fn arm_recover_append_pause()
+-> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    *RECOVER_APPEND_PAUSE_HOOK.lock().unwrap() = Some((entered_tx, release_rx));
+    (entered_rx, release_tx)
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+fn pause_recover_append() {
+    let pair = {
+        let mut guard = RECOVER_APPEND_PAUSE_HOOK.lock().unwrap();
+        guard.take()
+    };
+    if let Some((entered_tx, release_rx)) = pair {
+        let _ = entered_tx.send(());
+        let _ = release_rx.recv();
+    }
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+mod route_lifetime_tests;
+
 pub async fn decline(
+    deps: Option<Extension<solstone_core_backup_web::BackupWebDeps>>,
     State(journal_root): State<PathBuf>,
     body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Response {
@@ -313,8 +393,33 @@ pub async fn decline(
         Ok(context) => context,
         Err((status, state)) => return request_response(status, state),
     };
+    let deps = if let Some(Extension(deps)) = deps {
+        if deps.journal_root != journal_root {
+            return solstone_core_backup_web::invalid_operation_response();
+        }
+        Some(deps)
+    } else {
+        None
+    };
     let count = context.marks().len();
-    match tokio::task::spawn_blocking(move || decline_current(&journal_root, &context)).await {
+    match tokio::task::spawn_blocking(move || {
+        let _guard = if let Some(deps) = deps {
+            match solstone_core_backup_web::admit_write(
+                &deps.operations,
+                solstone_core_backup_web::AdmitWrite::DuringOperation,
+            ) {
+                Ok(guard) => Some(guard),
+                Err(response) => return response,
+            }
+        } else {
+            None
+        };
+        #[cfg(all(test, feature = "full-tests"))]
+        pause_decline();
+        decline_current(&journal_root, &context)
+    })
+    .await
+    {
         Ok(response) => response,
         Err(_) => Json(decline_payload(count, None)).into_response(),
     }
@@ -417,6 +522,7 @@ fn decode_review_request(body: &[u8]) -> Result<ReviewContext, &'static str> {
 }
 
 pub async fn recover(
+    deps: Option<Extension<solstone_core_backup_web::BackupWebDeps>>,
     State(journal_root): State<PathBuf>,
     Extension(clock): Extension<crate::Clock>,
     body: Bytes,
@@ -424,27 +530,58 @@ pub async fn recover(
     if let Err(state) = recover_empty(body) {
         return request_response(StatusCode::BAD_REQUEST, state);
     }
+    let deps = if let Some(Extension(deps)) = deps {
+        if deps.journal_root != journal_root {
+            return solstone_core_backup_web::invalid_operation_response();
+        }
+        Some(deps)
+    } else {
+        None
+    };
     let at = clock.now().to_rfc3339_opts(SecondsFormat::Secs, true);
-    let outcome = recover_from_call(call_recover(journal_root.clone(), at).await);
-    append_action(
-        &journal_root,
-        "removal_recover",
-        json!({
-            "finished_count": outcome.finished_count,
-            "not_finished_count": outcome.not_finished_count,
-            "halted": outcome.halted,
-            "refusals": outcome.refusals,
-            "outcome_state": outcome.state,
-        }),
-    );
-    Json(json!({
-        "state": outcome.state,
-        "finished_count": outcome.finished_count,
-        "not_finished_count": outcome.not_finished_count,
-        "halted": outcome.halted,
-        "refusals": outcome.refusals,
-    }))
-    .into_response()
+    let outcome = match tokio::task::spawn_blocking(move || {
+        let _guard = if let Some(deps) = deps {
+            match solstone_core_backup_web::admit_write(
+                &deps.operations,
+                solstone_core_backup_web::AdmitWrite::DuringOperation,
+            ) {
+                Ok(guard) => Some(guard),
+                Err(response) => return Err(Box::new(response)),
+            }
+        } else {
+            None
+        };
+        #[cfg(all(test, feature = "full-tests"))]
+        pause_recover();
+        let call = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            retention::recover(journal_root.clone(), at.clone())
+        })) {
+            Ok(result) => ClientCall::Completed(result),
+            Err(_) => ClientCall::Join,
+        };
+        #[cfg(all(test, feature = "full-tests"))]
+        pause_recover_append();
+        let outcome = recover_from_call(call);
+        append_action(
+            &journal_root,
+            "removal_recover",
+            json!({
+                "finished_count": outcome.finished_count,
+                "not_finished_count": outcome.not_finished_count,
+                "halted": outcome.halted,
+                "refusals": outcome.refusals,
+                "outcome_state": outcome.state,
+            }),
+        );
+        Ok(outcome)
+    })
+    .await
+    {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(response)) => return *response,
+        Err(_) => recover_from_call(ClientCall::Join),
+    };
+    recover_response(&outcome)
 }
 
 fn recover_empty(body: Bytes) -> Result<(), &'static str> {
@@ -454,13 +591,6 @@ fn recover_empty(body: Bytes) -> Result<(), &'static str> {
     match serde_json::from_slice::<Value>(&body) {
         Ok(Value::Object(request)) if request.is_empty() => Ok(()),
         _ => Err(REQUEST_INVALID),
-    }
-}
-
-async fn call_recover(journal_root: PathBuf, at: String) -> ClientCall {
-    match tokio::task::spawn_blocking(move || retention::recover(journal_root, at)).await {
-        Ok(result) => ClientCall::Completed(result),
-        Err(_) => ClientCall::Join,
     }
 }
 
@@ -639,6 +769,17 @@ fn recover_outcome(receipt: &Value) -> Option<RecoverOutcome> {
     })
 }
 
+fn recover_response(outcome: &RecoverOutcome) -> Response {
+    Json(json!({
+        "state": outcome.state,
+        "finished_count": outcome.finished_count,
+        "not_finished_count": outcome.not_finished_count,
+        "halted": outcome.halted,
+        "refusals": outcome.refusals,
+    }))
+    .into_response()
+}
+
 fn recover_from_call(call: ClientCall) -> RecoverOutcome {
     match call {
         ClientCall::Completed(Ok(receipt)) => {
@@ -774,7 +915,7 @@ mod tests {
         removal_outcome, remove_preflight_refusal,
     };
 
-    fn review_fixture(
+    pub(super) fn review_fixture(
         count: usize,
         reason_bytes: usize,
     ) -> (tempfile::TempDir, Vec<super::retention::Mark>) {

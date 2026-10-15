@@ -3669,6 +3669,7 @@ dependencies = [
  "solstone-core-distribution",
  "solstone-core-indexer-store",
  "solstone-core-installed-payload",
+ "solstone-core-journal-config",
  "solstone-core-journal-config-write",
  "solstone-core-journal-io",
  "solstone-core-spp-attest",
@@ -5070,6 +5071,7 @@ dependencies = [
  "solstone-core-segment",
  "solstone-core-system",
  "tempfile",
+ "ureq",
 ]
 
 [[package]]

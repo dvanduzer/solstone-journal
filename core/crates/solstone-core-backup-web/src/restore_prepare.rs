@@ -70,6 +70,9 @@ pub(crate) fn prepare(
             "A hosted restore handoff is already being prepared.",
         ));
     }
+    if operations.lock().map(|g| g.closed).unwrap_or(true) {
+        return Err(operation::busy_response());
+    }
     if operation::is_busy(operations) {
         return Err(operation::busy_response());
     }
@@ -109,6 +112,9 @@ where
     require_capability(lease, capability)?;
     if lease.stage != RestorePrepareStage::Prepared {
         return Err(wrong_stage_response());
+    }
+    if operations.lock().map(|g| g.closed).unwrap_or(true) {
+        return Err(operation::busy_response());
     }
     if operation::generation_of(operations).unwrap_or(0) != lease.baseline_generation
         || operation::is_busy(operations)
@@ -269,6 +275,9 @@ fn require_live_generation(
     lease: &RestorePrepareLease,
     operations: &SharedOperationSlot,
 ) -> Result<(), Response> {
+    if operations.lock().map(|g| g.closed).unwrap_or(true) {
+        return Err(operation::busy_response());
+    }
     if operation::generation_of(operations) == Some(lease.baseline_generation)
         && operation::is_busy(operations)
     {

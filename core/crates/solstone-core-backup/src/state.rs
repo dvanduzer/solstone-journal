@@ -33,7 +33,7 @@ pub fn get_destination(journal: &Path) -> Result<Option<Destination>, BackupErro
     Ok(destination_from_config(&get_backup_config(journal)?))
 }
 
-pub(crate) fn destination_from_config(config: &Map<String, Value>) -> Option<Destination> {
+pub fn destination_from_config(config: &Map<String, Value>) -> Option<Destination> {
     let destination = config.get("destination")?.as_object()?;
     let (Some(repository), Some(backend), Some(credentials)) = (
         destination.get("repository").and_then(Value::as_str),
@@ -237,6 +237,284 @@ pub(crate) fn cleared_backup_configuration(
     }
     let mut replacement = config.clone();
     replacement.insert("backup".into(), Value::Object(backup_defaults()));
+    Some(replacement)
+}
+
+/// Durable pending key revocation intent staged before remote key removal.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingKeyRevocation {
+    pub original_key_id: String,
+    pub candidate_binding: String,
+    pub execution: PendingExecution,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_fingerprint: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingExecution {
+    pub mode: String,
+    pub repository: String,
+    pub backend: String,
+    pub credential_binding: String,
+}
+
+impl PendingKeyRevocation {
+    /// A present malformed intent remains unresolved and permits no remote work.
+    pub fn parse(value: &Value) -> Option<Self> {
+        let pending: Self = serde_json::from_value(value.clone()).ok()?;
+        fn binding(value: &str) -> bool {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }
+        (!pending.original_key_id.trim().is_empty()
+            && !pending.original_key_id.contains("[redacted]")
+            && binding(&pending.candidate_binding)
+            && matches!(pending.execution.mode.as_str(), "byo" | "operated")
+            && !pending.execution.repository.trim().is_empty()
+            && !pending.execution.backend.trim().is_empty()
+            && binding(&pending.execution.credential_binding)
+            && pending.setup_fingerprint.as_deref().is_some_and(binding))
+        .then_some(pending)
+    }
+}
+
+#[cfg(test)]
+mod pending_revocation_tests {
+    use super::*;
+
+    fn intent(candidate: &str) -> PendingKeyRevocation {
+        PendingKeyRevocation {
+            original_key_id: "original".into(),
+            candidate_binding: candidate_binding("daily", candidate).unwrap(),
+            execution: PendingExecution {
+                mode: "byo".into(),
+                repository: "s3:example.invalid/bucket".into(),
+                backend: "s3".into(),
+                credential_binding: "b".repeat(64),
+            },
+            setup_fingerprint: Some("a".repeat(64)),
+        }
+    }
+
+    fn config() -> Map<String, Value> {
+        serde_json::json!({"backup":{"daily_key":"daily","recovery_key":"old", "confirmed_recovery_key":true}})
+            .as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn malformed_present_intents_never_decode_as_retryable() {
+        let valid = serde_json::to_value(intent("new")).unwrap();
+        assert!(PendingKeyRevocation::parse(&valid).is_some());
+        for malformed in [
+            Value::Null,
+            Value::Bool(false),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            assert!(PendingKeyRevocation::parse(&malformed).is_none());
+        }
+        for field in ["candidate_binding", "setup_fingerprint", "original_key_id"] {
+            let mut malformed = valid.clone();
+            malformed[field] = Value::String(String::new());
+            assert!(PendingKeyRevocation::parse(&malformed).is_none());
+        }
+        let mut missing = valid.clone();
+        missing.as_object_mut().unwrap().remove("setup_fingerprint");
+        assert!(PendingKeyRevocation::parse(&missing).is_none());
+        let mut unknown = valid;
+        unknown["unrecognized"] = Value::Bool(true);
+        assert!(PendingKeyRevocation::parse(&unknown).is_none());
+    }
+
+    #[test]
+    fn exact_restage_preserves_owner_confirmation_and_refuses_substitution() {
+        let pending = intent("new");
+        let mut staged = staged_revocation_configuration(&config(), "new", &pending).unwrap();
+        assert_eq!(staged["backup"]["confirmed_recovery_key"], false);
+        staged.get_mut("backup").unwrap()["confirmed_recovery_key"] = Value::Bool(true);
+        let restaged = staged_revocation_configuration(&staged, "new", &pending).unwrap();
+        assert_eq!(restaged["backup"]["confirmed_recovery_key"], true);
+        assert!(staged_revocation_configuration(&staged, "other", &pending).is_none());
+        assert!(staged_revocation_configuration(&staged, "other", &intent("other")).is_none());
+        let mut malformed = config();
+        malformed.get_mut("backup").unwrap()["pending_key_revocation"] = Value::Null;
+        assert!(staged_revocation_configuration(&malformed, "new", &pending).is_none());
+    }
+}
+
+/// Compute HMAC-SHA256 candidate binding of recovery key under daily key.
+pub fn candidate_binding(daily_key: &str, recovery_key: &str) -> Option<String> {
+    let mut inputs = serde_json::json!(["candidate-binding-v1", recovery_key]);
+    inputs.sort_all_objects();
+    let mut mac = Hmac::<Sha256>::new_from_slice(daily_key.as_bytes()).ok()?;
+    mac.update(&serde_json::to_vec(&inputs).ok()?);
+    Some(
+        mac.finalize()
+            .into_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
+
+/// Compute HMAC-SHA256 credential binding under daily key.
+pub fn credential_binding(daily_key: &str, credentials: &Map<String, Value>) -> Option<String> {
+    let mut inputs = serde_json::json!(["credential-binding-v1", credentials]);
+    inputs.sort_all_objects();
+    let mut mac = Hmac::<Sha256>::new_from_slice(daily_key.as_bytes()).ok()?;
+    mac.update(&serde_json::to_vec(&inputs).ok()?);
+    Some(
+        mac.finalize()
+            .into_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
+
+/// Stage pending key revocation and replacement recovery key beneath the retained root.
+pub fn stage_pending_key_revocation_at_root(
+    root: &Arc<JournalRoot>,
+    expected_sha256: &str,
+    candidate_key: &str,
+    pending: &PendingKeyRevocation,
+    expected_binding: Option<&HostedBinding>,
+) -> Result<BoundConfigOutcome, BoundConfigRefusal> {
+    update_pending_with_binding(root, expected_sha256, pending, expected_binding, |config| {
+        staged_revocation_configuration(config, candidate_key, pending)
+    })
+}
+
+fn update_pending_with_binding(
+    root: &Arc<JournalRoot>,
+    expected_sha256: &str,
+    pending: &PendingKeyRevocation,
+    expected_binding: Option<&HostedBinding>,
+    update: impl FnOnce(&Map<String, Value>) -> Option<Map<String, Value>>,
+) -> Result<BoundConfigOutcome, BoundConfigRefusal> {
+    let mut exclusion = None;
+    let mut result = solstone_core_journal_config_write::conditional_update_journal_config_at_root(
+        root,
+        expected_sha256,
+        |config| {
+            // This callback runs under config exclusion. Keep config→binding order,
+            // and retain the binding guard until publication and confirmation return.
+            if pending.execution.mode == "operated" {
+                exclusion =
+                    Some(crate::hold_rotation_binding_at_root(root, expected_binding?).ok()?);
+            } else if expected_binding.is_some() {
+                return None;
+            }
+            let backup = merge_backup_config(config);
+            if backup_setup_fingerprint(&backup, expected_binding) != pending.setup_fingerprint {
+                return None;
+            }
+            update(config)
+        },
+        mutation_lock_options(),
+    );
+    if let Some(held) = exclusion
+        && let Err(error) = held.revalidate()
+        && let Ok(BoundConfigOutcome::Published(publication)) = &mut result
+    {
+        publication.confirmation_refusal.get_or_insert(
+            solstone_core_journal_config_write::BoundConfigConfirmationRefusal::Admission(
+                Box::new(error),
+            ),
+        );
+    }
+    result
+}
+
+pub(crate) fn staged_revocation_configuration(
+    config: &Map<String, Value>,
+    candidate_key: &str,
+    pending: &PendingKeyRevocation,
+) -> Option<Map<String, Value>> {
+    let mut replacement = config.clone();
+    let mut backup = replacement
+        .get("backup")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    if PendingKeyRevocation::parse(&serde_json::to_value(pending).ok()?).as_ref() != Some(pending)
+        || candidate_binding(backup.get("daily_key")?.as_str()?, candidate_key).as_deref()
+            != Some(pending.candidate_binding.as_str())
+    {
+        return None;
+    }
+
+    if let Some(existing_pending) = backup.get("pending_key_revocation") {
+        let parsed = PendingKeyRevocation::parse(existing_pending)?;
+        if parsed != *pending
+            || backup.get("recovery_key").and_then(Value::as_str) != Some(candidate_key)
+        {
+            return None;
+        }
+    } else {
+        backup.insert("confirmed_recovery_key".into(), Value::Bool(false));
+    }
+
+    backup.insert(
+        "recovery_key".into(),
+        Value::String(candidate_key.to_owned()),
+    );
+    backup.insert(
+        "pending_key_revocation".into(),
+        serde_json::to_value(pending).ok()?,
+    );
+    replacement.insert("backup".into(), Value::Object(backup));
+    Some(replacement)
+}
+
+/// Clear pending key revocation intent beneath the retained root after confirmed remote revocation.
+pub fn clear_pending_key_revocation_at_root(
+    root: &Arc<JournalRoot>,
+    expected_sha256: &str,
+    expected_pending: &PendingKeyRevocation,
+    expected_binding: Option<&HostedBinding>,
+) -> Result<BoundConfigOutcome, BoundConfigRefusal> {
+    update_pending_with_binding(
+        root,
+        expected_sha256,
+        expected_pending,
+        expected_binding,
+        |config| cleared_revocation_configuration(config, expected_pending),
+    )
+}
+
+pub(crate) fn cleared_revocation_configuration(
+    config: &Map<String, Value>,
+    expected_pending: &PendingKeyRevocation,
+) -> Option<Map<String, Value>> {
+    let mut replacement = config.clone();
+    let mut backup = replacement
+        .get("backup")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    let existing_pending = backup.get("pending_key_revocation")?;
+    let parsed = PendingKeyRevocation::parse(existing_pending)?;
+    if parsed != *expected_pending {
+        return None;
+    }
+    if candidate_binding(
+        backup.get("daily_key")?.as_str()?,
+        backup.get("recovery_key")?.as_str()?,
+    )
+    .as_deref()
+        != Some(expected_pending.candidate_binding.as_str())
+    {
+        return None;
+    }
+    backup.remove("pending_key_revocation");
+    replacement.insert("backup".into(), Value::Object(backup));
     Some(replacement)
 }
 
@@ -528,6 +806,19 @@ pub fn status_view(journal: &Path) -> Result<Map<String, Value>, BackupError> {
         (
             "recovery_key_confirmed".into(),
             Value::Bool(config["confirmed_recovery_key"].as_bool().unwrap_or(false)),
+        ),
+        (
+            "recovery_key_revocation_pending".into(),
+            Value::Bool(
+                config
+                    .get("pending_key_revocation")
+                    .and_then(PendingKeyRevocation::parse)
+                    .is_some(),
+            ),
+        ),
+        (
+            "recovery_key_revocation_unresolved".into(),
+            Value::Bool(config.contains_key("pending_key_revocation")),
         ),
         ("retention".into(), config["retention"].clone()),
         ("offload".into(), config["offload"].clone()),
@@ -1706,7 +1997,7 @@ mod retained_clear_tests {
 
     #[cfg(windows)]
     #[test]
-    fn retained_clear_windows_refuses_before_lock_or_mutation() {
+    fn retained_clear_windows_refuses_changed_fingerprint_before_lock_or_mutation() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("config")).unwrap();
         let path = root.path().join("config/journal.json");
@@ -1716,7 +2007,7 @@ mod retained_clear_tests {
         let expected = get_backup_config(root.path()).unwrap();
         assert!(matches!(
             clear_backup_config_at_root(&admitted, "unneeded", &expected),
-            Err(BoundConfigRefusal::Unsupported)
+            Err(BoundConfigRefusal::Conflict)
         ));
         assert_eq!(std::fs::read(path).unwrap(), original);
         assert!(!root.path().join("config/journal.json.lock").exists());

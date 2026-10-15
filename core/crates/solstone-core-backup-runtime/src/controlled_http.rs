@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-//! One HTTP request owns its resolver, socket and runtime until join. On Linux
-//! and macOS the resolver is an installed child; Windows has none yet.
+//! One HTTP request owns its request worker, socket and runtime until join. On Linux
+//! and macOS the resolver is an installed child. Windows permits a hostname-only
+//! resolver survivor; Android uses one permanent hostname-only worker.
 
 use crate::hosted_runtime::{HttpError, HttpRequest, HttpResponse};
 use solstone_core_backup::archive_admission::ArchiveCancellation;
@@ -27,9 +28,12 @@ const CANCEL_POLL: Duration = Duration::from_millis(5);
 const RESOLVER_ENV: [&str; 3] = ["LOCALDOMAIN", "RES_OPTIONS", "HOSTALIASES"];
 pub(crate) const TEARDOWN_BODY_LIMIT: usize = 4 * 1024 * 1024;
 
+#[cfg(any(target_os = "android", all(test, feature = "full-tests")))]
+pub(crate) mod android_dns;
+
 #[derive(Clone, Copy)]
 enum RequestPolicy {
-    #[cfg_attr(windows, allow(dead_code))]
+    #[cfg_attr(any(windows, target_os = "android"), allow(dead_code))]
     Archive,
     Teardown,
 }
@@ -219,6 +223,17 @@ fn resolve_host(
     }
 }
 
+#[cfg(target_os = "android")]
+fn resolve_host(
+    host: &str,
+    port: u16,
+    family: ureq::config::IpFamily,
+    end: Instant,
+    cancellation: &ArchiveCancellation,
+) -> io::Result<Vec<SocketAddr>> {
+    android_dns::resolve(host, port, family, end, cancellation)
+}
+
 #[derive(Debug)]
 struct OwnedResolver(Arc<Control>);
 impl Resolver for OwnedResolver {
@@ -247,8 +262,8 @@ impl Resolver for OwnedResolver {
             self.0.phase_end(timeout),
             &self.0.cancellation,
         );
-        // Child completion has already waited and joined its readers. Check the
-        // terminal signal before propagating an internal child cancellation error.
+        // Recheck the original signal before any address can authorize a socket.
+        // A late Android/Windows hostname-only lookup cannot dispatch HTTP.
         self.0.check()?;
         let mut result = self.empty();
         for address in addresses? {
@@ -388,7 +403,7 @@ fn supported(request: &HttpRequest, config: &ureq::config::Config, policy: Reque
             .is_none_or(|proxy| proxy.protocol() == ureq::ProxyProtocol::Http)
 }
 
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg_attr(any(windows, target_os = "android"), allow(dead_code))]
 pub(crate) fn execute(
     request: &HttpRequest,
     cancellation: &ArchiveCancellation,

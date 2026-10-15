@@ -1,4 +1,5 @@
 {
+  "corpus_maintenance": "Served frontend assets (status 200, raw-body, text/html|javascript|css) are NOT body-asserted. Their records carry body_assertion instead of body_sha256/body_bytes/body_text, and a record with no body_sha256 is not body-asserted by the replay. Pinning an asset's bytes is not a product assertion -- it reddens on every deliberate frontend edit and says nothing about what changed -- and with no recorder left the only repair was hand-patching a hash. Status, content type, content disposition and Location are still asserted for these routes, and API response bodies (normalized-json) are still fully asserted. Assert frontend CONTENT with a targeted check on the thing you care about, never a whole-file digest.",
   "coverage_limits": {
     "mutation_census": {
       "cases_that_actually_mutated": 0,
@@ -36,22 +37,22 @@
   "phases": {
     "broken": [
       {
+        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance",
         "body_sha256_basis": "raw-body",
         "content_type": "text/html; charset=utf-8",
         "method": "GET",
         "path": "/app/backup/",
         "status": 200,
-        "why": "the app index: the SPA shell, byte-identical",
-        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance"
+        "why": "the app index: the SPA shell, byte-identical"
       },
       {
+        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance",
         "body_sha256_basis": "raw-body",
         "content_type": "text/html; charset=utf-8",
         "method": "GET",
         "path": "/app/backup/workspace",
         "status": 200,
-        "why": "the app fragment bytes",
-        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance"
+        "why": "the app fragment bytes"
       },
       {
         "body_bytes": 207,
@@ -65,22 +66,22 @@
         "why": "the background fragment"
       },
       {
+        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance",
         "body_sha256_basis": "raw-body",
         "content_type": "text/javascript; charset=utf-8",
         "method": "GET",
         "path": "/app/backup/static/backup.js",
         "status": 200,
-        "why": "per-app static script",
-        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance"
+        "why": "per-app static script"
       },
       {
+        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance",
         "body_sha256_basis": "raw-body",
         "content_type": "text/css; charset=utf-8",
         "method": "GET",
         "path": "/app/backup/static/backup.css",
         "status": 200,
-        "why": "per-app static stylesheet",
-        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance"
+        "why": "per-app static stylesheet"
       },
       {
         "body_sha256": "010028509b983a7c69b14b03dc8291a7b2b1c068b22db00bb4ab93c3b1a2ed0b",
@@ -103,6 +104,7 @@
             "status": "error",
             "time": 1770003600
           },
+          "last_backup_current_setup": null,
           "last_offload": {
             "bytes_marked": 0,
             "files_marked": 0,
@@ -145,6 +147,8 @@
           },
           "operation": null,
           "recovery_key_confirmed": true,
+          "recovery_key_revocation_pending": false,
+          "recovery_key_revocation_unresolved": false,
           "recovery_key_set": true,
           "retention": {
             "daily": 7,
@@ -156,13 +160,12 @@
             "enabled": false,
             "every": null
           },
-          "success": true,
-          "last_backup_current_setup": null
+          "success": true
         },
         "method": "GET",
         "path": "/app/backup/status",
         "status": 200,
-        "why": "🔴 the honesty probe: the full status view an owner's page renders from"
+        "why": "\ud83d\udd34 the honesty probe: the full status view an owner's page renders from"
       },
       {
         "body_sha256": "a44fa8b1fadf41ace15c40558c4ba43a093a9879352d82745921933c43a08a9d",
@@ -170,21 +173,21 @@
         "content_type": "application/json",
         "json": {
           "backup_only": {
+            "complete": true,
             "degraded": false,
+            "known_bytes": 0,
+            "known_days": 0,
+            "known_files": 0,
+            "known_segments": 0,
+            "present_files": 0,
             "skipped_records": 0,
             "total_bytes": 0,
             "total_days": 0,
             "total_files": 0,
             "total_segments": 0,
-            "unreadable_ledgers": [],
-            "known_bytes": 0,
-            "known_files": 0,
-            "known_segments": 0,
-            "known_days": 0,
-            "complete": true,
             "unbound_files": 0,
             "unknown_files": 0,
-            "present_files": 0
+            "unreadable_ledgers": []
           },
           "days": [],
           "device": {
@@ -232,24 +235,24 @@
             "total_files": null,
             "total_segments": null
           },
+          "proposed_release": {
+            "available": false,
+            "eligible_bytes": null,
+            "projected_local_bytes": null,
+            "structural_bytes": null
+          },
           "raw_media": {
-            "total_bytes": 0,
-            "total_files": 0,
+            "complete": true,
             "known_bytes": 0,
             "known_files": 0,
-            "complete": true,
+            "total_bytes": 0,
+            "total_files": 0,
             "unknown_paths": []
           },
           "success": true,
           "suggested_defaults": {
             "budget_bytes": 500000000000,
             "floor_bytes": 100000000000
-          },
-          "proposed_release": {
-            "structural_bytes": null,
-            "eligible_bytes": null,
-            "projected_local_bytes": null,
-            "available": false
           }
         },
         "method": "GET",
@@ -431,7 +434,7 @@
         "method": "GET",
         "path": "/app/backup/status",
         "status": 500,
-        "why": "🔴 the honesty probe: the full status view an owner's page renders from"
+        "why": "\ud83d\udd34 the honesty probe: the full status view an owner's page renders from"
       },
       {
         "body_bytes": 184,
@@ -539,22 +542,22 @@
     ],
     "enabled_never_run": [
       {
+        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance",
         "body_sha256_basis": "raw-body",
         "content_type": "text/html; charset=utf-8",
         "method": "GET",
         "path": "/app/backup/",
         "status": 200,
-        "why": "the app index: the SPA shell, byte-identical",
-        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance"
+        "why": "the app index: the SPA shell, byte-identical"
       },
       {
+        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance",
         "body_sha256_basis": "raw-body",
         "content_type": "text/html; charset=utf-8",
         "method": "GET",
         "path": "/app/backup/workspace",
         "status": 200,
-        "why": "the app fragment bytes",
-        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance"
+        "why": "the app fragment bytes"
       },
       {
         "body_bytes": 207,
@@ -568,22 +571,22 @@
         "why": "the background fragment"
       },
       {
+        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance",
         "body_sha256_basis": "raw-body",
         "content_type": "text/javascript; charset=utf-8",
         "method": "GET",
         "path": "/app/backup/static/backup.js",
         "status": 200,
-        "why": "per-app static script",
-        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance"
+        "why": "per-app static script"
       },
       {
+        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance",
         "body_sha256_basis": "raw-body",
         "content_type": "text/css; charset=utf-8",
         "method": "GET",
         "path": "/app/backup/static/backup.css",
         "status": 200,
-        "why": "per-app static stylesheet",
-        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance"
+        "why": "per-app static stylesheet"
       },
       {
         "body_sha256": "bf13bb0c168c0bcd5270405b3abbd4280698f8fa1325b6f2fcc7411fcbdab558",
@@ -606,6 +609,7 @@
             "status": null,
             "time": null
           },
+          "last_backup_current_setup": null,
           "last_offload": {
             "bytes_marked": 0,
             "files_marked": 0,
@@ -648,6 +652,8 @@
           },
           "operation": null,
           "recovery_key_confirmed": true,
+          "recovery_key_revocation_pending": false,
+          "recovery_key_revocation_unresolved": false,
           "recovery_key_set": true,
           "retention": {
             "daily": 7,
@@ -659,13 +665,12 @@
             "enabled": false,
             "every": null
           },
-          "success": true,
-          "last_backup_current_setup": null
+          "success": true
         },
         "method": "GET",
         "path": "/app/backup/status",
         "status": 200,
-        "why": "🔴 the honesty probe: the full status view an owner's page renders from"
+        "why": "\ud83d\udd34 the honesty probe: the full status view an owner's page renders from"
       },
       {
         "body_sha256": "dfb2a5280faa4df8ea0a9b99dc4341d2c83c6cbbe581ded351534b24bd919c55",
@@ -673,21 +678,21 @@
         "content_type": "application/json",
         "json": {
           "backup_only": {
+            "complete": true,
             "degraded": false,
+            "known_bytes": 0,
+            "known_days": 0,
+            "known_files": 0,
+            "known_segments": 0,
+            "present_files": 0,
             "skipped_records": 0,
             "total_bytes": 0,
             "total_days": 0,
             "total_files": 0,
             "total_segments": 0,
-            "unreadable_ledgers": [],
-            "known_bytes": 0,
-            "known_files": 0,
-            "known_segments": 0,
-            "known_days": 0,
-            "complete": true,
             "unbound_files": 0,
             "unknown_files": 0,
-            "present_files": 0
+            "unreadable_ledgers": []
           },
           "days": [],
           "device": {
@@ -735,24 +740,24 @@
             "total_files": null,
             "total_segments": null
           },
+          "proposed_release": {
+            "available": false,
+            "eligible_bytes": null,
+            "projected_local_bytes": null,
+            "structural_bytes": null
+          },
           "raw_media": {
-            "total_bytes": 0,
-            "total_files": 0,
+            "complete": true,
             "known_bytes": 0,
             "known_files": 0,
-            "complete": true,
+            "total_bytes": 0,
+            "total_files": 0,
             "unknown_paths": []
           },
           "success": true,
           "suggested_defaults": {
             "budget_bytes": 500000000000,
             "floor_bytes": 100000000000
-          },
-          "proposed_release": {
-            "structural_bytes": null,
-            "eligible_bytes": null,
-            "projected_local_bytes": null,
-            "available": false
           }
         },
         "method": "GET",
@@ -859,22 +864,22 @@
     ],
     "fresh": [
       {
+        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance",
         "body_sha256_basis": "raw-body",
         "content_type": "text/html; charset=utf-8",
         "method": "GET",
         "path": "/app/backup/",
         "status": 200,
-        "why": "the app index: the SPA shell, byte-identical",
-        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance"
+        "why": "the app index: the SPA shell, byte-identical"
       },
       {
+        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance",
         "body_sha256_basis": "raw-body",
         "content_type": "text/html; charset=utf-8",
         "method": "GET",
         "path": "/app/backup/workspace",
         "status": 200,
-        "why": "the app fragment bytes",
-        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance"
+        "why": "the app fragment bytes"
       },
       {
         "body_bytes": 207,
@@ -888,22 +893,22 @@
         "why": "the background fragment"
       },
       {
+        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance",
         "body_sha256_basis": "raw-body",
         "content_type": "text/javascript; charset=utf-8",
         "method": "GET",
         "path": "/app/backup/static/backup.js",
         "status": 200,
-        "why": "per-app static script",
-        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance"
+        "why": "per-app static script"
       },
       {
+        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance",
         "body_sha256_basis": "raw-body",
         "content_type": "text/css; charset=utf-8",
         "method": "GET",
         "path": "/app/backup/static/backup.css",
         "status": 200,
-        "why": "per-app static stylesheet",
-        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance"
+        "why": "per-app static stylesheet"
       },
       {
         "body_sha256": "4c8b34841a1e537f8c04ed6b975d738646f3ef2c02a729481beafb957627ec6f",
@@ -926,6 +931,7 @@
             "status": null,
             "time": null
           },
+          "last_backup_current_setup": null,
           "last_offload": {
             "bytes_marked": 0,
             "files_marked": 0,
@@ -968,6 +974,8 @@
           },
           "operation": null,
           "recovery_key_confirmed": false,
+          "recovery_key_revocation_pending": false,
+          "recovery_key_revocation_unresolved": false,
           "recovery_key_set": false,
           "retention": {
             "daily": 7,
@@ -979,13 +987,12 @@
             "enabled": false,
             "every": null
           },
-          "success": true,
-          "last_backup_current_setup": null
+          "success": true
         },
         "method": "GET",
         "path": "/app/backup/status",
         "status": 200,
-        "why": "🔴 the honesty probe: the full status view an owner's page renders from"
+        "why": "\ud83d\udd34 the honesty probe: the full status view an owner's page renders from"
       },
       {
         "body_sha256": "dfb2a5280faa4df8ea0a9b99dc4341d2c83c6cbbe581ded351534b24bd919c55",
@@ -993,21 +1000,21 @@
         "content_type": "application/json",
         "json": {
           "backup_only": {
+            "complete": true,
             "degraded": false,
+            "known_bytes": 0,
+            "known_days": 0,
+            "known_files": 0,
+            "known_segments": 0,
+            "present_files": 0,
             "skipped_records": 0,
             "total_bytes": 0,
             "total_days": 0,
             "total_files": 0,
             "total_segments": 0,
-            "unreadable_ledgers": [],
-            "known_bytes": 0,
-            "known_files": 0,
-            "known_segments": 0,
-            "known_days": 0,
-            "complete": true,
             "unbound_files": 0,
             "unknown_files": 0,
-            "present_files": 0
+            "unreadable_ledgers": []
           },
           "days": [],
           "device": {
@@ -1055,24 +1062,24 @@
             "total_files": null,
             "total_segments": null
           },
+          "proposed_release": {
+            "available": false,
+            "eligible_bytes": null,
+            "projected_local_bytes": null,
+            "structural_bytes": null
+          },
           "raw_media": {
-            "total_bytes": 0,
-            "total_files": 0,
+            "complete": true,
             "known_bytes": 0,
             "known_files": 0,
-            "complete": true,
+            "total_bytes": 0,
+            "total_files": 0,
             "unknown_paths": []
           },
           "success": true,
           "suggested_defaults": {
             "budget_bytes": 500000000000,
             "floor_bytes": 100000000000
-          },
-          "proposed_release": {
-            "structural_bytes": null,
-            "eligible_bytes": null,
-            "projected_local_bytes": null,
-            "available": false
           }
         },
         "method": "GET",
@@ -1179,22 +1186,22 @@
     ],
     "healthy": [
       {
+        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance",
         "body_sha256_basis": "raw-body",
         "content_type": "text/html; charset=utf-8",
         "method": "GET",
         "path": "/app/backup/",
         "status": 200,
-        "why": "the app index: the SPA shell, byte-identical",
-        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance"
+        "why": "the app index: the SPA shell, byte-identical"
       },
       {
+        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance",
         "body_sha256_basis": "raw-body",
         "content_type": "text/html; charset=utf-8",
         "method": "GET",
         "path": "/app/backup/workspace",
         "status": 200,
-        "why": "the app fragment bytes",
-        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance"
+        "why": "the app fragment bytes"
       },
       {
         "body_bytes": 207,
@@ -1208,22 +1215,22 @@
         "why": "the background fragment"
       },
       {
+        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance",
         "body_sha256_basis": "raw-body",
         "content_type": "text/javascript; charset=utf-8",
         "method": "GET",
         "path": "/app/backup/static/backup.js",
         "status": 200,
-        "why": "per-app static script",
-        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance"
+        "why": "per-app static script"
       },
       {
+        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance",
         "body_sha256_basis": "raw-body",
         "content_type": "text/css; charset=utf-8",
         "method": "GET",
         "path": "/app/backup/static/backup.css",
         "status": 200,
-        "why": "per-app static stylesheet",
-        "body_assertion": "not-asserted: served frontend asset, see corpus_maintenance"
+        "why": "per-app static stylesheet"
       },
       {
         "body_sha256": "b959ed45a703fcf7d299706186c5caeff82a1e12e288dbb0f7cefc13a50b593d",
@@ -1246,6 +1253,7 @@
             "status": "ok",
             "time": 1770000000
           },
+          "last_backup_current_setup": null,
           "last_offload": {
             "bytes_marked": 0,
             "files_marked": 0,
@@ -1288,6 +1296,8 @@
           },
           "operation": null,
           "recovery_key_confirmed": true,
+          "recovery_key_revocation_pending": false,
+          "recovery_key_revocation_unresolved": false,
           "recovery_key_set": true,
           "retention": {
             "daily": 7,
@@ -1299,13 +1309,12 @@
             "enabled": false,
             "every": null
           },
-          "success": true,
-          "last_backup_current_setup": null
+          "success": true
         },
         "method": "GET",
         "path": "/app/backup/status",
         "status": 200,
-        "why": "🔴 the honesty probe: the full status view an owner's page renders from"
+        "why": "\ud83d\udd34 the honesty probe: the full status view an owner's page renders from"
       },
       {
         "body_sha256": "14424b0d1ed9881501b3bffd9014e1e93c195aa37948d66b4af307ca8a3d714c",
@@ -1313,21 +1322,21 @@
         "content_type": "application/json",
         "json": {
           "backup_only": {
+            "complete": true,
             "degraded": false,
+            "known_bytes": 0,
+            "known_days": 0,
+            "known_files": 0,
+            "known_segments": 0,
+            "present_files": 0,
             "skipped_records": 0,
             "total_bytes": 0,
             "total_days": 0,
             "total_files": 0,
             "total_segments": 0,
-            "unreadable_ledgers": [],
-            "known_bytes": 0,
-            "known_files": 0,
-            "known_segments": 0,
-            "known_days": 0,
-            "complete": true,
             "unbound_files": 0,
             "unknown_files": 0,
-            "present_files": 0
+            "unreadable_ledgers": []
           },
           "days": [],
           "device": {
@@ -1375,24 +1384,24 @@
             "total_files": null,
             "total_segments": null
           },
+          "proposed_release": {
+            "available": false,
+            "eligible_bytes": null,
+            "projected_local_bytes": null,
+            "structural_bytes": null
+          },
           "raw_media": {
-            "total_bytes": 0,
-            "total_files": 0,
+            "complete": true,
             "known_bytes": 0,
             "known_files": 0,
-            "complete": true,
+            "total_bytes": 0,
+            "total_files": 0,
             "unknown_paths": []
           },
           "success": true,
           "suggested_defaults": {
             "budget_bytes": 500000000000,
             "floor_bytes": 100000000000
-          },
-          "proposed_release": {
-            "structural_bytes": null,
-            "eligible_bytes": null,
-            "projected_local_bytes": null,
-            "available": false
           }
         },
         "method": "GET",
@@ -1556,7 +1565,7 @@
         "method": "GET",
         "path": "/app/backup/status",
         "status": 302,
-        "why": "🔴 the honesty probe: the full status view an owner's page renders from"
+        "why": "\ud83d\udd34 the honesty probe: the full status view an owner's page renders from"
       },
       {
         "body_bytes": 197,
@@ -1655,6 +1664,5 @@
     "journal_root": "<JOURNAL_ROOT>"
   },
   "schema": "solstone-convey-backup-corpus-v1",
-  "tz": "UTC",
-  "corpus_maintenance": "Served frontend assets (status 200, raw-body, text/html|javascript|css) are NOT body-asserted. Their records carry body_assertion instead of body_sha256/body_bytes/body_text, and a record with no body_sha256 is not body-asserted by the replay. Pinning an asset's bytes is not a product assertion -- it reddens on every deliberate frontend edit and says nothing about what changed -- and with no recorder left the only repair was hand-patching a hash. Status, content type, content disposition and Location are still asserted for these routes, and API response bodies (normalized-json) are still fully asserted. Assert frontend CONTENT with a targeted check on the thing you care about, never a whole-file digest."
+  "tz": "UTC"
 }

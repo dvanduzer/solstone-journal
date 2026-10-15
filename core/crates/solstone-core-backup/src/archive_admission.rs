@@ -24,6 +24,7 @@ pub trait Clock {
 #[derive(Clone, Default)]
 pub struct ArchiveCancellation {
     cancelled: Arc<AtomicBool>,
+    ancestors: Arc<[Arc<AtomicBool>]>,
 }
 
 impl ArchiveCancellation {
@@ -31,12 +32,51 @@ impl ArchiveCancellation {
         Self::default()
     }
 
+    /// Observe an enclosing lifetime without letting this operation cancel it.
+    pub fn new_child(parent: &Self) -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            ancestors: parent
+                .ancestors
+                .iter()
+                .cloned()
+                .chain(std::iter::once(Arc::clone(&parent.cancelled)))
+                .collect(),
+        }
+    }
+
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire) || archive_work_stopping()
+        self.cancelled.load(Ordering::Acquire)
+            || self
+                .ancestors
+                .iter()
+                .any(|flag| flag.load(Ordering::Acquire))
+            || archive_work_stopping()
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::ArchiveCancellation;
+
+    #[test]
+    fn lifetime_stop_reaches_children_without_operation_cancel_stopping_siblings() {
+        let lifetime = ArchiveCancellation::new();
+        let first = ArchiveCancellation::new_child(&lifetime);
+        let sibling = ArchiveCancellation::new_child(&lifetime);
+        let nested = ArchiveCancellation::new_child(&first);
+        first.cancel();
+        assert!(first.is_cancelled());
+        assert!(nested.is_cancelled());
+        assert!(!lifetime.is_cancelled());
+        assert!(!sibling.is_cancelled());
+        lifetime.cancel();
+        assert!(sibling.is_cancelled());
+        assert!(!ArchiveCancellation::new().is_cancelled());
     }
 }
 

@@ -514,6 +514,19 @@ impl OwnedDirectReadHold {
         Ok(())
     }
 
+    /// Release only with the actual native carrier retirement retained.
+    pub fn release_retained(
+        self,
+    ) -> Result<(), crate::archive_activity::UnusedArchiveRelease<Box<Self>>> {
+        use crate::archive_activity::UnusedArchiveRelease;
+        if self.qualify_release().is_err() {
+            return Err(UnusedArchiveRelease::Held(Box::new(self)));
+        }
+        self.operation
+            .retire_unused()
+            .map_err(UnusedArchiveRelease::Retired)
+    }
+
     fn qualify_release(&self) -> Result<(), ReadbackError> {
         #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos"))]
         {
@@ -656,6 +669,41 @@ impl OwnedReadbackAdmissionError {
                 })
             }),
             owned => Err(Box::new(Self { reason, owned })),
+        }
+    }
+
+    /// Preserve native retirement facts when closing an app-owned admission.
+    pub fn release_retained(
+        self,
+    ) -> Result<(), crate::archive_activity::UnusedArchiveRelease<Box<Self>>> {
+        use crate::archive_activity::UnusedArchiveRelease;
+        let Self { reason, owned } = self;
+        match owned {
+            ClosedAdmissionOwner::Input(input)
+                if input
+                    ._predecessor
+                    .as_ref()
+                    .is_none_or(ArchivePredecessorCustody::unwritten) =>
+            {
+                input
+                    .operation
+                    .retire_unused()
+                    .map_err(UnusedArchiveRelease::Retired)
+            }
+            ClosedAdmissionOwner::Admitted(read) => {
+                (*read).release_retained().map_err(|held| match held {
+                    UnusedArchiveRelease::Held(read) => {
+                        UnusedArchiveRelease::Held(Box::new(Self {
+                            reason,
+                            owned: ClosedAdmissionOwner::Admitted(read),
+                        }))
+                    }
+                    UnusedArchiveRelease::Retired(retirement) => {
+                        UnusedArchiveRelease::Retired(retirement)
+                    }
+                })
+            }
+            owned => Err(UnusedArchiveRelease::Held(Box::new(Self { reason, owned }))),
         }
     }
 }

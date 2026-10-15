@@ -533,7 +533,12 @@ fn cleanup_copy(copy: &mut PreparedMedia, index: usize) -> Cleanup {
 }
 
 #[cfg(all(test, unix, feature = "full-tests"))]
-thread_local! { static SOURCE_CLEANUP_FAULT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) }; }
+thread_local! {
+    #[cfg(target_os = "android")]
+    static SOURCE_CLEANUP_FAULT: Box<std::cell::Cell<Option<usize>>> = Box::new(std::cell::Cell::new(None));
+    #[cfg(not(target_os = "android"))]
+    static SOURCE_CLEANUP_FAULT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
 #[cfg(all(test, unix, feature = "full-tests"))]
 pub(in crate::run) fn with_source_cleanup_fault<T>(
     index: usize,

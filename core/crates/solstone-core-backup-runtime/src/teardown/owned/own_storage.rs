@@ -10,6 +10,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use serde_json::Value;
+#[cfg(target_os = "android")]
 use solstone_core_backup::archive_admission::ArchiveCancellation;
 
 use super::{
@@ -22,19 +23,78 @@ use crate::teardown_admission::{CarrierTeardownAdmission, TeardownReader};
 
 const RETENTION_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[cfg(target_os = "android")]
+struct RetentionTransport<'a>(&'a TeardownOperation);
+
+#[cfg(target_os = "android")]
+impl crate::hosted_runtime::HttpTransport for RetentionTransport<'_> {
+    fn execute(
+        &self,
+        request: &crate::hosted_runtime::HttpRequest,
+    ) -> Result<crate::hosted_runtime::HttpResponse, crate::hosted_runtime::HttpError> {
+        self.0
+            .request(request.clone())
+            .map_err(|_| crate::hosted_runtime::HttpError::Other)
+    }
+
+    fn execute_cancellable(
+        &self,
+        request: &crate::hosted_runtime::HttpRequest,
+        cancellation: &ArchiveCancellation,
+    ) -> Result<crate::hosted_runtime::HttpResponse, crate::hosted_runtime::HttpError> {
+        if cancellation.is_cancelled() {
+            return Err(crate::hosted_runtime::HttpError::Other);
+        }
+        self.execute(request)
+    }
+}
+
 /// Every restic child honours the teardown's cancellation where the platform can stop it.
-struct Cancellable<'a>(&'a ArchiveCancellation);
+struct Cancellable<'a>(&'a TeardownOperation);
 impl ToolRunner for Cancellable<'_> {
     fn run(&self, request: &ToolRequest<'_>) -> io::Result<ToolOutput> {
-        if self.0.is_cancelled() {
+        if self.0.cancellation.is_cancelled() {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "teardown cancelled",
             ));
         }
+        #[cfg(target_os = "android")]
+        let bounded_request = {
+            use solstone_core_spp_attest::android_service_tools::{
+                AndroidServiceToolRole, resolve_admitted_android_service_tool,
+                revalidate_installed_android_service_tools,
+            };
+            revalidate_installed_android_service_tools().map_err(|error| {
+                io::Error::new(io::ErrorKind::PermissionDenied, error.to_string())
+            })?;
+            let admitted = resolve_admitted_android_service_tool(AndroidServiceToolRole::Restic)
+                .map_err(|error| {
+                    io::Error::new(io::ErrorKind::PermissionDenied, error.to_string())
+                })?;
+            if request.program != admitted.as_os_str() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "unadmitted teardown executable",
+                ));
+            }
+            let mut bounded = request.clone();
+            // Admission hashing must not renew the original child's end.
+            let remaining = self.0.remaining().map_err(|_| {
+                io::Error::new(io::ErrorKind::Interrupted, "teardown budget exhausted")
+            })?;
+            bounded.timeout = Some(bounded.timeout.unwrap_or(remaining).min(remaining));
+            bounded
+        };
+        #[cfg(target_os = "android")]
+        let request = &bounded_request;
+        #[cfg(all(target_os = "android", feature = "test-support"))]
+        if let Some(result) = crate::test_support::teardown_restic_fixture(request) {
+            return result;
+        }
         #[cfg(unix)]
         {
-            crate::runner::SystemToolRunner.run_cancellable(request, self.0)
+            crate::runner::SystemToolRunner.run_cancellable(request, &self.0.cancellation)
         }
         #[cfg(not(unix))]
         {
@@ -69,7 +129,7 @@ impl TeardownOperation {
     ) -> Result<ResticResult, TeardownRemoteRefusal> {
         let timeout: Duration = self.remaining().map_err(TeardownRemoteRefusal::Operation)?;
         let result = run_restic(
-            &Cancellable(&self.cancellation),
+            &Cancellable(self),
             args,
             repository,
             password,
@@ -159,9 +219,13 @@ impl TeardownOperation {
             .ok_or(TeardownRemoteRefusal::Timestamp)?
             .format("%Y%m%dT%H%M%SZ")
             .to_string();
+        #[cfg(target_os = "android")]
+        let retention_transport = RetentionTransport(self);
+        #[cfg(not(target_os = "android"))]
+        let retention_transport = crate::hosted_runtime::UreqHttpTransport;
         self.report.storage_retention = Some(super::retention::observe(
             destination,
-            &crate::hosted_runtime::UreqHttpTransport,
+            &retention_transport,
             &self.cancellation,
             check,
             &amz_date,

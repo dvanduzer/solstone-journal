@@ -18,6 +18,67 @@ const RESTIC_VERSION: &str = "0.19.0";
 const REFUSED_LATEST_EXIT: i32 = 97;
 const REFUSED_UNEXPECTED_EXIT: i32 = 98;
 
+/// A startup-only lookup fixture for an exact test in a fresh Android process.
+/// The production permanent owner, busy slot, deadline and transport remain in use.
+#[cfg(target_os = "android")]
+pub fn android_dns_lookup_before_start(
+    lookup: fn(&str, u16, ureq::config::IpFamily) -> io::Result<Vec<std::net::SocketAddr>>,
+) -> Result<(), &'static str> {
+    crate::controlled_http::android_dns::fixture_lookup_before_start(lookup)
+}
+
+#[cfg(target_os = "android")]
+pub fn android_dns_lookup_idle() -> bool {
+    crate::controlled_http::android_dns::fixture_idle()
+}
+
+#[cfg(target_os = "android")]
+thread_local! {
+    static TEARDOWN_RESTIC_FIXTURE: std::cell::RefCell<Option<Box<dyn ToolRunner>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Fixture restic responses after the coordinator's real native-tool admission.
+/// HTTP, operation budget, coverage and local effect owners stay in production.
+#[cfg(target_os = "android")]
+pub fn with_teardown_restic_fixture<T>(
+    runner: impl ToolRunner + 'static,
+    operation: impl FnOnce() -> T,
+) -> T {
+    TEARDOWN_RESTIC_FIXTURE.with(|slot| {
+        assert!(slot.borrow().is_none());
+        *slot.borrow_mut() = Some(Box::new(runner));
+    });
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            TEARDOWN_RESTIC_FIXTURE.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+    let _guard = Guard;
+    operation()
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn teardown_restic_fixture(request: &ToolRequest<'_>) -> Option<io::Result<ToolOutput>> {
+    TEARDOWN_RESTIC_FIXTURE.with(|slot| slot.borrow().as_ref().map(|runner| runner.run(request)))
+}
+
+/// Install the actual packaged closure for a native libtest process. This uses
+/// the same immutable pin, manifest, receipt and load-closure checks as startup.
+#[cfg(target_os = "android")]
+pub fn install_packaged_android_test_tools(native: &Path, assets: &Path) {
+    solstone_core_spp_attest::android_service_tools::install_android_service_tools(
+        native,
+        &assets.join("resources"),
+        &std::fs::read(assets.join("manifest.json")).unwrap(),
+        &std::fs::read(assets.join("mobile-native-build.json")).unwrap(),
+    )
+    .unwrap();
+}
+
 type OwnedReadAdmissionHook = Box<dyn FnOnce()>;
 thread_local! {
     static OWNED_READ_ADMISSION_HOOK: std::cell::RefCell<Option<OwnedReadAdmissionHook>> =
@@ -177,6 +238,14 @@ impl ToolRunner for ArgvResticFixture {
             _ => self.refuse(argv, REFUSED_UNEXPECTED_EXIT),
         }
     }
+
+    fn run_cancellable(
+        &self,
+        request: &ToolRequest<'_>,
+        _cancellation: &solstone_core_backup::archive_admission::ArchiveCancellation,
+    ) -> io::Result<ToolOutput> {
+        self.run(request)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -263,4 +332,14 @@ impl RestoreRecorder for RestoreRecorderSpy {
             Ok(())
         }
     }
+}
+
+/// Exercise the production Android transaction explicitly from a Unix host test.
+/// Public desktop dispatch is unchanged by this fixture feature.
+#[cfg(unix)]
+pub fn rotate_android_recovery_key(
+    journal: &Path,
+    services: &crate::BackupServices<'_>,
+) -> crate::RotationResult {
+    crate::rotation::rotate_android_for_test(journal, services)
 }

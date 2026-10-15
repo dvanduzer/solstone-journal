@@ -56,11 +56,25 @@ pub use status::home_backup_observation;
 mod teardown_report;
 mod validation;
 
+pub mod route_lifetime;
+
+pub use operation::{AdmitWrite, WriteGuard, admit_write};
+pub(crate) use route_lifetime::LifetimeRunner;
+pub use route_lifetime::{BackupRouteDrain, BackupRouteLifetime};
 pub use validation::{HandoffFieldError, require_https_portal_url};
 
 use measurement::SharedMeasurementCache;
 use operation::{SharedOperationSlot, Terminal};
 use restore_prepare::SharedRestorePrepare;
+
+pub fn invalid_operation_response() -> axum::response::Response {
+    response::error(
+        axum::http::StatusCode::BAD_REQUEST,
+        "that action isn't available in the current state.",
+        "invalid_operation_for_state",
+        "",
+    )
+}
 
 /// The service is stopping: running archive children are killed and reaped
 /// rather than left behind. False if some remain after `timeout`.
@@ -102,6 +116,12 @@ impl Clock for ProductionClock {
 }
 
 impl BackupWebDeps {
+    #[cfg(feature = "full-tests")]
+    pub fn poison_operation_mutex_for_test(&self) {
+        let _held = self.operations.lock().unwrap();
+        panic!("injected operation-domain mutex poison");
+    }
+
     pub fn new(journal_root: PathBuf) -> Self {
         let cache = measurement::new(&journal_root);
         Self::production(journal_root, cache)
@@ -122,6 +142,13 @@ impl BackupWebDeps {
             version: env!("CARGO_PKG_VERSION"),
             handoff_poll_lease: Arc::new(AtomicBool::new(false)),
             restore_prepare: restore_prepare::new_shared(),
+        }
+    }
+
+    pub fn lifetime(&self) -> BackupRouteLifetime {
+        BackupRouteLifetime {
+            operations: Arc::clone(&self.operations),
+            restore_prepare: Arc::clone(&self.restore_prepare),
         }
     }
 }
@@ -312,7 +339,80 @@ async fn get_offload(deps: BackupWebDeps) -> axum::response::Response {
     .await
 }
 
+#[cfg(all(test, feature = "full-tests"))]
+static GENERATE_KEYS_PAUSE_HOOK: std::sync::Mutex<
+    Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(all(test, feature = "full-tests"))]
+pub(crate) fn arm_generate_keys_pause()
+-> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    *GENERATE_KEYS_PAUSE_HOOK.lock().unwrap() = Some((entered_tx, release_rx));
+    (entered_rx, release_tx)
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+fn pause_generate_keys() {
+    let pair = {
+        let mut guard = GENERATE_KEYS_PAUSE_HOOK.lock().unwrap();
+        guard.take()
+    };
+    if let Some((entered_tx, release_rx)) = pair {
+        let _ = entered_tx.send(());
+        let _ = release_rx.recv();
+    }
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+struct ConfirmKeyPause {
+    journal: PathBuf,
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+static CONFIRM_KEY_PAUSE_HOOK: std::sync::Mutex<Option<ConfirmKeyPause>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(all(test, feature = "full-tests"))]
+pub(crate) fn arm_confirm_key_pause(
+    journal: &std::path::Path,
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    *CONFIRM_KEY_PAUSE_HOOK.lock().unwrap() = Some(ConfirmKeyPause {
+        journal: journal.to_path_buf(),
+        entered: entered_tx,
+        release: release_rx,
+    });
+    (entered_rx, release_tx)
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+fn pause_confirm_key(journal: &std::path::Path) {
+    let pair = {
+        let mut guard = CONFIRM_KEY_PAUSE_HOOK.lock().unwrap();
+        if guard.as_ref().is_some_and(|pause| pause.journal == journal) {
+            guard.take()
+        } else {
+            None
+        }
+    };
+    if let Some(pause) = pair {
+        let _ = pause.entered.send(());
+        let _ = pause.release.recv();
+    }
+}
+
 async fn generate_keys(deps: BackupWebDeps) -> axum::response::Response {
+    let _guard = match admit_write(&deps.operations, AdmitWrite::DuringOperation) {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
+    #[cfg(all(test, feature = "full-tests"))]
+    pause_generate_keys();
     let generated_daily = match keys::generated_key() {
         Ok(key) => key,
         Err(_) => return internal_error(),
@@ -375,6 +475,10 @@ async fn reveal_key(deps: BackupWebDeps) -> axum::response::Response {
 }
 
 async fn confirm_key(deps: BackupWebDeps, body: Bytes) -> axum::response::Response {
+    let _guard = match admit_write(&deps.operations, AdmitWrite::DuringOperation) {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let payload = match validation::object(&body, response::missing) {
         Ok(value) => value,
         Err(error) => return error,
@@ -395,7 +499,18 @@ async fn confirm_key(deps: BackupWebDeps, body: Bytes) -> axum::response::Respon
         }
         Err(_) => return internal_error(),
     };
-    if keys::parse(&entered).ok().as_deref() != Some(&recovery) {
+    let parsed_entered = match keys::parse(&entered) {
+        Ok(key) => key,
+        Err(_) => {
+            return response::error(
+                axum::http::StatusCode::BAD_REQUEST,
+                "that didn't match your recovery key.",
+                "recovery_key_mismatch",
+                "",
+            );
+        }
+    };
+    if parsed_entered != recovery {
         return response::error(
             axum::http::StatusCode::BAD_REQUEST,
             "that didn't match your recovery key.",
@@ -403,7 +518,15 @@ async fn confirm_key(deps: BackupWebDeps, body: Bytes) -> axum::response::Respon
             "",
         );
     }
+    #[cfg(all(test, feature = "full-tests"))]
+    pause_confirm_key(&deps.journal_root);
+
+    let mut mismatch = false;
     if config::mutate(&deps.journal_root, |backup| {
+        if backup.get("recovery_key") != Some(&Value::String(parsed_entered.clone())) {
+            mismatch = true;
+            return (false, ());
+        }
         let changed = backup.get("confirmed_recovery_key") != Some(&Value::Bool(true));
         backup.insert("confirmed_recovery_key".to_owned(), Value::Bool(true));
         (changed, ())
@@ -412,10 +535,22 @@ async fn confirm_key(deps: BackupWebDeps, body: Bytes) -> axum::response::Respon
     {
         return internal_error();
     }
+    if mismatch {
+        return response::error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "that didn't match your recovery key.",
+            "recovery_key_mismatch",
+            "",
+        );
+    }
     get_status(deps).await
 }
 
 async fn retention(deps: BackupWebDeps, body: Bytes) -> axum::response::Response {
+    let _guard = match admit_write(&deps.operations, AdmitWrite::DuringOperation) {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let payload = match validation::object(&body, response::invalid_config) {
         Ok(value) => value,
         Err(error) => return error,
@@ -438,6 +573,10 @@ async fn retention(deps: BackupWebDeps, body: Bytes) -> axum::response::Response
 }
 
 async fn offload_config(deps: BackupWebDeps, body: Bytes) -> axum::response::Response {
+    let _guard = match admit_write(&deps.operations, AdmitWrite::DuringOperation) {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let payload = match validation::object(&body, response::invalid_config) {
         Ok(value) => value,
         Err(error) => return error,
@@ -467,6 +606,10 @@ async fn offload_config(deps: BackupWebDeps, body: Bytes) -> axum::response::Res
 }
 
 async fn offload_enable(deps: BackupWebDeps) -> axum::response::Response {
+    let _guard = match admit_write(&deps.operations, AdmitWrite::DuringOperation) {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let backup = match config::backup(&deps.journal_root) {
         Ok(value) => value,
         Err(_) => return internal_error(),
@@ -505,6 +648,10 @@ async fn offload_enable(deps: BackupWebDeps) -> axum::response::Response {
 }
 
 async fn offload_disable(deps: BackupWebDeps) -> axum::response::Response {
+    let _guard = match admit_write(&deps.operations, AdmitWrite::DuringOperation) {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     if config::mutate(&deps.journal_root, |backup| { let old = backup.get("offload").and_then(Value::as_object); let value = json!({"enabled":false,"budget_bytes":old.and_then(|item| item.get("budget_bytes")).cloned().unwrap_or(Value::Null),"floor_bytes":old.and_then(|item| item.get("floor_bytes")).cloned().unwrap_or(Value::Null)}); let changed = backup.get("offload") != Some(&value); backup.insert("offload".to_owned(), value); (changed, ()) }).is_err() { return response::invalid_config(""); }
     measurement::invalidate(&deps.cache);
     get_offload(deps).await
@@ -606,12 +753,21 @@ fn resolve_tools(deps: &BackupWebDeps) -> Result<ResolvedTools, ClosedToolError>
     )
 }
 
+fn lifetime_runner<'a>(deps: &'a BackupWebDeps) -> LifetimeRunner<'a> {
+    let cancellation = match deps.operations.lock() {
+        Ok(guard) => guard.cancellation.clone(),
+        Err(poisoned) => poisoned.into_inner().cancellation.clone(),
+    };
+    LifetimeRunner::new(deps.runner.as_ref(), cancellation)
+}
+
 fn services<'a>(
     deps: &'a BackupWebDeps,
+    runner: &'a dyn ToolRunner,
     tools: &'a solstone_core_backup_runtime::ResolvedTools,
 ) -> BackupServices<'a> {
     BackupServices {
-        runner: deps.runner.as_ref(),
+        runner,
         http: deps.http.as_ref(),
         clock: deps.clock.as_ref(),
         restic_path: Some(&tools.restic_path),
@@ -640,6 +796,11 @@ fn map_restore(result: RestoreOutcome) -> Terminal {
 }
 
 fn publish_restore_error(deps: &BackupWebDeps, reason_code: &str) -> Terminal {
+    if let Some(reason) =
+        solstone_core_backup_runtime::restore::restore_pending_rotation_refusal(&deps.journal_root)
+    {
+        return Terminal::error(reason);
+    }
     map_restore(publish_restore_outcome(
         &deps.journal_root,
         deps.clock.as_ref(),
@@ -679,8 +840,9 @@ async fn enable_backup(deps: BackupWebDeps) -> axum::response::Response {
             Ok(Some(keys)) => keys,
             _ => return Terminal::error("invalid_operation_for_state"),
         };
+        let runner = lifetime_runner(&worker);
         if let Err(reason) = init_and_enable(
-            worker.runner.as_ref(),
+            &runner,
             &destination,
             &keys.daily_key,
             &keys.recovery_key,
@@ -800,11 +962,10 @@ async fn set_backup_destination(deps: BackupWebDeps, body: Bytes) -> axum::respo
     if let Err(error) = validation::destination(&payload) {
         return error;
     }
-    // Destination is synchronous (page reads destination_status on the POST) so
-    // it must not occupy the operation slot, but it still refuses backup_busy.
-    if operation::is_busy(&deps.operations) {
-        return operation::busy_response();
-    }
+    let _guard = match admit_write(&deps.operations, AdmitWrite::IdleOnly) {
+        Ok(guard) => guard,
+        Err(response) => return response,
+    };
     let destination = destination_from_payload(&payload);
     if set_destination(&deps.journal_root, &destination).is_err() {
         return internal_error();
@@ -831,13 +992,8 @@ async fn set_backup_destination(deps: BackupWebDeps, body: Bytes) -> axum::respo
             );
         }
     };
-    match validate_destination(
-        deps.runner.as_ref(),
-        &destination,
-        &password,
-        &tools.restic_path,
-        None,
-    ) {
+    let runner = lifetime_runner(&deps);
+    match validate_destination(&runner, &destination, &password, &tools.restic_path, None) {
         Ok(status) => destination_status_response(
             &deps,
             status.reachable,
@@ -891,7 +1047,8 @@ async fn rotate_key(deps: BackupWebDeps) -> axum::response::Response {
             Ok(tools) => tools,
             Err(error) => return Terminal::tool_error(error),
         };
-        let result = rotate_recovery_key(&worker.journal_root, &services(&worker, &tools));
+        let runner = lifetime_runner(&worker);
+        let result = rotate_recovery_key(&worker.journal_root, &services(&worker, &runner, &tools));
         match result.status.as_str() {
             "ok" => Terminal::done(),
             "skipped" => Terminal::error("invalid_operation_for_state"),
@@ -906,13 +1063,29 @@ async fn rotate_key(deps: BackupWebDeps) -> axum::response::Response {
 
 async fn teardown_route(deps: BackupWebDeps) -> axum::response::Response {
     match archive_worker::teardown::spawn(&deps) {
-        Ok(handle) => drop(handle),
+        Ok(_) => {}
         Err(error) => return error,
     }
     status_response(&deps)
 }
 
+fn restore_pending_response(deps: &BackupWebDeps) -> Option<axum::response::Response> {
+    solstone_core_backup_runtime::restore::restore_pending_rotation_refusal(&deps.journal_root).map(
+        |reason| {
+            response::error(
+                axum::http::StatusCode::CONFLICT,
+                "restore couldn't start.",
+                reason,
+                "",
+            )
+        },
+    )
+}
+
 async fn restore_route(deps: BackupWebDeps, body: Bytes) -> axum::response::Response {
+    if let Some(refusal) = restore_pending_response(&deps) {
+        return refusal;
+    }
     let payload = match validation::object(&body, response::missing) {
         Ok(value) => value,
         Err(error) => return error,
@@ -931,6 +1104,13 @@ async fn restore_route(deps: BackupWebDeps, body: Bytes) -> axum::response::Resp
     };
     spawn_backup_worker(deps.clone(), started.generation, move |worker| {
         panic::catch_unwind(AssertUnwindSafe(|| {
+            if let Some(reason) =
+                solstone_core_backup_runtime::restore::restore_pending_rotation_refusal(
+                    &worker.journal_root,
+                )
+            {
+                return Terminal::error(reason);
+            }
             let tools = match resolve_tools(&worker) {
                 Ok(tools) => tools,
                 Err(error) => {
@@ -940,9 +1120,10 @@ async fn restore_route(deps: BackupWebDeps, body: Bytes) -> axum::response::Resp
                     return terminal;
                 }
             };
+            let runner = lifetime_runner(&worker);
             map_restore(restore_journal(
                 &worker.journal_root,
-                &services(&worker, &tools),
+                &services(&worker, &runner, &tools),
                 worker.restore_recorder.as_ref(),
                 destination,
                 &recovery_key,
@@ -960,6 +1141,9 @@ async fn restore_route(deps: BackupWebDeps, body: Bytes) -> axum::response::Resp
 }
 
 async fn restore_hosted_route(deps: BackupWebDeps, body: Bytes) -> axum::response::Response {
+    if let Some(refusal) = restore_pending_response(&deps) {
+        return refusal;
+    }
     let Some(binding) = load_hosted_binding(&deps.journal_root) else {
         return response::error(
             axum::http::StatusCode::CONFLICT,
@@ -993,6 +1177,9 @@ async fn restore_hosted_route(deps: BackupWebDeps, body: Bytes) -> axum::respons
 }
 
 async fn restore_hosted_prepare_route(deps: BackupWebDeps) -> axum::response::Response {
+    if let Some(refusal) = restore_pending_response(&deps) {
+        return refusal;
+    }
     if load_hosted_binding(&deps.journal_root).is_some() {
         return response::error(
             axum::http::StatusCode::CONFLICT,
@@ -1011,6 +1198,9 @@ async fn restore_hosted_prepare_route(deps: BackupWebDeps) -> axum::response::Re
 }
 
 async fn restore_hosted_key_route(deps: BackupWebDeps, body: Bytes) -> axum::response::Response {
+    if let Some(refusal) = restore_pending_response(&deps) {
+        return refusal;
+    }
     let payload = match validation::object(&body, response::missing) {
         Ok(value) => value,
         Err(error) => return error,
@@ -1036,6 +1226,9 @@ async fn restore_hosted_key_route(deps: BackupWebDeps, body: Bytes) -> axum::res
 }
 
 async fn restore_hosted_arm_route(deps: BackupWebDeps, body: Bytes) -> axum::response::Response {
+    if let Some(refusal) = restore_pending_response(&deps) {
+        return refusal;
+    }
     let capability = match restore_prepare_capability(&body) {
         Ok(value) => value,
         Err(error) => return error,
@@ -1050,6 +1243,9 @@ async fn restore_hosted_activate_route(
     deps: BackupWebDeps,
     body: Bytes,
 ) -> axum::response::Response {
+    if let Some(refusal) = restore_pending_response(&deps) {
+        return refusal;
+    }
     let capability = match restore_prepare_capability(&body) {
         Ok(value) => value,
         Err(error) => return error,
@@ -1102,6 +1298,11 @@ fn bound_restore_hosted_inner(
     binding: HostedBinding,
     recovery_key: &str,
 ) -> Terminal {
+    if let Some(reason) =
+        solstone_core_backup_runtime::restore::restore_pending_rotation_refusal(&deps.journal_root)
+    {
+        return Terminal::error(reason);
+    }
     let tools = match resolve_tools(deps) {
         Ok(tools) => tools,
         Err(error) => {
@@ -1117,9 +1318,10 @@ fn bound_restore_hosted_inner(
             Err(error) => return publish_restore_error(deps, error.reason_code),
         };
     let destination = operated_destination(&binding, &credentials);
+    let runner = lifetime_runner(deps);
     map_restore(restore_journal(
         &deps.journal_root,
-        &services(deps, &tools),
+        &services(deps, &runner, &tools),
         deps.restore_recorder.as_ref(),
         destination,
         recovery_key,
@@ -1312,6 +1514,14 @@ pub(crate) fn persist_and_consume_hosted(
     restore_key: Option<String>,
 ) {
     spawn_backup_worker(deps.clone(), generation, move |worker| {
+        if kind == "restore_hosted"
+            && let Some(reason) =
+                solstone_core_backup_runtime::restore::restore_pending_rotation_refusal(
+                    &worker.journal_root,
+                )
+        {
+            return Terminal::error(reason);
+        }
         if save_hosted_binding(&worker.journal_root, &binding).is_err() {
             return Terminal::error("failed");
         }
@@ -1325,6 +1535,14 @@ pub(crate) fn consume_hosted(
     binding: HostedBinding,
     restore_key: Option<String>,
 ) -> Terminal {
+    if kind != "enable_hosted"
+        && let Some(reason) =
+            solstone_core_backup_runtime::restore::restore_pending_rotation_refusal(
+                &deps.journal_root,
+            )
+    {
+        return Terminal::error(reason);
+    }
     let tools = match resolve_tools(deps) {
         Ok(tools) => tools,
         Err(error) => return Terminal::tool_error(error),
@@ -1348,8 +1566,9 @@ pub(crate) fn consume_hosted(
             Ok(Some(keys)) => keys,
             _ => return Terminal::error("invalid_operation_for_state"),
         };
+        let runner = lifetime_runner(deps);
         if let Err(reason) = init_and_enable(
-            deps.runner.as_ref(),
+            &runner,
             &destination,
             &keys.daily_key,
             &keys.recovery_key,
@@ -1360,7 +1579,7 @@ pub(crate) fn consume_hosted(
         // `restic init` labels its key file with this machine's names. The repository
         // already opens with both secrets, so a miss here waits for the daily prune.
         log_key_label_outcome(neutralize_key_labels(
-            deps.runner.as_ref(),
+            &runner,
             &destination,
             &keys.daily_key,
             &keys.recovery_key,
@@ -1377,9 +1596,10 @@ pub(crate) fn consume_hosted(
     let Some(recovery_key) = restore_key else {
         return Terminal::error("invalid_operation_for_state");
     };
+    let runner = lifetime_runner(deps);
     let terminal = map_restore(restore_journal(
         &deps.journal_root,
-        &services(deps, &tools),
+        &services(deps, &runner, &tools),
         deps.restore_recorder.as_ref(),
         destination,
         &recovery_key,

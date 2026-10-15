@@ -11,7 +11,9 @@ use solstone_core_journal_io::JournalRoot;
 use solstone_core_journal_io::activity::ActivityLease;
 use solstone_core_journal_io::activity_obligations::observe_obligations;
 use solstone_core_journal_io::media::{
-    ActivityCarrierPreparationFailure, RootActivityCarrier, retire_orphan_root_carriers,
+    ActivityCarrierPreparationFailure, ActivityCarrierRetirement, ActivityCarrierRetirementEffect,
+    ActivityCarrierRetirementReceipt, Confirmation, Durability, RootActivityCarrier,
+    retire_orphan_root_carriers,
 };
 
 use crate::archive_admission::{AdmissionError, ArchiveBudget, ArchiveConfiguration, Clock};
@@ -221,6 +223,12 @@ impl OwnedPreparedArchiveHold {
     pub fn release_unused(self) {
         self.activity.release_unused();
     }
+
+    /// Close an unused operation while retaining any uncertain native retirement.
+    pub fn retire_unused(self) -> Result<(), OwnedUnusedArchiveRetirement> {
+        let root = Arc::clone(self.journal_root());
+        OwnedUnusedArchiveRetirement::retire(root, self.clock, Some(self.activity), None)
+    }
     #[cfg(any(unix, windows))]
     pub(crate) fn revalidate(&self) -> Result<(), AdmissionError> {
         revalidate_original(
@@ -239,7 +247,7 @@ pub struct OwnedArchivePreparationFailure {
     activity: Option<ArchiveActivity>,
     preparation: Option<ActivityPreparationFailure>,
     configuration: Option<Box<ArchiveConfiguration>>,
-    _budget: ArchiveBudget,
+    _budget: Box<ArchiveBudget>,
     clock: Arc<dyn Clock + Send + Sync>,
 }
 impl OwnedArchivePreparationFailure {
@@ -270,6 +278,100 @@ impl OwnedArchivePreparationFailure {
         if let Some(preparation) = self.preparation {
             preparation.release_unused();
         }
+    }
+
+    /// Close a refused preparation, retaining its actual partial reservation
+    /// when removal, synchronization or confirmation was not proved.
+    pub fn retire_unused(self) -> Result<(), OwnedUnusedArchiveRetirement> {
+        OwnedUnusedArchiveRetirement::retire(self.root, self.clock, self.activity, self.preparation)
+    }
+}
+
+/// Closed native custody from an unused preparation. It admits no work and
+/// preserves the actual retirement receipt; a failed receipt is never retried
+/// as though an already removed carrier were a fresh operation.
+#[must_use]
+pub struct OwnedUnusedArchiveRetirement {
+    root: Arc<JournalRoot>,
+    clock: Arc<dyn Clock + Send + Sync>,
+    owners: Vec<UnusedCarrier>,
+}
+
+enum UnusedCarrier {
+    Shared(Arc<RootActivityCarrier>),
+    Retired(ActivityCarrierRetirement<RootActivityCarrier>),
+    Partial(ActivityCarrierRetirement<ActivityCarrierPreparationFailure>),
+}
+
+/// A release either keeps its original owner or the actual closed retirement.
+#[must_use]
+pub enum UnusedArchiveRelease<T> {
+    Held(T),
+    Retired(OwnedUnusedArchiveRetirement),
+}
+
+impl OwnedUnusedArchiveRetirement {
+    fn retire(
+        root: Arc<JournalRoot>,
+        clock: Arc<dyn Clock + Send + Sync>,
+        activity: Option<ArchiveActivity>,
+        preparation: Option<ActivityPreparationFailure>,
+    ) -> Result<(), Self> {
+        let mut owners = Vec::new();
+        if let Some(activity) = activity {
+            owners.push(match Arc::try_unwrap(activity.carrier) {
+                Ok(carrier) => UnusedCarrier::Retired(carrier.retire_after_settlement()),
+                Err(carrier) => UnusedCarrier::Shared(carrier),
+            });
+        }
+        if let Some(preparation) = preparation
+            && let Some(partial) = preparation.inner.partial
+        {
+            owners.push(UnusedCarrier::Partial(partial.retire_after_settlement()));
+        }
+        let held = Self {
+            root,
+            clock,
+            owners,
+        };
+        if held.released() { Ok(()) } else { Err(held) }
+    }
+
+    pub fn journal_root(&self) -> &Arc<JournalRoot> {
+        &self.root
+    }
+    pub fn owned_clock(&self) -> &Arc<dyn Clock + Send + Sync> {
+        &self.clock
+    }
+    pub fn retirement_receipts(&self) -> impl Iterator<Item = &ActivityCarrierRetirementReceipt> {
+        self.owners.iter().filter_map(|owner| match owner {
+            UnusedCarrier::Shared(_) => None,
+            UnusedCarrier::Retired(retirement) => Some(&retirement.receipt),
+            UnusedCarrier::Partial(retirement) => Some(&retirement.receipt),
+        })
+    }
+    pub fn released(&self) -> bool {
+        self.owners.iter().all(|owner| {
+            let receipt = match owner {
+                UnusedCarrier::Shared(carrier) => {
+                    // Retain the native allocation, including when another
+                    // owner still prevents its original retirement.
+                    let _ = carrier;
+                    return false;
+                }
+                UnusedCarrier::Retired(retirement) => &retirement.receipt,
+                UnusedCarrier::Partial(retirement) => &retirement.receipt,
+            };
+            receipt.effect() == ActivityCarrierRetirementEffect::Removed
+                && receipt.root_durability()
+                    == if cfg!(windows) {
+                        Durability::Unproven
+                    } else {
+                        Durability::Synced
+                    }
+                && receipt.confirmation() == Confirmation::Confirmed
+                && receipt.failures().is_empty()
+        })
     }
 }
 
@@ -348,7 +450,7 @@ impl ArchiveOperationPreparationFailure<'_> {
             activity,
             preparation,
             configuration: None,
-            _budget,
+            _budget: Box::new(_budget),
             clock,
         })
     }
@@ -555,7 +657,7 @@ impl OwnedPreparedArchiveOperation {
                     activity,
                     preparation,
                     configuration: None,
-                    _budget,
+                    _budget: Box::new(_budget),
                     clock,
                 })
             }
@@ -672,7 +774,7 @@ impl OwnedArchivePreparationInput {
             activity: None,
             preparation: None,
             configuration: None,
-            _budget: budget,
+            _budget: Box::new(budget),
             clock: Arc::clone(&clock),
         };
         if let Err(reason) = failure._budget.remaining(clock.as_ref()) {
@@ -695,7 +797,7 @@ impl OwnedArchivePreparationInput {
             Self {
                 root,
                 lease,
-                budget: failure._budget,
+                budget: *failure._budget,
                 clock,
             },
             custody,
@@ -731,7 +833,7 @@ impl OwnedArchivePreparationInput {
                 activity: Some(activity),
                 preparation: None,
                 configuration: Some(Box::new(configuration)),
-                _budget: budget,
+                _budget: Box::new(budget),
                 clock,
             });
         }

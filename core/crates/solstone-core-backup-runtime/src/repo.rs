@@ -8,9 +8,13 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::path::Path;
 use std::time::Duration;
 
+#[cfg(any(target_os = "android", all(unix, any(test, feature = "test-support"))))]
+use solstone_core_backup::archive_admission::ArchiveCancellation;
 use solstone_core_backup::{BackupError, Destination, assemble_backend_env};
 
 use crate::destination::validate_destination;
+#[cfg(any(target_os = "android", all(unix, any(test, feature = "test-support"))))]
+use crate::runner::run_restic_with_stdin_cancellable;
 use crate::runner::{PassedHandle, ToolRunner, run_restic, run_restic_with_stdin};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -227,6 +231,126 @@ pub fn remove_key(
         &[],
         None,
     )
+}
+
+#[cfg(any(target_os = "android", all(unix, any(test, feature = "test-support"))))]
+pub(crate) fn capture_rotation_key_id(
+    runner: &dyn ToolRunner,
+    destination: &Destination,
+    password: &str,
+    restic_path: &Path,
+    timeout: Option<Duration>,
+) -> Result<String, RepoError> {
+    strict_key_list(runner, destination, password, restic_path, timeout)?
+        .into_iter()
+        .find(|(_, current)| *current)
+        .map(|(id, _)| id)
+        .ok_or(RepoError::Failed)
+}
+#[cfg(any(target_os = "android", all(unix, any(test, feature = "test-support"))))]
+pub(crate) fn remove_rotation_key(
+    runner: &dyn ToolRunner,
+    destination: &Destination,
+    password: &str,
+    key_id: &str,
+    restic_path: &Path,
+    timeout: Option<Duration>,
+    cancellation: &ArchiveCancellation,
+) -> Result<(), RepoError> {
+    let result = run_restic_with_stdin_cancellable(
+        runner,
+        &["key".into(), "remove".into(), key_id.into()],
+        &destination.repository,
+        password,
+        restic_path,
+        Some(&backend(destination)?),
+        false,
+        None,
+        timeout,
+        &[],
+        None,
+        cancellation,
+    )
+    .map_err(|_| RepoError::Failed)?;
+    if result.returncode == 0 {
+        Ok(())
+    } else {
+        Err(RepoError::Key(ResticKeyError {
+            returncode: result.returncode,
+        }))
+    }
+}
+
+#[cfg(any(target_os = "android", all(unix, any(test, feature = "test-support"))))]
+pub(crate) fn strict_key_list_absence(
+    runner: &dyn ToolRunner,
+    destination: &Destination,
+    password: &str,
+    target_key_id: &str,
+    restic_path: &Path,
+    timeout: Option<Duration>,
+) -> Result<bool, RepoError> {
+    Ok(
+        strict_key_list(runner, destination, password, restic_path, timeout)?
+            .iter()
+            .all(|(id, _)| id != target_key_id),
+    )
+}
+
+#[cfg(any(target_os = "android", all(unix, any(test, feature = "test-support"))))]
+fn strict_key_list(
+    runner: &dyn ToolRunner,
+    destination: &Destination,
+    password: &str,
+    restic_path: &Path,
+    timeout: Option<Duration>,
+) -> Result<Vec<(String, bool)>, RepoError> {
+    let args: Vec<String> = vec!["key".into(), "list".into()];
+    let result = run_restic(
+        runner,
+        &args,
+        &destination.repository,
+        password,
+        restic_path,
+        Some(&backend(destination)?),
+        true,
+        None,
+        timeout,
+        &[],
+    )
+    .map_err(|_| RepoError::Failed)?;
+    if result.returncode != 0 {
+        return Err(RepoError::Key(ResticKeyError {
+            returncode: result.returncode,
+        }));
+    }
+    // Diagnostic scrubbing must never become authority for key identity or
+    // absence. Rotating credentials can otherwise change the apparent IDs.
+    if result.stdout.contains("[redacted]") {
+        return Err(RepoError::Failed);
+    }
+    #[derive(serde::Deserialize)]
+    struct KeyRow {
+        id: String,
+        current: bool,
+    }
+    // Typed fields reject duplicates before a JSON map can overwrite them.
+    // Other restic metadata fields remain allowed.
+    let items: Vec<KeyRow> = serde_json::from_str(&result.stdout).map_err(|_| RepoError::Failed)?;
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut keys = Vec::with_capacity(items.len());
+    let mut current_count = 0;
+    for KeyRow { id, current } in items {
+        if id.trim().is_empty() || !seen_ids.insert(id.clone()) {
+            return Err(RepoError::Failed);
+        }
+        current_count += usize::from(current);
+        keys.push((id, current));
+    }
+    if current_count != 1 {
+        return Err(RepoError::Failed);
+    }
+    Ok(keys)
 }
 
 /// The username and hostname on every key file in an operated repository.
@@ -965,5 +1089,212 @@ mod tests {
                 .iter()
                 .any(|line| line.starts_with("remove"))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_key_list_absence_validates_json_strictly() {
+        struct ScriptRunner(ToolOutput);
+        impl ToolRunner for ScriptRunner {
+            fn run(&self, _: &ToolRequest<'_>) -> io::Result<ToolOutput> {
+                Ok(self.0.clone())
+            }
+        }
+
+        let destination = Destination {
+            repository: "repo".into(),
+            backend: "s3".into(),
+            credentials: serde_json::json!({"access_key_id":"fixture-access", "secret_access_key":"fixture-secret"}).as_object().unwrap().clone(),
+        };
+        let restic = Path::new("/fixture/bin/restic");
+
+        for malformed in [
+            "[]",
+            r#"[{"id":"k1","current":false}]"#,
+            r#"[{"id":"k1","current":true},{"id":"k2","current":true}]"#,
+            r#"[{"id":"k1","current":"true"}]"#,
+            r#"[{"id":"k1","current":null}]"#,
+            r#"[{"id":"old","id":"daily","current":true}]"#,
+            r#"[{"id":"k1","current":false,"current":true}]"#,
+            r#"[{"id":"[redacted]abc","current":true}]"#,
+            r#"[{"id":"fixture-accessabc","current":true}]"#,
+        ] {
+            let runner = ScriptRunner(ToolOutput {
+                returncode: 0,
+                stdout: malformed.as_bytes().to_vec(),
+                stderr: vec![],
+            });
+            assert!(
+                strict_key_list_absence(&runner, &destination, "pass", "target", restic, None)
+                    .is_err()
+            );
+            assert!(capture_rotation_key_id(&runner, &destination, "pass", restic, None).is_err());
+        }
+
+        // 1. duplicate ids -> Err
+        let runner = ScriptRunner(ToolOutput {
+            returncode: 0,
+            stdout: b"[{\"id\":\"k1\",\"current\":true},{\"id\":\"k1\",\"current\":false}]"
+                .to_vec(),
+            stderr: vec![],
+        });
+        assert!(matches!(
+            strict_key_list_absence(&runner, &destination, "pass", "target", restic, None),
+            Err(RepoError::Failed)
+        ));
+
+        // 2. truncated JSON -> Err
+        let runner = ScriptRunner(ToolOutput {
+            returncode: 0,
+            stdout: b"[{\"id\":\"k1\",\"current\":true".to_vec(),
+            stderr: vec![],
+        });
+        assert!(matches!(
+            strict_key_list_absence(&runner, &destination, "pass", "target", restic, None),
+            Err(RepoError::Failed)
+        ));
+
+        // 3. a non-array -> Err
+        let runner = ScriptRunner(ToolOutput {
+            returncode: 0,
+            stdout: b"{\"id\":\"k1\",\"current\":true}".to_vec(),
+            stderr: vec![],
+        });
+        assert!(matches!(
+            strict_key_list_absence(&runner, &destination, "pass", "target", restic, None),
+            Err(RepoError::Failed)
+        ));
+
+        // 4. element missing id -> Err
+        let runner = ScriptRunner(ToolOutput {
+            returncode: 0,
+            stdout: b"[{\"current\":true}]".to_vec(),
+            stderr: vec![],
+        });
+        assert!(matches!(
+            strict_key_list_absence(&runner, &destination, "pass", "target", restic, None),
+            Err(RepoError::Failed)
+        ));
+
+        // 5. element missing boolean current -> Err
+        let runner = ScriptRunner(ToolOutput {
+            returncode: 0,
+            stdout: b"[{\"id\":\"k1\"}]".to_vec(),
+            stderr: vec![],
+        });
+        assert!(matches!(
+            strict_key_list_absence(&runner, &destination, "pass", "target", restic, None),
+            Err(RepoError::Failed)
+        ));
+
+        // 6. empty id -> Err
+        let runner = ScriptRunner(ToolOutput {
+            returncode: 0,
+            stdout: b"[{\"id\":\"\",\"current\":true}]".to_vec(),
+            stderr: vec![],
+        });
+        assert!(matches!(
+            strict_key_list_absence(&runner, &destination, "pass", "target", restic, None),
+            Err(RepoError::Failed)
+        ));
+
+        // 7. NDJSON of two values -> Err
+        let runner = ScriptRunner(ToolOutput {
+            returncode: 0,
+            stdout: b"{\"id\":\"k1\",\"current\":true}\n{\"id\":\"k2\",\"current\":false}".to_vec(),
+            stderr: vec![],
+        });
+        assert!(matches!(
+            strict_key_list_absence(&runner, &destination, "pass", "target", restic, None),
+            Err(RepoError::Failed)
+        ));
+
+        // 8. Unique array that omits target -> Ok(true)
+        let runner = ScriptRunner(ToolOutput {
+            returncode: 0,
+            stdout: b"[{\"id\":\"k1\",\"current\":true},{\"id\":\"k2\",\"current\":false}]"
+                .to_vec(),
+            stderr: vec![],
+        });
+        assert!(
+            strict_key_list_absence(&runner, &destination, "pass", "target", restic, None).unwrap()
+        );
+
+        // 9. Unique array that contains target -> Ok(false)
+        let runner = ScriptRunner(ToolOutput {
+            returncode: 0,
+            stdout: b"[{\"id\":\"k1\",\"current\":true},{\"id\":\"target\",\"current\":false}]"
+                .to_vec(),
+            stderr: vec![],
+        });
+        assert!(
+            !strict_key_list_absence(&runner, &destination, "pass", "target", restic, None)
+                .unwrap()
+        );
+    }
+    #[test]
+    fn public_key_helpers_preserve_run_only_desktop_contract() {
+        use std::cell::RefCell;
+        use std::collections::VecDeque;
+        struct RunOnly {
+            outputs: RefCell<VecDeque<ToolOutput>>,
+            commands: RefCell<Vec<Vec<String>>>,
+        }
+        impl ToolRunner for RunOnly {
+            fn run(&self, request: &ToolRequest<'_>) -> io::Result<ToolOutput> {
+                self.commands.borrow_mut().push(
+                    request
+                        .argv
+                        .iter()
+                        .map(|arg| arg.to_string_lossy().into_owned())
+                        .collect(),
+                );
+                Ok(self
+                    .outputs
+                    .borrow_mut()
+                    .pop_front()
+                    .expect("maintained run only"))
+            }
+        }
+        let output = |code, bytes: &[u8]| ToolOutput {
+            returncode: code,
+            stdout: bytes.to_vec(),
+            stderr: vec![],
+        };
+        let runner = RunOnly {
+            outputs: RefCell::new(VecDeque::from([
+                output(0, br#"[{"id":"original","current":true},{"id":"other"}]"#),
+                output(0, b""),
+                output(12, b""),
+            ])),
+            commands: RefCell::new(vec![]),
+        };
+        let destination = Destination {
+            repository: "repo".into(),
+            backend: "s3".into(),
+            credentials: serde_json::json!({"access_key_id":"access","secret_access_key":"secret"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        };
+        let path = Path::new("/fixture/bin/restic");
+        assert_eq!(
+            capture_current_key_id(&runner, &destination, "password", path, None).unwrap(),
+            "original"
+        );
+        remove_key(&runner, &destination, "password", "original", path, None).unwrap();
+        assert!(matches!(
+            remove_key(&runner, &destination, "password", "original", path, None),
+            Err(RepoError::Key(ResticKeyError { returncode: 12 }))
+        ));
+        assert_eq!(
+            *runner.commands.borrow(),
+            [
+                vec!["key", "list", "--json"],
+                vec!["key", "remove", "original"],
+                vec!["key", "remove", "original"]
+            ]
+        );
+        assert!(runner.outputs.borrow().is_empty());
     }
 }

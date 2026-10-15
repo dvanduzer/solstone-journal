@@ -38,11 +38,12 @@ solstone-core-backup.workspace = true
 solstone-core-body-rebuild.workspace = true
 solstone-core-indexer-store.workspace = true
 solstone-core-journal-io.workspace = true
+solstone-core-journal-config.workspace = true
 solstone-core-journal-config-write.workspace = true
 solstone-core-system.workspace = true
 solstone-core-spp-attest.workspace = true
 
-[target.'cfg(any(target_os = "linux", target_os = "macos", windows))'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "android", windows))'.dependencies]
 tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros"] }
 socket2.workspace = true
 
@@ -59,7 +60,7 @@ solstone-core-journal-io = { workspace = true, features = ["test-hooks"] }
 solstone-core-backup-runtime = { path = ".", features = ["test-support"] }
 
 [target.'cfg(unix)'.dev-dependencies]
-nix = { workspace = true, features = ["fs", "signal"] }
+nix = { workspace = true, features = ["fs", "signal", "resource"] }
 
 [[test]]
 name = "backup_runtime_process"

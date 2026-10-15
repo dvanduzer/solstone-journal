@@ -1791,6 +1791,9 @@ dependencies = [
  "log",
  "serde_json",
  "sha2",
+ "solstone-core-backup",
+ "solstone-core-backup-runtime",
+ "solstone-core-backup-web",
  "solstone-core-brain-owner",
  "solstone-core-callosum",
  "solstone-core-convey-shell",
@@ -1799,6 +1802,7 @@ dependencies = [
  "solstone-core-indexer-store",
  "solstone-core-journal-config-write",
  "solstone-core-journal-io",
+ "solstone-core-maintenance",
  "solstone-core-mcp-endpoint",
  "solstone-core-spl",
  "solstone-core-transcribe",
@@ -3262,6 +3266,7 @@ dependencies = [
  "solstone-core-distribution",
  "solstone-core-indexer-store",
  "solstone-core-installed-payload",
+ "solstone-core-journal-config",
  "solstone-core-journal-config-write",
  "solstone-core-journal-io",
  "solstone-core-spp-attest",
@@ -4165,6 +4170,24 @@ dependencies = [
  "solstone-core-journal-config",
  "solstone-core-journal-io",
  "solstone-core-sol-link",
+]
+
+[[package]]
+name = "solstone-core-maintenance"
+version = "2.0.46"
+dependencies = [
+ "chrono",
+ "chrono-tz",
+ "serde",
+ "serde_json",
+ "solstone-core-backup-runtime",
+ "solstone-core-brain",
+ "solstone-core-journal-config",
+ "solstone-core-journal-io",
+ "solstone-core-offload",
+ "solstone-core-retention",
+ "solstone-core-speaker-resolve",
+ "solstone-core-system",
 ]
 
 [[package]]

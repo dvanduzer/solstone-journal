@@ -282,13 +282,17 @@ mod tests {
             let (release, released) = mpsc::channel();
             let (stopped, stop_observed) = mpsc::channel();
             let expected = terminal.clone();
-            let handle = operation::spawn_worker(slot.clone(), generation, move || {
-                entered.send(budget.remaining(&worker_clock)).unwrap();
-                released.recv_timeout(Duration::from_secs(5)).unwrap();
-                stopped.send(budget.remaining(&worker_clock)).unwrap();
-                terminal
-            })
-            .unwrap();
+            assert!(operation::spawn_worker(
+                slot.clone(),
+                generation,
+                move || {
+                    entered.send(budget.remaining(&worker_clock)).unwrap();
+                    released.recv_timeout(Duration::from_secs(5)).unwrap();
+                    stopped.send(budget.remaining(&worker_clock)).unwrap();
+                    terminal
+                }
+            ));
+            let handle = slot.lock().unwrap().threads.pop().unwrap();
             let worker = OwnedWorker {
                 release: Some(release),
                 handle: Some(handle),
@@ -373,13 +377,14 @@ mod tests {
                 ArchiveCancellationRequest::BeforeStart
             );
             let (entered, observed) = mpsc::channel();
-            assert!(
-                operation::spawn_worker(slot.clone(), generation, move || {
+            assert!(!operation::spawn_worker(
+                slot.clone(),
+                generation,
+                move || {
                     entered.send(budget.remaining(&clock)).unwrap();
                     operation::Terminal::done()
-                })
-                .is_none()
-            );
+                }
+            ));
             assert_eq!(
                 observed.recv_timeout(Duration::from_secs(5)),
                 Err(mpsc::RecvTimeoutError::Disconnected)
@@ -393,13 +398,16 @@ mod tests {
             let clock = TestClock::new(100);
             let (generation, budget) = admitted(&slot, &clock);
             let old_flag = budget.cancellation().unwrap().clone();
-            operation::spawn_worker(slot.clone(), generation, move || {
-                let _budget = budget;
-                panic!("archive worker control")
-            })
-            .unwrap()
-            .join()
-            .unwrap();
+            assert!(operation::spawn_worker(
+                slot.clone(),
+                generation,
+                move || {
+                    let _budget = budget;
+                    panic!("archive worker control")
+                }
+            ));
+            let handle = slot.lock().unwrap().threads.pop().unwrap();
+            handle.join().unwrap();
             assert_eq!(
                 operation::current(&slot).unwrap().reason_code.as_deref(),
                 Some("failed")

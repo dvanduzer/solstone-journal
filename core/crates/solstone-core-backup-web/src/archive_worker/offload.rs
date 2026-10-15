@@ -103,6 +103,9 @@ enum SettledReport {
 }
 
 enum ReturnState {
+    UnusedRetirement(Box<solstone_core_backup::archive_activity::OwnedUnusedArchiveRetirement>),
+    AdmissionClosed(OwnedArchiveAdmissionFailure),
+    Refused(OwnedDirectReadFinish),
     Preflight {
         prepared: Box<OwnedPreparedArchiveHold>,
         failure: InputFailure,
@@ -138,12 +141,6 @@ pub struct OffloadReturn {
     state: ReturnState,
 }
 
-fn retire_unshared(carrier: Arc<RootActivityCarrier>) {
-    if let Ok(carrier) = Arc::try_unwrap(carrier) {
-        drop(carrier.retire_after_settlement());
-    }
-}
-
 impl Inputs {
     fn unstaged(&self) -> bool {
         match self {
@@ -164,52 +161,77 @@ impl OffloadReturn {
                     InputFailure::Selected(failure) => failure.unstaged(),
                     InputFailure::Planned(_) => true,
                 };
-                if !unstaged {
+                if !unstaged || !Arc::ptr_eq(prepared.carrier(), failure.carrier()) {
                     return held(ReturnState::Preflight { prepared, failure });
                 }
                 drop(failure);
-                prepared.release_unused();
-                Ok(())
+                prepared.retire_unused().map_err(|retirement| {
+                    Box::new(Self {
+                        state: ReturnState::UnusedRetirement(Box::new(retirement)),
+                    })
+                })
             }
             ReturnState::Admission { input, failure } if input.unstaged() => {
-                let carrier = Arc::clone(input.carrier());
+                if !failure
+                    .carrier()
+                    .is_some_and(|carrier| Arc::ptr_eq(input.carrier(), carrier))
+                {
+                    return held(ReturnState::Admission { input, failure });
+                }
+                // Unstaged planning inputs hold only a shared carrier. Drop
+                // them before the actual admission owner attempts retirement.
+                drop(input);
                 match failure.release() {
-                    Ok(()) => {
-                        drop(input);
-                        retire_unshared(carrier);
-                        Ok(())
-                    }
-                    Err(failure) => held(ReturnState::Admission {
-                        input,
-                        failure: *failure,
-                    }),
+                    Ok(()) => Ok(()),
+                    Err(failure) => held(ReturnState::AdmissionClosed(*failure)),
                 }
             }
             ReturnState::Entry {
                 input,
                 admitted,
                 outside,
-            } if input.unstaged() => match (*admitted).release_unused() {
-                Ok(()) => {
-                    drop(input);
-                    outside.release_unused();
-                    Ok(())
+            } if input.unstaged() => {
+                if !Arc::ptr_eq(input.carrier(), admitted.carrier())
+                    || !Arc::ptr_eq(admitted.carrier(), outside.carrier())
+                    || !Arc::ptr_eq(admitted.owned_clock(), outside.owned_clock())
+                {
+                    return held(ReturnState::Entry {
+                        input,
+                        admitted,
+                        outside,
+                    });
                 }
-                Err(admitted) => held(ReturnState::Entry {
-                    input,
-                    admitted,
-                    outside,
-                }),
-            },
+                match (*admitted).release_refused() {
+                    Ok(read) => {
+                        drop(input);
+                        let runtime = outside.finish_refused(read);
+                        if runtime.released() {
+                            Ok(())
+                        } else {
+                            held(ReturnState::Refused(runtime))
+                        }
+                    }
+                    Err(admitted) => held(ReturnState::Entry {
+                        input,
+                        admitted,
+                        outside,
+                    }),
+                }
+            }
+            ReturnState::AdmissionClosed(failure) => failure.release().map_err(|failure| {
+                Box::new(Self {
+                    state: ReturnState::AdmissionClosed(*failure),
+                })
+            }),
             state => held(state),
         }
     }
 
     pub fn runtime(&self) -> Option<&OwnedDirectReadFinish> {
         match &self.state {
-            ReturnState::Finished { runtime, .. } | ReturnState::ActorUnknown { runtime } => {
-                Some(runtime)
-            }
+            ReturnState::Finished { runtime, .. }
+            | ReturnState::ActorUnknown { runtime }
+            | ReturnState::Refused(runtime) => Some(runtime),
             _ => None,
         }
     }
@@ -221,7 +243,9 @@ impl OffloadReturn {
     }
     pub fn admission_failure(&self) -> Option<&OwnedArchiveAdmissionFailure> {
         match &self.state {
-            ReturnState::Admission { failure, .. } => Some(failure),
+            ReturnState::Admission { failure, .. } | ReturnState::AdmissionClosed(failure) => {
+                Some(failure)
+            }
             _ => None,
         }
     }
@@ -317,6 +341,13 @@ impl OffloadReturn {
         custody: Option<&ArchivePreparationCustody>,
     ) -> bool {
         let (root, clock) = match &self.state {
+            ReturnState::UnusedRetirement(retirement) => {
+                (retirement.journal_root(), Some(retirement.owned_clock()))
+            }
+            ReturnState::AdmissionClosed(failure) => {
+                (failure.journal_root(), failure.owned_clock())
+            }
+            ReturnState::Refused(runtime) => (runtime.journal_root(), Some(runtime.owned_clock())),
             ReturnState::Preflight { prepared, failure } => {
                 if !Arc::ptr_eq(prepared.carrier(), failure.carrier()) {
                     return false;
