@@ -1154,7 +1154,12 @@ mod tests {
         }
         for empty in [false, true] {
             let root = tempfile::tempdir().unwrap();
-            let segment = root.path().join("chronicle/20260101/desktop/120000_300");
+            let segment = root
+                .path()
+                .join("chronicle")
+                .join("20260101")
+                .join("desktop")
+                .join("120000_300");
             fs::create_dir_all(&segment).unwrap();
             let facts = input(&segment);
             let (jsonl, npz) = transcript_paths(&facts.path);

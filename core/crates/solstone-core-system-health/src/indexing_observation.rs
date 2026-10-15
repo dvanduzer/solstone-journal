@@ -775,7 +775,8 @@ mod tests {
         let row3 = serde_json::json!({"event":"index.attempt","ts":base_ts + 2000,"path":abs.to_str().unwrap(),"outcome":"indexed"});
 
         // Missing file display path kept
-        let missing_path = "/nonexistent/path/outside/journal/note.md";
+        let outside = tempdir().unwrap();
+        let missing_path = outside.path().join("note.md").display().to_string();
         let row4 = serde_json::json!({"event":"index.attempt","ts":base_ts,"path":missing_path,"outcome":"failed","cause":"missing"});
 
         fs::write(

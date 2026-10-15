@@ -20,7 +20,7 @@ use tower::ServiceExt;
 
 use solstone_core_retention::policy::{policy_from_retention, policy_would_release};
 
-#[cfg(all(test, feature = "full-tests"))]
+#[cfg(all(test, unix, feature = "full-tests"))]
 const STUB_EXECUTOR: &str = r#"#!/bin/sh
 for _a in "$@"; do printf '%s\n' "$_a" >> "$ORACLE_STUB_LOG"; done
 printf '%s\n' '--END--' >> "$ORACLE_STUB_LOG"
@@ -111,7 +111,7 @@ impl ExecutorEnvironment {
 
 struct Harness {
     root: TempDir,
-    #[cfg(all(test, feature = "full-tests"))]
+    #[cfg(all(test, unix, feature = "full-tests"))]
     stub: PathBuf,
     log: PathBuf,
 }
@@ -129,12 +129,12 @@ impl Harness {
         });
         write_json(root.path(), "config/journal.json", &config);
         seed_chronicle(root.path());
-        #[cfg(all(test, feature = "full-tests"))]
+        #[cfg(all(test, unix, feature = "full-tests"))]
         let stub = root.path().join("stub-retention");
-        #[cfg(all(test, feature = "full-tests"))]
+        #[cfg(all(test, unix, feature = "full-tests"))]
         fs::write(&stub, STUB_EXECUTOR.as_bytes()).expect("stub bytes");
         #[cfg(unix)]
-        #[cfg(all(test, feature = "full-tests"))]
+        #[cfg(all(test, unix, feature = "full-tests"))]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("stub mode");
@@ -142,7 +142,7 @@ impl Harness {
         let log = root.path().join("invocations.log");
         Self {
             root,
-            #[cfg(all(test, feature = "full-tests"))]
+            #[cfg(all(test, unix, feature = "full-tests"))]
             stub,
             log,
         }
@@ -309,7 +309,7 @@ fn assert_corpus_response(
     );
 }
 
-#[cfg(all(test, feature = "full-tests"))]
+#[cfg(all(test, unix, feature = "full-tests"))]
 fn stub_case<'a>(corpus: &'a Value, name: &str) -> &'a Value {
     &corpus["purge_stubbed"][format!("POST {name}")]
 }
@@ -323,7 +323,8 @@ fn root_from_config(config: &Value) -> TempDir {
     root
 }
 
-#[cfg(all(test, feature = "full-tests"))]
+// This fixture executes a POSIX /bin/sh retention stub.
+#[cfg(all(test, unix, feature = "full-tests"))]
 #[test]
 fn ac4_stubbed_purge_never_marks_on_a_non_releasing_policy() {
     let corpus = crate::test_support::corpus();
@@ -381,7 +382,8 @@ fn ac4_stubbed_purge_never_marks_on_a_non_releasing_policy() {
     }
 }
 
-#[cfg(all(test, feature = "full-tests"))]
+// This fixture executes a POSIX /bin/sh retention stub.
+#[cfg(all(test, unix, feature = "full-tests"))]
 #[test]
 fn ac10_stubbed_purge_replays_recorded_status_and_digest() {
     let corpus = crate::test_support::corpus();
@@ -423,7 +425,8 @@ fn ac10_stubbed_purge_replays_recorded_status_and_digest() {
     }
 }
 
-#[cfg(all(test, feature = "full-tests"))]
+// This fixture executes a POSIX /bin/sh retention stub.
+#[cfg(all(test, unix, feature = "full-tests"))]
 #[test]
 fn ac5_releasing_policy_argv_is_semantically_equal_to_the_corpus() {
     let corpus = crate::test_support::corpus();
@@ -484,7 +487,8 @@ fn ac5_releasing_policy_argv_is_semantically_equal_to_the_corpus() {
     }
 }
 
-#[cfg(all(test, feature = "full-tests"))]
+// This fixture executes a POSIX /bin/sh retention stub.
+#[cfg(all(test, unix, feature = "full-tests"))]
 #[test]
 fn ac7_and_ac11_successful_purge_keeps_media_and_drops_unknown_skip_reasons() {
     let corpus = crate::test_support::corpus();
@@ -522,7 +526,8 @@ fn ac7_and_ac11_successful_purge_keeps_media_and_drops_unknown_skip_reasons() {
     }
 }
 
-#[cfg(all(test, feature = "full-tests"))]
+// This fixture executes a POSIX /bin/sh retention stub.
+#[cfg(all(test, unix, feature = "full-tests"))]
 #[test]
 fn ac9_refused_stub_receipts_preserve_media_and_carry_the_refusal_summary() {
     let corpus = crate::test_support::corpus();
@@ -590,7 +595,8 @@ fn ac3_purge_without_an_executor_matches_refusal_records() {
     }
 }
 
-#[cfg(all(test, feature = "full-tests"))]
+// This fixture executes a POSIX /bin/sh retention stub.
+#[cfg(all(test, unix, feature = "full-tests"))]
 #[test]
 fn ac14_true_days_releases_with_period_one() {
     let corpus = crate::test_support::corpus();

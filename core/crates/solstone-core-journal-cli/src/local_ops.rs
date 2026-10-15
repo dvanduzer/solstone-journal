@@ -2488,7 +2488,7 @@ mod facet_merge_tests {
     impl TempJournal {
         fn new() -> Self {
             let sequence = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
-            let path = PathBuf::from("/var/tmp").join(format!(
+            let path = std::env::temp_dir().join(format!(
                 "solstone-core-journal-cli-facet-merge-{}-{}",
                 std::process::id(),
                 sequence

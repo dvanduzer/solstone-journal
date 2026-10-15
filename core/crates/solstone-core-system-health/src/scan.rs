@@ -794,7 +794,12 @@ mod tests {
     #[test]
     fn writer_failed_depict_record_is_failed_not_pending() {
         let temporary = TempDir::new().unwrap();
-        let segment_dir = temporary.path().join("chronicle/20260101/field/120000_60");
+        let segment_dir = temporary
+            .path()
+            .join("chronicle")
+            .join("20260101")
+            .join("field")
+            .join("120000_60");
         fs::create_dir_all(&segment_dir).unwrap();
         let image = segment_dir.join("photo.png");
         fs::write(&image, STILL_PNG).unwrap();

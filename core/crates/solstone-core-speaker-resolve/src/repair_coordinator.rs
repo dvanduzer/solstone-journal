@@ -1448,14 +1448,15 @@ mod tests {
             if let Some((_, bytes_before)) = before_match {
                 if bytes_before != bytes_after {
                     // Allowed modified files: planned NP voiceprints, speaker_labels.json, repair-operations.jsonl
-                    let allowed = rel_str == "entities/coffee_shop/voiceprints.npz"
+                    let allowed = rel.as_path()
+                        == Path::new("entities/coffee_shop/voiceprints.npz")
                         || rel_str.ends_with("speaker_labels.json")
-                        || rel_str == "speakers/repair-operations.jsonl";
+                        || rel.as_path() == Path::new("speakers/repair-operations.jsonl");
                     assert!(allowed, "Unexpected modification to file: {}", rel_str);
                 }
             } else {
                 // Allowed new files: repair-operations.jsonl
-                let allowed = rel_str == "speakers/repair-operations.jsonl";
+                let allowed = rel.as_path() == Path::new("speakers/repair-operations.jsonl");
                 assert!(allowed, "Unexpected new file created: {}", rel_str);
             }
         }

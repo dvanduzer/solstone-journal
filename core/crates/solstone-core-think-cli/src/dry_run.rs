@@ -310,7 +310,8 @@ fn output_status(
         let start = crate::dispatch::snap_weekly_reflection_start(&context.day);
         context
             .journal
-            .join("reflections/weekly")
+            .join("reflections")
+            .join("weekly")
             .join(format!("{start}.json"))
     } else {
         get_output_path(&context.day_dir, name, segment, format, facet, stream)

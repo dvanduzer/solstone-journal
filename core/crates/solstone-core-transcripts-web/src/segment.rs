@@ -1882,7 +1882,11 @@ mod tests {
     fn writer_failed_depict_sidecar_is_failed_for_health_and_transcripts() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
-        let segment_dir = root.join("chronicle/20260101/field/120000_60");
+        let segment_dir = root
+            .join("chronicle")
+            .join("20260101")
+            .join("field")
+            .join("120000_60");
         std::fs::create_dir_all(&segment_dir).unwrap();
         let image = segment_dir.join("photo.png");
         std::fs::write(&image, STILL_PNG).unwrap();

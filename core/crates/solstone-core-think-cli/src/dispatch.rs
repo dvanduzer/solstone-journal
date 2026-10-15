@@ -312,7 +312,8 @@ pub(crate) fn dispatch_prepared(
             Value::String(
                 context
                     .journal
-                    .join("reflections/weekly")
+                    .join("reflections")
+                    .join("weekly")
                     .join(format!("{week_start}.md"))
                     .display()
                     .to_string(),

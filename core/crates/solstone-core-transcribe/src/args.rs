@@ -615,15 +615,15 @@ mod tests {
     #[test]
     fn missing_audio_path_has_exact_absolute_and_journal_relative_message() {
         let audio = Path::new("clip.wav");
-        let journal = Path::new("/journal");
+        let temporary = tempfile::tempdir().unwrap();
+        let journal = temporary.path();
         let error = resolve_single_audio_path_with(audio, journal, |_| false).unwrap_err();
         assert_eq!(error.exit_code(), 2);
-        assert_eq!(
-            error.message(),
-            Some(
-                "Audio file not found.\n  Tried absolute:         clip.wav\n  Tried journal-relative: /journal/clip.wav"
-            )
+        let expected = format!(
+            "Audio file not found.\n  Tried absolute:         clip.wav\n  Tried journal-relative: {}",
+            journal.join(audio).display()
         );
+        assert_eq!(error.message(), Some(expected.as_str()));
     }
 
     #[test]
