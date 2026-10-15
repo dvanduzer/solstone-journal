@@ -1739,7 +1739,7 @@ fn step_wrapper(context: &mut SetupContext<'_>) -> Result<StepResult, StepExecut
             (context.now)(),
         );
         result.reason = Some(SkipReason::WindowsPackageOwnsCommands.as_str().to_owned());
-        return Ok(result);
+        Ok(result)
     }
     #[cfg(not(windows))]
     {
@@ -1843,7 +1843,12 @@ fn step_wrapper(context: &mut SetupContext<'_>) -> Result<StepResult, StepExecut
 pub(crate) fn service_artifact_path(
     home: &Path,
 ) -> Result<Option<PathBuf>, solstone_core_installation_identity::IdentityError> {
-    #[cfg(windows)]
+    #[cfg(all(windows, test))]
+    {
+        // Native fixture artifacts stay beside the supplied temporary home.
+        Ok(Some(home.join("journal-service.xml")))
+    }
+    #[cfg(all(windows, not(test)))]
     {
         use solstone_core_installation_identity::{
             IdentityError, PlatformTag, namespace_name, owner_base, root_token_from_path,
@@ -3795,6 +3800,8 @@ mod tests {
         }
     }
     #[cfg(not(target_os = "macos"))]
+    // Exercises Unix shell provisioning; Windows exposes native executables.
+    #[cfg(unix)]
     #[test]
     fn wrapper_shell_path_refusal_is_failed_and_worktree_still_provisions_path() {
         let (args, resolved, root, home) = fixture("wrapper-warning", &[]);
@@ -3840,6 +3847,8 @@ mod tests {
     }
 
     #[cfg(not(target_os = "macos"))]
+    // Exercises Unix shell provisioning; Windows exposes native executables.
+    #[cfg(unix)]
     #[test]
     fn skip_path_provisions_wrappers_without_touching_login_files() {
         let (args, resolved, root, home) = fixture("wrapper-skip-path", &["--skip-path"]);
@@ -4209,6 +4218,31 @@ mod tests {
         );
     }
 
+    // Windows intentionally skips skill installation; keep the portable run-loop
+    // aggregation exercised while Unix still calls the real skill adapters.
+    fn fixture_skill_failure(_: &mut SetupContext<'_>) -> Result<StepResult, StepExecutionError> {
+        Ok(StepResult::failed(
+            StepName::SkillsUser,
+            Vec::new(),
+            now(),
+            StepError {
+                code: ErrorCode::StepSubprocessFailed,
+                message: "fixture skill failure".into(),
+                details: String::new(),
+                exit_code: 7,
+            },
+        ))
+    }
+
+    fn fixture_skill_success(_: &mut SetupContext<'_>) -> Result<StepResult, StepExecutionError> {
+        Ok(StepResult::new(
+            StepName::SkillsJournal,
+            StepStatus::Ok,
+            Vec::new(),
+            now(),
+        ))
+    }
+
     #[test]
     fn skills_failures_continue_and_single_failure_uses_its_exit_code() {
         let (args, resolved, root, home) = fixture("aggregate", &[]);
@@ -4252,12 +4286,20 @@ mod tests {
             },
             StepSpec {
                 name: StepName::SkillsUser,
-                executor: Some(step_skills_user),
+                executor: Some(if cfg!(windows) {
+                    fixture_skill_failure
+                } else {
+                    step_skills_user
+                }),
                 plan: plan_skills_user,
             },
             StepSpec {
                 name: StepName::SkillsJournal,
-                executor: Some(step_skills_journal),
+                executor: Some(if cfg!(windows) {
+                    fixture_skill_success
+                } else {
+                    step_skills_journal
+                }),
                 plan: plan_skills_journal,
             },
         ];
@@ -4489,8 +4531,8 @@ mod tests {
         let (args, resolved, root, home) = fixture("journal-match", &[]);
         fs::create_dir_all(config_path(&home).parent().unwrap()).unwrap();
         let existing = format!(
-            "journal = \"{}\"\nother = \"keep\"\n",
-            resolved.journal_path.display()
+            "journal = {}\nother = \"keep\"\n",
+            serde_json::to_string(&resolved.journal_path.to_string_lossy()).unwrap()
         );
         fs::write(config_path(&home), &existing).unwrap();
         let mut runner = FakeRunner::new(Vec::new());
@@ -4625,7 +4667,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             fs::read_to_string(config_path(&home)).unwrap(),
-            format!("journal = \"{}\"\n", resolved.journal_path.display())
+            format!(
+                "journal = {}\n",
+                serde_json::to_string(&resolved.journal_path.to_string_lossy()).unwrap()
+            )
         );
         assert_eq!(fs::read(&config).unwrap(), before);
     }
@@ -4855,6 +4900,7 @@ mod tests {
         assert!(!message.contains("setup."));
     }
 
+    #[cfg(unix)]
     fn write_app_owned_child_marker(path: &Path, target: &Path) {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap();
@@ -4867,6 +4913,8 @@ mod tests {
         .unwrap();
     }
 
+    // Exercises Unix shell provisioning; Windows exposes native executables.
+    #[cfg(unix)]
     #[test]
     fn native_probe_detects_macos_app_owned_child_marker_at_literal_sol_path() {
         let (args, resolved, root, home) = fixture("app-owned-child-probe", &[]);

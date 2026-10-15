@@ -1343,12 +1343,11 @@ runtime = "none"
 features = ["full-tests"]
 
 [[package_suites]]
-# Whole-library qualification needs isolated Windows owner fixtures; Unix homes and POSIX wrappers do not provide them.
 id = "package::solstone-core-setup"
 package = "solstone-core-setup"
 set = "component"
 areas = ["health"]
-platforms = ["linux", "macos"]
+platforms = ["linux", "macos", "windows"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
 default_full = true
