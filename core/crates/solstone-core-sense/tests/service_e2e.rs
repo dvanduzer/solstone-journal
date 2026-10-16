@@ -830,3 +830,317 @@ fn falsification_raw_child_signal_leaves_grandchild_alive() {
         .expect("cleanup grandchild");
     assert!(status.success());
 }
+
+#[cfg(feature = "full-tests")]
+struct TestMemoryProbe {
+    available: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "full-tests")]
+impl solstone_core_sense::memory::MemoryProbe for TestMemoryProbe {
+    fn available_bytes(&self) -> Option<u64> {
+        Some(self.available.load(std::sync::atomic::Ordering::SeqCst))
+    }
+    fn total_bytes(&self) -> Option<u64> {
+        None
+    }
+    fn unified_memory(&self) -> bool {
+        false
+    }
+}
+
+#[cfg(feature = "full-tests")]
+fn make_observing_envelope(
+    day: &str,
+    segment: &str,
+    files: &[&str],
+    batch: bool,
+    import_id: Option<&str>,
+) -> solstone_core_callosum::CallosumEnvelope {
+    let mut extra = Map::from_iter([
+        ("day".into(), json!(day)),
+        ("stream".into(), json!("stream1")),
+        ("segment".into(), json!(segment)),
+        ("files".into(), json!(files)),
+        ("batch".into(), json!(batch)),
+    ]);
+    if let Some(id) = import_id {
+        extra.insert("meta".into(), json!({ "import_id": id }));
+    }
+    solstone_core_callosum::CallosumEnvelope {
+        tract: "observe".into(),
+        event: "observing".into(),
+        ts: None,
+        extra,
+    }
+}
+
+#[cfg(feature = "full-tests")]
+#[test]
+fn live_arrival_takes_the_next_free_handler_slot() {
+    let temp = tempfile::tempdir().expect("temp journal");
+    std::fs::create_dir_all(temp.path().join("config")).expect("config");
+    std::fs::write(
+        temp.path().join("config/journal.json"),
+        br#"{"providers":{"active":{"provider":"openai"}},"memory":{"floor_mib":1}}"#,
+    )
+    .expect("settings");
+
+    let seg1 = temp.path().join("chronicle/20261010/stream1/100000_1");
+    let seg2 = temp.path().join("chronicle/20261011/stream1/110000_1");
+    let seg3 = temp.path().join("chronicle/20261012/stream1/120000_1");
+    let seg_live = temp.path().join("chronicle/20261001/stream1/010000_1");
+
+    std::fs::create_dir_all(&seg1).expect("seg1");
+    std::fs::create_dir_all(&seg2).expect("seg2");
+    std::fs::create_dir_all(&seg3).expect("seg3");
+    std::fs::create_dir_all(&seg_live).expect("seg_live");
+
+    std::fs::write(seg1.join("audio.flac"), b"audio").expect("audio1");
+    std::fs::write(seg2.join("audio.flac"), b"audio").expect("audio2");
+    std::fs::write(seg3.join("audio.flac"), b"audio").expect("audio3");
+    std::fs::write(seg_live.join("live_sleep.flac"), b"audio").expect("live_sleep");
+
+    let probe = Arc::new(TestMemoryProbe {
+        available: std::sync::atomic::AtomicU64::new(0),
+    });
+    let (outbound, receiver) = mpsc::channel();
+    let fixture = PathBuf::from(env!("CARGO_BIN_EXE_solstone-core-sense-test-handler"));
+    let admission = solstone_core_sense::memory::Admission::new(probe.clone());
+    let dispatcher = SenseDispatcher::new_with_fixture_program_and_admission(
+        temp.path().to_path_buf(),
+        false,
+        false,
+        outbound,
+        fixture,
+        admission,
+    );
+
+    dispatcher.handle(&make_observing_envelope(
+        "20261010",
+        "100000_1",
+        &["audio.flac"],
+        true,
+        Some("imp1"),
+    ));
+    dispatcher.handle(&make_observing_envelope(
+        "20261011",
+        "110000_1",
+        &["audio.flac"],
+        true,
+        Some("imp2"),
+    ));
+    dispatcher.handle(&make_observing_envelope(
+        "20261012",
+        "120000_1",
+        &["audio.flac"],
+        true,
+        Some("imp3"),
+    ));
+
+    let start = std::time::Instant::now();
+    loop {
+        let event = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("throttle event");
+        if event.event == "memory_throttle_started" {
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(10) {
+            panic!("timed out waiting for memory_throttle_started");
+        }
+    }
+
+    dispatcher.handle(&make_observing_envelope(
+        "20261001",
+        "010000_1",
+        &["live_sleep.flac"],
+        false,
+        None,
+    ));
+
+    probe
+        .available
+        .store(10 * 1024 * 1024, std::sync::atomic::Ordering::SeqCst);
+
+    let live_log = seg_live.join("live_sleep.flac.handler");
+    let start = std::time::Instant::now();
+    loop {
+        if live_log.is_file() {
+            let content = std::fs::read_to_string(&live_log).unwrap_or_default();
+            if content.contains("SOLSTONE_WORK_PRIORITY=1:20261001010000") {
+                break;
+            }
+        }
+        if start.elapsed() > Duration::from_secs(10) {
+            panic!("timed out waiting for live handler log");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(!seg1.join("audio.flac.handler").exists());
+    assert!(!seg2.join("audio.flac.handler").exists());
+    assert!(!seg3.join("audio.flac.handler").exists());
+
+    dispatcher.status();
+    let status = loop {
+        let event = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("status event");
+        if event.event == "status" {
+            break event;
+        }
+    };
+    assert_eq!(status.fields["recent_error_count"], 0);
+    assert_eq!(status.fields["pending_queue_depth"], 4);
+
+    assert!(dispatcher.stop_and_wait());
+}
+
+#[cfg(feature = "full-tests")]
+#[test]
+fn memory_release_runs_live_work_and_leaves_the_import_eligible() {
+    let temp = tempfile::tempdir().expect("temp journal");
+    std::fs::create_dir_all(temp.path().join("config")).expect("config");
+    std::fs::write(
+        temp.path().join("config/journal.json"),
+        br#"{"providers":{"active":{"provider":"openai"}},"transcribe":{"max_concurrent":2},"memory":{"floor_mib":1}}"#,
+    )
+    .expect("settings");
+
+    let seg_a = temp.path().join("chronicle/20261010/stream1/100000_1");
+    let seg_b = temp.path().join("chronicle/20261011/stream1/110000_1");
+    let seg_live = temp.path().join("chronicle/20261001/stream1/010000_1");
+
+    std::fs::create_dir_all(&seg_a).expect("seg_a");
+    std::fs::create_dir_all(&seg_b).expect("seg_b");
+    std::fs::create_dir_all(&seg_live).expect("seg_live");
+
+    std::fs::write(seg_a.join("import_a_sleep.flac"), b"audio").expect("audio_a");
+    std::fs::write(seg_b.join("import_b.flac"), b"audio").expect("audio_b");
+    std::fs::write(seg_live.join("live_sleep.flac"), b"audio").expect("audio_live");
+
+    let probe = Arc::new(TestMemoryProbe {
+        available: std::sync::atomic::AtomicU64::new(10 * 1024 * 1024),
+    });
+    let (outbound, receiver) = mpsc::channel();
+    let fixture = PathBuf::from(env!("CARGO_BIN_EXE_solstone-core-sense-test-handler"));
+    let admission = solstone_core_sense::memory::Admission::new(probe.clone());
+    let dispatcher = SenseDispatcher::new_with_fixture_program_and_admission(
+        temp.path().to_path_buf(),
+        false,
+        false,
+        outbound,
+        fixture,
+        admission,
+    );
+
+    dispatcher.handle(&make_observing_envelope(
+        "20261010",
+        "100000_1",
+        &["import_a_sleep.flac"],
+        true,
+        Some("imp_a"),
+    ));
+
+    let log_a = seg_a.join("import_a_sleep.flac.handler");
+    let start = std::time::Instant::now();
+    loop {
+        if log_a.is_file() {
+            let content = std::fs::read_to_string(&log_a).unwrap_or_default();
+            if content.contains("SOLSTONE_WORK_PRIORITY=4:") {
+                break;
+            }
+        }
+        if start.elapsed() > Duration::from_secs(10) {
+            panic!("timed out waiting for import A handler log");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    probe
+        .available
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+
+    dispatcher.handle(&make_observing_envelope(
+        "20261011",
+        "110000_1",
+        &["import_b.flac"],
+        true,
+        Some("imp_b"),
+    ));
+
+    let log_b = seg_b.join("import_b.flac.handler");
+    let start = std::time::Instant::now();
+    loop {
+        let event = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("event");
+        if event.event == "memory_throttle_started" {
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(10) {
+            panic!("timed out waiting for throttle on import B");
+        }
+    }
+    assert!(!log_b.exists());
+
+    dispatcher.handle(&make_observing_envelope(
+        "20261001",
+        "010000_1",
+        &["live_sleep.flac"],
+        false,
+        None,
+    ));
+
+    probe
+        .available
+        .store(10 * 1024 * 1024, std::sync::atomic::Ordering::SeqCst);
+
+    let live_log = seg_live.join("live_sleep.flac.handler");
+    let start = std::time::Instant::now();
+    loop {
+        if live_log.is_file() {
+            let content = std::fs::read_to_string(&live_log).unwrap_or_default();
+            if content.contains("SOLSTONE_WORK_PRIORITY=1:") {
+                break;
+            }
+        }
+        if start.elapsed() > Duration::from_secs(10) {
+            panic!("timed out waiting for live handler log");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(!log_b.exists());
+    let content_a = std::fs::read_to_string(&log_a).expect("read log A");
+    assert_eq!(
+        content_a
+            .lines()
+            .filter(|l| l.starts_with("SOLSTONE_WORK_PRIORITY=4:"))
+            .count(),
+        1
+    );
+    for event in receiver.try_iter() {
+        if event.event == "observed" {
+            assert_ne!(
+                event.fields.get("segment").and_then(|v| v.as_str()),
+                Some("110000_1")
+            );
+        }
+    }
+
+    dispatcher.status();
+    let status = loop {
+        let event = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("status event");
+        if event.event == "status" {
+            break event;
+        }
+    };
+    assert_eq!(status.fields["recent_error_count"], 0);
+    assert_eq!(status.fields["pending_queue_depth"], 3);
+
+    assert!(dispatcher.stop_and_wait());
+}
