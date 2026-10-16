@@ -612,6 +612,86 @@ impl ArchiveStore {
             .collect())
     }
 
+    pub fn part_is_rejected(
+        &self,
+        part: &AudioArchiveRecordPart,
+    ) -> Result<bool, AudioArchiveError> {
+        Ok(self.conn.query_row(
+            "SELECT outcome='rejected' FROM parts WHERE day=? AND segment_key=? AND stored_name=?",
+            params![part.day, part.segment_key, part.stored_name],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// The writer has established that this tile was never published and retired any private intent.
+    pub(crate) fn update_retryable_parts(
+        &mut self,
+        day: &str,
+        key: &str,
+        names: &[String],
+    ) -> Result<(), AudioArchiveError> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        let phase: u32 = tx.query_row(
+            "SELECT phase FROM tiles WHERE day=? AND segment_key=?",
+            params![day, key],
+            |row| row.get(0),
+        )?;
+        if phase == 2 {
+            return Err(AudioArchiveError::Other(
+                "published archive tiles cannot be retried".into(),
+            ));
+        }
+        let mut changed = 0;
+        let mut members = BTreeSet::new();
+        for name in names {
+            let ordinal: i64 = tx.query_row(
+                "SELECT member_ordinal FROM parts WHERE day=? AND segment_key=? AND stored_name=?",
+                params![day, key, name],
+                |row| row.get(0),
+            )?;
+            changed+=tx.execute("UPDATE parts SET outcome='planned',processing=0 WHERE day=? AND segment_key=? AND stored_name=? AND outcome='rejected'",params![day,key,name])?;
+            members.insert(ordinal);
+        }
+        tx.execute(
+            "UPDATE tiles SET phase=0,pending_parts=pending_parts+? WHERE day=? AND segment_key=?",
+            params![
+                i64::try_from(changed)
+                    .map_err(|error| AudioArchiveError::Other(error.to_string()))?,
+                day,
+                key
+            ],
+        )?;
+        tx.execute("UPDATE archive_run SET save_complete=0 WHERE id=1", [])?;
+        for ordinal in members {
+            let rejected = tx
+                .query_row(
+                    "SELECT 1 FROM parts WHERE member_ordinal=? AND outcome='rejected' LIMIT 1",
+                    [ordinal],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !rejected {
+                let payload: String = tx.query_row(
+                    "SELECT payload FROM members WHERE ordinal=?",
+                    [ordinal],
+                    |row| row.get(0),
+                )?;
+                let mut member: AudioArchiveRecordMember = serde_json::from_str(&payload)?;
+                member.save_rejection = None;
+                tx.execute(
+                    "UPDATE members SET payload=? WHERE ordinal=?",
+                    params![serde_json::to_string(&member)?, ordinal],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn set_tile_outcomes(
         &mut self,
         day: &str,

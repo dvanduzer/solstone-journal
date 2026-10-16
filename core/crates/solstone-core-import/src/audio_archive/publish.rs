@@ -356,13 +356,79 @@ pub fn publish_audio_archive(
     let plan_size = store.status()?.size;
     let mut tiles_saved = 0;
     let mut parts_saved = 0;
-    for (day, key) in store.tile_coordinates()? {
+    let coordinates = store.tile_coordinates()?;
+    if options.import_id.is_some() {
+        // Complete consumed-stage bookkeeping before any retry can reject other parts.
+        for (day, key) in &coordinates {
+            if store.tile_phase(day, key)? == 1 {
+                recover_published_tile(journal, &import_id, &mut store, day, key)?;
+            }
+        }
+    }
+    for (day, key) in coordinates {
+        let stage = stage_path(journal, &import_id, &day, &key);
+        let intent_path = intent_path(journal, &import_id, &day, &key);
+        if options.import_id.is_some()
+            && store.tile_phase(&day, &key)? != 2
+            && (!intent_path.try_exists()? || stage.try_exists()?)
+        {
+            let rejected: Vec<_> = store
+                .tile_parts(&day, &key)?
+                .into_iter()
+                .filter(|part| part.outcome == PartOutcome::Rejected)
+                .collect();
+            if !rejected.is_empty() {
+                let candidates: Vec<_> = rejected
+                    .iter()
+                    .map(|part| {
+                        let member = store.member_for_part(part)?;
+                        Ok(super::PlannedMember {
+                            identity: MemberIdentity::new(
+                                member.byte_len,
+                                member.sha256,
+                                member.canonical_occurrence,
+                            ),
+                            original_relative_name: member.original_relative_name,
+                            duration_ms: member.duration_ms,
+                            source_start: member.source_start,
+                            resolved_occurrence: None,
+                            disposition: super::MemberDisposition::Included,
+                            run_note: member.run_note,
+                        })
+                    })
+                    .collect::<Result<_, AudioArchiveError>>()?;
+                let held = find_held_members(
+                    journal,
+                    Some(&import_id),
+                    &candidates,
+                    DEFAULT_WRITE_BUSY_TIMEOUT,
+                )?;
+                let mut eligible = Vec::new();
+                for (part, member) in rejected.iter().zip(candidates) {
+                    if held.contains(&member.identity) {
+                        store.reject_member_remaining(
+                            part,
+                            super::SourceRejection::HeldByExistingRun,
+                        )?;
+                    } else {
+                        eligible.push(part.stored_name.clone());
+                    }
+                }
+                if !eligible.is_empty() {
+                    if intent_path.try_exists()? {
+                        // Retire the durable intent before discarding its intact unpublished stage.
+                        // Cleanup must never look like a consumed-stage publication to discovery.
+                        fs::remove_file(&intent_path)?;
+                        sync_directory(journal, &format!("imports/{import_id}/tiles"))?;
+                    }
+                    store.update_retryable_parts(&day, &key, &eligible)?;
+                }
+            }
+        }
         if store.tile_phase(&day, &key)? == 3 {
             continue;
         }
         let mut parts = store.publishable_tile_parts(&day, &key)?;
-        let stage = stage_path(journal, &import_id, &day, &key);
-        let intent_path = intent_path(journal, &import_id, &day, &key);
         let action = publication_action(
             store.tile_phase(&day, &key)? == 2,
             intent_path.try_exists()?,
@@ -387,7 +453,7 @@ pub fn publish_audio_archive(
                 let mut staged = Vec::with_capacity(parts.len());
                 for part in &parts {
                     let member = store.member_for_part(part)?;
-                    if member.save_rejection.is_some() {
+                    if store.part_is_rejected(part)? {
                         continue;
                     }
                     let target = stage.join(&part.stored_name);

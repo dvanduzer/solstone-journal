@@ -23,6 +23,212 @@ const UTC_ZONE: Tz = Tz::UTC;
 
 #[cfg(feature = "full-tests")]
 #[test]
+fn retry_rechecks_another_runs_ownership_of_previously_rejected_member() {
+    struct Unreadable;
+    impl AudioArchiveMaterializer for Unreadable {
+        fn materialize(
+            &self,
+            _member: &AudioArchiveRecordMember,
+            _part: &AudioArchiveRecordPart,
+            _target: &std::path::Path,
+        ) -> Result<(), AudioArchiveError> {
+            Err(AudioArchiveError::SourceRejected(
+                SourceRejection::Unreadable,
+            ))
+        }
+    }
+    let temp = TempDir::new().unwrap();
+    let journal = temp.path();
+    let (member, bytes) = storage_member(243, "2026-01-14T21:00:00Z", 7500);
+    let materials = HashMap::from([(member.sha256.clone(), bytes)]);
+    let rejected = publish_audio_archive(
+        journal,
+        AudioArchivePublishOptions {
+            import_id: None,
+            members: vec![member.clone()],
+            materializer: &Unreadable,
+            owner_zone: NY,
+            settings: default_settings(),
+            source_timestamp: None,
+        },
+        None,
+    )
+    .unwrap();
+    let owner = storage_publish(
+        journal,
+        None,
+        std::slice::from_ref(&member),
+        &materials,
+        None,
+    )
+    .unwrap();
+    let raw_part = &owner.record.parts[0];
+    let raw = journal
+        .join("chronicle")
+        .join(&raw_part.day)
+        .join(&owner.record.settings.stream)
+        .join(&raw_part.segment_key)
+        .join(&raw_part.stored_name);
+    let before = fs::metadata(&raw).unwrap().modified().unwrap();
+    let retried = storage_publish(
+        journal,
+        Some(&rejected.import_id),
+        &[member],
+        &materials,
+        None,
+    )
+    .unwrap();
+    assert_eq!(retried.parts_saved, 0);
+    assert_eq!(
+        retried.record.members[0].save_rejection,
+        Some(SourceRejection::HeldByExistingRun)
+    );
+    assert_eq!(retried.record.parts[0].outcome, PartOutcome::Rejected);
+    assert_eq!(fs::metadata(raw).unwrap().modified().unwrap(), before);
+    let status = ArchiveStore::open(journal, &rejected.import_id, false)
+        .unwrap()
+        .status()
+        .unwrap();
+    assert_eq!(
+        (
+            status.saved_parts,
+            status.rejected_parts,
+            status.pending_processing
+        ),
+        (0, 1, 0)
+    );
+    assert!(status.save_complete);
+}
+
+#[cfg(feature = "full-tests")]
+#[test]
+fn restored_source_resume_fills_only_rejected_unpublished_parts() {
+    struct RejectLater {
+        materials: HashMap<String, Vec<u8>>,
+        bad: String,
+    }
+    impl AudioArchiveMaterializer for RejectLater {
+        fn materialize(
+            &self,
+            member: &AudioArchiveRecordMember,
+            part: &AudioArchiveRecordPart,
+            target: &std::path::Path,
+        ) -> Result<(), AudioArchiveError> {
+            if member.sha256 == self.bad && part.origin_ms > 0 {
+                return Err(AudioArchiveError::SourceRejected(
+                    SourceRejection::Unreadable,
+                ));
+            }
+            self.materials.materialize(member, part, target)
+        }
+    }
+    for fault in [
+        None,
+        Some(ArchiveFault::BeforeTilePublish),
+        Some(ArchiveFault::AfterPublishBeforeSavedMark),
+    ] {
+        let temp = TempDir::new().unwrap();
+        let journal = temp.path();
+        let (member, bytes) = storage_member(241, "2026-01-14T21:00:00Z", 400_000);
+        let (neighbor, neighbor_bytes) = storage_member(242, "2026-01-14T21:06:50Z", 7500);
+        let sources = RejectLater {
+            materials: HashMap::from([
+                (member.sha256.clone(), bytes.clone()),
+                (neighbor.sha256.clone(), neighbor_bytes),
+            ]),
+            bad: member.sha256.clone(),
+        };
+        let members = if fault.is_some() {
+            vec![member.clone(), neighbor]
+        } else {
+            vec![member.clone()]
+        };
+        assert!(matches!(
+            storage_publish(
+                journal,
+                None,
+                &members,
+                &sources.materials,
+                Some(ArchiveFault::BetweenMultiTileParts)
+            ),
+            Err(AudioArchiveError::Fault(_))
+        ));
+        let id = storage_run(journal);
+        let record = read_audio_archive(journal, &id).unwrap().unwrap();
+        let first = &record.parts[0];
+        let raw = journal
+            .join("chronicle")
+            .join(&first.day)
+            .join(&record.settings.stream)
+            .join(&first.segment_key)
+            .join(&first.stored_name);
+        let before = fs::metadata(&raw).unwrap();
+        let rejected = publish_audio_archive(
+            journal,
+            AudioArchivePublishOptions {
+                import_id: Some(&id),
+                members: vec![],
+                materializer: &sources,
+                owner_zone: NY,
+                settings: default_settings(),
+                source_timestamp: None,
+            },
+            Some(AudioArchivePublishSeams {
+                fault,
+                emit_observed: None,
+                heartbeat_spawner: None,
+            }),
+        );
+        if fault.is_some() {
+            assert!(matches!(rejected, Err(AudioArchiveError::Fault(_))));
+        } else {
+            assert!(rejected.is_ok());
+        }
+        let restored =
+            storage_publish(journal, Some(&id), &members, &sources.materials, None).unwrap();
+        let status = ArchiveStore::open(journal, &id, false)
+            .unwrap()
+            .status()
+            .unwrap();
+        let published_gap = fault == Some(ArchiveFault::AfterPublishBeforeSavedMark);
+        let expected_saved = if fault == Some(ArchiveFault::BeforeTilePublish) {
+            3
+        } else {
+            2
+        };
+        assert_eq!(
+            (
+                status.saved_parts,
+                status.rejected_parts,
+                status.pending_processing
+            ),
+            (expected_saved, u64::from(published_gap), expected_saved)
+        );
+        assert!(status.save_complete);
+        assert_eq!(
+            restored
+                .record
+                .parts
+                .iter()
+                .filter(|part| part.outcome == PartOutcome::Rejected)
+                .count(),
+            usize::from(published_gap)
+        );
+        assert_eq!(fs::read(&raw).unwrap(), bytes);
+        assert_eq!(
+            fs::metadata(&raw).unwrap().modified().unwrap(),
+            before.modified().unwrap()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(&raw).unwrap().ino(), before.ino());
+        }
+    }
+}
+
+#[cfg(feature = "full-tests")]
+#[test]
 fn same_tile_multi_part_rejection_prunes_staged_bytes_and_skips_stale_callbacks() {
     struct Rejecting {
         materials: HashMap<String, Vec<u8>>,

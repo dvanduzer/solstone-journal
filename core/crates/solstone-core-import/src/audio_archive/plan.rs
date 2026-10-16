@@ -28,13 +28,14 @@ pub enum DurationInput {
     Rejected(SourceRejection),
 }
 
-/// Source-local failures leave other members eligible. Journal/storage failures remain errors.
+/// Member-local rejections leave other members eligible. Journal/storage failures remain errors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceRejection {
     Unreadable,
     Unsupported,
     Changed,
+    HeldByExistingRun,
 }
 
 /// Placement settings supplied for the archive run.
