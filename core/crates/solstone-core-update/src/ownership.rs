@@ -774,11 +774,10 @@ fn classify_platform_tree(
     {
         return None;
     }
-    let policy = match native_receipt.get("service_policy").map(String::as_str) {
-        Some("start") => ServicePolicy::Start,
-        Some("skip-service") => ServicePolicy::NoStart,
-        _ => return None,
-    };
+    if native_receipt.get("role").map(String::as_str) != Some(comp_name) {
+        return None;
+    }
+    let policy = native_tree_policy(&native_receipt)?;
 
     let mut components = vec![RecordedComponent {
         name: comp_name.to_owned(),
@@ -813,6 +812,21 @@ fn classify_platform_tree(
         current_platform_version: plat_ver,
         components,
     })
+}
+
+// Native tree receipts and platform package receipts have different policy
+// vocabularies. Preserve the native role/policy pairs written by install.sh.
+fn native_tree_policy(receipt: &BTreeMap<String, String>) -> Option<ServicePolicy> {
+    match (
+        receipt.get("role").map(String::as_str),
+        receipt.get("service_policy").map(String::as_str),
+    ) {
+        (Some("journal"), Some("start")) => Some(ServicePolicy::Start),
+        (Some("journal"), Some("no-start")) | (Some("cli"), Some("none")) => {
+            Some(ServicePolicy::NoStart)
+        }
+        _ => None,
+    }
 }
 
 fn classify_native_tree(
@@ -907,11 +921,7 @@ fn classify_native_tree(
         return None;
     }
 
-    let policy = match receipt.get("service_policy").map(|s| s.as_str()) {
-        Some("start") => ServicePolicy::Start,
-        Some("skip-service") => ServicePolicy::NoStart,
-        _ => return None,
-    };
+    let policy = native_tree_policy(&receipt)?;
 
     let role = receipt.get("role")?.clone();
     if !["journal", "cli"].contains(&role.as_str()) {
@@ -970,6 +980,38 @@ mod tests {
         {
             let current = prefix.join("current");
             std::os::unix::fs::symlink(format!("versions/{entry}"), &current).unwrap();
+        }
+    }
+
+    #[test]
+    fn native_receipt_role_policy_mismatches_refuse_ownership() {
+        for (role, policy) in [
+            ("cli", "start"),
+            ("journal", "none"),
+            ("journal", "skip-service"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let prefix = temp.path().join("local");
+            make_valid_tree(&prefix, "2.0.48");
+            let receipt = prefix.join("install-receipt");
+            let contents = fs::read_to_string(&receipt)
+                .unwrap()
+                .replace("role=journal\n", &format!("role={role}\n"))
+                .replace(
+                    "service_policy=start\n",
+                    &format!("service_policy={policy}\n"),
+                );
+            fs::write(receipt, contents).unwrap();
+            let res = classify_ownership(
+                &prefix.join("current/bin/solstone"),
+                &temp.path().join("data"),
+                &temp.path().join("etc"),
+                &MockPackageProbe(false),
+            );
+            assert!(
+                !matches!(res, OwnershipResult::Positive(_)),
+                "{role}/{policy}"
+            );
         }
     }
 

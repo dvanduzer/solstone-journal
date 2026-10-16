@@ -918,6 +918,93 @@ mod tests {
     }
 
     #[test]
+    fn native_cli_and_no_start_receipts_support_check_and_delegate() {
+        // These native receipt values come from distribution/install.sh;
+        // package receipts use the distinct skip-service vocabulary.
+        for platform in [true, false] {
+            for (role, policy) in [
+                ("cli", "none"),
+                ("journal", "no-start"),
+                ("journal", "start"),
+            ] {
+                let (dir, prefix, data, etc) = fixture();
+                let receipt = prefix.join("install-receipt");
+                let native = fs::read_to_string(&receipt)
+                    .unwrap()
+                    .replace("role=journal\n", &format!("role={role}\n"))
+                    .replace(
+                        "service_policy=start\n",
+                        &format!("service_policy={policy}\n"),
+                    );
+                fs::write(&receipt, native).unwrap();
+                let ini = data.join("install.conf");
+                if platform {
+                    let contents = fs::read_to_string(&ini)
+                        .unwrap()
+                        .replace("component:journal", &format!("component:{role}"));
+                    fs::write(&ini, contents).unwrap();
+                } else {
+                    fs::remove_file(&ini).unwrap();
+                }
+                let list = serde_json::json!({"lane":"release","platform_version":"2.0.49-r1","components":{"journal":{"version":"2.0.49"}}});
+                let runner = ScriptedRunner {
+                    responses: Mutex::new(vec![
+                        response(true, list.clone()),
+                        response(true, list),
+                        response(true, serde_json::json!({})),
+                    ]),
+                    recorded_args: Mutex::new(vec![]),
+                };
+                let fetch = ScriptedFetch {
+                    script_path: dir.path().join("installer.sh"),
+                    fetch_called: Mutex::new(false),
+                };
+                let exe = prefix.join("current/bin/solstone");
+                let report = check(
+                    &runner,
+                    &fetch,
+                    &MockPackageProbe(false),
+                    &exe,
+                    &data,
+                    &etc,
+                    true,
+                    None,
+                );
+                assert_eq!(
+                    report.availability,
+                    Availability::Available,
+                    "{platform}/{role}/{policy}: {report:?}"
+                );
+                let args = parse_args(&[OsString::from("--yes")]).unwrap();
+                perform(
+                    &runner,
+                    &fetch,
+                    &MockPackageProbe(false),
+                    &exe,
+                    &data,
+                    &etc,
+                    true,
+                    &args,
+                )
+                .unwrap();
+                let calls = runner.recorded_args.lock().unwrap();
+                assert_eq!(calls.len(), 3);
+                let mutation = calls.last().unwrap();
+                assert_eq!(
+                    mutation.contains(&OsString::from("--no-start")),
+                    policy != "start"
+                );
+                let role_flag = if platform { "--components" } else { "--role" };
+                assert!(
+                    mutation
+                        .windows(2)
+                        .any(|w| w == [OsString::from(role_flag), OsString::from(role)])
+                );
+            }
+        }
+    }
+
+    #[test]
     fn check_returns_available_on_newer_catalogue_version() {
         let temp = tempfile::tempdir().unwrap();
         let prefix = temp.path().join("local");
