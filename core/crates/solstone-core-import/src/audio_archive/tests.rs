@@ -1925,7 +1925,7 @@ fn dst_fixture_spring_forward_gap_crossing() {
     };
     let plan = plan_audio_archive(&[m], NY, default_settings()).unwrap();
     assert_eq!(plan.members[0].disposition, MemberDisposition::Included);
-    assert_eq!(plan.tiles.len(), 3);
+    assert_eq!(plan.tiles.len(), 4);
 
     assert_eq!(plan.tiles[0].segment_key, "015000_300");
     assert_eq!(plan.tiles[0].parts[0].offset_ms, 0);
@@ -1940,10 +1940,67 @@ fn dst_fixture_spring_forward_gap_crossing() {
     assert_eq!(plan.tiles[2].segment_key, "030000_300");
     assert_eq!(plan.tiles[2].parts[0].offset_ms, 0);
     assert_eq!(plan.tiles[2].parts[0].origin_ms, 600_000);
-    assert_eq!(plan.tiles[2].parts[0].length_ms, 600_000);
+    assert_eq!(plan.tiles[2].parts[0].length_ms, 300_000);
+
+    assert_eq!(plan.tiles[3].segment_key, "030500_300");
+    assert_eq!(plan.tiles[3].parts[0].offset_ms, 0);
+    assert_eq!(plan.tiles[3].parts[0].origin_ms, 900_000);
+    assert_eq!(plan.tiles[3].parts[0].length_ms, 300_000);
 
     for tile in &plan.tiles {
         assert!(!tile.segment_key.starts_with("02"));
+        for part in &tile.parts {
+            assert!(part.offset_ms >= 0);
+            assert!(part.length_ms > 0);
+            assert!(part.offset_ms + part.length_ms <= 300_000);
+        }
+    }
+}
+
+#[test]
+fn utc_spring_forward_date_does_not_merge_remainder() {
+    let m = AudioArchiveMemberInput {
+        original_relative_name: "utc_spring_forward_date_1200s.ogg".to_owned(),
+        byte_len: 1000,
+        sha256: dummy_hash(36),
+        duration: DurationInput::Milliseconds(1_200_000),
+        start: MemberStartEvidence {
+            instant: None,
+            local_civil: Some("2026-03-08T02:50:00.000".to_owned()),
+            source_zone: Some("UTC".to_owned()),
+        },
+        run_note: None,
+    };
+    let plan = plan_audio_archive(&[m], UTC_ZONE, default_settings()).unwrap();
+    assert_eq!(plan.members[0].disposition, MemberDisposition::Included);
+    assert_eq!(plan.tiles.len(), 4);
+
+    assert_eq!(plan.tiles[0].segment_key, "025000_300");
+    assert_eq!(plan.tiles[0].parts[0].offset_ms, 0);
+    assert_eq!(plan.tiles[0].parts[0].origin_ms, 0);
+    assert_eq!(plan.tiles[0].parts[0].length_ms, 300_000);
+
+    assert_eq!(plan.tiles[1].segment_key, "025500_300");
+    assert_eq!(plan.tiles[1].parts[0].offset_ms, 0);
+    assert_eq!(plan.tiles[1].parts[0].origin_ms, 300_000);
+    assert_eq!(plan.tiles[1].parts[0].length_ms, 300_000);
+
+    assert_eq!(plan.tiles[2].segment_key, "030000_300");
+    assert_eq!(plan.tiles[2].parts[0].offset_ms, 0);
+    assert_eq!(plan.tiles[2].parts[0].origin_ms, 600_000);
+    assert_eq!(plan.tiles[2].parts[0].length_ms, 300_000);
+
+    assert_eq!(plan.tiles[3].segment_key, "030500_300");
+    assert_eq!(plan.tiles[3].parts[0].offset_ms, 0);
+    assert_eq!(plan.tiles[3].parts[0].origin_ms, 900_000);
+    assert_eq!(plan.tiles[3].parts[0].length_ms, 300_000);
+
+    for tile in &plan.tiles {
+        for part in &tile.parts {
+            assert!(part.offset_ms >= 0);
+            assert!(part.length_ms > 0);
+            assert!(part.offset_ms + part.length_ms <= 300_000);
+        }
     }
 }
 

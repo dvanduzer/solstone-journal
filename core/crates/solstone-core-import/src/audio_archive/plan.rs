@@ -508,24 +508,19 @@ pub fn simulate_parts(
             }
         }
 
-        let part_len = if day == "20260308" && segment_key == "030000_300" && remaining == 600_000 {
-            600_000
-        } else {
-            let diff_dt = match first_diff {
-                Some(dt) => dt,
-                None => return Err(LeftOutReason::UnsettledTime),
-            };
-
-            if diff_dt > window_limit && remaining > window_limit {
-                return Err(LeftOutReason::UnsettledTime);
-            }
-
-            let part_len = diff_dt.min(remaining);
-            if part_len > window_limit {
-                return Err(LeftOutReason::UnsettledTime);
-            }
-            part_len
+        let diff_dt = match first_diff {
+            Some(dt) => dt,
+            None => return Err(LeftOutReason::UnsettledTime),
         };
+
+        if diff_dt > window_limit && remaining > window_limit {
+            return Err(LeftOutReason::UnsettledTime);
+        }
+
+        let part_len = diff_dt.min(remaining);
+        if part_len > window_limit {
+            return Err(LeftOutReason::UnsettledTime);
+        }
 
         parts.push(SimulatedPart {
             day,
