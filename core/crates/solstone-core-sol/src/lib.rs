@@ -2050,7 +2050,7 @@ mod tests {
         fs::write(dir.join(".archive-sha256"), digest).unwrap();
         fs::write(
             prefix.join("install-receipt"),
-            "service_policy=start\nsignature_verification=verified\njournal_state=present\n",
+            "role=journal\nservice_policy=start\nsignature_verification=verified\njournal_state=present\n",
         )
         .unwrap();
         fs::write(
@@ -2127,7 +2127,7 @@ mod tests {
         fs::write(dir.join(".archive-sha256"), digest).unwrap();
         fs::write(
             prefix.join("install-receipt"),
-            "service_policy=start\nsignature_verification=verified\njournal_state=present\n",
+            "role=journal\nservice_policy=start\nsignature_verification=verified\njournal_state=present\n",
         )
         .unwrap();
         fs::write(

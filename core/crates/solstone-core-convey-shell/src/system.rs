@@ -115,7 +115,7 @@ mod update_tests {
         std::fs::write(version.join(".release"), "version=2.0.48\n").unwrap();
         std::fs::write(
             prefix.join("install-receipt"),
-            "signature_verification=verified\nservice_policy=start\n",
+            "role=journal\nsignature_verification=verified\nservice_policy=start\n",
         )
         .unwrap();
         std::os::unix::fs::symlink(format!("versions/{entry}"), prefix.join("current")).unwrap();
