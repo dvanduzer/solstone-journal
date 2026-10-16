@@ -484,6 +484,66 @@ fn write_utc_zone(journal: &Path) {
     .unwrap();
 }
 
+#[test]
+fn a_timestamp_with_its_offset_imports_the_second_occurrence_of_a_repeated_hour() {
+    for (timestamp, instant) in [
+        ("2025-11-02T01:30:00-07:00", "2025-11-02T08:30:00Z"),
+        ("2025-11-02T01:30:00-06:00", "2025-11-02T07:30:00Z"),
+        // The journal's own form is unchanged: a repeated hour takes the first occurrence.
+        ("20251102_013000", "2025-11-02T07:30:00Z"),
+    ] {
+        let journal = tempfile::tempdir().unwrap();
+        fs::create_dir_all(journal.path().join("config")).unwrap();
+        fs::write(
+            journal.path().join("config/journal.json"),
+            br#"{"identity":{"timezone":"America/Denver"}}"#,
+        )
+        .unwrap();
+        let note = journal.path().join("note.md");
+        fs::write(&note, "a short imported note").unwrap();
+        let (run, import_id) = admitted(
+            journal.path(),
+            &["--timestamp", timestamp, note.to_str().unwrap()],
+        );
+        assert_eq!(run.exit_code, 0, "{timestamp}: {}", run.stderr);
+        assert_eq!(import_id, "20251102_013000", "{timestamp}");
+        let transcript = fs::read_to_string(
+            journal
+                .path()
+                .join("chronicle/20251102/import.text/013000_300/conversation_transcript.jsonl"),
+        )
+        .unwrap();
+        let entry: Value = serde_json::from_str(transcript.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(
+            entry["source_ms"],
+            chrono::DateTime::parse_from_rfc3339(instant)
+                .unwrap()
+                .timestamp_millis(),
+            "{timestamp}"
+        );
+    }
+}
+
+#[test]
+fn a_timestamp_in_neither_form_names_both() {
+    let journal = tempfile::tempdir().unwrap();
+    let note = journal.path().join("note.md");
+    fs::write(&note, "a short imported note").unwrap();
+    let result = run_at(
+        journal.path(),
+        &["--timestamp", "2025-11-02T01:30:00", note.to_str().unwrap()],
+        |name| (name == "SOL_SKIP_SUPERVISOR_CHECK").then(|| "1".to_owned()),
+        || false,
+    );
+    assert_eq!(result.exit_code, 1);
+    assert!(
+        result.stderr.contains("YYYYMMDD_HHMMSS") && result.stderr.contains("-07:00"),
+        "stderr={}",
+        result.stderr
+    );
+    assert!(!journal.path().join("imports").exists());
+}
+
 fn admitted(journal: &Path, args: &[&str]) -> (CliRun, String) {
     match run_cli_with(
         &args

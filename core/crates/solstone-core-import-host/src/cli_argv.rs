@@ -132,7 +132,7 @@ fn force_day_notice_with(
     journal: &Path,
     preflight: impl FnOnce() -> Result<(), SupervisorRefusal>,
 ) -> Result<Option<String>, CliRun> {
-    let Ok(ParsedCommand::Import(options)) = parse_arguments(args) else {
+    let Ok(ParsedCommand::Import(mut options)) = parse_arguments(args) else {
         return Ok(None);
     };
     if !options.force || options.dry_run {
@@ -140,6 +140,9 @@ fn force_day_notice_with(
     }
     if let Err(refusal) = preflight() {
         return Err(refusal_run(refusal));
+    }
+    if owner_instant(&mut options, journal).is_err() {
+        return Ok(None);
     }
     let Some(media) = options
         .media
@@ -325,7 +328,11 @@ fn run_sync(backend: &str, options: &Options, journal_path: &Path) -> CliRun {
     }
 }
 
-fn run_import(options: Options, journal_path: &Path) -> CliOutcome {
+fn run_import(mut options: Options, journal_path: &Path) -> CliOutcome {
+    let owner_instant = match owner_instant(&mut options, journal_path) {
+        Ok(instant) => instant,
+        Err(run) => return rendered(run),
+    };
     let Some(media) = options.media.as_deref() else {
         return rendered(argparse_error(
             "the following arguments are required: media".to_owned(),
@@ -397,6 +404,7 @@ fn run_import(options: Options, journal_path: &Path) -> CliOutcome {
             timestamp,
             ..
         } => {
+            let timestamp = with_owner_instant(timestamp, owner_instant);
             let (run, import_id) = run_audio(media, &options, journal_path, &timestamp, true);
             imported(run, &import_id, options.dry_run)
         }
@@ -405,6 +413,7 @@ fn run_import(options: Options, journal_path: &Path) -> CliOutcome {
             timestamp,
             stream,
         } => {
+            let timestamp = with_owner_instant(timestamp, owner_instant);
             let (run, import_id) = run_text(media, &options, journal_path, &timestamp, &stream);
             imported(run, &import_id, options.dry_run)
         }
@@ -422,6 +431,44 @@ fn run_import(options: Options, journal_path: &Path) -> CliOutcome {
             owner_timestamp: options.timestamp.clone(),
             fallback_timestamp: options.fallback_timestamp.clone(),
         }),
+    }
+}
+
+/// An owner's `--timestamp` may name the instant itself, with its offset, which is the only
+/// way to say the second occurrence of a repeated hour. It becomes the journal's own
+/// `YYYYMMDD_HHMMSS` here, so every importer reads one form, and the instant is returned for
+/// the imports that place elapsed time. A `YYYYMMDD_HHMMSS` value is left as it was.
+fn owner_instant(
+    options: &mut Options,
+    journal: &Path,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, CliRun> {
+    let Some(raw) = options.timestamp.as_deref() else {
+        return Ok(None);
+    };
+    if solstone_core_import::validate_timestamp(raw)
+        != Err(solstone_core_import::TimestampError::Shape)
+    {
+        return Ok(None);
+    }
+    let zone = solstone_core_journal_config::owner_zone(journal);
+    let Some(stamp) = solstone_core_import::owner_instant(raw, zone) else {
+        return Err(failure(
+            "",
+            "timestamp must be YYYYMMDD_HHMMSS, or a date and time with its offset, such as 2025-11-02T01:30:00-07:00\n",
+            1,
+        ));
+    };
+    options.timestamp = Some(stamp.as_str().to_owned());
+    Ok(stamp.source_instant())
+}
+
+fn with_owner_instant(
+    timestamp: solstone_core_import::Timestamp,
+    instant: Option<chrono::DateTime<chrono::Utc>>,
+) -> solstone_core_import::Timestamp {
+    match instant {
+        Some(instant) => timestamp.with_source_instant(instant),
+        None => timestamp,
     }
 }
 

@@ -238,6 +238,17 @@ pub fn decide(candidates: impl IntoIterator<Item = Timestamp>) -> Option<Timesta
     chosen
 }
 
+/// Read an owner's timestamp given as an instant with its offset, such as
+/// `2025-11-02T01:30:00-07:00`. The stamp is that instant's wall clock in `zone`, and the
+/// instant is kept as an instant read from a file is, so the second occurrence of a repeated
+/// hour stays the second occurrence.
+pub fn owner_instant(raw: &str, zone: Tz) -> Option<Timestamp> {
+    utc_stamp(
+        DateTime::parse_from_rfc3339(raw).ok()?.with_timezone(&Utc),
+        zone,
+    )
+}
+
 fn utc_stamp(instant: DateTime<Utc>, zone: Tz) -> Option<Timestamp> {
     let instant = DateTime::from_timestamp(instant.timestamp(), 0)?;
     validate_timestamp(
@@ -1483,6 +1494,25 @@ mod tests {
             detect_creation(&path, None, chrono_tz::America::Denver),
             None
         );
+    }
+
+    #[test]
+    fn an_owner_instant_names_either_occurrence_of_a_repeated_hour() {
+        let zone = chrono_tz::America::Denver;
+        let first = owner_instant("2025-11-02T01:30:00-06:00", zone).unwrap();
+        let second = owner_instant("2025-11-02T01:30:00-07:00", zone).unwrap();
+        assert_eq!(first.as_str(), "20251102_013000");
+        assert_eq!(second.as_str(), "20251102_013000");
+        assert_eq!(
+            second.source_instant().unwrap() - first.source_instant().unwrap(),
+            chrono::Duration::hours(1)
+        );
+        // Another offset names the same instant on the journal's own clock.
+        let utc = owner_instant("2025-07-15T14:03:22Z", zone).unwrap();
+        assert_eq!(utc.as_str(), "20250715_080322");
+        for raw in ["20251102_013000", "2025-11-02T01:30:00", "2025-11-02"] {
+            assert_eq!(owner_instant(raw, zone), None, "{raw}");
+        }
     }
 
     #[test]

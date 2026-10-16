@@ -50,7 +50,9 @@ pub use contract::{
     SaveRequest, SourceHash, SourceImmutabilityReport, SyncBackendRequest, SyncGuidance,
     SyncPreviewRequest, SyncSaveRequest, observe_source_immutability, should_write_manifest,
 };
-pub use creation::{decide, detect_creation, detect_creation_with_exif, exif_creation_candidates};
+pub use creation::{
+    decide, detect_creation, detect_creation_with_exif, exif_creation_candidates, owner_instant,
+};
 pub use dedupe::{
     ImportManifestBackfillReport, ManifestMatch, ManifestScan, ManifestSkip, ManifestSkipReason,
     ManifestWriteRequest, backfill_retained_import_manifests, find_manifest_by_hash,
