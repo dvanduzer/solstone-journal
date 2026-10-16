@@ -17,9 +17,9 @@ pub const LLAMA_SERVER_PINS: &[(&str, &str, &str, &str, &str)] = &[
     ),
     (
         "x86_64-unknown-linux-gnu",
-        "b11429",
-        "llama-b11429-bin-ubuntu-vulkan-x64.tar.gz",
-        "632c4e98feba2b94407a2130e3133e0c3aefb0ea1ab41337e926d8bfafdd0b74",
+        "b11669",
+        "llama-b11669-bin-ubuntu-vulkan-x64.tar.gz",
+        "e8709e5ba6c1b093dea7f3de57f4aba842f9a188fba6b465782d65d6fcfa4d9f",
         "llama-server",
     ),
     (
@@ -200,6 +200,72 @@ pub const VULKAN_LINUX_ARM64_B11669_REQUIRED: &[RequiredMember] = &[
     RequiredMember::Regular("libggml-cpu-armv8.6_2.so"),
     RequiredMember::Regular("libggml-cpu-armv9.2_1.so"),
     RequiredMember::Regular("libggml-cpu-armv9.2_2.so"),
+    RequiredMember::Regular("libggml-rpc.so"),
+    RequiredMember::Regular("libggml-vulkan.so"),
+    RequiredMember::Link {
+        name: "libggml.so",
+        target: "libggml.so.0",
+    },
+    RequiredMember::Link {
+        name: "libggml.so.0",
+        target: "libggml.so.0.27.0",
+    },
+    RequiredMember::Regular("libggml.so.0.27.0"),
+    RequiredMember::Link {
+        name: "libllama-common.so",
+        target: "libllama-common.so.0",
+    },
+    RequiredMember::Link {
+        name: "libllama-common.so.0",
+        target: "libllama-common.so.0.7.0",
+    },
+    RequiredMember::Regular("libllama-common.so.0.7.0"),
+    RequiredMember::Regular("libllama-server-impl.so"),
+    RequiredMember::Link {
+        name: "libllama.so",
+        target: "libllama.so.0",
+    },
+    RequiredMember::Link {
+        name: "libllama.so.0",
+        target: "libllama.so.0.7.0",
+    },
+    RequiredMember::Regular("libllama.so.0.7.0"),
+    RequiredMember::Link {
+        name: "libmtmd.so",
+        target: "libmtmd.so.0",
+    },
+    RequiredMember::Link {
+        name: "libmtmd.so.0",
+        target: "libmtmd.so.0.7.0",
+    },
+    RequiredMember::Regular("libmtmd.so.0.7.0"),
+    RequiredMember::Regular("llama-server"),
+];
+
+pub const VULKAN_LINUX_X64_B11669_REQUIRED: &[RequiredMember] = &[
+    RequiredMember::Regular("LICENSE"),
+    RequiredMember::Link {
+        name: "libggml-base.so",
+        target: "libggml-base.so.0",
+    },
+    RequiredMember::Link {
+        name: "libggml-base.so.0",
+        target: "libggml-base.so.0.27.0",
+    },
+    RequiredMember::Regular("libggml-base.so.0.27.0"),
+    RequiredMember::Regular("libggml-cpu-alderlake.so"),
+    RequiredMember::Regular("libggml-cpu-cannonlake.so"),
+    RequiredMember::Regular("libggml-cpu-cascadelake.so"),
+    RequiredMember::Regular("libggml-cpu-cooperlake.so"),
+    RequiredMember::Regular("libggml-cpu-haswell.so"),
+    RequiredMember::Regular("libggml-cpu-icelake.so"),
+    RequiredMember::Regular("libggml-cpu-ivybridge.so"),
+    RequiredMember::Regular("libggml-cpu-piledriver.so"),
+    RequiredMember::Regular("libggml-cpu-sandybridge.so"),
+    RequiredMember::Regular("libggml-cpu-sapphirerapids.so"),
+    RequiredMember::Regular("libggml-cpu-skylakex.so"),
+    RequiredMember::Regular("libggml-cpu-sse42.so"),
+    RequiredMember::Regular("libggml-cpu-x64.so"),
     RequiredMember::Regular("libggml-rpc.so"),
     RequiredMember::Regular("libggml-vulkan.so"),
     RequiredMember::Link {
@@ -426,6 +492,7 @@ pub fn required_members_for(
         ("b11429", "x86_64-unknown-linux-gnu") => Some(VULKAN_LINUX_X64_B11429_REQUIRED),
         ("b11429", "aarch64-unknown-linux-gnu") => Some(VULKAN_LINUX_ARM64_B11429_REQUIRED),
         ("b11429", "aarch64-apple-darwin") => Some(METAL_MACOS_ARM64_B11429_REQUIRED),
+        ("b11669", "x86_64-unknown-linux-gnu") => Some(VULKAN_LINUX_X64_B11669_REQUIRED),
         ("b11669", "aarch64-unknown-linux-gnu") => Some(VULKAN_LINUX_ARM64_B11669_REQUIRED),
         ("b11669", "aarch64-apple-darwin") => Some(METAL_MACOS_ARM64_B11669_REQUIRED),
         ("b10068", _) => Some(B10068_REQUIRED),

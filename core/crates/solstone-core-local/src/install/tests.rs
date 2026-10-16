@@ -628,7 +628,7 @@ fn origin_urls_follow_the_catalog_for_every_rust_download_unit() {
             "llama-server-vulkan",
             Some(Platform::LinuxX64),
             None,
-            "https://updates.solstone.app/assets/llama-server-vulkan/b11429/llama-b11429-bin-ubuntu-vulkan-x64.tar.gz",
+            "https://updates.solstone.app/assets/llama-server-vulkan/b11669/llama-b11669-bin-ubuntu-vulkan-x64.tar.gz",
         ),
         (
             "llama-server-cuda",
@@ -2571,7 +2571,7 @@ fn registry_preserves_prechange_identity_literals() {
     assert_ne!(current_vulkan, historical_vulkan);
     assert_eq!(
         current_vulkan,
-        "{\"artifact_key\":\"x86_64-unknown-linux-gnu\",\"binary_name\":\"llama-server\",\"filename\":\"llama-b11429-bin-ubuntu-vulkan-x64.tar.gz\",\"release_tag\":\"b11429\",\"sha256\":\"632c4e98feba2b94407a2130e3133e0c3aefb0ea1ab41337e926d8bfafdd0b74\",\"unit\":\"llama-server-vulkan\"}"
+        "{\"artifact_key\":\"x86_64-unknown-linux-gnu\",\"binary_name\":\"llama-server\",\"filename\":\"llama-b11669-bin-ubuntu-vulkan-x64.tar.gz\",\"release_tag\":\"b11669\",\"sha256\":\"e8709e5ba6c1b093dea7f3de57f4aba842f9a188fba6b465782d65d6fcfa4d9f\",\"unit\":\"llama-server-vulkan\"}"
     );
     let current_arm_vulkan =
         fingerprint::canonical(pins::vulkan_identity("aarch64-unknown-linux-gnu").unwrap())
@@ -2645,7 +2645,7 @@ fn registry_path_fixtures_keep_directory_and_manifest_filename_distinct() {
         pins::cache_root(journal)
             .join("bin")
             .join(key)
-            .join("b11429")
+            .join("b11669")
             .join("llama-server")
     );
     assert_eq!(
@@ -2688,7 +2688,7 @@ fn registry_path_fixtures_keep_directory_and_manifest_filename_distinct() {
         pins::cache_root(journal)
             .join("bin")
             .join(key)
-            .join("b11429")
+            .join("b11669")
             .join("llama-server")
     );
     assert_eq!(

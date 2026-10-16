@@ -243,7 +243,7 @@ fn candidates(target: &str) -> Result<Vec<RuntimeFetch>, FetchSetError> {
             // llama-server-vulkan x86_64
             let a = find_catalog_row(
                 "llama-server-vulkan",
-                "llama-b11429-bin-ubuntu-vulkan-x64.tar.gz",
+                "llama-b11669-bin-ubuntu-vulkan-x64.tar.gz",
                 Some("x86_64-unknown-linux-gnu"),
             );
             rows.push(RuntimeFetch {
@@ -633,7 +633,7 @@ mod tests {
     use super::*;
 
     const ORACLE_LINUX_X86_64: &[&str] = &[
-        "assets/llama-server-vulkan/b11429/llama-b11429-bin-ubuntu-vulkan-x64.tar.gz",
+        "assets/llama-server-vulkan/b11669/llama-b11669-bin-ubuntu-vulkan-x64.tar.gz",
         "assets/local-model/e87f176479d0855a907a41277aca2f8ee7a09523/Qwen3.5-4B-Q4_K_M.gguf",
         "assets/local-model/e87f176479d0855a907a41277aca2f8ee7a09523/mmproj-F16.gguf",
         "assets/location-accuracy/overture-2026-09-23.1-r2/containment.slpk",
