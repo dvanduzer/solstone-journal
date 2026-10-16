@@ -699,13 +699,22 @@ pub fn perform(
     };
     let mut components = Vec::new();
     for invocation in invocations {
-        let out = runner
-            .run(
-                Path::new("/bin/sh"),
-                &invocation.args,
-                invocation.stdin_mode,
-            )
-            .map_err(|_| refusal("runner-failed", "could not run the installer."))?;
+        let out = match runner.run(
+            Path::new("/bin/sh"),
+            &invocation.args,
+            invocation.stdin_mode,
+        ) {
+            Ok(out) => out,
+            Err(_) => {
+                report.availability = Availability::Unknown;
+                report.current = None;
+                report.platform_version = None;
+                report.code = Some("runner-failed".to_owned());
+                report.message = Some("could not run the installer.".to_owned());
+                report.components = Some(components);
+                return Err((report, 1));
+            }
+        };
         let value = serde_json::from_slice::<serde_json::Value>(&out.stdout)
             .unwrap_or(serde_json::Value::Null);
         let details = component_reports(&value);
@@ -729,6 +738,8 @@ pub fn perform(
         }
         if !out.success {
             report.availability = Availability::Unknown;
+            report.current = None;
+            report.platform_version = None;
             report.code = Some(
                 value["root_code"]
                     .as_str()
@@ -1605,6 +1616,7 @@ mod tests {
         .unwrap_err();
         assert_ne!(code, 0);
         assert_eq!(report.code.as_deref(), Some("fetch-failed"));
+        assert!(report.current.is_none() && report.platform_version.is_none());
         let details = report.components.unwrap();
         assert!(
             details

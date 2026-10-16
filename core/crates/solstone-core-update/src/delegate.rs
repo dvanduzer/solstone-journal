@@ -42,10 +42,13 @@ impl InstallerRunner for RealInstallerRunner {
         args: &[OsString],
         stdin: StdinMode,
     ) -> std::io::Result<InstallerOutput> {
+        // Catalogue checks have a deadline. Approved installations remain in
+        // the foreground until their owner exits; timing out a privileged
+        // package manager could return while it is still changing the system.
         let limit = if args.iter().any(|a| a == OsStr::new("--list")) {
-            Duration::from_secs(30)
+            Some(Duration::from_secs(30))
         } else {
-            Duration::from_secs(15 * 60)
+            None
         };
         run_installer(program, args, stdin, limit)
     }
@@ -75,6 +78,11 @@ fn drain_output(mut input: impl Read, echo: bool) -> std::io::Result<Vec<u8>> {
 // of the child we started if its deadline expires.
 #[cfg(target_os = "linux")]
 fn terminate_descendants(pid: u32) {
+    // Stop each parent before killing its descendants so a failed child cannot
+    // release the shell to run the next command while teardown is in progress.
+    let _ = Command::new("/bin/kill")
+        .args(["-STOP", "--", &pid.to_string()])
+        .status();
     let children =
         std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).unwrap_or_default();
     for child in children
@@ -92,7 +100,7 @@ fn run_installer(
     program: &Path,
     args: &[OsString],
     stdin: StdinMode,
-    timeout: Duration,
+    timeout: Option<Duration>,
 ) -> std::io::Result<InstallerOutput> {
     let mut cmd = Command::new(program);
     cmd.args(args)
@@ -114,7 +122,7 @@ fn run_installer(
         if let Some(status) = child.try_wait()? {
             break (status, false);
         }
-        if started.elapsed() >= timeout {
+        if timeout.is_some_and(|limit| started.elapsed() >= limit) {
             #[cfg(target_os = "linux")]
             terminate_descendants(child.id());
             child.kill()?;
@@ -603,7 +611,7 @@ mod process_tests {
             Path::new("/bin/sh"),
             &args,
             StdinMode::Closed,
-            Duration::from_millis(50),
+            Some(Duration::from_millis(50)),
         )
         .unwrap();
         assert!(!output.success);
