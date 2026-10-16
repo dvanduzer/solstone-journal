@@ -10,6 +10,10 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - on the command line, `--timestamp` also takes a date and time with its offset, such as `2025-11-02T01:30:00-07:00`, so a recording from the hour that repeats when daylight saving time ends can be placed at its true time. the `YYYYMMDD_HHMMSS` form works as before.
 
+### Fixed
+
+- on linux, installing your journal now retries interrupted downloads and temporary download errors. an incomplete download reports a download failure instead of a signature mismatch.
+
 ## [2.0.48] - 2026-10-16
 
 ### Changed

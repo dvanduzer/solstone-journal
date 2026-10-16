@@ -255,6 +255,7 @@ mkdir -p "$HTTP_BIN"
 	printf '%s\n' 'headers=' 'dest=' 'while [ "$#" -gt 0 ]; do' '  case $1 in' '    -D) headers=$2; shift 2 ;;' '    -o) dest=$2; shift 2 ;;' '    -w) shift 2 ;;' '    -sS|--http1.1) shift ;;' '    *) shift ;;' '  esac' 'done'
 	printf '%s\n' 'case ${SOLSTONE_CURL_MODE:-latest-invalid} in'
 	printf '%s\n' '  latest-invalid)' "    printf 'HTTP/1.1 200 OK\\r\\n' >\"\$headers\"" "    printf 'not-a-version-token\\n' >\"\$dest\"" "    printf '200'" '    ;;'
+	printf '%s\n' '  partial)' "    printf 'HTTP/1.1 200 OK\\r\\n' >\"\$headers\"" "    printf 'partial' >\"\$dest\"" "    printf '200'" '    exit 56' '    ;;'
 	printf '%s\n' '  redirect)' "    printf 'HTTP/1.1 302 Found\\r\\nLocation: http://127.0.0.1/again\\r\\n' >\"\$headers\"" "    : >\"\$dest\"" "    printf '302'" '    ;;' 'esac'
 } >"$HTTP_BIN/curl"
 chmod 755 "$HTTP_BIN/curl"
@@ -264,6 +265,10 @@ expect_refuse latest-invalid latest-invalid \
 expect_refuse latest-invalid redirect-hop-exhaustion \
 	env PATH="$HTTP_BIN:$PATH" SOLSTONE_CURL_MODE=redirect HOME="$BASE/redirect-home" \
 	"$INSTALL" --prefix "$BASE/redirect-prefix" --origin http://127.0.0.1
+
+expect_refuse origin-refused incomplete-http-200-refuses-before-verification \
+	env PATH="$HTTP_BIN:$PATH" SOLSTONE_CURL_MODE=partial HOME="$BASE/partial-home" \
+	"$INSTALL" --prefix "$BASE/partial-prefix" --version 1.0.22 --origin http://127.0.0.1
 
 # No curl on PATH: wget must return the redirect to our origin check before
 # it can make another request. The stub models wget's automatic-follow default.
@@ -275,6 +280,10 @@ for cmd in sh tar sha256sum uname mktemp mkdir cp mv ln cat awk chmod wc tr cut 
 done
 cat >"$WGET_BIN/wget" <<'EOF'
 #!/bin/sh
+if [ "${SOLSTONE_WGET_PARTIAL:-0}" = 1 ]; then
+	printf '  HTTP/1.1 200 OK\n' >&2
+	exit 4
+fi
 for arg in "$@"; do
 	if [ "$arg" = --max-redirect=0 ]; then
 		printf '  HTTP/1.1 302 Found\n  Location: https://outside.invalid/bytes\n' >&2
@@ -285,6 +294,10 @@ done
 exit 0
 EOF
 chmod 755 "$WGET_BIN/wget"
+expect_refuse origin-refused wget-incomplete-http-200-refuses-before-verification \
+	env PATH="$WGET_BIN" SOLSTONE_UNAME_S=Linux SOLSTONE_UNAME_M="$HOST_ARCH" \
+	SOLSTONE_WGET_PARTIAL=1 HOME="$BASE/wget-partial-home" \
+	"$INSTALL" --prefix "$BASE/wget-partial-prefix" --version 1.0.22 --origin http://127.0.0.1
 expect_refuse origin-refused wget-redirect-origin-checked \
 	env PATH="$WGET_BIN" SOLSTONE_UNAME_S=Linux SOLSTONE_UNAME_M="$HOST_ARCH" \
 	SOLSTONE_WGET_LEAK="$BASE/wget-leak" HOME="$BASE/wget-home" \
