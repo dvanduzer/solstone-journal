@@ -120,7 +120,7 @@ const MODE_CASES: &[ModeCase] = &[
                 Expected {
                     exit: 1,
                     stream: Stream::Stderr,
-                    identifies: "detected timestamp",
+                    identifies: "Could not detect timestamp",
                 },
             ),
             (

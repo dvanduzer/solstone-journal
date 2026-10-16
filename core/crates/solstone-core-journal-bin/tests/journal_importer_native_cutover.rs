@@ -392,7 +392,7 @@ fn importer_modes(inputs: &Inputs) -> [(&'static str, Vec<Case>); 8] {
                     args: vec![path(&inputs.text)],
                     exit: 1,
                     stream: Stream::Stderr,
-                    contains: "detected timestamp",
+                    contains: "Could not detect timestamp",
                 },
                 Case {
                     args: vec![
