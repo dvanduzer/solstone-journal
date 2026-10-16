@@ -371,6 +371,9 @@ impl Inputs {
         image::RgbaImage::new(1, 1)
             .save(&image)
             .expect("image input");
+        // Images and PDFs are claimed by their content now; no importer claims this.
+        fs::write(directory.join("unclassified.bin"), b"not an export")
+            .expect("unclassified input");
         let archive = directory.join("archive.zip");
         write_zip(
             &archive,
@@ -453,7 +456,7 @@ impl Invocation {
             Self::UnclassifiedMedia => vec![
                 "--timestamp".to_owned(),
                 "20260311_120000".to_owned(),
-                path(inputs.path(Input::Image)),
+                path(&inputs.path(Input::Image).with_file_name("unclassified.bin")),
             ],
             Self::Structured { source, input } => {
                 let mut args = vec![

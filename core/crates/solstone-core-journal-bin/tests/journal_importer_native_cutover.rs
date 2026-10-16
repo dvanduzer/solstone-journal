@@ -239,6 +239,9 @@ impl Inputs {
         fs::copy(root.join("core/fixtures/pdf_corpus/text.pdf"), &pdf).expect("copy PDF fixture");
         let image = directory.join("image.png");
         fs::copy(root.join("core/fixtures/import_image.png"), &image).expect("copy image fixture");
+        // Images and PDFs are claimed by their content now; no importer claims this.
+        fs::write(directory.join("unclassified.bin"), b"not an export")
+            .expect("unclassified input");
         let archive = directory.join("archive.zip");
         write_zip(
             &archive,
@@ -398,7 +401,7 @@ fn importer_modes(inputs: &Inputs) -> [(&'static str, Vec<Case>); 8] {
                     args: vec![
                         "--timestamp".to_owned(),
                         "20260311_120000".to_owned(),
-                        path(&inputs.image),
+                        path(&inputs.image.with_file_name("unclassified.bin")),
                     ],
                     exit: 1,
                     stream: Stream::Stderr,
