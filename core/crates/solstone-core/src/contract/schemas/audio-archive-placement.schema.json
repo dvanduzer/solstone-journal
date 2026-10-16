@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "solstone-journal-format:audio-archive-placement",
+  "title": "Audio Archive Tile Placement",
+  "type": "object",
+  "required": ["version", "parts"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Placement record version, pinned to 1."
+    },
+    "parts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "stored_name",
+          "original_occurrence",
+          "origin_ms",
+          "offset_ms",
+          "length_ms"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "stored_name": {
+            "type": "string",
+            "pattern": "^p[0-9]{4}_[0-9a-f]{16}(\\.[A-Za-z0-9]{1,8})?$",
+            "description": "Stored member raw filename in the tile directory."
+          },
+          "original_occurrence": {
+            "type": "string",
+            "description": "Canonical occurrence string: utc|<epoch_ms> for unique instants, or local|<zone>|<YYYY-MM-DDTHH:MM:SS.mmm> for settled folds."
+          },
+          "original_time_ms": {
+            "type": "integer",
+            "description": "UTC epoch millisecond timestamp for unique instants; omitted for settled folds."
+          },
+          "origin_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Playable start offset in milliseconds inside the original source member."
+          },
+          "offset_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 299999,
+            "description": "Offset in milliseconds from the start of the 300-second tile window."
+          },
+          "length_ms": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 300000,
+            "description": "Duration of this placed part in milliseconds."
+          }
+        }
+      }
+    }
+  },
+  "x-journal-contract": {
+    "format_id": "audio-archive-placement",
+    "schema_owner": "solstone-core-format",
+    "reference_writer": "solstone-core-import",
+    "allowed_producers": ["solstone-core-import"],
+    "write_discipline": "one JSON document per published tile, written with that tile's raw members; never a replacement of another import's segment.",
+    "file_kind": "json",
+    "key_fields": [
+      "version",
+      "stored_name",
+      "original_occurrence",
+      "origin_ms",
+      "offset_ms",
+      "length_ms"
+    ],
+    "producer_write_paths": ["chronicle/YYYYMMDD/{stream}/HHMMSS_LEN/placement.json"]
+  }
+}

@@ -4470,7 +4470,9 @@ version = "2.0.48"
 dependencies = [
  "chrono",
  "chrono-tz",
+ "log",
  "regex",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",
