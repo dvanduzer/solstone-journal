@@ -147,16 +147,35 @@ pub fn compare_platform_versions(a: &str, b: &str) -> Option<Ordering> {
     }
 }
 
-pub fn owner_data_dir() -> std::path::PathBuf {
-    std::env::var_os("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| {
-            std::env::var_os("HOME")
-                .map(|h| std::path::PathBuf::from(h).join(".local/share"))
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
+pub fn owner_data_dir() -> Option<std::path::PathBuf> {
+    owner_data_dir_from(
+        std::env::var_os("XDG_DATA_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+fn owner_data_dir_from(
+    xdg: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<std::path::PathBuf> {
+    xdg.map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            home.map(std::path::PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .map(|path| path.join(".local/share"))
         })
-        .join("solstone")
+        .map(|path| path.join("solstone"))
+}
+
+impl UpdateReport {
+    pub fn owner_context_unknown() -> Self {
+        Self::refusal_unknown(
+            "hold-unknown",
+            "the update hold cannot be read.",
+            HoldState::Unknown,
+        )
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1670,5 +1689,33 @@ esac
         let actual = fs::read_to_string(marker).unwrap();
         assert!(actual.contains("--lane\nstaging\n") && actual.contains("--version\n2.0.49-r3\n"));
         assert!(actual.contains("--confirm-package-command\n") && actual.contains("--no-path\n"));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod owner_context_tests {
+    use super::*;
+    use std::ffi::OsStr;
+    #[test]
+    fn owner_data_directory_never_falls_back_to_the_working_directory() {
+        assert_eq!(owner_data_dir_from(None, None), None);
+        assert_eq!(
+            owner_data_dir_from(
+                Some(OsStr::new("relative")),
+                Some(OsStr::new("also-relative"))
+            ),
+            None
+        );
+        assert_eq!(
+            owner_data_dir_from(Some(OsStr::new("/data")), Some(OsStr::new("/home/owner"))),
+            Some("/data/solstone".into())
+        );
+        assert_eq!(
+            owner_data_dir_from(
+                Some(OsStr::new("relative")),
+                Some(OsStr::new("/home/owner"))
+            ),
+            Some("/home/owner/.local/share/solstone".into())
+        );
     }
 }

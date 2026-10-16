@@ -111,7 +111,7 @@ fn run_with_stdin_provider(
                 rest,
                 cfg!(target_os = "linux"),
                 &exe,
-                &data_dir,
+                data_dir.as_deref(),
                 etc_dir,
                 &fetch,
                 &runner,
@@ -351,7 +351,7 @@ pub(crate) fn run_with_update_seams(
     args: &[OsString],
     os_linux: bool,
     executable: &Path,
-    data_dir: &Path,
+    data_dir: Option<&Path>,
     etc_dir: &Path,
     fetch: &dyn solstone_core_update::InstallerFetch,
     runner: &dyn solstone_core_update::InstallerRunner,
@@ -371,16 +371,23 @@ pub(crate) fn run_with_update_seams(
         }
     };
 
-    let result = solstone_core_update::perform(
-        runner,
-        fetch,
-        probe,
-        executable,
-        data_dir,
-        etc_dir,
-        os_linux,
-        &update_args,
-    );
+    let result = if let Some(data_dir) = data_dir {
+        solstone_core_update::perform(
+            runner,
+            fetch,
+            probe,
+            executable,
+            data_dir,
+            etc_dir,
+            os_linux,
+            &update_args,
+        )
+    } else {
+        Err((
+            solstone_core_update::UpdateReport::owner_context_unknown(),
+            1,
+        ))
+    };
 
     let (report, exit_code) = match result {
         Ok(rep) => (rep, 0),
@@ -2086,7 +2093,7 @@ mod tests {
             &[OsString::from("--check")],
             true,
             &exe,
-            &data,
+            Some(&data),
             &etc,
             &fetch,
             &runner,
@@ -2168,7 +2175,8 @@ mod tests {
             fetch_called: std::sync::Mutex::new(false),
         };
 
-        let out = run_with_update_seams(&[], true, &exe, &data, &etc, &fetch, &runner, &probe);
+        let out =
+            run_with_update_seams(&[], true, &exe, Some(&data), &etc, &fetch, &runner, &probe);
 
         assert_ne!(out.exit, 0);
         assert!(
@@ -2193,7 +2201,8 @@ mod tests {
             fetch_called: std::sync::Mutex::new(false),
         };
 
-        let out = run_with_update_seams(&[], false, &exe, &data, &etc, &fetch, &runner, &probe);
+        let out =
+            run_with_update_seams(&[], false, &exe, Some(&data), &etc, &fetch, &runner, &probe);
 
         assert_eq!(out.exit, 1);
         assert!(out.stdout.contains("non-linux"));
@@ -2221,7 +2230,7 @@ mod tests {
             &[OsString::from("--help")],
             false,
             &exe,
-            &data,
+            Some(&data),
             &etc,
             &fetch,
             &runner,
@@ -2233,5 +2242,33 @@ mod tests {
         assert!(out.stdout.contains("--hold"));
         assert!(!*fetch.fetch_called.lock().unwrap());
         assert_eq!(runner.recorded_args.lock().unwrap().len(), 0);
+    }
+    #[test]
+    fn update_without_an_owner_directory_refuses_before_fetch_or_mutation() {
+        let runner = MockUpdateRunner {
+            responses: std::sync::Mutex::new(vec![]),
+            recorded_args: std::sync::Mutex::new(vec![]),
+        };
+        let fetch = MockUpdateFetch {
+            script_path: PathBuf::from("unused"),
+            fetch_called: std::sync::Mutex::new(false),
+        };
+        let args = ["--hold", "--json"].map(OsString::from);
+        let out = run_with_update_seams(
+            &args,
+            true,
+            Path::new("/usr/bin/solstone"),
+            None,
+            Path::new("/etc"),
+            &fetch,
+            &runner,
+            &MockUpdatePackageProbe(true),
+        );
+        assert_ne!(out.exit, 0);
+        let json: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+        assert_eq!(json["code"], "hold-unknown");
+        assert_eq!(json["hold"], "unknown");
+        assert!(!*fetch.fetch_called.lock().unwrap());
+        assert!(runner.recorded_args.lock().unwrap().is_empty());
     }
 }

@@ -251,8 +251,9 @@ fn apply_permanent_devices_shell_divergence(expected: &mut Value) {
 fn apply_client_capture_projection_rename(expected: &mut Value) {
     #[cfg(target_os = "linux")]
     {
-        let hold_state =
-            solstone_core_update::read_hold_state(&solstone_core_update::owner_data_dir());
+        let hold_state = solstone_core_update::owner_data_dir()
+            .map(|dir| solstone_core_update::read_hold_state(&dir))
+            .unwrap_or(solstone_core_update::HoldState::Unknown);
         let hold_str = match hold_state {
             solstone_core_update::HoldState::Held => "held",
             solstone_core_update::HoldState::Unheld => "unheld",

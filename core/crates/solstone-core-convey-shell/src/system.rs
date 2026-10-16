@@ -18,17 +18,17 @@ pub async fn status(journal_root: PathBuf) -> Response {
     {
         let current_exe = std::env::current_exe();
         let version_report = tokio::task::spawn_blocking(move || {
+            let Some(data_dir) = solstone_core_update::owner_data_dir() else {
+                return solstone_core_update::UpdateReport::owner_context_unknown();
+            };
             let exe = match current_exe {
                 Ok(ref p) => p.as_path(),
                 Err(_) => {
                     return solstone_core_update::UpdateReport::not_owned_unknown(
-                        solstone_core_update::read_hold_state(
-                            &solstone_core_update::owner_data_dir(),
-                        ),
+                        solstone_core_update::read_hold_state(&data_dir),
                     );
                 }
             };
-            let data_dir = solstone_core_update::owner_data_dir();
             let etc_dir = std::path::Path::new("/etc");
             let fetch = solstone_core_update::RealInstallerFetch;
             let runner = solstone_core_update::RealInstallerRunner;
@@ -38,7 +38,9 @@ pub async fn status(journal_root: PathBuf) -> Response {
         .await
         .unwrap_or_else(|_| {
             solstone_core_update::UpdateReport::not_owned_unknown(
-                solstone_core_update::read_hold_state(&solstone_core_update::owner_data_dir()),
+                solstone_core_update::owner_data_dir()
+                    .map(|dir| solstone_core_update::read_hold_state(&dir))
+                    .unwrap_or(solstone_core_update::HoldState::Unknown),
             )
         });
 
