@@ -6,24 +6,29 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.0.48] - 2026-10-16
+
+### Changed
+
+- new imports use creation dates in common filenames, photos, audio and video files instead of the date a file was copied. when no creation date is found, you can choose one. this works from the import page and the command line without installing an extra tool.
+- returning to health or known voices takes less time on large journals.
+
 ### Fixed
 
-- audio processing reports when it is waiting or has failed, instead of saying it has finished.
-- photo blocks in transcripts' detail column now have a shaded fill and a visible border. before, they blended into the background with only a faint shadow.
-- after a linux package upgrade, your journal refreshes installed models and agent skills on its next start. you do not need to run setup again.
-- installed mac transcription models and location data now refresh in the background when an update includes changed files. if the refresh fails, the installed copy stays usable and your journal tries again on a later start.
-- new imports use creation dates in common filenames, photos, audio and video files instead of the date a file was copied. when no creation date is found, you can choose one. this works from the import page and the command line without installing an extra tool.
-- new conversations imported across midnight and daylight saving changes keep their source times. conversations in the repeated hour are kept separately, and timed text that crosses midnight continues on the next day. existing recordings stay where they are.
 - security fix: app updates on mac now check each download address before connecting. before, a redirected update download could contact another website and reveal that you were checking for updates.
-- fixed an access-denied error when importing a journal archive on windows.
-- security fix: on mac, a redirected speech-model download could tell another website that you were using transcription. missing or damaged models now ask you to repair them with the journal's installer.
-- when older recordings arrive late, your journal no longer links them as if they were recorded after newer ones.
+- security fix: on mac, a redirected speech-model download could tell another website that you were using transcription. when a speech model fails to load, your journal now leaves the installed files in place and reports the problem instead of downloading a replacement.
 - security fix: exports from older journals could include private keys for connections to other journals, giving a copy of those keys to anyone you shared the export with. exports now leave out those keys.
+- security fix: a redirect could disclose an install or update request to another website. the linux installer's wget downloads now check each redirect before following it, and windows update checks and downloads refuse redirects.
+- on the command line, audio processing now says when it is waiting or has failed, instead of saying it has finished.
+- photo blocks in transcripts' detail column now have a shaded fill and a visible border. before, they blended into the background with only a faint shadow.
+- after a linux package upgrade, you no longer need to run setup again. your journal refreshes what you've installed on its next start.
+- on mac, installed transcription models now refresh in the background when an update includes changed files, and on every platform installed location data does the same. if the refresh fails, the installed copy stays usable and your journal tries again on a later start.
+- new conversations imported across midnight and daylight saving changes keep their source times. conversations in the repeated hour are kept separately, and timed text that crosses midnight continues on the next day. existing imports stay where they are.
+- fixed an access-denied error when importing a journal archive on windows.
+- when older recordings arrive late, your journal no longer links them as if they were recorded after newer ones.
 - changing your backup recovery key now saves and checks the replacement before removing the old key. if removal is interrupted, trying again finishes the same change.
 - small orange links and labels in your journal dashboard are easier to read in light appearance. if your journal's mark cannot be read, its placeholder now follows the dashboard's appearance. opening support keeps the navigation in place.
-- security fix: a redirect could disclose an install or update request to another website. the linux installer's wget downloads now check each redirect before following it, and windows update checks and downloads refuse redirects.
 - the location accuracy download prompt now names updates.solstone.app.
-- returning to health or known voices takes less time on large journals.
 - in the date picker, each day now sits under its day of the week, and the days of the week are labeled along the top. before, every month started in the first column, so most dates looked like they fell on the wrong day. the up and down arrow keys now move a week at a time.
 - on windows, links to saved output from a thinking run open again.
 - on windows, `solstone link join` can finish pairing and save connection settings.
@@ -31,7 +36,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - sharing to your journal from your iphone or ipad works again. since 2.0.42, your journal turned away every photo, voice memo, pdf and piece of text you shared from your phone, saying to preview the import first, which the phone has no way to do. anything your phone is still holding goes into your journal on its own once your journal is updated and your phone connects to it again.
 - on the import page, dropping a photo or a pdf into quick import works again. since 2.0.42, its preview stopped with an error instead.
 - media offload runs again on some journals that go back to before version 2.0. 2.0.47 said offload ran again on a large journal, but on these journals the check it runs first still stopped it before it began. nothing was removed, and your media stayed on this computer.
-- opus recordings you import now keep their opening sound. before, each imported opus file lost about 20 milliseconds from its start.
+- Opus recordings you import now keep their opening sound. before, each imported Opus file lost about 20 milliseconds from its start.
 - when part of an audio file can't be imported, the command line now names the part that's missing, and the file is no longer counted as imported. before, trying the file again was turned away as already imported. importing it again adds a second copy of the parts that did get in.
 
 ## [2.0.47] - 2026-10-15
