@@ -1,26 +1,372 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
+#[cfg(feature = "full-tests")]
 use std::collections::HashMap;
+#[cfg(feature = "full-tests")]
 use std::fs;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(feature = "full-tests")]
+use std::time::Duration;
 
 use chrono_tz::Tz;
+#[cfg(feature = "full-tests")]
 use sha2::{Digest, Sha256};
+#[cfg(feature = "full-tests")]
 use solstone_core_format::audio_archive::AUDIO_ARCHIVE_PLACEMENT_FILENAME;
+#[cfg(feature = "full-tests")]
 use tempfile::TempDir;
 
 use super::*;
-use crate::metadata::{admit_running_attempt, record_completed_attempt};
 
 const NY: Tz = Tz::America__New_York;
 const UTC_ZONE: Tz = Tz::UTC;
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+#[cfg(feature = "full-tests")]
+#[test]
+fn same_tile_multi_part_rejection_prunes_staged_bytes_and_skips_stale_callbacks() {
+    struct Rejecting {
+        materials: HashMap<String, Vec<u8>>,
+        bad: String,
+        reject_zero: bool,
+        calls: std::cell::Cell<usize>,
+    }
+    impl AudioArchiveMaterializer for Rejecting {
+        fn materialize(
+            &self,
+            member: &AudioArchiveRecordMember,
+            part: &AudioArchiveRecordPart,
+            target: &std::path::Path,
+        ) -> Result<(), AudioArchiveError> {
+            if member.sha256 == self.bad {
+                self.calls.set(self.calls.get() + 1);
+                if (part.origin_ms == 0) == self.reject_zero {
+                    fs::write(target, b"partial failed source bytes")?;
+                    return Err(AudioArchiveError::SourceRejected(SourceRejection::Changed));
+                }
+            }
+            self.materials.materialize(member, part, target)
+        }
+    }
+    for reject_zero in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let journal = temp.path();
+        let (a, a_bytes) = storage_member(231, "2026-11-01T01:00:20-04:00", 3_590_000);
+        let (b, b_bytes) = storage_member(232, "2026-11-01T01:00:11-04:00", 7500);
+        let materializer = Rejecting {
+            materials: HashMap::from([
+                (a.sha256.clone(), a_bytes),
+                (b.sha256.clone(), b_bytes.clone()),
+            ]),
+            bad: a.sha256.clone(),
+            reject_zero,
+            calls: std::cell::Cell::new(0),
+        };
+        let result = publish_audio_archive(
+            journal,
+            AudioArchivePublishOptions {
+                import_id: None,
+                members: vec![a, b],
+                materializer: &materializer,
+                owner_zone: NY,
+                settings: default_settings(),
+                source_timestamp: None,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(materializer.calls.get(), if reject_zero { 2 } else { 1 });
+        let status = ArchiveStore::open(journal, &result.import_id, false)
+            .unwrap()
+            .status()
+            .unwrap();
+        assert!(status.save_complete);
+        assert_eq!(
+            (
+                status.saved_parts,
+                status.rejected_parts,
+                status.saved_tiles
+            ),
+            (1, 13, 1)
+        );
+        let healthy = result
+            .record
+            .parts
+            .iter()
+            .find(|part| part.outcome == PartOutcome::Saved)
+            .unwrap();
+        let tile = journal
+            .join("chronicle")
+            .join(&healthy.day)
+            .join(&result.record.settings.stream)
+            .join(&healthy.segment_key);
+        assert_eq!(fs::read(tile.join(&healthy.stored_name)).unwrap(), b_bytes);
+        let placement: solstone_core_format::audio_archive::AudioArchivePlacement =
+            serde_json::from_slice(&fs::read(tile.join(AUDIO_ARCHIVE_PLACEMENT_FILENAME)).unwrap())
+                .unwrap();
+        assert_eq!(placement.parts.len(), 1);
+        assert_eq!(
+            fs::read_dir(&tile)
+                .unwrap()
+                .filter(|entry| entry
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == "ogg"))
+                .count(),
+            1
+        );
+        let batch = update_pending_archive_tiles(journal, 64).unwrap();
+        assert!(batch.errors.is_empty());
+        assert_eq!(batch.tiles.len(), 1);
+        assert_eq!(batch.tiles[0].parts.len(), 1);
+    }
+}
+
+#[test]
+fn rejected_probe_preserves_source_evidence_without_reserving_a_tile() {
+    let input = AudioArchiveMemberInput {
+        original_relative_name: "unreadable.ogg".into(),
+        byte_len: 123,
+        sha256: String::new(),
+        duration: DurationInput::Rejected(SourceRejection::Unreadable),
+        start: MemberStartEvidence {
+            instant: Some("2025-06-01T08:00:00-06:00".into()),
+            ..Default::default()
+        },
+        run_note: None,
+    };
+    let plan = plan_audio_archive(std::slice::from_ref(&input), NY, default_settings()).unwrap();
+    assert!(plan.tiles.is_empty());
+    assert_eq!(plan.size.source_bytes, 123);
+    assert_eq!(plan.members[0].source_start, input.start);
+    assert_eq!(
+        plan.members[0].disposition,
+        MemberDisposition::LeftOut(LeftOutReason::SourceRejected {
+            cause: SourceRejection::Unreadable
+        })
+    );
+}
+
+#[cfg(feature = "full-tests")]
+#[test]
+fn source_rejections_preserve_saved_long_parts_and_do_not_block_other_members() {
+    struct Rejecting {
+        materials: HashMap<String, Vec<u8>>,
+        long: String,
+        unreadable: String,
+    }
+    impl AudioArchiveMaterializer for Rejecting {
+        fn materialize(
+            &self,
+            member: &AudioArchiveRecordMember,
+            part: &AudioArchiveRecordPart,
+            target: &std::path::Path,
+        ) -> Result<(), AudioArchiveError> {
+            if member.sha256 == self.long && part.origin_ms > 0 {
+                return Err(AudioArchiveError::SourceRejected(SourceRejection::Changed));
+            }
+            if member.sha256 == self.unreadable {
+                return Err(AudioArchiveError::SourceRejected(
+                    SourceRejection::Unreadable,
+                ));
+            }
+            self.materials.materialize(member, part, target)
+        }
+    }
+    let temp = TempDir::new().unwrap();
+    let journal = temp.path();
+    let sources = [
+        storage_member(201, "2026-01-14T21:00:00Z", 400_000),
+        storage_member(202, "2026-01-14T21:06:50Z", 7500),
+        storage_member(203, "2026-01-14T21:10:00Z", 7500),
+        storage_member(204, "2026-01-14T21:10:15Z", 7500),
+    ];
+    let members: Vec<_> = sources.iter().map(|(member, _)| member.clone()).collect();
+    let materializer = Rejecting {
+        materials: sources
+            .iter()
+            .map(|(member, bytes)| (member.sha256.clone(), bytes.clone()))
+            .collect(),
+        long: members[0].sha256.clone(),
+        unreadable: members[2].sha256.clone(),
+    };
+    let result = publish_audio_archive(
+        journal,
+        AudioArchivePublishOptions {
+            import_id: None,
+            members: members.clone(),
+            materializer: &materializer,
+            owner_zone: NY,
+            settings: default_settings(),
+            source_timestamp: None,
+        },
+        None,
+    )
+    .unwrap();
+    let status = ArchiveStore::open(journal, &result.import_id, false)
+        .unwrap()
+        .status()
+        .unwrap();
+    assert_eq!(
+        (
+            status.saved_parts,
+            status.rejected_parts,
+            status.saved_members,
+            status.pending_processing
+        ),
+        (3, 2, 2, 3)
+    );
+    assert!(status.save_complete);
+    assert_eq!(
+        result.record.members[0].save_rejection,
+        Some(SourceRejection::Changed)
+    );
+    assert_eq!(
+        result.record.members[2].save_rejection,
+        Some(SourceRejection::Unreadable)
+    );
+    assert_eq!(
+        result
+            .record
+            .parts
+            .iter()
+            .filter(|part| part.outcome == PartOutcome::Saved)
+            .count(),
+        3
+    );
+    let batch = update_pending_archive_tiles(journal, 64).unwrap();
+    assert!(batch.errors.is_empty());
+    assert_eq!(
+        batch
+            .tiles
+            .iter()
+            .map(|tile| tile.parts.len())
+            .sum::<usize>(),
+        3
+    );
+    let snapshots: Vec<_> = result
+        .record
+        .parts
+        .iter()
+        .filter(|part| part.outcome == PartOutcome::Saved)
+        .map(|part| {
+            let raw = journal
+                .join("chronicle")
+                .join(&part.day)
+                .join(&result.record.settings.stream)
+                .join(&part.segment_key)
+                .join(&part.stored_name);
+            (
+                raw.clone(),
+                fs::metadata(&raw).unwrap().modified().unwrap(),
+                fs::read(&raw).unwrap(),
+            )
+        })
+        .collect();
+    let resumed = publish_audio_archive(
+        journal,
+        AudioArchivePublishOptions {
+            import_id: Some(&result.import_id),
+            members,
+            materializer: &materializer,
+            owner_zone: NY,
+            settings: default_settings(),
+            source_timestamp: None,
+        },
+        None,
+    )
+    .unwrap();
+    assert_eq!(resumed.record, result.record);
+    for (raw, modified, bytes) in snapshots {
+        assert_eq!(fs::read(&raw).unwrap(), bytes);
+        assert_eq!(fs::metadata(raw).unwrap().modified().unwrap(), modified);
+    }
+}
+
+#[cfg(feature = "full-tests")]
+#[test]
+fn reused_timestamp_does_not_inherit_removed_run_claims_or_pending_coordinates() {
+    let temp = TempDir::new().unwrap();
+    let journal = temp.path();
+    let (a, a_bytes) = storage_member(211, "2026-01-14T21:00:00Z", 7500);
+    let (b, b_bytes) = storage_member(212, "2026-01-14T22:00:00Z", 7500);
+    let materializer = HashMap::from([(a.sha256.clone(), a_bytes), (b.sha256.clone(), b_bytes)]);
+    let run = |members: Vec<_>, qualifier: &str| {
+        publish_audio_archive(
+            journal,
+            AudioArchivePublishOptions {
+                import_id: None,
+                members,
+                materializer: &materializer,
+                owner_zone: NY,
+                settings: AudioArchiveSettings {
+                    qualifier: qualifier.into(),
+                    archive_identity: qualifier.into(),
+                },
+                source_timestamp: Some(
+                    crate::timestamp::validate_timestamp("20260115_000000").unwrap(),
+                ),
+            },
+            None,
+        )
+        .unwrap()
+    };
+    let first = run(vec![a.clone()], "original");
+    fs::remove_dir_all(journal.join("imports").join(&first.import_id)).unwrap();
+    let replacement = run(vec![b], "replacement");
+    assert_eq!(first.import_id, replacement.import_id);
+    let mut settings = default_settings();
+    settings.qualifier = "released".into();
+    let preview =
+        prepare_audio_archive_plan(journal, std::slice::from_ref(&a), NY, settings).unwrap();
+    assert_eq!(preview.members[0].disposition, MemberDisposition::Included);
+    let released = run(vec![a], "released");
+    assert_eq!(released.parts_saved, 1);
+    let batch = update_pending_archive_tiles(journal, 64).unwrap();
+    assert!(batch.errors.is_empty());
+    assert_eq!(batch.tiles.len(), 2);
+    assert!(
+        batch
+            .tiles
+            .iter()
+            .all(|tile| tile.stream != "import.original")
+    );
+}
+
+#[cfg(feature = "full-tests")]
+#[test]
+fn damaged_newer_pending_prefix_cannot_starve_healthy_older_work() {
+    let temp = TempDir::new().unwrap();
+    let journal = temp.path();
+    let (member, bytes) = storage_member(221, "2025-01-14T21:00:00Z", 7500);
+    let materials = HashMap::from([(member.sha256.clone(), bytes)]);
+    let healthy = storage_publish(journal, None, &[member], &materials, None).unwrap();
+    let bad_id = "20260120_000000";
+    fs::create_dir_all(journal.join("imports").join(bad_id)).unwrap();
+    fs::write(
+        journal
+            .join("imports")
+            .join(bad_id)
+            .join(AUDIO_ARCHIVE_RECORD_FILENAME),
+        b"not a sqlite database",
+    )
+    .unwrap();
+    for ordinal in 0..64 {
+        let minutes = ordinal * 5;
+        let key = format!("{:02}{:02}00_300", minutes / 60, minutes % 60);
+        super::claims::register_pending_tile(journal, bad_id, "20260120", &key).unwrap();
+    }
+    let first = update_pending_archive_tiles(journal, 64).unwrap();
+    assert_eq!(first.errors.len(), 64);
+    assert!(first.tiles.is_empty());
+    let second = update_pending_archive_tiles(journal, 64).unwrap();
+    assert!(
+        second
+            .tiles
+            .iter()
+            .any(|tile| tile.import_id == healthy.import_id)
+    );
 }
 
 fn default_settings() -> AudioArchiveSettings {
@@ -35,6 +381,150 @@ fn dummy_hash(idx: u8) -> String {
 }
 
 #[test]
+fn equal_bytes_at_two_times_in_one_tile_have_independent_raw_targets() {
+    let first = AudioArchiveMemberInput {
+        original_relative_name: "one.ogg".to_owned(),
+        byte_len: 100,
+        sha256: dummy_hash(91),
+        duration: DurationInput::Milliseconds(7500),
+        start: MemberStartEvidence {
+            instant: Some("2025-06-01T08:00:00-06:00".to_owned()),
+            ..Default::default()
+        },
+        run_note: None,
+    };
+    let mut second = first.clone();
+    second.original_relative_name = "renamed.ogg".to_owned();
+    second.start.instant = Some("2025-06-01T08:00:12.500-06:00".to_owned());
+    let plan =
+        plan_audio_archive(&[first, second], Tz::America__Denver, default_settings()).unwrap();
+    assert_eq!(plan.tiles.len(), 1);
+    assert_eq!(plan.tiles[0].parts.len(), 2);
+    assert_ne!(
+        plan.tiles[0].parts[0].stored_name,
+        plan.tiles[0].parts[1].stored_name
+    );
+    assert_eq!(plan.tiles[0].parts[1].offset_ms, 12_500);
+}
+
+#[test]
+fn held_member_reserves_no_interval_for_a_different_archive_stream() {
+    let first = AudioArchiveMemberInput {
+        original_relative_name: "held.ogg".to_owned(),
+        byte_len: 100,
+        sha256: dummy_hash(92),
+        duration: DurationInput::Milliseconds(7500),
+        start: MemberStartEvidence {
+            instant: Some("2025-06-01T08:00:00-06:00".to_owned()),
+            ..Default::default()
+        },
+        run_note: None,
+    };
+    let mut second = first.clone();
+    second.sha256 = dummy_hash(93);
+    second.original_relative_name = "other.ogg".to_owned();
+    let mut plan =
+        plan_audio_archive(&[first, second], Tz::America__Denver, default_settings()).unwrap();
+    let held = std::collections::HashSet::from([plan.members[0].identity.clone()]);
+    super::plan::apply_held_members(&mut plan, &held).unwrap();
+    assert_eq!(
+        plan.members[0].disposition,
+        MemberDisposition::LeftOut(LeftOutReason::HeldByExistingRun)
+    );
+    assert_eq!(plan.members[1].disposition, MemberDisposition::Included);
+    assert_eq!(
+        plan.tiles[0].parts[0].member_identity.sha256,
+        dummy_hash(93)
+    );
+}
+
+#[test]
+fn run_record_preserves_unsettled_evidence_and_source_population() {
+    let input = AudioArchiveMemberInput {
+        original_relative_name: "unknown.ogg".to_owned(),
+        byte_len: 123,
+        sha256: dummy_hash(94),
+        duration: DurationInput::Milliseconds(7500),
+        start: MemberStartEvidence {
+            local_civil: Some("2025-11-02T01:58:00".to_owned()),
+            authority: MemberTimeAuthority::Filename,
+            ..Default::default()
+        },
+        run_note: Some("owner note".to_owned()),
+    };
+    let plan = plan_audio_archive(
+        std::slice::from_ref(&input),
+        Tz::America__Denver,
+        default_settings(),
+    )
+    .unwrap();
+    let record = super::record::plan_to_record(&plan);
+    assert_eq!(record.members[0].source_start, input.start);
+    assert_eq!(record.members[0].duration_ms, 7500);
+    assert_eq!(record.members[0].run_note, input.run_note);
+    assert_eq!(plan.size.source_bytes, 123);
+    assert_eq!(plan.size.members, 1);
+    assert_eq!(plan.size.bytes, 0);
+}
+
+#[cfg(feature = "full-tests")]
+fn storage_member(
+    seed: u32,
+    instant: &str,
+    duration_ms: i64,
+) -> (AudioArchiveMemberInput, Vec<u8>) {
+    let bytes = format!("synthetic storage payload {seed}").into_bytes();
+    let member = AudioArchiveMemberInput {
+        original_relative_name: format!("member-{seed}.ogg"),
+        byte_len: bytes.len() as u64,
+        sha256: format!("{:x}", Sha256::digest(&bytes)),
+        duration: DurationInput::Milliseconds(duration_ms),
+        start: MemberStartEvidence {
+            instant: Some(instant.to_owned()),
+            ..Default::default()
+        },
+        run_note: None,
+    };
+    (member, bytes)
+}
+#[cfg(feature = "full-tests")]
+fn storage_publish(
+    journal: &std::path::Path,
+    id: Option<&str>,
+    members: &[AudioArchiveMemberInput],
+    bytes: &HashMap<String, Vec<u8>>,
+    fault: Option<ArchiveFault>,
+) -> Result<AudioArchivePublishResult, AudioArchiveError> {
+    publish_audio_archive(
+        journal,
+        AudioArchivePublishOptions {
+            import_id: id,
+            members: members.to_vec(),
+            materializer: bytes,
+            owner_zone: NY,
+            settings: default_settings(),
+            source_timestamp: None,
+        },
+        Some(AudioArchivePublishSeams {
+            fault,
+            emit_observed: None,
+            heartbeat_spawner: Some(|_, _| Ok(std::thread::spawn(|| {}))),
+        }),
+    )
+}
+#[cfg(feature = "full-tests")]
+fn storage_run(journal: &std::path::Path) -> String {
+    let ids: Vec<_> = fs::read_dir(journal.join("imports"))
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| entry.file_type().unwrap().is_dir())
+        .map(|entry| entry.file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 1);
+    ids[0].clone()
+}
+
+#[test]
 fn pure_plan_bad_durations_and_unsettled_times() {
     let inputs = vec![
         AudioArchiveMemberInput {
@@ -46,6 +536,7 @@ fn pure_plan_bad_durations_and_unsettled_times() {
                 instant: Some("2026-01-15T10:00:00.500Z".to_owned()),
                 local_civil: None,
                 source_zone: None,
+                ..Default::default()
             },
             run_note: None,
         },
@@ -58,6 +549,7 @@ fn pure_plan_bad_durations_and_unsettled_times() {
                 instant: Some("2026-01-15T10:00:00.500Z".to_owned()),
                 local_civil: None,
                 source_zone: None,
+                ..Default::default()
             },
             run_note: None,
         },
@@ -70,6 +562,7 @@ fn pure_plan_bad_durations_and_unsettled_times() {
                 instant: Some("2026-01-15T10:00:00.500Z".to_owned()),
                 local_civil: None,
                 source_zone: None,
+                ..Default::default()
             },
             run_note: None,
         },
@@ -82,6 +575,7 @@ fn pure_plan_bad_durations_and_unsettled_times() {
                 instant: Some("2026-01-15T10:00:00.500Z".to_owned()),
                 local_civil: None,
                 source_zone: None,
+                ..Default::default()
             },
             run_note: None,
         },
@@ -94,6 +588,7 @@ fn pure_plan_bad_durations_and_unsettled_times() {
                 instant: None,
                 local_civil: None,
                 source_zone: None,
+                ..Default::default()
             },
             run_note: None,
         },
@@ -106,6 +601,7 @@ fn pure_plan_bad_durations_and_unsettled_times() {
                 instant: Some("2026-01-15T10:00:00.500".to_owned()),
                 local_civil: None,
                 source_zone: None,
+                ..Default::default()
             },
             run_note: None,
         },
@@ -156,6 +652,7 @@ fn subsecond_and_short_durations() {
             instant: Some("2026-01-14T21:00:00.500Z".to_owned()),
             local_civil: None,
             source_zone: None,
+            ..Default::default()
         },
         run_note: None,
     }];
@@ -186,6 +683,7 @@ fn worked_fixtures_hardcoded_numbers() {
             instant: None,
             local_civil: Some("2026-01-15T10:00:00.500".to_owned()),
             source_zone: Some("Pacific/Auckland".to_owned()),
+            ..Default::default()
         },
         run_note: None,
     };
@@ -205,6 +703,7 @@ fn worked_fixtures_hardcoded_numbers() {
             instant: None,
             local_civil: Some("2026-01-15T18:07:30.250".to_owned()),
             source_zone: Some("Pacific/Auckland".to_owned()),
+            ..Default::default()
         },
         run_note: None,
     };
@@ -252,6 +751,7 @@ fn settled_fold_and_unsettled_folds() {
             instant: None,
             local_civil: Some("2026-11-01T01:30:00.000".to_owned()),
             source_zone: Some("America/New_York".to_owned()),
+            ..Default::default()
         },
         run_note: None,
     };
@@ -292,6 +792,7 @@ fn settled_fold_and_unsettled_folds() {
             instant: None,
             local_civil: Some("2026-11-01T01:30:00.000".to_owned()),
             source_zone: Some("America/New_York".to_owned()),
+            ..Default::default()
         },
         run_note: None,
     };
@@ -311,6 +812,7 @@ fn settled_fold_and_unsettled_folds() {
             instant: None,
             local_civil: Some("2026-03-08T02:30:00.000".to_owned()),
             source_zone: Some("America/New_York".to_owned()),
+            ..Default::default()
         },
         run_note: None,
     };
@@ -333,6 +835,7 @@ fn agreeing_and_conflicting_evidence() {
             instant: Some("2026-01-15T05:07:30.250Z".to_owned()),
             local_civil: Some("2026-01-15T18:07:30.250".to_owned()),
             source_zone: Some("Pacific/Auckland".to_owned()),
+            ..Default::default()
         },
         run_note: None,
     };
@@ -352,6 +855,7 @@ fn agreeing_and_conflicting_evidence() {
             instant: Some("2026-01-15T05:07:30.250Z".to_owned()),
             local_civil: Some("2026-01-15T18:07:30.250".to_owned()),
             source_zone: Some("America/New_York".to_owned()),
+            ..Default::default()
         },
         run_note: None,
     };
@@ -374,6 +878,7 @@ fn shared_tile_and_same_start_conflict() {
             instant: Some("2026-01-14T21:00:00.000Z".to_owned()),
             local_civil: None,
             source_zone: None,
+            ..Default::default()
         },
         run_note: None,
     };
@@ -386,6 +891,7 @@ fn shared_tile_and_same_start_conflict() {
             instant: Some("2026-01-14T21:00:20.000Z".to_owned()),
             local_civil: None,
             source_zone: None,
+            ..Default::default()
         },
         run_note: None,
     };
@@ -406,6 +912,7 @@ fn shared_tile_and_same_start_conflict() {
             instant: Some("2026-01-14T21:00:00.000Z".to_owned()),
             local_civil: None,
             source_zone: None,
+            ..Default::default()
         },
         run_note: None,
     };
@@ -418,6 +925,7 @@ fn shared_tile_and_same_start_conflict() {
             instant: Some("2026-01-14T21:00:00.000Z".to_owned()), // same start
             local_civil: None,
             source_zone: None,
+            ..Default::default()
         },
         run_note: None,
     };
@@ -449,6 +957,7 @@ fn deduplication_and_naming_rules() {
             instant: Some("2026-01-14T21:00:00.000Z".to_owned()),
             local_civil: None,
             source_zone: None,
+            ..Default::default()
         },
         run_note: None,
     };
@@ -461,12 +970,18 @@ fn deduplication_and_naming_rules() {
             instant: Some("2026-01-14T21:00:00.000+00:00".to_owned()), // Z and +00:00 dedupe
             local_civil: None,
             source_zone: None,
+            ..Default::default()
         },
         run_note: None,
     };
 
     let plan = plan_audio_archive(&[d1, d2], NY, default_settings()).unwrap();
-    assert_eq!(plan.members.len(), 1); // Deduped to 1 member
+    assert_eq!(plan.members.len(), 2);
+    assert_eq!(
+        plan.members[1].disposition,
+        MemberDisposition::LeftOut(LeftOutReason::DuplicateMember)
+    );
+    assert_eq!(plan.tiles[0].parts.len(), 1);
     assert_eq!(plan.members[0].original_relative_name, "dir1/clip.ogg"); // Retains first name
 
     // Equal bytes at different instants stay distinct
@@ -479,6 +994,7 @@ fn deduplication_and_naming_rules() {
             instant: Some("2026-01-14T21:00:00.000Z".to_owned()),
             local_civil: None,
             source_zone: None,
+            ..Default::default()
         },
         run_note: None,
     };
@@ -491,6 +1007,7 @@ fn deduplication_and_naming_rules() {
             instant: Some("2026-01-14T21:05:00.000Z".to_owned()), // 5 min later
             local_civil: None,
             source_zone: None,
+            ..Default::default()
         },
         run_note: None,
     };
@@ -499,6 +1016,7 @@ fn deduplication_and_naming_rules() {
     assert_eq!(plan_distinct.tiles.len(), 2);
 }
 
+#[cfg(feature = "full-tests")]
 #[test]
 fn claim_index_semantics_and_missing_run() {
     let temp = TempDir::new().unwrap();
@@ -515,6 +1033,7 @@ fn claim_index_semantics_and_missing_run() {
                 instant: Some("2026-01-14T21:00:00.000Z".to_owned()),
                 local_civil: None,
                 source_zone: None,
+                ..Default::default()
             },
             run_note: None,
         }],
@@ -547,7 +1066,12 @@ fn claim_index_semantics_and_missing_run() {
 
     // With run directory present, run2 sees it held
     let run1_dir = journal.join("imports").join("20260114_100001");
-    fs::create_dir_all(&run1_dir).unwrap();
+    save_audio_archive_record(
+        journal,
+        "20260114_100001",
+        &super::record::plan_to_record(&plan),
+    )
+    .unwrap();
     let held = find_held_members(journal, None, &plan.members, DEFAULT_WRITE_BUSY_TIMEOUT).unwrap();
     assert!(held.contains(&id1));
 
@@ -568,6 +1092,7 @@ fn claim_index_semantics_and_missing_run() {
     .unwrap();
 }
 
+#[cfg(feature = "full-tests")]
 #[test]
 fn publication_and_fault_seams() {
     let temp = TempDir::new().unwrap();
@@ -586,6 +1111,7 @@ fn publication_and_fault_seams() {
             instant: Some("2026-01-14T21:00:00.500Z".to_owned()),
             local_civil: None,
             source_zone: None,
+            ..Default::default()
         },
         run_note: None,
     };
@@ -605,7 +1131,7 @@ fn publication_and_fault_seams() {
         AudioArchivePublishOptions {
             import_id: None,
             members: vec![member.clone()],
-            member_bytes: bytes_map.clone(),
+            materializer: &bytes_map,
             owner_zone: NY,
             settings: default_settings(),
             source_timestamp: None,
@@ -630,7 +1156,7 @@ fn publication_and_fault_seams() {
         AudioArchivePublishOptions {
             import_id: None,
             members: vec![member.clone()],
-            member_bytes: bytes_map.clone(),
+            materializer: &bytes_map,
             owner_zone: NY,
             settings: default_settings(),
             source_timestamp: None,
@@ -643,9 +1169,9 @@ fn publication_and_fault_seams() {
     assert_eq!(clean_res.parts_saved, 1);
 
     // Frontier test on published run
-    let frontier = load_frontier(journal, &clean_res.import_id).unwrap();
+    let frontier = update_archive_frontier(journal, &clean_res.import_id).unwrap();
     assert_eq!(frontier.published_tiles.len(), 1);
-    assert_eq!(frontier.pending_tiles.len(), 0);
+    assert_eq!(frontier.pending_tiles.len(), 1);
     assert_eq!(frontier.unavailable_parts.len(), 0);
 
     // Remove chronicle raw -> frontier reports SavedButUnavailable
@@ -657,13 +1183,15 @@ fn publication_and_fault_seams() {
         .join(&clean_res.record.parts[0].stored_name);
     fs::remove_file(&raw_path).unwrap();
 
-    let frontier_after_removal = load_frontier(journal, &clean_res.import_id).unwrap();
+    let frontier_after_removal = update_archive_frontier(journal, &clean_res.import_id).unwrap();
     assert_eq!(frontier_after_removal.unavailable_parts.len(), 1);
-    assert_eq!(frontier_after_removal.published_tiles.len(), 1);
-    assert_eq!(
-        frontier_after_removal.published_tiles[0].parts[0].outcome,
-        PartOutcome::SavedButUnavailable
-    );
+    assert!(frontier_after_removal.pending_tiles.is_empty());
+    let status = ArchiveStore::open(journal, &clean_res.import_id, false)
+        .unwrap()
+        .status()
+        .unwrap();
+    assert_eq!(status.unavailable_parts, 1);
+    assert_eq!(status.processed_parts, 0);
 }
 
 #[test]
@@ -677,6 +1205,7 @@ fn negative_offset_instant_dedupes_with_z_and_auckland_original_time() {
             instant: Some("2026-01-14T16:00:00.500-05:00".to_owned()),
             local_civil: None,
             source_zone: None,
+            ..Default::default()
         },
         run_note: None,
     };
@@ -689,6 +1218,7 @@ fn negative_offset_instant_dedupes_with_z_and_auckland_original_time() {
             instant: Some("2026-01-14T21:00:00.500Z".to_owned()),
             local_civil: None,
             source_zone: None,
+            ..Default::default()
         },
         run_note: None,
     };
@@ -701,12 +1231,17 @@ fn negative_offset_instant_dedupes_with_z_and_auckland_original_time() {
             instant: None,
             local_civil: Some("2026-01-15T10:00:00.500".to_owned()),
             source_zone: Some("Pacific/Auckland".to_owned()),
+            ..Default::default()
         },
         run_note: None,
     };
 
     let plan_dedupe = plan_audio_archive(&[m1, m2], NY, default_settings()).unwrap();
-    assert_eq!(plan_dedupe.members.len(), 1);
+    assert_eq!(plan_dedupe.members.len(), 2);
+    assert_eq!(
+        plan_dedupe.members[1].disposition,
+        MemberDisposition::LeftOut(LeftOutReason::DuplicateMember)
+    );
     assert_eq!(
         plan_dedupe.members[0].identity.occurrence,
         "utc|1768424400500"
@@ -749,6 +1284,7 @@ fn distinct_stored_names_and_long_member_second_part() {
             instant: Some("2026-01-14T21:00:00.000Z".to_owned()),
             local_civil: None,
             source_zone: None,
+            ..Default::default()
         },
         run_note: None,
     };
@@ -761,6 +1297,7 @@ fn distinct_stored_names_and_long_member_second_part() {
             instant: Some("2026-01-14T21:05:00.000Z".to_owned()),
             local_civil: None,
             source_zone: None,
+            ..Default::default()
         },
         run_note: None,
     };
@@ -773,6 +1310,7 @@ fn distinct_stored_names_and_long_member_second_part() {
             instant: None,
             local_civil: Some("2026-01-15T18:07:30.250".to_owned()),
             source_zone: Some("Pacific/Auckland".to_owned()),
+            ..Default::default()
         },
         run_note: None,
     };
@@ -790,6 +1328,7 @@ fn distinct_stored_names_and_long_member_second_part() {
     assert!(!p1.stored_name.contains("001000"));
 }
 
+#[cfg(feature = "full-tests")]
 #[test]
 fn malformed_manifest_ignored_by_claims() {
     let temp = TempDir::new().unwrap();
@@ -809,6 +1348,7 @@ fn malformed_manifest_ignored_by_claims() {
                 instant: Some("2026-01-14T21:00:00.000Z".to_owned()),
                 local_civil: None,
                 source_zone: None,
+                ..Default::default()
             },
             run_note: None,
         }],
@@ -822,6 +1362,7 @@ fn malformed_manifest_ignored_by_claims() {
     assert!(res.unwrap().is_empty());
 }
 
+#[cfg(feature = "full-tests")]
 #[test]
 fn each_archive_fault_and_resume_publishes_raw() {
     let temp = TempDir::new().unwrap();
@@ -840,6 +1381,7 @@ fn each_archive_fault_and_resume_publishes_raw() {
             instant: Some("2026-01-14T21:00:00.000Z".to_owned()),
             local_civil: None,
             source_zone: None,
+            ..Default::default()
         },
         run_note: None,
     };
@@ -849,7 +1391,7 @@ fn each_archive_fault_and_resume_publishes_raw() {
     let faults = [
         ArchiveFault::AfterRecordFirstSaved,
         ArchiveFault::AfterTileBytesStaged,
-        ArchiveFault::AfterChronicleRawsWritten,
+        ArchiveFault::BeforeTilePublish,
         ArchiveFault::AfterPublishBeforeSavedMark,
         ArchiveFault::AfterSavedMarkBeforeEmit,
     ];
@@ -866,7 +1408,7 @@ fn each_archive_fault_and_resume_publishes_raw() {
             AudioArchivePublishOptions {
                 import_id: None,
                 members: vec![member.clone()],
-                member_bytes: bytes_map.clone(),
+                materializer: &bytes_map,
                 owner_zone: NY,
                 settings: default_settings(),
                 source_timestamp: None,
@@ -886,7 +1428,7 @@ fn each_archive_fault_and_resume_publishes_raw() {
         AudioArchivePublishOptions {
             import_id: None,
             members: vec![member.clone()],
-            member_bytes: bytes_map.clone(),
+            materializer: &bytes_map,
             owner_zone: NY,
             settings: default_settings(),
             source_timestamp: None,
@@ -918,7 +1460,7 @@ fn each_archive_fault_and_resume_publishes_raw() {
         AudioArchivePublishOptions {
             import_id: Some(&run_id),
             members: vec![member.clone()],
-            member_bytes: bytes_map.clone(),
+            materializer: &bytes_map,
             owner_zone: NY,
             settings: default_settings(),
             source_timestamp: None,
@@ -949,6 +1491,7 @@ fn each_archive_fault_and_resume_publishes_raw() {
     assert_eq!(count, 1);
 }
 
+#[cfg(feature = "full-tests")]
 #[test]
 fn between_multi_tile_parts_fault_semantics() {
     let temp = TempDir::new().unwrap();
@@ -966,6 +1509,7 @@ fn between_multi_tile_parts_fault_semantics() {
             instant: None,
             local_civil: Some("2026-01-15T18:07:30.250".to_owned()),
             source_zone: Some("Pacific/Auckland".to_owned()),
+            ..Default::default()
         },
         run_note: None,
     };
@@ -983,7 +1527,7 @@ fn between_multi_tile_parts_fault_semantics() {
         AudioArchivePublishOptions {
             import_id: None,
             members: vec![long_member],
-            member_bytes: map,
+            materializer: &map,
             owner_zone: NY,
             settings: default_settings(),
             source_timestamp: None,
@@ -1048,6 +1592,7 @@ fn between_multi_tile_parts_fault_semantics() {
     assert_eq!(count, 1);
 }
 
+#[cfg(feature = "full-tests")]
 #[test]
 fn resume_settings_mismatch_leaves_record_unchanged() {
     let temp = TempDir::new().unwrap();
@@ -1064,6 +1609,7 @@ fn resume_settings_mismatch_leaves_record_unchanged() {
             instant: Some("2026-01-14T21:00:00.000Z".to_owned()),
             local_civil: None,
             source_zone: None,
+            ..Default::default()
         },
         run_note: None,
     };
@@ -1080,7 +1626,7 @@ fn resume_settings_mismatch_leaves_record_unchanged() {
         AudioArchivePublishOptions {
             import_id: None,
             members: vec![member.clone()],
-            member_bytes: map.clone(),
+            materializer: &map,
             owner_zone: NY,
             settings: default_settings(),
             source_timestamp: None,
@@ -1101,7 +1647,7 @@ fn resume_settings_mismatch_leaves_record_unchanged() {
     let record_path = journal
         .join("imports")
         .join(&run_id)
-        .join("audio-archive.json");
+        .join(super::record::AUDIO_ARCHIVE_RECORD_FILENAME);
     let original_bytes = fs::read(&record_path).unwrap();
 
     let mismatched_settings = AudioArchiveSettings {
@@ -1113,7 +1659,7 @@ fn resume_settings_mismatch_leaves_record_unchanged() {
         AudioArchivePublishOptions {
             import_id: Some(&run_id),
             members: vec![member],
-            member_bytes: map,
+            materializer: &map,
             owner_zone: NY,
             settings: mismatched_settings,
             source_timestamp: None,
@@ -1129,6 +1675,7 @@ fn resume_settings_mismatch_leaves_record_unchanged() {
     assert_eq!(original_bytes, bytes_after);
 }
 
+#[cfg(feature = "full-tests")]
 #[test]
 fn delete_chronicle_raw_and_resume_does_not_recreate() {
     let temp = TempDir::new().unwrap();
@@ -1145,6 +1692,7 @@ fn delete_chronicle_raw_and_resume_does_not_recreate() {
             instant: Some("2026-01-14T21:00:00.000Z".to_owned()),
             local_civil: None,
             source_zone: None,
+            ..Default::default()
         },
         run_note: None,
     };
@@ -1156,7 +1704,7 @@ fn delete_chronicle_raw_and_resume_does_not_recreate() {
         AudioArchivePublishOptions {
             import_id: None,
             members: vec![member.clone()],
-            member_bytes: map.clone(),
+            materializer: &map,
             owner_zone: NY,
             settings: default_settings(),
             source_timestamp: None,
@@ -1182,7 +1730,7 @@ fn delete_chronicle_raw_and_resume_does_not_recreate() {
         AudioArchivePublishOptions {
             import_id: Some(&clean.import_id),
             members: vec![member],
-            member_bytes: map,
+            materializer: &map,
             owner_zone: NY,
             settings: default_settings(),
             source_timestamp: None,
@@ -1194,14 +1742,17 @@ fn delete_chronicle_raw_and_resume_does_not_recreate() {
     assert_eq!(resume_res.tiles_saved, 1);
     assert!(!raw_path.exists());
 
-    let frontier = load_frontier(journal, &clean.import_id).unwrap();
-    assert_eq!(frontier.unavailable_parts.len(), 1);
-    assert_eq!(
-        frontier.published_tiles[0].parts[0].outcome,
-        PartOutcome::SavedButUnavailable
-    );
+    let frontier = update_archive_frontier(journal, &clean.import_id).unwrap();
+    assert!(frontier.pending_tiles.is_empty());
+    let status = ArchiveStore::open(journal, &clean.import_id, false)
+        .unwrap()
+        .status()
+        .unwrap();
+    assert_eq!(status.unavailable_parts, 1);
+    assert_eq!(status.processed_parts, 0);
 }
 
+#[cfg(feature = "full-tests")]
 #[test]
 fn foreign_file_in_segment_refused_no_key_advance() {
     let temp = TempDir::new().unwrap();
@@ -1236,6 +1787,7 @@ fn foreign_file_in_segment_refused_no_key_advance() {
             instant: Some("2026-01-14T21:00:00.000Z".to_owned()),
             local_civil: None,
             source_zone: None,
+            ..Default::default()
         },
         run_note: None,
     };
@@ -1247,17 +1799,19 @@ fn foreign_file_in_segment_refused_no_key_advance() {
         AudioArchivePublishOptions {
             import_id: None,
             members: vec![member],
-            member_bytes: map,
+            materializer: &map,
             owner_zone: NY,
             settings: default_settings(),
             source_timestamp: None,
         },
         None,
     );
+    let result = res.unwrap();
     assert!(matches!(
-        res,
-        Err(AudioArchiveError::ChronicleSegmentRefused(_))
+        result.record.members[0].disposition,
+        MemberDisposition::LeftOut(LeftOutReason::PublishedTile { .. })
     ));
+    assert_eq!(result.parts_saved, 0);
 
     assert_eq!(fs::read(&foreign_path).unwrap(), b"foreign content");
     assert_eq!(fs::read(&phone_path).unwrap(), b"phone data");
@@ -1270,170 +1824,110 @@ fn foreign_file_in_segment_refused_no_key_advance() {
     assert_eq!(entries[0].file_name(), "160000_300");
 }
 
+#[cfg(feature = "full-tests")]
 #[test]
-fn frontier_invariants_across_attempts_and_parts() {
+fn processing_frontier_retires_only_the_acknowledged_member_part() {
     let temp = TempDir::new().unwrap();
     let journal = temp.path();
-
-    let import_id = "20260114_210000";
-    let run_dir = journal.join("imports").join(import_id);
-    fs::create_dir_all(&run_dir).unwrap();
-
-    let record = AudioArchiveRecord {
-        version: 1,
-        settings: AudioArchiveRecordSettings {
-            owner_zone: "America/New_York".to_owned(),
-            window_ms: 300_000,
-            stream: "import.clips".to_owned(),
-            qualifier: "clips".to_owned(),
-            archive_identity: "frontier_test".to_owned(),
-            len: 300,
-        },
-        members: vec![
-            AudioArchiveRecordMember {
-                byte_len: 100,
-                sha256: dummy_hash(1),
-                canonical_occurrence: "utc|1768424400000".to_owned(),
-                original_relative_name: "a.ogg".to_owned(),
-                run_note: None,
-                disposition: MemberDisposition::Included,
-            },
-            AudioArchiveRecordMember {
-                byte_len: 100,
-                sha256: dummy_hash(2),
-                canonical_occurrence: "utc|1768424400000".to_owned(),
-                original_relative_name: "b.ogg".to_owned(),
-                run_note: None,
-                disposition: MemberDisposition::Included,
-            },
-            AudioArchiveRecordMember {
-                byte_len: 200,
-                sha256: dummy_hash(3),
-                canonical_occurrence: "utc|1768453650250".to_owned(),
-                original_relative_name: "long.ogg".to_owned(),
-                run_note: None,
-                disposition: MemberDisposition::Included,
-            },
-            AudioArchiveRecordMember {
-                byte_len: 100,
-                sha256: dummy_hash(4),
-                canonical_occurrence: "utc|1768564800000".to_owned(),
-                original_relative_name: "d.ogg".to_owned(),
-                run_note: None,
-                disposition: MemberDisposition::Included,
-            },
-        ],
-        parts: vec![
-            AudioArchiveRecordPart {
-                member_sha256: dummy_hash(1),
-                member_occurrence: "utc|1768424400000".to_owned(),
-                day: "20260114".to_owned(),
-                segment_key: "160000_300".to_owned(),
-                offset_ms: 0,
-                origin_ms: 0,
-                length_ms: 5000,
-                stored_name: "p0000_1111111111111111.ogg".to_owned(),
-                outcome: PartOutcome::Saved,
-            },
-            AudioArchiveRecordPart {
-                member_sha256: dummy_hash(2),
-                member_occurrence: "utc|1768424400000".to_owned(),
-                day: "20260114".to_owned(),
-                segment_key: "160000_300".to_owned(),
-                offset_ms: 5000,
-                origin_ms: 0,
-                length_ms: 5000,
-                stored_name: "p0000_2222222222222222.ogg".to_owned(),
-                outcome: PartOutcome::Planned,
-            },
-            AudioArchiveRecordPart {
-                member_sha256: dummy_hash(3),
-                member_occurrence: "utc|1768453650250".to_owned(),
-                day: "20260115".to_owned(),
-                segment_key: "000500_300".to_owned(),
-                offset_ms: 150250,
-                origin_ms: 0,
-                length_ms: 149750,
-                stored_name: "p0000_3333333333333333.ogg".to_owned(),
-                outcome: PartOutcome::Saved,
-            },
-            AudioArchiveRecordPart {
-                member_sha256: dummy_hash(3),
-                member_occurrence: "utc|1768453650250".to_owned(),
-                day: "20260115".to_owned(),
-                segment_key: "001000_300".to_owned(),
-                offset_ms: 0,
-                origin_ms: 149750,
-                length_ms: 250250,
-                stored_name: "p0001_3333333333333333.ogg".to_owned(),
-                outcome: PartOutcome::Planned,
-            },
-            AudioArchiveRecordPart {
-                member_sha256: dummy_hash(4),
-                member_occurrence: "utc|1768564800000".to_owned(),
-                day: "20260116".to_owned(),
-                segment_key: "120000_300".to_owned(),
-                offset_ms: 0,
-                origin_ms: 0,
-                length_ms: 5000,
-                stored_name: "p0000_4444444444444444.ogg".to_owned(),
-                outcome: PartOutcome::Planned,
-            },
-        ],
-    };
-    save_audio_archive_record(journal, import_id, &record).unwrap();
-
-    let t1_dir = journal.join("chronicle/20260114/import.clips/160000_300");
-    fs::create_dir_all(&t1_dir).unwrap();
-    fs::write(t1_dir.join(AUDIO_ARCHIVE_PLACEMENT_FILENAME), b"{}").unwrap();
-
-    let t2_dir = journal.join("chronicle/20260115/import.clips/000500_300");
-    fs::create_dir_all(&t2_dir).unwrap();
-    fs::write(t2_dir.join(AUDIO_ARCHIVE_PLACEMENT_FILENAME), b"{}").unwrap();
-    fs::write(t2_dir.join("p0000_3333333333333333.ogg"), b"audio").unwrap();
-
-    admit_running_attempt(journal, import_id, now_ms(), None).unwrap();
-    record_completed_attempt(journal, import_id, 1, now_ms(), None, None).unwrap();
-
-    let frontier = load_frontier(journal, import_id).unwrap();
-
-    assert!(
-        frontier
-            .pending_tiles
-            .iter()
-            .any(|t| t.parts.iter().any(|p| p.outcome == PartOutcome::Planned))
-    );
-
-    let t1 = frontier
-        .published_tiles
+    let sources = [
+        storage_member(80, "2026-01-14T21:00:00Z", 7500),
+        storage_member(81, "2026-01-14T21:00:12.500Z", 720),
+        storage_member(82, "2026-01-15T23:58:17.123-05:00", 315485),
+    ];
+    let materials: HashMap<_, _> = sources
         .iter()
-        .chain(&frontier.pending_tiles)
-        .find(|t| t.day == "20260114" && t.segment_key == "160000_300")
-        .expect("tile 1 found");
-    assert_eq!(t1.parts.len(), 2);
-    assert!(t1.parts.iter().any(|p| p.outcome == PartOutcome::Planned));
-
-    assert!(
-        frontier.pending_tiles.iter().any(|t| t
-            .parts
-            .iter()
-            .any(|p| p.stored_name == "p0001_3333333333333333.ogg"
-                && p.outcome == PartOutcome::Planned))
-    );
-
-    assert_eq!(frontier.unavailable_parts.len(), 1);
+        .map(|(member, bytes)| (member.sha256.clone(), bytes.clone()))
+        .collect();
+    let members: Vec<_> = sources.iter().map(|(member, _)| member.clone()).collect();
+    let result = storage_publish(journal, None, &members, &materials, None).unwrap();
+    assert_eq!(result.record.parts.len(), 4);
+    let first = &result.record.parts[0];
+    finish_archive_part(
+        journal,
+        &result.import_id,
+        &first.day,
+        &first.segment_key,
+        &first.stored_name,
+        false,
+    )
+    .unwrap();
+    let long_first = result
+        .record
+        .parts
+        .iter()
+        .find(|part| part.member_sha256 == members[2].sha256 && part.origin_ms == 0)
+        .unwrap();
+    finish_archive_part(
+        journal,
+        &result.import_id,
+        &long_first.day,
+        &long_first.segment_key,
+        &long_first.stored_name,
+        false,
+    )
+    .unwrap();
+    let batch = update_pending_archive_tiles(journal, 64).unwrap();
+    assert!(batch.errors.is_empty());
     assert_eq!(
-        frontier.unavailable_parts[0].stored_name,
-        "p0000_1111111111111111.ogg"
-    );
-    assert!(
-        frontier
-            .pending_tiles
+        batch
+            .tiles
             .iter()
-            .any(|t| t.day == "20260116" && t.segment_key == "120000_300")
+            .map(|tile| tile.parts.len())
+            .sum::<usize>(),
+        2
+    );
+    let missing = result
+        .record
+        .parts
+        .iter()
+        .find(|part| part.member_sha256 == members[1].sha256)
+        .unwrap();
+    fs::remove_file(
+        journal
+            .join("chronicle")
+            .join(&missing.day)
+            .join(&result.record.settings.stream)
+            .join(&missing.segment_key)
+            .join(&missing.stored_name),
+    )
+    .unwrap();
+    let batch = update_pending_archive_tiles(journal, 64).unwrap();
+    assert!(batch.errors.is_empty());
+    assert_eq!(batch.tiles.len(), 1);
+    assert_eq!(batch.tiles[0].parts.len(), 1);
+    let last = &batch.tiles[0];
+    finish_archive_part(
+        journal,
+        &result.import_id,
+        &last.day,
+        &last.segment_key,
+        &last.parts[0].stored_name,
+        false,
+    )
+    .unwrap();
+    assert!(
+        update_pending_archive_tiles(journal, 64)
+            .unwrap()
+            .tiles
+            .is_empty()
+    );
+    let status = ArchiveStore::open(journal, &result.import_id, false)
+        .unwrap()
+        .status()
+        .unwrap();
+    assert_eq!(
+        (
+            status.saved_parts,
+            status.saved_members,
+            status.processed_parts,
+            status.unavailable_parts,
+            status.pending_processing
+        ),
+        (4, 3, 3, 1, 0)
     );
 }
 
+#[cfg(feature = "full-tests")]
 #[test]
 fn emit_seam_invoked_once_per_finished_tile() {
     use std::sync::Arc;
@@ -1460,6 +1954,7 @@ fn emit_seam_invoked_once_per_finished_tile() {
             instant: Some("2026-01-14T21:00:00.000Z".to_owned()),
             local_civil: None,
             source_zone: None,
+            ..Default::default()
         },
         run_note: None,
     };
@@ -1477,7 +1972,7 @@ fn emit_seam_invoked_once_per_finished_tile() {
         AudioArchivePublishOptions {
             import_id: None,
             members: vec![member.clone()],
-            member_bytes: map.clone(),
+            materializer: &map,
             owner_zone: NY,
             settings: default_settings(),
             source_timestamp: None,
@@ -1505,7 +2000,7 @@ fn emit_seam_invoked_once_per_finished_tile() {
         AudioArchivePublishOptions {
             import_id: None,
             members: vec![member],
-            member_bytes: map,
+            materializer: &map,
             owner_zone: NY,
             settings: default_settings(),
             source_timestamp: None,
@@ -1517,6 +2012,7 @@ fn emit_seam_invoked_once_per_finished_tile() {
     assert_eq!(clean_count.load(Ordering::SeqCst), 1);
 }
 
+#[cfg(feature = "full-tests")]
 #[test]
 fn claim_contention_zero_timeout_returns_busy() {
     let temp = TempDir::new().unwrap();
@@ -1536,8 +2032,9 @@ fn claim_contention_zero_timeout_returns_busy() {
     blocker_conn.execute_batch("COMMIT;").unwrap();
 }
 
+#[cfg(feature = "full-tests")]
 #[test]
-fn after_chronicle_raws_written_resume_publishes_raw_and_leaves_one_claim_row() {
+fn before_tile_publish_resume_publishes_one_complete_tile() {
     let temp = TempDir::new().unwrap();
     let journal = temp.path();
 
@@ -1554,6 +2051,7 @@ fn after_chronicle_raws_written_resume_publishes_raw_and_leaves_one_claim_row() 
             instant: Some("2026-01-14T21:00:00.500Z".to_owned()),
             local_civil: None,
             source_zone: None,
+            ..Default::default()
         },
         run_note: None,
     };
@@ -1562,7 +2060,7 @@ fn after_chronicle_raws_written_resume_publishes_raw_and_leaves_one_claim_row() 
     bytes_map.insert(sha256.clone(), member_bytes_data.clone());
 
     let seams_fault = AudioArchivePublishSeams {
-        fault: Some(ArchiveFault::AfterChronicleRawsWritten),
+        fault: Some(ArchiveFault::BeforeTilePublish),
         emit_observed: None,
         heartbeat_spawner: Some(|_, _| Ok(std::thread::spawn(|| {}))),
     };
@@ -1572,7 +2070,7 @@ fn after_chronicle_raws_written_resume_publishes_raw_and_leaves_one_claim_row() 
         AudioArchivePublishOptions {
             import_id: None,
             members: vec![member.clone()],
-            member_bytes: bytes_map.clone(),
+            materializer: &bytes_map,
             owner_zone: NY,
             settings: default_settings(),
             source_timestamp: None,
@@ -1581,9 +2079,7 @@ fn after_chronicle_raws_written_resume_publishes_raw_and_leaves_one_claim_row() 
     );
     assert!(matches!(
         res,
-        Err(AudioArchiveError::Fault(
-            ArchiveFault::AfterChronicleRawsWritten
-        ))
+        Err(AudioArchiveError::Fault(ArchiveFault::BeforeTilePublish))
     ));
 
     // Find the import_id created by this attempt
@@ -1603,10 +2099,17 @@ fn after_chronicle_raws_written_resume_publishes_raw_and_leaves_one_claim_row() 
         .join(&part.day)
         .join("import.clips")
         .join(&part.segment_key);
-    let partial_path = segment_dir.join(format!("{}.partial", part.stored_name));
+    let partial_path = journal
+        .join("imports")
+        .join(&import_id)
+        .join("staged")
+        .join(&part.day)
+        .join(&part.segment_key)
+        .join(&part.stored_name);
     let raw_path = segment_dir.join(&part.stored_name);
 
     assert!(partial_path.is_file());
+    assert!(!segment_dir.exists());
     assert!(!raw_path.exists());
 
     // Resume with same import_id and no fault
@@ -1620,7 +2123,7 @@ fn after_chronicle_raws_written_resume_publishes_raw_and_leaves_one_claim_row() 
         AudioArchivePublishOptions {
             import_id: Some(&import_id),
             members: vec![member],
-            member_bytes: bytes_map,
+            materializer: &bytes_map,
             owner_zone: NY,
             settings: default_settings(),
             source_timestamp: None,
@@ -1646,6 +2149,7 @@ fn after_chronicle_raws_written_resume_publishes_raw_and_leaves_one_claim_row() 
     assert_eq!(count, 1);
 }
 
+#[cfg(feature = "full-tests")]
 #[test]
 fn after_publish_before_saved_mark_delete_raw_resume() {
     let temp = TempDir::new().unwrap();
@@ -1664,6 +2168,7 @@ fn after_publish_before_saved_mark_delete_raw_resume() {
             instant: Some("2026-01-14T21:00:00.500Z".to_owned()),
             local_civil: None,
             source_zone: None,
+            ..Default::default()
         },
         run_note: None,
     };
@@ -1682,7 +2187,7 @@ fn after_publish_before_saved_mark_delete_raw_resume() {
         AudioArchivePublishOptions {
             import_id: None,
             members: vec![member.clone()],
-            member_bytes: bytes_map.clone(),
+            materializer: &bytes_map,
             owner_zone: NY,
             settings: default_settings(),
             source_timestamp: None,
@@ -1731,7 +2236,7 @@ fn after_publish_before_saved_mark_delete_raw_resume() {
         AudioArchivePublishOptions {
             import_id: Some(&import_id),
             members: vec![member],
-            member_bytes: bytes_map,
+            materializer: &bytes_map,
             owner_zone: NY,
             settings: default_settings(),
             source_timestamp: None,
@@ -1751,54 +2256,39 @@ fn after_publish_before_saved_mark_delete_raw_resume() {
     );
 }
 
+#[cfg(feature = "full-tests")]
 #[test]
-fn corrupt_audio_archive_json_returns_claim_database_corrupt() {
+fn corrupt_or_missing_run_record_is_not_treated_as_an_absent_run() {
     let temp = TempDir::new().unwrap();
     let journal = temp.path();
-
-    let plan = plan_audio_archive(
-        &[AudioArchiveMemberInput {
-            original_relative_name: "clip.ogg".to_owned(),
-            byte_len: 500,
-            sha256: dummy_hash(80),
-            duration: DurationInput::Milliseconds(5000),
-            start: MemberStartEvidence {
-                instant: Some("2026-01-14T21:00:00.000Z".to_owned()),
-                local_civil: None,
-                source_zone: None,
-            },
-            run_note: None,
-        }],
-        NY,
-        default_settings(),
-    )
-    .unwrap();
-
-    let id1 = plan.members[0].identity.clone();
+    let (member, _) = storage_member(70, "2026-01-14T21:00:00Z", 5000);
+    let plan = plan_audio_archive(&[member], NY, default_settings()).unwrap();
+    let id = "20260114_100003";
+    save_audio_archive_record(journal, id, &super::record::plan_to_record(&plan)).unwrap();
     insert_tile_claims(
         journal,
-        "20260114_100003",
-        std::slice::from_ref(&id1),
+        id,
+        &[plan.members[0].identity.clone()],
         DEFAULT_WRITE_BUSY_TIMEOUT,
     )
     .unwrap();
-
-    let run_dir = journal.join("imports").join("20260114_100003");
-    fs::create_dir_all(&run_dir).unwrap();
-
-    // Write {} to audio-archive.json -> returns ClaimDatabaseCorrupt
-    let archive_json = run_dir.join("audio-archive.json");
-    fs::write(&archive_json, b"{}").unwrap();
-
-    let err =
-        find_held_members(journal, None, &plan.members, DEFAULT_WRITE_BUSY_TIMEOUT).unwrap_err();
-    assert!(matches!(err, AudioArchiveError::ClaimDatabaseCorrupt(_)));
-
-    // Deleting that file restores the existing hold behavior. No tombstone.
-    fs::remove_file(&archive_json).unwrap();
-    let held = find_held_members(journal, None, &plan.members, DEFAULT_WRITE_BUSY_TIMEOUT).unwrap();
-    assert!(held.contains(&id1));
-    assert!(!run_dir.join("tombstone.json").exists());
+    let path = super::record::audio_archive_record_path(journal, id);
+    fs::write(&path, b"invalid database").unwrap();
+    assert!(matches!(
+        find_held_members(journal, None, &plan.members, DEFAULT_WRITE_BUSY_TIMEOUT),
+        Err(AudioArchiveError::ClaimDatabaseCorrupt(_))
+    ));
+    fs::remove_file(path).unwrap();
+    assert!(matches!(
+        find_held_members(journal, None, &plan.members, DEFAULT_WRITE_BUSY_TIMEOUT),
+        Err(AudioArchiveError::ClaimDatabaseCorrupt(_))
+    ));
+    fs::remove_dir_all(journal.join("imports").join(id)).unwrap();
+    assert!(
+        find_held_members(journal, None, &plan.members, DEFAULT_WRITE_BUSY_TIMEOUT)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -1812,6 +2302,7 @@ fn dst_fixture_fall_back_boundary() {
             instant: Some("2026-11-01T01:59:50-04:00".to_owned()),
             local_civil: None,
             source_zone: None,
+            ..Default::default()
         },
         run_note: None,
     };
@@ -1856,6 +2347,7 @@ fn dst_fixture_fall_back_crossing_unique() {
             instant: Some("2026-11-01T01:30:00-04:00".to_owned()),
             local_civil: None,
             source_zone: None,
+            ..Default::default()
         },
         run_note: None,
     };
@@ -1875,7 +2367,7 @@ fn dst_fixture_fall_back_crossing_unique() {
 }
 
 #[test]
-fn dst_fixture_ambiguous_civil_included() {
+fn ambiguous_long_civil_requires_an_instant() {
     let m = AudioArchiveMemberInput {
         original_relative_name: "ambiguous_settled.ogg".to_owned(),
         byte_len: 1000,
@@ -1885,28 +2377,16 @@ fn dst_fixture_ambiguous_civil_included() {
             instant: None,
             local_civil: Some("2026-11-01T01:30:00.000".to_owned()),
             source_zone: Some("America/New_York".to_owned()),
+            ..Default::default()
         },
         run_note: None,
     };
     let plan = plan_audio_archive(&[m], NY, default_settings()).unwrap();
-    assert_eq!(plan.members[0].disposition, MemberDisposition::Included);
     assert_eq!(
-        plan.members[0].identity.occurrence,
-        "local|America/New_York|2026-11-01T01:30:00.000"
+        plan.members[0].disposition,
+        MemberDisposition::LeftOut(LeftOutReason::UnsettledTime)
     );
-    assert_eq!(plan.tiles.len(), 2);
-
-    assert_eq!(plan.tiles[0].segment_key, "013000_300");
-    assert_eq!(plan.tiles[0].parts[0].offset_ms, 0);
-    assert_eq!(plan.tiles[0].parts[0].origin_ms, 0);
-    assert_eq!(plan.tiles[0].parts[0].length_ms, 300_000);
-    assert_eq!(plan.tiles[0].parts[0].original_time_ms, None);
-
-    assert_eq!(plan.tiles[1].segment_key, "013500_300");
-    assert_eq!(plan.tiles[1].parts[0].offset_ms, 0);
-    assert_eq!(plan.tiles[1].parts[0].origin_ms, 300_000);
-    assert_eq!(plan.tiles[1].parts[0].length_ms, 60_000);
-    assert_eq!(plan.tiles[1].parts[0].original_time_ms, None);
+    assert!(plan.tiles.is_empty());
 }
 
 #[test]
@@ -1920,6 +2400,7 @@ fn dst_fixture_spring_forward_gap_crossing() {
             instant: None,
             local_civil: Some("2026-03-08T01:50:00.000".to_owned()),
             source_zone: Some("America/New_York".to_owned()),
+            ..Default::default()
         },
         run_note: None,
     };
@@ -1968,6 +2449,7 @@ fn utc_spring_forward_date_does_not_merge_remainder() {
             instant: None,
             local_civil: Some("2026-03-08T02:50:00.000".to_owned()),
             source_zone: Some("UTC".to_owned()),
+            ..Default::default()
         },
         run_note: None,
     };
@@ -2015,6 +2497,7 @@ fn duration_i64_max_left_out_unsettled_time() {
             instant: Some("2026-01-14T21:00:00.000Z".to_owned()),
             local_civil: None,
             source_zone: None,
+            ..Default::default()
         },
         run_note: None,
     };
@@ -2026,6 +2509,7 @@ fn duration_i64_max_left_out_unsettled_time() {
     assert_eq!(plan.tiles.len(), 0);
 }
 
+#[cfg(feature = "full-tests")]
 #[test]
 fn placement_different_offset_refuses_chronicle_segment() {
     let temp = TempDir::new().unwrap();
@@ -2042,6 +2526,7 @@ fn placement_different_offset_refuses_chronicle_segment() {
             instant: Some("2026-01-14T21:00:00.000Z".to_owned()),
             local_civil: None,
             source_zone: None,
+            ..Default::default()
         },
         run_note: None,
     };
@@ -2053,7 +2538,7 @@ fn placement_different_offset_refuses_chronicle_segment() {
         AudioArchivePublishOptions {
             import_id: None,
             members: vec![member.clone()],
-            member_bytes: map.clone(),
+            materializer: &map,
             owner_zone: NY,
             settings: default_settings(),
             source_timestamp: None,
@@ -2094,7 +2579,7 @@ fn placement_different_offset_refuses_chronicle_segment() {
         AudioArchivePublishOptions {
             import_id: Some(&clean.import_id),
             members: vec![member],
-            member_bytes: map,
+            materializer: &map,
             owner_zone: NY,
             settings: default_settings(),
             source_timestamp: None,
@@ -2107,6 +2592,7 @@ fn placement_different_offset_refuses_chronicle_segment() {
     ));
 }
 
+#[cfg(feature = "full-tests")]
 #[test]
 fn publication_candidate_file_does_not_refuse_and_resume_does_not_recreate() {
     let temp = TempDir::new().unwrap();
@@ -2123,6 +2609,7 @@ fn publication_candidate_file_does_not_refuse_and_resume_does_not_recreate() {
             instant: Some("2026-01-14T21:00:00.000Z".to_owned()),
             local_civil: None,
             source_zone: None,
+            ..Default::default()
         },
         run_note: None,
     };
@@ -2134,7 +2621,7 @@ fn publication_candidate_file_does_not_refuse_and_resume_does_not_recreate() {
         AudioArchivePublishOptions {
             import_id: None,
             members: vec![member.clone()],
-            member_bytes: map.clone(),
+            materializer: &map,
             owner_zone: NY,
             settings: default_settings(),
             source_timestamp: None,
@@ -2162,7 +2649,7 @@ fn publication_candidate_file_does_not_refuse_and_resume_does_not_recreate() {
         AudioArchivePublishOptions {
             import_id: Some(&clean.import_id),
             members: vec![member],
-            member_bytes: map,
+            materializer: &map,
             owner_zone: NY,
             settings: default_settings(),
             source_timestamp: None,
@@ -2179,86 +2666,49 @@ fn publication_candidate_file_does_not_refuse_and_resume_does_not_recreate() {
     );
 }
 
+#[cfg(feature = "full-tests")]
 #[test]
-fn short_staged_raw_replaced_from_member_bytes_on_resume() {
+fn interrupted_pre_intent_stage_can_be_restaged_without_publishing_partial_bytes() {
     let temp = TempDir::new().unwrap();
     let journal = temp.path();
-
-    let raw_bytes = b"complete_valid_audio_payload_bytes".to_vec();
-    let sha256 = format!("{:x}", Sha256::digest(&raw_bytes));
-    let member = AudioArchiveMemberInput {
-        original_relative_name: "staged_truncate.ogg".to_owned(),
-        byte_len: raw_bytes.len() as u64,
-        sha256: sha256.clone(),
-        duration: DurationInput::Milliseconds(5000),
-        start: MemberStartEvidence {
-            instant: Some("2026-01-14T21:00:00.000Z".to_owned()),
-            local_civil: None,
-            source_zone: None,
-        },
-        run_note: None,
-    };
-    let mut map = HashMap::new();
-    map.insert(sha256.clone(), raw_bytes.clone());
-
-    let clean = publish_audio_archive(
-        journal,
-        AudioArchivePublishOptions {
-            import_id: None,
-            members: vec![member.clone()],
-            member_bytes: map.clone(),
-            owner_zone: NY,
-            settings: default_settings(),
-            source_timestamp: None,
-        },
-        None,
-    )
-    .unwrap();
-
-    let part = &clean.record.parts[0];
-    let staged_file = journal
+    let (member, bytes) = storage_member(71, "2026-01-14T21:00:00Z", 5000);
+    let materials = HashMap::from([(member.sha256.clone(), bytes.clone())]);
+    assert!(matches!(
+        storage_publish(
+            journal,
+            None,
+            std::slice::from_ref(&member),
+            &materials,
+            Some(ArchiveFault::AfterTileBytesStaged)
+        ),
+        Err(AudioArchiveError::Fault(ArchiveFault::AfterTileBytesStaged))
+    ));
+    let id = storage_run(journal);
+    let record = read_audio_archive(journal, &id).unwrap().unwrap();
+    let part = &record.parts[0];
+    let staged = journal
         .join("imports")
-        .join(&clean.import_id)
+        .join(&id)
         .join("staged")
         .join(&part.day)
         .join(&part.segment_key)
         .join(&part.stored_name);
-    assert!(staged_file.is_file());
-
-    fs::write(&staged_file, b"short").unwrap();
-
-    let seg_dir = journal
+    let destination = journal
         .join("chronicle")
         .join(&part.day)
-        .join("import.clips")
+        .join(&record.settings.stream)
         .join(&part.segment_key);
-    let raw_path = seg_dir.join(&part.stored_name);
-    let placement_path = seg_dir.join(AUDIO_ARCHIVE_PLACEMENT_FILENAME);
-
-    fs::remove_file(&raw_path).unwrap();
-    fs::remove_file(&placement_path).unwrap();
-
-    let resume_res = publish_audio_archive(
-        journal,
-        AudioArchivePublishOptions {
-            import_id: Some(&clean.import_id),
-            members: vec![member],
-            member_bytes: map,
-            owner_zone: NY,
-            settings: default_settings(),
-            source_timestamp: None,
-        },
-        None,
-    )
-    .unwrap();
-
-    assert_eq!(resume_res.tiles_saved, 1);
-    assert_eq!(resume_res.parts_saved, 1);
-
-    let chronicle_bytes = fs::read(&raw_path).unwrap();
-    assert_eq!(chronicle_bytes, raw_bytes);
+    assert!(!destination.exists());
+    fs::write(staged, b"partial").unwrap();
+    let resumed = storage_publish(journal, Some(&id), &[member], &materials, None).unwrap();
+    assert_eq!(resumed.parts_saved, 1);
+    assert_eq!(
+        fs::read(destination.join(&part.stored_name)).unwrap(),
+        bytes
+    );
 }
 
+#[cfg(feature = "full-tests")]
 #[test]
 fn find_held_members_zero_timeout_under_immediate_returns_busy() {
     let temp = TempDir::new().unwrap();
@@ -2274,6 +2724,7 @@ fn find_held_members_zero_timeout_under_immediate_returns_busy() {
                 instant: Some("2026-01-14T21:00:00.000Z".to_owned()),
                 local_civil: None,
                 source_zone: None,
+                ..Default::default()
             },
             run_note: None,
         }],
@@ -2301,6 +2752,7 @@ fn find_held_members_zero_timeout_under_immediate_returns_busy() {
     conn.execute_batch("ROLLBACK;").unwrap();
 }
 
+#[cfg(feature = "full-tests")]
 #[test]
 fn claim_row_with_dot_import_id_returns_claim_database_corrupt() {
     let temp = TempDir::new().unwrap();
@@ -2316,6 +2768,7 @@ fn claim_row_with_dot_import_id_returns_claim_database_corrupt() {
                 instant: Some("2026-01-14T21:00:00.000Z".to_owned()),
                 local_civil: None,
                 source_zone: None,
+                ..Default::default()
             },
             run_note: None,
         }],
@@ -2357,183 +2810,218 @@ fn claim_row_with_dot_import_id_returns_claim_database_corrupt() {
     assert_eq!(count, 1);
 }
 
+#[cfg(feature = "full-tests")]
 #[test]
-fn frontier_directory_and_symlink_are_saved_but_unavailable() {
+fn unsafe_or_missing_saved_raws_are_unavailable_without_blocking_other_work() {
     let temp = TempDir::new().unwrap();
     let journal = temp.path();
-
-    let import_id = "20260114_100007";
-    let run_dir = journal.join("imports").join(import_id);
-    fs::create_dir_all(&run_dir).unwrap();
-
-    let record = AudioArchiveRecord {
-        version: 1,
-        settings: AudioArchiveRecordSettings {
-            owner_zone: "America/New_York".to_owned(),
-            window_ms: 300_000,
-            stream: "import.clips".to_owned(),
-            qualifier: "clips".to_owned(),
-            archive_identity: "frontier_dir_sym_test".to_owned(),
-            len: 300,
-        },
-        members: vec![
-            AudioArchiveRecordMember {
-                byte_len: 100,
-                sha256: dummy_hash(42),
-                canonical_occurrence: "utc|1768424400000".to_owned(),
-                original_relative_name: "m1.ogg".to_owned(),
-                run_note: None,
-                disposition: MemberDisposition::Included,
-            },
-            AudioArchiveRecordMember {
-                byte_len: 200,
-                sha256: dummy_hash(43),
-                canonical_occurrence: "utc|1768424700000".to_owned(),
-                original_relative_name: "m2.ogg".to_owned(),
-                run_note: None,
-                disposition: MemberDisposition::Included,
-            },
-            AudioArchiveRecordMember {
-                byte_len: 300,
-                sha256: dummy_hash(44),
-                canonical_occurrence: "utc|1768425000000".to_owned(),
-                original_relative_name: "m3.ogg".to_owned(),
-                run_note: None,
-                disposition: MemberDisposition::Included,
-            },
-        ],
-        parts: vec![
-            AudioArchiveRecordPart {
-                member_sha256: dummy_hash(42),
-                member_occurrence: "utc|1768424400000".to_owned(),
-                day: "20260114".to_owned(),
-                segment_key: "160000_300".to_owned(),
-                stored_name: "p0000_2222222222222222.ogg".to_owned(),
-                offset_ms: 0,
-                origin_ms: 0,
-                length_ms: 1000,
-                outcome: PartOutcome::Saved,
-            },
-            AudioArchiveRecordPart {
-                member_sha256: dummy_hash(43),
-                member_occurrence: "utc|1768424700000".to_owned(),
-                day: "20260114".to_owned(),
-                segment_key: "160500_300".to_owned(),
-                stored_name: "p0000_3333333333333333.ogg".to_owned(),
-                offset_ms: 0,
-                origin_ms: 0,
-                length_ms: 1000,
-                outcome: PartOutcome::Saved,
-            },
-            AudioArchiveRecordPart {
-                member_sha256: dummy_hash(44),
-                member_occurrence: "utc|1768425000000".to_owned(),
-                day: "20260114".to_owned(),
-                segment_key: "161000_300".to_owned(),
-                stored_name: "p0000_4444444444444444.ogg".to_owned(),
-                offset_ms: 0,
-                origin_ms: 0,
-                length_ms: 1000,
-                outcome: PartOutcome::Planned,
-            },
-        ],
-    };
-
-    save_audio_archive_record(journal, import_id, &record).unwrap();
-    admit_running_attempt(journal, import_id, now_ms(), None).unwrap();
-    record_completed_attempt(journal, import_id, 1, now_ms(), None, None).unwrap();
-
-    let t1_dir = journal
-        .join("chronicle")
-        .join("20260114")
-        .join("import.clips")
-        .join("160000_300");
-    fs::create_dir_all(&t1_dir).unwrap();
-    let pl1 = solstone_core_format::audio_archive::AudioArchivePlacement {
-        version: 1,
-        parts: vec![
-            solstone_core_format::audio_archive::AudioArchivePlacementPart {
-                stored_name: "p0000_2222222222222222.ogg".to_owned(),
-                original_occurrence: "utc|1768424400000".to_owned(),
-                original_time_ms: Some(1768424400000),
-                origin_ms: 0,
-                offset_ms: 0,
-                length_ms: 1000,
-            },
-        ],
-    };
-    fs::write(
-        t1_dir.join(AUDIO_ARCHIVE_PLACEMENT_FILENAME),
-        serde_json::to_vec_pretty(&pl1).unwrap(),
-    )
-    .unwrap();
-    fs::create_dir_all(t1_dir.join("p0000_2222222222222222.ogg")).unwrap();
-
-    let t2_dir = journal
-        .join("chronicle")
-        .join("20260114")
-        .join("import.clips")
-        .join("160500_300");
-    fs::create_dir_all(&t2_dir).unwrap();
-    let pl2 = solstone_core_format::audio_archive::AudioArchivePlacement {
-        version: 1,
-        parts: vec![
-            solstone_core_format::audio_archive::AudioArchivePlacementPart {
-                stored_name: "p0000_3333333333333333.ogg".to_owned(),
-                original_occurrence: "utc|1768424700000".to_owned(),
-                original_time_ms: Some(1768424700000),
-                origin_ms: 0,
-                offset_ms: 0,
-                length_ms: 1000,
-            },
-        ],
-    };
-    fs::write(
-        t2_dir.join(AUDIO_ARCHIVE_PLACEMENT_FILENAME),
-        serde_json::to_vec_pretty(&pl2).unwrap(),
-    )
-    .unwrap();
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(
-        "target_does_not_matter",
-        t2_dir.join("p0000_3333333333333333.ogg"),
-    )
-    .unwrap();
-
-    let frontier = load_frontier(journal, import_id).unwrap();
-
-    assert_eq!(frontier.unavailable_parts.len(), 2);
-    assert!(
-        frontier
-            .unavailable_parts
-            .iter()
-            .any(|p| p.stored_name == "p0000_2222222222222222.ogg")
-    );
-    assert!(
-        frontier
-            .unavailable_parts
-            .iter()
-            .any(|p| p.stored_name == "p0000_3333333333333333.ogg")
-    );
-
-    let pub1 = frontier
-        .published_tiles
+    let sources = [
+        storage_member(90, "2026-01-14T21:00:00Z", 1000),
+        storage_member(91, "2026-01-14T21:05:00Z", 1000),
+        storage_member(92, "2026-01-14T21:10:00Z", 1000),
+    ];
+    let materials: HashMap<_, _> = sources
         .iter()
-        .find(|t| t.segment_key == "160000_300")
-        .expect("pub1");
-    assert_eq!(pub1.parts[0].outcome, PartOutcome::SavedButUnavailable);
-
-    let pub2 = frontier
-        .published_tiles
-        .iter()
-        .find(|t| t.segment_key == "160500_300")
-        .expect("pub2");
-    assert_eq!(pub2.parts[0].outcome, PartOutcome::SavedButUnavailable);
-
-    assert_eq!(frontier.pending_tiles.len(), 1);
-    assert_eq!(frontier.pending_tiles[0].segment_key, "161000_300");
+        .map(|(member, bytes)| (member.sha256.clone(), bytes.clone()))
+        .collect();
+    let members: Vec<_> = sources.iter().map(|(member, _)| member.clone()).collect();
+    let result = storage_publish(journal, None, &members, &materials, None).unwrap();
+    for (index, part) in result.record.parts.iter().take(2).enumerate() {
+        let raw = journal
+            .join("chronicle")
+            .join(&part.day)
+            .join(&result.record.settings.stream)
+            .join(&part.segment_key)
+            .join(&part.stored_name);
+        fs::remove_file(&raw).unwrap();
+        if index == 0 {
+            fs::create_dir(&raw).unwrap();
+        }
+        #[cfg(unix)]
+        if index == 1 {
+            std::os::unix::fs::symlink("unavailable-target", &raw).unwrap();
+        }
+    }
+    let batch = update_pending_archive_tiles(journal, 64).unwrap();
+    assert!(batch.errors.is_empty());
+    assert_eq!(batch.tiles.len(), 1);
+    assert_eq!(batch.tiles[0].segment_key, "161000_300");
+    let status = ArchiveStore::open(journal, &result.import_id, false)
+        .unwrap()
+        .status()
+        .unwrap();
     assert_eq!(
-        frontier.pending_tiles[0].parts[0].outcome,
-        PartOutcome::Planned
+        (
+            status.unavailable_parts,
+            status.processed_parts,
+            status.pending_processing
+        ),
+        (2, 0, 1)
     );
+}
+
+#[cfg(feature = "full-tests")]
+#[test]
+fn whole_saved_tile_absence_never_recreates_and_whole_run_absence_releases_identity() {
+    for fault in [None, Some(ArchiveFault::AfterPublishBeforeSavedMark)] {
+        let temp = TempDir::new().unwrap();
+        let journal = temp.path();
+        let (member, bytes) = storage_member(101, "2026-01-14T21:00:00Z", 7500);
+        let materials = HashMap::from([(member.sha256.clone(), bytes)]);
+        let initial = storage_publish(
+            journal,
+            None,
+            std::slice::from_ref(&member),
+            &materials,
+            fault,
+        );
+        if fault.is_none() {
+            assert!(initial.is_ok());
+        } else {
+            assert!(matches!(
+                initial,
+                Err(AudioArchiveError::Fault(
+                    ArchiveFault::AfterPublishBeforeSavedMark
+                ))
+            ));
+        }
+        let id = storage_run(journal);
+        let record = read_audio_archive(journal, &id).unwrap().unwrap();
+        let part = &record.parts[0];
+        let tile = journal
+            .join("chronicle")
+            .join(&part.day)
+            .join(&record.settings.stream)
+            .join(&part.segment_key);
+        assert!(tile.join(&part.stored_name).is_file());
+        fs::remove_dir_all(&tile).unwrap();
+        let resumed = storage_publish(
+            journal,
+            Some(&id),
+            std::slice::from_ref(&member),
+            &materials,
+            None,
+        )
+        .unwrap();
+        assert!(!tile.exists());
+        assert_eq!(
+            resumed.record.parts[0].outcome,
+            PartOutcome::SavedButUnavailable
+        );
+        let status = ArchiveStore::open(journal, &id, false)
+            .unwrap()
+            .status()
+            .unwrap();
+        assert_eq!(
+            (
+                status.saved_parts,
+                status.unavailable_parts,
+                status.processed_parts,
+                status.pending_processing
+            ),
+            (1, 1, 0, 0)
+        );
+        let next = publish_audio_archive(
+            journal,
+            AudioArchivePublishOptions {
+                import_id: None,
+                members: vec![member.clone()],
+                materializer: &materials,
+                owner_zone: NY,
+                settings: AudioArchiveSettings {
+                    qualifier: "second-archive".to_owned(),
+                    archive_identity: "second".to_owned(),
+                },
+                source_timestamp: None,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            next.record.members[0].disposition,
+            MemberDisposition::LeftOut(LeftOutReason::HeldByExistingRun)
+        );
+        assert!(next.record.parts.is_empty());
+        fs::remove_dir_all(journal.join("imports").join(&id)).unwrap();
+        let released = publish_audio_archive(
+            journal,
+            AudioArchivePublishOptions {
+                import_id: None,
+                members: vec![member],
+                materializer: &materials,
+                owner_zone: NY,
+                settings: AudioArchiveSettings {
+                    qualifier: "released-archive".to_owned(),
+                    archive_identity: "released".to_owned(),
+                },
+                source_timestamp: None,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            released.record.members[0].disposition,
+            MemberDisposition::Included
+        );
+        assert_eq!(released.parts_saved, 1);
+    }
+}
+
+#[cfg(feature = "full-tests")]
+#[test]
+fn publication_without_notification_is_recovered_by_discovery_without_rewriting_raw() {
+    for fault in [
+        ArchiveFault::AfterPublishBeforeSavedMark,
+        ArchiveFault::AfterSavedMarkBeforeEmit,
+    ] {
+        let temp = TempDir::new().unwrap();
+        let journal = temp.path();
+        let (member, bytes) = storage_member(102, "2026-01-14T21:00:00Z", 7500);
+        let materials = HashMap::from([(member.sha256.clone(), bytes.clone())]);
+        assert!(matches!(
+            storage_publish(journal, None, &[member], &materials, Some(fault)),
+            Err(AudioArchiveError::Fault(_))
+        ));
+        let id = storage_run(journal);
+        let record = read_audio_archive(journal, &id).unwrap().unwrap();
+        let part = &record.parts[0];
+        let raw = journal
+            .join("chronicle")
+            .join(&part.day)
+            .join(&record.settings.stream)
+            .join(&part.segment_key)
+            .join(&part.stored_name);
+        let before = fs::metadata(&raw).unwrap();
+        let batch = update_pending_archive_tiles(journal, 64).unwrap();
+        assert!(batch.errors.is_empty());
+        assert_eq!(batch.tiles.len(), 1);
+        assert_eq!(fs::read(&raw).unwrap(), bytes);
+        let after = fs::metadata(&raw).unwrap();
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(before.ino(), after.ino());
+        }
+        let status = ArchiveStore::open(journal, &id, false)
+            .unwrap()
+            .status()
+            .unwrap();
+        assert_eq!((status.saved_parts, status.pending_processing), (1, 1));
+        finish_archive_part(
+            journal,
+            &id,
+            &part.day,
+            &part.segment_key,
+            &part.stored_name,
+            false,
+        )
+        .unwrap();
+        assert!(
+            update_pending_archive_tiles(journal, 64)
+                .unwrap()
+                .tiles
+                .is_empty()
+        );
+    }
 }

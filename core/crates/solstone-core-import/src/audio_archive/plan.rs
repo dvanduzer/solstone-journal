@@ -25,6 +25,16 @@ pub enum DurationInput {
     Milliseconds(i64),
     NonFinite,
     Empty,
+    Rejected(SourceRejection),
+}
+
+/// Source-local failures leave other members eligible. Journal/storage failures remain errors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceRejection {
+    Unreadable,
+    Unsupported,
+    Changed,
 }
 
 /// Placement settings supplied for the archive run.
@@ -59,23 +69,29 @@ pub struct IntervalConflictPayload {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum LeftOutReason {
+    SourceRejected { cause: SourceRejection },
     BadDuration,
     UnsettledTime,
     NonexistentLocalTime,
     ConflictingEvidence,
     IntervalConflict(IntervalConflictPayload),
     HeldByExistingRun,
+    DuplicateMember,
+    PublishedTile { day: String, segment_key: String },
 }
 
 impl LeftOutReason {
     pub fn kind_key(&self) -> &'static str {
         match self {
+            Self::SourceRejected { .. } => "source_rejected",
             Self::BadDuration => "bad_duration",
             Self::UnsettledTime => "unsettled_time",
             Self::NonexistentLocalTime => "nonexistent_local_time",
             Self::ConflictingEvidence => "conflicting_evidence",
             Self::IntervalConflict(_) => "interval_conflict",
             Self::HeldByExistingRun => "held_by_existing_run",
+            Self::DuplicateMember => "duplicate_member",
+            Self::PublishedTile { .. } => "published_tile",
         }
     }
 }
@@ -96,12 +112,16 @@ pub enum PartOutcome {
     Staged,
     Saved,
     SavedButUnavailable,
+    Rejected,
 }
 
 /// Summary metrics computed from a plan.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AudioArchiveSize {
     pub members: usize,
+    /// All source bytes, including duplicate and left-out input members.
+    pub source_bytes: u64,
+    /// Original bytes of members accepted by this plan.
     pub bytes: u64,
     pub days: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -126,6 +146,7 @@ pub struct PlannedMember {
     pub identity: MemberIdentity,
     pub original_relative_name: String,
     pub duration_ms: i64,
+    pub source_start: MemberStartEvidence,
     pub resolved_occurrence: Option<ResolvedOccurrence>,
     pub disposition: MemberDisposition,
     pub run_note: Option<String>,
@@ -172,6 +193,15 @@ pub fn plan_audio_archive(
     owner_zone: Tz,
     settings: AudioArchiveSettings,
 ) -> Result<AudioArchivePlan, AudioArchiveError> {
+    plan_excluding(members, owner_zone, settings, &HashMap::new())
+}
+
+fn plan_excluding(
+    members: &[AudioArchiveMemberInput],
+    owner_zone: Tz,
+    settings: AudioArchiveSettings,
+    exclusions: &HashMap<MemberIdentity, LeftOutReason>,
+) -> Result<AudioArchivePlan, AudioArchiveError> {
     let stream = canonicalize_stream_name("import", Some(&settings.qualifier))
         .map_err(|e| AudioArchiveError::InvalidStreamName(e.to_string()))?;
     if stream == "import.audio" {
@@ -193,8 +223,12 @@ pub fn plan_audio_archive(
                     identity,
                     original_relative_name: input.original_relative_name.clone(),
                     duration_ms: 0,
+                    source_start: input.start.clone(),
                     resolved_occurrence: None,
-                    disposition: MemberDisposition::LeftOut(LeftOutReason::BadDuration),
+                    disposition: MemberDisposition::LeftOut(match input.duration {
+                        DurationInput::Rejected(cause) => LeftOutReason::SourceRejected { cause },
+                        _ => LeftOutReason::BadDuration,
+                    }),
                     run_note: input.run_note.clone(),
                 });
                 continue;
@@ -213,6 +247,7 @@ pub fn plan_audio_archive(
                     identity,
                     original_relative_name: input.original_relative_name.clone(),
                     duration_ms,
+                    source_start: input.start.clone(),
                     resolved_occurrence: None,
                     disposition: MemberDisposition::LeftOut(reason),
                     run_note: input.run_note.clone(),
@@ -222,17 +257,21 @@ pub fn plan_audio_archive(
         };
 
         let identity = MemberIdentity::new(input.byte_len, &input.sha256, resolved.canonical());
-        if seen_identities.contains(&identity) {
-            continue;
-        }
-        seen_identities.insert(identity.clone());
+        let duplicate = !seen_identities.insert(identity.clone());
 
         planned_members.push(PlannedMember {
-            identity,
+            identity: identity.clone(),
             original_relative_name: input.original_relative_name.clone(),
             duration_ms,
+            source_start: input.start.clone(),
             resolved_occurrence: Some(resolved),
-            disposition: MemberDisposition::Included,
+            disposition: if duplicate {
+                MemberDisposition::LeftOut(LeftOutReason::DuplicateMember)
+            } else if let Some(reason) = exclusions.get(&identity) {
+                MemberDisposition::LeftOut(reason.clone())
+            } else {
+                MemberDisposition::Included
+            },
             run_note: input.run_note.clone(),
         });
     }
@@ -327,7 +366,7 @@ pub fn plan_audio_archive(
                 let part_index = idx as u32;
                 let stored_name = build_stored_name(
                     part_index,
-                    &member.identity.sha256,
+                    &member.identity.storage_digest(),
                     &member.original_relative_name,
                 )
                 .map_err(|e| AudioArchiveError::Other(e.to_string()))?;
@@ -373,29 +412,59 @@ pub fn plan_audio_archive(
 }
 
 /// Pure helper to drop members flagged as held and recompute plan size.
-pub fn apply_held_members(plan: &mut AudioArchivePlan, held_identities: &HashSet<MemberIdentity>) {
+pub fn apply_held_members(
+    plan: &mut AudioArchivePlan,
+    held_identities: &HashSet<MemberIdentity>,
+) -> Result<(), AudioArchiveError> {
     if held_identities.is_empty() {
-        return;
+        return Ok(());
     }
-    let mut changed = false;
-    for member in &mut plan.members {
-        if member.disposition == MemberDisposition::Included
-            && held_identities.contains(&member.identity)
-        {
-            member.disposition = MemberDisposition::LeftOut(LeftOutReason::HeldByExistingRun);
-            changed = true;
-        }
-    }
-    if !changed {
-        return;
-    }
+    let exclusions = held_identities
+        .iter()
+        .map(|identity| (identity.clone(), LeftOutReason::HeldByExistingRun))
+        .collect();
+    apply_exclusions(plan, &exclusions)
+}
 
-    for tile in &mut plan.tiles {
-        tile.parts
-            .retain(|p| !held_identities.contains(&p.member_identity));
-    }
-    plan.tiles.retain(|t| !t.parts.is_empty());
-    plan.size = compute_plan_size(&plan.members, &plan.tiles);
+/// Excluded members reserve no intervals. Reconsider later input against the actual occupancy.
+pub fn apply_exclusions(
+    plan: &mut AudioArchivePlan,
+    exclusions: &HashMap<MemberIdentity, LeftOutReason>,
+) -> Result<(), AudioArchiveError> {
+    let mut combined: HashMap<_, _> = plan
+        .members
+        .iter()
+        .filter_map(|member| match &member.disposition {
+            MemberDisposition::LeftOut(
+                reason @ (LeftOutReason::HeldByExistingRun | LeftOutReason::PublishedTile { .. }),
+            ) => Some((member.identity.clone(), reason.clone())),
+            _ => None,
+        })
+        .collect();
+    combined.extend(
+        exclusions
+            .iter()
+            .map(|(identity, reason)| (identity.clone(), reason.clone())),
+    );
+    let inputs: Vec<_> = plan
+        .members
+        .iter()
+        .map(|member| AudioArchiveMemberInput {
+            original_relative_name: member.original_relative_name.clone(),
+            byte_len: member.identity.byte_len,
+            sha256: member.identity.sha256.clone(),
+            duration: match &member.disposition {
+                MemberDisposition::LeftOut(LeftOutReason::SourceRejected { cause }) => {
+                    DurationInput::Rejected(*cause)
+                }
+                _ => DurationInput::Milliseconds(member.duration_ms),
+            },
+            start: member.source_start.clone(),
+            run_note: member.run_note.clone(),
+        })
+        .collect();
+    *plan = plan_excluding(&inputs, plan.owner_zone, plan.settings.clone(), &combined)?;
+    Ok(())
 }
 
 pub fn compute_plan_size(members: &[PlannedMember], tiles: &[PlannedTile]) -> AudioArchiveSize {
@@ -429,6 +498,7 @@ pub fn compute_plan_size(members: &[PlannedMember], tiles: &[PlannedTile]) -> Au
 
     AudioArchiveSize {
         members: members.len(),
+        source_bytes: members.iter().map(|member| member.identity.byte_len).sum(),
         bytes,
         days: days_set.len(),
         span,
@@ -508,19 +578,22 @@ pub fn simulate_parts(
             }
         }
 
-        let diff_dt = match first_diff {
-            Some(dt) => dt,
-            None => return Err(LeftOutReason::UnsettledTime),
+        let part_len = {
+            let diff_dt = match first_diff {
+                Some(dt) => dt,
+                None => return Err(LeftOutReason::UnsettledTime),
+            };
+
+            if diff_dt > window_limit && remaining > window_limit {
+                return Err(LeftOutReason::UnsettledTime);
+            }
+
+            let part_len = diff_dt.min(remaining);
+            if part_len > window_limit {
+                return Err(LeftOutReason::UnsettledTime);
+            }
+            part_len
         };
-
-        if diff_dt > window_limit && remaining > window_limit {
-            return Err(LeftOutReason::UnsettledTime);
-        }
-
-        let part_len = diff_dt.min(remaining);
-        if part_len > window_limit {
-            return Err(LeftOutReason::UnsettledTime);
-        }
 
         parts.push(SimulatedPart {
             day,

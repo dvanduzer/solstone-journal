@@ -1,34 +1,34 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-//! Read-only inspection of an audio archive run's frontier across chronicle and imports.
+//! Bounded processing discovery. Saving and processing are independent durable facts.
 
-use std::collections::BTreeMap;
+use super::claims::{
+    claim_db_path, retire_pending_tile, update_pending_tiles, update_pending_tiles_for_run,
+};
+use super::publish::recover_published_tile;
+use super::record::ArchiveStore;
+use super::{AudioArchiveError, PartOutcome};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-
-use serde::{Deserialize, Serialize};
-use solstone_core_format::audio_archive::AUDIO_ARCHIVE_PLACEMENT_FILENAME;
-
-use super::AudioArchiveError;
-use super::plan::PartOutcome;
-use super::record::read_audio_archive;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrontierPart {
     pub stored_name: String,
+    /// Original member digest. Sensing hashes the actual independently playable raw part.
     pub sha256: String,
     pub outcome: PartOutcome,
 }
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrontierTile {
+    pub import_id: String,
     pub day: String,
     pub segment_key: String,
     pub stream: String,
     pub parts: Vec<FrontierPart>,
 }
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrontierUnavailablePart {
     pub day: String,
@@ -36,7 +36,7 @@ pub struct FrontierUnavailablePart {
     pub stored_name: String,
     pub sha256: String,
 }
-
+/// A bounded batch, not a full run snapshot. Pending means published but not yet processed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AudioArchiveFrontier {
     pub import_id: String,
@@ -44,125 +44,185 @@ pub struct AudioArchiveFrontier {
     pub pending_tiles: Vec<FrontierTile>,
     pub unavailable_parts: Vec<FrontierUnavailablePart>,
 }
+#[derive(Clone, Debug, Default)]
+pub struct PendingArchiveBatch {
+    pub tiles: Vec<FrontierTile>,
+    pub errors: Vec<(String, String)>,
+}
 
-/// Read-only inspection of a run's published, pending, and unavailable parts.
-///
-/// Refuses missing run directory without creating any files.
-pub fn load_frontier(
-    journal_root: &Path,
-    import_id: &str,
-) -> Result<AudioArchiveFrontier, AudioArchiveError> {
-    if crate::timestamp::validate_timestamp(import_id).is_err() {
-        return Err(AudioArchiveError::Other(format!(
-            "invalid import_id '{import_id}'"
-        )));
+fn collect_tile(
+    journal: &Path,
+    id: &str,
+    store: &mut ArchiveStore,
+    day: &str,
+    key: &str,
+    unavailable: &mut Vec<FrontierUnavailablePart>,
+) -> Result<Option<FrontierTile>, AudioArchiveError> {
+    if !store.has_tile(day, key)? {
+        // A valid replacement run at a reused timestamp does not inherit old work.
+        retire_pending_tile(journal, id, day, key)?;
+        return Ok(None);
     }
-    let run_dir = journal_root.join("imports").join(import_id);
-    if !run_dir.is_dir() {
-        return Err(AudioArchiveError::MissingRunDirectory(run_dir));
+    if !recover_published_tile(journal, id, store, day, key)? {
+        return Ok(None);
     }
-
-    let record = read_audio_archive(journal_root, import_id)?
-        .ok_or_else(|| AudioArchiveError::MissingRunDirectory(run_dir.clone()))?;
-
-    let stream = &record.settings.stream;
-
-    let mut tile_parts: BTreeMap<(String, String), Vec<&super::record::AudioArchiveRecordPart>> =
-        BTreeMap::new();
-    for part in &record.parts {
-        tile_parts
-            .entry((part.day.clone(), part.segment_key.clone()))
-            .or_default()
-            .push(part);
-    }
-
-    let mut published_tiles = Vec::new();
-    let mut pending_tiles = Vec::new();
-    let mut unavailable_parts = Vec::new();
-
-    for ((day, segment_key), parts) in tile_parts {
-        let segment_dir = journal_root
+    let stream = store.settings()?.stream;
+    let names: std::collections::HashSet<_> =
+        store.pending_part_names(day, key)?.into_iter().collect();
+    let mut parts = Vec::new();
+    for part in store.tile_parts(day, key)? {
+        if part.outcome == PartOutcome::SavedButUnavailable {
+            unavailable.push(FrontierUnavailablePart {
+                day: day.to_owned(),
+                segment_key: key.to_owned(),
+                stored_name: part.stored_name.clone(),
+                sha256: part.member_sha256.clone(),
+            });
+        }
+        if !names.contains(&part.stored_name) {
+            continue;
+        }
+        let raw = journal
             .join("chronicle")
-            .join(&day)
-            .join(stream)
-            .join(&segment_key);
-
-        let placement_file = segment_dir.join(AUDIO_ARCHIVE_PLACEMENT_FILENAME);
-        let placement_durable = fs::symlink_metadata(&placement_file)
-            .map(|m| m.file_type().is_file())
-            .unwrap_or(false);
-
-        let mut tile_is_published = placement_durable;
-        let mut frontier_parts = Vec::new();
-
-        for part in &parts {
-            let raw_path = segment_dir.join(&part.stored_name);
-            let raw_is_file = fs::symlink_metadata(&raw_path)
-                .map(|m| m.file_type().is_file())
-                .unwrap_or(false);
-
-            let is_saved = part.outcome == PartOutcome::Saved
-                || part.outcome == PartOutcome::SavedButUnavailable;
-
-            if is_saved && !raw_is_file {
-                unavailable_parts.push(FrontierUnavailablePart {
-                    day: day.clone(),
-                    segment_key: segment_key.clone(),
-                    stored_name: part.stored_name.clone(),
-                    sha256: part.member_sha256.clone(),
-                });
-                frontier_parts.push(FrontierPart {
-                    stored_name: part.stored_name.clone(),
-                    sha256: part.member_sha256.clone(),
-                    outcome: PartOutcome::SavedButUnavailable,
-                });
-            } else if (placement_durable || is_saved) && raw_is_file {
-                frontier_parts.push(FrontierPart {
-                    stored_name: part.stored_name.clone(),
-                    sha256: part.member_sha256.clone(),
-                    outcome: PartOutcome::Saved,
-                });
-            } else {
-                tile_is_published = false;
-                let staged_path = run_dir
-                    .join("staged")
-                    .join(&day)
-                    .join(&segment_key)
-                    .join(&part.stored_name);
-                let staged_is_file = fs::symlink_metadata(&staged_path)
-                    .map(|m| m.file_type().is_file())
-                    .unwrap_or(false);
-                let outcome = if staged_is_file {
-                    PartOutcome::Staged
-                } else {
-                    PartOutcome::Planned
-                };
-                frontier_parts.push(FrontierPart {
-                    stored_name: part.stored_name.clone(),
-                    sha256: part.member_sha256.clone(),
-                    outcome,
-                });
-            }
-        }
-
-        let tile = FrontierTile {
-            day,
-            segment_key,
-            stream: stream.clone(),
-            parts: frontier_parts,
+            .join(day)
+            .join(&stream)
+            .join(key)
+            .join(&part.stored_name);
+        let available = match fs::symlink_metadata(raw) {
+            Ok(metadata) => metadata.file_type().is_file(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
         };
-
-        if tile_is_published {
-            published_tiles.push(tile);
+        if available {
+            parts.push(FrontierPart {
+                stored_name: part.stored_name,
+                sha256: part.member_sha256,
+                outcome: PartOutcome::Saved,
+            });
         } else {
-            pending_tiles.push(tile);
+            store.set_tile_outcomes(
+                day,
+                key,
+                &[(part.stored_name.clone(), PartOutcome::SavedButUnavailable)],
+                2,
+            )?;
+            store.finish_processing(day, key, &part.stored_name, true)?;
+            unavailable.push(FrontierUnavailablePart {
+                day: day.to_owned(),
+                segment_key: key.to_owned(),
+                stored_name: part.stored_name,
+                sha256: part.member_sha256,
+            });
         }
     }
+    if parts.is_empty() {
+        if claim_db_path(journal).try_exists()? {
+            retire_pending_tile(journal, id, day, key)?;
+        }
+        return Ok(None);
+    }
+    Ok(Some(FrontierTile {
+        import_id: id.to_owned(),
+        day: day.to_owned(),
+        segment_key: key.to_owned(),
+        stream,
+        parts,
+    }))
+}
 
+/// Reconcile at most 64 owed tiles. One damaged run cannot suppress other runs' work.
+/// Call from the existing blocking discovery worker, never the supervisor event loop.
+pub fn update_pending_archive_tiles(
+    journal: &Path,
+    limit: u32,
+) -> Result<PendingArchiveBatch, AudioArchiveError> {
+    let mut batch = PendingArchiveBatch::default();
+    let mut stores = HashMap::new();
+    for (id, day, key) in update_pending_tiles(journal, limit)? {
+        let result = (|| {
+            let run = journal.join("imports").join(&id);
+            match fs::symlink_metadata(&run) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    retire_pending_tile(journal, &id, &day, &key)?;
+                    return Ok(None);
+                }
+                Err(error) => return Err(error.into()),
+                Ok(metadata) if !metadata.file_type().is_dir() => {
+                    return Err(AudioArchiveError::ClaimDatabaseCorrupt(format!(
+                        "run {id} is not a directory"
+                    )));
+                }
+                Ok(_) => {}
+            }
+            if !stores.contains_key(&id) {
+                stores.insert(id.clone(), ArchiveStore::open(journal, &id, true)?);
+            }
+            collect_tile(
+                journal,
+                &id,
+                stores.get_mut(&id).expect("opened run store"),
+                &day,
+                &key,
+                &mut Vec::new(),
+            )
+        })();
+        match result {
+            Ok(Some(tile)) => batch.tiles.push(tile),
+            Ok(None) => {}
+            Err(error) => batch.errors.push((id, error.to_string())),
+        }
+    }
+    Ok(batch)
+}
+
+pub fn update_archive_frontier(
+    journal: &Path,
+    id: &str,
+) -> Result<AudioArchiveFrontier, AudioArchiveError> {
+    crate::timestamp::validate_timestamp(id)
+        .map_err(|error| AudioArchiveError::Other(error.to_string()))?;
+    let run = journal.join("imports").join(id);
+    if !run.is_dir() {
+        return Err(AudioArchiveError::MissingRunDirectory(run));
+    }
+    let mut store = ArchiveStore::open(journal, id, true)?;
+    let mut coordinates: Vec<_> = update_pending_tiles_for_run(journal, 64, Some(id))?
+        .into_iter()
+        .map(|(_, day, key)| (day, key))
+        .collect();
+    if coordinates.is_empty() {
+        coordinates = store.pending_tiles(64)?;
+    }
+    let mut pending = Vec::new();
+    let mut unavailable_parts = Vec::new();
+    for (day, key) in coordinates {
+        if let Some(tile) =
+            collect_tile(journal, id, &mut store, &day, &key, &mut unavailable_parts)?
+        {
+            pending.push(tile);
+        }
+    }
     Ok(AudioArchiveFrontier {
-        import_id: import_id.to_owned(),
-        published_tiles,
-        pending_tiles,
+        import_id: id.to_owned(),
+        published_tiles: pending.clone(),
+        pending_tiles: pending,
         unavailable_parts,
     })
+}
+
+/// Acknowledge exactly one saved part after the native processing/indexing authorities finish it.
+pub fn finish_archive_part(
+    journal: &Path,
+    id: &str,
+    day: &str,
+    key: &str,
+    name: &str,
+    unavailable: bool,
+) -> Result<(), AudioArchiveError> {
+    let mut store = ArchiveStore::open(journal, id, true)?;
+    store.finish_processing(day, key, name, unavailable)?;
+    if store.tile_phase(day, key)? == 2 && store.pending_part_names(day, key)?.is_empty() {
+        retire_pending_tile(journal, id, day, key)?;
+    }
+    Ok(())
 }

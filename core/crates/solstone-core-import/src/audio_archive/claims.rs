@@ -5,20 +5,116 @@
 //!
 //! Stored in `imports/audio-archive-claims.sqlite`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use super::AudioArchiveError;
 use super::identity::MemberIdentity;
 use super::plan::PlannedMember;
-use super::record::AudioArchiveRecord;
+use super::record::ArchiveStore;
 
 const CLAIM_DB_FILENAME: &str = "audio-archive-claims.sqlite";
 pub const DEFAULT_WRITE_BUSY_TIMEOUT: Duration = Duration::from_millis(2000);
+
+/// Register owed discovery before a tile can become visible. Run-owned state stays authoritative.
+pub fn register_pending_tile(
+    journal: &Path,
+    import_id: &str,
+    day: &str,
+    segment: &str,
+) -> Result<(), AudioArchiveError> {
+    let conn = Connection::open(claim_db_path(journal))?;
+    conn.busy_timeout(DEFAULT_WRITE_BUSY_TIMEOUT)?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS audio_archive_pending_tile (
+        import_id TEXT NOT NULL, day TEXT NOT NULL, segment_key TEXT NOT NULL,
+        discovery_order INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(import_id,day,segment_key));
+        CREATE INDEX IF NOT EXISTS audio_archive_pending_time ON audio_archive_pending_tile(discovery_order,day DESC,segment_key DESC,import_id);
+        CREATE INDEX IF NOT EXISTS audio_archive_pending_run ON audio_archive_pending_tile(import_id,discovery_order,day DESC,segment_key DESC);")?;
+    conn.execute(
+        "INSERT OR IGNORE INTO audio_archive_pending_tile(import_id,day,segment_key) VALUES(?,?,?)",
+        params![import_id, day, segment],
+    )?;
+    Ok(())
+}
+
+/// Bounded indexed discovery, independent of the number of prior imports and members.
+pub fn update_pending_tiles(
+    journal: &Path,
+    limit: u32,
+) -> Result<Vec<(String, String, String)>, AudioArchiveError> {
+    update_pending_tiles_for_run(journal, limit, None)
+}
+
+pub(crate) fn update_pending_tiles_for_run(
+    journal: &Path,
+    limit: u32,
+    import_id: Option<&str>,
+) -> Result<Vec<(String, String, String)>, AudioArchiveError> {
+    let path = claim_db_path(journal);
+    if !path.try_exists()? {
+        return Ok(Vec::new());
+    }
+    let mut conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    conn.busy_timeout(DEFAULT_WRITE_BUSY_TIMEOUT)?;
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='audio_archive_pending_tile'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !exists {
+        return Ok(Vec::new());
+    }
+    // Rotate every selected batch, including damaged or not-yet-published tiles.
+    // Discovery fairness is separate from the worker's newest-first band-4 order.
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let selected: Vec<(String, String, String)> = {
+        let sql = if import_id.is_some() {
+            "SELECT import_id,day,segment_key FROM audio_archive_pending_tile WHERE import_id=?1 ORDER BY discovery_order,day DESC,segment_key DESC,import_id LIMIT ?2"
+        } else {
+            "SELECT import_id,day,segment_key FROM audio_archive_pending_tile WHERE ?1 IS NULL ORDER BY discovery_order,day DESC,segment_key DESC,import_id LIMIT ?2"
+        };
+        let mut query = tx.prepare(sql)?;
+        query
+            .query_map(params![import_id, limit.min(64)], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<_, _>>()?
+    };
+    let next: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(discovery_order),0)+1 FROM audio_archive_pending_tile",
+        [],
+        |row| row.get(0),
+    )?;
+    for (id, day, key) in &selected {
+        tx.execute("UPDATE audio_archive_pending_tile SET discovery_order=? WHERE import_id=? AND day=? AND segment_key=?",params![next,id,day,key])?;
+    }
+    tx.commit()?;
+    Ok(selected)
+}
+
+pub fn retire_pending_tile(
+    journal: &Path,
+    import_id: &str,
+    day: &str,
+    segment: &str,
+) -> Result<(), AudioArchiveError> {
+    let conn =
+        Connection::open_with_flags(claim_db_path(journal), OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    conn.busy_timeout(DEFAULT_WRITE_BUSY_TIMEOUT)?;
+    conn.execute(
+        "DELETE FROM audio_archive_pending_tile WHERE import_id=? AND day=? AND segment_key=?",
+        params![import_id, day, segment],
+    )?;
+    Ok(())
+}
 
 pub fn claim_db_path(journal_root: &Path) -> PathBuf {
     journal_root.join("imports").join(CLAIM_DB_FILENAME)
@@ -67,12 +163,10 @@ pub fn find_held_members(
         .map_err(|error| map_read_sqlite(&path, error))?;
 
     let mut held = HashSet::new();
+    let mut owners = HashMap::new();
+    let mut owner_order = VecDeque::new();
 
     for member in members {
-        if member.disposition != super::plan::MemberDisposition::Included {
-            continue;
-        }
-
         let mut rows = stmt
             .query(params![
                 member.identity.byte_len as i64,
@@ -103,20 +197,26 @@ pub fn find_held_members(
 
             let run_dir = journal_root.join("imports").join(&row_import_id);
             if run_dir.is_dir() {
-                let archive_json = run_dir.join("audio-archive.json");
-                if archive_json.exists() {
-                    let bytes = fs::read(&archive_json).map_err(|e| {
-                        AudioArchiveError::ClaimDatabaseCorrupt(format!(
-                            "{}: unreadable record: {e}",
-                            archive_json.display()
-                        ))
-                    })?;
-                    if serde_json::from_slice::<AudioArchiveRecord>(&bytes).is_err() {
-                        return Err(AudioArchiveError::ClaimDatabaseCorrupt(format!(
-                            "{}: invalid audio archive record",
-                            archive_json.display()
-                        )));
+                if !owners.contains_key(&row_import_id) {
+                    let store = ArchiveStore::open(journal_root, &row_import_id, false).map_err(
+                        |error| {
+                            AudioArchiveError::ClaimDatabaseCorrupt(format!(
+                                "run {row_import_id}: {error}"
+                            ))
+                        },
+                    )?;
+                    if owners.len() == 64
+                        && let Some(oldest) = owner_order.pop_front()
+                    {
+                        owners.remove(&oldest);
                     }
+                    owner_order.push_back(row_import_id.clone());
+                    owners.insert(row_import_id.clone(), store);
+                }
+                if !owners[&row_import_id].holds(&member.identity)? {
+                    // Timestamp directory IDs can be reused after whole-run removal.
+                    // The valid current run record, not this accelerator, owns identity.
+                    continue;
                 }
                 held.insert(member.identity.clone());
             }
@@ -223,7 +323,9 @@ pub fn insert_tile_claims(
                     )));
                 }
                 let other_dir = journal_root.join("imports").join(&existing_id);
-                if other_dir.is_dir() {
+                if other_dir.is_dir()
+                    && ArchiveStore::open(journal_root, &existing_id, false)?.holds(identity)?
+                {
                     return Err(AudioArchiveError::MemberHeldByLivingRun {
                         import_id: existing_id,
                     });

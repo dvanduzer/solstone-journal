@@ -15,8 +15,7 @@ pub const AUDIO_ARCHIVE_PLACEMENT_VERSION: u32 = 1;
 pub const AUDIO_ARCHIVE_PLACEMENT_FILENAME: &str = "placement.json";
 
 /// Placement descriptor for all parts published into a single tile.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct AudioArchivePlacement {
     pub version: u32,
     pub parts: Vec<AudioArchivePlacementPart>,
@@ -26,6 +25,7 @@ pub struct AudioArchivePlacement {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AudioArchivePlacementPart {
+    #[serde(deserialize_with = "deserialize_stored_name")]
     pub stored_name: String,
     pub original_occurrence: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -33,6 +33,51 @@ pub struct AudioArchivePlacementPart {
     pub origin_ms: i64,
     pub offset_ms: i64,
     pub length_ms: i64,
+}
+
+fn deserialize_stored_name<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
+    let name = String::deserialize(deserializer)?;
+    validate_stored_name(&name).map_err(serde::de::Error::custom)?;
+    Ok(name)
+}
+
+impl<'de> Deserialize<'de> for AudioArchivePlacement {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            version: u32,
+            parts: Vec<AudioArchivePlacementPart>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        if wire.version != AUDIO_ARCHIVE_PLACEMENT_VERSION {
+            return Err(serde::de::Error::custom(
+                "unsupported audio archive placement version",
+            ));
+        }
+        let mut names = std::collections::HashSet::new();
+        for part in &wire.parts {
+            if !names.insert(&part.stored_name)
+                || part.origin_ms < 0
+                || part.offset_ms < 0
+                || part.length_ms <= 0
+                || part
+                    .offset_ms
+                    .checked_add(part.length_ms)
+                    .is_none_or(|end| end > 300_000)
+            {
+                return Err(serde::de::Error::custom(
+                    "invalid or duplicate audio archive part",
+                ));
+            }
+        }
+        Ok(Self {
+            version: wire.version,
+            parts: wire.parts,
+        })
+    }
 }
 
 /// Errors occurring while constructing or validating stored part names.
@@ -142,6 +187,24 @@ fn extract_safe_extension(original_relative_name: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn untrusted_placement_rejects_unsafe_targets_and_out_of_tile_offsets() {
+        let part = serde_json::json!({"stored_name":"../outside.ogg","original_occurrence":"utc|1","origin_ms":0,"offset_ms":0,"length_ms":1000});
+        assert!(
+            serde_json::from_value::<AudioArchivePlacement>(
+                serde_json::json!({"version":1,"parts":[part]})
+            )
+            .is_err()
+        );
+        let part = serde_json::json!({"stored_name":"p0000_0123456789abcdef.ogg","original_occurrence":"utc|1","origin_ms":0,"offset_ms":299_500,"length_ms":1000});
+        assert!(
+            serde_json::from_value::<AudioArchivePlacement>(
+                serde_json::json!({"version":1,"parts":[part]})
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn valid_stored_names_and_extension_rules() {

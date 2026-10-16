@@ -20,23 +20,24 @@ pub use claims::{
     DEFAULT_WRITE_BUSY_TIMEOUT, claim_db_path, find_held_members, insert_tile_claims,
 };
 pub use frontier::{
-    AudioArchiveFrontier, FrontierPart, FrontierTile, FrontierUnavailablePart, load_frontier,
+    AudioArchiveFrontier, FrontierPart, FrontierTile, FrontierUnavailablePart, PendingArchiveBatch,
+    finish_archive_part, update_archive_frontier, update_pending_archive_tiles,
 };
-pub use identity::{MemberIdentity, MemberStartEvidence, ResolvedOccurrence};
+pub use identity::{MemberIdentity, MemberStartEvidence, MemberTimeAuthority, ResolvedOccurrence};
 pub use plan::{
     AUDIO_ARCHIVE_LEN_SECONDS, AUDIO_ARCHIVE_WINDOW_MS, AudioArchiveMemberInput, AudioArchivePlan,
     AudioArchiveSettings, AudioArchiveSize, DurationInput, IntervalConflictPayload, LeftOutReason,
     MemberDisposition, PartOutcome, PlannedMember, PlannedPart, PlannedTile, SimulatedPart,
-    apply_held_members, plan_audio_archive,
+    SourceRejection, apply_held_members, plan_audio_archive,
 };
 pub use publish::{
-    ArchiveFault, AudioArchivePublishOptions, AudioArchivePublishResult, AudioArchivePublishSeams,
-    EmitObservedFn, publish_audio_archive,
+    ArchiveFault, AudioArchiveMaterializer, AudioArchivePublishOptions, AudioArchivePublishResult,
+    AudioArchivePublishSeams, EmitObservedFn, prepare_audio_archive_plan, publish_audio_archive,
 };
 pub use record::{
-    AUDIO_ARCHIVE_RECORD_FILENAME, AUDIO_ARCHIVE_RECORD_VERSION, AudioArchiveRecord,
+    AUDIO_ARCHIVE_RECORD_FILENAME, AUDIO_ARCHIVE_RECORD_VERSION, ArchiveStore, AudioArchiveRecord,
     AudioArchiveRecordMember, AudioArchiveRecordPart, AudioArchiveRecordSettings,
-    read_audio_archive, save_audio_archive_record, validate_resume_settings,
+    AudioArchiveStatus, read_audio_archive, save_audio_archive_record, validate_resume_settings,
 };
 
 /// Dedicated error type for all audio archive operations.
@@ -50,6 +51,7 @@ pub enum AudioArchiveError {
     MemberHeldByLivingRun { import_id: String },
     ChronicleSegmentRefused(String),
     HashMismatch { expected: String, actual: String },
+    SourceRejected(SourceRejection),
     Fault(ArchiveFault),
     Io(std::io::Error),
     Json(serde_json::Error),
@@ -77,6 +79,7 @@ impl fmt::Display for AudioArchiveError {
                 write!(f, "hash mismatch: expected {expected}, actual {actual}")
             }
             Self::Fault(fault) => write!(f, "archive fault injected: {fault:?}"),
+            Self::SourceRejected(cause) => write!(f, "archive source rejected: {cause:?}"),
             Self::Io(err) => write!(f, "i/o error: {err}"),
             Self::Json(err) => write!(f, "json error: {err}"),
             Self::Sqlite(err) => write!(f, "sqlite error: {err}"),
@@ -93,6 +96,22 @@ impl std::error::Error for AudioArchiveError {
             Self::Sqlite(err) => Some(err),
             _ => None,
         }
+    }
+}
+
+impl From<rusqlite::Error> for AudioArchiveError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Sqlite(error)
+    }
+}
+impl From<serde_json::Error> for AudioArchiveError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
+    }
+}
+impl From<std::io::Error> for AudioArchiveError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
     }
 }
 

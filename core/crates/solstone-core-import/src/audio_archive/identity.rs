@@ -6,6 +6,7 @@
 use chrono::{DateTime, Datelike, LocalResult, NaiveDateTime, Offset, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::plan::LeftOutReason;
 
@@ -21,6 +22,17 @@ pub struct MemberStartEvidence {
     /// IANA time zone identifier for `local_civil` (e.g. 'America/New_York').
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_zone: Option<String>,
+    /// Origin of the owner's stated time, retained even when it cannot be settled.
+    #[serde(default)]
+    pub authority: MemberTimeAuthority,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberTimeAuthority {
+    #[default]
+    Manifest,
+    Filename,
 }
 
 /// Resolved occurrence of a member.
@@ -63,6 +75,16 @@ pub struct MemberIdentity {
 }
 
 impl MemberIdentity {
+    /// Raw targets bind the complete identity, including the stated occurrence.
+    pub fn storage_digest(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(self.byte_len.to_be_bytes());
+        digest.update(self.sha256.as_bytes());
+        digest.update([0]);
+        digest.update(self.occurrence.as_bytes());
+        format!("{:x}", digest.finalize())
+    }
+
     pub fn new(byte_len: u64, sha256: impl Into<String>, occurrence: impl Into<String>) -> Self {
         Self {
             byte_len,
@@ -197,6 +219,9 @@ fn resolve_civil_in_zone(
             Ok(ResolvedOccurrence::UniqueInstant { instant, canonical })
         }
         LocalResult::Ambiguous(inst1, inst2) => {
+            if duration_ms > super::plan::AUDIO_ARCHIVE_WINDOW_MS {
+                return Err(LeftOutReason::UnsettledTime);
+            }
             let cand1 = inst1.with_timezone(&Utc);
             let cand2 = inst2.with_timezone(&Utc);
 

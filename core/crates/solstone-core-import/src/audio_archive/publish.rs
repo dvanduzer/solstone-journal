@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-//! Atomic publication of complete audio archive tiles, coordination, and fault seams.
+//! Complete-tile publication. Consuming the private stage is the saved-once witness.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -16,69 +16,68 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use solstone_core_format::audio_archive::{
     AUDIO_ARCHIVE_PLACEMENT_FILENAME, AUDIO_ARCHIVE_PLACEMENT_VERSION, AudioArchivePlacement,
-    AudioArchivePlacementPart, validate_stored_name,
+    AudioArchivePlacementPart,
 };
 use solstone_core_journal_io::{AtomicWriteOptions, LockOptions, atomic_replace};
-use solstone_core_segment::output_attempt::{
-    OutputClaims, discover_output_claims, prepare_segment,
-};
-use solstone_core_segment::{
-    ImportSource, Kind, StreamHints, UnboundStreamAdvanceError, advance_unbound_stream,
-};
+use solstone_core_segment::output_attempt::SegmentMutation;
+use solstone_core_segment::{ImportSource, Kind, StreamHints, advance_unbound_stream};
 
-use super::AudioArchiveError;
-use super::claims::{DEFAULT_WRITE_BUSY_TIMEOUT, find_held_members, insert_tile_claims};
-use super::identity::MemberIdentity;
+use super::claims::{
+    DEFAULT_WRITE_BUSY_TIMEOUT, find_held_members, insert_tile_claims, register_pending_tile,
+};
 use super::plan::{
-    AudioArchiveMemberInput, AudioArchiveSettings, AudioArchiveSize, MemberDisposition,
-    PartOutcome, apply_held_members, plan_audio_archive,
+    AudioArchiveMemberInput, AudioArchivePlan, AudioArchiveSettings, AudioArchiveSize,
+    LeftOutReason, PartOutcome, apply_exclusions, apply_held_members, plan_audio_archive,
 };
 use super::record::{
-    AudioArchiveRecord, compute_size_from_record, plan_to_record, read_audio_archive,
-    save_audio_archive_record, validate_resume_settings,
+    ArchiveStore, AudioArchiveRecord, AudioArchiveRecordMember, AudioArchiveRecordPart,
+    plan_to_record, read_audio_archive, save_audio_archive_record, validate_resume_settings,
 };
+use super::{AudioArchiveError, MemberIdentity};
 use crate::allocate::allocate_import_id;
 use crate::heartbeat::{HeartbeatSpawner, ImportHeartbeat};
 use crate::metadata::{
     AttemptState, admit_running_attempt, record_completed_attempt, resume_running_attempt,
 };
 use crate::staging::ensure_import_private_chain;
-use crate::stream_name::canonicalize_stream_name;
 use crate::timestamp::{Timestamp, validate_timestamp};
 
-/// Injectable fault injection points for crash/recovery testing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArchiveFault {
-    /// Fails after the run record is first written to disk.
     AfterRecordFirstSaved,
-    /// Fails after raw member bytes for a tile are staged to disk.
     AfterTileBytesStaged,
-    /// Fails after claim transaction commits and intent is written, before prepare_segment.
     AfterClaimAndIntent,
-    /// Fails after chronicle raws are written, before segment exclusion commit.
-    AfterChronicleRawsWritten,
-    /// Fails after placement is durable and stream advanced, before marking parts Saved.
+    BeforeTilePublish,
     AfterPublishBeforeSavedMark,
-    /// Fails after one tile of a multi-tile member is fully bookkept, before the next tile begins.
     BetweenMultiTileParts,
-    /// Fails after marking parts Saved, before the emit seam.
     AfterSavedMarkBeforeEmit,
 }
 
 pub type EmitObservedFn = Box<dyn Fn(&str, &str, &str) + Send + Sync>;
-
 pub struct AudioArchivePublishSeams {
     pub fault: Option<ArchiveFault>,
     pub emit_observed: Option<EmitObservedFn>,
     pub heartbeat_spawner: Option<HeartbeatSpawner>,
 }
 
+/// The host stages only this part, verifying its original source against `member`.
+/// Whole members retain their original bytes; sliced parts have their own digest.
+/// Return `SourceRejected` for an unreadable, unsupported or changed source;
+/// other errors abort the writer because journal storage may be unavailable.
+pub trait AudioArchiveMaterializer {
+    fn materialize(
+        &self,
+        member: &AudioArchiveRecordMember,
+        part: &AudioArchiveRecordPart,
+        target: &Path,
+    ) -> Result<(), AudioArchiveError>;
+}
+
 pub struct AudioArchivePublishOptions<'a> {
     pub import_id: Option<&'a str>,
     pub members: Vec<AudioArchiveMemberInput>,
-    /// Raw member bytes provided by caller, keyed by sha256 or identity.
-    pub member_bytes: HashMap<String, Vec<u8>>,
+    pub materializer: &'a dyn AudioArchiveMaterializer,
     pub owner_zone: Tz,
     pub settings: AudioArchiveSettings,
     pub source_timestamp: Option<Timestamp>,
@@ -98,742 +97,425 @@ struct TileIntentPart {
     stored_name: String,
     sha256: String,
     byte_len: u64,
-    staged_rel_path: String,
 }
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct TileIntent {
     day: String,
     segment_key: String,
     stream: String,
+    placement: AudioArchivePlacement,
     parts: Vec<TileIntentPart>,
 }
 
-struct PublishPart {
-    stored_name: String,
-    member_identity: MemberIdentity,
-    origin_ms: i64,
-    offset_ms: i64,
-    length_ms: i64,
-    original_occurrence: String,
-    original_time_ms: Option<i64>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublicationAction {
+    Stage,
+    PublishStaged,
+    RecoverSaved,
+    KeepSaved,
 }
 
-struct PublishTile {
-    day: String,
-    segment_key: String,
-    parts: Vec<PublishPart>,
-}
-
-fn validate_day(day: &str) -> Result<(), AudioArchiveError> {
-    if day.len() == 8 && day.bytes().all(|b| b.is_ascii_digit()) {
-        Ok(())
+fn publication_action(saved: bool, intent: bool, stage: bool) -> PublicationAction {
+    if saved {
+        PublicationAction::KeepSaved
+    } else if !intent {
+        PublicationAction::Stage
+    } else if stage {
+        PublicationAction::PublishStaged
     } else {
-        Err(AudioArchiveError::Other(format!("invalid day '{day}'")))
+        PublicationAction::RecoverSaved
     }
 }
 
-fn validate_segment_key(segment_key: &str) -> Result<(), AudioArchiveError> {
-    if solstone_core_format::segment::segment_parse(segment_key).is_none() {
-        return Err(AudioArchiveError::Other(format!(
-            "invalid segment key '{segment_key}'"
-        )));
+#[cfg(test)]
+mod publication_policy_tests {
+    use super::*;
+    #[test]
+    fn saved_record_and_consumed_stage_both_forbid_new_publication() {
+        assert_eq!(
+            publication_action(true, false, false),
+            PublicationAction::KeepSaved
+        );
+        assert_eq!(
+            publication_action(false, true, false),
+            PublicationAction::RecoverSaved
+        );
     }
-    let Some((_time, len_str)) = segment_key.split_once('_') else {
-        return Err(AudioArchiveError::Other(format!(
-            "invalid segment key '{segment_key}'"
-        )));
-    };
-    if len_str != "300" {
-        return Err(AudioArchiveError::Other(format!(
-            "segment key '{segment_key}' length must be 300"
-        )));
+    #[test]
+    fn interrupted_private_staging_is_distinct_from_a_complete_unpublished_stage() {
+        assert_eq!(
+            publication_action(false, false, true),
+            PublicationAction::Stage
+        );
+        assert_eq!(
+            publication_action(false, true, true),
+            PublicationAction::PublishStaged
+        );
     }
-    Ok(())
 }
 
-fn scan_segment_dir(segment_dir: &Path, tile: &PublishTile) -> Result<(), AudioArchiveError> {
-    if !segment_dir.is_dir() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(segment_dir).map_err(AudioArchiveError::Io)? {
-        let entry = entry.map_err(AudioArchiveError::Io)?;
-        let name = entry.file_name();
-        if solstone_core_journal_io::is_publication_candidate_name(&name) {
+/// Read-only preview, including held identities and frozen tiles in this archive stream.
+pub fn prepare_audio_archive_plan(
+    journal: &Path,
+    members: &[AudioArchiveMemberInput],
+    owner_zone: Tz,
+    settings: AudioArchiveSettings,
+) -> Result<AudioArchivePlan, AudioArchiveError> {
+    let mut plan = plan_audio_archive(members, owner_zone, settings)?;
+    let held = find_held_members(journal, None, &plan.members, DEFAULT_WRITE_BUSY_TIMEOUT)?;
+    apply_held_members(&mut plan, &held)?;
+    let mut occupied = HashMap::new();
+    let mut checked = HashMap::new();
+    // Include members previously excluded by another input's interval. Once that
+    // input is left out, they must not bypass a frozen tile in their own span.
+    for member in &plan.members {
+        if held.contains(&member.identity) {
             continue;
         }
-
-        let name_str = match name.to_str() {
-            Some(s) => s,
-            None => {
-                return Err(AudioArchiveError::ChronicleSegmentRefused(format!(
-                    "segment directory {} contains non-utf8 entry",
-                    segment_dir.display()
-                )));
-            }
+        let instant = match &member.resolved_occurrence {
+            Some(super::ResolvedOccurrence::UniqueInstant { instant, .. }) => *instant,
+            Some(super::ResolvedOccurrence::SettledFold {
+                candidate_instants, ..
+            }) => candidate_instants[0],
+            None => continue,
         };
-
-        let is_placement = name_str == AUDIO_ARCHIVE_PLACEMENT_FILENAME;
-        let is_stream = name_str == "stream.json";
-        let is_tile_raw = tile.parts.iter().any(|p| p.stored_name == name_str);
-        let is_tile_partial = tile
-            .parts
-            .iter()
-            .any(|p| format!("{}.partial", p.stored_name) == name_str);
-        let is_tile_lock = tile
-            .parts
-            .iter()
-            .any(|p| format!("{}.lock", p.stored_name) == name_str);
-
-        if !is_placement && !is_stream && !is_tile_raw && !is_tile_partial && !is_tile_lock {
-            return Err(AudioArchiveError::ChronicleSegmentRefused(format!(
-                "segment directory {} contains foreign entry '{}'",
-                segment_dir.display(),
-                name_str
-            )));
-        }
-
-        let file_type = entry.file_type().map_err(AudioArchiveError::Io)?;
-        if !file_type.is_file() {
-            return Err(AudioArchiveError::ChronicleSegmentRefused(format!(
-                "segment directory {} entry '{}' is not a regular file",
-                segment_dir.display(),
-                name_str
-            )));
+        let Ok(parts) = super::plan::simulate_parts(instant, owner_zone, member.duration_ms) else {
+            continue;
+        };
+        for part in parts {
+            let coordinate = (part.day.clone(), part.segment_key.clone());
+            if !checked.contains_key(&coordinate) {
+                let target = journal
+                    .join("chronicle")
+                    .join(&part.day)
+                    .join(&plan.stream)
+                    .join(&part.segment_key);
+                let exists = match fs::symlink_metadata(target) {
+                    Ok(_) => true,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => return Err(error.into()),
+                };
+                checked.insert(coordinate.clone(), exists);
+            }
+            if checked[&coordinate] {
+                occupied.insert(
+                    member.identity.clone(),
+                    LeftOutReason::PublishedTile {
+                        day: part.day,
+                        segment_key: part.segment_key,
+                    },
+                );
+                break;
+            }
         }
     }
-    Ok(())
+    if !occupied.is_empty() {
+        apply_exclusions(&mut plan, &occupied)?;
+    }
+    Ok(plan)
 }
 
-/// Orchestrate execution of an indexed audio archive run.
+struct AttemptRelease<'a> {
+    journal: &'a Path,
+    import_id: String,
+}
+impl Drop for AttemptRelease<'_> {
+    fn drop(&mut self) {
+        crate::metadata::release_attempt(self.journal, &self.import_id);
+    }
+}
+
 pub fn publish_audio_archive(
-    journal_root: &Path,
+    journal: &Path,
     options: AudioArchivePublishOptions<'_>,
     seams: Option<AudioArchivePublishSeams>,
 ) -> Result<AudioArchivePublishResult, AudioArchiveError> {
-    let (import_id, stream, plan_size, tiles_to_publish, mut record, generation, _heartbeat) =
-        match options.import_id {
-            None => {
-                let mut plan = plan_audio_archive(
-                    &options.members,
-                    options.owner_zone,
-                    options.settings.clone(),
-                )?;
-
-                let held = find_held_members(
-                    journal_root,
-                    None,
-                    &plan.members,
-                    DEFAULT_WRITE_BUSY_TIMEOUT,
-                )?;
-                apply_held_members(&mut plan, &held);
-
-                let stamp = match options.source_timestamp {
-                    Some(ts) => ts,
-                    None => {
-                        let now_str = Utc::now().format("%Y%m%d_%H%M%S").to_string();
-                        validate_timestamp(&now_str)
-                            .map_err(|e| AudioArchiveError::Other(e.to_string()))?
-                    }
-                };
-
-                let allocated = allocate_import_id(journal_root, &stamp)
-                    .map_err(|e| AudioArchiveError::Other(e.to_string()))?;
-                let id = allocated.import_id.as_str().to_owned();
-
-                ensure_import_private_chain(journal_root, &id)
-                    .map_err(|e| AudioArchiveError::Other(e.to_string()))?;
-
-                let facts = admit_running_attempt(journal_root, &id, now_ms(), None)
-                    .map_err(|e| AudioArchiveError::Other(e.to_string()))?;
-
-                let record = plan_to_record(&plan);
-                save_audio_archive_record(journal_root, &id, &record)?;
-
-                check_fault(&seams, ArchiveFault::AfterRecordFirstSaved)?;
-
-                let heartbeat = start_run_heartbeat(
-                    journal_root,
-                    &id,
-                    facts.generation,
-                    &facts.attempt_id,
-                    &seams,
-                );
-
-                let tiles: Vec<PublishTile> = plan
-                    .tiles
-                    .iter()
-                    .map(|tile| {
-                        let parts = tile
-                            .parts
-                            .iter()
-                            .map(|p| {
-                                let member = plan
-                                    .members
-                                    .iter()
-                                    .find(|m| m.identity == p.member_identity);
-                                let orig_time = member
-                                    .and_then(|m| m.resolved_occurrence.as_ref())
-                                    .and_then(|o| o.original_time_ms());
-                                PublishPart {
-                                    stored_name: p.stored_name.clone(),
-                                    member_identity: p.member_identity.clone(),
-                                    origin_ms: p.origin_ms,
-                                    offset_ms: p.offset_ms,
-                                    length_ms: p.length_ms,
-                                    original_occurrence: p.member_identity.occurrence.clone(),
-                                    original_time_ms: orig_time,
-                                }
-                            })
-                            .collect();
-                        PublishTile {
-                            day: tile.day.clone(),
-                            segment_key: tile.segment_key.clone(),
-                            parts,
-                        }
-                    })
-                    .collect();
-
-                (
-                    id,
-                    plan.stream,
-                    plan.size,
-                    tiles,
-                    record,
-                    facts.generation,
-                    heartbeat,
-                )
-            }
-            Some(existing_id) => {
-                if validate_timestamp(existing_id).is_err() {
-                    return Err(AudioArchiveError::Other(format!(
-                        "invalid resume import_id '{existing_id}'"
-                    )));
-                }
-                let id = existing_id.to_owned();
-                let existing_record = read_audio_archive(journal_root, &id)?.ok_or_else(|| {
-                    AudioArchiveError::MissingRunDirectory(journal_root.join("imports").join(&id))
-                })?;
-
-                let stream = canonicalize_stream_name("import", Some(&options.settings.qualifier))
-                    .map_err(|e| AudioArchiveError::InvalidStreamName(e.to_string()))?;
-                if stream == "import.audio" || options.settings.qualifier == "audio" {
-                    return Err(AudioArchiveError::InvalidStreamName(
-                        "stream 'import.audio' is refused for indexed audio archives".to_owned(),
-                    ));
-                }
-
-                validate_resume_settings(
-                    &existing_record,
-                    options.owner_zone,
-                    &options.settings,
-                    &stream,
-                )?;
-
-                let provenance = crate::metadata::read_provenance(journal_root, &id)
-                    .map_err(|e| AudioArchiveError::Other(e.to_string()))?
-                    .and_then(|m| crate::metadata::get_attempt_facts(&m));
-                let is_running = provenance
-                    .as_ref()
-                    .map(|p| p.state == AttemptState::Running)
-                    .unwrap_or(false);
-
-                let (generation, attempt_id) = if is_running {
-                    resume_running_attempt(journal_root, &id)
-                        .map_err(|e| AudioArchiveError::Other(e.to_string()))?;
-                    let p = provenance.unwrap();
-                    (p.generation, p.attempt_id)
-                } else {
-                    let facts = admit_running_attempt(journal_root, &id, now_ms(), None)
-                        .map_err(|e| AudioArchiveError::Other(e.to_string()))?;
-                    (facts.generation, facts.attempt_id)
-                };
-
-                let heartbeat =
-                    start_run_heartbeat(journal_root, &id, generation, &attempt_id, &seams);
-
-                let plan_size = compute_size_from_record(&existing_record);
-
-                let mut tile_map: BTreeMap<(String, String), Vec<PublishPart>> = BTreeMap::new();
-                let mut tile_order: Vec<(String, String)> = Vec::new();
-
-                for part in &existing_record.parts {
-                    let key = (part.day.clone(), part.segment_key.clone());
-                    if !tile_map.contains_key(&key) {
-                        tile_order.push(key.clone());
-                    }
-                    let orig_time = if let Some(rest) = part.member_occurrence.strip_prefix("utc|")
-                    {
-                        rest.parse::<i64>().ok()
-                    } else {
-                        None
-                    };
-                    let member = existing_record
-                        .members
-                        .iter()
-                        .find(|m| {
-                            m.sha256 == part.member_sha256
-                                && m.canonical_occurrence == part.member_occurrence
-                        })
-                        .ok_or_else(|| {
-                            AudioArchiveError::ClaimDatabaseCorrupt(format!(
-                                "part with sha256 '{}' and occurrence '{}' matches no saved member in record",
-                                part.member_sha256, part.member_occurrence
-                            ))
-                        })?;
-                    let member_identity = MemberIdentity::new(
-                        member.byte_len,
-                        &part.member_sha256,
-                        &part.member_occurrence,
-                    );
-
-                    tile_map.entry(key).or_default().push(PublishPart {
-                        stored_name: part.stored_name.clone(),
-                        member_identity,
-                        origin_ms: part.origin_ms,
-                        offset_ms: part.offset_ms,
-                        length_ms: part.length_ms,
-                        original_occurrence: part.member_occurrence.clone(),
-                        original_time_ms: orig_time,
-                    });
-                }
-
-                let mut tiles = Vec::with_capacity(tile_order.len());
-                for key in tile_order {
-                    let parts = tile_map.remove(&key).ok_or_else(|| {
-                        AudioArchiveError::Other(format!(
-                            "missing tile parts for key ({}, {})",
-                            key.0, key.1
-                        ))
-                    })?;
-                    tiles.push(PublishTile {
-                        day: key.0,
-                        segment_key: key.1,
-                        parts,
-                    });
-                }
-
-                (
-                    id,
-                    stream,
-                    plan_size,
-                    tiles,
-                    existing_record,
-                    generation,
-                    heartbeat,
-                )
-            }
+    // Check claims before allocating: a removed run's timestamp may be reused.
+    let new_plan = if options.import_id.is_none() {
+        Some(prepare_audio_archive_plan(
+            journal,
+            &options.members,
+            options.owner_zone,
+            options.settings.clone(),
+        )?)
+    } else {
+        None
+    };
+    let import_id = if let Some(id) = options.import_id {
+        validate_timestamp(id).map_err(|error| AudioArchiveError::Other(error.to_string()))?;
+        if !journal.join("imports").join(id).is_dir() {
+            return Err(AudioArchiveError::MissingRunDirectory(
+                journal.join("imports").join(id),
+            ));
+        }
+        id.to_owned()
+    } else {
+        let stamp = match options.source_timestamp {
+            Some(stamp) => stamp,
+            None => validate_timestamp(&Utc::now().format("%Y%m%d_%H%M%S").to_string())
+                .map_err(|error| AudioArchiveError::Other(error.to_string()))?,
         };
-
-    let run_dir = journal_root.join("imports").join(&import_id);
-    let mut tiles_saved = 0;
-    let mut parts_saved = 0;
-
-    for tile in &tiles_to_publish {
-        validate_day(&tile.day)?;
-        validate_segment_key(&tile.segment_key)?;
-        for part in &tile.parts {
-            validate_stored_name(&part.stored_name)
-                .map_err(|e| AudioArchiveError::Other(e.to_string()))?;
-        }
-
-        let segment_dir = journal_root
-            .join("chronicle")
-            .join(&tile.day)
-            .join(&stream)
-            .join(&tile.segment_key);
-
-        scan_segment_dir(&segment_dir, tile)?;
-
-        let placement_path = segment_dir.join(AUDIO_ARCHIVE_PLACEMENT_FILENAME);
-        let placement_is_file = fs::symlink_metadata(&placement_path)
-            .map(|m| m.file_type().is_file())
-            .unwrap_or(false);
-
-        let placement_matches = if placement_is_file {
-            let bytes = fs::read(&placement_path).map_err(AudioArchiveError::Io)?;
-            let placement =
-                serde_json::from_slice::<AudioArchivePlacement>(&bytes).map_err(|e| {
-                    AudioArchiveError::ChronicleSegmentRefused(format!(
-                        "invalid placement.json in {}: {e}",
-                        segment_dir.display()
-                    ))
-                })?;
-
-            if placement.version != AUDIO_ARCHIVE_PLACEMENT_VERSION
-                || placement.parts.len() != tile.parts.len()
-            {
-                return Err(AudioArchiveError::ChronicleSegmentRefused(format!(
-                    "segment directory {} placement.json mismatch: version or part count",
-                    segment_dir.display()
-                )));
-            }
-
-            for planned in &tile.parts {
-                let matching = placement.parts.iter().any(|pl| {
-                    pl.stored_name == planned.stored_name
-                        && pl.original_occurrence == planned.original_occurrence
-                        && pl.original_time_ms == planned.original_time_ms
-                        && pl.origin_ms == planned.origin_ms
-                        && pl.offset_ms == planned.offset_ms
-                        && pl.length_ms == planned.length_ms
-                });
-                if !matching {
-                    return Err(AudioArchiveError::ChronicleSegmentRefused(format!(
-                        "segment directory {} placement.json part mismatch for stored_name '{}'",
-                        segment_dir.display(),
-                        planned.stored_name
-                    )));
-                }
-            }
-            true
-        } else if placement_path.exists() {
-            return Err(AudioArchiveError::ChronicleSegmentRefused(format!(
-                "placement.json in {} is not a regular file",
-                segment_dir.display()
-            )));
-        } else {
-            false
-        };
-
-        if placement_matches {
-            prepare_segment(&segment_dir).map_err(AudioArchiveError::Io)?;
-
-            let raw_targets: Vec<PathBuf> = tile
-                .parts
-                .iter()
-                .map(|p| segment_dir.join(&p.stored_name))
-                .collect();
-            let _ = discover_output_claims(&segment_dir).map_err(AudioArchiveError::Io)?;
-            let claims = OutputClaims::acquire(raw_targets, LockOptions::default())
-                .map_err(AudioArchiveError::Io)?;
-            {
-                let _commit = claims.commit(&segment_dir).map_err(AudioArchiveError::Io)?;
-
-                let hints = StreamHints {
-                    kind: Some(Kind::Imported(ImportSource::Named(
-                        options.settings.qualifier.clone(),
-                    ))),
-                    host: None,
-                    platform: None,
-                };
-                advance_unbound_stream(journal_root, &stream, &tile.day, &tile.segment_key, hints)
-                    .map_err(|e| match e {
-                        UnboundStreamAdvanceError::Advance(err) => {
-                            AudioArchiveError::Other(err.to_string())
-                        }
-                        UnboundStreamAdvanceError::MarkerWrite { source, .. } => {
-                            AudioArchiveError::Io(std::io::Error::other(source.to_string()))
-                        }
-                    })?;
-            }
-
-            let mut all_raws_present = true;
-            for part in &tile.parts {
-                let raw_path = segment_dir.join(&part.stored_name);
-                let raw_is_file = fs::symlink_metadata(&raw_path)
-                    .map(|m| m.file_type().is_file())
-                    .unwrap_or(false);
-                if !raw_is_file {
-                    all_raws_present = false;
-                }
-                for rp in &mut record.parts {
-                    if rp.day == tile.day
-                        && rp.segment_key == tile.segment_key
-                        && rp.stored_name == part.stored_name
-                    {
-                        rp.outcome = if raw_is_file {
-                            PartOutcome::Saved
-                        } else {
-                            PartOutcome::SavedButUnavailable
-                        };
-                    }
-                }
-                parts_saved += 1;
-            }
-            tiles_saved += 1;
-            save_audio_archive_record(journal_root, &import_id, &record)?;
-
-            if all_raws_present
-                && let Some(seams_ref) = &seams
-                && let Some(emit) = &seams_ref.emit_observed
-            {
-                emit(&tile.day, &tile.segment_key, &stream);
-            }
-
-            continue;
-        }
-
-        let tile_staged_dir = run_dir
-            .join("staged")
-            .join(&tile.day)
-            .join(&tile.segment_key);
-        fs::create_dir_all(&tile_staged_dir).map_err(AudioArchiveError::Io)?;
-
-        let mut intent_parts = Vec::with_capacity(tile.parts.len());
-        let mut tile_member_identities = Vec::with_capacity(tile.parts.len());
-
-        for part in &tile.parts {
-            validate_stored_name(&part.stored_name)
-                .map_err(|e| AudioArchiveError::Other(e.to_string()))?;
-            tile_member_identities.push(part.member_identity.clone());
-            let staged_path = tile_staged_dir.join(&part.stored_name);
-
-            let staged_valid = if fs::symlink_metadata(&staged_path)
-                .map(|m| m.file_type().is_file())
-                .unwrap_or(false)
-            {
-                let meta = fs::metadata(&staged_path).map_err(AudioArchiveError::Io)?;
-                if meta.len() == part.member_identity.byte_len {
-                    hash_file(&staged_path)
-                        .map(|h| h == part.member_identity.sha256)
-                        .unwrap_or(false)
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-
-            if !staged_valid {
-                let bytes = options
-                    .member_bytes
-                    .get(&part.member_identity.sha256)
-                    .or_else(|| {
-                        record
-                            .members
-                            .iter()
-                            .find(|m| {
-                                m.sha256 == part.member_identity.sha256
-                                    && m.canonical_occurrence == part.member_identity.occurrence
-                            })
-                            .and_then(|m| options.member_bytes.get(&m.original_relative_name))
-                    })
-                    .ok_or_else(|| AudioArchiveError::HashMismatch {
-                        expected: part.member_identity.sha256.clone(),
-                        actual: "missing".to_owned(),
-                    })?;
-
-                if bytes.len() as u64 != part.member_identity.byte_len {
-                    return Err(AudioArchiveError::HashMismatch {
-                        expected: format!("len {}", part.member_identity.byte_len),
-                        actual: format!("len {}", bytes.len()),
-                    });
-                }
-                let actual_hash = to_hex_lower(&Sha256::digest(bytes));
-                if actual_hash != part.member_identity.sha256 {
-                    return Err(AudioArchiveError::HashMismatch {
-                        expected: part.member_identity.sha256.clone(),
-                        actual: actual_hash,
-                    });
-                }
-
-                let temp_staged_path =
-                    tile_staged_dir.join(format!(".tmp_stage_{}.tmp", part.stored_name));
-                fs::write(&temp_staged_path, bytes).map_err(AudioArchiveError::Io)?;
-                fs::rename(&temp_staged_path, &staged_path).map_err(AudioArchiveError::Io)?;
-            }
-
-            intent_parts.push(TileIntentPart {
-                stored_name: part.stored_name.clone(),
-                sha256: part.member_identity.sha256.clone(),
-                byte_len: part.member_identity.byte_len,
-                staged_rel_path: format!(
-                    "staged/{}/{}/{}",
-                    tile.day, tile.segment_key, part.stored_name
-                ),
-            });
-
-            for rp in &mut record.parts {
-                if rp.day == tile.day
-                    && rp.segment_key == tile.segment_key
-                    && rp.stored_name == part.stored_name
-                    && rp.outcome == PartOutcome::Planned
-                {
-                    rp.outcome = PartOutcome::Staged;
-                }
-            }
-        }
-
-        save_audio_archive_record(journal_root, &import_id, &record)?;
-        check_fault(&seams, ArchiveFault::AfterTileBytesStaged)?;
-
-        insert_tile_claims(
-            journal_root,
+        allocate_import_id(journal, &stamp)
+            .map_err(|error| AudioArchiveError::Other(error.to_string()))?
+            .import_id
+            .as_str()
+            .to_owned()
+    };
+    let run = ensure_import_private_chain(journal, &import_id)
+        .map_err(|error| AudioArchiveError::Other(error.to_string()))?;
+    let _writer = solstone_core_journal_io::hold_lock(
+        run.join(".audio-archive-writer"),
+        LockOptions::default(),
+    )
+    .map_err(|error| AudioArchiveError::Other(error.to_string()))?;
+    let _release = AttemptRelease {
+        journal,
+        import_id: import_id.clone(),
+    };
+    let generation;
+    let attempt_id;
+    if options.import_id.is_none() {
+        let plan = new_plan.expect("new run was planned before allocation");
+        let facts = admit_running_attempt(
+            journal,
             &import_id,
-            &tile_member_identities,
-            DEFAULT_WRITE_BUSY_TIMEOUT,
-        )?;
-
-        let tiles_dir = run_dir.join("tiles");
-        fs::create_dir_all(&tiles_dir).map_err(AudioArchiveError::Io)?;
-        let intent = TileIntent {
-            day: tile.day.clone(),
-            segment_key: tile.segment_key.clone(),
-            stream: stream.clone(),
-            parts: intent_parts,
-        };
-        let intent_bytes = serde_json::to_vec_pretty(&intent).map_err(AudioArchiveError::Json)?;
-        let intent_path = tiles_dir.join(format!("{}_{}.intent.json", tile.day, tile.segment_key));
-        atomic_replace(&intent_path, &intent_bytes, AtomicWriteOptions::default()).map_err(
-            |e| {
-                AudioArchiveError::Io(std::io::Error::other(format!(
-                    "{}: {e}",
-                    intent_path.display()
-                )))
-            },
-        )?;
-
-        check_fault(&seams, ArchiveFault::AfterClaimAndIntent)?;
-
-        prepare_segment(&segment_dir).map_err(AudioArchiveError::Io)?;
-
-        let raw_targets: Vec<PathBuf> = tile
-            .parts
-            .iter()
-            .map(|p| segment_dir.join(&p.stored_name))
-            .collect();
-        let _ = discover_output_claims(&segment_dir).map_err(AudioArchiveError::Io)?;
-        let claims = OutputClaims::acquire(raw_targets, LockOptions::default())
-            .map_err(AudioArchiveError::Io)?;
-
-        for part in &tile.parts {
-            let staged_path = tile_staged_dir.join(&part.stored_name);
-            let temp_name = format!("{}.partial", part.stored_name);
-            let temp_path = segment_dir.join(&temp_name);
-
-            fs::copy(&staged_path, &temp_path).map_err(AudioArchiveError::Io)?;
-
-            let hash = hash_file(&temp_path)?;
-            if hash != part.member_identity.sha256 {
-                return Err(AudioArchiveError::HashMismatch {
-                    expected: part.member_identity.sha256.clone(),
-                    actual: hash,
-                });
-            }
-        }
-
-        check_fault(&seams, ArchiveFault::AfterChronicleRawsWritten)?;
-
-        {
-            let _commit = claims.commit(&segment_dir).map_err(AudioArchiveError::Io)?;
-
-            scan_segment_dir(&segment_dir, tile)?;
-
-            for part in &tile.parts {
-                let temp_path = segment_dir.join(format!("{}.partial", part.stored_name));
-                let final_path = segment_dir.join(&part.stored_name);
-                fs::rename(&temp_path, &final_path).map_err(AudioArchiveError::Io)?;
-            }
-
-            let placement_parts = tile
-                .parts
+            now_ms(),
+            Some(&options.settings.archive_identity),
+        )
+        .map_err(|error| AudioArchiveError::Other(error.to_string()))?;
+        generation = facts.generation;
+        attempt_id = facts.attempt_id;
+        save_audio_archive_record(journal, &import_id, &plan_to_record(&plan))?;
+    } else {
+        let record = read_audio_archive(journal, &import_id)?
+            .ok_or_else(|| AudioArchiveError::MissingRunDirectory(run.clone()))?;
+        let stream = crate::stream_name::canonicalize_stream_name(
+            "import",
+            Some(&options.settings.qualifier),
+        )
+        .map_err(|error| AudioArchiveError::Other(error.to_string()))?;
+        validate_resume_settings(&record, options.owner_zone, &options.settings, &stream)?;
+        // Resume uses the frozen plan. Supplied facts may rename a source but cannot change its identity, time or length.
+        if !options.members.is_empty() {
+            let fresh = plan_audio_archive(
+                &options.members,
+                options.owner_zone,
+                options.settings.clone(),
+            )?;
+            let mut fresh_facts: Vec<_> = fresh
+                .members
                 .iter()
-                .map(|p| AudioArchivePlacementPart {
-                    stored_name: p.stored_name.clone(),
-                    original_occurrence: p.original_occurrence.clone(),
-                    original_time_ms: p.original_time_ms,
-                    origin_ms: p.origin_ms,
-                    offset_ms: p.offset_ms,
-                    length_ms: p.length_ms,
+                .map(|member| {
+                    (
+                        &member.identity.sha256,
+                        &member.identity.occurrence,
+                        member.identity.byte_len,
+                        member.duration_ms,
+                    )
                 })
                 .collect();
-
-            let placement = AudioArchivePlacement {
-                version: AUDIO_ARCHIVE_PLACEMENT_VERSION,
-                parts: placement_parts,
-            };
-            let placement_bytes =
-                serde_json::to_vec_pretty(&placement).map_err(AudioArchiveError::Json)?;
-            let placement_dest = segment_dir.join(AUDIO_ARCHIVE_PLACEMENT_FILENAME);
-            atomic_replace(
-                &placement_dest,
-                &placement_bytes,
-                AtomicWriteOptions::default(),
-            )
-            .map_err(|e| {
-                AudioArchiveError::Io(std::io::Error::other(format!(
-                    "{}: {e}",
-                    placement_dest.display()
-                )))
-            })?;
-
-            let hints = StreamHints {
-                kind: Some(Kind::Imported(ImportSource::Named(
-                    options.settings.qualifier.clone(),
-                ))),
-                host: None,
-                platform: None,
-            };
-            advance_unbound_stream(journal_root, &stream, &tile.day, &tile.segment_key, hints)
-                .map_err(|e| match e {
-                    UnboundStreamAdvanceError::Advance(err) => {
-                        AudioArchiveError::Other(err.to_string())
-                    }
-                    UnboundStreamAdvanceError::MarkerWrite { source, .. } => {
-                        AudioArchiveError::Io(std::io::Error::other(source.to_string()))
-                    }
-                })?;
-        } // h. Release exclusion
-
-        check_fault(&seams, ArchiveFault::AfterPublishBeforeSavedMark)?;
-
-        for part in &tile.parts {
-            for rp in &mut record.parts {
-                if rp.day == tile.day
-                    && rp.segment_key == tile.segment_key
-                    && rp.stored_name == part.stored_name
-                {
-                    rp.outcome = PartOutcome::Saved;
-                }
-            }
-            parts_saved += 1;
-        }
-        tiles_saved += 1;
-        save_audio_archive_record(journal_root, &import_id, &record)?;
-
-        let has_later_parts = tile.parts.iter().any(|part| {
-            tiles_to_publish
+            let mut saved_facts: Vec<_> = record
+                .members
                 .iter()
-                .skip_while(|t| t.day != tile.day || t.segment_key != tile.segment_key)
-                .skip(1)
-                .any(|later_tile| {
-                    later_tile
-                        .parts
-                        .iter()
-                        .any(|later_part| later_part.member_identity == part.member_identity)
+                .map(|member| {
+                    (
+                        &member.sha256,
+                        &member.canonical_occurrence,
+                        member.byte_len,
+                        member.duration_ms,
+                    )
                 })
-        });
-        if has_later_parts {
-            check_fault(&seams, ArchiveFault::BetweenMultiTileParts)?;
+                .collect();
+            fresh_facts.sort_unstable();
+            saved_facts.sort_unstable();
+            if fresh_facts != saved_facts {
+                return Err(AudioArchiveError::SettingsMismatch(
+                    "source identities or timing differ from the saved archive plan".to_owned(),
+                ));
+            }
         }
-
-        check_fault(&seams, ArchiveFault::AfterSavedMarkBeforeEmit)?;
-
-        if let Some(seams_ref) = &seams
-            && let Some(emit) = &seams_ref.emit_observed
-        {
-            emit(&tile.day, &tile.segment_key, &stream);
+        let previous = crate::metadata::read_provenance(journal, &import_id)
+            .map_err(|error| AudioArchiveError::Other(error.to_string()))?
+            .and_then(|metadata| crate::metadata::get_attempt_facts(&metadata));
+        if let Some(previous) = previous.filter(|facts| facts.state == AttemptState::Running) {
+            resume_running_attempt(journal, &import_id)
+                .map_err(|error| AudioArchiveError::Other(error.to_string()))?;
+            generation = previous.generation;
+            attempt_id = previous.attempt_id;
+        } else {
+            let facts = admit_running_attempt(journal, &import_id, now_ms(), None)
+                .map_err(|error| AudioArchiveError::Other(error.to_string()))?;
+            generation = facts.generation;
+            attempt_id = facts.attempt_id;
         }
     }
-
-    record_completed_attempt(journal_root, &import_id, generation, now_ms(), None, None)
-        .map_err(|e| AudioArchiveError::Other(e.to_string()))?;
-
-    log::info!(
-        "audio archive import {import_id} finished: {tiles_saved} tiles saved, {} members included, {} members left out",
-        record
-            .members
-            .iter()
-            .filter(|m| m.disposition == MemberDisposition::Included)
-            .count(),
-        record
-            .members
-            .iter()
-            .filter(|m| m.disposition != MemberDisposition::Included)
-            .count()
-    );
-
+    let _heartbeat = start_run_heartbeat(journal, &import_id, generation, &attempt_id, &seams);
+    check_fault(&seams, ArchiveFault::AfterRecordFirstSaved)?;
+    let mut store = ArchiveStore::open(journal, &import_id, true)?;
+    let settings = store.settings()?;
+    let plan_size = store.status()?.size;
+    let mut tiles_saved = 0;
+    let mut parts_saved = 0;
+    for (day, key) in store.tile_coordinates()? {
+        if store.tile_phase(&day, &key)? == 3 {
+            continue;
+        }
+        let mut parts = store.publishable_tile_parts(&day, &key)?;
+        let stage = stage_path(journal, &import_id, &day, &key);
+        let intent_path = intent_path(journal, &import_id, &day, &key);
+        let action = publication_action(
+            store.tile_phase(&day, &key)? == 2,
+            intent_path.try_exists()?,
+            stage.try_exists()?,
+        );
+        if action == PublicationAction::KeepSaved {
+            refresh_saved_availability(
+                journal,
+                &import_id,
+                &mut store,
+                &day,
+                &key,
+                &settings.stream,
+            )?;
+        } else {
+            if action == PublicationAction::Stage {
+                // Nothing with this stage has been published. A partial pre-intent stage is disposable.
+                if stage.try_exists()? {
+                    fs::remove_dir_all(&stage)?;
+                }
+                fs::create_dir_all(&stage)?;
+                let mut staged = Vec::with_capacity(parts.len());
+                for part in &parts {
+                    let member = store.member_for_part(part)?;
+                    if member.save_rejection.is_some() {
+                        continue;
+                    }
+                    let target = stage.join(&part.stored_name);
+                    match options.materializer.materialize(&member, part, &target) {
+                        Ok(()) => {}
+                        Err(AudioArchiveError::SourceRejected(cause)) => {
+                            store.reject_member_remaining(part, cause)?;
+                            if target.try_exists()? {
+                                fs::remove_file(&target)?;
+                            }
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                    if !fs::symlink_metadata(&target)?.file_type().is_file() {
+                        return Err(AudioArchiveError::Other(
+                            "materializer did not stage a plain file".to_owned(),
+                        ));
+                    }
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
+                    }
+                    File::options()
+                        .read(true)
+                        .write(true)
+                        .open(&target)?
+                        .sync_all()?;
+                    staged.push(TileIntentPart {
+                        stored_name: part.stored_name.clone(),
+                        sha256: hash_file(&target)?,
+                        byte_len: fs::metadata(&target)?.len(),
+                    });
+                }
+                parts = store.publishable_tile_parts(&day, &key)?;
+                let surviving: std::collections::HashSet<_> =
+                    parts.iter().map(|part| part.stored_name.as_str()).collect();
+                for rejected in staged
+                    .iter()
+                    .filter(|part| !surviving.contains(part.stored_name.as_str()))
+                {
+                    fs::remove_file(stage.join(&rejected.stored_name))?;
+                }
+                staged.retain(|part| surviving.contains(part.stored_name.as_str()));
+                if parts.is_empty() {
+                    fs::remove_dir_all(&stage)?;
+                    continue;
+                }
+                let placement = placement_for(&parts);
+                atomic_replace(
+                    stage.join(AUDIO_ARCHIVE_PLACEMENT_FILENAME),
+                    &serde_json::to_vec(&placement)?,
+                    AtomicWriteOptions::default(),
+                )
+                .map_err(|error| AudioArchiveError::Other(error.to_string()))?;
+                sync_stage_chain(journal, &import_id, &day, &key)?;
+                store.set_tile_outcomes(
+                    &day,
+                    &key,
+                    &parts
+                        .iter()
+                        .map(|part| (part.stored_name.clone(), PartOutcome::Staged))
+                        .collect::<Vec<_>>(),
+                    1,
+                )?;
+                check_fault(&seams, ArchiveFault::AfterTileBytesStaged)?;
+                let identities: Vec<_> = parts
+                    .iter()
+                    .map(|part| {
+                        let member = store.member_for_part(part)?;
+                        Ok(MemberIdentity::new(
+                            member.byte_len,
+                            member.sha256,
+                            member.canonical_occurrence,
+                        ))
+                    })
+                    .collect::<Result<_, AudioArchiveError>>()?;
+                insert_tile_claims(journal, &import_id, &identities, DEFAULT_WRITE_BUSY_TIMEOUT)?;
+                fs::create_dir_all(intent_path.parent().expect("tile intent parent"))?;
+                let intent = TileIntent {
+                    day: day.clone(),
+                    segment_key: key.clone(),
+                    stream: settings.stream.clone(),
+                    placement,
+                    parts: staged,
+                };
+                atomic_replace(
+                    &intent_path,
+                    &serde_json::to_vec(&intent)?,
+                    AtomicWriteOptions::default(),
+                )
+                .map_err(|error| AudioArchiveError::Other(error.to_string()))?;
+                sync_directory(journal, &format!("imports/{import_id}"))?;
+            }
+            register_pending_tile(journal, &import_id, &day, &key)?;
+            sync_directory(journal, "imports")?;
+            check_fault(&seams, ArchiveFault::AfterClaimAndIntent)?;
+            check_fault(&seams, ArchiveFault::BeforeTilePublish)?;
+            recover_or_publish_tile(journal, &import_id, &mut store, &day, &key, true, &seams)?;
+        }
+        tiles_saved += 1;
+        parts_saved += parts.len();
+        if seams
+            .as_ref()
+            .is_some_and(|seams| seams.fault == Some(ArchiveFault::BetweenMultiTileParts))
+        {
+            for part in &parts {
+                if store.has_other_unsaved_parts(part)? {
+                    check_fault(&seams, ArchiveFault::BetweenMultiTileParts)?;
+                }
+            }
+        }
+        check_fault(&seams, ArchiveFault::AfterSavedMarkBeforeEmit)?;
+        // A single wake is sufficient: discovery reads the durable, bounded frontier.
+        if tiles_saved == 1
+            && let Some(emit) = seams
+                .as_ref()
+                .and_then(|seams| seams.emit_observed.as_ref())
+        {
+            emit(&day, &key, &settings.stream);
+        }
+    }
+    store.finish_saving()?;
+    record_completed_attempt(journal, &import_id, generation, now_ms(), None, None)
+        .map_err(|error| AudioArchiveError::Other(error.to_string()))?;
+    let record = read_audio_archive(journal, &import_id)?
+        .ok_or_else(|| AudioArchiveError::MissingRunDirectory(run))?;
     Ok(AudioArchivePublishResult {
         import_id,
         plan_size,
@@ -843,81 +525,362 @@ pub fn publish_audio_archive(
     })
 }
 
+fn stage_path(journal: &Path, id: &str, day: &str, key: &str) -> PathBuf {
+    journal
+        .join("imports")
+        .join(id)
+        .join("staged")
+        .join(day)
+        .join(key)
+}
+fn intent_path(journal: &Path, id: &str, day: &str, key: &str) -> PathBuf {
+    journal
+        .join("imports")
+        .join(id)
+        .join("tiles")
+        .join(format!("{day}_{key}.intent.json"))
+}
+fn placement_for(parts: &[AudioArchiveRecordPart]) -> AudioArchivePlacement {
+    AudioArchivePlacement {
+        version: AUDIO_ARCHIVE_PLACEMENT_VERSION,
+        parts: parts
+            .iter()
+            .map(|part| AudioArchivePlacementPart {
+                stored_name: part.stored_name.clone(),
+                original_occurrence: part.member_occurrence.clone(),
+                original_time_ms: part
+                    .member_occurrence
+                    .strip_prefix("utc|")
+                    .and_then(|value| value.parse().ok()),
+                origin_ms: part.origin_ms,
+                offset_ms: part.offset_ms,
+                length_ms: part.length_ms,
+            })
+            .collect(),
+    }
+}
+
+/// Recovery discovery may finish bookkeeping, but never creates chronicle data.
+/// A missing intent-bound stage witnesses an earlier consuming publication.
+pub fn recover_published_tile(
+    journal: &Path,
+    id: &str,
+    store: &mut ArchiveStore,
+    day: &str,
+    key: &str,
+) -> Result<bool, AudioArchiveError> {
+    super::record::validate_coordinates(day, key)?;
+    if store.tile_phase(day, key)? == 2 {
+        let stream = store.settings()?.stream;
+        refresh_saved_availability(journal, id, store, day, key, &stream)?;
+        return Ok(true);
+    }
+    let stage = stage_path(journal, id, day, key);
+    match fs::symlink_metadata(&stage) {
+        Ok(metadata) if metadata.file_type().is_dir() => return Ok(false),
+        Ok(_) => {
+            return Err(AudioArchiveError::Other(
+                "archive stage is not a directory".to_owned(),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    if !intent_path(journal, id, day, key).try_exists()? {
+        return Ok(false);
+    }
+    recover_or_publish_tile(journal, id, store, day, key, false, &None)?;
+    Ok(true)
+}
+
+fn recover_or_publish_tile(
+    journal: &Path,
+    id: &str,
+    store: &mut ArchiveStore,
+    day: &str,
+    key: &str,
+    allow_publish: bool,
+    seams: &Option<AudioArchivePublishSeams>,
+) -> Result<(), AudioArchiveError> {
+    let parts = store.publishable_tile_parts(day, key)?;
+    let stream = store.settings()?.stream;
+    let intent: TileIntent =
+        serde_json::from_slice(&fs::read(intent_path(journal, id, day, key))?)?;
+    if intent.day != day
+        || intent.segment_key != key
+        || intent.stream != stream
+        || intent.placement != placement_for(&parts)
+        || intent.parts.len() != parts.len()
+        || !intent
+            .parts
+            .iter()
+            .zip(&parts)
+            .all(|(staged, part)| staged.stored_name == part.stored_name)
+    {
+        return Err(AudioArchiveError::ClaimDatabaseCorrupt(
+            "tile intent differs from the saved plan".to_owned(),
+        ));
+    }
+    let stage = stage_path(journal, id, day, key);
+    let target = journal.join("chronicle").join(day).join(&stream).join(key);
+    let stage_exists = match fs::symlink_metadata(&stage) {
+        Ok(metadata) if metadata.file_type().is_dir() => true,
+        Ok(_) => {
+            return Err(AudioArchiveError::Other(
+                "archive stage is not a directory".to_owned(),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    if stage_exists {
+        if !allow_publish {
+            return Ok(());
+        }
+        for part in &intent.parts {
+            let path = stage.join(&part.stored_name);
+            if !fs::symlink_metadata(&path)?.file_type().is_file()
+                || fs::metadata(&path)?.len() != part.byte_len
+                || hash_file(&path)? != part.sha256
+            {
+                return Err(AudioArchiveError::Other(
+                    "intent-bound archive stage changed".to_owned(),
+                ));
+            }
+        }
+        solstone_core_journal_io::ensure_directory(target.parent().expect("segment parent"))
+            .map_err(|error| AudioArchiveError::Other(error.to_string()))?;
+        let _exclusion = SegmentMutation::acquire(&target, LockOptions::default())?;
+        match fs::symlink_metadata(&target) {
+            Ok(_) => {
+                return Err(AudioArchiveError::ChronicleSegmentRefused(format!(
+                    "tile already exists: {day}/{stream}/{key}"
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        fs::rename(&stage, &target)?;
+        sync_directory(journal, &format!("imports/{id}/staged/{day}"))?;
+        for directory in [
+            format!("chronicle/{day}/{stream}"),
+            format!("chronicle/{day}"),
+            "chronicle".to_owned(),
+        ] {
+            sync_directory(journal, &directory)?;
+        }
+        #[cfg(unix)]
+        solstone_core_journal_io::sync_root(journal)
+            .map_err(|error| AudioArchiveError::Other(error.to_string()))?;
+        advance_stream(journal, &stream, day, key)?;
+        check_fault(seams, ArchiveFault::AfterPublishBeforeSavedMark)?;
+    } else if target.try_exists()? {
+        // Synchronize with a writer that just consumed its stage before recording Saved.
+        let _exclusion = SegmentMutation::acquire(&target, LockOptions::default())?;
+        let placement: AudioArchivePlacement =
+            serde_json::from_slice(&fs::read(target.join(AUDIO_ARCHIVE_PLACEMENT_FILENAME))?)?;
+        if placement != intent.placement {
+            return Err(AudioArchiveError::ClaimDatabaseCorrupt(
+                "published tile differs from its intent".to_owned(),
+            ));
+        }
+        sync_directory(journal, &format!("imports/{id}/staged/{day}"))?;
+        sync_directory(journal, &format!("chronicle/{day}/{stream}"))?;
+        advance_stream(journal, &stream, day, key)?;
+    }
+    refresh_saved_availability(journal, id, store, day, key, &stream)
+}
+
+fn advance_stream(
+    journal: &Path,
+    stream: &str,
+    day: &str,
+    key: &str,
+) -> Result<(), AudioArchiveError> {
+    let qualifier = stream.strip_prefix("import.").unwrap_or(stream).to_owned();
+    advance_unbound_stream(
+        journal,
+        stream,
+        day,
+        key,
+        StreamHints {
+            kind: Some(Kind::Imported(ImportSource::Named(qualifier))),
+            host: None,
+            platform: None,
+        },
+    )
+    .map_err(|error| AudioArchiveError::Other(error.to_string()))?;
+    Ok(())
+}
+fn refresh_saved_availability(
+    journal: &Path,
+    _id: &str,
+    store: &mut ArchiveStore,
+    day: &str,
+    key: &str,
+    stream: &str,
+) -> Result<(), AudioArchiveError> {
+    let planned = store.publishable_tile_parts(day, key)?;
+    let placement_path = journal
+        .join("chronicle")
+        .join(day)
+        .join(stream)
+        .join(key)
+        .join(AUDIO_ARCHIVE_PLACEMENT_FILENAME);
+    let placement_available = match fs::symlink_metadata(&placement_path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let placement: AudioArchivePlacement =
+                serde_json::from_slice(&fs::read(&placement_path)?).map_err(|error| {
+                    AudioArchiveError::ChronicleSegmentRefused(error.to_string())
+                })?;
+            if placement != placement_for(&planned) {
+                return Err(AudioArchiveError::ChronicleSegmentRefused(
+                    "saved placement differs from the archive plan".to_owned(),
+                ));
+            }
+            true
+        }
+        Ok(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    let mut outcomes = Vec::new();
+    for part in planned {
+        let raw = journal
+            .join("chronicle")
+            .join(day)
+            .join(stream)
+            .join(key)
+            .join(&part.stored_name);
+        let available = match fs::symlink_metadata(raw) {
+            Ok(metadata) => metadata.file_type().is_file(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        outcomes.push((
+            part.stored_name,
+            if placement_available && available {
+                PartOutcome::Saved
+            } else {
+                PartOutcome::SavedButUnavailable
+            },
+        ));
+    }
+    store.set_tile_outcomes(day, key, &outcomes, 2)?;
+    for (name, outcome) in outcomes {
+        if outcome == PartOutcome::SavedButUnavailable {
+            store.finish_processing(day, key, &name, true)?;
+        }
+    }
+    Ok(())
+}
+fn sync_directory(journal: &Path, relative: &str) -> Result<(), AudioArchiveError> {
+    solstone_core_journal_io::sync_dir(journal, relative)
+        .map_err(|error| AudioArchiveError::Other(error.to_string()))
+}
+fn sync_stage_chain(
+    journal: &Path,
+    id: &str,
+    day: &str,
+    key: &str,
+) -> Result<(), AudioArchiveError> {
+    for relative in [
+        format!("imports/{id}/staged/{day}/{key}"),
+        format!("imports/{id}/staged/{day}"),
+        format!("imports/{id}/staged"),
+        format!("imports/{id}"),
+        "imports".to_owned(),
+    ] {
+        sync_directory(journal, &relative)?;
+    }
+    Ok(())
+}
 fn check_fault(
     seams: &Option<AudioArchivePublishSeams>,
     expected: ArchiveFault,
 ) -> Result<(), AudioArchiveError> {
-    if let Some(seams_ref) = seams
-        && seams_ref.fault == Some(expected)
+    if seams
+        .as_ref()
+        .is_some_and(|seams| seams.fault == Some(expected))
     {
-        return Err(AudioArchiveError::Fault(expected));
+        Err(AudioArchiveError::Fault(expected))
+    } else {
+        Ok(())
     }
-    Ok(())
 }
-
 fn start_run_heartbeat(
-    journal_root: &Path,
-    import_id: &str,
+    journal: &Path,
+    id: &str,
     generation: u64,
     attempt_id: &str,
     seams: &Option<AudioArchivePublishSeams>,
 ) -> ImportHeartbeat {
-    if let Some(seams_ref) = seams
-        && let Some(spawner) = seams_ref.heartbeat_spawner
-    {
+    if let Some(spawner) = seams.as_ref().and_then(|seams| seams.heartbeat_spawner) {
         return ImportHeartbeat::start_injected(
             None,
             Arc::new(|_| {}),
             spawner,
             Arc::new(|| {}),
             Arc::new(|| {}),
-            import_id.to_owned(),
+            id.to_owned(),
             generation,
             attempt_id.to_owned(),
             "audio_archive".to_owned(),
             Instant::now(),
         );
     }
-
     ImportHeartbeat::start(
         Some(Duration::from_secs(1)),
-        journal_root.to_path_buf(),
-        import_id.to_owned(),
+        journal.to_path_buf(),
+        id.to_owned(),
         generation,
         attempt_id.to_owned(),
         "audio_archive".to_owned(),
         Instant::now(),
     )
 }
-
 fn hash_file(path: &Path) -> Result<String, AudioArchiveError> {
-    let mut file = File::open(path).map_err(AudioArchiveError::Io)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 8192];
+    let mut file = File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 65536];
     loop {
-        let count = file.read(&mut buffer).map_err(AudioArchiveError::Io)?;
+        let count = file.read(&mut buffer)?;
         if count == 0 {
             break;
         }
-        hasher.update(&buffer[..count]);
+        digest.update(&buffer[..count]);
     }
-    Ok(to_hex_lower(&hasher.finalize()))
+    Ok(format!("{:x}", digest.finalize()))
 }
-
-fn to_hex_lower(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
-}
-
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+impl AudioArchiveMaterializer for HashMap<String, Vec<u8>> {
+    fn materialize(
+        &self,
+        member: &AudioArchiveRecordMember,
+        _part: &AudioArchiveRecordPart,
+        target: &Path,
+    ) -> Result<(), AudioArchiveError> {
+        let bytes = self
+            .get(&member.sha256)
+            .or_else(|| self.get(&member.original_relative_name))
+            .ok_or_else(|| AudioArchiveError::Other("missing fixture member".to_owned()))?;
+        let actual = format!("{:x}", Sha256::digest(bytes));
+        if bytes.len() as u64 != member.byte_len || actual != member.sha256 {
+            return Err(AudioArchiveError::HashMismatch {
+                expected: member.sha256.clone(),
+                actual,
+            });
+        }
+        fs::write(target, bytes)?;
+        Ok(())
+    }
 }
 
 #[cfg(all(unix, test, feature = "full-tests"))]
@@ -944,6 +907,7 @@ mod crash_tests {
                 instant: Some("2026-01-14T21:00:00.500Z".to_owned()),
                 local_civil: None,
                 source_zone: None,
+                ..Default::default()
             },
             run_note: None,
         };
@@ -961,7 +925,7 @@ mod crash_tests {
             AudioArchivePublishOptions {
                 import_id: None,
                 members: vec![member],
-                member_bytes: map,
+                materializer: &map,
                 owner_zone: Tz::America__New_York,
                 settings: AudioArchiveSettings {
                     qualifier: "clips".to_owned(),
