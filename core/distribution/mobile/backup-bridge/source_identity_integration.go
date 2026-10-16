@@ -1,0 +1,206 @@
+//go:build integration
+
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 sol pbc
+
+// Public-C entrypoint exercise helpers; excluded from production file closure.
+package main
+
+/*
+#include <stdint.h>
+
+#ifndef SOLSTONE_RESTIC_OPERATION_OPTIONS_V1
+#define SOLSTONE_RESTIC_OPERATION_OPTIONS_V1
+typedef struct {
+    uint32_t version;
+    uint32_t check_read_mode;
+    uint64_t retry_lock_ms;
+    uint32_t group;
+    uint32_t groups;
+    uint32_t reserved1;
+    uint32_t reserved2;
+} restic_operation_options_v1;
+#endif
+
+
+typedef struct {
+    int32_t operation;
+    const char *password;
+    uint32_t password_len;
+    const char *recovery_password;
+    uint32_t recovery_password_len;
+    const char *repo_path;
+    uint32_t repo_path_len;
+    const char *source_path;
+    uint32_t source_path_len;
+    const char *restore_path;
+    uint32_t restore_path_len;
+    const char *snapshot_id;
+    uint32_t snapshot_id_len;
+} restic_request;
+
+typedef struct {
+    int32_t status;
+    char key_id[65];
+    char snapshot_id[65];
+    uint32_t snapshot_count;
+    char snapshot_ids[4096][65];
+    char diagnostic[256];
+} restic_result;
+
+typedef struct {
+    uint32_t version;
+    uint32_t target_admitted;
+    uint32_t target_may_have_mutated;
+} restic_restore_root_outcome_v1;
+
+
+#include <stdint.h>
+
+#ifndef SOLSTONE_RESTIC_OPERATION_OPTIONS_V1
+#define SOLSTONE_RESTIC_OPERATION_OPTIONS_V1
+typedef struct {
+    uint32_t version;
+    uint32_t check_read_mode;
+    uint64_t retry_lock_ms;
+    uint32_t group;
+    uint32_t groups;
+    uint32_t reserved1;
+    uint32_t reserved2;
+} restic_operation_options_v1;
+#endif
+
+typedef struct {
+    uint32_t version;
+    int32_t operation;
+    const char *endpoint; uint32_t endpoint_len;
+    const char *region; uint32_t region_len;
+    const char *bucket; uint32_t bucket_len;
+    const char *prefix; uint32_t prefix_len;
+    const char *access_key; uint32_t access_key_len;
+    const char *secret_key; uint32_t secret_key_len;
+    const char *session_token; uint32_t session_token_len;
+    const char *password; uint32_t password_len;
+    const char *recovery_password; uint32_t recovery_password_len;
+    const char *state_path; uint32_t state_path_len;
+    const char *source_path; uint32_t source_path_len;
+    const char *restore_path; uint32_t restore_path_len;
+    const char *snapshot_id; uint32_t snapshot_id_len;
+    const char *workspace_path; uint32_t workspace_path_len;
+} restic_s3_request;
+
+#include <stdlib.h>
+int32_t restic_bridge_snapshot_source_v1_start(restic_request*,restic_operation_options_v1*,int32_t,const char*,uint32_t,const char*,uint32_t,uint64_t*);
+int32_t restic_bridge_s3_snapshot_source_v1_start(restic_s3_request*,restic_operation_options_v1*,int32_t,const char*,uint32_t,uint64_t*);
+int32_t restic_bridge_operation_v1_start(restic_request*,restic_operation_options_v1*,const char*,uint32_t,const char*,uint32_t,uint64_t*);
+int32_t restic_bridge_s3_operation_v1_start(restic_s3_request*,restic_operation_options_v1*,const char*,uint32_t,uint64_t*);
+int32_t restic_bridge_cancel(uint64_t);
+int32_t restic_bridge_wait(uint64_t,restic_result*);
+int32_t restic_bridge_free(uint64_t);
+*/
+import "C"
+import "unsafe"
+
+type sourceCInput struct {
+	recovery                             []byte
+	repository, source, workspace, state string
+	password                             []byte
+	remote                               *s3Config
+}
+
+func sourceCStart(input sourceCInput, fd int, selection []byte, retryMillis uint64) (uint64, int32) {
+	return sourceCVersionedStart(input, OpSnapshot, true, fd, selection, retryMillis)
+}
+
+func sourceCVersionedStart(input sourceCInput, operation int32, sourceEntry bool, fd int, selection []byte, retryMillis uint64) (uint64, int32) {
+	var allocations []unsafe.Pointer
+	defer func() {
+		for _, p := range allocations {
+			C.free(p)
+		}
+	}()
+	bytes := func(value []byte) (*C.char, C.uint32_t) {
+		if len(value) == 0 {
+			return nil, 0
+		}
+		p := C.CBytes(value)
+		allocations = append(allocations, p)
+		return (*C.char)(p), C.uint32_t(len(value))
+	}
+	text := func(value string) (*C.char, C.uint32_t) { return bytes([]byte(value)) }
+	options := C.restic_operation_options_v1{version: 1, retry_lock_ms: C.uint64_t(retryMillis)}
+	if operation == OpCheck {
+		options.check_read_mode = C.uint32_t(checkReadStructure)
+	}
+	policy, policyLen := bytes(selection)
+	id := C.uint64_t(0xfedcba9876543210)
+	var status C.int32_t
+	if input.remote == nil {
+		request := C.restic_request{operation: C.int32_t(operation)}
+		request.password, request.password_len = bytes(input.password)
+		if operation == OpInit || operation == OpAddRecoveryKey {
+			request.recovery_password, request.recovery_password_len = bytes(input.recovery)
+		}
+		request.repo_path, request.repo_path_len = text(input.repository)
+		if operation == OpSnapshot {
+			request.source_path, request.source_path_len = text(input.source)
+		}
+		var workspace *C.char
+		var workspaceLen C.uint32_t
+		if operation == OpSnapshot {
+			workspace, workspaceLen = text(input.workspace)
+		}
+		if sourceEntry {
+			status = C.restic_bridge_snapshot_source_v1_start(&request, &options, C.int32_t(fd), workspace, workspaceLen, policy, policyLen, &id)
+		} else {
+			status = C.restic_bridge_operation_v1_start(&request, &options, workspace, workspaceLen, policy, policyLen, &id)
+		}
+	} else {
+		cfg := input.remote
+		request := C.restic_s3_request{version: 1, operation: C.int32_t(operation)}
+		request.endpoint, request.endpoint_len = text(cfg.endpoint)
+		request.region, request.region_len = text(cfg.region)
+		request.bucket, request.bucket_len = text(cfg.bucket)
+		request.prefix, request.prefix_len = text(cfg.prefix)
+		request.access_key, request.access_key_len = text(cfg.access)
+		request.secret_key, request.secret_key_len = text(cfg.secret)
+		request.session_token, request.session_token_len = text(cfg.token)
+		request.password, request.password_len = bytes(input.password)
+		if operation == OpInit || operation == OpAddRecoveryKey {
+			request.recovery_password, request.recovery_password_len = bytes(input.recovery)
+		}
+		request.state_path, request.state_path_len = text(input.state)
+		if operation == OpSnapshot {
+			request.source_path, request.source_path_len = text(input.source)
+		}
+		if operation == OpSnapshot {
+			request.workspace_path, request.workspace_path_len = text(input.workspace)
+		}
+		if sourceEntry {
+			status = C.restic_bridge_s3_snapshot_source_v1_start(&request, &options, C.int32_t(fd), policy, policyLen, &id)
+		} else {
+			status = C.restic_bridge_s3_operation_v1_start(&request, &options, policy, policyLen, &id)
+		}
+	}
+	return uint64(id), int32(status)
+}
+
+func sourceCCancel(id uint64) int32 {
+	return int32(C.restic_bridge_cancel(C.uint64_t(id)))
+}
+
+func sourceCFree(id uint64) int32 {
+	return int32(C.restic_bridge_free(C.uint64_t(id)))
+}
+
+func sourceCWaitAndFree(id uint64) (bridgeResult, int32, int32) {
+	output := (*C.restic_result)(C.calloc(1, C.size_t(C.sizeof_restic_result)))
+	if output == nil {
+		return bridgeResult{}, StatusInternal, StatusInternal
+	}
+	defer C.free(unsafe.Pointer(output))
+	status := C.restic_bridge_wait(C.uint64_t(id), output)
+	result := bridgeResult{status: int32(output.status), snapshotID: C.GoString(&output.snapshot_id[0]), keyID: C.GoString(&output.key_id[0]), diagnostic: C.GoString(&output.diagnostic[0])}
+	freed := C.restic_bridge_free(C.uint64_t(id))
+	return result, int32(status), int32(freed)
+}

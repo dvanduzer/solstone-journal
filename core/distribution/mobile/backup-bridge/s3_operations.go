@@ -235,6 +235,9 @@ func finishS3Call(h *callHandle, result bridgeResult, wrote, pending, stateUncer
 // After confirmed SDK/native drain, release descriptors even if local cleanup
 // panics. No further deletion is attempted; any residue stays explicit.
 func closeS3RequestPaths(req *bridgeRequest) (resultErr error) {
+	if req.owned != nil {
+		return closeRequestPaths(req)
+	}
 	metadata := req.metadataRoot != nil || req.metadataFile != nil
 	defer func() {
 		if recover() == nil {
@@ -263,6 +266,7 @@ func closeS3RequestPaths(req *bridgeRequest) (resultErr error) {
 }
 
 func runS3Worker(h *callHandle, req bridgeRequest) {
+	req.owned.retain(&req)
 	// If an unexpected failure prevents confirming drain, keep the full request
 	// in its live handle. Cancellation alone cannot publish stopped or free roots.
 	defer func() {
@@ -270,6 +274,10 @@ func runS3Worker(h *callHandle, req bridgeRequest) {
 			return
 		}
 		h.cancel()
+		if req.owned != nil {
+			req.owned.markFault()
+			req.owned.blockIfFault(&req)
+		}
 		h.mu.Lock()
 		h.retainedS3Request = &req
 		h.state = handleRunning
@@ -297,11 +305,15 @@ func runS3Worker(h *callHandle, req bridgeRequest) {
 		result = executeS3Operation(h, &req, &wrote)
 	}
 	// All operation defers, including actual Unlock, have returned before here.
+	req.owned.blockIfFault(&req)
 	drainErr := owner.drainPrimary()
+	req.owned.blockIfFault(&req)
 	if started && drainErr == nil {
 		_ = safelyCleanupS3Locks(req.remote)
 	}
+	req.owned.blockIfFault(&req)
 	cleanupErr := closeS3RequestPaths(&req)
+	req.owned.blockIfFault(&req)
 	workspace := errors.Is(cleanupErr, errMetadataCleanup) || result.diagnostic == DiagWorkspaceCleanupRequired
 	if started {
 		if drainErr != nil {
@@ -317,6 +329,7 @@ func runS3Worker(h *callHandle, req bridgeRequest) {
 			}
 		}
 	}
+	req.owned.blockIfFault(&req)
 	owner.mu.Lock()
 	if result.keyID == "" && (req.operation == OpInit || req.operation == OpAddRecoveryKey) {
 		result.keyID = owner.knownKeyID
@@ -337,5 +350,6 @@ func runS3Worker(h *callHandle, req bridgeRequest) {
 	if err := owner.Close(); err != nil {
 		result.status, result.diagnostic = StatusFailed, DiagIoFailed
 	}
+	req.owned.blockIfFault(&req)
 	finishS3Call(h, result, wrote, pending, stateUncertain, workspace, req.restorePublished, cleanupErr != nil)
 }

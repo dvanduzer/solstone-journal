@@ -65,6 +65,7 @@ const (
 
 // Internal Go representation of caller request parameters.
 type bridgeRequest struct {
+	owned             *ownedCall
 	operation         int32
 	password          []byte
 	recoveryPassword  []byte
@@ -74,6 +75,7 @@ type bridgeRequest struct {
 	restorePath       string
 	snapshotID        string
 	snapshotSelection *snapshotSelection
+	executionOptions  *operationOptions
 	// pathFiles pin caller-authorized directories for the complete asynchronous
 	// operation.
 	pathFiles            []*os.File

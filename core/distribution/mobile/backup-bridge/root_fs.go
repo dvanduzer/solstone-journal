@@ -24,6 +24,7 @@ var (
 )
 
 type rootFS struct {
+	owned        *ownedCall
 	root         *os.Root
 	metadataRoot *os.Root
 	sourcePath   string
@@ -270,7 +271,7 @@ func (rf *rootFile) ToNode(ignoreXattrListError bool, warnf func(format string, 
 		node.Type = data.NodeTypeDir
 	case os.ModeSymlink:
 		node.Type = data.NodeTypeSymlink
-		target, err := readMetadataLink(rf.fsys.metadataRoot, rf.file)
+		target, err := readMetadataLinkOwned(rf.fsys.metadataRoot, rf.file, rf.fsys.owned)
 		if err != nil {
 			return nil, err
 		}

@@ -60,3 +60,7 @@ func readMetadataLink(_ *os.Root, file *os.File) (string, error) {
 	}
 	return "", errors.New("source symlink target exceeds bound")
 }
+
+func readMetadataLinkOwned(workspace *os.Root, file *os.File, _ *ownedCall) (string, error) {
+	return readMetadataLink(workspace, file)
+}

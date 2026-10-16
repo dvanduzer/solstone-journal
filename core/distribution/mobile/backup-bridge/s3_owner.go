@@ -77,6 +77,7 @@ type s3OwnerRecord struct {
 }
 
 type s3Owner struct {
+	owned           *ownedCall
 	mu              sync.Mutex
 	path            string
 	destination     s3Destination
@@ -125,11 +126,16 @@ func (destination s3Destination) config(credential s3RetainedCredential) s3Confi
 }
 
 func newS3Owner(path string, cfg s3Config) (_ *s3Owner, resultErr error) {
+	return newS3OwnerOwned(path, cfg, nil)
+}
+
+func newS3OwnerOwned(path string, cfg s3Config, entry *ownedCall) (_ *s3Owner, resultErr error) {
 	destination, err := s3DestinationFor(cfg)
 	if err != nil || sanitizePath(path) != nil {
 		return nil, errS3OwnerInvalid
 	}
-	owner := &s3Owner{path: path, destination: destination, lockAcks: make(map[string]bool)}
+	owner := &s3Owner{owned: entry, path: path, destination: destination, lockAcks: make(map[string]bool)}
+	entry.retainOwner(owner)
 	s3OwnersMu.Lock()
 	if s3Owners[destination] != nil {
 		s3OwnersMu.Unlock()
@@ -139,10 +145,11 @@ func newS3Owner(path string, cfg s3Config) (_ *s3Owner, resultErr error) {
 	s3OwnersMu.Unlock()
 	defer func() {
 		if resultErr != nil {
+			entry.scrubRejection()
 			_ = owner.Close()
 		}
 	}()
-	file, err := openPinnedDirectory(path)
+	file, err := openOwnedDirectory(path, entry)
 	if err != nil {
 		return nil, errS3OwnerInvalid
 	}
@@ -151,7 +158,7 @@ func newS3Owner(path string, cfg s3Config) (_ *s3Owner, resultErr error) {
 	if unix.Fstat(int(file.Fd()), &stat) != nil || stat.Uid != uint32(os.Geteuid()) || stat.Mode&07777 != 0700 {
 		return nil, errS3OwnerInvalid
 	}
-	if err := reserveRootedPrivateDirectory(file); err != nil {
+	if err := reserveOwnedPrivateDirectory(file, entry); err != nil {
 		return nil, err
 	}
 	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
@@ -163,7 +170,7 @@ func newS3Owner(path string, cfg s3Config) (_ *s3Owner, resultErr error) {
 	if err := s3StateRootPolicy(int(file.Fd())); err != nil {
 		return nil, errS3OwnerPolicy
 	}
-	owner.root, err = adoptRoot(path, file)
+	owner.root, err = adoptOwnedRoot(path, file, entry)
 	if err != nil {
 		return nil, errS3OwnerInvalid
 	}
@@ -192,7 +199,16 @@ func (owner *s3Owner) census(temporary string) error {
 	}
 	listing := os.NewFile(uintptr(fd), "S3 owner state census")
 	names, readErr := listing.Readdirnames(10)
-	closeErr := listing.Close()
+	if owner.owned != nil {
+		invalid := readErr != nil && !errors.Is(readErr, io.EOF) || len(names) > 2
+		for _, name := range names {
+			invalid = invalid || name != s3OwnerStateName && (temporary == "" || name != temporary)
+		}
+		if invalid {
+			owner.owned.scrubRejection()
+		}
+	}
+	closeErr := owner.owned.close(listing, "s3-state-census")
 	if readErr != nil && !errors.Is(readErr, io.EOF) || closeErr != nil || len(names) > 2 {
 		return errS3OwnerInvalid
 	}
@@ -222,7 +238,8 @@ func (owner *s3Owner) read() error {
 	keep := false
 	defer func() {
 		if !keep {
-			_ = file.Close()
+			owner.owned.scrubRejection()
+			_ = owner.owned.close(file, "s3-state-rejected-read")
 		}
 	}()
 	if !privateS3StateFile(file) || s3StateFilePolicy(fd, false) != nil {
@@ -403,12 +420,17 @@ func (record s3OwnerRecord) validate() error {
 	return nil
 }
 
-func (owner *s3Owner) recheckDirectory() error {
-	file, err := openPinnedDirectory(owner.path)
+func (owner *s3Owner) recheckDirectory() (resultErr error) {
+	file, err := openOwnedDirectory(owner.path, owner.owned)
 	if err != nil {
 		return errS3OwnerInvalid
 	}
-	defer file.Close()
+	defer func() {
+		err := owner.owned.close(file, "s3-state-recheck-directory")
+		if owner.owned != nil {
+			resultErr = errors.Join(resultErr, err)
+		}
+	}()
 	same, err := sameDirectory(file, owner.directory)
 	if err != nil || !same {
 		return errS3OwnerInvalid
@@ -461,7 +483,7 @@ func (owner *s3Owner) persist(record s3OwnerRecord) (published bool, resultErr e
 		return false, errS3OwnerIO
 	}
 	file := os.NewFile(uintptr(fd), "S3 owner state temporary")
-	defer file.Close()
+	defer func() { _ = owner.owned.close(file, "s3-state-write-temporary") }()
 	if !privateS3StateFile(file) || s3StateFilePolicy(fd, true) != nil {
 		return false, errS3OwnerPolicy
 	}
@@ -485,13 +507,13 @@ func (owner *s3Owner) persist(record s3OwnerRecord) (published bool, resultErr e
 	keepIdentity := false
 	defer func() {
 		if !keepIdentity {
-			_ = identity.Close()
+			_ = owner.owned.close(identity, "s3-state-read-identity")
 		}
 	}()
 	if same, err := sameDirectory(file, identity); err != nil || !same || !privateS3StateFile(identity) {
 		return false, errS3OwnerInvalid
 	}
-	if err := file.Close(); err != nil {
+	if err := owner.owned.close(file, "s3-state-write-temporary"); err != nil {
 		return false, errS3OwnerIO
 	}
 	if owner.gate("before-rename") != nil || owner.recheckCustody(name) != nil {
@@ -519,7 +541,9 @@ func (owner *s3Owner) persist(record s3OwnerRecord) (published bool, resultErr e
 			_ = unix.Fsync(int(owner.directory.Fd()))
 			return true, errS3OwnerIO
 		}
-		_ = owner.stateFile.Close()
+		if err := owner.owned.close(owner.stateFile, "s3-state-displaced-file"); err != nil && owner.owned != nil {
+			return true, err
+		}
 	}
 	owner.stateFile, owner.record, owner.exists = identity, record, true
 	keepIdentity = true
@@ -690,6 +714,9 @@ func (owner *s3Owner) complete() (published bool, err error) {
 }
 
 func (owner *s3Owner) Close() error {
+	if owner.owned != nil {
+		return owner.closeOwned()
+	}
 	owner.mu.Lock()
 	if owner.closed {
 		owner.mu.Unlock()

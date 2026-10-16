@@ -6,6 +6,20 @@ package main
 /*
 #include <stdint.h>
 
+#ifndef SOLSTONE_RESTIC_OPERATION_OPTIONS_V1
+#define SOLSTONE_RESTIC_OPERATION_OPTIONS_V1
+typedef struct {
+    uint32_t version;
+    uint32_t check_read_mode;
+    uint64_t retry_lock_ms;
+    uint32_t group;
+    uint32_t groups;
+    uint32_t reserved1;
+    uint32_t reserved2;
+} restic_operation_options_v1;
+#endif
+
+
 typedef struct {
     int32_t operation;
     const char *password;
@@ -58,6 +72,7 @@ const (
 
 // Internal call handle tracking worker lifecycle and owned memory.
 type callHandle struct {
+	owned                *ownedCall
 	id                   uint64
 	ctx                  context.Context
 	cancel               context.CancelFunc
@@ -122,6 +137,10 @@ func copyCString(dst []C.char, s string) {
 
 // validateRequest validates C request lengths and path invariants.
 func validateRequest(req *C.restic_request) (bridgeRequest, int32) {
+	return validateRequestOwned(req, nil)
+}
+
+func validateRequestOwned(req *C.restic_request, entry *ownedCall) (bridgeRequest, int32) {
 	if req == nil {
 		return bridgeRequest{}, StatusInvalidArgument
 	}
@@ -193,6 +212,7 @@ func validateRequest(req *C.restic_request) (bridgeRequest, int32) {
 	}
 
 	breq := bridgeRequest{
+		owned:            entry,
 		operation:        op,
 		password:         copyCBytes(req.password, req.password_len),
 		recoveryPassword: copyCBytes(req.recovery_password, req.recovery_password_len),
@@ -201,7 +221,16 @@ func validateRequest(req *C.restic_request) (bridgeRequest, int32) {
 		restorePath:      restorePath,
 		snapshotID:       snapshotID,
 	}
+	entry.retain(&breq)
+	if testOwnedStage != nil && entry != nil {
+		testOwnedStage("copied", entry)
+	}
 	if err := pinRequestPaths(&breq); err != nil {
+		if entry != nil {
+			zeroBytes(breq.password)
+			zeroBytes(breq.recoveryPassword)
+			return breq, StatusInvalidArgument
+		}
 		closeRequestPaths(&breq)
 		return bridgeRequest{}, StatusInvalidArgument
 	}
@@ -223,6 +252,24 @@ func allocateID(counter *atomic.Uint64) (uint64, int32) {
 
 // rejectBridgeCall cleans admitted resources without masking retained scratch.
 func rejectBridgeCall(req *bridgeRequest, status int32) int32 {
+	if req.owned != nil {
+		zeroBytes(req.password)
+		zeroBytes(req.recoveryPassword)
+		err := closeRequestPaths(req)
+		req.owned.blockIfFault(req)
+		if req.remote != nil {
+			err = errors.Join(err, req.remote.owner.Close())
+		}
+		req.owned.blockIfFault(req)
+		if errors.Is(err, errMetadataCleanup) {
+			return StatusWorkspaceCleanupRequired
+		}
+		if err != nil {
+			return StatusFailed
+		}
+		return status
+	}
+
 	err := closeRequestPaths(req)
 	if req.remote != nil {
 		err = errors.Join(err, req.remote.owner.Close())
@@ -241,6 +288,8 @@ func rejectBridgeCall(req *bridgeRequest, status int32) int32 {
 
 // startBridgeCall allocates a handle, initializes context, and launches the worker.
 func startBridgeCall(req bridgeRequest) (uint64, int32) {
+	req.owned.retain(&req)
+	req.owned.blockIfFault(&req)
 	id, status := allocateID(&nextID)
 	if status != StatusOk {
 		return 0, rejectBridgeCall(&req, status)
@@ -248,6 +297,7 @@ func startBridgeCall(req bridgeRequest) (uint64, int32) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	h := &callHandle{
+		owned:         req.owned,
 		id:            id,
 		ctx:           ctx,
 		cancel:        cancel,
@@ -257,6 +307,17 @@ func startBridgeCall(req bridgeRequest) (uint64, int32) {
 		rootedRestore: req.rootedRestore,
 	}
 
+	if req.owned != nil {
+		if testOwnedStage != nil {
+			testOwnedStage("before-publication", req.owned)
+		}
+		ownedCalls.Lock()
+		if ownedCalls.sealed {
+			ownedCalls.Unlock()
+			cancel()
+			return 0, rejectBridgeCall(&req, StatusFailed)
+		}
+	}
 	handlesMu.Lock()
 	running := 0
 	for _, active := range handles {
@@ -268,12 +329,25 @@ func startBridgeCall(req bridgeRequest) (uint64, int32) {
 	}
 	if running >= 4 || len(handles) >= 16 {
 		handlesMu.Unlock()
+		if req.owned != nil {
+			ownedCalls.Unlock()
+		}
 		cancel()
 		return 0, rejectBridgeCall(&req, StatusBusy)
 	}
 	handles[id] = h
+	if req.owned != nil {
+		req.owned.published = true
+		req.owned.admitted.Store(true)
+	}
 	handlesMu.Unlock()
+	if req.owned != nil {
+		ownedCalls.Unlock()
+	}
 
+	if req.owned != nil && testOwnedStage != nil {
+		testOwnedStage("worker-launch", req.owned)
+	}
 	go runWorker(h, req)
 
 	return id, StatusOk
@@ -325,6 +399,7 @@ func runWorker(h *callHandle, req bridgeRequest) {
 	defer func() {
 		panicValue := recover()
 		cleanupErr := closeRequestPaths(&req)
+		req.owned.blockIfFault(&req)
 		if errors.Is(cleanupErr, errMetadataCleanup) {
 			result = bridgeResult{status: StatusFailed, diagnostic: DiagWorkspaceCleanupRequired}
 		} else if panicValue != nil {
@@ -381,6 +456,54 @@ func runWorker(h *callHandle, req bridgeRequest) {
 	default:
 		result = bridgeResult{status: StatusInvalidArgument, diagnostic: DiagInvalidArgument}
 	}
+}
+
+// parseCOperationOptions takes an immutable owned copy before a worker exists.
+func parseCOperationOptions(operation int32, options *C.restic_operation_options_v1) (*operationOptions, int32) {
+	if options == nil {
+		return nil, StatusInvalidArgument
+	}
+	return parseOperationOptions(operation, uint32(options.version), uint32(options.check_read_mode), uint64(options.retry_lock_ms), uint32(options.group), uint32(options.groups), uint32(options.reserved1), uint32(options.reserved2))
+}
+
+//export restic_bridge_operation_v1_start
+func restic_bridge_operation_v1_start(request *C.restic_request, options *C.restic_operation_options_v1, workspace *C.char, workspaceLen C.uint32_t, policy *C.char, policyLen C.uint32_t, outID *C.uint64_t) (returned C.int32_t) {
+	if outID == nil {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	*outID = 0
+	entry, status := reserveOwnedCall()
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	defer func() { returned = C.int32_t(entry.finishAdmission(int32(returned))) }()
+	if request == nil {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	ownedOptions, status := parseCOperationOptions(int32(request.operation), options)
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	if request.operation == C.int32_t(OpSnapshot) {
+		selection, status := parseCSnapshotSelection(policy, policyLen)
+		if status != StatusOk {
+			return C.int32_t(status)
+		}
+		return startWithWorkspaceSourceOwned(request, workspace, workspaceLen, selection, ownedOptions, nil, entry, outID)
+	}
+	if workspaceLen != 0 || policyLen != 0 {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	req, status := validateRequestOwned(request, entry)
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	req.executionOptions = ownedOptions
+	id, status := startBridgeCall(req)
+	if status == StatusOk {
+		*outID = C.uint64_t(id)
+	}
+	return C.int32_t(status)
 }
 
 //export restic_bridge_start
@@ -517,6 +640,47 @@ func restic_bridge_snapshot_v1_start(req *C.restic_request, workspace *C.char, w
 }
 
 func startWithWorkspace(req *C.restic_request, workspace *C.char, workspaceLen C.uint32_t, selection *snapshotSelection, outID *C.uint64_t) C.int32_t {
+	return startWithWorkspaceOptions(req, workspace, workspaceLen, selection, nil, outID)
+}
+
+func startWithWorkspaceOptions(req *C.restic_request, workspace *C.char, workspaceLen C.uint32_t, selection *snapshotSelection, options *operationOptions, outID *C.uint64_t) C.int32_t {
+	return startWithWorkspaceSource(req, workspace, workspaceLen, selection, options, nil, outID)
+}
+
+//export restic_bridge_snapshot_source_v1_start
+func restic_bridge_snapshot_source_v1_start(req *C.restic_request, options *C.restic_operation_options_v1, sourceFD C.int32_t, workspace *C.char, workspaceLen C.uint32_t, policy *C.char, policyLen C.uint32_t, outID *C.uint64_t) (returned C.int32_t) {
+	if outID == nil {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	*outID = 0
+	entry, status := reserveOwnedCall()
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	defer func() { returned = C.int32_t(entry.finishAdmission(int32(returned))) }()
+	if req == nil || req.operation != C.int32_t(OpSnapshot) {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	ownedOptions, status := parseCOperationOptions(int32(req.operation), options)
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	selection, status := parseCSnapshotSelection(policy, policyLen)
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	expected, status := readBorrowedSourceIdentity(int(sourceFD))
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	return startWithWorkspaceSourceOwned(req, workspace, workspaceLen, selection, ownedOptions, expected, entry, outID)
+}
+
+func startWithWorkspaceSource(req *C.restic_request, workspace *C.char, workspaceLen C.uint32_t, selection *snapshotSelection, options *operationOptions, expected *borrowedSourceIdentity, outID *C.uint64_t) C.int32_t {
+	return startWithWorkspaceSourceOwned(req, workspace, workspaceLen, selection, options, expected, nil, outID)
+}
+
+func startWithWorkspaceSourceOwned(req *C.restic_request, workspace *C.char, workspaceLen C.uint32_t, selection *snapshotSelection, options *operationOptions, expected *borrowedSourceIdentity, entry *ownedCall, outID *C.uint64_t) C.int32_t {
 	if outID == nil {
 		return C.int32_t(StatusInvalidArgument)
 	}
@@ -531,11 +695,18 @@ func startWithWorkspace(req *C.restic_request, workspace *C.char, workspaceLen C
 	if sanitizePath(path) != nil {
 		return C.int32_t(StatusInvalidArgument)
 	}
-	breq, status := validateRequest(req)
+	breq, status := validateRequestOwned(req, entry)
 	if status != StatusOk {
 		return C.int32_t(status)
 	}
 	if err := pinMetadataWorkspace(&breq, path); err != nil {
+		if entry != nil {
+			status := StatusInvalidArgument
+			if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
+				status = StatusBusy
+			}
+			return C.int32_t(rejectBridgeCall(&breq, status))
+		}
 		_ = closeRequestPaths(&breq)
 		zeroBytes(breq.password)
 		zeroBytes(breq.recoveryPassword)
@@ -545,6 +716,12 @@ func startWithWorkspace(req *C.restic_request, workspace *C.char, workspaceLen C
 		return C.int32_t(StatusInvalidArgument)
 	}
 	breq.snapshotSelection = selection
+	breq.executionOptions = options
+	if expected != nil {
+		if status := verifyCapturedSource(&breq, expected); status != StatusOk {
+			return C.int32_t(rejectBridgeCall(&breq, status))
+		}
+	}
 	id, status := startBridgeCall(breq)
 	if status == StatusOk {
 		*outID = C.uint64_t(id)
@@ -661,6 +838,7 @@ func freeCall(id uint64) int32 {
 	h.mu.Unlock()
 	handlesMu.Unlock()
 
+	h.owned.retire()
 	return StatusOk
 }
 

@@ -75,30 +75,30 @@ func ensureDirectoryEmpty(file *os.File) error {
 
 func pinRequestPaths(req *bridgeRequest) (err error) {
 	defer func() {
-		if err != nil {
+		if err != nil && req.owned == nil {
 			_ = closeRequestPaths(req)
 		}
 	}()
 	if req.rootedRestore != nil && !utf8.ValidString(req.repoPath) {
 		return errPinnedIdentity
 	}
-	repo, err := openPinnedDirectory(req.repoPath)
+	repo, err := openOwnedDirectory(req.repoPath, req.owned)
 	if err != nil {
 		if req.operation == OpInit && (errors.Is(err, unix.ENOENT) || os.IsNotExist(err)) {
 			if mkErr := os.MkdirAll(req.repoPath, 0700); mkErr != nil {
 				return mkErr
 			}
-			repo, err = openPinnedDirectory(req.repoPath)
+			repo, err = openOwnedDirectory(req.repoPath, req.owned)
 		}
 		if err != nil {
 			return err
 		}
 	}
 	req.pathFiles = append(req.pathFiles, repo)
-	if err := reserveRootedPrivateDirectory(repo); err != nil {
+	if err := reserveOwnedPrivateDirectory(repo, req.owned); err != nil {
 		return err
 	}
-	repoRoot, err := adoptRoot(req.repoPath, repo)
+	repoRoot, err := adoptOwnedRoot(req.repoPath, repo, req.owned)
 	if err != nil {
 		return err
 	}
@@ -115,20 +115,20 @@ func pinDataPaths(req *bridgeRequest, protected []*os.File) (err error) {
 	var source *os.File
 	if req.operation == OpSnapshot || req.operation == OpRestore {
 		originalSource := req.sourcePath
-		source, err = openPinnedDirectory(originalSource)
+		source, err = openOwnedDirectory(originalSource, req.owned)
 		if err != nil {
 			return err
 		}
 		req.pathFiles = append(req.pathFiles, source)
 		for _, other := range protected {
-			if overlap, overlapErr := pinnedDirectoriesOverlap(other, source); overlapErr != nil || overlap {
+			if overlap, overlapErr := ownedDirectoriesOverlap(other, source, req.owned); overlapErr != nil || overlap {
 				if overlapErr != nil {
 					return overlapErr
 				}
 				return errPathOverlap
 			}
 		}
-		sourceRoot, err := adoptRoot(originalSource, source)
+		sourceRoot, err := adoptOwnedRoot(originalSource, source, req.owned)
 		if err != nil {
 			return err
 		}
@@ -379,6 +379,9 @@ func clearDirectoryContents(fd int) error {
 }
 
 func closeRequestPaths(req *bridgeRequest) (cleanupErr error) {
+	if req.owned != nil {
+		return closeOwnedRequestPaths(req)
+	}
 	if req.rootedRestore != nil {
 		defer func() { cleanupErr = errors.Join(cleanupErr, req.rootedRestore.close()) }()
 	}

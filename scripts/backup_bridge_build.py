@@ -72,7 +72,7 @@ def check_native_http_closure(selection, target, header, symbols):
         key: selection.get(key, []) for key in ("GoFiles", "CgoFiles", "MFiles", "HFiles")
     }
     names = [name for values in selected.values() for name in values]
-    if any("testhooks" in name or "_probe" in name for name in names):
+    if any("testhooks" in name or "_probe" in name or name.endswith("_integration.go") for name in names):
         raise ValueError("qualification hooks selected in production archive")
     if target == "ios":
         if (
@@ -428,6 +428,13 @@ int main(void) {{
         self.run_step("selection-c-link", selection_link, cwd=host_artifacts, env=env)
         self.run_step("selection-c-run", [selection_bin, host_artifacts], cwd=host_artifacts, env=env)
 
+        options_caller = host_artifacts / "options-caller.c"
+        shutil.copy2(BRIDGE_SRC_PATH / "operation_options_caller.c.fixture", options_caller)
+        options_bin = host_artifacts / "options-caller"
+        options_link = [str(item) if item not in (host_caller, host_caller_bin) else str(options_caller if item == host_caller else options_bin) for item in host_link]
+        self.run_step("options-c-link", options_link, cwd=host_artifacts, env=env)
+        self.run_step("options-c-run", [options_bin, host_artifacts], cwd=host_artifacts, env=env)
+
         rooted_caller = host_artifacts / "rooted-caller.c"
         shutil.copy2(BRIDGE_SRC_PATH / "rooted_restore_caller.c.fixture", rooted_caller)
         rooted_bin = host_artifacts / "rooted-caller"
@@ -518,7 +525,11 @@ int main(void) {{
             '    int32_t metadata = restic_bridge_result_metadata(0, 0, 0, &required);\n'
             '    int32_t selected = restic_bridge_snapshot_v1_start(0, 0, 0, 0, 0, &id);\n'
             '    int32_t remote_selected = restic_bridge_s3_snapshot_v1_start(0, 0, 0, &id);\n'
-            '    return rc == 0 || cancelled == 0 || waited == 0 || freed == 0 || metadata == 0 || selected == 0 || remote_selected == 0 ? 1 : 0;\n'
+            '    int32_t normal = restic_bridge_operation_v1_start(0, 0, 0, 0, 0, 0, &id);\n'
+            '    int32_t remote_normal = restic_bridge_s3_operation_v1_start(0, 0, 0, 0, &id);\n'
+            '    int32_t source = restic_bridge_snapshot_source_v1_start(0, 0, -1, 0, 0, 0, 0, &id);\n'
+            '    int32_t remote_source = restic_bridge_s3_snapshot_source_v1_start(0, 0, -1, 0, 0, &id);\n'
+            '    return rc == 0 || cancelled == 0 || waited == 0 || freed == 0 || metadata == 0 || selected == 0 || remote_selected == 0 || normal == 0 || remote_normal == 0 || source == 0 || remote_source == 0 ? 1 : 0;\n'
             '}\n'
         )
         caller_bin = artifacts_dir / "caller-link"

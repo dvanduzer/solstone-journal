@@ -240,7 +240,13 @@ func (b *rootBackend) Remove(_ context.Context, h backend.Handle) error {
 	return b.root.Remove(name)
 }
 
+// Private test observation of actual lock enumeration; no external setter.
+var testRootLockList func(context.Context)
+
 func (b *rootBackend) List(ctx context.Context, t backend.FileType, fn func(backend.FileInfo) error) error {
+	if t == backend.LockFile && testRootLockList != nil {
+		testRootLockList(ctx)
+	}
 	basedir, subdirs := b.layout.Basedir(t)
 	basedir = cleanRel(basedir)
 	var err error

@@ -5,6 +5,20 @@ package main
 
 /*
 #include <stdint.h>
+
+#ifndef SOLSTONE_RESTIC_OPERATION_OPTIONS_V1
+#define SOLSTONE_RESTIC_OPERATION_OPTIONS_V1
+typedef struct {
+    uint32_t version;
+    uint32_t check_read_mode;
+    uint64_t retry_lock_ms;
+    uint32_t group;
+    uint32_t groups;
+    uint32_t reserved1;
+    uint32_t reserved2;
+} restic_operation_options_v1;
+#endif
+
 typedef struct {
     uint32_t version;
     int32_t operation;
@@ -97,6 +111,10 @@ func validateS3Request(request *C.restic_s3_request) (result bridgeRequest, stat
 }
 
 func validateS3RequestForRoot(request *C.restic_s3_request, rooted *rootedRestore) (result bridgeRequest, status int32) {
+	return validateS3RequestOwned(request, rooted, nil)
+}
+
+func validateS3RequestOwned(request *C.restic_s3_request, rooted *rootedRestore, entry *ownedCall) (result bridgeRequest, status int32) {
 	if request == nil {
 		return bridgeRequest{}, StatusInvalidArgument
 	}
@@ -127,8 +145,12 @@ func validateS3RequestForRoot(request *C.restic_s3_request, rooted *rootedRestor
 	if cfg.validate() != nil {
 		return bridgeRequest{}, StatusInvalidArgument
 	}
-	result = bridgeRequest{operation: operation, password: copyCBytes(request.password, request.password_len), recoveryPassword: copyCBytes(request.recovery_password, request.recovery_password_len),
+	result = bridgeRequest{owned: entry, operation: operation, password: copyCBytes(request.password, request.password_len), recoveryPassword: copyCBytes(request.recovery_password, request.recovery_password_len),
 		sourcePath: readString(request.source_path, request.source_path_len), restorePath: readString(request.restore_path, request.restore_path_len), snapshotID: readString(request.snapshot_id, request.snapshot_id_len), rootedRestore: rooted}
+	entry.retain(&result)
+	if testOwnedStage != nil && entry != nil {
+		testOwnedStage("copied", entry)
+	}
 	defer func() {
 		if status != StatusOk {
 			zeroBytes(result.password)
@@ -156,7 +178,7 @@ func validateS3RequestForRoot(request *C.restic_s3_request, rooted *rootedRestor
 	if rooted != nil && (!utf8.ValidString(statePath) || !utf8.ValidString(result.restorePath)) {
 		return result, StatusInvalidArgument
 	}
-	owner, err := newS3Owner(statePath, cfg)
+	owner, err := newS3OwnerOwned(statePath, cfg, entry)
 	if err != nil {
 		if errors.Is(err, errS3OwnerBusy) {
 			return result, StatusBusy
@@ -265,6 +287,89 @@ func restic_bridge_s3_snapshot_v1_start(request *C.restic_s3_request, policy *C.
 	if status != StatusOk {
 		return C.int32_t(status)
 	}
+	req.snapshotSelection = selection
+	id, status := startBridgeCall(req)
+	if status == StatusOk {
+		*outID = C.uint64_t(id)
+	}
+	return C.int32_t(status)
+}
+
+//export restic_bridge_s3_operation_v1_start
+func restic_bridge_s3_operation_v1_start(request *C.restic_s3_request, options *C.restic_operation_options_v1, policy *C.char, policyLen C.uint32_t, outID *C.uint64_t) (returned C.int32_t) {
+	if outID == nil {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	*outID = 0
+	entry, status := reserveOwnedCall()
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	defer func() { returned = C.int32_t(entry.finishAdmission(int32(returned))) }()
+
+	return startS3OperationWithSource(request, options, nil, entry, policy, policyLen, outID)
+}
+
+//export restic_bridge_s3_snapshot_source_v1_start
+func restic_bridge_s3_snapshot_source_v1_start(request *C.restic_s3_request, options *C.restic_operation_options_v1, sourceFD C.int32_t, policy *C.char, policyLen C.uint32_t, outID *C.uint64_t) (returned C.int32_t) {
+	if outID == nil {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	*outID = 0
+	entry, status := reserveOwnedCall()
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	defer func() { returned = C.int32_t(entry.finishAdmission(int32(returned))) }()
+
+	if outID == nil {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	*outID = 0
+	if request == nil || request.operation != C.int32_t(OpSnapshot) {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	return startS3OperationWithSource(request, options, &sourceFD, entry, policy, policyLen, outID)
+}
+
+func startS3OperationWithSource(request *C.restic_s3_request, options *C.restic_operation_options_v1, sourceFD *C.int32_t, entry *ownedCall, policy *C.char, policyLen C.uint32_t, outID *C.uint64_t) C.int32_t {
+	if outID == nil {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	*outID = 0
+	if request == nil {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	ownedOptions, status := parseCOperationOptions(int32(request.operation), options)
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	var selection *snapshotSelection
+	if request.operation == C.int32_t(OpSnapshot) {
+		selection, status = parseCSnapshotSelection(policy, policyLen)
+		if status != StatusOk {
+			return C.int32_t(status)
+		}
+	} else if policyLen != 0 {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	var expected *borrowedSourceIdentity
+	if sourceFD != nil {
+		expected, status = readBorrowedSourceIdentity(int(*sourceFD))
+		if status != StatusOk {
+			return C.int32_t(status)
+		}
+	}
+	req, status := validateS3RequestOwned(request, nil, entry)
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	if expected != nil {
+		if status := verifyCapturedSource(&req, expected); status != StatusOk {
+			return C.int32_t(rejectBridgeCall(&req, status))
+		}
+	}
+	req.executionOptions = ownedOptions
 	req.snapshotSelection = selection
 	id, status := startBridgeCall(req)
 	if status == StatusOk {

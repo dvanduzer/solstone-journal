@@ -109,3 +109,63 @@ func readMetadataLink(workspace *os.Root, file *os.File) (target string, resultE
 	}
 	return "", errors.New("source symlink target exceeds bound")
 }
+
+func readMetadataLinkOwned(workspace *os.Root, file *os.File, entry *ownedCall) (target string, resultErr error) {
+	if entry == nil {
+		return readMetadataLink(workspace, file)
+	}
+	if entry.failed() {
+		return "", errOwnedCleanup
+	}
+	if workspace == nil {
+		return "", errors.New("source symlink metadata workspace is unavailable")
+	}
+	// Darwin cannot readlink an O_SYMLINK descriptor. Clone that held object
+	// into an explicit private workspace, then inspect the clone. No source
+	// directory entry is resolved, and no source inode is modified.
+	var nonce [32]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", err
+	}
+	name := ".backup-metadata-" + hex.EncodeToString(nonce[:16])
+	cloneName := hex.EncodeToString(nonce[16:])
+	if err := workspace.Mkdir(name, 0700); err != nil {
+		return "", err
+	}
+	dir, err := workspace.OpenFile(name, os.O_RDONLY, 0)
+	if err != nil {
+		return "", errors.Join(err, workspace.Remove(name))
+	}
+	entry.hold(dir)
+	defer func() {
+		cleanupErr := entry.cleanup(func() error {
+			err := clearOwnedMetadataDirectory(int(dir.Fd()), entry)
+			if entry.failed() {
+				return errOwnedCleanup
+			}
+			closeErr := entry.close(dir, "metadata-clone-directory")
+			if entry.failed() {
+				return errOwnedCleanup
+			}
+			return errors.Join(err, closeErr, workspace.Remove(name))
+		})
+		resultErr = errors.Join(resultErr, cleanupErr)
+	}()
+	if err := unix.Fchmod(int(dir.Fd()), 0300); err != nil {
+		return "", err
+	}
+	if err := unix.Fclonefileat(int(file.Fd()), int(dir.Fd()), cloneName, unix.CLONE_NOFOLLOW); err != nil {
+		return "", err
+	}
+	for size := 256; size <= 65536; size *= 2 {
+		buf := make([]byte, size)
+		n, err := unix.Readlinkat(int(dir.Fd()), cloneName, buf)
+		if err != nil {
+			return "", err
+		}
+		if n < len(buf) {
+			return string(buf[:n]), nil
+		}
+	}
+	return "", errors.New("source symlink target exceeds bound")
+}

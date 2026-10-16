@@ -49,7 +49,7 @@ func (owner *s3Owner) attachBackend(be *s3Backend) (*s3OperationBackend, error) 
 	owner.mu.Lock()
 	if owner.closed || owner.sealing || owner.record.Active == nil || owner.stateFailed || owner.liveID == "" || owner.liveID != owner.record.Active.ID {
 		owner.mu.Unlock()
-		_ = be.Close()
+		_ = owner.owned.close(be, "s3-rejected-backend")
 		return nil, errS3OwnerInvalid
 	}
 	wrapped := &s3OperationBackend{s3Backend: be, owner: owner}
@@ -69,6 +69,13 @@ func (be *s3OperationBackend) enterTracked() (func(), error) {
 }
 
 func (be *s3OperationBackend) Close() error {
+	if be.owner.owned != nil {
+		return be.owner.owned.closeAction(be, "s3-operation-backend", be.closeNative)
+	}
+	return be.closeNative()
+}
+
+func (be *s3OperationBackend) closeNative() error {
 	be.mu.Lock()
 	be.sealed = true
 	be.mu.Unlock()
@@ -144,6 +151,9 @@ func (be *s3OperationBackend) Remove(ctx context.Context, handle backend.Handle)
 }
 
 func (owner *s3Owner) drainPrimary() error {
+	if owner.owned.failed() {
+		return errOwnedCleanup
+	}
 	owner.mu.Lock()
 	owner.sealing = true
 	backends := append([]*s3OperationBackend(nil), owner.backends...)
@@ -151,6 +161,9 @@ func (owner *s3Owner) drainPrimary() error {
 	var result error
 	for _, be := range backends {
 		result = errors.Join(result, be.Close())
+		if owner.owned.failed() {
+			return errOwnedCleanup
+		}
 	}
 	if result == nil {
 		owner.mu.Lock()

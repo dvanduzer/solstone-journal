@@ -1,0 +1,154 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 sol pbc
+#include "librestic_bridge.h"
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#if defined(__APPLE__)
+#include <CoreFoundation/CoreFoundation.h>
+#endif
+
+_Static_assert(sizeof(restic_operation_options_v1) == 32, "operation options ABI size");
+_Static_assert(offsetof(restic_operation_options_v1, retry_lock_ms) == 8, "retry alignment");
+_Static_assert(offsetof(restic_operation_options_v1, reserved2) == 28, "reserved alignment");
+
+static int local_refuses(restic_request *request, restic_operation_options_v1 *options, int status) {
+    uint64_t id = 777;
+    int actual = restic_bridge_operation_v1_start(request, options, NULL, 0, NULL, 0, &id);
+    int failed = actual != status || id != 0;
+    if (actual == 0 && id) {
+        restic_result *result = calloc(1, sizeof(*result));
+        if (!result) return 1;
+        restic_bridge_cancel(id); restic_bridge_wait(id, result); restic_bridge_free(id); free(result);
+    }
+    return failed;
+}
+static int remote_refuses(restic_s3_request *request, restic_operation_options_v1 *options, int status) {
+    uint64_t id = 777;
+    int actual = restic_bridge_s3_operation_v1_start(request, options, NULL, 0, &id);
+    int failed = actual != status || id != 0;
+    if (actual == 0 && id) {
+        restic_result *result = calloc(1, sizeof(*result));
+        if (!result) return 1;
+        restic_bridge_cancel(id); restic_bridge_wait(id, result); restic_bridge_free(id); free(result);
+    }
+    return failed;
+}
+static int call(restic_request *request, restic_operation_options_v1 *options, const char *workspace, const char *selection, restic_result *result) {
+    uint64_t id = 0;
+    if (restic_bridge_operation_v1_start(request, options, (char *)workspace, workspace ? (uint32_t)strlen(workspace) : 0, (char *)selection, selection ? (uint32_t)strlen(selection) : 0, &id) || !id) return 1;
+    /* The asynchronous operation must retain its own validated value. */
+    memset(options, 0xff, sizeof(*options));
+    if (restic_bridge_wait(id, result) || result->status || restic_bridge_free(id)) return 1;
+    return 0;
+}
+int main(int argc, char **argv) {
+    if (argc != 2) return 1;
+    restic_request request = {0}; request.operation = 7;
+    restic_s3_request remote = {0}; remote.version = 1; remote.operation = 7;
+    restic_operation_options_v1 options = {0}; options.version = 1; options.check_read_mode = 2;
+    if (local_refuses(&request, NULL, 1) || remote_refuses(&remote, NULL, 1)) return 2;
+    options.version = 2;
+    if (local_refuses(&request, &options, 1) || remote_refuses(&remote, &options, 1)) return 3;
+    options.version = 1; options.reserved1 = 1;
+    if (local_refuses(&request, &options, 1) || remote_refuses(&remote, &options, 1)) return 4;
+    options.reserved1 = 0; options.reserved2 = 1;
+    if (local_refuses(&request, &options, 1) || remote_refuses(&remote, &options, 1)) return 5;
+    options.reserved2 = 0; options.retry_lock_ms = UINT64_MAX;
+    if (local_refuses(&request, &options, 5) || remote_refuses(&remote, &options, 5)) return 6;
+    options.retry_lock_ms = 0; options.check_read_mode = 3; options.groups = 257; options.group = 1;
+    if (local_refuses(&request, &options, 5) || remote_refuses(&remote, &options, 5)) return 7;
+    options.groups = 52; options.group = 53;
+    if (local_refuses(&request, &options, 1) || remote_refuses(&remote, &options, 1)) return 8;
+    options.group = 0;
+    if (local_refuses(&request, &options, 1) || remote_refuses(&remote, &options, 1)) return 9;
+    options.groups = 0; options.check_read_mode = 0; request.operation = 6; remote.operation = 6;
+    if (local_refuses(&request, &options, 1) || remote_refuses(&remote, &options, 1)) return 10;
+    request.operation = 1; remote.operation = 1; options.retry_lock_ms = 1;
+    if (local_refuses(&request, &options, 1) || remote_refuses(&remote, &options, 1)) return 11;
+    if (restic_bridge_operation_v1_start(NULL, NULL, NULL, 0, NULL, 0, NULL) != 1 || restic_bridge_s3_operation_v1_start(NULL, NULL, NULL, 0, NULL) != 1) return 12;
+
+    char repo[4096], source[4096], workspace[4096], file[4096];
+    if (snprintf(repo, sizeof(repo), "%s/options-repo", argv[1]) >= (int)sizeof(repo) ||
+        snprintf(source, sizeof(source), "%s/options-source", argv[1]) >= (int)sizeof(source) ||
+        snprintf(workspace, sizeof(workspace), "%s/options-workspace", argv[1]) >= (int)sizeof(workspace) ||
+        snprintf(file, sizeof(file), "%s/owner", source) >= (int)sizeof(file)) return 13;
+    if (mkdir(repo, 0700) || mkdir(source, 0700) || mkdir(workspace, 0700)) return 14;
+    FILE *out = fopen(file, "wb");
+    if (!out || fwrite("owner bytes", 1, 11, out) != 11 || fclose(out)) return 15;
+    char password[] = "options-c-synthetic-password";
+    request = (restic_request){0}; request.operation = 1;
+    request.password = password; request.password_len = (uint32_t)strlen(password);
+    request.repo_path = repo; request.repo_path_len = (uint32_t)strlen(repo);
+    restic_result *result = calloc(1, sizeof(*result));
+    options = (restic_operation_options_v1){.version = 1};
+    if (!result || call(&request, &options, NULL, NULL, result)) return 16;
+    /* Calibrate the C boundary with a fully admissible existing repository. */
+    request.operation = 7;
+    options = (restic_operation_options_v1){.version = 1, .check_read_mode = 1};
+    if (call(&request, &options, NULL, NULL, result)) return 23;
+    char state[4096];
+    if (snprintf(state, sizeof(state), "%s/options-state", argv[1]) >= (int)sizeof(state) || mkdir(state, 0700)) return 24;
+#if defined(__APPLE__)
+    CFURLRef state_url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)state, strlen(state), true);
+    CFErrorRef policy_error = NULL;
+    if (!state_url || !CFURLSetResourcePropertyForKey(state_url, kCFURLIsExcludedFromBackupKey, kCFBooleanTrue, &policy_error)) return 28;
+    CFRelease(state_url);
+#endif
+    remote = (restic_s3_request){.version = 1, .operation = 7};
+    remote.endpoint = "https://backup.invalid"; remote.endpoint_len = 22;
+    remote.region = "us-east-1"; remote.region_len = 9;
+    remote.bucket = "options-fixture"; remote.bucket_len = 15;
+    remote.prefix = "caller"; remote.prefix_len = 6;
+    remote.access_key = "synthetic-access"; remote.access_key_len = 16;
+    remote.secret_key = "synthetic-secret"; remote.secret_key_len = 16;
+    remote.password = password; remote.password_len = (uint32_t)strlen(password);
+    remote.state_path = state; remote.state_path_len = (uint32_t)strlen(state);
+    for (int variant = 0; variant < 10; variant++) {
+        options = (restic_operation_options_v1){.version = 1, .check_read_mode = 2};
+        int expected = 1;
+        switch (variant) {
+            case 0: options.version = 2; break;
+            case 1: options.reserved1 = 1; break;
+            case 2: options.reserved2 = 1; break;
+            case 3: options.check_read_mode = 0; break;
+            case 4: options.check_read_mode = 4; break;
+            case 5: options.group = 1; break;
+            case 6: options.check_read_mode = 3; options.groups = 52; break;
+            case 7: options.check_read_mode = 3; options.groups = 52; options.group = 53; break;
+            case 8: options.check_read_mode = 3; options.groups = 257; options.group = 1; expected = 5; break;
+            case 9: options.retry_lock_ms = UINT64_MAX; expected = 5; break;
+        }
+        if (local_refuses(&request, &options, expected) || remote_refuses(&remote, &options, expected)) return 25;
+    }
+    /* A valid remote shape really publishes a handle. Cancel and join it; the
+       reserved .invalid fixture has no provider or usable credentials. */
+    options = (restic_operation_options_v1){.version = 1, .check_read_mode = 1};
+    uint64_t remote_id = 0;
+    if (restic_bridge_s3_operation_v1_start(&remote, &options, NULL, 0, &remote_id) || !remote_id) return 26;
+    if (restic_bridge_cancel(remote_id) || restic_bridge_wait(remote_id, result) || restic_bridge_free(remote_id)) return 27;
+    options = (restic_operation_options_v1){.version = 1, .retry_lock_ms = 1000};
+    request.operation = 4; request.source_path = source; request.source_path_len = (uint32_t)strlen(source);
+    uint64_t id = 777;
+    if (restic_bridge_operation_v1_start(&request, &options, workspace, (uint32_t)strlen(workspace), (char *)(uintptr_t)1, 8*1024*1024+1, &id) != 5 || id) return 17;
+    if (call(&request, &options, workspace, "[]", result) || strlen(result->snapshot_id) != 64) return 18;
+    request.operation = 7; request.source_path = NULL; request.source_path_len = 0;
+    for (uint32_t mode = 1; mode <= 3; mode++) {
+        options = (restic_operation_options_v1){.version = 1, .check_read_mode = mode, .retry_lock_ms = 1000};
+        if (mode == 3) { options.group = 1; options.groups = 256; }
+        if (call(&request, &options, NULL, NULL, result)) return 19;
+    }
+    options = (restic_operation_options_v1){.version = 1, .check_read_mode = 3, .group = 256, .groups = 256};
+    if (call(&request, &options, NULL, NULL, result)) return 20;
+    options = (restic_operation_options_v1){.version = 1, .check_read_mode = 1};
+    id = 777;
+    if (restic_bridge_operation_v1_start(&request, &options, workspace, (uint32_t)strlen(workspace), NULL, 0, &id) != 1 || id) return 21;
+    options = (restic_operation_options_v1){.version = 1, .check_read_mode = 1};
+    id = 777;
+    if (restic_bridge_operation_v1_start(&request, &options, NULL, 0, "[]", 2, &id) != 1 || id) return 22;
+    free(result);
+    return 0;
+}

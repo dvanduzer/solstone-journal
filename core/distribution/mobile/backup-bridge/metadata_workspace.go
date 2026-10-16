@@ -36,14 +36,15 @@ func pinMetadataWorkspace(req *bridgeRequest, path string) (resultErr error) {
 	if err := sanitizePath(path); err != nil {
 		return err
 	}
-	file, err := openPinnedDirectory(path)
+	file, err := openOwnedDirectory(path, req.owned)
 	if err != nil {
 		return err
 	}
 	retained := false
 	defer func() {
 		if !retained {
-			_ = closeRootedPrivateDirectory(file)
+			req.owned.scrubRejection()
+			_ = closeOwnedPrivateDirectory(file, req.owned, "metadata-unassigned-directory")
 		}
 	}()
 	var stat unix.Stat_t
@@ -53,7 +54,7 @@ func pinMetadataWorkspace(req *bridgeRequest, path string) (resultErr error) {
 	if stat.Uid != uint32(os.Geteuid()) || stat.Mode&0777 != 0700 {
 		return errors.New("metadata workspace must be privately owned")
 	}
-	if err := reserveRootedPrivateDirectory(file); err != nil {
+	if err := reserveOwnedPrivateDirectory(file, req.owned); err != nil {
 		return err
 	}
 	// flock is tied to this open directory description, not to a removable lock
@@ -70,7 +71,7 @@ func pinMetadataWorkspace(req *bridgeRequest, path string) (resultErr error) {
 		if err != nil {
 			return err
 		}
-		overlap, overlapErr := pinnedDirectoriesOverlap(file, other)
+		overlap, overlapErr := ownedDirectoriesOverlap(file, other, req.owned)
 		if root == req.sourceRoot && metadataRequiresSameVolume() {
 			var sourceStat unix.Stat_t
 			if err := unix.Fstat(int(other.Fd()), &sourceStat); err != nil {
@@ -79,7 +80,12 @@ func pinMetadataWorkspace(req *bridgeRequest, path string) (resultErr error) {
 				overlapErr = errors.Join(overlapErr, errors.New("metadata workspace is on a different source volume"))
 			}
 		}
-		_ = other.Close()
+		if overlapErr != nil || overlap {
+			req.owned.scrubRejection()
+		}
+		if err := req.owned.close(other, "metadata-overlap-directory"); err != nil && req.owned != nil {
+			return err
+		}
 		if overlapErr != nil {
 			return overlapErr
 		}
@@ -87,7 +93,7 @@ func pinMetadataWorkspace(req *bridgeRequest, path string) (resultErr error) {
 			return errPathOverlap
 		}
 	}
-	root, err := adoptRoot(path, file)
+	root, err := adoptOwnedRoot(path, file, req.owned)
 	if err != nil {
 		return err
 	}
@@ -102,6 +108,10 @@ func pinMetadataWorkspace(req *bridgeRequest, path string) (resultErr error) {
 // explicitly dedicates this private directory to metadata scratch. Foreign or
 // malformed entries are preserved; no recursive deletion follows links.
 func cleanupMetadataWorkspace(req *bridgeRequest) (resultErr error) {
+	return req.owned.cleanup(func() error { return cleanupMetadataWorkspaceImpl(req) })
+}
+
+func cleanupMetadataWorkspaceImpl(req *bridgeRequest) (resultErr error) {
 	if req.metadataRoot == nil || req.metadataFile == nil {
 		return nil
 	}
@@ -118,7 +128,7 @@ func cleanupMetadataWorkspace(req *bridgeRequest) (resultErr error) {
 	if len(names) > 64 {
 		readErr = errors.New("metadata workspace residue exceeds bound")
 	}
-	closeErr := listing.Close()
+	closeErr := req.owned.close(listing, "metadata-census")
 	if readErr != nil || closeErr != nil {
 		return errors.Join(errMetadataCleanup, readErr, closeErr)
 	}
@@ -135,12 +145,15 @@ func cleanupMetadataWorkspace(req *bridgeRequest) (resultErr error) {
 	entries := make([]residue, 0, len(names))
 	defer func() {
 		for _, entry := range entries {
+			if req.owned.failed() {
+				return
+			}
 			if !entry.removed {
 				if err := unix.Fchmod(int(entry.file.Fd()), entry.mode); err != nil {
 					resultErr = errors.Join(resultErr, errMetadataCleanup, err)
 				}
 			}
-			if err := entry.file.Close(); err != nil {
+			if err := req.owned.close(entry.file, "metadata-residue-final"); err != nil {
 				resultErr = errors.Join(resultErr, errMetadataCleanup, err)
 			}
 		}
@@ -164,22 +177,32 @@ func cleanupMetadataWorkspace(req *bridgeRequest) (resultErr error) {
 		child := os.NewFile(uintptr(childFD), "metadata residue")
 		var held unix.Stat_t
 		if err := unix.Fstat(childFD, &held); err != nil || held.Dev != stat.Dev || held.Ino != stat.Ino {
-			_ = child.Close()
+			if closeErr := req.owned.close(child, "metadata-residue-directory"); closeErr != nil && req.owned != nil {
+				return refuse(closeErr)
+			}
 			return refuse(errors.Join(err, errors.New("metadata residue changed")))
 		}
 		if err := chmodRetainedMetadataDirectory(childFD, 0700); err != nil {
-			_ = child.Close()
+			if closeErr := req.owned.close(child, "metadata-residue-directory"); closeErr != nil && req.owned != nil {
+				return refuse(closeErr)
+			}
 			return refuse(err)
 		}
 		readableFD, err := unix.Openat(childFD, ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 		if err != nil {
 			restoreErr := chmodRetainedMetadataDirectory(childFD, uint32(stat.Mode&0777))
-			_ = child.Close()
+			if closeErr := req.owned.close(child, "metadata-residue-directory"); closeErr != nil && req.owned != nil {
+				return refuse(closeErr)
+			}
 			return refuse(errors.Join(err, restoreErr))
 		}
-		_ = child.Close()
+		readable := os.NewFile(uintptr(readableFD), "metadata residue")
+		req.owned.hold(readable)
+		if closeErr := req.owned.close(child, "metadata-residue-directory"); closeErr != nil && req.owned != nil {
+			return refuse(closeErr)
+		}
 		childFD = readableFD
-		child = os.NewFile(uintptr(readableFD), "metadata residue")
+		child = readable
 		entries = append(entries, residue{name: name, file: child, mode: uint32(stat.Mode & 0777)})
 		// Recognized parents may be mode 0300 after an interrupted clone. Restore
 		// enumeration on this retained, identity-checked private object only.
@@ -195,7 +218,7 @@ func cleanupMetadataWorkspace(req *bridgeRequest) (resultErr error) {
 		if errors.Is(readErr, io.EOF) {
 			readErr = nil
 		}
-		closeErr := reader.Close()
+		closeErr := req.owned.close(reader, "metadata-residue-census")
 		if readErr != nil || closeErr != nil {
 			return refuse(errors.Join(readErr, closeErr))
 		}
@@ -220,7 +243,7 @@ func cleanupMetadataWorkspace(req *bridgeRequest) (resultErr error) {
 		if err != nil || !matches {
 			return refuse(errors.Join(err, errors.New("metadata residue changed before cleanup")))
 		}
-		if err := clearDirectoryContents(int(entry.file.Fd())); err != nil {
+		if err := clearOwnedMetadataDirectory(int(entry.file.Fd()), req.owned); err != nil {
 			return refuse(err)
 		}
 		if err := unix.Unlinkat(fd, entry.name, unix.AT_REMOVEDIR); err != nil {

@@ -260,7 +260,7 @@ func executeOpen(ctx context.Context, req bridgeRequest) (bridgeResult, error) {
 		}
 		return refusalResult(err, DiagAuthFailed), err
 	}
-	unlock, lockCtx, err := lockRepo(ctx, repo, false)
+	unlock, lockCtx, err := lockRepoForRequest(ctx, req, repo, false)
 	if err != nil {
 		return bridgeResult{status: StatusFailed, diagnostic: DiagLocked}, err
 	}
@@ -308,7 +308,7 @@ func executeAddRecoveryKey(ctx context.Context, req bridgeRequest, setWrote func
 		}
 		return refusalResult(err, DiagAuthFailed), err
 	}
-	unlock, lockCtx, err := lockRepo(ctx, repo, false)
+	unlock, lockCtx, err := lockRepoForRequest(ctx, req, repo, false)
 	if err != nil {
 		return bridgeResult{status: StatusFailed, diagnostic: DiagLocked}, err
 	}
@@ -406,7 +406,7 @@ func executeSnapshot(ctx context.Context, req bridgeRequest, setWrote func()) (b
 		}
 		return refusalResult(err, DiagAuthFailed), err
 	}
-	unlock, lockCtx, err := lockRepo(ctx, repo, false)
+	unlock, lockCtx, err := lockRepoForRequest(ctx, req, repo, false)
 	if err != nil {
 		return bridgeResult{status: StatusFailed, diagnostic: DiagLocked}, err
 	}
@@ -432,6 +432,7 @@ func executeSnapshot(ctx context.Context, req bridgeRequest, setWrote func()) (b
 		sourceName = filepath.Base(req.sourcePath)
 	}
 	rootFS := newRootFS(req.sourceRoot, sourceName, req.metadataRoot)
+	rootFS.owned = req.owned
 	arch := archiver.New(repo, rootFS, archiver.Options{})
 	if req.snapshotSelection != nil {
 		arch.SelectByName = func(item string) bool { return req.snapshotSelection.permits(lockCtx, rootFS, item) }
@@ -493,7 +494,7 @@ func executeListSnapshots(ctx context.Context, req bridgeRequest) (bridgeResult,
 		}
 		return refusalResult(err, DiagAuthFailed), err
 	}
-	unlock, lockCtx, err := lockRepo(ctx, repo, false)
+	unlock, lockCtx, err := lockRepoForRequest(ctx, req, repo, false)
 	if err != nil {
 		return bridgeResult{status: StatusFailed, diagnostic: DiagLocked}, err
 	}
@@ -681,20 +682,25 @@ func executeCheck(ctx context.Context, req bridgeRequest) (bridgeResult, error) 
 		}
 		return refusalResult(err, DiagAuthFailed), err
 	}
-	unlock, lockCtx, err := lockRepo(ctx, repo, true)
+	unlock, lockCtx, err := lockRepoForRequest(ctx, req, repo, true)
 	if err != nil {
 		return bridgeResult{status: StatusFailed, diagnostic: DiagLocked}, err
 	}
 	defer unlock()
-	_ = lockCtx
 
 	chkr := checker.New(repo, false)
 	err = chkr.LoadSnapshots(lockCtx, &data.SnapshotFilter{}, nil)
+	if result, contextErr := checkContextsAfterPhase(ctx, lockCtx, "snapshots", unlock); contextErr != nil {
+		return result, contextErr
+	}
 	if err != nil {
 		return refusalResult(err, DiagRepoCorrupt), err
 	}
 
 	hints, errs := chkr.LoadIndex(lockCtx, &progress.NoopPrinter{})
+	if result, contextErr := checkContextsAfterPhase(ctx, lockCtx, "index", unlock); contextErr != nil {
+		return result, contextErr
+	}
 	if len(errs) > 0 {
 		return refusalResult(errs[0], DiagRepoCorrupt), errs[0]
 	}
@@ -723,11 +729,17 @@ func executeCheck(ctx context.Context, req bridgeRequest) (bridgeResult, error) 
 			hardPackErr = err
 		}
 	}
+	if result, contextErr := checkContextsAfterPhase(ctx, lockCtx, "packs", unlock); contextErr != nil {
+		return result, contextErr
+	}
 	if hardPackErr != nil {
 		return bridgeResult{status: StatusFailed, diagnostic: DiagRepoCorrupt}, hardPackErr
 	}
 
 	// Structure check
+	if testCheckPhase != nil {
+		testCheckPhase("before-structure", lockCtx, unlock)
+	}
 	structCounter := progress.NewCounter(time.Hour, 0, nil)
 	structErrChan := make(chan error)
 	go chkr.Structure(lockCtx, structCounter, structErrChan)
@@ -738,23 +750,38 @@ func executeCheck(ctx context.Context, req bridgeRequest) (bridgeResult, error) 
 		}
 	}
 	structCounter.Done()
+	if result, contextErr := checkContextsAfterPhase(ctx, lockCtx, "structure", unlock); contextErr != nil {
+		return result, contextErr
+	}
 	if hardStructErr != nil {
 		return bridgeResult{status: StatusFailed, diagnostic: DiagRepoCorrupt}, hardStructErr
 	}
 
-	// ReadPacks check (full read-data over all packs)
-	readCounter := progress.NewCounter(time.Hour, 0, nil)
-	readErrChan := make(chan error)
-	go chkr.ReadPacks(lockCtx, func(packs map[restic.ID]int64) map[restic.ID]int64 { return packs }, readCounter, readErrChan)
-	var hardReadErr error
-	for err := range readErrChan {
-		if err != nil && hardReadErr == nil {
-			hardReadErr = err
+	// Structure reads required tree blobs independently of this optional full
+	// pack-content verification. Grouping only selects this latter phase.
+	if filter := checkPackFilter(req.executionOptions); filter != nil {
+		if testCheckPhase != nil {
+			testCheckPhase("before-read-packs", lockCtx, unlock)
+		}
+		readCounter := progress.NewCounter(time.Hour, 0, nil)
+		readErrChan := make(chan error)
+		go chkr.ReadPacks(lockCtx, filter, readCounter, readErrChan)
+		var hardReadErr error
+		for err := range readErrChan {
+			if err != nil && hardReadErr == nil {
+				hardReadErr = err
+			}
+		}
+		readCounter.Done()
+		if result, contextErr := checkContextsAfterPhase(ctx, lockCtx, "read-packs", unlock); contextErr != nil {
+			return result, contextErr
+		}
+		if hardReadErr != nil {
+			return bridgeResult{status: StatusFailed, diagnostic: DiagRepoCorrupt}, hardReadErr
 		}
 	}
-	readCounter.Done()
-	if hardReadErr != nil {
-		return bridgeResult{status: StatusFailed, diagnostic: DiagRepoCorrupt}, hardReadErr
+	if result, contextErr := checkContextsAfterPhase(ctx, lockCtx, "complete", unlock); contextErr != nil {
+		return result, contextErr
 	}
 
 	return bridgeResult{status: StatusOk}, nil
