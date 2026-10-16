@@ -1812,6 +1812,18 @@ timeout = "standard"
 default_full = false
 runtime = "none"
 
+[[package_suites]]
+id = "package::solstone-core-update"
+package = "solstone-core-update"
+set = "component"
+areas = ["trust", "commands"]
+platforms = ["linux"]
+prerequisites = ["cargo-cache"]
+timeout = "standard"
+runtime = "none"
+default_full = true
+features = ["full-tests"]
+
 [[suites]]
 id = "solstone-core-installation-identity::linux_admission"
 package = "solstone-core-installation-identity"

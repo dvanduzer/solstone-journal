@@ -138,6 +138,7 @@ members = [
     "crates/solstone-core-transcripts-web",
     "crates/solstone-core-facets-web",
     "crates/solstone-core-home",
+    "crates/solstone-core-update",
 ]
 exclude = ["crates/solstone-core-service-legacy-evidence"]
 resolver = "3"
@@ -283,6 +284,7 @@ solstone-core-map-web = { path = "crates/solstone-core-map-web" }
 solstone-core-assets = { path = "crates/solstone-core-assets" }
 solstone-core-origin = { path = "crates/solstone-core-origin" }
 solstone-core-spp-attest = { path = "crates/solstone-core-spp-attest" }
+solstone-core-update = { path = "crates/solstone-core-update" }
 solstone-core-spp-ratls = { path = "crates/solstone-core-spp-ratls" }
 solstone-core-nvattest-authority = { path = "crates/solstone-core-nvattest-authority" }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }

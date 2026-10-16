@@ -100,6 +100,24 @@ fn run_with_stdin_provider(
         [command, rest @ ..] if command == OsStr::new("link") => {
             run_top_level_link(&args, rest, stdin_provider)
         }
+        [command, rest @ ..] if command == OsStr::new("update") => {
+            let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("solstone"));
+            let data_dir = solstone_core_update::owner_data_dir();
+            let etc_dir = Path::new("/etc");
+            let fetch = solstone_core_update::RealInstallerFetch;
+            let runner = solstone_core_update::RealInstallerRunner;
+            let probe = solstone_core_update::RealPackageProbe;
+            render_output(run_with_update_seams(
+                rest,
+                cfg!(target_os = "linux"),
+                &exe,
+                &data_dir,
+                etc_dir,
+                &fetch,
+                &runner,
+                &probe,
+            ))
+        }
         // The journal family acts on this computer only; it never reaches a
         // connected journal, so it is entered before any access setup.
         [command, rest @ ..] if command == OsStr::new("journal") => {
@@ -326,6 +344,64 @@ fn run_top_level_native(
         return render_output(output);
     }
     run_dispatched(all_args, command_args, stdin_provider)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_with_update_seams(
+    args: &[OsString],
+    os_linux: bool,
+    executable: &Path,
+    data_dir: &Path,
+    etc_dir: &Path,
+    fetch: &dyn solstone_core_update::InstallerFetch,
+    runner: &dyn solstone_core_update::InstallerRunner,
+    probe: &dyn solstone_core_update::PackageProbe,
+) -> CommandOutput {
+    if args
+        .iter()
+        .any(|arg| arg == OsStr::new("--help") || arg == OsStr::new("-h"))
+    {
+        return CommandOutput::success(solstone_core_update::render_help());
+    }
+
+    let update_args = match solstone_core_update::parse_args(args) {
+        Ok(args) => args,
+        Err(err) => {
+            return CommandOutput::failure(format!("{}\n", err.message), i32::from(EXIT_USAGE));
+        }
+    };
+
+    let result = solstone_core_update::perform(
+        runner,
+        fetch,
+        probe,
+        executable,
+        data_dir,
+        etc_dir,
+        os_linux,
+        &update_args,
+    );
+
+    let (report, exit_code) = match result {
+        Ok(rep) => (rep, 0),
+        Err((rep, code)) => (rep, code),
+    };
+
+    if update_args.json {
+        let json_str = serde_json::to_string(&report).unwrap_or_default();
+        CommandOutput {
+            stdout: format!("{json_str}\n"),
+            stderr: String::new(),
+            exit: exit_code,
+        }
+    } else {
+        let body = solstone_core_update::render_human(&report);
+        CommandOutput {
+            stdout: body,
+            stderr: String::new(),
+            exit: exit_code,
+        }
+    }
 }
 
 fn run_top_level_link(
@@ -1901,5 +1977,261 @@ mod tests {
             assert_ne!(about_output(&refused).exit, 0);
             refused.assert_done();
         }
+    }
+
+    struct MockUpdateFetch {
+        script_path: PathBuf,
+        fetch_called: std::sync::Mutex<bool>,
+    }
+
+    impl solstone_core_update::InstallerFetch for MockUpdateFetch {
+        fn fetch(
+            &self,
+            _source: solstone_core_update::InstallerSource,
+        ) -> std::io::Result<PathBuf> {
+            *self.fetch_called.lock().unwrap() = true;
+            Ok(self.script_path.clone())
+        }
+    }
+
+    struct MockUpdateRunner {
+        responses: std::sync::Mutex<Vec<solstone_core_update::InstallerOutput>>,
+        recorded_args: std::sync::Mutex<Vec<Vec<OsString>>>,
+    }
+
+    impl solstone_core_update::InstallerRunner for MockUpdateRunner {
+        fn run(
+            &self,
+            _program: &Path,
+            args: &[OsString],
+            _stdin: solstone_core_update::StdinMode,
+        ) -> std::io::Result<solstone_core_update::InstallerOutput> {
+            self.recorded_args.lock().unwrap().push(args.to_vec());
+            let mut list = self.responses.lock().unwrap();
+            if list.is_empty() {
+                Ok(solstone_core_update::InstallerOutput {
+                    success: true,
+                    exit_code: Some(0),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            } else {
+                Ok(list.remove(0))
+            }
+        }
+    }
+
+    struct MockUpdatePackageProbe(bool);
+    impl solstone_core_update::PackageProbe for MockUpdatePackageProbe {
+        fn payload_matches(&self, _executable: &Path, _version: &str) -> bool {
+            true
+        }
+        fn owns_journal(&self, _executable: &Path) -> bool {
+            self.0
+        }
+    }
+
+    #[test]
+    fn update_public_dispatch_reports_available_check_without_side_effects() {
+        let temp = tempfile::tempdir().unwrap();
+        let prefix = temp.path().join("local");
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let entry = format!("2.0.48-{}", &digest[..12]);
+        let dir = prefix.join("versions").join(&entry);
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        fs::write(dir.join("bin/solstone"), b"#!/bin/sh\n").unwrap();
+        fs::write(dir.join(".archive-sha256"), digest).unwrap();
+        fs::write(
+            prefix.join("install-receipt"),
+            "service_policy=start\nsignature_verification=verified\njournal_state=present\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join(".release"),
+            "product=solstone-journal\nversion=2.0.48\nupgrade_epoch=epoch-1\nretention_window=3\nstate_reader_min=1.0.0\nstate_reader_max=2.0.48\n",
+        )
+        .unwrap();
+        let current = prefix.join("current");
+        std::os::unix::fs::symlink(format!("versions/{entry}"), &current).unwrap();
+
+        let data = temp.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        let ini = format!(
+            "[solstone]\nschema_version=1\norigin=https://updates.solstone.app\nroute=tree\nphase=complete\nprefix={}\nlane=release\nplatform_version=2.0.48-r1\n\n[component:journal]\nrole=journal\nroute=tree\nstatus=installed\nno_start=0\n",
+            prefix.display()
+        );
+        let receipt_path = data.join("install.conf");
+        fs::write(&receipt_path, &ini).unwrap();
+        let etc = temp.path().join("etc");
+
+        let exe = prefix.join("current/bin/solstone");
+        let probe = MockUpdatePackageProbe(false);
+
+        let list_json = r#"{"status":"success","root_code":"list","platform_version":"2.0.49-r1","lane":"release","components":{"journal":{"version":"2.0.49"}}}"#;
+        let runner = MockUpdateRunner {
+            responses: std::sync::Mutex::new(vec![solstone_core_update::InstallerOutput {
+                success: true,
+                exit_code: Some(0),
+                stdout: list_json.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            }]),
+            recorded_args: std::sync::Mutex::new(Vec::new()),
+        };
+        let fetch = MockUpdateFetch {
+            script_path: temp.path().join("install.sh"),
+            fetch_called: std::sync::Mutex::new(false),
+        };
+
+        let out = run_with_update_seams(
+            &[OsString::from("--check")],
+            true,
+            &exe,
+            &data,
+            &etc,
+            &fetch,
+            &runner,
+            &probe,
+        );
+
+        assert_eq!(out.exit, 0);
+        assert!(
+            out.stdout.contains("2.0.48")
+                && out.stdout.contains("2.0.49-r1")
+                && out.stdout.contains("platform-tree")
+                && out.stdout.contains("release")
+        );
+        assert_eq!(fs::read_to_string(&receipt_path).unwrap(), ini);
+        assert!(!data.join("update-hold").exists());
+        let recorded = runner.recorded_args.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert!(recorded[0].contains(&OsString::from("--list")));
+        assert!(!recorded[0].contains(&OsString::from("--upgrade")));
+    }
+
+    #[test]
+    fn update_public_dispatch_handles_package_consent_rejection() {
+        let temp = tempfile::tempdir().unwrap();
+        let prefix = temp.path().join("local");
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let entry = format!("2.0.48-{}", &digest[..12]);
+        let dir = prefix.join("versions").join(&entry);
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        fs::write(dir.join("bin/solstone"), b"#!/bin/sh\n").unwrap();
+        fs::write(dir.join(".archive-sha256"), digest).unwrap();
+        fs::write(
+            prefix.join("install-receipt"),
+            "service_policy=start\nsignature_verification=verified\njournal_state=present\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join(".release"),
+            "product=solstone-journal\nversion=2.0.48\nupgrade_epoch=epoch-1\nretention_window=3\nstate_reader_min=1.0.0\nstate_reader_max=2.0.48\n",
+        )
+        .unwrap();
+        let current = prefix.join("current");
+        std::os::unix::fs::symlink(format!("versions/{entry}"), &current).unwrap();
+
+        let data = temp.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        let ini = format!(
+            "[solstone]\nschema_version=1\norigin=https://updates.solstone.app\nroute=tree\nphase=complete\nprefix={}\nlane=release\nplatform_version=2.0.48-r1\n\n[component:journal]\nrole=journal\nroute=tree\nstatus=installed\nno_start=0\n",
+            prefix.display()
+        );
+        let receipt_path = data.join("install.conf");
+        fs::write(&receipt_path, &ini).unwrap();
+        let etc = temp.path().join("etc");
+
+        let exe = prefix.join("current/bin/solstone");
+        let probe = MockUpdatePackageProbe(false);
+
+        let list_json = r#"{"status":"success","root_code":"list","platform_version":"2.0.49-r1","lane":"release","components":{"journal":{"version":"2.0.49"}}}"#;
+        let rejection_json = r#"{"status":"refusal","root_code":"unknown-argument","message":"unrecognized option --confirm-package-command"}"#;
+        let runner = MockUpdateRunner {
+            responses: std::sync::Mutex::new(vec![
+                solstone_core_update::InstallerOutput {
+                    success: true,
+                    exit_code: Some(0),
+                    stdout: list_json.as_bytes().to_vec(),
+                    stderr: Vec::new(),
+                },
+                solstone_core_update::InstallerOutput {
+                    success: false,
+                    exit_code: Some(1),
+                    stdout: rejection_json.as_bytes().to_vec(),
+                    stderr: Vec::new(),
+                },
+            ]),
+            recorded_args: std::sync::Mutex::new(Vec::new()),
+        };
+        let fetch = MockUpdateFetch {
+            script_path: temp.path().join("install.sh"),
+            fetch_called: std::sync::Mutex::new(false),
+        };
+
+        let out = run_with_update_seams(&[], true, &exe, &data, &etc, &fetch, &runner, &probe);
+
+        assert_ne!(out.exit, 0);
+        assert!(
+            out.stdout.contains("unknown-argument")
+                && out.stdout.contains("confirm-package-command")
+        );
+    }
+
+    #[test]
+    fn update_public_dispatch_refuses_on_non_linux_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let exe = PathBuf::from("/bin/solstone");
+        let data = temp.path().join("data");
+        let etc = temp.path().join("etc");
+        let probe = MockUpdatePackageProbe(false);
+        let runner = MockUpdateRunner {
+            responses: std::sync::Mutex::new(Vec::new()),
+            recorded_args: std::sync::Mutex::new(Vec::new()),
+        };
+        let fetch = MockUpdateFetch {
+            script_path: temp.path().join("install.sh"),
+            fetch_called: std::sync::Mutex::new(false),
+        };
+
+        let out = run_with_update_seams(&[], false, &exe, &data, &etc, &fetch, &runner, &probe);
+
+        assert_eq!(out.exit, 1);
+        assert!(out.stdout.contains("non-linux"));
+        assert!(!*fetch.fetch_called.lock().unwrap());
+        assert_eq!(runner.recorded_args.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn update_help_renders_prose_on_all_platforms() {
+        let temp = tempfile::tempdir().unwrap();
+        let exe = PathBuf::from("/bin/solstone");
+        let data = temp.path().join("data");
+        let etc = temp.path().join("etc");
+        let probe = MockUpdatePackageProbe(false);
+        let runner = MockUpdateRunner {
+            responses: std::sync::Mutex::new(Vec::new()),
+            recorded_args: std::sync::Mutex::new(Vec::new()),
+        };
+        let fetch = MockUpdateFetch {
+            script_path: temp.path().join("install.sh"),
+            fetch_called: std::sync::Mutex::new(false),
+        };
+
+        let out = run_with_update_seams(
+            &[OsString::from("--help")],
+            false,
+            &exe,
+            &data,
+            &etc,
+            &fetch,
+            &runner,
+            &probe,
+        );
+
+        assert_eq!(out.exit, 0);
+        assert!(out.stdout.contains("--check"));
+        assert!(out.stdout.contains("--hold"));
+        assert!(!*fetch.fetch_called.lock().unwrap());
+        assert_eq!(runner.recorded_args.lock().unwrap().len(), 0);
     }
 }

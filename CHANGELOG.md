@@ -6,6 +6,10 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- on linux, solstone update checks for updates and installs them through the installer that owns your copy. the health page shows the same update availability, including when it cannot tell.
+
 ### Changed
 
 - on the command line, `--timestamp` also takes a date and time with its offset, such as `2025-11-02T01:30:00-07:00`, so a recording from the hour that repeats when daylight saving time ends can be placed at its true time. the `YYYYMMDD_HHMMSS` form works as before.
