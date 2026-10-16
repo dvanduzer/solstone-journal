@@ -13,6 +13,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - on linux, installing your journal now retries interrupted downloads and temporary download errors. an incomplete download reports a download failure instead of a signature mismatch.
+- on ubuntu 22.04, the installer points you to Minisign's installation page when the verifier is missing.
 
 ## [2.0.48] - 2026-10-16
 
