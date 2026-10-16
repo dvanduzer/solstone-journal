@@ -16,6 +16,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - downloading location accuracy no longer pauses to save its progress after every small piece of the download, which could make it take hours on windows.
 - on linux, installing your journal now retries interrupted downloads and temporary download errors. an incomplete download reports a download failure instead of a signature mismatch.
 - on ubuntu 22.04, the installer points you to Minisign's installation page when the verifier is missing.
+- with media offload turned off, its nightly run no longer reports that offload didn't start or didn't finish. it now notes that offload is off and stops there. nothing was removed, and your media stayed on this computer.
 
 ## [2.0.48] - 2026-10-16
 

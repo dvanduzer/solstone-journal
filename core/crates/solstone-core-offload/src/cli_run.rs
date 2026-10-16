@@ -13,7 +13,9 @@ use solstone_core_backup::archive_activity::{
     ArchivePreparationCustody, OwnedArchivePreparationFailure, OwnedArchivePreparationInput,
     OwnedPreparedArchiveHold,
 };
-use solstone_core_backup::archive_admission::{AdmissionError, ArchiveBudget, Clock};
+use solstone_core_backup::archive_admission::{
+    AdmissionError, ArchiveBudget, ArchiveConfiguration, Clock,
+};
 use solstone_core_backup_runtime::{
     ClosedToolError, DirectReadFinishOwner, DirectReadFinishState, OwnedArchiveAdmissionFailure,
     OwnedDirectReadFinish, admit_prepared_archive_owned_creator_installed, resolve_restic_member,
@@ -48,6 +50,7 @@ pub enum CliUnwindPhase {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CliRunPhase {
     Prelaunch,
+    Skipped,
     PreparationRefused,
     PreparedHeld,
     AdmissionRefused,
@@ -77,6 +80,11 @@ enum Custody {
     Prelaunch {
         refusal: CliPrelaunchRefusal,
         _root: Option<Arc<JournalRoot>>,
+        _clock: Arc<dyn Clock + Send + Sync>,
+    },
+    /// Offload is off in this journal's configuration, so nothing was prepared.
+    Skipped {
+        _root: Arc<JournalRoot>,
         _clock: Arc<dyn Clock + Send + Sync>,
     },
     PreparationFailure {
@@ -147,6 +155,7 @@ impl OwnedOffloadCliRun {
     pub fn phase(&self) -> CliRunPhase {
         match &self.custody {
             Custody::Prelaunch { .. } => CliRunPhase::Prelaunch,
+            Custody::Skipped { .. } => CliRunPhase::Skipped,
             Custody::PreparationFailure { .. } => CliRunPhase::PreparationRefused,
             Custody::PreparedHold { .. } => CliRunPhase::PreparedHeld,
             Custody::AdmissionFailure { .. } => CliRunPhase::AdmissionRefused,
@@ -157,7 +166,7 @@ impl OwnedOffloadCliRun {
     }
     pub fn preparation_custody(&self) -> Option<&ArchivePreparationCustody> {
         match &self.custody {
-            Custody::Prelaunch { .. } => None,
+            Custody::Prelaunch { .. } | Custody::Skipped { .. } => None,
             Custody::PreparationFailure { custody, .. } => custody.as_ref(),
             Custody::PreparedHold { custody, .. }
             | Custody::AdmissionFailure { custody, .. }
@@ -307,6 +316,18 @@ pub fn run_cli_offload(
     if let Ok(activity) = ActivityLease::try_acquire(Arc::clone(&root)) {
         recover_interrupted_removals(&activity);
         recover_abandoned_restores(&activity);
+    }
+    // Offload stays off until the owner turns it on, and a scheduled run then
+    // has nothing to do. Configuration that can't be read goes on to
+    // preparation, which refuses it.
+    if ArchiveConfiguration::capture(&root).is_ok_and(|config| !config.offload_enabled()) {
+        return OwnedOffloadCliRun::receive(
+            Custody::Skipped {
+                _root: root,
+                _clock: clock,
+            },
+            CliObservedEffects::default(),
+        );
     }
     let budget = match ArchiveBudget::new(clock.as_ref()) {
         Ok(budget) => budget,
