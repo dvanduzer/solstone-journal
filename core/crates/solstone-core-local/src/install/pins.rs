@@ -24,18 +24,18 @@ pub const LLAMA_SERVER_PINS: &[(&str, &str, &str, &str, &str)] = &[
     ),
     (
         "aarch64-unknown-linux-gnu",
-        "b11429",
-        "llama-b11429-bin-ubuntu-vulkan-arm64.tar.gz",
-        "702d99c4219b4314cc6d3b10fb41ae96cbfc68226305c2681269dfb51487af34",
+        "b11669",
+        "llama-b11669-bin-ubuntu-vulkan-arm64.tar.gz",
+        "d283522e479c0d532e3a04d715dd852ffb2d95925caa6d41ef2ba53a65e46a51",
         "llama-server",
     ),
 ];
 pub const CUDA_ARTIFACTS: &[(&str, &str, &str, u64)] = &[
     (
         "x86_64-unknown-linux-gnu",
-        "https://updates.solstone.app/runtimes/llama-cuda13/b11429/llama-b11429-bin-linux-cuda13-amd64-sol1.tar.gz",
-        "a9d8c0a4ece9f9dce7d8e634dd55f943ba39b93b339462dd645202db34aafbbd",
-        591752886,
+        "https://updates.solstone.app/runtimes/llama-cuda13/b11669/llama-b11669-bin-linux-cuda13-amd64-sol1.tar.gz",
+        "2288ff1960305206f11495c3407caf9f196bc8510ca9016c9bc3b5054f9db80d",
+        592895506,
     ),
     (
         "aarch64-unknown-linux-gnu",
@@ -178,6 +178,67 @@ pub const VULKAN_LINUX_ARM64_B11429_REQUIRED: &[RequiredMember] = &[
         target: "libmtmd.so.0.6.0",
     },
     RequiredMember::Regular("libmtmd.so.0.6.0"),
+    RequiredMember::Regular("llama-server"),
+];
+
+pub const VULKAN_LINUX_ARM64_B11669_REQUIRED: &[RequiredMember] = &[
+    RequiredMember::Regular("LICENSE"),
+    RequiredMember::Link {
+        name: "libggml-base.so",
+        target: "libggml-base.so.0",
+    },
+    RequiredMember::Link {
+        name: "libggml-base.so.0",
+        target: "libggml-base.so.0.27.0",
+    },
+    RequiredMember::Regular("libggml-base.so.0.27.0"),
+    RequiredMember::Regular("libggml-cpu-armv8.0_1.so"),
+    RequiredMember::Regular("libggml-cpu-armv8.2_1.so"),
+    RequiredMember::Regular("libggml-cpu-armv8.2_2.so"),
+    RequiredMember::Regular("libggml-cpu-armv8.2_3.so"),
+    RequiredMember::Regular("libggml-cpu-armv8.6_1.so"),
+    RequiredMember::Regular("libggml-cpu-armv8.6_2.so"),
+    RequiredMember::Regular("libggml-cpu-armv9.2_1.so"),
+    RequiredMember::Regular("libggml-cpu-armv9.2_2.so"),
+    RequiredMember::Regular("libggml-rpc.so"),
+    RequiredMember::Regular("libggml-vulkan.so"),
+    RequiredMember::Link {
+        name: "libggml.so",
+        target: "libggml.so.0",
+    },
+    RequiredMember::Link {
+        name: "libggml.so.0",
+        target: "libggml.so.0.27.0",
+    },
+    RequiredMember::Regular("libggml.so.0.27.0"),
+    RequiredMember::Link {
+        name: "libllama-common.so",
+        target: "libllama-common.so.0",
+    },
+    RequiredMember::Link {
+        name: "libllama-common.so.0",
+        target: "libllama-common.so.0.7.0",
+    },
+    RequiredMember::Regular("libllama-common.so.0.7.0"),
+    RequiredMember::Regular("libllama-server-impl.so"),
+    RequiredMember::Link {
+        name: "libllama.so",
+        target: "libllama.so.0",
+    },
+    RequiredMember::Link {
+        name: "libllama.so.0",
+        target: "libllama.so.0.7.0",
+    },
+    RequiredMember::Regular("libllama.so.0.7.0"),
+    RequiredMember::Link {
+        name: "libmtmd.so",
+        target: "libmtmd.so.0",
+    },
+    RequiredMember::Link {
+        name: "libmtmd.so.0",
+        target: "libmtmd.so.0.7.0",
+    },
+    RequiredMember::Regular("libmtmd.so.0.7.0"),
     RequiredMember::Regular("llama-server"),
 ];
 
@@ -365,6 +426,7 @@ pub fn required_members_for(
         ("b11429", "x86_64-unknown-linux-gnu") => Some(VULKAN_LINUX_X64_B11429_REQUIRED),
         ("b11429", "aarch64-unknown-linux-gnu") => Some(VULKAN_LINUX_ARM64_B11429_REQUIRED),
         ("b11429", "aarch64-apple-darwin") => Some(METAL_MACOS_ARM64_B11429_REQUIRED),
+        ("b11669", "aarch64-unknown-linux-gnu") => Some(VULKAN_LINUX_ARM64_B11669_REQUIRED),
         ("b11669", "aarch64-apple-darwin") => Some(METAL_MACOS_ARM64_B11669_REQUIRED),
         ("b10068", _) => Some(B10068_REQUIRED),
         _ => None,
@@ -514,17 +576,17 @@ pub fn cuda_identity(key: &str) -> Option<Value> {
         "amd64" => json!([
             {
                 "role": "engine",
-                "filename": "llama-b11429-bin-ubuntu-cuda-13.4-x64.tar.gz",
-                "sha256": "8082b7eaa74a714c9fecca19128f751c8e32da763ee8096b8ad1e824da7621d3",
-                "size_bytes": 152519318,
-                "url_prefix": "https://github.com/ggml-org/llama.cpp/releases/download/b11429/"
+                "filename": "llama-b11669-bin-ubuntu-cuda-13.4-x64.tar.gz",
+                "sha256": "80878473d27278dbe9c38fb7e704f292a51e889d3c28a1e863137cdee1e2ba4e",
+                "size_bytes": 153679828,
+                "url_prefix": "https://github.com/ggml-org/llama.cpp/releases/download/b11669/"
             },
             {
                 "role": "cudart",
-                "filename": "cudart-llama-b11429-bin-ubuntu-cuda-13.4-x64.tar.gz",
-                "sha256": "93d18648d815b2bd624d83d82f653e1db97afb478f02064305fe3cf570040a6d",
-                "size_bytes": 440236630,
-                "url_prefix": "https://github.com/ggml-org/llama.cpp/releases/download/b11429/"
+                "filename": "cudart-llama-b11669-bin-ubuntu-cuda-13.4-x64.tar.gz",
+                "sha256": "1108bd9300a281e8eabb18d3fa028d4240ecd983f9f90dbbbc3297671016d697",
+                "size_bytes": 440236547,
+                "url_prefix": "https://github.com/ggml-org/llama.cpp/releases/download/b11669/"
             }
         ]),
         "arm64" => json!([

@@ -224,12 +224,12 @@ static ARTIFACTS: &[Artifact] = &[
     },
     Artifact {
         unit: "llama-server-cuda",
-        version: "b11429",
-        filename: "llama-b11429-bin-linux-cuda13-amd64-sol1.tar.gz",
-        sha256: "a9d8c0a4ece9f9dce7d8e634dd55f943ba39b93b339462dd645202db34aafbbd",
-        size_bytes: 591752886,
-        upstream_url: "https://updates.solstone.app/runtimes/llama-cuda13/b11429/llama-b11429-bin-linux-cuda13-amd64-sol1.tar.gz",
-        origin_key: "runtimes/llama-cuda13/b11429/llama-b11429-bin-linux-cuda13-amd64-sol1.tar.gz",
+        version: "b11669",
+        filename: "llama-b11669-bin-linux-cuda13-amd64-sol1.tar.gz",
+        sha256: "2288ff1960305206f11495c3407caf9f196bc8510ca9016c9bc3b5054f9db80d",
+        size_bytes: 592895506,
+        upstream_url: "https://updates.solstone.app/runtimes/llama-cuda13/b11669/llama-b11669-bin-linux-cuda13-amd64-sol1.tar.gz",
+        origin_key: "runtimes/llama-cuda13/b11669/llama-b11669-bin-linux-cuda13-amd64-sol1.tar.gz",
         artifact_key: Some("x86_64-unknown-linux-gnu"),
         platform: Some(Platform::LinuxX64),
         backend: None,
@@ -265,12 +265,12 @@ static ARTIFACTS: &[Artifact] = &[
     },
     Artifact {
         unit: "llama-server-vulkan",
-        version: "b11429",
-        filename: "llama-b11429-bin-ubuntu-vulkan-arm64.tar.gz",
-        sha256: "702d99c4219b4314cc6d3b10fb41ae96cbfc68226305c2681269dfb51487af34",
-        size_bytes: 24845090,
-        upstream_url: "https://github.com/ggml-org/llama.cpp/releases/download/b11429/llama-b11429-bin-ubuntu-vulkan-arm64.tar.gz",
-        origin_key: "assets/llama-server-vulkan/b11429/llama-b11429-bin-ubuntu-vulkan-arm64.tar.gz",
+        version: "b11669",
+        filename: "llama-b11669-bin-ubuntu-vulkan-arm64.tar.gz",
+        sha256: "d283522e479c0d532e3a04d715dd852ffb2d95925caa6d41ef2ba53a65e46a51",
+        size_bytes: 24187561,
+        upstream_url: "https://github.com/ggml-org/llama.cpp/releases/download/b11669/llama-b11669-bin-ubuntu-vulkan-arm64.tar.gz",
+        origin_key: "assets/llama-server-vulkan/b11669/llama-b11669-bin-ubuntu-vulkan-arm64.tar.gz",
         artifact_key: Some("aarch64-unknown-linux-gnu"),
         platform: Some(Platform::LinuxArm64),
         backend: None,
@@ -1461,7 +1461,7 @@ mod tests {
 
         assert!(exceptions.iter().any(|artifact| {
             artifact.origin_key
-                == "runtimes/llama-cuda13/b11429/llama-b11429-bin-linux-cuda13-amd64-sol1.tar.gz"
+                == "runtimes/llama-cuda13/b11669/llama-b11669-bin-linux-cuda13-amd64-sol1.tar.gz"
         }));
         assert!(exceptions.iter().any(|artifact| {
             artifact.origin_key
