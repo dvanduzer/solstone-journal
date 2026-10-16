@@ -10,7 +10,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- new imports use creation dates in common filenames, photos, audio and video files instead of the date a file was copied. when no creation date is found, you can choose one. this works from the import page and the command line without installing an extra tool.
+- new imports use creation dates in common filenames, photos, audio and video files instead of the date a file was copied. when no creation date is found, you can choose one. this works from the import page and the command line without installing an extra tool. audio you sync from a folder still uses the time the file was last changed when it has no creation date.
 - returning to health or known voices takes less time on large journals.
 
 ### Fixed
