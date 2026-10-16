@@ -120,7 +120,7 @@ const MODE_CASES: &[ModeCase] = &[
                 Expected {
                     exit: 1,
                     stream: Stream::Stderr,
-                    identifies: "detected timestamp",
+                    identifies: "Could not detect timestamp",
                 },
             ),
             (
@@ -371,6 +371,9 @@ impl Inputs {
         image::RgbaImage::new(1, 1)
             .save(&image)
             .expect("image input");
+        // Images and PDFs are claimed by their content now; no importer claims this.
+        fs::write(directory.join("unclassified.bin"), b"not an export")
+            .expect("unclassified input");
         let archive = directory.join("archive.zip");
         write_zip(
             &archive,
@@ -453,7 +456,7 @@ impl Invocation {
             Self::UnclassifiedMedia => vec![
                 "--timestamp".to_owned(),
                 "20260311_120000".to_owned(),
-                path(inputs.path(Input::Image)),
+                path(&inputs.path(Input::Image).with_file_name("unclassified.bin")),
             ],
             Self::Structured { source, input } => {
                 let mut args = vec![
@@ -898,24 +901,33 @@ fn local_syncs_save_into_the_journal_and_only_once() {
         recordings.join("memo.mp3"),
     )
     .expect("copy recording");
-    // Audio sync adopts the file's modified time. Keep this long recording within
-    // one owner day regardless of when the test runs.
+    fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/long_audio_remux_corpus/long-remux.opus"),
+        recordings.join("memo_20260310_091500.opus"),
+    )
+    .expect("copy dated recording");
+    // An undated synced recording adopts the file's modified time; a dated one keeps
+    // its creation date. Keep each long recording within one owner day regardless of
+    // when the test runs.
     fs::create_dir_all(journal.path().join("config")).expect("config directory");
     fs::write(
         journal.path().join("config/journal.json"),
         br#"{"identity":{"timezone":"UTC"}}"#,
     )
     .expect("UTC owner zone");
-    File::options()
-        .write(true)
-        .open(recordings.join("memo.mp3"))
-        .expect("audio fixture metadata")
-        .set_times(
-            fs::FileTimes::new()
-                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_773_230_400)),
-        )
-        .expect("fixed audio source time");
-    for saved in ["saved=1", "saved=0"] {
+    for name in ["memo.mp3", "memo_20260310_091500.opus"] {
+        File::options()
+            .write(true)
+            .open(recordings.join(name))
+            .expect("audio fixture metadata")
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_773_230_400)),
+            )
+            .expect("fixed audio source time");
+    }
+    for saved in ["saved=2", "saved=0"] {
         let output = run(
             &["--sync", "audio", "--path", &path(&recordings), "--save"],
             &journal,
@@ -937,6 +949,21 @@ fn local_syncs_save_into_the_journal_and_only_once() {
     )
     .expect("audio sync state JSON");
     assert_eq!(state["files"]["memo.mp3"]["status"], "imported");
+    assert_eq!(
+        state["files"]["memo_20260310_091500.opus"]["status"],
+        "imported"
+    );
+    // The modified time (2026-03-11 12:00 UTC) places the undated recording; the
+    // filename date places the dated one, though its modified time names the 11th.
+    let audio = journal.path().join("chronicle");
+    assert!(
+        audio.join("20260311/import.audio/120000_300").is_dir(),
+        "undated recording at its modified time"
+    );
+    assert!(
+        audio.join("20260310/import.audio/091500_300").is_dir(),
+        "dated recording at its creation date"
+    );
 }
 
 fn find_named_file(root: &Path, name: &str) -> Option<PathBuf> {

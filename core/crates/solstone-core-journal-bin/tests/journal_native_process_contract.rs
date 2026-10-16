@@ -1783,16 +1783,12 @@ fn native_sense_batch_keeps_transcribe_and_describe_free_of_any_interpreter() {
         &[("SOL_SKIP_SUPERVISOR_CHECK", "1")],
     )
     .expect("run native audio sense batch through dispatcher");
-    // On macOS native media decoders report corrupt input as a failed child,
-    // while the Linux implementation records the same durable failure without
-    // failing the batch. Both outcomes prove the dispatcher exercised native
-    // handlers rather than an interpreter.
+    // A failed transcription is a nonzero handler status on every platform
+    // (9f026a088), so corrupt input fails the batch with EX_TEMPFAIL after the
+    // handler records its durable failure. Either outcome proves the dispatcher
+    // exercised native handlers rather than an interpreter.
     assert!(
-        if cfg!(target_os = "macos") {
-            matches!(audio_output.status.code(), Some(0 | 75))
-        } else {
-            audio_output.status.code() == Some(0)
-        },
+        matches!(audio_output.status.code(), Some(0 | 75)),
         "sense stderr: {}",
         String::from_utf8_lossy(&audio_output.stderr),
     );
@@ -1841,12 +1837,11 @@ fn native_sense_batch_keeps_transcribe_and_describe_free_of_any_interpreter() {
         &[("SOL_SKIP_SUPERVISOR_CHECK", "1")],
     )
     .expect("run native screen sense batch through dispatcher");
+    // Describe output left unfinished by corrupt input is a failed handler on
+    // every platform (9f026a088), so the batch exits EX_TEMPFAIL after the
+    // handler records its durable failure, as the audio leg above does.
     assert!(
-        if cfg!(target_os = "macos") {
-            matches!(screen_output.status.code(), Some(0 | 75))
-        } else {
-            screen_output.status.code() == Some(0)
-        },
+        matches!(screen_output.status.code(), Some(0 | 75)),
         "sense stderr: {}",
         String::from_utf8_lossy(&screen_output.stderr),
     );
