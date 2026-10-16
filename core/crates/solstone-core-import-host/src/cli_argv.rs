@@ -1154,9 +1154,20 @@ impl ImportPipeline for GenericAudioPipeline<'_> {
         request: PipelineImportRequest<'_>,
     ) -> Result<PipelineOutcome, String> {
         let media = request.source.to_string_lossy().into_owned();
+        // A synced recording has no owner to choose its time. When the resolver finds no
+        // creation evidence, it lands at the file's modified time in the owner's zone.
+        let fallback_timestamp = if request.timestamp.is_none() {
+            file_mtime_stamp(
+                request.source,
+                solstone_core_journal_config::owner_zone(self.journal_path),
+            )
+        } else {
+            None
+        };
         let options = Options {
             media: Some(media.clone()),
             timestamp: request.timestamp.map(str::to_owned),
+            fallback_timestamp,
             auto: match request.auto {
                 PipelineAuto::Enabled => Some(None),
                 PipelineAuto::Disabled => None,
@@ -1196,6 +1207,18 @@ impl ImportPipeline for GenericAudioPipeline<'_> {
             }
         }
     }
+}
+
+/// A file's last-modified time, as a wall-clock stamp in the owner zone.
+fn file_mtime_stamp(path: &Path, zone: chrono_tz::Tz) -> Option<String> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    let stamp = chrono::DateTime::<chrono::Utc>::from(modified)
+        .with_timezone(&zone)
+        .format("%Y%m%d_%H%M%S")
+        .to_string();
+    solstone_core_import::validate_timestamp(&stamp)
+        .ok()
+        .map(|_| stamp)
 }
 
 fn audio_auto(options: &Options) -> AudioAuto {
