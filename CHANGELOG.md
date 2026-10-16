@@ -6,6 +6,10 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- downloading location accuracy no longer pauses to save its progress after every small piece of the download, which could make it take hours on windows.
+
 ### Changed
 
 - on the command line, `--timestamp` also takes a date and time with its offset, such as `2025-11-02T01:30:00-07:00`, so a recording from the hour that repeats when daylight saving time ends can be placed at its true time. the `YYYYMMDD_HHMMSS` form works as before.

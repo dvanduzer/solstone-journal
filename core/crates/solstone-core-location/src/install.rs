@@ -16,7 +16,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -553,6 +553,7 @@ fn install_reserved_offer(
 
         let total = offered.size_bytes();
         let mut done = 0u64;
+        let mut last_progress_write = Instant::now();
         for file in &offered.files {
             let destination = staging.join(&file.file);
             if let Some(dest_parent) = destination.parent()
@@ -564,6 +565,13 @@ fn install_reserved_offer(
             let file_size = file.size_bytes;
             if let Err(error) = fetch(file, &destination, &mut |received| {
                 progress(done + received, total);
+                // This is display progress, not a download checkpoint. A durable
+                // replacement after every network read can stall the transfer on
+                // Windows. Leave time between completed writes, including when
+                // the write itself is slow.
+                if last_progress_write.elapsed() < Duration::from_secs(1) {
+                    return;
+                }
                 let prog_job = AccuracyJob {
                     state: "downloading".to_string(),
                     source,
@@ -576,6 +584,7 @@ fn install_reserved_offer(
                 {
                     let _ = write_job(journal, &prog_job);
                 }
+                last_progress_write = Instant::now();
             }) {
                 let _ = fs::remove_dir_all(&staging);
                 return Err(error);
