@@ -53,6 +53,7 @@ mod service_process;
 mod session;
 mod signals;
 mod sme_account;
+mod sme_account_replace;
 #[cfg(all(unix, any(test, feature = "test-hooks")))]
 mod test_seam;
 #[cfg(all(test, unix, not(feature = "full-tests")))]

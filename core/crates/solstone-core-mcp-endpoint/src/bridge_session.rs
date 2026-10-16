@@ -621,7 +621,11 @@ async fn run_renewal_fetcher(
                             changed = shutdown.changed() => {
                                 if changed.is_err() || *shutdown.borrow_and_update() { return; }
                             }
-                            _ = sleep(delay) => {}
+                            _ = crate::sme_account_replace::wait_out_hold(
+                                owner.journal_path(),
+                                hold,
+                                delay,
+                            ) => {}
                         }
                         continue;
                     }

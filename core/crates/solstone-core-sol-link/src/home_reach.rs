@@ -96,6 +96,8 @@ struct AssertionClaims<'a> {
     exp: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     acme_account_uri: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    acme_account_replace: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -116,7 +118,7 @@ pub fn sign_home_reach_assertion(
     committed: &CommittedIdentity,
     wall_unix_seconds: i64,
 ) -> Result<HomeReachAssertion, HomeReachAssertionError> {
-    sign_home_reach_assertion_inner(scope, committed, wall_unix_seconds, None)
+    sign_home_reach_assertion_inner(scope, committed, wall_unix_seconds, None, None)
 }
 
 /// Sign a compact home-reach assertion that also carries the journal's ACME
@@ -128,7 +130,32 @@ pub fn sign_home_reach_assertion_with_acme_account(
     wall_unix_seconds: i64,
     acme_account_uri: &str,
 ) -> Result<HomeReachAssertion, HomeReachAssertionError> {
-    sign_home_reach_assertion_inner(scope, committed, wall_unix_seconds, Some(acme_account_uri))
+    sign_home_reach_assertion_inner(
+        scope,
+        committed,
+        wall_unix_seconds,
+        Some(acme_account_uri),
+        None,
+    )
+}
+
+/// Sign the account-URL assertion with the owner's request to move the
+/// address's pinned account to this one. The service swaps the pin only while
+/// it still holds the account it read, so a request that races another change
+/// is refused rather than applied.
+pub fn sign_home_reach_assertion_replacing_acme_account(
+    scope: &str,
+    committed: &CommittedIdentity,
+    wall_unix_seconds: i64,
+    acme_account_uri: &str,
+) -> Result<HomeReachAssertion, HomeReachAssertionError> {
+    sign_home_reach_assertion_inner(
+        scope,
+        committed,
+        wall_unix_seconds,
+        Some(acme_account_uri),
+        Some(true),
+    )
 }
 
 fn sign_home_reach_assertion_inner(
@@ -136,6 +163,7 @@ fn sign_home_reach_assertion_inner(
     committed: &CommittedIdentity,
     wall_unix_seconds: i64,
     acme_account_uri: Option<&str>,
+    acme_account_replace: Option<bool>,
 ) -> Result<HomeReachAssertion, HomeReachAssertionError> {
     let exp = wall_unix_seconds
         .checked_add(ASSERTION_LIFETIME_SECONDS)
@@ -159,6 +187,7 @@ fn sign_home_reach_assertion_inner(
         iat: wall_unix_seconds,
         exp,
         acme_account_uri,
+        acme_account_replace,
     })
     .map_err(|_| HomeReachAssertionError::ClaimsJsonSerialization)?;
     let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&claims_bytes);
@@ -644,10 +673,26 @@ mod tests {
         .expect("claim signs");
         let (signing_input, claims) = claims_of(&with.compact);
         assert_eq!(claims["acme_account_uri"], uri);
+        assert_eq!(claims.get("acme_account_replace"), None);
         for key in ["aud", "exp", "iat", "instance_id", "iss", "scope"] {
             assert_eq!(claims[key], plain_claims[key], "{key}");
         }
         assert!(verify_sig(&spki_der, &signing_input, &with.signature));
+
+        let replacing = sign_home_reach_assertion_replacing_acme_account(
+            "mcp.bridge.register",
+            &committed,
+            wall,
+            uri,
+        )
+        .expect("replace claim signs");
+        let (signing_input, claims) = claims_of(&replacing.compact);
+        assert_eq!(claims["acme_account_uri"], uri);
+        assert_eq!(claims["acme_account_replace"], true);
+        for key in ["aud", "exp", "iat", "instance_id", "iss", "scope"] {
+            assert_eq!(claims[key], plain_claims[key], "{key}");
+        }
+        assert!(verify_sig(&spki_der, &signing_input, &replacing.signature));
     }
 
     #[test]
