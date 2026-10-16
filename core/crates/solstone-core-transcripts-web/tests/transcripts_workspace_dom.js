@@ -461,6 +461,19 @@ function loadTranscriptsScript() {
 }
 
 const scriptSource = loadTranscriptsScript();
+const dateFormatSource = fs.readFileSync(path.join(crateDir, '../solstone-core-convey-shell/assets/static/date_format.js'), 'utf8');
+
+// The shell's real JournalFormat with a seeded provenance table. Seeded labels
+// are synthetic and never contain the stream name they stand for, so a test
+// can tell the label from the id it must keep reachable.
+function seededJournalFormat(labels, says = {}) {
+  const context = { window: {}, Intl, Date, Math, Number, String, Object, Array, Set, Map, Promise, JSON, console };
+  vm.createContext(context);
+  vm.runInContext(dateFormatSource, context);
+  const format = context.window.JournalFormat;
+  format.installStreamLabels({ status: 'complete', labels, says });
+  return format;
+}
 const apiSource = fs.readFileSync(path.join(crateDir, '../solstone-core-convey-shell/assets/static/api.js'), 'utf8');
 
 function createTranscriptsDOM() {
@@ -652,8 +665,9 @@ async function createEnvironment(
       empty: (opts = {}) => `<div class="surface-state surface-state--empty"><h2 class="surface-state-heading">${opts.heading || ''}</h2><p class="surface-state-desc">${opts.desc || ''}</p></div>`,
       error: () => '<div class="surface-state surface-state--error"></div>',
     },
-    JournalFormat: {
+    JournalFormat: options.journalFormat || {
       stream: (s) => String(s ?? ''),
+      streamSays: () => ({ what: null, imported: false }),
     },
     ApiError: class ApiError extends Error {
       constructor(opts = {}) {
@@ -717,7 +731,7 @@ async function createEnvironment(
       return Promise.resolve({
         ok: true,
         status: 200,
-        json: async () => ({ outcomes: [] }),
+        json: async () => ({ outcomes: options.deleteOutcomes || [] }),
       });
     }
 
@@ -914,6 +928,7 @@ async function createEnvironment(
     AbortController,
     ResizeObserver: MockResizeObserver,
     MutationObserver: MockMutationObserver,
+    navigator: options.navigator || {},
     setTimeout,
     clearTimeout,
     setInterval: (callback) => {
@@ -1986,6 +2001,147 @@ test('protected_video markdown chunk rendered in transcript panel and replaced o
     (el.textContent || '').includes('PROTECTED_VIDEO_SENTINEL_9f3c')
   );
   assert.strictEqual(remainingEntries.length, 0);
+});
+
+test('provenance labels reach every transcripts site and the stream name stays one hover away', async () => {
+  const format = seededJournalFormat(
+    { room: 'LABEL-A · audio', desk: 'LABEL-B', phone: 'LABEL-C', watch: 'LABEL-D' },
+    { room: { what: 'audio', imported: false }, desk: { what: null, imported: false } },
+  );
+  const copied = [];
+  const env = await createEnvironment(undefined, 'analyzed', false, null, {
+    journalFormat: format,
+    navigator: { clipboard: { writeText: async (text) => { copied.push(text); } } },
+    locationSegments: [
+      { key: '100000_60', stream: 'phone', start: '10:00' },
+      { key: '101500_60', stream: 'watch', start: '10:15' },
+    ],
+  });
+
+  // Zoom pills: the friendly title keeps time and label and ends with the
+  // stream name; the accessible name never carries it. A label that says the
+  // type drops it; one that does not keeps it.
+  const pills = getZoomPills(env.doc);
+  const room = pills.find((pill) => pill.dataset.stream === 'room');
+  const desk = pills.find((pill) => pill.dataset.stream === 'desk');
+  assert.ok(room.title.includes('LABEL-A · audio') && room.title.endsWith('(room)'), room.title);
+  assert.ok(!room.title.includes('min · audio ·'), room.title);
+  assert.ok(desk.title.includes('min · audio ·') && desk.title.endsWith('(desk)'), desk.title);
+  for (const pill of pills) {
+    const aria = pill.getAttribute('aria-label');
+    assert.ok(!aria.includes(pill.dataset.stream), aria);
+  }
+  assert.ok(!room.getAttribute('aria-label').includes(', audio,'), room.getAttribute('aria-label'));
+  assert.ok(desk.getAttribute('aria-label').includes(', audio,'), desk.getAttribute('aria-label'));
+
+  // Day grid: the composite title appends the stream names.
+  const blocks = env.doc.querySelectorAll('.tr-seg');
+  assert.ok(blocks.length > 0);
+  for (const block of blocks) {
+    assert.ok(block.title.endsWith('(desk, room)'), block.title);
+    assert.ok(block.title.includes('LABEL-A · audio') && block.title.includes('LABEL-B'), block.title);
+    assert.ok(!block.getAttribute('aria-label').includes('room'), block.getAttribute('aria-label'));
+  }
+
+  // Picker options read the label and carry the stream name as their title.
+  const options = env.doc.getElementById('trSegmentPicker').children.filter((option) => option.value);
+  assert.ok(options.length >= 3);
+  for (const option of options) {
+    const stream = JSON.parse(option.value)[0];
+    assert.strictEqual(option.title, stream);
+    assert.ok(!option.textContent.includes(stream), option.textContent);
+  }
+
+  // Location rows name the device only when the labels differ, with the
+  // stream name on the label's span.
+  env.doc.querySelector('.tr-location-toggle').dispatchEvent({ type: 'click' });
+  const rows = env.doc.querySelectorAll('.tr-location-row');
+  assert.strictEqual(rows.length, 2);
+  for (const row of rows) {
+    const span = row.querySelector('span');
+    assert.ok(span, 'device label span');
+    assert.strictEqual(span.getAttribute('title'), row.getAttribute('data-stream'));
+    assert.ok(span.textContent.startsWith('LABEL-'));
+  }
+
+  // Panel title, its copy button, and the delete dialog identity.
+  room.dispatchEvent({ type: 'click' });
+  await env.releasePendingSegmentGets();
+  const title = env.doc.querySelector('.tr-title');
+  assert.strictEqual(title.textContent, 'LABEL-A · audio');
+  assert.strictEqual(title.title, 'room');
+  env.doc.getElementById('trCopyStreamBtn').dispatchEvent({ type: 'click' });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepStrictEqual(copied, ['room']);
+  env.doc.querySelector('#trDeleteBtn').dispatchEvent({ type: 'click' });
+  const identity = env.doc.querySelector('.tr-delete-segment-meta strong');
+  assert.strictEqual(identity.textContent, 'LABEL-A · audio');
+  assert.strictEqual(identity.getAttribute('title'), 'room');
+  env.doc.querySelector('#trDeleteSegmentModalClose').dispatchEvent({ type: 'click' });
+});
+
+test('location rows from streams with one label name no device', async () => {
+  const format = seededJournalFormat({ room: 'LABEL-A', desk: 'LABEL-B', phone: 'LABEL-C', tablet: 'LABEL-C' });
+  const env = await createEnvironment(undefined, 'analyzed', false, null, {
+    journalFormat: format,
+    locationSegments: [
+      { key: '100000_60', stream: 'phone', start: '10:00' },
+      { key: '101500_60', stream: 'tablet', start: '10:15' },
+    ],
+  });
+  env.doc.querySelector('.tr-location-toggle').dispatchEvent({ type: 'click' });
+  for (const row of env.doc.querySelectorAll('.tr-location-row')) {
+    assert.strictEqual(row.querySelector('span'), null);
+  }
+});
+
+test('a copy that fails says so and copies nothing', async () => {
+  const format = seededJournalFormat({ room: 'LABEL-A', desk: 'LABEL-B' });
+  const env = await createEnvironment(undefined, 'analyzed', false, null, {
+    journalFormat: format,
+    navigator: { clipboard: { writeText: async () => { throw new Error('denied'); } } },
+  });
+  getZoomPills(env.doc)[0].dispatchEvent({ type: 'click' });
+  await env.releasePendingSegmentGets();
+  const toast = env.doc.getElementById('trToast');
+  const before = toast.textContent;
+  env.doc.getElementById('trCopyStreamBtn').dispatchEvent({ type: 'click' });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.ok(toast.textContent && toast.textContent !== before);
+  assert.strictEqual(toast.hidden, false);
+});
+
+test('a label that says half of a segment type keeps the type, an import drops it', async () => {
+  const format = seededJournalFormat(
+    { mac: 'LABEL-M · screen', 'import.oura': 'LABEL-O' },
+    { mac: { what: 'screen', imported: false }, 'import.oura': { what: null, imported: true } },
+  );
+  const env = await createEnvironment(undefined, 'analyzed', false, [
+    { key: '114500_300', stream: 'mac', start: '11:45', end: '11:50', types: ['audio', 'screen'], data_state: { audio: 'analyzed' } },
+    { key: '115500_300', stream: 'mac', start: '11:55', end: '12:00', types: ['screen'], data_state: { audio: 'analyzed' } },
+    { key: '120000_300', stream: 'import.oura', start: '12:00', end: '12:05', types: ['markdown'], data_state: { audio: 'analyzed' } },
+  ], { journalFormat: format });
+  const pills = getZoomPills(env.doc);
+  const both = pills.find((pill) => pill.dataset.key === '114500_300');
+  const screenOnly = pills.find((pill) => pill.dataset.key === '115500_300');
+  const imported = pills.find((pill) => pill.dataset.key === '120000_300');
+  assert.ok(both.title.includes('audio + screen'), both.title);
+  assert.ok(both.getAttribute('aria-label').includes('audio and screen'), both.getAttribute('aria-label'));
+  assert.ok(!screenOnly.title.includes('min · screen ·'), screenOnly.title);
+  assert.ok(!imported.title.includes('min · import ·'), imported.title);
+  assert.ok(imported.title.endsWith('(import.oura)'), imported.title);
+});
+
+test('an unfinished delete reported on open names its stream by label, keeping the id behind it', async () => {
+  const format = seededJournalFormat({ room: 'LABEL-A', desk: 'LABEL-B' });
+  const env = await createEnvironment(undefined, 'analyzed', false, null, {
+    journalFormat: format,
+    deleteOutcomes: [{ pending: 'p1', state: 'not_deleted', reason: 'synthetic reason', stream: 'room', day: '20200115', segment_key: '114500_300' }],
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const notice = env.notifications.find((item) => String(item.message || '').includes('LABEL-A'));
+  assert.ok(notice, 'the outcome names the label');
+  assert.ok(notice.message.includes('<span title="room">LABEL-A</span>'), notice.message);
 });
 
 async function run() {

@@ -314,7 +314,7 @@ mod tests {
         for key in ["100100_300", "100600_300"] {
             segment(root, "extro_tmux", key);
         }
-        bind(root, "device_2", DESKTOP_CID, "screen");
+        bind(root, "device_2", DESKTOP_CID, "");
         bind(root, "extro_tmux", TERMINAL_CID, "tmux");
         describe(
             root,
@@ -454,8 +454,8 @@ mod tests {
         let root = TempDir::new().unwrap();
         segment(root.path(), "device_2", "100000_300");
         segment(root.path(), "device_3", "100100_300");
-        bind(root.path(), "device_2", DESKTOP_CID, "screen");
-        bind(root.path(), "device_3", LAPTOP_CID, "screen");
+        bind(root.path(), "device_2", DESKTOP_CID, "");
+        bind(root.path(), "device_3", LAPTOP_CID, "");
         describe(
             root.path(),
             &[

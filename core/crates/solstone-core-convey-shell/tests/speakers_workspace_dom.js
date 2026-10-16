@@ -269,6 +269,61 @@ async function overviewFailuresStayUnavailable(workspace) {
     'a failed quality read never becomes zero progress');
 }
 
+// Where a voice appears reads each stream's provenance label once, joined,
+// with the stream names behind each label kept in its title.
+async function voiceStreamsReadAsLabels(workspace) {
+  const format = {};
+  vm.runInNewContext(
+    fs.readFileSync(path.join(__dirname, '../assets/static/date_format.js'), 'utf8'),
+    { window: format },
+  );
+  format.JournalFormat.installStreamLabels({
+    status: 'complete',
+    labels: { macos_screen: 'LABEL-ONE', macos_audio: 'LABEL-ONE', ios_audio: 'LABEL-TWO' },
+  });
+  const ownerPanel = { innerHTML: '' };
+  const context = {
+    window: format,
+    COPY: {},
+    TODAY: '20261016',
+    ownerPanel,
+    document: { getElementById: () => null },
+    escapeHtml: (value) => String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'),
+    relabelHtml: () => '',
+    ownerSamplesText: () => '',
+    cohesion: () => '',
+    absoluteDate: () => '',
+    ownerUndoAsk: () => {},
+  };
+  vm.createContext(context);
+  vm.runInContext(functionSource(workspace, 'ownerConfirmed'), context);
+  vm.runInContext(`ownerConfirmed(${JSON.stringify({ centroid_metadata: { streams: ['macos_screen', 'macos_audio', 'ios_audio'] } })})`, context);
+  const spans = [...ownerPanel.innerHTML.matchAll(/<span title="([^"]*)">([^<]*)<\/span>/g)];
+  check(spans.length === 2, 'repeated labels are shown once');
+  check(spans[0][2] === 'LABEL-ONE' && spans[0][1] === 'macos_screen, macos_audio', 'a label keeps every stream name behind it');
+  check(spans[1][2] === 'LABEL-TWO' && spans[1][1] === 'ios_audio', 'each label keeps its own stream name');
+  check(!ownerPanel.innerHTML.replace(/title="[^"]*"/g, '').includes('macos_'), 'no stream name is shown as text');
+}
+
+// A voice sample with no setting is named by its stream's label, not its id.
+function sampleFallsBackToTheLabel() {
+  const source = fs.readFileSync(path.join(__dirname, '../assets/speakers/who_is_this.js'), 'utf8');
+  const method = functionSource(source.replace('    sampleLabel(sample) {', '    function sampleLabel(sample) {'), 'sampleLabel');
+  const format = {};
+  vm.runInNewContext(
+    fs.readFileSync(path.join(__dirname, '../assets/static/date_format.js'), 'utf8'),
+    { window: format },
+  );
+  format.JournalFormat.installStreamLabels({ status: 'complete', labels: { device_9e92ab54: 'LABEL-ONE' } });
+  const context = { window: format };
+  vm.createContext(context);
+  vm.runInContext(method, context);
+  const self = { formatDateShort: () => 'DAY' };
+  const label = (sample) => vm.runInContext('sampleLabel', context).call(self, sample);
+  check(label({ day: '20261016', stream: 'device_9e92ab54' }) === 'DAY · LABEL-ONE', 'a sample with no setting reads its label');
+  check(label({ day: '20261016', stream: 'device_9e92ab54', setting: 'kitchen' }) === 'DAY · kitchen', 'a setting still wins');
+}
+
 async function main() {
   const manifestDir = process.argv[2];
   if (!manifestDir) throw new Error('manifest directory required');
@@ -302,6 +357,8 @@ async function main() {
   check(true, 'the Speakers day script parses without syntax error');
   await teachingReachesPastDays(workspace);
   await overviewFailuresStayUnavailable(workspace);
+  await voiceStreamsReadAsLabels(workspace);
+  sampleFallsBackToTheLabel();
 
   console.log(`DOM CASES: ${cases} passed`);
 }

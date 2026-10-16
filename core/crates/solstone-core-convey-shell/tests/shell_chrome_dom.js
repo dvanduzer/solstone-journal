@@ -1118,11 +1118,16 @@ asyncCase('boot proceeds after labels timeout and late response installs stream 
   await bootPromise;
 
   assert.strictEqual(mountCount, 1, 'workspace mounted once after timeout');
+  assert.strictEqual(
+    harness.logErrors.filter((entry) => entry.context && entry.context.context === 'stream-labels').length,
+    0,
+    'a labels load that is only slow is not an error on the page'
+  );
 
   releaseLabels({
     status: 'complete',
     labels: {
-      ja1r: 'your mac · screen',
+      ja1r: 'LABEL-ONE',
     },
   });
 
@@ -1131,9 +1136,203 @@ asyncCase('boot proceeds after labels timeout and late response installs stream 
   assert.strictEqual(mountCount, 1, 'mount count is still 1 after late labels response');
   assert.strictEqual(
     harness.window.JournalFormat.stream('ja1r'),
-    'your mac · screen',
+    'LABEL-ONE',
     'JournalFormat.stream returns seeded label'
   );
+});
+
+asyncCase('settings has no devices section and its old links land on network devices', async () => {
+  const source = fs.readFileSync(path.join(crateDir, '../solstone-core-settings-web/assets/workspace.html'), 'utf8');
+  for (const marker of ['id="tab-devices"', 'id="section-devices"', '<option value="devices">']) {
+    assert.ok(!source.includes(marker), marker);
+  }
+  const start = source.indexOf('function redirectRetiredSection(raw) {');
+  const end = source.indexOf("window.addEventListener('hashchange'", start);
+  assert.ok(start > 0 && end > start, 'test exercises the production redirect and hash entry');
+  for (const [hash, expected] of [['devices', '/app/network/#devices'], ['observer', '/app/network/#devices'], ['vision', null]]) {
+    const replaced = [];
+    const switched = [];
+    const context = vm.createContext({
+      window: { location: { hash: '#' + hash, replace: (url) => replaced.push(url) } },
+      VALID_SECTIONS: ['vision'],
+      switchSection: (section) => switched.push(section),
+    });
+    vm.runInContext(source.slice(start, end), context);
+    vm.runInContext('initFromHash()', context);
+    assert.deepStrictEqual(replaced, expected ? [expected] : [], hash);
+    assert.deepStrictEqual(switched, expected ? [] : [hash], hash);
+  }
+});
+
+// JournalFormat's provenance labels, against a controllable labels endpoint.
+// Seeded labels are synthetic; fallback words are compared with each other,
+// never with owner copy.
+function labelFormat(extra = {}) {
+  const reads = [];
+  const logs = [];
+  const warnings = [];
+  const context = {
+    window: { logError: (error, ctx) => logs.push({ error, ctx }) },
+    Intl, Date, Math, Number, String, Object, Array, Set, Map, Promise, JSON, Error,
+    console: { warn: (message) => warnings.push(message), log() {}, error() {} },
+    fetch: (url, options) => new Promise((resolve, reject) => {
+      reads.push({ url, resolve, reject });
+      options?.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+    }),
+    ...extra,
+  };
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(path.join(crateDir, 'assets/static/date_format.js'), 'utf8'), context, { filename: 'date_format.js' });
+  const answer = (body) => reads.shift().resolve({ ok: true, status: 200, json: () => Promise.resolve(body) });
+  const fail = () => reads.shift().reject(new Error('offline'));
+  return { format: context.window.JournalFormat, reads, logs, warnings, answer, fail };
+}
+
+const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+asyncCase('stream labels: a failed table decides only dotted names, never a device word', async () => {
+  const { format, logs, fail } = labelFormat();
+  const loading = format.beginStreamLabels();
+  fail();
+  assert.strictEqual(await loading, false);
+  assert.strictEqual(logs.length, 1, 'the failure is logged');
+  const unknown = format.stream('_default');
+  for (const name of ['device_9e92ab54', 'macos_screen', 'pixel-7', 'fedora', 'device_omi-audio',
+    'device_mac_screen', 'agent-memory-' + 'a'.repeat(64), 'device.omi.audio']) {
+    assert.strictEqual(format.stream(name), unknown, name);
+  }
+  const terminal = format.stream('fedora.tmux');
+  assert.strictEqual(format.stream('suze.tmux'), terminal);
+  assert.notStrictEqual(terminal, unknown);
+  const watch = format.stream('fedora.watch');
+  const oura = format.stream('import.oura');
+  assert.strictEqual(new Set([terminal, watch, oura, unknown]).size, 4);
+  for (const name of ['fedora.tmux', 'fedora.watch', 'import.oura', 'device_9e92ab54']) {
+    const label = format.stream(name);
+    assert.notStrictEqual(label, name);
+    assert.notStrictEqual(label, name.replace(/[._-]+/g, ' '));
+  }
+  assert.strictEqual(format.streamSays('import.oura').imported, true);
+  assert.strictEqual(format.streamSays('fedora.tmux').imported, false);
+});
+
+asyncCase('stream labels: a loaded table wins, and a name it lacks is unknown', async () => {
+  const { format, answer } = labelFormat();
+  const loading = format.beginStreamLabels();
+  answer({ status: 'complete', labels: { macos_screen: 'LABEL-M' }, says: { macos_screen: { what: 'screen', imported: false } } });
+  assert.strictEqual(await loading, true);
+  assert.strictEqual(format.stream('macos_screen'), 'LABEL-M');
+  assert.strictEqual(format.streamSays('macos_screen').what, 'screen');
+  assert.strictEqual(format.stream('fedora.tmux'), format.stream('_default'));
+  assert.strictEqual(format.streamSays('import.oura').imported, false);
+});
+
+asyncCase('stream labels: a failed re-read falls back for the new names only, logged once', async () => {
+  const { format, logs, answer, fail } = labelFormat();
+  const first = format.beginStreamLabels();
+  answer({ status: 'complete', labels: { macos_screen: 'LABEL-M' } });
+  await first;
+  const unknown = format.stream('_default');
+  const tmux = format.noteLiveStream('fedora.tmux');
+  const watch = format.noteLiveStream('suze.watch');
+  fail();
+  await Promise.all([tmux, watch]);
+  assert.strictEqual(format.stream('macos_screen'), 'LABEL-M', 'shown labels stay');
+  assert.notStrictEqual(format.stream('fedora.tmux'), unknown, 'first new name falls back');
+  assert.notStrictEqual(format.stream('suze.watch'), unknown, 'second new name falls back');
+  assert.strictEqual(format.needsStreamLabel('fedora.tmux'), false, 'one re-read per name');
+  const another = format.noteLiveStream('laptop.tmux');
+  fail();
+  await another;
+  assert.strictEqual(logs.length, 1, 'repeated failures log once');
+  // A later read that answers replaces every fallback with what it says.
+  const later = format.noteLiveStream('device_new');
+  answer({ status: 'complete', labels: { macos_screen: 'LABEL-M', device_new: 'LABEL-N' } });
+  await later;
+  assert.strictEqual(format.stream('device_new'), 'LABEL-N');
+  assert.strictEqual(format.stream('fedora.tmux'), unknown);
+});
+
+asyncCase('stream labels: a partial re-read adds new names but never changes a complete table', async () => {
+  const { format, logs, warnings, answer } = labelFormat();
+  const first = format.beginStreamLabels();
+  answer({ status: 'complete', labels: { a: 'LABEL-A' } });
+  await first;
+  const second = format.noteLiveStream('b');
+  answer({ status: 'partial', labels: { a: 'LABEL-A-PARTIAL', b: 'LABEL-B' } });
+  await second;
+  assert.strictEqual(format.stream('a'), 'LABEL-A');
+  assert.strictEqual(format.stream('b'), 'LABEL-B');
+  const third = format.noteLiveStream('c');
+  answer({ status: 'partial', labels: { a: 'LABEL-A', b: 'LABEL-B' } });
+  await third;
+  assert.strictEqual(format.stream('c'), format.stream('_default'), 'a name the registry lacks is unknown');
+  assert.strictEqual(logs.length, 0, 'a partial table is not an error on the page');
+  assert.strictEqual(warnings.length, 1, 'partial is noted once');
+});
+
+asyncCase('stream labels: a name met during an earlier read gets a read of its own', async () => {
+  const { format, reads, answer } = labelFormat();
+  const boot = format.beginStreamLabels();
+  const late = format.noteLiveStream('device_new');
+  answer({ status: 'complete', labels: { macos_screen: 'LABEL-M' } });
+  await boot;
+  await settle();
+  assert.strictEqual(reads.length, 1, 'the miss starts a fresh read');
+  answer({ status: 'complete', labels: { macos_screen: 'LABEL-M', device_new: 'LABEL-N' } });
+  await late;
+  assert.strictEqual(format.stream('device_new'), 'LABEL-N');
+});
+
+asyncCase('stream labels: a read that hangs gives up, and the next stream reads again', async () => {
+  const timers = [];
+  const { format, reads, logs, warnings, answer } = labelFormat({
+    AbortController,
+    setTimeout: (fn) => { timers.push(fn); return timers.length; },
+    clearTimeout: () => {},
+  });
+  const hung = format.noteLiveStream('fedora.tmux');
+  assert.strictEqual(reads.length, 1);
+  timers.shift()();
+  await hung;
+  reads.shift();
+  assert.strictEqual(logs.length, 0, 'a slow read is not an error on the page');
+  assert.strictEqual(warnings.length, 1);
+  assert.notStrictEqual(format.stream('fedora.tmux'), format.stream('_default'), 'the waiting name falls back');
+  const next = format.noteLiveStream('device_new');
+  assert.strictEqual(reads.length, 1, 'a later stream starts a new read');
+  answer({ status: 'complete', labels: { device_new: 'LABEL-N' } });
+  await next;
+  assert.strictEqual(format.stream('device_new'), 'LABEL-N');
+});
+
+asyncCase('stream labels: a dotted name with an empty side is unknown, as on the journal', async () => {
+  const { format, fail } = labelFormat();
+  const loading = format.beginStreamLabels();
+  fail();
+  await loading;
+  for (const name of ['a..tmux', 'x.tmux.', '.tmux', 'import.']) {
+    assert.strictEqual(format.stream(name), format.stream('_default'), name);
+  }
+  assert.strictEqual(format.streamSays('import.').imported, false);
+});
+
+asyncCase('stream labels: concurrent misses share reads, and a joiner the read lacks reads once more', async () => {
+  const { format, reads, answer } = labelFormat();
+  const a = format.noteLiveStream('x.tmux');
+  const b = format.noteLiveStream('y.tmux');
+  const c = format.noteLiveStream('z.tmux');
+  assert.strictEqual(reads.length, 1, 'misses share the read in flight');
+  answer({ status: 'complete', labels: { 'x.tmux': 'LABEL-X' } });
+  await a;
+  await settle();
+  assert.strictEqual(reads.length, 1, 'the joiners share one follow-up read');
+  answer({ status: 'complete', labels: { 'x.tmux': 'LABEL-X', 'y.tmux': 'LABEL-Y' } });
+  await Promise.all([b, c]);
+  assert.strictEqual(format.stream('x.tmux'), 'LABEL-X');
+  assert.strictEqual(format.stream('y.tmux'), 'LABEL-Y');
+  assert.strictEqual(format.stream('z.tmux'), format.stream('_default'));
+  assert.strictEqual(format.needsStreamLabel('z.tmux'), false);
 });
 
 async function runAsyncCases() {

@@ -74,7 +74,7 @@
 //! `validate_ceremony_pairing_identity` on `additional_fields`:
 //! absent → accept (`None`); valid `client_label` 1..=253 bytes → accept;
 //! valid `platform` vocab → accept; an invalid hint is ignored and the function
-//! returns without a platform. It does not refuse the pairing and it does not
+//! returns without that hint. It does not refuse the pairing and it does not
 //! preserve that as a refusal.
 
 use serde_json::{Map, Value};

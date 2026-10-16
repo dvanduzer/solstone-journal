@@ -113,20 +113,19 @@
       !/55/.test(segment) && window.JournalFormat.segmentTime('200155_300') === '20:01:55',
       `got "${segment}"`);
 
-    // JournalFormat.stream: recast at part level.
-    for (const [key, expected] of [
-      ['import.chatgpt', 'ChatGPT · imported'],
-      ['import.strava', 'Strava · imported'],
-      ['import.ics', 'calendar · imported'],
-      ['import.some_tool', 'some tool · imported'],
-      ['my-host.tmux', 'your terminal'],
-      ['device.watch.audio', 'source unknown'],
-      ['ja1r', 'source unknown'],
-      ['_default', 'source unknown'],
-    ]) {
-      const actual = window.JournalFormat.stream(key);
-      assert(`JournalFormat.stream(${JSON.stringify(key)})`, actual === expected,
-        `expected "${expected}", got "${actual}"`);
+    // JournalFormat.stream before the label table loads: a dotted name decides
+    // its own parts; any other name is unknown, and nothing reads as its id.
+    {
+      const unknown = window.JournalFormat.stream('_default');
+      for (const key of ['device.watch.audio', 'ja1r', 'macos_screen']) {
+        assert(`JournalFormat.stream(${JSON.stringify(key)}) is unknown`,
+          window.JournalFormat.stream(key) === unknown);
+      }
+      const decided = ['import.chatgpt', 'import.some_tool', 'my-host.tmux', 'my-host.watch']
+        .map(key => window.JournalFormat.stream(key));
+      assert('dotted names decide distinct parts', new Set([...decided, unknown]).size === decided.length + 1);
+      assert('two terminals read alike',
+        window.JournalFormat.stream('a.tmux') === window.JournalFormat.stream('b.tmux'));
     }
 
     // JournalFormat.duration: seconds in, and an hours rung so a stats bucket

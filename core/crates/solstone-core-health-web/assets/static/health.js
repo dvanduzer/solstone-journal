@@ -2201,15 +2201,20 @@
     const tmux = displayedStream ? freshClients.get(displayedStream + '.tmux') : null;
     const confirmedLocal = Boolean(state.localHost && confirmedPrimary && displayedStream === state.localHost);
     if (!confirmedLocal && displayedStream) {
-      const label = window.JournalFormat ? window.JournalFormat.stream(displayedStream) : displayedStream;
-      if (state.localHost) {
-        elements.observeSourceNote.textContent = label === 'source unknown'
-          ? HEALTH_GLANCE_COPY.HEALTH_OBSERVE_LOCAL_SILENT
-          : formatCopy(HEALTH_GLANCE_COPY.HEALTH_OBSERVE_LOCAL_REPORTING, { label });
-      } else {
-        elements.observeSourceNote.textContent = label === 'source unknown'
-          ? HEALTH_GLANCE_COPY.HEALTH_OBSERVE_UNKNOWN_SILENT
-          : formatCopy(HEALTH_GLANCE_COPY.HEALTH_OBSERVE_UNKNOWN_REPORTING, { label });
+      const label = window.JournalFormat.stream(displayedStream);
+      const unknown = label === window.JournalFormat.stream('_default');
+      const template = state.localHost
+        ? (unknown ? HEALTH_GLANCE_COPY.HEALTH_OBSERVE_LOCAL_SILENT : HEALTH_GLANCE_COPY.HEALTH_OBSERVE_LOCAL_REPORTING)
+        : (unknown ? HEALTH_GLANCE_COPY.HEALTH_OBSERVE_UNKNOWN_SILENT : HEALTH_GLANCE_COPY.HEALTH_OBSERVE_UNKNOWN_REPORTING);
+      // The label reads in the sentence; the stream name it stands for stays
+      // one hover away.
+      const [before, after = ''] = template.split('{label}');
+      elements.observeSourceNote.replaceChildren(document.createTextNode(before));
+      if (template.includes('{label}')) {
+        const labelEl = document.createElement('span');
+        labelEl.textContent = label;
+        labelEl.title = displayedStream;
+        elements.observeSourceNote.append(labelEl, document.createTextNode(after));
       }
       elements.observeSourceNote.classList.remove('hidden');
     } else {
@@ -2402,7 +2407,7 @@
 
         const qualEl = document.createElement('div');
         qualEl.className = 'client-stream-qualifier';
-        qualEl.textContent = window.JournalFormat ? window.JournalFormat.stream(stream) : stream;
+        qualEl.textContent = window.JournalFormat.stream(stream);
         qualEl.title = stream;
         row.appendChild(qualEl);
 
@@ -3346,12 +3351,13 @@
     state.clients.set(msg.stream, { ...existing, ...msg, lastSeen: Date.now() });
     updateObserve();
     updateClients();
-    if (window.JournalFormat && typeof window.JournalFormat.noteLiveStream === 'function') {
-      window.JournalFormat.noteLiveStream(msg.stream)
-        .finally(() => {
-          updateObserve();
-          updateClients();
-        });
+    // A stream first met on the socket re-reads the label table once, then
+    // renders again with what it learned.
+    if (window.JournalFormat.needsStreamLabel(msg.stream)) {
+      window.JournalFormat.noteLiveStream(msg.stream).then(() => {
+        updateObserve();
+        updateClients();
+      });
     }
   }
 

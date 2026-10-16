@@ -214,6 +214,11 @@ class Document {
   }
 
   createElement(tagName) { return new Element(tagName, this); }
+  createTextNode(text) {
+    const node = new Element('#text', this);
+    node.textContent = text;
+    return node;
+  }
   getElementById(id) { return this.querySelector('#' + id); }
   querySelector(selector) {
     if (selector === 'body') return this.body;
@@ -727,12 +732,15 @@ test('observe uses fresh selected evidence rather than a stale populated map', a
   env.state.localHost = null;
   env.observe();
   assert.ok(!env.elements.observeSourceNote.textContent.includes('remote'));
-  env.context.window.JournalFormat.installStreamLabels({ status: 'complete', labels: { ja1r: 'your mac · screen' } });
+  env.context.window.JournalFormat.installStreamLabels({ status: 'complete', labels: { ja1r: 'LABEL-ONE' } });
   env.state.clients.delete('remote');
   env.state.clients.set('ja1r', { lastSeen: env.clock.now, mode: 'screencast', audio: { threshold_hits: 7 } });
   env.observe();
-  assert.ok(env.elements.observeSourceNote.textContent.includes('your mac · screen'));
+  assert.ok(env.elements.observeSourceNote.textContent.includes('LABEL-ONE'));
   assert.ok(!env.elements.observeSourceNote.textContent.includes('ja1r'));
+  const labelSpan = env.elements.observeSourceNote.querySelector('span');
+  assert.strictEqual(labelSpan.textContent, 'LABEL-ONE');
+  assert.strictEqual(labelSpan.title, 'ja1r');
   env.state.clients = new Map();
   env.state.registeredClients = [];
   env.observe();
@@ -825,13 +833,61 @@ test('live sources tolerate unloaded names and keep equal labels as separate dev
     ['other', { cid: 'two', lastSeen: Date.now() }],
   ]) };
   vm.runInContext(sourceBlock(loadHealthSource(), 'function updateClients(', 'const sinceDay ='), context);
-  context.window.JournalFormat.installStreamLabels({ status: 'complete', labels: { opaque: 'your mac · screen' } });
+  context.window.JournalFormat.installStreamLabels({ status: 'complete', labels: { opaque: 'LABEL-TWO' } });
   vm.runInContext('updateClients()', context);
   assert.strictEqual(context.elements.clientsGrid.children.length, 2);
   const qualEls = context.elements.clientsGrid.querySelectorAll('.client-stream-qualifier');
-  assert.strictEqual(qualEls[0].textContent, 'your mac · screen');
+  assert.strictEqual(qualEls[0].textContent, 'LABEL-TWO');
   assert.strictEqual(qualEls[0].title, 'opaque');
   assert.strictEqual(context.elements.clientsGrid.children.length, 2);
+});
+
+test('a stream first met on the socket re-reads the label table once and renders what it learned', async () => {
+  const env = createDeviceEnvironment();
+  await env.load([device('phone')]);
+  const tables = [];
+  let reads = 0;
+  env.context.fetch = async (route) => {
+    if (route === '/api/streams/labels') {
+      reads += 1;
+      return { ok: true, json: async () => tables.shift() };
+    }
+    return { ok: true, json: async () => ({ clients: [] }) };
+  };
+  let clientRenders = 0;
+  env.context.updateClients = () => { clientRenders += 1; };
+  vm.runInContext(sourceBlock(loadHealthSource(), 'function handleObserveEvent(', 'function handleImporterEvent('), env.context);
+  const receive = async (stream) => {
+    vm.runInContext(`handleObserveEvent(${JSON.stringify({ stream, mode: 'screencast', audio: { threshold_hits: 3 } })})`, env.context);
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+  };
+  const unknown = env.context.window.JournalFormat.stream('_default');
+
+  tables.push({ status: 'complete', labels: { ja1r: 'LABEL-ONE' } });
+  await receive('ja1r');
+  assert.strictEqual(reads, 1);
+  const span = env.elements.observeSourceNote.querySelector('span');
+  assert.strictEqual(span.textContent, 'LABEL-ONE');
+  assert.strictEqual(span.title, 'ja1r');
+
+  // A known stream re-reads nothing and renders once per message.
+  const before = clientRenders;
+  await receive('ja1r');
+  assert.strictEqual(reads, 1);
+  assert.strictEqual(clientRenders, before + 1);
+
+  // A second new stream gets its own re-read; one the registry lacks is
+  // unknown, and the note then says nothing about what it shows.
+  env.state.clients.delete('ja1r');
+  tables.push({ status: 'complete', labels: { ja1r: 'LABEL-ONE' } });
+  await receive('device_new');
+  assert.strictEqual(reads, 2);
+  assert.strictEqual(env.context.window.JournalFormat.stream('device_new'), unknown);
+  assert.strictEqual(env.elements.observeSourceNote.querySelector('span'), null);
+  assert.ok(!env.elements.observeSourceNote.textContent.includes('device_new'));
+  await receive('device_new');
+  assert.strictEqual(reads, 2, 'a name gets one re-read');
 });
 
 test('holds require queued work at their scope even while unrelated work is active', async () => {

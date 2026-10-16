@@ -437,7 +437,7 @@
       const stream = String(sample?.stream || '').trim();
       const place = setting
         ? setting
-        : (stream ? (window.JournalFormat ? window.JournalFormat.stream(stream) : stream) : '');
+        : (stream ? window.JournalFormat.stream(stream) : '');
       return [dateLabel, place].filter(Boolean).join(' · ');
     }
 
