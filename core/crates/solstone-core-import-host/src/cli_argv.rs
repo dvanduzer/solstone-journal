@@ -987,17 +987,21 @@ fn classify_export(path: &Path) -> Option<&'static str> {
         })
 }
 
+fn is_generic_audio_extension(extension: &str) -> bool {
+    GENERIC_AUDIO_EXTENSIONS.contains(&extension)
+}
+
 fn requires_registry_classification(path: &Path) -> bool {
     let Some(extension) = lowercase_extension(path) else {
         return true;
     };
-    !(GENERIC_AUDIO_EXTENSIONS.contains(&extension.as_str())
+    !(is_generic_audio_extension(extension.as_str())
         || GENERIC_TEXT_EXTENSIONS.contains(&extension.as_str()))
 }
 
 fn is_generic_media(path: &Path) -> bool {
     lowercase_extension(path).is_some_and(|extension| {
-        GENERIC_AUDIO_EXTENSIONS.contains(&extension.as_str())
+        is_generic_audio_extension(extension.as_str())
             || GENERIC_TEXT_EXTENSIONS.contains(&extension.as_str())
     })
 }
@@ -1318,8 +1322,7 @@ fn collect_audio_candidates(
             .extension()
             .and_then(|value| value.to_str())
             .map(str::to_ascii_lowercase);
-        if !path.is_file() || !matches!(extension.as_deref(), Some("m4a" | "mp3" | "wav" | "opus"))
-        {
+        if !path.is_file() || !extension.as_deref().is_some_and(is_generic_audio_extension) {
             continue;
         }
         let relative_path = path
@@ -2137,5 +2140,34 @@ mod tests {
             Some("20260312_090000")
         );
         assert!(!matches.contains_key("new"));
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[test]
+    fn filesystem_audio_scanner_finds_all_generic_audio_extensions_and_recurses() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let sub = root.join("nested");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("track1.ogg"), b"audio").unwrap();
+        fs::write(sub.join("track2.OGG"), b"audio").unwrap();
+        fs::write(root.join("sample.wav"), b"audio").unwrap();
+        fs::write(root.join("clip.mp4"), b"audio").unwrap();
+        fs::write(root.join("notes.txt"), b"text").unwrap();
+        fs::write(sub.join("info.txt"), b"text").unwrap();
+
+        let candidates = FilesystemAudioScanner.audio_candidates(root).unwrap();
+        let paths: std::collections::BTreeSet<_> = candidates
+            .into_iter()
+            .map(|c| c.relative_path.replace('\\', "/"))
+            .collect();
+
+        let expected = std::collections::BTreeSet::from([
+            "nested/track1.ogg".to_string(),
+            "nested/track2.OGG".to_string(),
+            "sample.wav".to_string(),
+            "clip.mp4".to_string(),
+        ]);
+        assert_eq!(paths, expected);
     }
 }
