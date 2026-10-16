@@ -12,6 +12,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- downloading location accuracy no longer pauses to save its progress after every small piece of the download, which could make it take hours on windows.
 - on linux, installing your journal now retries interrupted downloads and temporary download errors. an incomplete download reports a download failure instead of a signature mismatch.
 - on ubuntu 22.04, the installer points you to Minisign's installation page when the verifier is missing.
 
