@@ -254,10 +254,32 @@ pub fn run_cli(
         &generation_context,
     )
     .map_err(CliRunError::Transcribe)?;
-    Ok(CliRun {
-        files: vec![record_transcribe_file(outcome, &audio_path)],
+    Ok(single_file_result(outcome, &audio_path))
+}
+
+fn single_file_result(outcome: stage::ProcessOutcome, audio_path: &Path) -> CliRun {
+    let failed = outcome == stage::ProcessOutcome::Failed;
+    CliRun {
+        exit_code: if failed { 1 } else { 0 },
+        stderr: failed.then(|| format!("{}\n", failed_transcription_line(audio_path))),
+        files: vec![record_transcribe_file(outcome, audio_path)],
         ..CliRun::default()
-    })
+    }
+}
+
+fn failed_transcription_line(audio_path: &Path) -> String {
+    let output = audio_path.with_extension("jsonl");
+    let record = solstone_core_processing_record::read_processing_record_header(&output);
+    let reason = record
+        .as_ref()
+        .and_then(|value| value.get("reason_code"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    format!(
+        "{}: transcription failed ({reason}); details: {}",
+        audio_path.display(),
+        output.display()
+    )
 }
 
 fn record_transcribe_file(outcome: stage::ProcessOutcome, audio_path: &Path) -> TranscribeFile {
@@ -350,7 +372,7 @@ where
             Ok(outcome) => {
                 if outcome == stage::ProcessOutcome::Failed {
                     failed += 1;
-                    failed_lines.push(format!("{}: transcription failed", audio_path.display()));
+                    failed_lines.push(failed_transcription_line(&audio_path));
                 } else {
                     processed += 1;
                 }
@@ -952,6 +974,60 @@ mod tests {
         let path = directory.join(filename);
         fs::write(&path, contents).unwrap();
         path
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn a_single_failed_transcription_returns_nonzero_without_claiming_success() {
+        let raw = std::path::Path::new("audio.flac");
+        let run = super::single_file_result(crate::stage::ProcessOutcome::Failed, raw);
+        assert_eq!(run.exit_code, 1);
+        assert!(run.stderr.unwrap().contains("transcription failed"));
+        assert_eq!(run.files[0].outcome, super::TranscribeOutcome::Failed);
+        for outcome in [
+            crate::stage::ProcessOutcome::Skipped,
+            crate::stage::ProcessOutcome::Transcribed,
+            crate::stage::ProcessOutcome::Preserved,
+        ] {
+            let run = super::single_file_result(outcome, raw);
+            assert_eq!(run.exit_code, 0);
+            assert!(run.stderr.is_none());
+        }
+    }
+
+    #[cfg(all(feature = "full-tests", not(windows)))]
+    #[test]
+    fn real_m4a_and_flac_decode_failures_reach_the_single_file_cli_status() {
+        let root = tempfile::tempdir().unwrap();
+        let segment = root.path().join("chronicle/20261015/phone/160000_300");
+        fs::create_dir_all(&segment).unwrap();
+        for suffix in ["m4a", "flac"] {
+            let raw = segment.join(format!("audio.{suffix}"));
+            fs::write(&raw, b"invalid audio container").unwrap();
+            let outcome = crate::stage::process_one(
+                &raw,
+                root.path(),
+                false,
+                None,
+                &solstone_core_journal_config::read_journal_config(root.path()).unwrap(),
+                &solstone_core_spp_ratls::AttestationStateStore::new(),
+            )
+            .unwrap();
+            let run = super::single_file_result(outcome, &raw);
+            assert_eq!(run.exit_code, 1);
+            let record = solstone_core_processing_record::read_processing_record_header(
+                &raw.with_extension("jsonl"),
+            )
+            .unwrap();
+            assert_eq!(record["state"], "failed");
+            assert!(
+                run.stderr
+                    .unwrap()
+                    .contains(record["reason_code"].as_str().unwrap())
+            );
+            assert!(raw.exists(), "failed decoding retains the input");
+            fs::remove_file(raw.with_extension("jsonl")).unwrap();
+        }
     }
 
     #[test]

@@ -112,6 +112,7 @@ struct WorkerContext {
 pub(crate) struct JobTally {
     ran: AtomicUsize,
     failed: AtomicUsize,
+    deferred: AtomicUsize,
 }
 
 impl JobTally {
@@ -119,6 +120,7 @@ impl JobTally {
         Self {
             ran: AtomicUsize::new(0),
             failed: AtomicUsize::new(0),
+            deferred: AtomicUsize::new(0),
         }
     }
 
@@ -129,6 +131,15 @@ impl JobTally {
     fn failure(&self) {
         self.ran.fetch_add(1, Ordering::SeqCst);
         self.failed.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn defer(&self) {
+        self.ran.fetch_add(1, Ordering::SeqCst);
+        self.deferred.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn deferred(&self) -> usize {
+        self.deferred.load(Ordering::SeqCst)
     }
 
     pub(crate) fn snapshot(&self) -> (usize, usize) {
@@ -566,6 +577,7 @@ impl SenseDispatcher {
                 false
             };
             if !queued {
+                self.tally.failure();
                 let reason = format!("{handler} pool unavailable");
                 self.state
                     .lock()
@@ -1042,8 +1054,42 @@ fn run_job(
         }
         thread::sleep(Duration::from_millis(50));
     };
+    if exit == Some(0)
+        && let Some(reason) = unfinished_output(&file, &job.item.handler)
+    {
+        worker_context.tally.failure();
+        state.lock().expect("sense state").health.failure(&reason);
+        complete(
+            state,
+            outbound,
+            &worker_context.journal,
+            &key,
+            Some(&file),
+            Some(reason),
+            None,
+            worker_context.batch.marker_policy,
+        );
+        cleanup_async(process, &worker_context.cleanups, true);
+        return;
+    }
+    if exit != Some(0) {
+        eprintln!(
+            "sense: handler={} file={} outcome={} log={}",
+            job.item.handler,
+            file.display(),
+            match exit {
+                Some(PROVIDER_BLOCKED) => "deferred (exit 69)".to_owned(),
+                Some(code) => format!("failed (exit {code})"),
+                None => "watchdog or process wait failed".to_owned(),
+            },
+            process.log_path().display(),
+        );
+    }
     let outcome = match exit {
         Some(PROVIDER_BLOCKED) => {
+            if let Some(segment) = state.lock().expect("sense state").segments.get_mut(&key) {
+                segment.hold_note = Some("handler_deferred");
+            }
             let marker_succeeded = complete(
                 state,
                 outbound,
@@ -1051,15 +1097,15 @@ fn run_job(
                 &key,
                 Some(&file),
                 None,
-                None,
+                Some("handler_deferred"),
                 worker_context.batch.marker_policy,
             );
             if marker_succeeded {
-                worker_context.tally.success();
+                worker_context.tally.defer();
             } else {
                 worker_context.tally.failure();
             }
-            cleanup_async(process, &worker_context.cleanups);
+            cleanup_async(process, &worker_context.cleanups, true);
             return;
         }
         Some(0) => {
@@ -1079,7 +1125,7 @@ fn run_job(
             } else {
                 worker_context.tally.failure();
             }
-            cleanup_async(process, &worker_context.cleanups);
+            cleanup_async(process, &worker_context.cleanups, false);
             return;
         }
         Some(code) => {
@@ -1135,10 +1181,56 @@ fn run_job(
         None,
         worker_context.batch.marker_policy,
     );
-    cleanup_async(process, &worker_context.cleanups);
+    cleanup_async(process, &worker_context.cleanups, true);
 }
 
-fn cleanup_async(process: ManagedProcess, cleanups: &Arc<Mutex<Vec<thread::JoinHandle<()>>>>) {
+/// Exit zero cannot finish a file that the ordinary scanner would admit again.
+fn unfinished_output(file: &Path, handler: &str) -> Option<String> {
+    use solstone_core_processing_record::{
+        read_processing_record_header, should_reenter_analysis_output,
+    };
+    let output = file.with_extension("jsonl");
+    match std::fs::metadata(&output) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Some(format!(
+                "{handler} exited 0 without a regular output: {}",
+                output.display()
+            ));
+        }
+        Err(error) => {
+            return Some(format!(
+                "{handler} exited 0 without readable output {}: {error}",
+                output.display()
+            ));
+        }
+    }
+    let record = read_processing_record_header(&output);
+    if record
+        .as_ref()
+        .and_then(|value| value.get("state"))
+        .and_then(Value::as_str)
+        == Some("failed")
+        || should_reenter_analysis_output(record.as_ref(), &output, handler)
+    {
+        let reason = record
+            .as_ref()
+            .and_then(|value| value.get("reason_code"))
+            .and_then(Value::as_str)
+            .unwrap_or("analysis output incomplete");
+        return Some(format!(
+            "{handler} exited 0 with unfinished output ({reason}): {}",
+            output.display()
+        ));
+    }
+    None
+}
+
+fn cleanup_async(
+    process: ManagedProcess,
+    cleanups: &Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
+    diagnostic: bool,
+) {
     let handoff = Arc::new(Mutex::new(Some(process)));
     let cleanup_handoff = Arc::clone(&handoff);
     let spawned = thread::Builder::new()
@@ -1146,6 +1238,9 @@ fn cleanup_async(process: ManagedProcess, cleanups: &Arc<Mutex<Vec<thread::JoinH
         .spawn(move || {
             if let Some(mut process) = cleanup_handoff.lock().expect("cleanup handoff").take() {
                 process.cleanup();
+                if diagnostic {
+                    report_diagnostic_tail(&process.log_path());
+                }
             }
         });
     if let Ok(cleanup) = spawned {
@@ -1177,6 +1272,31 @@ fn cleanup_async(process: ManagedProcess, cleanups: &Arc<Mutex<Vec<thread::JoinH
             .expect("cleanup process");
         let _ = process.terminate(SERVICE_SHUTDOWN_TIMEOUT);
         process.cleanup();
+        if diagnostic {
+            report_diagnostic_tail(&process.log_path());
+        }
+    }
+}
+
+fn report_diagnostic_tail(path: &Path) {
+    use std::io::{Read, Seek, SeekFrom};
+    let tail = (|| -> std::io::Result<String> {
+        let mut file = std::fs::File::open(path)?;
+        let length = file.metadata()?.len();
+        file.seek(SeekFrom::Start(length.saturating_sub(4096)))?;
+        let mut bytes = Vec::new();
+        file.take(4096).read_to_end(&mut bytes)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    })();
+    match tail {
+        Ok(tail) => eprintln!(
+            "sense: handler diagnostic log={} tail={tail:?}",
+            path.display()
+        ),
+        Err(error) => eprintln!(
+            "sense: handler diagnostic log={} unreadable: {error}",
+            path.display()
+        ),
     }
 }
 
@@ -1279,6 +1399,14 @@ fn complete(
                 return true;
             };
             if let Some(error) = error {
+                eprintln!(
+                    "sense: day={} stream={} segment={} file={} error={error}",
+                    key.day,
+                    key.stream.as_deref().unwrap_or("default"),
+                    key.segment,
+                    file.map(|path| path.display().to_string())
+                        .unwrap_or_default()
+                );
                 segment.errors.push(error);
             }
             if let Some(file) = file {
@@ -1322,6 +1450,38 @@ fn complete(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn deferred_jobs_are_counted_separately_from_failures() {
+        let tally = super::JobTally::new();
+        tally.success();
+        tally.defer();
+        tally.failure();
+        assert_eq!(tally.snapshot(), (1, 3));
+        assert_eq!(tally.deferred(), 1);
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn zero_exit_cannot_hide_retryable_or_exhausted_failed_output() {
+        let root = tempfile::tempdir().unwrap();
+        let raw = root.path().join("audio.flac");
+        let output = raw.with_extension("jsonl");
+        for attempts in [1, 3] {
+            std::fs::write(&output, format!("{}\n", serde_json::json!({"_solstone_processing": {
+                "state":"failed", "handler":"transcribe", "reason_code":"decode_transient", "attempts":attempts
+            }}))).unwrap();
+            assert!(
+                super::unfinished_output(&raw, "transcribe")
+                    .unwrap()
+                    .contains("decode_transient")
+            );
+        }
+        std::fs::write(&output, "{}\n").unwrap();
+        assert!(super::unfinished_output(&raw, "describe").is_some());
+        std::fs::write(&output, "{}\n{\"timestamp\":0}\n").unwrap();
+        assert!(super::unfinished_output(&raw, "describe").is_none());
+    }
     use std::sync::mpsc;
 
     use serde_json::json;
@@ -1853,13 +2013,17 @@ mod tests {
         std::fs::write(segment.join("audio.flac"), b"audio").expect("audio");
         std::fs::write(segment.join("screen.webm"), b"screen").expect("screen");
         assert!(crate::config::no_thinking_engine(&read_config(temp.path())));
+        let fixture = temp.path().join("transcribe-fixture");
+        std::fs::write(&fixture, "#!/bin/sh\nprintf '{}\\n' > \"${2%.*}.jsonl\"\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755)).unwrap();
         let (outbound, receiver) = mpsc::channel();
         let dispatcher = SenseDispatcher::new_with_fixture_program(
             temp.path().to_path_buf(),
             false,
             false,
             outbound,
-            PathBuf::from("/usr/bin/true"),
+            fixture,
         );
         let mut message = observing("one", "120000_1");
         message

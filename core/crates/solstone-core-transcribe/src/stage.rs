@@ -76,7 +76,7 @@ pub(crate) enum TerminalOutcome {
     Failed,
 }
 
-/// A completed single-file driver disposition with an intentional zero exit status.
+/// A single-file driver disposition; failed output must yield a nonzero CLI status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProcessOutcome {
     Skipped,

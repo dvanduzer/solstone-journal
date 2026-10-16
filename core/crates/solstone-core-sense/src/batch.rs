@@ -694,7 +694,14 @@ where
     if failed > 0 {
         return Err(BatchError::Failed { failed, ran });
     }
-    println!("Batch processing complete");
+    let deferred = dispatcher.tally.deferred();
+    if deferred > 0 {
+        println!(
+            "Batch processing deferred: {deferred} of {ran} handlers waiting; unfinished files will retry"
+        );
+    } else {
+        println!("Batch processing complete");
+    }
     Ok(())
 }
 

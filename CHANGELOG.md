@@ -8,6 +8,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- audio processing reports when it is waiting or has failed, instead of saying it has finished.
+
 - after a linux package upgrade, your journal refreshes installed models and agent skills on its next start. you do not need to run setup again.
 - installed mac transcription models and location data now refresh in the background when an update includes changed files. if the refresh fails, the installed copy stays usable and your journal tries again on a later start.
 - new imports use creation dates in common filenames, photos, audio and video files instead of the date a file was copied. when no creation date is found, you can choose one. this works from the import page and the command line without installing an extra tool.

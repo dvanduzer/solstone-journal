@@ -19,7 +19,11 @@ fn main() {
     }
     let file = arguments
         .iter()
-        .find(|value| value.ends_with(".flac") || value.ends_with(".webm"))
+        .find(|value| {
+            [".flac", ".m4a", ".webm", ".png"]
+                .iter()
+                .any(|suffix| value.ends_with(suffix))
+        })
         .expect("handler input file");
     let marker = format!("{file}.handler");
     let mut log = std::fs::OpenOptions::new()
@@ -44,6 +48,7 @@ fn main() {
         }
     }
     if file.contains("blocked") {
+        eprintln!("speech server not ready");
         std::process::exit(69);
     }
     if file.contains("fail") {
@@ -61,5 +66,15 @@ fn main() {
             .spawn()
             .expect("spawn grandchild");
         std::thread::sleep(Duration::from_secs(30));
+    }
+    if !file.contains("no-output") {
+        let output = std::path::Path::new(file).with_extension("jsonl");
+        std::fs::create_dir_all(output.parent().unwrap()).expect("output parent");
+        let row = if file.ends_with(".webm") {
+            "{\"timestamp\":0}\n"
+        } else {
+            "{\"start\":0,\"text\":\"fixture\"}\n"
+        };
+        std::fs::write(output, format!("{{}}\n{row}")).expect("handler output");
     }
 }

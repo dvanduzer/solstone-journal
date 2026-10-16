@@ -245,6 +245,29 @@ async fn batch_nonzero_exit_returns_failed_tally() {
 }
 
 #[tokio::test]
+async fn batch_zero_exit_without_output_is_a_failure_for_each_modality() {
+    for name in [
+        "no-output.flac",
+        "no-output.m4a",
+        "no-output.webm",
+        "no-output.png",
+    ] {
+        let result = run_fixture_batch(&[name]).await;
+        assert!(
+            matches!(result, Err(BatchError::Failed { failed: 1, ran: 1 })),
+            "{name}: {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn batch_success_requires_an_output_and_accepts_each_modality() {
+    for name in ["ok.flac", "ok.m4a", "ok.webm", "ok.png"] {
+        run_fixture_batch(&[name]).await.expect(name);
+    }
+}
+
+#[tokio::test]
 async fn batch_provider_blocked_exit_is_not_a_failure() {
     run_fixture_batch(&["blocked.flac"])
         .await
