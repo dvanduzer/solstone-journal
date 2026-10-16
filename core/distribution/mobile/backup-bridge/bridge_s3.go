@@ -115,6 +115,10 @@ func validateS3RequestForRoot(request *C.restic_s3_request, rooted *rootedRestor
 }
 
 func validateS3RequestOwned(request *C.restic_s3_request, rooted *rootedRestore, entry *ownedCall) (result bridgeRequest, status int32) {
+	return validateS3RequestDirectoriesOwned(request, rooted, entry, nil, nil)
+}
+
+func validateS3RequestDirectoriesOwned(request *C.restic_s3_request, rooted *rootedRestore, entry *ownedCall, stateIdentity, workspaceIdentity *borrowedDirectoryIdentity) (result bridgeRequest, status int32) {
 	if request == nil {
 		return bridgeRequest{}, StatusInvalidArgument
 	}
@@ -178,7 +182,7 @@ func validateS3RequestOwned(request *C.restic_s3_request, rooted *rootedRestore,
 	if rooted != nil && (!utf8.ValidString(statePath) || !utf8.ValidString(result.restorePath)) {
 		return result, StatusInvalidArgument
 	}
-	owner, err := newS3OwnerOwned(statePath, cfg, entry)
+	owner, err := newS3OwnerExpected(statePath, cfg, entry, stateIdentity)
 	if err != nil {
 		if errors.Is(err, errS3OwnerBusy) {
 			return result, StatusBusy
@@ -197,7 +201,7 @@ func validateS3RequestOwned(request *C.restic_s3_request, rooted *rootedRestore,
 	}
 	if operation == OpSnapshot {
 		workspace := readString(request.workspace_path, request.workspace_path_len)
-		if err := pinMetadataWorkspace(&result, workspace); err != nil {
+		if err := pinMetadataWorkspaceExpected(&result, workspace, workspaceIdentity); err != nil {
 			if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
 				return result, rejectBridgeCall(&result, StatusBusy)
 			}
@@ -333,6 +337,43 @@ func restic_bridge_s3_snapshot_source_v1_start(request *C.restic_s3_request, opt
 }
 
 func startS3OperationWithSource(request *C.restic_s3_request, options *C.restic_operation_options_v1, sourceFD *C.int32_t, entry *ownedCall, policy *C.char, policyLen C.uint32_t, outID *C.uint64_t) C.int32_t {
+	return startS3OperationWithDirectories(request, options, sourceFD, nil, nil, entry, policy, policyLen, outID)
+}
+
+//export restic_bridge_s3_operation_directories_v1_start
+func restic_bridge_s3_operation_directories_v1_start(request *C.restic_s3_request, options *C.restic_operation_options_v1, sourceFD C.int32_t, stateFD C.int32_t, workspaceFD C.int32_t, policy *C.char, policyLen C.uint32_t, outID *C.uint64_t) (returned C.int32_t) {
+	if outID == nil {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	*outID = 0
+	entry, status := reserveOwnedCall()
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	defer func() { returned = C.int32_t(entry.finishAdmission(int32(returned))) }()
+	if request == nil || !normalDirectoryOperation(int32(request.operation)) {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	if request.operation != C.int32_t(OpSnapshot) && (sourceFD != -1 || workspaceFD != -1 || request.source_path_len != 0 || request.workspace_path_len != 0 || policyLen != 0) {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	state, status := readBorrowedDirectoryIdentity(int(stateFD))
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	var metadata *borrowedDirectoryIdentity
+	var source *C.int32_t
+	if request.operation == C.int32_t(OpSnapshot) {
+		metadata, status = readBorrowedDirectoryIdentity(int(workspaceFD))
+		if status != StatusOk {
+			return C.int32_t(status)
+		}
+		source = &sourceFD
+	}
+	return startS3OperationWithDirectories(request, options, source, state, metadata, entry, policy, policyLen, outID)
+}
+
+func startS3OperationWithDirectories(request *C.restic_s3_request, options *C.restic_operation_options_v1, sourceFD *C.int32_t, stateIdentity, workspaceIdentity *borrowedDirectoryIdentity, entry *ownedCall, policy *C.char, policyLen C.uint32_t, outID *C.uint64_t) C.int32_t {
 	if outID == nil {
 		return C.int32_t(StatusInvalidArgument)
 	}
@@ -360,7 +401,7 @@ func startS3OperationWithSource(request *C.restic_s3_request, options *C.restic_
 			return C.int32_t(status)
 		}
 	}
-	req, status := validateS3RequestOwned(request, nil, entry)
+	req, status := validateS3RequestDirectoriesOwned(request, nil, entry, stateIdentity, workspaceIdentity)
 	if status != StatusOk {
 		return C.int32_t(status)
 	}

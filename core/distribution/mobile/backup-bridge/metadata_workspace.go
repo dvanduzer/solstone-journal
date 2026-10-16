@@ -30,6 +30,10 @@ func isMetadataNonce(name string) bool {
 }
 
 func pinMetadataWorkspace(req *bridgeRequest, path string) (resultErr error) {
+	return pinMetadataWorkspaceExpected(req, path, nil)
+}
+
+func pinMetadataWorkspaceExpected(req *bridgeRequest, path string, expected *borrowedDirectoryIdentity) (resultErr error) {
 	if req.operation != OpSnapshot || req.metadataRoot != nil || req.sourceRoot == nil || req.repoRoot == nil && req.remote == nil {
 		return errors.New("invalid metadata workspace operation")
 	}
@@ -53,6 +57,9 @@ func pinMetadataWorkspace(req *bridgeRequest, path string) (resultErr error) {
 	}
 	if stat.Uid != uint32(os.Geteuid()) || stat.Mode&0777 != 0700 {
 		return errors.New("metadata workspace must be privately owned")
+	}
+	if !matchesBorrowedDirectory("workspace", file, expected) {
+		return errors.New("metadata workspace identity changed")
 	}
 	if err := reserveOwnedPrivateDirectory(file, req.owned); err != nil {
 		return err

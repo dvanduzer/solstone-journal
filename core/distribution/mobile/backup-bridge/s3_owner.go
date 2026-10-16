@@ -130,6 +130,10 @@ func newS3Owner(path string, cfg s3Config) (_ *s3Owner, resultErr error) {
 }
 
 func newS3OwnerOwned(path string, cfg s3Config, entry *ownedCall) (_ *s3Owner, resultErr error) {
+	return newS3OwnerExpected(path, cfg, entry, nil)
+}
+
+func newS3OwnerExpected(path string, cfg s3Config, entry *ownedCall, expected *borrowedDirectoryIdentity) (_ *s3Owner, resultErr error) {
 	destination, err := s3DestinationFor(cfg)
 	if err != nil || sanitizePath(path) != nil {
 		return nil, errS3OwnerInvalid
@@ -156,6 +160,9 @@ func newS3OwnerOwned(path string, cfg s3Config, entry *ownedCall) (_ *s3Owner, r
 	owner.directory = file
 	var stat unix.Stat_t
 	if unix.Fstat(int(file.Fd()), &stat) != nil || stat.Uid != uint32(os.Geteuid()) || stat.Mode&07777 != 0700 {
+		return nil, errS3OwnerInvalid
+	}
+	if !matchesBorrowedDirectory("state", file, expected) {
 		return nil, errS3OwnerInvalid
 	}
 	if err := reserveOwnedPrivateDirectory(file, entry); err != nil {

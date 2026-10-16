@@ -24,13 +24,14 @@ import (
 )
 
 type ownedFaultCase struct {
-	Stage     string `json:"stage"`
-	Remote    bool   `json:"remote"`
-	Published bool   `json:"published"`
-	Mode      string `json:"mode"`
-	Setup     string `json:"setup,omitempty"`
-	Options   bool   `json:"options,omitempty"`
-	Operation int32  `json:"operation,omitempty"`
+	Directories bool   `json:"directories,omitempty"`
+	Stage       string `json:"stage"`
+	Remote      bool   `json:"remote"`
+	Published   bool   `json:"published"`
+	Mode        string `json:"mode"`
+	Setup       string `json:"setup,omitempty"`
+	Options     bool   `json:"options,omitempty"`
+	Operation   int32  `json:"operation,omitempty"`
 }
 
 func ownedControlledFactory(entry *ownedCall, peer *s3MemoryPeer) {
@@ -100,8 +101,15 @@ func TestOwnedPublicCleanupFaultsRetainActualCustody(t *testing.T) {
 		cases = append(cases, ownedFaultCase{Stage: "metadata-clone-directory", Remote: false, Published: true, Mode: "closed-error", Setup: ""})
 	}
 
+	// Reuse every existing actual cleanup scenario through the new directory
+	// exports too; old option/source positives cannot qualify their call paths.
+	originalCases := append([]ownedFaultCase(nil), cases...)
+	for _, control := range originalCases {
+		control.Directories = true
+		cases = append(cases, control)
+	}
 	for _, control := range cases {
-		t.Run(fmt.Sprintf("%s/remote=%t/published=%t/%s", fmt.Sprint(control.Stage, "/", control.Setup, "/options=", control.Options, "/operation=", control.Operation), control.Remote, control.Published, control.Mode), func(t *testing.T) {
+		t.Run(fmt.Sprintf("%s/remote=%t/published=%t/%s", fmt.Sprint(control.Stage, "/", control.Setup, "/options=", control.Options, "/operation=", control.Operation, "/directories=", control.Directories), control.Remote, control.Published, control.Mode), func(t *testing.T) {
 			encoded, err := json.Marshal(control)
 			if err != nil {
 				t.Fatal(err)
@@ -306,6 +314,16 @@ func TestOwnedPublicCleanupFaultChild(t *testing.T) {
 			}
 		}
 	}
+	if control.Directories {
+		id, status := directoryCWithPaths(input, OpSnapshot, int(held.Fd()), []byte(`[]`))
+		if status != StatusOk || id == 0 {
+			t.Fatal("healthy directory export refused", status, id)
+		}
+		result, waited, freed := sourceCWaitAndFree(id)
+		if result.status != StatusOk || waited != StatusOk || freed != StatusOk {
+			t.Fatal("healthy directory export failed", result.status, result.diagnostic, waited, freed)
+		}
+	}
 	if copied.Load() == 0 || opens.Load() == 0 || workers.Load() == 0 {
 		t.Fatal("production observers were not positively calibrated")
 	}
@@ -381,7 +399,13 @@ func TestOwnedPublicCleanupFaultChild(t *testing.T) {
 		if operation == OpSnapshot {
 			selection = []byte(`[]`)
 		}
-		id, status := sourceCVersionedStart(input, operation, !control.Options, descriptor, selection, 0)
+		var id uint64
+		var status int32
+		if control.Directories {
+			id, status = directoryCWithPaths(input, operation, descriptor, selection)
+		} else {
+			id, status = sourceCVersionedStart(input, operation, !control.Options, descriptor, selection, 0)
+		}
 		returned <- started{id, status}
 	}()
 	var entry *ownedCall

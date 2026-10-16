@@ -506,6 +506,54 @@ func restic_bridge_operation_v1_start(request *C.restic_request, options *C.rest
 	return C.int32_t(status)
 }
 
+//export restic_bridge_operation_directories_v1_start
+func restic_bridge_operation_directories_v1_start(request *C.restic_request, options *C.restic_operation_options_v1, sourceFD C.int32_t, workspaceFD C.int32_t, workspace *C.char, workspaceLen C.uint32_t, policy *C.char, policyLen C.uint32_t, outID *C.uint64_t) (returned C.int32_t) {
+	if outID == nil {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	*outID = 0
+	entry, status := reserveOwnedCall()
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	defer func() { returned = C.int32_t(entry.finishAdmission(int32(returned))) }()
+	if request == nil || !normalDirectoryOperation(int32(request.operation)) || request.restore_path_len != 0 || request.snapshot_id_len != 0 {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	ownedOptions, status := parseCOperationOptions(int32(request.operation), options)
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	if request.operation == C.int32_t(OpSnapshot) {
+		selection, status := parseCSnapshotSelection(policy, policyLen)
+		if status != StatusOk {
+			return C.int32_t(status)
+		}
+		source, status := readBorrowedSourceIdentity(int(sourceFD))
+		if status != StatusOk {
+			return C.int32_t(status)
+		}
+		metadata, status := readBorrowedDirectoryIdentity(int(workspaceFD))
+		if status != StatusOk {
+			return C.int32_t(status)
+		}
+		return startWithWorkspaceDirectoriesOwned(request, workspace, workspaceLen, selection, ownedOptions, source, metadata, entry, outID)
+	}
+	if sourceFD != -1 || workspaceFD != -1 || request.source_path_len != 0 || workspaceLen != 0 || policyLen != 0 {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	req, status := validateRequestOwned(request, entry)
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	req.executionOptions = ownedOptions
+	id, status := startBridgeCall(req)
+	if status == StatusOk {
+		*outID = C.uint64_t(id)
+	}
+	return C.int32_t(status)
+}
+
 //export restic_bridge_start
 func restic_bridge_start(req *C.restic_request, outID *C.uint64_t) C.int32_t {
 	if outID == nil {
@@ -681,6 +729,10 @@ func startWithWorkspaceSource(req *C.restic_request, workspace *C.char, workspac
 }
 
 func startWithWorkspaceSourceOwned(req *C.restic_request, workspace *C.char, workspaceLen C.uint32_t, selection *snapshotSelection, options *operationOptions, expected *borrowedSourceIdentity, entry *ownedCall, outID *C.uint64_t) C.int32_t {
+	return startWithWorkspaceDirectoriesOwned(req, workspace, workspaceLen, selection, options, expected, nil, entry, outID)
+}
+
+func startWithWorkspaceDirectoriesOwned(req *C.restic_request, workspace *C.char, workspaceLen C.uint32_t, selection *snapshotSelection, options *operationOptions, expected *borrowedSourceIdentity, workspaceIdentity *borrowedDirectoryIdentity, entry *ownedCall, outID *C.uint64_t) C.int32_t {
 	if outID == nil {
 		return C.int32_t(StatusInvalidArgument)
 	}
@@ -699,7 +751,7 @@ func startWithWorkspaceSourceOwned(req *C.restic_request, workspace *C.char, wor
 	if status != StatusOk {
 		return C.int32_t(status)
 	}
-	if err := pinMetadataWorkspace(&breq, path); err != nil {
+	if err := pinMetadataWorkspaceExpected(&breq, path, workspaceIdentity); err != nil {
 		if entry != nil {
 			status := StatusInvalidArgument
 			if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {

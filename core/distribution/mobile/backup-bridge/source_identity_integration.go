@@ -94,6 +94,8 @@ int32_t restic_bridge_snapshot_source_v1_start(restic_request*,restic_operation_
 int32_t restic_bridge_s3_snapshot_source_v1_start(restic_s3_request*,restic_operation_options_v1*,int32_t,const char*,uint32_t,uint64_t*);
 int32_t restic_bridge_operation_v1_start(restic_request*,restic_operation_options_v1*,const char*,uint32_t,const char*,uint32_t,uint64_t*);
 int32_t restic_bridge_s3_operation_v1_start(restic_s3_request*,restic_operation_options_v1*,const char*,uint32_t,uint64_t*);
+int32_t restic_bridge_operation_directories_v1_start(restic_request*,restic_operation_options_v1*,int32_t,int32_t,const char*,uint32_t,const char*,uint32_t,uint64_t*);
+int32_t restic_bridge_s3_operation_directories_v1_start(restic_s3_request*,restic_operation_options_v1*,int32_t,int32_t,int32_t,const char*,uint32_t,uint64_t*);
 int32_t restic_bridge_cancel(uint64_t);
 int32_t restic_bridge_wait(uint64_t,restic_result*);
 int32_t restic_bridge_free(uint64_t);
@@ -113,6 +115,14 @@ func sourceCStart(input sourceCInput, fd int, selection []byte, retryMillis uint
 }
 
 func sourceCVersionedStart(input sourceCInput, operation int32, sourceEntry bool, fd int, selection []byte, retryMillis uint64) (uint64, int32) {
+	return sourceCDispatch(input, operation, sourceEntry, fd, selection, retryMillis, nil)
+}
+
+func directoryCStart(input sourceCInput, operation int32, sourceFD, stateFD, workspaceFD int, selection []byte, retryMillis uint64) (uint64, int32) {
+	return sourceCDispatch(input, operation, false, sourceFD, selection, retryMillis, &[2]int{stateFD, workspaceFD})
+}
+
+func sourceCDispatch(input sourceCInput, operation int32, sourceEntry bool, fd int, selection []byte, retryMillis uint64, directories *[2]int) (uint64, int32) {
 	var allocations []unsafe.Pointer
 	defer func() {
 		for _, p := range allocations {
@@ -150,7 +160,9 @@ func sourceCVersionedStart(input sourceCInput, operation int32, sourceEntry bool
 		if operation == OpSnapshot {
 			workspace, workspaceLen = text(input.workspace)
 		}
-		if sourceEntry {
+		if directories != nil {
+			status = C.restic_bridge_operation_directories_v1_start(&request, &options, C.int32_t(fd), C.int32_t(directories[1]), workspace, workspaceLen, policy, policyLen, &id)
+		} else if sourceEntry {
 			status = C.restic_bridge_snapshot_source_v1_start(&request, &options, C.int32_t(fd), workspace, workspaceLen, policy, policyLen, &id)
 		} else {
 			status = C.restic_bridge_operation_v1_start(&request, &options, workspace, workspaceLen, policy, policyLen, &id)
@@ -176,7 +188,12 @@ func sourceCVersionedStart(input sourceCInput, operation int32, sourceEntry bool
 		if operation == OpSnapshot {
 			request.workspace_path, request.workspace_path_len = text(input.workspace)
 		}
-		if sourceEntry {
+		if operation == OpS3Inspect {
+			request.password, request.password_len = nil, 0
+		}
+		if directories != nil {
+			status = C.restic_bridge_s3_operation_directories_v1_start(&request, &options, C.int32_t(fd), C.int32_t(directories[0]), C.int32_t(directories[1]), policy, policyLen, &id)
+		} else if sourceEntry {
 			status = C.restic_bridge_s3_snapshot_source_v1_start(&request, &options, C.int32_t(fd), policy, policyLen, &id)
 		} else {
 			status = C.restic_bridge_s3_operation_v1_start(&request, &options, policy, policyLen, &id)
@@ -200,7 +217,7 @@ func sourceCWaitAndFree(id uint64) (bridgeResult, int32, int32) {
 	}
 	defer C.free(unsafe.Pointer(output))
 	status := C.restic_bridge_wait(C.uint64_t(id), output)
-	result := bridgeResult{status: int32(output.status), snapshotID: C.GoString(&output.snapshot_id[0]), keyID: C.GoString(&output.key_id[0]), diagnostic: C.GoString(&output.diagnostic[0])}
+	result := bridgeResult{status: int32(output.status), snapshotCount: uint32(output.snapshot_count), snapshotID: C.GoString(&output.snapshot_id[0]), keyID: C.GoString(&output.key_id[0]), diagnostic: C.GoString(&output.diagnostic[0])}
 	freed := C.restic_bridge_free(C.uint64_t(id))
 	return result, int32(status), int32(freed)
 }

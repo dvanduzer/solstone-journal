@@ -471,6 +471,13 @@ int main(void) {{
         self.run_step("options-c-link", options_link, cwd=host_artifacts, env=env)
         self.run_step("options-c-run", [options_bin, host_artifacts], cwd=host_artifacts, env=env)
 
+        directories_caller = host_artifacts / "directories-caller.c"
+        shutil.copy2(BRIDGE_SRC_PATH / "directory_identity_caller.c.fixture", directories_caller)
+        directories_bin = host_artifacts / "directories-caller"
+        directories_link = [str(item) if item not in (host_caller, host_caller_bin) else str(directories_caller if item == host_caller else directories_bin) for item in host_link]
+        self.run_step("directories-c-link", directories_link, cwd=host_artifacts, env=env)
+        self.run_step("directories-c-run", [directories_bin, host_artifacts], cwd=host_artifacts, env=env)
+
         identity_caller = host_artifacts / "identity-caller.c"
         shutil.copy2(BRIDGE_SRC_PATH / "build_identity_caller.c.fixture", identity_caller)
         identity_bin = host_artifacts / "identity-caller"
@@ -573,8 +580,10 @@ int main(void) {{
             '    int32_t remote_normal = restic_bridge_s3_operation_v1_start(0, 0, 0, 0, &id);\n'
             '    int32_t source = restic_bridge_snapshot_source_v1_start(0, 0, -1, 0, 0, 0, 0, &id);\n'
             '    int32_t remote_source = restic_bridge_s3_snapshot_source_v1_start(0, 0, -1, 0, 0, &id);\n'
+            '    int32_t directories = restic_bridge_operation_directories_v1_start(0, 0, -1, -1, 0, 0, 0, 0, &id);\n'
+            '    int32_t remote_directories = restic_bridge_s3_operation_directories_v1_start(0, 0, -1, -1, -1, 0, 0, &id);\n'
             '    int32_t identity = restic_bridge_build_identity_v1(0, 32);\n'
-            '    return rc == 0 || cancelled == 0 || waited == 0 || freed == 0 || metadata == 0 || selected == 0 || remote_selected == 0 || normal == 0 || remote_normal == 0 || source == 0 || remote_source == 0 || identity == 0 ? 1 : 0;\n'
+            '    return rc == 0 || cancelled == 0 || waited == 0 || freed == 0 || metadata == 0 || selected == 0 || remote_selected == 0 || normal == 0 || remote_normal == 0 || source == 0 || remote_source == 0 || directories == 0 || remote_directories == 0 || identity == 0 ? 1 : 0;\n'
             '}\n'
         )
         caller_bin = artifacts_dir / "caller-link"
