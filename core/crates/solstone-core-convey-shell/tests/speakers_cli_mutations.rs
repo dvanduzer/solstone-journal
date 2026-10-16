@@ -1301,7 +1301,7 @@ async fn test_hooks_pause_after_snapshot_concurrent_status_waits() {
 }
 
 #[cfg(feature = "test-hooks")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_hooks_stale_confirm_cannot_clear_replacement() {
     use solstone_core_convey_shell::speakers_owner_write::test_hooks;
     use solstone_core_speaker_resolve::owner_candidate::{

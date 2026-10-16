@@ -300,10 +300,16 @@ pub fn discover_index_status_files(
         return Err(DiscoveryError::NonUtf8Root(journal.to_path_buf()));
     }
 
+    let journal_clean = glob_root_path(journal);
+    let normalized = journal_clean.to_str().expect("UTF-8 root checked above");
+    // Escaped or relative prefixes retain the original glob's traversal and
+    // error behavior. Only absolute literal prefixes use shared listings.
+    if !journal_clean.is_absolute() || Pattern::escape(normalized) != normalized {
+        return discover_indexable_files(journal);
+    }
+
     let mut files = BTreeMap::new();
     let mut listing_cache = HashMap::new();
-
-    let journal_clean = glob_root_path(journal);
     let journal_scope = if journal == Path::new(".") {
         PathBuf::from(".")
     } else {
@@ -735,7 +741,11 @@ mod tests {
     #[test]
     fn status_walk_equals_oracle_with_metacharacter_root() {
         let parent = temp_root("status-meta-root");
-        let root = parent.join("journal-[meta]?*");
+        let root = parent.join(if cfg!(windows) {
+            "journal-[meta]"
+        } else {
+            "journal-[meta]?*"
+        });
         fs::create_dir_all(&root).expect("create meta root");
         write(&root, "chronicle/20240101/talents/flow.md");
         write(&root, "facets/work/news/20240101.md");
@@ -985,13 +995,13 @@ mod tests {
         fs::remove_dir_all(external).expect("cleanup external");
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "full-tests"))]
     struct TempRoot {
         path: PathBuf,
         restore: Vec<(PathBuf, u32)>,
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "full-tests"))]
     impl TempRoot {
         fn new(name: &str) -> Self {
             Self {
@@ -1005,7 +1015,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "full-tests"))]
     impl std::ops::Deref for TempRoot {
         type Target = Path;
 
@@ -1014,14 +1024,14 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "full-tests"))]
     impl AsRef<Path> for TempRoot {
         fn as_ref(&self) -> &Path {
             &self.path
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "full-tests"))]
     impl Drop for TempRoot {
         fn drop(&mut self) {
             use std::os::unix::fs::PermissionsExt;
@@ -1032,7 +1042,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "full-tests"))]
     #[test]
     fn status_walk_semantics_execute_only_ancestor_matches_oracle() {
         use std::os::unix::fs::PermissionsExt;
@@ -1081,7 +1091,7 @@ mod tests {
         assert_eq!(err_status.to_string(), err_oracle.to_string());
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "full-tests"))]
     #[test]
     fn status_walk_semantics_first_unreadable_directory_error_matches_oracle() {
         use std::os::unix::fs::PermissionsExt;
@@ -1129,7 +1139,7 @@ mod tests {
         assert_eq!(err_status.to_string(), err_oracle.to_string());
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "full-tests"))]
     #[test]
     fn status_walk_semantics_unreadable_unmatched_directory_does_not_error() {
         use std::os::unix::fs::PermissionsExt;

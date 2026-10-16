@@ -773,7 +773,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "full-tests"))]
+#[cfg(all(test, feature = "full-tests", unix))]
 mod permission_tests {
     use super::*;
     use std::fs::{self, File};

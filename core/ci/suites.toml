@@ -869,8 +869,10 @@ areas = ["indexing"]
 platforms = ["linux", "macos", "windows"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
-default_full = false
+default_full = true
 runtime = "none"
+
+features = ["full-tests"]
 
 [[package_suites]]
 id = "package::solstone-core-indexer-query"
@@ -3140,6 +3142,19 @@ prerequisites = ["cargo-cache"]
 timeout = "standard"
 default_full = true
 required_features = []
+runtime = "none"
+
+[[suites]]
+id = "solstone-core-indexer::status_discovery_roots"
+package = "solstone-core-indexer"
+target = "status_discovery_roots"
+set = "component"
+areas = ["indexing"]
+platforms = ["linux", "macos", "windows"]
+prerequisites = ["cargo-cache"]
+timeout = "standard"
+default_full = true
+required_features = ["full-tests"]
 runtime = "none"
 
 [[suites]]
