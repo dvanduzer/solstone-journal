@@ -67,6 +67,31 @@ def tree_digest(root):
     return digest.hexdigest()
 
 
+BUILD_IDENTITY_SCHEMA = "solstone-mobile-backup-linked-build-v1"
+
+
+def linked_build_identity(goos, goarch, toolchain_sha256):
+    """Source provenance supplied to the actual archive, never runtime input."""
+    fields = {
+        "schema": BUILD_IDENTITY_SCHEMA,
+        "abi": "1",
+        "goos": goos,
+        "goarch": goarch,
+        "inputs_sha256": sha256(INPUTS_PATH),
+        "builder_sha256": sha256(Path(__file__)),
+        "acquisition_helper_sha256": sha256(ROOT / "scripts/android_cross_build.py"),
+        "bridge_source_sha256": tree_digest(BRIDGE_SRC_PATH),
+        "library_safety_patch_sha256": sha256(BRIDGE_SRC_PATH / "restic-library-safety.patch"),
+        "rooted_restorer_patch_sha256": sha256(BRIDGE_SRC_PATH / "restic-rooted-restorer.patch"),
+        "existing_root_patch_sha256": sha256(BRIDGE_SRC_PATH / "restic-existing-root.patch"),
+        "restic_archive_sha256": json.loads(INPUTS_PATH.read_text())["inputs"]["restic"]["sha256"],
+        "toolchain_archive_sha256": toolchain_sha256,
+    }
+    canonical = json.dumps(fields, sort_keys=True, separators=(",", ":")).encode("ascii")
+    digest = hashlib.sha256(BUILD_IDENTITY_SCHEMA.encode("ascii") + b"\0" + canonical).hexdigest()
+    return fields, digest
+
+
 def check_native_http_closure(selection, target, header, symbols):
     selected = {
         key: selection.get(key, []) for key in ("GoFiles", "CgoFiles", "MFiles", "HFiles")
@@ -336,6 +361,16 @@ class BridgeBuild:
         self.run_step("go-compile-integration", [go_bin, "test", "-buildvcs=false", "-c", "-tags", "integration", "-o", integration_bin, "./mobilebackup"], cwd=restic_dir, env=env)
         self.run_step("go-run-integration", [integration_bin, "-test.count=1"], cwd=restic_dir, env=env)
 
+        host_identity, host_identity_sha256 = linked_build_identity(env["GOOS"], env["GOARCH"], toolchain_pin["sha256"])
+        target_identity, target_identity_sha256 = linked_build_identity(goos, goarch, toolchain_pin["sha256"])
+        self.receipt.update({
+            "host_linked_build_identity": host_identity,
+            "host_linked_build_identity_sha256": host_identity_sha256,
+            "linked_build_identity": target_identity,
+            "linked_build_identity_sha256": target_identity_sha256,
+        })
+        self.save_receipt()
+
         # Exercise the exported ABI through a real host C caller. The target
         # archive receives its own link/platform checks below; an iOS executable
         # cannot be executed by the Darwin build host.
@@ -345,6 +380,7 @@ class BridgeBuild:
         self.run_step(
             "host-c-archive-build",
             [go_bin, "build", "-trimpath", "-mod=readonly", "-buildvcs=false",
+             "-ldflags=-X=main.linkedBuildIdentitySha256=" + host_identity_sha256,
              "-tags=selfupdate,disable_grpc_modules", "-buildmode=c-archive",
              "-o", host_archive, "./mobilebackup"],
             cwd=restic_dir, env=env,
@@ -435,6 +471,13 @@ int main(void) {{
         self.run_step("options-c-link", options_link, cwd=host_artifacts, env=env)
         self.run_step("options-c-run", [options_bin, host_artifacts], cwd=host_artifacts, env=env)
 
+        identity_caller = host_artifacts / "identity-caller.c"
+        shutil.copy2(BRIDGE_SRC_PATH / "build_identity_caller.c.fixture", identity_caller)
+        identity_bin = host_artifacts / "identity-caller"
+        identity_link = [str(item) if item not in (host_caller, host_caller_bin) else str(identity_caller if item == host_caller else identity_bin) for item in host_link]
+        self.run_step("identity-c-link", identity_link, cwd=host_artifacts, env=env)
+        self.run_step("identity-c-run", [identity_bin, host_identity_sha256], cwd=host_artifacts, env=env)
+
         rooted_caller = host_artifacts / "rooted-caller.c"
         shutil.copy2(BRIDGE_SRC_PATH / "rooted_restore_caller.c.fixture", rooted_caller)
         rooted_bin = host_artifacts / "rooted-caller"
@@ -487,6 +530,7 @@ int main(void) {{
             "-trimpath",
             "-mod=readonly",
             "-buildvcs=false",
+            "-ldflags=-X=main.linkedBuildIdentitySha256=" + target_identity_sha256,
             "-tags=selfupdate,disable_grpc_modules",
             "-buildmode=c-archive",
             "-o", archive_path,
@@ -529,7 +573,8 @@ int main(void) {{
             '    int32_t remote_normal = restic_bridge_s3_operation_v1_start(0, 0, 0, 0, &id);\n'
             '    int32_t source = restic_bridge_snapshot_source_v1_start(0, 0, -1, 0, 0, 0, 0, &id);\n'
             '    int32_t remote_source = restic_bridge_s3_snapshot_source_v1_start(0, 0, -1, 0, 0, &id);\n'
-            '    return rc == 0 || cancelled == 0 || waited == 0 || freed == 0 || metadata == 0 || selected == 0 || remote_selected == 0 || normal == 0 || remote_normal == 0 || source == 0 || remote_source == 0 ? 1 : 0;\n'
+            '    int32_t identity = restic_bridge_build_identity_v1(0, 32);\n'
+            '    return rc == 0 || cancelled == 0 || waited == 0 || freed == 0 || metadata == 0 || selected == 0 || remote_selected == 0 || normal == 0 || remote_normal == 0 || source == 0 || remote_source == 0 || identity == 0 ? 1 : 0;\n'
             '}\n'
         )
         caller_bin = artifacts_dir / "caller-link"

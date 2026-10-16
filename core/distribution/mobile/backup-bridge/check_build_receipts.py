@@ -17,6 +17,38 @@ import backup_bridge_build as bridge_build
 
 
 class TestBackupBridgeBuild(unittest.TestCase):
+    def test_linked_identity_binds_staged_producer_dependencies_and_new_bridge_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            module, args = self.staged_build(root)
+            build = module.BridgeBuild(args)
+            toolchain = build.inputs["go-android"]["sha256"]
+            fields, original = module.linked_build_identity("linux", "amd64", toolchain)
+            self.assertEqual(fields["acquisition_helper_sha256"], module.sha256(module.ROOT / "scripts/android_cross_build.py"))
+            self.assertEqual(len(original), 64)
+            self.assertEqual(module.linked_build_identity("linux", "amd64", toolchain)[1], original)
+            for path in [
+                module.ROOT / "scripts/android_cross_build.py",
+                Path(module.__file__), module.INPUTS_PATH,
+                module.BRIDGE_SRC_PATH / "restic-library-safety.patch",
+                module.BRIDGE_SRC_PATH / "restic-rooted-restorer.patch",
+                module.BRIDGE_SRC_PATH / "restic-existing-root.patch",
+            ]:
+                prior = path.read_bytes()
+                try:
+                    # JSON input gets a whitespace-only change, preserving parse.
+                    path.write_bytes(prior + b"\n")
+                    self.assertNotEqual(module.linked_build_identity("linux", "amd64", toolchain)[1], original, str(path))
+                finally:
+                    path.write_bytes(prior)
+            added = module.BRIDGE_SRC_PATH / "unexpected-new-source.go"
+            added.write_text("package main\n")
+            self.assertNotEqual(module.linked_build_identity("linux", "amd64", toolchain)[1], original)
+            added.unlink()
+            self.assertEqual(module.linked_build_identity("linux", "amd64", toolchain)[1], original)
+            for os_name, arch, pin in [("ios", "amd64", toolchain), ("linux", "arm64", toolchain), ("linux", "amd64", "0" * 64)]:
+                self.assertNotEqual(module.linked_build_identity(os_name, arch, pin)[1], original)
+
     def test_native_http_closure_refuses_selected_or_linked_qualification_authority(self):
         selection = {"CgoFiles": ["native_http_apple.go", "s3_owner_policy_apple.go"], "MFiles": ["native_http_darwin.m", "s3_owner_policy_darwin.m"]}
         bridge_build.check_native_http_closure(selection, "ios", "public ABI", "fixed native symbols")

@@ -1,0 +1,35 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 sol pbc
+
+#include "librestic_bridge.h"
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+int main(int argc, char **argv) {
+    if (argc != 2) return 2;
+    int unavailable = strcmp(argv[1], "unavailable") == 0;
+    if (!unavailable && strlen(argv[1]) != 64) return 2;
+    uint8_t bytes[34];
+    memset(bytes, 0xa5, sizeof(bytes));
+    if (restic_bridge_build_identity_v1(NULL, 32) == 0) return 3;
+    for (uint32_t size = 0; size <= 33; size++) {
+        if (size == 32) continue;
+        if (restic_bridge_build_identity_v1(bytes + 1, size) == 0) return 4;
+        for (size_t i = 0; i < sizeof(bytes); i++) if (bytes[i] != 0xa5) return 5;
+    }
+    int32_t status = restic_bridge_build_identity_v1(bytes + 1, 32);
+    if (bytes[0] != 0xa5 || bytes[33] != 0xa5) return 7;
+    if (unavailable) {
+        if (status == 0) return 6;
+        for (size_t i = 1; i <= 32; i++) if (bytes[i] != 0) return 9;
+        puts("unassigned linked build identity refused and cleared output");
+        return 0;
+    }
+    if (status != 0) return 6;
+    char actual[65];
+    for (size_t i = 0; i < 32; i++) snprintf(actual + 2*i, 3, "%02x", bytes[i+1]);
+    if (strcmp(actual, argv[1]) != 0) return 8;
+    puts("actual linked build identity and bounded getter passed");
+    return 0;
+}
