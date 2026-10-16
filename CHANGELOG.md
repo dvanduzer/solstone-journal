@@ -12,6 +12,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- while catching up on older recordings, your journal could think about the same recording over and over. this happened when an earlier version had started a step for it, and that step no longer exists. each recording like this now gets at most one more look, and then it is left alone.
 - downloading location accuracy no longer pauses to save its progress after every small piece of the download, which could make it take hours on windows.
 - on linux, installing your journal now retries interrupted downloads and temporary download errors. an incomplete download reports a download failure instead of a signature mismatch.
 - on ubuntu 22.04, the installer points you to Minisign's installation page when the verifier is missing.
