@@ -1929,7 +1929,7 @@ fn journal_sync_does_not_name_the_running_resident_as_another_writer() {
 
     let row = result("journal_sync", &context);
     assert_eq!(row.status, Status::Ok, "{}", row.detail);
-    assert_eq!(row.detail, "this device only (fixture-host)");
+    assert_eq!(row.detail, "this computer only (fixture-host)");
 
     // Another machine's heartbeat is still named.
     let foreign = write_sync_heartbeat_fixture(

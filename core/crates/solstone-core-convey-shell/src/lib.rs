@@ -1058,6 +1058,7 @@ fn router_with_roots(
         .route("/favicon.ico", get(favicon))
         .route("/static/{*path}", get(static_asset))
         .route("/api/shell", get(shell_api))
+        .route("/api/streams/labels", get(streams_labels_api))
         .route(
             "/api/system/about",
             get(|| async {
@@ -1482,6 +1483,28 @@ async fn shell_api(
         }),
     );
     Json(Value::Object(payload)).into_response()
+}
+
+async fn streams_labels_api(Extension(journal): Extension<Arc<JournalRoot>>) -> Response {
+    let table = solstone_core_home::provenance::load_stream_labels(&journal.0);
+    match table.status {
+        solstone_core_home::provenance::LabelTableStatus::Failed => {
+            Json(serde_json::json!({ "status": "failed" })).into_response()
+        }
+        status => {
+            let status_str = match status {
+                solstone_core_home::provenance::LabelTableStatus::Complete => "complete",
+                solstone_core_home::provenance::LabelTableStatus::Partial => "partial",
+                solstone_core_home::provenance::LabelTableStatus::Failed => unreachable!(),
+            };
+            let labels = solstone_core_home::provenance::rendered_stream_labels(&table);
+            Json(serde_json::json!({
+                "status": status_str,
+                "labels": labels,
+            }))
+            .into_response()
+        }
+    }
 }
 
 async fn app_bare(Path(app): Path<String>, include_agents: bool) -> Response {

@@ -113,29 +113,21 @@
       !/55/.test(segment) && window.JournalFormat.segmentTime('200155_300') === '20:01:55',
       `got "${segment}"`);
 
-    // JournalFormat.stream: a stream key is structured, so it is parsed, not
-    // stripped of its punctuation. G1-203 / S-1. An import source in the
-    // catalog's brand table reads the way the import screen writes it; one
-    // outside it keeps the parsed lowercase form. S-8.
+    // JournalFormat.stream: recast at part level.
     for (const [key, expected] of [
-      ['device.watch.audio', 'watch audio'],
-      ['device.omi.audio', 'omi audio'],
-      ['device.pixel_watch.audio', 'pixel watch audio'],
-      ['import.chatgpt', 'ChatGPT import'],
-      ['import.apple_health', 'Apple Health import'],
-      ['import.oura', 'Oura import'],
-      ['import.granola', 'granola import'],
-      ['ja1r', 'ja1r'],
-      ['192-168-1-1', '192-168-1-1'],
-      ['_default', 'default'],
-      ['', ''],
+      ['import.chatgpt', 'ChatGPT · imported'],
+      ['import.strava', 'Strava · imported'],
+      ['import.ics', 'calendar · imported'],
+      ['import.some_tool', 'some tool · imported'],
+      ['my-host.tmux', 'your terminal'],
+      ['device.watch.audio', 'source unknown'],
+      ['ja1r', 'source unknown'],
+      ['_default', 'source unknown'],
     ]) {
       const actual = window.JournalFormat.stream(key);
       assert(`JournalFormat.stream(${JSON.stringify(key)})`, actual === expected,
         `expected "${expected}", got "${actual}"`);
     }
-    assert('JournalFormat.stream keeps no dot on a parsed key',
-      !window.JournalFormat.stream('device.watch.audio').includes('.'));
 
     // JournalFormat.duration: seconds in, and an hours rung so a stats bucket
     // of 1,995 minutes does not read "1995 min 0 sec". S-3 / G2-B14. A zero

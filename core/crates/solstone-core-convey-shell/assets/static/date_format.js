@@ -111,6 +111,11 @@
     // body sources
     apple_health: 'Apple Health',
     oura: 'Oura',
+    strava: 'Strava',
+    ics: 'calendar',
+    document: 'documents',
+    image: 'images',
+    audio: 'audio',
     // import catalog
     chatgpt: 'ChatGPT',
     claude: 'Claude',
@@ -120,28 +125,130 @@
     obsidian: 'notes',
   };
 
-  // A stream key is structured, so parse it rather than stripping punctuation:
-  // `device.watch.audio` names a watch's audio, not a device called "device
-  // watch audio", and `import.chatgpt` is a ChatGPT import, not "import
-  // chatgpt". A dot-free key is the machine's own name and stands as it is.
-  // Anything else falls back to the old separator swap. G1-203.
-  function formatStreamLabel(stream) {
-    const raw = String(stream || '').trim();
+  let streamLabelsTable = null;
+  let streamLabelsFailed = false;
+  let inFlightLabelsFetch = null;
+  const settledRereadStreams = new Set();
+
+  function dottedFallback(raw) {
+    if (!raw || raw === '_default') return 'source unknown';
     const parts = raw.split('.').filter(part => part !== '');
-    const device = /^device[._-](.+)[._-](audio|screen)$/.exec(raw);
-    if (device) return `${device[1].replace(/[._-]+/g, ' ')} ${device[2]}`;
-    const words = part => part.replace(/[_-]+/g, ' ').trim();
-    // A machine's own stream name is one dot-free label the journal already
-    // reduced from its hostname; it reads as itself, dashes and all.
-    if (parts.length === 1 && /^[a-z0-9][a-z0-9-]*$/.test(parts[0])) return parts[0];
-    if (parts[0] === 'device' && parts.length >= 3) return parts.slice(1).map(words).join(' ').trim();
+    if (parts.length <= 1) return 'source unknown';
     if (parts[0] === 'import' && parts.length === 2) {
       const branded = Object.prototype.hasOwnProperty.call(IMPORT_SOURCE_LABELS, parts[1])
         ? IMPORT_SOURCE_LABELS[parts[1]]
-        : words(parts[1]);
-      return `${branded} import`;
+        : parts[1].replace(/[_-]+/g, ' ').trim().toLowerCase();
+      return `${branded} · imported`;
     }
-    return raw.replace(/[._-]+/g, ' ').trim();
+    if (parts.length === 2) {
+      const qualifier = parts[1];
+      if (qualifier === 'tmux') return 'your terminal';
+      if (qualifier === 'watch') return 'your watch';
+      if (qualifier === 'mobile' || qualifier === 'phone') return 'your phone';
+      if (qualifier === 'browser') return 'your browser';
+    }
+    return 'source unknown';
+  }
+
+  function installStreamLabels(body) {
+    if (!body || typeof body !== 'object' || body.status === 'failed') {
+      if (!streamLabelsTable) {
+        streamLabelsFailed = true;
+      }
+      return;
+    }
+    if (body.status === 'complete') {
+      streamLabelsTable = {
+        status: 'complete',
+        labels: Object.assign({}, body.labels || {}),
+      };
+      streamLabelsFailed = false;
+      return;
+    }
+    if (body.status === 'partial') {
+      if (!streamLabelsTable || streamLabelsTable.status !== 'complete') {
+        streamLabelsTable = {
+          status: 'partial',
+          labels: Object.assign({}, body.labels || {}),
+        };
+        streamLabelsFailed = false;
+      }
+    }
+  }
+
+  function formatStreamLabel(stream) {
+    const raw = String(stream || '').trim();
+    if (!raw || raw === '_default') return 'source unknown';
+    if (streamLabelsTable && (streamLabelsTable.status === 'complete' || streamLabelsTable.status === 'partial')) {
+      if (Object.prototype.hasOwnProperty.call(streamLabelsTable.labels, raw)) {
+        return streamLabelsTable.labels[raw];
+      }
+      return 'source unknown';
+    }
+    return dottedFallback(raw);
+  }
+
+  function beginStreamLabels() {
+    if (inFlightLabelsFetch) {
+      return inFlightLabelsFetch;
+    }
+    let loggedThisWave = false;
+    const logOnce = (msg) => {
+      if (!loggedThisWave) {
+        loggedThisWave = true;
+        if (typeof window !== 'undefined' && typeof window.logError === 'function') {
+          window.logError(msg);
+        }
+      }
+    };
+
+    inFlightLabelsFetch = fetch('/api/streams/labels')
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
+      .then((body) => {
+        if (body && body.status === 'complete') {
+          installStreamLabels(body);
+        } else if (body && body.status === 'partial') {
+          installStreamLabels(body);
+          logOnce('stream labels partial');
+        } else {
+          logOnce('stream labels failed');
+        }
+        return body;
+      })
+      .catch((err) => {
+        logOnce(err && err.message ? err.message : String(err));
+        throw err;
+      })
+      .finally(() => {
+        inFlightLabelsFetch = null;
+      });
+
+    return inFlightLabelsFetch;
+  }
+
+  function noteLiveStream(name) {
+    const raw = String(name || '').trim();
+    if (!raw || raw === '_default') {
+      return Promise.resolve('source unknown');
+    }
+    if (streamLabelsTable && Object.prototype.hasOwnProperty.call(streamLabelsTable.labels, raw)) {
+      return Promise.resolve(streamLabelsTable.labels[raw]);
+    }
+    if (settledRereadStreams.has(raw)) {
+      return Promise.resolve(formatStreamLabel(raw));
+    }
+    return beginStreamLabels()
+      .then(() => {
+        settledRereadStreams.add(raw);
+        return formatStreamLabel(raw);
+      })
+      .catch(() => {
+        settledRereadStreams.add(raw);
+        return formatStreamLabel(raw);
+      });
   }
 
   function parseSegmentClock(segment) {
@@ -266,6 +373,21 @@
       : day + " '" + String(value.getFullYear()).slice(-2);
   }
 
-  window.JournalFormat = { processingLane, sinceDay, compactTokens: value => value >= 999500 ? `${Math.round(value / 1000000)}M` : value >= 1000 ? `${Math.round(value / 1000)}K` : String(Math.round(value)),  day: formatDateShort, dayFull: formatDateFull, stream: formatStreamLabel, segmentTime: formatSegmentTime, segmentTimeOfDay: formatSegmentTimeOfDay, timestamp: formatTimestamp, time: formatTimeOfDay, duration: formatDuration };
+  window.JournalFormat = {
+    processingLane,
+    sinceDay,
+    compactTokens: value => value >= 999500 ? `${Math.round(value / 1000000)}M` : value >= 1000 ? `${Math.round(value / 1000)}K` : String(Math.round(value)),
+    day: formatDateShort,
+    dayFull: formatDateFull,
+    stream: formatStreamLabel,
+    installStreamLabels,
+    beginStreamLabels,
+    noteLiveStream,
+    segmentTime: formatSegmentTime,
+    segmentTimeOfDay: formatSegmentTimeOfDay,
+    timestamp: formatTimestamp,
+    time: formatTimeOfDay,
+    duration: formatDuration,
+  };
   window.formatDateShort = formatDateShort;
 })();

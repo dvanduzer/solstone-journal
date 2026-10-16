@@ -451,20 +451,30 @@ function createHarness(options = {}) {
   const logErrors = [];
   const backgroundFailures = [];
   const readyCalls = [];
+  const setTimeoutFn = options.setTimeout || setTimeout;
+  const clearTimeoutFn = options.clearTimeout || clearTimeout;
   const fetch = (url) => {
     const requested = String(url);
     fetchCalls.push(requested);
     const fixture = options.fetchResponses?.[requested];
     if (!fixture) {
+      if (requested === '/api/streams/labels') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          text() { return Promise.resolve(JSON.stringify({ status: 'complete', labels: {} })); },
+          json() { return Promise.resolve({ status: 'complete', labels: {} }); },
+        });
+      }
       return Promise.reject(new Error('unexpected fetch ' + requested));
     }
-    const status = fixture.status;
+    const status = fixture.status !== undefined ? fixture.status : 200;
     const body = fixture.body || '';
     return Promise.resolve({
-      ok: status >= 200 && status < 300,
+      ok: fixture.ok !== undefined ? fixture.ok : (status >= 200 && status < 300),
       status,
-      text() { return Promise.resolve(body); },
-      json() { return Promise.resolve().then(() => JSON.parse(body)); },
+      text() { return typeof fixture.text === 'function' ? fixture.text() : Promise.resolve(body); },
+      json() { return typeof fixture.json === 'function' ? fixture.json() : Promise.resolve().then(() => JSON.parse(body)); },
     });
   };
   const document = new Document();
@@ -495,8 +505,8 @@ function createHarness(options = {}) {
     document,
     Element,
     MutationObserver: MutationObserverShim,
-    setTimeout,
-    clearTimeout,
+    setTimeout: setTimeoutFn,
+    clearTimeout: clearTimeoutFn,
     navigator,
     location,
     top: null,
@@ -560,8 +570,8 @@ function createHarness(options = {}) {
     console,
     URL,
     URLSearchParams,
-    setTimeout,
-    clearTimeout,
+    setTimeout: setTimeoutFn,
+    clearTimeout: clearTimeoutFn,
     requestAnimationFrame: window.requestAnimationFrame,
     getComputedStyle: window.getComputedStyle,
     CustomEvent: window.CustomEvent,
@@ -591,6 +601,7 @@ function createHarness(options = {}) {
   }
   if (options.boot) {
     vm.runInContext(read('convey_copy.js'), context, { filename: 'convey_copy.js' });
+    vm.runInContext(read('date_format.js'), context, { filename: 'date_format.js' });
     vm.runInContext(read('mount-workspace.js'), context, { filename: 'mount-workspace.js' });
   }
   const bootSource = read('shell_boot.js').replace(
@@ -832,6 +843,7 @@ asyncCase('unconverted workspace keeps its unavailable notice after boot', async
   await harness.boot();
 
   assert.deepStrictEqual(harness.fetchCalls, [
+    '/api/streams/labels',
     '/app/support/background',
     '/app/activities/workspace',
   ]);
@@ -1057,6 +1069,71 @@ asyncCase('a pending about read does not delay known device facts', async () => 
   finish({about: 'journal 2.0.29 · ubuntu 24.04 · x86_64'});
   await loading;
   assert.strictEqual(h.document.getElementById('settingsAboutBlock').textContent, 'journal 2.0.29 · ubuntu 24.04 · x86_64');
+});
+
+asyncCase('boot proceeds after labels timeout and late response installs stream labels', async () => {
+  let timerCb = null;
+  let timerDelay = null;
+  const fakeSetTimeout = (cb, delay) => {
+    timerCb = cb;
+    timerDelay = delay;
+    return 999;
+  };
+  const fakeClearTimeout = () => {};
+
+  let releaseLabels;
+  const labelsPromise = new Promise((resolve) => {
+    releaseLabels = resolve;
+  });
+
+  const harness = createHarness({
+    boot: true,
+    setTimeout: fakeSetTimeout,
+    clearTimeout: fakeClearTimeout,
+    fetchResponses: {
+      '/api/streams/labels': {
+        status: 200,
+        json: () => labelsPromise,
+        text: () => labelsPromise.then((body) => JSON.stringify(body)),
+      },
+      '/app/support/background': { status: 200, body: '' },
+      '/app/home/workspace': { status: 200, body: '<div id="home-workspace">home</div>' },
+    },
+  });
+
+  let mountCount = 0;
+  const origMount = harness.window.mountWorkspaceFragment;
+  harness.window.mountWorkspaceFragment = async function (...args) {
+    mountCount += 1;
+    return origMount.apply(this, args);
+  };
+
+  const bootPromise = harness.boot();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.ok(timerCb, 'race timeout timer was registered');
+  assert.ok(timerDelay > 0 && timerDelay <= 1500, 'race timer delay is up to 1500ms');
+
+  timerCb();
+  await bootPromise;
+
+  assert.strictEqual(mountCount, 1, 'workspace mounted once after timeout');
+
+  releaseLabels({
+    status: 'complete',
+    labels: {
+      ja1r: 'your mac · screen',
+    },
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.strictEqual(mountCount, 1, 'mount count is still 1 after late labels response');
+  assert.strictEqual(
+    harness.window.JournalFormat.stream('ja1r'),
+    'your mac · screen',
+    'JournalFormat.stream returns seeded label'
+  );
 });
 
 async function runAsyncCases() {

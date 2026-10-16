@@ -20,6 +20,7 @@ const TARGETS: &[&str] = &[
     "relocate_segment",
     "is_tail",
     "list_stream_records_tolerant",
+    "list_stream_records",
 ];
 
 struct TargetIdentVisitor<'a> {
@@ -307,6 +308,12 @@ fn expected_consumers() -> BTreeSet<(String, String)> {
             "solstone-core-segment/src/stream_record.rs",
             "advance_unbound_stream",
         ),
+        (
+            "solstone-core-segment/src/stream_record.rs",
+            "list_stream_records",
+        ),
+        // reviewed display-only consumer
+        ("solstone-core-home/src/provenance.rs", "load_stream_labels"),
         // name-keyed unlink of streams/<name>.json; no production caller today
         (
             "solstone-core-segment/src/stream_record.rs",

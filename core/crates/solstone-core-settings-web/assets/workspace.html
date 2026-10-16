@@ -2173,7 +2173,6 @@ button:focus:not(:focus-visible) {
         <option value="transcription">transcription</option>
       </optgroup>
       <optgroup label="devices">
-        <option value="devices">devices</option>
         <option value="vision">vision</option>
       </optgroup>
       <optgroup label="data">
@@ -2205,7 +2204,6 @@ button:focus:not(:focus-visible) {
     </div>
     <div class="settings-nav-group">
       <div class="settings-nav-label">devices</div>
-      <button class="settings-nav-item" data-section="devices" id="tab-devices" role="tab" aria-selected="false" aria-controls="section-devices" tabindex="-1">devices</button>
       <button class="settings-nav-item" data-section="vision" id="tab-vision" role="tab" aria-selected="false" aria-controls="section-vision" tabindex="-1">vision</button>
     </div>
     <div class="settings-nav-group">
@@ -2475,16 +2473,6 @@ button:focus:not(:focus-visible) {
       </fieldset>
       <div class="form-help" id="transcribeResourceInfo"></div>
       </form>
-    </section>
-
-    <!-- devices section -->
-    <section class="settings-section" id="section-devices" role="tabpanel" aria-labelledby="tab-devices">
-      <h2>devices</h2>
-      <p class="settings-section-desc">manage the devices that add to your journal.</p>
-      <p><a href="/app/network/">view your devices →</a></p>
-      <h3 class="settings-subsection-title">terminal</h3>
-      <p class="settings-subsection-desc">terminal sharing is controlled on the computer running the solstone app for tmux. this dashboard cannot start, stop, or change it.</p>
-      <p class="settings-subsection-desc">on that computer, use <code>solstone-tmux status</code> to check its service and sync status.</p>
     </section>
 
     <!-- Vision Section -->
@@ -3051,14 +3039,7 @@ setupModalAccessibility('cleanupModal');
 setupModalAccessibility('facetCreateModal');
 
 // ========== NAVIGATION ==========
-const VALID_SECTIONS = ['about', 'guide', 'profile', 'apikeys', 'transcription', 'devices', 'vision', 'sync', 'storage', 'support', 'facets'];
-// G3-312: the devices pane used to answer to #observer, an internal section name
-// in the owner's address bar. Links and bookmarks that still carry the old
-// fragment land on the same pane.
-const RETIRED_SECTION_HASHES = { observer: 'devices' };
-function resolveSectionHash(hash) {
-  return Object.hasOwn(RETIRED_SECTION_HASHES, hash) ? RETIRED_SECTION_HASHES[hash] : hash;
-}
+const VALID_SECTIONS = ['about', 'guide', 'profile', 'apikeys', 'transcription', 'vision', 'sync', 'storage', 'support', 'facets'];
 
 let settingsAbout = '';
 let settingsAboutLoad = null;
@@ -3415,17 +3396,24 @@ document.getElementById('navSelect').addEventListener('change', (e) => {
 
 // Hash-based navigation
 function initFromHash() {
-  const hash = resolveSectionHash(window.location.hash.slice(1));
-  if (hash && VALID_SECTIONS.includes(hash)) {
-    switchSection(hash, hash !== window.location.hash.slice(1), true, true);
+  const raw = window.location.hash.slice(1);
+  if (raw === 'devices' || raw === 'observer') {
+    window.location.replace('/app/network/#devices');
+    return;
+  }
+  if (raw && VALID_SECTIONS.includes(raw)) {
+    switchSection(raw, false, true, true);
   }
 }
 
 window.addEventListener('hashchange', () => {
   const raw = window.location.hash.slice(1);
-  const hash = resolveSectionHash(raw);
-  if (hash && VALID_SECTIONS.includes(hash)) {
-    switchSection(hash, hash !== raw, true, true);
+  if (raw === 'devices' || raw === 'observer') {
+    window.location.replace('/app/network/#devices');
+    return;
+  }
+  if (raw && VALID_SECTIONS.includes(raw)) {
+    switchSection(raw, false, true, true);
   } else if (!raw) {
     switchSection('guide', false);
   }

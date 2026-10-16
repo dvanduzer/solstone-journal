@@ -451,6 +451,36 @@
   margin: 0;
 }
 
+.tr-copy-stream-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid var(--hairline-2, #ccc);
+  background: var(--paper, #fff);
+  color: var(--ink-faint, #666);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.tr-copy-stream-btn:hover {
+  color: var(--ink, #111);
+  border-color: var(--ink, #111);
+}
+
+.tr-toast {
+  position: absolute;
+  margin-left: 8px;
+  background: var(--surface-dark, #222);
+  color: var(--ink-on-dark, #fff);
+  padding: 0.2em 0.8em;
+  border-radius: 12px;
+  font-size: 12px;
+  z-index: 10;
+}
+
 .tr-range-text {
   color: var(--ink-faint);
   font-size: 13px;
@@ -2498,7 +2528,13 @@ body.presentation-mode .tr-screen-text { font-size: 16px; padding: 12px 16px; bo
       </label>
       <div class="tr-header">
         <div>
-          <h2 class="tr-title">transcripts</h2>
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <h2 class="tr-title">transcripts</h2>
+            <button type="button" id="trCopyStreamBtn" class="tr-copy-stream-btn" aria-label="copy stream id" style="display: none;">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+            </button>
+            <div id="trToast" class="tr-toast" role="status" aria-live="polite" hidden></div>
+          </div>
           <div class="tr-range-text" id="trRangeText"></div>
         </div>
         <button type="button" id="trDeleteBtn" class="tr-delete-btn" title="delete segment">
@@ -2618,6 +2654,38 @@ body.presentation-mode .tr-screen-text { font-size: 16px; padding: 12px 16px; bo
 
   // Elements - content panel
   const titleEl = document.querySelector('.tr-title');
+  const copyStreamBtn = document.getElementById('trCopyStreamBtn');
+  const toastEl = document.getElementById('trToast');
+  let toastTimer = null;
+  function showToast(msg) {
+    if (!toastEl) return;
+    toastEl.textContent = msg;
+    toastEl.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { toastEl.hidden = true; }, 2500);
+  }
+
+  async function clipboardWriteText(text) {
+    if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
+      return false;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (err) {
+      window.logError?.(err, { context: 'transcripts: clipboard write failed' });
+      return false;
+    }
+  }
+
+  if (copyStreamBtn) {
+    copyStreamBtn.addEventListener('click', async () => {
+      const stream = (selectedSegment && selectedSegment.stream) || (titleEl ? titleEl.title : '') || '';
+      if (!stream) return;
+      const ok = await clipboardWriteText(stream);
+      showToast(ok ? 'stream id copied' : "couldn't copy stream id");
+    });
+  }
   const rangeText = document.getElementById('trRangeText');
   const tabsContainer = document.getElementById('trTabs');
   tabsContainer.addEventListener('keydown', e => {
@@ -3648,6 +3716,26 @@ body.presentation-mode .tr-screen-text { font-size: 16px; padding: 12px 16px; bo
     return window.JournalFormat.stream(stream);
   }
 
+  function shouldOmitStreamType(label, stream, typeDesc) {
+    if (!label) return false;
+    if (label === 'your terminal') return false;
+    const s = String(stream || '');
+    if (s.startsWith('import.') && label.endsWith(' · imported')) {
+      return true;
+    }
+    const t = String(typeDesc || '').trim().toLowerCase();
+    const parts = label.split(' · ');
+    if (parts.length > 1) {
+      const what = parts[parts.length - 1].trim().toLowerCase();
+      if (['audio', 'screen', 'camera', 'location'].includes(what)) {
+        if (what === t || t.includes(what)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   // Build range text with total media size
   // A segment's range is its recording device's own wall clock. When that
   // device reported a zone other than the one this journal shows times in,
@@ -3770,11 +3858,12 @@ body.presentation-mode .tr-screen-text { font-size: 16px; padding: 12px 16px; bo
     el.setAttribute('aria-label', _label);
     const sortedStreams = [...streams].sort();
     const humanizedStreams = sortedStreams.map(humanizeStreamName);
-    const streamHead = humanizedStreams.slice(0, 3).join(' + ');
-    const streamToken = humanizedStreams.length > 3 ? streamHead + ' +' + (humanizedStreams.length - 3) : streamHead;
-    const streamSuffix = sortedStreams.length ? ' · ' + streamToken : '';
+    const omitType = sortedStreams.length > 0 && sortedStreams.every(s => shouldOmitStreamType(humanizeStreamName(s), s, type));
+    const typePart = omitType ? '' : ', ' + type;
+    const labelPart = humanizedStreams.length ? ', ' + humanizedStreams.join(', ') : '';
+    const rawSuffix = sortedStreams.length ? ' (' + sortedStreams.join(', ') + ')' : '';
     const stateSuffix = state === 'pending' ? ' · pending' : state === 'analyzing' ? ' · analyzing' : (think === 'awaiting' ? ' · ' + AWAITING_THINKING_LABEL : '');
-    el.title = hhmm(startMin) + ' – ' + hhmm(endMin) + ' (' + (endMin - startMin) + ' min, ' + type + streamSuffix + stateSuffix + ')';
+    el.title = hhmm(startMin) + ' – ' + hhmm(endMin) + ' (' + (endMin - startMin) + ' min' + typePart + labelPart + stateSuffix + ')' + rawSuffix;
     const activate = () => {
       if (segment) {
         selectSegment(segment);
@@ -3931,6 +4020,7 @@ body.presentation-mode .tr-screen-text { font-size: 16px; padding: 12px 16px; bo
       const option = document.createElement('option');
       option.value = segmentChoiceId(seg);
       option.textContent = `${seg.start} – ${seg.end} · ${humanizeStreamName(seg.stream)}`;
+      option.title = seg.stream;
       segmentPicker.appendChild(option);
     });
     segmentPicker.value = selectedSegment && !selectedSegment.locationRow ? segmentChoiceId(selectedSegment) : '';
@@ -4009,8 +4099,12 @@ body.presentation-mode .tr-screen-text { font-size: 16px; padding: 12px 16px; bo
       const segmentStatusLabel = hasAnalyzingAdvertised ? 'analyzing' : hasPendingAdvertised ? 'pending' : seg.think === 'awaiting' ? AWAITING_THINKING_LABEL : '';
       const statusSuffix = segmentStatusLabel ? ' · ' + segmentStatusLabel : '';
       const ariaStatusSuffix = segmentStatusLabel ? ', ' + segmentStatusLabel : '';
-      pill.title = seg.start + ' – ' + seg.end + ' · ' + duration + ' min · ' + typeDesc + ' · ' + humanizeStreamName(seg.stream) + statusSuffix;
-      pill.setAttribute('aria-label', 'segment ' + seg.start + ' \u2013 ' + seg.end + ', ' + typeLabel + ', ' + humanizeStreamName(seg.stream) + ariaStatusSuffix);
+      const label = humanizeStreamName(seg.stream);
+      const omitType = shouldOmitStreamType(label, seg.stream, typeDesc);
+      const typeTitlePart = omitType ? '' : ' · ' + typeDesc;
+      const typeAriaPart = omitType ? '' : ', ' + typeLabel;
+      pill.title = seg.start + ' – ' + seg.end + ' · ' + duration + ' min' + typeTitlePart + ' · ' + label + statusSuffix + ' (' + seg.stream + ')';
+      pill.setAttribute('aria-label', 'segment ' + seg.start + ' \u2013 ' + seg.end + typeAriaPart + ', ' + label + ariaStatusSuffix);
       pill.dataset.key = seg.key;
       pill.dataset.stream = seg.stream;
 
@@ -4074,6 +4168,8 @@ body.presentation-mode .tr-screen-text { font-size: 16px; padding: 12px 16px; bo
     });
 
     titleEl.textContent = humanizeStreamName(seg.stream);
+    titleEl.title = seg.stream;
+    if (copyStreamBtn) copyStreamBtn.style.display = '';
     selectedSegmentZone = null;
     updateSegmentEntryCount(null);
 
@@ -4154,6 +4250,8 @@ body.presentation-mode .tr-screen-text { font-size: 16px; padding: 12px 16px; bo
     });
 
     titleEl.textContent = humanizeStreamName(seg.stream);
+    titleEl.title = seg.stream;
+    if (copyStreamBtn) copyStreamBtn.style.display = '';
     selectedSegmentZone = null;
     rangeText.textContent = seg.start;
     deleteBtn.classList.add('visible');
@@ -6564,7 +6662,7 @@ body.presentation-mode .tr-screen-text { font-size: 16px; padding: 12px 16px; bo
       const count = locationSegments.length;
       const collapsedText = count === 1 ? 'show 1 location segment' : `show ${count} location segments`;
       // Name each row's device only when more than one sent location this day.
-      const manyLocationStreams = new Set(locationSegments.map(s => s.stream)).size > 1;
+      const manyLocationStreams = new Set(locationSegments.map(s => humanizeStreamName(s.stream))).size > 1;
       const rowsHtml = locationSectionExpanded ? `
         <div class="tr-location-rows">
           ${locationSegments.map(s => {
@@ -6925,7 +7023,7 @@ body.presentation-mode .tr-screen-text { font-size: 16px; padding: 12px 16px; bo
         <li>analysis stored with it</li>`;
 
     deleteSegmentModalBody.innerHTML = `
-      <p class="tr-delete-segment-meta"><strong>${escapeHtml(humanizeStreamName(seg.stream))}</strong> · <strong>${escapeHtml(day)}</strong> · <strong>${metaTime}</strong></p>
+      <p class="tr-delete-segment-meta"><strong title="${escapeHtml(seg.stream)}">${escapeHtml(humanizeStreamName(seg.stream))}</strong> · <strong>${escapeHtml(day)}</strong> · <strong>${metaTime}</strong></p>
       <p>You'll have about 10 seconds to cancel after confirming.</p>
       <p>This deletes the segment's own:</p>
       <ul class="tr-delete-segment-list">
@@ -7226,7 +7324,7 @@ body.presentation-mode .tr-screen-text { font-size: 16px; padding: 12px 16px; bo
       const key = String(outcome.segment_key || '');
       const time = key.length >= 4 ? `${key.slice(0, 2)}:${key.slice(2, 4)}` : key;
       const date = String(outcome.day || '').replace(/^(\d{4})(\d{2})(\d{2})$/, '$1-$2-$3');
-      const label = `${humanizeStreamName(outcome.stream)} · ${date} ${time}.`;
+      const label = `<span title="${escapeHtml(outcome.stream)}">${escapeHtml(humanizeStreamName(outcome.stream))}</span> · ${date} ${time}.`;
       showDeleteOutcome(outcome.pending, outcome.state, outcome.reason, null, null, label);
     }
   }
@@ -7331,6 +7429,8 @@ body.presentation-mode .tr-screen-text { font-size: 16px; padding: 12px 16px; bo
 
     // Reset UI
     titleEl.textContent = 'transcripts';
+    titleEl.removeAttribute('title');
+    if (copyStreamBtn) copyStreamBtn.style.display = 'none';
     rangeText.textContent = '';
     tabsContainer.innerHTML = '';
     tabsContainer.classList.remove('visible');

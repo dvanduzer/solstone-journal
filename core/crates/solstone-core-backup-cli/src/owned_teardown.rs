@@ -22,7 +22,7 @@ pub(super) const BACKUP_ONLY_HELD: &str = "your backup holds the only copy of so
 pub(super) const DESTINATION_UNSUPPORTED: &str = "your backup's settings are incomplete, so your journal can't reach it, and no backup changes were made.";
 pub(super) const TOOL_UNAVAILABLE: &str =
     "the backup program that comes with your journal is missing, so no backup changes were made.";
-pub(super) const BACKUP_ONLY_UNPLACED: &str = "your backup holds the only copy of some older media that can't be matched to a recording on this device, so it can't be restored and no backup changes were made. if your journal was moved or copied, bring back its missing days, then try again.";
+pub(super) const BACKUP_ONLY_UNPLACED: &str = "your backup holds the only copy of some older media that can't be matched to a recording on this computer, so it can't be restored and no backup changes were made. if your journal was moved or copied, bring back its missing days, then try again.";
 pub(super) const OFFLOAD_RECORD_UNAVAILABLE: &str = "the record of what media offload moved into your backup is missing or can't be read, so no backup changes were made. if your journal was moved or copied, bring back its health folder, then try again.";
 pub(super) const STORAGE_UNREACHED: &str = "turning off and deleting your backup stopped before anything was deleted, so it's safe to try again.";
 pub(super) const NOT_STARTED: &str =

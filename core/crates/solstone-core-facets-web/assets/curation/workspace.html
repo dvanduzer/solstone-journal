@@ -414,21 +414,20 @@ window.CUR_COPY = CUR_COPY;
     const day = sample?.day ? String(sample.day) : '';
     const stream = sample?.stream ? String(sample.stream) : '';
     const segment = sample?.segment_key ? String(sample.segment_key) : '';
-    const readable = [
-      day && window.JournalFormat.day(day),
-      stream && window.JournalFormat.stream(stream),
-      segment && window.JournalFormat.segmentTime(segment)
-    ].filter(Boolean).join(' · ');
+    const dayHtml = day ? escapeHtml(window.JournalFormat.day(day)) : '';
+    const streamHtml = stream ? `<span title="${escapeHtml(stream)}">${escapeHtml(window.JournalFormat.stream(stream))}</span>` : '';
+    const segmentHtml = segment ? escapeHtml(window.JournalFormat.segmentTime(segment)) : '';
+    const readableHtml = [dayHtml, streamHtml, segmentHtml].filter(Boolean).join(' · ');
     const rawRows = [
       day && `<li>day: ${escapeHtml(day)}</li>`,
-      stream && `<li>stream: ${escapeHtml(stream)}</li>`,
+      stream && `<li title="${escapeHtml(stream)}">stream: ${escapeHtml(window.JournalFormat.stream(stream))}</li>`,
       segment && `<li>segment: ${escapeHtml(segment)}</li>`,
       sample?.source && `<li>source: ${escapeHtml(sample.source)}</li>`,
       (sample?.cluster_label !== undefined && sample.cluster_label >= 0) && `<li>cluster: ${escapeHtml(sample.cluster_label)}</li>`
     ].filter(Boolean).join('');
     return `
       <li class="curation-pair-sample">
-        ${readable ? `<p class="curation-pair-sample-readable">${escapeHtml(readable)}</p>` : ''}
+        ${readableHtml ? `<p class="curation-pair-sample-readable">${readableHtml}</p>` : ''}
         ${sampleAudioHtml(sample)}
         ${rawRows ? `<details class="curation-pair-sample-details"><summary>technical details</summary><ul>${rawRows}</ul></details>` : ''}
       </li>

@@ -80,7 +80,31 @@
  function renderHit(hit,dayHref){
   const card=node('article','search-result');const meta=node('div','search-meta');
   const recordTime=Number.isFinite(hit.ts)&&hit.ts>0?window.JournalFormat.time(hit.ts):'';
-  for(const text of [hit.agent_label,hit.facet_title,window.JournalFormat.stream(hit.stream),recordTime])if(text)meta.append(node('span','',text));
+  const rawStream=String(hit.stream||'').trim();
+  const streamLabel=rawStream&&window.JournalFormat?window.JournalFormat.stream(rawStream):'';
+  let showAgentLabel=Boolean(hit.agent_label);
+  if(showAgentLabel&&streamLabel&&streamLabel!=='your terminal'){
+   const agentLower=String(hit.agent_label).trim().toLowerCase();
+   if(rawStream.startsWith('import.')&&streamLabel.endsWith(' · imported')){
+    showAgentLabel=false;
+   } else {
+    const parts=streamLabel.split(' · ');
+    if(parts.length>1){
+     const what=parts[parts.length-1].trim().toLowerCase();
+     if(['audio','screen','camera','location'].includes(what)&&(what===agentLower||agentLower.includes(what))){
+      showAgentLabel=false;
+     }
+    }
+   }
+  }
+  if(showAgentLabel)meta.append(node('span','',hit.agent_label));
+  if(hit.facet_title)meta.append(node('span','',hit.facet_title));
+  if(streamLabel){
+   const streamSpan=node('span','',streamLabel);
+   streamSpan.setAttribute('title',rawStream);
+   meta.append(streamSpan);
+  }
+  if(recordTime)meta.append(node('span','',recordTime));
   card.append(meta);const text=node('p','search-excerpt');
   text.append(excerpt(hit.text));
   card.append(text);

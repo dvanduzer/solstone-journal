@@ -357,6 +357,11 @@
   }
 
   async function boot() {
+    const startedAt = Date.now();
+    const labelsPromise = (window.JournalFormat && typeof window.JournalFormat.beginStreamLabels === 'function')
+      ? window.JournalFormat.beginStreamLabels()
+      : fetch('/api/streams/labels').then(res => res.json());
+
     const context = pathContext();
     applyChromeCopy();
     try {
@@ -381,6 +386,23 @@
       if (!app.workspace_url) {
         throw new Error('Workspace unavailable');
       }
+
+      let raceTimerId = null;
+      const raceTimeoutPromise = new Promise((resolve) => {
+        const remaining = Math.max(0, 1500 - (Date.now() - startedAt));
+        raceTimerId = setTimeout(() => {
+          resolve('timeout');
+        }, remaining);
+      });
+
+      const winner = await Promise.race([
+        labelsPromise.then(() => 'labels').catch(() => 'labels'),
+        raceTimeoutPromise,
+      ]);
+      if (winner === 'labels' && raceTimerId !== null) {
+        clearTimeout(raceTimerId);
+      }
+
       await window.mountWorkspaceFragment(app.workspace_url, { appName: app.name });
     } catch (error) {
       if (window.logError) {

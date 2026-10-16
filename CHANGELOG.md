@@ -12,6 +12,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- wherever the dashboard shows where something came from, it now names the device or import, like "your mac · screen" or "Apple Health · imported", instead of an internal id.
+- the health page no longer keeps its own list of your devices; it says how many are adding to your journal, shows any that need attention, and links to network, where you manage them. the settings page's devices section is gone for the same reason.
 - on large journals, health takes less time to open after your journal starts. speaker dates and stats also load faster.
 - on the command line, `--timestamp` also takes a date and time with its offset, such as `2025-11-02T01:30:00-07:00`, so a recording from the hour that repeats when daylight saving time ends can be placed at its true time. the `YYYYMMDD_HHMMSS` form works as before.
 

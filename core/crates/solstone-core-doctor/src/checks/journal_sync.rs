@@ -43,7 +43,7 @@ pub fn run(context: &CheckContext, check: Check) -> RunnerResult {
     // (read-only, no side effects) and report it exactly the way the Clean
     // branch below would: Ok, but naming the last peer's identity when one is
     // present, so a genuine foreign writer is still surfaced instead of
-    // silently erased by an unconditional "this device only". The status
+    // silently erased by an unconditional "this computer only". The status
     // socket cannot identify our own heartbeat, but the resident's boot
     // record can: `clean_detail` leaves it out of that name.
     if matches!(diagnosis, SyncRescanDiagnosis::HeartbeatNeedsAttention(_))
@@ -61,7 +61,7 @@ pub fn run(context: &CheckContext, check: Check) -> RunnerResult {
     render_sync_rescan(context, check, diagnosis)
 }
 
-/// Render the "this device only" detail, naming the last peer heartbeat's
+/// Render the "this computer only" detail, naming the last peer heartbeat's
 /// identity when one is present. Shared by the confirmed-running downgrade
 /// above and the `Clean` diagnosis below so both report another writer
 /// identically instead of one of them silently dropping it.
@@ -71,7 +71,7 @@ pub fn run(context: &CheckContext, check: Check) -> RunnerResult {
 /// verifiably alive now and exactly one heartbeat carries that process's host,
 /// pid and lifetime; anything less leaves every heartbeat in view.
 fn clean_detail(context: &CheckContext, result: Option<&SyncCheckResult>) -> String {
-    let clean = format!("this device only ({})", context.hostname);
+    let clean = format!("this computer only ({})", context.hostname);
     let Some(result) = result else {
         return clean;
     };
@@ -187,7 +187,7 @@ mod tests {
         let clean =
             render_sync_rescan(&context, check(), SyncRescanDiagnosis::Clean(None)).unwrap();
         assert_eq!(clean.status, Status::Ok);
-        assert!(clean.detail.starts_with("this device only"));
+        assert!(clean.detail.starts_with("this computer only"));
 
         let heartbeat_needs_attention = render_sync_rescan(
             &context,

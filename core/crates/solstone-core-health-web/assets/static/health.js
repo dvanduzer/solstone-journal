@@ -32,7 +32,17 @@
     "HEALTH_GLANCE_CHECKINS_STALE": "{n} journal runs stopped checking in with your journal: {names}.",
     "HEALTH_GLANCE_SERVICE_ATTENTION": "1 service needs attention: {service_names}.",
     "HEALTH_GLANCE_SERVICES_ATTENTION": "{n} services need attention: {service_names}.",
-    "HEALTH_GLANCE_SERVICES_UNREACHABLE": "the journal's services couldn't be reached. check that your journal is running."
+    "HEALTH_GLANCE_SERVICES_UNREACHABLE": "the journal's services couldn't be reached. check that your journal is running.",
+    "HEALTH_OBSERVE_LOCAL_REPORTING": "this computer isn't reporting yet. showing {label}.",
+    "HEALTH_OBSERVE_LOCAL_SILENT": "this computer isn't reporting yet.",
+    "HEALTH_OBSERVE_UNKNOWN_REPORTING": "can't identify this computer yet. showing {label}.",
+    "HEALTH_OBSERVE_UNKNOWN_SILENT": "can't identify this computer yet.",
+    "HEALTH_DEVICES_COUNT_ONE": "1 device is adding to your journal.",
+    "HEALTH_DEVICES_COUNT_MANY": "{n} devices are adding to your journal.",
+    "HEALTH_DEVICES_EMPTY": "no devices are paired yet.",
+    "HEALTH_DEVICES_PAIR_LINK": "pair a device →",
+    "HEALTH_DEVICES_SEE_LINK": "see your devices in network →",
+    "HEALTH_DEVICES_MANAGE_LINK": "manage in network →"
   };
   // Worst signal wins, and green is earned: a verdict may not read "everything's
   // working" while the device rows below it say a device has gone quiet, and a
@@ -1104,7 +1114,15 @@
     }
 
     return null;
-	  }
+  }
+
+  function formatCopy(template, values = {}) {
+    let text = String(template || '');
+    for (const [key, value] of Object.entries(values || {})) {
+      text = text.replaceAll('{' + key + '}', () => String(value ?? ''));
+    }
+    return text;
+  }
 
   function formatGlanceSentence(selection) {
     if (!selection) return '';
@@ -2183,9 +2201,16 @@
     const tmux = displayedStream ? freshClients.get(displayedStream + '.tmux') : null;
     const confirmedLocal = Boolean(state.localHost && confirmedPrimary && displayedStream === state.localHost);
     if (!confirmedLocal && displayedStream) {
-      elements.observeSourceNote.textContent = state.localHost
-        ? "this computer's stream isn't reporting yet."
-        : `this computer is unknown. showing ${displayedStream}`;
+      const label = window.JournalFormat ? window.JournalFormat.stream(displayedStream) : displayedStream;
+      if (state.localHost) {
+        elements.observeSourceNote.textContent = label === 'source unknown'
+          ? HEALTH_GLANCE_COPY.HEALTH_OBSERVE_LOCAL_SILENT
+          : formatCopy(HEALTH_GLANCE_COPY.HEALTH_OBSERVE_LOCAL_REPORTING, { label });
+      } else {
+        elements.observeSourceNote.textContent = label === 'source unknown'
+          ? HEALTH_GLANCE_COPY.HEALTH_OBSERVE_UNKNOWN_SILENT
+          : formatCopy(HEALTH_GLANCE_COPY.HEALTH_OBSERVE_UNKNOWN_REPORTING, { label });
+      }
       elements.observeSourceNote.classList.remove('hidden');
     } else {
       elements.observeSourceNote.textContent = '';
@@ -2372,19 +2397,13 @@
         const row = document.createElement('div');
         row.className = 'client-stream-row';
 
-        const dotIdx = stream.indexOf('.');
-        const sourceKind = { 'watch-audio': 'watch', tmux: 'terminal', 'mobile-segment': 'phone' }[data.source]
-          || (data.source?.startsWith('browser') ? 'browser' : null);
-        const ownSource = !data.source || ['audio', 'screen', 'camera', 'location'].includes(data.source);
-        const qualifier = sourceKind || (dotIdx >= 0 ? stream.slice(dotIdx + 1)
-          : ownSource ? reported?.device_type || data.device_type || 'source' : 'source');
-
         const stale = (now - data.lastSeen) >= STALE_MS;
         if (stale) row.classList.add('stale');
 
         const qualEl = document.createElement('div');
         qualEl.className = 'client-stream-qualifier';
-        qualEl.textContent = qualifier;
+        qualEl.textContent = window.JournalFormat ? window.JournalFormat.stream(stream) : stream;
+        qualEl.title = stream;
         row.appendChild(qualEl);
 
         const modeEl = document.createElement('div');
@@ -2519,24 +2538,29 @@
   }
 
   function renderRegisteredClients(clients) {
-    if ((!clients || clients.length === 0) && !state.registeredClientsFailed) {
-      elements.registeredClientsCard.classList.add('hidden');
-      elements.registeredClientsStrip.innerHTML = '';
-      return;
-    }
-
     elements.registeredClientsCard.classList.remove('hidden');
     if (!devicesDeepLinkScrolled && window.location.hash === '#registeredClientsCard') {
       devicesDeepLinkScrolled = true;
       const card = elements.registeredClientsCard;
       requestAnimationFrame(() => card.scrollIntoView({ block: 'start' }));
     }
-    const wasOpen = elements.registeredClientsStrip.querySelector('.registered-client-unstarted')?.open || false;
     const openKeys = new Set(Array.from(elements.registeredClientsStrip.querySelectorAll('.registered-client-tech'))
       .filter(detail => detail.open).map(detail => detail.dataset.rejectionKey));
     const focusedKey = document.activeElement?.closest('.registered-client-tech')?.dataset.rejectionKey;
     const focusedClient = document.activeElement?.closest('.registered-client-row')?.dataset.cid;
     elements.registeredClientsStrip.innerHTML = '';
+
+    const list = Array.isArray(clients) ? clients : [];
+
+    const isAttention = client => {
+      const capture = client.capture_state;
+      return capture === 'degraded' || capture === 'stale' || capture === 'offline' || capture === 'unknown'
+        || registeredClientNeedsAttention(client)
+        || Boolean(client.clock_skew);
+    };
+
+    const attentionClients = list.filter(isAttention);
+
     if (state.registeredClientsFailed) {
       const notice = document.createElement('p');
       notice.className = 'registered-client-recovery';
@@ -2544,36 +2568,33 @@
       notice.textContent = "delivery status couldn't be checked."
         + (state.registeredClientsObservedAt === null ? ''
           : ` last successful check: ${new Date(state.registeredClientsObservedAt).toLocaleString()}.`)
-        + (clients?.length ? ' the rows below show that last check.' : '');
+        + (attentionClients.length ? ' the rows below show that last check.' : '');
       elements.registeredClientsStrip.appendChild(notice);
-    }
-    if (!clients || clients.length === 0) {
-      const manage = document.createElement('a');
-      manage.className = 'registered-clients-manage';
-      manage.href = '/app/network/#devices';
-      manage.textContent = 'manage in network →';
-      elements.registeredClientsStrip.appendChild(manage);
+    } else if (list.length === 0) {
+      const emptyP = document.createElement('p');
+      emptyP.className = 'registered-clients-empty';
+      emptyP.textContent = HEALTH_GLANCE_COPY.HEALTH_DEVICES_EMPTY;
+      elements.registeredClientsStrip.appendChild(emptyP);
+
+      const pairLink = document.createElement('a');
+      pairLink.className = 'registered-clients-manage';
+      pairLink.href = '/app/network/#devices';
+      pairLink.textContent = HEALTH_GLANCE_COPY.HEALTH_DEVICES_PAIR_LINK;
+      elements.registeredClientsStrip.appendChild(pairLink);
       return;
+    } else {
+      const activeCount = list.filter(c => c.capture_state === 'active').length;
+      if (activeCount > 0) {
+        const countP = document.createElement('p');
+        countP.className = 'registered-clients-count';
+        countP.textContent = activeCount === 1
+          ? HEALTH_GLANCE_COPY.HEALTH_DEVICES_COUNT_ONE
+          : formatCopy(HEALTH_GLANCE_COPY.HEALTH_DEVICES_COUNT_MANY, { n: activeCount });
+        elements.registeredClientsStrip.appendChild(countP);
+      }
     }
-    const unstarted = document.createElement('details');
-    unstarted.className = 'registered-client-unstarted';
-    unstarted.open = wasOpen;
-    const summary = document.createElement('summary');
-    const unused = clients.filter(client => client.capture_state === 'no_capture' && !registeredClientNeedsAttention(client));
-    summary.textContent = `devices with no material yet (${unused.length})`;
-    unstarted.appendChild(summary);
-    // G3-208: opening the group used to be a dead end. The action the owner
-    // wants lives one app over, so the group points at it rather than growing
-    // a second copy of it here.
-    const manage = document.createElement('a');
-    manage.className = 'registered-clients-manage';
-    manage.href = '/app/network/#devices';
-    manage.textContent = 'manage in network →';
-    unstarted.appendChild(manage);
-    const activityRank = client => registeredClientNeedsAttention(client) ? 0 : client.capture_state === 'active' ? 1 : 2;
-    const sorted = [...clients].sort((a, b) => activityRank(a) - activityRank(b)
-      || (Date.parse(b.last_accepted_ingest_at) || 0) - (Date.parse(a.last_accepted_ingest_at) || 0));
-    for (const client of sorted) {
+
+    for (const client of attentionClients) {
       const needsAttention = registeredClientNeedsAttention(client);
       let stateClass = ['connected', 'stale', 'disconnected'].includes(client.state)
         ? client.state
@@ -2585,8 +2606,6 @@
       if (needsAttention) {
         stateClass = 'failing';
         labelText = 'uploads rejected';
-      } else if (client.capture_state === 'no_capture') {
-        labelText = 'no material yet';
       } else if (client.capture_state === 'unknown') {
         labelText = 'delivery unknown';
       }
@@ -2619,15 +2638,8 @@
           renderIngestRejection(row, client.ingest_rejection, null,
             JSON.stringify([client.cid, null]), openKeys);
         }
-        const manage = document.createElement('a');
-        manage.className = 'registered-clients-manage';
-        manage.href = '/app/network/#devices';
-        manage.textContent = 'manage in network →';
-        row.appendChild(manage);
       }
 
-      // The chip already carries this state for a device with no delivery yet;
-      // printing it again on the right of the same row said nothing new.
       const metaText = registeredClientMeta(client);
       if (metaText && metaText !== labelText) {
         const metaEl = document.createElement('span');
@@ -2636,14 +2648,30 @@
         row.appendChild(metaEl);
       }
 
-      const skewEl = document.createElement('span');
-      skewEl.className = 'registered-client-skew' + (client.clock_skew ? '' : ' hidden');
-      skewEl.textContent = 'clock skew';
-	      row.appendChild(skewEl);
+      if (client.clock_skew) {
+        const skewEl = document.createElement('span');
+        skewEl.className = 'registered-client-skew';
+        skewEl.textContent = 'clock skew';
+        row.appendChild(skewEl);
+      }
 
-      (client.capture_state === 'no_capture' && !needsAttention ? unstarted : elements.registeredClientsStrip).appendChild(row);
+      const manage = document.createElement('a');
+      manage.className = 'registered-clients-manage';
+      manage.href = '/app/network/#devices';
+      manage.textContent = HEALTH_GLANCE_COPY.HEALTH_DEVICES_MANAGE_LINK;
+      row.appendChild(manage);
+
+      elements.registeredClientsStrip.appendChild(row);
     }
-    if (unused.length) elements.registeredClientsStrip.appendChild(unstarted);
+
+    if (list.length > 0) {
+      const seeDevices = document.createElement('a');
+      seeDevices.className = 'registered-clients-manage';
+      seeDevices.href = '/app/network/#devices';
+      seeDevices.textContent = HEALTH_GLANCE_COPY.HEALTH_DEVICES_SEE_LINK;
+      elements.registeredClientsStrip.appendChild(seeDevices);
+    }
+
     if (focusedKey) {
       const detail = Array.from(elements.registeredClientsStrip.querySelectorAll('.registered-client-tech'))
         .find(item => item.dataset.rejectionKey === focusedKey);
@@ -3318,6 +3346,13 @@
     state.clients.set(msg.stream, { ...existing, ...msg, lastSeen: Date.now() });
     updateObserve();
     updateClients();
+    if (window.JournalFormat && typeof window.JournalFormat.noteLiveStream === 'function') {
+      window.JournalFormat.noteLiveStream(msg.stream)
+        .finally(() => {
+          updateObserve();
+          updateClients();
+        });
+    }
   }
 
   function handleImporterEvent(msg) {

@@ -1479,7 +1479,7 @@ fn offload_restore_failure_reason(reason: &str) -> String {
         "destination_admission_failed" => "the backup destination couldn't be reached".into(),
         "failed" => "the restore attempt failed for an unspecified reason".into(),
         "insufficient_free_space" => {
-            "there isn't enough free space on this device to bring the files back".into()
+            "there isn't enough free space on this computer to bring the files back".into()
         }
         "ledger_degraded" => {
             "the record of what was offloaded is damaged and can't be used to restore".into()
@@ -1518,7 +1518,7 @@ fn offload_restore_failure_reason(reason: &str) -> String {
              its own identity record"
             .into(),
         "segment_missing" => {
-            "the journal location these files belong to no longer exists on this device".into()
+            "the journal location these files belong to no longer exists on this computer".into()
         }
         "stream_marker_failed" => {
             "the files were restored, but updating the journal's records afterward failed".into()
@@ -2181,7 +2181,7 @@ mod tests {
         assert_eq!(rendered.exit_code, 1);
         assert!(
             rendered.stdout.contains(
-                "reason=the journal location these files belong to no longer exists on this device"
+                "reason=the journal location these files belong to no longer exists on this computer"
             ),
             "{}",
             rendered.stdout

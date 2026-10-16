@@ -4958,6 +4958,32 @@ required_features = []
 runtime = "none"
 
 [[suites]]
+id = "solstone-core-records-web::search_dom"
+package = "solstone-core-records-web"
+target = "search_dom"
+set = "component"
+areas = ["records"]
+platforms = ["linux", "macos"]
+prerequisites = ["cargo-cache"]
+timeout = "standard"
+default_full = true
+required_features = []
+runtime = "none"
+
+[[suites]]
+id = "solstone-core-facets-web::curation_dom"
+package = "solstone-core-facets-web"
+target = "curation_dom"
+set = "component"
+areas = ["facets"]
+platforms = ["linux", "macos"]
+prerequisites = ["cargo-cache"]
+timeout = "standard"
+default_full = true
+required_features = []
+runtime = "none"
+
+[[suites]]
 id = "solstone-core-stats-web::stats_web_dom"
 package = "solstone-core-stats-web"
 target = "stats_web_dom"

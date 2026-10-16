@@ -1249,6 +1249,10 @@ pub fn list_stream_bindings(journal: &Path) -> Result<Vec<StreamBindingRecord>, 
         .collect())
 }
 
+pub fn list_stream_records(journal: &Path) -> Result<BTreeMap<String, StreamRecord>, SegmentError> {
+    read_registry_records(journal)
+}
+
 /// Whether any stream record is missing a complete `(cid, source)` binding.
 pub fn has_unattributed_stream_record(journal: &Path) -> Result<bool, SegmentError> {
     Ok(read_registry_records(journal)?

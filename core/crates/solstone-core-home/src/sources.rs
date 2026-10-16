@@ -20,8 +20,8 @@ use std::path::Path;
 
 use serde_json::{Map, Value};
 use solstone_core_journal_io::{PathOrDay, iter_segments};
-use solstone_core_segment::list_stream_bindings;
-use solstone_core_sol_link::client_description_store::read_descriptions;
+
+use crate::provenance::{LabelTableStatus, load_stream_labels, resolve_stream_label};
 
 /// One activity record as the source pass sees it: the facet it was read from
 /// and the record itself.
@@ -52,26 +52,46 @@ pub fn concurrent_source_labels(
     if concurrent.iter().all(|stream| stream.is_none()) {
         return vec![None; placed.len()];
     }
-    let names = SourceNames::read(journal);
-    let words = concurrent
+    let table = load_stream_labels(journal);
+    if table.status == LabelTableStatus::Failed {
+        return vec![None; placed.len()];
+    }
+    let parts = concurrent
         .iter()
-        .map(|stream| stream.as_deref().and_then(|stream| names.kind(stream)))
+        .map(|stream| stream.as_deref().map(|s| resolve_stream_label(&table, s)))
         .collect::<Vec<_>>();
+    let words = parts
+        .iter()
+        .map(|part| part.as_ref().and_then(|p| p.device_word()))
+        .collect::<Vec<_>>();
+
     (0..placed.len())
         .map(|index| {
             let stream = concurrent[index].as_deref()?;
-            let kind = words[index]?;
-            // Two computers (or two phones) side by side would both read "from
-            // your computer". Name the device when its partner shares the word
-            // and the two devices carry different names.
-            let device = partners(index, placed, &shapes)
-                .filter(|&other| words[other] == Some(kind))
-                .filter_map(|other| concurrent[other].as_deref())
-                .filter(|other_stream| *other_stream != stream)
-                .any(|other_stream| names.device(other_stream) != names.device(stream))
-                .then(|| names.device(stream))
-                .flatten();
-            Some(source_phrase(kind, device))
+            let device_word = words[index]?;
+            let part = parts[index].as_ref()?;
+            let identity = part.identity();
+            let this_id = identity;
+            let show_parenthetical = if let Some(this_id_str) = this_id {
+                partners(index, placed, &shapes)
+                    .filter(|&other| words[other] == Some(device_word))
+                    .filter_map(|other| {
+                        let other_stream = concurrent[other].as_deref()?;
+                        (other_stream != stream).then_some(other)
+                    })
+                    .any(|other| {
+                        if let Some(other_id_str) = parts[other].as_ref().and_then(|p| p.identity())
+                        {
+                            this_id_str != other_id_str
+                        } else {
+                            false
+                        }
+                    })
+            } else {
+                false
+            };
+            let device = if show_parenthetical { this_id } else { None };
+            Some(source_phrase(device_word.as_str(), device))
         })
         .collect()
 }
@@ -213,86 +233,6 @@ fn runs_alongside_another_stream(
         .then(|| stream.to_owned())
 }
 
-/// What the journal knows about each stream: the paired client and source it
-/// is bound to, and what that client says it is.
-struct SourceNames {
-    bindings: BTreeMap<String, (String, String)>,
-    devices: BTreeMap<String, (Option<String>, Option<String>)>,
-}
-
-impl SourceNames {
-    fn read(journal: &Path) -> Self {
-        let bindings = list_stream_bindings(journal)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|binding| (binding.name, (binding.cid, binding.source)))
-            .collect();
-        let devices = read_descriptions(journal)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(cid, description)| {
-                let reported = description.reported.as_ref();
-                let name = description
-                    .owner_label
-                    .clone()
-                    .or_else(|| reported.and_then(|reported| reported.name.clone()))
-                    .filter(|name| !name.trim().is_empty());
-                let device_type = reported.and_then(|reported| reported.device_type.clone());
-                (cid, (name, device_type))
-            })
-            .collect();
-        Self { bindings, devices }
-    }
-
-    /// The plain word for what captured a stream, or `None` when the journal
-    /// cannot say. A stream directory name is never shown.
-    fn kind(&self, stream: &str) -> Option<&'static str> {
-        let Some((cid, source)) = self.bindings.get(stream) else {
-            return legacy_kind(stream);
-        };
-        match source.as_str() {
-            "watch-audio" => Some("watch"),
-            "tmux" => Some("terminal"),
-            "mobile-segment" => Some("phone"),
-            source if source.starts_with("browser") => Some("browser"),
-            // The device's own capture: say what the device says it is.
-            "" | "audio" | "screen" | "camera" | "location" => {
-                match self.devices.get(cid)?.1.as_deref()? {
-                    "desktop" | "laptop" => Some("computer"),
-                    "terminal" => Some("terminal"),
-                    "phone" => Some("phone"),
-                    "tablet" => Some("tablet"),
-                    _ => None,
-                }
-            }
-            // An accessory relayed through another device (a pendant through
-            // the phone) is not the phone; with no word for it, say nothing.
-            _ => None,
-        }
-    }
-
-    /// The device's own name for a stream's client, when it has one.
-    fn device(&self, stream: &str) -> Option<&str> {
-        let (cid, _) = self.bindings.get(stream)?;
-        self.devices.get(cid)?.0.as_deref()
-    }
-}
-
-/// Streams written before paired bindings are named `<host>.<qualifier>`.
-fn legacy_kind(stream: &str) -> Option<&'static str> {
-    let (host, qualifier) = stream.rsplit_once('.')?;
-    if host.is_empty() || host == "import" {
-        return None;
-    }
-    match qualifier {
-        "tmux" => Some("terminal"),
-        "watch" => Some("watch"),
-        "mobile" | "phone" => Some("phone"),
-        "browser" => Some("browser"),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -374,7 +314,7 @@ mod tests {
         for key in ["100100_300", "100600_300"] {
             segment(root, "extro_tmux", key);
         }
-        bind(root, "device_2", DESKTOP_CID, "");
+        bind(root, "device_2", DESKTOP_CID, "screen");
         bind(root, "extro_tmux", TERMINAL_CID, "tmux");
         describe(
             root,
@@ -514,8 +454,8 @@ mod tests {
         let root = TempDir::new().unwrap();
         segment(root.path(), "device_2", "100000_300");
         segment(root.path(), "device_3", "100100_300");
-        bind(root.path(), "device_2", DESKTOP_CID, "");
-        bind(root.path(), "device_3", LAPTOP_CID, "");
+        bind(root.path(), "device_2", DESKTOP_CID, "screen");
+        bind(root.path(), "device_3", LAPTOP_CID, "screen");
         describe(
             root.path(),
             &[
@@ -554,15 +494,5 @@ mod tests {
             ],
         );
         assert_eq!(got, vec![Some(source_phrase("computer", None)), None]);
-    }
-
-    #[test]
-    fn legacy_stream_names_read_by_their_qualifier_only() {
-        assert_eq!(legacy_kind("fedora.tmux"), Some("terminal"));
-        assert_eq!(legacy_kind("iphone.watch"), Some("watch"));
-        assert_eq!(legacy_kind("suze.browser"), Some("browser"));
-        assert_eq!(legacy_kind("fedora"), None);
-        assert_eq!(legacy_kind("import.plaud"), None);
-        assert_eq!(legacy_kind("rokid-rg-glasses.glasses"), None);
     }
 }

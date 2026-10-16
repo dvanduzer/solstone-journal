@@ -526,6 +526,15 @@ function createTranscriptsDOM() {
   titleEl.className = 'tr-title';
   doc.body.appendChild(titleEl);
 
+  const copyStreamBtn = doc.createElement('button');
+  copyStreamBtn.id = 'trCopyStreamBtn';
+  copyStreamBtn.setAttribute('aria-label', 'copy stream id');
+  doc.body.appendChild(copyStreamBtn);
+
+  const toast = doc.createElement('div');
+  toast.id = 'trToast';
+  doc.body.appendChild(toast);
+
   const rangeText = doc.createElement('div');
   rangeText.id = 'trRangeText';
   doc.body.appendChild(rangeText);
