@@ -4,7 +4,7 @@
 //! Read-only index status: how far the index is from the files on disk.
 //!
 //! Opens the index read-only, never creates it, never takes the writer lease and
-//! never writes. Walks the journal with the scan's own discovery and stat rule
+//! never writes. Walks the journal with the status walk and the scan's stat rule
 //! and compares against the `files` table. Reads no journal content: the only
 //! bytes read besides the index are per-directory `shape.json` sidecars, and
 //! only for discovered paths the index has no row for.
@@ -16,7 +16,7 @@ use rusqlite::{Connection, OpenFlags};
 use serde_json::json;
 use solstone_core_format::content::{ContentResolution, resolve_content_shape};
 use solstone_core_format::segment::day_of;
-use solstone_core_indexer::discovery::discover_indexable_files;
+use solstone_core_indexer::discovery::discover_index_status_files;
 
 use crate::StoreError;
 use crate::chunk_sources::chunk_path_lookup_ready;
@@ -262,7 +262,7 @@ fn sample(paths: &BTreeSet<String>) -> Vec<&str> {
 
 /// Measure the index against the disk without changing either.
 pub fn inspect_index(journal: &Path) -> Result<IndexStatus, StoreError> {
-    let files = discover_indexable_files(journal)?;
+    let files = discover_index_status_files(journal)?;
     let mut status = IndexStatus {
         database: IndexDatabase::Absent,
         stamp: None,
