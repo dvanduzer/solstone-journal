@@ -11,6 +11,7 @@ use solstone_core_system_health::{
     is_floor_talent_capped, lookup_segment_progress, read_completed_since, read_completed_units,
     read_daily_deterministic_failures, read_segment_progress, read_terminal_states,
     segment_fully_sensed, segment_fully_thought, segment_requires_processing,
+    segment_thinking_is_current,
 };
 
 static NEXT_ROOT: AtomicUsize = AtomicUsize::new(0);
@@ -543,6 +544,52 @@ fn optional_recommendation_withdrawal_is_stream_scoped_and_redispatch_restores_w
             ThoughtVerdict::Dispatched(name.to_owned())
         );
     }
+}
+
+#[test]
+fn a_later_pass_supersedes_work_it_no_longer_selects() {
+    let root = root();
+    write(
+        &root,
+        "20990202",
+        "001.jsonl",
+        &[
+            r#"{"event":"talent.dispatch","ts":1,"mode":"segment","stream":"default","segment":"s","name":"sense","use_id":"s1"}"#,
+            r#"{"event":"talent.complete","ts":2,"mode":"segment","stream":"default","segment":"s","name":"sense","use_id":"s1"}"#,
+            r#"{"event":"sense.complete","ts":2,"mode":"segment","stream":"default","segment":"s","density":"active"}"#,
+            r#"{"event":"talent.dispatch","ts":3,"mode":"segment","stream":"default","segment":"s","name":"removed","use_id":"r1"}"#,
+            r#"{"event":"talent.fail","ts":4,"mode":"segment","stream":"default","segment":"s","name":"removed","use_id":"r1"}"#,
+            r#"{"event":"talent.complete","ts":5,"mode":"segment","stream":"default","segment":"s","name":"documents"}"#,
+        ],
+    );
+    assert_eq!(
+        thought_for(&progress_for(&root, "20990202"), "s"),
+        ThoughtVerdict::Dispatched("removed".into())
+    );
+    write(
+        &root,
+        "20990202",
+        "002.jsonl",
+        &[
+            r#"{"event":"talent.dispatch","ts":6,"mode":"segment","stream":"default","segment":"s","name":"sense","use_id":"s2"}"#,
+            r#"{"event":"talent.complete","ts":7,"mode":"segment","stream":"default","segment":"s","name":"sense","use_id":"s2"}"#,
+            r#"{"event":"sense.complete","ts":7,"mode":"segment","stream":"default","segment":"s","density":"active"}"#,
+            r#"{"event":"talent.dispatch","ts":8,"mode":"segment","stream":"default","segment":"s","name":"documents","use_id":"d2"}"#,
+            r#"{"event":"talent.complete","ts":9,"mode":"segment","stream":"default","segment":"s","name":"documents","use_id":"d2"}"#,
+        ],
+    );
+    let progress = progress_for(&root, "20990202");
+    assert_eq!(thought_for(&progress, "s"), ThoughtVerdict::Complete);
+    assert!(segment_thinking_is_current(
+        lookup_segment_progress(&progress, "default", "s"),
+        Some(5)
+    ));
+    let retry = r#"{"event":"talent.dispatch","ts":10,"mode":"segment","stream":"default","segment":"s","name":"screen","use_id":"x1"}"#;
+    write(&root, "20990202", "003.jsonl", &[retry]);
+    assert_eq!(
+        thought_for(&progress_for(&root, "20990202"), "s"),
+        ThoughtVerdict::Dispatched("screen".into())
+    );
 }
 
 #[test]

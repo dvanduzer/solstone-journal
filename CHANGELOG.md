@@ -12,13 +12,17 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- on large journals, health takes less time to open after your journal starts. speaker dates and stats also load faster.
 - on the command line, `--timestamp` also takes a date and time with its offset, such as `2025-11-02T01:30:00-07:00`, so a recording from the hour that repeats when daylight saving time ends can be placed at its true time. the `YYYYMMDD_HHMMSS` form works as before.
 
 ### Fixed
 
+- while catching up on older recordings, your journal could think about the same recording over and over. this happened when an earlier version had started a step for it, and that step no longer exists. each recording like this now gets at most one more look, and then it is left alone.
+- after you restore your journal onto a new device, you can bring your solstone.me address back to it in the agents app. before, the address stayed off. your journal tells you when the address has come back, and the other copy stops using it.
 - downloading location accuracy no longer pauses to save its progress after every small piece of the download, which could make it take hours on windows.
 - on linux, installing your journal now retries interrupted downloads and temporary download errors. an incomplete download reports a download failure instead of a signature mismatch.
 - on ubuntu 22.04, the installer points you to Minisign's installation page when the verifier is missing.
+- with media offload turned off, its nightly run no longer reports that offload didn't start or didn't finish. it now notes that offload is off and stops there. nothing was removed, and your media stayed on this computer.
 
 ## [2.0.48] - 2026-10-16
 

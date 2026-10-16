@@ -141,6 +141,82 @@ async fn grid_matches_the_populated_speakers_corpus() {
 }
 
 #[tokio::test]
+async fn speaker_dates_follow_ingest_retention_admission_and_label_changes() {
+    async fn get(app: &axum::Router, route: &str) -> Value {
+        let response = app
+            .clone()
+            .oneshot(Request::get(route).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
+    }
+
+    let journal = EmptyEstablishedJournal::new();
+    let app = router(journal.0.clone());
+    let index = "/app/speakers/api/index";
+    let grid = "/app/speakers/api/grid";
+    assert_eq!(get(&app, index).await["months"], serde_json::json!({}));
+
+    let segment = journal.0.join("chronicle/20260101/main/090000_60");
+    fs::create_dir_all(segment.join("talents")).unwrap();
+    fs::write(segment.join("audio.npz"), []).unwrap();
+    // The date count needs embedding presence, not a readable speaker payload.
+    fs::write(segment.join("talents/speakers.json"), "{malformed").unwrap();
+    let labels = segment.join("talents/speaker_labels.json");
+    fs::write(
+        &labels,
+        serde_json::json!({"labels":[{"speaker":"reader","confidence":"high"}]}).to_string(),
+    )
+    .unwrap();
+    assert_eq!(get(&app, index).await["months"]["202601"], 1);
+    assert_eq!(get(&app, grid).await["activity"]["20260101"], 1);
+    assert_eq!(get(&app, grid).await["days"]["20260101"], 1);
+
+    let entity = journal.0.join("entities/reader/entity.json");
+    fs::create_dir_all(entity.parent().unwrap()).unwrap();
+    for (kind, blocked, review) in [
+        ("Person", false, false),
+        ("Tool", false, true),
+        ("Person", true, true),
+        ("Person", false, false),
+    ] {
+        fs::write(
+            &entity,
+            serde_json::json!({"id":"reader","name":"Reader","type":kind,"blocked":blocked})
+                .to_string(),
+        )
+        .unwrap();
+        let value = get(&app, grid).await;
+        assert_eq!(value["activity"]["20260101"], 1);
+        assert_eq!(value["days"]["20260101"].as_u64(), review.then_some(1));
+    }
+    for (confidence, review) in [("medium", true), ("high", false)] {
+        fs::write(
+            &labels,
+            serde_json::json!({"labels":[{"speaker":"reader","confidence":confidence}]})
+                .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            get(&app, grid).await["days"]["20260101"].as_u64(),
+            review.then_some(1),
+        );
+    }
+
+    fs::remove_file(segment.join("audio.npz")).unwrap();
+    fs::create_dir(segment.join("audio.npz")).unwrap();
+    fs::write(segment.join("unrelated.npz"), []).unwrap();
+    assert_eq!(get(&app, index).await["months"], serde_json::json!({}));
+    assert_eq!(get(&app, grid).await["activity"], serde_json::json!({}));
+    fs::write(segment.join("mic_audio.npz"), []).unwrap();
+    assert_eq!(get(&app, index).await["months"]["202601"], 1);
+    fs::remove_dir_all(&segment).unwrap();
+    assert_eq!(get(&app, index).await["months"], serde_json::json!({}));
+    assert_eq!(get(&app, grid).await["activity"], serde_json::json!({}));
+}
+
+#[tokio::test]
 async fn stats_matches_the_populated_speakers_corpus() {
     let journal = support::build_populated_journal();
     let app = router(journal.root().to_path_buf());

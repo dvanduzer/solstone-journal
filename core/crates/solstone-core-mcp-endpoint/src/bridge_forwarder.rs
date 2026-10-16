@@ -48,7 +48,12 @@ async fn wait_after_failed_connect(
         let next_attempt = chrono::Utc::now()
             + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::seconds(300));
         crate::owner_state::write_mcp_hold_state(journal_root, hold, address, legs, next_attempt);
-        wait_for_fixed_delay(shutdown, delay).await;
+        tokio::select! {
+            changed = shutdown.changed() => {
+                let _ = changed;
+            }
+            _ = crate::sme_account_replace::wait_out_hold(journal_root, hold, delay) => {}
+        }
     } else {
         wait_for_retry(shutdown, *backoff_cap_seconds).await;
         *backoff_cap_seconds = backoff_cap_seconds.saturating_mul(2).min(60);
@@ -236,15 +241,6 @@ async fn join_generation_tasks(tasks: &mut JoinSet<()>) {
 
 async fn wait_for_retry(shutdown: &mut watch::Receiver<bool>, cap_seconds: u64) {
     let delay = full_jitter_delay(cap_seconds);
-    tokio::select! {
-        changed = shutdown.changed() => {
-            let _ = changed;
-        }
-        _ = sleep(delay) => {}
-    }
-}
-
-async fn wait_for_fixed_delay(shutdown: &mut watch::Receiver<bool>, delay: Duration) {
     tokio::select! {
         changed = shutdown.changed() => {
             let _ = changed;

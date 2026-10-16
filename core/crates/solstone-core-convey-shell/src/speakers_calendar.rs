@@ -227,7 +227,13 @@ fn speaker_segment_counts(
         if month.is_some_and(|month| !day.starts_with(month)) {
             continue;
         }
-        let count = scan_segment_embeddings(root, &day)?.len();
+        let count = iter_segments(root, &day)?
+            .into_iter()
+            .filter(|segment| {
+                parse_segment(&segment.time_key).is_some()
+                    && !audio_embedding_sources(&segment.path).is_empty()
+            })
+            .count();
         if count > 0 {
             counts.insert(day, count);
         }
@@ -374,11 +380,15 @@ pub(crate) fn audio_embedding_sources(path: &Path) -> Vec<String> {
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let path = entry.path();
-            (path.is_file() && path.extension().is_some_and(|extension| extension == "npz"))
-                .then(|| path.file_stem()?.to_str().map(str::to_owned))
-                .flatten()
+            if !path.extension().is_some_and(|extension| extension == "npz") {
+                return None;
+            }
+            let stem = path.file_stem()?.to_str()?;
+            if stem != "audio" && !stem.ends_with("_audio") {
+                return None;
+            }
+            path.is_file().then(|| stem.to_owned())
         })
-        .filter(|stem| stem == "audio" || stem.ends_with("_audio"))
         .collect::<Vec<_>>();
     sources.sort();
     sources

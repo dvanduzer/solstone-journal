@@ -57,6 +57,14 @@ pub fn owner_routes(journal_root: PathBuf) -> Router {
             "/app/agents/api/replay-notices/{id}/dismiss",
             post(dismiss_replay_notice),
         )
+        .route(
+            "/app/agents/api/solstone-me/account/replace",
+            post(replace_sme_account),
+        )
+        .route(
+            "/app/agents/api/solstone-me/account/notice/dismiss",
+            post(dismiss_sme_account_notice),
+        )
         .route("/app/agents/api/activity", get(activity));
     with_byo_routes(router)
         .route_layer(middleware::from_fn(admit_owner))
@@ -676,6 +684,14 @@ pub(crate) fn state_value_with_iface(
         "certificate": certificate,
         "connections": connections,
         "replay_notices": replay_notices,
+        "sme_account": {
+            "replace_pending": status == "account_changed"
+                && crate::sme_account_replace::pending_request(root, Utc::now()).is_some(),
+            "replaced": crate::sme_account_replace::read_notice(root).map(|notice| json!({
+                "address": notice.address,
+                "replaced_at": notice.replaced_at,
+            })),
+        },
         "facets": facets,
         "pairing": pairing.map(pairing_json),
     });
@@ -1469,6 +1485,9 @@ async fn set_capability(
     Extension(journal): Extension<Arc<PathBuf>>,
     Json(body): Json<CapabilityBody>,
 ) -> Response {
+    if !body.enabled {
+        crate::sme_account_replace::withdraw_request(&journal);
+    }
     write_endpoint_switch(&journal, "enabled", body.enabled)
 }
 
@@ -1790,6 +1809,46 @@ async fn dismiss_replay_notice(
         ),
         Err(error) => refusal(
             "replay_notice_dismiss_failed",
+            error,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// The owner's click to bring the solstone.me address back to this journal.
+/// Accepted only while the address is refused for a changed certificate
+/// account; the service process carries it on its next address request.
+async fn replace_sme_account(Extension(journal): Extension<Arc<PathBuf>>) -> Response {
+    let enabled = read_journal_config(&journal).is_ok_and(|config| {
+        matches!(
+            mcp_endpoint_capability(&config),
+            Ok(McpEndpointCapability::Enabled)
+        )
+    });
+    let account_changed = crate::read_mcp_owner_state(&journal)
+        .is_some_and(|owner_state| owner_state.status == "account_changed");
+    if !enabled || !account_changed {
+        return refusal(
+            "not_account_changed",
+            "solstone.me is not refusing this journal for a changed certificate account",
+            StatusCode::CONFLICT,
+        );
+    }
+    if let Err(error) = crate::sme_account_replace::record_request(&journal, Utc::now()) {
+        return refusal(
+            "account_replace_request_failed",
+            error,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
+    }
+    state(Extension(journal)).await
+}
+
+async fn dismiss_sme_account_notice(Extension(journal): Extension<Arc<PathBuf>>) -> Response {
+    match crate::sme_account_replace::dismiss_notice(&journal) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => refusal(
+            "account_notice_dismiss_failed",
             error,
             StatusCode::INTERNAL_SERVER_ERROR,
         ),
@@ -2393,6 +2452,121 @@ mod tests {
             assert!(!detail.is_empty(), "{status} carries owner words");
             assert!(value.get("subscribe_url").is_none(), "{status}");
         }
+    }
+
+    fn post_owner(uri: &str) -> Request<Body> {
+        let mut request = Request::builder()
+            .method(axum::http::Method::POST)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(AccessBasis::Localhost);
+        request
+    }
+
+    #[tokio::test]
+    async fn the_owner_can_ask_to_bring_the_address_back_only_while_the_account_changed() {
+        use crate::bridge_carrier::RegistrationHold;
+        let temp = TempDir::new_in(crate::test_scratch()).unwrap();
+        let journal_root = temp.path();
+        std::fs::create_dir_all(journal_root.join("config")).unwrap();
+        std::fs::create_dir_all(journal_root.join("mcp-endpoint")).unwrap();
+        std::fs::write(
+            journal_root.join("config/journal.json"),
+            r#"{"mcp_endpoint":{"enabled":true}}"#,
+        )
+        .unwrap();
+        let replace = || {
+            owner_routes(journal_root.to_path_buf())
+                .oneshot(post_owner("/app/agents/api/solstone-me/account/replace"))
+        };
+
+        // No refusal on record, then a different refusal: nothing to bring back.
+        assert_eq!(replace().await.unwrap().status(), StatusCode::CONFLICT);
+        crate::owner_state::write_mcp_hold_state(
+            journal_root,
+            RegistrationHold::AddressNotReady,
+            None,
+            ("waiting", "waiting", "waiting"),
+            Utc::now() + Duration::seconds(60),
+        );
+        assert_eq!(replace().await.unwrap().status(), StatusCode::CONFLICT);
+        assert!(crate::sme_account_replace::pending_request(journal_root, Utc::now()).is_none());
+
+        crate::owner_state::write_mcp_hold_state(
+            journal_root,
+            RegistrationHold::AccountChanged,
+            None,
+            ("waiting", "waiting", "waiting"),
+            Utc::now() + Duration::seconds(300),
+        );
+        let before = state_value(journal_root).unwrap();
+        assert_eq!(before["status"], "account_changed");
+        assert_eq!(before["sme_account"]["replace_pending"], false);
+        let response = replace().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let after: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(after["sme_account"]["replace_pending"], true);
+        assert!(crate::sme_account_replace::pending_request(journal_root, Utc::now()).is_some());
+
+        // Turning solstone.me off withdraws the waiting click, and while it is
+        // off a click is refused even with the refusal still on record.
+        let mut off = Request::builder()
+            .method(axum::http::Method::PUT)
+            .uri("/app/agents/api/capability")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"enabled":false}"#))
+            .unwrap();
+        off.extensions_mut().insert(AccessBasis::Localhost);
+        let off = owner_routes(journal_root.to_path_buf())
+            .oneshot(off)
+            .await
+            .unwrap();
+        assert!(off.status().is_success(), "{}", off.status());
+        assert!(crate::sme_account_replace::pending_request(journal_root, Utc::now()).is_none());
+        assert_eq!(replace().await.unwrap().status(), StatusCode::CONFLICT);
+        assert!(crate::sme_account_replace::pending_request(journal_root, Utc::now()).is_none());
+    }
+
+    #[tokio::test]
+    async fn the_notice_that_the_address_came_back_shows_until_dismissed() {
+        let temp = TempDir::new_in(crate::test_scratch()).unwrap();
+        let journal_root = temp.path();
+        std::fs::create_dir_all(journal_root.join("mcp-endpoint")).unwrap();
+        assert_eq!(
+            state_value(journal_root).unwrap()["sme_account"]["replaced"],
+            Value::Null
+        );
+        let at = Utc::now();
+        crate::sme_account_replace::observe_replacement(
+            journal_root,
+            "aaaqeaye.solstone.me",
+            "reported",
+            Some(at),
+            at,
+        );
+        let value = state_value(journal_root).unwrap();
+        assert_eq!(
+            value["sme_account"]["replaced"]["address"],
+            "aaaqeaye.solstone.me"
+        );
+        assert_eq!(value["sme_account"]["replaced"]["replaced_at"], json!(at));
+        let response = owner_routes(journal_root.to_path_buf())
+            .oneshot(post_owner(
+                "/app/agents/api/solstone-me/account/notice/dismiss",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            state_value(journal_root).unwrap()["sme_account"]["replaced"],
+            Value::Null
+        );
     }
 
     #[test]

@@ -375,6 +375,10 @@ where
                         ("waiting", "waiting", "waiting"),
                         next_attempt,
                     );
+                    let carried = crate::sme_account_replace::pending_request(
+                        journal_root,
+                        chrono::Utc::now(),
+                    );
                     let mut sleep = std::pin::pin!(tokio::time::sleep(delay));
                     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
                     loop {
@@ -383,6 +387,13 @@ where
                             _ = ticker.tick() => {
                                 if shutdown_requested(shutdown) || !capability_enabled(journal_root) {
                                     return Ok(None);
+                                }
+                                // The owner asked to bring the address back: ask now
+                                // rather than at the end of the hold.
+                                if hold == crate::bridge_carrier::RegistrationHold::AccountChanged
+                                    && crate::sme_account_replace::new_click(journal_root, carried)
+                                {
+                                    break;
                                 }
                             }
                         }
@@ -646,6 +657,60 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_request_the_service_did_not_accept_waits_five_minutes_before_the_next_attempt() {
         assert_a_hold_waits_five_minutes(McpBridgeCarrierError::NotAccepted, "not_accepted").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_owners_click_on_a_changed_account_asks_again_at_once_and_nothing_else_does() {
+        let journal = enabled_journal();
+        let (_keep, shutdown) = watch::channel(false);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let task = spawn_first_connect(
+            journal.path().to_path_buf(),
+            shutdown,
+            Arc::clone(&attempts),
+            McpBridgeCarrierError::AccountChanged,
+        );
+        settle().await;
+        assert_eq!(
+            read_mcp_owner_state(journal.path())
+                .expect("owner state")
+                .status,
+            "account_changed"
+        );
+        tokio::time::advance(Duration::from_secs(60)).await;
+        settle().await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "no click, no new attempt"
+        );
+
+        crate::sme_account_replace::record_request(journal.path(), chrono::Utc::now())
+            .expect("click records");
+        tokio::time::advance(Duration::from_secs(2)).await;
+        settle().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(task.await.expect("task"), Ok(Some(())));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_click_does_not_cut_short_any_other_hold() {
+        let journal = enabled_journal();
+        let (_keep, shutdown) = watch::channel(false);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let task = spawn_first_connect(
+            journal.path().to_path_buf(),
+            shutdown,
+            Arc::clone(&attempts),
+            McpBridgeCarrierError::NeedsSubscription,
+        );
+        settle().await;
+        crate::sme_account_replace::record_request(journal.path(), chrono::Utc::now())
+            .expect("click records");
+        tokio::time::advance(Duration::from_secs(60)).await;
+        settle().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        task.abort();
     }
 
     #[tokio::test(start_paused = true)]
