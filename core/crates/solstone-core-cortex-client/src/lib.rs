@@ -397,12 +397,10 @@ fn request_is_claimed(talents_dir: &Path, name: &str, use_id: &str) -> io::Resul
 
 /// Read the last recognized terminal event from a durable use log.
 pub fn get_use_end_state(journal: &Path, use_id: &str) -> Result<UseEndState, io::Error> {
-    let talents_dir = journal.join("talents");
-    let (status, path) = find_use_file(&talents_dir, use_id)?;
-    let Some(path) = path else {
+    let (status, events) = read_use_log(&journal.join("talents"), use_id)?;
+    let Some(events) = events else {
         return Ok(UseEndState::Unknown);
     };
-    let events = read_events_at(&path)?;
     if let Some(event) = events.into_iter().rev().find_map(|event| {
         match event.get("event").and_then(Value::as_str) {
             Some("finish") => Some(UseEndState::Finish),
@@ -420,14 +418,48 @@ pub fn get_use_end_state(journal: &Path, use_id: &str) -> Result<UseEndState, io
 
 /// Read all valid event JSON values from a durable use log.
 pub fn read_use_events(journal: &Path, use_id: &str) -> Result<Vec<Value>, io::Error> {
-    let (_, path) = find_use_file(&journal.join("talents"), use_id)?;
-    let path = path.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("Talent log not found: {use_id}"),
-        )
-    })?;
-    read_events_at(&path)
+    read_use_log(&journal.join("talents"), use_id)?
+        .1
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Talent log not found: {use_id}"),
+            )
+        })
+}
+
+/// Resolve and read a use log across Cortex's completion rename.
+///
+/// The active leaf can be renamed between resolving it and opening it. Completion only ever
+/// moves a log from `_active.jsonl` to `.jsonl`, so resolving once more finds it there.
+fn read_use_log(
+    talents_dir: &Path,
+    use_id: &str,
+) -> Result<(UseFileStatus, Option<Vec<Value>>), io::Error> {
+    read_use_log_with(talents_dir, use_id, find_use_file)
+}
+
+fn read_use_log_with(
+    talents_dir: &Path,
+    use_id: &str,
+    mut find: impl FnMut(&Path, &str) -> Result<(UseFileStatus, Option<PathBuf>), io::Error>,
+) -> Result<(UseFileStatus, Option<Vec<Value>>), io::Error> {
+    let (status, path) = find(talents_dir, use_id)?;
+    let Some(path) = path else {
+        return Ok((status, None));
+    };
+    match read_events_at(&path) {
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound && status == UseFileStatus::Running =>
+        {
+            let (status, path) = find(talents_dir, use_id)?;
+            match path {
+                Some(path) => Ok((status, Some(read_events_at(&path)?))),
+                None => Ok((status, None)),
+            }
+        }
+        events => Ok((status, Some(events?))),
+    }
 }
 
 /// Return the reference's completed/running/not-found durable-file status.
@@ -439,28 +471,47 @@ fn find_use_file(
     talents_dir: &Path,
     use_id: &str,
 ) -> Result<(UseFileStatus, Option<PathBuf>), io::Error> {
+    find_use_file_with(talents_dir, use_id, || {})
+}
+
+/// The completed scan runs before the active one, so a completion rename landing between
+/// them hid the log from both: a terminal error already on disk read as no log, and the
+/// failure was recorded as `reason_code=error` (owner's journal, 2026-10-16, a `screen` use
+/// whose log ended in `incomplete_json_length`). The rename is one-way, so once the active
+/// leaf is gone a second completed scan finds the log.
+fn find_use_file_with(
+    talents_dir: &Path,
+    use_id: &str,
+    mut between_scans: impl FnMut(),
+) -> Result<(UseFileStatus, Option<PathBuf>), io::Error> {
     if !talents_dir.exists() {
         return Ok((UseFileStatus::NotFound, None));
     }
-    for entry in fs::read_dir(talents_dir)? {
-        let path = entry?.path();
-        if path.is_dir() {
-            let candidate = path.join(format!("{use_id}.jsonl"));
-            if candidate.is_file() && candidate_matches(&candidate, use_id)? {
-                return Ok((UseFileStatus::Completed, Some(candidate)));
-            }
-        }
+    let completed = format!("{use_id}.jsonl");
+    if let Some(path) = find_use_leaf(talents_dir, use_id, &completed)? {
+        return Ok((UseFileStatus::Completed, Some(path)));
     }
-    for entry in fs::read_dir(talents_dir)? {
-        let path = entry?.path();
-        if path.is_dir() {
-            let candidate = path.join(format!("{use_id}_active.jsonl"));
-            if candidate.is_file() && candidate_matches(&candidate, use_id)? {
-                return Ok((UseFileStatus::Running, Some(candidate)));
-            }
-        }
+    between_scans();
+    if let Some(path) = find_use_leaf(talents_dir, use_id, &format!("{use_id}_active.jsonl"))? {
+        return Ok((UseFileStatus::Running, Some(path)));
+    }
+    if let Some(path) = find_use_leaf(talents_dir, use_id, &completed)? {
+        return Ok((UseFileStatus::Completed, Some(path)));
     }
     Ok((UseFileStatus::NotFound, None))
+}
+
+fn find_use_leaf(talents_dir: &Path, use_id: &str, leaf: &str) -> io::Result<Option<PathBuf>> {
+    for entry in fs::read_dir(talents_dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            let candidate = path.join(leaf);
+            if candidate.is_file() && candidate_matches(&candidate, use_id)? {
+                return Ok(Some(candidate));
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn candidate_matches(path: &Path, use_id: &str) -> io::Result<bool> {
@@ -774,6 +825,53 @@ mod tests {
         recover_completed_from_disk(journal.path(), &mut pending, &mut completed).unwrap();
         assert!(pending.is_empty());
         assert_eq!(completed["moving"].end_state, UseEndState::Finish);
+    }
+
+    fn terminal_reason(events: &[Value]) -> Option<&str> {
+        events.last()?.get("reason_code")?.as_str()
+    }
+
+    const FAILED_USE: &str = "{\"use_id\":\"moving\"}\n{\"event\":\"error\",\"reason_code\":\"incomplete_json_length\"}\n";
+
+    #[test]
+    fn a_use_completed_between_the_two_scans_keeps_its_terminal_reason() {
+        let journal = tempfile::tempdir().unwrap();
+        active_use(journal.path(), "moving", FAILED_USE);
+        let talents = journal.path().join("talents");
+        let active = talents.join("test/moving_active.jsonl");
+        let (status, events) = read_use_log_with(&talents, "moving", |dir, id| {
+            find_use_file_with(dir, id, || {
+                fs::rename(&active, active.with_file_name("moving.jsonl")).unwrap();
+            })
+        })
+        .unwrap();
+        assert_eq!(status, UseFileStatus::Completed);
+        assert_eq!(
+            terminal_reason(&events.unwrap()),
+            Some("incomplete_json_length")
+        );
+    }
+
+    #[test]
+    fn a_use_completed_between_resolving_and_opening_keeps_its_terminal_reason() {
+        let journal = tempfile::tempdir().unwrap();
+        active_use(journal.path(), "moving", FAILED_USE);
+        let talents = journal.path().join("talents");
+        let mut first = true;
+        let (status, events) = read_use_log_with(&talents, "moving", |dir, id| {
+            let found = find_use_file(dir, id)?;
+            if std::mem::take(&mut first) {
+                let active = found.1.clone().unwrap();
+                fs::rename(&active, active.with_file_name("moving.jsonl"))?;
+            }
+            Ok(found)
+        })
+        .unwrap();
+        assert_eq!(status, UseFileStatus::Completed);
+        assert_eq!(
+            terminal_reason(&events.unwrap()),
+            Some("incomplete_json_length")
+        );
     }
 
     #[test]
