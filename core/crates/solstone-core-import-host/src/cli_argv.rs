@@ -592,11 +592,12 @@ fn run_audio(
     };
     let outcome = runtime.block_on(import_audio(request));
     finish_audio_attempt(journal_path, &import_id, attempt.generation, &outcome);
-    // Only an import that finished cleanly is recorded: a failed or stalled segment should
-    // be able to import again.
+    // Only an import that finished cleanly is recorded: a file with a part left out, or a
+    // failed or stalled segment, should be able to import again.
     let manifest = match &outcome {
         Ok(imported)
-            if imported.created().processing.failed_segments.is_empty()
+            if imported.writes_dedupe_manifest()
+                && imported.created().processing.failed_segments.is_empty()
                 && imported.created().processing.stalled_segments.is_empty() =>
         {
             Some(write_audio_manifest(
@@ -1849,9 +1850,40 @@ pub fn audio_import_cli_run(
             if !lines.is_empty() {
                 return failure("", &lines, 1);
             }
-            success(format!("Generic audio import complete: {outcome:?}\n"))
+            // A chunk left out keeps the import a success with gaps, but the owner is told
+            // which part is missing before trying the file again.
+            let left_out = outcome
+                .dropped_chunks()
+                .iter()
+                .map(|chunk| {
+                    format!(
+                        "{} to {}",
+                        recording_offset(chunk.start_offset_seconds),
+                        recording_offset(chunk.start_offset_seconds + chunk.duration_seconds)
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut run = success(format!("Generic audio import complete: {outcome:?}\n"));
+            if !left_out.is_empty() {
+                run.stderr = format!(
+                    "part of this recording couldn't be imported: {} into the recording. the other parts are in your journal, and importing the file again would add them a second time.\n",
+                    left_out.join(", ")
+                );
+            }
+            run
         }
         Err(error) => failure("", &format!("{error}\n"), 1),
+    }
+}
+
+/// A position in a recording as `m:ss`, or `h:mm:ss` past the first hour.
+fn recording_offset(seconds: f64) -> String {
+    let total = seconds.max(0.0).round() as u64;
+    let (hours, minutes, seconds) = (total / 3600, total / 60 % 60, total % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
     }
 }
 

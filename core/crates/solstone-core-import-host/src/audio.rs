@@ -1007,6 +1007,10 @@ fn remux_slice_to_stage(
         .map_err(|error| AudioSliceError::Remux { error })?;
 
     let end_seconds = start_seconds + duration_seconds;
+    // The first chunk starts where the source starts. A packet before zero (Opus pre-skip,
+    // AAC priming) carries the opening audio and keeps its own timestamp; cutting it lost
+    // about 20 ms from the start of every Opus recording.
+    let first_chunk = start_seconds <= 0.0;
     let mut output_origin_timestamp = None;
     for (stream, mut packet) in input.packets() {
         if stream.index() != input_index {
@@ -1016,13 +1020,17 @@ fn remux_slice_to_stage(
             continue;
         };
         let packet_seconds = timestamp as f64 * f64::from(input_time_base);
-        if packet_seconds < start_seconds {
+        if !first_chunk && packet_seconds < start_seconds {
             continue;
         }
         if packet_seconds >= end_seconds {
             break;
         }
-        let origin_timestamp = *output_origin_timestamp.get_or_insert(timestamp);
+        let origin_timestamp = *output_origin_timestamp.get_or_insert(if first_chunk {
+            timestamp.max(0)
+        } else {
+            timestamp
+        });
         if let Some(pts) = packet.pts() {
             packet.set_pts(Some(pts.saturating_sub(origin_timestamp)));
         }
@@ -1348,7 +1356,8 @@ pub mod native_long_audio_remux_corpus {
                 continue;
             };
             let packet_seconds = timestamp as f64 * f64::from(input_time_base);
-            if packet_seconds < start_seconds {
+            // The first chunk owns every packet before its end, including those before zero.
+            if start_seconds > 0.0 && packet_seconds < start_seconds {
                 continue;
             }
             if packet_seconds >= end_seconds {

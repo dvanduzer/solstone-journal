@@ -31,6 +31,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - sharing to your journal from your iphone or ipad works again. since 2.0.42, your journal turned away every photo, voice memo, pdf and piece of text you shared from your phone, saying to preview the import first, which the phone has no way to do. anything your phone is still holding goes into your journal on its own once your journal is updated and your phone connects to it again.
 - on the import page, dropping a photo or a pdf into quick import works again. since 2.0.42, its preview stopped with an error instead.
 - media offload runs again on some journals that go back to before version 2.0. 2.0.47 said offload ran again on a large journal, but on these journals the check it runs first still stopped it before it began. nothing was removed, and your media stayed on this computer.
+- opus recordings you import now keep their opening sound. before, each imported opus file lost about 20 milliseconds from its start.
+- when part of an audio file can't be imported, the command line now names the part that's missing, and the file is no longer counted as imported. before, trying the file again was turned away as already imported. importing it again adds a second copy of the parts that did get in.
 
 ## [2.0.47] - 2026-10-15
 

@@ -856,4 +856,155 @@ fn partial_remux_without_failed_or_stalled_wait_still_succeeds() {
         "stdout={}",
         run.stdout
     );
+    assert!(
+        run.stderr.contains("5:00 to 10:00") && run.stderr.contains("10:00 to 10:01"),
+        "the parts left out are named: stderr={}",
+        run.stderr
+    );
+}
+
+/// The repository's long Opus recording, copied under a name that carries its time.
+#[cfg(feature = "full-tests")]
+fn synced_opus_source(folder: &Path, name: &str) -> PathBuf {
+    let source = folder.join(name);
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/long_audio_remux_corpus/long-remux.opus"),
+        &source,
+    )
+    .unwrap();
+    source
+}
+
+/// Move the granule positions of the Ogg pages between 420 s and 440 s back by 60 s, so the
+/// second five-minute chunk goes backwards in time and cannot be copied.
+#[cfg(feature = "full-tests")]
+fn step_back_inside_second_chunk(path: &Path) {
+    fn crc(bytes: &[u8]) -> u32 {
+        bytes.iter().fold(0_u32, |crc, byte| {
+            let mut value = crc ^ (u32::from(*byte) << 24);
+            for _ in 0..8 {
+                value = if value & 0x8000_0000 != 0 {
+                    (value << 1) ^ 0x04C1_1DB7
+                } else {
+                    value << 1
+                };
+            }
+            value
+        })
+    }
+    let mut data = fs::read(path).unwrap();
+    let mut position = 0;
+    let mut changed = 0;
+    while position < data.len() {
+        assert_eq!(&data[position..position + 4], b"OggS");
+        let segments = usize::from(data[position + 26]);
+        let body: usize = data[position + 27..position + 27 + segments]
+            .iter()
+            .map(|lacing| usize::from(*lacing))
+            .sum();
+        let length = 27 + segments + body;
+        let granule = i64::from_le_bytes(data[position + 6..position + 14].try_into().unwrap());
+        if (420 * 48_000..440 * 48_000).contains(&granule) {
+            let moved = granule - 60 * 48_000;
+            data[position + 6..position + 14].copy_from_slice(&moved.to_le_bytes());
+            data[position + 22..position + 26].fill(0);
+            let checksum = crc(&data[position..position + length]);
+            data[position + 22..position + 26].copy_from_slice(&checksum.to_le_bytes());
+            changed += 1;
+        }
+        position += length;
+    }
+    assert!(changed > 0, "the fixture has pages in the second chunk");
+    fs::write(path, data).unwrap();
+}
+
+#[cfg(feature = "full-tests")]
+fn sync_audio_folder(journal: &Path, folder: &Path) -> CliRun {
+    run_at(
+        journal,
+        &[
+            "--sync",
+            "audio",
+            "--path",
+            folder.to_str().unwrap(),
+            "--save",
+        ],
+        |name| (name == "SOL_SKIP_SUPERVISOR_CHECK").then(|| "1".to_owned()),
+        || false,
+    )
+}
+
+#[cfg(feature = "full-tests")]
+fn opening_packet(path: &Path) -> (i64, Vec<u8>) {
+    ffmpeg_next::init().unwrap();
+    let mut input = ffmpeg_next::format::input(path).unwrap();
+    let audio = input
+        .streams()
+        .best(ffmpeg_next::media::Type::Audio)
+        .unwrap()
+        .index();
+    input
+        .packets()
+        .find(|(stream, _)| stream.index() == audio)
+        .map(|(_, packet)| {
+            (
+                packet.pts().unwrap(),
+                packet.data().unwrap_or_default().to_vec(),
+            )
+        })
+        .unwrap()
+}
+
+#[cfg(feature = "full-tests")]
+#[test]
+fn an_import_with_a_part_left_out_is_not_marked_imported() {
+    let journal = tempfile::tempdir().unwrap();
+    write_utc_zone(journal.path());
+    let folder = tempfile::tempdir().unwrap();
+    let source = synced_opus_source(folder.path(), "20250717_120000.opus");
+    step_back_inside_second_chunk(&source);
+
+    let run = sync_audio_folder(journal.path(), folder.path());
+    assert_eq!(
+        run.exit_code, 0,
+        "stdout={} stderr={}",
+        run.stdout, run.stderr
+    );
+    let day = journal.path().join("chronicle/20250717/import.audio");
+    assert!(day.join("120000_300/imported_audio.opus").is_file());
+    assert!(
+        !day.join("120500_300").exists(),
+        "the second chunk was left out"
+    );
+
+    let hash = solstone_core_import::hash_source(&source).unwrap();
+    let scan = solstone_core_import::find_manifest_by_hash(journal.path(), &hash).unwrap();
+    assert!(
+        scan.found.is_none(),
+        "a partial import must stay importable: {:?}",
+        scan.found.map(|found| found.path)
+    );
+}
+
+#[cfg(feature = "full-tests")]
+#[test]
+fn an_opus_import_keeps_its_opening_packet() {
+    let journal = tempfile::tempdir().unwrap();
+    write_utc_zone(journal.path());
+    let folder = tempfile::tempdir().unwrap();
+    let source = synced_opus_source(folder.path(), "20250717_130000.opus");
+    let (source_pts, source_bytes) = opening_packet(&source);
+    assert!(source_pts < 0, "the fixture opens before zero (pre-skip)");
+
+    let run = sync_audio_folder(journal.path(), folder.path());
+    assert_eq!(
+        run.exit_code, 0,
+        "stdout={} stderr={}",
+        run.stdout, run.stderr
+    );
+    let chunk = journal
+        .path()
+        .join("chronicle/20250717/import.audio/130000_300/imported_audio.opus");
+    assert_eq!(opening_packet(&chunk), (source_pts, source_bytes));
 }
