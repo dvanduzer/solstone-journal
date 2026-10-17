@@ -45,6 +45,13 @@
       font-family: var(--font-display);
     }
     .machine-card p { margin: 0; font-size: 0.9rem; line-height: 1.5; }
+    .setup-rows { margin: 0; display: grid; gap: 0.6rem; }
+    .setup-row { display: grid; grid-template-columns: 9.5rem 1fr; gap: 0.75rem; align-items: baseline; }
+    .setup-row dt { margin: 0; color: var(--ink); font-family: var(--font-display); font-weight: 600; font-size: 0.95rem; }
+    .setup-row dd { margin: 0; font-size: 0.9rem; line-height: 1.5; }
+    @media (max-width: 480px) {
+      .setup-row { grid-template-columns: 1fr; gap: 0.1rem; }
+    }
     .field-group { margin-bottom: 0.75rem; }
     .field-group label { display: block; font-size: 0.85rem; color: var(--ink-soft-paper); margin-bottom: 0.25rem; }
     .field-group input:not([type="checkbox"]):not([type="radio"]) {
@@ -217,9 +224,22 @@
     <h1>create your journal</h1>
     <p class="product-tagline">welcome to solstone.</p>
 
-    <section id="section-machine-card" class="section machine-card">
-      <h2 class="machine-card-headline">your journal lives on this computer.</h2>
-      <p>the solstone app takes in what you share with it, and all of it goes into your journal. nothing else is required to start.</p>
+    <section id="section-machine-card" class="section machine-card" aria-labelledby="machine-card-headline">
+      <h2 class="machine-card-headline" id="machine-card-headline">how it fits together</h2>
+      <dl class="setup-rows">
+        <div class="setup-row">
+          <dt>your journal</dt>
+          <dd>lives on this computer and keeps everything that goes into it.</dd>
+        </div>
+        <div class="setup-row">
+          <dt>the solstone app</dt>
+          <dd>runs on each device you choose and takes in what you share with it. all of it goes into your journal.</dd>
+        </div>
+        <div class="setup-row">
+          <dt>thinking</dt>
+          <dd>helps your journal make sense of what it keeps. choose where it happens below, or later.</dd>
+        </div>
+      </dl>
     </section>
 
     <section class="init-section" id="section-journal-mark">
@@ -253,8 +273,8 @@
     </section>
 
     <section class="init-section" id="section-provider">
-      <h3>choose how thinking works</h3>
-      <p class="section-hint">choose how processing runs for the agents working from your journal. you can change this anytime in <b>thinking</b>.</p>
+      <h3>where does the thinking happen?</h3>
+      <p class="section-hint">your journal stays on this computer whatever you choose. this only decides where your journal content goes when there's thinking to do. you can change it anytime in <b>thinking</b>.</p>
       <div class="lanes" id="provider-lanes" aria-live="polite"></div>
       <div class="routenote">when you finish, <b>thinking</b> opens to the lane you picked. the fork lives in thinking from here on. switch anytime.</div>
       <p class="deferlink"><a href="#" id="provider-skip">set up thinking later</a>. your journal keeps what you add from day one. choose a thinking option whenever you're ready.</p>

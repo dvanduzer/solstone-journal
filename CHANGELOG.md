@@ -16,6 +16,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - home and your morning briefing now say "plans" for the meetings and deadlines the journal noticed in what you've shared, the same word the activities app uses.
 - when today has no activities yet, the activities app still shows today's hours, with a line at the current time.
 - the note at the top of your morning briefing says what it drew on in plain words, and names anything that was missing. it no longer counts "source paths", which always read 0.
+- the first-run setup page opens with how your journal, the solstone app and thinking fit together. its thinking section now asks where the thinking happens and says your journal stays on your computer whichever you pick.
 
 ### Fixed
 
