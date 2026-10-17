@@ -331,6 +331,11 @@ impl ParentLossLedger {
         self.generation_path(generation).join("ledger.json")
     }
 
+    pub fn closure_recovery_path(&self, generation: ParentLossGeneration) -> PathBuf {
+        self.generation_path(generation)
+            .join("closure-recovery.json")
+    }
+
     pub fn active_generation(&self) -> Result<Option<ActiveGeneration>, ParentLossLedgerError> {
         read_json_optional(&self.active_path())
     }
