@@ -225,7 +225,7 @@ fn restic(
     )
     .map_err(|error| {
         log::warn!(
-            "restore step {} refused: {error}",
+            "restore step {} refused: {error:?}",
             args.first().map_or("", String::as_str)
         );
         runner_error_reason
