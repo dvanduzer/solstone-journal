@@ -91,6 +91,7 @@ type s3Owner struct {
 	begun           bool
 	primaryDrained  bool
 	liveID          string
+	liveCredential  s3RetainedCredential
 	baselineCreds   []s3RetainedCredential
 	baselinePasses  [][]byte
 	attemptFailed   bool
@@ -634,6 +635,7 @@ func (owner *s3Owner) begin(operation int32, cfg s3Config, passwords ...[]byte) 
 	} else {
 		owner.liveID = record.Active.ID
 		owner.baselineCreds, owner.baselinePasses, owner.attemptFailed = baselineCreds, baselinePasses, false
+		owner.liveCredential = credential
 	}
 	return err
 }
@@ -750,11 +752,15 @@ func (owner *s3Owner) complete() (published bool, err error) {
 	record := owner.record
 	record.Complete = &s3OwnerCompletion{ID: record.Active.ID, Operation: record.Active.Operation}
 	record.Active = nil
-	// A failed attempt (a mistyped recovery key, a refused credential) adds no
-	// retained material, so repeated failures cannot exhaust the destination.
-	if owner.attemptFailed && len(owner.baselineCreds) != 0 && len(owner.baselinePasses) != 0 {
+	// A failed attempt that wrote nothing (a mistyped recovery key, a refused
+	// credential) adds no retained material; one that may have written keeps
+	// it in custody. A successful attempt's credential is the only one still
+	// needed, so rotating or session credentials cannot exhaust the destination.
+	if owner.attemptFailed && !owner.record.Active.MayHaveWritten && len(owner.baselineCreds) != 0 && len(owner.baselinePasses) != 0 {
 		record.Credentials = owner.baselineCreds
 		record.Passwords = owner.baselinePasses
+	} else if !owner.attemptFailed {
+		record.Credentials = []s3RetainedCredential{owner.liveCredential}
 	}
 	previous := owner.record.Passwords
 	published, err = owner.persist(record)

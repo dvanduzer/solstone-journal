@@ -116,3 +116,22 @@ func TestS3MistypedPasswordsNeverExhaustTheDestination(t *testing.T) {
 		t.Fatal("destination exhausted by mistyped passwords", r.status, r.diagnostic)
 	}
 }
+
+func TestS3RotatedCredentialsNeverExhaustTheDestination(t *testing.T) {
+	cfg, state := s3TestConfig(), s3OwnerTestDirectory(t)
+	peer := &s3MemoryPeer{cfg: cfg, objects: make(map[string][]byte)}
+	run := func(cfg s3Config, operation int32) bridgeResult {
+		id, handle := s3TestStartOperation(t, cfg, state, "", peer, bridgeRequest{operation: operation, password: []byte("fixture-password")})
+		return s3TestWaitOperation(t, id, handle)
+	}
+	if r := run(cfg, OpInit); r.status != StatusOk {
+		t.Fatal("init", r.status, r.diagnostic)
+	}
+	for rotation := 0; rotation < 2*maxS3OwnerCredentials; rotation++ {
+		rotated := cfg
+		rotated.secret = fmt.Sprintf("rotated-secret-%02d", rotation)
+		if r := run(rotated, OpOpen); r.status != StatusOk {
+			t.Fatal("rotated credential exhausted the destination", rotation, r.status, r.diagnostic)
+		}
+	}
+}
