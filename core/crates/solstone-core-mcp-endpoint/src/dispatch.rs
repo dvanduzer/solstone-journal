@@ -1088,7 +1088,7 @@ fn search(
         })
         .transpose()?;
     let mut results = Vec::new();
-    let mut subjects_data = Vec::new();
+    let mut response_checks = 0;
     // The owner's coordinates for each hit released. ⚠ These never enter
     // `results`: the wire response carries no path or chunk index.
     let mut targets = Vec::new();
@@ -1168,6 +1168,45 @@ fn search(
             } else {
                 None
             };
+
+            #[cfg(feature = "test-hooks")]
+            crate::source_freeze_barrier::checkpoint(
+                crate::source_freeze_barrier::FreezePoint::Before,
+            );
+            let allowed = crate::source_release::check_indexed_source_release(
+                journal_root,
+                &hit.metadata.path,
+            );
+            let mut single_subject = [LinkSubject {
+                path: &hit.metadata.path,
+                idx: hit.metadata.idx,
+                text: &hit.text,
+                segments: Vec::new(),
+                more_segments: false,
+            }];
+            let mut checker = LiveTranscriptPages;
+            if allowed {
+                issue_segment_links(
+                    journal_root,
+                    principal,
+                    snapshot,
+                    &mut single_subject,
+                    3,
+                    30,
+                    &mut response_checks,
+                    &mut checker,
+                );
+            }
+            #[cfg(feature = "test-hooks")]
+            crate::source_freeze_barrier::checkpoint(
+                crate::source_freeze_barrier::FreezePoint::After,
+            );
+
+            if !allowed {
+                live_dropped = true;
+                continue;
+            }
+
             targets.push(format!("{}#{}", hit.metadata.path, hit.metadata.idx));
             let reference = codec()
                 .mint(
@@ -1191,8 +1230,13 @@ fn search(
             if let Some(origin) = memory_origin {
                 value["origin"] = public_memory_origin(&origin);
             }
+            if !single_subject[0].segments.is_empty() {
+                value["segments"] = Value::Array(std::mem::take(&mut single_subject[0].segments));
+            }
+            if single_subject[0].more_segments {
+                value["more_segments"] = Value::Bool(true);
+            }
             results.push(value);
-            subjects_data.push((hit.metadata.path, hit.metadata.idx, hit.text));
             if results.len() == request.limit {
                 break;
             }
@@ -1239,35 +1283,6 @@ fn search(
         }
     }
     let complete = index_coverage_complete && live_examination_complete && !degraded;
-    let mut subjects: Vec<LinkSubject<'_>> = subjects_data
-        .iter()
-        .map(|(path, idx, text)| LinkSubject {
-            path,
-            idx: *idx,
-            text,
-            segments: Vec::new(),
-            more_segments: false,
-        })
-        .collect();
-    let mut checker = LiveTranscriptPages;
-    issue_segment_links(
-        journal_root,
-        principal,
-        snapshot,
-        &mut subjects,
-        3,
-        30,
-        &mut checker,
-    );
-    for (i, result) in results.iter_mut().enumerate() {
-        let subject = &subjects[i];
-        if !subject.segments.is_empty() {
-            result["segments"] = Value::Array(subject.segments.clone());
-        }
-        if subject.more_segments {
-            result["more_segments"] = Value::Bool(true);
-        }
-    }
     let mut response_val = json!({
         "results": results,
         "next_cursor": next_cursor,
@@ -1392,12 +1407,10 @@ fn fetch(
     else {
         return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
     };
-    let mut value = json!({"title": entry_title(&entry.day), "date": entry.day, "text": text});
-    if entry.stream.starts_with("agent-memory-") {
-        let origin = memory_hit_origin(journal_root, &entry.path, &entry.stream)
-            .ok_or(DispatchError::Tool(ToolError::ReferenceNotFound))?;
-        value["origin"] = public_memory_origin(&origin);
-    }
+
+    #[cfg(feature = "test-hooks")]
+    crate::source_freeze_barrier::checkpoint(crate::source_freeze_barrier::FreezePoint::Before);
+    let allowed = crate::source_release::check_indexed_source_release(journal_root, &entry.path);
     let mut subjects = [LinkSubject {
         path: &entry.path,
         idx: entry.idx,
@@ -1406,15 +1419,32 @@ fn fetch(
         more_segments: false,
     }];
     let mut checker = LiveTranscriptPages;
-    issue_segment_links(
-        journal_root,
-        principal,
-        snapshot,
-        &mut subjects,
-        48,
-        48,
-        &mut checker,
-    );
+    let mut response_checks = 0;
+    if allowed {
+        issue_segment_links(
+            journal_root,
+            principal,
+            snapshot,
+            &mut subjects,
+            48,
+            48,
+            &mut response_checks,
+            &mut checker,
+        );
+    }
+    #[cfg(feature = "test-hooks")]
+    crate::source_freeze_barrier::checkpoint(crate::source_freeze_barrier::FreezePoint::After);
+
+    if !allowed {
+        return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
+    }
+
+    let mut value = json!({"title": entry_title(&entry.day), "date": entry.day, "text": text});
+    if entry.stream.starts_with("agent-memory-") {
+        let origin = memory_hit_origin(journal_root, &entry.path, &entry.stream)
+            .ok_or(DispatchError::Tool(ToolError::ReferenceNotFound))?;
+        value["origin"] = public_memory_origin(&origin);
+    }
     if !subjects[0].segments.is_empty() {
         value["segments"] = Value::Array(subjects[0].segments.clone());
     }
@@ -1944,6 +1974,43 @@ fn list_transcripts(
                 continue;
             }
 
+            #[cfg(feature = "test-hooks")]
+            crate::source_freeze_barrier::checkpoint(
+                crate::source_freeze_barrier::FreezePoint::Before,
+            );
+            let allowed = crate::source_release::check_segment_transcript_release(
+                journal_root,
+                day,
+                &stream,
+                &name,
+            );
+            let page = if allowed && segments.len() < request.limit {
+                Some(solstone_core_transcripts::read_segment_transcript_page(
+                    journal_root,
+                    &segment,
+                    None,
+                ))
+            } else {
+                None
+            };
+            // Freeze the page before the last deletion observation. A removal
+            // can replace the directory while its initial live marker is read.
+            let allowed = allowed
+                && crate::source_release::check_segment_transcript_release(
+                    journal_root,
+                    day,
+                    &stream,
+                    &name,
+                );
+            #[cfg(feature = "test-hooks")]
+            crate::source_freeze_barrier::checkpoint(
+                crate::source_freeze_barrier::FreezePoint::After,
+            );
+
+            if !allowed {
+                continue;
+            }
+
             if segments.len() == request.limit {
                 has_more = true;
                 break 'outer;
@@ -1951,11 +2018,7 @@ fn list_transcripts(
 
             last_examined = Some((day.clone(), stream.clone(), name.clone()));
 
-            let page = match solstone_core_transcripts::read_segment_transcript_page(
-                journal_root,
-                &segment,
-                None,
-            ) {
+            let page = match page.expect("allowed and within limit reads page") {
                 Ok(page) => page,
                 Err(_) => {
                     unreadable += 1;
@@ -2112,12 +2175,39 @@ fn get_transcript(
             })
         })
         .transpose()?;
-    let page = solstone_core_transcripts::read_segment_transcript_page(
+    #[cfg(feature = "test-hooks")]
+    crate::source_freeze_barrier::checkpoint(crate::source_freeze_barrier::FreezePoint::Before);
+    let allowed = crate::source_release::check_segment_transcript_release(
         journal_root,
-        &segment,
-        continuation.as_ref(),
-    )
-    .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?;
+        &reference.day,
+        &reference.stream,
+        &reference.segment,
+    );
+    let page_res = if allowed {
+        Some(solstone_core_transcripts::read_segment_transcript_page(
+            journal_root,
+            &segment,
+            continuation.as_ref(),
+        ))
+    } else {
+        None
+    };
+    let allowed = allowed
+        && crate::source_release::check_segment_transcript_release(
+            journal_root,
+            &reference.day,
+            &reference.stream,
+            &reference.segment,
+        );
+    #[cfg(feature = "test-hooks")]
+    crate::source_freeze_barrier::checkpoint(crate::source_freeze_barrier::FreezePoint::After);
+
+    if !allowed {
+        return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
+    }
+    let page = page_res
+        .expect("allowed reads page")
+        .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?;
     if page.version.fingerprint() != reference.version {
         return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
     }

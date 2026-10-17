@@ -2173,13 +2173,11 @@ fn unreadable_or_deleted_segments_get_no_link_and_search_still_succeeds() {
     )
     .unwrap();
     let results = search["results"].as_array().unwrap();
-    assert_eq!(results.len(), 5);
-    let (readable_hits, unreadable_hits): (Vec<_>, Vec<_>) =
-        results.iter().partition(|h| h.get("segments").is_some());
-    assert_eq!(readable_hits.len(), 1);
-    assert_eq!(unreadable_hits.len(), 4);
+    assert_eq!(results.len(), 1);
+    let readable_hit = &results[0];
+    assert!(readable_hit.get("segments").is_some());
 
-    let old_link = readable_hits[0]["segments"][0]["reference"]
+    let old_link = readable_hit["segments"][0]["reference"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -2198,12 +2196,10 @@ fn unreadable_or_deleted_segments_get_no_link_and_search_still_succeeds() {
     )
     .unwrap();
     let results2 = search2["results"].as_array().unwrap();
-    let readable_hits2: Vec<_> = results2
-        .iter()
-        .filter(|h| h.get("segments").is_some())
-        .collect();
-    assert_eq!(readable_hits2.len(), 1);
-    let new_link = readable_hits2[0]["segments"][0]["reference"]
+    assert_eq!(results2.len(), 1);
+    let readable_hit2 = &results2[0];
+    assert!(readable_hit2.get("segments").is_some());
+    let new_link = readable_hit2["segments"][0]["reference"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -2694,6 +2690,7 @@ fn link_checks_stay_within_budget_and_more_segments_reflects_readable_segments()
     };
     let mut checker = CountingChecker { count: 0 };
     let mut subjects = [subject];
+    let mut response_checks = 0;
     issue_segment_links(
         journal.path(),
         principal,
@@ -2701,6 +2698,7 @@ fn link_checks_stay_within_budget_and_more_segments_reflects_readable_segments()
         &mut subjects,
         48,
         48,
+        &mut response_checks,
         &mut checker,
     );
     assert_eq!(checker.count, 48);
@@ -2716,6 +2714,7 @@ fn link_checks_stay_within_budget_and_more_segments_reflects_readable_segments()
     };
     let mut checker30 = CountingChecker { count: 0 };
     let mut subjects30 = [subject30];
+    let mut response_checks30 = 0;
     issue_segment_links(
         journal.path(),
         principal,
@@ -2723,6 +2722,7 @@ fn link_checks_stay_within_budget_and_more_segments_reflects_readable_segments()
         &mut subjects30,
         48,
         30,
+        &mut response_checks30,
         &mut checker30,
     );
     assert_eq!(checker30.count, 30);
@@ -2772,6 +2772,7 @@ fn link_checks_stay_within_budget_and_more_segments_reflects_readable_segments()
     };
     let mut checker_budget1 = CountingChecker { count: 0 };
     let mut subjects_budget1 = [subject_budget1];
+    let mut response_checks_budget1 = 0;
     issue_segment_links(
         journal.path(),
         principal,
@@ -2779,6 +2780,7 @@ fn link_checks_stay_within_budget_and_more_segments_reflects_readable_segments()
         &mut subjects_budget1,
         48,
         1,
+        &mut response_checks_budget1,
         &mut checker_budget1,
     );
     assert_eq!(checker_budget1.count, 1);
@@ -2818,6 +2820,7 @@ fn no_links_without_the_transcripts_grant() {
     };
     let mut chk_tr = CountingChecker { count: 0 };
     let mut subs_tr = [sub_tr];
+    let mut response_checks_tr = 0;
     issue_segment_links(
         journal.path(),
         principal,
@@ -2825,6 +2828,7 @@ fn no_links_without_the_transcripts_grant() {
         &mut subs_tr,
         48,
         48,
+        &mut response_checks_tr,
         &mut chk_tr,
     );
     assert_eq!(chk_tr.count, 2);
@@ -2846,6 +2850,7 @@ fn no_links_without_the_transcripts_grant() {
     };
     let mut chk_no_tr = CountingChecker { count: 0 };
     let mut subs_no_tr = [sub_no_tr];
+    let mut response_checks_no_tr = 0;
     issue_segment_links(
         journal.path(),
         principal,
@@ -2853,6 +2858,7 @@ fn no_links_without_the_transcripts_grant() {
         &mut subs_no_tr,
         48,
         48,
+        &mut response_checks_no_tr,
         &mut chk_no_tr,
     );
     assert_eq!(chk_no_tr.count, 0);
@@ -6381,4 +6387,1217 @@ fn capture_zone_does_not_follow_an_excluded_segments_receipt() {
     let fetched = probe(&journal, "fetch", json!({"reference": hit["reference"]})).unwrap();
     assert!(fetched["segments"][0].get("capture_zone").is_none());
     assert!(!fetched.to_string().contains("Asia/Tokyo"));
+}
+
+fn setup_freeze_barrier_journal() -> tempfile::TempDir {
+    let journal = fixture();
+    PermissionStore::open(journal.path())
+        .set_permission(CONNECTION, ReadPermission::default_whole_journal())
+        .unwrap();
+
+    let seg1_name = "100000_300";
+    let seg1_dir = journal
+        .path()
+        .join("chronicle")
+        .join(DAY)
+        .join(STREAM)
+        .join(seg1_name);
+    fs::create_dir_all(seg1_dir.join("talents")).unwrap();
+    fs::write(
+        seg1_dir.join("talents/facets.json"),
+        "[{\"facet\":\"alpha\"}]",
+    )
+    .unwrap();
+    fs::write(
+        seg1_dir.join("meeting_transcript.md"),
+        "first approved transcript\n",
+    )
+    .unwrap();
+    fs::write(seg1_dir.join("audio.jsonl"), "first percept\n").unwrap();
+    fs::write(seg1_dir.join("talents/brief.md"), "first disk bytes\n").unwrap();
+
+    let seg1_path = format!("{DAY}/{STREAM}/{seg1_name}/talents/brief.md");
+    plant_chunk(
+        journal.path(),
+        &seg1_path,
+        DAY,
+        STREAM,
+        0,
+        "freezetestneedle hit 100000",
+        "transcripts",
+        "segment_assigned",
+        &[FACET_A],
+    );
+
+    let seg2_path = format!("{DAY}/{STREAM}/{SEGMENT}/talents/brief.md");
+    plant_chunk(
+        journal.path(),
+        &seg2_path,
+        DAY,
+        STREAM,
+        0,
+        "freezetestneedle hit 090000",
+        "transcripts",
+        "segment_assigned",
+        &[FACET_A],
+    );
+
+    journal
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn removal_after_marker_sampling_never_advertises_a_tombstone_page() {
+    use crate::source_freeze_barrier::{FreezePoint, run_with_source_freeze_barrier};
+
+    let journal = setup_freeze_barrier_journal();
+    let root = journal.path().to_path_buf();
+    let (result, fired) = run_with_source_freeze_barrier(
+        FreezePoint::MarkerSampled,
+        1,
+        move || {
+            let target = solstone_core_retention::Target {
+                day: DAY.to_owned(),
+                stream: STREAM.to_owned(),
+                dir: SEGMENT.to_owned(),
+            };
+            let outcome = solstone_core_retention::door::remove_segments(
+                &root,
+                &[target],
+                "2026-10-17T12:00:00Z",
+                solstone_core_retention::RemovalReason::OwnerSegmentDelete,
+                "marker-sampling-removal",
+            );
+            assert!(outcome.targets[0].not_removed.is_empty());
+            assert!(
+                root.join(format!("chronicle/{DAY}/{STREAM}/{SEGMENT}/tombstone.json"))
+                    .is_file()
+            );
+        },
+        || probe(&journal, "list_transcripts", json!({"day": DAY})),
+    );
+    assert!(fired, "the removal must run after observing a live marker");
+    let listed = result.unwrap();
+    let transcripts = listed["transcripts"].as_array().unwrap();
+    assert_eq!(transcripts.len(), 1, "only the surviving sibling is live");
+    assert!(
+        transcripts[0]["time"]
+            .as_str()
+            .unwrap()
+            .starts_with("10:00")
+    );
+    let reference = transcripts[0]["reference"].as_str().unwrap();
+    assert!(probe(&journal, "get_transcript", json!({"reference": reference})).is_ok());
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn removal_after_marker_sampling_refuses_an_old_live_empty_reference() {
+    use crate::source_freeze_barrier::{FreezePoint, run_with_source_freeze_barrier};
+
+    let journal = fixture();
+    let root = journal.path().to_path_buf();
+    let segment = root.join(format!("chronicle/{DAY}/{STREAM}/{SEGMENT}"));
+    fs::remove_file(segment.join("meeting_transcript.md")).unwrap();
+    if segment.join("audio.jsonl").exists() {
+        fs::remove_file(segment.join("audio.jsonl")).unwrap();
+    }
+    let list = probe(&journal, "list_transcripts", json!({"day": DAY})).unwrap();
+    let reference = list["transcripts"][0]["reference"].as_str().unwrap();
+    let before = probe(&journal, "get_transcript", json!({"reference": reference})).unwrap();
+    assert!(before["entries"].as_array().unwrap().is_empty());
+    let (result, fired) = run_with_source_freeze_barrier(
+        FreezePoint::MarkerSampled,
+        1,
+        move || {
+            let target = solstone_core_retention::Target {
+                day: DAY.to_owned(),
+                stream: STREAM.to_owned(),
+                dir: SEGMENT.to_owned(),
+            };
+            let outcome = solstone_core_retention::door::remove_segments(
+                &root,
+                &[target],
+                "2026-10-17T12:00:00Z",
+                solstone_core_retention::RemovalReason::OwnerSegmentDelete,
+                "empty-marker-sampling-removal",
+            );
+            assert!(outcome.targets[0].not_removed.is_empty());
+            assert!(segment.join("tombstone.json").is_file());
+        },
+        || probe(&journal, "get_transcript", json!({"reference": reference})),
+    );
+    assert!(fired, "the removal must run after observing a live marker");
+    assert_eq!(result, Err(McpProbeError::Unavailable));
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_tombstone_withholds_all_segment_reads() {
+    let journal = fixture();
+    let search = probe(&journal, "search", json!({"query": "indexed"})).unwrap();
+    let fetch_reference = &search["results"][0]["reference"];
+    let listed = probe(&journal, "list_transcripts", json!({"day": DAY})).unwrap();
+    let transcript_reference = &listed["transcripts"][0]["reference"];
+    let segment = journal
+        .path()
+        .join(format!("chronicle/{DAY}/{STREAM}/{SEGMENT}"));
+    std::os::unix::fs::symlink(
+        segment.join("meeting_transcript.md"),
+        segment.join("tombstone.json"),
+    )
+    .unwrap();
+    assert_eq!(
+        solstone_core_segment::owner_deletion_state(&segment).unwrap(),
+        solstone_core_segment::OwnerDeletionState::Occupied,
+    );
+    assert!(
+        probe(&journal, "search", json!({"query": "indexed"})).unwrap()["results"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        probe(&journal, "list_transcripts", json!({"day": DAY})).unwrap()["transcripts"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        probe(&journal, "fetch", json!({"reference": fetch_reference})),
+        Err(McpProbeError::Unavailable)
+    );
+    assert_eq!(
+        probe(
+            &journal,
+            "get_transcript",
+            json!({"reference": transcript_reference})
+        ),
+        Err(McpProbeError::Unavailable)
+    );
+}
+
+#[test]
+fn removed_segment_marker_matrix_withheld_from_all_read_tools() {
+    use crate::references::{ReferenceTarget, SegmentReference};
+
+    // 1. tombstone
+    {
+        let journal = fixture();
+        PermissionStore::open(journal.path())
+            .set_permission(CONNECTION, ReadPermission::default_whole_journal())
+            .unwrap();
+
+        let search_before = probe(&journal, "search", json!({"query": "indexed"})).unwrap();
+        let fetch_ref = search_before["results"][0]["reference"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let seg_dir = journal
+            .path()
+            .join("chronicle")
+            .join(DAY)
+            .join(STREAM)
+            .join(SEGMENT);
+        fs::write(seg_dir.join("tombstone.json"), "{}").unwrap();
+
+        let search_after = probe(&journal, "search", json!({"query": "indexed"})).unwrap();
+        assert!(search_after["results"].as_array().unwrap().is_empty());
+
+        assert_eq!(
+            probe(&journal, "fetch", json!({"reference": fetch_ref})),
+            Err(McpProbeError::Unavailable)
+        );
+
+        let list_after = probe(&journal, "list_transcripts", json!({"day": DAY})).unwrap();
+        assert!(list_after["transcripts"].as_array().unwrap().is_empty());
+
+        let seg_obj =
+            solstone_core_journal_io::Segment::resolve_exact(journal.path(), DAY, STREAM, SEGMENT)
+                .unwrap()
+                .unwrap();
+        let page =
+            solstone_core_transcripts::read_segment_transcript_page(journal.path(), &seg_obj, None)
+                .unwrap();
+        let perm_record = PermissionStore::open(journal.path())
+            .get_permission(CONNECTION)
+            .unwrap()
+            .unwrap();
+        let token = crate::dispatch::codec()
+            .mint(
+                CONNECTION,
+                perm_record.generation,
+                ReferenceTarget::Segment(SegmentReference {
+                    day: DAY.to_owned(),
+                    stream: STREAM.to_owned(),
+                    segment: SEGMENT.to_owned(),
+                    version: page.version.fingerprint(),
+                    source_index: None,
+                    byte_offset: None,
+                    statement_ordinal: None,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            probe(&journal, "get_transcript", json!({"reference": token})),
+            Err(McpProbeError::Unavailable)
+        );
+    }
+
+    // 2. staged
+    {
+        let journal = fixture();
+        PermissionStore::open(journal.path())
+            .set_permission(CONNECTION, ReadPermission::default_whole_journal())
+            .unwrap();
+
+        let search_before = probe(&journal, "search", json!({"query": "indexed"})).unwrap();
+        let fetch_ref = search_before["results"][0]["reference"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let seg_dir = journal
+            .path()
+            .join("chronicle")
+            .join(DAY)
+            .join(STREAM)
+            .join(SEGMENT);
+        fs::rename(
+            &seg_dir,
+            seg_dir
+                .parent()
+                .unwrap()
+                .join(format!(".removing_{SEGMENT}")),
+        )
+        .unwrap();
+
+        assert!(
+            probe(&journal, "search", json!({"query": "indexed"})).unwrap()["results"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            probe(&journal, "fetch", json!({"reference": fetch_ref})),
+            Err(McpProbeError::Unavailable)
+        );
+        assert!(
+            probe(&journal, "list_transcripts", json!({"day": DAY})).unwrap()["transcripts"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // 3. absent
+    {
+        let journal = fixture();
+        PermissionStore::open(journal.path())
+            .set_permission(CONNECTION, ReadPermission::default_whole_journal())
+            .unwrap();
+
+        let search_before = probe(&journal, "search", json!({"query": "indexed"})).unwrap();
+        let fetch_ref = search_before["results"][0]["reference"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let seg_dir = journal
+            .path()
+            .join("chronicle")
+            .join(DAY)
+            .join(STREAM)
+            .join(SEGMENT);
+        fs::remove_dir_all(&seg_dir).unwrap();
+
+        assert!(
+            probe(&journal, "search", json!({"query": "indexed"})).unwrap()["results"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            probe(&journal, "fetch", json!({"reference": fetch_ref})),
+            Err(McpProbeError::Unavailable)
+        );
+        assert!(
+            probe(&journal, "list_transcripts", json!({"day": DAY})).unwrap()["transcripts"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // 4. occupied
+    {
+        let journal = fixture();
+        PermissionStore::open(journal.path())
+            .set_permission(CONNECTION, ReadPermission::default_whole_journal())
+            .unwrap();
+
+        let search_before = probe(&journal, "search", json!({"query": "indexed"})).unwrap();
+        let fetch_ref = search_before["results"][0]["reference"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let list_before = probe(&journal, "list_transcripts", json!({"day": DAY})).unwrap();
+        let transcript_ref = list_before["transcripts"][0]["reference"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let seg_dir = journal
+            .path()
+            .join("chronicle")
+            .join(DAY)
+            .join(STREAM)
+            .join(SEGMENT);
+        fs::write(
+            seg_dir
+                .parent()
+                .unwrap()
+                .join(format!(".removing_{SEGMENT}")),
+            b"occupied staged coordinate",
+        )
+        .unwrap();
+        assert_eq!(
+            solstone_core_segment::owner_deletion_state(&seg_dir).unwrap(),
+            solstone_core_segment::OwnerDeletionState::Occupied,
+        );
+
+        assert!(
+            probe(&journal, "search", json!({"query": "indexed"})).unwrap()["results"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            probe(&journal, "fetch", json!({"reference": fetch_ref})),
+            Err(McpProbeError::Unavailable)
+        );
+        assert!(
+            probe(&journal, "list_transcripts", json!({"day": DAY})).unwrap()["transcripts"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            probe(
+                &journal,
+                "get_transcript",
+                json!({"reference": transcript_ref})
+            ),
+            Err(McpProbeError::Unavailable)
+        );
+    }
+
+    // 5. unreadable
+    {
+        let journal = fixture();
+        PermissionStore::open(journal.path())
+            .set_permission(CONNECTION, ReadPermission::default_whole_journal())
+            .unwrap();
+
+        let search_before = probe(&journal, "search", json!({"query": "indexed"})).unwrap();
+        let fetch_ref = search_before["results"][0]["reference"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let seg_dir = journal
+            .path()
+            .join("chronicle")
+            .join(DAY)
+            .join(STREAM)
+            .join(SEGMENT);
+        fs::remove_dir_all(&seg_dir).unwrap();
+        fs::write(&seg_dir, b"regular file not a directory").unwrap();
+
+        assert!(
+            probe(&journal, "search", json!({"query": "indexed"})).unwrap()["results"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            probe(&journal, "fetch", json!({"reference": fetch_ref})),
+            Err(McpProbeError::Unavailable)
+        );
+    }
+}
+
+#[test]
+fn live_empty_segment_releases_empty_transcript_and_survives_listing() {
+    let journal = fixture();
+    let seg_dir = journal
+        .path()
+        .join("chronicle")
+        .join(DAY)
+        .join(STREAM)
+        .join(SEGMENT);
+
+    fs::remove_file(seg_dir.join("meeting_transcript.md")).unwrap();
+    if seg_dir.join("audio.jsonl").exists() {
+        fs::remove_file(seg_dir.join("audio.jsonl")).unwrap();
+    }
+
+    let list = probe(&journal, "list_transcripts", json!({"day": DAY})).unwrap();
+    let transcripts = list["transcripts"].as_array().unwrap();
+    assert_eq!(
+        transcripts.len(),
+        1,
+        "empty transcript segment must be listed"
+    );
+    let transcript_ref = transcripts[0]["reference"].as_str().unwrap();
+
+    let transcript = probe(
+        &journal,
+        "get_transcript",
+        json!({"reference": transcript_ref}),
+    )
+    .unwrap();
+    assert!(
+        transcript["entries"].as_array().unwrap().is_empty(),
+        "empty transcript entries must be empty"
+    );
+
+    let search = probe(&journal, "search", json!({"query": "indexed"})).unwrap();
+    assert_eq!(search["results"].as_array().unwrap().len(), 1);
+    let fetch_ref = search["results"][0]["reference"].as_str().unwrap();
+    let fetched = probe(&journal, "fetch", json!({"reference": fetch_ref})).unwrap();
+    assert_eq!(fetched["text"], "indexed bytes");
+}
+
+#[test]
+fn raw_media_offload_preserves_derived_fetch_and_transcript() {
+    let journal = fixture();
+    let seg_dir = journal
+        .path()
+        .join("chronicle")
+        .join(DAY)
+        .join(STREAM)
+        .join(SEGMENT);
+
+    fs::write(seg_dir.join("audio.flac"), b"audio flac bytes\n").unwrap();
+
+    let search = probe(&journal, "search", json!({"query": "indexed"})).unwrap();
+    let fetch_ref = search["results"][0]["reference"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let list = probe(&journal, "list_transcripts", json!({"day": DAY})).unwrap();
+    let transcript_ref = list["transcripts"][0]["reference"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    fs::remove_file(seg_dir.join("audio.flac")).unwrap();
+
+    let fetched = probe(&journal, "fetch", json!({"reference": fetch_ref})).unwrap();
+    assert_eq!(fetched["text"], "indexed bytes");
+
+    let transcript = probe(
+        &journal,
+        "get_transcript",
+        json!({"reference": transcript_ref}),
+    )
+    .unwrap();
+    assert!(!transcript["entries"].as_array().unwrap().is_empty());
+
+    let search_after = probe(&journal, "search", json!({"query": "indexed"})).unwrap();
+    assert_eq!(search_after["results"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn unindexed_planted_sibling_outside_facet_does_not_affect_grant() {
+    let journal = fixture();
+
+    let search_before = probe(&journal, "search", json!({"query": "indexed"})).unwrap();
+    let coverage_before = search_before["coverage"].clone();
+    let cursor_before = search_before.get("next_cursor").cloned();
+
+    let parent_dir = journal.path().join("chronicle").join(DAY).join(STREAM);
+
+    let s1 = parent_dir.join("100000_300");
+    fs::create_dir_all(&s1).unwrap();
+    fs::write(s1.join("tombstone.json"), "{}").unwrap();
+
+    let s2 = parent_dir.join(".removing_110000_300");
+    fs::create_dir_all(&s2).unwrap();
+
+    let s3 = parent_dir.join("120000_300");
+    fs::create_dir_all(s3.join("talents")).unwrap();
+    fs::write(s3.join("talents/brief.md"), "disk bytes\n").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(s3.join("talents/brief.md"), s3.join("tombstone.json")).unwrap();
+
+    fs::write(parent_dir.join("130000_300"), b"regular file").unwrap();
+
+    let search_after = probe(&journal, "search", json!({"query": "indexed"})).unwrap();
+    assert_eq!(
+        visible_search_page(&search_after),
+        visible_search_page(&search_before)
+    );
+    let extract_segments_times = |res: &Value| {
+        res["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                r["segments"].as_array().map(|segs| {
+                    segs.iter()
+                        .map(|s| s["time"].as_str().unwrap().to_owned())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        extract_segments_times(&search_after),
+        extract_segments_times(&search_before)
+    );
+    assert_eq!(search_after["coverage"], coverage_before);
+    assert_eq!(search_after.get("next_cursor"), cursor_before.as_ref());
+}
+
+#[test]
+fn door_seam_remove_segments_withholds_retained_references_without_leak() {
+    let journal = fixture();
+    PermissionStore::open(journal.path())
+        .set_permission(CONNECTION, ReadPermission::default_whole_journal())
+        .unwrap();
+
+    let seg2_name = "090500_300";
+    let seg2_dir = journal
+        .path()
+        .join("chronicle")
+        .join(DAY)
+        .join(STREAM)
+        .join(seg2_name);
+    fs::create_dir_all(seg2_dir.join("talents")).unwrap();
+    fs::write(
+        seg2_dir.join("talents/facets.json"),
+        "[{\"facet\":\"alpha\"}]",
+    )
+    .unwrap();
+    fs::write(
+        seg2_dir.join("meeting_transcript.md"),
+        "second approved transcript\n",
+    )
+    .unwrap();
+    fs::write(seg2_dir.join("audio.jsonl"), "second percept\n").unwrap();
+    fs::write(seg2_dir.join("talents/brief.md"), "second disk bytes\n").unwrap();
+
+    let seg2_path = format!("{DAY}/{STREAM}/{seg2_name}/talents/brief.md");
+    plant_chunk(
+        journal.path(),
+        &seg2_path,
+        DAY,
+        STREAM,
+        0,
+        "second indexed bytes",
+        "transcripts",
+        "segment_assigned",
+        &[FACET_A],
+    );
+
+    let search1 = probe(&journal, "search", json!({"query": "indexed bytes"})).unwrap();
+    let results1 = search1["results"].as_array().unwrap();
+    assert_eq!(results1.len(), 2);
+    let ref1 = results1
+        .iter()
+        .find(|r| {
+            let s = r["snippet"].as_str().unwrap();
+            s.contains("indexed bytes") && !s.contains("second")
+        })
+        .unwrap()["reference"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let ref2 = results1
+        .iter()
+        .find(|r| r["snippet"].as_str().unwrap().contains("second"))
+        .unwrap()["reference"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let list1 = probe(&journal, "list_transcripts", json!({"day": DAY})).unwrap();
+    let tr_list1 = list1["transcripts"].as_array().unwrap();
+    assert_eq!(tr_list1.len(), 2);
+    let tr_ref1 = tr_list1
+        .iter()
+        .find(|t| {
+            t["time"]
+                .as_str()
+                .map(|s| s.starts_with("09:00"))
+                .unwrap_or(false)
+        })
+        .unwrap()["reference"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let target1 = solstone_core_retention::Target {
+        day: DAY.to_owned(),
+        stream: STREAM.to_owned(),
+        dir: SEGMENT.to_owned(),
+    };
+    let outcome = solstone_core_retention::door::remove_segments(
+        journal.path(),
+        &[target1],
+        "2026-10-17T12:00:00Z",
+        solstone_core_retention::RemovalReason::OwnerSegmentDelete,
+        "door-seam-test",
+    );
+    assert_eq!(outcome.targets.len(), 1);
+    assert!(
+        outcome.targets[0].not_removed.is_empty(),
+        "segment 1 removal must succeed: {:?}",
+        outcome
+    );
+
+    fn walk_rel_paths(root: &Path) -> BTreeSet<PathBuf> {
+        let mut set = BTreeSet::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            if let Ok(entries) = fs::read_dir(&dir) {
+                for entry in entries.filter_map(Result::ok) {
+                    let path = entry.path();
+                    if let Ok(rel) = path.strip_prefix(root) {
+                        if rel.components().any(|c| c.as_os_str() == "mcp.agent") {
+                            continue;
+                        }
+                        set.insert(rel.to_path_buf());
+                    }
+                    if path.is_dir() {
+                        stack.push(path);
+                    }
+                }
+            }
+        }
+        set
+    }
+
+    let paths_before_probes = walk_rel_paths(journal.path());
+
+    let search_after = probe(&journal, "search", json!({"query": "indexed bytes"})).unwrap();
+    let results_after = search_after["results"].as_array().unwrap();
+    assert_eq!(results_after.len(), 1);
+    assert!(
+        results_after[0]["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("second indexed bytes")
+    );
+
+    assert_eq!(
+        probe(&journal, "fetch", json!({"reference": ref1})),
+        Err(McpProbeError::Unavailable)
+    );
+    let fetched2 = probe(&journal, "fetch", json!({"reference": ref2})).unwrap();
+    assert_eq!(fetched2["text"], "second indexed bytes");
+
+    let list_after = probe(&journal, "list_transcripts", json!({"day": DAY})).unwrap();
+    let tr_list_after = list_after["transcripts"].as_array().unwrap();
+    assert_eq!(tr_list_after.len(), 1);
+    assert!(
+        tr_list_after[0]["time"]
+            .as_str()
+            .unwrap()
+            .starts_with("09:05")
+    );
+
+    assert_eq!(
+        probe(&journal, "get_transcript", json!({"reference": tr_ref1})),
+        Err(McpProbeError::Unavailable)
+    );
+
+    let seg1_obj =
+        solstone_core_journal_io::Segment::resolve_exact(journal.path(), DAY, STREAM, SEGMENT)
+            .unwrap()
+            .unwrap();
+    let page1 =
+        solstone_core_transcripts::read_segment_transcript_page(journal.path(), &seg1_obj, None)
+            .unwrap();
+    let perm_record = PermissionStore::open(journal.path())
+        .get_permission(CONNECTION)
+        .unwrap()
+        .unwrap();
+    let fresh_token = crate::dispatch::codec()
+        .mint(
+            CONNECTION,
+            perm_record.generation,
+            crate::references::ReferenceTarget::Segment(crate::references::SegmentReference {
+                day: DAY.to_owned(),
+                stream: STREAM.to_owned(),
+                segment: SEGMENT.to_owned(),
+                version: page1.version.fingerprint(),
+                source_index: None,
+                byte_offset: None,
+                statement_ordinal: None,
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        probe(
+            &journal,
+            "get_transcript",
+            json!({"reference": fresh_token})
+        ),
+        Err(McpProbeError::Unavailable)
+    );
+
+    let paths_after_probes = walk_rel_paths(journal.path());
+    assert_eq!(paths_before_probes, paths_after_probes);
+}
+
+#[test]
+fn search_examination_budget_continuation_over_withheld_candidates() {
+    use crate::references::{ReferenceKind, ReferenceTarget};
+
+    // Block 1: 1001 removed rows, names 000000_0001 through 000000_1001, no later live row.
+    {
+        let journal = fixture();
+        PermissionStore::open(journal.path())
+            .set_permission(CONNECTION, ReadPermission::default_whole_journal())
+            .unwrap();
+
+        let mut index = solstone_core_indexer_store::db::open_index(journal.path()).unwrap();
+        let tx = index.transaction().unwrap();
+        for i in 1..=1001 {
+            let seg = format!("000000_{i:04}");
+            let path = format!("20260914/default/{seg}/talents/brief.md");
+            let seg_dir = journal
+                .path()
+                .join("chronicle")
+                .join("20260914")
+                .join("default")
+                .join(&seg);
+            fs::create_dir_all(&seg_dir).unwrap();
+            fs::write(seg_dir.join("tombstone.json"), "{}").unwrap();
+
+            let content = "budgetexamneedle removed";
+            tx.execute(
+                "INSERT INTO chunks(content, path, day, facet, agent, stream, idx, time_bucket) \
+                 VALUES (?1, ?2, '20260914', '', 'fixture-stream', 'default', 0, '')",
+                params![content, path],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT OR REPLACE INTO chunk_classification(path, category, basis, eligible, unclassified) \
+                 VALUES (?1, 'transcripts', 'segment_assigned', 1, 0)",
+                params![path],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT OR REPLACE INTO chunk_classification_facets(path, facet_id) VALUES (?1, ?2)",
+                params![path, FACET_A],
+            )
+            .unwrap();
+        }
+        tx.execute(
+            "REPLACE INTO chunk_classification_backfill(id, cursor, completed, stalled, stalled_path, resume_count) \
+             VALUES (1, '', 1, 0, NULL, 0)",
+            [],
+        )
+        .unwrap();
+        tx.execute(
+            "REPLACE INTO index_build_state(id, schema_version, state, files_count, chunks_count) \
+             VALUES (1, 1, 'complete', 1002, 1002)",
+            [],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let page1 = probe(&journal, "search", json!({"query": "budgetexamneedle"})).unwrap();
+        assert!(page1["results"].as_array().unwrap().is_empty());
+        assert_eq!(page1["coverage"]["live_examination_complete"], false);
+        for res in page1["results"].as_array().unwrap() {
+            assert!(
+                !res["snippet"]
+                    .as_str()
+                    .unwrap()
+                    .contains("budgetexamneedle removed")
+            );
+        }
+        let token = page1["next_cursor"]
+            .as_str()
+            .expect("must return continuation cursor at examination budget");
+
+        let perm_record = PermissionStore::open(journal.path())
+            .get_permission(CONNECTION)
+            .unwrap()
+            .unwrap();
+        let ReferenceTarget::Cursor(cursor) = crate::dispatch::codec()
+            .resolve(
+                token,
+                ReferenceKind::Cursor,
+                CONNECTION,
+                perm_record.generation,
+            )
+            .unwrap()
+        else {
+            panic!("decoded target must be Cursor");
+        };
+        assert!(
+            cursor.path.contains("000000_0002"),
+            "1000th examined row path must be 000000_0002, got {}",
+            cursor.path
+        );
+        assert!(
+            !cursor.path.contains("000000_0001"),
+            "000000_0001 must not have been reached yet, got {}",
+            cursor.path
+        );
+    }
+
+    // Block 2: 000000_0001 through 000000_1000 removed, plus one live segment on day 20260913
+    {
+        let journal = fixture();
+        PermissionStore::open(journal.path())
+            .set_permission(CONNECTION, ReadPermission::default_whole_journal())
+            .unwrap();
+
+        let mut index = solstone_core_indexer_store::db::open_index(journal.path()).unwrap();
+        let tx = index.transaction().unwrap();
+        for i in 1..=1000 {
+            let seg = format!("000000_{i:04}");
+            let path = format!("20260914/default/{seg}/talents/brief.md");
+            let seg_dir = journal
+                .path()
+                .join("chronicle")
+                .join("20260914")
+                .join("default")
+                .join(&seg);
+            fs::create_dir_all(&seg_dir).unwrap();
+            fs::write(seg_dir.join("tombstone.json"), "{}").unwrap();
+
+            let content = "budgetexamneedle removed";
+            tx.execute(
+                "INSERT INTO chunks(content, path, day, facet, agent, stream, idx, time_bucket) \
+                 VALUES (?1, ?2, '20260914', '', 'fixture-stream', 'default', 0, '')",
+                params![content, path],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT OR REPLACE INTO chunk_classification(path, category, basis, eligible, unclassified) \
+                 VALUES (?1, 'transcripts', 'segment_assigned', 1, 0)",
+                params![path],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT OR REPLACE INTO chunk_classification_facets(path, facet_id) VALUES (?1, ?2)",
+                params![path, FACET_A],
+            )
+            .unwrap();
+        }
+
+        let live_seg = journal
+            .path()
+            .join("chronicle")
+            .join("20260913")
+            .join("default")
+            .join("090000_300");
+        fs::create_dir_all(live_seg.join("talents")).unwrap();
+        fs::write(live_seg.join("talents/brief.md"), "live brief bytes\n").unwrap();
+        fs::write(live_seg.join("meeting_transcript.md"), "live transcript\n").unwrap();
+
+        let live_path = "20260913/default/090000_300/talents/brief.md";
+        tx.execute(
+            "INSERT INTO chunks(content, path, day, facet, agent, stream, idx, time_bucket) \
+             VALUES ('budgetexamneedle live', ?1, '20260913', '', 'fixture-stream', 'default', 0, '')",
+            params![live_path],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT OR REPLACE INTO chunk_classification(path, category, basis, eligible, unclassified) \
+             VALUES (?1, 'transcripts', 'segment_assigned', 1, 0)",
+            params![live_path],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT OR REPLACE INTO chunk_classification_facets(path, facet_id) VALUES (?1, ?2)",
+            params![live_path, FACET_A],
+        )
+        .unwrap();
+
+        tx.execute(
+            "REPLACE INTO chunk_classification_backfill(id, cursor, completed, stalled, stalled_path, resume_count) \
+             VALUES (1, '', 1, 0, NULL, 0)",
+            [],
+        )
+        .unwrap();
+        tx.execute(
+            "REPLACE INTO index_build_state(id, schema_version, state, files_count, chunks_count) \
+             VALUES (1, 1, 'complete', 1002, 1002)",
+            [],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let page1 = probe(&journal, "search", json!({"query": "budgetexamneedle"})).unwrap();
+        assert!(page1["results"].as_array().unwrap().is_empty());
+        assert_eq!(page1["coverage"]["live_examination_complete"], false);
+        let cursor = page1["next_cursor"]
+            .as_str()
+            .expect("must return continuation cursor at examination budget");
+
+        let page2 = probe(
+            &journal,
+            "search",
+            json!({"query": "budgetexamneedle", "cursor": cursor}),
+        )
+        .unwrap();
+        let results2 = page2["results"].as_array().unwrap();
+        assert_eq!(results2.len(), 1, "page 2 must find the live hit");
+        assert!(
+            results2[0]["snippet"]
+                .as_str()
+                .unwrap()
+                .contains("budgetexamneedle live")
+        );
+        assert!(!results2[0]["snippet"].as_str().unwrap().contains("removed"));
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn source_freeze_barrier_atomicity_withhold_vs_commit() {
+    use crate::source_freeze_barrier::{FreezePoint, run_with_source_freeze_barrier};
+
+    // 1. Search, Before, ordinal 2: remove_segments on 090000_300
+    {
+        let journal = setup_freeze_barrier_journal();
+        let journal_path = journal.path().to_path_buf();
+        let (res, fired) = run_with_source_freeze_barrier(
+            FreezePoint::Before,
+            2,
+            move || {
+                let target = solstone_core_retention::Target {
+                    day: DAY.to_owned(),
+                    stream: STREAM.to_owned(),
+                    dir: SEGMENT.to_owned(),
+                };
+                let outcome = solstone_core_retention::door::remove_segments(
+                    &journal_path,
+                    &[target],
+                    "2026-10-17T12:00:00Z",
+                    solstone_core_retention::RemovalReason::OwnerSegmentDelete,
+                    "freeze-search-before",
+                );
+                assert!(outcome.targets[0].not_removed.is_empty());
+            },
+            || probe(&journal, "search", json!({"query": "freezetestneedle"})),
+        );
+        assert!(fired, "Before ordinal 2 barrier must fire");
+        let results = res.unwrap()["results"].as_array().unwrap().clone();
+        assert_eq!(results.len(), 1);
+        assert!(results[0]["snippet"].as_str().unwrap().contains("100000"));
+        assert!(!results[0]["snippet"].as_str().unwrap().contains("090000"));
+        assert!(!results[0]["segments"].as_array().unwrap().is_empty());
+    }
+
+    // 2. Search, After, ordinal 2: remove_segments on 090000_300
+    {
+        let journal = setup_freeze_barrier_journal();
+        let journal_path = journal.path().to_path_buf();
+        let (res, fired) = run_with_source_freeze_barrier(
+            FreezePoint::After,
+            2,
+            move || {
+                let target = solstone_core_retention::Target {
+                    day: DAY.to_owned(),
+                    stream: STREAM.to_owned(),
+                    dir: SEGMENT.to_owned(),
+                };
+                let outcome = solstone_core_retention::door::remove_segments(
+                    &journal_path,
+                    &[target],
+                    "2026-10-17T12:00:00Z",
+                    solstone_core_retention::RemovalReason::OwnerSegmentDelete,
+                    "freeze-search-after",
+                );
+                assert!(outcome.targets[0].not_removed.is_empty());
+            },
+            || probe(&journal, "search", json!({"query": "freezetestneedle"})),
+        );
+        assert!(fired, "After ordinal 2 barrier must fire");
+        let results = res.unwrap()["results"].as_array().unwrap().clone();
+        assert_eq!(results.len(), 2);
+        let hit_09 = results
+            .iter()
+            .find(|r| r["snippet"].as_str().unwrap().contains("090000"))
+            .unwrap();
+        assert!(!hit_09["segments"].as_array().unwrap().is_empty());
+    }
+
+    // 3. Fetch of 090000_300 entry reference, Before ordinal 1
+    {
+        let journal = setup_freeze_barrier_journal();
+        let search = probe(&journal, "search", json!({"query": "freezetestneedle"})).unwrap();
+        let results = search["results"].as_array().unwrap();
+        let ref_09 = results
+            .iter()
+            .find(|r| r["snippet"].as_str().unwrap().contains("090000"))
+            .unwrap()["reference"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let journal_path = journal.path().to_path_buf();
+        let (res, fired) = run_with_source_freeze_barrier(
+            FreezePoint::Before,
+            1,
+            move || {
+                let target = solstone_core_retention::Target {
+                    day: DAY.to_owned(),
+                    stream: STREAM.to_owned(),
+                    dir: SEGMENT.to_owned(),
+                };
+                let outcome = solstone_core_retention::door::remove_segments(
+                    &journal_path,
+                    &[target],
+                    "2026-10-17T12:00:00Z",
+                    solstone_core_retention::RemovalReason::OwnerSegmentDelete,
+                    "freeze-fetch-before",
+                );
+                assert!(outcome.targets[0].not_removed.is_empty());
+            },
+            || probe(&journal, "fetch", json!({"reference": ref_09})),
+        );
+        assert!(fired, "Before ordinal 1 barrier must fire");
+        assert_eq!(res, Err(McpProbeError::Unavailable));
+    }
+
+    // 4. Fetch of 090000_300 entry reference, After ordinal 1
+    {
+        let journal = setup_freeze_barrier_journal();
+        let search = probe(&journal, "search", json!({"query": "freezetestneedle"})).unwrap();
+        let results = search["results"].as_array().unwrap();
+        let ref_09 = results
+            .iter()
+            .find(|r| r["snippet"].as_str().unwrap().contains("090000"))
+            .unwrap()["reference"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let journal_path = journal.path().to_path_buf();
+        let (res, fired) = run_with_source_freeze_barrier(
+            FreezePoint::After,
+            1,
+            move || {
+                let target = solstone_core_retention::Target {
+                    day: DAY.to_owned(),
+                    stream: STREAM.to_owned(),
+                    dir: SEGMENT.to_owned(),
+                };
+                let outcome = solstone_core_retention::door::remove_segments(
+                    &journal_path,
+                    &[target],
+                    "2026-10-17T12:00:00Z",
+                    solstone_core_retention::RemovalReason::OwnerSegmentDelete,
+                    "freeze-fetch-after",
+                );
+                assert!(outcome.targets[0].not_removed.is_empty());
+            },
+            || probe(&journal, "fetch", json!({"reference": ref_09})),
+        );
+        assert!(fired, "After ordinal 1 barrier must fire");
+        let val = res.unwrap();
+        assert_eq!(val["text"], "freezetestneedle hit 090000");
+        assert!(!val["segments"].as_array().unwrap().is_empty());
+    }
+
+    // 5. Get of 090000_300 transcript reference, Before ordinal 1
+    {
+        let journal = setup_freeze_barrier_journal();
+        let list = probe(&journal, "list_transcripts", json!({"day": DAY})).unwrap();
+        let transcripts = list["transcripts"].as_array().unwrap();
+        let tr_ref_09 = transcripts
+            .iter()
+            .find(|t| {
+                t["time"]
+                    .as_str()
+                    .map(|s| s.starts_with("09:00"))
+                    .unwrap_or(false)
+            })
+            .unwrap()["reference"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let journal_path = journal.path().to_path_buf();
+        let (res, fired) = run_with_source_freeze_barrier(
+            FreezePoint::Before,
+            1,
+            move || {
+                let target = solstone_core_retention::Target {
+                    day: DAY.to_owned(),
+                    stream: STREAM.to_owned(),
+                    dir: SEGMENT.to_owned(),
+                };
+                let outcome = solstone_core_retention::door::remove_segments(
+                    &journal_path,
+                    &[target],
+                    "2026-10-17T12:00:00Z",
+                    solstone_core_retention::RemovalReason::OwnerSegmentDelete,
+                    "freeze-get-before",
+                );
+                assert!(outcome.targets[0].not_removed.is_empty());
+            },
+            || probe(&journal, "get_transcript", json!({"reference": tr_ref_09})),
+        );
+        assert!(fired, "Before ordinal 1 barrier must fire");
+        assert_eq!(res, Err(McpProbeError::Unavailable));
+    }
+
+    // 6. Get of 090000_300 transcript reference, After ordinal 1
+    {
+        let journal = setup_freeze_barrier_journal();
+        let list = probe(&journal, "list_transcripts", json!({"day": DAY})).unwrap();
+        let transcripts = list["transcripts"].as_array().unwrap();
+        let tr_ref_09 = transcripts
+            .iter()
+            .find(|t| {
+                t["time"]
+                    .as_str()
+                    .map(|s| s.starts_with("09:00"))
+                    .unwrap_or(false)
+            })
+            .unwrap()["reference"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let journal_path = journal.path().to_path_buf();
+        let (res, fired) = run_with_source_freeze_barrier(
+            FreezePoint::After,
+            1,
+            move || {
+                let target = solstone_core_retention::Target {
+                    day: DAY.to_owned(),
+                    stream: STREAM.to_owned(),
+                    dir: SEGMENT.to_owned(),
+                };
+                let outcome = solstone_core_retention::door::remove_segments(
+                    &journal_path,
+                    &[target],
+                    "2026-10-17T12:00:00Z",
+                    solstone_core_retention::RemovalReason::OwnerSegmentDelete,
+                    "freeze-get-after",
+                );
+                assert!(outcome.targets[0].not_removed.is_empty());
+            },
+            || probe(&journal, "get_transcript", json!({"reference": tr_ref_09})),
+        );
+        assert!(fired, "After ordinal 1 barrier must fire");
+        let val = res.unwrap();
+        let entries = val["entries"].as_array().unwrap();
+        assert!(!entries.is_empty());
+        assert!(entries[0].as_str().unwrap().contains("approved transcript"));
+    }
 }

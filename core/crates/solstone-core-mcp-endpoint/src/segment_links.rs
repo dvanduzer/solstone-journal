@@ -55,6 +55,7 @@ pub(crate) struct LinkSubject<'a> {
     pub more_segments: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn issue_segment_links(
     journal_root: &Path,
     principal: DispatchPrincipal<'_>,
@@ -62,6 +63,7 @@ pub(crate) fn issue_segment_links(
     subjects: &mut [LinkSubject<'_>],
     per_result: usize,
     response_budget: usize,
+    response_checks: &mut usize,
     checker: &mut dyn TranscriptPageCheck,
 ) {
     if !snapshot.categories.contains(&AdmittedCategory::Transcripts) {
@@ -74,7 +76,6 @@ pub(crate) fn issue_segment_links(
     let owner_zone = solstone_core_journal_config::owner_zone(journal_root);
 
     let mut day_cache: BTreeMap<String, Vec<Segment>> = BTreeMap::new();
-    let mut response_checks = 0;
 
     for subject in subjects.iter_mut() {
         let candidates = resolve_candidates(journal_root, subject, &mut day_cache);
@@ -98,13 +99,29 @@ pub(crate) fn issue_segment_links(
             if !transcript_boundary.allows_classification(&classification) {
                 continue;
             }
-            if subject_checks == per_result || response_checks == response_budget {
+            if !crate::source_release::check_segment_transcript_release(
+                journal_root,
+                &day,
+                identity.stream,
+                identity.name,
+            ) {
+                continue;
+            }
+            if subject_checks == per_result || *response_checks == response_budget {
                 subject.more_segments = true;
                 break;
             }
             subject_checks += 1;
-            response_checks += 1;
+            *response_checks += 1;
             if let Ok(Some(version)) = checker.check_first_page(journal_root, &candidate) {
+                if !crate::source_release::check_segment_transcript_release(
+                    journal_root,
+                    &day,
+                    identity.stream,
+                    identity.name,
+                ) {
+                    continue;
+                }
                 let target = ReferenceTarget::Segment(SegmentReference {
                     day: day.clone(),
                     stream: identity.stream.to_string(),
