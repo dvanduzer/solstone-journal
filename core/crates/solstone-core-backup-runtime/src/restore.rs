@@ -289,6 +289,33 @@ pub fn restore_pending_rotation_refusal(journal: &Path) -> Option<&'static str> 
     }
 }
 
+/// Files at the restored journal's root that name the resident running it on
+/// this machine. Backups omit them, but a snapshot taken before they were
+/// omitted still carries another machine's copies; restoring those over a live
+/// resident leaves its service unable to recognise or stop it. Each pattern is
+/// rooted at the restored subtree, so owner files with the same name elsewhere
+/// in the journal still restore.
+pub(crate) const RESTORE_KEEPS_LOCAL: [&str; 2] = [
+    "/health/supervisor.process_instance",
+    "/health/callosum.pipe-*",
+];
+
+/// The restic argv that restores one journal snapshot's tree onto `target`.
+pub(crate) fn restore_args(snapshot_id: &str, tree_path: &str, target: &str) -> Vec<String> {
+    let mut args = vec![
+        "restore".to_owned(),
+        format!("{snapshot_id}:{tree_path}"),
+        "--target".to_owned(),
+        target.to_owned(),
+    ];
+    for pattern in RESTORE_KEEPS_LOCAL {
+        args.extend(["--exclude".to_owned(), pattern.to_owned()]);
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    args.extend(["--exclude".to_owned(), "backup-activity.lock".to_owned()]);
+    args
+}
+
 /// Restore a BYO repository. The three config setters remain purposefully independent.
 pub fn restore_journal(
     journal: &Path,
@@ -454,25 +481,11 @@ pub fn restore_journal(
     let restored = match restic(
         services,
         &admitted,
-        {
-            let args = vec![
-                "restore".into(),
-                format!(
-                    "{}:{}",
-                    snapshot.id,
-                    crate::restic_tree_path(Path::new(&snapshot.path))
-                ),
-                "--target".into(),
-                target_path.display().to_string(),
-            ];
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            let args = {
-                let mut args = args;
-                args.extend(["--exclude".to_owned(), "backup-activity.lock".to_owned()]);
-                args
-            };
-            args
-        },
+        restore_args(
+            &snapshot.id,
+            &crate::restic_tree_path(Path::new(&snapshot.path)),
+            &target_path.display().to_string(),
+        ),
         &destination,
         &canonical,
         &env,
@@ -1001,6 +1014,14 @@ mod tests {
                 format!("{CAPTURED_SNAPSHOT_ID}:/tmp/journal")
             ]
         );
+        for pattern in RESTORE_KEEPS_LOCAL {
+            assert!(
+                runner.calls()[1]
+                    .windows(2)
+                    .any(|pair| pair == ["--exclude", pattern]),
+                "restore keeps {pattern} local"
+            );
+        }
         assert_recorded_counters(
             &recorder,
             "ok",

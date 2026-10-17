@@ -213,27 +213,7 @@ impl ToolRunner for ArgvResticFixture {
                 stdout: self.catalog.as_bytes().to_vec(),
                 stderr: vec![],
             }),
-            Some("restore")
-                if matches!(
-                    argv.as_slice(),
-                    [command, snapshot, target, _, json]
-                        if command == "restore"
-                            && snapshot.contains(':')
-                            && target == "--target"
-                            && json == "--json"
-                ) || matches!(
-                    argv.as_slice(),
-                    [command, snapshot, target, _, exclude, name, json]
-                        if command == "restore"
-                            && snapshot.contains(':')
-                            && target == "--target"
-                            && exclude == "--exclude"
-                            && name == "backup-activity.lock"
-                            && json == "--json"
-                ) =>
-            {
-                Ok(self.restore.clone())
-            }
+            Some("restore") if admitted_restore_argv(&argv) => Ok(self.restore.clone()),
             Some("check") if argv == ["check"] => Ok(self.check.clone()),
             _ => self.refuse(argv, REFUSED_UNEXPECTED_EXIT),
         }
@@ -332,4 +312,27 @@ impl RestoreRecorder for RestoreRecorderSpy {
             Ok(())
         }
     }
+}
+
+/// A restore argv as the journal builds it: the snapshot tree onto a target,
+/// keeping this machine's resident identity, then the optional lock exclude.
+fn admitted_restore_argv(argv: &[String]) -> bool {
+    let [command, snapshot, target, _, rest @ ..] = argv else {
+        return false;
+    };
+    if command != "restore" || !snapshot.contains(':') || target != "--target" {
+        return false;
+    }
+    let mut expected: Vec<&str> = crate::restore::RESTORE_KEEPS_LOCAL
+        .iter()
+        .flat_map(|pattern| ["--exclude", *pattern])
+        .collect();
+    let keeps = expected.len();
+    expected.push("--json");
+    let with_lock = {
+        let mut with_lock = expected[..keeps].to_vec();
+        with_lock.extend(["--exclude", "backup-activity.lock", "--json"]);
+        with_lock
+    };
+    rest == expected.as_slice() || rest == with_lock.as_slice()
 }

@@ -24,6 +24,11 @@ pub const COPY_EXCLUDES: &[&str] = &[
     "health/brain-refresh.lease",
     "health/supervisor.ready",
     "health/supervisor.start_time",
+    // The Windows resident's own process identity and Callosum pipe file,
+    // its counterparts of the pid, start time and socket above. Another
+    // machine's copies would name a process this one is not running.
+    "health/supervisor.process_instance",
+    "health/callosum.pipe-*",
     "health/parakeet-cpp.placement",
     "health/scheduler.json",
     "health/**/*.sock",
@@ -139,6 +144,8 @@ mod tests {
             "cache/providers/model",
             "health/brain-fingerprint.key",
             "health/callosum.sock",
+            "health/callosum.pipe-secret",
+            "health/supervisor.process_instance",
             "health/locks/backup-activity.lock",
             "health/sync/state",
             "mcp-endpoint/pop.ed25519.pk8",

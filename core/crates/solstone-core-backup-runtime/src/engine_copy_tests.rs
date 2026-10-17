@@ -53,6 +53,7 @@ fn real_restic_preserves_owner_names_and_excludes_operational_secrets() {
         "imports/item/mcp-endpoint/pop.ed25519.pk8",
         "health/retention.log",
         "health/pruning-runs/run.jsonl",
+        "chronicle/20260101/health/supervisor.process_instance",
         "chronicle/20260101/health/talent-provenance/run.json",
         "config/journal.json",
         "chronicle/20260102/indexer/indexer.sqlite/original.key",
@@ -74,6 +75,8 @@ fn real_restic_preserves_owner_names_and_excludes_operational_secrets() {
         "health/brain-refresh.lease",
         "health/callosum.sock",
         "health/supervisor.pid",
+        "health/supervisor.process_instance",
+        "health/callosum.pipe-secret",
         "health/local.port",
         "health/locks/backup-activity.lock",
         "health/sync/state",
@@ -194,6 +197,46 @@ fn real_restic_preserves_owner_names_and_excludes_operational_secrets() {
         for name in omitted {
             assert!(!restored_root.join(name).exists(), "{name}");
         }
+    }
+    // A snapshot taken before the resident identity was omitted carries
+    // another machine's copies; restoring it over a live journal keeps this one's.
+    let unfiltered = snapshot_id(run(&[
+        "backup".into(),
+        crate::restic_filesystem_path(&root),
+        "--json".into(),
+    ]));
+    let live = temp.path().join("restored-over-live");
+    fs::create_dir_all(live.join("health")).unwrap();
+    for name in [
+        "health/supervisor.process_instance",
+        "health/callosum.pipe-secret",
+    ] {
+        fs::write(live.join(name), b"live resident").unwrap();
+    }
+    run(&crate::restore::restore_args(
+        &unfiltered,
+        &crate::restic_tree_path(&root),
+        &crate::restic_filesystem_path(&live),
+    ));
+    for name in [
+        "health/supervisor.process_instance",
+        "health/callosum.pipe-secret",
+    ] {
+        assert_eq!(
+            fs::read(live.join(name)).unwrap(),
+            b"live resident",
+            "{name}"
+        );
+    }
+    for name in [
+        "config/journal.json",
+        "chronicle/20260101/health/supervisor.process_instance",
+    ] {
+        assert_eq!(
+            fs::read(live.join(name)).expect(name),
+            name.as_bytes(),
+            "{name}"
+        );
     }
     let owner_directory = "imports/health-dedupe.sqlite/original.key";
     fs::remove_file(root.join("imports/health-dedupe.sqlite")).unwrap();

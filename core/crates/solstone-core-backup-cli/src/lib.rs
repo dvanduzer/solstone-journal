@@ -3041,6 +3041,10 @@ mod tests {
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:/journal".into(),
             "--target".into(),
             journal.path().display().to_string(),
+            "--exclude".into(),
+            "/health/supervisor.process_instance".into(),
+            "--exclude".into(),
+            "/health/callosum.pipe-*".into(),
         ];
         #[cfg(target_os = "linux")]
         restore_argv.extend(["--exclude".into(), "backup-activity.lock".into()]);

@@ -1855,6 +1855,10 @@ async fn restore_success_records_snapshots_then_restore() {
                 format!("{JOURNAL_SNAPSHOT_ID}:/original"),
                 "--target".into(),
                 root.path().display().to_string(),
+                "--exclude".into(),
+                "/health/supervisor.process_instance".into(),
+                "--exclude".into(),
+                "/health/callosum.pipe-*".into(),
                 #[cfg(target_os = "linux")]
                 "--exclude".into(),
                 #[cfg(target_os = "linux")]
@@ -6090,6 +6094,10 @@ async fn hosted_poll_restore_failure_matches_local_handoff_contract() {
                     format!("{JOURNAL_SNAPSHOT_ID}:/original"),
                     "--target".into(),
                     root.path().display().to_string(),
+                    "--exclude".into(),
+                    "/health/supervisor.process_instance".into(),
+                    "--exclude".into(),
+                    "/health/callosum.pipe-*".into(),
                     #[cfg(target_os = "linux")]
                     "--exclude".into(),
                     #[cfg(target_os = "linux")]
