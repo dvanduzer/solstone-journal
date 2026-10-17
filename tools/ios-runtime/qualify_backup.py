@@ -208,7 +208,8 @@ def main():
             'credentials': {'access_key_id': storage['access_key_id'],
                             'secret_access_key': storage['secret_access_key']}})
         check('destination', destination)
-        assert destination.get('reachable') is True and destination.get('repo_exists') is False, destination
+        reach = destination.get('destination_status') or {}
+        assert reach.get('reachable') is True and reach.get('repo_exists') is False, reach
         enabled = operate(phone, '/enable', kind='enable')
         check('A2_enable', enabled)
         assert enabled.get('operation', {}).get('phase') == 'done', enabled
