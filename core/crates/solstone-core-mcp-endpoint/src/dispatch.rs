@@ -27,7 +27,8 @@ use solstone_core_transcripts::segment_clock;
 use solstone_core_mcp_audit::{Admission, AuditCoordinates, Outcome, result_shape};
 
 use crate::activity_admit::{
-    ActivityAdmit, activity_cursor_proof_matches, admit_activity, is_activity_path,
+    ActivityAdmit, ActivityCursorProof, activity_cursor_proof_matches, activity_proof_required,
+    admit_activity,
 };
 use crate::audit;
 use crate::permissions::{ConnectionReadSnapshot, PermissionDecision, evaluate_connection_read};
@@ -1168,39 +1169,35 @@ fn search(
                 live_dropped = true;
                 continue;
             }
-            let (served_text, activity_proof, hidden, record) =
-                if is_activity_path(&hit.metadata.path) {
-                    match admit_activity(
-                        journal_root,
-                        &boundary,
-                        &hit.metadata.path,
-                        hit.metadata.idx,
-                        hit.row_id,
-                        &hit.text,
-                        None,
-                        MAX_INDEXED_ENTRY_BYTES,
-                    ) {
-                        Ok(ActivityAdmit::Admitted(admitted)) => (
-                            admitted.text,
-                            Some(admitted.proof),
-                            Some(admitted.hidden),
-                            Some(admitted.record),
-                        ),
-                        Ok(ActivityAdmit::Withheld { cursor_proof }) => {
-                            if let Some(anchor) = anchor.as_mut() {
-                                match cursor_proof {
-                                    Some(proof) => anchor.activity_proof = Some(proof),
-                                    None => anchor.omit_cursor = true,
-                                }
-                            }
-                            live_dropped = true;
-                            continue;
+            let (served_text, activity_proof, hidden, record) = match admit_activity(
+                journal_root,
+                &boundary,
+                &hit.metadata.path,
+                hit.metadata.idx,
+                hit.row_id,
+                &hit.text,
+                None,
+                MAX_INDEXED_ENTRY_BYTES,
+            ) {
+                Ok(ActivityAdmit::NotActivity) => (hit.text, None, None, None),
+                Ok(ActivityAdmit::Admitted(admitted)) => (
+                    admitted.text,
+                    Some(admitted.proof),
+                    Some(admitted.hidden),
+                    Some(admitted.record),
+                ),
+                Ok(ActivityAdmit::Withheld { cursor_proof }) => {
+                    if let Some(anchor) = anchor.as_mut() {
+                        match cursor_proof {
+                            Some(proof) => anchor.activity_proof = Some(proof),
+                            None => anchor.omit_cursor = true,
                         }
-                        Err(error) => return Err(index_error(error)),
                     }
-                } else {
-                    (hit.text, None, None, None)
-                };
+                    live_dropped = true;
+                    continue;
+                }
+                Err(error) => return Err(index_error(error)),
+            };
             if let Some(anchor) = anchor.as_mut() {
                 anchor.activity_proof = activity_proof.clone();
             }
@@ -1408,22 +1405,21 @@ fn resolve_search_cursor(
     else {
         return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
     };
-    if is_activity_path(&cursor.path) {
-        let Some(proof) = cursor.activity_proof.as_deref() else {
-            return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
-        };
-        if !activity_cursor_proof_matches(
-            journal_root,
-            boundary,
-            &cursor.path,
-            cursor.idx,
-            cursor.row_id,
-            &content,
-            proof,
-            MAX_INDEXED_ENTRY_BYTES,
-        )
-        .map_err(index_error)?
-        {
+    match activity_cursor_proof_matches(
+        journal_root,
+        boundary,
+        &cursor.path,
+        cursor.idx,
+        cursor.row_id,
+        &content,
+        cursor.activity_proof.as_deref().unwrap_or(""),
+        MAX_INDEXED_ENTRY_BYTES,
+    )
+    .map_err(index_error)?
+    {
+        ActivityCursorProof::NotActivity => {}
+        ActivityCursorProof::Matches => {}
+        ActivityCursorProof::Reject => {
             return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
         }
     }
@@ -1458,7 +1454,16 @@ fn fetch(
     if !live_allows(journal_root, &boundary, &entry.path, Some(&entry.stream)) {
         return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
     }
-    if is_activity_path(&entry.path) && entry.activity_proof.is_none() {
+    let proof_required = activity_proof_required(
+        journal_root,
+        &boundary,
+        &entry.path,
+        entry.idx,
+        entry.row_id,
+        MAX_INDEXED_ENTRY_BYTES,
+    )
+    .map_err(index_error)?;
+    if proof_required && entry.activity_proof.is_none() {
         return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
     }
     let IndexedEntry::Found(text) = read_indexed_entry(
@@ -1473,7 +1478,7 @@ fn fetch(
     else {
         return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
     };
-    let (text, hidden, record) = if is_activity_path(&entry.path) {
+    let (text, hidden, record) = if proof_required {
         match admit_activity(
             journal_root,
             &boundary,
@@ -1487,7 +1492,7 @@ fn fetch(
             Ok(ActivityAdmit::Admitted(admitted)) => {
                 (admitted.text, Some(admitted.hidden), Some(admitted.record))
             }
-            Ok(ActivityAdmit::Withheld { .. }) => {
+            Ok(ActivityAdmit::Withheld { .. } | ActivityAdmit::NotActivity) => {
                 return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
             }
             Err(error) => return Err(index_error(error)),

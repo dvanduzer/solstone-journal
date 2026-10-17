@@ -240,10 +240,12 @@ not promise directory-entry durability across sudden power loss.
 ## Activity reads
 
 Search and fetch check an activity against the file it was indexed from before
-they return its text. An activity result includes `hidden`, true or false, taken
-from that index observation. Trust that field. The text can mention hidden
-without the activity being hidden, and a short preview can omit the mention
-entirely.
+they return its text. An activity is a file the index recorded as an activity,
+including one indexed from a written shape. The read uses that record and does
+not open a shape file again. An activity result includes `hidden`, true or
+false, taken from that index observation. Trust that field. The text can mention
+hidden without the activity being hidden, and a short preview can omit the
+mention entirely.
 
 The check is the whole file. A change to any record in that daily file, including
 one the result did not show, leaves every activity from that file out until the

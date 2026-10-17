@@ -490,9 +490,11 @@ fn scan_journal_pass(
         };
         match observed_mtime {
             Ok(mtime) => {
-                let needs_index = if memory_note || is_activity_rel(rel) {
+                let needs_index = if memory_note || written_activity(path, rel) {
                     // Memory readiness and activity file bytes can change inside
                     // one mtime second. Queue them and decide from the bytes.
+                    // The activity decision is the written family, including a
+                    // sibling shape sidecar, matching the index pass below.
                     true
                 } else {
                     db_mtimes.get(rel) != Some(&mtime)
@@ -1771,8 +1773,8 @@ pub(crate) fn file_mtime_secs(path: &Path) -> Result<i64, StoreError> {
     Ok(duration.as_secs() as i64)
 }
 
-pub(crate) fn is_activity_rel(rel: &str) -> bool {
-    classify(rel) == ContentResolution::Indexed(Family::Activity)
+fn written_activity(path: &Path, rel: &str) -> bool {
+    resolve_content_shape(path, rel) == ContentResolution::Indexed(Family::Activity)
 }
 
 pub(crate) fn is_memory_note(rel: &str) -> bool {

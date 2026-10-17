@@ -701,11 +701,28 @@ pub struct ActivityObservation {
     pub hidden: bool,
 }
 
-/// Read one activity chunk and its proof in a single statement.
+/// What one bounded read of a chunk says about the activity the index recorded.
 ///
-/// Missing proof, a malformed proof, an oversized entry, or a missing proof
-/// table is `Ok(None)`. The caller withholds the activity. Real index errors
-/// still propagate. This does not open the source file.
+/// `Ready` and `Unavailable` mean an `activity_provenance` row joins this
+/// chunk, so the writer indexed it as an activity. `Unproven` is a chunk with
+/// no proof row. `Absent` is no chunk in this snapshot. A canonical activity
+/// path with no proof is still withheld by the caller. This does not read
+/// `chunks.agent` or a shape sidecar.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ActivityObservationRead {
+    Absent,
+    Unproven,
+    Unavailable,
+    Ready(ActivityObservation),
+}
+
+/// Read one chunk and its activity proof in a single statement.
+///
+/// The digest is returned only when SQLite reports a 32-byte blob, and the
+/// hidden flag only when it is the integer 0 or 1, so a text or oversized
+/// value is `Unavailable` rather than allocated or returned as an index error.
+/// A missing proof table is `Unproven`. Real index errors still propagate.
+/// This does not open the source file.
 pub fn read_activity_observation(
     journal: &Path,
     boundary: QueryBoundary,
@@ -713,10 +730,12 @@ pub fn read_activity_observation(
     idx: i64,
     row_id: i64,
     max_bytes: u64,
-) -> Result<Option<ActivityObservation>, IndexAccessError> {
+) -> Result<ActivityObservationRead, IndexAccessError> {
     let reader = match open_index_reader(journal, &boundary) {
         Ok(reader) => reader,
-        Err(IndexAccessError::Absent { .. } | IndexAccessError::Empty { .. }) => return Ok(None),
+        Err(IndexAccessError::Absent { .. } | IndexAccessError::Empty { .. }) => {
+            return Ok(ActivityObservationRead::Absent);
+        }
         Err(error) => return Err(error),
     };
     let mut clause = String::from(
@@ -744,8 +763,13 @@ pub fn read_activity_observation(
         &format!(
             "SELECT length(CAST(chunks.content AS BLOB)),
                     CASE WHEN length(CAST(chunks.content AS BLOB)) <= ? THEN chunks.content ELSE NULL END,
-                    activity_provenance.digest,
-                    activity_provenance.hidden
+                    CASE WHEN activity_provenance.rowid IS NOT NULL THEN 1 ELSE 0 END,
+                    CASE WHEN typeof(activity_provenance.digest) = 'blob'
+                          AND length(activity_provenance.digest) = 32
+                         THEN activity_provenance.digest ELSE NULL END,
+                    CASE WHEN typeof(activity_provenance.hidden) = 'integer'
+                          AND activity_provenance.hidden IN (0, 1)
+                         THEN activity_provenance.hidden ELSE NULL END
              FROM chunks
              LEFT JOIN activity_provenance ON activity_provenance.rowid = chunks.rowid
              WHERE {clause} LIMIT 1"
@@ -755,31 +779,40 @@ pub fn read_activity_observation(
             Ok((
                 row.get::<_, Option<i64>>(0)?,
                 row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<Vec<u8>>>(2)?,
-                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<Vec<u8>>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
             ))
         },
     );
     let found = match found {
         Ok(row) => Some(row),
-        Err(error) if activity_provenance_missing(&error) => return Ok(None),
+        Err(error) if activity_provenance_missing(&error) => {
+            return Ok(ActivityObservationRead::Unproven);
+        }
         Err(error) => {
             return match error {
-                Error::QueryReturnedNoRows => Ok(None),
+                Error::QueryReturnedNoRows => Ok(ActivityObservationRead::Absent),
                 other => Err(reader.classify(other)),
             };
         }
     };
-    let Some((_, Some(content), Some(digest), Some(hidden))) = found else {
-        return Ok(None);
+    let Some((_, content, proof_present, digest, hidden)) = found else {
+        return Ok(ActivityObservationRead::Absent);
     };
-    if hidden != 0 && hidden != 1 {
-        return Ok(None);
+    if proof_present == 0 {
+        return Ok(ActivityObservationRead::Unproven);
     }
-    let Ok(digest) = <[u8; 32]>::try_from(digest.as_slice()) else {
-        return Ok(None);
+    let Some(content) = content else {
+        return Ok(ActivityObservationRead::Unavailable);
     };
-    Ok(Some(ActivityObservation {
+    let (Some(digest), Some(hidden)) = (digest, hidden) else {
+        return Ok(ActivityObservationRead::Unavailable);
+    };
+    let Ok(digest) = <[u8; 32]>::try_from(digest.as_slice()) else {
+        return Ok(ActivityObservationRead::Unavailable);
+    };
+    Ok(ActivityObservationRead::Ready(ActivityObservation {
         content,
         digest,
         hidden: hidden == 1,

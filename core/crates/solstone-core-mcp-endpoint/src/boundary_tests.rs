@@ -1868,7 +1868,7 @@ fn activity_links_require_the_live_record_to_match_the_indexed_one() {
     let line2 =
         json!({"id": "twin-unrewritten", "title": "Twin", "segments": ["090000_300"]}).to_string();
 
-    let file_content = format!("\nnot a json object\n{line0}\n{line1}\n{line2}\n");
+    let file_content = format!("\n{line0}\n{line1}\n{line2}\n");
     fs::write(journal.path().join(act_path), &file_content).unwrap();
 
     let p0 = produce_chunks(Family::Activity, act_path, &line0);
@@ -1958,7 +1958,7 @@ fn activity_links_require_the_live_record_to_match_the_indexed_one() {
 
     let line0_new =
         json!({"id": "completely-different-id", "segments": ["090000_300"]}).to_string();
-    let rewritten_content = format!("\nnot a json object\n{line0_new}\n{line1}\n{line2}\n");
+    let rewritten_content = format!("\n{line0_new}\n{line1}\n{line2}\n");
     fs::write(journal.path().join(act_path), &rewritten_content).unwrap();
 
     let search2 = probe(
@@ -4929,7 +4929,7 @@ fn activity_changes_stay_out_until_the_file_is_indexed_again() {
             assert_eq!(activity_hits_for(&journal, "sealedactivityneedle").len(), 1);
             let sealed_path = journal.path().join(sealed);
             let mut permissions = fs::metadata(&sealed_path).unwrap().permissions();
-            permissions.set_mode(0);
+            permissions.set_mode(0o0);
             fs::set_permissions(&sealed_path, permissions.clone()).unwrap();
             assert!(activity_hits_for(&journal, "sealedactivityneedle").is_empty());
             permissions.set_mode(0o644);
@@ -5046,4 +5046,310 @@ fn activity_read_withholds_when_the_index_changes_before_the_proof() {
         )
         .unwrap();
     assert_eq!(stored, "replacementstoryneedle");
+}
+
+fn grant_chosen_facet(journal: &Path, facet_id: &str) {
+    PermissionStore::open(journal)
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec![
+                    "transcripts".to_owned(),
+                    "entities".to_owned(),
+                    "facets".to_owned(),
+                ],
+                scope: ReadScope::Facets {
+                    ids: vec![facet_id.to_owned()],
+                },
+            },
+        )
+        .unwrap();
+}
+
+fn restore_mtime(path: &Path, mtime: std::time::SystemTime) {
+    fs::File::open(path).unwrap().set_modified(mtime).unwrap();
+}
+
+#[test]
+fn shaped_activity_follows_the_indexed_family_under_a_chosen_facet_grant() {
+    let journal = tempfile::Builder::new()
+        .prefix("shaped-activity-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    setup_facets(journal.path());
+    let shaped = "facets/alpha/events/20261010.jsonl";
+    let alias = "facets/alpha/events/20261011.jsonl";
+    let named = "facets/alpha/activities/20261010/notes/activity.md";
+    let beta = "facets/beta/events/20261010.jsonl";
+    write_activity(
+        journal.path(),
+        "facets/alpha/events/shape.json",
+        r#"{"20261010.jsonl":"Activity","20261011.jsonl":"Event"}"#,
+    );
+    write_activity(
+        journal.path(),
+        shaped,
+        &format!(
+            "{}\n",
+            json!({
+                "id": "shaped",
+                "title": "Shaped",
+                "hidden": true,
+                "story": {"body": "shapedactivityneedle"}
+            })
+        ),
+    );
+    write_activity(
+        journal.path(),
+        alias,
+        &format!(
+            "{}\n",
+            json!({"title": "Alias", "summary": "aliascontrolneedle"})
+        ),
+    );
+    write_activity(journal.path(), named, "# Activity\n\nagentactivityneedle\n");
+    write_activity(
+        journal.path(),
+        "facets/beta/events/shape.json",
+        r#"{"20261010.jsonl":"Activity"}"#,
+    );
+    write_activity(
+        journal.path(),
+        beta,
+        &format!(
+            "{}\n",
+            json!({
+                "id": "beta",
+                "title": "Beta",
+                "hidden": true,
+                "story": {"body": "betashapedneedle"}
+            })
+        ),
+    );
+    solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
+    grant_chosen_facet(journal.path(), FACET_A);
+
+    let hidden_saved = indexed_content(journal.path(), shaped, 0);
+    let hits = activity_hits_for(&journal, "shapedactivityneedle");
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0]["hidden"], true);
+    let reference = hits[0]["reference"].as_str().unwrap().to_owned();
+    let fetched = probe(&journal, "fetch", json!({"reference": reference})).unwrap();
+    assert_eq!(fetched["hidden"], true);
+    assert_eq!(fetched["text"].as_str(), Some(hidden_saved.as_str()));
+
+    let alias_hits = activity_hits_for(&journal, "aliascontrolneedle");
+    assert_eq!(alias_hits.len(), 1, "{alias_hits:?}");
+    assert!(alias_hits[0].get("hidden").is_none());
+    let alias_saved = indexed_content(journal.path(), alias, 0);
+    let alias_fetch = probe(
+        &journal,
+        "fetch",
+        json!({"reference": alias_hits[0]["reference"]}),
+    )
+    .unwrap();
+    assert!(alias_fetch.get("hidden").is_none());
+    assert_eq!(alias_fetch["text"].as_str(), Some(alias_saved.as_str()));
+
+    let named_hits = activity_hits_for(&journal, "agentactivityneedle");
+    assert_eq!(named_hits.len(), 1, "{named_hits:?}");
+    assert!(named_hits[0].get("hidden").is_none());
+    let named_fetch = probe(
+        &journal,
+        "fetch",
+        json!({"reference": named_hits[0]["reference"]}),
+    )
+    .unwrap();
+    assert!(named_fetch.get("hidden").is_none());
+    assert!(activity_hits_for(&journal, "betashapedneedle").is_empty());
+
+    let shaped_path = journal.path().join(shaped);
+    let shaped_mtime = fs::metadata(&shaped_path).unwrap().modified().unwrap();
+    write_activity(
+        journal.path(),
+        shaped,
+        &format!(
+            "{}\n",
+            json!({
+                "id": "shaped",
+                "title": "Shaped",
+                "hidden": false,
+                "story": {"body": "shapedactivitychanged"}
+            })
+        ),
+    );
+    restore_mtime(&shaped_path, shaped_mtime);
+    assert!(activity_hits_for(&journal, "shapedactivityneedle").is_empty());
+    assert!(activity_hits_for(&journal, "shapedactivitychanged").is_empty());
+    assert_eq!(
+        probe(&journal, "fetch", json!({"reference": reference})),
+        Err(McpProbeError::Unavailable)
+    );
+    assert_eq!(activity_hits_for(&journal, "aliascontrolneedle").len(), 1);
+
+    solstone_core_indexer_store::scan::scan_journal(journal.path(), false).unwrap();
+    let refreshed = activity_hits_for(&journal, "shapedactivitychanged");
+    assert_eq!(refreshed.len(), 1, "{refreshed:?}");
+    assert_eq!(refreshed[0]["hidden"], false);
+    let refreshed_saved = indexed_content(journal.path(), shaped, 0);
+    assert_eq!(
+        probe(
+            &journal,
+            "fetch",
+            json!({"reference": refreshed[0]["reference"]})
+        )
+        .unwrap()["text"]
+            .as_str(),
+        Some(refreshed_saved.as_str())
+    );
+
+    let rescanned_mtime = fs::metadata(&shaped_path).unwrap().modified().unwrap();
+    write_activity(
+        journal.path(),
+        shaped,
+        &format!(
+            "{}\n",
+            json!({
+                "id": "shaped",
+                "title": "Shaped",
+                "hidden": true,
+                "story": {"body": "shapedactivityrescanned"}
+            })
+        ),
+    );
+    restore_mtime(&shaped_path, rescanned_mtime);
+    assert!(activity_hits_for(&journal, "shapedactivityrescanned").is_empty());
+    solstone_core_indexer_store::scan::rescan_file(journal.path(), Path::new(shaped)).unwrap();
+    let rescanned = activity_hits_for(&journal, "shapedactivityrescanned");
+    assert_eq!(rescanned.len(), 1, "{rescanned:?}");
+    assert_eq!(rescanned[0]["hidden"], true);
+
+    let alias_path = journal.path().join(alias);
+    let alias_before = indexed_content(journal.path(), alias, 0);
+    let alias_mtime = fs::metadata(&alias_path).unwrap().modified().unwrap();
+    write_activity(
+        journal.path(),
+        alias,
+        &format!(
+            "{}\n",
+            json!({"title": "Alias", "summary": "aliaschangedneedle"})
+        ),
+    );
+    restore_mtime(&alias_path, alias_mtime);
+    solstone_core_indexer_store::scan::scan_journal(journal.path(), false).unwrap();
+    assert_eq!(indexed_content(journal.path(), alias, 0), alias_before);
+    assert!(activity_hits_for(&journal, "aliaschangedneedle").is_empty());
+    let alias_after = activity_hits_for(&journal, "aliascontrolneedle");
+    assert_eq!(alias_after.len(), 1);
+    assert!(alias_after[0].get("hidden").is_none());
+
+    write_activity(
+        journal.path(),
+        "facets/alpha/events/shape.json",
+        r#"{"20261010.jsonl":"Event","20261011.jsonl":"Activity"}"#,
+    );
+    let still_activity = activity_hits_for(&journal, "shapedactivityrescanned");
+    assert_eq!(still_activity.len(), 1, "{still_activity:?}");
+    assert_eq!(still_activity[0]["hidden"], true);
+    let still_alias = activity_hits_for(&journal, "aliascontrolneedle");
+    assert_eq!(still_alias.len(), 1);
+    assert!(still_alias[0].get("hidden").is_none());
+
+    let index_path = solstone_core_indexer_store::db::db_path(journal.path());
+    let conn = rusqlite::Connection::open(&index_path).unwrap();
+    conn.execute(
+        "UPDATE activity_provenance SET digest = ?1 WHERE rowid = (SELECT rowid FROM chunks WHERE path = ?2 AND idx = 0)",
+        params!["text-digest-is-not-a-blob", shaped],
+    )
+    .unwrap();
+    drop(conn);
+    let broken = probe(
+        &journal,
+        "search",
+        json!({"query": "shapedactivityrescanned"}),
+    )
+    .unwrap();
+    assert!(broken["results"].as_array().unwrap().is_empty(), "{broken}");
+    assert_eq!(broken["coverage"]["live_examination_complete"], false);
+}
+
+#[test]
+fn malformed_activity_source_withholds_the_whole_file_after_indexing() {
+    let journal = tempfile::Builder::new()
+        .prefix("malformed-activity-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    setup_facets(journal.path());
+    let rel = "facets/alpha/activities/20261010.jsonl";
+    let body = "{\"id\":\"kept\",\"title\":\"Kept\",\"story\":{\"body\":\"validrowneedle\"}}\n\n{\"id\":\"torn\",\"title\":\"Torn\"\n";
+    write_activity(journal.path(), rel, body);
+    solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
+    grant_whole_journal(journal.path());
+
+    let saved = indexed_content(journal.path(), rel, 0);
+    assert!(saved.contains("validrowneedle"), "{saved}");
+    let index = solstone_core_indexer_store::db::open_index(journal.path()).unwrap();
+    let chunks: i64 = index
+        .query_row(
+            "SELECT count(*) FROM chunks WHERE path = ?1",
+            [rel],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let proofs: i64 = index
+        .query_row(
+            "SELECT count(*) FROM activity_provenance AS p \
+             JOIN chunks AS c ON c.rowid = p.rowid WHERE c.path = ?1",
+            [rel],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let row_id: i64 = index
+        .query_row(
+            "SELECT rowid FROM chunks WHERE path = ?1 AND idx = 0",
+            [rel],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let digest: Vec<u8> = index
+        .query_row(
+            "SELECT digest FROM activity_provenance WHERE rowid = ?1",
+            [row_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(index);
+    assert_eq!(chunks, 1);
+    assert_eq!(proofs, 1);
+
+    let search = probe(&journal, "search", json!({"query": "validrowneedle"})).unwrap();
+    assert!(search["results"].as_array().unwrap().is_empty(), "{search}");
+    assert_eq!(search["coverage"]["live_examination_complete"], false);
+
+    let decision = evaluate_connection_read(journal.path(), CONNECTION);
+    let PermissionDecision::Snapshot(snapshot) = decision else {
+        panic!("grant snapshot, got {decision:?}");
+    };
+    let proof = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let reference = crate::dispatch::codec()
+        .mint(
+            CONNECTION,
+            snapshot.generation,
+            crate::references::ReferenceTarget::Entry(crate::references::EntryReference {
+                day: "20261010".to_string(),
+                stream: String::new(),
+                path: rel.to_string(),
+                idx: 0,
+                row_id,
+                activity_proof: Some(proof),
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        probe(&journal, "fetch", json!({"reference": reference})),
+        Err(McpProbeError::Unavailable)
+    );
 }

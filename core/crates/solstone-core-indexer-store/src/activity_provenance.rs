@@ -142,7 +142,7 @@ mod tests {
     }
 
     fn file_digest(root: &Path, rel: &str) -> Vec<u8> {
-        Sha256::digest(&fs::read(root.join(rel)).expect("read activity")).to_vec()
+        Sha256::digest(fs::read(root.join(rel)).expect("read activity")).to_vec()
     }
 
     fn chunk_content(conn: &Connection, rel: &str) -> Vec<String> {
@@ -435,6 +435,150 @@ mod tests {
             .optional()
             .expect("later proof");
         assert!(later_proof.is_none());
+        drop(conn);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn written_activity_shape_refreshes_on_same_second_change_and_alias_does_not() {
+        let root = temp_root("shape");
+        let shaped = "facets/alpha/events/20261010.jsonl";
+        let alias = "facets/alpha/events/20261011.jsonl";
+        let named = "facets/alpha/activities/20261010/notes/activity.md";
+        write(
+            &root,
+            "facets/alpha/events/shape.json",
+            r#"{"20261010.jsonl":"Activity","20261011.jsonl":"Event"}"#,
+        );
+        write(
+            &root,
+            shaped,
+            "{\"id\":\"one\",\"title\":\"First\",\"hidden\":true}\n",
+        );
+        write(
+            &root,
+            alias,
+            "{\"title\":\"Alias\",\"summary\":\"aliascontrolneedle\"}\n",
+        );
+        write(&root, named, "# Activity\n\nagentactivityneedle\n");
+        let first = scan_journal(&root, true).expect("scan written shape");
+        assert_eq!(first.failed, 0, "{first:?}");
+
+        let conn = Connection::open(db_path(&root)).expect("open");
+        assert_eq!(proofs(&conn, shaped).len(), 1);
+        assert_eq!(proofs(&conn, shaped)[0].1, 1);
+        assert!(chunk_content(&conn, shaped)[0].contains("First"));
+        assert!(proofs(&conn, alias).is_empty());
+        assert!(proofs(&conn, named).is_empty());
+        let alias_saved = chunk_content(&conn, alias);
+        let named_saved = chunk_content(&conn, named);
+        let agent: String = conn
+            .query_row("SELECT agent FROM chunks WHERE path = ?", [named], |row| {
+                row.get(0)
+            })
+            .expect("markdown agent");
+        assert_eq!(agent, "activity");
+        drop(conn);
+
+        let shaped_path = root.join(shaped);
+        let alias_path = root.join(alias);
+        let named_path = root.join(named);
+        let shaped_mtime = fs::metadata(&shaped_path)
+            .expect("shaped mtime")
+            .modified()
+            .expect("modified");
+        let alias_mtime = fs::metadata(&alias_path)
+            .expect("alias mtime")
+            .modified()
+            .expect("modified");
+        let named_mtime = fs::metadata(&named_path)
+            .expect("named mtime")
+            .modified()
+            .expect("modified");
+        write(
+            &root,
+            shaped,
+            "{\"id\":\"two\",\"title\":\"Second\",\"hidden\":false}\n",
+        );
+        write(
+            &root,
+            alias,
+            "{\"title\":\"Alias\",\"summary\":\"aliaschangedneedle\"}\n",
+        );
+        write(&root, named, "# Activity\n\nagentchangedneedle\n");
+        File::open(&shaped_path)
+            .expect("shaped")
+            .set_modified(shaped_mtime)
+            .expect("keep shaped mtime");
+        File::open(&alias_path)
+            .expect("alias")
+            .set_modified(alias_mtime)
+            .expect("keep alias mtime");
+        File::open(&named_path)
+            .expect("named")
+            .set_modified(named_mtime)
+            .expect("keep named mtime");
+
+        let second = scan_journal(&root, false).expect("same-second scan");
+        assert!(second.indexed >= 1, "{second:?}");
+        let conn = Connection::open(db_path(&root)).expect("open after same second");
+        let rewritten = chunk_content(&conn, shaped);
+        assert!(rewritten[0].contains("Second"), "{rewritten:?}");
+        assert!(!rewritten[0].contains("First"));
+        assert_eq!(proofs(&conn, shaped)[0].0, file_digest(&root, shaped));
+        assert_eq!(proofs(&conn, shaped)[0].1, 0);
+        assert_eq!(chunk_content(&conn, alias), alias_saved);
+        assert!(proofs(&conn, alias).is_empty());
+        assert_eq!(chunk_content(&conn, named), named_saved);
+        assert!(proofs(&conn, named).is_empty());
+        drop(conn);
+
+        write(
+            &root,
+            shaped,
+            "{\"id\":\"two\",\"title\":\"Second\",\"hidden\":false}\n",
+        );
+        File::open(&shaped_path)
+            .expect("reopen legacy")
+            .set_modified(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_100))
+            .expect("align mtime");
+        scan_journal(&root, false).expect("align digest");
+        let conn = Connection::open(db_path(&root)).expect("open before legacy");
+        conn.execute(
+            "UPDATE chunks SET content = ? WHERE path = ?",
+            params!["LEGACY PROSE", shaped],
+        )
+        .expect("plant legacy prose");
+        drop(conn);
+        let kept = scan_journal(&root, false).expect("matching digest scan");
+        assert_eq!(kept.indexed, 0, "{kept:?}");
+        let conn = Connection::open(db_path(&root)).expect("open after legacy");
+        assert_eq!(
+            chunk_content(&conn, shaped),
+            vec!["LEGACY PROSE".to_string()]
+        );
+        drop(conn);
+
+        write(
+            &root,
+            shaped,
+            "{\"id\":\"three\",\"title\":\"Third\",\"hidden\":true}\n",
+        );
+        let current = fs::metadata(&shaped_path)
+            .expect("third mtime")
+            .modified()
+            .expect("modified");
+        File::open(&shaped_path)
+            .expect("third")
+            .set_modified(current)
+            .expect("keep third mtime");
+        rescan_file(&root, Path::new(shaped)).expect("rescan shaped activity");
+        let conn = Connection::open(db_path(&root)).expect("open after rescan");
+        assert!(chunk_content(&conn, shaped)[0].contains("Third"));
+        assert_eq!(proofs(&conn, shaped)[0].1, 1);
+        assert_eq!(proofs(&conn, shaped)[0].0, file_digest(&root, shaped));
+        assert_eq!(chunk_content(&conn, alias), alias_saved);
+        assert!(proofs(&conn, alias).is_empty());
         drop(conn);
         fs::remove_dir_all(root).expect("cleanup");
     }

@@ -3,17 +3,16 @@
 
 //! Admit one indexed activity only when its source file still matches the proof.
 
-use std::fs;
 use std::path::Path;
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use solstone_core_format::content::{ContentResolution, Family, classify};
 use solstone_core_indexer_query::{
-    ActivityObservation, ConnectionBoundary, IndexAccessError, QueryBoundary,
-    read_activity_observation,
+    ActivityObservation, ActivityObservationRead, ConnectionBoundary, IndexAccessError,
+    QueryBoundary, read_activity_observation,
 };
-use solstone_core_journal_io::paths::resolve_journal_path;
+use solstone_core_journal_io::{JournalRoot, read_relative_file_bounded};
 
 /// Largest activity file an agent read will open. A larger file is withheld.
 pub(crate) const ACTIVITY_SOURCE_BUDGET: u64 = 4 * 1024 * 1024;
@@ -26,8 +25,15 @@ pub(crate) struct AdmittedActivity {
 }
 
 pub(crate) enum ActivityAdmit {
+    NotActivity,
     Admitted(AdmittedActivity),
     Withheld { cursor_proof: Option<String> },
+}
+
+pub(crate) enum ActivityCursorProof {
+    NotActivity,
+    Matches,
+    Reject,
 }
 
 pub(crate) fn is_activity_path(path: &str) -> bool {
@@ -48,15 +54,18 @@ pub(crate) fn admit_activity(
     max_bytes: u64,
 ) -> Result<ActivityAdmit, IndexAccessError> {
     pause_activity_read_seam();
-    let Some(observation) = read_activity_observation(
+    let read = read_activity_observation(
         journal_root,
         QueryBoundary::Connection(boundary.clone()),
         path,
         idx,
         row_id,
         max_bytes,
-    )?
-    else {
+    )?;
+    if !indexed_activity(&read, path) {
+        return Ok(ActivityAdmit::NotActivity);
+    }
+    let ActivityObservationRead::Ready(observation) = read else {
         return Ok(ActivityAdmit::Withheld { cursor_proof: None });
     };
     if observation.content != candidate {
@@ -107,20 +116,58 @@ pub(crate) fn activity_cursor_proof_matches(
     candidate: &str,
     proof: &str,
     max_bytes: u64,
-) -> Result<bool, IndexAccessError> {
+) -> Result<ActivityCursorProof, IndexAccessError> {
     pause_activity_read_seam();
-    let Some(observation) = read_activity_observation(
+    let read = read_activity_observation(
         journal_root,
         QueryBoundary::Connection(boundary.clone()),
         path,
         idx,
         row_id,
         max_bytes,
-    )?
-    else {
-        return Ok(false);
+    )?;
+    if !indexed_activity(&read, path) {
+        return Ok(ActivityCursorProof::NotActivity);
+    }
+    let ActivityObservationRead::Ready(observation) = read else {
+        return Ok(ActivityCursorProof::Reject);
     };
-    Ok(observation_matches(&observation, candidate, proof))
+    Ok(if observation_matches(&observation, candidate, proof) {
+        ActivityCursorProof::Matches
+    } else {
+        ActivityCursorProof::Reject
+    })
+}
+
+/// Whether a missing activity proof on the token must fail closed.
+///
+/// This reads the index only. It does not open the source or a shape sidecar.
+pub(crate) fn activity_proof_required(
+    journal_root: &Path,
+    boundary: &ConnectionBoundary,
+    path: &str,
+    idx: i64,
+    row_id: i64,
+    max_bytes: u64,
+) -> Result<bool, IndexAccessError> {
+    let read = read_activity_observation(
+        journal_root,
+        QueryBoundary::Connection(boundary.clone()),
+        path,
+        idx,
+        row_id,
+        max_bytes,
+    )?;
+    Ok(indexed_activity(&read, path))
+}
+
+fn indexed_activity(read: &ActivityObservationRead, path: &str) -> bool {
+    match read {
+        ActivityObservationRead::Ready(_) | ActivityObservationRead::Unavailable => true,
+        ActivityObservationRead::Unproven | ActivityObservationRead::Absent => {
+            is_activity_path(path)
+        }
+    }
 }
 
 fn observation_matches(observation: &ActivityObservation, candidate: &str, proof: &str) -> bool {
@@ -135,38 +182,21 @@ fn kept_record(text: &str, idx: i64) -> Option<Map<String, Value>> {
         if trimmed.is_empty() {
             continue;
         }
-        if let Ok(Value::Object(record)) = serde_json::from_str::<Value>(trimmed) {
-            kept.push(record);
+        match serde_json::from_str::<Value>(trimmed) {
+            Ok(Value::Object(record)) => kept.push(record),
+            _ => return None,
         }
     }
     kept.into_iter().nth(index)
 }
 
 fn read_contained_source(journal_root: &Path, rel: &str) -> Option<Vec<u8>> {
-    let resolved = resolve_journal_path(journal_root, rel).ok()?;
-    let relative = resolved.strip_prefix(journal_root).ok()?;
-    let mut cursor = journal_root.to_path_buf();
-    let mut components = relative.components().peekable();
-    components.peek()?;
-    while let Some(component) = components.next() {
-        cursor.push(component);
-        let metadata = fs::symlink_metadata(&cursor).ok()?;
-        if metadata.file_type().is_symlink() {
-            return None;
-        }
-        if components.peek().is_none() {
-            if !metadata.file_type().is_file() || metadata.len() > ACTIVITY_SOURCE_BUDGET {
-                return None;
-            }
-        } else if !metadata.is_dir() {
-            return None;
-        }
+    let root = JournalRoot::open(journal_root).ok()?;
+    let maximum = usize::try_from(ACTIVITY_SOURCE_BUDGET).ok()?;
+    match read_relative_file_bounded(&root, Path::new(rel), maximum) {
+        Ok(Some(observation)) => Some(observation.bytes),
+        Ok(None) | Err(_) => None,
     }
-    let bytes = fs::read(&cursor).ok()?;
-    if bytes.len() as u64 > ACTIVITY_SOURCE_BUDGET {
-        return None;
-    }
-    Some(bytes)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
