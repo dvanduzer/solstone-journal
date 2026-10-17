@@ -344,6 +344,8 @@ async fn init_state(
 
 async fn compute_local_capability(journal_root: &Path) -> LocalCapabilityResponse {
     let journal_root = journal_root.to_path_buf();
+    #[cfg(all(test, feature = "full-tests"))]
+    let checkpoint_root = journal_root.clone();
     let report = tokio::task::spawn_blocking(move || {
         build_check_report(&gather_host_inputs(
             &journal_root,
@@ -351,7 +353,7 @@ async fn compute_local_capability(journal_root: &Path) -> LocalCapabilityRespons
         ))
     })
     .await;
-    match report {
+    let capability = match report {
         Ok(report) => local_capability(&report),
         Err(error) => {
             log::warn!("local capability check did not finish: {error}");
@@ -360,6 +362,86 @@ async fn compute_local_capability(journal_root: &Path) -> LocalCapabilityRespons
                 checks: Vec::new(),
             }
         }
+    };
+    #[cfg(all(test, feature = "full-tests"))]
+    if let Some(paused) = setup_probe_test::after_probe(&checkpoint_root) {
+        return paused;
+    }
+    capability
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+pub(crate) mod setup_probe_test {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, OnceLock, mpsc};
+
+    struct Pause {
+        reached: mpsc::SyncSender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    static PAUSES: OnceLock<Mutex<BTreeMap<PathBuf, Pause>>> = OnceLock::new();
+    static CAPABILITIES: OnceLock<Mutex<BTreeMap<PathBuf, &'static str>>> = OnceLock::new();
+
+    pub(crate) fn capability(root: &Path, overall: &'static str) {
+        CAPABILITIES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(root.to_owned(), overall);
+    }
+
+    pub(crate) fn clear(root: &Path) {
+        PAUSES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .remove(root);
+        CAPABILITIES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .remove(root);
+    }
+
+    pub(crate) fn pause(root: &Path) -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+        let (reached_tx, reached_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        PAUSES.get_or_init(Default::default).lock().unwrap().insert(
+            root.to_owned(),
+            Pause {
+                reached: reached_tx,
+                release: release_rx,
+            },
+        );
+        (reached_rx, release_tx)
+    }
+
+    pub(super) fn after_probe(root: &Path) -> Option<LocalCapabilityResponse> {
+        let pause = PAUSES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .remove(root);
+        let overall = if let Some(pause) = pause {
+            pause.reached.send(()).unwrap();
+            pause
+                .release
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .unwrap();
+            "ok"
+        } else {
+            *CAPABILITIES
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap()
+                .get(root)?
+        };
+        Some(LocalCapabilityResponse {
+            overall,
+            checks: Vec::new(),
+        })
     }
 }
 
@@ -406,7 +488,7 @@ async fn build_setup_state(
         }
     }
 
-    let done = completed || (mark_is_locked && saved);
+    let done = completed;
 
     let redirect = match thinking.choice.as_deref() {
         Some("byo") => "/app/thinking#byo-setup",
@@ -530,39 +612,18 @@ async fn init_mark(
     if !is_local(&basis) {
         return init_local_only();
     }
-    match establish::load_committed(&state.journal_root) {
-        Ok(Some(link_state)) => match mark_from_jid(&link_state.instance_id) {
-            Ok(mark) => Json(MarkResponse {
-                mark: Some(mark.to_render_spec()),
-                locked: true,
-                availability: "ready",
-                proposal_id: Some(link_state.instance_id),
-            })
-            .into_response(),
-            Err(_) => Json(MarkResponse {
-                mark: None,
-                locked: true,
-                availability: "unavailable",
-                proposal_id: Some(link_state.instance_id),
-            })
-            .into_response(),
-        },
-        Ok(None) => match establish::current_candidate(&state.journal_root) {
-            Ok(candidate) => match jid_from_spki(candidate.spki_der()) {
-                Ok(instance_id) => match mark_from_jid(&instance_id) {
-                    Ok(mark) => Json(MarkResponse {
-                        mark: Some(mark.to_render_spec()),
-                        locked: false,
-                        availability: "candidate",
-                        proposal_id: Some(instance_id),
-                    })
-                    .into_response(),
-                    Err(error) => establish_error(EstablishError::Mark(error)),
-                },
-                Err(error) => establish_error(EstablishError::Ca(error)),
+    match establish::ensure_mark_snapshot(&state.journal_root) {
+        Ok(snapshot) => Json(MarkResponse {
+            mark: snapshot.render,
+            locked: snapshot.state == establish::MarkState::Locked,
+            availability: if snapshot.state == establish::MarkState::Locked {
+                "ready"
+            } else {
+                "candidate"
             },
-            Err(error) => establish_error(error),
-        },
+            proposal_id: snapshot.proposal_id,
+        })
+        .into_response(),
         Err(error) => establish_error(error),
     }
 }
@@ -710,6 +771,107 @@ fn resolve_local_provider_update(
     Ok(())
 }
 
+type ChoiceError = (&'static str, &'static str, StatusCode);
+
+fn choice_error(error: ChoiceError) -> Response {
+    error_envelope(
+        error.0,
+        error.2.canonical_reason().unwrap_or("Error"),
+        error.1,
+        error.2,
+    )
+    .into_response()
+}
+
+/// Called only while the journal config authority is held. An unchanged choice
+/// is a replay, not permission to restart a cancelled job or replace settings.
+fn transition_thinking_choice(
+    config: &mut Map<String, Value>,
+    choice: &str,
+    local_available: bool,
+) -> Result<(bool, bool), ChoiceError> {
+    if !finalize_config_sections_are_objects(config) {
+        return Err((
+            "corrupt_config",
+            "your journal settings could not be read",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ));
+    }
+    if setup_is_complete(config) {
+        return Ok((false, false));
+    }
+    let previous = nested_string(config, "setup", "thinking_choice");
+    if choice == "local" {
+        if previous == choice {
+            return Ok((false, false));
+        }
+        if !local_available {
+            return Err((
+                "local_unavailable",
+                "local thinking is not available on your journal's computer",
+                StatusCode::BAD_REQUEST,
+            ));
+        }
+        resolve_local_provider_update(config)?;
+        let selected = local_provider_val();
+        object_mut(config, "providers").insert("active".into(), selected.clone());
+        let setup = object_mut(config, "setup");
+        setup.insert("thinking_choice".into(), json!(choice));
+        setup.insert("thinking_selection".into(), selected);
+        return Ok((true, true));
+    }
+    let mut changed = previous != choice;
+    let active = nested_value(config, "providers", "active");
+    let selection = nested_value(config, "setup", "thinking_selection");
+    if selection.is_some() && active == selection {
+        object_mut(config, "providers").remove("active");
+        changed = true;
+    }
+    let setup = object_mut(config, "setup");
+    changed |= setup.remove("thinking_selection").is_some();
+    if previous != choice {
+        setup.insert("thinking_choice".into(), json!(choice));
+    }
+    Ok((changed, false))
+}
+
+/// Retry may repair the unfinished setup selection, but never reactivate an
+/// intention superseded while the capability probe was in flight.
+fn admit_thinking_retry(config: &mut Map<String, Value>) -> Result<bool, ChoiceError> {
+    if !finalize_config_sections_are_objects(config) {
+        return Err((
+            "corrupt_config",
+            "your journal settings could not be read",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ));
+    }
+    if nested_string(config, "setup", "thinking_choice") != "local" {
+        return Err((
+            "thinking_choice_changed",
+            "your thinking choice changed; review it before trying again",
+            StatusCode::CONFLICT,
+        ));
+    }
+    let local = local_provider_val();
+    let active = nested_value(config, "providers", "active");
+    let selected = nested_value(config, "setup", "thinking_selection");
+    if active.as_ref() == Some(&local) && selected.as_ref() == Some(&local) {
+        resolve_local_provider_update(config)?;
+        return Ok(false);
+    }
+    if setup_is_complete(config) || active.is_some() || selected.is_some() {
+        return Err((
+            "thinking_choice_changed",
+            "your thinking settings changed; open thinking to choose what to use",
+            StatusCode::CONFLICT,
+        ));
+    }
+    resolve_local_provider_update(config)?;
+    object_mut(config, "providers").insert("active".into(), local.clone());
+    object_mut(config, "setup").insert("thinking_selection".into(), local);
+    Ok(true)
+}
+
 async fn init_action(
     Extension(basis): Extension<AccessBasis>,
     State(state): State<LinkHttpState>,
@@ -800,179 +962,86 @@ async fn init_action(
                 .into_response();
             }
 
-            if choice == "local" {
-                let cap = compute_local_capability(&state.journal_root).await.overall;
-                if cap == "ok" {
-                    let base_config = match load_mutation_base(&state.journal_root) {
-                        Ok(base) => base.config,
-                        Err(_) => return corrupt_config(),
-                    };
-                    if let Err((code, msg, status)) = resolve_local_provider_update(&base_config) {
-                        return error_envelope(code, "Bad Request", msg, status).into_response();
-                    }
-                    let mutation = mutate_journal_config(
-                        &state.journal_root,
-                        solstone_core_journal_config_write::LockOptions::default(),
-                        |config| {
-                            let mut changed = false;
-                            let setup = object_mut(config, "setup");
-                            if setup.get("thinking_choice") != Some(&json!("local")) {
-                                setup.insert("thinking_choice".into(), json!("local"));
-                                changed = true;
-                            }
-                            let local_val = local_provider_val();
-                            let providers = object_mut(config, "providers");
-                            if providers.get("active") != Some(&local_val) {
-                                providers.insert("active".into(), local_val.clone());
-                                changed = true;
-                            }
-                            let setup = object_mut(config, "setup");
-                            if setup.get("thinking_selection") != Some(&local_val) {
-                                setup.insert("thinking_selection".into(), local_val);
-                                changed = true;
-                            }
-                            JournalConfigMutation { changed, value: () }
-                        },
-                    );
-                    if let Err(e) = mutation {
-                        return config_error(e);
-                    }
-                    let journal = state.journal_root.clone();
-                    let host = state.host.clone();
-                    let start_res =
-                        tokio::task::spawn_blocking(move || host.start_local(&journal)).await;
-                    match start_res {
-                        Ok(Ok(())) => {}
-                        Ok(Err(err)) => {
-                            start_err_overlay = Some(err);
-                        }
-                        Err(err) => {
-                            return error_envelope(
-                                "start_failed",
-                                "Internal Server Error",
-                                err.to_string(),
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                            )
-                            .into_response();
-                        }
-                    }
-                } else {
-                    let mutation = mutate_journal_config(
-                        &state.journal_root,
-                        solstone_core_journal_config_write::LockOptions::default(),
-                        |config| {
-                            let mut changed = false;
-                            let setup = object_mut(config, "setup");
-                            if setup.get("thinking_choice") != Some(&json!("local")) {
-                                setup.insert("thinking_choice".into(), json!("local"));
-                                changed = true;
-                            }
-                            JournalConfigMutation { changed, value: () }
-                        },
-                    );
-                    if let Err(e) = mutation {
-                        return config_error(e);
-                    }
-                }
-            } else {
-                let mutation = mutate_journal_config(
-                    &state.journal_root,
-                    solstone_core_journal_config_write::LockOptions::default(),
-                    |config| {
-                        let mut changed = false;
-                        let setup = object_mut(config, "setup");
-                        if setup.get("thinking_choice") != Some(&json!(choice)) {
-                            setup.insert("thinking_choice".into(), json!(choice));
-                            changed = true;
-                        }
-                        let providers = object_mut(config, "providers");
-                        let active = providers.get("active").cloned();
-                        let setup = object_mut(config, "setup");
-                        let selection = setup.get("thinking_selection").cloned();
-                        if active.is_some() && active == selection {
-                            let providers = object_mut(config, "providers");
-                            providers.remove("active");
-                            let setup = object_mut(config, "setup");
-                            setup.remove("thinking_selection");
-                            changed = true;
-                        }
-                        JournalConfigMutation { changed, value: () }
+            let local_available = choice != "local"
+                || compute_local_capability(&state.journal_root).await.overall == "ok";
+            let mutation = mutate_journal_config(
+                &state.journal_root,
+                solstone_core_journal_config_write::LockOptions::default(),
+                |config| match transition_thinking_choice(config, choice, local_available) {
+                    Ok((changed, start)) => JournalConfigMutation {
+                        changed,
+                        value: Ok(start),
                     },
-                );
-                if let Err(e) = mutation {
-                    return config_error(e);
+                    Err(error) => JournalConfigMutation {
+                        changed: false,
+                        value: Err(error),
+                    },
+                },
+            );
+            let start = match mutation {
+                Ok(transaction) => match transaction.value {
+                    Ok(start) => start,
+                    Err(error) => return choice_error(error),
+                },
+                Err(error) => return config_error(error),
+            };
+            if start {
+                let journal = state.journal_root.clone();
+                let host = state.host.clone();
+                match tokio::task::spawn_blocking(move || host.start_local(&journal)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => start_err_overlay = Some(error),
+                    Err(error) => start_err_overlay = Some(error.to_string()),
                 }
             }
         }
         "start_thinking_download" => {
-            let base_config = match load_mutation_base(&state.journal_root) {
+            let base = match load_mutation_base(&state.journal_root) {
                 Ok(base) => base.config,
                 Err(_) => return corrupt_config(),
             };
-            let saved_choice = nested_string(&base_config, "setup", "thinking_choice");
-            if saved_choice != "local" {
-                return error_envelope(
+            if nested_string(&base, "setup", "thinking_choice") != "local" {
+                return choice_error((
                     "thinking_choice_required",
-                    "Bad Request",
-                    "local thinking choice is required",
+                    "choose local thinking before starting its download",
                     StatusCode::BAD_REQUEST,
-                )
-                .into_response();
+                ));
             }
-            let cap = compute_local_capability(&state.journal_root).await.overall;
-            if cap != "ok" {
-                return error_envelope(
+            if compute_local_capability(&state.journal_root).await.overall != "ok" {
+                return choice_error((
                     "local_unavailable",
-                    "Bad Request",
-                    "local thinking is not available on this host",
+                    "local thinking is not available on your journal's computer",
                     StatusCode::BAD_REQUEST,
-                )
-                .into_response();
+                ));
             }
-            if nested_value(&base_config, "setup", "thinking_selection").is_none() {
-                if let Err((code, msg, status)) = resolve_local_provider_update(&base_config) {
-                    return error_envelope(code, "Bad Request", msg, status).into_response();
-                }
-                let mutation = mutate_journal_config(
-                    &state.journal_root,
-                    solstone_core_journal_config_write::LockOptions::default(),
-                    |config| {
-                        let mut changed = false;
-                        let local_val = local_provider_val();
-                        let providers = object_mut(config, "providers");
-                        if providers.get("active") != Some(&local_val) {
-                            providers.insert("active".into(), local_val.clone());
-                            changed = true;
-                        }
-                        let setup = object_mut(config, "setup");
-                        if setup.get("thinking_selection") != Some(&local_val) {
-                            setup.insert("thinking_selection".into(), local_val);
-                            changed = true;
-                        }
-                        JournalConfigMutation { changed, value: () }
+            let mutation = mutate_journal_config(
+                &state.journal_root,
+                solstone_core_journal_config_write::LockOptions::default(),
+                |config| match admit_thinking_retry(config) {
+                    Ok(changed) => JournalConfigMutation {
+                        changed,
+                        value: Ok(()),
                     },
-                );
-                if let Err(e) = mutation {
-                    return config_error(e);
+                    Err(error) => JournalConfigMutation {
+                        changed: false,
+                        value: Err(error),
+                    },
+                },
+            );
+            match mutation {
+                Ok(transaction) => {
+                    if let Err(error) = transaction.value {
+                        return choice_error(error);
+                    }
                 }
+                Err(error) => return config_error(error),
             }
             let journal = state.journal_root.clone();
             let host = state.host.clone();
-            let start_res = tokio::task::spawn_blocking(move || host.start_local(&journal)).await;
-            match start_res {
+            match tokio::task::spawn_blocking(move || host.start_local(&journal)).await {
                 Ok(Ok(())) => {}
-                Ok(Err(err)) => {
-                    start_err_overlay = Some(err);
-                }
-                Err(err) => {
-                    return error_envelope(
-                        "start_failed",
-                        "Internal Server Error",
-                        err.to_string(),
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                    )
-                    .into_response();
-                }
+                Ok(Err(error)) => start_err_overlay = Some(error),
+                Err(error) => start_err_overlay = Some(error.to_string()),
             }
         }
         "cancel_thinking_download" => {
@@ -1088,27 +1157,50 @@ async fn init_action(
                 &state.journal_root,
                 solstone_core_journal_config_write::LockOptions::default(),
                 |config| {
+                    if !finalize_config_sections_are_objects(config) {
+                        return JournalConfigMutation {
+                            changed: false,
+                            value: Err((
+                                "corrupt_config",
+                                "your journal settings could not be read",
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                            )),
+                        };
+                    }
                     if setup_is_complete(config) {
                         return JournalConfigMutation {
                             changed: false,
-                            value: false,
+                            value: Ok(false),
                         };
                     }
-                    let setup = object_mut(config, "setup");
-                    setup.insert("completed_at".into(), json!(now_ms()));
-                    let changed = true;
+                    let choice = nested_string(config, "setup", "thinking_choice");
+                    if !matches!(choice.as_str(), "local" | "byo" | "spp" | "later") {
+                        return JournalConfigMutation {
+                            changed: false,
+                            value: Err((
+                                "thinking_choice_required",
+                                "choose thinking before finishing setup",
+                                StatusCode::BAD_REQUEST,
+                            )),
+                        };
+                    }
+                    object_mut(config, "setup").insert("completed_at".into(), json!(now_ms()));
                     if let Some(tz) = valid_tz.as_ref() {
-                        let identity = object_mut(config, "identity");
-                        identity.insert("timezone".into(), json!(tz));
+                        object_mut(config, "identity").insert("timezone".into(), json!(tz));
                     }
                     JournalConfigMutation {
-                        changed,
-                        value: true,
+                        changed: true,
+                        value: Ok(true),
                     }
                 },
             );
-            if let Err(e) = mutation {
-                return config_error(e);
+            match mutation {
+                Ok(transaction) => {
+                    if let Err(error) = transaction.value {
+                        return choice_error(error);
+                    }
+                }
+                Err(error) => return config_error(error),
             }
         }
         _ => {
@@ -1191,11 +1283,6 @@ async fn init_finalize(
         "confidential" => "spp",
         _ => return invalid_lane(),
     };
-    let redirect = match choice {
-        "byo" => "/app/thinking#byo-setup".to_string(),
-        "spp" => "/app/thinking#confidential-setup".to_string(),
-        _ => "/app/home".to_string(),
-    };
 
     let retention_mode = request
         .retention_mode
@@ -1224,16 +1311,8 @@ async fn init_finalize(
 
     let completed_at_existing = setup_is_complete(&config);
 
-    let mut should_start_local = false;
     let cap = if !completed_at_existing && choice == "local" {
-        let cap_overall = compute_local_capability(&state.journal_root).await.overall;
-        if cap_overall == "ok" {
-            if let Err((code, msg, status)) = resolve_local_provider_update(&config) {
-                return error_envelope(code, "Bad Request", msg, status).into_response();
-            }
-            should_start_local = true;
-        }
-        cap_overall
+        compute_local_capability(&state.journal_root).await.overall
     } else {
         "unknown"
     };
@@ -1245,16 +1324,33 @@ async fn init_finalize(
             if !finalize_config_sections_are_objects(config) {
                 return JournalConfigMutation {
                     changed: false,
-                    value: Err(()),
+                    value: Err((
+                        "corrupt_config",
+                        "your journal settings could not be read",
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    )),
                 };
             }
             if setup_is_complete(config) {
                 return JournalConfigMutation {
                     changed: false,
-                    value: Ok(false),
+                    value: Ok((
+                        false,
+                        false,
+                        nested_string(config, "setup", "thinking_choice"),
+                    )),
                 };
             }
-            let mut changed = false;
+            let (mut changed, start_local) =
+                match transition_thinking_choice(config, choice, cap == "ok") {
+                    Ok(transition) => transition,
+                    Err(error) => {
+                        return JournalConfigMutation {
+                            changed: false,
+                            value: Err(error),
+                        };
+                    }
+                };
             let convey = object_mut(config, "convey");
             if convey.remove("allow_network_access").is_some() {
                 changed = true;
@@ -1283,23 +1379,6 @@ async fn init_finalize(
                 setup.insert("completed_at".to_owned(), json!(completed_at));
                 changed = true;
             }
-            if setup.get("thinking_choice") != Some(&json!(choice)) {
-                setup.insert("thinking_choice".to_owned(), json!(choice));
-                changed = true;
-            }
-            if choice == "local" && cap == "ok" {
-                let local_val = local_provider_val();
-                let providers = object_mut(config, "providers");
-                if providers.get("active") != Some(&local_val) {
-                    providers.insert("active".to_owned(), local_val.clone());
-                    changed = true;
-                }
-                let setup = object_mut(config, "setup");
-                if setup.get("thinking_selection") != Some(&local_val) {
-                    setup.insert("thinking_selection".to_owned(), local_val);
-                    changed = true;
-                }
-            }
             let retention = object_mut(config, "retention");
             for (key, value) in [
                 ("raw_media", Value::String(retention_mode)),
@@ -1315,14 +1394,14 @@ async fn init_finalize(
             }
             JournalConfigMutation {
                 changed,
-                value: Ok(true),
+                value: Ok((true, start_local, choice.to_owned())),
             }
         },
     );
-    let wrote_first_completion = match result {
+    let (wrote_first_completion, should_start_local, saved_choice) = match result {
         Ok(transaction) => match transaction.value {
             Ok(first) => first,
-            Err(()) => return corrupt_config(),
+            Err(error) => return choice_error(error),
         },
         Err(error) => return config_error(error),
     };
@@ -1341,6 +1420,13 @@ async fn init_finalize(
             .into_response();
         }
     }
+
+    let redirect = match saved_choice.as_str() {
+        "byo" => "/app/thinking#byo-setup",
+        "spp" => "/app/thinking#confidential-setup",
+        _ => "/app/home",
+    }
+    .to_owned();
 
     Json(FinalizeResponse {
         success: true,
@@ -1381,7 +1467,7 @@ fn invalid_finalize_config_sections(config: &Map<String, Value>) -> Option<Respo
 }
 
 fn finalize_config_sections_are_objects(config: &Map<String, Value>) -> bool {
-    ["convey", "identity", "setup", "retention"]
+    ["convey", "identity", "setup", "retention", "providers"]
         .into_iter()
         .all(|key| config.get(key).is_none_or(Value::is_object))
 }

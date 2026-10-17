@@ -1139,6 +1139,70 @@ pub fn lock_is_held(path: impl AsRef<Path>) -> Result<bool, LockError> {
     }
 }
 
+/// Read-lock an existing authority sidecar without creating directories or files.
+/// A missing sidecar means that its first writer has not established the lock yet.
+#[cfg(unix)]
+pub fn hold_existing_lock(
+    path: impl AsRef<Path>,
+    options: LockOptions,
+) -> Result<Option<FileLock>, LockError> {
+    let path = path.as_ref();
+    let file_name = path.file_name().ok_or_else(|| {
+        io_error(
+            path,
+            io::Error::new(io::ErrorKind::InvalidInput, "lock path has no file name"),
+        )
+    })?;
+    let sidecar = derive_sidecar_path(parent_dir(path), file_name);
+    let deadline = Instant::now() + options.timeout;
+    loop {
+        let file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(&sidecar)
+        {
+            Ok(file) => file,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(io_error(path, source)),
+        };
+        if !file
+            .metadata()
+            .map_err(|source| io_error(path, source))?
+            .is_file()
+        {
+            return Err(io_error(
+                path,
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "lock sidecar is not a regular file",
+                ),
+            ));
+        }
+        match Flock::lock(file, FlockArg::LockSharedNonblock) {
+            Ok(guard) => {
+                return Ok(Some(FileLock {
+                    _guard: guard,
+                    path: path.to_path_buf(),
+                }));
+            }
+            Err((file, Errno::EACCES | Errno::EAGAIN)) => {
+                drop(file);
+                if Instant::now() >= deadline {
+                    return Err(LockError::Timeout(LockTimeout {
+                        path: path.to_path_buf(),
+                        timeout: options.timeout,
+                    }));
+                }
+                thread::sleep(retry_delay(options.poll_interval));
+            }
+            Err((file, error)) => {
+                drop(file);
+                return Err(io_error(path, io::Error::from_raw_os_error(error as i32)));
+            }
+        }
+    }
+}
+
 /// Sidecar path: parent joined with file_name's native bytes plus ".lock".
 fn derive_sidecar_path(parent: &Path, file_name: &OsStr) -> PathBuf {
     let mut name = file_name.to_os_string();
@@ -1953,6 +2017,70 @@ pub fn lock_is_held(path: impl AsRef<Path>) -> Result<bool, LockError> {
         Err((file, source)) => {
             drop(file);
             Err(io_error(path, source))
+        }
+    }
+}
+
+/// Hold the existing authority sidecar without creating directories or files.
+#[cfg(windows)]
+pub fn hold_existing_lock(
+    path: impl AsRef<Path>,
+    options: LockOptions,
+) -> Result<Option<FileLock>, LockError> {
+    let path = path.as_ref();
+    let file_name = path.file_name().ok_or_else(|| {
+        io_error(
+            path,
+            io::Error::new(io::ErrorKind::InvalidInput, "lock path has no file name"),
+        )
+    })?;
+    let sidecar = derive_sidecar_path(parent_dir(path), file_name);
+    let deadline = Instant::now() + options.timeout;
+    loop {
+        let file = match open_windows_path(
+            &sidecar,
+            GENERIC_READ,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+        ) {
+            Ok(file) => file,
+            Err(source) if matches!(source.raw_os_error(), Some(code) if code == ERROR_FILE_NOT_FOUND as i32 || code == ERROR_PATH_NOT_FOUND as i32) =>
+            {
+                return Ok(None);
+            }
+            Err(source) => return Err(io_error(path, source)),
+        };
+        let attributes = attribute_tag_windows(&file).map_err(|source| io_error(path, source))?;
+        if is_reparse_point_windows(attributes) {
+            return Err(io_error(
+                path,
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "lock sidecar is a reparse point",
+                ),
+            ));
+        }
+        match try_lock_exclusive(file) {
+            Ok(guard) => {
+                return Ok(Some(FileLock {
+                    _guard: guard,
+                    path: path.to_path_buf(),
+                }));
+            }
+            Err((file, error)) if windows_contention(&error) => {
+                drop(file);
+                if Instant::now() >= deadline {
+                    return Err(LockError::Timeout(LockTimeout {
+                        path: path.to_path_buf(),
+                        timeout: options.timeout,
+                    }));
+                }
+                thread::sleep(retry_delay(options.poll_interval));
+            }
+            Err((file, source)) => {
+                drop(file);
+                return Err(io_error(path, source));
+            }
         }
     }
 }

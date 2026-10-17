@@ -454,7 +454,7 @@ async fn committed_mark_returns_the_locked_identity_mark() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response_json(response).await,
-        json!({"availability":"ready","locked":true,"mark":expected_mark})
+        json!({"availability":"ready","locked":true,"mark":expected_mark,"proposal_id":committed.instance_id})
     );
 }
 
@@ -551,7 +551,7 @@ async fn init_redirects_after_finalize() {
         AccessBasis::Localhost,
         Method::POST,
         "/init/finalize",
-        Some(json!({"lane":"local"})),
+        Some(json!({"lane":"later"})),
     )
     .await;
     assert_eq!(finalize.status(), StatusCode::OK);
@@ -1146,56 +1146,59 @@ async fn save_thinking_choices_persist_without_active_provider() {
 
 #[tokio::test]
 async fn save_thinking_local_respects_capability() {
-    let temporary = TempDir::new();
-    let host = Arc::new(FakeSetupHost::default());
-    let state = response_json(
-        request_with_host(
-            temporary.path(),
-            host.clone(),
-            AccessBasis::Localhost,
-            Method::GET,
-            "/init/api/state",
-            None,
-        )
-        .await,
-    )
-    .await;
-    let cap = state["thinking"]["capability"].as_str().unwrap();
-
-    let res = response_json(
-        request_with_host(
+    for capability in ["ok", "blocked", "unknown"] {
+        let temporary = TempDir::new();
+        crate::http::setup_probe_test::capability(temporary.path(), capability);
+        let host = Arc::new(FakeSetupHost::default());
+        let response = request_with_host(
             temporary.path(),
             host.clone(),
             AccessBasis::Localhost,
             Method::POST,
             "/init/api/action",
-            Some(json!({"action": "save_thinking", "choice": "local"})),
+            Some(json!({"action":"save_thinking", "choice":"local"})),
         )
-        .await,
-    )
-    .await;
-    assert_eq!(res["thinking"]["choice"], "local");
-    assert_eq!(res["thinking"]["saved"], true);
-
-    let config: Value = serde_json::from_slice(
-        &fs::read(temporary.path().join("config").join("journal.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(config["setup"]["thinking_choice"], "local");
-
-    if cap == "ok" {
-        assert_eq!(
-            config["providers"]["active"],
-            json!({"provider": "local", "model": "local/qwen3.5-4b"})
-        );
-        assert_eq!(
-            config["setup"]["thinking_selection"],
-            json!({"provider": "local", "model": "local/qwen3.5-4b"})
-        );
-        assert_eq!(host.start_calls.lock().unwrap().len(), 1);
-    } else {
-        assert!(config["providers"].get("active").is_none());
-        assert_eq!(host.start_calls.lock().unwrap().len(), 0);
+        .await;
+        if capability == "ok" {
+            assert_eq!(response.status(), StatusCode::OK);
+            let state = response_json(response).await;
+            assert_eq!(state["thinking"]["choice"], "local");
+            assert_eq!(state["thinking"]["saved"], true);
+            let config: Value = serde_json::from_slice(
+                &fs::read(temporary.path().join("config/journal.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                config["providers"]["active"],
+                json!({"provider":"local", "model":"local/qwen3.5-4b"})
+            );
+            assert_eq!(
+                config["setup"]["thinking_selection"],
+                config["providers"]["active"]
+            );
+            assert_eq!(host.start_calls.lock().unwrap().len(), 1);
+        } else {
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response_json(response).await["reason_code"],
+                "local_unavailable"
+            );
+            let state = response_json(
+                request_with_host(
+                    temporary.path(),
+                    host.clone(),
+                    AccessBasis::Localhost,
+                    Method::GET,
+                    "/init/api/state",
+                    None,
+                )
+                .await,
+            )
+            .await;
+            assert!(state["thinking"]["choice"].is_null());
+            assert_eq!(state["thinking"]["saved"], false);
+            assert!(host.start_calls.lock().unwrap().is_empty());
+        }
     }
 }
 
@@ -1481,6 +1484,7 @@ async fn old_finalize_lane_redirects_and_choice_storage() {
 
     // local completes even when host start returns Err
     let temp_local = committed_journal();
+    crate::http::setup_probe_test::capability(temp_local.path(), "ok");
     let host = Arc::new(FakeSetupHost::default());
     *host.start_error.lock().unwrap() = Some("model download blocked".into());
     let res_local = request_with_host(
@@ -1524,6 +1528,257 @@ fn committed_journal() -> TempDir {
     temporary
 }
 
+#[tokio::test]
+async fn first_setup_state_read_does_not_create_any_journal_files() {
+    let temporary = TempDir::new();
+    let response = request(
+        temporary.path(),
+        AccessBasis::Localhost,
+        Method::GET,
+        "/init/api/state",
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let state = response_json(response).await;
+    assert_eq!(state["mark"]["state"], "unavailable");
+    assert_eq!(state["done"], false);
+    assert!(fs::read_dir(temporary.path()).unwrap().next().is_none());
+}
+
+#[tokio::test]
+async fn mark_and_saved_choice_are_not_done_until_finalize_commits() {
+    let temporary = TempDir::new();
+    let proposal = establish::ensure_mark_snapshot(temporary.path()).unwrap();
+    establish::commit_proposal(temporary.path(), proposal.proposal_id.as_deref().unwrap()).unwrap();
+    let saved = request(
+        temporary.path(),
+        AccessBasis::Localhost,
+        Method::POST,
+        "/init/api/action",
+        Some(json!({"action":"save_thinking","choice":"later"})),
+    )
+    .await;
+    assert_eq!(saved.status(), StatusCode::OK);
+    assert_eq!(response_json(saved).await["done"], false);
+    let state = request(
+        temporary.path(),
+        AccessBasis::Localhost,
+        Method::GET,
+        "/init/api/state",
+        None,
+    )
+    .await;
+    assert_eq!(response_json(state).await["done"], false);
+    let finished = request(
+        temporary.path(),
+        AccessBasis::Localhost,
+        Method::POST,
+        "/init/api/action",
+        Some(json!({"action":"finalize"})),
+    )
+    .await;
+    assert_eq!(finished.status(), StatusCode::OK);
+    assert_eq!(response_json(finished).await["done"], true);
+}
+
+#[tokio::test]
+async fn repeated_local_save_does_not_restart_a_cancelled_attempt() {
+    let temporary = TempDir::new();
+    let local = json!({"provider":"local","model":"local/qwen3.5-4b"});
+    fs::create_dir_all(temporary.path().join("config")).unwrap();
+    fs::write(
+        temporary.path().join("config/journal.json"),
+        serde_json::to_vec(&json!({
+            "setup":{"thinking_choice":"local","thinking_selection":local},
+            "providers":{"active":local}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let host = Arc::new(FakeSetupHost::default());
+    let mut projected = host.project_downloads(temporary.path());
+    projected.thinking.state = "cancelled".into();
+    projected.thinking.attempt_id = Some("cancelled-attempt".into());
+    *host.projected.lock().unwrap() = Some(projected);
+    let response = request_with_host(
+        temporary.path(),
+        host.clone(),
+        AccessBasis::Localhost,
+        Method::POST,
+        "/init/api/action",
+        Some(json!({"action":"save_thinking","choice":"local"})),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(host.start_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn retained_finalize_releases_only_its_own_local_selection() {
+    for (lane, choice) in [("later", "later"), ("byo", "byo"), ("confidential", "spp")] {
+        for owner_changed in [false, true] {
+            let temporary = TempDir::new();
+            let proposal = establish::ensure_mark_snapshot(temporary.path()).unwrap();
+            establish::commit_proposal(temporary.path(), proposal.proposal_id.as_deref().unwrap())
+                .unwrap();
+            let local = json!({"provider":"local","model":"local/qwen3.5-4b"});
+            let owner = json!({"provider":"openai","model":"owner-model"});
+            fs::create_dir_all(temporary.path().join("config")).unwrap();
+            fs::write(
+                temporary.path().join("config/journal.json"),
+                serde_json::to_vec(&json!({
+                    "setup":{"thinking_choice":"local","thinking_selection":local},
+                    "providers":{"active":if owner_changed { &owner } else { &local }}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let response = request(
+                temporary.path(),
+                AccessBasis::Localhost,
+                Method::POST,
+                "/init/finalize",
+                Some(json!({"lane":lane})),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let config: Value = serde_json::from_slice(
+                &fs::read(temporary.path().join("config/journal.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(config["setup"]["thinking_choice"], choice);
+            if owner_changed {
+                assert_eq!(config["providers"]["active"], owner);
+            } else {
+                assert!(config["providers"].get("active").is_none());
+            }
+            assert!(config["setup"].get("thinking_selection").is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn corrupt_proposal_is_visible_and_never_silently_replaced() {
+    let temporary = TempDir::new();
+    establish::ensure_mark_snapshot(temporary.path()).unwrap();
+    let key = temporary.path().join("link/ca-staging/private.pem");
+    fs::write(&key, b"corrupt fixture").unwrap();
+    for (method, route, body) in [
+        (Method::GET, "/init/api/state", None),
+        (Method::GET, "/init/mark", None),
+        (
+            Method::POST,
+            "/init/api/action",
+            Some(json!({"action":"regenerate_mark"})),
+        ),
+    ] {
+        let response = request(
+            temporary.path(),
+            AccessBasis::Localhost,
+            method,
+            route,
+            body,
+        )
+        .await;
+        assert!(!response.status().is_success(), "{route}");
+        assert_eq!(fs::read(&key).unwrap(), b"corrupt fixture");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_retry_cannot_reactivate_local_after_another_client_saves_later() {
+    let temporary = TempDir::new();
+    let root = temporary.path().to_owned();
+    let local = json!({"provider":"local","model":"local/qwen3.5-4b"});
+    fs::create_dir_all(root.join("config")).unwrap();
+    fs::write(root.join("config/journal.json"), serde_json::to_vec(&json!({"setup":{"thinking_choice":"local","thinking_selection":local},"providers":{"active":local}})).unwrap()).unwrap();
+    let host = Arc::new(FakeSetupHost::default());
+    let (reached, release) = crate::http::setup_probe_test::pause(&root);
+    let retry_root = root.clone();
+    let retry_host = host.clone();
+    let retry = tokio::spawn(async move {
+        request_with_host(
+            &retry_root,
+            retry_host,
+            AccessBasis::Localhost,
+            Method::POST,
+            "/init/api/action",
+            Some(json!({"action":"start_thinking_download"})),
+        )
+        .await
+    });
+    tokio::task::spawn_blocking(move || {
+        reached
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let later = request_with_host(
+        &root,
+        host.clone(),
+        AccessBasis::Localhost,
+        Method::POST,
+        "/init/api/action",
+        Some(json!({"action":"save_thinking","choice":"later"})),
+    )
+    .await;
+    assert_eq!(later.status(), StatusCode::OK);
+    release.send(()).unwrap();
+    assert_eq!(retry.await.unwrap().status(), StatusCode::CONFLICT);
+    assert!(host.start_calls.lock().unwrap().is_empty());
+    let config: Value =
+        serde_json::from_slice(&fs::read(root.join("config/journal.json")).unwrap()).unwrap();
+    assert_eq!(config["setup"]["thinking_choice"], "later");
+    assert!(config["providers"].get("active").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_finalize_rechecks_provider_eligibility_after_probe() {
+    let temporary = TempDir::new();
+    let root = temporary.path().to_owned();
+    let proposal = establish::ensure_mark_snapshot(&root).unwrap();
+    establish::commit_proposal(&root, proposal.proposal_id.as_deref().unwrap()).unwrap();
+    let host = Arc::new(FakeSetupHost::default());
+    let (reached, release) = crate::http::setup_probe_test::pause(&root);
+    let finalize_root = root.clone();
+    let finalize_host = host.clone();
+    let finalize = tokio::spawn(async move {
+        request_with_host(
+            &finalize_root,
+            finalize_host,
+            AccessBasis::Localhost,
+            Method::POST,
+            "/init/finalize",
+            Some(json!({"lane":"local"})),
+        )
+        .await
+    });
+    tokio::task::spawn_blocking(move || {
+        reached
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    solstone_core_journal_config_write::mutate_journal_config(&root, Default::default(), |config| {
+        config.insert("providers".into(), json!({"local":{"endpoint_url":"http://127.0.0.1:9","served_model_id":"owner-model"}}));
+        solstone_core_journal_config_write::JournalConfigMutation { changed:true, value:() }
+    }).unwrap();
+    release.send(()).unwrap();
+    assert_eq!(finalize.await.unwrap().status(), StatusCode::BAD_REQUEST);
+    assert!(host.start_calls.lock().unwrap().is_empty());
+    let config: Value =
+        serde_json::from_slice(&fs::read(root.join("config/journal.json")).unwrap()).unwrap();
+    assert!(config["providers"].get("active").is_none());
+    assert!(config["setup"].get("completed_at").is_none());
+    assert_eq!(
+        config["providers"]["local"]["served_model_id"],
+        "owner-model"
+    );
+}
+
 struct TempDir {
     path: PathBuf,
 }
@@ -1547,6 +1802,7 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
+        crate::http::setup_probe_test::clear(&self.path);
         let _ = fs::remove_dir_all(&self.path);
     }
 }
