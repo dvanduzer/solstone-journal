@@ -112,7 +112,7 @@ cargo check --manifest-path core\Cargo.toml --locked --workspace --exclude solst
 echo === native restic owner-filename round trip ===
 call :run_exact_library "solstone-core-backup-runtime" "engine::copy_tests::real_restic_preserves_owner_names_and_excludes_operational_secrets" "full-tests" "ignored" || exit /b 1
 echo === cargo test --locked (portable archive owner filenames) ===
-call :run_exact_library "solstone-core-journal-archive" "windows_source::tests::windows_export_preserves_owner_names_and_omits_operational_secrets" || exit /b 1
+call :run_exact_library "solstone-core-journal-archive" "windows_source::tests::windows_export_preserves_owner_names_and_credentials" || exit /b 1
 call :run_exact_integration "solstone-core-import-sources" "source_archive_contracts" "archive_merge::portable_export_and_merge_preserve_colliding_owner_names" || exit /b 1
 
 call :phase portable
