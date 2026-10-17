@@ -5673,3 +5673,549 @@ fn get_entity_description_truncation_scalars() {
     assert!(g_none.get("description_truncated").is_none());
     assert!(g_none.get("description").is_none());
 }
+
+fn write_ingest_receipt(
+    seg_dir: &Path,
+    stream: &str,
+    day: &str,
+    segment: &str,
+    tz: Option<&str>,
+    utc_offset_seconds: Option<i32>,
+) {
+    let mut meta = serde_json::Map::new();
+    if let Some(tz) = tz {
+        meta.insert("tz".to_owned(), json!(tz));
+    }
+    if let Some(offset) = utc_offset_seconds {
+        meta.insert("utc_offset_seconds".to_owned(), json!(offset));
+    }
+    let event = json!({
+        "record_type": "device_ingest",
+        "record_version": 1,
+        "outcome": "accepted",
+        "protocol_version": 3,
+        "cid": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "source": "",
+        "stream": stream,
+        "day": day,
+        "segment": segment,
+        "files": [],
+        "meta": meta,
+    });
+    fs::write(seg_dir.join("events.jsonl"), format!("{event}\n")).unwrap();
+}
+
+fn write_journal_timezone(journal_path: &Path, tz: &str) {
+    fs::create_dir_all(journal_path.join("config")).unwrap();
+    fs::write(
+        journal_path.join("config/journal.json"),
+        json!({"identity": {"timezone": tz}}).to_string(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn capture_zone_reports_differing_device_clock_across_all_read_surfaces() {
+    let journal = fixture();
+    write_journal_timezone(journal.path(), "America/Denver");
+    let seg_dir = journal
+        .path()
+        .join("chronicle")
+        .join(DAY)
+        .join(STREAM)
+        .join(SEGMENT);
+    write_ingest_receipt(
+        &seg_dir,
+        STREAM,
+        DAY,
+        SEGMENT,
+        Some("Asia/Tokyo"),
+        Some(32400),
+    );
+    let transcript_105 = (1..=105).map(|i| format!("line {i}\n")).collect::<String>();
+    fs::write(seg_dir.join("meeting_transcript.md"), transcript_105).unwrap();
+
+    let expected_zone = json!({"tz": "Asia/Tokyo", "utc_offset_seconds": 32400, "label": "Tokyo"});
+
+    // 1. list_transcripts
+    let list = probe(&journal, "list_transcripts", json!({})).unwrap();
+    let item = &list["transcripts"][0];
+    assert_eq!(item["capture_zone"], expected_zone);
+    assert_eq!(item["time"], "09:00-09:05");
+    let seg_ref = item["reference"].as_str().unwrap();
+
+    // 2. get_transcript (first page)
+    let p1 = probe(&journal, "get_transcript", json!({"reference": seg_ref})).unwrap();
+    assert_eq!(p1["entries"].as_array().unwrap().len(), 100);
+    assert_eq!(p1["capture_zone"], expected_zone);
+    assert!(p1.get("time").is_none());
+    let cursor = p1["next_cursor"].as_str().unwrap();
+
+    // 3. get_transcript (continuation page)
+    let p2 = probe(
+        &journal,
+        "get_transcript",
+        json!({"reference": seg_ref, "cursor": cursor}),
+    )
+    .unwrap();
+    assert_eq!(p2["entries"].as_array().unwrap().len(), 5);
+    assert!(p2["next_cursor"].is_null());
+    assert_eq!(p2["capture_zone"], expected_zone);
+    assert!(p2.get("time").is_none());
+
+    // 4. search segment link
+    let search = probe(&journal, "search", json!({"query": "indexed"})).unwrap();
+    let search_link = &search["results"][0]["segments"][0];
+    assert_eq!(search_link["capture_zone"], expected_zone);
+    assert_eq!(search_link["time"], "09:00-09:05");
+
+    // 5. fetch segment link
+    let entry_ref = search["results"][0]["reference"].as_str().unwrap();
+    let fetch = probe(&journal, "fetch", json!({"reference": entry_ref})).unwrap();
+    let fetch_link = &fetch["segments"][0];
+    assert_eq!(fetch_link["capture_zone"], expected_zone);
+    assert_eq!(fetch_link["time"], "09:00-09:05");
+}
+
+#[test]
+fn capture_zone_omitted_when_device_matches_configured_owner_timezone() {
+    let journal = fixture();
+    write_journal_timezone(journal.path(), "Asia/Tokyo");
+    let seg_dir = journal
+        .path()
+        .join("chronicle")
+        .join(DAY)
+        .join(STREAM)
+        .join(SEGMENT);
+    write_ingest_receipt(
+        &seg_dir,
+        STREAM,
+        DAY,
+        SEGMENT,
+        Some("Asia/Tokyo"),
+        Some(32400),
+    );
+    let transcript_105 = (1..=105).map(|i| format!("line {i}\n")).collect::<String>();
+    fs::write(seg_dir.join("meeting_transcript.md"), transcript_105).unwrap();
+
+    let list = probe(&journal, "list_transcripts", json!({})).unwrap();
+    let item = &list["transcripts"][0];
+    assert!(item.get("capture_zone").is_none());
+    assert_eq!(item["time"], "09:00-09:05");
+    let seg_ref = item["reference"].as_str().unwrap();
+
+    let p1 = probe(&journal, "get_transcript", json!({"reference": seg_ref})).unwrap();
+    assert!(p1.get("capture_zone").is_none());
+    let cursor = p1["next_cursor"].as_str().unwrap();
+
+    let p2 = probe(
+        &journal,
+        "get_transcript",
+        json!({"reference": seg_ref, "cursor": cursor}),
+    )
+    .unwrap();
+    assert!(p2.get("capture_zone").is_none());
+
+    let search = probe(&journal, "search", json!({"query": "indexed"})).unwrap();
+    let search_link = &search["results"][0]["segments"][0];
+    assert!(search_link.get("capture_zone").is_none());
+
+    let entry_ref = search["results"][0]["reference"].as_str().unwrap();
+    let fetch = probe(&journal, "fetch", json!({"reference": entry_ref})).unwrap();
+    let fetch_link = &fetch["segments"][0];
+    assert!(fetch_link.get("capture_zone").is_none());
+}
+
+#[test]
+fn capture_zone_persists_across_paged_list_transcripts() {
+    let journal = fixture();
+    write_journal_timezone(journal.path(), "America/Denver");
+    let seg_dir1 = journal
+        .path()
+        .join("chronicle")
+        .join(DAY)
+        .join(STREAM)
+        .join(SEGMENT);
+    write_ingest_receipt(
+        &seg_dir1,
+        STREAM,
+        DAY,
+        SEGMENT,
+        Some("Asia/Tokyo"),
+        Some(32400),
+    );
+
+    let seg_dir2 = journal
+        .path()
+        .join("chronicle")
+        .join(DAY)
+        .join(STREAM)
+        .join("100000_300");
+    fs::create_dir_all(seg_dir2.join("talents")).unwrap();
+    fs::write(
+        seg_dir2.join("talents/facets.json"),
+        "[{\"facet\":\"alpha\"}]",
+    )
+    .unwrap();
+    fs::write(
+        seg_dir2.join("meeting_transcript.md"),
+        "second transcript\n",
+    )
+    .unwrap();
+    write_ingest_receipt(
+        &seg_dir2,
+        STREAM,
+        DAY,
+        "100000_300",
+        Some("Asia/Kolkata"),
+        Some(19800),
+    );
+
+    let page1 = probe(&journal, "list_transcripts", json!({"limit": 1})).unwrap();
+    let transcripts1 = page1["transcripts"].as_array().unwrap();
+    assert_eq!(transcripts1.len(), 1);
+    assert_eq!(transcripts1[0]["time"], "09:00-09:05");
+    assert_eq!(
+        transcripts1[0]["capture_zone"],
+        json!({"tz": "Asia/Tokyo", "utc_offset_seconds": 32400, "label": "Tokyo"})
+    );
+    let cursor = page1["next_cursor"].as_str().unwrap();
+
+    let page2 = probe(
+        &journal,
+        "list_transcripts",
+        json!({"limit": 1, "cursor": cursor}),
+    )
+    .unwrap();
+    let transcripts2 = page2["transcripts"].as_array().unwrap();
+    assert_eq!(transcripts2.len(), 1);
+    assert_eq!(transcripts2[0]["time"], "10:00-10:05");
+    assert_eq!(
+        transcripts2[0]["capture_zone"],
+        json!({"tz": "Asia/Kolkata", "utc_offset_seconds": 19800, "label": "Kolkata"})
+    );
+}
+
+#[test]
+fn capture_zone_omitted_for_home_offset_twin() {
+    let journal = fixture();
+    write_journal_timezone(journal.path(), "America/Denver");
+    let seg_dir = journal
+        .path()
+        .join("chronicle")
+        .join("20260929")
+        .join(STREAM)
+        .join(SEGMENT);
+    fs::create_dir_all(seg_dir.join("talents")).unwrap();
+    fs::write(
+        seg_dir.join("talents/facets.json"),
+        "[{\"facet\":\"alpha\"}]",
+    )
+    .unwrap();
+    fs::write(seg_dir.join("meeting_transcript.md"), "transcript text\n").unwrap();
+    write_ingest_receipt(
+        &seg_dir,
+        STREAM,
+        "20260929",
+        SEGMENT,
+        Some("America/Denver"),
+        Some(-21600),
+    );
+
+    let list = probe(&journal, "list_transcripts", json!({"day": "20260929"})).unwrap();
+    let item = &list["transcripts"][0];
+    assert_eq!(item["time"], "09:00-09:05");
+    assert!(item.get("capture_zone").is_none());
+}
+
+#[test]
+fn capture_zone_omitted_when_receipt_is_missing_or_unusable() {
+    let journal = fixture();
+    write_journal_timezone(journal.path(), "America/Denver");
+    // Case A: missing events.jsonl
+    let list_missing = probe(&journal, "list_transcripts", json!({})).unwrap();
+    assert!(list_missing["transcripts"][0].get("capture_zone").is_none());
+
+    // Case B: unusable receipt (no parsable zone and no offset)
+    let seg_dir = journal
+        .path()
+        .join("chronicle")
+        .join(DAY)
+        .join(STREAM)
+        .join(SEGMENT);
+    write_ingest_receipt(&seg_dir, STREAM, DAY, SEGMENT, None, None);
+    let list_unusable = probe(&journal, "list_transcripts", json!({})).unwrap();
+    assert!(
+        list_unusable["transcripts"][0]
+            .get("capture_zone")
+            .is_none()
+    );
+}
+
+#[test]
+fn capture_zone_projects_null_tz_when_iana_name_is_invalid_but_offset_is_valid() {
+    let journal = fixture();
+    write_journal_timezone(journal.path(), "America/Denver");
+    let seg_dir = journal
+        .path()
+        .join("chronicle")
+        .join(DAY)
+        .join(STREAM)
+        .join(SEGMENT);
+    write_ingest_receipt(
+        &seg_dir,
+        STREAM,
+        DAY,
+        SEGMENT,
+        Some("Not/A_Zone"),
+        Some(-12600),
+    );
+
+    let list = probe(&journal, "list_transcripts", json!({})).unwrap();
+    let item = &list["transcripts"][0];
+    assert_eq!(
+        item["capture_zone"],
+        json!({"tz": null, "utc_offset_seconds": -12600, "label": "UTC-3:30"})
+    );
+}
+
+#[test]
+fn capture_zone_fails_closed_on_malformed_receipts_preserving_transcript_read() {
+    let journal = fixture();
+    write_journal_timezone(journal.path(), "America/Denver");
+    let seg_dir = journal
+        .path()
+        .join("chronicle")
+        .join(DAY)
+        .join(STREAM)
+        .join(SEGMENT);
+    let transcript_105 = (1..=105).map(|i| format!("line {i}\n")).collect::<String>();
+    fs::write(seg_dir.join("meeting_transcript.md"), transcript_105).unwrap();
+
+    // 1. Non-JSON line in events.jsonl
+    fs::write(seg_dir.join("events.jsonl"), b"not valid json at all\n").unwrap();
+    let list = probe(&journal, "list_transcripts", json!({})).unwrap();
+    let item = &list["transcripts"][0];
+    assert!(item.get("capture_zone").is_none());
+    let seg_ref = item["reference"].as_str().unwrap();
+
+    let p1 = probe(&journal, "get_transcript", json!({"reference": seg_ref})).unwrap();
+    assert_eq!(p1["entries"].as_array().unwrap().len(), 100);
+    assert!(p1["next_cursor"].is_string());
+    assert!(p1.get("capture_zone").is_none());
+
+    // 2. events.jsonl replaced with a directory
+    fs::remove_file(seg_dir.join("events.jsonl")).unwrap();
+    fs::create_dir(seg_dir.join("events.jsonl")).unwrap();
+
+    let p1_dir = probe(&journal, "get_transcript", json!({"reference": seg_ref})).unwrap();
+    assert_eq!(p1_dir["entries"].as_array().unwrap().len(), 100);
+    assert!(p1_dir["next_cursor"].is_string());
+    assert!(p1_dir.get("capture_zone").is_none());
+}
+
+#[test]
+fn capture_zone_isolates_multi_stream_segments_and_respects_access_grants() {
+    let journal = setup_shared_link_journal();
+    write_journal_timezone(journal.path(), "America/Denver");
+    let chronicle = journal.path().join("chronicle/20261010");
+    let alpha_seg = chronicle.join("alpha").join("090000_300");
+    let beta_seg = chronicle.join("beta").join("090000_300");
+
+    write_ingest_receipt(
+        &alpha_seg,
+        "alpha",
+        "20261010",
+        "090000_300",
+        Some("Asia/Tokyo"),
+        Some(32400),
+    );
+    write_ingest_receipt(
+        &beta_seg,
+        "beta",
+        "20261010",
+        "090000_300",
+        Some("Europe/London"),
+        Some(3600),
+    );
+
+    let act_path = "facets/alpha/activities/20261010.jsonl";
+    let act_line = json!({"id": "act-multi", "segments": ["090000_300"]}).to_string();
+    fs::create_dir_all(journal.path().join("facets/alpha/activities")).unwrap();
+    fs::write(journal.path().join(act_path), format!("{act_line}\n")).unwrap();
+    let produced = produce_chunks(Family::Activity, act_path, &act_line);
+    let content = format!("{}\nmultistreamneedle", produced.chunks[0].content);
+    plant_chunk(
+        journal.path(),
+        act_path,
+        "20261010",
+        "",
+        0,
+        &content,
+        "facets",
+        "facet_owned",
+        &[FACET_A],
+    );
+    PermissionStore::open(journal.path())
+        .set_permission(CONNECTION, ReadPermission::default_whole_journal())
+        .unwrap();
+
+    let tokyo_zone = json!({"tz": "Asia/Tokyo", "utc_offset_seconds": 32400, "label": "Tokyo"});
+    let london_zone = json!({"tz": "Europe/London", "utc_offset_seconds": 3600, "label": "London"});
+
+    // list_transcripts shows each stream's zone
+    let list = probe(&journal, "list_transcripts", json!({"day": "20261010"})).unwrap();
+    let mut alpha_ref = None;
+    let mut beta_ref = None;
+    for item in list["transcripts"].as_array().unwrap() {
+        let reference = item["reference"].as_str().unwrap();
+        let get = probe(&journal, "get_transcript", json!({"reference": reference})).unwrap();
+        let text = get["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e.as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if text.contains("alpha_transcript_token") {
+            assert_eq!(item["capture_zone"], tokyo_zone);
+            assert_eq!(get["capture_zone"], tokyo_zone);
+            alpha_ref = Some(reference.to_owned());
+        } else if text.contains("beta_transcript_token") {
+            assert_eq!(item["capture_zone"], london_zone);
+            assert_eq!(get["capture_zone"], london_zone);
+            beta_ref = Some(reference.to_owned());
+        }
+    }
+    let alpha_ref = alpha_ref.expect("alpha segment in list");
+    let _beta_ref = beta_ref.expect("beta segment in list");
+
+    // Search and fetch activity links carry those two zones
+    let search = probe(&journal, "search", json!({"query": "multistreamneedle"})).unwrap();
+    let hit = &search["results"][0];
+    let seg_links = hit["segments"].as_array().unwrap();
+    assert_eq!(seg_links.len(), 2);
+    for link in seg_links {
+        let reference = link["reference"].as_str().unwrap();
+        let get = probe(&journal, "get_transcript", json!({"reference": reference})).unwrap();
+        let text = get["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e.as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if text.contains("alpha_transcript_token") {
+            assert_eq!(link["capture_zone"], tokyo_zone);
+        } else if text.contains("beta_transcript_token") {
+            assert_eq!(link["capture_zone"], london_zone);
+        } else {
+            panic!("unexpected transcript in search segment links: {text}");
+        }
+    }
+
+    let fetch = probe(&journal, "fetch", json!({"reference": hit["reference"]})).unwrap();
+    let fetch_links = fetch["segments"].as_array().unwrap();
+    assert_eq!(fetch_links.len(), 2);
+    for link in fetch_links {
+        let reference = link["reference"].as_str().unwrap();
+        let get = probe(&journal, "get_transcript", json!({"reference": reference})).unwrap();
+        let text = get["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e.as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if text.contains("alpha_transcript_token") {
+            assert_eq!(link["capture_zone"], tokyo_zone);
+        } else if text.contains("beta_transcript_token") {
+            assert_eq!(link["capture_zone"], london_zone);
+        } else {
+            panic!("unexpected transcript in fetch segment links: {text}");
+        }
+    }
+
+    // Grant exclusion: point beta segment at facet beta, grant only facet alpha
+    fs::write(
+        beta_seg.join("talents/facets.json"),
+        "[{\"facet\":\"beta\"}]",
+    )
+    .unwrap();
+    PermissionStore::open(journal.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["transcripts".to_owned(), "facets".to_owned()],
+                scope: ReadScope::Facets {
+                    ids: vec![FACET_A.to_owned()],
+                },
+            },
+        )
+        .unwrap();
+
+    let list_scoped = probe(&journal, "list_transcripts", json!({"day": "20261010"})).unwrap();
+    for item in list_scoped["transcripts"].as_array().unwrap() {
+        let reference = item["reference"].as_str().unwrap();
+        let get = probe(&journal, "get_transcript", json!({"reference": reference})).unwrap();
+        let text = get["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e.as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(!text.contains("beta_transcript_token"));
+        if text.contains("alpha_transcript_token") {
+            assert_eq!(item["capture_zone"], tokyo_zone);
+        }
+    }
+
+    let search_scoped = probe(&journal, "search", json!({"query": "multistreamneedle"})).unwrap();
+    let hit_scoped = &search_scoped["results"][0];
+    let links_scoped = hit_scoped["segments"].as_array().unwrap();
+    assert_eq!(links_scoped.len(), 1);
+    assert_eq!(links_scoped[0]["capture_zone"], tokyo_zone);
+
+    // Narrowed grant: connection only granted FACET_B -> alpha_ref returns Unavailable
+    PermissionStore::open(journal.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["transcripts".to_owned()],
+                scope: ReadScope::Facets {
+                    ids: vec![FACET_B.to_owned()],
+                },
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        probe(&journal, "get_transcript", json!({"reference": alpha_ref})),
+        Err(McpProbeError::Unavailable)
+    );
+
+    // Revoked / tampered reference
+    assert_eq!(
+        probe(
+            &journal,
+            "get_transcript",
+            json!({"reference": "tampered_ref"})
+        ),
+        Err(McpProbeError::Unavailable)
+    );
+    PermissionStore::open(journal.path())
+        .set_permission(
+            "bearer:other-bearer",
+            ReadPermission::default_whole_journal(),
+        )
+        .unwrap();
+    assert_eq!(
+        run_mcp_probe(
+            journal.path(),
+            "bearer:other-bearer",
+            "get_transcript",
+            &json!({"reference": alpha_ref}),
+        ),
+        Err(McpProbeError::Unavailable)
+    );
+}

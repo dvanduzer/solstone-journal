@@ -19,7 +19,7 @@ use solstone_core_indexer_query::{
 };
 use solstone_core_indexer_store::classification::{FacetDeclarationSet, classify_source};
 use solstone_core_journal_io::paths::{
-    PathOrDay, day_dirs, iter_segments_skipping_unreadable_streams,
+    PathOrDay, Segment, day_dirs, iter_segments_skipping_unreadable_streams,
 };
 use solstone_core_memory_original::{OriginalRead, read_original};
 use solstone_core_transcripts::segment_clock;
@@ -1841,6 +1841,7 @@ fn list_transcripts(
         Some(AdmittedCategory::Transcripts),
         request.facet_id.as_deref(),
     );
+    let owner_zone = solstone_core_journal_config::owner_zone(journal_root);
 
     let day_map =
         day_dirs(journal_root).map_err(|_| DispatchError::Tool(ToolError::FileUnreadable))?;
@@ -1973,12 +1974,16 @@ fn list_transcripts(
 
             targets.push(format!("{day}/{stream}/{name}"));
             let time_str = clock.as_ref().map(|c| c.label.as_str()).unwrap_or("");
-            segments.push(json!({
+            let mut seg_val = json!({
                 "title": format!("Transcript segment — {}", day),
                 "date": day,
                 "time": time_str,
                 "reference": reference,
-            }));
+            });
+            if let Some(zone) = differing_capture_zone(&owner_zone, day, &name, &segment) {
+                seg_val["capture_zone"] = zone;
+            }
+            segments.push(seg_val);
         }
     }
 
@@ -2028,6 +2033,7 @@ fn get_transcript(
     snapshot: &ConnectionReadSnapshot,
     request: ValidatedGetTranscript,
 ) -> Result<Prepared, DispatchError> {
+    let owner_zone = solstone_core_journal_config::owner_zone(journal_root);
     let ReferenceTarget::Segment(reference) = codec()
         .resolve(
             &request.reference,
@@ -2140,7 +2146,36 @@ fn get_transcript(
     if page.untimed {
         response_val["untimed"] = Value::Bool(true);
     }
+    if let Some(zone) =
+        differing_capture_zone(&owner_zone, &reference.day, &reference.segment, &segment)
+    {
+        response_val["capture_zone"] = zone;
+    }
     Ok(Prepared::new(response_val, count, vec![target]).when_empty(GET_TRANSCRIPT_EMPTY))
+}
+
+pub(crate) fn differing_capture_zone(
+    owner: &solstone_core_journal_config::Tz,
+    day: &str,
+    key: &str,
+    segment: &Segment,
+) -> Option<Value> {
+    let reported = solstone_core_callosum::read_reported_zone(segment.path())?;
+    let view = solstone_core_journal_config::capture_zone_view(
+        day,
+        key,
+        reported.tz.as_deref(),
+        reported.utc_offset_seconds,
+        owner,
+    )?;
+    if !view.differs {
+        return None;
+    }
+    Some(json!({
+        "tz": view.tz,
+        "utc_offset_seconds": view.utc_offset_seconds,
+        "label": view.label,
+    }))
 }
 
 /// An admitted segment-derived path used only to classify the segment's live

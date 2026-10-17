@@ -3,6 +3,7 @@
 
 //! Strict journal configuration reads and default materialization.
 
+mod capture_zone;
 mod defaults;
 mod direct_port;
 mod mcp_endpoint;
@@ -18,6 +19,7 @@ mod zone;
 #[cfg(test)]
 mod test_support;
 
+pub use capture_zone::{CaptureZone, capture_zone_view};
 pub use defaults::{materialized_defaults, plain_defaults};
 pub use direct_port::{
     DEFAULT_DIRECT_DOOR_PORT, DirectDoorPortError, DirectDoorPortValueError,
