@@ -132,6 +132,12 @@ pub trait ToolRunner {
     fn ios_journal_root(&self) -> Option<&std::sync::Arc<solstone_core_journal_io::JournalRoot>> {
         None
     }
+
+    /// The admitted target of the whole-journal restore this runner serves, if any.
+    #[cfg(target_os = "ios")]
+    fn ios_restore_target(&self) -> Option<&crate::ios_callable::RestoreTarget> {
+        None
+    }
 }
 
 #[derive(Debug, Default)]
@@ -683,6 +689,7 @@ pub(crate) fn run_restic_with_stdin<'invocation>(
             pass_fds,
             stdin,
             runner.cancellation(),
+            runner.ios_restore_target(),
         );
     }
     let restic_path = invocation.executable_path().ok_or_else(|| {
@@ -777,6 +784,7 @@ pub(crate) fn run_restic_with_stdin_cancellable<'invocation>(
             pass_fds,
             stdin,
             Some(cancellation),
+            runner.ios_restore_target(),
         );
     }
     let restic_path = invocation.executable_path().ok_or_else(|| {

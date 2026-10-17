@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 const OK: i32 = 0;
 const INVALID_ARGUMENT: i32 = 1;
 const SNAPSHOT: i32 = 4;
+const RESTORE: i32 = 6;
 const CAP_EXCEEDED: i32 = 5;
 const MAX_METADATA: u32 = 4 * 1024 * 1024;
 static DRAIN_FAILED: AtomicBool = AtomicBool::new(false);
@@ -111,6 +112,22 @@ unsafe extern "C" {
         policy_len: u32,
         out: *mut u64,
     ) -> i32;
+    fn restic_bridge_target_admit_v1(
+        version: u32,
+        target_fd: i32,
+        path: *const c_char,
+        path_len: u32,
+        out: *mut u64,
+    ) -> i32;
+    fn restic_bridge_target_revalidate_v1(version: u32, id: u64) -> i32;
+    fn restic_bridge_target_release_v1(version: u32, id: u64) -> i32;
+    fn restic_bridge_s3_restore_admitted_v1_start(
+        request: *const RemoteRequest,
+        target: u64,
+        selector: *const c_char,
+        selector_len: u32,
+        out: *mut u64,
+    ) -> i32;
     fn restic_bridge_cancel(id: u64) -> i32;
     fn restic_bridge_wait(id: u64, result: *mut ResultFields) -> i32;
     fn restic_bridge_result_metadata(
@@ -162,6 +179,52 @@ fn snapshot_directories<'a>(
         )),
         (1 | 2 | 3 | 5 | 7, None, None) => Ok(("", -1, "", -1)),
         _ => Err(INVALID_ARGUMENT),
+    }
+}
+
+/// Native custody of one existing journal root as a restore target. Go holds
+/// the target's activity lease from admission until release; an operation's
+/// wait/free never releases it. A refused admission that still names an owner
+/// keeps that cleanup custody in native code, so nothing here can reuse it.
+pub(super) struct Target {
+    id: u64,
+}
+
+impl Target {
+    pub(super) fn admit(descriptor: BorrowedFd<'_>, path: &str) -> Result<Self, i32> {
+        let path = Bytes::new(path.as_bytes())?;
+        let mut id = 0;
+        let status = unsafe {
+            restic_bridge_target_admit_v1(
+                1,
+                descriptor.as_raw_fd(),
+                path.pointer,
+                path.length,
+                &mut id,
+            )
+        };
+        match (status, id) {
+            (OK, 0) => Err(INVALID_ARGUMENT),
+            (OK, id) => Ok(Self { id }),
+            (status, _) => Err(status),
+        }
+    }
+
+    pub(super) fn revalidate(&self) -> Result<(), i32> {
+        match unsafe { restic_bridge_target_revalidate_v1(1, self.id) } {
+            OK => Ok(()),
+            status => Err(status),
+        }
+    }
+}
+
+impl Drop for Target {
+    fn drop(&mut self) {
+        // Every borrowing operation has already returned through wait/free.
+        let status = unsafe { restic_bridge_target_release_v1(1, self.id) };
+        if status != OK {
+            log::warn!("restore target release refused (status {status}); native custody retained");
+        }
     }
 }
 
@@ -288,6 +351,49 @@ impl Call {
                 workspace_fd,
                 policy.pointer,
                 policy.length,
+                &mut id,
+            )
+        };
+        Self::published(id, status, began)
+    }
+
+    /// Restore one snapshot subtree into the admitted target. The snapshot ID,
+    /// selector and target path are each checked again natively.
+    pub(super) fn remote_restore(
+        password: &[u8],
+        remote: &Remote<'_>,
+        target: &Target,
+        target_path: &str,
+        snapshot: &str,
+        selector: &str,
+    ) -> Result<Self, i32> {
+        let began = Instant::now();
+        let request = RemoteRequest {
+            version: 1,
+            operation: RESTORE,
+            endpoint: Bytes::new(remote.endpoint.as_bytes())?,
+            region: Bytes::new(remote.region.as_bytes())?,
+            bucket: Bytes::new(remote.bucket.as_bytes())?,
+            prefix: Bytes::new(remote.prefix.as_bytes())?,
+            access: Bytes::new(remote.access)?,
+            secret: Bytes::new(remote.secret)?,
+            token: Bytes::new(remote.token)?,
+            password: Bytes::new(password)?,
+            recovery_password: Bytes::new(&[])?,
+            state: Bytes::new(remote.state.path.as_bytes())?,
+            source: Bytes::new(&[])?,
+            restore: Bytes::new(target_path.as_bytes())?,
+            snapshot: Bytes::new(snapshot.as_bytes())?,
+            workspace: Bytes::new(&[])?,
+        };
+        let selector = Bytes::new(selector.as_bytes())?;
+        let mut id = 0;
+        let status = unsafe {
+            restic_bridge_s3_restore_admitted_v1_start(
+                &request,
+                target.id,
+                selector.pointer,
+                selector.length,
                 &mut id,
             )
         };

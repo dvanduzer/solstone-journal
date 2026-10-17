@@ -28,6 +28,12 @@ pub(super) enum Operation {
         exclude_file: Option<PathBuf>,
     },
     Check(CheckRead),
+    /// One snapshot's journal subtree into the admitted existing journal root.
+    Restore {
+        snapshot: String,
+        selector: String,
+        target: PathBuf,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -139,6 +145,29 @@ pub(super) fn decode(args: &[String]) -> Result<Command, UnsupportedCommand> {
             exclude_file: None,
         },
         Some("check") => Operation::Check(CheckRead::Structure),
+        Some("restore") => {
+            let (snapshot, selector) = args
+                .next()
+                .and_then(|value| value.split_once(':'))
+                .ok_or(UnsupportedCommand)?;
+            if snapshot.len() != 64
+                || !snapshot
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(UnsupportedCommand);
+            }
+            let selector = absolute_path(selector)?;
+            if args.next() != Some("--target") {
+                return Err(UnsupportedCommand);
+            }
+            let target = absolute_path(args.next().ok_or(UnsupportedCommand)?)?;
+            Operation::Restore {
+                snapshot: snapshot.to_owned(),
+                selector: selector.to_str().ok_or(UnsupportedCommand)?.to_owned(),
+                target,
+            }
+        }
         _ => return Err(UnsupportedCommand),
     };
     let mut retry = None;
@@ -192,7 +221,12 @@ pub(super) fn decode(args: &[String]) -> Result<Command, UnsupportedCommand> {
             _ => return Err(UnsupportedCommand),
         }
     }
-    if retry.is_some() && matches!(operation, Operation::Init | Operation::Open) {
+    if retry.is_some()
+        && matches!(
+            operation,
+            Operation::Init | Operation::Open | Operation::Restore { .. }
+        )
+    {
         return Err(UnsupportedCommand);
     }
     Ok(Command {

@@ -131,6 +131,27 @@ struct Snapshot {
     summary: Option<Value>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestoreEnvelope {
+    schema: String,
+    kind: String,
+    state: RestoreState,
+}
+/// restic's own restore progress state; restic's JSON summary reports exactly these.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(non_snake_case)]
+struct RestoreState {
+    FilesFinished: u64,
+    FilesTotal: u64,
+    FilesSkipped: u64,
+    FilesDeleted: u64,
+    AllBytesWritten: u64,
+    AllBytesTotal: u64,
+    AllBytesSkipped: u64,
+}
+
 fn metadata(completed: &Completed) -> Result<&[u8], RunnerError> {
     completed
         .metadata
@@ -208,6 +229,26 @@ fn successful(
             Ok(Some(
                 json!({"message_type":"summary","snapshot_id":snapshot_id}),
             ))
+        }
+        Some(Operation::Restore { .. }) => {
+            let envelope: RestoreEnvelope =
+                serde_json::from_slice(metadata(completed)?).map_err(|_| invalid())?;
+            if envelope.schema != "solstone.backup-metadata.v1"
+                || envelope.kind != "existing-root-restore"
+            {
+                return Err(invalid());
+            }
+            let state = envelope.state;
+            Ok(Some(json!({
+                "message_type": "summary",
+                "total_files": state.FilesTotal,
+                "files_restored": state.FilesFinished,
+                "files_skipped": state.FilesSkipped,
+                "files_deleted": state.FilesDeleted,
+                "total_bytes": state.AllBytesTotal,
+                "bytes_restored": state.AllBytesWritten,
+                "bytes_skipped": state.AllBytesSkipped,
+            })))
         }
         Some(Operation::Init | Operation::Check(_)) | None => Ok(None),
     }

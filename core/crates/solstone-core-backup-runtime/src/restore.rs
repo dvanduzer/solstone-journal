@@ -295,6 +295,7 @@ pub fn restore_pending_rotation_refusal(journal: &Path) -> Option<&'static str> 
 /// resident leaves its service unable to recognise or stop it. Each pattern is
 /// rooted at the restored subtree, so owner files with the same name elsewhere
 /// in the journal still restore.
+#[cfg_attr(target_os = "ios", allow(dead_code))]
 pub(crate) const RESTORE_KEEPS_LOCAL: [&str; 2] = [
     "/health/supervisor.process_instance",
     "/health/callosum.pipe-*",
@@ -308,12 +309,53 @@ pub(crate) fn restore_args(snapshot_id: &str, tree_path: &str, target: &str) -> 
         "--target".to_owned(),
         target.to_owned(),
     ];
+    // These name a desktop journal's own resident; iOS runs none, reads neither
+    // file, and its linked restore takes no exclusions, so it emits none.
+    #[cfg(not(target_os = "ios"))]
     for pattern in RESTORE_KEEPS_LOCAL {
         args.extend(["--exclude".to_owned(), pattern.to_owned()]);
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     args.extend(["--exclude".to_owned(), "backup-activity.lock".to_owned()]);
     args
+}
+
+#[cfg(target_os = "ios")]
+struct IosTargetRunner<'a> {
+    inner: &'a dyn crate::runner::ToolRunner,
+    target: &'a crate::ios_callable::RestoreTarget,
+}
+
+#[cfg(target_os = "ios")]
+impl crate::runner::ToolRunner for IosTargetRunner<'_> {
+    fn run(
+        &self,
+        request: &crate::runner::ToolRequest<'_>,
+    ) -> std::io::Result<crate::runner::ToolOutput> {
+        self.inner.run(request)
+    }
+
+    fn run_cancellable(
+        &self,
+        request: &crate::runner::ToolRequest<'_>,
+        cancellation: &solstone_core_backup::archive_admission::ArchiveCancellation,
+    ) -> std::io::Result<crate::runner::ToolOutput> {
+        self.inner.run_cancellable(request, cancellation)
+    }
+
+    fn cancellation(
+        &self,
+    ) -> Option<&solstone_core_backup::archive_admission::ArchiveCancellation> {
+        self.inner.cancellation()
+    }
+
+    fn ios_journal_root(&self) -> Option<&std::sync::Arc<solstone_core_journal_io::JournalRoot>> {
+        self.inner.ios_journal_root()
+    }
+
+    fn ios_restore_target(&self) -> Option<&crate::ios_callable::RestoreTarget> {
+        Some(self.target)
+    }
 }
 
 /// Restore a BYO repository. The three config setters remain purposefully independent.
@@ -324,16 +366,23 @@ pub fn restore_journal(
     destination: Destination,
     entered_recovery_key: &str,
 ) -> RestoreOutcome {
-    // iOS still needs retained-root post-work and panic-fallback ownership.
-    // Callable backup readiness does not admit this whole restore orchestration.
-    if cfg!(target_os = "ios") {
-        return unrecorded_outcome(error_draft(RESTORE_REASON_RESTIC_UNAVAILABLE));
-    }
     let admitted = match crate::destination_admission::admit_restore_destination(journal) {
         Ok(admitted) => admitted,
         Err(_) => {
             return unrecorded_outcome(error_draft(RESTORE_REASON_DESTINATION_ADMISSION_FAILED));
         }
+    };
+    // iOS: the linked restore copies into exactly this admitted target, whose
+    // native lease is held through every later step until `admitted` drops.
+    #[cfg(target_os = "ios")]
+    let targeted_runner = IosTargetRunner {
+        inner: services.runner,
+        target: admitted.ios_restore_target(),
+    };
+    #[cfg(target_os = "ios")]
+    let services = &BackupServices {
+        runner: &targeted_runner,
+        ..*services
     };
     #[cfg(windows)]
     let admitted = std::sync::Arc::new(admitted);

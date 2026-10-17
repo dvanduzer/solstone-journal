@@ -124,6 +124,43 @@ impl AdmittedIosBackupAuthority {
     }
 }
 
+/// Retained custody of the app's journal root as the target of one whole-journal
+/// restore. The native activity lease lasts until this value drops, covering
+/// every later step of the restore, not only the native copy.
+pub struct RestoreTarget {
+    target: native::Target,
+    root: Arc<JournalRoot>,
+    path: String,
+}
+
+impl std::fmt::Debug for RestoreTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RestoreTarget")
+            .finish_non_exhaustive()
+    }
+}
+
+impl RestoreTarget {
+    pub fn admit(root: Arc<JournalRoot>) -> Result<Self, ()> {
+        root.revalidate_canonical_binding().map_err(|_| ())?;
+        let path = root.canonical_path().to_str().ok_or(())?.to_owned();
+        let target = native::Target::admit(root.as_fd(), &path).map_err(|_| ())?;
+        let admitted = Self { target, root, path };
+        admitted.revalidate()?;
+        Ok(admitted)
+    }
+
+    pub fn revalidate(&self) -> Result<(), ()> {
+        self.target.revalidate().map_err(|_| ())?;
+        self.root.revalidate_canonical_binding().map_err(|_| ())
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        self.root.canonical_path()
+    }
+}
+
 pub fn admitted_ios_backup(
     root: Arc<JournalRoot>,
 ) -> Result<Arc<AdmittedIosBackupAuthority>, ClosedToolError> {
@@ -420,6 +457,7 @@ pub(crate) fn run(
     pass_fds: &[PassedHandle<'_>],
     stdin: Option<Vec<u8>>,
     cancellation: Option<&ArchiveCancellation>,
+    restore_target: Option<&RestoreTarget>,
 ) -> Result<ResticResult, RunnerError> {
     if max_repack_size.is_some() || !pass_fds.is_empty() || stdin.is_some() {
         return Err(refused("ios_backup_unsupported_process_input"));
@@ -434,6 +472,25 @@ pub(crate) fn run(
         cancellation,
     )?;
     let command = command::decode(args).map_err(|_| refused("ios_backup_unsupported_command"))?;
+    if let command::Operation::Restore {
+        snapshot,
+        selector,
+        target,
+    } = &command.operation
+    {
+        let completed = restore(
+            authority,
+            repository,
+            password,
+            restore_target.ok_or_else(|| refused("ios_backup_restore_target_missing"))?,
+            target,
+            snapshot,
+            selector,
+            timeout,
+            cancellation,
+        )?;
+        return outcome::project(Some(&command.operation), completed, args, json);
+    }
     let selection = policy(authority, &command.operation)?;
     let mut options = native::Options {
         version: 1,
@@ -449,6 +506,7 @@ pub(crate) fn run(
         command::Operation::Open => 2,
         command::Operation::Snapshot { .. } => 4,
         command::Operation::ListSnapshots => 5,
+        command::Operation::Restore { .. } => unreachable!("restore dispatched above"),
         command::Operation::Check(mode) => {
             match mode {
                 command::CheckRead::Structure => {}
@@ -481,6 +539,76 @@ pub(crate) fn run(
     )
     .map_err(ExecuteError::into_runner)?;
     outcome::project(Some(&command.operation), completed, args, json)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore(
+    authority: &AdmittedIosBackupAuthority,
+    repository: repository::Repository<'_>,
+    password: &str,
+    admitted: &RestoreTarget,
+    target: &std::path::Path,
+    snapshot: &str,
+    selector: &str,
+    timeout: Option<Duration>,
+    cancellation: Option<&ArchiveCancellation>,
+) -> Result<native::Completed, RunnerError> {
+    // The requested target must be exactly the admitted root, which must be the
+    // backup authority's own retained journal.
+    if target.as_os_str() != admitted.path.as_str()
+        || admitted.root.canonical_path() != authority.root.canonical_path()
+    {
+        return Err(refused("ios_backup_restore_target_mismatch"));
+    }
+    let repository::Repository::S3 {
+        destination,
+        access,
+        secret,
+        token,
+    } = repository
+    else {
+        return Err(refused("ios_backup_restore_local_unsupported"));
+    };
+    admitted
+        .revalidate()
+        .map_err(|_| refused("ios_backup_restore_target_changed"))?;
+    authority
+        .revalidate()
+        .map_err(|reason| refused(reason.code()))?;
+    let password = Zeroizing::new(password.as_bytes().to_vec());
+    let state = authority
+        .installed
+        .storage
+        .create_state(&destination.namespace())
+        .map_err(|reason| refused(reason.code()))?;
+    state
+        .revalidate()
+        .map_err(|reason| refused(reason.code()))?;
+    let remote = native::Remote {
+        endpoint: &destination.endpoint,
+        region: &destination.region,
+        bucket: &destination.bucket,
+        prefix: &destination.prefix,
+        access: access.as_bytes(),
+        secret: secret.as_bytes(),
+        token: token.as_bytes(),
+        state: native::PrivateDirectory {
+            path: state.path(),
+            descriptor: state.as_fd(),
+        },
+    };
+    let call = native::Call::remote_restore(
+        &password,
+        &remote,
+        &admitted.target,
+        &admitted.path,
+        snapshot,
+        selector,
+    )
+    .map_err(|status| ExecuteError::Entry(status).into_runner())?;
+    let cancelled = || cancellation.is_some_and(ArchiveCancellation::is_cancelled);
+    // The target, state directory and credentials stay borrowed until wait/free.
+    Ok(call.wait(timeout, Some(&cancelled), true))
 }
 
 #[allow(clippy::too_many_arguments)]
