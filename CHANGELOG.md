@@ -13,6 +13,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- in the activities app, today's column now ends at the right hour, with its line at the current time. before, it ran far past the end of the day.
 - your backup now clears older copies on schedule even after your computer's name changes, your journal moves to another folder, or you restore it onto a new computer. before, copies taken under the earlier name or folder were kept indefinitely. the first cleanup after you update removes the ones outside your retention setting. offloaded media stays as before.
 - restoring your whole journal from a backup you set up in your own storage now works even after media offload has moved anything into that backup. before, the restore stopped and said "the list of backups is invalid". nothing in your backup was changed.
 

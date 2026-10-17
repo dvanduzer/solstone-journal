@@ -908,7 +908,7 @@
       if (window.JournalClock && window.JournalClock.parts) {
         const p = window.JournalClock.parts(d);
         const m = MONTHS_SHORT[Number(p.month) - 1] || '';
-        const day = String(p.day);
+        const day = String(Number(p.day));
         const hr = String(p.hour).padStart(2, '0');
         const min = String(p.minute).padStart(2, '0');
         return `${m} ${day}, ${hr}:${min}`;
@@ -1191,7 +1191,8 @@
     let nowMinute = null;
     if (ctx === 'today' && window.JournalClock && window.JournalClock.parts) {
       const parts = window.JournalClock.parts();
-      nowMinute = parts.hour * 60 + parts.minute;
+      // parts() returns zero-padded strings; '05' * 60 + '49' would concatenate.
+      nowMinute = Number(parts.hour) * 60 + Number(parts.minute);
     }
 
     if (timed.length) {
