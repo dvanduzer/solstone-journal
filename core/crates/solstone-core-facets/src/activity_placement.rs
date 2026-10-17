@@ -435,6 +435,8 @@ mod tests {
         chronicle_segment(root.path(), Some("s2"), "130000_300");
         chronicle_segment(root.path(), Some("s1"), "140000_300");
         chronicle_segment(root.path(), Some("s2"), "140200_300");
+        chronicle_segment(root.path(), None, "150000_300");
+        chronicle_segment(root.path(), Some("s1"), "150100_300");
 
         // Pair 1: Same keys under s1 and s2, both carry stream -> both concurrent
         let r1 = record("r1", Some("s1"), &["100000_300"], false);
@@ -444,8 +446,8 @@ mod tests {
         let r3 = record("r3", Some("s1"), &["110000_300"], false);
         let r4 = record("r4", Some("s1"), &["110100_300"], false);
 
-        // Pair 3: _default overlapping named stream s1 -> neither concurrent
-        let r5 = record("r5", None, &["120000_300"], false); // direct layout _default
+        // Pair 3: Multiple stream matches -> stream is None, neither concurrent
+        let r5 = record("r5", None, &["120000_300"], false); // stream is None because 120000_300 exists under multiple streams
         let r6 = record("r6", Some("s1"), &["120000_300"], false);
 
         // Pair 4: Hidden row on s2 overlapping visible row on s1 -> neither concurrent, hidden has empty partners
@@ -455,6 +457,10 @@ mod tests {
         // Pair 5: Mixed partner (spans s1 and s2) -> mixed partner not concurrent (mixed), single-stream partner is concurrent
         let r9 = record("r9", None, &["140000_300", "140200_300"], false); // mixed
         let r10 = record("r10", Some("s1"), &["140000_300"], false);
+
+        // Pair 6: _default stream (root segment only) overlapping named stream s1 -> neither concurrent
+        let r11 = record("r11", None, &["150000_300"], false); // resolves to _default
+        let r12 = record("r12", Some("s1"), &["150100_300"], false);
 
         let placed = [
             PlacedRecord {
@@ -497,6 +503,14 @@ mod tests {
                 facet: "work",
                 record: &r10,
             },
+            PlacedRecord {
+                facet: "work",
+                record: &r11,
+            },
+            PlacedRecord {
+                facet: "work",
+                record: &r12,
+            },
         ];
         let courses = place_activity_records(root.path(), DAY, &placed);
 
@@ -525,5 +539,11 @@ mod tests {
         assert!(!courses[8].concurrent);
         assert!(courses[9].concurrent);
         assert_eq!(courses[9].partners, vec![8]);
+
+        // Pair 6
+        assert_eq!(courses[10].stream.as_deref(), Some("_default"));
+        assert_eq!(courses[11].stream.as_deref(), Some("s1"));
+        assert!(!courses[10].concurrent);
+        assert!(!courses[11].concurrent);
     }
 }

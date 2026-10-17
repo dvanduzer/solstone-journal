@@ -558,6 +558,7 @@
       return '<div class="pulse-empty-state" data-home-surface="today">'
         + '<h2 class="pulse-section-header">today</h2>'
         + '<div class="pulse-empty-message">no anticipated activities or recent activity yet today.</div>'
+        + '<a class="pulse-today-link" href="/app/activities/" data-copy-key="home-today-link">all of today\'s activities →</a>'
         + '</div>';
     }
     const nowTime = currentTimeString(pulse.now);
@@ -573,10 +574,16 @@
         const title = event.title || 'Untitled';
         const start = String(event.start || '').substring(0, 5);
         const isPast = Boolean(event.occurred) || Boolean(event.end && String(event.end) < nowTime);
-        html += '<div class="pulse-event' + (isPast ? ' past' : '') + '">'
+        const day = event.day || pulse.today || pulse.day || '';
+        const facet = event.facet || '';
+        const id = event.id || '';
+        const href = '/app/activities/' + esc(day)
+          + '?facet=' + esc(encodeURIComponent(facet))
+          + '#' + esc(encodeURIComponent(facet)) + '/' + esc(encodeURIComponent(id));
+        html += '<a class="pulse-event' + (isPast ? ' past' : '') + '" href="' + href + '">'
           + '<span class="pulse-event-time">' + esc(start) + '</span>'
           + '<span class="pulse-event-title">' + esc(title) + '</span>'
-          + '</div>';
+          + '</a>';
       });
       html += '</div>';
     }
@@ -598,12 +605,18 @@
         // stay on the list, and the server names the source of each only when
         // another stream ran alongside it in the same facet.
         const source = typeof activity.source_label === 'string' ? activity.source_label.trim() : '';
-        html += '<div class="pulse-activity">'
+        const day = activity.day || pulse.today || pulse.day || '';
+        const facet = activity.facet || (Array.isArray(activity.facets) ? activity.facets[0] : '') || '';
+        const id = activity.id || '';
+        const href = '/app/activities/' + esc(day)
+          + '?facet=' + esc(encodeURIComponent(facet))
+          + '#' + esc(encodeURIComponent(facet)) + '/' + esc(encodeURIComponent(id));
+        html += '<a class="pulse-activity" href="' + href + '">'
           + '<span class="pulse-activity-time">' + esc(activity.display_time ? window.JournalFormat.time(activity.display_time) : '') + '</span>'
           + '<span class="pulse-activity-text">' + esc(description)
           + (source ? '<span class="pulse-activity-source">' + esc(source) + '</span>' : '')
           + '</span>'
-          + '</div>';
+          + '</a>';
       });
       html += '</div>';
     }
@@ -630,6 +643,7 @@
       });
       html += '</div>';
     }
+    html += '<a class="pulse-today-link" href="/app/activities/" data-copy-key="home-today-link">all of today\'s activities →</a>';
     html += '</div></div>';
     return html;
   }

@@ -151,10 +151,6 @@ mod tests {
         let journal = EstablishedJournal::established();
         let app = crate::router(journal.0.path().to_path_buf());
         assert_eq!(get(app.clone(), "/app/body/").await.0, StatusCode::OK);
-        assert_eq!(
-            get(app.clone(), "/app/activities/").await.0,
-            StatusCode::NOT_IMPLEMENTED
-        );
         for path in [
             "/app/body/",
             "/app/body/trends",

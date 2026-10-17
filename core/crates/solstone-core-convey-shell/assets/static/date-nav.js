@@ -78,7 +78,8 @@
     monthError: new Map(),
     warningVisible: false,
     facet: null,
-    currentMax: 0
+    currentMax: 0,
+    fetchGeneration: 0
   };
 
   function parseDayString(value) {
@@ -331,11 +332,18 @@
       return { data: indexPayload(), error: state.indexError };
     }
 
+    const gen = state.fetchGeneration;
+    const keepSearch = Boolean(state.host && state.host.hasAttribute('data-date-nav-keep-search'));
+    const search = keepSearch && window.location.search ? window.location.search : '';
+
     state.indexInflight = (async () => {
       try {
         const payload = normalizeIndexPayload(
-          await window.apiJson(`${apiBase()}api/index`)
+          await window.apiJson(`${apiBase()}api/index${search}`)
         );
+        if (gen !== state.fetchGeneration) {
+          return { data: null, error: null };
+        }
         state.coverage = payload.coverage;
         state.months = payload.months;
         state.indexLoaded = true;
@@ -344,19 +352,24 @@
         updateLabels();
         return { data: payload, error: null };
       } catch (error) {
+        if (gen !== state.fetchGeneration) {
+          return { data: null, error: null };
+        }
         state.indexError = error;
         state.warningVisible = true;
         updateLabels();
         logDateNavError(error, {
           context: 'date-nav:index',
-          url: `${apiBase()}api/index`
+          url: `${apiBase()}api/index${search}`
         });
         return {
           data: state.indexLoaded ? indexPayload() : null,
           error
         };
       } finally {
-        state.indexInflight = null;
+        if (gen === state.fetchGeneration) {
+          state.indexInflight = null;
+        }
       }
     })();
     return state.indexInflight;
@@ -369,9 +382,16 @@
     if (state.monthInflight.has(month)) return state.monthInflight.get(month);
     if (!force && state.monthCache.has(month)) return state.monthCache.get(month);
 
+    const gen = state.fetchGeneration;
+    const keepSearch = Boolean(state.host && state.host.hasAttribute('data-date-nav-keep-search'));
+    const search = keepSearch && window.location.search ? window.location.search : '';
+
     const request = (async () => {
       try {
-        const data = await window.apiJson(`${apiBase()}api/stats/${month}`);
+        const data = await window.apiJson(`${apiBase()}api/stats/${month}${search}`);
+        if (gen !== state.fetchGeneration) {
+          return { data: {}, error: null };
+        }
         const result = { data: data || {}, error: null };
         state.monthCache.set(month, result);
         state.monthError.delete(month);
@@ -379,17 +399,49 @@
         updateLabels();
         return result;
       } catch (error) {
+        if (gen !== state.fetchGeneration) {
+          return { data: {}, error: null };
+        }
         state.monthError.set(month, error);
         state.warningVisible = true;
         updateLabels();
         const stale = state.monthCache.get(month) || null;
         return { data: stale ? stale.data : {}, error };
       } finally {
-        state.monthInflight.delete(month);
+        if (gen === state.fetchGeneration) {
+          state.monthInflight.delete(month);
+        }
       }
     })();
     state.monthInflight.set(month, request);
     return request;
+  }
+
+  function refresh() {
+    state.fetchGeneration += 1;
+    state.monthCache.clear();
+    state.monthError.clear();
+    state.indexLoaded = false;
+    state.indexError = null;
+    state.indexInflight = null;
+    state.monthInflight.clear();
+
+    const indexPromise = fetchIndex(true);
+    let monthPromise = null;
+    if (state.month) {
+      monthPromise = fetchMonth(state.month, true);
+      prefetchAdjacentMonths(state.month);
+    }
+    updateLabels();
+    if (state.open) {
+      renderPanel();
+    }
+    return Promise.all([indexPromise, monthPromise]).then(() => {
+      updateLabels();
+      if (state.open) {
+        renderPanel();
+      }
+    });
   }
 
   function prefetchAdjacentMonths(month) {
@@ -467,6 +519,10 @@
     state.warningVisible = false;
     state.facet = null;
     state.currentMax = 0;
+    if (state.host && state.host.refresh) {
+      delete state.host.refresh;
+    }
+    state.fetchGeneration = 0;
     parsedDayInitialized = false;
   }
 
@@ -614,7 +670,9 @@
   function navigateTo(day) {
     const normalized = parseDayString(day);
     if (!normalized || !state.appName) return;
-    window.location.href = `/app/${state.appName}/${normalized}`;
+    const keepSearch = Boolean(state.host && state.host.hasAttribute('data-date-nav-keep-search'));
+    const search = keepSearch && window.location.search ? window.location.search : '';
+    window.location.href = `/app/${state.appName}/${normalized}${search}`;
   }
 
   function navigateDay(delta) {
@@ -1115,6 +1173,7 @@
   }
 
   function handleDocumentKeydown(event) {
+    if (event.defaultPrevented) return;
     if (!state.config || isTypingTarget(event.target)) return;
     if (state.root && state.root.contains(event.target) && event.target.matches('[data-date-nav-cell]')) return;
     if (event.key === 'ArrowLeft') {
@@ -1161,6 +1220,9 @@
     state.year = state.month ? Number(state.month.slice(0, 4)) : null;
 
     renderShell();
+    if (host.hasAttribute('data-date-nav-keep-search')) {
+      host.refresh = refresh;
+    }
     state.root.addEventListener('click', handleRootClick, { signal: mountAbort.signal });
     state.root.addEventListener('keydown', handleGridKeydown, { signal: mountAbort.signal });
     document.addEventListener('click', handleDocumentClick, { signal: mountAbort.signal });

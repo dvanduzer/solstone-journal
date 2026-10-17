@@ -404,7 +404,16 @@ fn owner_read_role_classification_table_exhaustiveness() {
             "/source",
             RouteClassification::Moved(OwnerReadRole::SourceLink),
         ),
-        // Activities (3 live GET paths in facets-web activities)
+        // Activities (6 live GET paths in facets-web activities)
+        ("/app/activities/", RouteClassification::NoQualifyingWork),
+        (
+            "/app/activities/{day}",
+            RouteClassification::NoQualifyingWork,
+        ),
+        (
+            "/app/activities/workspace",
+            RouteClassification::NoQualifyingWork,
+        ),
         (
             "/app/activities/api/index",
             RouteClassification::Moved(OwnerReadRole::ActivitiesIndex),
@@ -419,7 +428,7 @@ fn owner_read_role_classification_table_exhaustiveness() {
         ),
     ];
 
-    assert_eq!(table.len(), 91, "Must classify all 91 live GET routes");
+    assert_eq!(table.len(), 94, "Must classify all 94 live GET routes");
 
     let mut distinct_paths = BTreeSet::new();
     for (path, _) in table {
@@ -486,7 +495,7 @@ fn owner_read_role_classification_table_exhaustiveness() {
     assert_eq!(
         no_qualifying.len(),
         29,
-        "NoQualifyingWork must have exactly 29 routes"
+        "NoQualifyingWork must have exactly 32 routes"
     );
 }
 

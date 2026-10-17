@@ -304,12 +304,6 @@ mod tests {
             json_body(&body).get("reason_code"),
             Some(&Value::String("app_not_converted".to_owned()))
         );
-
-        let (status, _headers, body) =
-            routed(&journal, "GET", "/app/activities/workspace", b"").await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-        assert_eq!(json_body(&body)["reason_code"], "app_not_converted");
-        assert_eq!(json_body(&body)["app"], "activities");
     }
 
     #[tokio::test]

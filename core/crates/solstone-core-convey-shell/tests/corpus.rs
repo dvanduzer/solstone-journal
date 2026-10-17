@@ -842,7 +842,7 @@ async fn speakers_state_uses_the_owner_zone_today_semantics() {
 }
 
 #[tokio::test]
-async fn registry_and_unconverted_refusal_contract_are_stable() {
+async fn registry_contract_is_stable() {
     let journal = journal_for_phase("established");
     let (_, _, _, shell_body) = get(router(journal.0.clone()), "/api/shell").await;
     let shell: Value = serde_json::from_slice(&shell_body).expect("shell parses");
@@ -859,22 +859,6 @@ async fn registry_and_unconverted_refusal_contract_are_stable() {
         .filter_map(|app| app["background_url"].as_str())
         .collect();
     assert!(backgrounds.is_empty());
-
-    let (status, content_type, _, body) =
-        get(router(journal.0.clone()), "/app/activities/workspace").await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    assert_eq!(content_type, "application/json");
-    let refusal: Value = serde_json::from_slice(&body).expect("refusal parses");
-    assert_eq!(refusal["reason_code"], "app_not_converted");
-    assert_eq!(refusal["app"], "activities");
-
-    let shell = include_bytes!("../assets/static/shell.html");
-    for path in ["/app/activities/", "/app/activities"] {
-        let (status, content_type, _, body) = get(router(journal.0.clone()), path).await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{path}");
-        assert_eq!(content_type, "text/html; charset=utf-8", "{path}");
-        assert_eq!(body, shell, "{path}");
-    }
 }
 
 #[tokio::test]
@@ -980,56 +964,6 @@ async fn sse_is_gated_and_exposes_a_heartbeat_after_establishment() {
     assert_eq!(response.headers()["content-type"], "text/event-stream");
     assert_eq!(response.headers()["cache-control"], "no-cache");
     assert_eq!(response.headers()["x-accel-buffering"], "no");
-}
-
-#[tokio::test]
-async fn an_unconverted_app_refusal_is_never_a_success_status() {
-    // Found in a browser, not a test: shell_boot.js only evaluates a response
-    // when `response.ok`, so a refusal at 200 was parsed as JavaScript. Every
-    // client branches on that bit -- pin it rather than the exact code.
-    let journal = journal_for_phase("established");
-    for path in [
-        // `/app/home/` and `/app/home/workspace` were here until 2026-08-14, when
-        // the home page's shell and workspace became native routes. The INVARIANT is
-        // unchanged -- an unconverted app's refusal is never 2xx -- only these
-        // examples went stale. Replaced with a still-unconverted app rather than
-        // deleted, so the assertion keeps covering shell and workspace paths.
-        "/app/activities/",
-        "/app/activities/workspace",
-        // `/app/tokens/background` was here until 2026-08-15, when the tokens
-        // registry entry was removed and its usage surface moved natively under
-        // stats; `/app/support/background` replaced it and went stale the same
-        // day, when the support conversion landed and made that path serve the
-        // app's real backdrop -- support is the only app in its plate whose
-        // background is real content rather than a 404. The INVARIANT is
-        // unchanged -- an unconverted app's refusal is never 2xx -- only these
-        // examples went stale. Replaced with a still-unconverted app rather than
-        // deleted, so the assertion keeps covering a background path.
-        "/app/activities/background",
-        // `/app/sol/background` was here until 2026-08-15, when Sol's
-        // registry entry was removed after its identity mutations moved
-        // natively under Thinking. The INVARIANT is unchanged -- an
-        // unconverted app's refusal is never 2xx -- only this example went
-        // stale. Replaced with a still-unconverted app rather than deleted,
-        // so the assertion keeps covering a background path.
-        // `/app/network/background` was here until 2026-08-18, when Network
-        // flipped converted: its mint, ceremony, devices, and write routes
-        // were already native, and the 501 "not ported" body on unmounted
-        // paths was the lie. activities remains the unconverted example.
-    ] {
-        let (status, _content_type, _location, body) = get(router(journal.0.clone()), path).await;
-        assert!(
-            !status.is_success(),
-            "{path} returned a success status for an unconverted app: {status}"
-        );
-        // On 2026-08-24, the `/` tail moved to the shell HTML navigation response
-        // while the workspace tail retained its JSON fragment refusal.
-        if path.ends_with("/workspace") || path.ends_with("/background") {
-            let refusal: Value = serde_json::from_slice(&body)
-                .unwrap_or_else(|_| panic!("{path} refusal parses as JSON"));
-            assert_eq!(refusal["reason_code"], "app_not_converted", "{path}");
-        }
-    }
 }
 
 #[cfg(unix)]

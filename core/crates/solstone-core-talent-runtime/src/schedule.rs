@@ -1730,4 +1730,249 @@ mod tests {
                 .contains("superseded by anticipated_meeting_103000_0317")
         );
     }
+
+    #[test]
+    fn batch_publication_owner_hidden_plan_reappearing_unhidden_remains_hidden() {
+        let root = tempfile::TempDir::new_in("/var/tmp").unwrap();
+        solstone_core_facets::create_facet(root.path(), "work", "Work", "", "", "", None).unwrap();
+        let day_file = root.path().join("facets/work/activities/20260314.jsonl");
+        std::fs::create_dir_all(day_file.parent().unwrap()).unwrap();
+
+        let seed_record = json!({
+            "id": "anticipated_meeting_093000_0314",
+            "activity": "meeting",
+            "target_date": "2026-03-14",
+            "start": "09:30:00",
+            "end": "10:00:00",
+            "title": "Roadmap sync",
+            "description": "Discuss roadmap",
+            "details": "old details",
+            "facet": "work",
+            "source": "anticipated",
+            "active_entities": [],
+            "participation": [],
+            "participation_confidence": Value::Null,
+            "cancelled": false,
+            "hidden": true,
+            "edits": [
+                {
+                    "timestamp": "2026-03-10T09:00:00Z",
+                    "actor": "schedule",
+                    "fields": ["activity", "target_date", "start", "end", "title", "description", "details", "source", "active_entities", "participation", "participation_confidence", "cancelled", "hidden"],
+                    "note": "created by schedule"
+                },
+                {
+                    "timestamp": "2026-03-10T10:00:00Z",
+                    "actor": "owner:mute",
+                    "fields": ["hidden"],
+                    "note": "muted by owner"
+                }
+            ]
+        });
+        std::fs::write(
+            &day_file,
+            format!("{}\n", serde_json::to_string(&seed_record).unwrap()),
+        )
+        .unwrap();
+
+        let sighting = json!({
+            "events": [{
+                "activity": "meeting",
+                "target_date": "2026-03-14",
+                "start": "09:30:00",
+                "end": "10:00:00",
+                "title": "Roadmap sync",
+                "description": "Discuss roadmap",
+                "details": "new details",
+                "facet": "work",
+                "participation": []
+            }]
+        })
+        .to_string();
+
+        let batches = prepare_publication(root.path(), &sighting, "20260310").unwrap();
+        for batch in batches {
+            solstone_core_facets::publish_anticipation_batch(root.path(), &batch, true, || Ok(()))
+                .unwrap();
+        }
+
+        let records =
+            solstone_core_facets::load_activity_records(root.path(), "work", "20260314", true)
+                .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["hidden"], true);
+        assert_eq!(records[0]["details"], "new details");
+    }
+
+    #[test]
+    fn batch_publication_owner_retitled_plan_keeps_title_while_end_time_updates() {
+        let root = tempfile::TempDir::new_in("/var/tmp").unwrap();
+        solstone_core_facets::create_facet(root.path(), "work", "Work", "", "", "", None).unwrap();
+        let day_file = root.path().join("facets/work/activities/20260314.jsonl");
+        std::fs::create_dir_all(day_file.parent().unwrap()).unwrap();
+
+        let seed_record = json!({
+            "id": "anticipated_meeting_093000_0314",
+            "activity": "meeting",
+            "target_date": "2026-03-14",
+            "start": "09:30:00",
+            "end": "10:00:00",
+            "title": "Owner Title",
+            "description": "Discuss roadmap",
+            "details": "old details",
+            "facet": "work",
+            "source": "anticipated",
+            "active_entities": [],
+            "participation": [],
+            "participation_confidence": Value::Null,
+            "cancelled": false,
+            "hidden": false,
+            "edits": [
+                {
+                    "timestamp": "2026-03-10T09:00:00Z",
+                    "actor": "schedule",
+                    "fields": ["activity", "target_date", "start", "end", "title", "description", "details", "source", "active_entities", "participation", "participation_confidence", "cancelled", "hidden"],
+                    "note": "created by schedule"
+                },
+                {
+                    "timestamp": "2026-03-10T09:30:00Z",
+                    "actor": "owner:update",
+                    "fields": ["title"],
+                    "note": "updated title"
+                }
+            ]
+        });
+        std::fs::write(
+            &day_file,
+            format!("{}\n", serde_json::to_string(&seed_record).unwrap()),
+        )
+        .unwrap();
+
+        let sighting = json!({
+            "events": [{
+                "activity": "meeting",
+                "target_date": "2026-03-14",
+                "start": "09:30:00",
+                "end": "10:30:00",
+                "title": "Schedule Title",
+                "description": "Discuss roadmap",
+                "details": "old details",
+                "facet": "work",
+                "participation": []
+            }]
+        })
+        .to_string();
+
+        let batches = prepare_publication(root.path(), &sighting, "20260310").unwrap();
+        for batch in batches {
+            solstone_core_facets::publish_anticipation_batch(root.path(), &batch, true, || Ok(()))
+                .unwrap();
+        }
+
+        let records =
+            solstone_core_facets::load_activity_records(root.path(), "work", "20260314", true)
+                .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["title"], "Owner Title");
+        assert_eq!(records[0]["end"], "10:30:00");
+    }
+
+    #[test]
+    fn batch_publication_owner_hidden_plan_seen_cancelled_and_uncancelled_remains_hidden() {
+        let root = tempfile::TempDir::new_in("/var/tmp").unwrap();
+        solstone_core_facets::create_facet(root.path(), "work", "Work", "", "", "", None).unwrap();
+        let day_file = root.path().join("facets/work/activities/20260314.jsonl");
+        std::fs::create_dir_all(day_file.parent().unwrap()).unwrap();
+
+        let seed_record = json!({
+            "id": "anticipated_meeting_093000_0314",
+            "activity": "meeting",
+            "target_date": "2026-03-14",
+            "start": "09:30:00",
+            "end": "10:00:00",
+            "title": "Project sync",
+            "description": "Discuss roadmap",
+            "details": "",
+            "facet": "work",
+            "source": "anticipated",
+            "active_entities": [],
+            "participation": [],
+            "participation_confidence": 0.5,
+            "cancelled": false,
+            "hidden": true,
+            "edits": [
+                {
+                    "timestamp": "2026-03-10T09:00:00Z",
+                    "actor": "schedule",
+                    "fields": ["activity", "target_date", "start", "end", "title", "description", "details", "source", "active_entities", "participation", "participation_confidence", "cancelled", "hidden"],
+                    "note": "created by schedule"
+                },
+                {
+                    "timestamp": "2026-03-10T10:00:00Z",
+                    "actor": "owner:mute",
+                    "fields": ["hidden"],
+                    "note": "muted by owner"
+                }
+            ]
+        });
+        std::fs::write(
+            &day_file,
+            format!("{}\n", serde_json::to_string(&seed_record).unwrap()),
+        )
+        .unwrap();
+
+        let cancelled_sighting = json!({
+            "events": [{
+                "activity": "meeting",
+                "target_date": "2026-03-14",
+                "start": "09:30:00",
+                "end": "10:00:00",
+                "title": "Project sync",
+                "description": "Discuss roadmap",
+                "facet": "work",
+                "cancelled": true,
+                "participation": []
+            }]
+        })
+        .to_string();
+
+        let batches = prepare_publication(root.path(), &cancelled_sighting, "20260310").unwrap();
+        for batch in batches {
+            solstone_core_facets::publish_anticipation_batch(root.path(), &batch, true, || Ok(()))
+                .unwrap();
+        }
+
+        let records =
+            solstone_core_facets::load_activity_records(root.path(), "work", "20260314", true)
+                .unwrap();
+        assert_eq!(records[0]["hidden"], true);
+        assert_eq!(records[0]["cancelled"], true);
+
+        let uncancelled_sighting = json!({
+            "events": [{
+                "activity": "meeting",
+                "target_date": "2026-03-14",
+                "start": "09:30:00",
+                "end": "10:00:00",
+                "title": "Project sync",
+                "description": "Discuss roadmap",
+                "facet": "work",
+                "cancelled": false,
+                "participation": []
+            }]
+        })
+        .to_string();
+
+        let batches = prepare_publication(root.path(), &uncancelled_sighting, "20260310").unwrap();
+        for batch in batches {
+            solstone_core_facets::publish_anticipation_batch(root.path(), &batch, true, || Ok(()))
+                .unwrap();
+        }
+
+        let records =
+            solstone_core_facets::load_activity_records(root.path(), "work", "20260314", true)
+                .unwrap();
+        assert_eq!(records[0]["hidden"], true);
+        assert_eq!(records[0]["cancelled"], false);
+    }
 }

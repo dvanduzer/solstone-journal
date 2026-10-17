@@ -20,6 +20,7 @@ CONVEY_ICON_NAMES: tuple[str, ...] = (
     "bell-off",
     "bot",
     "brain",
+    "calendar",
     "calendar-days",
     "chart-column",
     "check",
@@ -28,6 +29,7 @@ CONVEY_ICON_NAMES: tuple[str, ...] = (
     "clock",
     "coins",
     "eye",
+    "eye-off",
     "file-text",
     "inbox",
     "life-buoy",
@@ -36,6 +38,7 @@ CONVEY_ICON_NAMES: tuple[str, ...] = (
     "mic-vocal",
     "monitor",
     "mouse-pointer-2",
+    "pencil",
     "refresh-cw",
     "satellite-dish",
     "search",
@@ -53,9 +56,24 @@ CONVEY_ICON_NAMES: tuple[str, ...] = (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LUCIDE_JSON_PATH = (
-    REPO_ROOT / "solstone" / "convey" / "static" / "icons" / "lucide.json"
+    REPO_ROOT
+    / "core"
+    / "crates"
+    / "solstone-core-convey-shell"
+    / "assets"
+    / "static"
+    / "icons"
+    / "lucide.json"
 )
-OUTPUT_PATH = REPO_ROOT / "solstone" / "convey" / "static" / "convey_icons.js"
+OUTPUT_PATH = (
+    REPO_ROOT
+    / "core"
+    / "crates"
+    / "solstone-core-convey-shell"
+    / "assets"
+    / "static"
+    / "convey_icons.js"
+)
 
 
 def load_lucide_icons(path: Path = LUCIDE_JSON_PATH) -> dict[str, str]:

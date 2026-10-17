@@ -7,8 +7,8 @@ use std::path::Path;
 use serde_json::{Map, Value, json};
 use solstone_core_facets::{
     ActivityRecord, PlacedRecord, activity_value_truthy, list_activity_day_stems,
-    list_declared_facet_names, load_activity_records, place_activity_records,
-    read_activity_definitions, read_facet_declaration,
+    list_declared_facet_names, load_activity_records, observe_facet_declaration,
+    place_activity_records, read_activity_definitions,
 };
 
 pub fn compute_day_counts(root: &Path, query: Option<&str>) -> BTreeMap<String, usize> {
@@ -26,7 +26,7 @@ pub fn compute_day_counts(root: &Path, query: Option<&str>) -> BTreeMap<String, 
         None => declared
             .into_iter()
             .filter(|f| {
-                read_facet_declaration(root, f)
+                observe_facet_declaration(root, f)
                     .ok()
                     .flatten()
                     .is_none_or(|d| d.muted != Some(true))
@@ -57,6 +57,32 @@ pub fn compute_day_counts(root: &Path, query: Option<&str>) -> BTreeMap<String, 
     counts
 }
 
+fn map_facet_declaration(root: &Path, facet_name: &str, count: usize) -> Value {
+    match observe_facet_declaration(root, facet_name) {
+        Ok(Some(d)) => {
+            let title = if d.title.trim().is_empty() {
+                facet_name.to_owned()
+            } else {
+                d.title
+            };
+            json!({
+                "name": facet_name,
+                "count": count,
+                "title": title,
+                "color": d.color,
+                "muted": d.muted.unwrap_or(false)
+            })
+        }
+        _ => json!({
+            "name": facet_name,
+            "count": count,
+            "title": facet_name,
+            "color": "",
+            "muted": false
+        }),
+    }
+}
+
 pub fn build_view(root: &Path, day: &str, query: Option<&str>) -> Result<Value, String> {
     let declared = list_declared_facet_names(root).map_err(|e| e.to_string())?;
 
@@ -65,7 +91,7 @@ pub fn build_view(root: &Path, day: &str, query: Option<&str>) -> Result<Value, 
         let count = load_activity_records(root, f, day, false)
             .unwrap_or_default()
             .len();
-        facet_entries.push(json!({"name": f, "count": count}));
+        facet_entries.push(map_facet_declaration(root, f, count));
     }
 
     let query_facet = query_value(query, "facet").filter(|f| !f.is_empty());
@@ -80,7 +106,7 @@ pub fn build_view(root: &Path, day: &str, query: Option<&str>) -> Result<Value, 
         None => declared
             .iter()
             .filter(|f| {
-                read_facet_declaration(root, f)
+                observe_facet_declaration(root, f)
                     .ok()
                     .flatten()
                     .is_none_or(|d| d.muted != Some(true))

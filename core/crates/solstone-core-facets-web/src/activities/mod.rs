@@ -28,8 +28,14 @@ use crate::{Clock, http};
 
 mod view;
 
+pub(crate) const ACTOR_HEADER: &str = "x-solstone-actor";
+pub(crate) const ACTOR_OWNER: &str = "owner";
+
 pub fn routes(root: PathBuf, clock: Clock) -> Router {
     Router::new()
+        .route("/app/activities/workspace", get(activities_workspace_route))
+        .route("/app/activities/", get(activities_today_redirect))
+        .route("/app/activities/{day}", get(activities_day_shell))
         .route("/app/activities/api/day/{day}/view", get(day_view))
         .route("/app/activities/api/index", get(activities_index))
         .route("/app/activities/api/stats/{month}", get(activities_stats))
@@ -54,6 +60,48 @@ pub fn routes(root: PathBuf, clock: Clock) -> Router {
             post(unmute),
         )
         .with_state((root, clock))
+}
+
+async fn activities_workspace_route() -> Response {
+    crate::assets::activities_workspace()
+}
+
+fn today(clock: &Clock) -> String {
+    clock.now().date_naive().format("%Y%m%d").to_string()
+}
+
+async fn activities_today_redirect(
+    State((_, clock)): State<(PathBuf, Clock)>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let day = today(&clock);
+    let location = match query {
+        Some(q) if !q.is_empty() => format!("/app/activities/{day}?{q}"),
+        _ => format!("/app/activities/{day}"),
+    };
+    Response::builder()
+        .status(StatusCode::FOUND)
+        .header(axum::http::header::LOCATION, location)
+        .body(axum::body::Body::empty())
+        .expect("redirect response builds")
+        .into_response()
+}
+
+async fn activities_day_shell(RoutePath(day): RoutePath<String>) -> Response {
+    if crate::segments::is_day(&day) {
+        crate::assets::shell()
+    } else {
+        invalid_day_not_found()
+    }
+}
+
+fn invalid_day_not_found() -> Response {
+    http::error(
+        "invalid_day",
+        "that day couldn't be used.",
+        "Day not found".to_owned(),
+        StatusCode::NOT_FOUND,
+    )
 }
 
 async fn list(
@@ -206,12 +254,7 @@ async fn day_view(
     RawQuery(query): RawQuery,
 ) -> Response {
     if !crate::segments::is_day(&day) {
-        return http::error(
-            "invalid_day",
-            "that day couldn't be used.",
-            "Day not found".to_owned(),
-            StatusCode::NOT_FOUND,
-        );
+        return invalid_day_not_found();
     }
     solstone_core_convey_http::owner_read::spawn_blocking_response(
         solstone_core_convey_http::owner_read::OwnerReadRole::ActivitiesDayView,
@@ -271,10 +314,7 @@ async fn update(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
-    let is_owner = headers
-        .get("x-solstone-actor")
-        .and_then(|v| v.to_str().ok())
-        == Some("owner");
+    let is_owner = headers.get(ACTOR_HEADER).and_then(|v| v.to_str().ok()) == Some(ACTOR_OWNER);
     let (actor, log_source, log_actor) = if is_owner {
         ("owner:update", "app", "activities")
     } else {
@@ -293,10 +333,7 @@ async fn mute(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
-    let is_owner = headers
-        .get("x-solstone-actor")
-        .and_then(|v| v.to_str().ok())
-        == Some("owner");
+    let is_owner = headers.get(ACTOR_HEADER).and_then(|v| v.to_str().ok()) == Some(ACTOR_OWNER);
     let (actor, log_source, log_actor) = if is_owner {
         ("owner:mute", "app", "activities")
     } else {
@@ -314,10 +351,7 @@ async fn unmute(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
-    let is_owner = headers
-        .get("x-solstone-actor")
-        .and_then(|v| v.to_str().ok())
-        == Some("owner");
+    let is_owner = headers.get(ACTOR_HEADER).and_then(|v| v.to_str().ok()) == Some(ACTOR_OWNER);
     let (actor, log_source, log_actor) = if is_owner {
         ("owner:unmute", "app", "activities")
     } else {
@@ -1873,5 +1907,247 @@ mod tests {
         )
         .await;
         assert_eq!(res["record"]["edits"][0]["actor"], "cli:update");
+    }
+
+    #[tokio::test]
+    async fn activities_workspace_asset_contains_owner_constants() {
+        let res = crate::assets::activities_workspace();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body_str = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body_str.contains(ACTOR_HEADER));
+        assert!(body_str.contains(ACTOR_OWNER));
+    }
+
+    #[tokio::test]
+    async fn activities_today_redirect_preserves_query_and_uses_injected_clock() {
+        let root = phase_root("established_empty");
+        let dt = chrono::DateTime::parse_from_rfc3339("2026-10-15T23:30:00-07:00").unwrap();
+        let clock = Clock::new(move || dt);
+        let app = gated(root.path(), clock);
+
+        // 302 redirect with query preserved
+        let req = Request::builder()
+            .method("GET")
+            .uri("/app/activities/?facet=work")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FOUND);
+        assert_eq!(
+            res.headers().get(header::LOCATION).unwrap(),
+            "/app/activities/20261015?facet=work"
+        );
+
+        // 302 redirect without query
+        let req2 = Request::builder()
+            .method("GET")
+            .uri("/app/activities/")
+            .body(Body::empty())
+            .unwrap();
+        let res2 = app.clone().oneshot(req2).await.unwrap();
+        assert_eq!(res2.status(), StatusCode::FOUND);
+        assert_eq!(
+            res2.headers().get(header::LOCATION).unwrap(),
+            "/app/activities/20261015"
+        );
+
+        // Shell route on valid day returns 200 shell
+        let req3 = Request::builder()
+            .method("GET")
+            .uri("/app/activities/20261015")
+            .body(Body::empty())
+            .unwrap();
+        let res3 = app.clone().oneshot(req3).await.unwrap();
+        assert_eq!(res3.status(), StatusCode::OK);
+
+        // Shell route on invalid day returns 404
+        let req4 = Request::builder()
+            .method("GET")
+            .uri("/app/activities/notaday")
+            .body(Body::empty())
+            .unwrap();
+        let res4 = app.clone().oneshot(req4).await.unwrap();
+        assert_eq!(res4.status(), StatusCode::NOT_FOUND);
+        let bytes4 = to_bytes(res4.into_body(), usize::MAX).await.unwrap();
+        let body4: Value = serde_json::from_slice(&bytes4).unwrap();
+        assert_eq!(body4["reason_code"], "invalid_day");
+
+        // Workspace route returns 200 and contains data-date-nav-keep-search
+        let req5 = Request::builder()
+            .method("GET")
+            .uri("/app/activities/workspace")
+            .body(Body::empty())
+            .unwrap();
+        let res5 = app.oneshot(req5).await.unwrap();
+        assert_eq!(res5.status(), StatusCode::OK);
+        let bytes5 = to_bytes(res5.into_body(), usize::MAX).await.unwrap();
+        let body5 = String::from_utf8(bytes5.to_vec()).unwrap();
+        assert!(body5.contains("data-date-nav-keep-search"));
+    }
+
+    #[tokio::test]
+    async fn activities_view_facets_carry_title_color_and_muted() {
+        let root = tempfile::Builder::new().tempdir_in("/var/tmp").unwrap();
+        write(
+            &root.path().join("config/journal.json"),
+            r#"{"setup":{"completed_at":1767225600}}"#,
+        );
+        solstone_core_facets::create_facet(root.path(), "work", "Work", "", "#123456", "", None)
+            .unwrap();
+        write(
+            &root.path().join("facets/untitled/facet.json"),
+            r#"{"title":"","color":""}"#,
+        );
+        write(
+            &root.path().join("facets/quiet/facet.json"),
+            r##"{"title":"Quiet","color":"#abcdef","muted":true,"id":"not-well-formed"}"##,
+        );
+        let seed = |id: &str| {
+            format!(
+                r#"{{"id":"{id}","activity":"meeting","title":"t","description":"","details":"","segments":[],"active_entities":[],"created_at":1767225600000,"source":"user","hidden":false,"edits":[]}}"#
+            )
+        };
+        write(
+            &root.path().join("facets/quiet/activities/20260510.jsonl"),
+            &format!("{}\n", seed("quiet_one")),
+        );
+        write(
+            &root.path().join("facets/work/activities/20260510.jsonl"),
+            &format!("{}\n", seed("work_one")),
+        );
+
+        let (status, res) = request(
+            gated(root.path(), fixed_clock()),
+            "GET",
+            "/app/activities/api/day/20260510/view",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let facets = res["facets"].as_array().expect("facets array");
+        let entry = |name: &str| {
+            facets
+                .iter()
+                .find(|f| f["name"] == name)
+                .unwrap_or_else(|| panic!("{name} listed"))
+                .clone()
+        };
+        let work = entry("work");
+        assert_eq!(work["title"], "Work");
+        assert_eq!(work["color"], "#123456");
+        assert_eq!(work["muted"], false);
+        assert_eq!(entry("untitled")["title"], "untitled");
+        let quiet = entry("quiet");
+        assert_eq!(quiet["muted"], true);
+        assert_eq!(quiet["count"], 1);
+        let ids: Vec<&str> = res["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["work_one"]);
+        assert_eq!(res["hidden_count"], 0);
+
+        let (_, stats) = request(
+            gated(root.path(), fixed_clock()),
+            "GET",
+            "/app/activities/api/stats/202605",
+            None,
+        )
+        .await;
+        assert_eq!(stats["20260510"], 1);
+    }
+
+    #[tokio::test]
+    async fn activities_edit_ordering_on_owner_muted_record() {
+        let root = tempfile::Builder::new().tempdir_in("/var/tmp").unwrap();
+        write(
+            &root.path().join("config/journal.json"),
+            r#"{"setup":{"completed_at":1767225600}}"#,
+        );
+        solstone_core_facets::create_facet(root.path(), "work", "Work", "", "", "", None).unwrap();
+
+        let seed = r#"{"id":"rec_muted_order","activity":"meeting","title":"Seed Muted Order","description":"","details":"","segments":[],"active_entities":[],"created_at":1767225600000,"source":"user","hidden":false,"edits":[]}"#;
+        write(
+            &root.path().join("facets/work/activities/20260510.jsonl"),
+            &format!("{seed}\n"),
+        );
+
+        // 1. Mute as owner
+        let app = gated(root.path(), fixed_clock());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/app/activities/api/day/20260510/record/rec_muted_order/mute?facet=work")
+            .header(ACTOR_HEADER, ACTOR_OWNER)
+            .body(Body::empty())
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // 2. Append schedule cancellation edit (fields: ["cancelled"])
+        let day_file = root.path().join("facets/work/activities/20260510.jsonl");
+        let raw = std::fs::read_to_string(&day_file).unwrap();
+        let mut rec: Value = serde_json::from_str(raw.trim()).unwrap();
+        rec["cancelled"] = json!(true);
+        rec["edits"].as_array_mut().unwrap().push(json!({
+            "timestamp": "2026-05-10T12:00:00Z",
+            "actor": "schedule",
+            "fields": ["cancelled"],
+            "note": "cancelled"
+        }));
+        write(
+            &day_file,
+            &format!("{}\n", serde_json::to_string(&rec).unwrap()),
+        );
+
+        // View with include_hidden=1: hidden is true, hidden_reason is "owner"
+        let (status, res) = request(
+            gated(root.path(), fixed_clock()),
+            "GET",
+            "/app/activities/api/day/20260510/view?include_hidden=1",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let items = res["items"].as_array().unwrap();
+        let item = items.iter().find(|i| i["id"] == "rec_muted_order").unwrap();
+        assert_eq!(item["hidden"], true);
+        assert_eq!(item["hidden_reason"], "owner");
+        assert_eq!(item["cancelled"], true);
+
+        // 3. Append schedule un-cancellation edit
+        let raw2 = std::fs::read_to_string(&day_file).unwrap();
+        let mut rec2: Value = serde_json::from_str(raw2.trim()).unwrap();
+        rec2["cancelled"] = json!(false);
+        rec2["edits"].as_array_mut().unwrap().push(json!({
+            "timestamp": "2026-05-10T13:00:00Z",
+            "actor": "schedule",
+            "fields": ["cancelled"],
+            "note": "uncancelled"
+        }));
+        write(
+            &day_file,
+            &format!("{}\n", serde_json::to_string(&rec2).unwrap()),
+        );
+
+        // View again: hidden is still true, hidden_reason is still "owner", cancelled is false
+        let (status2, res2) = request(
+            gated(root.path(), fixed_clock()),
+            "GET",
+            "/app/activities/api/day/20260510/view?include_hidden=1",
+            None,
+        )
+        .await;
+        assert_eq!(status2, StatusCode::OK);
+        let items2 = res2["items"].as_array().unwrap();
+        let item2 = items2
+            .iter()
+            .find(|i| i["id"] == "rec_muted_order")
+            .unwrap();
+        assert_eq!(item2["hidden"], true);
+        assert_eq!(item2["hidden_reason"], "owner");
+        assert_eq!(item2["cancelled"], false);
     }
 }

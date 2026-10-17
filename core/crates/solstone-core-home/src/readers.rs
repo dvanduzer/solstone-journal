@@ -185,7 +185,18 @@ pub fn collect_anticipated_activities(context: &HomeContext, day: &str) -> Vec<V
                 let participants = record.get("participation").and_then(Value::as_array).into_iter().flatten().filter_map(|entry| {
                     (entry.get("role").and_then(Value::as_str) == Some("attendee")).then(|| entry.get("name").and_then(Value::as_str).unwrap_or("").trim().to_owned()).filter(|name| !name.is_empty())
                 }).collect::<Vec<_>>();
-                json!({"title": record.get("title").cloned().unwrap_or(Value::String(String::new())), "start": record.get("start").cloned().unwrap_or(Value::String(String::new())), "end": record.get("end").cloned().unwrap_or(Value::String(String::new())), "facet": facet.clone(), "occurred": false, "participants": participants})
+                let mut row = json!({
+                    "title": record.get("title").cloned().unwrap_or(Value::String(String::new())),
+                    "start": record.get("start").cloned().unwrap_or(Value::String(String::new())),
+                    "end": record.get("end").cloned().unwrap_or(Value::String(String::new())),
+                    "facet": facet.clone(),
+                    "occurred": false,
+                    "participants": participants
+                });
+                if let Some(id) = record.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()) {
+                    row["id"] = Value::String(id.to_owned());
+                }
+                row
             })
         })
     }).collect()

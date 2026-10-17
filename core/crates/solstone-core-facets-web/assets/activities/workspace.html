@@ -1,0 +1,2027 @@
+<style>
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* Copyright (c) 2026 sol pbc */
+
+.act-shell {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: inherit;
+  box-sizing: border-box;
+}
+
+.act-shell * {
+  box-sizing: border-box;
+}
+
+.act-header {
+  padding: 1rem 1.5rem 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  border-bottom: 1px solid var(--hairline);
+  background: var(--panel);
+}
+
+.act-top-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.act-scope-wrap {
+  position: relative;
+  display: inline-block;
+}
+
+.act-scope-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: var(--touch-min, 44px);
+  padding: 0.5rem 0.75rem;
+  background: var(--paper);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-m, 6px);
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+}
+
+.act-scope-btn:hover {
+  background: var(--panel);
+}
+
+.act-scope-listbox {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 50;
+  min-width: 200px;
+  max-height: 320px;
+  overflow-y: auto;
+  background: var(--paper);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-m, 6px);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+  padding: 0.25rem 0;
+  list-style: none;
+  margin: 0;
+}
+
+.act-scope-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  min-height: var(--touch-min, 44px);
+  padding: 0.5rem 0.75rem;
+  cursor: pointer;
+  color: var(--ink);
+}
+
+.act-scope-option:hover,
+.act-scope-option[aria-selected="true"],
+.act-scope-option--active {
+  background: var(--orange-wash);
+}
+
+.act-scope-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.act-heading {
+  margin: 0;
+  font-size: 1.5rem;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.act-day-note {
+  font-size: 0.875rem;
+  color: var(--ink-faint);
+  margin-top: -0.25rem;
+}
+
+.act-content {
+  display: flex;
+  flex: 1;
+  position: relative;
+  border-top: 2px solid transparent;
+}
+
+.act-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 1rem 1.5rem 3rem;
+  min-width: 0;
+}
+
+.act-untimed {
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.act-untimed-heading {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--ink-soft);
+  margin: 0 0 0.5rem;
+}
+
+.act-untimed-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.act-untimed-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: var(--touch-min, 44px);
+  padding: 0.4rem 0.6rem;
+  background: var(--panel);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-s, 4px);
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.875rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+.act-untimed-row:hover {
+  background: var(--orange-wash);
+}
+
+.act-timeline-wrap {
+  display: flex;
+  position: relative;
+}
+
+.act-time-axis {
+  width: 50px;
+  flex-shrink: 0;
+  position: relative;
+}
+
+.act-time-label {
+  position: absolute;
+  right: 8px;
+  font-size: 0.75rem;
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+  transform: translateY(-50%);
+  user-select: none;
+}
+
+.act-columns {
+  flex: 1;
+  position: relative;
+  min-width: 0;
+}
+
+.act-grid-lines {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.act-grid-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.act-grid-line--half {
+  border-bottom: 1px dashed var(--hairline);
+}
+
+.act-now-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--orange-ink);
+  z-index: 20;
+  pointer-events: none;
+}
+
+.act-now-badge {
+  position: absolute;
+  left: 0;
+  top: -9px;
+  background: var(--orange-ink);
+  color: #fff;
+  font-size: 0.65rem;
+  font-weight: 600;
+  padding: 1px 4px;
+  border-radius: 2px;
+}
+
+.act-blocks {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+.act-block {
+  position: absolute;
+  box-sizing: border-box;
+  padding: 3px 6px;
+  background: var(--panel);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-s, 4px);
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.8rem;
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  line-height: 1.2;
+  min-height: 26px;
+  z-index: 10;
+}
+
+.act-block:hover {
+  border-color: var(--orange-ink);
+  z-index: 15;
+}
+
+.act-block--plan {
+  border-style: dashed;
+  background: transparent;
+}
+
+.act-block--hidden {
+  background: repeating-linear-gradient(
+    45deg,
+    var(--panel),
+    var(--panel) 6px,
+    var(--paper) 6px,
+    var(--paper) 12px
+  );
+  opacity: 0.75;
+}
+
+.act-block--selected {
+  border: 2px solid var(--orange-ink) !important;
+  background: var(--orange-wash) !important;
+  z-index: 25 !important;
+}
+
+.act-block-line1 {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.75rem;
+  color: var(--ink-soft);
+  white-space: nowrap;
+}
+
+.act-block-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.act-block-time {
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+.act-block-icon {
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+  display: inline-flex;
+}
+
+.act-block-icon svg {
+  width: 100%;
+  height: 100%;
+}
+
+.act-block-line2 {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  min-width: 0;
+}
+
+.act-block-source {
+  font-size: 0.7rem;
+  color: var(--orange-ink);
+  font-weight: 500;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.act-block-title {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  word-break: break-word;
+}
+
+.act-block--short {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  padding-top: 2px;
+  padding-bottom: 2px;
+}
+
+.act-block--short .act-block-line1 {
+  flex: none;
+}
+
+.act-block--short .act-block-line2 {
+  flex: 1;
+  min-width: 0;
+}
+
+.act-block--short .act-block-title {
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.act-shell [hidden] {
+  display: none !important;
+}
+
+.act-block-outline {
+  position: absolute;
+  border: 1px dashed var(--hairline);
+  background: transparent;
+  box-sizing: border-box;
+  border-radius: var(--radius-s, 4px);
+  padding: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+  font-size: 0.75rem;
+  color: var(--ink-faint);
+  z-index: 10;
+}
+
+.act-unhide-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font: inherit;
+  font-size: 0.75rem;
+  background: var(--paper);
+  border: 1px solid var(--hairline);
+  border-radius: 3px;
+  color: var(--ink);
+  padding: 2px 6px;
+  cursor: pointer;
+  min-height: var(--touch-min, 44px);
+}
+
+.act-footer {
+  margin-top: 1.5rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--hairline);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  font-size: 0.875rem;
+  color: var(--ink-soft);
+}
+
+.act-empty {
+  padding: 3rem 1rem;
+  text-align: center;
+}
+
+.act-empty-heading {
+  margin: 0 0 0.5rem;
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.act-empty-body {
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 0.875rem;
+}
+
+.act-empty-btn {
+  margin-top: 1rem;
+  min-height: var(--touch-min, 44px);
+  padding: 0.5rem 1rem;
+  background: var(--paper);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-m, 6px);
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+}
+
+/* Panel */
+.act-panel {
+  width: 360px;
+  flex-shrink: 0;
+  border-left: 1px solid var(--hairline);
+  background: var(--panel);
+  padding: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+}
+
+.act-panel-empty {
+  color: var(--ink-faint);
+  font-size: 0.875rem;
+  margin: auto 0;
+  text-align: center;
+}
+
+.act-panel-header {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.act-panel-title-wrap {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+}
+
+.act-panel-title {
+  margin: 0;
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: var(--ink);
+  line-height: 1.3;
+}
+
+.act-panel-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  font-size: 0.8rem;
+  color: var(--ink-soft);
+}
+
+.act-cue {
+  display: inline-block;
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 10px;
+  background: var(--orange-wash);
+  color: var(--orange-ink);
+}
+
+.act-panel-source {
+  font-size: 0.8rem;
+  color: var(--ink-soft);
+}
+
+.act-panel-hidden-reason {
+  font-size: 0.8rem;
+  color: var(--ink-soft);
+  font-style: italic;
+  padding: 0.4rem 0.6rem;
+  background: var(--paper);
+  border-left: 3px solid var(--orange-ink);
+  border-radius: var(--radius-s, 4px);
+}
+
+.act-panel-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.act-panel-heading {
+  margin: 0;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--ink-soft);
+}
+
+.act-panel-text {
+  margin: 0;
+  font-size: 0.875rem;
+  line-height: 1.45;
+  color: var(--ink);
+}
+
+.act-panel-people {
+  font-size: 0.85rem;
+  color: var(--ink-soft);
+}
+
+.act-panel-evidence-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.act-panel-evidence-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 0.8rem;
+  color: var(--ink);
+}
+
+.act-panel-evidence-link {
+  color: var(--orange-ink);
+  text-decoration: none;
+  min-height: var(--touch-min, 44px);
+  display: inline-flex;
+  align-items: center;
+}
+
+.act-panel-history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.act-panel-history-item {
+  font-size: 0.8rem;
+  color: var(--ink-soft);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.act-panel-history-date {
+  font-size: 0.75rem;
+  color: var(--ink-faint);
+}
+
+.act-panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: auto;
+  padding-top: 1rem;
+  border-top: 1px solid var(--hairline);
+}
+
+.act-btn {
+  min-height: var(--touch-min, 44px);
+  padding: 0.5rem 1rem;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-m, 6px);
+  background: var(--paper);
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.875rem;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+}
+
+.act-btn--primary {
+  background: var(--orange-ink);
+  color: #fff;
+  border-color: var(--orange-ink);
+}
+
+.act-form {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.act-form-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.act-form-label {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--ink-soft);
+}
+
+.act-form-input,
+.act-form-textarea {
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+  background: var(--paper);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-m, 6px);
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.875rem;
+}
+
+.act-form-textarea {
+  min-height: 80px;
+  resize: vertical;
+}
+
+.act-form-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+/* 700px Breakpoint */
+@media (max-width: 700px) {
+  .act-top-bar {
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  .act-scope-btn {
+    white-space: nowrap;
+  }
+
+  .act-panel {
+    position: fixed;
+    top: auto;
+    bottom: var(--app-dock-height, 0px);
+    left: 0;
+    right: 0;
+    width: 100%;
+    height: auto;
+    max-height: 70vh;
+    background: var(--paper);
+    border-left: none;
+    border-top: 1px solid var(--hairline);
+    border-radius: 16px 16px 0 0;
+    box-shadow: 0 -4px 20px rgba(0,0,0,0.15);
+    z-index: 100;
+  }
+
+  .act-panel-grab {
+    width: 36px;
+    height: 4px;
+    background: var(--hairline);
+    border-radius: 2px;
+    margin: -0.5rem auto 0.5rem;
+  }
+}
+</style>
+
+<div class="act-shell" data-activities-root>
+  <div class="act-header">
+    <div class="act-top-bar">
+      <div class="act-scope-wrap">
+        <button type="button" class="act-scope-btn" aria-haspopup="listbox" aria-expanded="false" data-scope-btn>
+          <span class="act-scope-label" data-scope-label data-copy-key="scope-all">showing all facets</span>
+          <span class="act-scope-chev">▾</span>
+        </button>
+        <ul class="act-scope-listbox" role="listbox" tabindex="-1" hidden data-scope-listbox></ul>
+      </div>
+      <div data-date-nav data-date-nav-keep-search></div>
+    </div>
+    <h1 class="act-heading" data-date-nav-heading></h1>
+    <div class="act-day-note" data-day-note></div>
+  </div>
+  <div id="act-state-area" data-state-area></div>
+  <div class="act-content" id="act-content-area" data-content-area hidden>
+    <div class="act-main">
+      <div class="act-untimed" hidden data-untimed-area>
+        <h2 class="act-untimed-heading" data-copy-key="untimed-heading">without a time</h2>
+        <div class="act-untimed-list" data-untimed-list></div>
+      </div>
+      <div class="act-timeline-wrap" data-timeline-wrap>
+        <div class="act-time-axis" data-time-axis></div>
+        <div class="act-columns" data-columns-area>
+          <div class="act-grid-lines" data-grid-lines></div>
+          <div class="act-now-line" hidden data-now-line data-copy-key="now"><span class="act-now-badge" data-copy-key="now">now</span></div>
+          <div class="act-blocks" data-blocks-container></div>
+        </div>
+      </div>
+      <div class="act-footer" hidden data-footer-area>
+        <span class="act-footer-count" data-copy-key="hidden-footer"></span>
+        <button type="button" class="act-btn" data-copy-key="show-hidden" data-toggle-hidden>show hidden</button>
+      </div>
+      <div class="act-empty" hidden data-empty-area></div>
+    </div>
+    <aside class="act-panel" data-panel-area tabindex="-1"></aside>
+  </div>
+</div>
+
+<script>
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 sol pbc
+
+(() => {
+  // --- owner-facing strings ---
+  const STRINGS = {
+    'loading': 'loading activities…',
+    'load-error': "couldn't load activities",
+    'empty-pick': "pick an activity to see what it's based on.",
+    'empty-pick-plan': 'pick a plan to see where it came from.',
+    'today-note': 'activities appear here a little while after they end, and can still grow as more comes in.',
+    'future-note': "plans the journal noticed in what you've shared.",
+    'untimed-heading': 'without a time',
+    'hidden-footer': '{n} hidden on this day',
+    'showing-hidden': 'showing {n} hidden',
+    'show-hidden': 'show hidden',
+    'stop-showing-hidden': 'stop showing hidden',
+    'scope-all': 'showing all facets',
+    'scope-facet': 'showing {facet}',
+    'hidden-outline': 'hidden',
+    'unhide': 'unhide',
+    'hidden-status': "hidden. it's still in your journal.",
+    'label-title': 'title',
+    'label-description': 'description',
+    'label-details': 'details',
+    'details-placeholder': 'anything you want to add',
+    'save': 'save',
+    'cancel': 'cancel',
+    'save-failure': "couldn't save. your changes are still here, so you can try again.",
+    'action-edit': 'edit',
+    'action-hide': 'hide',
+    'action-unhide': 'unhide',
+    'sheet-close': 'close',
+    'reason-owner': 'you hid this',
+    'reason-command': 'hidden with the solstone command',
+    'reason-replaced': 'replaced by a newer version of this plan',
+    'reason-cancelled': 'seen as cancelled or declined',
+    'reason-other': 'hidden',
+    'cue-planned': 'planned',
+    'cue-edited': 'edited by you',
+    'source-mixed': 'more than one source',
+    'source-unknown': 'source unknown',
+    'evidence-heading': "what it's based on",
+    'evidence-open': 'open in transcripts ›',
+    'evidence-open-narrow': 'open ›',
+    'evidence-show-all': 'show all {n} segments',
+    'plan-heading': 'where it came from',
+    'plan-origin': "a plan the journal noticed in what you've shared. it shows what was planned, not what happened.",
+    'plan-origin-future': "a plan the journal noticed in what you've shared.",
+    'heading-summary': 'summary',
+    'heading-description': 'description',
+    'heading-details': 'details',
+    'heading-history': 'history',
+    'history-found': 'found in segments from {stream}',
+    'history-found-mixed': 'found in segments from more than one source',
+    'history-found-unknown': 'found in segments from an unknown source',
+    'history-grew': 'grew as more of it came in',
+    'history-plan-noticed': 'noticed as a plan in what you shared',
+    'history-plan-updated': 'updated when the plan showed up again in what you shared',
+    'history-plan-replaced': 'replaced by a newer version of this plan',
+    'history-cancelled': 'seen as cancelled or declined',
+    'history-you-changed': 'you changed {fields}',
+    'history-you-hid': 'you hid it',
+    'history-you-unhid': 'you unhid it',
+    'history-cli-changed': 'changed with the solstone command',
+    'history-cli-hid': 'hidden with the solstone command',
+    'history-cli-unhid': 'unhidden with the solstone command',
+    'history-cli-added': 'added with the solstone command',
+    'empty-past-heading': 'no activities on this day',
+    'empty-past-body': "the journal adds activities as it works through what you've shared.",
+    'empty-facet-heading': 'nothing in {facet} on this day',
+    'empty-facet-body': 'other facets have activities on this day.',
+    'empty-facet-show-all': 'show all facets',
+    'empty-today-heading': 'nothing yet today',
+    'empty-today-body': 'as the day goes on, activities from what you share show up here.',
+    'empty-future-heading': 'no plans found for this day',
+    'empty-future-body': 'plans for this day show up here once the journal notices them in what you share.',
+    'scope-all-option': 'all facets',
+    'source-unknown-phrase': 'an unknown source',
+    'segments-one': '1 segment from {source}, {range}',
+    'segments-many': '{n} segments from {source}, {range}',
+    'segment-minutes': '{n} min',
+    'people-one': 'with {a}',
+    'people-two': 'with {a} and {b}',
+    'people-many-one': 'with {a}, {b} and 1 other',
+    'people-many': 'with {a}, {b} and {n} others',
+    'fields-title': 'the title',
+    'fields-description': 'the description',
+    'fields-details': 'the details',
+    'fields-title-description': 'the title and description',
+    'fields-title-details': 'the title and details',
+    'fields-description-details': 'the description and details',
+    'fields-all': 'the title, description and details',
+    'now': 'now',
+    'home-today-link': "all of today's activities →"
+  };
+  // --- end owner-facing strings ---
+
+  const fmt = (key, vars) => String(STRINGS[key] ?? '').replace(/\{(\w+)\}/g, (m, k) => (vars && vars[k] != null ? String(vars[k]) : m));
+  const cssId = (v) => (window.CSS && CSS.escape ? CSS.escape(String(v)) : String(v).replace(/["\\]/g, '\\$&'));
+
+  const ACTOR_HEADER = 'x-solstone-actor';
+  const ACTOR_OWNER = 'owner';
+
+  const esc = (s) => (window.AppServices?.escapeHtml ? window.AppServices.escapeHtml(s) : String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])));
+
+  const MONTHS_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+  const state = {
+    day: null,
+    facet: null,
+    includeHidden: false,
+    view: null,
+    selectedFacet: null,
+    selectedId: null,
+    editing: false,
+    isDirty: false,
+    expandedEvidence: false,
+    outlineBlock: null,
+    fetchSequence: 0,
+    justHidden: null,
+    listboxOpen: false
+  };
+
+  function parsePathDay() {
+    const m = window.location.pathname.match(/\/app\/activities\/(\d{8})/);
+    return m ? m[1] : (window.JournalClock ? window.JournalClock.today() : '');
+  }
+
+  function readUrlParams() {
+    const params = new URLSearchParams(window.location.search);
+    state.facet = params.get('facet') || null;
+    const hash = (window.location.hash || '').replace(/^#/, '');
+    if (hash) {
+      const slash = hash.indexOf('/');
+      if (slash !== -1) {
+        state.selectedFacet = decodeURIComponent(hash.slice(0, slash));
+        state.selectedId = decodeURIComponent(hash.slice(slash + 1));
+      } else {
+        state.selectedId = decodeURIComponent(hash);
+        state.selectedFacet = null;
+      }
+    } else {
+      state.selectedFacet = null;
+      state.selectedId = null;
+    }
+  }
+
+  function isMobile() {
+    return window.matchMedia ? window.matchMedia('(max-width: 700px)').matches : false;
+  }
+
+  function formatInstant(timestamp) {
+    if (!timestamp) return '';
+    try {
+      const d = new Date(timestamp);
+      if (isNaN(d.getTime())) return '';
+      if (window.JournalClock && window.JournalClock.parts) {
+        const p = window.JournalClock.parts(d);
+        const m = MONTHS_SHORT[Number(p.month) - 1] || '';
+        const day = String(p.day);
+        const hr = String(p.hour).padStart(2, '0');
+        const min = String(p.minute).padStart(2, '0');
+        return `${m} ${day}, ${hr}:${min}`;
+      }
+      const m = MONTHS_SHORT[d.getUTCMonth()];
+      const day = String(d.getUTCDate());
+      const hr = String(d.getUTCHours()).padStart(2, '0');
+      const min = String(d.getUTCMinutes()).padStart(2, '0');
+      return `${m} ${day}, ${hr}:${min}`;
+    } catch {
+      return '';
+    }
+  }
+
+  function formatPeople(people) {
+    if (!Array.isArray(people) || !people.length) return '';
+    if (people.length === 1) return fmt('people-one', { a: people[0] });
+    if (people.length === 2) return fmt('people-two', { a: people[0], b: people[1] });
+    const rem = people.length - 2;
+    return fmt(rem === 1 ? 'people-many-one' : 'people-many', { a: people[0], b: people[1], n: rem });
+  }
+
+  function formatFieldList(fields) {
+    const arr = Array.isArray(fields) ? fields : [];
+    const hasTitle = arr.includes('title');
+    const hasDesc = arr.includes('description');
+    const hasDetails = arr.includes('details');
+    if (hasTitle && hasDesc && hasDetails) return STRINGS['fields-all'];
+    if (hasTitle && hasDetails) return STRINGS['fields-title-details'];
+    if (hasTitle && hasDesc) return STRINGS['fields-title-description'];
+    if (hasTitle) return STRINGS['fields-title'];
+    if (hasDesc && hasDetails) return STRINGS['fields-description-details'];
+    if (hasDesc) return STRINGS['fields-description'];
+    if (hasDetails) return STRINGS['fields-details'];
+    return '';
+  }
+
+  let viewLoadedOnce = false;
+
+  async function fetchView() {
+    const seq = ++state.fetchSequence;
+    const params = new URLSearchParams();
+    if (state.facet) params.set('facet', state.facet);
+    if (state.includeHidden) params.set('include_hidden', '1');
+    const q = params.toString() ? '?' + params.toString() : '';
+    const url = `/app/activities/api/day/${state.day}/view${q}`;
+
+    try {
+      const data = await (window.apiJson ? window.apiJson(url) : fetch(url).then(r => r.json()));
+      if (seq !== state.fetchSequence) return;
+      state.view = data;
+      viewLoadedOnce = true;
+      showContent();
+
+      // Validate facet
+      if (state.facet && Array.isArray(data.facets)) {
+        const found = data.facets.some(f => f.name === state.facet);
+        if (!found) {
+          const u = new URL(window.location.href);
+          u.searchParams.delete('facet');
+          window.history.replaceState(null, '', u.pathname + (u.search ? u.search : '') + u.hash);
+          state.facet = null;
+          fetchView();
+          const host = document.querySelector('[data-date-nav]');
+          if (host && typeof host.refresh === 'function') host.refresh();
+          return;
+        }
+      }
+
+      // Validate selection (a record just hidden stays selected so its unhide is reachable)
+      if (state.selectedId) {
+        const item = (data.items || []).find(it => it.id === state.selectedId && (!state.selectedFacet || it.facet === state.selectedFacet));
+        if (!item && !justHiddenMatches(state.selectedId, state.selectedFacet)) {
+          const u = new URL(window.location.href);
+          u.hash = '';
+          window.history.replaceState(null, '', u.pathname + u.search);
+          state.selectedId = null;
+          state.selectedFacet = null;
+        }
+      }
+
+      render();
+    } catch (err) {
+      if (seq !== state.fetchSequence) return;
+      const stateArea = document.querySelector('[data-state-area]');
+      if (!stateArea || !window.SurfaceState) return;
+      const errorHtml = window.SurfaceState.error({ heading: STRINGS['load-error'], retry: true, detail: err });
+      if (!viewLoadedOnce) {
+        stateArea.innerHTML = errorHtml;
+        stateArea.setAttribute('data-state', 'error');
+        stateArea.querySelector('.surface-state-retry')?.addEventListener('click', () => {
+          showLoading();
+          fetchView();
+        });
+      } else {
+        clearRefreshError();
+        window.SurfaceState.replaceLoading('act-state-area', errorHtml);
+        const refreshError = stateArea.nextElementSibling;
+        if (refreshError && refreshError.classList.contains('surface-state-refresh-error')) {
+          refreshError.querySelector('.surface-state-retry')?.addEventListener('click', () => fetchView());
+        }
+      }
+    }
+  }
+
+  function showLoading() {
+    const stateArea = document.querySelector('[data-state-area]');
+    if (stateArea && window.SurfaceState) {
+      stateArea.innerHTML = window.SurfaceState.loading({ text: STRINGS['loading'] });
+      stateArea.setAttribute('data-state', 'loading');
+    }
+  }
+
+  function clearRefreshError() {
+    const stateArea = document.querySelector('[data-state-area]');
+    const next = stateArea && stateArea.nextElementSibling;
+    if (next && next.classList.contains('surface-state-refresh-error')) next.remove();
+  }
+
+  function showContent() {
+    const stateArea = document.querySelector('[data-state-area]');
+    if (stateArea) {
+      stateArea.innerHTML = '';
+      stateArea.removeAttribute('data-state');
+    }
+    clearRefreshError();
+    const content = document.querySelector('[data-content-area]');
+    if (content) content.hidden = false;
+  }
+
+  function justHiddenMatches(id, facet) {
+    const jh = state.justHidden;
+    return Boolean(jh && jh.item.id === id && (!facet || jh.item.facet === facet));
+  }
+
+  function computeDayContext() {
+    if (!window.JournalClock) return 'past';
+    const today = window.JournalClock.today();
+    if (state.day === today) return 'today';
+    return state.day > today ? 'future' : 'past';
+  }
+
+  function render() {
+    if (!state.view) return;
+    renderHeader();
+    renderMain();
+    renderPanel();
+  }
+
+  function renderHeader() {
+    // Scope listbox
+    const labelEl = document.querySelector('[data-scope-label]');
+    const listboxEl = document.querySelector('[data-scope-listbox]');
+    const btnEl = document.querySelector('[data-scope-btn]');
+    const facets = state.view.facets || [];
+
+    const nonMutedTotal = facets.filter(f => !f.muted).reduce((sum, f) => sum + (f.count || 0), 0);
+    const selectedObj = state.facet ? facets.find(f => f.name === state.facet) : null;
+    if (labelEl) {
+      labelEl.textContent = selectedObj ? fmt('scope-facet', { facet: selectedObj.title || selectedObj.name }) : STRINGS['scope-all'];
+      labelEl.setAttribute('data-copy-key', selectedObj ? 'scope-facet' : 'scope-all');
+    }
+
+    // Border tint: columns region only, not whole content area
+    const columnsArea = document.querySelector('[data-columns-area]');
+    if (columnsArea) {
+      columnsArea.style.borderTopColor = selectedObj && selectedObj.color ? selectedObj.color : 'transparent';
+    }
+
+    if (listboxEl) {
+      let opts = `<li class="act-scope-option" role="option" aria-selected="${state.facet === null}" data-facet="" tabindex="-1"><span data-copy-key="scope-all-option">${STRINGS['scope-all-option']}</span><span class="act-scope-count">${nonMutedTotal}</span></li>`;
+      facets.filter(f => !f.muted).forEach(f => {
+        const dot = f.color ? `<span class="act-scope-dot" style="background-color: ${esc(f.color)}"></span>` : '';
+        opts += `<li class="act-scope-option" role="option" aria-selected="${state.facet === f.name}" data-facet="${esc(f.name)}" tabindex="-1"><span>${dot} ${esc(f.title || f.name)}</span><span class="act-scope-count">${f.count || 0}</span></li>`;
+      });
+      facets.filter(f => f.muted).forEach(f => {
+        const dot = f.color ? `<span class="act-scope-dot" style="background-color: ${esc(f.color)}"></span>` : '';
+        opts += `<li class="act-scope-option act-scope-option--muted" role="option" aria-selected="${state.facet === f.name}" data-facet="${esc(f.name)}" tabindex="-1"><span>${dot} ${esc(f.title || f.name)}</span><span class="act-scope-count">${f.count || 0}</span></li>`;
+      });
+      listboxEl.innerHTML = opts;
+    }
+
+    // Note under heading
+    const noteEl = document.querySelector('[data-day-note]');
+    if (noteEl) {
+      const ctx = computeDayContext();
+      if (ctx === 'today') {
+        noteEl.textContent = STRINGS['today-note'];
+        noteEl.setAttribute('data-copy-key', 'today-note');
+        noteEl.hidden = false;
+      } else if (ctx === 'future') {
+        noteEl.textContent = STRINGS['future-note'];
+        noteEl.setAttribute('data-copy-key', 'future-note');
+        noteEl.hidden = false;
+      } else {
+        noteEl.hidden = true;
+      }
+    }
+  }
+
+  function renderMain() {
+    const items = state.view.items || [];
+    const untimedArea = document.querySelector('[data-untimed-area]');
+    const untimedList = document.querySelector('[data-untimed-list]');
+    const timelineWrap = document.querySelector('[data-timeline-wrap]');
+    const footerArea = document.querySelector('[data-footer-area]');
+    const emptyArea = document.querySelector('[data-empty-area]');
+    const blocksContainer = document.querySelector('[data-blocks-container]');
+    const timeAxis = document.querySelector('[data-time-axis]');
+    const gridLines = document.querySelector('[data-grid-lines]');
+    const nowLine = document.querySelector('[data-now-line]');
+
+    const untimed = items.filter(it => it.start_min == null);
+    const timed = items.filter(it => it.start_min != null);
+    // A record just hidden keeps its place as an outline, laid out like any block,
+    // so the records beside it keep their lanes until the owner moves on.
+    const outlineItem = state.outlineBlock && state.justHidden && !state.includeHidden
+      && state.justHidden.item.start_min != null
+      && !timed.some(it => it.id === state.justHidden.item.id && it.facet === state.justHidden.item.facet)
+      ? { ...state.justHidden.item, _outline: true }
+      : null;
+    if (outlineItem) timed.push(outlineItem);
+
+    // Empty state check
+    if (!items.length && !outlineItem) {
+      if (timelineWrap) timelineWrap.hidden = true;
+      if (untimedArea) untimedArea.hidden = true;
+      if (emptyArea) {
+        emptyArea.hidden = false;
+        const ctx = computeDayContext();
+        if (state.facet) {
+          const facets = state.view.facets || [];
+          const otherHasCounts = facets.some(f => !f.muted && f.name !== state.facet && f.count > 0);
+          if (otherHasCounts) {
+            const chosen = facets.find(f => f.name === state.facet);
+            emptyArea.innerHTML = `<h2 class="act-empty-heading" data-copy-key="empty-facet-heading">${esc(fmt('empty-facet-heading', { facet: chosen ? (chosen.title || chosen.name) : state.facet }))}</h2><p class="act-empty-body" data-copy-key="empty-facet-body">${STRINGS['empty-facet-body']}</p><button type="button" class="act-empty-btn" data-copy-key="empty-facet-show-all">${STRINGS['empty-facet-show-all']}</button>`;
+            emptyArea.querySelector('[data-copy-key="empty-facet-show-all"]')?.addEventListener('click', () => {
+              selectFacet(null);
+            });
+          } else {
+            renderGenericEmpty(emptyArea, ctx);
+          }
+        } else {
+          renderGenericEmpty(emptyArea, ctx);
+        }
+      }
+      renderFooter();
+      return;
+    }
+
+    if (emptyArea) emptyArea.hidden = true;
+    if (timelineWrap) timelineWrap.hidden = false;
+
+    // Untimed render
+    if (untimed.length) {
+      untimedArea.hidden = false;
+      let uhtml = '';
+      untimed.forEach(it => {
+        const fObj = (state.view.facets || []).find(f => f.name === it.facet);
+        const fColor = fObj && fObj.color ? fObj.color : '';
+        const dot = !state.facet && fColor ? `<span class="act-block-dot" style="background-color: ${esc(fColor)}"></span>` : '';
+        uhtml += `<button type="button" class="act-untimed-row" data-id="${esc(it.id)}" data-facet="${esc(it.facet)}">${dot}<span class="act-untimed-label">${esc(it.activity_label || it.kind)}</span><span class="act-untimed-title">${esc(it.title)}</span></button>`;
+      });
+      untimedList.innerHTML = uhtml;
+    } else {
+      untimedArea.hidden = true;
+    }
+
+    // Time scale calculation
+    const hourHeight = isMobile() ? 70 : 78;
+    let minMinute = 8 * 60;
+    let maxMinute = 18 * 60;
+
+    const ctx = computeDayContext();
+    let nowMinute = null;
+    if (ctx === 'today' && window.JournalClock && window.JournalClock.parts) {
+      const parts = window.JournalClock.parts();
+      nowMinute = parts.hour * 60 + parts.minute;
+    }
+
+    if (timed.length) {
+      minMinute = Math.min(...timed.map(it => it.start_min));
+      maxMinute = Math.max(...timed.map(it => {
+        const span = it.end_min != null ? (it.end_min - it.start_min) : (it.kind === 'plan' ? 15 : 24);
+        return it.start_min + Math.max(24, span);
+      }));
+      if (nowMinute != null) {
+        minMinute = Math.min(minMinute, nowMinute);
+        maxMinute = Math.max(maxMinute, nowMinute);
+      }
+    } else if (nowMinute != null) {
+      minMinute = Math.min(minMinute, nowMinute);
+      maxMinute = Math.max(maxMinute, nowMinute);
+    }
+
+    const startHour = Math.floor(minMinute / 60);
+    const endHour = Math.ceil(maxMinute / 60);
+    const totalHours = Math.max(1, endHour - startHour);
+    const totalHeight = totalHours * hourHeight;
+
+    timelineWrap.style.height = `${totalHeight}px`;
+
+    // Render axis and grid lines
+    let axisHtml = '';
+    let gridHtml = '';
+    for (let h = startHour; h <= endHour; h++) {
+      const top = (h - startHour) * hourHeight;
+      const displayHour = (h % 24 + 24) % 24;
+      const label = `${String(displayHour).padStart(2, '0')}:00`;
+      axisHtml += `<div class="act-time-label" style="top: ${top}px">${label}</div>`;
+      if (h < endHour) {
+        gridHtml += `<div class="act-grid-line" style="top: ${top}px"></div>`;
+        gridHtml += `<div class="act-grid-line act-grid-line--half" style="top: ${top + hourHeight / 2}px"></div>`;
+      } else {
+        gridHtml += `<div class="act-grid-line" style="top: ${top}px"></div>`;
+      }
+    }
+    timeAxis.innerHTML = axisHtml;
+    gridLines.innerHTML = gridHtml;
+
+    // Now line
+    if (nowMinute != null && nowMinute >= startHour * 60 && nowMinute <= endHour * 60) {
+      const nowTop = ((nowMinute - startHour * 60) / 60) * hourHeight;
+      nowLine.style.top = `${nowTop}px`;
+      nowLine.hidden = false;
+    } else {
+      nowLine.hidden = true;
+    }
+
+    // Lane allocation & block preparation
+    const processed = timed.map(it => {
+      const rawSpan = it.end_min != null ? (it.end_min - it.start_min) : (it.kind === 'plan' ? 15 : 24);
+      const drawnSpan = Math.max(24, rawSpan);
+      return {
+        ...it,
+        drawn_span: drawnSpan,
+        drawn_end: it.start_min + drawnSpan
+      };
+    });
+
+    // Sort: start_min asc, drawn_span desc, id asc
+    processed.sort((a, b) => {
+      if (a.start_min !== b.start_min) return a.start_min - b.start_min;
+      if (a.drawn_span !== b.drawn_span) return b.drawn_span - a.drawn_span;
+      return a.id.localeCompare(b.id);
+    });
+
+    // Group into clusters of transitive overlap
+    const clusters = [];
+    let currentCluster = [];
+    let clusterEnd = -1;
+
+    processed.forEach(item => {
+      if (!currentCluster.length) {
+        currentCluster.push(item);
+        clusterEnd = item.drawn_end;
+      } else if (item.start_min < clusterEnd) {
+        currentCluster.push(item);
+        clusterEnd = Math.max(clusterEnd, item.drawn_end);
+      } else {
+        clusters.push(currentCluster);
+        currentCluster = [item];
+        clusterEnd = item.drawn_end;
+      }
+    });
+    if (currentCluster.length) clusters.push(currentCluster);
+
+    // Assign lanes per cluster
+    clusters.forEach(cluster => {
+      const laneEnds = [];
+      cluster.forEach(item => {
+        let assignedLane = -1;
+        for (let i = 0; i < laneEnds.length; i++) {
+          if (laneEnds[i] <= item.start_min) {
+            assignedLane = i;
+            laneEnds[i] = item.drawn_end;
+            break;
+          }
+        }
+        if (assignedLane === -1) {
+          assignedLane = laneEnds.length;
+          laneEnds.push(item.drawn_end);
+        }
+        item.lane = assignedLane;
+      });
+      const laneCount = Math.max(1, laneEnds.length);
+      cluster.forEach(item => {
+        item.cluster_lanes = laneCount;
+        item.fraction = laneCount === 1 ? '1' : `1/${laneCount}`;
+      });
+    });
+
+    // Sort for DOM order: start_min asc, lane asc
+    processed.sort((a, b) => {
+      if (a.start_min !== b.start_min) return a.start_min - b.start_min;
+      return a.lane - b.lane;
+    });
+
+    // Render blocks
+    let bhtml = '';
+    processed.forEach(item => {
+      const top = ((item.start_min - startHour * 60) / 60) * hourHeight;
+      const height = (item.drawn_span / 60) * hourHeight;
+      const leftPct = (item.lane / item.cluster_lanes) * 100;
+      const widthPct = (1 / item.cluster_lanes) * 100;
+
+      if (item._outline) {
+        const undoIcon = window.ConveyIcons ? window.ConveyIcons.svg('undo-2') : '';
+        bhtml += `<div class="act-block-outline" data-copy-key="hidden-outline" style="top: ${top}px; height: ${height}px; left: ${leftPct}%; width: ${widthPct}%;"><span>${STRINGS['hidden-outline']}</span><button type="button" class="act-unhide-btn" data-copy-key="unhide" data-outline-unhide="${esc(item.id)}" data-facet="${esc(item.facet)}">${undoIcon} ${STRINGS['unhide']}</button></div>`;
+        return;
+      }
+
+      const isPlan = item.kind === 'plan';
+      const isSelected = item.id === state.selectedId && (!state.selectedFacet || item.facet === state.selectedFacet);
+      const isHidden = Boolean(item.hidden);
+      const isShort = item.drawn_span < 40;
+
+      let classes = 'act-block';
+      if (isPlan) classes += ' act-block--plan';
+      if (isHidden) classes += ' act-block--hidden';
+      if (isSelected) classes += ' act-block--selected';
+      if (isShort) classes += ' act-block--short';
+
+      // Accessible label
+      const timeRange = item.end_min != null ? `${item.start}–${item.end}` : item.start;
+      const facetObj = (state.view.facets || []).find(f => f.name === item.facet);
+      const facetTitle = facetObj ? (facetObj.title || facetObj.name) : item.facet;
+      const streamWords = item.concurrent && window.JournalFormat?.hasStreamLabel?.(item.stream) ? window.JournalFormat.stream(item.stream) : '';
+      const stateWords = [isPlan ? STRINGS['cue-planned'] : '', isHidden ? STRINGS['hidden-outline'] : ''].filter(Boolean).join(', ');
+      const ariaLabel = `${timeRange}, ${facetTitle}${streamWords ? ', ' + streamWords : ''}${stateWords ? ', ' + stateWords : ''}: ${item.title}`;
+
+      // Line 1
+      const facetColor = facetObj && facetObj.color ? facetObj.color : '';
+      const dot = !state.facet && facetColor ? `<span class="act-block-dot" style="background-color: ${esc(facetColor)}"></span>` : '';
+      const pencil = item.edited_by_owner && window.ConveyIcons ? `<span class="act-block-icon">${window.ConveyIcons.svg('pencil')}</span>` : '';
+      const line1 = `<div class="act-block-line1">${dot}<span class="act-block-time">${esc(timeRange)}</span>${pencil}</div>`;
+
+      // Line 2
+      const sourceSpan = streamWords ? `<span class="act-block-source" title="${esc(item.stream)}">${esc(streamWords)}</span>` : '';
+      const planIcon = isPlan && window.ConveyIcons ? `<span class="act-block-icon">${window.ConveyIcons.svg('calendar')}</span> ` : '';
+      const eyeIcon = isHidden && window.ConveyIcons ? `<span class="act-block-icon">${window.ConveyIcons.svg('eye-off')}</span> ` : '';
+      const line2 = `<div class="act-block-line2">${sourceSpan}<span class="act-block-title">${planIcon}${eyeIcon}${esc(item.title)}</span></div>`;
+
+      bhtml += `<button type="button" class="${classes}" data-id="${esc(item.id)}" data-facet="${esc(item.facet)}" data-lane="${item.lane}" data-width="${item.fraction}" data-drawn-minutes="${item.drawn_span}" style="top: ${top}px; height: ${height}px; left: ${leftPct}%; width: ${widthPct}%;" aria-pressed="${isSelected}" aria-label="${esc(ariaLabel)}">${line1}${line2}</button>`;
+    });
+
+    blocksContainer.innerHTML = bhtml;
+    renderFooter();
+  }
+
+  function renderGenericEmpty(emptyArea, ctx) {
+    if (ctx === 'past') {
+      emptyArea.innerHTML = `<h2 class="act-empty-heading" data-copy-key="empty-past-heading">${STRINGS['empty-past-heading']}</h2><p class="act-empty-body" data-copy-key="empty-past-body">${STRINGS['empty-past-body']}</p>`;
+    } else if (ctx === 'today') {
+      emptyArea.innerHTML = `<h2 class="act-empty-heading" data-copy-key="empty-today-heading">${STRINGS['empty-today-heading']}</h2><p class="act-empty-body" data-copy-key="empty-today-body">${STRINGS['empty-today-body']}</p>`;
+    } else {
+      emptyArea.innerHTML = `<h2 class="act-empty-heading" data-copy-key="empty-future-heading">${STRINGS['empty-future-heading']}</h2><p class="act-empty-body" data-copy-key="empty-future-body">${STRINGS['empty-future-body']}</p>`;
+    }
+  }
+
+  function renderFooter() {
+    const footerArea = document.querySelector('[data-footer-area]');
+    if (!footerArea) return;
+    const count = state.view.hidden_count || 0;
+    if (count > 0) {
+      footerArea.hidden = false;
+      const label = footerArea.querySelector('[data-copy-key="hidden-footer"]') || footerArea.querySelector('[data-copy-key="showing-hidden"]') || footerArea.querySelector('.act-footer-count');
+      if (label) {
+        if (state.includeHidden) {
+          label.textContent = fmt('showing-hidden', { n: count });
+          label.setAttribute('data-copy-key', 'showing-hidden');
+        } else {
+          label.textContent = fmt('hidden-footer', { n: count });
+          label.setAttribute('data-copy-key', 'hidden-footer');
+        }
+      }
+      const btn = footerArea.querySelector('[data-toggle-hidden]');
+      if (btn) {
+        btn.textContent = state.includeHidden ? STRINGS['stop-showing-hidden'] : STRINGS['show-hidden'];
+        btn.setAttribute('data-copy-key', state.includeHidden ? 'stop-showing-hidden' : 'show-hidden');
+      }
+    } else {
+      footerArea.hidden = true;
+    }
+  }
+
+  function renderPanel() {
+    const panelArea = document.querySelector('[data-panel-area]');
+    if (!panelArea) return;
+
+    const items = state.view.items || [];
+    const mobile = isMobile();
+
+    // Reconcile dialog role
+    if (mobile && state.selectedId) {
+      panelArea.setAttribute('role', 'dialog');
+      panelArea.setAttribute('aria-modal', 'true');
+    } else {
+      panelArea.removeAttribute('role');
+      panelArea.removeAttribute('aria-modal');
+    }
+
+    if (!state.selectedId || (!items.length && !justHiddenMatches(state.selectedId, state.selectedFacet))) {
+      if (mobile) {
+        panelArea.hidden = true;
+        panelArea.innerHTML = '';
+      } else {
+        panelArea.hidden = false;
+        if (!items.length) {
+          panelArea.innerHTML = '';
+        } else {
+          const ctx = computeDayContext();
+          const pickKey = ctx === 'future' ? 'empty-pick-plan' : 'empty-pick';
+          panelArea.innerHTML = `<div class="act-panel-empty" data-copy-key="${pickKey}">${STRINGS[pickKey]}</div>`;
+        }
+      }
+      return;
+    }
+
+    panelArea.hidden = false;
+    const found = items.find(it => it.id === state.selectedId && (!state.selectedFacet || it.facet === state.selectedFacet));
+    const justHidden = !found && justHiddenMatches(state.selectedId, state.selectedFacet);
+    const item = found || (justHidden ? { ...state.justHidden.item, hidden: true, hidden_reason: 'owner' } : null);
+    if (!item) {
+      panelArea.innerHTML = '';
+      return;
+    }
+
+    if (state.editing) {
+      renderEditForm(panelArea, item);
+      return;
+    }
+
+    let phtml = '';
+    if (mobile) {
+      phtml += `<div class="act-panel-grab"></div><button type="button" class="act-btn" data-copy-key="sheet-close" data-close-sheet style="align-self: flex-end;">${STRINGS['sheet-close']}</button>`;
+    }
+
+    // Title
+    const isPlan = item.kind === 'plan';
+    const calIcon = isPlan && window.ConveyIcons ? window.ConveyIcons.svg('calendar') + ' ' : '';
+    phtml += `<div class="act-panel-header"><div class="act-panel-title-wrap"><h2 class="act-panel-title">${calIcon}${esc(item.title)}</h2></div>`;
+
+    // Meta
+    const timeRange = item.end_min != null ? `${item.start}–${item.end}` : item.start;
+    const facetObj = (state.view.facets || []).find(f => f.name === item.facet);
+    const facetTitle = facetObj ? (facetObj.title || facetObj.name) : item.facet;
+    const dot = !state.facet && facetObj && facetObj.color ? `<span class="act-block-dot" style="background-color: ${esc(facetObj.color)}"></span>` : '';
+    const plannedCue = isPlan ? `<span class="act-cue" data-copy-key="cue-planned">${STRINGS['cue-planned']}</span>` : '';
+    const editedCue = item.edited_by_owner ? `<span class="act-cue" data-copy-key="cue-edited">${STRINGS['cue-edited']}</span>` : '';
+    let metaSource = '';
+    if (item.mixed) {
+      metaSource = STRINGS['source-mixed'];
+    } else if (item.stream && item.stream !== '_default' && window.JournalFormat?.hasStreamLabel?.(item.stream)) {
+      metaSource = window.JournalFormat.stream(item.stream);
+    } else if (item.kind === 'detected') {
+      metaSource = STRINGS['source-unknown'];
+    }
+    const metaSourceHtml = metaSource ? `<span class="act-panel-source">${esc(metaSource)}</span> · ` : '';
+    phtml += `<div class="act-panel-meta"><span class="act-panel-time">${esc(timeRange)}</span> · ${metaSourceHtml}<span class="act-panel-kind">${esc(item.activity_label || item.kind)}</span> · <span>${dot} ${esc(facetTitle)}</span>${plannedCue}${editedCue}</div></div>`;
+
+    // Hidden status & reason line
+    if (item.hidden) {
+      if (justHidden) {
+        phtml += `<div class="act-panel-status" role="status" data-copy-key="hidden-status">${STRINGS['hidden-status']}</div>`;
+      }
+      const reasonKey = `reason-${item.hidden_reason || 'other'}`;
+      phtml += `<div class="act-panel-hidden-reason" data-copy-key="${reasonKey}">${STRINGS[reasonKey] || STRINGS['reason-other']}</div>`;
+    }
+
+    // Summary & People for non-plan
+    if (!isPlan) {
+      if (item.summary != null) {
+        phtml += `<div class="act-panel-section"><h3 class="act-panel-heading" data-copy-key="heading-summary">${STRINGS['heading-summary']}</h3><p class="act-panel-text">${esc(item.summary)}</p></div>`;
+      }
+      if (item.people?.length) {
+        phtml += `<div class="act-panel-people" data-copy-key="people">${esc(formatPeople(item.people))}</div>`;
+      }
+    }
+
+    // Description
+    if (item.description && item.description !== item.title) {
+      phtml += `<div class="act-panel-section"><h3 class="act-panel-heading" data-copy-key="heading-description">${STRINGS['heading-description']}</h3><p class="act-panel-text">${esc(item.description)}</p></div>`;
+    }
+
+    // Details
+    if (item.details) {
+      phtml += `<div class="act-panel-section"><h3 class="act-panel-heading" data-copy-key="heading-details">${STRINGS['heading-details']}</h3><p class="act-panel-text">${esc(item.details)}</p></div>`;
+    }
+
+    // Evidence
+    if (!isPlan && item.segments?.length) {
+      const count = item.segments.length;
+      const shown = state.expandedEvidence ? item.segments : item.segments.slice(0, 4);
+      const openKey = mobile ? 'evidence-open-narrow' : 'evidence-open';
+      let eitems = '';
+      shown.forEach(seg => {
+        const key = seg.key || '';
+        const stream = seg.stream || null;
+        const href = stream ? `/app/transcripts/${state.day}?stream=${encodeURIComponent(stream)}#${encodeURIComponent(key)}` : `/app/transcripts/${state.day}#${encodeURIComponent(key)}`;
+        let parts = [];
+        if (seg.start) parts.push(seg.start);
+        if (seg.seconds != null) {
+          const m = Math.max(1, Math.round(seg.seconds / 60));
+          parts.push(fmt('segment-minutes', { n: m }));
+        }
+        let segText = parts.join(' · ');
+        if (item.mixed && seg.stream) {
+          const segStreamWords = window.JournalFormat?.hasStreamLabel?.(seg.stream) ? window.JournalFormat.stream(seg.stream) : seg.stream;
+          if (segStreamWords) segText += ` · ${segStreamWords}`;
+        }
+        eitems += `<li class="act-panel-evidence-item"><span data-copy-key="evidence-segment">${esc(segText)}</span><a class="act-panel-evidence-link" href="${esc(href)}" data-copy-key="${openKey}">${STRINGS[openKey]}</a></li>`;
+      });
+      const showAllBtn = (!state.expandedEvidence && count > 4) ? `<button type="button" class="act-btn" data-copy-key="evidence-show-all" data-expand-evidence>${esc(fmt('evidence-show-all', { n: count }))}</button>` : '';
+
+      let srcWords = '';
+      if (item.mixed) {
+        srcWords = STRINGS['source-mixed'];
+      } else if (!item.stream || item.stream === '_default' || !window.JournalFormat?.hasStreamLabel?.(item.stream)) {
+        srcWords = STRINGS['source-unknown-phrase'];
+      } else {
+        srcWords = window.JournalFormat.stream(item.stream);
+      }
+      const timePart = item.end ? `${item.start}–${item.end}` : (item.start || '');
+      const countLine = fmt(count === 1 ? 'segments-one' : 'segments-many', { n: count, source: srcWords, range: timePart });
+
+      phtml += `<div class="act-panel-section"><h3 class="act-panel-heading" data-copy-key="evidence-heading">${STRINGS['evidence-heading']}</h3><div class="act-panel-text" data-copy-key="evidence-count">${esc(countLine)}</div><ul class="act-panel-evidence-list">${eitems}</ul>${showAllBtn}</div>`;
+    }
+
+    // Plan origin
+    if (isPlan) {
+      const ctx = computeDayContext();
+      const originKey = ctx === 'future' ? 'plan-origin-future' : 'plan-origin';
+      phtml += `<div class="act-panel-section"><h3 class="act-panel-heading" data-copy-key="plan-heading">${STRINGS['plan-heading']}</h3><div class="act-panel-text" data-copy-key="${originKey}">${STRINGS[originKey]}</div>`;
+      if (item.people?.length) {
+        phtml += `<div class="act-panel-people" data-copy-key="people">${esc(formatPeople(item.people))}</div>`;
+      }
+      phtml += `</div>`;
+    }
+
+    // History
+    const historyEntries = [];
+    if (item.kind === 'detected' && item.found_at) {
+      const foundDate = formatInstant(item.found_at);
+      let foundKey = 'history-found-unknown';
+      let streamWords = '';
+      if (item.mixed) {
+        foundKey = 'history-found-mixed';
+      } else if (item.stream && item.stream !== '_default' && window.JournalFormat?.hasStreamLabel?.(item.stream)) {
+        foundKey = 'history-found';
+        streamWords = window.JournalFormat.stream(item.stream);
+      } else {
+        foundKey = 'history-found-unknown';
+      }
+      let foundText = STRINGS[foundKey];
+      if (foundKey === 'history-found') {
+        foundText = fmt('history-found', { stream: streamWords });
+      }
+      const foundInstant = new Date(item.found_at).getTime();
+      historyEntries.push({
+        instant: isNaN(foundInstant) ? 0 : foundInstant,
+        isFound: true,
+        html: `<li class="act-panel-history-item"><span data-copy-key="${foundKey}">${esc(foundText)}</span>${foundDate ? `<span class="act-panel-history-date">${esc(foundDate)}</span>` : ''}</li>`
+      });
+    }
+
+    (item.edits || []).forEach((ed, idx) => {
+      if (ed.kind === 'other') return;
+      const dateStr = ed.timestamp ? formatInstant(ed.timestamp) : '';
+      let kindKey = null;
+      switch (ed.kind) {
+        case 'grew': kindKey = 'history-grew'; break;
+        case 'plan_noticed': kindKey = 'history-plan-noticed'; break;
+        case 'plan_updated': kindKey = 'history-plan-updated'; break;
+        case 'plan_replaced': kindKey = 'history-plan-replaced'; break;
+        case 'owner_update': kindKey = 'history-you-changed'; break;
+        case 'owner_hide': kindKey = 'history-you-hid'; break;
+        case 'owner_unhide': kindKey = 'history-you-unhid'; break;
+        case 'command_update': kindKey = 'history-cli-changed'; break;
+        case 'command_hide': kindKey = 'history-cli-hid'; break;
+        case 'command_unhide': kindKey = 'history-cli-unhid'; break;
+        case 'command_create': kindKey = 'history-cli-added'; break;
+        default: kindKey = null; break;
+      }
+      let editHtml = '';
+      if (kindKey) {
+        let label = STRINGS[kindKey];
+        if (kindKey === 'history-you-changed') {
+          label = fmt('history-you-changed', { fields: formatFieldList(ed.fields) });
+        }
+        editHtml += `<li class="act-panel-history-item"><span data-copy-key="${kindKey}">${esc(label)}</span>${dateStr ? `<span class="act-panel-history-date">${esc(dateStr)}</span>` : ''}</li>`;
+      }
+      if (ed.cancelled) {
+        editHtml += `<li class="act-panel-history-item"><span data-copy-key="history-cancelled">${STRINGS['history-cancelled']}</span>${dateStr ? `<span class="act-panel-history-date">${esc(dateStr)}</span>` : ''}</li>`;
+      }
+      if (editHtml) {
+        const editInstant = ed.timestamp ? new Date(ed.timestamp).getTime() : null;
+        historyEntries.push({
+          instant: editInstant != null && !isNaN(editInstant) ? editInstant : null,
+          index: idx,
+          isFound: false,
+          html: editHtml
+        });
+      }
+    });
+
+    historyEntries.sort((a, b) => {
+      if (a.instant != null && b.instant != null) return a.instant - b.instant;
+      if (a.instant == null && b.instant != null) return 1;
+      if (a.instant != null && b.instant == null) return -1;
+      return (a.index || 0) - (b.index || 0);
+    });
+
+    phtml += `<div class="act-panel-section"><h3 class="act-panel-heading" data-copy-key="heading-history">${STRINGS['heading-history']}</h3><ul class="act-panel-history-list">${historyEntries.map(e => e.html).join('')}</ul></div>`;
+
+    // Actions
+    phtml += `<div class="act-panel-actions">`;
+    if (!item.hidden) {
+      phtml += `<button type="button" class="act-btn" data-copy-key="action-edit" data-action-edit>${STRINGS['action-edit']}</button>`;
+      phtml += `<button type="button" class="act-btn" data-copy-key="action-hide" data-action-hide>${STRINGS['action-hide']}</button>`;
+    } else if (item.hidden_reason === 'owner' || item.hidden_reason === 'command') {
+      phtml += `<button type="button" class="act-btn" data-copy-key="action-unhide" data-action-unhide>${STRINGS['action-unhide']}</button>`;
+    }
+    phtml += `<span class="control-save-error" role="alert" data-control-save-error hidden></span>`;
+    phtml += `</div>`;
+
+    panelArea.innerHTML = phtml;
+
+    // Bind panel events
+    panelArea.querySelector('[data-close-sheet]')?.addEventListener('click', () => {
+      closePanel();
+    });
+    panelArea.querySelector('[data-expand-evidence]')?.addEventListener('click', () => {
+      state.expandedEvidence = true;
+      renderPanel();
+    });
+    panelArea.querySelector('[data-action-edit]')?.addEventListener('click', () => {
+      state.editing = true;
+      state.isDirty = false;
+      renderPanel();
+    });
+    panelArea.querySelector('[data-action-hide]')?.addEventListener('click', (e) => {
+      mutateHide(item, e.currentTarget);
+    });
+    panelArea.querySelector('[data-action-unhide]')?.addEventListener('click', (e) => {
+      mutateUnhide(item, e.currentTarget);
+    });
+  }
+
+  function renderEditForm(panelArea, item) {
+    let fhtml = `<form class="act-form" data-edit-form><div class="act-form-field"><label class="act-form-label" for="act-edit-title" data-copy-key="label-title">${STRINGS['label-title']}</label><input type="text" class="act-form-input" id="act-edit-title" name="title" value="${esc(item.title || '')}" required /></div><div class="act-form-field"><label class="act-form-label" for="act-edit-description" data-copy-key="label-description">${STRINGS['label-description']}</label><textarea class="act-form-textarea" id="act-edit-description" name="description">${esc(item.description || '')}</textarea></div><div class="act-form-field"><label class="act-form-label" for="act-edit-details" data-copy-key="label-details">${STRINGS['label-details']}</label><textarea class="act-form-textarea" id="act-edit-details" name="details" placeholder="${esc(STRINGS['details-placeholder'])}">${esc(item.details || '')}</textarea></div><div class="act-form-actions"><span class="control-save-error" role="alert" data-copy-key="save-failure" hidden>${STRINGS['save-failure']}</span><button type="button" class="act-btn" data-copy-key="cancel" data-form-cancel>${STRINGS['cancel']}</button><button type="submit" class="act-btn act-btn--primary" data-copy-key="save">${STRINGS['save']}</button></div></form>`;
+    panelArea.innerHTML = fhtml;
+
+    const form = panelArea.querySelector('[data-edit-form]');
+    const titleInput = form.querySelector('input[name="title"]');
+    const descInput = form.querySelector('textarea[name="description"]');
+    const detailsInput = form.querySelector('textarea[name="details"]');
+    titleInput.focus();
+
+    const checkDirty = () => {
+      state.isDirty = (titleInput.value !== (item.title || '') || descInput.value !== (item.description || '') || detailsInput.value !== (item.details || ''));
+    };
+
+    form.addEventListener('input', checkDirty);
+
+    form.querySelector('[data-form-cancel]').addEventListener('click', () => {
+      state.editing = false;
+      state.isDirty = false;
+      renderPanel();
+    });
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const patch = {};
+      if (titleInput.value !== (item.title || '')) patch.title = titleInput.value;
+      if (descInput.value !== (item.description || '')) patch.description = descInput.value;
+      if (detailsInput.value !== (item.details || '')) patch.details = detailsInput.value;
+
+      if (!Object.keys(patch).length) {
+        state.editing = false;
+        state.isDirty = false;
+        renderPanel();
+        return;
+      }
+
+      const errEl = form.querySelector('[data-copy-key="save-failure"]');
+      try {
+        const url = `/app/activities/api/day/${state.day}/record/${encodeURIComponent(item.id)}/update?facet=${encodeURIComponent(item.facet)}`;
+        await (window.apiJson
+          ? window.apiJson(url, { method: 'POST', headers: { [ACTOR_HEADER]: ACTOR_OWNER, 'Content-Type': 'application/json' }, body: JSON.stringify({ patch }) })
+          : fetch(url, { method: 'POST', headers: { [ACTOR_HEADER]: ACTOR_OWNER, 'Content-Type': 'application/json' }, body: JSON.stringify({ patch }) }).then(r => r.json()));
+
+        state.editing = false;
+        state.isDirty = false;
+        await fetchView();
+        document.querySelector('[data-action-edit]')?.focus();
+      } catch (err) {
+        if (errEl) errEl.hidden = false;
+      }
+    });
+  }
+
+  function postRecord(item, action, control) {
+    const url = `/app/activities/api/day/${state.day}/record/${encodeURIComponent(item.id)}/${action}?facet=${encodeURIComponent(item.facet)}`;
+    const opts = { method: 'POST', headers: { [ACTOR_HEADER]: ACTOR_OWNER, 'Content-Type': 'application/json' }, body: '{}' };
+    if (control && window.saveControl) {
+      return window.saveControl({ el: control, fetchArgs: [url, opts], revertOnError: false });
+    }
+    return window.apiJson(url, opts);
+  }
+
+  async function mutateHide(item, control) {
+    try {
+      await postRecord(item, 'mute', control);
+
+      state.outlineBlock = true;
+      state.justHidden = state.includeHidden ? null : { item };
+      await fetchView();
+      refreshDateNav();
+      (document.querySelector(`[data-outline-unhide="${cssId(item.id)}"]`) || document.querySelector('[data-action-unhide]'))?.focus();
+    } catch (_) {
+      // saveControl has shown the error beside the control; the record is unchanged.
+    }
+  }
+
+  async function mutateUnhide(item, control) {
+    try {
+      await postRecord(item, 'unmute', control);
+      state.outlineBlock = null;
+      state.justHidden = null;
+      await fetchView();
+      refreshDateNav();
+      document.querySelector(`button.act-block[data-id="${cssId(item.id)}"][data-facet="${cssId(item.facet)}"]`)?.focus();
+    } catch (_) {
+      // saveControl has shown the error beside the control; the record is unchanged.
+    }
+  }
+
+  function refreshDateNav() {
+    const host = document.querySelector('[data-date-nav]');
+    if (host && typeof host.refresh === 'function') host.refresh();
+  }
+
+  function selectBlock(id, facet) {
+    if (state.editing && state.isDirty) {
+      document.querySelector('[data-edit-form] input[name="title"]')?.focus();
+      return;
+    }
+    if (!justHiddenMatches(id, facet)) {
+      state.justHidden = null;
+      state.outlineBlock = null;
+    }
+    state.selectedId = id;
+    state.selectedFacet = facet;
+    state.editing = false;
+    state.isDirty = false;
+    state.expandedEvidence = false;
+    const hash = `#${encodeURIComponent(facet)}/${encodeURIComponent(id)}`;
+    window.history.pushState(null, '', window.location.pathname + window.location.search + hash);
+    renderMain();
+    renderPanel();
+    if (isMobile()) {
+      document.querySelector('[data-panel-area]')?.focus();
+    }
+  }
+
+  function closePanel() {
+    if (state.editing && state.isDirty) {
+      document.querySelector('[data-edit-form] input[name="title"]')?.focus();
+      return;
+    }
+    const prevId = state.selectedId;
+    state.selectedId = null;
+    state.selectedFacet = null;
+    state.editing = false;
+    state.isDirty = false;
+    window.history.pushState(null, '', window.location.pathname + window.location.search);
+    renderMain();
+    renderPanel();
+    if (prevId) {
+      document.querySelector(`button.act-block[data-id="${cssId(prevId)}"]`)?.focus();
+    }
+  }
+
+  function selectFacet(facet) {
+    state.justHidden = null;
+    state.outlineBlock = null;
+    state.facet = facet;
+    state.editing = false;
+    state.isDirty = false;
+    const u = new URL(window.location.href);
+    if (facet) u.searchParams.set('facet', facet);
+    else u.searchParams.delete('facet');
+    window.history.pushState(null, '', u.pathname + (u.search ? u.search : '') + u.hash);
+    fetchView();
+    refreshDateNav();
+  }
+
+  function toggleScopeListbox(open) {
+    state.listboxOpen = open !== undefined ? open : !state.listboxOpen;
+    const listbox = document.querySelector('[data-scope-listbox]');
+    const btn = document.querySelector('[data-scope-btn]');
+    if (listbox) listbox.hidden = !state.listboxOpen;
+    if (btn) btn.setAttribute('aria-expanded', String(state.listboxOpen));
+    if (state.listboxOpen) {
+      listbox?.focus();
+      const first = listbox?.querySelector('.act-scope-option');
+      if (first) first.classList.add('act-scope-option--active');
+    }
+  }
+
+  function setupEvents() {
+    // Listbox keydown listener directly on listbox
+    const listbox = document.querySelector('[data-scope-listbox]');
+    if (listbox) {
+      listbox.addEventListener('keydown', (e) => {
+        if (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 't' || e.key === 'T') {
+          e.preventDefault();
+          return;
+        }
+        const options = Array.from(listbox.querySelectorAll('.act-scope-option') || []);
+        let activeIdx = options.findIndex(o => o.classList.contains('act-scope-option--active'));
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          if (activeIdx < options.length - 1) {
+            options[activeIdx]?.classList.remove('act-scope-option--active');
+            activeIdx++;
+            options[activeIdx]?.classList.add('act-scope-option--active');
+            options[activeIdx]?.scrollIntoView({ block: 'nearest' });
+          }
+          return;
+        }
+        if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          if (activeIdx > 0) {
+            options[activeIdx]?.classList.remove('act-scope-option--active');
+            activeIdx--;
+            options[activeIdx]?.classList.add('act-scope-option--active');
+            options[activeIdx]?.scrollIntoView({ block: 'nearest' });
+          }
+          return;
+        }
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          if (activeIdx >= 0) {
+            const facet = options[activeIdx].getAttribute('data-facet') || null;
+            selectFacet(facet);
+          }
+          toggleScopeListbox(false);
+          return;
+        }
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          toggleScopeListbox(false);
+          document.querySelector('[data-scope-btn]')?.focus();
+          return;
+        }
+      });
+    }
+
+    // Media query listener
+    if (window.matchMedia) {
+      const mql = window.matchMedia('(max-width: 700px)');
+      const onMediaChange = () => renderPanel();
+      if (typeof mql.addEventListener === 'function') {
+        mql.addEventListener('change', onMediaChange);
+      } else if (typeof mql.addListener === 'function') {
+        mql.addListener(onMediaChange);
+      }
+    }
+
+    // Scope control
+    document.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-scope-btn]');
+      if (btn) {
+        toggleScopeListbox();
+        return;
+      }
+      const opt = e.target.closest('.act-scope-option');
+      if (opt) {
+        const facet = opt.getAttribute('data-facet') || null;
+        selectFacet(facet);
+        toggleScopeListbox(false);
+        return;
+      }
+      if (state.listboxOpen && !e.target.closest('.act-scope-wrap')) {
+        toggleScopeListbox(false);
+      }
+
+      // Block click
+      const block = e.target.closest('button.act-block');
+      if (block) {
+        selectBlock(block.getAttribute('data-id'), block.getAttribute('data-facet'));
+        return;
+      }
+
+      // Untimed row click
+      const urow = e.target.closest('.act-untimed-row');
+      if (urow) {
+        selectBlock(urow.getAttribute('data-id'), urow.getAttribute('data-facet'));
+        return;
+      }
+
+      // Outline unhide click
+      const unhideBtn = e.target.closest('[data-outline-unhide]');
+      if (unhideBtn) {
+        mutateUnhide({ id: unhideBtn.getAttribute('data-outline-unhide'), facet: unhideBtn.getAttribute('data-facet') }, unhideBtn);
+        return;
+      }
+
+      // Backdrop click on mobile sheet
+      if (isMobile() && state.selectedId && !e.target.closest('[data-panel-area]') && !e.target.closest('button.act-block') && !e.target.closest('.act-untimed-row')) {
+        closePanel();
+      }
+    });
+
+    // Keydown handling on document
+    document.addEventListener('keydown', (e) => {
+      if (state.listboxOpen) {
+        const listbox = document.querySelector('[data-scope-listbox]');
+        const options = Array.from(listbox?.querySelectorAll('.act-scope-option') || []);
+        let activeIdx = options.findIndex(o => o.classList.contains('act-scope-option--active'));
+
+        if (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 't' || e.key === 'T') {
+          e.preventDefault();
+          return;
+        }
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          if (activeIdx < options.length - 1) {
+            options[activeIdx]?.classList.remove('act-scope-option--active');
+            activeIdx++;
+            options[activeIdx]?.classList.add('act-scope-option--active');
+            options[activeIdx]?.scrollIntoView({ block: 'nearest' });
+          }
+          return;
+        }
+        if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          if (activeIdx > 0) {
+            options[activeIdx]?.classList.remove('act-scope-option--active');
+            activeIdx--;
+            options[activeIdx]?.classList.add('act-scope-option--active');
+            options[activeIdx]?.scrollIntoView({ block: 'nearest' });
+          }
+          return;
+        }
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          if (activeIdx >= 0) {
+            const facet = options[activeIdx].getAttribute('data-facet') || null;
+            selectFacet(facet);
+          }
+          toggleScopeListbox(false);
+          return;
+        }
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          toggleScopeListbox(false);
+          document.querySelector('[data-scope-btn]')?.focus();
+          return;
+        }
+      }
+
+      if (e.key === 'Escape' && state.selectedId) {
+        e.preventDefault();
+        closePanel();
+        return;
+      }
+    });
+
+    // Toggle hidden
+    document.querySelector('[data-toggle-hidden]')?.addEventListener('click', () => {
+      state.includeHidden = !state.includeHidden;
+      state.justHidden = null;
+      state.outlineBlock = null;
+      fetchView();
+    });
+
+    // Popstate
+    window.addEventListener('popstate', () => {
+      const oldFacet = state.facet;
+      const wasDirty = state.editing && state.isDirty;
+      const prevSelectedId = state.selectedId;
+      const prevSelectedFacet = state.selectedFacet;
+      readUrlParams();
+      if (state.facet !== oldFacet) {
+        state.editing = false;
+        state.isDirty = false;
+        fetchView();
+        const host = document.querySelector('[data-date-nav]');
+        if (host && typeof host.refresh === 'function') host.refresh();
+      } else {
+        if (wasDirty) {
+          state.selectedId = prevSelectedId;
+          state.selectedFacet = prevSelectedFacet;
+          document.querySelector('[data-edit-form] input[name="title"]')?.focus();
+          return;
+        }
+        renderMain();
+        renderPanel();
+      }
+    });
+  }
+
+  function init() {
+    state.day = parsePathDay();
+    readUrlParams();
+    setupEvents();
+    showLoading();
+    fetchView();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+})();
+</script>

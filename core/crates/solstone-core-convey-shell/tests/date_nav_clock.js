@@ -493,6 +493,7 @@ async function run() {
 
   const locationObj = {
     pathname: '/app/records/20260901',
+    search: '',
     href: '',
   };
 
@@ -685,6 +686,151 @@ async function run() {
     '20261001',
     'daygrid today cell is 20261001'
   );
+
+  // 7. Date nav keep-search, generation-tracked refresh, and defaultPrevented keydown guard
+  windowObj.solShellData.apps.push({
+    id: 'searchapp',
+    name: 'searchapp',
+    date_nav: { allow_future: true, unit: 'item' },
+  });
+  locationObj.pathname = '/app/searchapp/20261001';
+  locationObj.search = '?facet=work';
+  locationObj.href = '/app/searchapp/20261001?facet=work';
+
+  navHost.setAttribute('data-date-nav-keep-search', '');
+
+  const requestedUrls = [];
+  windowObj.apiJson = async (url) => {
+    requestedUrls.push(url);
+    if (url.includes('api/index')) {
+      return {
+        coverage: { start: '20261001', end: '20261031' },
+        months: { '202610': 3 },
+      };
+    }
+    if (url.includes('api/stats')) {
+      return { '20261001': 3 };
+    }
+    return {};
+  };
+
+  documentObj.dispatchEvent({
+    type: 'workspace:mounted',
+    detail: { appName: 'searchapp' },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  assert.strictEqual(typeof navHost.refresh, 'function', 'host.refresh is attached when data-date-nav-keep-search is present');
+  assert.ok(requestedUrls.some((u) => u.includes('api/index?facet=work')), 'index fetch includes location.search');
+
+  // navigateTo preserves location.search
+  const todayBtnSearch = documentObj.querySelector('[data-date-nav-today]');
+  todayBtnSearch.click();
+  assert.ok(locationObj.href.endsWith('20261001?facet=work'), `href preserves search: ${locationObj.href}`);
+
+  // Test defaultPrevented guard on keydown
+  const prevHref = locationObj.href;
+  documentObj.dispatchEvent({
+    type: 'keydown',
+    key: 'ArrowLeft',
+    defaultPrevented: true,
+    target: navHost,
+    preventDefault: () => {},
+  });
+  assert.strictEqual(locationObj.href, prevHref, 'keydown with defaultPrevented does not navigate');
+
+  // Test refresh() increments generation and refetches both index and shown month with search while panel closed
+  requestedUrls.length = 0;
+  await navHost.refresh();
+  assert.ok(requestedUrls.some((u) => u.includes('api/index?facet=work')), 'refresh triggers index refetch with search');
+  assert.ok(requestedUrls.some((u) => u.includes('api/stats/202610?facet=work')), 'refresh triggers stats refetch for shown month with search while panel closed');
+
+  // Refresh while in-flight issues a second fetch; second response renders, earlier discarded
+  let resolveFirstIndex, resolveSecondIndex;
+  const firstIndexPromise = new Promise((res) => { resolveFirstIndex = res; });
+  const secondIndexPromise = new Promise((res) => { resolveSecondIndex = res; });
+  let indexCalls = 0;
+  windowObj.apiJson = async (url) => {
+    if (url.includes('api/index')) {
+      indexCalls += 1;
+      if (indexCalls === 1) {
+        await firstIndexPromise;
+        return {
+          coverage: { start: '20261001', end: '20261031' },
+          months: { '202610': 1 },
+        };
+      } else {
+        await secondIndexPromise;
+        return {
+          coverage: { start: '20261001', end: '20261031' },
+          months: { '202610': 99 },
+        };
+      }
+    }
+    if (url.includes('api/stats')) {
+      return { '20261001': indexCalls === 1 ? 1 : 99 };
+    }
+    return {};
+  };
+
+  const refresh1 = navHost.refresh();
+  const refresh2 = navHost.refresh();
+  resolveSecondIndex();
+  await refresh2;
+  resolveFirstIndex();
+  await refresh1;
+
+  const triggerForCheck = documentObj.querySelector('[data-date-nav-trigger]');
+  triggerForCheck.click();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const cellOct1 = documentObj.querySelector('[data-date-nav-cell="day"][data-value="20261001"]');
+  assert.ok(cellOct1, 'October 1 cell exists');
+  assert.ok(cellOct1.getAttribute('aria-label').includes('99'), 'second response rendered, earlier response discarded');
+  triggerForCheck.click(); // close panel
+
+  // Stale fetch that fails after current generation succeeded shows no warning
+  let rejectStaleIndex;
+  const staleIndexPromise = new Promise((_, rej) => { rejectStaleIndex = rej; });
+  indexCalls = 0;
+  windowObj.apiJson = async (url) => {
+    if (url.includes('api/index')) {
+      indexCalls += 1;
+      if (indexCalls === 1) {
+        await staleIndexPromise;
+      }
+      return {
+        coverage: { start: '20261001', end: '20261031' },
+        months: { '202610': 3 },
+      };
+    }
+    return { '20261001': 3 };
+  };
+  const refreshStale = navHost.refresh();
+  const refreshCurrent = navHost.refresh();
+  await refreshCurrent;
+  try {
+    rejectStaleIndex(new Error('stale network error'));
+    await refreshStale;
+  } catch (_) {}
+  const warningNode = documentObj.querySelector('[data-date-nav-warning]');
+  assert.strictEqual(warningNode.hidden, true, 'stale fetch failure shows no warning');
+
+  // Host without the attribute still drops location.search on day change
+  navHost.removeAttribute('data-date-nav-keep-search');
+  todayBtnSearch.click();
+  assert.ok(locationObj.href.endsWith('20261001'), 'without keep-search attribute, day change drops search');
+  assert.strictEqual(locationObj.href.includes('?'), false, 'no query string in href');
+
+  // Unprevented ArrowRight steps the day (the fixture's coverage starts on this day)
+  const hrefBeforeStep = locationObj.href;
+  documentObj.dispatchEvent({
+    type: 'keydown',
+    key: 'ArrowRight',
+    defaultPrevented: false,
+    target: navHost,
+    preventDefault: () => {},
+  });
+  assert.notStrictEqual(locationObj.href, hrefBeforeStep, 'unprevented ArrowRight steps the day');
 }
 
 run()

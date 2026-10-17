@@ -1179,7 +1179,9 @@ mod tests {
         assert_eq!(table.rows[0].part, ProvenancePart::Unknown);
     }
 
-    fn describe(root: &Path, entries: &[(&str, Option<&str>, Option<&str>, Option<&str>)]) {
+    type DescribeEntry<'a> = (&'a str, Option<&'a str>, Option<&'a str>, Option<&'a str>);
+
+    fn describe(root: &Path, entries: &[DescribeEntry<'_>]) {
         let mut map = serde_json::Map::new();
         for (cid, name, platform, device_type) in entries {
             map.insert(

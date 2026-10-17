@@ -39,16 +39,32 @@ assert(renderTodayHtml, 'renderTodayHtml exported');
 // carrying the server's label. A row without a label gets no source element.
 const html = renderTodayHtml({
   activities: [
-    { id: 'a', display_time: '2026-06-02T12:00:00+00:00', description: 'first half', source_label: 'SOURCE-A' },
-    { id: 'b', display_time: '2026-06-02T12:01:00+00:00', description: 'second half', source_label: 'SOURCE-<b>' },
-    { id: 'c', display_time: '2026-06-02T09:00:00+00:00', description: 'alone' },
-    { id: 'd', display_time: '2026-06-02T08:00:00+00:00', description: 'blank label', source_label: '  ' },
+    { id: 'a', day: '20260602', facet: 'work', display_time: '2026-06-02T12:00:00+00:00', description: 'first half', source_label: 'SOURCE-A' },
+    { id: 'b', day: '20260602', facet: 'work', display_time: '2026-06-02T12:01:00+00:00', description: 'second half', source_label: 'SOURCE-<b>' },
+    { id: 'c', day: '20260602', facet: 'work', display_time: '2026-06-02T09:00:00+00:00', description: 'alone' },
+    { id: 'd', day: '20260602', facet: 'work', display_time: '2026-06-02T08:00:00+00:00', description: 'blank label', source_label: '  ' },
   ],
 });
 
-const rows = html.split('<div class="pulse-activity">').slice(1);
+const rows = html.split('<a class="pulse-activity"').slice(1);
 assert.strictEqual(rows.length, 4, html);
+assert(rows[0].includes('href="/app/activities/20260602?facet=work#work/a"'), rows[0]);
 assert(rows[0].includes('first half<span class="pulse-activity-source">SOURCE-A</span>'), rows[0]);
+assert(rows[1].includes('href="/app/activities/20260602?facet=work#work/b"'), rows[1]);
 assert(rows[1].includes('<span class="pulse-activity-source">SOURCE-&lt;b&gt;</span>'), rows[1]);
+assert(rows[2].includes('href="/app/activities/20260602?facet=work#work/c"'), rows[2]);
 assert(!rows[2].includes('pulse-activity-source'), rows[2]);
+assert(rows[3].includes('href="/app/activities/20260602?facet=work#work/d"'), rows[3]);
 assert(!rows[3].includes('pulse-activity-source'), rows[3]);
+
+assert(html.includes('href="/app/activities/" data-copy-key="home-today-link"'));
+
+const emptyHtml = renderTodayHtml({});
+assert(emptyHtml.includes('href="/app/activities/" data-copy-key="home-today-link"'));
+
+const planHtml = renderTodayHtml({
+  anticipated_activities: [
+    { id: 'p1', day: '20260602', facet: 'work', title: 'Plan Item', start: '10:00' },
+  ],
+});
+assert(planHtml.includes('href="/app/activities/20260602?facet=work#work/p1"'));

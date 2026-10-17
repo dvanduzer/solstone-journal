@@ -93,7 +93,7 @@ pub static APP_REGISTRY: &[AppDefinition] = &[
             },
         }),
         has_background: false,
-        converted: false,
+        converted: true,
     },
     AppDefinition {
         name: "backup",

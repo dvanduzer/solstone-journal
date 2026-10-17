@@ -12,9 +12,14 @@ const SHELL: &[u8] = include_bytes!("../../solstone-core-convey-shell/assets/sta
 const NEWS_WORKSPACE: &[u8] = include_bytes!("../assets/news/workspace.html");
 const CURATION_WORKSPACE: &[u8] = include_bytes!("../assets/curation/workspace.html");
 const CURATION_EVIDENCE_JS: &[u8] = include_bytes!("../assets/curation/curation_evidence.js");
+const ACTIVITIES_WORKSPACE: &[u8] = include_bytes!("../assets/activities/workspace.html");
 
 pub fn shell() -> axum::response::Response {
     asset(SHELL, "text/html; charset=utf-8")
+}
+
+pub fn activities_workspace() -> axum::response::Response {
+    asset(ACTIVITIES_WORKSPACE, "text/html; charset=utf-8")
 }
 
 pub fn news_workspace() -> axum::response::Response {
