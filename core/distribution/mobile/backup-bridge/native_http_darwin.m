@@ -84,6 +84,9 @@ static const NSUInteger SBErrorLimit = 64 * 1024;
         }
         [request setValue:[values componentsJoinedByString:@","] forHTTPHeaderField:key];
     }
+    // URLSession otherwise offers gzip and decodes it while keeping the encoded
+    // length and encoding headers, which this exact-length transport refuses.
+    [request setValue:@"identity" forHTTPHeaderField:@"Accept-Encoding"];
     _condition = [[NSCondition alloc] init];
     _queue = [[NSOperationQueue alloc] init];
     _queue.maxConcurrentOperationCount = 1;
