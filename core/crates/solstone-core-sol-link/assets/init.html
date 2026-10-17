@@ -713,35 +713,49 @@
       const regenerateButton = document.getElementById('journal-mark-regenerate');
       const lockButton = document.getElementById('journal-mark-lock');
       const finishButton = document.querySelector('button[type="submit"].cta-button');
+      let currentProposalId = null;
+      let markGeneration = 0;
 
       async function loadMark() {
+        const generation = ++markGeneration;
         const originalLabel = retryButton ? retryButton.textContent : '';
         if (retryButton && !retryButton.hidden) {
           retryButton.disabled = true;
           retryButton.textContent = 'trying…';
         }
+        if (regenerateButton) regenerateButton.disabled = true;
+        if (lockButton) lockButton.disabled = true;
         const display = document.getElementById('journal-mark-display');
         try {
           const data = await window.apiJson('/init/mark');
+          if (generation !== markGeneration) return;
           if (!data || data.availability === 'none') {
+            currentProposalId = null;
             renderGenericMark(display);
             applyLockState(false);
           } else if ((data.availability === 'candidate' || data.availability === 'ready') && validMarkSpec(data.mark)) {
+            currentProposalId = data.proposal_id || null;
             renderMark(data.mark, data.locked);
           } else {
+            currentProposalId = data.proposal_id || null;
             renderUnavailableMark(display);
             if (data && data.locked) applyLockState(true);
             else applyLockState(false);
           }
         } catch (err) {
+          if (generation !== markGeneration) return;
           renderUnavailableMark(display);
           showMarkError((err && err.serverMessage) || "couldn't load your mark. try again.");
           if (retryButton) retryButton.hidden = false;
           if (finishButton) finishButton.disabled = true;
         } finally {
-          if (retryButton && !retryButton.hidden) {
-            retryButton.textContent = originalLabel || 'try again';
-            retryButton.disabled = false;
+          if (generation === markGeneration) {
+            if (retryButton && !retryButton.hidden) {
+              retryButton.textContent = originalLabel || 'try again';
+              retryButton.disabled = false;
+            }
+            if (regenerateButton) regenerateButton.disabled = false;
+            if (lockButton && !lockButton.hidden) lockButton.disabled = false;
           }
         }
       }
@@ -749,35 +763,55 @@
       if (retryButton) retryButton.addEventListener('click', loadMark);
       if (regenerateButton) {
         regenerateButton.addEventListener('click', async () => {
+          const generation = ++markGeneration;
           const originalLabel = regenerateButton.textContent;
           regenerateButton.disabled = true;
           regenerateButton.textContent = 'trying…';
+          if (lockButton) lockButton.disabled = true;
           try {
             const data = await window.apiJson('/init/mark/regenerate', {method: 'POST'});
+            if (generation !== markGeneration) return;
+            currentProposalId = data.proposal_id || null;
             renderMark(data.mark, false);
           } catch (err) {
+            if (generation !== markGeneration) return;
             showMarkError((err && err.serverMessage) || "couldn't regenerate. try again.");
           } finally {
-            regenerateButton.textContent = originalLabel;
-            regenerateButton.disabled = false;
+            if (generation === markGeneration) {
+              regenerateButton.textContent = originalLabel;
+              regenerateButton.disabled = false;
+              if (lockButton && !lockButton.hidden) lockButton.disabled = false;
+            }
           }
         });
       }
       if (lockButton) {
         lockButton.addEventListener('click', async () => {
+          const generation = ++markGeneration;
           const originalLabel = lockButton.textContent;
           lockButton.disabled = true;
           lockButton.textContent = 'locking…';
+          if (regenerateButton) regenerateButton.disabled = true;
           try {
-            const data = await window.apiJson('/init/mark/lock', {method: 'POST'});
+            const data = await window.apiJson('/init/mark/lock', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({proposal_id: currentProposalId})
+            });
+            if (generation !== markGeneration) return;
+            currentProposalId = data.proposal_id || null;
             renderMark(data.mark, true);
           } catch (err) {
+            if (generation !== markGeneration) return;
             showMarkError((err && err.serverMessage) || "couldn't lock it in. try again.");
             applyLockState(false);
           } finally {
-            if (!lockButton.hidden) {
-              lockButton.textContent = originalLabel;
-              lockButton.disabled = false;
+            if (generation === markGeneration) {
+              if (!lockButton.hidden) {
+                lockButton.textContent = originalLabel;
+                lockButton.disabled = false;
+              }
+              if (regenerateButton) regenerateButton.disabled = false;
             }
           }
         });

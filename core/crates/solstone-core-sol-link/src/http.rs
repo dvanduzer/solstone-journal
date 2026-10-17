@@ -4,6 +4,7 @@
 //! Link-owned HTTP routes for the Rust convey substrate.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
@@ -23,19 +24,110 @@ use solstone_core_journal_config_write::{
     ConfigMutationError, JournalConfigMutation, mutate_journal_config,
 };
 use solstone_core_thinking_copy::{
-    CONFIDENTIAL_LANE_DETAIL, ConfidentialLaneDetail, LANES, Lane, thinking_copy_payload,
+    CONFIDENTIAL_LANE_DETAIL, ConfidentialLaneDetail, LANES, Lane, SetupCatalogFacts,
+    thinking_copy_payload,
 };
 
+use crate::ca::jid_from_spki;
 use crate::establish::{self, EstablishError};
 use crate::ledger::{AuthorizedClientsRead, read_authorized_clients};
 use crate::mark::mark_from_jid;
 
 const INIT_HTML: &str = include_str!("../assets/init.html");
 const INIT_LOCAL_ONLY_DETAIL: &str = "setup routes require a localhost connection";
+const LOCAL_PROVIDER_SELECTION: &str = r#"{"provider":"local","model":"local/qwen3.5-4b"}"#;
+
+fn local_provider_val() -> Value {
+    serde_json::from_str(LOCAL_PROVIDER_SELECTION).expect("valid local provider json")
+}
+
+pub trait SetupHost: Send + Sync {
+    fn start_local(&self, journal_root: &Path) -> Result<(), String>;
+    fn cancel_local(&self, journal_root: &Path, attempt_id: &str) -> Result<(), String>;
+    fn retry_speech(&self, journal_root: &Path) -> Result<(), String>;
+    fn project_downloads(&self, journal_root: &Path) -> SetupDownloads;
+    fn catalog_facts(&self) -> SetupCatalogFacts;
+}
+
+pub struct NoopSetupHost;
+
+impl SetupHost for NoopSetupHost {
+    fn start_local(&self, _journal_root: &Path) -> Result<(), String> {
+        Err("start_local unavailable in noop host".into())
+    }
+
+    fn cancel_local(&self, _journal_root: &Path, _attempt_id: &str) -> Result<(), String> {
+        Err("cancel_local unavailable in noop host".into())
+    }
+
+    fn retry_speech(&self, _journal_root: &Path) -> Result<(), String> {
+        Err("retry_speech unavailable in noop host".into())
+    }
+
+    fn project_downloads(&self, _journal_root: &Path) -> SetupDownloads {
+        SetupDownloads {
+            speech: SetupDownloadTask {
+                state: "idle".into(),
+                attempt_id: None,
+                bytes_done: None,
+                bytes_total: None,
+                error: None,
+            },
+            thinking: SetupDownloadTask {
+                state: "idle".into(),
+                attempt_id: None,
+                bytes_done: None,
+                bytes_total: None,
+                error: None,
+            },
+        }
+    }
+
+    fn catalog_facts(&self) -> SetupCatalogFacts {
+        solstone_core_thinking_copy::current_setup_facts()
+    }
+}
 
 #[derive(Clone)]
-struct LinkHttpState {
-    journal_root: PathBuf,
+pub struct LinkHttpState {
+    pub journal_root: PathBuf,
+    pub host: Arc<dyn SetupHost>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetupDownloads {
+    pub speech: SetupDownloadTask,
+    pub thinking: SetupDownloadTask,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetupDownloadTask {
+    pub state: String,
+    pub attempt_id: Option<String>,
+    pub bytes_done: Option<u64>,
+    pub bytes_total: Option<u64>,
+    pub error: Option<SetupDownloadError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetupDownloadError {
+    pub code: String,
+    pub detail: String,
+}
+
+#[derive(Serialize)]
+pub struct SetupMarkState {
+    pub render: Option<crate::mark::MarkRenderSpec>,
+    pub state: &'static str,
+    pub proposal_id: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct SetupThinkingState {
+    pub choice: Option<String>,
+    pub saved: bool,
+    pub capability: &'static str,
+    pub download_bytes: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -61,6 +153,8 @@ struct IdentityResponse {
 
 #[derive(Serialize)]
 struct InitStateResponse {
+    schema: &'static str,
+    journal_ready: bool,
     version: &'static str,
     journal_path: String,
     identity_name: String,
@@ -69,6 +163,13 @@ struct InitStateResponse {
     retention_days: Value,
     lanes: [Lane; 3],
     confidential: ConfidentialResponse,
+    mark: SetupMarkState,
+    thinking: SetupThinkingState,
+    downloads: SetupDownloads,
+    remaining_required_steps: Vec<&'static str>,
+    done: bool,
+    redirect: &'static str,
+    copy: Value,
 }
 
 #[derive(Serialize)]
@@ -81,6 +182,7 @@ struct MarkResponse {
     mark: Option<crate::mark::MarkRenderSpec>,
     locked: bool,
     availability: &'static str,
+    proposal_id: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -115,8 +217,13 @@ struct FinalizeResponse {
 
 /// First-run setup routes only. Fallback-free so a convey-shell merge keeps the HTML 404.
 pub fn init_router(journal_root: impl AsRef<Path>) -> Router {
+    init_router_with_host(journal_root, Arc::new(NoopSetupHost))
+}
+
+pub fn init_router_with_host(journal_root: impl AsRef<Path>, host: Arc<dyn SetupHost>) -> Router {
     let state = LinkHttpState {
         journal_root: journal_root.as_ref().to_path_buf(),
+        host,
     };
     Router::new()
         .route("/init/api/state", get(init_state))
@@ -125,6 +232,7 @@ pub fn init_router(journal_root: impl AsRef<Path>) -> Router {
         .route("/init/mark", get(init_mark))
         .route("/init/mark/regenerate", post(init_mark_regenerate))
         .route("/init/mark/lock", post(init_mark_lock))
+        .route("/init/api/action", post(init_action))
         .route("/init/finalize", post(init_finalize))
         .with_state(state)
 }
@@ -134,6 +242,7 @@ pub fn router(journal_root: impl AsRef<Path>) -> Router {
     let journal_root = journal_root.as_ref();
     let state = LinkHttpState {
         journal_root: journal_root.to_path_buf(),
+        host: Arc::new(NoopSetupHost),
     };
     init_router(journal_root)
         .merge(
@@ -227,24 +336,112 @@ async fn init_state(
         Ok(base) => base.config,
         Err(_) => return corrupt_config(),
     };
-    let retention_mode = nested_string(&config, "retention", "raw_media");
-    Json(InitStateResponse {
+    match build_setup_state(&state, &config).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(err_resp) => err_resp,
+    }
+}
+
+async fn compute_local_capability(journal_root: &Path) -> LocalCapabilityResponse {
+    let journal_root = journal_root.to_path_buf();
+    let report = tokio::task::spawn_blocking(move || {
+        build_check_report(&gather_host_inputs(
+            &journal_root,
+            env!("CARGO_PKG_VERSION"),
+        ))
+    })
+    .await;
+    match report {
+        Ok(report) => local_capability(&report),
+        Err(error) => {
+            log::warn!("local capability check did not finish: {error}");
+            LocalCapabilityResponse {
+                overall: "unknown",
+                checks: Vec::new(),
+            }
+        }
+    }
+}
+
+async fn build_setup_state(
+    state: &LinkHttpState,
+    config: &Map<String, Value>,
+) -> Result<InitStateResponse, Response> {
+    let mark_snapshot = match establish::read_mark_snapshot(&state.journal_root) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return Err(establish_error(error)),
+    };
+    let mark_is_locked = mark_snapshot.state == establish::MarkState::Locked;
+    let mark = SetupMarkState {
+        render: mark_snapshot.render,
+        state: mark_snapshot.state.as_str(),
+        proposal_id: mark_snapshot.proposal_id,
+    };
+
+    let thinking_choice_raw = nested_string(config, "setup", "thinking_choice");
+    let (choice, saved) = match thinking_choice_raw.as_str() {
+        "local" | "byo" | "spp" | "later" => (Some(thinking_choice_raw), true),
+        _ => (None, false),
+    };
+    let capability = compute_local_capability(&state.journal_root).await.overall;
+    let catalog_facts = state.host.catalog_facts();
+    let download_bytes = catalog_facts.thinking_download_bytes;
+    let thinking = SetupThinkingState {
+        choice,
+        saved,
+        capability,
+        download_bytes,
+    };
+
+    let downloads = state.host.project_downloads(&state.journal_root);
+
+    let completed = setup_is_complete(config);
+    let mut remaining_required_steps = Vec::new();
+    if !completed {
+        if !mark_is_locked {
+            remaining_required_steps.push("mark");
+        }
+        if !saved {
+            remaining_required_steps.push("thinking");
+        }
+    }
+
+    let done = completed || (mark_is_locked && saved);
+
+    let redirect = match thinking.choice.as_deref() {
+        Some("byo") => "/app/thinking#byo-setup",
+        Some("spp") => "/app/thinking#confidential-setup",
+        _ => "/app/home",
+    };
+
+    let copy = solstone_core_thinking_copy::setup_copy(&catalog_facts);
+    let retention_mode = nested_string(config, "retention", "raw_media");
+
+    Ok(InitStateResponse {
+        schema: "solstone.setup-state.v1",
+        journal_ready: true,
         version: env!("CARGO_PKG_VERSION"),
         journal_path: state.journal_root.display().to_string(),
-        identity_name: nested_string(&config, "identity", "name"),
-        identity_preferred: nested_string(&config, "identity", "preferred"),
+        identity_name: nested_string(config, "identity", "name"),
+        identity_preferred: nested_string(config, "identity", "preferred"),
         retention_mode: if retention_mode.is_empty() {
             "keep".to_owned()
         } else {
             retention_mode
         },
-        retention_days: nested_value(&config, "retention", "raw_media_days").unwrap_or(Value::Null),
+        retention_days: nested_value(config, "retention", "raw_media_days").unwrap_or(Value::Null),
         lanes: LANES,
         confidential: ConfidentialResponse {
             lane_detail: CONFIDENTIAL_LANE_DETAIL,
         },
+        mark,
+        thinking,
+        downloads,
+        remaining_required_steps,
+        done,
+        redirect,
+        copy,
     })
-    .into_response()
 }
 
 async fn init_local_capability(
@@ -254,25 +451,7 @@ async fn init_local_capability(
     if !is_local(&basis) {
         return init_local_only();
     }
-    let journal_root = state.journal_root.clone();
-    let report = tokio::task::spawn_blocking(move || {
-        build_check_report(&gather_host_inputs(
-            &journal_root,
-            env!("CARGO_PKG_VERSION"),
-        ))
-    })
-    .await;
-    let capability = match report {
-        Ok(report) => local_capability(&report),
-        Err(error) => {
-            log::warn!("init local capability check did not finish: {error}");
-            LocalCapabilityResponse {
-                overall: "unknown",
-                checks: Vec::new(),
-            }
-        }
-    };
-    Json(capability).into_response()
+    Json(compute_local_capability(&state.journal_root).await).into_response()
 }
 
 /// Answer "can this computer run local thinking" from the same platform, GPU and
@@ -357,24 +536,31 @@ async fn init_mark(
                 mark: Some(mark.to_render_spec()),
                 locked: true,
                 availability: "ready",
+                proposal_id: Some(link_state.instance_id),
             })
             .into_response(),
             Err(_) => Json(MarkResponse {
                 mark: None,
                 locked: true,
                 availability: "unavailable",
+                proposal_id: Some(link_state.instance_id),
             })
             .into_response(),
         },
-        Ok(None) => match establish::current_candidate(&state.journal_root)
-            .and_then(|candidate| establish::candidate_mark(&candidate))
-        {
-            Ok(mark) => Json(MarkResponse {
-                mark: Some(mark.to_render_spec()),
-                locked: false,
-                availability: "candidate",
-            })
-            .into_response(),
+        Ok(None) => match establish::current_candidate(&state.journal_root) {
+            Ok(candidate) => match jid_from_spki(candidate.spki_der()) {
+                Ok(instance_id) => match mark_from_jid(&instance_id) {
+                    Ok(mark) => Json(MarkResponse {
+                        mark: Some(mark.to_render_spec()),
+                        locked: false,
+                        availability: "candidate",
+                        proposal_id: Some(instance_id),
+                    })
+                    .into_response(),
+                    Err(error) => establish_error(EstablishError::Mark(error)),
+                },
+                Err(error) => establish_error(EstablishError::Ca(error)),
+            },
             Err(error) => establish_error(error),
         },
         Err(error) => establish_error(error),
@@ -388,59 +574,572 @@ async fn init_mark_regenerate(
     if !is_local(&basis) {
         return init_local_only();
     }
-    match establish::load_committed(&state.journal_root) {
-        Ok(Some(_)) => error_envelope(
+    match establish::regenerate_proposal(&state.journal_root) {
+        Ok(candidate) => match jid_from_spki(candidate.spki_der()) {
+            Ok(instance_id) => match mark_from_jid(&instance_id) {
+                Ok(mark) => Json(MarkResponse {
+                    mark: Some(mark.to_render_spec()),
+                    locked: false,
+                    availability: "candidate",
+                    proposal_id: Some(instance_id),
+                })
+                .into_response(),
+                Err(error) => establish_error(EstablishError::Mark(error)),
+            },
+            Err(error) => establish_error(EstablishError::Ca(error)),
+        },
+        Err(EstablishError::AlreadyLocked) => error_envelope(
             "invalid_operation_for_state",
             "Bad Request",
             "journal id already locked",
             StatusCode::BAD_REQUEST,
         )
         .into_response(),
-        Ok(None) => match establish::regenerate_candidate(&state.journal_root)
-            .and_then(|candidate| establish::candidate_mark(&candidate))
-        {
-            Ok(mark) => Json(MarkResponse {
-                mark: Some(mark.to_render_spec()),
-                locked: false,
-                availability: "candidate",
-            })
-            .into_response(),
-            Err(error) => establish_error(error),
-        },
         Err(error) => establish_error(error),
     }
+}
+
+#[derive(Deserialize)]
+struct MarkLockRequest {
+    proposal_id: Option<String>,
 }
 
 async fn init_mark_lock(
     Extension(basis): Extension<AccessBasis>,
     State(state): State<LinkHttpState>,
+    body: Bytes,
 ) -> Response {
     if !is_local(&basis) {
         return init_local_only();
     }
-    match establish::lock_in(&state.journal_root) {
+    let req: MarkLockRequest = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(_) => {
+            return error_envelope(
+                "invalid_request",
+                "Bad Request",
+                "malformed lock request",
+                StatusCode::BAD_REQUEST,
+            )
+            .into_response();
+        }
+    };
+    let Some(proposal_id) = req.proposal_id.filter(|s| !s.trim().is_empty()) else {
+        return error_envelope(
+            "proposal_required",
+            "Bad Request",
+            "proposal_id is required",
+            StatusCode::BAD_REQUEST,
+        )
+        .into_response();
+    };
+    match establish::commit_proposal(&state.journal_root, &proposal_id) {
         Ok(link_state) => match mark_from_jid(&link_state.instance_id) {
             Ok(mark) => Json(MarkResponse {
                 mark: Some(mark.to_render_spec()),
                 locked: true,
                 availability: "ready",
+                proposal_id: Some(link_state.instance_id),
             })
             .into_response(),
             Err(_) => Json(MarkResponse {
                 mark: None,
                 locked: true,
                 availability: "unavailable",
+                proposal_id: Some(link_state.instance_id),
             })
             .into_response(),
         },
-        Err(EstablishError::NoCandidate) => error_envelope(
-            "invalid_operation_for_state",
-            "Bad Request",
-            "no journal id candidate to lock in — request a preview first",
-            StatusCode::BAD_REQUEST,
+        Err(EstablishError::ProposalConflict) => error_envelope(
+            "proposal_conflict",
+            "Conflict",
+            "identity proposal conflict",
+            StatusCode::CONFLICT,
         )
         .into_response(),
         Err(error) => establish_error(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct SetupActionRequest {
+    action: Option<String>,
+    proposal_id: Option<String>,
+    choice: Option<String>,
+    attempt_id: Option<String>,
+    timezone: Option<String>,
+}
+
+fn resolve_local_provider_update(
+    config: &Map<String, Value>,
+) -> Result<(), (&'static str, &'static str, StatusCode)> {
+    let endpoint_configured = config
+        .get("providers")
+        .and_then(Value::as_object)
+        .and_then(|p| p.get("local"))
+        .and_then(Value::as_object)
+        .is_some_and(|local| {
+            local
+                .get("endpoint_url")
+                .and_then(Value::as_str)
+                .is_some_and(|v| !v.trim().is_empty())
+                && local
+                    .get("served_model_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|v| !v.trim().is_empty())
+        });
+    let confidential_provisioned = config
+        .get("services")
+        .and_then(Value::as_object)
+        .and_then(|s| s.get("confidential"))
+        .is_some_and(Value::is_object);
+    if confidential_provisioned {
+        return Err((
+            "invalid_operation_for_state",
+            "turn off confidential processing first, then switch to the bundled local model.",
+            StatusCode::BAD_REQUEST,
+        ));
+    }
+    if endpoint_configured {
+        return Err((
+            "invalid_operation_for_state",
+            "clear your own endpoint first to run the bundled local model.",
+            StatusCode::BAD_REQUEST,
+        ));
+    }
+    Ok(())
+}
+
+async fn init_action(
+    Extension(basis): Extension<AccessBasis>,
+    State(state): State<LinkHttpState>,
+    body: Bytes,
+) -> Response {
+    if !is_local(&basis) {
+        return init_local_only();
+    }
+    let req: SetupActionRequest = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(_) => {
+            return error_envelope(
+                "invalid_request",
+                "Bad Request",
+                "malformed json request",
+                StatusCode::BAD_REQUEST,
+            )
+            .into_response();
+        }
+    };
+    let Some(action) = req.action.as_deref() else {
+        return error_envelope(
+            "invalid_operation_for_state",
+            "Bad Request",
+            "action is required",
+            StatusCode::BAD_REQUEST,
+        )
+        .into_response();
+    };
+
+    let mut start_err_overlay: Option<String> = None;
+
+    match action {
+        "commit_mark" => {
+            let Some(proposal_id) = req.proposal_id.filter(|s| !s.trim().is_empty()) else {
+                return error_envelope(
+                    "proposal_required",
+                    "Bad Request",
+                    "proposal_id is required",
+                    StatusCode::BAD_REQUEST,
+                )
+                .into_response();
+            };
+            match establish::commit_proposal(&state.journal_root, &proposal_id) {
+                Ok(_) => {}
+                Err(EstablishError::ProposalConflict) => {
+                    return error_envelope(
+                        "proposal_conflict",
+                        "Conflict",
+                        "identity proposal conflict",
+                        StatusCode::CONFLICT,
+                    )
+                    .into_response();
+                }
+                Err(error) => return establish_error(error),
+            }
+        }
+        "regenerate_mark" => match establish::regenerate_proposal(&state.journal_root) {
+            Ok(_) => {}
+            Err(EstablishError::AlreadyLocked) => {
+                return error_envelope(
+                    "invalid_operation_for_state",
+                    "Bad Request",
+                    "journal id already locked",
+                    StatusCode::BAD_REQUEST,
+                )
+                .into_response();
+            }
+            Err(error) => return establish_error(error),
+        },
+        "save_thinking" => {
+            let Some(choice) = req.choice.as_deref() else {
+                return error_envelope(
+                    "invalid_config_value",
+                    "Bad Request",
+                    "choice is required",
+                    StatusCode::BAD_REQUEST,
+                )
+                .into_response();
+            };
+            if !matches!(choice, "local" | "byo" | "spp" | "later") {
+                return error_envelope(
+                    "invalid_config_value",
+                    "Bad Request",
+                    "unknown thinking choice",
+                    StatusCode::BAD_REQUEST,
+                )
+                .into_response();
+            }
+
+            if choice == "local" {
+                let cap = compute_local_capability(&state.journal_root).await.overall;
+                if cap == "ok" {
+                    let base_config = match load_mutation_base(&state.journal_root) {
+                        Ok(base) => base.config,
+                        Err(_) => return corrupt_config(),
+                    };
+                    if let Err((code, msg, status)) = resolve_local_provider_update(&base_config) {
+                        return error_envelope(code, "Bad Request", msg, status).into_response();
+                    }
+                    let mutation = mutate_journal_config(
+                        &state.journal_root,
+                        solstone_core_journal_config_write::LockOptions::default(),
+                        |config| {
+                            let mut changed = false;
+                            let setup = object_mut(config, "setup");
+                            if setup.get("thinking_choice") != Some(&json!("local")) {
+                                setup.insert("thinking_choice".into(), json!("local"));
+                                changed = true;
+                            }
+                            let local_val = local_provider_val();
+                            let providers = object_mut(config, "providers");
+                            if providers.get("active") != Some(&local_val) {
+                                providers.insert("active".into(), local_val.clone());
+                                changed = true;
+                            }
+                            let setup = object_mut(config, "setup");
+                            if setup.get("thinking_selection") != Some(&local_val) {
+                                setup.insert("thinking_selection".into(), local_val);
+                                changed = true;
+                            }
+                            JournalConfigMutation { changed, value: () }
+                        },
+                    );
+                    if let Err(e) = mutation {
+                        return config_error(e);
+                    }
+                    let journal = state.journal_root.clone();
+                    let host = state.host.clone();
+                    let start_res =
+                        tokio::task::spawn_blocking(move || host.start_local(&journal)).await;
+                    match start_res {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            start_err_overlay = Some(err);
+                        }
+                        Err(err) => {
+                            return error_envelope(
+                                "start_failed",
+                                "Internal Server Error",
+                                err.to_string(),
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                            )
+                            .into_response();
+                        }
+                    }
+                } else {
+                    let mutation = mutate_journal_config(
+                        &state.journal_root,
+                        solstone_core_journal_config_write::LockOptions::default(),
+                        |config| {
+                            let mut changed = false;
+                            let setup = object_mut(config, "setup");
+                            if setup.get("thinking_choice") != Some(&json!("local")) {
+                                setup.insert("thinking_choice".into(), json!("local"));
+                                changed = true;
+                            }
+                            JournalConfigMutation { changed, value: () }
+                        },
+                    );
+                    if let Err(e) = mutation {
+                        return config_error(e);
+                    }
+                }
+            } else {
+                let mutation = mutate_journal_config(
+                    &state.journal_root,
+                    solstone_core_journal_config_write::LockOptions::default(),
+                    |config| {
+                        let mut changed = false;
+                        let setup = object_mut(config, "setup");
+                        if setup.get("thinking_choice") != Some(&json!(choice)) {
+                            setup.insert("thinking_choice".into(), json!(choice));
+                            changed = true;
+                        }
+                        let providers = object_mut(config, "providers");
+                        let active = providers.get("active").cloned();
+                        let setup = object_mut(config, "setup");
+                        let selection = setup.get("thinking_selection").cloned();
+                        if active.is_some() && active == selection {
+                            let providers = object_mut(config, "providers");
+                            providers.remove("active");
+                            let setup = object_mut(config, "setup");
+                            setup.remove("thinking_selection");
+                            changed = true;
+                        }
+                        JournalConfigMutation { changed, value: () }
+                    },
+                );
+                if let Err(e) = mutation {
+                    return config_error(e);
+                }
+            }
+        }
+        "start_thinking_download" => {
+            let base_config = match load_mutation_base(&state.journal_root) {
+                Ok(base) => base.config,
+                Err(_) => return corrupt_config(),
+            };
+            let saved_choice = nested_string(&base_config, "setup", "thinking_choice");
+            if saved_choice != "local" {
+                return error_envelope(
+                    "thinking_choice_required",
+                    "Bad Request",
+                    "local thinking choice is required",
+                    StatusCode::BAD_REQUEST,
+                )
+                .into_response();
+            }
+            let cap = compute_local_capability(&state.journal_root).await.overall;
+            if cap != "ok" {
+                return error_envelope(
+                    "local_unavailable",
+                    "Bad Request",
+                    "local thinking is not available on this host",
+                    StatusCode::BAD_REQUEST,
+                )
+                .into_response();
+            }
+            if nested_value(&base_config, "setup", "thinking_selection").is_none() {
+                if let Err((code, msg, status)) = resolve_local_provider_update(&base_config) {
+                    return error_envelope(code, "Bad Request", msg, status).into_response();
+                }
+                let mutation = mutate_journal_config(
+                    &state.journal_root,
+                    solstone_core_journal_config_write::LockOptions::default(),
+                    |config| {
+                        let mut changed = false;
+                        let local_val = local_provider_val();
+                        let providers = object_mut(config, "providers");
+                        if providers.get("active") != Some(&local_val) {
+                            providers.insert("active".into(), local_val.clone());
+                            changed = true;
+                        }
+                        let setup = object_mut(config, "setup");
+                        if setup.get("thinking_selection") != Some(&local_val) {
+                            setup.insert("thinking_selection".into(), local_val);
+                            changed = true;
+                        }
+                        JournalConfigMutation { changed, value: () }
+                    },
+                );
+                if let Err(e) = mutation {
+                    return config_error(e);
+                }
+            }
+            let journal = state.journal_root.clone();
+            let host = state.host.clone();
+            let start_res = tokio::task::spawn_blocking(move || host.start_local(&journal)).await;
+            match start_res {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    start_err_overlay = Some(err);
+                }
+                Err(err) => {
+                    return error_envelope(
+                        "start_failed",
+                        "Internal Server Error",
+                        err.to_string(),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    )
+                    .into_response();
+                }
+            }
+        }
+        "cancel_thinking_download" => {
+            let Some(attempt_id) = req.attempt_id.filter(|s| !s.trim().is_empty()) else {
+                return error_envelope(
+                    "attempt_required",
+                    "Bad Request",
+                    "attempt_id is required",
+                    StatusCode::BAD_REQUEST,
+                )
+                .into_response();
+            };
+            let journal = state.journal_root.clone();
+            let host = state.host.clone();
+            let attempt = attempt_id.clone();
+            let cancel_res =
+                tokio::task::spawn_blocking(move || host.cancel_local(&journal, &attempt)).await;
+            match cancel_res {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    return error_envelope(
+                        "cancel_failed",
+                        "Bad Request",
+                        &err,
+                        StatusCode::BAD_REQUEST,
+                    )
+                    .into_response();
+                }
+                Err(err) => {
+                    return error_envelope(
+                        "cancel_failed",
+                        "Internal Server Error",
+                        err.to_string(),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    )
+                    .into_response();
+                }
+            }
+        }
+        "retry_speech_download" => {
+            let journal = state.journal_root.clone();
+            let host = state.host.clone();
+            let retry_res = tokio::task::spawn_blocking(move || host.retry_speech(&journal)).await;
+            match retry_res {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    return error_envelope(
+                        "retry_failed",
+                        "Bad Request",
+                        &err,
+                        StatusCode::BAD_REQUEST,
+                    )
+                    .into_response();
+                }
+                Err(err) => {
+                    return error_envelope(
+                        "retry_failed",
+                        "Internal Server Error",
+                        err.to_string(),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    )
+                    .into_response();
+                }
+            }
+        }
+        "finalize" => {
+            let mut valid_tz = None;
+            if let Some(tz) = req.timezone.filter(|s| !s.trim().is_empty()) {
+                if solstone_core_journal_config::parse_zone(&tz).is_none() {
+                    return error_envelope(
+                        "invalid_config_value",
+                        "Bad Request",
+                        "invalid timezone",
+                        StatusCode::BAD_REQUEST,
+                    )
+                    .into_response();
+                }
+                valid_tz = Some(tz);
+            }
+
+            match establish::load_committed(&state.journal_root) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return error_envelope(
+                        "identity_not_locked",
+                        "Bad Request",
+                        "journal id must be locked before setup can finish",
+                        StatusCode::BAD_REQUEST,
+                    )
+                    .into_response();
+                }
+                Err(error) => return establish_error(error),
+            }
+
+            let base_config = match load_mutation_base(&state.journal_root) {
+                Ok(base) => base.config,
+                Err(_) => return corrupt_config(),
+            };
+            if !setup_is_complete(&base_config) {
+                let saved_choice = nested_string(&base_config, "setup", "thinking_choice");
+                if !matches!(saved_choice.as_str(), "local" | "byo" | "spp" | "later") {
+                    return error_envelope(
+                        "thinking_choice_required",
+                        "Bad Request",
+                        "thinking choice is required before setup can finish",
+                        StatusCode::BAD_REQUEST,
+                    )
+                    .into_response();
+                }
+            }
+
+            let mutation = mutate_journal_config(
+                &state.journal_root,
+                solstone_core_journal_config_write::LockOptions::default(),
+                |config| {
+                    if setup_is_complete(config) {
+                        return JournalConfigMutation {
+                            changed: false,
+                            value: false,
+                        };
+                    }
+                    let setup = object_mut(config, "setup");
+                    setup.insert("completed_at".into(), json!(now_ms()));
+                    let changed = true;
+                    if let Some(tz) = valid_tz.as_ref() {
+                        let identity = object_mut(config, "identity");
+                        identity.insert("timezone".into(), json!(tz));
+                    }
+                    JournalConfigMutation {
+                        changed,
+                        value: true,
+                    }
+                },
+            );
+            if let Err(e) = mutation {
+                return config_error(e);
+            }
+        }
+        _ => {
+            return error_envelope(
+                "invalid_operation_for_state",
+                "Bad Request",
+                "unknown action",
+                StatusCode::BAD_REQUEST,
+            )
+            .into_response();
+        }
+    }
+
+    let config = match load_mutation_base(&state.journal_root) {
+        Ok(base) => base.config,
+        Err(_) => return corrupt_config(),
+    };
+    match build_setup_state(&state, &config).await {
+        Ok(mut state_resp) => {
+            if let Some(err) = start_err_overlay
+                && state_resp.downloads.thinking.state == "idle"
+            {
+                state_resp.downloads.thinking.state = "error".into();
+                state_resp.downloads.thinking.error = Some(SetupDownloadError {
+                    code: "start_failed".into(),
+                    detail: err,
+                });
+            }
+            Json(state_resp).into_response()
+        }
+        Err(err_resp) => err_resp,
     }
 }
 
@@ -466,11 +1165,38 @@ async fn init_finalize(
         Err(error) => return establish_error(error),
     }
 
-    let request = serde_json::from_slice::<FinalizeRequest>(&body).unwrap_or_default();
-    let redirect = match finalize_redirect(request.lane.as_ref()) {
-        Some(redirect) => redirect,
-        None => return invalid_lane(),
+    let request = match serde_json::from_slice::<FinalizeRequest>(&body) {
+        Ok(req) => req,
+        Err(_) => {
+            return error_envelope(
+                "invalid_request",
+                "Bad Request",
+                "malformed json request",
+                StatusCode::BAD_REQUEST,
+            )
+            .into_response();
+        }
     };
+
+    let lane_str = request
+        .lane
+        .as_ref()
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let choice = match lane_str {
+        "" | "defer" | "later" => "later",
+        "local" => "local",
+        "byo" => "byo",
+        "confidential" => "spp",
+        _ => return invalid_lane(),
+    };
+    let redirect = match choice {
+        "byo" => "/app/thinking#byo-setup".to_string(),
+        "spp" => "/app/thinking#confidential-setup".to_string(),
+        _ => "/app/home".to_string(),
+    };
+
     let retention_mode = request
         .retention_mode
         .as_ref()
@@ -496,8 +1222,22 @@ async fn init_finalize(
         return response;
     }
 
-    // Deliberately does not seed config/convey.json — see
-    // solstone/convey/config.py:seed_default_app_navigation; out of scope this wave.
+    let completed_at_existing = setup_is_complete(&config);
+
+    let mut should_start_local = false;
+    let cap = if !completed_at_existing && choice == "local" {
+        let cap_overall = compute_local_capability(&state.journal_root).await.overall;
+        if cap_overall == "ok" {
+            if let Err((code, msg, status)) = resolve_local_provider_update(&config) {
+                return error_envelope(code, "Bad Request", msg, status).into_response();
+            }
+            should_start_local = true;
+        }
+        cap_overall
+    } else {
+        "unknown"
+    };
+
     let result = mutate_journal_config(
         &state.journal_root,
         solstone_core_journal_config_write::LockOptions::default(),
@@ -505,7 +1245,13 @@ async fn init_finalize(
             if !finalize_config_sections_are_objects(config) {
                 return JournalConfigMutation {
                     changed: false,
-                    value: false,
+                    value: Err(()),
+                };
+            }
+            if setup_is_complete(config) {
+                return JournalConfigMutation {
+                    changed: false,
+                    value: Ok(false),
                 };
             }
             let mut changed = false;
@@ -519,7 +1265,6 @@ async fn init_finalize(
                 ("preferred", request.preferred.as_ref()),
                 ("timezone", request.timezone.as_ref()),
             ] {
-                // A zone name must be a real one; setup never stores a guess.
                 let usable = |text: &str| {
                     !text.is_empty()
                         && (key != "timezone"
@@ -538,6 +1283,23 @@ async fn init_finalize(
                 setup.insert("completed_at".to_owned(), json!(completed_at));
                 changed = true;
             }
+            if setup.get("thinking_choice") != Some(&json!(choice)) {
+                setup.insert("thinking_choice".to_owned(), json!(choice));
+                changed = true;
+            }
+            if choice == "local" && cap == "ok" {
+                let local_val = local_provider_val();
+                let providers = object_mut(config, "providers");
+                if providers.get("active") != Some(&local_val) {
+                    providers.insert("active".to_owned(), local_val.clone());
+                    changed = true;
+                }
+                let setup = object_mut(config, "setup");
+                if setup.get("thinking_selection") != Some(&local_val) {
+                    setup.insert("thinking_selection".to_owned(), local_val);
+                    changed = true;
+                }
+            }
             let retention = object_mut(config, "retention");
             for (key, value) in [
                 ("raw_media", Value::String(retention_mode)),
@@ -553,15 +1315,33 @@ async fn init_finalize(
             }
             JournalConfigMutation {
                 changed,
-                value: true,
+                value: Ok(true),
             }
         },
     );
-    match result {
-        Ok(transaction) if !transaction.value => return corrupt_config(),
-        Ok(_) => {}
+    let wrote_first_completion = match result {
+        Ok(transaction) => match transaction.value {
+            Ok(first) => first,
+            Err(()) => return corrupt_config(),
+        },
         Err(error) => return config_error(error),
+    };
+
+    if wrote_first_completion && should_start_local {
+        let journal = state.journal_root.clone();
+        let host = state.host.clone();
+        let start_res = tokio::task::spawn_blocking(move || host.start_local(&journal)).await;
+        if let Err(err) = start_res {
+            return error_envelope(
+                "start_failed",
+                "Internal Server Error",
+                err.to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+            .into_response();
+        }
     }
+
     Json(FinalizeResponse {
         success: true,
         redirect,
@@ -633,20 +1413,6 @@ fn setup_is_complete(config: &Map<String, Value>) -> bool {
     nested_value(config, "setup", "completed_at")
         .and_then(|value| value.as_f64())
         .is_some_and(|completed_at| completed_at > 0.0)
-}
-
-fn finalize_redirect(lane: Option<&Value>) -> Option<String> {
-    let Some(lane) = lane else {
-        return Some("/app/thinking".to_owned());
-    };
-    let lane = lane.as_str()?;
-    if lane.is_empty() {
-        return Some("/app/thinking".to_owned());
-    }
-    if LANES.iter().any(|candidate| candidate.id == lane) {
-        return Some(format!("/app/thinking#{lane}-setup"));
-    }
-    None
 }
 
 fn invalid_lane() -> Response {

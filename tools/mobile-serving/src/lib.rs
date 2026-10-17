@@ -751,16 +751,14 @@ mod tests {
         let server =
             MobileServing::start_with_payload(root.path().to_path_buf(), address, payload).unwrap();
         assert_eq!(server.status()["door_address"], Value::Null);
+        let mark_response = server.request_owner("GET", "/init/mark", "").unwrap();
+        assert_eq!(mark_response.status, 200);
+        let mark_json: Value = serde_json::from_str(&mark_response.body).unwrap();
+        let proposal_id = mark_json["proposal_id"].as_str().expect("proposal_id");
+        let lock_body = serde_json::json!({ "proposal_id": proposal_id }).to_string();
         assert_eq!(
             server
-                .request_owner("GET", "/init/mark", "")
-                .unwrap()
-                .status,
-            200
-        );
-        assert_eq!(
-            server
-                .request_owner("POST", "/init/mark/lock", "{}")
+                .request_owner("POST", "/init/mark/lock", &lock_body)
                 .unwrap()
                 .status,
             200

@@ -635,6 +635,32 @@ async fn loopback_post(address: SocketAddr, path: &str, body: &[u8]) -> u16 {
         .expect("status parses")
 }
 
+async fn loopback_post_with_body(address: SocketAddr, path: &str, body: &[u8]) -> (u16, String) {
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("loopback connects");
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("request headers write");
+    stream.write_all(body).await.expect("request body writes");
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.expect("response");
+    let text = std::str::from_utf8(&response).expect("response is text");
+    let status: u16 = text
+        .split_whitespace()
+        .nth(1)
+        .expect("status token")
+        .parse()
+        .expect("status parses");
+    let body_text = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+    (status, body_text)
+}
+
 async fn loopback_status(address: SocketAddr) -> std::io::Result<u16> {
     let mut stream = tokio::net::TcpStream::connect(address).await?;
     stream
@@ -1951,13 +1977,17 @@ async fn finalize_starts_the_door_boot_withheld_for_an_unestablished_journal() {
     assert!(handle.live_door_addr().is_none());
 
     let loopback = handle.loopback_ipv4_addr();
+    let (status, regen_body) =
+        loopback_post_with_body(loopback, "/init/mark/regenerate", b"{}").await;
+    assert_eq!(status, 200, "wizard mark regenerate");
+    let regen_json: serde_json::Value = serde_json::from_str(&regen_body).expect("json");
+    let proposal_id = regen_json["proposal_id"]
+        .as_str()
+        .expect("proposal_id")
+        .to_string();
+    let lock_body = serde_json::json!({"proposal_id": proposal_id}).to_string();
     assert_eq!(
-        loopback_post(loopback, "/init/mark/regenerate", b"{}").await,
-        200,
-        "wizard mark regenerate"
-    );
-    assert_eq!(
-        loopback_post(loopback, "/init/mark/lock", b"{}").await,
+        loopback_post(loopback, "/init/mark/lock", lock_body.as_bytes()).await,
         200,
         "wizard mark lock"
     );
@@ -1999,6 +2029,89 @@ async fn finalize_starts_the_door_boot_withheld_for_an_unestablished_journal() {
     handle.shutdown();
     fs::remove_dir_all(peer_root).expect("peer root removes");
     fs::remove_dir_all(root).expect("temporary root removes");
+}
+
+#[tokio::test]
+async fn action_finalize_starts_the_door_boot_withheld_for_an_unestablished_journal() {
+    let root = std::env::temp_dir().join(format!(
+        "solstone-door-action-finalize-opens-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("config")).expect("config");
+    let mut handle = serve(ConveyServeOptions {
+        journal_root: root.clone(),
+        loopback_port: 0,
+        door_port: 0,
+        handshake_timeout: Duration::from_secs(2),
+        stream_stall_timeout: Duration::from_secs(2),
+        router: solstone_core_sol_link::http::init_router(root.clone()),
+        carrier_loop_iterations: Arc::new(AtomicU64::new(0)),
+        handshake_authorization_read_ticks: Arc::new(AtomicU64::new(0)),
+    })
+    .await
+    .expect("loopback");
+    assert!(matches!(
+        handle.door_outcome(),
+        DoorOutcome::Withheld(DoorWithheldReason::Unestablished)
+    ));
+    assert!(handle.live_door_addr().is_none());
+
+    let loopback = handle.loopback_ipv4_addr();
+    let (status, regen_body) =
+        loopback_post_with_body(loopback, "/init/mark/regenerate", b"{}").await;
+    assert_eq!(status, 200, "wizard mark regenerate");
+    let regen_json: serde_json::Value = serde_json::from_str(&regen_body).expect("json");
+    let proposal_id = regen_json["proposal_id"]
+        .as_str()
+        .expect("proposal_id")
+        .to_string();
+    let lock_body = serde_json::json!({"proposal_id": proposal_id}).to_string();
+    assert_eq!(
+        loopback_post(loopback, "/init/mark/lock", lock_body.as_bytes()).await,
+        200,
+        "wizard mark lock"
+    );
+    assert!(
+        handle.live_door_addr().is_none(),
+        "locking the journal id does not start the door"
+    );
+
+    let (status, _) =
+        loopback_post_with_body(loopback, "/init/api/action", br#"{"action":"finalize"}"#).await;
+    assert_ne!(status, 200, "finalize without saved choice is non-2xx");
+    assert!(
+        handle.live_door_addr().is_none(),
+        "unsuccessful finalize does not start the door"
+    );
+
+    let (status, _) = loopback_post_with_body(
+        loopback,
+        "/init/api/action",
+        br#"{"action":"save_thinking","choice":"later"}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "save_thinking later");
+
+    let (status, _) =
+        loopback_post_with_body(loopback, "/init/api/action", br#"{"action":"finalize"}"#).await;
+    assert_eq!(status, 200, "finalize starts the door");
+    assert!(
+        handle.live_door_addr().is_some(),
+        "finalize starts the withheld door"
+    );
+
+    let (status, _) =
+        loopback_post_with_body(loopback, "/init/api/action", br#"{"action":"finalize"}"#).await;
+    assert_eq!(status, 200, "second finalize is 2xx");
+    assert!(
+        handle.live_door_addr().is_some(),
+        "door remains started on repeated finalize"
+    );
+
+    handle.stop_authorization_refresh().await;
+    handle.shutdown();
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[tokio::test]
