@@ -34,6 +34,7 @@ pub(super) enum Repository<'a> {
         access: &'a str,
         secret: &'a str,
         token: &'a str,
+        append_only: bool,
     },
 }
 
@@ -198,6 +199,7 @@ pub(super) fn parse<'a>(
                 | "AWS_SECRET_ACCESS_KEY"
                 | "AWS_SESSION_TOKEN"
                 | "AWS_DEFAULT_REGION"
+                | "SOLSTONE_APPEND_ONLY"
         )
     }) {
         return Err(RepositoryRefusal);
@@ -220,11 +222,17 @@ pub(super) fn parse<'a>(
     {
         return Err(RepositoryRefusal);
     }
+    let append_only = match env.get("SOLSTONE_APPEND_ONLY") {
+        None => false,
+        Some(Some(value)) if value == "1" => true,
+        Some(_) => return Err(RepositoryRefusal),
+    };
     Ok(Repository::S3 {
         destination: destination(repository, get("AWS_DEFAULT_REGION")?)?,
         access,
         secret,
         token,
+        append_only,
     })
 }
 

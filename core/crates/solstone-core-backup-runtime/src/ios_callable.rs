@@ -403,6 +403,7 @@ fn execute(
             access,
             secret,
             token,
+            append_only,
         } => {
             state = authority
                 .installed
@@ -425,6 +426,13 @@ fn execute(
                     descriptor: state.as_fd(),
                 },
             };
+            // Options version 2 carries the create-only bit for an append-only
+            // (operated) destination; owner storage keeps ordinary writes.
+            let options = native::Options {
+                version: if append_only { 2 } else { options.version },
+                reserved1: u32::from(append_only),
+                ..*options
+            };
             native::Call::remote(
                 operation,
                 &password,
@@ -433,7 +441,7 @@ fn execute(
                 snapshot_source,
                 private_workspace,
                 selection,
-                options,
+                &options,
             )
         }
     }
@@ -561,11 +569,14 @@ fn restore(
     {
         return Err(refused("ios_backup_restore_target_mismatch"));
     }
+    // Restore writes only its repository lock remotely, so it needs no
+    // create-only condition.
     let repository::Repository::S3 {
         destination,
         access,
         secret,
         token,
+        ..
     } = repository
     else {
         return Err(refused("ios_backup_restore_local_unsupported"));

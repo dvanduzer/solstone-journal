@@ -117,6 +117,10 @@ func s3ErrorResponse(method string, status int, body []byte) error {
 	if status == http.StatusUnauthorized || status == http.StatusForbidden {
 		return errS3Denied
 	}
+	// Only a create-only write is conditional, so this is an existing object.
+	if status == http.StatusPreconditionFailed && method == http.MethodPut {
+		return errS3ObjectExists
+	}
 	if status == http.StatusRequestedRangeNotSatisfiable {
 		return errS3Range
 	}
@@ -147,6 +151,10 @@ func s3ErrorResponse(method string, status int, body []byte) error {
 // Only the pinned signer runs here. No SDK client may discover a region,
 // credential, session or alternate authority. Each call owns a complete reply.
 func (be *s3Backend) request(ctx context.Context, method, key string, query url.Values, payload []byte, rangeValue string) (*http.Response, []byte, error) {
+	return be.send(ctx, method, key, query, payload, rangeValue, false)
+}
+
+func (be *s3Backend) send(ctx context.Context, method, key string, query url.Values, payload []byte, rangeValue string, createOnly bool) (*http.Response, []byte, error) {
 	if ctx.Err() != nil {
 		return nil, nil, ctx.Err()
 	}
@@ -169,6 +177,9 @@ func (be *s3Backend) request(ctx context.Context, method, key string, query url.
 	}
 	if method == http.MethodPut {
 		req.Header.Set("Content-Type", "application/octet-stream")
+	}
+	if createOnly {
+		req.Header.Set("If-None-Match", "*")
 	}
 	digest := sha256.Sum256(payload)
 	req.Header.Set("X-Amz-Content-Sha256", hex.EncodeToString(digest[:]))
@@ -262,7 +273,9 @@ func (be *s3Backend) Save(ctx context.Context, handle backend.Handle, reader bac
 	if int64(len(body)) != length {
 		return errS3Protocol
 	}
-	reply, response, err := be.request(owned, http.MethodPut, key, nil, body, "")
+	// An append-only destination never replaces an object; only locks are mutable.
+	createOnly := be.cfg.appendOnly && handle.Type != backend.LockFile
+	reply, response, err := be.send(owned, http.MethodPut, key, nil, body, "", createOnly)
 	defer zeroBytes(response)
 	if err != nil {
 		return err

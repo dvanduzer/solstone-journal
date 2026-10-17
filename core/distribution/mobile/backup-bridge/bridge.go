@@ -459,7 +459,16 @@ func runWorker(h *callHandle, req bridgeRequest) {
 }
 
 // parseCOperationOptions takes an immutable owned copy before a worker exists.
+// Append-only applies only to remote storage; local entries refuse it.
 func parseCOperationOptions(operation int32, options *C.restic_operation_options_v1) (*operationOptions, int32) {
+	parsed, status := parseCRemoteOperationOptions(operation, options)
+	if status == StatusOk && parsed.appendOnly {
+		return nil, StatusInvalidArgument
+	}
+	return parsed, status
+}
+
+func parseCRemoteOperationOptions(operation int32, options *C.restic_operation_options_v1) (*operationOptions, int32) {
 	if options == nil {
 		return nil, StatusInvalidArgument
 	}

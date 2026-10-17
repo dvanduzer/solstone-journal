@@ -62,12 +62,9 @@ fn resolve_ios_tools(
     journal: &Path,
     needs_rclone: bool,
 ) -> Result<ResolvedTools, ClosedToolError> {
-    if needs_rclone {
-        return Err(ClosedToolError::RcloneUnavailable {
-            detail: "ios_append_only_transport_unavailable".into(),
-            guidance: solstone_core_installed_payload::guidance::PACKAGE_MISMATCH.into(),
-        });
-    }
+    // Operated storage needs no rclone here: the linked transport keeps an
+    // operated destination's non-lock writes create-only.
+    let _ = needs_rclone;
     let unavailable = |detail: &str| ClosedToolError::ResticUnavailable {
         detail: detail.into(),
         guidance: solstone_core_installed_payload::guidance::PACKAGE_MISMATCH.into(),

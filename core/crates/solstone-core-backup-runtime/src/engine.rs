@@ -515,7 +515,9 @@ fn runtime(
             binding,
             credentials,
         }) => {
-            let session = if append_only {
+            // iOS's operated destination is itself create-only through the
+            // linked transport, so it needs no append-only rclone session.
+            let session = if append_only && !cfg!(target_os = "ios") {
                 let rclone = services
                     .rclone_path
                     .ok_or_else(|| "rclone_unavailable".to_owned())?;
@@ -1235,11 +1237,17 @@ impl AdmittedCapability {
                 let credentials =
                     fetch_hosted_credentials(services.http, &binding, "operated", services.version)
                         .map_err(|error| error.reason_code.to_owned())?;
-                let rclone = services
-                    .rclone_path
-                    .ok_or_else(|| "rclone_unavailable".to_owned())?;
-                let session = hosted_append_only_session(&binding, &credentials, rclone)
-                    .map_err(|_| "rclone_unavailable")?;
+                // iOS's operated destination is itself create-only.
+                #[cfg(target_os = "ios")]
+                let session = hosted_session(&binding, &credentials).map_err(|_| "failed")?;
+                #[cfg(not(target_os = "ios"))]
+                let session = {
+                    let rclone = services
+                        .rclone_path
+                        .ok_or_else(|| "rclone_unavailable".to_owned())?;
+                    hosted_append_only_session(&binding, &credentials, rclone)
+                        .map_err(|_| "rclone_unavailable")?
+                };
                 Ok(Runtime {
                     destination: session.destination,
                     password: keys.daily_key,

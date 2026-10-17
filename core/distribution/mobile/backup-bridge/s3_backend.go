@@ -28,6 +28,7 @@ var (
 	errS3IO            = errors.New("S3_IO_FAILED")
 	errS3Denied        = errors.New("S3_ACCESS_DENIED")
 	errS3NotFound      = errors.New("S3_OBJECT_NOT_FOUND")
+	errS3ObjectExists  = errors.New("S3_OBJECT_EXISTS")
 	errS3BucketMissing = errors.New("S3_BUCKET_NOT_FOUND")
 	errS3Ambiguous404  = errors.New("S3_ABSENCE_UNCONFIRMED")
 	errS3Callback      = errors.New("S3_CONSUMER_FAILED")
@@ -39,6 +40,8 @@ var (
 type s3Config struct {
 	endpoint, region, bucket, prefix string
 	access, secret, token            string
+	// appendOnly makes every non-lock write create-only; it is not identity.
+	appendOnly bool
 }
 
 func printableS3Value(value string, maximum int, optional bool) bool {
