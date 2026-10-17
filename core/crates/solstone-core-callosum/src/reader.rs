@@ -387,7 +387,7 @@ mod tests {
         const CHILD: &str = "SOLSTONE_TEST_RELATIVE_REPORTED_ZONE";
         if std::env::var_os(CHILD).is_none() {
             let directory = tempfile::tempdir().unwrap();
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "reader::tests::reported_zone_accepts_relative_journal_paths",
@@ -395,9 +395,14 @@ mod tests {
                 ])
                 .current_dir(directory.path())
                 .env(CHILD, "1")
-                .status()
+                .output()
                 .unwrap();
-            assert!(status.success());
+            assert!(
+                output.status.success(),
+                "relative-path child failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
             assert_eq!(
                 fs::read(directory.path().join("relative-zone-verified")).unwrap(),
                 b"passed"

@@ -31,6 +31,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- agent search and transcript reads now leave out deleted recordings without waiting for the search index to catch up.
 - security fix: a symbolic link in a recording's metadata could make a transcript page read time-zone information from outside your journal. those links are now refused.
 - transcript reads by your agent now include the recording's reported time zone when its UTC offset differs from your journal's.
 - your agent can continue through facet and entity lists instead of stopping at the first page, and can tell when an entity description was shortened.
