@@ -12,6 +12,7 @@ use super::{
 pub(crate) struct ValidatedListEntities {
     pub(crate) facet_id: Option<String>,
     pub(crate) limit: usize,
+    pub(crate) cursor: Option<String>,
 }
 
 pub(crate) struct ValidatedGetEntity {
@@ -25,6 +26,8 @@ struct ListParams {
     facet: Option<String>,
     #[serde(default = "default_limit")]
     limit: usize,
+    #[serde(default)]
+    cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -47,9 +50,17 @@ pub(crate) fn validate_list(params: Option<&Value>) -> Result<ValidatedListEntit
     if !optional_string_within_limit(&params.facet, MAX_FACET_BYTES) {
         return Err(ToolError::InvalidInput);
     }
+    if params
+        .cursor
+        .as_ref()
+        .is_some_and(|value| value.is_empty() || value.len() > MAX_OPAQUE_REFERENCE_BYTES)
+    {
+        return Err(ToolError::InvalidInput);
+    }
     Ok(ValidatedListEntities {
         facet_id: params.facet,
         limit: params.limit,
+        cursor: params.cursor,
     })
 }
 

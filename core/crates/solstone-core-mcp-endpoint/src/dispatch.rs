@@ -29,8 +29,8 @@ use solstone_core_mcp_audit::{Admission, AuditCoordinates, Outcome, result_shape
 use crate::audit;
 use crate::permissions::{ConnectionReadSnapshot, PermissionDecision, evaluate_connection_read};
 use crate::references::{
-    CursorReference, EntityReference, EntryReference, ReferenceCodec, ReferenceKind,
-    ReferenceTarget, SegmentReference, TranscriptListCursor,
+    CursorReference, EntityListCursor, EntityReference, EntryReference, FacetListCursor,
+    ReferenceCodec, ReferenceKind, ReferenceTarget, SegmentReference, TranscriptListCursor,
 };
 use crate::registry::{ToolEntry, category_token, find_tool, snapshot_allows};
 use crate::segment_links::{LinkSubject, LiveTranscriptPages, issue_segment_links};
@@ -410,6 +410,9 @@ fn recorded_arguments(validated: &ValidatedTool) -> Map<String, Value> {
     match validated {
         ValidatedTool::ListFacets(request) => {
             arguments.insert("limit".to_owned(), request.limit.into());
+            if let Some(cursor) = request.cursor.as_deref() {
+                arguments.insert("cursor".to_owned(), reference_fingerprint(cursor).into());
+            }
         }
         ValidatedTool::Search(request) => {
             arguments.insert("query".to_owned(), request.query.clone().into());
@@ -453,6 +456,9 @@ fn recorded_arguments(validated: &ValidatedTool) -> Map<String, Value> {
         ValidatedTool::ListEntities(request) => {
             arguments.insert("limit".to_owned(), request.limit.into());
             insert_present(&mut arguments, "facet", request.facet_id.as_deref());
+            if let Some(cursor) = request.cursor.as_deref() {
+                arguments.insert("cursor".to_owned(), reference_fingerprint(cursor).into());
+            }
         }
         ValidatedTool::GetEntity(request) => {
             arguments.insert(
@@ -582,7 +588,9 @@ fn execute_validated(
     validated: ValidatedTool,
 ) -> Result<Prepared, DispatchError> {
     match validated {
-        ValidatedTool::ListFacets(request) => list_facets(journal_root, snapshot, request),
+        ValidatedTool::ListFacets(request) => {
+            list_facets(journal_root, principal, snapshot, request)
+        }
         ValidatedTool::Search(request) => search(journal_root, principal, snapshot, request),
         ValidatedTool::Fetch(request) => fetch(journal_root, principal, snapshot, request),
         ValidatedTool::ListTranscripts(request) => {
@@ -1459,21 +1467,92 @@ fn public_memory_origin(origin: &Origin) -> Value {
 
 fn list_facets(
     journal_root: &Path,
+    principal: DispatchPrincipal<'_>,
     snapshot: &ConnectionReadSnapshot,
     request: ValidatedListFacets,
 ) -> Result<Prepared, DispatchError> {
+    let cursor = request
+        .cursor
+        .as_deref()
+        .map(|token| {
+            let ReferenceTarget::FacetList(cursor) = codec()
+                .resolve(
+                    token,
+                    ReferenceKind::FacetList,
+                    principal.connection,
+                    snapshot.generation,
+                )
+                .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?
+            else {
+                return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
+            };
+            Ok(cursor)
+        })
+        .transpose()?;
+
     let include_details = snapshot.categories.contains(&AdmittedCategory::Facets);
-    let facets = available_facets(journal_root, snapshot)?;
+    let mut facets = available_facets(journal_root, snapshot)?;
+    facets.sort_by(|(id_a, _, _), (id_b, _, _)| id_a.cmp(id_b));
+
+    if let Some(cursor) = cursor.as_ref() {
+        facets.retain(|(id, _, _)| id > &cursor.last_facet_id);
+    }
+
+    let has_more = facets.len() > request.limit;
+    let page = facets.into_iter().take(request.limit).collect::<Vec<_>>();
+    let last_facet_id = page.last().map(|(id, _, _)| id.clone());
+
     let mut targets = Vec::new();
-    let values = facets.into_iter().take(request.limit).map(|(id, name, declaration)| {
-        let title = declaration.as_ref().map_or_else(|| name.clone(), |value| if value.title.is_empty() { name.clone() } else { value.title.clone() });
-        targets.push(format!("facet:{id}"));
-        if include_details {
-            json!({"id": id, "name": title, "description": declaration.as_ref().map(|item| item.description.clone()).unwrap_or_default()})
-        } else { json!({"id": id, "name": title}) }
-    }).collect::<Vec<_>>();
+    let values = page
+        .into_iter()
+        .map(|(id, name, declaration)| {
+            let title = declaration.as_ref().map_or_else(
+                || name.clone(),
+                |value| {
+                    if value.title.is_empty() {
+                        name.clone()
+                    } else {
+                        value.title.clone()
+                    }
+                },
+            );
+            targets.push(format!("facet:{id}"));
+            if include_details {
+                json!({
+                    "id": id,
+                    "name": title,
+                    "description": declaration.as_ref().map(|item| item.description.clone()).unwrap_or_default(),
+                })
+            } else {
+                json!({"id": id, "name": title})
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let next_cursor = if has_more {
+        if let Some(last_facet_id) = last_facet_id {
+            Some(
+                codec()
+                    .mint(
+                        principal.connection,
+                        snapshot.generation,
+                        ReferenceTarget::FacetList(FacetListCursor { last_facet_id }),
+                    )
+                    .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let count = values.len();
-    Ok(Prepared::new(json!({"facets": values}), count, targets).when_empty(LIST_FACETS_EMPTY))
+    let mut response_val = json!({"facets": values});
+    if let Some(next_cursor) = next_cursor {
+        response_val["next_cursor"] = json!(next_cursor);
+    }
+    Ok(Prepared::new(response_val, count, targets).when_empty(LIST_FACETS_EMPTY))
 }
 
 fn read_scoped_entities(
@@ -1490,37 +1569,121 @@ fn list_entities(
     snapshot: &ConnectionReadSnapshot,
     request: ValidatedListEntities,
 ) -> Result<Prepared, DispatchError> {
+    let cursor = request
+        .cursor
+        .as_deref()
+        .map(|token| {
+            let ReferenceTarget::EntityList(cursor) = codec()
+                .resolve(
+                    token,
+                    ReferenceKind::EntityList,
+                    principal.connection,
+                    snapshot.generation,
+                )
+                .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?
+            else {
+                return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
+            };
+            if cursor.facet != request.facet_id {
+                return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
+            }
+            Ok(cursor)
+        })
+        .transpose()?;
+
     let facets = available_facets(journal_root, snapshot)?;
-    let mut entities = Vec::new();
-    let mut targets = Vec::new();
+    // Every facet in the effective filter must be read before paging so a malformed relationship fails closed.
+    let mut all_entities = Vec::new();
     for (facet_id, facet_dir, _) in facets {
         if request.facet_id.as_deref().is_some_and(|id| id != facet_id) {
             continue;
         }
         let scoped = read_scoped_entities(journal_root, &facet_dir)?;
         for item in scoped {
-            if entities.len() == request.limit {
-                break;
-            }
-            let reference = codec()
-                .mint(
-                    principal.connection,
-                    snapshot.generation,
-                    ReferenceTarget::Entity(EntityReference {
-                        facet_id: facet_id.clone(),
-                        entity_id: item.entity_id.clone(),
-                    }),
-                )
-                .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?;
-            targets.push(format!("facet:{facet_id}/entity:{}", item.entity_id));
-            entities.push(json!({"name": entity_name(&item.identity), "reference": reference}));
+            all_entities.push((facet_id.clone(), item));
         }
     }
+
+    all_entities.sort_by(|(f_a, item_a), (f_b, item_b)| {
+        f_a.cmp(f_b)
+            .then_with(|| item_a.entity_id.cmp(&item_b.entity_id))
+            .then_with(|| item_a.relationship_dir.cmp(&item_b.relationship_dir))
+    });
+
+    if let Some(cursor) = cursor.as_ref() {
+        all_entities.retain(|(facet_id, item)| {
+            (
+                facet_id.as_str(),
+                item.entity_id.as_str(),
+                item.relationship_dir.as_str(),
+            ) > (
+                cursor.last_facet_id.as_str(),
+                cursor.last_entity_id.as_str(),
+                cursor.last_relationship_dir.as_str(),
+            )
+        });
+    }
+
+    let has_more = all_entities.len() > request.limit;
+    let page = all_entities
+        .into_iter()
+        .take(request.limit)
+        .collect::<Vec<_>>();
+
+    let last_anchor = page.last().map(|(facet_id, item)| {
+        (
+            facet_id.clone(),
+            item.entity_id.clone(),
+            item.relationship_dir.clone(),
+        )
+    });
+
+    let mut targets = Vec::new();
+    let mut entities = Vec::new();
+    for (facet_id, item) in page {
+        let reference = codec()
+            .mint(
+                principal.connection,
+                snapshot.generation,
+                ReferenceTarget::Entity(EntityReference {
+                    facet_id: facet_id.clone(),
+                    entity_id: item.entity_id.clone(),
+                }),
+            )
+            .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?;
+        targets.push(format!("facet:{facet_id}/entity:{}", item.entity_id));
+        entities.push(json!({"name": entity_name(&item.identity), "reference": reference}));
+    }
+
+    let next_cursor = if has_more {
+        if let Some((last_facet_id, last_entity_id, last_relationship_dir)) = last_anchor {
+            Some(
+                codec()
+                    .mint(
+                        principal.connection,
+                        snapshot.generation,
+                        ReferenceTarget::EntityList(EntityListCursor {
+                            facet: request.facet_id.clone(),
+                            last_facet_id,
+                            last_entity_id,
+                            last_relationship_dir,
+                        }),
+                    )
+                    .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let count = entities.len();
-    Ok(
-        Prepared::new(json!({"entities": entities}), count, targets)
-            .when_empty(LIST_ENTITIES_EMPTY),
-    )
+    let mut response_val = json!({"entities": entities});
+    if let Some(next_cursor) = next_cursor {
+        response_val["next_cursor"] = json!(next_cursor);
+    }
+    Ok(Prepared::new(response_val, count, targets).when_empty(LIST_ENTITIES_EMPTY))
 }
 
 fn get_entity(
@@ -1570,6 +1733,9 @@ fn get_entity(
         value["type"] = json!(kind);
     }
     if let Some(description) = text(&item.relationship, "description") {
+        if description.chars().count() > MAX_ENTITY_DESCRIPTION_CHARS {
+            value["description_truncated"] = json!(true);
+        }
         value["description"] = json!(
             description
                 .chars()

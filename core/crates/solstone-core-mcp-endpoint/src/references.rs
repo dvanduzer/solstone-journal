@@ -25,6 +25,8 @@ pub(crate) enum ReferenceKind {
     Cursor,
     MemoryRecall,
     TranscriptList,
+    FacetList,
+    EntityList,
 }
 
 impl ReferenceKind {
@@ -36,6 +38,8 @@ impl ReferenceKind {
             Self::Cursor => 4,
             Self::MemoryRecall => 5,
             Self::TranscriptList => 6,
+            Self::FacetList => 7,
+            Self::EntityList => 8,
         }
     }
 
@@ -47,6 +51,8 @@ impl ReferenceKind {
             4 => Some(Self::Cursor),
             5 => Some(Self::MemoryRecall),
             6 => Some(Self::TranscriptList),
+            7 => Some(Self::FacetList),
+            8 => Some(Self::EntityList),
             _ => None,
         }
     }
@@ -124,6 +130,20 @@ pub(crate) struct TranscriptListCursor {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct FacetListCursor {
+    pub last_facet_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct EntityListCursor {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub facet: Option<String>,
+    pub last_facet_id: String,
+    pub last_entity_id: String,
+    pub last_relationship_dir: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "target", rename_all = "snake_case")]
 pub(crate) enum ReferenceTarget {
     Entry(EntryReference),
@@ -132,6 +152,8 @@ pub(crate) enum ReferenceTarget {
     Cursor(CursorReference),
     MemoryRecall(MemoryRecallCursor),
     TranscriptList(TranscriptListCursor),
+    FacetList(FacetListCursor),
+    EntityList(EntityListCursor),
 }
 
 impl ReferenceTarget {
@@ -143,6 +165,8 @@ impl ReferenceTarget {
             Self::Cursor(_) => ReferenceKind::Cursor,
             Self::MemoryRecall(_) => ReferenceKind::MemoryRecall,
             Self::TranscriptList(_) => ReferenceKind::TranscriptList,
+            Self::FacetList(_) => ReferenceKind::FacetList,
+            Self::EntityList(_) => ReferenceKind::EntityList,
         }
     }
 }
@@ -317,6 +341,60 @@ mod tests {
                 "bearer:a",
                 7
             ),
+            Err(ReferenceError::NotFound)
+        );
+    }
+
+    #[test]
+    fn reference_kind_tags_roundtrip_1_through_8() {
+        for (kind, expected_tag) in [
+            (ReferenceKind::Entry, 1),
+            (ReferenceKind::Segment, 2),
+            (ReferenceKind::Entity, 3),
+            (ReferenceKind::Cursor, 4),
+            (ReferenceKind::MemoryRecall, 5),
+            (ReferenceKind::TranscriptList, 6),
+            (ReferenceKind::FacetList, 7),
+            (ReferenceKind::EntityList, 8),
+        ] {
+            assert_eq!(kind.tag(), expected_tag);
+            assert_eq!(ReferenceKind::from_tag(expected_tag), Some(kind));
+        }
+        for unknown in [0, 9, 255] {
+            assert_eq!(ReferenceKind::from_tag(unknown), None);
+        }
+    }
+
+    #[test]
+    fn list_cursors_fail_cross_kind_resolve() {
+        let codec = ReferenceCodec::new().unwrap();
+        let facet_token = codec
+            .mint(
+                "bearer:a",
+                1,
+                ReferenceTarget::FacetList(super::FacetListCursor {
+                    last_facet_id: "facet-1".to_owned(),
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            codec.resolve(&facet_token, ReferenceKind::EntityList, "bearer:a", 1),
+            Err(ReferenceError::NotFound)
+        );
+        let entity_token = codec
+            .mint(
+                "bearer:a",
+                1,
+                ReferenceTarget::EntityList(super::EntityListCursor {
+                    facet: None,
+                    last_facet_id: "facet-1".to_owned(),
+                    last_entity_id: "ent-1".to_owned(),
+                    last_relationship_dir: "rel-1".to_owned(),
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            codec.resolve(&entity_token, ReferenceKind::FacetList, "bearer:a", 1),
             Err(ReferenceError::NotFound)
         );
     }

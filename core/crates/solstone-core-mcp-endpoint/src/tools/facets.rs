@@ -4,10 +4,11 @@
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{ToolError, search::MAX_LIMIT};
+use super::{MAX_OPAQUE_REFERENCE_BYTES, ToolError, search::MAX_LIMIT};
 
 pub(crate) struct ValidatedListFacets {
     pub(crate) limit: usize,
+    pub(crate) cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -15,6 +16,8 @@ pub(crate) struct ValidatedListFacets {
 struct Params {
     #[serde(default = "default_limit")]
     limit: usize,
+    #[serde(default)]
+    cursor: Option<String>,
 }
 
 const fn default_limit() -> usize {
@@ -27,7 +30,15 @@ pub(crate) fn validate(params: Option<&Value>) -> Result<ValidatedListFacets, To
     if !(1..=MAX_LIMIT).contains(&params.limit) {
         return Err(ToolError::InvalidInput);
     }
+    if params
+        .cursor
+        .as_ref()
+        .is_some_and(|value| value.is_empty() || value.len() > MAX_OPAQUE_REFERENCE_BYTES)
+    {
+        return Err(ToolError::InvalidInput);
+    }
     Ok(ValidatedListFacets {
         limit: params.limit,
+        cursor: params.cursor,
     })
 }
