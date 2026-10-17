@@ -557,7 +557,7 @@
     if (!anticipated.length && !activities.length) {
       return '<div class="pulse-empty-state" data-home-surface="today">'
         + '<h2 class="pulse-section-header">today</h2>'
-        + '<div class="pulse-empty-message">no anticipated activities or recent activity yet today.</div>'
+        + '<div class="pulse-empty-message">no plans or recent activity yet today.</div>'
         + '<a class="pulse-today-link" href="/app/activities/" data-copy-key="home-today-link">all of today\'s activities →</a>'
         + '</div>';
     }

@@ -143,7 +143,7 @@ fn build_packet(
         std::slice::from_ref(&presentation_day),
         context,
         &mut gaps,
-        "no anticipated activities today",
+        "no plans today",
     );
     let forward_days = (1..8)
         .map(|offset| {
@@ -157,7 +157,7 @@ fn build_packet(
         &forward_days,
         context,
         &mut gaps,
-        "no anticipated activities in the next 7 days",
+        "no plans in the next 7 days",
     );
     let pulse = read_pulse(&home, day, &mut gaps);
     let counts = json!({
@@ -261,9 +261,7 @@ fn load_activities(
                         values.push(Value::Object(record));
                     }
                 }
-                Err(error) => gaps.push(format!(
-                    "anticipated activities unavailable for {facet} {day}: {error}"
-                )),
+                Err(error) => gaps.push(format!("plans unavailable for {facet} {day}: {error}")),
             }
         }
     }
@@ -418,9 +416,18 @@ fn participants(value: &Value) -> String {
     names.join(", ")
 }
 fn coverage_preamble(counts: &Value, gaps: &[String], forward: usize) -> String {
+    let count = |key: &str| counts[key].as_u64().unwrap_or(0);
+    let plural = |n: u64, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
     let mut sentence = format!(
-        "Built from {} source paths, {} anticipated activities today, {forward} forward-looking anticipated activities, {} facet newsletters.",
-        counts["segments"], counts["anticipated_activities"], counts["facet_newsletters"],
+        "Built from {} source paths, {} today, {} in the next 7 days, {}.",
+        counts["segments"],
+        plural(count("anticipated_activities"), "plan", "plans"),
+        plural(forward as u64, "plan", "plans"),
+        plural(
+            count("facet_newsletters"),
+            "facet newsletter",
+            "facet newsletters"
+        ),
     );
     if gaps.is_empty() {
         sentence.push_str(" No gaps.");
@@ -438,6 +445,20 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    #[test]
+    fn coverage_preamble_counts_plans_and_newsletters_in_words() {
+        let one = json!({"segments": 0, "anticipated_activities": 1, "facet_newsletters": 1});
+        assert_eq!(
+            coverage_preamble(&one, &[], 1),
+            "Built from 0 source paths, 1 plan today, 1 plan in the next 7 days, 1 facet newsletter. No gaps."
+        );
+        let many = json!({"segments": 4, "anticipated_activities": 0, "facet_newsletters": 2});
+        assert_eq!(
+            coverage_preamble(&many, &["no plans today".to_owned()], 3),
+            "Built from 4 source paths, 0 plans today, 3 plans in the next 7 days, 2 facet newsletters. Gaps: no plans today."
+        );
+    }
 
     #[test]
     fn generated_reads_the_journals_clock_not_this_computers() {

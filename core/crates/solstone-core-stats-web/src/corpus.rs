@@ -257,7 +257,7 @@ fn ac17_fixture_census_and_non_replayed_dispositions_are_exhaustive() {
 }
 
 #[test]
-fn stats_background_is_composed_html_404_not_unconverted_refusal() {
+fn stats_background_is_composed_html_404() {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -280,7 +280,7 @@ fn stats_background_is_composed_html_404_not_unconverted_refusal() {
                     .to_vec(),
             )
             .expect("text");
-            assert!(!body.contains("app_not_converted"));
+            assert!(body.contains("<title>404 Not Found</title>"));
         });
 }
 

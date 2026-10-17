@@ -59,11 +59,11 @@ $active_facets
 
 $facet_newsletters
 
-### Anticipated Activities Today
+### Plans Today
 
 $anticipated_today
 
-### Anticipated Activities Next 7 Days
+### Plans Next 7 Days
 
 $anticipated_forward
 
@@ -73,17 +73,17 @@ $pulse_surface
 
 ## Synthesis Rules
 
-**Voice.** Every string here is shown directly to the owner in their own journal. Address them in second person ("you", "your") and write everything else as a plain statement of what happened. The software never speaks as "I", "we" or "my", and never refers to the owner as "the user", "the owner", or in the third person. Never write "capture" in any form; never say the software watches, observes, records, monitors, tracks, listens, sees, hears or surveils, in any voice, including the passive ("was recorded", "were captured"); attach every claim to what the journal holds.
+**Voice.** Every string here is shown directly to the owner in their own journal. Address them in second person ("you", "your") and write everything else as a plain statement of what happened. The software never speaks as "I", "we" or "my", and never refers to the owner as "the user", "the owner", or in the third person. Never write "capture" in any form; never say the software watches, observes, records, monitors, tracks, listens, sees, hears or surveils, in any voice, including the passive ("was recorded", "were captured"); attach every claim to what the journal holds. Call the schedule-derived items plans, never anticipated activities.
 
-**Source attribution.** Attribute high-consequence factual claims to their source using inline parenthetical links with `sol://` URIs when a source URI is present in the packet. Not every claim needs attribution; anticipated activities are schedule-derived and the Reading section is inherently attributed.
+**Source attribution.** Attribute high-consequence factual claims to their source using inline parenthetical links with `sol://` URIs when a source URI is present in the packet. Not every claim needs attribution; plans are schedule-derived and the Reading section is inherently attributed.
 
-**Your Day** - What's ahead today. Lead with anticipated activities in chronological order (by `start`, then by `end` for items with no `start`). Put a zero-padded `HH:MM` in `start` when the item has a specific start time; otherwise use `""`. Put a zero-padded `HH:MM` in `end` only when the item has a known, distinct end time (e.g. a meeting from 13:00 to 13:30); otherwise use `""` — never leave `end` equal to `start` on purpose and never write a range like "13:00-13:30" into `text` or into either time field. A point-in-time item (a deadline, a reminder, an appointment with no announced duration) gets only `start`; only set `end` when the source packet actually gives you a distinct end time. For each meeting, include who's attending and source-backed context when available. If no anticipated activities exist, draw from pulse needs.
+**Your Day** - What's ahead today. Lead with plans in chronological order (by `start`, then by `end` for items with no `start`). Put a zero-padded `HH:MM` in `start` when the item has a specific start time; otherwise use `""`. Put a zero-padded `HH:MM` in `end` only when the item has a known, distinct end time (e.g. a meeting from 13:00 to 13:30); otherwise use `""` — never leave `end` equal to `start` on purpose and never write a range like "13:00-13:30" into `text` or into either time field. A point-in-time item (a deadline, a reminder, an appointment with no announced duration) gets only `start`; only set `end` when the source packet actually gives you a distinct end time. For each meeting, include who's attending and source-backed context when available. If no plans exist, draw from pulse needs.
 
 **Yesterday** - What happened. Draw from facet newsletters and pulse. Highlight accomplishments and notable interactions. Keep to 3-5 bullets max. Only include if facet newsletters or pulse have content for the analysis day.
 
 **Needs Attention** - Draw from pulse pipeline gaps only. Set `source_id` to the supplied primary source's `sol://` URI when one exists, else `""`. Keep inline `[label](sol://...)` links inside `text`.
 
-**Forward Look** - What's coming. Draw from anticipated activity records and upcoming scheduled items in the next seven days. Note preparation needed for upcoming meetings or deadlines.
+**Forward Look** - What's coming. Draw from plans and upcoming scheduled items in the next seven days. Note preparation needed for upcoming meetings or deadlines.
 
 **Reading** - Links to full facet newsletters for deeper context. List each active facet slug that has a newsletter for the analysis day, with a brief one-line description of what it covers.
 

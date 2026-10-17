@@ -824,47 +824,6 @@ testCase('status instrument target', () => {
 });
 
 
-asyncCase('unconverted workspace keeps its unavailable notice after boot', async () => {
-  const harness = createHarness({
-    boot: true,
-    pathname: '/app/activities/',
-    fetchResponses: {
-      '/app/support/background': { status: 200, body: '' },
-      '/app/activities/workspace': {
-        status: 501,
-        body: JSON.stringify({
-          reason_code: 'app_not_converted',
-          app: 'activities',
-        }),
-      },
-    },
-  });
-
-  await harness.boot();
-
-  assert.deepStrictEqual(harness.fetchCalls, [
-    '/api/streams/labels',
-    '/app/support/background',
-    '/app/activities/workspace',
-  ]);
-  assert.strictEqual(harness.surfaceCalls.length, 1);
-  assert.strictEqual(harness.surfaceCalls[0].kind, 'empty');
-  assert.strictEqual(
-    harness.surfaceCalls[0].state.heading,
-    "activities isn't available in the browser yet."
-  );
-  assert.strictEqual(
-    harness.surfaceCalls[0].state.desc,
-    "nothing is wrong on your end. this screen hasn't been built."
-  );
-  assert.strictEqual(harness.surfaceCalls[0].state.headingLevel, 'h1');
-  assert.ok(harness.document.querySelector('[data-surface-state="empty"]'));
-  assert.ok(!harness.document.querySelector('[data-surface-state="error"]'));
-  assert.strictEqual(harness.logErrors.length, 0);
-  assert.strictEqual(harness.backgroundFailures.length, 0);
-  assert.strictEqual(harness.readyCalls.length, 1);
-});
-
 asyncCase('generic workspace failures still reach the shell error state', async () => {
   const harness = createHarness({
     boot: true,

@@ -417,6 +417,10 @@
   text-align: center;
 }
 
+.act-empty--above-column {
+  padding: 1.5rem 1rem;
+}
+
 .act-empty-heading {
   margin: 0 0 0.5rem;
   font-size: 1.25rem;
@@ -721,6 +725,7 @@
   <div id="act-state-area" data-state-area></div>
   <div class="act-content" id="act-content-area" data-content-area hidden>
     <div class="act-main">
+      <div class="act-empty" hidden data-empty-area></div>
       <div class="act-untimed" hidden data-untimed-area>
         <h2 class="act-untimed-heading" data-copy-key="untimed-heading">without a time</h2>
         <div class="act-untimed-list" data-untimed-list></div>
@@ -737,7 +742,6 @@
         <span class="act-footer-count" data-copy-key="hidden-footer"></span>
         <button type="button" class="act-btn" data-copy-key="show-hidden" data-toggle-hidden>show hidden</button>
       </div>
-      <div class="act-empty" hidden data-empty-area></div>
     </div>
     <aside class="act-panel" data-panel-area tabindex="-1"></aside>
   </div>
@@ -1128,9 +1132,12 @@
       : null;
     if (outlineItem) timed.push(outlineItem);
 
-    // Empty state check
+    // Empty state check. An empty today still draws its column and now line
+    // under the message, so the morning reads as today's timeline.
+    const emptyToday = !items.length && !outlineItem && computeDayContext() === 'today';
+    if (emptyArea) emptyArea.classList.toggle('act-empty--above-column', emptyToday);
     if (!items.length && !outlineItem) {
-      if (timelineWrap) timelineWrap.hidden = true;
+      if (timelineWrap) timelineWrap.hidden = !emptyToday;
       if (untimedArea) untimedArea.hidden = true;
       if (emptyArea) {
         emptyArea.hidden = false;
@@ -1151,12 +1158,14 @@
           renderGenericEmpty(emptyArea, ctx);
         }
       }
-      renderFooter();
-      return;
+      if (!emptyToday) {
+        renderFooter();
+        return;
+      }
+    } else {
+      if (emptyArea) emptyArea.hidden = true;
+      if (timelineWrap) timelineWrap.hidden = false;
     }
-
-    if (emptyArea) emptyArea.hidden = true;
-    if (timelineWrap) timelineWrap.hidden = false;
 
     // Untimed render
     if (untimed.length) {

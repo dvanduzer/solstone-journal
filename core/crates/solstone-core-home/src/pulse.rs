@@ -262,10 +262,7 @@ fn build_pulse_context(context: &HomeContext) -> PulseContext {
     let mut today_parts = Vec::new();
     if !anticipated_activities.is_empty() {
         let count = anticipated_activities.len();
-        today_parts.push(format!(
-            "{count} anticipated activit{}",
-            if count == 1 { "y" } else { "ies" }
-        ));
+        today_parts.push(format!("{count} plan{}", if count == 1 { "" } else { "s" }));
     }
     if !activities.is_empty() {
         let count = activities.len();

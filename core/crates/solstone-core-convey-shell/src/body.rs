@@ -133,8 +133,6 @@ mod tests {
     async fn all_body_api_routes_are_native() {
         let journal = EstablishedJournal::established();
         let app = crate::router(journal.0.path().to_path_buf());
-        let expected = serde_json::to_value(crate::refusal::AppNotConverted::new("body"))
-            .expect("refusal serializes");
         for path in [
             "/app/body/api/status",
             "/app/body/api/recent",
@@ -142,12 +140,11 @@ mod tests {
         ] {
             let response = get(app.clone(), path).await;
             assert_ne!(response.0, StatusCode::NOT_IMPLEMENTED, "{path}");
-            assert_ne!(json_body(&response.2), expected, "{path}");
         }
     }
 
     #[tokio::test]
-    async fn body_conversion_leaves_other_apps_unconverted_and_unknown_body_api_html_404() {
+    async fn body_routes_are_native_and_unknown_body_api_html_404() {
         let journal = EstablishedJournal::established();
         let app = crate::router(journal.0.path().to_path_buf());
         assert_eq!(get(app.clone(), "/app/body/").await.0, StatusCode::OK);
@@ -164,11 +161,7 @@ mod tests {
             "/app/body/api/window?from=2026-08-01T00%3A00%3A00%2B00%3A00&to=2026-08-02T00%3A00%3A00%2B00%3A00",
         ] {
             let response = get(app.clone(), path).await;
-            assert_ne!(
-                json_body_or_null(&response.2).and_then(|value| value.get("reason_code").cloned()),
-                Some(Value::String("app_not_converted".to_owned())),
-                "{path}"
-            );
+            assert_ne!(response.0, StatusCode::NOT_IMPLEMENTED, "{path}");
         }
         let unknown = get(app, "/app/body/api/nope").await;
         assert_eq!(unknown.0, StatusCode::NOT_FOUND);
@@ -230,9 +223,5 @@ mod tests {
                 "{path}"
             );
         }
-    }
-
-    fn json_body_or_null(body: &[u8]) -> Option<Value> {
-        serde_json::from_slice(body).ok()
     }
 }

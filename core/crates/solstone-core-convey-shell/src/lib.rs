@@ -38,14 +38,11 @@
 //! while retaining byte-identical source assets where appropriate; Thinking and Network use
 //! intentionally shrunken crate-local copies.
 //!
-//! ## D6: converted workspaces, explicit named refusal for the rest
+//! ## D6: every registry app is a native workspace
 //!
-//! Body, Entities, Health, Settings, Speakers, Stats, and Network are converted workspaces in this wave.
-//! Home's shell, workspace, and static script are natively served while its API routes remain unconverted.
-//! A known app that remains unconverted serves the embedded shell document at 501 for navigation paths,
-//! including its bare path rather than following the converted-app redirect convention. Its nested fragment
-//! paths receive a 501 `app_not_converted` JSON payload carrying its app name; unknown app paths remain the
-//! legacy HTML 404 fallback.
+//! Each app in the registry serves its own native routes. A bare `/app/{app}`
+//! path for a registry app permanently redirects to `/app/{app}/`; any other
+//! `/app/...` path no app route claims is the HTML 404 fallback.
 //!
 //! ## D7: host transport has one indispensable listener and one capability
 //!
@@ -75,8 +72,8 @@
 //! migration and is not owner-visible yet: the client is unchanged and the
 //! five stub data routes still answer with a refusal.
 //!
-//! `/app/body` without its trailing slash reaches the generic converted-app
-//! catch-all, which permanently redirects to `/app/body/`. Every converted
+//! `/app/body` without its trailing slash reaches the generic app
+//! catch-all, which permanently redirects to `/app/body/`. Every registry
 //! app uses that same bare-path redirect; the slashed form is the native
 //! shell entry point.
 
@@ -139,7 +136,6 @@ mod network_writes;
 mod pair_window_manager;
 #[cfg(feature = "host")]
 mod paired_device;
-pub mod refusal;
 pub mod registry;
 mod relay_access;
 mod relay_admission;
@@ -200,7 +196,6 @@ pub use thinking::{
 };
 
 use assets::lookup;
-use refusal::AppNotConverted;
 use registry::{ShellPayload, served_app, shell_payload, shell_payload_with_agents};
 
 /// Journal filesystem root shared with converted app route handlers.
@@ -1377,15 +1372,8 @@ fn router_with_roots(
             "/app/{app}",
             get(move |app: Path<String>| app_bare(app, include_agents)),
         )
-        .route(
-            "/app/{app}/",
-            get(move |app: Path<String>| app_root(app, include_agents)),
-        )
-        .route(
-            "/app/{app}/{*tail}",
-            get(move |path: Path<(String, String)>| app_nested(path, include_agents))
-                .fallback(not_found),
-        )
+        .route("/app/{app}/", get(not_found))
+        .route("/app/{app}/{*tail}", get(not_found).fallback(not_found))
         .merge(solstone_core_records_web::api_router(journal_root.clone()))
         .merge(match payload_roots {
             Some(roots) => thinking::router_with_roots(route_journal_root.clone(), roots),
@@ -1510,42 +1498,10 @@ async fn streams_labels_api(Extension(journal): Extension<Arc<JournalRoot>>) -> 
 }
 
 async fn app_bare(Path(app): Path<String>, include_agents: bool) -> Response {
-    if served_app(&app, include_agents).is_some_and(|definition| definition.converted) {
+    if served_app(&app, include_agents).is_some() {
         return Redirect::permanent(&format!("/app/{app}/")).into_response();
     }
-    app_response(&app, include_agents, AppRequestKind::Navigation)
-}
-
-async fn app_root(Path(app): Path<String>, include_agents: bool) -> Response {
-    app_response(&app, include_agents, AppRequestKind::Navigation)
-}
-
-async fn app_nested(Path((app, _tail)): Path<(String, String)>, include_agents: bool) -> Response {
-    app_response(&app, include_agents, AppRequestKind::Fragment)
-}
-
-enum AppRequestKind {
-    Navigation,
-    Fragment,
-}
-
-fn app_response(app: &str, include_agents: bool, request_kind: AppRequestKind) -> Response {
-    match served_app(app, include_agents) {
-        Some(definition) if definition.converted => not_found_response(),
-        // 🔴 NOT 2xx. The shell's loadBackground evaluates any response whose
-        // `ok` is true, so a refusal served at 200 was parsed as JavaScript and
-        // threw on every page load. 501 is the exact meaning -- the path is
-        // recognized, the functionality is not implemented.
-        Some(_) => match request_kind {
-            AppRequestKind::Navigation => {
-                asset_response_with_status("/static/shell.html", StatusCode::NOT_IMPLEMENTED)
-            }
-            AppRequestKind::Fragment => {
-                (StatusCode::NOT_IMPLEMENTED, Json(AppNotConverted::new(app))).into_response()
-            }
-        },
-        None => not_found_response(),
-    }
+    not_found_response()
 }
 
 async fn not_found() -> Response {
@@ -1563,7 +1519,6 @@ mod tests {
     use tower::ServiceExt;
 
     use super::router;
-    use crate::assets::lookup;
     use crate::registry::APP_REGISTRY;
 
     #[cfg(feature = "host")]
@@ -1661,9 +1616,6 @@ mod tests {
                 include_agents.then(axum::Router::new),
             );
             for definition in crate::registry::served_apps(include_agents) {
-                if !definition.converted {
-                    continue;
-                }
                 let path = format!("/app/{}", definition.name);
                 let response = app
                     .clone()
@@ -1707,7 +1659,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_conversion_flag_controls_fallback_refusals() {
+    async fn no_registry_app_is_served_a_not_implemented_response() {
         let journal = tempfile::TempDir::new_in("/var/tmp").expect("journal root");
         fs::create_dir_all(journal.path().join("config")).expect("config directory");
         fs::write(
@@ -1716,98 +1668,19 @@ mod tests {
         )
         .expect("journal config");
         let app = router(journal.path().to_path_buf());
-        let shell = lookup("/static/shell.html").expect("embedded shell").bytes;
 
         for definition in APP_REGISTRY {
-            let root_path = format!("/app/{}/", definition.name);
-            let root = app
-                .clone()
-                .oneshot(
-                    Request::get(&root_path)
-                        .body(Body::empty())
-                        .expect("root request"),
-                )
-                .await
-                .expect("root responds");
-
-            if definition.converted {
-                let shell_refusal = root.status() == StatusCode::NOT_IMPLEMENTED
-                    && root
-                        .headers()
-                        .get(header::CONTENT_TYPE)
-                        .and_then(|value| value.to_str().ok())
-                        == Some("text/html; charset=utf-8");
-                assert!(
-                    !shell_refusal,
-                    "{} used the unconverted navigation fallback",
-                    definition.name
-                );
-                continue;
-            }
-
-            assert_eq!(root.status(), StatusCode::NOT_IMPLEMENTED, "{root_path}");
-            assert_eq!(
-                root.headers().get(header::CONTENT_TYPE).unwrap(),
-                "text/html; charset=utf-8",
-                "{root_path}"
-            );
-            let root_body = to_bytes(root.into_body(), usize::MAX)
-                .await
-                .expect("root body");
-            assert_eq!(root_body.as_ref(), shell, "{root_path}");
-
-            let bare_path = format!("/app/{}", definition.name);
-            let bare = app
-                .clone()
-                .oneshot(
-                    Request::get(&bare_path)
-                        .body(Body::empty())
-                        .expect("bare request"),
-                )
-                .await
-                .expect("bare responds");
-            assert_eq!(bare.status(), StatusCode::NOT_IMPLEMENTED, "{bare_path}");
-            assert_eq!(
-                bare.headers().get(header::CONTENT_TYPE).unwrap(),
-                "text/html; charset=utf-8",
-                "{bare_path}"
-            );
-            let bare_body = to_bytes(bare.into_body(), usize::MAX)
-                .await
-                .expect("bare body");
-            assert_eq!(bare_body.as_ref(), shell, "{bare_path}");
-
-            let workspace_path = format!("/app/{}/workspace", definition.name);
-            let workspace = app
-                .clone()
-                .oneshot(
-                    Request::get(&workspace_path)
-                        .body(Body::empty())
-                        .expect("workspace request"),
-                )
-                .await
-                .expect("workspace responds");
-            assert_eq!(
-                workspace.status(),
-                StatusCode::NOT_IMPLEMENTED,
-                "{workspace_path}"
-            );
-            assert_eq!(
-                workspace.headers().get(header::CONTENT_TYPE).unwrap(),
-                "application/json",
-                "{workspace_path}"
-            );
-            let refusal: Value = serde_json::from_slice(
-                &to_bytes(workspace.into_body(), usize::MAX)
+            for path in [
+                format!("/app/{}/", definition.name),
+                format!("/app/{}/workspace", definition.name),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(Request::get(&path).body(Body::empty()).expect("request"))
                     .await
-                    .expect("workspace body"),
-            )
-            .expect("workspace refusal parses");
-            assert_eq!(
-                refusal["reason_code"], "app_not_converted",
-                "{workspace_path}"
-            );
-            assert_eq!(refusal["app"], definition.name, "{workspace_path}");
+                    .expect("router responds");
+                assert_ne!(response.status(), StatusCode::NOT_IMPLEMENTED, "{path}");
+            }
         }
     }
 
@@ -1855,11 +1728,7 @@ mod tests {
         fs::write(deleted.join("stream.json"), b"{}").unwrap();
         fs::write(deleted.join("talents/sense.json"), b"{}").unwrap();
 
-        assert!(
-            APP_REGISTRY
-                .iter()
-                .any(|app| app.name == "transcripts" && app.converted)
-        );
+        assert!(APP_REGISTRY.iter().any(|app| app.name == "transcripts"));
         let app = router(root.clone());
         let reprocess = app
             .clone()
@@ -1959,7 +1828,6 @@ mod tests {
 
         let missing = app
             .oneshot(
-                // A path outside /app cannot match app_nested's unconverted-app refusal.
                 Request::get("/native-route-registration-probe")
                     .body(Body::empty())
                     .unwrap(),

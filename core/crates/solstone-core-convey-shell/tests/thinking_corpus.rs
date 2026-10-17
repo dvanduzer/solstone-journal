@@ -2261,25 +2261,6 @@ async fn confidential_routes_are_session_gated_and_registered_404s_stay_unchange
     }
 }
 
-#[test]
-fn thinking_conversion_is_explicit_at_the_catch_all_boundary() {
-    let shell = include_str!("../src/lib.rs");
-    let registry = include_str!("../src/registry.rs");
-    assert_eq!(
-        shell
-            .matches("Some(definition) if definition.converted => not_found_response(),")
-            .count(),
-        1
-    );
-    assert!(!shell.contains("struct ShellApp {\n    pub converted"));
-    let thinking = registry
-        .split("name: \"thinking\",")
-        .nth(1)
-        .and_then(|tail| tail.split("    },\n    AppDefinition").next())
-        .expect("thinking registry entry");
-    assert!(thinking.contains("converted: true"));
-}
-
 #[tokio::test]
 async fn confidential_disable_while_worker_is_parked_cancels_operation_and_prevents_provisioning() {
     let journal = journal_for_phase("none");

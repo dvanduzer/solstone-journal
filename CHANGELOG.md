@@ -6,6 +6,11 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- home and your morning briefing now say "plans" for the meetings and deadlines the journal noticed in what you've shared, the same word the activities app uses.
+- when today has no activities yet, the activities app still shows today's hours, with a line at the current time.
+
 ### Fixed
 
 - your backup now clears older copies on schedule even after your computer's name changes, your journal moves to another folder, or you restore it onto a new computer. before, copies taken under the earlier name or folder were kept indefinitely. the first cleanup after you update removes the ones outside your retention setting. offloaded media stays as before.

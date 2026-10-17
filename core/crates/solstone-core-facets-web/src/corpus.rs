@@ -1054,11 +1054,6 @@ async fn ac1d_convey_shell_uses_converted_news_registry_row() {
         .await
         .expect("body");
     assert_eq!(body.len(), 207);
-    assert!(
-        !std::str::from_utf8(&body)
-            .expect("HTML")
-            .contains("app_not_converted")
-    );
 }
 
 #[tokio::test]
@@ -1081,11 +1076,6 @@ async fn ac1e_convey_shell_uses_converted_curation_registry_row() {
         .await
         .expect("body");
     assert_eq!(body.len(), 207);
-    assert!(
-        !std::str::from_utf8(&body)
-            .expect("HTML")
-            .contains("app_not_converted")
-    );
 }
 
 #[test]

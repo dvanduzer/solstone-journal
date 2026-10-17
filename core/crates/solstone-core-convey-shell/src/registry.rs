@@ -19,7 +19,6 @@ pub struct AppDefinition {
     pub rail_rank: u8,
     pub date_nav: Option<DateNav>,
     pub has_background: bool,
-    pub converted: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -70,7 +69,6 @@ pub static AGENTS_APP: AppDefinition = AppDefinition {
     rail_rank: 0,
     date_nav: None,
     has_background: false,
-    converted: true,
 };
 
 pub static APP_REGISTRY: &[AppDefinition] = &[
@@ -93,7 +91,6 @@ pub static APP_REGISTRY: &[AppDefinition] = &[
             },
         }),
         has_background: false,
-        converted: true,
     },
     AppDefinition {
         name: "backup",
@@ -106,7 +103,6 @@ pub static APP_REGISTRY: &[AppDefinition] = &[
         rail_rank: 0,
         date_nav: None,
         has_background: false,
-        converted: true,
     },
     AppDefinition {
         name: "body",
@@ -119,7 +115,6 @@ pub static APP_REGISTRY: &[AppDefinition] = &[
         rail_rank: 0,
         date_nav: Some(content_date_nav("reading", "readings", "no readings")),
         has_background: false,
-        converted: true,
     },
     AppDefinition {
         name: "curation",
@@ -132,7 +127,6 @@ pub static APP_REGISTRY: &[AppDefinition] = &[
         rail_rank: 0,
         date_nav: None,
         has_background: false,
-        converted: true,
     },
     AppDefinition {
         name: "entities",
@@ -145,7 +139,6 @@ pub static APP_REGISTRY: &[AppDefinition] = &[
         rail_rank: 3,
         date_nav: None,
         has_background: false,
-        converted: true,
     },
     AppDefinition {
         name: "health",
@@ -158,7 +151,6 @@ pub static APP_REGISTRY: &[AppDefinition] = &[
         rail_rank: 0,
         date_nav: None,
         has_background: false,
-        converted: true,
     },
     AppDefinition {
         name: "home",
@@ -171,7 +163,6 @@ pub static APP_REGISTRY: &[AppDefinition] = &[
         rail_rank: 0,
         date_nav: None,
         has_background: false,
-        converted: true,
     },
     AppDefinition {
         name: "import",
@@ -184,7 +175,6 @@ pub static APP_REGISTRY: &[AppDefinition] = &[
         rail_rank: 0,
         date_nav: None,
         has_background: false,
-        converted: true,
     },
     AppDefinition {
         name: "map",
@@ -197,7 +187,6 @@ pub static APP_REGISTRY: &[AppDefinition] = &[
         rail_rank: 0,
         date_nav: Some(content_date_nav("record", "records", "no location")),
         has_background: false,
-        converted: true,
     },
     AppDefinition {
         name: "network",
@@ -210,7 +199,6 @@ pub static APP_REGISTRY: &[AppDefinition] = &[
         rail_rank: 2,
         date_nav: None,
         has_background: false,
-        converted: true,
     },
     AppDefinition {
         name: "news",
@@ -227,7 +215,6 @@ pub static APP_REGISTRY: &[AppDefinition] = &[
             "no newsletters",
         )),
         has_background: false,
-        converted: true,
     },
     AppDefinition {
         name: "search",
@@ -240,7 +227,6 @@ pub static APP_REGISTRY: &[AppDefinition] = &[
         rail_rank: 2,
         date_nav: None,
         has_background: false,
-        converted: true,
     },
     AppDefinition {
         name: "settings",
@@ -253,7 +239,6 @@ pub static APP_REGISTRY: &[AppDefinition] = &[
         rail_rank: 1,
         date_nav: None,
         has_background: false,
-        converted: true,
     },
     AppDefinition {
         name: "speakers",
@@ -266,7 +251,6 @@ pub static APP_REGISTRY: &[AppDefinition] = &[
         rail_rank: 0,
         date_nav: Some(content_date_nav("segment", "segments", "no segments")),
         has_background: false,
-        converted: true,
     },
     AppDefinition {
         name: "stats",
@@ -279,7 +263,6 @@ pub static APP_REGISTRY: &[AppDefinition] = &[
         rail_rank: 0,
         date_nav: None,
         has_background: false,
-        converted: true,
     },
     AppDefinition {
         name: "support",
@@ -292,7 +275,6 @@ pub static APP_REGISTRY: &[AppDefinition] = &[
         rail_rank: 0,
         date_nav: None,
         has_background: false,
-        converted: true,
     },
     AppDefinition {
         name: "thinking",
@@ -305,7 +287,6 @@ pub static APP_REGISTRY: &[AppDefinition] = &[
         rail_rank: 4,
         date_nav: None,
         has_background: false,
-        converted: true,
     },
     AppDefinition {
         name: "transcripts",
@@ -318,7 +299,6 @@ pub static APP_REGISTRY: &[AppDefinition] = &[
         rail_rank: 0,
         date_nav: Some(content_date_nav("segment", "segments", "no segments")),
         has_background: false,
-        converted: true,
     },
 ];
 
@@ -454,20 +434,12 @@ mod tests {
 
     #[test]
     fn body_remains_a_converted_native_registry_entry() {
-        assert!(
-            APP_REGISTRY
-                .iter()
-                .any(|app| app.name == "body" && app.converted)
-        );
+        assert!(APP_REGISTRY.iter().any(|app| app.name == "body"));
     }
 
     #[test]
     fn network_is_a_converted_native_registry_entry() {
-        assert!(
-            APP_REGISTRY
-                .iter()
-                .any(|app| app.name == "network" && app.converted)
-        );
+        assert!(APP_REGISTRY.iter().any(|app| app.name == "network"));
     }
 
     #[test]
@@ -524,7 +496,6 @@ mod tests {
             .filter(|app| app.name == "stats")
             .collect();
         assert_eq!(stats.len(), 1);
-        assert!(stats[0].converted);
         assert!(!APP_REGISTRY.iter().any(|app| app.name == "tokens"));
     }
 
@@ -550,7 +521,6 @@ mod tests {
             .filter(|app| app.name == "thinking")
             .collect();
         assert_eq!(thinking.len(), 1);
-        assert!(thinking[0].converted);
         assert!(known_app("sol").is_none());
     }
 

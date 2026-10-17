@@ -297,13 +297,9 @@ mod tests {
             Some("text/html; charset=utf-8")
         );
 
-        let (status, _headers, body) =
+        let (status, _headers, _body) =
             routed(&journal, "GET", "/app/entities/api/state", b"").await;
         assert_ne!(status, StatusCode::NOT_IMPLEMENTED);
-        assert_ne!(
-            json_body(&body).get("reason_code"),
-            Some(&Value::String("app_not_converted".to_owned()))
-        );
     }
 
     #[tokio::test]
