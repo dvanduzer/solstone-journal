@@ -304,7 +304,7 @@
     unavailable: {
       state: 'status unavailable',
       explanation: "speech recognition setup couldn't be checked.",
-      summary: 'show recovery steps',
+      summary: 'setup details',
     },
   };
 

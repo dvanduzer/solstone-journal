@@ -111,12 +111,10 @@ pub fn read_speech_setup(
         );
         if let crate::provider_runtime::RuntimeHealthObservation::Present { phase, detail } =
             &runtime_obs
+            && (*phase == crate::provider_runtime::RuntimePhase::NotDesired
+                || detail.get("pin_follow").and_then(|v| v.as_str()) == Some("provider-not-needed"))
         {
-            if *phase == crate::provider_runtime::RuntimePhase::NotDesired
-                || detail.get("pin_follow").and_then(|v| v.as_str()) == Some("provider-not-needed")
-            {
-                return SpeechSetupPresentation::hidden(true);
-            }
+            return SpeechSetupPresentation::hidden(true);
         }
     }
 
@@ -222,20 +220,14 @@ pub fn read_speech_setup(
         SttRuntimeKind::LinuxCpp => {
             pin_follow == Some("backoff") && status_record.install_state == "failed"
         }
-        SttRuntimeKind::MacosCoreml => {
-            if status_record.install_state == "failed" {
-                status_record
-                    .last_transition_at
-                    .as_deref()
-                    .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
-                    .and_then(|at| (now - at.with_timezone(&chrono::Utc)).to_std().ok())
-                    .is_some_and(|since| {
-                        since < solstone_core_local::install::coreml_install::COREML_HEAL_COOLDOWN
-                    })
-            } else {
-                false
-            }
-        }
+        SttRuntimeKind::MacosCoreml if status_record.install_state == "failed" => status_record
+            .last_transition_at
+            .as_deref()
+            .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
+            .and_then(|at| (now - at.with_timezone(&chrono::Utc)).to_std().ok())
+            .is_some_and(|since| {
+                since < solstone_core_local::install::coreml_install::COREML_HEAL_COOLDOWN
+            }),
         _ => false,
     };
 
