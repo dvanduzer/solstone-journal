@@ -2038,6 +2038,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn update_public_dispatch_reports_available_check_without_side_effects() {
         let temp = tempfile::tempdir().unwrap();
@@ -2115,6 +2116,7 @@ mod tests {
         assert!(!recorded[0].contains(&OsString::from("--upgrade")));
     }
 
+    #[cfg(unix)]
     #[test]
     fn update_public_dispatch_handles_package_consent_rejection() {
         let temp = tempfile::tempdir().unwrap();

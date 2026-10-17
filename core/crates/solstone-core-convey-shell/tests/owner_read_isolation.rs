@@ -494,7 +494,7 @@ fn owner_read_role_classification_table_exhaustiveness() {
         .collect();
     assert_eq!(
         no_qualifying.len(),
-        29,
+        32,
         "NoQualifyingWork must have exactly 32 routes"
     );
 }

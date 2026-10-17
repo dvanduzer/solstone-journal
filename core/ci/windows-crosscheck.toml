@@ -7,9 +7,10 @@ target = "x86_64-pc-windows-msvc"
 # Count workspace_members joined to packages, then packages with any target
 # whose kind includes `lib`. solstone-core-linked-share and
 # solstone-core-brain-owner add two members and two libraries to the previous
-# 136/129 baseline.
-workspace_packages = 138
-library_packages = 131
+# 136/129 baseline. Re-derived on 2026-10-17: solstone-core-update adds
+# one member and one library (138/131 -> 139/132).
+workspace_packages = 139
+library_packages = 132
 
 [[exclusions]]
 package = "ring"

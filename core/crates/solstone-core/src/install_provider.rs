@@ -2541,7 +2541,7 @@ mod tests {
         let _g = AcquisitionTestGuard::new(true);
         let journal = tempfile::tempdir().unwrap();
         let cuda_key = "x86_64-unknown-linux-gnu";
-        let digest = "a9d8c0a4ece9f9dce7d8e634dd55f943ba39b93b339462dd645202db34aafbbd";
+        let (_, digest, _) = solstone_core_local::install::pins::cuda_pin(cuda_key).unwrap();
         let install_dir = solstone_core_local::install::pins::cache_root(journal.path())
             .join("cuda")
             .join(cuda_key)
