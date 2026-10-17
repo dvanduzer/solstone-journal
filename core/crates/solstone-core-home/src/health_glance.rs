@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use crate::formatting::relative_time;
 use crate::model::{BacklogSource, BacklogValidity};
 use crate::needs_you::format_degraded_capture_line;
+use solstone_core_system_health::NotYet;
 
 const UNAVAILABLE_HEADLINE: &str = "your devices' status is unclear right now.";
 const EMPTY_REGISTRY_HEADLINE: &str =
@@ -59,7 +60,19 @@ pub fn build_health_glance(
         now,
         transcription_issue,
     );
-    if let BacklogValidity::NotYet(not_yet) = backlog.validity {
+    // A journal with no devices always keeps its way to add one, whatever else
+    // the glance is saying: a new journal is exactly when it's needed.
+    if glance["cta"].is_null() && is_empty_registry(capture) {
+        glance["cta"] = empty_registry_cta();
+    }
+    let not_yet = match backlog.validity {
+        BacklogValidity::NotYet(not_yet) => Some(not_yet),
+        // No way to think chosen is a choice still ahead, never a fault: it
+        // rides as the note even when a summary from earlier exists.
+        _ if engine_not_chosen(brain) => Some(NotYet::AwaitingEngine),
+        _ => None,
+    };
+    if let Some(not_yet) = not_yet {
         // Not counted, never hidden: the note rides every verdict. Green is
         // earned by a summary, so an `ok` the note sits beside becomes calm.
         if glance["verdict"] == "ok" {
@@ -201,6 +214,22 @@ fn assessed_empty_or_all_active(capture: &Value) -> bool {
             .all(|row| row.get("status").and_then(Value::as_str) == Some("active"))
 }
 
+fn is_empty_registry(capture: &Value) -> bool {
+    matches!(
+        capture_disposition(capture),
+        CaptureDisposition::Calm(CalmKind::EmptyRegistry)
+    )
+}
+
+fn empty_registry_cta() -> Value {
+    json!({"text": "set one up →", "href": "/app/network/#devices"})
+}
+
+/// The brain reason for a journal with no way to think chosen yet.
+fn engine_not_chosen(brain: &Value) -> bool {
+    brain.get("reason_code").and_then(Value::as_str) == Some("thinking_engine_not_chosen")
+}
+
 fn unavailable_json() -> Value {
     json!({"verdict":"unavailable","severity":"amber","headline":UNAVAILABLE_HEADLINE,"last_observation":null,"cta":null,"issues":[]})
 }
@@ -212,7 +241,7 @@ fn calm_json(kind: CalmKind) -> Value {
             "severity": "neutral",
             "headline": EMPTY_REGISTRY_HEADLINE,
             "last_observation": null,
-            "cta": {"text": "set one up →", "href": "/app/network/#devices"},
+            "cta": empty_registry_cta(),
             "issues": [],
         }),
         CalmKind::AwaitingFirst => json!({
@@ -446,7 +475,8 @@ fn format_idle_age(seconds: i64) -> String {
 }
 fn brain_issue(brain: &Value) -> Option<Value> {
     let state = brain.get("state").and_then(Value::as_str)?;
-    if state == "ready"
+    if engine_not_chosen(brain)
+        || state == "ready"
         || state == "checking"
         || (state == "blocked" && brain.get("progressing").and_then(Value::as_bool) == Some(true))
     {
@@ -1176,15 +1206,40 @@ mod tests {
         assert_eq!(note(&delivering).as_deref(), Some(NOT_YET_FIRST_NIGHT));
         assert_eq!(delivering["note"]["href"], "/app/health/#backlogVerdict");
 
-        // No way to think yet: the one real ask is the only count.
+        // No way to think yet is a choice still ahead, not a fault: the note
+        // carries it, nothing is counted, and the device invite stays.
         let empty = json!({"status": "no_clients", "registry": "registry_empty"});
-        let blocked = json!({"state": "blocked", "headline": "processing needs a setup"});
+        let blocked = json!({"state": "blocked", "reason_code": "thinking_engine_not_chosen",
+            "headline": "thinking isn't set up yet"});
         let no_engine = not_yet_glance(&empty, &blocked, &not_yet(NotYet::AwaitingEngine));
-        assert_eq!(no_engine["verdict"], "attention");
-        assert_eq!(no_engine["headline"], "1 thing needs your attention");
-        assert_eq!(no_engine["issues"][0]["text"], "processing needs a setup");
+        assert_eq!(no_engine["verdict"], "calm");
+        assert!(no_engine["issues"].as_array().unwrap().is_empty());
+        assert_eq!(no_engine["cta"]["href"], "/app/network/#devices");
         assert_eq!(note(&no_engine).as_deref(), Some(NOT_YET_ENGINE));
         assert_eq!(no_engine["note"]["href"], "/app/thinking/");
+
+        // A summary from earlier exists, and still no way to think is chosen:
+        // the same note, never an issue.
+        let unchosen_later = not_yet_glance(&active, &blocked, &fresh_backlog());
+        assert!(unchosen_later["issues"].as_array().unwrap().is_empty());
+        assert_eq!(note(&unchosen_later).as_deref(), Some(NOT_YET_ENGINE));
+        assert_eq!(unchosen_later["verdict"], "calm");
+
+        // A blocked lane that needs a step is still the ask it was.
+        let key_missing = json!({"state": "blocked", "reason_code": "provider_key_missing",
+            "headline": "thinking isn't set up yet"});
+        let asked = not_yet_glance(&empty, &key_missing, &fresh_backlog());
+        assert_eq!(asked["verdict"], "attention");
+        assert_eq!(asked["issues"][0]["text"], "thinking isn't set up yet");
+        // ...and with no devices, the invite to add one survives the count.
+        assert_eq!(asked["cta"]["href"], "/app/network/#devices");
+
+        // Local thinking still arriving: progressing, and the invite stays.
+        let arriving = json!({"state": "blocked", "reason_code": "local_runtime_not_ready",
+            "headline": "setting up local thinking", "progressing": true});
+        let progressing = not_yet_glance(&empty, &arriving, &fresh_backlog());
+        assert_eq!(progressing["verdict"], "progressing");
+        assert_eq!(progressing["cta"]["href"], "/app/network/#devices");
 
         // No devices, thinking set up: the first-run invite comes back.
         let first_run = not_yet_glance(&empty, &Value::Null, &not_yet(NotYet::FirstNight));

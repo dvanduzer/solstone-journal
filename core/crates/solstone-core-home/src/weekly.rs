@@ -1184,7 +1184,7 @@ pub fn card(context: &HomeContext) -> Value {
 
 fn next_week_card(context: &HomeContext) -> Value {
     let line = if solstone_core_journal_config::no_thinking_engine_chosen(context.journal_root()) {
-        "your next week comes once processing is set up.".to_string()
+        "your next week comes once you choose where the thinking happens.".to_string()
     } else {
         let weekday =
             solstone_core_system::schedule::configured_weekly_day_name(context.journal_root());
@@ -1214,7 +1214,7 @@ fn unchecked_card() -> Value {
 
 fn first_card(context: &HomeContext) -> Value {
     let line = if solstone_core_journal_config::no_thinking_engine_chosen(context.journal_root()) {
-        "your first week comes once processing is set up.".to_string()
+        "your first week comes once you choose where the thinking happens.".to_string()
     } else {
         let weekday =
             solstone_core_system::schedule::configured_weekly_day_name(context.journal_root());
@@ -1630,7 +1630,7 @@ mod tests {
         assert_eq!(card(&ctx)["state"], "first");
         assert_eq!(
             card(&ctx)["line"],
-            "your first week comes once processing is set up."
+            "your first week comes once you choose where the thinking happens."
         );
 
         // 2. config engine set, schedule weekly_day = Mon
@@ -1714,7 +1714,7 @@ mod tests {
         assert_eq!(card_md_no_engine["state"], "first");
         assert_eq!(
             card_md_no_engine["line"],
-            "your next week comes once processing is set up."
+            "your next week comes once you choose where the thinking happens."
         );
 
         // 8. Newer .md does not hide older trusted .json

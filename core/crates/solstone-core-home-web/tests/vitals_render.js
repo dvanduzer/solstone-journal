@@ -113,13 +113,16 @@ const noted = renderVitalsHtml({
     verdict: 'attention',
     severity: 'amber',
     headline: '1 thing needs your attention',
-    issues: [{ text: 'processing needs a setup', severity: 'amber', href: '/app/thinking/' }],
-    note: { text: 'your journal starts catching up once processing is set up.', href: '/app/health/#backlogVerdict' },
+    issues: [{ text: 'thinking needs a key', severity: 'amber', href: '/app/thinking/' }],
+    note: { text: 'your journal starts catching up once you choose where the thinking happens.', href: '/app/health/#backlogVerdict' },
+    cta: { text: 'set one up →', href: '/app/network/#devices' },
   },
 });
+// A journal with no devices keeps the way to add one beside any count.
+assert(noted.includes('<a class="pulse-vitals-item pulse-vitals-cta" href="/app/network/#devices">'), noted);
 assert(noted.includes('<a class="pulse-vitals-note" href="/app/health/#backlogVerdict">'), noted);
 assert(noted.includes('pulse-vitals-ring'), noted);
-assert(noted.includes('your journal starts catching up once processing is set up. →'), noted);
+assert(noted.includes('your journal starts catching up once you choose where the thinking happens. →'), noted);
 assert.strictEqual((noted.match(/pulse-vitals-chip/g) || []).length, 1, noted);
 const calmNoted = renderVitalsHtml({
   health_glance: {

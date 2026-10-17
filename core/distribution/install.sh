@@ -927,6 +927,36 @@ write_one_profile() {
 	rm -f "$_tmp" "${_tmp}.out"
 }
 
+# The umbrella installer owns the handoff when it delegates this bootstrap.
+finish_journal_install() {
+	[ "$ROLE" = journal ] && [ "$UPGRADE" -eq 0 ] && [ "$NO_START" -eq 0 ] || return 0
+	[ "${SOLSTONE_INSTALLER_NO_HANDOFF:-0}" != 1 ] || return 0
+	if ! _handoff_status=$(run_journal_at "$CURRENT" "$VERSION" settings convey status --json); then
+		printf 'to finish setup, use the browser link printed by journal setup above.\n'
+		return 0
+	fi
+	_handoff_url=$(printf '%s\n' "$_handoff_status" | sed -n 's/^[[:space:]]*"dashboard_url"[[:space:]]*:[[:space:]]*"\(http:\/\/localhost:[0-9][0-9]*\)"[[:space:]]*$/\1/p')
+	_handoff_port=${_handoff_url##*:}
+	case "$_handoff_port" in ''|*[!0-9]*|??????*) _handoff_port=0 ;; esac
+	if [ "$_handoff_port" -lt 1 ] || [ "$_handoff_port" -gt 65535 ]; then
+		printf 'to finish setup, use the browser link printed by journal setup above.\n'
+		return 0
+	fi
+	printf 'finish setup: %s/init\n' "$_handoff_url"
+	if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v xdg-open >/dev/null 2>&1; then
+		if ! xdg-open "$_handoff_url/init" </dev/null >/dev/null 2>&1; then
+			printf 'the browser could not open. open the setup link above.\n'
+		fi
+	else
+		printf "from another computer, forward the journal's port over SSH:\n"
+		printf '  ssh -N -L %s:127.0.0.1:%s YOUR_LOGIN@JOURNAL_COMPUTER\n' "$_handoff_port" "$_handoff_port"
+		printf 'replace YOUR_LOGIN and JOURNAL_COMPUTER with this computer\047s SSH login and address. keep that terminal open, then open %s/init on the other computer.\n' "$_handoff_url"
+	fi
+	printf 'next: add the solstone app on this computer.\n'
+	printf 'after setup, open %s/app/network/ and choose pair a device to make its pairing link.\n' "$_handoff_url"
+	printf 'linux app setup: https://github.com/solpbc/solstone-linux/blob/main/INSTALL.md\n'
+}
+
 report_success() {
 	_prefix=$1
 	printf 'installed %s %s at %s\n' "$PRODUCT" "$VERSION" "$_prefix"
@@ -942,6 +972,7 @@ report_success() {
 		printf 'open a new terminal, or: . ~/.profile\n'
 	fi
 	printf 'then: %s --version\n' "$(journal_command_for_version "$VERSION")"
+	finish_journal_install
 }
 
 package_upgrade_command() {

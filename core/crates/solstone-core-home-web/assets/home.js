@@ -370,14 +370,14 @@
         html += '<a class="pulse-vitals-chip ' + esc(issue.severity || 'amber') + '" href="' + esc(issue.href || '#') + '">'
           + esc(issue.text || '') + ' →</a>';
       });
-    } else {
-      if (g.last_observation) {
-        html += '<div class="pulse-vitals-sep"></div><div class="pulse-vitals-item">last reached your journal ' + esc(g.last_observation) + '</div>';
-      }
-      if (g.cta) {
-        html += '<div class="pulse-vitals-sep"></div><a class="pulse-vitals-item pulse-vitals-cta" href="' + esc(g.cta.href || '#') + '">'
-          + esc(g.cta.text || '') + '</a>';
-      }
+    } else if (g.last_observation) {
+      html += '<div class="pulse-vitals-sep"></div><div class="pulse-vitals-item">last reached your journal ' + esc(g.last_observation) + '</div>';
+    }
+    // The way to add a device stays beside any count: a journal with no
+    // devices needs it most on its first day.
+    if (g.cta) {
+      html += '<div class="pulse-vitals-sep"></div><a class="pulse-vitals-item pulse-vitals-cta" href="' + esc(g.cta.href || '#') + '">'
+        + esc(g.cta.text || '') + '</a>';
     }
     notes.forEach(note => {
       html += '<a class="pulse-vitals-note" href="' + esc(note.href) + '">' + esc(note.text) + ' →</a>';
@@ -1001,7 +1001,7 @@
   // Before the nightly run has had its first chance, say when the first
   // briefing is due rather than calling it late or missing.
   const BRIEFING_NOT_YET = Object.assign(Object.create(null), {
-    awaiting_engine: 'morning briefings start once processing is set up.',
+    awaiting_engine: 'morning briefings start once you choose where the thinking happens.',
     first_night: "your first briefing is due by 10 am, after your journal's first night.",
     first_night_empty: 'your first briefing is due the morning after something goes into your journal.'
   });

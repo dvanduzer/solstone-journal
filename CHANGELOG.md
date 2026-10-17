@@ -9,11 +9,19 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - agents that can see the whole journal, and that have transcripts and facets, can read one week with `get_week`. memories on that page are generated. quotes are the owner's words. leaving an entry off the week page leaves that source visible to search and transcripts.
+- when a device finishes pairing, the dialog names it by the name the device gave itself, and "didn't do this?" now has a button that unpairs that device straight away.
 - `solstone journal talent passages` copies passages from the source an activity's story is written from, word for word, with where each one sits in that source. each short part of the source is kept whole without asking your model anything. each longer part takes one request to your model to choose what to keep, and the passages are still the source's own words. stories are written the same way as before.
 - health now shows when local speech recognition is missing, installing, paused or needs attention.
 
 ### Changed
 
+- while no device is paired, home keeps "set one up →" next to anything that needs your attention. before, it disappeared whenever anything else showed, which on a new journal was almost always.
+- not having chosen where the thinking happens yet no longer counts as something that needs your attention on home. a note says your journal starts catching up once you choose, and links to the thinking app.
+- the status lines on home, the thinking app and health now say "thinking" where they said "processing", and say why thinking isn't set up in plain words. "processing needs a setup" is now "thinking isn't set up yet", with a reason such as "the local model isn't installed yet". a local model that has stopped now reads "local thinking isn't running".
+- on a computer that can't run local thinking, the thinking app says so in a card of its own instead of a greyed-out option.
+- the agents app now has a place in the side rail.
+- "pair a device" now asks what's joining (a phone, another computer or a terminal) and shows how that device pairs: scan the code, paste the pairing link, or save it as pairing-link.txt. the time left on the code counts down while the dialog is open, and a link that goes through your private network says the device can be anywhere.
+- when your journal is closed to devices on your network, "pair a device" says what opening it means before you choose, and on windows, that windows may ask too.
 - journal exports now keep your settings, saved connections and credentials, along with app data and other journal files that were previously left out. processing logs, rebuildable indexes and caches, locks and temporary files stay out. merging keeps the receiving journal's settings and connections.
 
 - home and your morning briefing now say "plans" for the meetings and deadlines the journal noticed in what you've shared, the same word the activities app uses.
@@ -26,6 +34,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - security fix: a symbolic link in a recording's metadata could make a transcript page read time-zone information from outside your journal. those links are now refused.
 - transcript reads by your agent now include the recording's reported time zone when its UTC offset differs from your journal's.
 - your agent can continue through facet and entity lists instead of stopping at the first page, and can tell when an entity description was shortened.
+- on linux, the installer opens setup in your browser and shows where to add the solstone app. without a desktop, it prints the setup link and an SSH tunnel command for another computer.
+
 - transcripts warn when a sentence may contain words from more than one speaker.
 - linux: `solstone update` and the status pane now recognize installs made by the public installer.
 

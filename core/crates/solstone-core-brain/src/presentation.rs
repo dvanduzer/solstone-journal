@@ -60,6 +60,10 @@ pub fn present_brain_inspection(
 /// journal without one, so the words name it.
 const NOT_ON_PLATFORM: &str = "confidential processing isn't on windows yet";
 
+/// Local thinking needs hardware this computer doesn't have. Checking again
+/// won't change it, so the words say so plainly rather than asking for setup.
+const CANT_RUN_LOCAL: &str = "this computer can't run local thinking";
+
 /// The owner headline for a brain state. Some `blocked` reasons have nothing
 /// for the owner to set up: the work waits for the service, or for something
 /// already under way, so the headline says so instead. Two confidential
@@ -69,18 +73,19 @@ fn headline(state: &str, reason: Option<&str>, progressing: bool) -> &'static st
         ("blocked", Some("attestation_not_verified")) => {
             "can't reach confidential processing right now"
         }
-        ("blocked", Some("local_runtime_not_ready")) if progressing => {
-            "setting up local processing"
-        }
+        ("blocked", Some("local_runtime_not_ready")) if progressing => "setting up local thinking",
+        // A local model that has stopped was set up once; it is not a first-run step.
+        ("blocked", Some("local_runtime_not_ready")) => "local thinking isn't running",
         ("blocked", Some("nvattest_platform_unsupported")) => NOT_ON_PLATFORM,
-        ("blocked", Some("nvattest_unavailable")) => "processing needs attention",
+        ("blocked", Some("gpu_unavailable")) => CANT_RUN_LOCAL,
+        ("blocked", Some("nvattest_unavailable")) => "thinking needs attention",
         ("blocked", Some("confidential_access_ended")) => {
             "confidential processing isn't active for this sign-in"
         }
-        ("ready", _) => "processing is ready",
-        ("checking", _) => "checking how processing runs",
-        ("blocked", _) => "processing needs a setup",
-        ("unhealthy", _) => "processing needs attention",
+        ("ready", _) => "thinking is ready",
+        ("checking", _) => "checking on thinking",
+        ("blocked", _) => "thinking isn't set up yet",
+        ("unhealthy", _) => "thinking needs attention",
         _ => "thinking status unavailable",
     }
 }
@@ -97,7 +102,14 @@ pub fn processing_headline_for_reason(reason: &str) -> Option<&'static str> {
 pub fn brain_reason_text(reason: Option<&str>) -> String {
     match reason {
         None => "ok".to_owned(),
-        Some("thinking_engine_not_chosen") => "no model chosen".to_owned(),
+        Some("thinking_engine_not_chosen") => "nothing chosen yet".to_owned(),
+        Some("local_artifact_not_ready") => "the local model isn't installed yet".to_owned(),
+        Some("local_runtime_not_ready") => "the local model isn't running".to_owned(),
+        Some("gpu_unavailable") => "it needs supported hardware".to_owned(),
+        Some("provider_key_missing") => "no key added yet".to_owned(),
+        Some("endpoint_configuration_incomplete") => {
+            "your endpoint isn't fully set up yet".to_owned()
+        }
         Some("configuration_invalid") => "configuration invalid".to_owned(),
         Some("stale_expected_fingerprint") => "stale expected fingerprint".to_owned(),
         Some("lost_fence") => "refresh fence lost".to_owned(),
@@ -230,7 +242,7 @@ mod tests {
             &inspection,
             chrono::Utc.with_ymd_and_hms(2026, 1, 1, 1, 1, 0).unwrap(),
         );
-        assert_eq!(view.headline, "processing needs attention");
+        assert_eq!(view.headline, "thinking needs attention");
         assert_eq!(view.reason_text, "configuration invalid");
         assert_eq!(view.failing_component.as_deref(), Some("generate"));
         assert_eq!(view.evidence.age_text.as_deref(), Some("1h"));
@@ -269,15 +281,18 @@ mod tests {
             );
         }
         assert_eq!(
-            view_of("blocked", "local_runtime_not_ready", false).headline,
+            view_of("blocked", "local_artifact_not_ready", false).headline,
             setup.headline
         );
 
         let unreachable = view_of("blocked", "attestation_not_verified", false);
         let local = view_of("blocked", "local_runtime_not_ready", true);
+        // A local model that stopped is not told it was never set up.
+        let stopped = view_of("blocked", "local_runtime_not_ready", false);
         assert!(!unreachable.progressing);
         assert!(local.progressing);
-        let headlines = [&unreachable.headline, &local.headline];
+        assert!(!stopped.progressing);
+        let headlines = [&unreachable.headline, &local.headline, &stopped.headline];
         for (index, headline) in headlines.iter().enumerate() {
             assert_ne!(**headline, setup.headline);
             assert!(headlines[index + 1..].iter().all(|other| other != headline));

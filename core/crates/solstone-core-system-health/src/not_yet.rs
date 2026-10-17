@@ -21,7 +21,8 @@ pub const OVERNIGHT_WINDOW_END_HOUR: u32 = 10;
 
 pub const NOT_YET_FIRST_NIGHT: &str =
     "you'll see whether your journal is caught up after its first night.";
-pub const NOT_YET_ENGINE: &str = "your journal starts catching up once processing is set up.";
+pub const NOT_YET_ENGINE: &str =
+    "your journal starts catching up once you choose where the thinking happens.";
 pub const NOT_YET_SEARCH: &str = "search catches up overnight.";
 
 /// Why the nightly catch-up hasn't had its first chance yet.

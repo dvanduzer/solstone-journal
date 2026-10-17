@@ -37,7 +37,7 @@ One command does the whole thing, including signed-manifest verification and `so
 curl -fsSL https://solstone.app/install.sh | sh
 ```
 
-That follows the `release` lane's `latest` pointer, fetches the archive and signed release set from `updates.solstone.app`, verifies the manifest signature with the pinned minisign key, then checks the manifest digests for the selected archive, checksum, and release record. It installs and runs setup. Pass `--version <version>` to pin a version instead of following `latest`. A tree downgrade with `--version` proceeds only when that exact build is still inside this release's three-directory `journal-v2` window; outside the epoch or window it refuses without touching the journal. The archive route below is the same operation with the files already on disk.
+That follows the `release` lane's `latest` pointer, fetches the archive and signed release set from `updates.solstone.app`, verifies the manifest signature with the pinned minisign key, then checks the manifest digests for the selected archive, checksum, and release record. It installs and runs setup once. When a desktop is available, the installer opens the setup page; otherwise it prints the link and an SSH tunnel command for opening it from another computer. After setup, use the printed network-page link to make a pairing link for the solstone app. Pass `--version <version>` to pin a version instead of following `latest`. A tree downgrade with `--version` proceeds only when that exact build is still inside this release's three-directory `journal-v2` window; outside the epoch or window it refuses without touching the journal. The archive route below is the same operation with the files already on disk.
 
 Every release names its files the same way: `solstone-journal-<version>-linux-<arch>`, where `<arch>` is `x86_64` or `aarch64`. The three archives are `.tar.gz`, `.deb` and `.rpm`. Each release also carries a `.sha256`, a `.manifest.json`, a `.manifest.json.minisig` and a `.release` record.
 
@@ -136,14 +136,9 @@ If you have an older command-line journal installation, install the journal app 
 windows 10 (22H2) or 11 on an Intel or AMD (x64) computer. No administrator access is needed: the journal installs for you alone, under `%LOCALAPPDATA%\SolstoneJournal`, and it is separate from the solstone app for windows.
 
 1. Download the journal installer from [solstone.app/download/journal/windows/latest](https://solstone.app/download/journal/windows/latest) and run it. It is about 1.1 GB, and it is signed by sol pbc.
-2. Open a new terminal window, so it picks up the `solstone` command the installer added, and run:
+2. Open **journal** from the Start menu and follow its first-run steps. It sets up your journal (`%USERPROFILE%\journal` by default) and starts it in the background. It starts again each time you sign in.
 
-   ```powershell
-   solstone journal setup
-   ```
-
-   This sets up your selected journal and starts it in the background. The default location is `%USERPROFILE%\journal`; the location guidance below explains how to select an existing journal. It starts again each time you sign in.
-3. Open http://localhost:5015 in a browser and follow the first-run steps.
+For command-line diagnostics after that, open a new terminal window so it picks up the `solstone` command the installer added. If you need to select an existing journal, use the location guidance below.
 
 The journal starts closed to devices on your network, so windows doesn't ask about the network when the journal first starts. To pair the solstone app on this computer, open the journal's network page, choose "pair a device", then "pair the solstone app on this computer". Your journal stays closed. To pair a phone or another computer over your own network, choose "open to devices on your network" on that page, or run `solstone call link local-network open`. windows may then ask whether **journal**, from sol pbc, can use public and private networks, and on a standard account an administrator has to allow it. If windows didn't ask and a device still can't reach your journal, an earlier choice in windows may be blocking **journal**: an administrator can allow it in Windows Security, under Firewall & network protection › Allow an app through firewall.
 
@@ -171,7 +166,9 @@ Get-AuthenticodeSignature .\solstone-journal-<version>-windows-x86_64-setup.exe 
 
 The status should read `Valid`, and the signer certificate's subject should start with `CN=sol pbc`. Every file in the journal's program folder is listed in a manifest signed with the same release key as the linux and mac releases. Before it uses its bundled tools and models, the journal checks the program folder against that manifest and refuses them if anything does not match.
 
-## Set up on linux
+## Finish setup on linux
+
+The installer above already runs journal setup. Follow the setup page it prints; do not run setup a second time. If you installed a `.deb` or `.rpm` directly, or are repairing setup, run:
 
 ```bash
 solstone journal setup
@@ -179,7 +176,7 @@ solstone journal setup
 
 This runs the setup readiness doctor battery and sets up your selected journal (`~/journal` by default). It fetches the local transcription model (~1 GB), installs the `solstone` skill for Claude Code, Codex, and Gemini when their configuration folders are already present, and installs the journal-side `solstone` and `journal` router skills so your agents can help tend your journal. It then starts a systemd user service listening on http://localhost:5015. The default port is shared across logins. A second journal on that port, including one started under another login, cannot bind it.
 
-Let your human know: **open http://localhost:5015 in a browser**. The first-run wizard walks them through setting their identity and choosing a provider.
+Let your human know: **open http://localhost:5015/init in a browser on the journal's computer**. The first-run wizard walks them through setting their identity and choosing a provider.
 
 ⚠ **The tree carries the binaries the journal needs to run, not the transcription stack.** The Parakeet transcription helper and its model are fetched during setup, by `solstone journal install-models`. `solstone journal doctor --readiness` runs the actual binary before reporting it ready, and on linux it gives the exact package-manager command when the system OpenMP runtime is missing.
 
@@ -193,7 +190,7 @@ If the service fails to start, check `solstone journal service logs`.
 
 Choose a provider in the journal's thinking app. The available paths have different hardware needs and data flows.
 
-- **local built-in, the default.** a capable setup needs **6 GB of GPU memory** on linux or windows, or a **16 GB Apple Silicon mac** (the model is ~3.4 GB on disk, plus the ~1 GB transcription model). The `solstone journal check` command checks first and tells you what will not fit; on linux it also needs a supported hardware GPU (see [set up on linux](#set-up-on-linux)).
+- **local built-in, the default.** a capable setup needs **6 GB of GPU memory** on linux or windows, or a **16 GB Apple Silicon mac** (the model is ~3.4 GB on disk, plus the ~1 GB transcription model). The `solstone journal check` command checks first and tells you what will not fit; on linux it also needs a supported hardware GPU (see [set up on linux](#finish-setup-on-linux)).
 
   On windows, the local built-in model needs a compatible GPU with at least **6 GB of GPU memory**. A new setup leaves thinking unchosen if the GPU has less or its memory cannot be checked. A local install refuses before downloading and shows the reason on the thinking page. You can choose a model you bring yourself or confidential processing. on mac and linux, a local install also stops before downloading when the computer is known to be below the bar or has no usable GPU; if the computer's memory can't be checked, installation still starts and the thinking page keeps a warning for that attempt.
 - **a model you bring yourself**, if your machine cannot clear that bar or you would rather not spend its power. Configure Google (Gemini), OpenAI, or Anthropic in your journal's thinking app using **your own developer API key**, created in that provider's developer console, *not* the consumer chat product (gemini.google.com / chatgpt.com / claude.ai). You can also configure it with your own endpoint instead of a cloud provider: a model you run yourself, on this machine or another one you control. You can switch any time in the thinking app.
@@ -232,7 +229,7 @@ That one setup command finds a real prior install, its `solstone`, `journal`, an
 
 When setup replaces recognized legacy launchers, it keeps durable recovery backups under `~/.local/share/solstone/setup-backups/` before touching those launchers.
 
-⚠ **There is no CUDA build of the tree.** If you were on `solstone-journal-cuda`, transcription moves to the CPU runtime. It uses the same model on the CPU, so long recordings take longer to process; nothing else about them changes. The local *model* provider still uses your GPU where it can. That path is separate and is described under [set up on linux](#set-up-on-linux).
+⚠ **There is no CUDA build of the tree.** If you were on `solstone-journal-cuda`, transcription moves to the CPU runtime. It uses the same model on the CPU, so long recordings take longer to process; nothing else about them changes. The local *model* provider still uses your GPU where it can. That path is separate and is described under [set up on linux](#finish-setup-on-linux).
 
 ## Upgrading
 

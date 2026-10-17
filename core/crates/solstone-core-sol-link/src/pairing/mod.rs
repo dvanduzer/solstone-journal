@@ -752,6 +752,13 @@ pub fn complete_pairing(
         ledger_entry.network = Some("home".to_owned());
     }
     ledger.add(ledger_entry).map_err(PairingError::Ledger)?;
+    // The pairing stands without this record; it only lets the owner's dialog
+    // name and remove the device it just paired.
+    if let Err(error) =
+        NonceStore::new(journal_root).record_paired_client(ceremony.nonce, issued.cid())
+    {
+        log::warn!("pairing could not record the paired client on its nonce: {error}");
+    }
     let attestation =
         mint_home_attestation(identity.ca(), identity.instance_id(), issued.cid(), now)
             .map_err(PairingError::Attestation)?;

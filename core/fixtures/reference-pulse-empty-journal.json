@@ -32,7 +32,10 @@
     "flow_content": null,
     "flow_updated_at": null,
     "health_glance": {
-      "cta": null,
+      "cta": {
+        "href": "/app/network/#devices",
+        "text": "set one up →"
+      },
       "headline": "1 thing needs your attention",
       "issues": [
         {
@@ -44,7 +47,7 @@
       "last_observation": null,
       "note": {
         "href": "/app/thinking/",
-        "text": "your journal starts catching up once processing is set up."
+        "text": "your journal starts catching up once you choose where the thinking happens."
       },
       "severity": "amber",
       "verdict": "attention"

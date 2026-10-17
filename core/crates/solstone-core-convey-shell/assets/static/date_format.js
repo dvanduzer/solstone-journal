@@ -365,14 +365,16 @@
   // named 'constructor' or 'toString' returned a function and the sentence
   // rendered it. Own keys only.
   //
-  // This map is the sentence register: it is read after "running on" and
-  // before a reason, so the local lane says 'local processing' here. The runs
+  // This map is the sentence register: it is read before a reason or a
+  // "last confirmed" age, so the local lane says 'local thinking' here, the
+  // same noun as the status headline above it. The runs
   // and token tables name the same lane in a provider column, where the row's
   // other cells carry the sense and the bare 'local' is the value (X-05,
   // G2-43, S-5, and the matching notes in thinking.js and token-card.js).
   // 'confidential processing' is one phrase in both, so the column already
   // reads that way.
-  const PROCESSING_LANES = {spp: 'confidential processing', local: 'local processing',
+  const PROCESSING_LANES = {spp: 'confidential processing', local: 'local thinking',
+    bundled: 'local thinking', 'byo-cloud': 'your own model', 'byo-endpoint': 'your own model',
     openai: 'OpenAI', anthropic: 'Anthropic', google: 'Google'};
   function processingLane(lane) {
     return Object.hasOwn(PROCESSING_LANES, lane) ? PROCESSING_LANES[lane] : 'processing';

@@ -67,7 +67,16 @@
       check: findById(documentRef, 'link-pairing-check'),
       successHeading: findById(documentRef, 'link-pairing-success-heading'),
       successSubhead: findById(documentRef, 'link-pairing-success-subhead'),
+      successVerify: findById(documentRef, 'link-pairing-success-verify'),
+      remove: findById(documentRef, 'link-pairing-remove'),
+      removeResult: findById(documentRef, 'link-pairing-remove-result'),
     };
+    // What's joining decides the method shown: a phone scans, a computer
+    // pastes the link, a terminal saves it to a file. The link is the same.
+    const DEVICE_TYPES = ['phone', 'computer', 'terminal'];
+    const typeButtons = Object.fromEntries(DEVICE_TYPES.map((type) => [type, findById(documentRef, `link-pairing-type-${type}`)]));
+    const typeBlocks = Object.fromEntries(DEVICE_TYPES.map((type) => [type, findById(documentRef, `link-pairing-for-${type}`)]));
+    if ([...Object.values(typeButtons), ...Object.values(typeBlocks)].some((element) => !element)) return null;
     if (Object.values(elements).some((element) => !element)) return null;
 
     const ceremony = {
@@ -75,6 +84,10 @@
       state: 'idle',
       material: null,
       timer: null,
+      tick: null,
+      deadline: 0,
+      deviceType: DEVICE_TYPES.includes(options.deviceType) ? options.deviceType : 'phone',
+      pairedDevice: null,
       unsubscribe: null,
       openerSelector: '[data-pairing-action="open"]',
       // A link for the solstone app on this computer, asked for when the
@@ -90,10 +103,18 @@
       return global.location?.pathname?.startsWith('/app/link') ? '/app/link' : '/app/network';
     }
 
+    function now() {
+      return typeof options.now === 'function' ? options.now() : Date.now();
+    }
+
     function clearTimer() {
       if (ceremony.timer !== null) {
         global.clearTimeout(ceremony.timer);
         ceremony.timer = null;
+      }
+      if (ceremony.tick !== null) {
+        global.clearInterval?.(ceremony.tick);
+        ceremony.tick = null;
       }
     }
 
@@ -107,7 +128,18 @@
       clearTimer();
       clearSubscription();
       ceremony.material = null;
+      ceremony.pairedDevice = null;
       return ceremony.generation;
+    }
+
+    function selectType(type) {
+      if (!DEVICE_TYPES.includes(type)) return;
+      ceremony.deviceType = type;
+      for (const candidate of DEVICE_TYPES) {
+        typeBlocks[candidate].hidden = candidate !== type;
+        typeButtons[candidate].setAttribute('aria-pressed', String(candidate === type));
+      }
+      dialog.dataset.pairingDeviceType = type;
     }
 
     function displayState(next, recovery = '') {
@@ -132,25 +164,6 @@
     function formatExpiry(value) {
       const seconds = Math.max(0, Math.ceil(value));
       return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
-    }
-
-    function defaultDeviceLabel() {
-      const now = global.JournalClock?.now ? global.JournalClock.now() : Date.now();
-      const parts = global.JournalClock?.parts ? global.JournalClock.parts(now) : null;
-      let month, day;
-      if (parts) {
-        const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
-        const monthIdx = Number.parseInt(parts.month, 10) - 1;
-        month = MONTHS[monthIdx] || parts.month;
-        day = String(Number.parseInt(parts.day, 10));
-      } else {
-        const today = new Date();
-        month = today.toLocaleString('en-US', { month: 'short' }).toLowerCase();
-        day = String(today.getDate());
-      }
-      return copy('DEVICE_LABEL_DEFAULT_FORMAT')
-        .replace('{month}', month)
-        .replace('{day}', day);
     }
 
     function renderCode(pairLink) {
@@ -185,6 +198,7 @@
         && body.expires_in > 0
         && (body.device_label === undefined || typeof body.device_label === 'string')
         && typeof body.home_address_is_public === 'boolean'
+        && (body.relay === undefined || typeof body.relay === 'boolean')
         && typeof global.qrcode === 'function'
       );
     }
@@ -193,16 +207,22 @@
       const label = typeof body.device_label === 'string' ? body.device_label.trim() : '';
       elements.label.textContent = label;
       elements.labelRow.hidden = !label;
-      const networkCopy = ceremony.sameMachine
-        ? 'PAIR_THIS_COMPUTER_LINE'
-        : body.home_address_is_public
-          ? 'PAIR_PUBLIC_ADDRESS_LINE'
-          : 'PAIR_NETWORK_LINE';
-      elements.networkLine.textContent = copy(networkCopy).replace('{time}', formatExpiry(body.expires_in));
+      renderNetworkLine(body.expires_in);
       renderAddresses(Array.isArray(body.link_addresses) ? body.link_addresses : []);
       elements.fingerprint.textContent = body.ca_fingerprint;
       elements.linkValue.textContent = body.pair_link;
       renderCode(body.pair_link);
+    }
+
+    function networkLineKey() {
+      const body = ceremony.material;
+      if (ceremony.sameMachine) return 'PAIR_THIS_COMPUTER_LINE';
+      if (body?.relay === true) return 'PAIR_RELAY_LINE';
+      return body?.home_address_is_public ? 'PAIR_PUBLIC_ADDRESS_LINE' : 'PAIR_NETWORK_LINE';
+    }
+
+    function renderNetworkLine(seconds) {
+      elements.networkLine.textContent = copy(networkLineKey()).replace('{time}', formatExpiry(seconds));
     }
 
     // Only a direct link encodes addresses; a relay link's list is empty and
@@ -219,10 +239,47 @@
     }
 
     function renderCompletion() {
-      const label = ceremony.material?.device_label?.trim() || '';
+      // The device names itself when it pairs; the owner can rename it under
+      // devices.
+      const label = ceremony.pairedDevice?.display_label?.trim()
+        || ceremony.material?.device_label?.trim()
+        || '';
       const shortFingerprint = ceremony.material?.ca_fingerprint?.replace(/^sha256:/, '').slice(0, 16) || '';
-      elements.successHeading.textContent = copy('SUCCESS_HEADING').replace('{label}', label);
+      elements.successHeading.textContent = label
+        ? copy('SUCCESS_HEADING').replace('{label}', label)
+        : copy('SUCCESS_HEADING_UNNAMED');
       elements.successSubhead.textContent = copy('SUCCESS_SUBHEAD').replace('{short_fp}', shortFingerprint);
+      elements.successVerify.textContent = copy(ceremony.material?.relay === true ? 'SUCCESS_VERIFY_NOTE_ANYWHERE' : 'SUCCESS_VERIFY_NOTE');
+      elements.remove.hidden = !ceremony.pairedDevice?.cid;
+      elements.remove.disabled = false;
+      elements.removeResult.hidden = true;
+      elements.removeResult.textContent = '';
+    }
+
+    function pairedDeviceFrom(body) {
+      const device = body?.device;
+      if (!device || typeof device !== 'object' || typeof device.cid !== 'string' || !device.cid) return null;
+      return { cid: device.cid, display_label: typeof device.display_label === 'string' ? device.display_label : '' };
+    }
+
+    async function removePairedDevice() {
+      const cid = ceremony.pairedDevice?.cid;
+      if (!cid || elements.remove.disabled) return;
+      const generation = ceremony.generation;
+      elements.remove.disabled = true;
+      let removed = false;
+      try {
+        const response = await global.fetch(`${prefix()}/api/clients/${encodeURIComponent(cid)}`, { method: 'DELETE' });
+        removed = response.ok;
+      } catch (_error) {
+        removed = false;
+      }
+      if (generation !== ceremony.generation || ceremony.state !== 'complete') return;
+      elements.remove.hidden = removed;
+      elements.remove.disabled = false;
+      elements.removeResult.textContent = copy(removed ? 'SUCCESS_REMOVED' : 'SUCCESS_REMOVE_FAIL');
+      elements.removeResult.hidden = false;
+      if (removed) options.onDeviceRemoved?.();
     }
 
     function renderUnavailable(response, body) {
@@ -282,7 +339,10 @@
 
       if (p) {
         p.setAttribute('data-copy', bodyCopyKey);
-        p.textContent = copy(bodyCopyKey);
+        // Say what opening involves before the owner chooses it: on Windows
+        // the system may ask too, and an administrator may have to allow it.
+        const windowsNote = showLocalNetwork && options.windowsAsks?.() ? copy('LOCAL_NETWORK_WINDOWS_ASKS_NOTE') : '';
+        p.textContent = [copy(bodyCopyKey), windowsNote].filter(Boolean).join(' ');
       }
       if (regenBtn) {
         regenBtn.hidden = !showRegen;
@@ -328,6 +388,15 @@
     }
 
     function armExpiry(generation, seconds) {
+      ceremony.deadline = now() + seconds * 1000;
+      // The line counts down while the dialog is open; the timeout below is
+      // what actually ends the code.
+      if (typeof global.setInterval === 'function') {
+        ceremony.tick = global.setInterval(() => {
+          if (generation !== ceremony.generation || ceremony.state !== 'material') return;
+          renderNetworkLine(Math.max(0, (ceremony.deadline - now()) / 1000));
+        }, 1000);
+      }
       ceremony.timer = global.setTimeout(() => {
         if (generation !== ceremony.generation || ceremony.state !== 'material') return;
         clearSubscription();
@@ -372,6 +441,7 @@
       if (body.used) {
         clearTimer();
         clearSubscription();
+        ceremony.pairedDevice = pairedDeviceFrom(body);
         renderCompletion();
         displayState('complete');
       } else if (!body.present) {
@@ -390,9 +460,7 @@
         response = await global.fetch(`${prefix()}/pair-start`, {
           method: 'POST',
           headers: { 'content-type': 'application/json', accept: 'application/json' },
-          body: JSON.stringify(ceremony.sameMachine
-            ? { device_label: defaultDeviceLabel(), same_machine: true }
-            : { device_label: defaultDeviceLabel() }),
+          body: JSON.stringify(ceremony.sameMachine ? { same_machine: true } : {}),
         });
         body = await responseBody(response);
       } catch (_error) {
@@ -416,9 +484,10 @@
       listenForCompletion(generation);
     }
 
-    function open() {
+    function open(type) {
       options.beforeOpen?.();
       ceremony.sameMachine = false;
+      selectType(DEVICE_TYPES.includes(type) ? type : ceremony.deviceType);
       const generation = startGeneration();
       dialog.hidden = false;
       requestMaterial(generation);
@@ -475,6 +544,10 @@
         if (!control.disabled) checkCurrentNonce(ceremony.generation, true);
       } else if (action === 'copy') {
         copyLink();
+      } else if (action === 'type') {
+        selectType(control.dataset.pairingType);
+      } else if (action === 'remove') {
+        removePairedDevice();
       } else if (action === 'private-link-repair') {
         if (typeof options.onPrivateLinkRepair !== 'function') return;
         close();
@@ -509,7 +582,8 @@
       }
     });
 
-    return { close };
+    selectType(ceremony.deviceType);
+    return { close, open };
   }
 
   // ── delivery vs connection ────────────────────────────────────────────────
