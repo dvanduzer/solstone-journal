@@ -156,10 +156,10 @@ pub const JOURNAL_ARTIFACTS: &[DurableArtifact] = &[
     },
     DurableArtifact {
         id: ArtifactId::ParentLossClosureRecovery,
-        path: "health/parent-loss/generations/*/closure-recovery.json",
+        path: "health/parent-loss/generations/*/closure-recovery/*/*.json",
         class: DurabilityClass::Healable,
         parser: ParserKind::WholeJson,
-        rationale: "checkpoint for abandoned generation closure; set aside on corruption and rebuilt from surviving admission drops",
+        rationale: "set aside the bad file and rebuild those ids from the surviving admission drops",
     },
     DurableArtifact {
         id: ArtifactId::Entity,

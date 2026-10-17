@@ -331,7 +331,68 @@ impl ParentLossLedger {
         self.generation_path(generation).join("ledger.json")
     }
 
-    pub fn closure_recovery_path(&self, generation: ParentLossGeneration) -> PathBuf {
+    pub fn closure_recovery_dir(&self, generation: ParentLossGeneration) -> PathBuf {
+        self.generation_path(generation).join("closure-recovery")
+    }
+
+    pub fn closure_recovery_batches_dir(&self, generation: ParentLossGeneration) -> PathBuf {
+        self.closure_recovery_dir(generation).join("batches")
+    }
+
+    pub fn closure_recovery_ids_dir(&self, generation: ParentLossGeneration) -> PathBuf {
+        self.closure_recovery_dir(generation).join("ids")
+    }
+
+    pub fn closure_recovery_live_dir(&self, generation: ParentLossGeneration) -> PathBuf {
+        self.closure_recovery_dir(generation).join("live")
+    }
+
+    pub fn closure_recovery_provisional_dir(&self, generation: ParentLossGeneration) -> PathBuf {
+        self.closure_recovery_dir(generation).join("provisional")
+    }
+
+    pub fn closure_recovery_phase_dir(&self, generation: ParentLossGeneration) -> PathBuf {
+        self.closure_recovery_dir(generation).join("phase")
+    }
+
+    pub fn closure_recovery_batch_path(
+        &self,
+        generation: ParentLossGeneration,
+        seq: u64,
+    ) -> PathBuf {
+        self.closure_recovery_batches_dir(generation)
+            .join(format!("{seq:06}.json"))
+    }
+
+    pub fn closure_recovery_ids_path(&self, generation: ParentLossGeneration, seq: u64) -> PathBuf {
+        self.closure_recovery_ids_dir(generation)
+            .join(format!("{seq:06}.json"))
+    }
+
+    pub fn closure_recovery_live_path(
+        &self,
+        generation: ParentLossGeneration,
+        launch_id: &str,
+    ) -> PathBuf {
+        self.closure_recovery_live_dir(generation)
+            .join(format!("{launch_id}.json"))
+    }
+
+    pub fn closure_recovery_provisional_path(
+        &self,
+        generation: ParentLossGeneration,
+        launch_id: &str,
+    ) -> PathBuf {
+        self.closure_recovery_provisional_dir(generation)
+            .join(format!("{launch_id}.json"))
+    }
+
+    pub fn closure_recovery_scan_complete_path(&self, generation: ParentLossGeneration) -> PathBuf {
+        self.closure_recovery_phase_dir(generation)
+            .join("scan-complete.json")
+    }
+
+    pub fn closure_recovery_legacy_path(&self, generation: ParentLossGeneration) -> PathBuf {
         self.generation_path(generation)
             .join("closure-recovery.json")
     }
@@ -1133,7 +1194,7 @@ pub(crate) fn read_json_optional<T: for<'de> Deserialize<'de>>(
     }
 }
 
-fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>, ParentLossLedgerError> {
+pub(crate) fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>, ParentLossLedgerError> {
     let mut value = serde_json::to_value(value)?;
     sort_json_value(&mut value);
     let mut bytes = serde_json::to_vec_pretty(&value)?;
