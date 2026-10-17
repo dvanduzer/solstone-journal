@@ -17,9 +17,7 @@ use solstone_core_thinking_copy::SetupCatalogFacts;
 use tower::ServiceExt;
 
 use crate::establish;
-use crate::http::{
-    SetupDownloadError, SetupDownloadTask, SetupDownloads, SetupHost, init_router_with_host, router,
-};
+use crate::http::{SetupDownloadTask, SetupDownloads, SetupHost, init_router_with_host, router};
 use crate::ledger::{AuthorizationLedger, ClientEntry, ClientRole};
 use crate::mark::mark_from_jid;
 

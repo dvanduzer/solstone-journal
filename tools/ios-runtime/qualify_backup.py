@@ -116,8 +116,8 @@ def restore_phase(args, phone, restic, repository, storage, canonical, wrong, sn
     phone.control('serve-stop')
     args.suite = args.restore_suite
     phone.launch()
-    owner(phone, 'GET', '/init/mark')
-    owner(phone, 'POST', '/init/mark/lock', {})
+    mark = owner(phone, 'GET', '/init/mark')
+    owner(phone, 'POST', '/init/mark/lock', {'proposal_id': mark['proposal_id']})
     owner(phone, 'POST', '/init/finalize', {'name': 'Synthetic iOS restore', 'timezone': 'America/Denver'})
     fresh_identity = owner(phone, 'GET', '/app/network/api/identity')
     credentials = {'access_key_id': storage['access_key_id'], 'secret_access_key': storage['secret_access_key']}
@@ -184,8 +184,8 @@ def main():
         check('A1_startup', [r['value'] for r in phone.rows if r.get('event') == 'backup.admission'])
         admission = results['checks']['A1_startup']
         assert admission and admission[-1].get('admitted') is True, admission
-        owner(phone, 'GET', '/init/mark')
-        owner(phone, 'POST', '/init/mark/lock', {})
+        mark = owner(phone, 'GET', '/init/mark')
+        owner(phone, 'POST', '/init/mark/lock', {'proposal_id': mark['proposal_id']})
         owner(phone, 'POST', '/init/finalize', {'name': 'Synthetic iOS backup', 'timezone': 'America/Denver'})
         owner(phone, 'POST', '/app/settings/api/facet', {'title': 'Work'})
         status = native(phone.control('serve-status'))

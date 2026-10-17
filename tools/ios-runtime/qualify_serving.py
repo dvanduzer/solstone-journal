@@ -250,8 +250,8 @@ def main():
         phone.launch()
         phone.control('serve-status')
         phone.owner('GET', '/init/api/state')
-        phone.owner('GET', '/init/mark')
-        phone.owner('POST', '/init/mark/lock', {})
+        mark = phone.owner('GET', '/init/mark')
+        phone.owner('POST', '/init/mark/lock', {'proposal_id': mark['proposal_id']})
         phone.owner('POST', '/init/finalize', {'name': 'Synthetic iOS LAN', 'timezone': 'America/Denver'})
         status = native(phone.control('serve-status'))
         assert status['door_address'] == f'{args.host}:{args.port}', status

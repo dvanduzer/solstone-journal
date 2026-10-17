@@ -151,7 +151,7 @@ class Qualification:
         self.event('installed_apk', sha256=digest, bytes=len(apk))
         mark = self.owner('GET', '/init/mark')
         if not mark['locked']:
-            locked = self.owner('POST', '/init/mark/lock', {})
+            locked = self.owner('POST', '/init/mark/lock', {'proposal_id': mark['proposal_id']})
             assert locked['mark'] == mark['mark'], (locked, mark)
         self.owner('POST', '/init/finalize', {})
         state = self.control('status')['native']['value']
