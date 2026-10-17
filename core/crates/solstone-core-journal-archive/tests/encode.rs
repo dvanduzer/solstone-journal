@@ -203,7 +203,7 @@ fn encodes_empty_and_mixed_sources_with_the_fixed_archive_shape() {
 }
 
 #[test]
-fn portable_zip_keeps_owner_bytes_and_omits_credentials() {
+fn portable_zip_keeps_owner_bytes_and_credentials() {
     use solstone_core_journal_io::operational_log::{
         OplogFormat, OplogNameClassification, classify_oplog_name,
     };
@@ -236,6 +236,20 @@ fn portable_zip_keeps_owner_bytes_and_omits_credentials() {
     let directory_child_log_path = format!("chronicle/20260102/health/{LOG_LEAF}/child.txt");
 
     let kept_paths: Vec<&str> = vec![
+        "config/journal.json",
+        "config/push-vapid.json",
+        "config/push-registry.json",
+        "backup/hosted/binding.json",
+        "link/client.json",
+        "link/service-ca.key",
+        "link/authorized_clients.json",
+        "mcp-endpoint/pop.ed25519.pk8",
+        "peers/remote/client.key",
+        "config/chatgpt-sign-in.json.unreadable-1",
+        "config/chatgpt-sign-in.json",
+        "mcp-endpoint/oauth.json",
+        "mcp-endpoint/byo/accounts/owner/key.json",
+        "peers/remote/client.crt",
         "chronicle/20260101/a.txt",
         "entities/owner/entity.json",
         "facets/work/facet.json",
@@ -303,10 +317,16 @@ fn portable_zip_keeps_owner_bytes_and_omits_credentials() {
 
     let omitted_log_leaf_path = format!("chronicle/20260101/health/{LOG_LEAF}");
     let omitted_regular_paths: Vec<&str> = vec![
-        "config/journal.json",
-        "config/push-vapid.json",
-        "config/push-registry.json",
-        "backup/hosted/binding.json",
+        "mcp-endpoint/byo/ingress.sock",
+        "mcp-endpoint/byo/cutover.sock",
+        "mcp-endpoint/local-door-state.json",
+        "mcp-endpoint/lan-door-state.json",
+        "mcp-endpoint/byo-door-state.json",
+        "mcp-endpoint/.create.lock",
+        "mcp-endpoint/tls/.tmp_candidate",
+        "mcp-endpoint/.removing_old/key",
+        "config/chatgpt-sign-in.json.tmp",
+        "config/chatgpt-sign-in.json.lock",
         "awareness/discovery_clusters.json",
         "awareness/activity_state.json",
         "awareness/activity_state/child.txt",
@@ -320,13 +340,7 @@ fn portable_zip_keeps_owner_bytes_and_omits_credentials() {
         "chronicle/20260101/task_log.txt",
         "chronicle/20260101/stats.json",
         &omitted_log_leaf_path,
-        "link/client.json",
-        "link/service-ca.key",
-        "link/authorized_clients.json",
-        "mcp-endpoint/pop.ed25519.pk8",
-        "peers/remote/client.key",
         "imports/archive-merge-work/extract/x",
-        "config/chatgpt-sign-in.json.unreadable-1",
         "chronicle/20260101/.removing_original",
     ];
 
@@ -370,7 +384,7 @@ fn portable_zip_keeps_owner_bytes_and_omits_credentials() {
         .iter()
         .map(|s| s.as_str())
         .collect();
-    assert_eq!(skipped_names, vec!["mcp-endpoint", "peers"]);
+    assert!(skipped_names.is_empty());
 
     let mut archive =
         ZipArchive::new(File::open(&zip_path).expect("open zip output")).expect("parse zip output");
@@ -386,6 +400,8 @@ fn portable_zip_keeps_owner_bytes_and_omits_credentials() {
         "owner-root/",
         "tokens/",
         "link/",
+        "mcp-endpoint/",
+        "peers/",
         "solstone/",
         "apps/",
         "awareness/",
@@ -487,9 +503,9 @@ fn portable_zip_keeps_owner_bytes_and_omits_credentials() {
     assert!(actual_names.contains(&"imports/".to_owned()));
     assert!(actual_names.contains(&"config/".to_owned()));
     assert!(actual_names.contains(&"link/client-descriptions.json".to_owned()));
-    assert!(!actual_names.iter().any(|n| n.starts_with("mcp-endpoint")));
-    assert!(!actual_names.iter().any(|n| n.starts_with("peers")));
-    assert!(!actual_names.contains(&"config/journal.json".to_owned()));
+    assert!(actual_names.contains(&"mcp-endpoint/pop.ed25519.pk8".to_owned()));
+    assert!(actual_names.contains(&"peers/remote/client.key".to_owned()));
+    assert!(actual_names.contains(&"config/journal.json".to_owned()));
     assert_eq!(actual_names, expected_sequence);
 }
 
@@ -699,7 +715,7 @@ fn exported_archives_never_report_a_fault_for_an_unchanged_source() {
 }
 
 #[test]
-fn portable_zip_omits_legacy_peer_credentials() {
+fn portable_zip_preserves_legacy_peer_credentials() {
     let temporary = TempDir::new("encode-peers");
     let root = journal(&temporary);
     write(&root, "peers/remote/client.key", b"peer-key-sentinel-7f3a");
@@ -730,27 +746,15 @@ fn portable_zip_omits_legacy_peer_credentials() {
         members.push((name, body));
     }
 
-    for (name, _) in &members {
-        assert!(
-            name != "peers" && name != "peers/" && !name.starts_with("peers/"),
-            "forbidden peer member name: {name}"
-        );
-    }
-
-    let key_sentinel = b"peer-key-sentinel-7f3a";
-    let crt_sentinel = b"peer-crt-sentinel-9c2e";
-    for (name, body) in &members {
-        assert!(
-            !body
-                .windows(key_sentinel.len())
-                .any(|window| window == key_sentinel),
-            "key sentinel found in {name}"
-        );
-        assert!(
-            !body
-                .windows(crt_sentinel.len())
-                .any(|window| window == crt_sentinel),
-            "crt sentinel found in {name}"
+    for (name, expected) in [
+        ("peers/remote/client.key", pre_key.as_slice()),
+        ("peers/remote/client.crt", pre_crt.as_slice()),
+    ] {
+        let member = members.iter().find(|(member, _)| member == name);
+        assert_eq!(
+            member.map(|(_, body)| body.as_slice()),
+            Some(expected),
+            "{name}"
         );
     }
 

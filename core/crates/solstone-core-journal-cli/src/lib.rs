@@ -795,7 +795,7 @@ mod tests {
                 &spawner,
             ),
             Outcome::LocalSuccess {
-                stdout: "Usage: solstone journal archive export [--out PATH] [--quiet] [--day YYYYMMDD | --from YYYYMMDD [--to YYYYMMDD] | --to YYYYMMDD]\n".to_owned(),
+                stdout: "Usage: solstone journal archive export [--out PATH] [--quiet] [--day YYYYMMDD | --from YYYYMMDD [--to YYYYMMDD] | --to YYYYMMDD]\n\ncreate a ZIP of your journal, including settings and credentials.\nprocessing logs, rebuildable indexes and caches, locks and temporary files are left out.\nwith a date filter, only the selected days are included.\n".to_owned(),
                 stderr: String::new(),
             }
         );

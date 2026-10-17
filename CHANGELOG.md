@@ -13,6 +13,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- journal exports now keep your settings, saved connections and credentials, along with app data and other journal files that were previously left out. processing logs, rebuildable indexes and caches, locks and temporary files stay out. merging keeps the receiving journal's settings and connections.
+
 - home and your morning briefing now say "plans" for the meetings and deadlines the journal noticed in what you've shared, the same word the activities app uses.
 - when today has no activities yet, the activities app still shows today's hours, with a line at the current time.
 - the note at the top of your morning briefing says what it drew on in plain words, and names anything that was missing. it no longer counts "source paths", which always read 0.
