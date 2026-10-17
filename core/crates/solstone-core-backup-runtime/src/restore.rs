@@ -422,7 +422,7 @@ pub fn restore_journal(
             draft.resumable = false;
             return unrecorded_outcome(draft);
         }
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "ios"))]
         {
             let mut draft = draft;
             if admitted.revalidate_for_target().is_err() {
@@ -444,7 +444,7 @@ pub fn restore_journal(
             }
             outcome
         }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "ios")))]
         {
             if admitted.revalidate_for_target().is_err() {
                 return unrecorded_outcome(error_draft(
@@ -617,7 +617,7 @@ pub fn restore_journal(
         )
     };
     let admission_failed = || {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "ios"))]
         {
             finish(
                 journal,
@@ -631,7 +631,7 @@ pub fn restore_journal(
                 ),
             )
         }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "ios")))]
         {
             unrecorded_outcome(error_draft(RESTORE_REASON_DESTINATION_ADMISSION_FAILED))
         }

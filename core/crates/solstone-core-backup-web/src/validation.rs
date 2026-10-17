@@ -223,6 +223,24 @@ pub fn destination(value: &Map<String, Value>) -> Result<(), Response> {
             return Err(response::missing(&format!("missing {key}")));
         }
     }
+    // An optional S3 signing region must be one a signer can use.
+    if backend == "s3"
+        && let Some(region) = source.get("region")
+        && !region.as_str().map(str::trim).is_some_and(|region| {
+            !region.is_empty()
+                && region.len() <= 64
+                && region
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+    {
+        return Err(response::error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "one of those values couldn't be used.",
+            "invalid_request_value",
+            "invalid region",
+        ));
+    }
     Ok(())
 }
 pub fn retention(value: &Map<String, Value>) -> Result<Map<String, Value>, Response> {
@@ -297,6 +315,28 @@ pub fn restore_day(value: &Map<String, Value>) -> Result<(), Response> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn s3_destination_region_is_optional_but_must_be_usable() {
+        let base = json!({"repository":"s3:s3.us-west-004.backblazeb2.com/b/p","backend":"s3",
+            "credentials":{"access_key_id":"a","secret_access_key":"s"}});
+        assert!(destination(base.as_object().unwrap()).is_ok());
+        for (region, ok) in [
+            (json!("us-west-004"), true),
+            (json!("US-EAST-1"), false),
+            (json!(""), false),
+            (json!("a b"), false),
+            (json!(7), false),
+        ] {
+            let mut value = base.clone();
+            value["credentials"]["region"] = region.clone();
+            assert_eq!(
+                destination(value.as_object().unwrap()).is_ok(),
+                ok,
+                "{region}"
+            );
+        }
+    }
 
     const PORTAL: &str = "https://services.solstone.app";
     const HOSTED_BINDING_FIELDS: [&str; 6] = [

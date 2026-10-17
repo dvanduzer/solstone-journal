@@ -347,6 +347,20 @@ func executeRootedRestore(ctx context.Context, req *bridgeRequest, setWrote func
 		return failed(err)
 	}
 	defer unlock()
+	// Past the key and the lock, an error is never a password or a missing
+	// repository, whatever its text says; restore may already have written.
+	failed = func(err error) (bridgeResult, error) {
+		if ctx.Err() != nil {
+			return bridgeResult{status: StatusCancelled, diagnostic: DiagCancelled}, err
+		}
+		if errors.Is(err, errResourceLimit) {
+			return refusalResult(err, DiagIoFailed), err
+		}
+		if strings.Contains(err.Error(), "ciphertext verification failed") {
+			return bridgeResult{status: StatusFailed, diagnostic: DiagRepoCorrupt}, err
+		}
+		return bridgeResult{status: StatusFailed, diagnostic: DiagIoFailed}, err
+	}
 	if err := repo.LoadIndex(lockCtx, &progress.NoopPrinter{}); err != nil {
 		return failed(err)
 	}
