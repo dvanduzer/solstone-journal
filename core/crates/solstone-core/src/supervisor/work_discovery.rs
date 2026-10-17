@@ -344,6 +344,8 @@ struct DayWork {
 
 #[derive(Default)]
 struct HistoryDay {
+    /// Daily evidence is deferred while the indexed archive prerequisite remains.
+    archive_pending: bool,
     owed: u64,
     segments_owed: u64,
     daily_units_owed: u64,
@@ -954,75 +956,80 @@ fn inspect_day(
         }
         owed_segments.push((segment, p, readiness));
     }
-    if solstone_core_import::audio_archive::archive_day_has_pending(journal, day)
-        .map_err(|error| error.to_string())?
-    {
-        prerequisites_ready = false;
-        segments_thought = false;
-    }
-    let closing =
-        super::tick::day_still_closing(journal, queue, SystemTime::now()).as_deref() == Some(day);
-    let imported = sources
-        .imports
-        .iter()
-        .any(|import| import.days.contains(day));
-    let explicit = intent
-        .map(|_| WorkBand::Waiting)
-        .or_else(|| imported.then_some(WorkBand::Import));
-    let coverage = daily_coverage::read_daily_coverage(journal, day)?;
-    let p = daily_priority(priority(day, None, today, explicit), &coverage);
-    let mut permanently_held_daily = BTreeSet::new();
-    work.candidates.extend(daily_retries(
-        journal,
-        day,
-        &coverage,
-        intent,
-        sources.imports,
-        policy,
-        prerequisites_ready && !closing,
-        &mut permanently_held_daily,
-        report,
-    )?);
-    // A daily output waiting solely on set-aside recordings, or on their
-    // set-aside thinking, is also set aside for the range. Ordinary
-    // prerequisites remain work owed.
-    let permanently_blocked =
-        !segments_thought && work.history.owed == 0 && work.history.set_aside > 0;
-    for covered in &coverage.units {
-        let unit = Unit::Daily {
-            day: day.into(),
-            talent: covered.identity.name.clone(),
-            facet: covered.identity.facet.clone(),
-        };
-        let id = unit.id()?;
-        let hold = report
-            .holds
+    work.history.archive_pending =
+        solstone_core_import::audio_archive::archive_day_has_pending(journal, day)
+            .map_err(|error| error.to_string())?;
+    let closes_day = if work.history.archive_pending {
+        // Coverage projects the whole day's sources. Pending archive parts
+        // already prohibit daily work, so do not walk their unselected tiles
+        // just to rediscover that prerequisite. Segment work still proceeds.
+        held(report, day, None, WorkBand::Import, "segment_prerequisites");
+        false
+    } else {
+        let closing = super::tick::day_still_closing(journal, queue, SystemTime::now()).as_deref()
+            == Some(day);
+        let imported = sources
+            .imports
             .iter()
-            .find(|hold| hold.retry_unit.as_ref() == Some(&id));
-        if covered.state.is_owed() || hold.is_some() {
-            if permanently_blocked || permanently_held_daily.contains(&id) {
-                work.history.set_aside += 1;
-                work.history.daily_units_set_aside += u64::from(p.band >= WorkBand::Completing);
-            } else if p.band != WorkBand::Remake {
-                // Updating an older day's outputs (band 6) is still counted as
-                // left, but it runs after history and must not hold the range.
-                work.history.owed += 1;
-            }
-        }
-    }
-    let closes_day = day < today.format("%Y%m%d").to_string().as_str()
-        && queue_daily(
+            .any(|import| import.days.contains(day));
+        let explicit = intent
+            .map(|_| WorkBand::Waiting)
+            .or_else(|| imported.then_some(WorkBand::Import));
+        let coverage = daily_coverage::read_daily_coverage(journal, day)?;
+        let p = daily_priority(priority(day, None, today, explicit), &coverage);
+        let mut permanently_held_daily = BTreeSet::new();
+        work.candidates.extend(daily_retries(
             journal,
             day,
             &coverage,
-            segments_thought && !closing,
-            prerequisites_ready,
             intent,
-            p,
+            sources.imports,
             policy,
-            &mut work,
+            prerequisites_ready && !closing,
+            &mut permanently_held_daily,
             report,
-        )?;
+        )?);
+        // A daily output waiting solely on set-aside recordings, or on their
+        // set-aside thinking, is also set aside for the range. Ordinary
+        // prerequisites remain work owed.
+        let permanently_blocked =
+            !segments_thought && work.history.owed == 0 && work.history.set_aside > 0;
+        for covered in &coverage.units {
+            let unit = Unit::Daily {
+                day: day.into(),
+                talent: covered.identity.name.clone(),
+                facet: covered.identity.facet.clone(),
+            };
+            let id = unit.id()?;
+            let hold = report
+                .holds
+                .iter()
+                .find(|hold| hold.retry_unit.as_ref() == Some(&id));
+            if covered.state.is_owed() || hold.is_some() {
+                if permanently_blocked || permanently_held_daily.contains(&id) {
+                    work.history.set_aside += 1;
+                    work.history.daily_units_set_aside += u64::from(p.band >= WorkBand::Completing);
+                } else if p.band != WorkBand::Remake {
+                    // Updating an older day's outputs (band 6) is still counted as
+                    // left, but it runs after history and must not hold the range.
+                    work.history.owed += 1;
+                }
+            }
+        }
+        day < today.format("%Y%m%d").to_string().as_str()
+            && queue_daily(
+                journal,
+                day,
+                &coverage,
+                segments_thought && !closing,
+                prerequisites_ready,
+                intent,
+                p,
+                policy,
+                &mut work,
+                report,
+            )?
+    };
     for (segment, p, readiness) in owed_segments {
         report.band(p.band).segments_owed += 1;
         // The day's daily work publishes the segments only owed publication.
@@ -1137,6 +1144,25 @@ thread_local! {
     static STILL_OWED_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// A candidate's readiness depends on its own coordinate, never its siblings.
+struct ExactSegmentSource<'a> {
+    stream: &'a str,
+    key: &'a str,
+}
+
+impl solstone_core_system_health::SegmentSource for ExactSegmentSource<'_> {
+    fn segments(
+        &self,
+        journal: &Path,
+        day: &str,
+    ) -> Result<Vec<solstone_core_journal_io::Segment>, solstone_core_system_health::HealthError>
+    {
+        solstone_core_journal_io::Segment::resolve_exact(journal, day, self.stream, self.key)
+            .map(|segment| segment.into_iter().collect())
+            .map_err(|error| solstone_core_system_health::HealthError::Source(error.to_string()))
+    }
+}
+
 fn still_owed(journal: &Path, candidate: &DiscoveredTask) -> Result<bool, String> {
     #[cfg(test)]
     STILL_OWED_CHECKS.with(|checks| checks.set(checks.get() + 1));
@@ -1160,7 +1186,10 @@ fn still_owed(journal: &Path, candidate: &DiscoveredTask) -> Result<bool, String
                 (evidence.input, evidence.reason)
             }
             Unit::Daily { .. } => {
-                if !solstone_core_system_health::day_segments_ready(journal, day)? {
+                if solstone_core_import::audio_archive::archive_day_has_pending(journal, day)
+                    .map_err(|error| error.to_string())?
+                    || !solstone_core_system_health::day_segments_ready(journal, day)?
+                {
                     return Ok(false);
                 }
                 let Some(input) = work_retry::daily::observe(journal, &record.unit)? else {
@@ -1206,7 +1235,10 @@ fn still_owed(journal: &Path, candidate: &DiscoveredTask) -> Result<bool, String
     if let Some(segment) = argument("--segment") {
         let stream = argument("--stream").ok_or("work has no stream")?;
         let (_, _, segments) = solstone_core_system_health::scan_day(
-            &solstone_core_system_health::FilesystemSegmentSource,
+            &ExactSegmentSource {
+                stream,
+                key: segment,
+            },
             journal,
             day,
             chrono::Utc::now(),
@@ -1233,6 +1265,11 @@ fn still_owed(journal: &Path, candidate: &DiscoveredTask) -> Result<bool, String
             &progress.value,
         )
         .map(|ready| !ready);
+    }
+    if solstone_core_import::audio_archive::archive_day_has_pending(journal, day)
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(false);
     }
     Ok(daily_coverage::read_daily_coverage(journal, day)?
         .state
@@ -1419,7 +1456,7 @@ fn history_progress(
     let newest_owed = historical
         .iter()
         .rev()
-        .find(|(_, (work, unreadable))| !unreadable && work.owed > 0)
+        .find(|(_, (work, unreadable))| !unreadable && (work.owed > 0 || work.archive_pending))
         .map(|(day, _)| day.as_str());
     let caught_up_since = match newest_owed {
         Some(day) if day == through_day => None,
@@ -1449,7 +1486,9 @@ fn history_progress(
     let mut unreadable = report.unreadable.clone();
     unreadable.sort();
     unreadable.dedup();
-    let sample = (report.days_inspected == report.days_total).then(|| HistorySample {
+    let sample = (report.days_inspected == report.days_total
+        && !days.values().any(|(work, _)| work.archive_pending))
+    .then(|| HistorySample {
         local_day: today.format("%Y%m%d").to_string(),
         journal_version: env!("CARGO_PKG_VERSION").into(),
         as_of_ms: report.as_of_ms,
@@ -3718,5 +3757,556 @@ mod tests {
             past_archive_c.request.priority.unwrap().band,
             WorkBand::Import
         );
+    }
+
+    #[cfg(all(unix, feature = "full-tests"))]
+    #[test]
+    fn pending_archive_defers_coverage_without_claiming_finished_history() {
+        use solstone_core_import::audio_archive::claims::{
+            register_pending_tile, retire_pending_tile,
+        };
+        let root = fixture("local");
+        let day = "19990101";
+        let selected = root
+            .path()
+            .join("chronicle")
+            .join(day)
+            .join("import.archive/120000_60");
+        std::fs::create_dir_all(&selected).unwrap();
+        std::fs::write(selected.join("audio.opus"), "audio").unwrap();
+        std::fs::write(
+            selected.join("audio.jsonl"),
+            "{}\n{\"start\":\"12:00:00\",\"text\":\"speech\"}\n",
+        )
+        .unwrap();
+        segment(root.path(), day, "120100_60");
+        let other = root
+            .path()
+            .join("chronicle")
+            .join(day)
+            .join("import.archive/130000_300");
+        std::fs::create_dir_all(&other).unwrap();
+        let poison = other.join("unselected-source");
+        std::os::unix::fs::symlink(root.path().join("absent"), &poison).unwrap();
+        // Positive control: the old daily evidence projection reaches this sibling.
+        assert!(daily_coverage::read_daily_coverage(root.path(), day).is_err());
+        std::fs::create_dir_all(root.path().join("imports")).unwrap();
+        use solstone_core_import::audio_archive::{
+            AudioArchiveMemberInput, AudioArchiveSettings, DurationInput, MemberStartEvidence,
+            plan_audio_archive,
+            record::{plan_to_record, save_audio_archive_record},
+        };
+        let plan = plan_audio_archive(
+            &[AudioArchiveMemberInput {
+                original_relative_name: "other.opus".into(),
+                byte_len: 1,
+                sha256: "a".repeat(64),
+                duration: DurationInput::Milliseconds(1000),
+                start: MemberStartEvidence {
+                    instant: Some("1999-01-01T13:00:00Z".into()),
+                    ..Default::default()
+                },
+                run_note: None,
+            }],
+            chrono_tz::UTC,
+            AudioArchiveSettings {
+                qualifier: "archive".into(),
+                archive_identity: "fixture".into(),
+            },
+        )
+        .unwrap();
+        save_audio_archive_record(root.path(), "19990101_010101", &plan_to_record(&plan)).unwrap();
+
+        register_pending_tile(root.path(), "19990101_010101", day, "130000_300").unwrap();
+        let q = queue(root.path());
+        let policy = WorkPolicy::read(root.path()).unwrap();
+        let coords = BTreeSet::from([Coordinate {
+            day: day.into(),
+            stream: "import.archive".into(),
+            segment: "120000_60".into(),
+        }]);
+        let mut report = WorkInventory::default();
+        let work = inspect_day(
+            root.path(),
+            day,
+            &q,
+            None,
+            DaySources {
+                imports: &[],
+                archive_coordinates: &coords,
+            },
+            policy,
+            &mut report,
+        )
+        .unwrap();
+        assert!(!work.daily_current);
+        assert!(work.history.archive_pending);
+        assert!(
+            work.candidates
+                .iter()
+                .any(|c| c.request.reference.ends_with("import.archive-120000_60"))
+        );
+        assert!(
+            work.candidates
+                .iter()
+                .any(|c| c.request.reference.ends_with("notes-120100_60"))
+        );
+        assert!(!work.candidates.iter().any(|c| {
+            c.request
+                .cmd
+                .as_wire()
+                .iter()
+                .any(|arg| arg == "--daily-only")
+        }));
+        assert!(
+            report
+                .holds
+                .iter()
+                .any(|h| h.day == day && h.reason == "segment_prerequisites")
+        );
+        let daily = task(
+            day,
+            None,
+            priority(day, None, chrono::Utc::now().date_naive(), None),
+            None,
+        );
+        assert!(!still_owed(root.path(), &daily).unwrap());
+        let unit = Unit::Daily {
+            day: day.into(),
+            talent: "schedule".into(),
+            facet: None,
+        };
+        work_retry::observe_held(root.path(), &unit, "fixture", "input").unwrap();
+        let mut retry = daily.clone();
+        let mut wire = retry.request.cmd.as_wire().to_vec();
+        wire.extend(["--retry-unit".into(), unit.id().unwrap()]);
+        retry.request.cmd = TaskArgv::from_wire(wire).unwrap();
+        assert!(!still_owed(root.path(), &retry).unwrap());
+        // Even a selected Ready tile cannot release the day's other pending
+        // archive prerequisite or complete its outstanding owner intent.
+        thought_without_receipt(root.path(), day, &["120000_60"]);
+        std::fs::remove_dir_all(&selected).unwrap();
+        std::fs::rename(
+            root.path()
+                .join("chronicle")
+                .join(day)
+                .join("notes/120000_60"),
+            &selected,
+        )
+        .unwrap();
+        for entry in
+            std::fs::read_dir(root.path().join("chronicle").join(day).join("health")).unwrap()
+        {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "jsonl") {
+                let text = std::fs::read_to_string(&path)
+                    .unwrap()
+                    .replace("\"stream\":\"notes\"", "\"stream\":\"import.archive\"");
+                std::fs::write(path, text).unwrap();
+            }
+        }
+        let input = solstone_core_system_health::newest_segment_input_ms(&selected).unwrap();
+        solstone_core_system::segment_publication::publish(
+            root.path(),
+            &selected,
+            input,
+            |_, _| {
+                Ok(
+                    solstone_core_indexer_store::scan::RescanFileStatus::Indexed {
+                        warnings: Vec::new(),
+                    },
+                )
+            },
+        )
+        .unwrap();
+        let intent = work_intent::register(root.path(), day, false).unwrap();
+        let mut report = WorkInventory::default();
+        let work = inspect_day(
+            root.path(),
+            day,
+            &q,
+            Some(&intent),
+            DaySources {
+                imports: &[],
+                archive_coordinates: &coords,
+            },
+            policy,
+            &mut report,
+        )
+        .unwrap();
+        assert!(work.completed_segments.contains(&Coordinate {
+            day: day.into(),
+            stream: "import.archive".into(),
+            segment: "120000_60".into()
+        }));
+        assert!(!work.daily_current);
+        assert!(work.history.archive_pending);
+        assert_eq!(work_intent::read(root.path()).unwrap()[day].id, intent.id);
+        let days = BTreeMap::from([(day.to_string(), root.path().join("chronicle").join(day))]);
+        let reports = BTreeMap::from([(day.to_string(), report)]);
+        let mut total = WorkInventory::default();
+        aggregate(&mut total, &reports, &[], &days, 1);
+        let history = history_progress(
+            &total,
+            &BTreeMap::from([(day.to_string(), (work.history, false))]),
+            chrono::Utc::now().date_naive(),
+            None,
+        );
+        assert_eq!(history.caught_up_since.as_deref(), Some("19990102"));
+        assert!(history.sample.is_none());
+        assert!(history.net_per_hour.is_none());
+        assert!(
+            total
+                .holds
+                .iter()
+                .any(|h| h.reason == "segment_prerequisites")
+        );
+        reconcile(root.path(), &q, &AtomicBool::new(false)).unwrap();
+        assert_eq!(work_intent::read(root.path()).unwrap()[day].id, intent.id);
+        let published = solstone_core_system::work_inventory::read(root.path())
+            .unwrap()
+            .unwrap();
+        let history = published.history.unwrap();
+        assert!(history.sample.is_none());
+        assert!(history.net_per_hour.is_none());
+        assert!(
+            published
+                .holds
+                .iter()
+                .any(|h| h.day == day && h.reason == "segment_prerequisites")
+        );
+        // Clearing the final indexed prerequisite restores the actual coverage
+        // read. The poisoned source must still be visible as an error then.
+        retire_pending_tile(root.path(), "19990101_010101", day, "130000_300").unwrap();
+        assert!(
+            inspect_day(
+                root.path(),
+                day,
+                &q,
+                None,
+                DaySources {
+                    imports: &[],
+                    archive_coordinates: &coords
+                },
+                policy,
+                &mut WorkInventory::default()
+            )
+            .is_err()
+        );
+        assert!(still_owed(root.path(), &daily).is_err());
+        std::fs::remove_file(poison).unwrap();
+        let work = inspect_day(
+            root.path(),
+            day,
+            &q,
+            None,
+            DaySources {
+                imports: &[],
+                archive_coordinates: &coords,
+            },
+            policy,
+            &mut WorkInventory::default(),
+        )
+        .unwrap();
+        assert!(!work.history.archive_pending);
+        assert!(
+            !work.daily_current,
+            "ordinary unsensed segment still blocks daily readiness"
+        );
+        assert!(!work.candidates.iter().any(|c| {
+            c.request
+                .cmd
+                .as_wire()
+                .iter()
+                .any(|arg| arg == "--daily-only")
+        }));
+        assert!(!still_owed(root.path(), &daily).unwrap());
+        let coverage = daily_coverage::read_daily_coverage(root.path(), day).unwrap();
+        let covered = coverage
+            .units
+            .iter()
+            .find(|u| !u.evidence_revision.is_empty())
+            .unwrap();
+        let valid_unit = Unit::Daily {
+            day: day.into(),
+            talent: covered.identity.name.clone(),
+            facet: covered.identity.facet.clone(),
+        };
+        let evidence = work_retry::daily::evidence(root.path(), &valid_unit).unwrap();
+        let mut capped = solstone_core_journal_io::DailyUnitRecord::new(
+            work_retry::daily::identity(&valid_unit).unwrap(),
+            &evidence.revision,
+            &evidence.contract,
+        );
+        capped.status = solstone_core_journal_io::DailyUnitStatus::Capped;
+        capped.reason_code = Some("schema_invalid".into());
+        solstone_core_journal_io::save_daily_unit_record(root.path(), &capped).unwrap();
+        let owner = work_retry::daily::request(root.path(), &valid_unit).unwrap();
+        let mut valid_retry = daily.clone();
+        let mut wire = valid_retry.request.cmd.as_wire().to_vec();
+        wire.extend([
+            "--retry-unit".into(),
+            valid_unit.id().unwrap(),
+            "--retry-cause".into(),
+            format!("owner:{owner}"),
+        ]);
+        valid_retry.request.cmd = TaskArgv::from_wire(wire).unwrap();
+        assert!(
+            !still_owed(root.path(), &valid_retry).unwrap(),
+            "ordinary prerequisite also holds a genuinely granted daily retry"
+        );
+        std::fs::remove_dir_all(
+            root.path()
+                .join("chronicle")
+                .join(day)
+                .join("notes/120100_60"),
+        )
+        .unwrap();
+        let work = inspect_day(
+            root.path(),
+            day,
+            &q,
+            Some(&intent),
+            DaySources {
+                imports: &[],
+                archive_coordinates: &coords,
+            },
+            policy,
+            &mut WorkInventory::default(),
+        )
+        .unwrap();
+        assert!(
+            work.candidates.iter().any(|c| c
+                .request
+                .cmd
+                .as_wire()
+                .iter()
+                .any(|arg| arg == "--daily-only")),
+            "last archive prerequisite released and real daily work is admitted"
+        );
+        assert!(still_owed(root.path(), &daily).unwrap());
+        assert!(
+            still_owed(root.path(), &valid_retry).unwrap(),
+            "granted daily retry resumes once prerequisites are Ready"
+        );
+        register_pending_tile(root.path(), "19990101_010101", day, "130000_300").unwrap();
+        assert!(
+            !still_owed(root.path(), &valid_retry).unwrap(),
+            "pending archive also holds a valid retry grant"
+        );
+        retire_pending_tile(root.path(), "19990101_010101", day, "130000_300").unwrap();
+        assert!(still_owed(root.path(), &valid_retry).unwrap());
+    }
+
+    #[cfg(all(unix, feature = "full-tests"))]
+    #[test]
+    fn exact_candidate_recheck_does_not_read_unrelated_segments() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = fixture("local");
+        let day = "19990101";
+        segment(root.path(), day, "120000_60");
+        let sibling = root
+            .path()
+            .join("chronicle")
+            .join(day)
+            .join("notes/130000_60");
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("audio.opus"), "audio").unwrap();
+        std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let same_key = root
+            .path()
+            .join("chronicle")
+            .join(day)
+            .join("import.archive/120000_60");
+        std::fs::create_dir_all(&same_key).unwrap();
+        std::fs::write(same_key.join("audio.opus"), "other audio").unwrap();
+        let whole = solstone_core_system_health::scan_day(
+            &solstone_core_system_health::FilesystemSegmentSource,
+            root.path(),
+            day,
+            chrono::Utc::now(),
+        );
+        let ordinary = task(
+            day,
+            Some(("120000_60", "notes")),
+            priority(
+                day,
+                Some("120000_60"),
+                chrono::Utc::now().date_naive(),
+                None,
+            ),
+            None,
+        );
+        let archive = task(
+            day,
+            Some(("120000_60", "import.archive")),
+            priority(
+                day,
+                Some("120000_60"),
+                chrono::Utc::now().date_naive(),
+                None,
+            ),
+            None,
+        );
+        let ordinary_result = still_owed(root.path(), &ordinary);
+        let archive_result = still_owed(root.path(), &archive);
+        std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            whole.is_err(),
+            "positive control requires denied sibling traversal"
+        );
+        assert!(ordinary_result.unwrap());
+        assert!(archive_result.unwrap());
+        thought_without_receipt(root.path(), day, &["120000_60"]);
+        assert!(
+            still_owed(root.path(), &ordinary).unwrap(),
+            "thought output still owes publication"
+        );
+        let target = root
+            .path()
+            .join("chronicle")
+            .join(day)
+            .join("notes/120000_60");
+        let input = solstone_core_system_health::newest_segment_input_ms(&target).unwrap();
+        solstone_core_system::segment_publication::publish(root.path(), &target, input, |_, _| {
+            Ok(
+                solstone_core_indexer_store::scan::RescanFileStatus::Indexed {
+                    warnings: Vec::new(),
+                },
+            )
+        })
+        .unwrap();
+        assert!(
+            !still_owed(root.path(), &ordinary).unwrap(),
+            "Ready target is not requeued"
+        );
+        assert!(
+            still_owed(root.path(), &archive).unwrap(),
+            "same-key archive remains independently owed"
+        );
+        std::fs::remove_dir_all(&target).unwrap();
+        assert!(!still_owed(root.path(), &ordinary).unwrap());
+        thought_without_receipt(root.path(), day, &["120000_60"]);
+        std::fs::remove_dir_all(&same_key).unwrap();
+        std::fs::rename(&target, &same_key).unwrap();
+        for entry in
+            std::fs::read_dir(root.path().join("chronicle").join(day).join("health")).unwrap()
+        {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "jsonl") {
+                let text = std::fs::read_to_string(&path)
+                    .unwrap()
+                    .replace("\"stream\":\"notes\"", "\"stream\":\"import.archive\"");
+                std::fs::write(path, text).unwrap();
+            }
+        }
+        assert!(
+            still_owed(root.path(), &archive).unwrap(),
+            "archive thinking alone still owes publication"
+        );
+        let input = solstone_core_system_health::newest_segment_input_ms(&same_key).unwrap();
+        solstone_core_system::segment_publication::publish(
+            root.path(),
+            &same_key,
+            input,
+            |_, _| {
+                Ok(
+                    solstone_core_indexer_store::scan::RescanFileStatus::Indexed {
+                        warnings: Vec::new(),
+                    },
+                )
+            },
+        )
+        .unwrap();
+        assert!(
+            !still_owed(root.path(), &archive).unwrap(),
+            "Ready archive target is not requeued"
+        );
+        assert!(
+            !still_owed(root.path(), &ordinary).unwrap(),
+            "other stream does not borrow archive readiness"
+        );
+        std::fs::remove_dir_all(same_key).unwrap();
+        assert!(!still_owed(root.path(), &archive).unwrap());
+        assert!(!still_owed(root.path(), &ordinary).unwrap());
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn corrupt_archive_barrier_does_not_admit_daily_work() {
+        let root = fixture("local");
+        std::fs::create_dir_all(root.path().join("imports")).unwrap();
+        std::fs::write(
+            solstone_core_import::audio_archive::claim_db_path(root.path()),
+            "not sqlite",
+        )
+        .unwrap();
+        let day = "19990101";
+        let candidate = task(
+            day,
+            None,
+            priority(day, None, chrono::Utc::now().date_naive(), None),
+            None,
+        );
+        assert!(still_owed(root.path(), &candidate).is_err());
+        assert!(
+            inspect_day(
+                root.path(),
+                day,
+                &queue(root.path()),
+                None,
+                DaySources {
+                    imports: &[],
+                    archive_coordinates: &BTreeSet::new()
+                },
+                WorkPolicy::read(root.path()).unwrap(),
+                &mut WorkInventory::default()
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(all(unix, feature = "full-tests"))]
+    #[test]
+    fn maintenance_keeps_its_recent_key_projection_outside_archive_processing_bound() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = fixture("local");
+        let recent = (chrono::Utc::now().date_naive() - chrono::Duration::days(1))
+            .format("%Y%m%d")
+            .to_string();
+        let stream = root
+            .path()
+            .join("chronicle")
+            .join(&recent)
+            .join("import.archive");
+        std::fs::create_dir_all(stream.join("120000_300")).unwrap();
+        std::fs::write(stream.join("120000_300/audio.opus"), "audio").unwrap();
+        std::fs::create_dir_all(root.path().join("imports")).unwrap();
+        solstone_core_import::audio_archive::claims::register_pending_tile(
+            root.path(),
+            "19990101_010101",
+            &recent,
+            "120000_300",
+        )
+        .unwrap();
+        assert!(
+            !solstone_core_import::audio_archive::archive_day_has_pending(root.path(), "19990102")
+                .unwrap()
+        );
+        std::fs::set_permissions(&stream, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let coverage = daily_coverage::read_daily_coverage(root.path(), "19990102");
+        std::fs::set_permissions(&stream, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let maintenance = coverage.unwrap().maintenance.unwrap();
+        assert_eq!(maintenance.identity.name, "daily_schedule");
+        assert_eq!(
+            maintenance.state,
+            CoverageState::Unreadable,
+            "global maintenance still reads recent archive keys from a nonpending day's coverage"
+        );
+        let restored = daily_coverage::read_daily_coverage(root.path(), "19990102")
+            .unwrap()
+            .maintenance
+            .unwrap();
+        assert_ne!(restored.state, CoverageState::Unreadable);
     }
 }
