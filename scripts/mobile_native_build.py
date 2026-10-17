@@ -69,17 +69,20 @@ def require_ios_platform(text):
         raise ValueError(f"artifact requires newer than iOS 26: {minimums}")
 
 
-def require_current_pins(pins):
+def require_current_pins(pins, components=None):
+    """Mobile inputs follow the desktop pins. A subset build checks only what it builds."""
     distribution = ROOT / "core/crates/solstone-core-distribution/src"
-    guards = (("llama", "llama_windows_source.rs", "LLAMA_COMMIT"),
-              ("ced", "ced_windows.rs", "CED_CPP_COMMIT"),
-              ("ggml", "ced_windows.rs", "GGML_COMMIT"),
-              ("rfdetr", "rfdetr_windows.rs", "RF_DETR_COMMIT"),
-              ("ggml", "rfdetr_windows.rs", "GGML_COMMIT"),
-              ("nvattest", "nvattest_windows.rs", "NVATTEST_SDK_REVISION"),
-              ("pdfium-android", "pdfium.rs", "RELEASE_TAG"),
-              ("pdfium-ios", "pdfium.rs", "RELEASE_TAG"))
-    for name, filename, constant in guards:
+    guards = (("llama", "llama", "llama_windows_source.rs", "LLAMA_COMMIT"),
+              ("ced", "ced", "ced_windows.rs", "CED_CPP_COMMIT"),
+              ("ggml", "ced", "ced_windows.rs", "GGML_COMMIT"),
+              ("rfdetr", "rfdetr", "rfdetr_windows.rs", "RF_DETR_COMMIT"),
+              ("ggml", "rfdetr", "rfdetr_windows.rs", "GGML_COMMIT"),
+              ("nvattest", "nvattest", "nvattest_windows.rs", "NVATTEST_SDK_REVISION"),
+              ("pdfium-android", "pdfium", "pdfium.rs", "RELEASE_TAG"),
+              ("pdfium-ios", "pdfium", "pdfium.rs", "RELEASE_TAG"))
+    for name, component, filename, constant in guards:
+        if components is not None and component not in components:
+            continue
         matches = re.findall(rf'^pub const {constant}: &str = "([^\"]+)";',
                              (distribution / filename).read_text(), re.MULTILINE)
         if matches != [pins[name]["revision"]]:
@@ -200,7 +203,7 @@ class Build:
         return destination
 
     def setup(self):
-        require_current_pins(self.pins)
+        require_current_pins(self.pins, None if self.args.full_run else self.args.components)
         ios = self.args.platform == "ios"
         expected = ("Darwin", "arm64") if ios else ("Linux", "x86_64")
         if (platform.system(), platform.machine()) != expected:
