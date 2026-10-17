@@ -1,7 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-//! Keeps an installed Parakeet provider on the release's pins.
+//! Keeps the Parakeet provider installed and on the release's pins.
+//!
+//! On linux, Parakeet is the default speech recognizer, and `journal setup`
+//! installs it into the journal's provider cache. A journal can still lack it:
+//! setup's model step failed or was skipped, or the journal was restored or
+//! copied, which leaves `cache/` behind. Transcription then defers every audio
+//! file with `no_port` for a server that is never started. So when admission
+//! says Parakeet is wanted and its artifacts are missing or behind their pins,
+//! this starts the same installer `journal install-provider parakeet` runs,
+//! whether or not a model was installed before. Owner cancellation, persisted
+//! cooldown and launch spacing still apply.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -96,13 +106,14 @@ impl ParakeetFollow {
 
         if decision == ParakeetFollowDecision::Launch {
             memory.record_launch(now_instant);
+            let why = if input.model_installed_before {
+                "parakeet provider artifacts are behind this release's pins"
+            } else {
+                "parakeet speech recognition is not installed in this journal"
+            };
             match (self.launcher)(journal) {
-                Ok(()) => log::info!(
-                    "parakeet provider artifacts are behind this release's pins; started the installer"
-                ),
-                Err(error) => log::warn!(
-                    "parakeet provider artifacts are behind this release's pins; installer did not start: {error}"
-                ),
+                Ok(()) => log::warn!("{why}; started the installer"),
+                Err(error) => log::warn!("{why}; installer did not start: {error}"),
             }
         }
 
@@ -125,10 +136,6 @@ fn decide(
     if !input.desired {
         return ParakeetFollowDecision::Hold("provider-not-needed".to_owned());
     }
-    if !input.model_installed_before {
-        return ParakeetFollowDecision::Hold("never-installed".to_owned());
-    }
-
     let mut moved = false;
     for proof in [input.cpu_proof, input.vulkan_proof, input.model_proof] {
         match proof.get("status").and_then(Value::as_str) {
@@ -315,6 +322,11 @@ mod tests {
         }
     }
 
+    fn idle_record() -> InstallStatus {
+        // What `status::read_status` returns when no installer ever ran.
+        solstone_core_local::install::status::idle_status("parakeet")
+    }
+
     fn record_failed_cancelled(at: &str) -> InstallStatus {
         let mut r = record_installed(at);
         r.install_state = "failed".into();
@@ -416,17 +428,18 @@ mod tests {
     }
 
     #[test]
-    fn model_installed_before_false_holds_never_installed() {
+    fn never_installed_journal_that_wants_parakeet_starts_the_installer() {
         let called = Arc::new(AtomicU32::new(0));
+        let called_clone = called.clone();
         let follow = ParakeetFollow::new(Arc::new(move |_| {
-            called.fetch_add(1, Ordering::SeqCst);
+            called_clone.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }));
 
         let cpu = proof_missing();
-        let vulkan = proof_ready();
-        let model = proof_ready();
-        let record = record_installed("2026-09-01T12:00:00Z");
+        let vulkan = proof_missing();
+        let model = proof_missing();
+        let record = idle_record();
         let input = ParakeetFollowInput {
             cpu_proof: &cpu,
             vulkan_proof: &vulkan,
@@ -438,12 +451,59 @@ mod tests {
             now: dummy_now(),
         };
 
-        let decision = follow.observe_at(Path::new("/"), &input, || Ok(false), Instant::now());
+        let now = Instant::now();
+        let decision = follow.observe_at(Path::new("/"), &input, || Ok(false), now);
+        assert_eq!(decision, ParakeetFollowDecision::Launch);
+        assert_eq!(called.load(Ordering::SeqCst), 1);
 
+        // The same spacing as a pin follow: no second launch right away.
+        let again = follow.observe_at(Path::new("/"), &input, || Ok(false), now);
+        assert_eq!(again, ParakeetFollowDecision::Hold("backoff".into()));
+        assert_eq!(called.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn never_installed_journal_holds_for_owner_cancel_running_install_and_admission() {
+        let called = Arc::new(AtomicU32::new(0));
+        let called_clone = called.clone();
+        let follow = ParakeetFollow::new(Arc::new(move |_| {
+            called_clone.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+        let missing = proof_missing();
+        let cancelled = record_failed_cancelled("2026-09-01T12:00:00Z");
+        let idle = idle_record();
+        let mut input = ParakeetFollowInput {
+            cpu_proof: &missing,
+            vulkan_proof: &missing,
+            model_proof: &missing,
+            desired: true,
+            blocked: false,
+            model_installed_before: false,
+            record: Some(&cancelled),
+            now: dummy_now(),
+        };
         assert_eq!(
-            decision,
-            ParakeetFollowDecision::Hold("never-installed".into())
+            follow.observe_at(Path::new("/"), &input, || Ok(false), Instant::now()),
+            ParakeetFollowDecision::Hold("owner-cancelled".into())
         );
+        input.record = Some(&idle);
+        assert_eq!(
+            follow.observe_at(Path::new("/"), &input, || Ok(true), Instant::now()),
+            ParakeetFollowDecision::Hold("install-running".into())
+        );
+        input.desired = false;
+        assert_eq!(
+            follow.observe_at(Path::new("/"), &input, || Ok(false), Instant::now()),
+            ParakeetFollowDecision::Hold("provider-not-needed".into())
+        );
+        input.desired = true;
+        input.blocked = true;
+        assert_eq!(
+            follow.observe_at(Path::new("/"), &input, || Ok(false), Instant::now()),
+            ParakeetFollowDecision::Hold("host-admission-blocked".into())
+        );
+        assert_eq!(called.load(Ordering::SeqCst), 0);
     }
 
     #[test]

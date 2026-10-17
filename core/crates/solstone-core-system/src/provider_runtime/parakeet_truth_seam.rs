@@ -6,8 +6,9 @@
 //! Derives pinned paths and checks that the resolved backend binary and model
 //! are regular files. When this seam has an installer, Linux also does a
 //! presence check of the current CPU server, Vulkan server, and model
-//! manifests and, for a journal that already installed a Parakeet model, starts
-//! that installer once if a current pin is missing or mismatched. Presence
+//! manifests and starts that installer once if a current pin is missing or
+//! mismatched, including for a journal that never installed a Parakeet model
+//! (see `parakeet_follow`). Presence
 //! checks do not hash artifact bytes or probe the binary. Vulkan devices come
 //! from the packaged probe helper; `decide_parakeet_auto_placement` /
 //! `is_local_provider_needed` co-location remains follow-up work. File checks
@@ -1473,7 +1474,7 @@ mod composition_tests {
     }
 
     #[test]
-    fn case_e_never_installed_and_owner_cancelled() {
+    fn case_e_never_installed_launches_and_owner_cancelled_holds() {
         let state = ProviderRuntimeState::new(ProviderName::Parakeet);
 
         // Subcase 1: no model manifest (bin only)
@@ -1513,9 +1514,10 @@ mod composition_tests {
                 .as_ref()
                 .and_then(|d| d.get("pin_follow"))
                 .and_then(Value::as_str),
-            Some("never-installed")
+            Some("launch")
         );
-        assert_eq!(called1.load(Ordering::SeqCst), 0);
+        assert_eq!(obs1.phase, RuntimePhase::ArtifactNotReady);
+        assert_eq!(called1.load(Ordering::SeqCst), 1);
 
         // Subcase 2: old opt-in, missing manifests, failed + install_cancelled status
         let dir2 = setup_journal_with_config(false);

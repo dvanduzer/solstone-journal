@@ -1955,9 +1955,9 @@ pub(crate) async fn boot_and_tick(
     //
     // ⚠ STILL NARROWER THAN PYTHON, and deliberately — see the module header on
     // `provider_runtime::parakeet_truth_seam`. Linux presence-follows the
-    // current CPU server, Vulkan server, and model manifests for a journal
-    // that already installed a Parakeet model, and starts `install-provider
-    // parakeet` when a pin is missing or mismatched. This tick still does not
+    // current CPU server, Vulkan server, and model manifests, and starts
+    // `install-provider parakeet` when a pin is missing or mismatched,
+    // including for a journal that never installed a model. This tick still does not
     // hash artifact bytes, probe the binary, or run
     // `decide_parakeet_auto_placement` / `is_local_provider_needed`
     // co-location. It reads install status and the lease only to decide
