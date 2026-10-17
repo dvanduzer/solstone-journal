@@ -624,11 +624,19 @@
           const packageMissing = dl.speech.error?.code === 'speech_package_unavailable';
           const guidance = packageMissing && typeof dl.speech.error.detail === 'string'
             ? '<p data-speech-guidance>' + esc(dl.speech.error.detail) + '</p>' : '';
-          html += '<div class="pulse-download" data-download="speech" data-download-state="' + esc(state) + '">'
-            + '<p>the speech model didn&#39;t finish downloading.</p>'
-            + (packageMissing ? guidance
-              : '<button type="button" data-speech-retry' + (speechRetryInFlight ? ' disabled' : '') + '>try again</button>')
-            + '</div>';
+          // Nothing was downloaded in that case, only a bundle checked, so the
+          // download line would be false: the journal's guidance stands alone.
+          if (packageMissing) {
+            if (guidance) {
+              html += '<div class="pulse-download" data-download="speech" data-download-state="' + esc(state) + '">'
+                + guidance + '</div>';
+            }
+          } else {
+            html += '<div class="pulse-download" data-download="speech" data-download-state="' + esc(state) + '">'
+              + '<p>the speech model didn&#39;t finish downloading.</p>'
+              + '<button type="button" data-speech-retry' + (speechRetryInFlight ? ' disabled' : '') + '>try again</button>'
+              + '</div>';
+          }
         }
       }
     }

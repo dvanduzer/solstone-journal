@@ -1043,6 +1043,8 @@ async function runTests() {
   renderPulse(welcomePulse);
   assert(!surface.querySelector('[data-speech-retry]'), 'no retry for a missing speech package');
   assert(surface.querySelector('[data-speech-guidance]'), 'guidance shown for a missing speech package');
+  assert.strictEqual(surface.querySelector('[data-download="speech"]').querySelectorAll('p').length, 1,
+    'a missing speech package shows only the guidance, no download line');
 
   // 7. DOWNLOAD TIMER (15000 ms):
   timerLog.length = 0;
