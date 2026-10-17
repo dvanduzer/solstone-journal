@@ -223,7 +223,13 @@ fn restic(
             }
         },
     )
-    .map_err(|_| runner_error_reason)
+    .map_err(|error| {
+        log::warn!(
+            "restore step {} refused: {error}",
+            args.first().map_or("", String::as_str)
+        );
+        runner_error_reason
+    })
 }
 
 fn recognized_returncode_reason(returncode: i32) -> Option<&'static str> {

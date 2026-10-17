@@ -61,19 +61,21 @@ pub extern "C" fn journal_ios_backup_admission_diagnostic() -> *mut c_char {
 struct DoorWarnings;
 impl log::Log for DoorWarnings {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        let target = metadata.target();
         metadata.level() <= log::Level::Warn
-            && metadata
-                .target()
-                .starts_with("solstone_core_convey_shell::door")
+            && (target.starts_with("solstone_core_convey_shell::door")
+                || target.starts_with("solstone_core_backup")
+                || target.starts_with("journal_mobile_serving"))
     }
     fn log(&self, record: &log::Record<'_>) {
         if self.enabled(record.metadata()) {
             use std::io::Write;
             let _ = writeln!(
                 std::io::stderr().lock(),
-                "ios-door time_ms={} pid={} {}: {}",
+                "ios-log time_ms={} pid={} {} {}: {}",
                 chrono::Utc::now().timestamp_millis(),
                 std::process::id(),
+                record.target(),
                 record.level(),
                 record.args()
             );
