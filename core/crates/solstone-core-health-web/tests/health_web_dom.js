@@ -1729,6 +1729,69 @@ test('initHealth fires health:initial-ready while speech setup read is still pen
   assert.strictEqual(vm.runInContext('speechReadPending', env.context), true);
 });
 
+test('after successful applicable visible downloading payload, later getJson result of {} paints unavailable, clears bytes, and leaves row shown', async () => {
+  const env = createSpeechEnvironment();
+  env.context.getJson = async () => ({
+    applicable: true,
+    visible: true,
+    state: 'downloading',
+    tone: 'neutral',
+    bytes_received: 1000,
+    bytes_total: 5000,
+    cause: null,
+    recovery_representable: true,
+    command: null,
+  });
+  await vm.runInContext('loadSpeechSetup()', env.context);
+  assert.strictEqual(env.speechSetup.hidden, false);
+  assert.strictEqual(env.speechSetup.getAttribute('data-state'), 'downloading');
+  assert.strictEqual(env.bytesEl.getAttribute('data-received'), '1000');
+  assert.strictEqual(env.bytesEl.getAttribute('data-total'), '5000');
+
+  env.context.getJson = async () => ({});
+  await vm.runInContext('loadSpeechSetup()', env.context);
+
+  assert.strictEqual(env.speechSetup.hidden, false);
+  assert.strictEqual(env.speechSetup.getAttribute('data-state'), 'unavailable');
+  assert.ok(env.speechSetup.classList.contains('speech-setup-tone-unavailable'));
+  assert.strictEqual(env.bytesEl.hasAttribute('data-received'), false);
+  assert.strictEqual(env.bytesEl.hasAttribute('data-total'), false);
+  assert.strictEqual(env.bytesEl.hidden, true);
+});
+
+test('first load returning {} with no prior success leaves the row hidden', async () => {
+  const env = createSpeechEnvironment();
+  env.context.getJson = async () => ({});
+  await vm.runInContext('loadSpeechSetup()', env.context);
+
+  assert.strictEqual(env.speechSetup.hidden, true);
+  assert.strictEqual(env.speechSetup.getAttribute('data-state'), null);
+});
+
+test('after successful applicable visible: false payload, later {applicable: 1} paints unavailable and does not leave row hidden', async () => {
+  const env = createSpeechEnvironment();
+  env.context.getJson = async () => ({
+    applicable: true,
+    visible: false,
+    state: null,
+    tone: null,
+    bytes_received: null,
+    bytes_total: null,
+    cause: null,
+    recovery_representable: false,
+    command: null,
+  });
+  await vm.runInContext('loadSpeechSetup()', env.context);
+  assert.strictEqual(env.speechSetup.hidden, true);
+
+  env.context.getJson = async () => ({ applicable: 1 });
+  await vm.runInContext('loadSpeechSetup()', env.context);
+
+  assert.strictEqual(env.speechSetup.hidden, false);
+  assert.strictEqual(env.speechSetup.getAttribute('data-state'), 'unavailable');
+  assert.ok(env.speechSetup.classList.contains('speech-setup-tone-unavailable'));
+});
+
 async function runAsyncCases() {
   for (const runCase of asyncCases) await runCase();
   console.log('DOM CASES: ' + cases + ' passed');

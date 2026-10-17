@@ -493,15 +493,15 @@
     try {
       const payload = await getJson('/app/health/api/speech-setup', { signal: controller.signal });
       if (settled || attempt !== speechAttempt) return;
-      settled = true;
-      clearTimeout(timeout);
-      speechReadPending = false;
-
       if (!card.isConnected) return;
 
       if (!payload || typeof payload !== 'object' || typeof payload.applicable !== 'boolean') {
         throw new Error('invalid speech-setup payload');
       }
+
+      settled = true;
+      clearTimeout(timeout);
+      speechReadPending = false;
 
       if (payload.applicable === false) {
         speechApplicableLatched = false;
