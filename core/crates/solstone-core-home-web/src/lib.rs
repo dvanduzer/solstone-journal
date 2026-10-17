@@ -30,6 +30,8 @@ pub fn routes_with_backup_deps(
 pub fn routes(journal_root: PathBuf, clock: Clock, is_moment: fn(&str) -> bool) -> Router {
     let pulse_root = journal_root.clone();
     let pulse_clock = clock.clone();
+    let first_minutes_root = journal_root.clone();
+    let first_minutes_clock = clock.clone();
     let briefing_root = journal_root.clone();
     let removal_clock = clock.clone();
     let week_shell_root = journal_root.clone();
@@ -100,11 +102,27 @@ pub fn routes(journal_root: PathBuf, clock: Clock, is_moment: fn(&str) -> bool) 
             ),
         )
         .route(
+            "/app/home/api/first-minutes",
+            get(move || first_minutes(first_minutes_root.clone(), first_minutes_clock.clone())),
+        )
+        .route(
             "/app/home/api/briefing",
             get(move || briefing(briefing_root.clone(), clock.clone())),
         )
         .layer(Extension(removal_clock))
         .with_state(journal_root)
+}
+
+async fn first_minutes(journal_root: PathBuf, clock: Clock) -> Response {
+    let now = clock.now();
+    spawn_blocking_response(OwnerReadRole::HomeFirstMinutes, move || {
+        let context = solstone_core_home::HomeContext::new(journal_root, now);
+        Json(solstone_core_home::first_minutes::read_first_minutes(
+            &context,
+        ))
+        .into_response()
+    })
+    .await
 }
 
 async fn pulse(
@@ -339,6 +357,63 @@ mod tests {
             assert_eq!(response.1, "application/json", "{path}");
             assert_json_key_set(&response.3, &keys, path);
         }
+
+        let response = get(router.clone(), "/app/home/api/first-minutes").await;
+        assert_eq!(response.0, StatusCode::OK);
+        assert_eq!(response.1, "application/json");
+        let body: Value = serde_json::from_slice(&response.3).expect("JSON");
+        assert_eq!(body, json!({"window_open": false}));
+    }
+
+    #[tokio::test]
+    async fn first_minutes_route_window_timing() {
+        let root = TempDir::new().expect("temporary journal");
+        let config_dir = root.path().join("config");
+        fs::create_dir_all(&config_dir).unwrap();
+        let completed_at = 1_700_000_000_000i64;
+        fs::write(
+            config_dir.join("journal.json"),
+            json!({"setup": {"completed_at": completed_at}}).to_string(),
+        )
+        .unwrap();
+
+        // 1. Open: 1 day after completed_at
+        let open_time = chrono::DateTime::from_timestamp_millis(completed_at + 86_400_000).unwrap();
+        let router = super::routes(
+            root.path().to_path_buf(),
+            super::Clock::fixed(open_time),
+            |_| false,
+        );
+        let response = get(router, "/app/home/api/first-minutes").await;
+        assert_eq!(response.0, StatusCode::OK);
+        let body: Value = serde_json::from_slice(&response.3).expect("JSON");
+        assert_eq!(body["window_open"], true);
+
+        // 2. Just under 7 days: 604_799_999 ms after completed_at
+        let just_under_time =
+            chrono::DateTime::from_timestamp_millis(completed_at + 604_799_999).unwrap();
+        let router = super::routes(
+            root.path().to_path_buf(),
+            super::Clock::fixed(just_under_time),
+            |_| false,
+        );
+        let response = get(router, "/app/home/api/first-minutes").await;
+        assert_eq!(response.0, StatusCode::OK);
+        let body: Value = serde_json::from_slice(&response.3).expect("JSON");
+        assert_eq!(body["window_open"], true);
+
+        // 3. Exactly 7 days: 604_800_000 ms after completed_at -> closed
+        let exact_7d_time =
+            chrono::DateTime::from_timestamp_millis(completed_at + 604_800_000).unwrap();
+        let router = super::routes(
+            root.path().to_path_buf(),
+            super::Clock::fixed(exact_7d_time),
+            |_| false,
+        );
+        let response = get(router, "/app/home/api/first-minutes").await;
+        assert_eq!(response.0, StatusCode::OK);
+        let body: Value = serde_json::from_slice(&response.3).expect("JSON");
+        assert_eq!(body, json!({"window_open": false}));
     }
 
     #[tokio::test]
@@ -363,6 +438,7 @@ mod tests {
         for (path, key, expected) in [
             ("/app/home/api/pulse", "home_state", json!("welcome")),
             ("/app/home/api/briefing", "needs_shared_count", json!(0)),
+            ("/app/home/api/first-minutes", "window_open", json!(false)),
         ] {
             let response = get(router.clone(), path).await;
             assert_eq!(response.0, StatusCode::OK, "{path}");
@@ -372,7 +448,11 @@ mod tests {
 
         let unestablished = TempDir::new().expect("temporary journal");
         let router = shell_router(unestablished.path());
-        for path in ["/app/home/api/pulse", "/app/home/api/briefing"] {
+        for path in [
+            "/app/home/api/pulse",
+            "/app/home/api/briefing",
+            "/app/home/api/first-minutes",
+        ] {
             let response = get(router.clone(), path).await;
             assert_eq!(response.0, StatusCode::FOUND, "{path}");
             assert_eq!(response.2.as_deref(), Some("/init"), "{path}");
@@ -380,7 +460,11 @@ mod tests {
 
         let corrupt = corrupt_root();
         let router = shell_router(corrupt.path());
-        for path in ["/app/home/api/pulse", "/app/home/api/briefing"] {
+        for path in [
+            "/app/home/api/pulse",
+            "/app/home/api/briefing",
+            "/app/home/api/first-minutes",
+        ] {
             let response = get(router.clone(), path).await;
             assert_eq!(response.0, StatusCode::INTERNAL_SERVER_ERROR, "{path}");
             assert_eq!(response.1, "application/json", "{path}");

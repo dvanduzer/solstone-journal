@@ -1086,7 +1086,7 @@ fn google_exact_model_advisory(config: &Map<String, Value>) -> Value {
         json!({"id":"choose_exact_gemini_model","heading":"choose an exact Gemini model","google_model_resolution_targets":targets,"action":{"label":"choose model","href":"/app/thinking/#byo-setup"}})
     }
 }
-fn ui_lane(config: &Map<String, Value>) -> &'static str {
+pub fn ui_lane(config: &Map<String, Value>) -> &'static str {
     match derive_active_brain_lane(config).lane.as_deref() {
         Some("bundled") => "local",
         Some("spp") => "confidential",

@@ -62,7 +62,7 @@ const NOT_ON_PLATFORM: &str = "confidential processing isn't on windows yet";
 
 /// Local thinking needs hardware this computer doesn't have. Checking again
 /// won't change it, so the words say so plainly rather than asking for setup.
-const CANT_RUN_LOCAL: &str = "this computer can't run local thinking";
+const CANT_RUN_LOCAL: &str = "your journal's computer can't run local thinking";
 
 /// The owner headline for a brain state. Some `blocked` reasons have nothing
 /// for the owner to set up: the work waits for the service, or for something
