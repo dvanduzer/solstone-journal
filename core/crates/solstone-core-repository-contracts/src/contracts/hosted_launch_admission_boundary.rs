@@ -374,11 +374,6 @@ const SCANNED_MODULE_SOURCES: &[(&str, &str, &str)] = &[
     ),
     (
         "convey",
-        "refusal",
-        include_str!("../../../solstone-core-convey-shell/src/refusal.rs"),
-    ),
-    (
-        "convey",
         "registry",
         include_str!("../../../solstone-core-convey-shell/src/registry.rs"),
     ),
