@@ -602,7 +602,9 @@ fetch_url() {
 		check_origin_url "$_current"
 		if command -v curl >/dev/null 2>&1; then
 			_hdrs=$(mktemp "$WORK/solstone-install-headers-XXXXXX")
-			_code=$(curl -q -sS --http1.1 --connect-timeout 10 --max-time 120 --retry 2 --retry-all-errors --retry-delay 1 --retry-max-time 30 -D "$_hdrs" -o "$_dest" -w '%{http_code}' "$_current") || _code=000
+			# A stalled transfer times out, not a long one: the journal archive is
+			# hundreds of megabytes, so a whole-transfer cap fails slower links.
+			_code=$(curl -q -sS --http1.1 --connect-timeout 10 --speed-limit 1 --speed-time 120 --retry 2 --retry-all-errors --retry-delay 1 -D "$_hdrs" -o "$_dest" -w '%{http_code}' "$_current") || _code=000
 			_location=$(awk '/^[Ll][Oo][Cc][Aa][Tt][Ii][Oo][Nn]:/{sub(/\r$/,""); sub(/^[^:]*:[[:space:]]*/,""); print; exit}' "$_hdrs")
 			rm -f "$_hdrs"
 		elif command -v wget >/dev/null 2>&1; then
