@@ -1128,6 +1128,7 @@ function buildHistoryHeader(total, totalEntriesWritten) {
 }
 
 function sourceLabel(imp) {
+  if (imp.source_type === 'audio_archive') return 'audio archive';
   const knownSourceName = sourceMetadataByName[imp.source_type]?.display_name || '';
   const recordedDisplay = typeof imp.source_display === 'string' ? imp.source_display.trim() : '';
   const recordedIsFilename = /\.[a-z0-9]{2,5}$/i.test(recordedDisplay);
