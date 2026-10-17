@@ -152,74 +152,46 @@ function createSearchEnvironment() {
   return { context, window: windowObj };
 }
 
+// Seeded labels are synthetic and never contain the stream name; what a
+// label says comes from the table's parts, the way the journal serves it.
+function seededSearch() {
+  const env = createSearchEnvironment();
+  env.window.JournalFormat.installStreamLabels({
+    status: 'complete',
+    labels: { ja1r: 'LABEL-ONE', phone_audio: 'LABEL-TWO', 'import.oura': 'LABEL-THREE' },
+    says: {
+      ja1r: { what: 'screen', imported: false },
+      phone_audio: { what: 'audio', imported: false },
+      'import.oura': { what: null, imported: true },
+    },
+  });
+  return env;
+}
+
+function metaSpans(env, hit) {
+  const card = env.window.renderHit({ text: 'synthetic text', ts: 1775199600000, ...hit }, '/app/transcripts/20260403');
+  return card.querySelector('.search-meta').querySelectorAll('span');
+}
+
 test('renderHit renders seeded stream label with raw name in title attribute', () => {
-  const env = createSearchEnvironment();
-  env.window.JournalFormat.installStreamLabels({
-    status: 'complete',
-    labels: { ja1r: 'your mac · screen' },
-  });
-
-  const hit = {
-    stream: 'ja1r',
-    text: 'searching across time',
-    ts: 1775199600000,
-    path: 'chronicle/20260403/ja1r/120000_300/screen.jsonl',
-    facet_title: 'personal',
-  };
-
-  const card = env.window.renderHit(hit, '/app/transcripts/20260403');
-  const meta = card.querySelector('.search-meta');
-  assert.ok(meta, 'search-meta element exists');
-
-  const spans = meta.querySelectorAll('span');
+  const spans = metaSpans(seededSearch(), { stream: 'ja1r', facet_title: 'personal' });
   const streamSpan = spans.find((s) => s.getAttribute('title') === 'ja1r');
-  assert.ok(streamSpan, 'stream span with title=ja1r exists');
-  assert.strictEqual(streamSpan.textContent, 'your mac · screen');
-  assert.strictEqual(streamSpan.getAttribute('title'), 'ja1r');
+  assert.ok(streamSpan, 'stream span carries the stream name as its title');
+  assert.strictEqual(streamSpan.textContent, 'LABEL-ONE');
 });
 
-test('renderHit suppresses agent label when subsumed by stream label', () => {
-  const env = createSearchEnvironment();
-  env.window.JournalFormat.installStreamLabels({
-    status: 'complete',
-    labels: { ja1r: 'your mac · screen' },
-  });
-
-  const hit = {
-    stream: 'ja1r',
-    agent_label: 'screen',
-    text: 'matching content',
-    ts: 1775199600000,
-    path: 'chronicle/20260403/ja1r/120000_300/screen.jsonl',
-  };
-
-  const card = env.window.renderHit(hit, '/app/transcripts/20260403');
-  const meta = card.querySelector('.search-meta');
-  const spans = meta.querySelectorAll('span');
-  const agentSpan = spans.find((s) => s.textContent === 'screen' && !s.getAttribute('title'));
-  assert.strictEqual(agentSpan, undefined, 'agent label is omitted when stream label subsumes it');
-});
-
-test('renderHit keeps agent label for distinct agent and stream', () => {
-  const env = createSearchEnvironment();
-  env.window.JournalFormat.installStreamLabels({
-    status: 'complete',
-    labels: { ja1r: 'your mac · screen' },
-  });
-
-  const hit = {
-    stream: 'ja1r',
-    agent_label: 'describe',
-    text: 'vision summary',
-    ts: 1775199600000,
-    path: 'chronicle/20260403/ja1r/120000_300/screen.jsonl',
-  };
-
-  const card = env.window.renderHit(hit, '/app/transcripts/20260403');
-  const meta = card.querySelector('.search-meta');
-  const spans = meta.querySelectorAll('span');
-  const agentSpan = spans.find((s) => s.textContent === 'describe');
-  assert.ok(agentSpan, 'agent label describe is rendered');
+test('renderHit drops an agent label the stream label already says, and keeps any other', () => {
+  const env = seededSearch();
+  const agentShown = (hit) => metaSpans(env, hit).some((s) => s.textContent === hit.agent_label);
+  // The indexed agent is a file's basename: "screen", "audio", "imported",
+  // or a talent such as "audio_transcript" or "event_transcript".
+  assert.strictEqual(agentShown({ stream: 'ja1r', agent_label: 'Screen' }), false);
+  assert.strictEqual(agentShown({ stream: 'phone_audio', agent_label: 'Audio' }), false);
+  assert.strictEqual(agentShown({ stream: 'import.oura', agent_label: 'Imported' }), false);
+  assert.strictEqual(agentShown({ stream: 'ja1r', agent_label: 'Audio' }), true);
+  assert.strictEqual(agentShown({ stream: 'phone_audio', agent_label: 'Audio Transcript' }), true);
+  assert.strictEqual(agentShown({ stream: 'import.oura', agent_label: 'Event Transcript' }), true);
+  assert.strictEqual(agentShown({ stream: 'ja1r', agent_label: 'Describe' }), true);
 });
 
 console.log(`DOM CASES: ${cases} passed`);

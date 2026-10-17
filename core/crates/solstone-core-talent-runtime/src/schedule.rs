@@ -576,6 +576,14 @@ fn dedup_anticipation(
             .trim()
             .to_owned();
         if existing_id == new_id {
+            let stored_cancelled = existing
+                .get("cancelled")
+                .is_some_and(solstone_core_facets::activity_value_truthy);
+            let incoming_cancelled = record
+                .get("cancelled")
+                .is_some_and(solstone_core_facets::activity_value_truthy);
+            let cancel_flip = !stored_cancelled && incoming_cancelled;
+
             let mut patch = Map::new();
             for key in [
                 "activity",
@@ -594,6 +602,13 @@ fn dedup_anticipation(
                 let existing_val = existing.get(key).unwrap_or(&Value::Null);
                 let new_val = record.get(key).unwrap_or(&Value::Null);
                 if existing_val != new_val {
+                    if solstone_core_facets::activity_field_held(&existing, key) {
+                        if key == "hidden" && cancel_flip {
+                            // Cancel exception: hidden is unheld on cancel flip
+                        } else {
+                            continue;
+                        }
+                    }
                     patch.insert(key.to_owned(), new_val.clone());
                 }
             }
@@ -1239,6 +1254,480 @@ mod tests {
         assert_eq!(
             warnings[2],
             "schedule event skipped for day 20260910: non-object event"
+        );
+    }
+
+    #[test]
+    fn schedule_anticipation_protection_and_cancellation_lifecycle() {
+        let root = tempfile::TempDir::new_in("/var/tmp").unwrap();
+        solstone_core_facets::create_facet(root.path(), "work", "Work", "", "", "", None).unwrap();
+        let day_file = root.path().join("facets/work/activities/20260314.jsonl");
+        std::fs::create_dir_all(day_file.parent().unwrap()).unwrap();
+
+        // 1. An owner-hidden plan (owner:mute is the latest edit listing hidden, value true)
+        // stays hidden when the sighting says hidden: false.
+        // 2. An owner-retitled plan (owner:update lists title) keeps title while changed details is written.
+        let seed_record = json!({
+            "id": "anticipated_meeting_093000_0314",
+            "activity": "meeting",
+            "target_date": "2026-03-14",
+            "start": "09:30:00",
+            "end": "10:00:00",
+            "title": "Owner Title",
+            "description": "Discuss roadmap",
+            "details": "old details",
+            "facet": "work",
+            "source": "anticipated",
+            "active_entities": [],
+            "participation": [],
+            "participation_confidence": Value::Null,
+            "cancelled": false,
+            "hidden": true,
+            "edits": [
+                {
+                    "timestamp": "2026-03-10T09:00:00Z",
+                    "actor": "schedule",
+                    "fields": ["activity", "target_date", "start", "end", "title", "description", "details", "source", "active_entities", "participation", "participation_confidence", "cancelled", "hidden"],
+                    "note": "created by schedule"
+                },
+                {
+                    "timestamp": "2026-03-10T09:30:00Z",
+                    "actor": "owner:update",
+                    "fields": ["title"],
+                    "note": "updated title"
+                },
+                {
+                    "timestamp": "2026-03-10T10:00:00Z",
+                    "actor": "owner:mute",
+                    "fields": ["hidden"],
+                    "note": "muted by owner"
+                }
+            ]
+        });
+        std::fs::write(
+            &day_file,
+            format!("{}\n", serde_json::to_string(&seed_record).unwrap()),
+        )
+        .unwrap();
+
+        // Single path: sighting says hidden: false, title: "Schedule Title", details: "new details"
+        let sighting = json!({
+            "events": [{
+                "activity": "meeting",
+                "target_date": "2026-03-14",
+                "start": "09:30:00",
+                "end": "10:00:00",
+                "title": "Schedule Title",
+                "description": "Discuss roadmap",
+                "details": "new details",
+                "facet": "work",
+                "participation": []
+            }]
+        })
+        .to_string();
+        apply_result(root.path(), &sighting, "20260310").unwrap();
+
+        let records =
+            solstone_core_facets::load_activity_records(root.path(), "work", "20260314", true)
+                .unwrap();
+        assert_eq!(records.len(), 1);
+        // Stays hidden
+        assert_eq!(records[0]["hidden"], true);
+        // Keeps owner title
+        assert_eq!(records[0]["title"], "Owner Title");
+        // Details updated
+        assert_eq!(records[0]["details"], "new details");
+
+        // 3. A plan whose edits are only schedule updates every changed field.
+        let plain_plan = json!({
+            "id": "anticipated_call_140000_0314",
+            "activity": "call",
+            "target_date": "2026-03-14",
+            "start": "14:00:00",
+            "end": "14:30:00",
+            "title": "Old Call",
+            "description": "Old desc",
+            "details": "old details",
+            "facet": "work",
+            "source": "anticipated",
+            "active_entities": [],
+            "participation": [],
+            "participation_confidence": 0.5,
+            "cancelled": false,
+            "hidden": false,
+            "edits": [
+                {
+                    "timestamp": "2026-03-10T09:00:00Z",
+                    "actor": "schedule",
+                    "fields": ["activity", "target_date", "start", "end", "title", "description", "details", "source", "active_entities", "participation", "participation_confidence", "cancelled", "hidden"],
+                    "note": "created by schedule"
+                }
+            ]
+        });
+        std::fs::write(
+            &day_file,
+            format!("{}\n", serde_json::to_string(&plain_plan).unwrap()),
+        )
+        .unwrap();
+        let sighting_call = json!({
+            "events": [{
+                "activity": "call",
+                "target_date": "2026-03-14",
+                "start": "14:00:00",
+                "end": "15:00:00",
+                "title": "New Call",
+                "description": "New desc",
+                "details": "new details",
+                "facet": "work",
+                "participation": []
+            }]
+        })
+        .to_string();
+        apply_result(root.path(), &sighting_call, "20260310").unwrap();
+        let records =
+            solstone_core_facets::load_activity_records(root.path(), "work", "20260314", true)
+                .unwrap();
+        assert_eq!(records[0]["end"], "15:00:00");
+        assert_eq!(records[0]["title"], "New Call");
+        assert_eq!(records[0]["description"], "New desc");
+
+        // 4. A protected-only difference leaves the day file bytes identical and appends no schedule edit.
+        // For the batch, assert after == before on the PreparedAnticipationBatch.
+        // For the single path, read the file before and after apply_result.
+        // Single path:
+        std::fs::write(
+            &day_file,
+            format!("{}\n", serde_json::to_string(&seed_record).unwrap()),
+        )
+        .unwrap();
+        let before_bytes = std::fs::read(&day_file).unwrap();
+        // Sighting only differs in title (held) and hidden (held)
+        let protected_only_sighting = json!({
+            "events": [{
+                "activity": "meeting",
+                "target_date": "2026-03-14",
+                "start": "09:30:00",
+                "end": "10:00:00",
+                "title": "Schedule Title",
+                "description": "Discuss roadmap",
+                "details": "old details",
+                "facet": "work",
+                "participation": []
+            }]
+        })
+        .to_string();
+        apply_result(root.path(), &protected_only_sighting, "20260310").unwrap();
+        let after_bytes = std::fs::read(&day_file).unwrap();
+        assert_eq!(before_bytes, after_bytes);
+
+        // Batch path:
+        let batches =
+            prepare_publication(root.path(), &protected_only_sighting, "20260310").unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].after, batches[0].before.clone().unwrap());
+
+        // 5. An owner-unhid plan (owner:unmute, hidden false) that arrives cancelled is hidden,
+        // the new schedule edit lists hidden, and its note is "updated by schedule (cancelled on calendar)".
+        // A following uncancelled sighting makes it visible. On that second sighting the latest edit that listed
+        // hidden is the schedule cancel, so hidden may change.
+        let unhid_record = json!({
+            "id": "anticipated_meeting_093000_0314",
+            "activity": "meeting",
+            "target_date": "2026-03-14",
+            "start": "09:30:00",
+            "end": "10:00:00",
+            "title": "Project sync",
+            "description": "Discuss roadmap",
+            "details": "",
+            "facet": "work",
+            "source": "anticipated",
+            "active_entities": [],
+            "participation": [],
+            "participation_confidence": 0.5,
+            "cancelled": false,
+            "hidden": false,
+            "edits": [
+                {
+                    "timestamp": "2026-03-10T09:00:00Z",
+                    "actor": "schedule",
+                    "fields": ["activity", "target_date", "start", "end", "title", "description", "details", "source", "active_entities", "participation", "participation_confidence", "cancelled", "hidden"],
+                    "note": "created by schedule"
+                },
+                {
+                    "timestamp": "2026-03-10T10:00:00Z",
+                    "actor": "owner:unmute",
+                    "fields": ["hidden"],
+                    "note": "unmuted by owner"
+                }
+            ]
+        });
+        std::fs::write(
+            &day_file,
+            format!("{}\n", serde_json::to_string(&unhid_record).unwrap()),
+        )
+        .unwrap();
+        let cancelled_sighting = json!({
+            "events": [{
+                "activity": "meeting",
+                "target_date": "2026-03-14",
+                "start": "09:30:00",
+                "end": "10:00:00",
+                "title": "Project sync",
+                "description": "Discuss roadmap",
+                "facet": "work",
+                "cancelled": true,
+                "participation": []
+            }]
+        })
+        .to_string();
+        apply_result(root.path(), &cancelled_sighting, "20260310").unwrap();
+        let records =
+            solstone_core_facets::load_activity_records(root.path(), "work", "20260314", true)
+                .unwrap();
+        assert_eq!(records[0]["hidden"], true);
+        let edits = records[0]["edits"].as_array().unwrap();
+        let last_edit = edits.last().unwrap();
+        assert_eq!(
+            last_edit["note"],
+            "updated by schedule (cancelled on calendar)"
+        );
+        let fields = last_edit["fields"].as_array().unwrap();
+        assert!(fields.iter().any(|f| f == "hidden"));
+        assert!(fields.iter().any(|f| f == "cancelled"));
+
+        // A following uncancelled sighting makes it visible.
+        let uncancelled_sighting = json!({
+            "events": [{
+                "activity": "meeting",
+                "target_date": "2026-03-14",
+                "start": "09:30:00",
+                "end": "10:00:00",
+                "title": "Project sync",
+                "description": "Discuss roadmap",
+                "facet": "work",
+                "cancelled": false,
+                "participation": []
+            }]
+        })
+        .to_string();
+        apply_result(root.path(), &uncancelled_sighting, "20260310").unwrap();
+        let records =
+            solstone_core_facets::load_activity_records(root.path(), "work", "20260314", true)
+                .unwrap();
+        assert_eq!(records[0]["hidden"], false);
+        assert_eq!(records[0]["cancelled"], false);
+
+        // 6. An owner-hidden plan that arrives cancelled and then uncancelled stays hidden.
+        // The cancel edit does not list hidden because the value was already true. hidden's latest listing edit is still owner:mute.
+        let owner_hidden_record = json!({
+            "id": "anticipated_meeting_093000_0314",
+            "activity": "meeting",
+            "target_date": "2026-03-14",
+            "start": "09:30:00",
+            "end": "10:00:00",
+            "title": "Project sync",
+            "description": "Discuss roadmap",
+            "details": "",
+            "facet": "work",
+            "source": "anticipated",
+            "active_entities": [],
+            "participation": [],
+            "participation_confidence": 0.5,
+            "cancelled": false,
+            "hidden": true,
+            "edits": [
+                {
+                    "timestamp": "2026-03-10T09:00:00Z",
+                    "actor": "schedule",
+                    "fields": ["activity", "target_date", "start", "end", "title", "description", "details", "source", "active_entities", "participation", "participation_confidence", "cancelled", "hidden"],
+                    "note": "created by schedule"
+                },
+                {
+                    "timestamp": "2026-03-10T10:00:00Z",
+                    "actor": "owner:mute",
+                    "fields": ["hidden"],
+                    "note": "muted by owner"
+                }
+            ]
+        });
+        std::fs::write(
+            &day_file,
+            format!("{}\n", serde_json::to_string(&owner_hidden_record).unwrap()),
+        )
+        .unwrap();
+        apply_result(root.path(), &cancelled_sighting, "20260310").unwrap();
+        let records =
+            solstone_core_facets::load_activity_records(root.path(), "work", "20260314", true)
+                .unwrap();
+        let edits = records[0]["edits"].as_array().unwrap();
+        let cancel_edit = edits.last().unwrap();
+        let fields = cancel_edit["fields"].as_array().unwrap();
+        assert!(!fields.iter().any(|f| f == "hidden"));
+        assert!(fields.iter().any(|f| f == "cancelled"));
+
+        // Following uncancelled sighting:
+        apply_result(root.path(), &uncancelled_sighting, "20260310").unwrap();
+        let records =
+            solstone_core_facets::load_activity_records(root.path(), "work", "20260314", true)
+                .unwrap();
+        assert_eq!(records[0]["hidden"], true);
+
+        // 7. Batch creation of a cancelled plan: the one creation edit's note is
+        // "created by schedule (cancelled on calendar)" and its fields include cancelled.
+        // There is no second creation edit.
+        let batch_create_cancelled = json!({
+            "events": [{
+                "activity": "meeting",
+                "target_date": "2026-03-15",
+                "start": "09:30:00",
+                "end": "10:00:00",
+                "title": "Cancelled from start",
+                "description": "Discuss roadmap",
+                "facet": "work",
+                "cancelled": true,
+                "participation": []
+            }]
+        })
+        .to_string();
+        let batches =
+            prepare_publication(root.path(), &batch_create_cancelled, "20260310").unwrap();
+        assert_eq!(batches.len(), 1);
+        let created_row: Value =
+            serde_json::from_str(batches[0].after.lines().next().unwrap()).unwrap();
+        let edits = created_row["edits"].as_array().unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(
+            edits[0]["note"],
+            "created by schedule (cancelled on calendar)"
+        );
+        let fields = edits[0]["fields"].as_array().unwrap();
+        assert!(fields.iter().any(|f| f == "cancelled"));
+
+        // 8. A later batch cancel of an uncancelled plan: the creation edit's note does not contain cancelled;
+        // the update edit's note is "updated by schedule (cancelled on calendar)" and its fields include cancelled.
+        let batch_create_uncancelled = json!({
+            "events": [{
+                "activity": "meeting",
+                "target_date": "2026-03-16",
+                "start": "09:30:00",
+                "end": "10:00:00",
+                "title": "Will be cancelled",
+                "description": "Discuss roadmap",
+                "facet": "work",
+                "cancelled": false,
+                "participation": []
+            }]
+        })
+        .to_string();
+        let batches =
+            prepare_publication(root.path(), &batch_create_uncancelled, "20260310").unwrap();
+        assert_eq!(batches.len(), 1);
+        let day_file_20260316 = root.path().join("facets/work/activities/20260316.jsonl");
+        std::fs::write(&day_file_20260316, &batches[0].after).unwrap();
+        let created_row: Value =
+            serde_json::from_str(batches[0].after.lines().next().unwrap()).unwrap();
+        assert_eq!(created_row["edits"][0]["note"], "created by schedule");
+
+        let batch_cancel = json!({
+            "events": [{
+                "activity": "meeting",
+                "target_date": "2026-03-16",
+                "start": "09:30:00",
+                "end": "10:00:00",
+                "title": "Will be cancelled",
+                "description": "Discuss roadmap",
+                "facet": "work",
+                "cancelled": true,
+                "participation": []
+            }]
+        })
+        .to_string();
+        let batches = prepare_publication(root.path(), &batch_cancel, "20260310").unwrap();
+        let updated_row: Value =
+            serde_json::from_str(batches[0].after.lines().next().unwrap()).unwrap();
+        let edits = updated_row["edits"].as_array().unwrap();
+        assert_eq!(edits.len(), 2);
+        assert_eq!(
+            edits[1]["note"],
+            "updated by schedule (cancelled on calendar)"
+        );
+        let fields = edits[1]["fields"].as_array().unwrap();
+        assert!(fields.iter().any(|f| f == "cancelled"));
+
+        // 9. Single-path resight of an already-cancelled plan with a new details:
+        // the appended edit's fields do not include cancelled. Its note is still
+        // "updated by schedule (cancelled on calendar)" because apply_event was not changed.
+        // Assert that note so a future edit cannot "fix" it by dropping the suffix.
+        std::fs::write(&day_file_20260316, &batches[0].after).unwrap();
+        let resight_cancelled_new_details = json!({
+            "events": [{
+                "activity": "meeting",
+                "target_date": "2026-03-16",
+                "start": "09:30:00",
+                "end": "10:00:00",
+                "title": "Will be cancelled",
+                "description": "Discuss roadmap",
+                "details": "brand new details",
+                "facet": "work",
+                "cancelled": true,
+                "participation": []
+            }]
+        })
+        .to_string();
+        apply_result(root.path(), &resight_cancelled_new_details, "20260310").unwrap();
+        let records =
+            solstone_core_facets::load_activity_records(root.path(), "work", "20260316", true)
+                .unwrap();
+        let edits = records[0]["edits"].as_array().unwrap();
+        assert_eq!(edits.len(), 3);
+        let third_edit = &edits[2];
+        assert_eq!(
+            third_edit["note"],
+            "updated by schedule (cancelled on calendar)"
+        );
+        let fields = third_edit["fields"].as_array().unwrap();
+        assert!(!fields.iter().any(|f| f == "cancelled"));
+        assert!(fields.iter().any(|f| f == "details"));
+
+        // 10. Supersede of a different id still hides it with superseded by {new_id}.
+        // One assertion on the existing path is enough; do not rewrite the fuzzy matcher.
+        let batch_create_to_supersede = json!({
+            "events": [{
+                "activity": "meeting",
+                "target_date": "2026-03-17",
+                "start": "09:30:00",
+                "end": "10:00:00",
+                "title": "Will be superseded",
+                "description": "Discuss roadmap",
+                "facet": "work",
+                "cancelled": false,
+                "participation": []
+            }]
+        })
+        .to_string();
+        let batches =
+            prepare_publication(root.path(), &batch_create_to_supersede, "20260310").unwrap();
+        let day_file_20260317 = root.path().join("facets/work/activities/20260317.jsonl");
+        std::fs::write(&day_file_20260317, &batches[0].after).unwrap();
+
+        let batch_supersede = json!({
+            "events": [{
+                "activity": "meeting",
+                "target_date": "2026-03-17",
+                "start": "10:30:00",
+                "end": "11:00:00",
+                "title": "Will be superseded",
+                "description": "Discuss roadmap",
+                "facet": "work",
+                "participation": []
+            }]
+        })
+        .to_string();
+        let batches = prepare_publication(root.path(), &batch_supersede, "20260310").unwrap();
+        assert!(
+            batches[0]
+                .after
+                .contains("superseded by anticipated_meeting_103000_0317")
         );
     }
 }

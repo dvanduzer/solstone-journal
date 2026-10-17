@@ -420,7 +420,7 @@ window.CUR_COPY = CUR_COPY;
     const readableHtml = [dayHtml, streamHtml, segmentHtml].filter(Boolean).join(' · ');
     const rawRows = [
       day && `<li>day: ${escapeHtml(day)}</li>`,
-      stream && `<li title="${escapeHtml(stream)}">stream: ${escapeHtml(window.JournalFormat.stream(stream))}</li>`,
+      stream && `<li>stream: ${escapeHtml(stream)}</li>`,
       segment && `<li>segment: ${escapeHtml(segment)}</li>`,
       sample?.source && `<li>source: ${escapeHtml(sample.source)}</li>`,
       (sample?.cluster_label !== undefined && sample.cluster_label >= 0) && `<li>cluster: ${escapeHtml(sample.cluster_label)}</li>`

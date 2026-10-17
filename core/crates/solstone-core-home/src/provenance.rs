@@ -213,8 +213,8 @@ fn classify_record(
             .cid
             .as_deref()
             .and_then(|cid| ledger_clients.get(cid));
-        let platform = resolve_first_hit_platform(record, description, ledger_entry);
-        let device = match platform {
+        let platform = unbound_platform(record, description, ledger_entry);
+        let device = match platform.as_deref() {
             Some("macos") => Some(DeviceWord::Mac),
             Some("linux") | Some("windows") => Some(DeviceWord::Computer),
             _ => None,
@@ -259,29 +259,49 @@ fn classify_record(
     ProvenancePart::Unknown
 }
 
-fn resolve_first_hit_platform<'a>(
-    record: &'a solstone_core_segment::StreamRecord,
-    description: Option<&'a solstone_core_sol_link::client_description::StoredClientDescription>,
-    ledger_entry: Option<&'a ClientEntry>,
-) -> Option<&'a str> {
-    if let Some(reported) = description
-        .and_then(|d| d.reported.as_ref())
-        .and_then(|r| r.platform.as_deref())
+/// A read text fact, trimmed and lowercased; an empty value was not reported.
+fn read_fact(value: Option<&str>) -> Option<String> {
+    value
+        .map(|s| s.trim().to_ascii_lowercase())
         .filter(|s| !s.is_empty())
-    {
+}
+
+/// The platform a bound stream's facts report, first of: the client's reported
+/// description, the pairing ledger hint, the record's allocation when it was
+/// named from the platform.
+fn bound_platform(
+    record: &solstone_core_segment::StreamRecord,
+    description: Option<&solstone_core_sol_link::client_description::StoredClientDescription>,
+    ledger_entry: Option<&ClientEntry>,
+) -> Option<String> {
+    if let Some(reported) = read_fact(
+        description
+            .and_then(|d| d.reported.as_ref())
+            .and_then(|r| r.platform.as_deref()),
+    ) {
         return Some(reported);
     }
     if let Some(plat) = ledger_entry.and_then(|e| e.platform) {
-        return Some(plat.as_wire());
+        return Some(plat.as_wire().to_owned());
     }
-    if let Some(allocation) = record
-        .allocation
-        .as_ref()
-        .filter(|a| a.base == StreamAllocationBase::Platform)
-    {
-        return Some(allocation.base_input.as_str());
-    }
-    record.platform.as_deref().filter(|s| !s.is_empty())
+    read_fact(
+        record
+            .allocation
+            .as_ref()
+            .filter(|a| a.base == StreamAllocationBase::Platform)
+            .map(|a| a.base_input.as_str()),
+    )
+}
+
+/// An unbound record's platform: the bound sources when it carries a cid, then
+/// the platform the older writer recorded on the record itself.
+fn unbound_platform(
+    record: &solstone_core_segment::StreamRecord,
+    description: Option<&solstone_core_sol_link::client_description::StoredClientDescription>,
+    ledger_entry: Option<&ClientEntry>,
+) -> Option<String> {
+    bound_platform(record, description, ledger_entry)
+        .or_else(|| read_fact(record.platform.as_deref()))
 }
 
 fn classify_bound_source(
@@ -296,7 +316,9 @@ fn classify_bound_source(
         "watch-audio" => (Some(DeviceWord::Watch), Some(WhatWord::Audio)),
         "tmux" => (Some(DeviceWord::Terminal), None),
         source if source.starts_with("browser") => (Some(DeviceWord::Browser), None),
-        "audio" | "screen" | "camera" | "location" | "mobile-segment" | "mobile" => {
+        // An empty source is what ingest stores when a client names none: the
+        // device's own recording, with nothing read about what it recorded.
+        "" | "audio" | "screen" | "camera" | "location" | "mobile-segment" | "mobile" => {
             let device_word = resolve_platform_device_word(record, description, ledger_entry);
             let what_word = match source {
                 "audio" => Some(WhatWord::Audio),
@@ -318,14 +340,16 @@ fn resolve_platform_device_word(
     description: Option<&solstone_core_sol_link::client_description::StoredClientDescription>,
     ledger_entry: Option<&ClientEntry>,
 ) -> Option<DeviceWord> {
-    let platform = resolve_first_hit_platform(record, description, ledger_entry);
+    let platform = bound_platform(record, description, ledger_entry);
 
-    let device_type = description
-        .and_then(|d| d.reported.as_ref())
-        .and_then(|r| r.device_type.as_deref())
-        .filter(|s| !s.is_empty());
+    let device_type = read_fact(
+        description
+            .and_then(|d| d.reported.as_ref())
+            .and_then(|r| r.device_type.as_deref()),
+    );
+    let device_type = device_type.as_deref();
 
-    match platform {
+    match platform.as_deref() {
         Some("macos") => Some(DeviceWord::Mac),
         Some("ios") => match device_type {
             Some("tablet") => Some(DeviceWord::Ipad),
@@ -476,6 +500,43 @@ pub fn rendered_stream_labels(table: &StreamLabelTable) -> Option<BTreeMap<Strin
     Some(result)
 }
 
+/// What a label says, as parts a page can compare without reading its words:
+/// the what word, and whether it names an import.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct StreamLabelSays {
+    pub what: Option<&'static str>,
+    pub imported: bool,
+}
+
+pub fn rendered_stream_says(table: &StreamLabelTable) -> Option<BTreeMap<String, StreamLabelSays>> {
+    if table.status == LabelTableStatus::Failed {
+        return None;
+    }
+    Some(
+        table
+            .rows
+            .iter()
+            .map(|row| {
+                let says = match &row.part {
+                    ProvenancePart::Import { .. } => StreamLabelSays {
+                        what: None,
+                        imported: true,
+                    },
+                    ProvenancePart::Bound { what, .. } => StreamLabelSays {
+                        what: what.map(|what| what.as_str()),
+                        imported: false,
+                    },
+                    _ => StreamLabelSays {
+                        what: None,
+                        imported: false,
+                    },
+                };
+                (row.name.clone(), says)
+            })
+            .collect(),
+    )
+}
+
 fn compute_parenthetical<'a>(
     row: &'a StreamLabelRow,
     all_rows: &'a [StreamLabelRow],
@@ -613,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn omi_audio_is_bound_none_none() {
+    fn accessory_source_is_bound_with_no_device_or_what_word() {
         let root = make_journal();
         write_stream(
             root.path(),
@@ -633,8 +694,6 @@ mod tests {
                 identity: None,
             }
         );
-        let rendered = rendered_stream_labels(&table).unwrap();
-        assert_eq!(rendered.get("omi").unwrap(), "your device");
     }
 
     #[test]
@@ -914,7 +973,7 @@ mod tests {
             "sha256:1111": {
                 "protocol_version": 1, "revision": 1, "owner_label": null, "updated_at": null,
                 "reported": {
-                    "name": "dev", "platform": "iOS", "device_type": null,
+                    "name": "dev", "platform": "visionos", "device_type": null,
                     "app_id": null, "app_version": null
                 }
             }
@@ -1118,5 +1177,644 @@ mod tests {
         );
         let table = load_stream_labels(root.path());
         assert_eq!(table.rows[0].part, ProvenancePart::Unknown);
+    }
+
+    fn describe(root: &Path, entries: &[(&str, Option<&str>, Option<&str>, Option<&str>)]) {
+        let mut map = serde_json::Map::new();
+        for (cid, name, platform, device_type) in entries {
+            map.insert(
+                (*cid).to_owned(),
+                json!({
+                    "protocol_version": 1, "revision": 1, "owner_label": null, "updated_at": null,
+                    "reported": {
+                        "name": name, "platform": platform, "device_type": device_type,
+                        "app_id": null, "app_version": null
+                    }
+                }),
+            );
+        }
+        write_file(
+            root,
+            "link/client-descriptions.json",
+            &serde_json::Value::Object(map).to_string(),
+        );
+    }
+
+    fn pair(root: &Path, entries: &[(&str, &str, u32, Option<&str>)]) {
+        let rows: Vec<_> = entries
+            .iter()
+            .map(|(cid, label, ordinal, platform)| {
+                json!({
+                    "fingerprint": cid, "device_label": label, "paired_at": "2026-01-01T00:00:00Z",
+                    "instance_id": format!("inst-{cid}"), "role": "observer", "network": null,
+                    "client_label": label, "label_ordinal": ordinal, "kind": "cert",
+                    "platform": platform
+                })
+            })
+            .collect();
+        write_file(
+            root,
+            "link/authorized_clients.json",
+            &serde_json::Value::Array(rows).to_string(),
+        );
+    }
+
+    fn write_allocated(root: &Path, name: &str, cid: &str, source: &str, base: &str, input: &str) {
+        let stream = json!({
+            "name": name, "kind": "observer", "host": null, "platform": null,
+            "created_at": 1, "last_day": null, "last_segment": null, "seq": 1,
+            "cid": cid, "source": source,
+            "allocation": { "base": base, "base_input": input, "source": source }
+        });
+        write_file(root, &format!("streams/{name}.json"), &stream.to_string());
+    }
+
+    fn bound(
+        device: Option<DeviceWord>,
+        what: Option<WhatWord>,
+        identity: Option<&str>,
+    ) -> ProvenancePart {
+        ProvenancePart::Bound {
+            device,
+            what,
+            identity: identity.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn empty_source_is_the_devices_own_recording_with_no_what_word() {
+        let root = make_journal();
+        write_stream(
+            root.path(),
+            "device_2",
+            "observer",
+            Some("sha256:1"),
+            Some(""),
+            None,
+        );
+        describe(
+            root.path(),
+            &[("sha256:1", Some("fedora"), Some("linux"), Some("desktop"))],
+        );
+        let table = load_stream_labels(root.path());
+        assert_eq!(
+            resolve_stream_label(&table, "device_2"),
+            bound(Some(DeviceWord::Computer), None, Some("fedora"))
+        );
+    }
+
+    #[test]
+    fn ledger_platform_hint_answers_when_nothing_is_reported() {
+        let root = make_journal();
+        write_stream(
+            root.path(),
+            "s1",
+            "observer",
+            Some("sha256:1"),
+            Some("screen"),
+            None,
+        );
+        pair(root.path(), &[("sha256:1", "studio", 1, Some("macos"))]);
+        let table = load_stream_labels(root.path());
+        assert_eq!(
+            resolve_stream_label(&table, "s1"),
+            bound(
+                Some(DeviceWord::Mac),
+                Some(WhatWord::Screen),
+                Some("studio")
+            )
+        );
+    }
+
+    #[test]
+    fn unpaired_allocation_platform_gives_mac_but_never_a_phone_word() {
+        let root = make_journal();
+        write_allocated(
+            root.path(),
+            "macos_screen",
+            "sha256:m",
+            "screen",
+            "platform",
+            "macos",
+        );
+        write_allocated(
+            root.path(),
+            "ios_audio",
+            "sha256:i",
+            "audio",
+            "platform",
+            "ios",
+        );
+        write_allocated(
+            root.path(),
+            "android_audio",
+            "sha256:a",
+            "audio",
+            "platform",
+            "android",
+        );
+        write_allocated(
+            root.path(),
+            "sams_macbook_screen",
+            "sha256:s",
+            "screen",
+            "client_label",
+            "Sam's MacBook",
+        );
+        let table = load_stream_labels(root.path());
+        assert_eq!(
+            resolve_stream_label(&table, "macos_screen").device_word(),
+            Some(DeviceWord::Mac)
+        );
+        assert_eq!(
+            resolve_stream_label(&table, "ios_audio"),
+            bound(None, Some(WhatWord::Audio), None)
+        );
+        assert_eq!(
+            resolve_stream_label(&table, "android_audio"),
+            bound(None, Some(WhatWord::Audio), None)
+        );
+        assert_eq!(
+            resolve_stream_label(&table, "sams_macbook_screen"),
+            bound(None, Some(WhatWord::Screen), None)
+        );
+    }
+
+    #[test]
+    fn bound_record_platform_alone_is_not_a_bound_fact() {
+        let root = make_journal();
+        write_stream(
+            root.path(),
+            "s1",
+            "observer",
+            Some("sha256:1"),
+            Some("screen"),
+            Some("macos"),
+        );
+        let table = load_stream_labels(root.path());
+        assert_eq!(
+            resolve_stream_label(&table, "s1"),
+            bound(None, Some(WhatWord::Screen), None)
+        );
+    }
+
+    #[test]
+    fn platform_and_device_type_are_read_case_insensitively() {
+        let root = make_journal();
+        write_stream(
+            root.path(),
+            "s1",
+            "observer",
+            Some("sha256:1"),
+            Some("audio"),
+            None,
+        );
+        describe(
+            root.path(),
+            &[("sha256:1", None, Some(" iOS "), Some("Phone"))],
+        );
+        let table = load_stream_labels(root.path());
+        assert_eq!(
+            resolve_stream_label(&table, "s1").device_word(),
+            Some(DeviceWord::Iphone)
+        );
+    }
+
+    #[test]
+    fn unlisted_platform_with_a_listed_device_type_uses_the_device_type() {
+        let root = make_journal();
+        write_stream(
+            root.path(),
+            "s1",
+            "observer",
+            Some("sha256:1"),
+            Some("screen"),
+            None,
+        );
+        describe(
+            root.path(),
+            &[("sha256:1", None, Some("visionos"), Some("phone"))],
+        );
+        let table = load_stream_labels(root.path());
+        assert_eq!(
+            resolve_stream_label(&table, "s1").device_word(),
+            Some(DeviceWord::Phone)
+        );
+    }
+
+    #[test]
+    fn linux_reporting_terminal_is_terminal() {
+        let root = make_journal();
+        write_stream(
+            root.path(),
+            "s1",
+            "observer",
+            Some("sha256:1"),
+            Some("screen"),
+            None,
+        );
+        describe(
+            root.path(),
+            &[("sha256:1", None, Some("linux"), Some("terminal"))],
+        );
+        let table = load_stream_labels(root.path());
+        assert_eq!(
+            resolve_stream_label(&table, "s1").device_word(),
+            Some(DeviceWord::Terminal)
+        );
+    }
+
+    #[test]
+    fn accessories_relayed_by_a_phone_are_not_the_phone() {
+        let root = make_journal();
+        describe(
+            root.path(),
+            &[
+                ("sha256:i", None, Some("ios"), Some("phone")),
+                ("sha256:a", None, Some("android"), Some("phone")),
+            ],
+        );
+        write_stream(
+            root.path(),
+            "omi",
+            "observer",
+            Some("sha256:i"),
+            Some("omi-audio"),
+            None,
+        );
+        write_stream(
+            root.path(),
+            "watch",
+            "observer",
+            Some("sha256:a"),
+            Some("watch"),
+            None,
+        );
+        write_stream(
+            root.path(),
+            "glasses",
+            "observer",
+            Some("sha256:a"),
+            Some("glasses"),
+            None,
+        );
+        let table = load_stream_labels(root.path());
+        for name in ["omi", "watch", "glasses"] {
+            assert_eq!(
+                resolve_stream_label(&table, name),
+                bound(None, None, None),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn mobile_segment_never_names_the_phone() {
+        let root = make_journal();
+        describe(root.path(), &[("sha256:i", None, Some("ios"), None)]);
+        write_stream(
+            root.path(),
+            "read",
+            "observer",
+            Some("sha256:i"),
+            Some("mobile-segment"),
+            None,
+        );
+        write_stream(
+            root.path(),
+            "unread",
+            "observer",
+            Some("sha256:x"),
+            Some("mobile-segment"),
+            None,
+        );
+        let table = load_stream_labels(root.path());
+        assert_eq!(
+            resolve_stream_label(&table, "read"),
+            resolve_stream_label(&table, "unread")
+        );
+        assert_eq!(resolve_stream_label(&table, "read").device_word(), None);
+    }
+
+    #[test]
+    fn two_macs_named_only_by_the_ledger_carry_their_ordinals() {
+        let root = make_journal();
+        pair(
+            root.path(),
+            &[
+                ("sha256:1", "macbook", 1, Some("macos")),
+                ("sha256:2", "macbook", 2, Some("macos")),
+            ],
+        );
+        write_stream(
+            root.path(),
+            "a",
+            "observer",
+            Some("sha256:1"),
+            Some("screen"),
+            None,
+        );
+        write_stream(
+            root.path(),
+            "b",
+            "observer",
+            Some("sha256:2"),
+            Some("screen"),
+            None,
+        );
+        let table = load_stream_labels(root.path());
+        assert_eq!(
+            resolve_stream_label(&table, "a").identity(),
+            Some("macbook")
+        );
+        assert_eq!(
+            resolve_stream_label(&table, "b").identity(),
+            Some("macbook 2")
+        );
+        let rows = &table.rows;
+        assert_eq!(compute_parenthetical(&rows[0], rows), Some("macbook"));
+        assert_eq!(compute_parenthetical(&rows[1], rows), Some("macbook 2"));
+    }
+
+    #[test]
+    fn two_macs_with_no_names_get_no_parentheses() {
+        let root = make_journal();
+        pair(
+            root.path(),
+            &[
+                ("sha256:1", "", 1, Some("macos")),
+                ("sha256:2", "", 1, Some("macos")),
+            ],
+        );
+        write_stream(
+            root.path(),
+            "a",
+            "observer",
+            Some("sha256:1"),
+            Some("screen"),
+            None,
+        );
+        write_stream(
+            root.path(),
+            "b",
+            "observer",
+            Some("sha256:2"),
+            Some("screen"),
+            None,
+        );
+        let table = load_stream_labels(root.path());
+        assert!(
+            table
+                .rows
+                .iter()
+                .all(|row| row.part.device_word() == Some(DeviceWord::Mac))
+        );
+        assert!(
+            table
+                .rows
+                .iter()
+                .all(|row| compute_parenthetical(row, &table.rows).is_none())
+        );
+    }
+
+    #[test]
+    fn legacy_unbound_name_beside_a_bound_stream_with_nothing_read() {
+        let root = make_journal();
+        write_stream(root.path(), "fedora", "observer", None, None, None);
+        write_stream(
+            root.path(),
+            "macos_screen",
+            "observer",
+            Some("sha256:1"),
+            Some("screen"),
+            None,
+        );
+        let table = load_stream_labels(root.path());
+        assert_eq!(
+            resolve_stream_label(&table, "fedora"),
+            ProvenancePart::Unknown
+        );
+        assert_eq!(
+            resolve_stream_label(&table, "macos_screen"),
+            bound(None, Some(WhatWord::Screen), None)
+        );
+    }
+
+    #[test]
+    fn unreadable_streams_directory_fails_the_table() {
+        let root = make_journal();
+        write_file(root.path(), "streams", "not a directory");
+        let table = load_stream_labels(root.path());
+        assert_eq!(table.status, LabelTableStatus::Failed);
+        assert_eq!(rendered_stream_labels(&table), None);
+    }
+
+    #[test]
+    fn readcompat_shapes() {
+        let root = make_journal();
+        // cid with no source, platform ios: an older phone record.
+        write_stream(
+            root.path(),
+            "iphone",
+            "observer",
+            Some("sha256:1"),
+            None,
+            Some("ios"),
+        );
+        // no cid, platform linux: an older desktop record.
+        write_stream(
+            root.path(),
+            "workstation",
+            "observer",
+            None,
+            None,
+            Some("linux"),
+        );
+        write_stream(root.path(), "pixel-7", "observer", None, None, None);
+        write_stream(root.path(), "recovered", "unknown", None, None, None);
+        let table = load_stream_labels(root.path());
+        assert_eq!(
+            resolve_stream_label(&table, "iphone"),
+            ProvenancePart::Unknown
+        );
+        assert_eq!(
+            resolve_stream_label(&table, "workstation"),
+            ProvenancePart::Unbound {
+                device: DeviceWord::Computer,
+                identity: Some("workstation".to_owned()),
+            }
+        );
+        assert_eq!(
+            resolve_stream_label(&table, "pixel-7"),
+            ProvenancePart::Unknown
+        );
+        assert_eq!(
+            resolve_stream_label(&table, "recovered"),
+            ProvenancePart::Unknown
+        );
+    }
+
+    #[test]
+    fn legacy_qualifier_tokens_win_over_a_read_platform() {
+        let root = make_journal();
+        write_stream(
+            root.path(),
+            "fedora.tmux",
+            "observer",
+            None,
+            None,
+            Some("linux"),
+        );
+        write_stream(root.path(), "suze.tmux", "observer", None, None, None);
+        let table = load_stream_labels(root.path());
+        assert_eq!(
+            resolve_stream_label(&table, "fedora.tmux").device_word(),
+            Some(DeviceWord::Terminal)
+        );
+        assert_eq!(
+            resolve_stream_label(&table, "fedora.tmux").identity(),
+            Some("fedora")
+        );
+        assert_eq!(
+            resolve_stream_label(&table, "suze.tmux").identity(),
+            Some("suze")
+        );
+    }
+
+    #[test]
+    fn device_dotted_names_have_no_writer_and_read_unknown() {
+        let root = make_journal();
+        for name in [
+            "device.omi.audio",
+            "device.mac.audio",
+            "device.pixel_watch.audio",
+        ] {
+            write_stream(root.path(), name, "observer", None, None, None);
+        }
+        let table = load_stream_labels(root.path());
+        assert!(
+            table
+                .rows
+                .iter()
+                .all(|row| row.part == ProvenancePart::Unknown)
+        );
+    }
+
+    #[test]
+    fn unlisted_import_keeps_its_parsed_source() {
+        let root = make_journal();
+        write_stream(root.path(), "import.apple", "import", None, None, None);
+        let table = load_stream_labels(root.path());
+        assert_eq!(
+            resolve_stream_label(&table, "import.apple"),
+            ProvenancePart::Import {
+                source: "apple".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn two_legacy_linux_computers_are_told_apart_by_name() {
+        let root = make_journal();
+        write_stream(root.path(), "fedora", "observer", None, None, Some("linux"));
+        write_stream(root.path(), "suze", "observer", None, None, Some("linux"));
+        let table = load_stream_labels(root.path());
+        for row in &table.rows {
+            assert_eq!(row.part.device_word(), Some(DeviceWord::Computer));
+            assert_eq!(
+                compute_parenthetical(row, &table.rows),
+                Some(row.name.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn empty_source_with_nothing_read_or_a_read_mac() {
+        let root = make_journal();
+        write_stream(
+            root.path(),
+            "unread",
+            "observer",
+            Some("sha256:1"),
+            Some(""),
+            None,
+        );
+        write_allocated(root.path(), "macos", "sha256:2", "", "platform", "macos");
+        let table = load_stream_labels(root.path());
+        assert_eq!(
+            resolve_stream_label(&table, "unread"),
+            bound(None, None, None)
+        );
+        assert_eq!(
+            resolve_stream_label(&table, "macos"),
+            bound(Some(DeviceWord::Mac), None, None)
+        );
+    }
+
+    #[test]
+    fn served_parts_say_the_what_word_and_imports() {
+        let root = make_journal();
+        write_stream(
+            root.path(),
+            "s1",
+            "observer",
+            Some("sha256:1"),
+            Some("audio"),
+            None,
+        );
+        write_stream(
+            root.path(),
+            "s2",
+            "observer",
+            Some("sha256:2"),
+            Some("tmux"),
+            None,
+        );
+        write_stream(root.path(), "import.oura", "import", None, None, None);
+        let table = load_stream_labels(root.path());
+        let says = rendered_stream_says(&table).unwrap();
+        assert_eq!(
+            says["s1"],
+            StreamLabelSays {
+                what: Some("audio"),
+                imported: false
+            }
+        );
+        assert_eq!(
+            says["s2"],
+            StreamLabelSays {
+                what: None,
+                imported: false
+            }
+        );
+        assert_eq!(
+            says["import.oura"],
+            StreamLabelSays {
+                what: None,
+                imported: true
+            }
+        );
+        write_file(root.path(), "streams/broken.json", "{");
+        assert_eq!(rendered_stream_says(&load_stream_labels(root.path())), None);
+    }
+
+    #[test]
+    fn a_whitespace_only_platform_is_absent_and_the_next_fact_answers() {
+        let root = make_journal();
+        write_stream(
+            root.path(),
+            "s1",
+            "observer",
+            Some("sha256:1"),
+            Some("screen"),
+            None,
+        );
+        describe(root.path(), &[("sha256:1", None, Some("   "), None)]);
+        pair(root.path(), &[("sha256:1", "studio", 1, Some("macos"))]);
+        let table = load_stream_labels(root.path());
+        assert_eq!(
+            resolve_stream_label(&table, "s1").device_word(),
+            Some(DeviceWord::Mac)
+        );
     }
 }

@@ -4637,7 +4637,7 @@
     if (streams.length) {
       const labelToRaw = new Map();
       for (const s of streams) {
-        const lbl = window.JournalFormat ? window.JournalFormat.stream(s) : s;
+        const lbl = window.JournalFormat.stream(s);
         if (!labelToRaw.has(lbl)) {
           labelToRaw.set(lbl, []);
         }

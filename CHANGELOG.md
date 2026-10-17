@@ -21,6 +21,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- home's cards no longer list activities you've hidden.
+- a plan you hid or edited stays that way when it shows up again in what you share, unless its start time changes.
 - while catching up on older recordings, your journal could think about the same recording over and over. this happened when an earlier version had started a step for it, and that step no longer exists. each recording like this now gets at most one more look, and then it is left alone.
 - after you restore your journal onto a new device, you can bring your solstone.me address back to it in the agents app. before, the address stayed off. your journal tells you when the address has come back, and the other copy stops using it.
 - downloading location accuracy no longer pauses to save its progress after every small piece of the download, which could make it take hours on windows.

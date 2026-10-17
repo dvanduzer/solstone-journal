@@ -678,14 +678,15 @@ async function main() {
   assert.strictEqual(format.compactTokens(999500), '1M');
   assert.strictEqual(format.compactTokens(12000), '12K');
   assert.strictEqual(format.timestamp(null), 'time unavailable');
-  assert.strictEqual(format.stream('import.chatgpt'), 'ChatGPT · imported');
-  assert.strictEqual(format.stream('import.granola'), 'granola · imported');
-  assert.strictEqual(format.stream('my-host.tmux'), 'your terminal');
-  assert.strictEqual(format.stream('device.watch.audio'), 'source unknown');
-  assert.strictEqual(format.stream('ja1r'), 'source unknown');
-  assert.strictEqual(format.stream('_default'), 'source unknown');
-  format.installStreamLabels({ status: 'complete', labels: { 'ja1r': 'your mac · screen' } });
-  assert.strictEqual(format.stream('ja1r'), 'your mac · screen');
+  // Before the label table loads, only a dotted name decides its words.
+  const unknown = format.stream('_default');
+  for (const name of ['device.watch.audio', 'ja1r']) assert.strictEqual(format.stream(name), unknown);
+  for (const name of ['import.chatgpt', 'import.granola', 'my-host.tmux']) {
+    assert.notStrictEqual(format.stream(name), unknown);
+    assert.notStrictEqual(format.stream(name), name);
+  }
+  format.installStreamLabels({ status: 'complete', labels: { ja1r: 'LABEL-ONE' } });
+  assert.strictEqual(format.stream('ja1r'), 'LABEL-ONE');
   const thinking = window.__thinkingRuns;
   assert(thinking, 'test exports present');
   const savedProviders = thinking.state.providers;

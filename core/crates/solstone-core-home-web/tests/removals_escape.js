@@ -125,7 +125,7 @@ function escaped(value) {
   })[char]);
 }
 
-async function boot(source, lists, responses) {
+async function boot(source, lists, responses, labels = null) {
   let root = new Element();
   const timers = new Map();
   let nextTimer = 0;
@@ -168,6 +168,7 @@ async function boot(source, lists, responses) {
   window.location = { pathname: '/app/home' };
   class FixtureDate extends Date { constructor(...args) { super(...(args.length ? args : [2026, 8, 5])); } }
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../../solstone-core-convey-shell/assets/static/date_format.js'), 'utf8'), { window, Date: FixtureDate });
+  if (labels) window.JournalFormat.installStreamLabels({ status: 'complete', labels });
   const load = () => vm.runInNewContext(source, { document, Promise, setImmediate, window, Set }, { filename: 'removals.js' });
   load();
   // The shell mounts a workspace's scripts, then announces it; the card mounts on that event.
@@ -361,6 +362,19 @@ async function main() {
     await confirmation(card, id);
     assert(card.innerHTML.includes(rendered(copy, key, { n: count, date: row.day, stream: streamName })));
   }
+
+  // A seeded provenance label names the row; the stream key stays in its title.
+  const labelledRow = marked('labelled', 'policy', 2, 'device_9e92ab54');
+  const labelledCard = await boot(
+    source,
+    { state: 'list.ready', removals: [labelledRow] },
+    { approve: { state: 'approve.refused_before_start', refusals: [] } },
+    { device_9e92ab54: 'LABEL-ONE' }
+  );
+  const identityMatch = labelledCard.innerHTML.match(/<p class="removals-card-identity" data-removal-identity title="([^"]*)">([^<]*)<\/p>/);
+  assert(identityMatch, 'labelled row states its identity');
+  assert.strictEqual(identityMatch[1], 'device_9e92ab54');
+  assert(identityMatch[2].includes('LABEL-ONE') && !identityMatch[2].includes('device_9e92ab54'), identityMatch[2]);
 
   const defaultRow = marked('default', 'policy', 2, '_default');
   const defaultCard = await boot(

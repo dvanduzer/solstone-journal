@@ -3716,24 +3716,15 @@ body.presentation-mode .tr-screen-text { font-size: 16px; padding: 12px 16px; bo
     return window.JournalFormat.stream(stream);
   }
 
-  function shouldOmitStreamType(label, stream, typeDesc) {
-    if (!label) return false;
-    if (label === 'your terminal') return false;
-    const s = String(stream || '');
-    if (s.startsWith('import.') && label.endsWith(' · imported')) {
-      return true;
-    }
-    const t = String(typeDesc || '').trim().toLowerCase();
-    const parts = label.split(' · ');
-    if (parts.length > 1) {
-      const what = parts[parts.length - 1].trim().toLowerCase();
-      if (['audio', 'screen', 'camera', 'location'].includes(what)) {
-        if (what === t || t.includes(what)) {
-          return true;
-        }
-      }
-    }
-    return false;
+  // Don't say the type twice: omit a content type the stream's label already
+  // says, either as its what word ("screen" beside a screen label) or as an
+  // import. "audio + screen" beside a screen label keeps the type, since the
+  // label says only half of it.
+  function shouldOmitStreamType(stream, typeDesc) {
+    if (!stream) return false;
+    const says = window.JournalFormat.streamSays(stream);
+    if (says.imported) return true;
+    return Boolean(says.what) && says.what === String(typeDesc || '').trim().toLowerCase();
   }
 
   // Build range text with total media size
@@ -3858,7 +3849,7 @@ body.presentation-mode .tr-screen-text { font-size: 16px; padding: 12px 16px; bo
     el.setAttribute('aria-label', _label);
     const sortedStreams = [...streams].sort();
     const humanizedStreams = sortedStreams.map(humanizeStreamName);
-    const omitType = sortedStreams.length > 0 && sortedStreams.every(s => shouldOmitStreamType(humanizeStreamName(s), s, type));
+    const omitType = sortedStreams.length > 0 && sortedStreams.every(s => shouldOmitStreamType(s, type));
     const typePart = omitType ? '' : ', ' + type;
     const labelPart = humanizedStreams.length ? ', ' + humanizedStreams.join(', ') : '';
     const rawSuffix = sortedStreams.length ? ' (' + sortedStreams.join(', ') + ')' : '';
@@ -4100,7 +4091,7 @@ body.presentation-mode .tr-screen-text { font-size: 16px; padding: 12px 16px; bo
       const statusSuffix = segmentStatusLabel ? ' · ' + segmentStatusLabel : '';
       const ariaStatusSuffix = segmentStatusLabel ? ', ' + segmentStatusLabel : '';
       const label = humanizeStreamName(seg.stream);
-      const omitType = shouldOmitStreamType(label, seg.stream, typeDesc);
+      const omitType = shouldOmitStreamType(seg.stream, typeDesc);
       const typeTitlePart = omitType ? '' : ' · ' + typeDesc;
       const typeAriaPart = omitType ? '' : ', ' + typeLabel;
       pill.title = seg.start + ' – ' + seg.end + ' · ' + duration + ' min' + typeTitlePart + ' · ' + label + statusSuffix + ' (' + seg.stream + ')';
@@ -6696,7 +6687,9 @@ body.presentation-mode .tr-screen-text { font-size: 16px; padding: 12px 16px; bo
       const rowsHtml = locationSectionExpanded ? `
         <div class="tr-location-rows">
           ${locationSegments.map(s => {
-            const deviceSuffix = manyLocationStreams ? ` · ${humanizeStreamName(s.stream)}` : '';
+            const deviceSuffix = manyLocationStreams
+              ? ` · <span title="${escapeHtml(s.stream)}">${escapeHtml(humanizeStreamName(s.stream))}</span>`
+              : '';
             const hasReadings = typeof s.location_readings === 'number';
             const readings = hasReadings ? s.location_readings : null;
             let text = s.start;
@@ -6706,7 +6699,7 @@ body.presentation-mode .tr-screen-text { font-size: 16px; padding: 12px 16px; bo
               text = `${s.start} · ${readings} readings`;
             }
             const dataReadingsAttr = hasReadings ? ` data-readings="${readings}"` : '';
-            return `<button type="button" class="tr-location-row" data-key="${escapeHtml(s.key)}" data-stream="${escapeHtml(s.stream)}"${dataReadingsAttr}>${escapeHtml(text + deviceSuffix)}</button>`;
+            return `<button type="button" class="tr-location-row" data-key="${escapeHtml(s.key)}" data-stream="${escapeHtml(s.stream)}"${dataReadingsAttr}>${escapeHtml(text)}${deviceSuffix}</button>`;
           }).join('')}
         </div>
       ` : '';

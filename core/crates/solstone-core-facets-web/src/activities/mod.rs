@@ -26,8 +26,13 @@ use solstone_core_format::content::{Family, produce_chunks_by_shape};
 
 use crate::{Clock, http};
 
+mod view;
+
 pub fn routes(root: PathBuf, clock: Clock) -> Router {
     Router::new()
+        .route("/app/activities/api/day/{day}/view", get(day_view))
+        .route("/app/activities/api/index", get(activities_index))
+        .route("/app/activities/api/stats/{month}", get(activities_stats))
         .route(
             "/app/activities/api/day/{day}/records",
             get(list).post(create),
@@ -195,31 +200,135 @@ async fn create(
     }
 }
 
+async fn day_view(
+    State((root, _)): State<(PathBuf, Clock)>,
+    RoutePath(day): RoutePath<String>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    if !crate::segments::is_day(&day) {
+        return http::error(
+            "invalid_day",
+            "that day couldn't be used.",
+            "Day not found".to_owned(),
+            StatusCode::NOT_FOUND,
+        );
+    }
+    solstone_core_convey_http::owner_read::spawn_blocking_response(
+        solstone_core_convey_http::owner_read::OwnerReadRole::ActivitiesDayView,
+        move || match view::build_view(&root, &day, query.as_deref()) {
+            Ok(val) => Json(val).into_response(),
+            Err(err) => internal(err),
+        },
+    )
+    .await
+}
+
+async fn activities_index(
+    State((root, _)): State<(PathBuf, Clock)>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    solstone_core_convey_http::owner_read::spawn_blocking_response(
+        solstone_core_convey_http::owner_read::OwnerReadRole::ActivitiesIndex,
+        move || {
+            let counts = view::compute_day_counts(&root, query.as_deref());
+            Json(crate::date_nav::date_nav_index(&counts)).into_response()
+        },
+    )
+    .await
+}
+
+async fn activities_stats(
+    State((root, _)): State<(PathBuf, Clock)>,
+    RoutePath(month): RoutePath<String>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    if !crate::segments::is_month(&month) {
+        return http::error(
+            "invalid_month",
+            "that month couldn't be used.",
+            "Invalid month format, expected YYYYMM".to_owned(),
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    solstone_core_convey_http::owner_read::spawn_blocking_response(
+        solstone_core_convey_http::owner_read::OwnerReadRole::ActivitiesMonthStats,
+        move || {
+            let counts = view::compute_day_counts(&root, query.as_deref());
+            let filtered: std::collections::BTreeMap<String, usize> = counts
+                .into_iter()
+                .filter(|(day, _)| day.starts_with(&month))
+                .collect();
+            Json(filtered).into_response()
+        },
+    )
+    .await
+}
+
 async fn update(
     State((root, clock)): State<(PathBuf, Clock)>,
     RoutePath((day, span_id)): RoutePath<(String, String)>,
     RawQuery(query): RawQuery,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
-    mutate_update(&root, &clock, day, span_id, query, body).await
+    let is_owner = headers
+        .get("x-solstone-actor")
+        .and_then(|v| v.to_str().ok())
+        == Some("owner");
+    let (actor, log_source, log_actor) = if is_owner {
+        ("owner:update", "app", "activities")
+    } else {
+        ("cli:update", "call", "agent")
+    };
+    mutate_update(
+        &root, &clock, day, span_id, query, body, actor, log_source, log_actor,
+    )
+    .await
 }
+
 async fn mute(
     State((root, clock)): State<(PathBuf, Clock)>,
     RoutePath((day, span_id)): RoutePath<(String, String)>,
     RawQuery(query): RawQuery,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
-    set_hidden(&root, &clock, day, span_id, query, body, true)
+    let is_owner = headers
+        .get("x-solstone-actor")
+        .and_then(|v| v.to_str().ok())
+        == Some("owner");
+    let (actor, log_source, log_actor) = if is_owner {
+        ("owner:mute", "app", "activities")
+    } else {
+        ("cli:mute", "call", "agent")
+    };
+    set_hidden(
+        &root, &clock, day, span_id, query, body, true, actor, log_source, log_actor,
+    )
 }
+
 async fn unmute(
     State((root, clock)): State<(PathBuf, Clock)>,
     RoutePath((day, span_id)): RoutePath<(String, String)>,
     RawQuery(query): RawQuery,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
-    set_hidden(&root, &clock, day, span_id, query, body, false)
+    let is_owner = headers
+        .get("x-solstone-actor")
+        .and_then(|v| v.to_str().ok())
+        == Some("owner");
+    let (actor, log_source, log_actor) = if is_owner {
+        ("owner:unmute", "app", "activities")
+    } else {
+        ("cli:unmute", "call", "agent")
+    };
+    set_hidden(
+        &root, &clock, day, span_id, query, body, false, actor, log_source, log_actor,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn mutate_update(
     root: &Path,
     clock: &Clock,
@@ -227,6 +336,9 @@ async fn mutate_update(
     span_id: String,
     query: Option<String>,
     body: Bytes,
+    actor: &str,
+    log_source: &str,
+    log_actor: &str,
 ) -> Response {
     let facet = query_value(query.as_deref(), "facet").unwrap_or_default();
     if facet.is_empty() {
@@ -257,21 +369,14 @@ async fn mutate_update(
         .format("%Y-%m-%dT%H:%M:%SZ")
         .to_string();
     match solstone_core_facets::update_activity_record(
-        root,
-        &facet,
-        &day,
-        &span_id,
-        patch,
-        "cli:update",
-        &note,
-        &timestamp,
+        root, &facet, &day, &span_id, patch, actor, &note, &timestamp,
     ) {
         Ok(Some(record)) => {
             if let Err(error) = solstone_core_facets::append_action_log_for_day(
                 root,
                 Some(&facet),
-                "call",
-                "agent",
+                log_source,
+                log_actor,
                 "activity_update",
                 json!({"id":span_id,"fields":patch.keys().collect::<Vec<_>>() }),
                 &day,
@@ -287,6 +392,7 @@ async fn mutate_update(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn set_hidden(
     root: &Path,
     clock: &Clock,
@@ -295,6 +401,9 @@ fn set_hidden(
     query: Option<String>,
     body: Bytes,
     hidden: bool,
+    actor: &str,
+    log_source: &str,
+    log_actor: &str,
 ) -> Response {
     let facet = query_value(query.as_deref(), "facet").unwrap_or_default();
     if facet.is_empty() {
@@ -308,14 +417,7 @@ fn set_hidden(
         .format("%Y-%m-%dT%H:%M:%SZ")
         .to_string();
     match solstone_core_facets::set_activity_hidden(
-        root,
-        &facet,
-        &day,
-        &span_id,
-        hidden,
-        if hidden { "cli:mute" } else { "cli:unmute" },
-        reason,
-        &timestamp,
+        root, &facet, &day, &span_id, hidden, actor, reason, &timestamp,
     ) {
         Ok(Some(record)) => {
             let action = if hidden {
@@ -326,8 +428,8 @@ fn set_hidden(
             if let Err(error) = solstone_core_facets::append_action_log_for_day(
                 root,
                 Some(&facet),
-                "call",
-                "agent",
+                log_source,
+                log_actor,
                 action,
                 json!({"id":span_id,"reason":reason}),
                 &day,
@@ -990,5 +1092,786 @@ mod tests {
             body["error"],
             "activities couldn't be updated right now because they were busy. try again in a moment."
         );
+    }
+
+    #[tokio::test]
+    async fn activities_view_contract_and_spot_check() {
+        let root = tempfile::Builder::new().tempdir_in("/var/tmp").unwrap();
+        write(
+            &root.path().join("config/journal.json"),
+            r#"{"setup":{"completed_at":1767225600}}"#,
+        );
+        solstone_core_facets::create_facet(root.path(), "work", "Work", "", "", "", None).unwrap();
+        solstone_core_facets::create_facet(root.path(), "home", "Home", "", "", "", None).unwrap();
+        solstone_core_facets::create_facet(root.path(), "m", "Muted", "", "", "", None).unwrap();
+        write(
+            &root.path().join("facets/m/facet.json"),
+            r#"{"name":"Muted","muted":true}"#,
+        );
+
+        // Spot-check chronicle directories under day 20260715:
+        std::fs::create_dir_all(root.path().join("chronicle/20260715/s1/100000_300")).unwrap();
+        std::fs::create_dir_all(root.path().join("chronicle/20260715/s2/100000_300")).unwrap();
+        std::fs::create_dir_all(root.path().join("chronicle/20260715/s1/100200_300")).unwrap();
+
+        // 1. Day 20260715:
+        // work: 2 visible, 2 hidden
+        // home: 1 visible (shared_item)
+        // m: 2 visible
+        // Unscoped visible count: 2 (work) + 1 (home) = 3
+        // Unscoped hidden count: 2 (work) + 0 (home) = 2
+        let work_rows = r#"{"id":"spot_s1","activity":"meeting","title":"Spot S1","segments":["100000_300"],"stream":"s1","hidden":false,"source":"user"}
+{"id":"spot_s2","activity":"meeting","title":"Spot S2","segments":["100000_300"],"stream":"s2","hidden":false,"source":"user"}
+{"id":"spot_hid","activity":"meeting","title":"Spot Hid","segments":["100200_300"],"stream":"s1","hidden":true,"source":"user"}
+{"id":"shared_item","activity":"meeting","title":"Shared Work","hidden":true,"source":"user"}"#;
+        write(
+            &root.path().join("facets/work/activities/20260715.jsonl"),
+            work_rows,
+        );
+
+        let home_rows = r#"{"id":"shared_item","activity":"meeting","title":"Shared Home","hidden":false,"source":"user"}"#;
+        write(
+            &root.path().join("facets/home/activities/20260715.jsonl"),
+            home_rows,
+        );
+
+        let m_rows = r#"{"id":"m1","activity":"meeting","title":"M1","hidden":false,"source":"user"}
+{"id":"m2","activity":"meeting","title":"M2","hidden":false,"source":"user"}"#;
+        write(
+            &root.path().join("facets/m/activities/20260715.jsonl"),
+            m_rows,
+        );
+
+        // GET /app/activities/api/day/20260715/view
+        let (status, res) = request(
+            gated(root.path(), fixed_clock()),
+            "GET",
+            "/app/activities/api/day/20260715/view",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(res.get("items").is_some());
+        assert!(res.get("facets").is_some());
+        assert!(res.get("hidden_count").is_some());
+
+        let items = res["items"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(res["hidden_count"], 2);
+
+        // Two declared facets, work and home, same activity id stored in both.
+        // Hiding only the work copy removes only that item from the default list.
+        assert!(
+            items
+                .iter()
+                .any(|i| i["id"] == "shared_item" && i["facet"] == "home")
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|i| i["id"] == "shared_item" && i["facet"] == "work")
+        );
+
+        // Muted facet m is absent from default items and default hidden_count
+        assert!(!items.iter().any(|i| i["facet"] == "m"));
+        let facets = res["facets"].as_array().unwrap();
+        let m_facet = facets.iter().find(|f| f["name"] == "m").unwrap();
+        assert_eq!(m_facet["count"], 2);
+        let work_facet = facets.iter().find(|f| f["name"] == "work").unwrap();
+        assert_eq!(work_facet["count"], 2);
+        let home_facet = facets.iter().find(|f| f["name"] == "home").unwrap();
+        assert_eq!(home_facet["count"], 1);
+
+        // GET .../view?facet=m lists those 2
+        let (status_m, res_m) = request(
+            gated(root.path(), fixed_clock()),
+            "GET",
+            "/app/activities/api/day/20260715/view?facet=m",
+            None,
+        )
+        .await;
+        assert_eq!(status_m, StatusCode::OK);
+        assert_eq!(res_m["items"].as_array().unwrap().len(), 2);
+        // facets[f].count equals the visible count ?facet=f would return, and does not change when request's own ?facet= is different
+        let facets_m = res_m["facets"].as_array().unwrap();
+        assert_eq!(
+            facets_m.iter().find(|f| f["name"] == "work").unwrap()["count"],
+            2
+        );
+        assert_eq!(
+            facets_m.iter().find(|f| f["name"] == "home").unwrap()["count"],
+            1
+        );
+        assert_eq!(
+            facets_m.iter().find(|f| f["name"] == "m").unwrap()["count"],
+            2
+        );
+
+        // With ?include_hidden=1: items length equals visible count plus hidden_count (3 + 2 = 5)
+        let (status_all, res_all) = request(
+            gated(root.path(), fixed_clock()),
+            "GET",
+            "/app/activities/api/day/20260715/view?include_hidden=1",
+            None,
+        )
+        .await;
+        assert_eq!(status_all, StatusCode::OK);
+        let all_items = res_all["items"].as_array().unwrap();
+        assert_eq!(all_items.len(), 5);
+        assert_eq!(
+            all_items.len(),
+            items.len() + res["hidden_count"].as_u64().unwrap() as usize
+        );
+        assert!(
+            all_items
+                .iter()
+                .any(|i| i["id"] == "shared_item" && i["facet"] == "home")
+        );
+        assert!(
+            all_items
+                .iter()
+                .any(|i| i["id"] == "shared_item" && i["facet"] == "work")
+        );
+
+        // ?facet=work lists work's rows while that response's facets still shows home with home's real count
+        let (status_w, res_w) = request(
+            gated(root.path(), fixed_clock()),
+            "GET",
+            "/app/activities/api/day/20260715/view?facet=work",
+            None,
+        )
+        .await;
+        assert_eq!(status_w, StatusCode::OK);
+        let work_items = res_w["items"].as_array().unwrap();
+        assert_eq!(work_items.len(), 2);
+        assert!(work_items.iter().all(|i| i["facet"] == "work"));
+        let facets_w = res_w["facets"].as_array().unwrap();
+        assert_eq!(
+            facets_w.iter().find(|f| f["name"] == "home").unwrap()["count"],
+            1
+        );
+        assert_eq!(
+            facets_w.iter().find(|f| f["name"] == "work").unwrap()["count"],
+            2
+        );
+        assert_eq!(
+            facets_w.iter().find(|f| f["name"] == "m").unwrap()["count"],
+            2
+        );
+
+        // Spot-check fixture assertions:
+        // Visible s1 item: stream is "s1", concurrent is true, segment stream is "s1" (not null)
+        let s1_item = items.iter().find(|i| i["id"] == "spot_s1").unwrap();
+        assert_eq!(s1_item["stream"], "s1");
+        assert_eq!(s1_item["concurrent"], true);
+        assert_eq!(s1_item["segments"][0]["stream"], "s1");
+
+        // With include_hidden=1, hidden row on s1 is concurrent false
+        let hid_item = all_items.iter().find(|i| i["id"] == "spot_hid").unwrap();
+        assert_eq!(hid_item["concurrent"], false);
+
+        // 2. Day 20260716:
+        // Field fixtures: hidden reasons, edits kinds, edited_by_owner, minute cases, malformed activities.jsonl
+        std::fs::create_dir_all(root.path().join("chronicle/20260716/s1/100000_3600")).unwrap();
+        std::fs::create_dir_all(root.path().join("chronicle/20260716/s1/101500_600")).unwrap();
+        std::fs::create_dir_all(root.path().join("chronicle/20260716/s1/235000_1200")).unwrap();
+
+        // Write malformed activities.jsonl under work:
+        write(
+            &root.path().join("facets/work/activities/activities.jsonl"),
+            "{\"id\":\"project_review\",\"name\":\"Project Review\"}\n{not valid json\n",
+        );
+
+        let day16_rows = r#"{"id":"h_owner","activity":"project_review","title":"H Owner","hidden":true,"edits":[{"actor":"owner:mute","fields":["hidden"],"note":"muted"}]}
+{"id":"h_cmd","activity":"team_sync","title":"H Cmd","hidden":true,"edits":[{"actor":"cli:mute","fields":["hidden"],"note":"cmd mute"}]}
+{"id":"h_repl","activity":"project_review","title":"H Repl","hidden":true,"edits":[{"actor":"schedule","fields":["hidden"],"note":"superseded by new_plan"}]}
+{"id":"h_canc","activity":"project_review","title":"H Canc","hidden":true,"cancelled":true}
+{"id":"h_other","activity":"project_review","title":"H Other","hidden":true}
+{"id":"h_canc_owner","activity":"project_review","title":"H Canc Owner","hidden":true,"cancelled":true,"edits":[{"actor":"schedule","fields":["cancelled"],"note":"cancelled by schedule"},{"actor":"owner:mute","fields":["hidden"],"note":"muted by owner"}]}
+{"id":"v_open","activity":"project_review","title":"V Open","hidden":false,"source":"user"}
+{"id":"v_plan","activity":"project_review","title":"V Plan","hidden":false,"source":"anticipated"}
+{"id":"v_detected","activity":"project_review","title":"V Detected","hidden":false}
+{"id":"v_other","activity":"project_review","title":"V Other","hidden":false,"source":"custom"}
+{"id":"rec_edits","activity":"project_review","title":"Edits Rec","hidden":false,"source":"user","edits":[{"actor":"activity","note":"grew"},{"actor":"schedule","note":"created by schedule"},{"actor":"schedule","note":"superseded by x"},{"actor":"schedule","note":"updated by schedule"},{"actor":"owner:update","fields":["title"],"note":"updated"},{"actor":"owner:mute","fields":["hidden"],"note":"muted"},{"actor":"owner:unmute","fields":["hidden"],"note":"unmuted"},{"actor":"cli:update","fields":["title"],"note":"cli update"},{"actor":"cli:mute","fields":["hidden"],"note":"cli mute"},{"actor":"cli:unmute","fields":["hidden"],"note":"cli unmute"},{"actor":"cli:create","fields":["title"],"note":"cli create"},{"actor":"owner:other","note":"other"},{"actor":"schedule","note":"cancelled by schedule","fields":["cancelled"]},{"actor":"schedule","note":"not cancelled","fields":["title"]}]}
+{"id":"rec_owner1","activity":"project_review","title":"Owner 1","hidden":false,"source":"user","edits":[{"actor":"cli:create","fields":["title"]}]}
+{"id":"rec_owner2","activity":"project_review","title":"Owner 2","hidden":false,"source":"user","edits":[{"actor":"schedule","fields":["title"]}]}
+{"id":"rec_owner3","activity":"project_review","title":"Owner 3","hidden":false,"source":"user","edits":[{"actor":"cli:update","fields":["title"]}]}
+{"id":"rec_owner4","activity":"project_review","title":"Owner 4","hidden":false,"source":"user","edits":[{"actor":"owner:update","fields":["title"]}]}
+{"id":"rec_owner5","activity":"project_review","title":"Owner 5","hidden":false,"source":"user","edits":[{"actor":"owner:update","fields":["description"]}]}
+{"id":"rec_owner6","activity":"project_review","title":"Owner 6","hidden":false,"source":"user","edits":[{"actor":"owner:update","fields":["details"]}]}
+{"id":"rec_owner7","activity":"project_review","title":"Owner 7","hidden":false,"source":"user","edits":[{"actor":"owner:update","fields":["hidden"]}]}
+{"id":"plan_null_start","activity":"project_review","title":"Plan Null Start","hidden":false,"source":"anticipated","start":null,"end":"10:00:00"}
+{"id":"plan_midnight","activity":"project_review","title":"Plan Midnight","hidden":false,"source":"anticipated","start":"23:00:00","end":"00:30:00"}
+{"id":"plan_same","activity":"project_review","title":"Plan Same","hidden":false,"source":"anticipated","start":"09:00:00","end":"09:00:00"}
+{"id":"det_midnight","activity":"project_review","title":"Det Midnight","hidden":false,"segments":["235000_1200"],"stream":"s1"}
+{"id":"det_longer","activity":"project_review","title":"Det Longer","hidden":false,"segments":["100000_3600","101500_600"],"stream":"s1"}
+{"id":"det_no_seg","activity":"project_review","title":"Det No Seg","hidden":false}
+{"id":"story_and_people","activity":"project_review","title":"Story & People","hidden":false,"source":"user","story":{"body":"Discussed quarterly roadmap"},"participation":[{"name":"Carol","role":"attendee"},{"name":"Dave","role":"organizer"}]}"#;
+        write(
+            &root.path().join("facets/work/activities/20260716.jsonl"),
+            day16_rows,
+        );
+
+        // GET .../view?include_hidden=1 on 20260716
+        let (status16, res16) = request(
+            gated(root.path(), fixed_clock()),
+            "GET",
+            "/app/activities/api/day/20260716/view?include_hidden=1",
+            None,
+        )
+        .await;
+        assert_eq!(status16, StatusCode::OK);
+        let items16 = res16["items"].as_array().unwrap();
+
+        // Malformed activities.jsonl: activity_label is activity id with '_' replaced by spaces
+        let team_sync = items16.iter().find(|i| i["id"] == "h_cmd").unwrap();
+        assert_eq!(team_sync["activity_label"], "team sync");
+        let proj_rev = items16.iter().find(|i| i["id"] == "v_open").unwrap();
+        assert_eq!(proj_rev["activity_label"], "project review");
+
+        // hidden_reason assertions
+        assert_eq!(
+            items16.iter().find(|i| i["id"] == "h_owner").unwrap()["hidden_reason"],
+            "owner"
+        );
+        assert_eq!(
+            items16.iter().find(|i| i["id"] == "h_cmd").unwrap()["hidden_reason"],
+            "command"
+        );
+        assert_eq!(
+            items16.iter().find(|i| i["id"] == "h_repl").unwrap()["hidden_reason"],
+            "replaced"
+        );
+        assert_eq!(
+            items16.iter().find(|i| i["id"] == "h_canc").unwrap()["hidden_reason"],
+            "cancelled"
+        );
+        assert_eq!(
+            items16.iter().find(|i| i["id"] == "h_other").unwrap()["hidden_reason"],
+            "other"
+        );
+        // A cancelled plan the owner later hid is "owner"
+        assert_eq!(
+            items16.iter().find(|i| i["id"] == "h_canc_owner").unwrap()["hidden_reason"],
+            "owner"
+        );
+        // hidden_reason is absent when item is not hidden
+        assert!(
+            items16
+                .iter()
+                .find(|i| i["id"] == "v_open")
+                .unwrap()
+                .get("hidden_reason")
+                .is_none()
+        );
+
+        // kind mapping
+        assert_eq!(
+            items16.iter().find(|i| i["id"] == "v_plan").unwrap()["kind"],
+            "plan"
+        );
+        assert_eq!(
+            items16.iter().find(|i| i["id"] == "v_open").unwrap()["kind"],
+            "added"
+        );
+        assert_eq!(
+            items16.iter().find(|i| i["id"] == "v_detected").unwrap()["kind"],
+            "detected"
+        );
+        assert_eq!(
+            items16.iter().find(|i| i["id"] == "v_other").unwrap()["kind"],
+            "other"
+        );
+
+        // edits[].kind mapping on rec_edits
+        let edits = items16.iter().find(|i| i["id"] == "rec_edits").unwrap()["edits"]
+            .as_array()
+            .unwrap();
+        assert_eq!(edits[0]["kind"], "grew");
+        assert_eq!(edits[1]["kind"], "plan_noticed");
+        assert_eq!(edits[2]["kind"], "plan_replaced");
+        assert_eq!(edits[3]["kind"], "plan_updated");
+        assert_eq!(edits[4]["kind"], "owner_update");
+        assert_eq!(edits[5]["kind"], "owner_hide");
+        assert_eq!(edits[6]["kind"], "owner_unhide");
+        assert_eq!(edits[7]["kind"], "command_update");
+        assert_eq!(edits[8]["kind"], "command_hide");
+        assert_eq!(edits[9]["kind"], "command_unhide");
+        assert_eq!(edits[10]["kind"], "command_create");
+        assert_eq!(edits[11]["kind"], "other");
+        // cancelled: true on edit only for schedule edit whose note contains cancelled and fields contains cancelled
+        assert_eq!(edits[12]["cancelled"], true);
+        assert!(edits[13].get("cancelled").is_none());
+
+        // edited_by_owner
+        assert_eq!(
+            items16.iter().find(|i| i["id"] == "rec_owner1").unwrap()["edited_by_owner"],
+            false
+        );
+        assert_eq!(
+            items16.iter().find(|i| i["id"] == "rec_owner2").unwrap()["edited_by_owner"],
+            false
+        );
+        assert_eq!(
+            items16.iter().find(|i| i["id"] == "rec_owner3").unwrap()["edited_by_owner"],
+            false
+        );
+        assert_eq!(
+            items16.iter().find(|i| i["id"] == "rec_owner4").unwrap()["edited_by_owner"],
+            true
+        );
+        assert_eq!(
+            items16.iter().find(|i| i["id"] == "rec_owner5").unwrap()["edited_by_owner"],
+            true
+        );
+        assert_eq!(
+            items16.iter().find(|i| i["id"] == "rec_owner6").unwrap()["edited_by_owner"],
+            true
+        );
+        assert_eq!(
+            items16.iter().find(|i| i["id"] == "rec_owner7").unwrap()["edited_by_owner"],
+            false
+        );
+
+        // Minute cases:
+        let p_null = items16
+            .iter()
+            .find(|i| i["id"] == "plan_null_start")
+            .unwrap();
+        assert!(p_null["start_min"].is_null());
+        assert_eq!(p_null["end_min"], 600);
+        assert!(p_null["start"].is_null());
+        assert_eq!(p_null["end"], "10:00");
+
+        let p_mid = items16.iter().find(|i| i["id"] == "plan_midnight").unwrap();
+        assert_eq!(p_mid["start_min"], 1380);
+        assert_eq!(p_mid["end_min"], 1470);
+        assert_eq!(p_mid["start"], "23:00");
+        assert_eq!(p_mid["end"], "00:30");
+
+        let p_same = items16.iter().find(|i| i["id"] == "plan_same").unwrap();
+        assert_eq!(p_same["start_min"], 540);
+        assert_eq!(p_same["end_min"], 540);
+
+        let d_mid = items16.iter().find(|i| i["id"] == "det_midnight").unwrap();
+        assert!(d_mid["end_min"].as_u64().unwrap() > 1440);
+
+        let d_longer = items16.iter().find(|i| i["id"] == "det_longer").unwrap();
+        assert_eq!(d_longer["start_min"], 600);
+        assert_eq!(d_longer["end_min"], 660);
+
+        let d_no_seg = items16.iter().find(|i| i["id"] == "det_no_seg").unwrap();
+        assert!(d_no_seg["start_min"].is_null());
+        assert!(d_no_seg["end_min"].is_null());
+
+        // summary and people
+        let sp = items16
+            .iter()
+            .find(|i| i["id"] == "story_and_people")
+            .unwrap();
+        assert_eq!(sp["summary"], "Discussed quarterly roadmap");
+        assert_eq!(sp["people"], serde_json::json!(["Carol"]));
+
+        // Empty day and ?facet= of an undeclared name return empty items, every declared facet at count 0, hidden_count 0
+        let (status_emp, res_emp) = request(
+            gated(root.path(), fixed_clock()),
+            "GET",
+            "/app/activities/api/day/20260717/view?facet=undeclared",
+            None,
+        )
+        .await;
+        assert_eq!(status_emp, StatusCode::OK);
+        assert_eq!(res_emp["items"].as_array().unwrap().len(), 0);
+        assert_eq!(res_emp["hidden_count"], 0);
+        let emp_facets = res_emp["facets"].as_array().unwrap();
+        for f in emp_facets {
+            assert_eq!(f["count"], 0);
+        }
+
+        // An invalid day (2026-09-01, not eight digits) returns 404 with error invalid_day
+        let (status_inv, res_inv) = request(
+            gated(root.path(), fixed_clock()),
+            "GET",
+            "/app/activities/api/day/2026-09-01/view",
+            None,
+        )
+        .await;
+        assert_eq!(status_inv, StatusCode::NOT_FOUND);
+        assert_eq!(res_inv["reason_code"], "invalid_day");
+        assert_eq!(res_inv["detail"], "Day not found");
+        assert_eq!(res_inv["error"], "that day couldn't be used.");
+    }
+
+    #[tokio::test]
+    async fn activities_index_and_stats_contract() {
+        let root = tempfile::Builder::new().tempdir_in("/var/tmp").unwrap();
+        write(
+            &root.path().join("config/journal.json"),
+            r#"{"setup":{"completed_at":1767225600}}"#,
+        );
+
+        // Empty journal index and stats
+        let (status_emp_idx, res_emp_idx) = request(
+            gated(root.path(), fixed_clock()),
+            "GET",
+            "/app/activities/api/index",
+            None,
+        )
+        .await;
+        assert_eq!(status_emp_idx, StatusCode::OK);
+        assert_eq!(
+            res_emp_idx,
+            serde_json::json!({"coverage": null, "months": {}})
+        );
+
+        let (status_emp_st, res_emp_st) = request(
+            gated(root.path(), fixed_clock()),
+            "GET",
+            "/app/activities/api/stats/202603",
+            None,
+        )
+        .await;
+        assert_eq!(status_emp_st, StatusCode::OK);
+        assert_eq!(res_emp_st, serde_json::json!({}));
+
+        // Invalid month 2026-09 returns 400 invalid_month
+        let (status_inv_m, res_inv_m) = request(
+            gated(root.path(), fixed_clock()),
+            "GET",
+            "/app/activities/api/stats/2026-09",
+            None,
+        )
+        .await;
+        assert_eq!(status_inv_m, StatusCode::BAD_REQUEST);
+        assert_eq!(res_inv_m["reason_code"], "invalid_month");
+        assert_eq!(res_inv_m["detail"], "Invalid month format, expected YYYYMM");
+
+        // Six-digit 202613 is 200 and {}
+        let (status_13, res_13) = request(
+            gated(root.path(), fixed_clock()),
+            "GET",
+            "/app/activities/api/stats/202613",
+            None,
+        )
+        .await;
+        assert_eq!(status_13, StatusCode::OK);
+        assert_eq!(res_13, serde_json::json!({}));
+
+        // Now populate facets work and quiet (muted)
+        solstone_core_facets::create_facet(root.path(), "work", "Work", "", "", "", None).unwrap();
+        solstone_core_facets::create_facet(root.path(), "quiet", "Quiet", "", "", "", None)
+            .unwrap();
+        write(
+            &root.path().join("facets/quiet/facet.json"),
+            r#"{"name":"Quiet","muted":true}"#,
+        );
+
+        // Non-day files in activities directory
+        write(
+            &root.path().join("facets/work/activities/activities.jsonl"),
+            "{\"id\":\"act\"}\n",
+        );
+        write(
+            &root.path().join("facets/work/activities/not_a_day.txt"),
+            "not a day\n",
+        );
+        write(&root.path().join("facets/work/activities/.lock"), "");
+
+        // 20260301: 1 visible, 1 hidden -> visible count 1
+        let w_0301 = r#"{"id":"w1","hidden":false,"source":"user"}
+{"id":"w2","hidden":true,"source":"user"}"#;
+        write(
+            &root.path().join("facets/work/activities/20260301.jsonl"),
+            w_0301,
+        );
+
+        // 20260302: 1 hidden -> visible count 0 -> absent
+        let w_0302 = r#"{"id":"w3","hidden":true,"source":"user"}"#;
+        write(
+            &root.path().join("facets/work/activities/20260302.jsonl"),
+            w_0302,
+        );
+
+        // 20260405: 2 visible
+        let w_0405 = r#"{"id":"w4","hidden":false,"source":"user"}
+{"id":"w5","hidden":false,"source":"user"}"#;
+        write(
+            &root.path().join("facets/work/activities/20260405.jsonl"),
+            w_0405,
+        );
+
+        // Future day 20990115: 1 visible plan
+        let w_future = r#"{"id":"plan_future","hidden":false,"source":"anticipated","start":"10:00:00","end":"11:00:00"}"#;
+        write(
+            &root.path().join("facets/work/activities/20990115.jsonl"),
+            w_future,
+        );
+
+        // Under quiet: 20260301 has 1 visible, 20260303 has 3 visible
+        let q_0301 = r#"{"id":"q1","hidden":false,"source":"user"}"#;
+        write(
+            &root.path().join("facets/quiet/activities/20260301.jsonl"),
+            q_0301,
+        );
+        let q_0303 = r#"{"id":"q2","hidden":false,"source":"user"}
+{"id":"q3","hidden":false,"source":"user"}
+{"id":"q4","hidden":false,"source":"user"}"#;
+        write(
+            &root.path().join("facets/quiet/activities/20260303.jsonl"),
+            q_0303,
+        );
+
+        // Unscoped index:
+        let (status_idx, res_idx) = request(
+            gated(root.path(), fixed_clock()),
+            "GET",
+            "/app/activities/api/index",
+            None,
+        )
+        .await;
+        assert_eq!(status_idx, StatusCode::OK);
+        assert!(res_idx.get("coverage").is_some());
+        assert!(res_idx.get("months").is_some());
+        let months = res_idx["months"].as_object().unwrap();
+        // months keys are only YYYYMM
+        for k in months.keys() {
+            assert_eq!(k.len(), 6);
+            assert!(k.chars().all(|c| c.is_ascii_digit()));
+        }
+        // Unscoped omits muted facet quiet
+        assert!(months.contains_key("202603"));
+        assert!(months.contains_key("202604"));
+        assert!(months.contains_key("209901"));
+
+        // Unscoped stats for 202603: {YYYYMMDD: count} and nothing else
+        let (status_st, res_st) = request(
+            gated(root.path(), fixed_clock()),
+            "GET",
+            "/app/activities/api/stats/202603",
+            None,
+        )
+        .await;
+        assert_eq!(status_st, StatusCode::OK);
+        assert_eq!(res_st, serde_json::json!({"20260301": 1}));
+
+        // ?facet= limits both payloads to that facet, including muted facet
+        let (status_q_st, res_q_st) = request(
+            gated(root.path(), fixed_clock()),
+            "GET",
+            "/app/activities/api/stats/202603?facet=quiet",
+            None,
+        )
+        .await;
+        assert_eq!(status_q_st, StatusCode::OK);
+        assert_eq!(res_q_st, serde_json::json!({"20260301": 1, "20260303": 3}));
+
+        let (status_q_idx, res_q_idx) = request(
+            gated(root.path(), fixed_clock()),
+            "GET",
+            "/app/activities/api/index?facet=quiet",
+            None,
+        )
+        .await;
+        assert_eq!(status_q_idx, StatusCode::OK);
+        let q_months = res_q_idx["months"].as_object().unwrap();
+        assert!(q_months.contains_key("202603"));
+        assert!(!q_months.contains_key("202604"));
+    }
+
+    #[tokio::test]
+    async fn activities_owner_marker_actor_and_audit_log() {
+        let root = tempfile::Builder::new().tempdir_in("/var/tmp").unwrap();
+        write(
+            &root.path().join("config/journal.json"),
+            r#"{"setup":{"completed_at":1767225600}}"#,
+        );
+        solstone_core_facets::create_facet(root.path(), "work", "Work", "", "", "", None).unwrap();
+
+        // Seed record 1: id rec_owner
+        let seed1 = r#"{"id":"rec_owner","activity":"meeting","title":"Seed Owner","description":"","details":"","segments":[],"active_entities":[],"created_at":1767225600000,"source":"user","hidden":false,"edits":[]}"#;
+        write(
+            &root.path().join("facets/work/activities/20260510.jsonl"),
+            &format!("{seed1}\n"),
+        );
+
+        // Helper to send request with x-solstone-actor header
+        let send_with_marker = |method: &'static str,
+                                uri: String,
+                                actor: Option<&'static str>,
+                                body: Option<Value>| {
+            let app = gated(root.path(), fixed_clock());
+            async move {
+                let mut req = Request::builder().method(method).uri(uri);
+                if let Some(a) = actor {
+                    req = req.header("x-solstone-actor", a);
+                }
+                if body.is_some() {
+                    req = req.header(header::CONTENT_TYPE, "application/json");
+                }
+                let body_bytes = body
+                    .map(|b| Body::from(serde_json::to_vec(&b).unwrap()))
+                    .unwrap_or_else(Body::empty);
+                let res = app.oneshot(req.body(body_bytes).unwrap()).await.unwrap();
+                let status = res.status();
+                let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+                let val: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                (status, val)
+            }
+        };
+
+        // 1. With X-Solstone-Actor: owner
+        let (status, res) = send_with_marker(
+            "POST",
+            "/app/activities/api/day/20260510/record/rec_owner/update?facet=work".into(),
+            Some("owner"),
+            Some(serde_json::json!({"patch":{"title":"Updated Owner"}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(res["record"]["edits"][0]["actor"], "owner:update");
+
+        let (status, res) = send_with_marker(
+            "POST",
+            "/app/activities/api/day/20260510/record/rec_owner/mute?facet=work".into(),
+            Some("owner"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(res["record"]["edits"][1]["actor"], "owner:mute");
+
+        let (status, res) = send_with_marker(
+            "POST",
+            "/app/activities/api/day/20260510/record/rec_owner/unmute?facet=work".into(),
+            Some("owner"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(res["record"]["edits"][2]["actor"], "owner:unmute");
+
+        // Action log check for owner calls: source "app", actor "activities"
+        let logs_raw =
+            std::fs::read_to_string(root.path().join("facets/work/logs/20260510.jsonl")).unwrap();
+        let log_lines: Vec<Value> = logs_raw
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(log_lines.len(), 3);
+        for entry in &log_lines[0..3] {
+            assert_eq!(entry["source"], "app");
+            assert_eq!(entry["actor"], "activities");
+        }
+
+        // 2. The same three routes with no header on a different record store cli:update, cli:mute, cli:unmute
+        let seed2 = r#"{"id":"rec_cli","activity":"meeting","title":"Seed Cli","description":"","details":"","segments":[],"active_entities":[],"created_at":1767225600000,"source":"user","hidden":false,"edits":[]}"#;
+        let _ = solstone_core_facets::append_activity_record(
+            root.path(),
+            "work",
+            "20260510",
+            serde_json::from_str(seed2).unwrap(),
+        )
+        .unwrap();
+
+        let (status, res) = send_with_marker(
+            "POST",
+            "/app/activities/api/day/20260510/record/rec_cli/update?facet=work".into(),
+            None,
+            Some(serde_json::json!({"patch":{"title":"Updated Cli"}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(res["record"]["edits"][0]["actor"], "cli:update");
+
+        let (status, res) = send_with_marker(
+            "POST",
+            "/app/activities/api/day/20260510/record/rec_cli/mute?facet=work".into(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(res["record"]["edits"][1]["actor"], "cli:mute");
+
+        let (status, res) = send_with_marker(
+            "POST",
+            "/app/activities/api/day/20260510/record/rec_cli/unmute?facet=work".into(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(res["record"]["edits"][2]["actor"], "cli:unmute");
+
+        let logs_raw2 =
+            std::fs::read_to_string(root.path().join("facets/work/logs/20260510.jsonl")).unwrap();
+        let log_lines2: Vec<Value> = logs_raw2
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(log_lines2.len(), 6);
+        for entry in &log_lines2[3..6] {
+            assert_eq!(entry["source"], "call");
+            assert_eq!(entry["actor"], "agent");
+        }
+
+        // 3. Create with header still stores cli:create and logs source "call", actor "agent"
+        let (status, res) = send_with_marker(
+            "POST",
+            "/app/activities/api/day/20260510/records?facet=work".into(),
+            Some("owner"),
+            Some(serde_json::json!({"title":"Created With Header","activity":"meeting"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(res["record"]["edits"][0]["actor"], "cli:create");
+
+        let logs_raw3 =
+            std::fs::read_to_string(root.path().join("facets/work/logs/20260510.jsonl")).unwrap();
+        let log_lines3: Vec<Value> = logs_raw3
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(log_lines3.len(), 7);
+        assert_eq!(log_lines3[6]["source"], "call");
+        assert_eq!(log_lines3[6]["actor"], "agent");
+
+        // 4. Header value owner:update or Owner is the command path (cli:*)
+        let seed3 = r#"{"id":"rec_bad_actor1","activity":"meeting","title":"Seed Bad 1","description":"","details":"","segments":[],"active_entities":[],"created_at":1767225600000,"source":"user","hidden":false,"edits":[]}"#;
+        let _ = solstone_core_facets::append_activity_record(
+            root.path(),
+            "work",
+            "20260510",
+            serde_json::from_str(seed3).unwrap(),
+        )
+        .unwrap();
+        let (_, res) = send_with_marker(
+            "POST",
+            "/app/activities/api/day/20260510/record/rec_bad_actor1/update?facet=work".into(),
+            Some("owner:update"),
+            Some(serde_json::json!({"patch":{"title":"Updated Bad 1"}})),
+        )
+        .await;
+        assert_eq!(res["record"]["edits"][0]["actor"], "cli:update");
+
+        let seed4 = r#"{"id":"rec_bad_actor2","activity":"meeting","title":"Seed Bad 2","description":"","details":"","segments":[],"active_entities":[],"created_at":1767225600000,"source":"user","hidden":false,"edits":[]}"#;
+        let _ = solstone_core_facets::append_activity_record(
+            root.path(),
+            "work",
+            "20260510",
+            serde_json::from_str(seed4).unwrap(),
+        )
+        .unwrap();
+        let (_, res) = send_with_marker(
+            "POST",
+            "/app/activities/api/day/20260510/record/rec_bad_actor2/update?facet=work".into(),
+            Some("Owner"),
+            Some(serde_json::json!({"patch":{"title":"Updated Bad 2"}})),
+        )
+        .await;
+        assert_eq!(res["record"]["edits"][0]["actor"], "cli:update");
     }
 }

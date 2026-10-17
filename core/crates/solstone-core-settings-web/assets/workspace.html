@@ -3158,9 +3158,9 @@ function switchSection(sectionId, updateHash = true, loadSection = true, replace
   if (updateHash) {
     const nextHash = '#' + sectionId;
     if (window.location.hash !== nextHash) {
-      // A retired fragment is a rewrite of the address the owner already has,
-      // not a new place. Pushing it kept #observer on the history stack, so
-      // Back landed on it, got redirected, and never left the page (F-19).
+      // replaceHash rewrites the address instead of adding a history entry,
+      // so a corrected address is not a new place Back has to step through
+      // (F-19).
       if (replaceHash) history.replaceState(null, '', nextHash);
       else history.pushState(null, '', nextHash);
     }
@@ -3394,13 +3394,17 @@ document.getElementById('navSelect').addEventListener('change', (e) => {
   switchSection(e.target.value);
 });
 
+// Devices moved to the network app; an old settings link lands there.
+function redirectRetiredSection(raw) {
+  if (raw !== 'devices' && raw !== 'observer') return false;
+  window.location.replace('/app/network/#devices');
+  return true;
+}
+
 // Hash-based navigation
 function initFromHash() {
   const raw = window.location.hash.slice(1);
-  if (raw === 'devices' || raw === 'observer') {
-    window.location.replace('/app/network/#devices');
-    return;
-  }
+  if (redirectRetiredSection(raw)) return;
   if (raw && VALID_SECTIONS.includes(raw)) {
     switchSection(raw, false, true, true);
   }
@@ -3408,10 +3412,7 @@ function initFromHash() {
 
 window.addEventListener('hashchange', () => {
   const raw = window.location.hash.slice(1);
-  if (raw === 'devices' || raw === 'observer') {
-    window.location.replace('/app/network/#devices');
-    return;
-  }
+  if (redirectRetiredSection(raw)) return;
   if (raw && VALID_SECTIONS.includes(raw)) {
     switchSection(raw, false, true, true);
   } else if (!raw) {

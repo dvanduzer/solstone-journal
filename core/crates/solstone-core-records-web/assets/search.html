@@ -82,20 +82,14 @@
   const recordTime=Number.isFinite(hit.ts)&&hit.ts>0?window.JournalFormat.time(hit.ts):'';
   const rawStream=String(hit.stream||'').trim();
   const streamLabel=rawStream&&window.JournalFormat?window.JournalFormat.stream(rawStream):'';
+  // Don't say the type twice: drop the agent label when the stream label
+  // already says it, as its what word ("Audio" beside an audio label) or as
+  // an import ("Imported" beside an imported label).
   let showAgentLabel=Boolean(hit.agent_label);
-  if(showAgentLabel&&streamLabel&&streamLabel!=='your terminal'){
-   const agentLower=String(hit.agent_label).trim().toLowerCase();
-   if(rawStream.startsWith('import.')&&streamLabel.endsWith(' · imported')){
-    showAgentLabel=false;
-   } else {
-    const parts=streamLabel.split(' · ');
-    if(parts.length>1){
-     const what=parts[parts.length-1].trim().toLowerCase();
-     if(['audio','screen','camera','location'].includes(what)&&(what===agentLower||agentLower.includes(what))){
-      showAgentLabel=false;
-     }
-    }
-   }
+  if(showAgentLabel&&rawStream){
+   const agentKey=String(hit.agent_label).trim().toLowerCase();
+   const says=window.JournalFormat.streamSays(rawStream);
+   if((says.imported&&agentKey==='imported')||(says.what&&agentKey===says.what))showAgentLabel=false;
   }
   if(showAgentLabel)meta.append(node('span','',hit.agent_label));
   if(hit.facet_title)meta.append(node('span','',hit.facet_title));

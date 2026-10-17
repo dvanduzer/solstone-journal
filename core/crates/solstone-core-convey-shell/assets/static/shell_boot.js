@@ -358,9 +358,11 @@
 
   async function boot() {
     const startedAt = Date.now();
+    // The provenance table loads beside the shell API; the workspace mounts
+    // once it settles or 1500 ms after boot began, whichever is first.
     const labelsPromise = (window.JournalFormat && typeof window.JournalFormat.beginStreamLabels === 'function')
       ? window.JournalFormat.beginStreamLabels()
-      : fetch('/api/streams/labels').then(res => res.json());
+      : Promise.resolve(false);
 
     const context = pathContext();
     applyChromeCopy();
@@ -396,11 +398,15 @@
       });
 
       const winner = await Promise.race([
-        labelsPromise.then(() => 'labels').catch(() => 'labels'),
+        labelsPromise.then(() => 'labels', () => 'labels'),
         raceTimeoutPromise,
       ]);
       if (winner === 'labels' && raceTimerId !== null) {
         clearTimeout(raceTimerId);
+      }
+      if (winner === 'timeout' && window.JournalFormat
+        && typeof window.JournalFormat.logStreamLabelProblem === 'function') {
+        window.JournalFormat.logStreamLabelProblem('slow');
       }
 
       await window.mountWorkspaceFragment(app.workspace_url, { appName: app.name });
