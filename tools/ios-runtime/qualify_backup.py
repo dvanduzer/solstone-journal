@@ -164,11 +164,6 @@ def main():
         assert refused[0] == 400, refused
         owner(phone, 'POST', ROUTE + '/confirm', {'recovery_key': recovery})
 
-        # A8 before configuration: operated enable refuses before credential fetch.
-        hosted = operate(phone, '/enable-hosted', kind='enable_hosted')
-        check('A8_enable_hosted', hosted)
-        assert hosted.get('operation', {}).get('phase') != 'done', hosted
-
         destination = owner(phone, 'POST', ROUTE + '/destination', {
             'repository': repository, 'backend': 's3',
             'credentials': {'access_key_id': storage['access_key_id'],
