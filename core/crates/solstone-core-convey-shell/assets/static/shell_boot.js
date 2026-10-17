@@ -357,6 +357,13 @@
   }
 
   async function boot() {
+    const startedAt = Date.now();
+    // The provenance table loads beside the shell API; the workspace mounts
+    // once it settles or 1500 ms after boot began, whichever is first.
+    const labelsPromise = (window.JournalFormat && typeof window.JournalFormat.beginStreamLabels === 'function')
+      ? window.JournalFormat.beginStreamLabels()
+      : Promise.resolve(false);
+
     const context = pathContext();
     applyChromeCopy();
     try {
@@ -381,6 +388,27 @@
       if (!app.workspace_url) {
         throw new Error('Workspace unavailable');
       }
+
+      let raceTimerId = null;
+      const raceTimeoutPromise = new Promise((resolve) => {
+        const remaining = Math.max(0, 1500 - (Date.now() - startedAt));
+        raceTimerId = setTimeout(() => {
+          resolve('timeout');
+        }, remaining);
+      });
+
+      const winner = await Promise.race([
+        labelsPromise.then(() => 'labels', () => 'labels'),
+        raceTimeoutPromise,
+      ]);
+      if (winner === 'labels' && raceTimerId !== null) {
+        clearTimeout(raceTimerId);
+      }
+      if (winner === 'timeout' && window.JournalFormat
+        && typeof window.JournalFormat.logStreamLabelProblem === 'function') {
+        window.JournalFormat.logStreamLabelProblem('slow');
+      }
+
       await window.mountWorkspaceFragment(app.workspace_url, { appName: app.name });
     } catch (error) {
       if (window.logError) {

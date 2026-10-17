@@ -1068,3 +1068,788 @@ fn an_opus_import_keeps_its_opening_packet() {
         .join("chronicle/20250717/import.audio/130000_300/imported_audio.opus");
     assert_eq!(opening_packet(&chunk), (source_pts, source_bytes));
 }
+
+#[cfg(feature = "full-tests")]
+mod audio_archive {
+    use super::*;
+
+    fn write_test_ogg_page(
+        writer: &mut impl std::io::Write,
+        header_type: u8,
+        granule_pos: i64,
+        serial: u32,
+        page_seq: u32,
+        payload: &[u8],
+    ) {
+        let mut segment_table = Vec::new();
+        let mut rem = payload.len();
+        while rem >= 255 {
+            segment_table.push(255u8);
+            rem -= 255;
+        }
+        segment_table.push(rem as u8);
+
+        let mut header = vec![0u8; 27 + segment_table.len()];
+        header[0..4].copy_from_slice(b"OggS");
+        header[4] = 0;
+        header[5] = header_type;
+        header[6..14].copy_from_slice(&granule_pos.to_le_bytes());
+        header[14..18].copy_from_slice(&serial.to_le_bytes());
+        header[18..22].copy_from_slice(&page_seq.to_le_bytes());
+        header[22..26].copy_from_slice(&0u32.to_le_bytes());
+        header[26] = segment_table.len() as u8;
+        header[27..27 + segment_table.len()].copy_from_slice(&segment_table);
+
+        let mut full = header;
+        full.extend_from_slice(payload);
+        let checksum = full.iter().fold(0_u32, |crc, byte| {
+            let mut value = crc ^ (u32::from(*byte) << 24);
+            for _ in 0..8 {
+                value = if value & 0x8000_0000 != 0 {
+                    (value << 1) ^ 0x04C1_1DB7
+                } else {
+                    value << 1
+                };
+            }
+            value
+        });
+        full[22..26].copy_from_slice(&checksum.to_le_bytes());
+        writer.write_all(&full).unwrap();
+    }
+
+    fn write_test_opus_file(path: &Path, duration_ms: i64) {
+        let mut file = fs::File::create(path).unwrap();
+        let serial = 0x12345678;
+        // Page 0: OpusHead (BOS)
+        let head = b"OpusHead\x01\x01\x00\x00\x80\xbb\x00\x00\x00\x00\x00";
+        write_test_ogg_page(&mut file, 0x02, 0, serial, 0, head);
+        // Page 1: OpusTags
+        let tags = b"OpusTags\x08\x00\x00\x00solstone\x00\x00\x00\x00";
+        write_test_ogg_page(&mut file, 0x00, 0, serial, 1, tags);
+        // Each packet has its own lacing terminator and advancing granule.
+        let packet_count = (duration_ms / 20).max(1);
+        for index in 0..packet_count {
+            write_test_ogg_page(
+                &mut file,
+                if index + 1 == packet_count { 4 } else { 0 },
+                (index + 1) * 960,
+                serial,
+                (index + 2) as u32,
+                &[0xf8, 0xff, 0xfe],
+            );
+        }
+    }
+
+    #[test]
+    fn audio_archive_folder_zone_required() {
+        let journal = tempfile::tempdir().unwrap();
+        write_utc_zone(journal.path());
+        let folder = tempfile::tempdir().unwrap();
+        write_test_opus_file(&folder.path().join("rec.opus"), 1000);
+        let run = run_at(
+            journal.path(),
+            &["--audio-archive", folder.path().to_str().unwrap()],
+            |name| (name == "SOL_SKIP_SUPERVISOR_CHECK").then(|| "1".to_owned()),
+            || false,
+        );
+        assert_eq!(run.exit_code, 1);
+        assert!(run.stderr.contains("--source-zone"));
+    }
+
+    #[test]
+    fn audio_archive_manifest_offset_instant_does_not_need_the_flag() {
+        let journal = tempfile::tempdir().unwrap();
+        write_utc_zone(journal.path());
+        let folder = tempfile::tempdir().unwrap();
+        write_test_opus_file(&folder.path().join("rec.opus"), 1000);
+        let manifest_file = folder.path().join("manifest.json");
+        fs::write(
+            &manifest_file,
+            r#"{"members":[{"path":"rec.opus","instant":"2026-08-11T12:00:00Z"}]}"#,
+        )
+        .unwrap();
+        let run = run_at(
+            journal.path(),
+            &[
+                "--audio-archive",
+                manifest_file.to_str().unwrap(),
+                "--dry-run",
+            ],
+            |name| (name == "SOL_SKIP_SUPERVISOR_CHECK").then(|| "1".to_owned()),
+            || false,
+        );
+        assert_eq!(run.exit_code, 0, "stderr={}", run.stderr);
+        assert!(run.stdout.contains("audio archive preview:"));
+    }
+
+    #[test]
+    fn audio_archive_agreeing_evidence_included() {
+        let journal = tempfile::tempdir().unwrap();
+        write_utc_zone(journal.path());
+        let folder = tempfile::tempdir().unwrap();
+        let name = "limitless_pendant_2026-08-11T12-00-00_to_2026-08-11T12-05-00.opus";
+        write_test_opus_file(&folder.path().join(name), 1000);
+        let manifest_file = folder.path().join("manifest.json");
+        fs::write(
+        &manifest_file,
+        format!(
+            r#"{{"members":[{{"path":"{name}","instant":"2026-08-11T12:00:00Z","source_zone":"UTC"}}]}}"#
+        ),
+    )
+    .unwrap();
+        let run = run_at(
+            journal.path(),
+            &[
+                "--audio-archive",
+                manifest_file.to_str().unwrap(),
+                "--dry-run",
+                "--json",
+            ],
+            |name| (name == "SOL_SKIP_SUPERVISOR_CHECK").then(|| "1".to_owned()),
+            || false,
+        );
+        assert_eq!(run.exit_code, 0, "stderr={}", run.stderr);
+        let parsed: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
+        assert_eq!(parsed["members"], 1);
+    }
+
+    #[test]
+    fn audio_archive_selected_manifest_fields_can_conflict() {
+        let journal = tempfile::tempdir().unwrap();
+        write_utc_zone(journal.path());
+        let folder = tempfile::tempdir().unwrap();
+        let name = "limitless_pendant_2026-08-11T12-00-00_to_2026-08-11T12-05-00.opus";
+        write_test_opus_file(&folder.path().join(name), 1000);
+        let manifest_file = folder.path().join("manifest.json");
+        fs::write(
+        &manifest_file,
+        format!(
+            r#"{{"members":[{{"path":"{name}","instant":"2026-08-11T18:00:00Z","local_civil":"2026-08-11T12:00:00","source_zone":"UTC"}}]}}"#
+        ),
+    )
+    .unwrap();
+        let run = run_at(
+            journal.path(),
+            &[
+                "--audio-archive",
+                manifest_file.to_str().unwrap(),
+                "--dry-run",
+                "--json",
+            ],
+            |name| (name == "SOL_SKIP_SUPERVISOR_CHECK").then(|| "1".to_owned()),
+            || false,
+        );
+        assert_eq!(run.exit_code, 0, "stderr={}", run.stderr);
+        let parsed: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
+        assert_eq!(parsed["tiles"], 0);
+        assert_eq!(parsed["left_out"]["conflicting_evidence"], 1);
+    }
+
+    #[test]
+    fn audio_archive_dry_run_creates_no_run_directory() {
+        let journal = tempfile::tempdir().unwrap();
+        write_utc_zone(journal.path());
+        let folder = tempfile::tempdir().unwrap();
+        write_test_opus_file(&folder.path().join("rec.opus"), 1000);
+        let manifest_file = folder.path().join("manifest.json");
+        fs::write(
+            &manifest_file,
+            r#"{"members":[{"path":"rec.opus","instant":"2026-08-11T12:00:00Z"}]}"#,
+        )
+        .unwrap();
+        let run = run_at(
+            journal.path(),
+            &[
+                "--audio-archive",
+                manifest_file.to_str().unwrap(),
+                "--dry-run",
+            ],
+            |name| (name == "SOL_SKIP_SUPERVISOR_CHECK").then(|| "1".to_owned()),
+            || false,
+        );
+        assert_eq!(run.exit_code, 0);
+        assert!(!journal.path().join("imports").exists());
+    }
+
+    #[test]
+    fn audio_archive_uses_the_admitted_plan_for_its_preview() {
+        let journal = tempfile::tempdir().unwrap();
+        write_utc_zone(journal.path());
+        let args = vec![
+            "--audio-archive".to_owned(),
+            "/path/to/archive".to_owned(),
+            "--source-zone".to_owned(),
+            "UTC".to_owned(),
+        ];
+        assert!(
+            solstone_core_import_host::cli_argv::preview_arguments(&args, journal.path())
+                .unwrap()
+                .is_none()
+        );
+
+        let mut dry_args = vec!["--dry-run".to_owned()];
+        dry_args.extend(args.clone());
+        assert!(
+            solstone_core_import_host::cli_argv::preview_arguments(&dry_args, journal.path())
+                .unwrap()
+                .is_none()
+        );
+
+        let status_args = vec![
+            "--audio-archive-status".to_owned(),
+            "20260811_120000".to_owned(),
+        ];
+        assert!(
+            solstone_core_import_host::cli_argv::preview_arguments(&status_args, journal.path())
+                .unwrap()
+                .is_none()
+        );
+
+        let members_args = vec![
+            "--audio-archive-members".to_owned(),
+            "20260811_120000".to_owned(),
+        ];
+        assert!(
+            solstone_core_import_host::cli_argv::preview_arguments(&members_args, journal.path())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn audio_archive_save_does_not_print_the_size_again() {
+        let journal = tempfile::tempdir().unwrap();
+        write_utc_zone(journal.path());
+        let folder = tempfile::tempdir().unwrap();
+        write_test_opus_file(&folder.path().join("rec.opus"), 1000);
+        let manifest_file = folder.path().join("manifest.json");
+        fs::write(
+            &manifest_file,
+            r#"{"members":[{"path":"rec.opus","instant":"2026-08-11T12:00:00Z"}]}"#,
+        )
+        .unwrap();
+        let run = run_at(
+            journal.path(),
+            &["--audio-archive", manifest_file.to_str().unwrap()],
+            |name| (name == "SOL_SKIP_SUPERVISOR_CHECK").then(|| "1".to_owned()),
+            || false,
+        );
+        assert_eq!(run.exit_code, 0, "stderr={}", run.stderr);
+        assert!(!run.stdout.contains("audio archive preview:"));
+        assert!(run.stdout.contains("audio archive new:"));
+    }
+
+    #[test]
+    fn audio_archive_status_and_members_do_not_call_frontier_writers() {
+        let journal = tempfile::tempdir().unwrap();
+        write_utc_zone(journal.path());
+        let folder = tempfile::tempdir().unwrap();
+        write_test_opus_file(&folder.path().join("rec.opus"), 1000);
+        let manifest_file = folder.path().join("manifest.json");
+        fs::write(
+            &manifest_file,
+            r#"{"members":[{"path":"rec.opus","instant":"2026-08-11T12:00:00Z"}]}"#,
+        )
+        .unwrap();
+        let save_run = run_at(
+            journal.path(),
+            &["--audio-archive", manifest_file.to_str().unwrap(), "--json"],
+            |name| (name == "SOL_SKIP_SUPERVISOR_CHECK").then(|| "1".to_owned()),
+            || false,
+        );
+        assert_eq!(save_run.exit_code, 0);
+        let parsed: serde_json::Value = serde_json::from_str(&save_run.stdout).unwrap();
+        let run_id = parsed["run_id"].as_str().unwrap();
+
+        let status_run = run_at(
+            journal.path(),
+            &["--audio-archive-status", run_id],
+            |name| (name == "SOL_SKIP_SUPERVISOR_CHECK").then(|| "1".to_owned()),
+            || false,
+        );
+        assert_eq!(status_run.exit_code, 0);
+        assert!(status_run.stdout.contains("audio archive status:"));
+
+        let members_run = run_at(
+            journal.path(),
+            &[
+                "--audio-archive-members",
+                run_id,
+                "--offset",
+                "0",
+                "--limit",
+                "10",
+            ],
+            |name| (name == "SOL_SKIP_SUPERVISOR_CHECK").then(|| "1".to_owned()),
+            || false,
+        );
+        assert_eq!(members_run.exit_code, 0);
+        assert!(members_run.stdout.contains("audio archive members:"));
+        assert!(members_run.stdout.contains("disposition=included"));
+    }
+
+    #[test]
+    fn audio_archive_explicit_resume_does_not_reopen_an_already_saved_source() {
+        let journal = tempfile::tempdir().unwrap();
+        write_utc_zone(journal.path());
+        let folder = tempfile::tempdir().unwrap();
+        write_test_opus_file(&folder.path().join("rec.opus"), 1000);
+        let manifest_file = folder.path().join("manifest.json");
+        fs::write(
+            &manifest_file,
+            r#"{"members":[{"path":"rec.opus","instant":"2026-08-11T12:00:00Z"}]}"#,
+        )
+        .unwrap();
+        let save_run = run_at(
+            journal.path(),
+            &["--audio-archive", manifest_file.to_str().unwrap(), "--json"],
+            |name| (name == "SOL_SKIP_SUPERVISOR_CHECK").then(|| "1".to_owned()),
+            || false,
+        );
+        assert_eq!(save_run.exit_code, 0);
+        let parsed: serde_json::Value = serde_json::from_str(&save_run.stdout).unwrap();
+        let run_id = parsed["run_id"].as_str().unwrap();
+
+        // Now change file (2000ms duration instead of 1000ms, changing hash and length)
+        write_test_opus_file(&folder.path().join("rec.opus"), 2000);
+        let resume_run = run_at(
+            journal.path(),
+            &[
+                "--audio-archive",
+                manifest_file.to_str().unwrap(),
+                "--resume",
+                run_id,
+            ],
+            |name| (name == "SOL_SKIP_SUPERVISOR_CHECK").then(|| "1".to_owned()),
+            || false,
+        );
+        assert_eq!(resume_run.exit_code, 0, "{}", resume_run.stderr);
+
+        let entries: Vec<_> = fs::read_dir(journal.path().join("imports"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "no new run allocated on explicit resume mismatch"
+        );
+    }
+
+    #[test]
+    fn audio_archive_automatic_rerun_fills_only_unsaved_parts() {
+        let journal = tempfile::tempdir().unwrap();
+        write_utc_zone(journal.path());
+        let folder = tempfile::tempdir().unwrap();
+        write_test_opus_file(&folder.path().join("rec.opus"), 1000);
+        let manifest_file = folder.path().join("manifest.json");
+        fs::write(
+            &manifest_file,
+            r#"{"members":[{"path":"rec.opus","instant":"2026-08-11T12:00:00Z"}]}"#,
+        )
+        .unwrap();
+
+        let options = solstone_core_import_host::audio_archive::AudioArchiveDispatchOptions {
+            path: manifest_file.clone(),
+            source_zone: None,
+            resume: None,
+            dry_run: false,
+            json: true,
+        };
+        let run1 = solstone_core_import_host::audio_archive::run_audio_archive_with(
+            options.clone(),
+            journal.path(),
+            None,
+            Some(solstone_core_import::audio_archive::ArchiveFault::AfterRecordFirstSaved),
+        );
+        assert_eq!(run1.exit_code, 1);
+
+        let run2 = solstone_core_import_host::audio_archive::run_audio_archive_with(
+            options,
+            journal.path(),
+            None,
+            None,
+        );
+        assert_eq!(run2.exit_code, 0, "stderr={}", run2.stderr);
+        let parsed: serde_json::Value = serde_json::from_str(&run2.stdout).unwrap();
+        assert_eq!(parsed["operation"], "resume");
+        assert_eq!(parsed["tiles_saved"], 1);
+        assert_eq!(parsed["parts_saved"], 1);
+    }
+
+    #[test]
+    fn audio_archive_time_correction_keeps_identity_gets_settings_mismatch_then_new_run_saves() {
+        let journal = tempfile::tempdir().unwrap();
+        write_utc_zone(journal.path());
+        let folder = tempfile::tempdir().unwrap();
+        write_test_opus_file(&folder.path().join("rec.opus"), 1000);
+        let manifest_file = folder.path().join("manifest.json");
+        fs::write(
+            &manifest_file,
+            r#"{"members":[{"path":"rec.opus","instant":"2026-08-11T12:00:00Z"}]}"#,
+        )
+        .unwrap();
+
+        let options = solstone_core_import_host::audio_archive::AudioArchiveDispatchOptions {
+            path: manifest_file.clone(),
+            source_zone: None,
+            resume: None,
+            dry_run: false,
+            json: true,
+        };
+        let run1 = solstone_core_import_host::audio_archive::run_audio_archive_with(
+            options.clone(),
+            journal.path(),
+            None,
+            Some(solstone_core_import::audio_archive::ArchiveFault::AfterRecordFirstSaved),
+        );
+        assert_eq!(run1.exit_code, 1);
+
+        // Correct the time: instant changes from 12:00:00 to 14:00:00.
+        // Name, byte_len, sha256 are unchanged so identity is identical.
+        fs::write(
+            &manifest_file,
+            r#"{"members":[{"path":"rec.opus","instant":"2026-08-11T14:00:00Z"}]}"#,
+        )
+        .unwrap();
+
+        let run2 = solstone_core_import_host::audio_archive::run_audio_archive_with(
+            options,
+            journal.path(),
+            None,
+            None,
+        );
+        assert_eq!(run2.exit_code, 0, "stderr={}", run2.stderr);
+        let parsed: serde_json::Value = serde_json::from_str(&run2.stdout).unwrap();
+        assert_eq!(parsed["operation"], "new");
+        assert_eq!(parsed["tiles_saved"], 1);
+
+        let entries: Vec<_> = fs::read_dir(journal.path().join("imports"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .collect();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn audio_archive_save_complete_rerun_does_not_allocate() {
+        let journal = tempfile::tempdir().unwrap();
+        write_utc_zone(journal.path());
+        let folder = tempfile::tempdir().unwrap();
+        write_test_opus_file(&folder.path().join("rec.opus"), 1000);
+        let manifest_file = folder.path().join("manifest.json");
+        fs::write(
+            &manifest_file,
+            r#"{"members":[{"path":"rec.opus","instant":"2026-08-11T12:00:00Z"}]}"#,
+        )
+        .unwrap();
+        let run1 = run_at(
+            journal.path(),
+            &["--audio-archive", manifest_file.to_str().unwrap(), "--json"],
+            |name| (name == "SOL_SKIP_SUPERVISOR_CHECK").then(|| "1".to_owned()),
+            || false,
+        );
+        assert_eq!(run1.exit_code, 0);
+
+        let run2 = run_at(
+            journal.path(),
+            &["--audio-archive", manifest_file.to_str().unwrap(), "--json"],
+            |name| (name == "SOL_SKIP_SUPERVISOR_CHECK").then(|| "1".to_owned()),
+            || false,
+        );
+        assert_eq!(run2.exit_code, 0);
+        let parsed: serde_json::Value = serde_json::from_str(&run2.stdout).unwrap();
+        assert_eq!(parsed["operation"], "unchanged");
+        assert_eq!(parsed["tiles_saved"], 0);
+        assert_eq!(parsed["parts_saved"], 0);
+
+        let entries: Vec<_> = fs::read_dir(journal.path().join("imports"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .collect();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn audio_archive_after_tile_bytes_staged_is_not_tiles_saved() {
+        let journal = tempfile::tempdir().unwrap();
+        write_utc_zone(journal.path());
+        let folder = tempfile::tempdir().unwrap();
+        write_test_opus_file(&folder.path().join("rec.opus"), 1000);
+        let manifest_file = folder.path().join("manifest.json");
+        fs::write(
+            &manifest_file,
+            r#"{"members":[{"path":"rec.opus","instant":"2026-08-11T12:00:00Z"}]}"#,
+        )
+        .unwrap();
+
+        let options = solstone_core_import_host::audio_archive::AudioArchiveDispatchOptions {
+            path: manifest_file,
+            source_zone: None,
+            resume: None,
+            dry_run: false,
+            json: true,
+        };
+        let run = solstone_core_import_host::audio_archive::run_audio_archive_with(
+            options,
+            journal.path(),
+            None,
+            Some(solstone_core_import::audio_archive::ArchiveFault::AfterTileBytesStaged),
+        );
+        assert_ne!(run.exit_code, 0);
+
+        fn has_placement_json(dir: &Path) -> bool {
+            if !dir.exists() {
+                return false;
+            }
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() && entry.file_name() == "placement.json" {
+                        return true;
+                    }
+                    if path.is_dir() && has_placement_json(&path) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        assert!(
+            !has_placement_json(&journal.path().join("chronicle")),
+            "chronicle must have no placement.json after aborted tile staging"
+        );
+    }
+
+    #[test]
+    fn audio_archive_journal_importer_file_timestamp_still_parses_as_one_file_import() {
+        let journal = tempfile::tempdir().unwrap();
+        write_utc_zone(journal.path());
+        let note = journal.path().join("note.md");
+        fs::write(&note, "hello single file").unwrap();
+        let run = run_at(
+            journal.path(),
+            &[note.to_str().unwrap(), "--timestamp", "20260811_120000"],
+            |name| (name == "SOL_SKIP_SUPERVISOR_CHECK").then(|| "1".to_owned()),
+            || false,
+        );
+        assert_eq!(run.exit_code, 0, "stderr={}", run.stderr);
+        assert!(run.stdout.contains("Generic text import complete"));
+    }
+
+    #[test]
+    fn audio_archive_invalid_argv_combinations() {
+        let journal = tempfile::tempdir().unwrap();
+        write_utc_zone(journal.path());
+
+        // --offset without --audio-archive-members
+        let run_offset = run_at(
+            journal.path(),
+            &["--offset", "10"],
+            |name| (name == "SOL_SKIP_SUPERVISOR_CHECK").then(|| "1".to_owned()),
+            || false,
+        );
+        assert_eq!(run_offset.exit_code, 2);
+        assert!(
+            run_offset
+                .stderr
+                .contains("usage: solstone journal importer")
+        );
+
+        // --limit without --audio-archive-members
+        let run_limit = run_at(
+            journal.path(),
+            &["--limit", "50"],
+            |name| (name == "SOL_SKIP_SUPERVISOR_CHECK").then(|| "1".to_owned()),
+            || false,
+        );
+        assert_eq!(run_limit.exit_code, 2);
+        assert!(
+            run_limit
+                .stderr
+                .contains("usage: solstone journal importer")
+        );
+
+        // positional media together with --audio-archive
+        let run_conflict = run_at(
+            journal.path(),
+            &["media.opus", "--audio-archive", "archive_dir"],
+            |name| (name == "SOL_SKIP_SUPERVISOR_CHECK").then(|| "1".to_owned()),
+            || false,
+        );
+        assert_eq!(run_conflict.exit_code, 2);
+        assert!(
+            run_conflict
+                .stderr
+                .contains("usage: solstone journal importer")
+        );
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    mod opus_full_tests {
+        use super::*;
+
+        #[test]
+        fn full_test_subsecond_opus_member() {
+            let journal = tempfile::tempdir().unwrap();
+            write_utc_zone(journal.path());
+            let folder = tempfile::tempdir().unwrap();
+            let audio_path = folder.path().join("subsecond.opus");
+            write_test_opus_file(&audio_path, 400);
+            let manifest_path = folder.path().join("manifest.json");
+            fs::write(
+                &manifest_path,
+                r#"{"members":[{"path":"subsecond.opus","instant":"2026-08-11T12:00:00Z"}]}"#,
+            )
+            .unwrap();
+            let run = run_at(
+                journal.path(),
+                &["--audio-archive", manifest_path.to_str().unwrap(), "--json"],
+                |name| (name == "SOL_SKIP_SUPERVISOR_CHECK").then(|| "1".to_owned()),
+                || false,
+            );
+            assert_eq!(run.exit_code, 0, "stderr={}", run.stderr);
+            let parsed: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
+            assert_eq!(parsed["parts_saved"], 1);
+        }
+
+        #[test]
+        fn full_test_short_opus_members_at_different_offsets() {
+            let journal = tempfile::tempdir().unwrap();
+            write_utc_zone(journal.path());
+            let folder = tempfile::tempdir().unwrap();
+            let a1 = folder.path().join("a1.opus");
+            let a2 = folder.path().join("a2.opus");
+            let a3 = folder.path().join("a3.opus");
+            write_test_opus_file(&a1, 2000);
+            write_test_opus_file(&a2, 4000);
+            write_test_opus_file(&a3, 3000);
+            let manifest_path = folder.path().join("manifest.json");
+            fs::write(
+                &manifest_path,
+                r#"{"members":[
+                {"path":"a1.opus","instant":"2026-08-11T12:00:00Z"},
+                {"path":"a2.opus","instant":"2026-08-11T12:01:00Z"},
+                {"path":"a3.opus","instant":"2026-08-11T12:03:00Z"}
+            ]}"#,
+            )
+            .unwrap();
+            let run = run_at(
+                journal.path(),
+                &["--audio-archive", manifest_path.to_str().unwrap(), "--json"],
+                |name| (name == "SOL_SKIP_SUPERVISOR_CHECK").then(|| "1".to_owned()),
+                || false,
+            );
+            assert_eq!(run.exit_code, 0);
+            let parsed: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
+            assert_eq!(parsed["tiles_saved"], 1);
+            assert_eq!(parsed["parts_saved"], 3);
+        }
+
+        #[test]
+        fn full_test_opus_members_with_gap() {
+            let journal = tempfile::tempdir().unwrap();
+            write_utc_zone(journal.path());
+            let folder = tempfile::tempdir().unwrap();
+            let g1 = folder.path().join("g1.opus");
+            let g2 = folder.path().join("g2.opus");
+            write_test_opus_file(&g1, 5000);
+            write_test_opus_file(&g2, 5000);
+            let manifest_path = folder.path().join("manifest.json");
+            fs::write(
+                &manifest_path,
+                r#"{"members":[
+                {"path":"g1.opus","instant":"2026-08-11T12:00:00Z"},
+                {"path":"g2.opus","instant":"2026-08-11T12:02:00Z"}
+            ]}"#,
+            )
+            .unwrap();
+            let run = run_at(
+                journal.path(),
+                &["--audio-archive", manifest_path.to_str().unwrap(), "--json"],
+                |name| (name == "SOL_SKIP_SUPERVISOR_CHECK").then(|| "1".to_owned()),
+                || false,
+            );
+            assert_eq!(run.exit_code, 0);
+            let parsed: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
+            assert_eq!(parsed["tiles_saved"], 1);
+            assert_eq!(parsed["parts_saved"], 2);
+        }
+
+        #[test]
+        fn full_test_long_opus_member_across_midnight() {
+            let journal = tempfile::tempdir().unwrap();
+            write_utc_zone(journal.path());
+            let folder = tempfile::tempdir().unwrap();
+            let long_file = folder.path().join("long.opus");
+            write_test_opus_file(&long_file, 360_000);
+            let manifest_path = folder.path().join("manifest.json");
+            fs::write(
+                &manifest_path,
+                r#"{"members":[{"path":"long.opus","instant":"2026-08-11T23:57:00Z"}]}"#,
+            )
+            .unwrap();
+            let run = run_at(
+                journal.path(),
+                &["--audio-archive", manifest_path.to_str().unwrap(), "--json"],
+                |name| (name == "SOL_SKIP_SUPERVISOR_CHECK").then(|| "1".to_owned()),
+                || false,
+            );
+            assert_eq!(run.exit_code, 0);
+            let parsed: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
+            assert!(parsed["tiles_saved"].as_u64().unwrap() >= 2);
+        }
+
+        #[test]
+        fn full_test_opus_member_across_dst_fold() {
+            let journal = tempfile::tempdir().unwrap();
+            fs::create_dir_all(journal.path().join("config")).unwrap();
+            fs::write(
+                journal.path().join("config/journal.json"),
+                br#"{"identity":{"timezone":"America/New_York"}}"#,
+            )
+            .unwrap();
+            let folder = tempfile::tempdir().unwrap();
+            let dst_file = folder.path().join("dst.opus");
+            write_test_opus_file(&dst_file, 5000);
+            let manifest_path = folder.path().join("manifest.json");
+            fs::write(
+                &manifest_path,
+                r#"{"members":[{"path":"dst.opus","instant":"2026-11-01T05:30:00Z"}]}"#,
+            )
+            .unwrap();
+            let run = run_at(
+                journal.path(),
+                &["--audio-archive", manifest_path.to_str().unwrap(), "--json"],
+                |name| (name == "SOL_SKIP_SUPERVISOR_CHECK").then(|| "1".to_owned()),
+                || false,
+            );
+            assert_eq!(run.exit_code, 0);
+        }
+
+        #[test]
+        fn full_test_fractional_non_packet_boundary() {
+            let journal = tempfile::tempdir().unwrap();
+            write_utc_zone(journal.path());
+            let folder = tempfile::tempdir().unwrap();
+            let frac_file = folder.path().join("frac.opus");
+            write_test_opus_file(&frac_file, 10_015);
+            let manifest_path = folder.path().join("manifest.json");
+            fs::write(
+                &manifest_path,
+                r#"{"members":[{"path":"frac.opus","instant":"2026-08-11T12:00:00Z"}]}"#,
+            )
+            .unwrap();
+            let run = run_at(
+                journal.path(),
+                &["--audio-archive", manifest_path.to_str().unwrap(), "--json"],
+                |name| (name == "SOL_SKIP_SUPERVISOR_CHECK").then(|| "1".to_owned()),
+                || false,
+            );
+            assert_eq!(run.exit_code, 0);
+        }
+    }
+}

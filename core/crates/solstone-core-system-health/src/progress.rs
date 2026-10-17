@@ -153,9 +153,22 @@ pub fn read_segment_progress<S: HealthLogSource>(
             // `None`: no Sense use was dispatched.  `Some(None)`: the latest
             // one has not completed.  `Some(Some(ts))`: it completed.
             let mut sense_dispatch: Option<Option<i64>> = None;
-            if let Some(by_name) = records.remove(&key) {
-                for (name, mut entries) in by_name {
+            if let Some(mut by_name) = records.remove(&key) {
+                for entries in by_name.values_mut() {
                     entries.sort_by_key(|item| (item.ts, item.sequence));
+                }
+                // Each pass starts with Sense and dispatches what it selects
+                // from the talents that exist now. A talent dispatched before
+                // the latest Sense belongs to an earlier pass, so the latest
+                // pass's selection supersedes it; otherwise a talent that was
+                // since removed would keep the segment unthought forever.
+                let pass_start = by_name.get("sense").and_then(|entries| {
+                    entries
+                        .iter()
+                        .rfind(|item| item.kind == ProgressKind::Dispatch)
+                        .map(|item| (item.ts, item.sequence))
+                });
+                for (name, entries) in by_name {
                     if name == "sense" {
                         sense_dispatch = entries
                             .iter()
@@ -173,7 +186,12 @@ pub fn read_segment_progress<S: HealthLogSource>(
                                 ProgressKind::Dispatch | ProgressKind::NotRecommended
                             )
                         })
-                        .is_some_and(|item| item.kind == ProgressKind::Dispatch)
+                        .is_some_and(|item| {
+                            item.kind == ProgressKind::Dispatch
+                                && (name == "facet_routing"
+                                    || pass_start
+                                        .is_none_or(|start| (item.ts, item.sequence) >= start))
+                        })
                     {
                         dispatched.insert(name.clone());
                     }

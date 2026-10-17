@@ -433,13 +433,23 @@
     sampleLabel(sample) {
       const day = String(sample?.day || '');
       const dateLabel = this.formatDateShort(day);
-      const place = String(sample?.setting || sample?.stream || '').trim();
+      const setting = String(sample?.setting || '').trim();
+      const stream = String(sample?.stream || '').trim();
+      const place = setting
+        ? setting
+        : (stream ? window.JournalFormat.stream(stream) : '');
       return [dateLabel, place].filter(Boolean).join(' · ');
     }
 
     sampleRow(sample) {
       const row = el(this.doc, 'div', 'spk-who-sample');
-      append(row, textEl(this.doc, 'span', 'spk-who-sample-label', this.sampleLabel(sample)));
+      const labelSpan = textEl(this.doc, 'span', 'spk-who-sample-label', this.sampleLabel(sample));
+      const setting = String(sample?.setting || '').trim();
+      const stream = String(sample?.stream || '').trim();
+      if (!setting && stream) {
+        labelSpan.setAttribute('title', stream);
+      }
+      append(row, labelSpan);
       const audioUrl = sample?.audio_url;
       if (!audioUrl) {
         this.markSampleUnavailable(row);

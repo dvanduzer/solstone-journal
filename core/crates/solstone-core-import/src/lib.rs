@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 
 pub mod allocate;
+pub mod audio_archive;
 pub mod cli_render;
 pub mod connect;
 pub mod consent_gate;

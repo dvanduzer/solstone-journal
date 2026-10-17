@@ -27,8 +27,9 @@ fn audio_sources(dir: &Path) -> Vec<String> {
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name().into_string().ok()?;
-            name.ends_with("audio.jsonl")
-                .then(|| name.trim_end_matches(".jsonl").into())
+            (name.ends_with("audio.jsonl")
+                || solstone_core_format::audio_archive::is_audio_archive_transcript_name(&name))
+            .then(|| name.trim_end_matches(".jsonl").into())
         })
         .collect::<Vec<String>>();
     values.sort();
@@ -44,7 +45,10 @@ pub fn speaker_label_source(dir: &Path) -> (Option<String>, bool) {
         .filter_map(|entry| {
             let name = entry.file_name().into_string().ok()?;
             let stem = name.strip_suffix(".npz")?;
-            (stem == "audio" || stem.ends_with("_audio")).then(|| stem.into())
+            (stem == "audio"
+                || stem.ends_with("_audio")
+                || solstone_core_format::audio_archive::is_audio_archive_part_stem(stem))
+            .then(|| stem.into())
         })
         .collect::<Vec<String>>();
     npz.sort();

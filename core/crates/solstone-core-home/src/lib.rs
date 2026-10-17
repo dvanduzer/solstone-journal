@@ -27,6 +27,7 @@ pub mod formatting;
 pub mod health_glance;
 pub mod model;
 pub mod needs_you;
+pub mod provenance;
 pub mod pulse;
 pub mod readers;
 pub mod sources;

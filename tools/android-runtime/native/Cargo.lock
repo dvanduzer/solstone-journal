@@ -3535,6 +3535,7 @@ dependencies = [
  "solstone-core-thinking",
  "solstone-core-thinking-copy",
  "solstone-core-transcripts-web",
+ "solstone-core-update",
  "spl-core",
  "spl-home",
  "time",
@@ -3850,7 +3851,9 @@ version = "2.0.48"
 dependencies = [
  "chrono",
  "chrono-tz",
+ "log",
  "regex",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
@@ -4462,6 +4465,7 @@ dependencies = [
  "serde_json",
  "solstone-core-callosum",
  "solstone-core-format",
+ "solstone-core-import",
  "solstone-core-journal-config",
  "solstone-core-journal-io",
  "solstone-core-local",
@@ -4901,6 +4905,7 @@ dependencies = [
  "solstone-core-assets",
  "solstone-core-brain",
  "solstone-core-callosum",
+ "solstone-core-format",
  "solstone-core-journal-config",
  "solstone-core-journal-io",
  "solstone-core-local",
@@ -4963,6 +4968,18 @@ dependencies = [
  "solstone-core-transcripts",
  "tokio",
  "zip",
+]
+
+[[package]]
+name = "solstone-core-update"
+version = "2.0.48"
+dependencies = [
+ "serde",
+ "serde_json",
+ "solstone-core-installed-payload",
+ "solstone-core-journal",
+ "tempfile",
+ "ureq",
 ]
 
 [[package]]

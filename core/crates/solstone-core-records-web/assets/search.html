@@ -80,7 +80,25 @@
  function renderHit(hit,dayHref){
   const card=node('article','search-result');const meta=node('div','search-meta');
   const recordTime=Number.isFinite(hit.ts)&&hit.ts>0?window.JournalFormat.time(hit.ts):'';
-  for(const text of [hit.agent_label,hit.facet_title,window.JournalFormat.stream(hit.stream),recordTime])if(text)meta.append(node('span','',text));
+  const rawStream=String(hit.stream||'').trim();
+  const streamLabel=rawStream&&window.JournalFormat?window.JournalFormat.stream(rawStream):'';
+  // Don't say the type twice: drop the agent label when the stream label
+  // already says it, as its what word ("Audio" beside an audio label) or as
+  // an import ("Imported" beside an imported label).
+  let showAgentLabel=Boolean(hit.agent_label);
+  if(showAgentLabel&&rawStream){
+   const agentKey=String(hit.agent_label).trim().toLowerCase();
+   const says=window.JournalFormat.streamSays(rawStream);
+   if((says.imported&&agentKey==='imported')||(says.what&&agentKey===says.what))showAgentLabel=false;
+  }
+  if(showAgentLabel)meta.append(node('span','',hit.agent_label));
+  if(hit.facet_title)meta.append(node('span','',hit.facet_title));
+  if(streamLabel){
+   const streamSpan=node('span','',streamLabel);
+   streamSpan.setAttribute('title',rawStream);
+   meta.append(streamSpan);
+  }
+  if(recordTime)meta.append(node('span','',recordTime));
   card.append(meta);const text=node('p','search-excerpt');
   text.append(excerpt(hit.text));
   card.append(text);

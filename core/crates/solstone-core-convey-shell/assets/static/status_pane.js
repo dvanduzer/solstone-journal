@@ -396,17 +396,30 @@ window.whenShellReady(() => {
     if (!section || !text) return;
 
     section.style.display = '';
-    if (version?.update_available) {
-      text.textContent = '';
-      text.appendChild(document.createTextNode('v' + (version.current || '?') + ' · '));
-      const span = document.createElement('span');
-      span.style.color = 'var(--warn-ink)';
-      span.textContent = 'update available (v' + (version.latest || '?') + ')';
-      text.appendChild(span);
-      text.style.color = '';
-    } else {
+    const isAvailable = version?.availability === 'available' || (!version?.availability && Boolean(version?.update_available));
+    if (!version?.availability && version?.update_available === false) {
       text.textContent = 'v' + (version?.current || 'unknown');
       text.style.color = 'var(--ink-faint)';
+    } else if (isAvailable) {
+      const differ = Boolean(
+        version?.platform_version &&
+        version?.latest_platform_version &&
+        version.platform_version !== version.latest_platform_version
+      );
+      const targetVer = differ ? version.latest_platform_version : (version?.latest || '?');
+      text.textContent = '';
+      text.appendChild(document.createTextNode('v' + (version?.current || '?') + ' · '));
+      const span = document.createElement('span');
+      span.style.color = 'var(--warn-ink)';
+      span.textContent = 'update available (v' + targetVer + ')';
+      text.appendChild(span);
+      text.style.color = '';
+    } else if (version?.availability === 'not_available') {
+      text.textContent = 'v' + (version?.current || 'unknown') + ' · up to date';
+      text.style.color = '';
+    } else {
+      text.textContent = 'update status unknown';
+      text.style.color = '';
     }
   }
 

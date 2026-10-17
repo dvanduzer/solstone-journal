@@ -10,7 +10,8 @@
     },
     {
       "commands": [
-        "journal"
+        "journal",
+        "update"
       ],
       "heading": "This computer"
     },

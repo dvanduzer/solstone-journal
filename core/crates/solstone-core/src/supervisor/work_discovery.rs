@@ -791,12 +791,17 @@ fn talent_retries(
     Ok(candidates)
 }
 
+struct DaySources<'a> {
+    imports: &'a [ImportThinking],
+    archive_coordinates: &'a BTreeSet<Coordinate>,
+}
+
 fn inspect_day(
     journal: &Path,
     day: &str,
     queue: &TaskQueue,
     intent: Option<&OwnerIntent>,
-    imports: &[ImportThinking],
+    sources: DaySources<'_>,
     policy: WorkPolicy,
     report: &mut WorkInventory,
 ) -> Result<DayWork, String> {
@@ -837,8 +842,16 @@ fn inspect_day(
         }
         return Ok(work);
     }
+    let selected: Vec<_> = sources
+        .archive_coordinates
+        .iter()
+        .filter(|c| c.day == day)
+        .map(|c| (c.stream.clone(), c.segment.clone()))
+        .collect();
     let (_, _, segments) = solstone_core_system_health::scan_day(
-        &solstone_core_system_health::FilesystemSegmentSource,
+        &solstone_core_system_health::ArchiveFrontierSegmentSource {
+            selected: &selected,
+        },
         journal,
         day,
         now,
@@ -870,13 +883,23 @@ fn inspect_day(
         if super::tick::is_mcp_audit_segment(Some(&segment.stream)) {
             continue;
         }
+        // Archive ASR belongs to the shared Sense workers. A segment repair
+        // would create a second handler pool and bypass live-file priority.
+        if segment.stream == "import.archive"
+            && !solstone_core_system_health::segment_fully_sensed(&segment.data_state)
+        {
+            prerequisites_ready = false;
+            segments_thought = false;
+            work.history.owed += 1;
+            continue;
+        }
         let mut permanently_held = false;
         work.candidates.extend(raw_retries(
             journal,
             day,
             segment,
             intent,
-            imports,
+            sources.imports,
             policy,
             &failures.value.capped,
             &mut permanently_held,
@@ -887,11 +910,13 @@ fn inspect_day(
             stream: segment.stream.clone(),
             segment: segment.key.clone(),
         };
-        let imported = imports
+        let imported = sources
+            .imports
             .iter()
             .any(|import| import.segments.contains(&coordinate));
         let explicit = intent
             .map(|_| WorkBand::Waiting)
+            .or_else(|| (segment.stream == "import.archive").then_some(WorkBand::Import))
             .or_else(|| imported.then_some(WorkBand::Import));
         let p = priority(day, Some(&segment.key), today, explicit);
         let readiness =
@@ -929,9 +954,18 @@ fn inspect_day(
         }
         owed_segments.push((segment, p, readiness));
     }
+    if solstone_core_import::audio_archive::archive_day_has_pending(journal, day)
+        .map_err(|error| error.to_string())?
+    {
+        prerequisites_ready = false;
+        segments_thought = false;
+    }
     let closing =
         super::tick::day_still_closing(journal, queue, SystemTime::now()).as_deref() == Some(day);
-    let imported = imports.iter().any(|import| import.days.contains(day));
+    let imported = sources
+        .imports
+        .iter()
+        .any(|import| import.days.contains(day));
     let explicit = intent
         .map(|_| WorkBand::Waiting)
         .or_else(|| imported.then_some(WorkBand::Import));
@@ -943,7 +977,7 @@ fn inspect_day(
         day,
         &coverage,
         intent,
-        imports,
+        sources.imports,
         policy,
         prerequisites_ready && !closing,
         &mut permanently_held_daily,
@@ -993,6 +1027,15 @@ fn inspect_day(
         report.band(p.band).segments_owed += 1;
         // The day's daily work publishes the segments only owed publication.
         if closes_day && readiness == SegmentReadiness::Unpublished {
+            continue;
+        }
+        let coordinate = Coordinate {
+            day: day.into(),
+            stream: segment.stream.clone(),
+            segment: segment.key.clone(),
+        };
+        if segment.stream == "import.archive" && !sources.archive_coordinates.contains(&coordinate)
+        {
             continue;
         }
         if policy.permits(p.band) {
@@ -1497,6 +1540,23 @@ fn reconcile_pass(
         .into_iter()
         .collect::<BTreeMap<_, _>>();
     let imports = solstone_core_import::thinking::read(journal)?;
+    let pending_archives =
+        match solstone_core_import::audio_archive::update_pending_archive_tiles(journal, 64) {
+            Ok(batch) => {
+                for tile in &batch.tiles {
+                    days.entry(tile.day.clone())
+                        .or_insert_with(|| journal.join("chronicle").join(&tile.day));
+                }
+                batch
+            }
+            Err(error) => {
+                log::warn!("pending audio archive batch unreadable: {error}");
+                solstone_core_import::audio_archive::PendingArchiveBatch {
+                    errors: vec![("archive".to_string(), error.to_string())],
+                    ..Default::default()
+                }
+            }
+        };
     let (activities, activity_errors) = solstone_core_think_cli::discover_activity_retries(
         journal,
         chrono::Utc::now().timestamp_millis(),
@@ -1538,6 +1598,17 @@ fn reconcile_pass(
     report.unreadable.extend(activity_errors);
     report.unreadable.extend(held_errors);
     report.unreadable.extend(retry_errors);
+    for (id, error) in pending_archives.errors {
+        report.unreadable.push(format!("{id}: {error}"));
+    }
+    let mut archive_coordinates = BTreeSet::new();
+    for tile in &pending_archives.tiles {
+        archive_coordinates.insert(Coordinate {
+            day: tile.day.clone(),
+            stream: tile.stream.clone(),
+            segment: tile.segment_key.clone(),
+        });
+    }
     // Until this pass can say more, its progress carries the last finished
     // pass's history line: only while that line was still current, and not
     // when this pass could not have produced one.
@@ -1609,12 +1680,52 @@ fn reconcile_pass(
             &day,
             queue,
             intents.get(&day),
-            &imports.imports,
+            DaySources {
+                imports: &imports.imports,
+                archive_coordinates: &archive_coordinates,
+            },
             policy,
             &mut day_report,
         ) {
             Ok(work) => {
                 history_day = work.history;
+                for tile in pending_archives.tiles.iter().filter(|tile| tile.day == day) {
+                    let coordinate = Coordinate {
+                        day: tile.day.clone(),
+                        stream: tile.stream.clone(),
+                        segment: tile.segment_key.clone(),
+                    };
+                    if !work.completed_segments.contains(&coordinate) {
+                        continue;
+                    }
+                    let directory = journal
+                        .join("chronicle")
+                        .join(&tile.day)
+                        .join(&tile.stream)
+                        .join(&tile.segment_key);
+                    for part in &tile.parts {
+                        // Text-row existence proves neither current thinking
+                        // nor saved-output publication. Both are required by
+                        // completed_segments before retiring durable backlog.
+                        if solstone_core_sense::archive::transcription_state(
+                            &directory.join(&part.stored_name),
+                        ) == solstone_core_sense::archive::ArchiveTranscription::Complete
+                            && let Err(error) =
+                                solstone_core_import::audio_archive::finish_archive_part(
+                                    journal,
+                                    &tile.import_id,
+                                    &tile.day,
+                                    &tile.segment_key,
+                                    &part.stored_name,
+                                    false,
+                                )
+                        {
+                            day_report
+                                .unreadable
+                                .push(format!("{}: {error}", tile.import_id));
+                        }
+                    }
+                }
                 fulfilled_segments.extend(work.completed_segments);
                 if work.daily_current {
                     fulfilled_days.insert(day.clone());
@@ -2136,7 +2247,19 @@ mod tests {
         let queue = queue(root.path());
         let policy = WorkPolicy::read(root.path()).unwrap();
         let mut report = WorkInventory::default();
-        let work = inspect_day(root.path(), day, &queue, None, &[], policy, &mut report).unwrap();
+        let work = inspect_day(
+            root.path(),
+            day,
+            &queue,
+            None,
+            DaySources {
+                imports: &[],
+                archive_coordinates: &BTreeSet::new(),
+            },
+            policy,
+            &mut report,
+        )
+        .unwrap();
         assert_eq!(work.history.owed, 0);
         assert_eq!(work.history.segments_set_aside, 1);
         assert!(work.history.daily_units_set_aside > 0);
@@ -2157,14 +2280,38 @@ mod tests {
         // Another, ordinary prerequisite on the same day still pins the range.
         segment(root.path(), day, "120100_60");
         let mut report = WorkInventory::default();
-        let work = inspect_day(root.path(), day, &queue, None, &[], policy, &mut report).unwrap();
+        let work = inspect_day(
+            root.path(),
+            day,
+            &queue,
+            None,
+            DaySources {
+                imports: &[],
+                archive_coordinates: &BTreeSet::new(),
+            },
+            policy,
+            &mut report,
+        )
+        .unwrap();
         assert!(work.history.owed > 1);
         assert_eq!(work.history.segments_set_aside, 1);
         assert_eq!(work.history.daily_units_set_aside, 0);
         // Fresh input permits a retry. It is real work again, not an exception.
         std::fs::write(directory.join("audio.wav"), "changed source for retry").unwrap();
         let mut report = WorkInventory::default();
-        let work = inspect_day(root.path(), day, &queue, None, &[], policy, &mut report).unwrap();
+        let work = inspect_day(
+            root.path(),
+            day,
+            &queue,
+            None,
+            DaySources {
+                imports: &[],
+                archive_coordinates: &BTreeSet::new(),
+            },
+            policy,
+            &mut report,
+        )
+        .unwrap();
         assert_eq!(work.history.segments_set_aside, 0);
         assert_eq!(work.history.set_aside, 0);
         assert!(work.history.owed > 0);
@@ -3173,7 +3320,10 @@ mod tests {
             "19990101",
             &queue,
             None,
-            &[],
+            DaySources {
+                imports: &[],
+                archive_coordinates: &BTreeSet::new(),
+            },
             policy,
             &mut report,
         )
@@ -3427,5 +3577,146 @@ mod tests {
         assert_eq!(read.as_of_ms, 1_000);
         let due = read.next_pass_ms.unwrap();
         assert!(due >= before + 599_000 && due <= after + 600_000, "{due}");
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn inspect_day_enqueues_archive_segment_by_coordinate_and_sets_work_band() {
+        let root = fixture("local");
+        let now = chrono::Utc::now();
+        let today = daily_coverage::local_day(root.path(), now);
+        let archive_key = "120000_60";
+        let notes_key = "120100_60";
+
+        // 1. Today: import.archive/<key> and notes/<key>
+        let archive_dir = root
+            .path()
+            .join("chronicle")
+            .join(&today)
+            .join("import.archive")
+            .join(archive_key);
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        std::fs::write(archive_dir.join("audio.opus"), "audio").unwrap();
+        std::fs::write(
+            archive_dir.join("audio.jsonl"),
+            "{}\n{\"start\":\"12:00:00\",\"text\":\"speech\"}\n",
+        )
+        .unwrap();
+
+        let notes_dir = root
+            .path()
+            .join("chronicle")
+            .join(&today)
+            .join("notes")
+            .join(notes_key);
+        std::fs::create_dir_all(&notes_dir).unwrap();
+        std::fs::write(notes_dir.join("audio.opus"), "audio").unwrap();
+
+        let queue = queue(root.path());
+        let policy = WorkPolicy::read(root.path()).unwrap();
+        let mut report_today = WorkInventory::default();
+
+        let mut archive_coords_today = BTreeSet::new();
+        archive_coords_today.insert(Coordinate {
+            day: today.clone(),
+            stream: "import.archive".to_string(),
+            segment: archive_key.to_string(),
+        });
+
+        let work_today = inspect_day(
+            root.path(),
+            &today,
+            &queue,
+            None,
+            DaySources {
+                imports: &[],
+                archive_coordinates: &archive_coords_today,
+            },
+            policy,
+            &mut report_today,
+        )
+        .unwrap();
+
+        let archive_c = work_today
+            .candidates
+            .iter()
+            .find(|c| c.request.reference.ends_with("import.archive-120000_60"))
+            .expect("archive candidate");
+        assert_eq!(archive_c.request.priority.unwrap().band, WorkBand::Import);
+
+        let notes_c = work_today
+            .candidates
+            .iter()
+            .find(|c| c.request.reference.ends_with("notes-120100_60"))
+            .expect("notes candidate");
+        assert_eq!(notes_c.request.priority.unwrap().band, WorkBand::Now);
+
+        // 2. Day 19990101
+        let past_day = "19990101";
+        let past_archive_dir = root
+            .path()
+            .join("chronicle")
+            .join(past_day)
+            .join("import.archive")
+            .join(archive_key);
+        std::fs::create_dir_all(&past_archive_dir).unwrap();
+        std::fs::write(past_archive_dir.join("audio.opus"), "audio").unwrap();
+        std::fs::write(
+            past_archive_dir.join("audio.jsonl"),
+            "{}\n{\"start\":\"12:00:00\",\"text\":\"speech\"}\n",
+        )
+        .unwrap();
+
+        let mut report_past_empty = WorkInventory::default();
+        let work_past_empty = inspect_day(
+            root.path(),
+            past_day,
+            &queue,
+            None,
+            DaySources {
+                imports: &[],
+                archive_coordinates: &BTreeSet::new(),
+            },
+            policy,
+            &mut report_past_empty,
+        )
+        .unwrap();
+        assert!(
+            !work_past_empty
+                .candidates
+                .iter()
+                .any(|c| c.request.reference.contains("import.archive"))
+        );
+
+        let mut past_archive_coords = BTreeSet::new();
+        past_archive_coords.insert(Coordinate {
+            day: past_day.to_string(),
+            stream: "import.archive".to_string(),
+            segment: archive_key.to_string(),
+        });
+        let mut report_past_set = WorkInventory::default();
+        let work_past_set = inspect_day(
+            root.path(),
+            past_day,
+            &queue,
+            None,
+            DaySources {
+                imports: &[],
+                archive_coordinates: &past_archive_coords,
+            },
+            policy,
+            &mut report_past_set,
+        )
+        .unwrap();
+
+        let past_archive_c = work_past_set
+            .candidates
+            .iter()
+            .find(|c| c.request.reference.ends_with("import.archive-120000_60"))
+            .expect("past archive candidate");
+        assert_eq!(
+            past_archive_c.request.priority.unwrap().band,
+            WorkBand::Import
+        );
     }
 }

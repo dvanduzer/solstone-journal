@@ -409,7 +409,7 @@ fi
 
 # The install_hint block is shared byte-for-byte with solstone helpers/install-hint.sh,
 # which pins the same digest. Change both copies and both pins together.
-SHARED_INSTALL_HINT_SHA256=a39261fb9cef1e5ac12de862a686368141911442823a89954425e1f8a8990318
+SHARED_INSTALL_HINT_SHA256=04cfc9ebb8d4a4c5f786399b50a8582d7f197d26b9cdd06543a3be78d412842e
 HINT_BLOCK=$BASE/install-hint.sh
 sed -n '/^# BEGIN shared install_hint$/,/^# END shared install_hint$/p' "$INSTALL_SOURCE" >"$HINT_BLOCK"
 if [ "$(sha256sum "$HINT_BLOCK" | awk '{print $1}')" = "$SHARED_INSTALL_HINT_SHA256" ]; then
@@ -421,6 +421,7 @@ for _hint_case in \
 	'ID=fedora|sudo dnf install minisign' \
 	'ID="almalinux" ID_LIKE="rhel centos fedora"|sudo dnf install epel-release \&\& sudo dnf install minisign' \
 	'ID=ubuntu ID_LIKE=debian|sudo apt install minisign' \
+	'ID=ubuntu ID_LIKE=debian VERSION_ID=22.04|install minisign from https://jedisct1.github.io/minisign/' \
 	'ID=arch|sudo pacman -S minisign' \
 	'ID=nixos|install minisign from your distribution'"'"'s packages'; do
 	_hint_os=${_hint_case%%|*}

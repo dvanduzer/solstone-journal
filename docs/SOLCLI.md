@@ -103,7 +103,7 @@ are no retained Python services.
 Use this authority route for top-level commands that read or write journal data
 through the native HTTP boundary. For local commands that touch no journal data
 and have no `solstone call` oracle path, use a direct match arm in
-`solstone_core_sol::run` alongside `root` and `skills`.
+`solstone_core_sol::run` alongside `root` and `skills`. `update` is a direct match arm in `solstone_core_sol::run`. It does not read or write the journal and it has no native authority.
 
 For host-only commands, use the `solstone journal` family. Register retained
 processes and explicit native cutovers in `processes.rs`; implement direct

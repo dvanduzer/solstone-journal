@@ -8,10 +8,14 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::Value;
+use solstone_core_format::audio_archive::{
+    AUDIO_ARCHIVE_PLACEMENT_FILENAME, AudioArchivePlacement,
+};
 use solstone_core_format::segment::segment_start_and_end_seconds;
 use solstone_core_journal_io::{SegmentIdentityError, SegmentLayout, StreamLocation};
 use solstone_core_processing_record::{
-    MediaKind, analysis_row_key, jsonl_has_row_with_key, media_kind, vocab,
+    MediaKind, TerminalProofOutcome, analysis_row_key, evaluate_terminal_proof,
+    jsonl_has_row_with_key, media_kind, read_processing_record_header, vocab,
 };
 
 use crate::{
@@ -272,19 +276,28 @@ pub(crate) fn detect_data_state(
         .filter(|path| media_kind_for(path) == Some(MediaKind::Audio))
         .collect();
     let markdown = markdown_transcript_files(&files);
-    let audio_analyzed = audio_jsonl
-        .iter()
-        .any(|path| jsonl_has_row_with_key(path, vocab::AUDIO_TRANSCRIPT_ROW_KEY))
-        || markdown.iter().any(|path| has_nonempty_text(path));
-    let audio = derive_modality_state(
-        segment_path,
-        "audio",
-        audio_analyzed,
-        !audio_jsonl.is_empty(),
-        has_raw_media(&files, MediaKind::Audio),
-        read_processing_record(&audio_jsonl).as_ref(),
-        now,
-    );
+    let placement_path = segment_path.join(AUDIO_ARCHIVE_PLACEMENT_FILENAME);
+    let audio = if placement_path.is_file() {
+        fs::read(&placement_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<AudioArchivePlacement>(&bytes).ok())
+            .map_or(DataState::Pending, |placement| {
+                archive_audio_state(segment_path, &placement, now)
+            })
+    } else {
+        derive_modality_state(
+            segment_path,
+            "audio",
+            audio_jsonl
+                .iter()
+                .any(|path| jsonl_has_row_with_key(path, vocab::AUDIO_TRANSCRIPT_ROW_KEY))
+                || markdown.iter().any(|path| has_nonempty_text(path)),
+            !audio_jsonl.is_empty(),
+            has_raw_media(&files, MediaKind::Audio),
+            read_processing_record(&audio_jsonl).as_ref(),
+            now,
+        )
+    };
 
     let screen_jsonl = files
         .iter()
@@ -356,6 +369,77 @@ pub(crate) fn detect_data_state(
     Ok((DataStateMap(states), modality_input_mtime_ms))
 }
 
+fn archive_audio_state(
+    directory: &Path,
+    placement: &AudioArchivePlacement,
+    now: DateTime<Utc>,
+) -> DataState {
+    let mut states = Vec::new();
+    for part in &placement.parts {
+        let raw = directory.join(&part.stored_name);
+        let metadata = match fs::symlink_metadata(&raw) {
+            Ok(metadata) if metadata.file_type().is_file() => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                states.push(DataState::Purged);
+                continue;
+            }
+            _ => {
+                states.push(DataState::Pending);
+                continue;
+            }
+        };
+        let output = raw.with_extension("jsonl");
+        let record = read_processing_record_header(&output);
+        let state =
+            if evaluate_terminal_proof(record.as_ref(), vocab::HANDLER_TRANSCRIBE, metadata.len())
+                == TerminalProofOutcome::Held
+            {
+                if record
+                    .as_ref()
+                    .and_then(|r| r.get("state"))
+                    .and_then(Value::as_str)
+                    == Some(vocab::STATE_EMPTY)
+                {
+                    DataState::Empty
+                } else {
+                    DataState::Analyzed
+                }
+            } else if record.is_none()
+                && jsonl_has_row_with_key(&output, vocab::AUDIO_TRANSCRIPT_ROW_KEY)
+            {
+                DataState::Analyzed
+            } else {
+                derive_modality_state(
+                    directory,
+                    "audio",
+                    false,
+                    output.is_file(),
+                    true,
+                    record.as_ref().filter(|r| {
+                        r.get("input_size").and_then(Value::as_u64) == Some(metadata.len())
+                    }),
+                    now,
+                )
+            };
+        states.push(state);
+    }
+    // A first member's terminal header cannot hide an unsensed later member.
+    for state in [
+        DataState::Pending,
+        DataState::Analyzing,
+        DataState::Failed,
+        DataState::FailedFinal,
+        DataState::Analyzed,
+        DataState::Empty,
+        DataState::Purged,
+    ] {
+        if states.contains(&state) {
+            return state;
+        }
+    }
+    DataState::Pending
+}
+
 fn is_markdown_only_body_card_segment(stream_parent_name: &str, files: &[PathBuf]) -> bool {
     if !solstone_core_body_source::health_card_streams().any(|stream| stream == stream_parent_name)
         || !markdown_transcript_files(files)
@@ -407,7 +491,8 @@ fn is_audio_jsonl(path: &Path) -> bool {
     file_name(path).is_some_and(|name| {
         name == "audio.jsonl"
             || name.ends_with("_audio.jsonl")
-            || name.ends_with("_transcript.jsonl")
+            || (name.ends_with("_transcript.jsonl")
+                || solstone_core_format::audio_archive::is_audio_archive_transcript_name(name))
     })
 }
 
@@ -1066,5 +1151,131 @@ mod tests {
         let missing =
             list_location_only_segments(&FilesystemSegmentSource, root, "20260102", now).unwrap();
         assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn placement_audio_analyzed_contract() {
+        let temporary = TempDir::new().unwrap();
+        let segment_dir = temporary
+            .path()
+            .join("chronicle/20260811/import.archive/120000_300");
+        fs::create_dir_all(&segment_dir).unwrap();
+        let now = Utc::now();
+
+        // 1. Two raws and a two-part placement, one "start" jsonl -> audio not analyzed
+        let raw1 = segment_dir.join("p0000_0123456789abcdef.opus");
+        let raw2 = segment_dir.join("p0001_0123456789abcdef.opus");
+        fs::write(&raw1, b"raw1").unwrap();
+        fs::write(&raw2, b"raw2").unwrap();
+
+        let placement_json = serde_json::json!({
+            "version": 1,
+            "parts": [
+                {
+                    "stored_name": "p0000_0123456789abcdef.opus",
+                    "original_occurrence": "rec1",
+                    "origin_ms": 0,
+                    "offset_ms": 0,
+                    "length_ms": 1000
+                },
+                {
+                    "stored_name": "p0001_0123456789abcdef.opus",
+                    "original_occurrence": "rec2",
+                    "origin_ms": 0,
+                    "offset_ms": 1000,
+                    "length_ms": 1000
+                }
+            ]
+        });
+        fs::write(
+            segment_dir.join("placement.json"),
+            placement_json.to_string(),
+        )
+        .unwrap();
+
+        let jsonl1 = segment_dir.join("p0000_0123456789abcdef.jsonl");
+        fs::write(&jsonl1, "{\"start\":\"12:00:00\",\"text\":\"hello\"}\n").unwrap();
+
+        let (states, _) = detect_data_state(&segment_dir, "import.archive", now).unwrap();
+        assert_ne!(states.0.get("audio").map(String::as_str), Some("analyzed"));
+
+        // 2. Both parts terminal (both have "start" jsonl) -> analyzed
+        let jsonl2 = segment_dir.join("p0001_0123456789abcdef.jsonl");
+        fs::write(&jsonl2, "{\"start\":\"12:00:01\",\"text\":\"world\"}\n").unwrap();
+
+        let (states, _) = detect_data_state(&segment_dir, "import.archive", now).unwrap();
+        assert_eq!(states.0.get("audio").map(String::as_str), Some("analyzed"));
+
+        // 3. A missing raw plus the other part's "start" jsonl -> analyzed
+        fs::remove_file(&raw2).unwrap();
+        fs::remove_file(&jsonl2).unwrap();
+
+        let (states, _) = detect_data_state(&segment_dir, "import.archive", now).unwrap();
+        assert_eq!(states.0.get("audio").map(String::as_str), Some("analyzed"));
+
+        // 4. A directory with no placement and one audio.jsonl that has "start" -> analyzed
+        let no_placement_dir = temporary.path().join("chronicle/20260811/notes/120000_60");
+        fs::create_dir_all(&no_placement_dir).unwrap();
+        fs::write(no_placement_dir.join("audio.wav"), b"audio").unwrap();
+        fs::write(
+            no_placement_dir.join("audio.jsonl"),
+            "{\"start\":\"12:00:00\",\"text\":\"hello\"}\n",
+        )
+        .unwrap();
+
+        let (states, _) = detect_data_state(&no_placement_dir, "notes", now).unwrap();
+        assert_eq!(states.0.get("audio").map(String::as_str), Some("analyzed"));
+    }
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn an_empty_first_archive_member_does_not_hide_an_unsensed_later_one() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path();
+        let mut parts = Vec::new();
+        for (index, hash) in ["0123456789abcdef", "fedcba9876543210"]
+            .into_iter()
+            .enumerate()
+        {
+            let name = format!("p0000_{hash}.ogg");
+            fs::write(directory.join(&name), b"audio").unwrap();
+            parts.push(
+                solstone_core_format::audio_archive::AudioArchivePlacementPart {
+                    stored_name: name,
+                    original_occurrence: format!("occ-{index}"),
+                    original_time_ms: None,
+                    origin_ms: 0,
+                    offset_ms: index as i64 * 10_000,
+                    length_ms: 1000,
+                },
+            );
+        }
+        let placement = AudioArchivePlacement { version: 1, parts };
+        let header = serde_json::json!({"_solstone_processing":{"schema":vocab::SCHEMA,
+            "state":"empty","handler":"transcribe","input_size":5}});
+        let first = directory
+            .join(&placement.parts[0].stored_name)
+            .with_extension("jsonl");
+        fs::write(&first, format!("{header}\n")).unwrap();
+        assert_eq!(
+            archive_audio_state(directory, &placement, Utc::now()),
+            DataState::Pending
+        );
+        let second = directory
+            .join(&placement.parts[1].stored_name)
+            .with_extension("jsonl");
+        fs::write(
+            &second,
+            "{}\n{\"start\":\"12:00:10\",\"text\":\"speech\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            archive_audio_state(directory, &placement, Utc::now()),
+            DataState::Analyzed
+        );
+        fs::write(&second, format!("{header}\n")).unwrap();
+        assert_eq!(
+            archive_audio_state(directory, &placement, Utc::now()),
+            DataState::Empty
+        );
     }
 }

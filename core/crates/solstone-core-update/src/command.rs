@@ -1,0 +1,300 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 sol pbc
+
+use std::ffi::OsString;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandMode {
+    Update,
+    Check,
+    Hold,
+    Unhold,
+    Rollback,
+    Help,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateArgs {
+    pub mode: CommandMode,
+    pub json: bool,
+    pub lane: Option<String>,
+    pub version: Option<String>,
+    pub yes: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandParseError {
+    pub message: String,
+}
+
+impl std::fmt::Display for CommandParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for CommandParseError {}
+
+pub fn render_help() -> String {
+    "usage: solstone update [--check] [--json] [--lane release|staging|dev] [--version VER] [--hold] [--unhold] [--rollback] [--yes] [--help]\n\
+     \n\
+     update your installed solstone journal and apps.\n\
+     \n\
+     options:\n\
+     \x20 --check      check whether an update is available without changing anything\n\
+     \x20 --json       emit output as json\n\
+     \x20 --lane       release lane to track (release, staging, or dev)\n\
+     \x20 --version    specific target version to install\n\
+     \x20 --hold       hold updates so a later update does not install them\n\
+     \x20 --unhold     release update hold\n\
+     \x20 --rollback   roll back to an earlier retained installation\n\
+     \x20 --yes        accept unattended update prompts\n\
+     \x20 --help       show this help message\n"
+        .to_owned()
+}
+
+pub fn parse_args(args: &[OsString]) -> Result<UpdateArgs, CommandParseError> {
+    let mut check = false;
+    let mut json = false;
+    let mut lane = None;
+    let mut version = None;
+    let mut hold = false;
+    let mut unhold = false;
+    let mut rollback = false;
+    let mut yes = false;
+    let mut help = false;
+
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        let s = arg.to_str().ok_or_else(|| CommandParseError {
+            message: "arguments must be valid utf-8".to_owned(),
+        })?;
+
+        if s == "--help" || s == "-h" {
+            help = true;
+        } else if s == "--check" {
+            check = true;
+        } else if s == "--json" {
+            json = true;
+        } else if s == "--hold" {
+            hold = true;
+        } else if s == "--unhold" {
+            unhold = true;
+        } else if s == "--rollback" {
+            rollback = true;
+        } else if s == "--yes" || s == "-y" {
+            yes = true;
+        } else if s == "--lane" {
+            let next_val = iter.next().ok_or_else(|| CommandParseError {
+                message: "--lane requires a value".to_owned(),
+            })?;
+            let lane_str = next_val.to_str().ok_or_else(|| CommandParseError {
+                message: "--lane must be valid utf-8".to_owned(),
+            })?;
+            if lane_str != "release" && lane_str != "staging" && lane_str != "dev" {
+                return Err(CommandParseError {
+                    message: format!(
+                        "invalid release lane '{lane_str}'; choose release, staging, or dev"
+                    ),
+                });
+            }
+            lane = Some(lane_str.to_owned());
+        } else if let Some(lane_str) = s.strip_prefix("--lane=") {
+            if lane_str != "release" && lane_str != "staging" && lane_str != "dev" {
+                return Err(CommandParseError {
+                    message: format!(
+                        "invalid release lane '{lane_str}'; choose release, staging, or dev"
+                    ),
+                });
+            }
+            lane = Some(lane_str.to_owned());
+        } else if s == "--version" {
+            let next_val = iter.next().ok_or_else(|| CommandParseError {
+                message: "--version requires a value".to_owned(),
+            })?;
+            let ver_str = next_val.to_str().ok_or_else(|| CommandParseError {
+                message: "--version must be valid utf-8".to_owned(),
+            })?;
+            validate_version_pattern(ver_str)?;
+            version = Some(ver_str.to_owned());
+        } else if let Some(ver_str) = s.strip_prefix("--version=") {
+            validate_version_pattern(ver_str)?;
+            version = Some(ver_str.to_owned());
+        } else {
+            return Err(CommandParseError {
+                message: format!("unrecognized flag: {s}"),
+            });
+        }
+    }
+
+    if help {
+        return Ok(UpdateArgs {
+            mode: CommandMode::Help,
+            json,
+            lane,
+            version,
+            yes,
+        });
+    }
+
+    let mode_flags_count =
+        (check as usize) + (hold as usize) + (unhold as usize) + (rollback as usize);
+    if mode_flags_count > 1 {
+        return Err(CommandParseError {
+            message: "choose only one of --check, --hold, --unhold, or --rollback".to_owned(),
+        });
+    }
+
+    if yes && (check || hold || unhold) {
+        return Err(CommandParseError {
+            message: "--yes cannot be combined with --check, --hold, or --unhold".to_owned(),
+        });
+    }
+
+    if version.is_some() && (check || hold || unhold) {
+        return Err(CommandParseError {
+            message: "--version cannot be combined with --check, --hold, or --unhold".to_owned(),
+        });
+    }
+
+    let mode = if check {
+        CommandMode::Check
+    } else if hold {
+        CommandMode::Hold
+    } else if unhold {
+        CommandMode::Unhold
+    } else if rollback {
+        CommandMode::Rollback
+    } else {
+        CommandMode::Update
+    };
+
+    Ok(UpdateArgs {
+        mode,
+        json,
+        lane,
+        version,
+        yes,
+    })
+}
+
+fn validate_version_pattern(version: &str) -> Result<(), CommandParseError> {
+    let (base, revision) = match version.split_once("-r") {
+        Some((b, r)) => (b, Some(r)),
+        None => (version, None),
+    };
+
+    let parts: Vec<&str> = base.split('.').collect();
+    if parts.len() != 3 {
+        return Err(CommandParseError {
+            message: format!(
+                "invalid version format '{version}'; must be MAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH-rN"
+            ),
+        });
+    }
+
+    for part in parts {
+        if part.is_empty() || !part.chars().all(|c| c.is_ascii_digit()) {
+            return Err(CommandParseError {
+                message: format!("invalid version format '{version}'; components must be numeric"),
+            });
+        }
+    }
+
+    if let Some(rev) = revision
+        && (rev.is_empty() || !rev.chars().all(|c| c.is_ascii_digit()))
+    {
+        return Err(CommandParseError {
+            message: format!(
+                "invalid platform revision in '{version}'; revision must be numeric digits"
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_rejects_conflicting_mode_flags() {
+        let args = vec![OsString::from("--check"), OsString::from("--hold")];
+        let err = parse_args(&args).unwrap_err();
+        assert!(err.message.contains("choose only one"));
+
+        let args = vec![OsString::from("--rollback"), OsString::from("--unhold")];
+        let err = parse_args(&args).unwrap_err();
+        assert!(err.message.contains("choose only one"));
+    }
+
+    #[test]
+    fn parse_rejects_yes_with_check_or_hold_modes() {
+        let args = vec![OsString::from("--check"), OsString::from("--yes")];
+        let err = parse_args(&args).unwrap_err();
+        assert!(err.message.contains("--yes cannot be combined"));
+
+        let args = vec![OsString::from("--hold"), OsString::from("-y")];
+        let err = parse_args(&args).unwrap_err();
+        assert!(err.message.contains("--yes cannot be combined"));
+
+        let args = vec![OsString::from("--unhold"), OsString::from("--yes")];
+        let err = parse_args(&args).unwrap_err();
+        assert!(err.message.contains("--yes cannot be combined"));
+    }
+
+    #[test]
+    fn parse_rejects_version_with_check_or_hold_modes() {
+        let args = vec![
+            OsString::from("--check"),
+            OsString::from("--version"),
+            OsString::from("2.0.48"),
+        ];
+        let err = parse_args(&args).unwrap_err();
+        assert!(err.message.contains("--version cannot be combined"));
+
+        let args = vec![
+            OsString::from("--hold"),
+            OsString::from("--version"),
+            OsString::from("2.0.48"),
+        ];
+        let err = parse_args(&args).unwrap_err();
+        assert!(err.message.contains("--version cannot be combined"));
+    }
+
+    #[test]
+    fn parse_accepts_rollback_with_explicit_version() {
+        let args = vec![
+            OsString::from("--rollback"),
+            OsString::from("--version"),
+            OsString::from("2.0.47"),
+        ];
+        let parsed = parse_args(&args).expect("valid rollback with version");
+        assert_eq!(parsed.mode, CommandMode::Rollback);
+        assert_eq!(parsed.version.as_deref(), Some("2.0.47"));
+    }
+
+    #[test]
+    fn parse_rejects_invalid_lane_string() {
+        let args = vec![OsString::from("--lane"), OsString::from("nightly")];
+        let err = parse_args(&args).unwrap_err();
+        assert!(err.message.contains("invalid release lane"));
+    }
+
+    #[test]
+    fn parse_rejects_malformed_version_pattern() {
+        let bad = ["2.0", "v2.0.48", "2.0.48-beta", "2.0.48-r", "2.0.x"];
+        for v in bad {
+            let args = vec![OsString::from("--version"), OsString::from(v)];
+            assert!(parse_args(&args).is_err(), "expected error for {v}");
+        }
+    }
+
+    #[test]
+    fn parse_rejects_unknown_flag() {
+        let args = vec![OsString::from("--unknown-option")];
+        let err = parse_args(&args).unwrap_err();
+        assert!(err.message.contains("unrecognized flag"));
+    }
+}

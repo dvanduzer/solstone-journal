@@ -377,9 +377,12 @@ impl OwnedOffloadCliRun {
             || self
                 .runtime()
                 .is_some_and(|r| r.state() == DirectReadFinishState::Unknown);
-        self.exit_code = if complete { 0 } else { 1 };
+        let skipped = matches!(self.custody, Custody::Skipped { .. });
+        self.exit_code = if complete || skipped { 0 } else { 1 };
         let status = if complete {
             "completed"
+        } else if skipped {
+            "skipped"
         } else if unknown {
             "unknown"
         } else {
@@ -393,6 +396,7 @@ impl OwnedOffloadCliRun {
                 CliPrelaunchRefusal::Root(_) => "journal_unavailable",
                 CliPrelaunchRefusal::Budget(_) => "deadline_unavailable",
             },
+            Custody::Skipped { .. } => "offload_off",
             Custody::PreparationFailure { .. } => "preparation_refused",
             Custody::PreparedHold { refusal, .. } => match refusal {
                 CliPreparedRefusal::Timestamp => "clock_unavailable",
@@ -422,7 +426,7 @@ impl OwnedOffloadCliRun {
             )
             .unwrap();
         }
-        self.stderr = if complete {
+        self.stderr = if complete || skipped {
             String::new()
         } else {
             let guidance = match reason {
@@ -439,7 +443,8 @@ impl OwnedOffloadCliRun {
                 "deadline_unavailable" | "clock_unavailable" => {
                     "the operation clock could not be confirmed."
                 }
-                "preparation_refused" => "offload did not start.",
+                // Planning refuses before admission: no media has left or been removed.
+                "preparation_refused" | "planning_refused" => "offload did not start.",
                 _ => {
                     "offload did not finish. keep its recovery files and review the recorded effects before retrying."
                 }

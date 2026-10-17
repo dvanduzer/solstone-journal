@@ -28,8 +28,10 @@ ffmpeg-next = { version = "9.0.0", default-features = false, features = ["format
 ffmpeg-sys-next = { version = "9.0.0", default-features = false, features = ["build-portable"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+sha2 = { workspace = true }
 solstone-core-body-ingest.workspace = true
 solstone-core-callosum = { workspace = true, features = ["wire"] }
+solstone-core-format = { workspace = true }
 solstone-core-import.workspace = true
 solstone-core-import-sources.workspace = true
 solstone-core-journal-config.workspace = true

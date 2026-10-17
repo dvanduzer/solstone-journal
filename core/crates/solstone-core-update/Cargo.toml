@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026 sol pbc
+
+[package]
+name = "solstone-core-update"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints.rust]
+unsafe_code = "deny"
+
+[features]
+full-tests = []
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+ureq = { workspace = true, features = ["rustls"] }
+solstone-core-installed-payload.workspace = true
+solstone-core-journal.workspace = true
+
+tempfile = "3.24.0"

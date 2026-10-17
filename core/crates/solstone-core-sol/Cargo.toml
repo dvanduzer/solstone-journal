@@ -21,6 +21,7 @@ solstone-core-skill-state = { workspace = true }
 solstone-core-user-skill = { workspace = true }
 env_logger.workspace = true
 solstone-core-journal-cli = { workspace = true }
+solstone-core-update = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["signal"] }

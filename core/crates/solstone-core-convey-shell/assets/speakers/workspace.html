@@ -4633,6 +4633,23 @@
   function ownerConfirmed(data) {
     const meta = data.centroid_metadata || {};
     const streams = meta.streams || [];
+    let streamsHtml = escapeHtml(COPY.SPK_OVERVIEW_OWNER_STREAMS_UNKNOWN);
+    if (streams.length) {
+      const labelToRaw = new Map();
+      for (const s of streams) {
+        const lbl = window.JournalFormat.stream(s);
+        if (!labelToRaw.has(lbl)) {
+          labelToRaw.set(lbl, []);
+        }
+        labelToRaw.get(lbl).push(s);
+      }
+      const spans = [];
+      for (const [lbl, rawList] of labelToRaw.entries()) {
+        const titleAttr = escapeHtml(rawList.join(', '));
+        spans.push(`<span title="${titleAttr}">${escapeHtml(lbl)}</span>`);
+      }
+      streamsHtml = spans.join(', ');
+    }
     // G1-207: on a voice that has never been rebuilt, "built" and "refreshed"
     // render the identical readable time. Two rows saying one thing read as a
     // discrepancy, so the second only appears once it differs.
@@ -4645,7 +4662,7 @@
       <strong>${escapeHtml(COPY.SPK_OVERVIEW_YOUR_VOICE_CONFIRMED)}</strong>
       ${relabelHtml(data.relabel)}
       <p class="spk-card-line">${escapeHtml(COPY.SPK_OVERVIEW_OWNER_SAMPLES_LABEL)}: ${escapeHtml(ownerSamplesText(meta))}</p>
-      <p class="spk-card-line">${escapeHtml(COPY.SPK_OVERVIEW_OWNER_STREAMS_LABEL)}: ${escapeHtml(streams.length ? streams.join(' · ') : COPY.SPK_OVERVIEW_OWNER_STREAMS_UNKNOWN)}</p>
+      <p class="spk-card-line">${escapeHtml(COPY.SPK_OVERVIEW_OWNER_STREAMS_LABEL)}: ${streamsHtml}</p>
       <p class="spk-card-line">${escapeHtml(COPY.SPK_OVERVIEW_OWNER_COHESION_LABEL)}: ${cohesion(meta.intra_cosine_p25)}</p>
       <p class="spk-card-line">${escapeHtml(COPY.SPK_OVERVIEW_OWNER_BUILT_PREFIX)}: ${built}</p>
       ${refreshedRow}

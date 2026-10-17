@@ -8,6 +8,7 @@ const vm = require('vm');
 
 const crateDir = process.argv[2];
 assert.ok(crateDir, 'crate directory argument is required');
+const dateFormatSource = fs.readFileSync(path.resolve(crateDir, '../solstone-core-convey-shell/assets/static/date_format.js'), 'utf8');
 
 class ClassList {
   constructor(element) {
@@ -213,6 +214,11 @@ class Document {
   }
 
   createElement(tagName) { return new Element(tagName, this); }
+  createTextNode(text) {
+    const node = new Element('#text', this);
+    node.textContent = text;
+    return node;
+  }
   getElementById(id) { return this.querySelector('#' + id); }
   querySelector(selector) {
     if (selector === 'body') return this.body;
@@ -292,7 +298,6 @@ function createEnvironment() {
     state: {},
     renderHeldWork: () => {},
     window: {
-      JournalFormat: { day: (d) => `Apr 3, 2026` },
       location: { href: '' },
     },
     console,
@@ -302,6 +307,8 @@ function createEnvironment() {
     Array,
     Object,
   });
+  vm.runInContext(dateFormatSource, context);
+  context.window.JournalFormat.day = (d) => `Apr 3, 2026`;
 
   const glue = `
     let backlogCopy = {};
@@ -531,12 +538,13 @@ function createDeviceEnvironment() {
   };
   const context = vm.createContext({
     document: doc, elements, state, Date: ControlledDate, clock, console: { warn() {} },
-    window: { location: { hash: '' }, JournalFormat: { sinceDay: () => 'synthetic day' } },
+    window: { location: { hash: '' } },
     requestAnimationFrame: fn => fn(), CustomEvent: class { constructor(type) { this.type = type; } },
     STALE_MS: 30000, brainSnapshot: null, connectError: false, updateClients() {},
     serviceName: value => value, relativeTime: value => String(value), ageAgo: value => String(value),
     fetch: async () => ({ ok: true, json: async () => ({ clients: [] }) }),
   });
+  vm.runInContext(dateFormatSource, context);
   context.updateStatusSummary = () => {
     context.selection = vm.runInContext('selectGlanceSentence(state, Date.now())', context);
   };
@@ -650,7 +658,7 @@ test('failed refresh retains evidence and observation time until a new successfu
   await vm.runInContext('loadRegisteredClients()', env.context);
   assert.strictEqual(env.state.registeredClientsObservedAt, healthyReadAt);
   assert.strictEqual(env.verdict().key, 'HEALTH_GLANCE_DEVICES_UNAVAILABLE');
-  assert.strictEqual(env.doc.querySelectorAll('.registered-client-row').length, 1);
+  assert.strictEqual(env.doc.querySelectorAll('.registered-client-row').length, 0);
   assert.ok(env.doc.querySelector('[data-read-state="unavailable"]'));
   assert.strictEqual(env.doc.querySelector('.registered-client-label.connected'), null);
 });
@@ -723,7 +731,16 @@ test('observe uses fresh selected evidence rather than a stale populated map', a
   assert.ok(!env.elements.audioStatus.textContent.includes('999'));
   env.state.localHost = null;
   env.observe();
-  assert.ok(env.elements.observeSourceNote.textContent.includes('remote'));
+  assert.ok(!env.elements.observeSourceNote.textContent.includes('remote'));
+  env.context.window.JournalFormat.installStreamLabels({ status: 'complete', labels: { ja1r: 'LABEL-ONE' } });
+  env.state.clients.delete('remote');
+  env.state.clients.set('ja1r', { lastSeen: env.clock.now, mode: 'screencast', audio: { threshold_hits: 7 } });
+  env.observe();
+  assert.ok(env.elements.observeSourceNote.textContent.includes('LABEL-ONE'));
+  assert.ok(!env.elements.observeSourceNote.textContent.includes('ja1r'));
+  const labelSpan = env.elements.observeSourceNote.querySelector('span');
+  assert.strictEqual(labelSpan.textContent, 'LABEL-ONE');
+  assert.strictEqual(labelSpan.title, 'ja1r');
   env.state.clients = new Map();
   env.state.registeredClients = [];
   env.observe();
@@ -816,16 +833,61 @@ test('live sources tolerate unloaded names and keep equal labels as separate dev
     ['other', { cid: 'two', lastSeen: Date.now() }],
   ]) };
   vm.runInContext(sourceBlock(loadHealthSource(), 'function updateClients(', 'const sinceDay ='), context);
+  context.window.JournalFormat.installStreamLabels({ status: 'complete', labels: { opaque: 'LABEL-TWO' } });
   vm.runInContext('updateClients()', context);
   assert.strictEqual(context.elements.clientsGrid.children.length, 2);
-  const unknown = context.elements.clientsGrid.querySelector('.client-stream-qualifier').textContent;
-  context.state.registeredClients = ['one', 'two'].map(cid => ({ cid, display_label: 'my device', reported: {device_type:'phone'} }));
-  vm.runInContext('updateClients()', context);
+  const qualEls = context.elements.clientsGrid.querySelectorAll('.client-stream-qualifier');
+  assert.strictEqual(qualEls[0].textContent, 'LABEL-TWO');
+  assert.strictEqual(qualEls[0].title, 'opaque');
   assert.strictEqual(context.elements.clientsGrid.children.length, 2);
-  assert.notStrictEqual(context.elements.clientsGrid.querySelector('.client-stream-qualifier').textContent, unknown);
-  context.state.clients.get('opaque').source = 'watch-audio';
-  vm.runInContext('updateClients()', context);
-  assert.strictEqual(context.elements.clientsGrid.querySelector('.client-stream-qualifier').textContent, 'watch');
+});
+
+test('a stream first met on the socket re-reads the label table once and renders what it learned', async () => {
+  const env = createDeviceEnvironment();
+  await env.load([device('phone')]);
+  const tables = [];
+  let reads = 0;
+  env.context.fetch = async (route) => {
+    if (route === '/api/streams/labels') {
+      reads += 1;
+      return { ok: true, json: async () => tables.shift() };
+    }
+    return { ok: true, json: async () => ({ clients: [] }) };
+  };
+  let clientRenders = 0;
+  env.context.updateClients = () => { clientRenders += 1; };
+  vm.runInContext(sourceBlock(loadHealthSource(), 'function handleObserveEvent(', 'function handleImporterEvent('), env.context);
+  const receive = async (stream) => {
+    vm.runInContext(`handleObserveEvent(${JSON.stringify({ stream, mode: 'screencast', audio: { threshold_hits: 3 } })})`, env.context);
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+  };
+  const unknown = env.context.window.JournalFormat.stream('_default');
+
+  tables.push({ status: 'complete', labels: { ja1r: 'LABEL-ONE' } });
+  await receive('ja1r');
+  assert.strictEqual(reads, 1);
+  const span = env.elements.observeSourceNote.querySelector('span');
+  assert.strictEqual(span.textContent, 'LABEL-ONE');
+  assert.strictEqual(span.title, 'ja1r');
+
+  // A known stream re-reads nothing and renders once per message.
+  const before = clientRenders;
+  await receive('ja1r');
+  assert.strictEqual(reads, 1);
+  assert.strictEqual(clientRenders, before + 1);
+
+  // A second new stream gets its own re-read; one the registry lacks is
+  // unknown, and the note then says nothing about what it shows.
+  env.state.clients.delete('ja1r');
+  tables.push({ status: 'complete', labels: { ja1r: 'LABEL-ONE' } });
+  await receive('device_new');
+  assert.strictEqual(reads, 2);
+  assert.strictEqual(env.context.window.JournalFormat.stream('device_new'), unknown);
+  assert.strictEqual(env.elements.observeSourceNote.querySelector('span'), null);
+  assert.ok(!env.elements.observeSourceNote.textContent.includes('device_new'));
+  await receive('device_new');
+  assert.strictEqual(reads, 2, 'a name gets one re-read');
 });
 
 test('holds require queued work at their scope even while unrelated work is active', async () => {
@@ -1172,6 +1234,72 @@ if (process.env.BACKUP_STATUS_FIXTURES) {
     }
   });
 }
+
+test('registered clients card state choices', async () => {
+  const env = createDeviceEnvironment();
+
+  // A count sentence is present only when at least one client has capture_state active.
+  await env.load([]);
+  assert.strictEqual(env.doc.querySelector('.registered-clients-count'), null);
+  await env.load([{ ...device('phone'), capture_state: 'degraded' }]);
+  assert.strictEqual(env.doc.querySelector('.registered-clients-count'), null);
+  await env.load([{ ...device('phone'), capture_state: 'active' }]);
+  assert.ok(env.doc.querySelector('.registered-clients-count'));
+
+  // An empty list shows no devices are paired yet. and a pair link to /app/network/#devices, and the card stays visible.
+  await env.load([]);
+  assert.strictEqual(env.elements.registeredClientsCard.classList.contains('hidden'), false);
+  const emptyP = env.doc.querySelector('.registered-clients-empty');
+  assert.ok(emptyP && emptyP.textContent.includes('no devices are paired yet.'));
+  const pairLink = env.doc.querySelector('.registered-clients-manage');
+  assert.ok(pairLink && pairLink.getAttribute('href') === '/app/network/#devices');
+
+  // A failed read shows delivery status couldn't be checked., no count sentence, no empty-state sentence,
+  // and the rows below show that last check. only when an attention row exists.
+  // 1) When attention row exists from previous check:
+  await env.load([{ ...device('phone'), capture_state: 'degraded' }]);
+  assert.strictEqual(env.doc.querySelectorAll('.registered-client-row').length, 1);
+  env.context.fetch = async () => ({ ok: false, status: 500 });
+  await vm.runInContext('loadRegisteredClients()', env.context);
+  assert.strictEqual(env.doc.querySelector('.registered-clients-count'), null);
+  assert.strictEqual(env.doc.querySelector('.registered-clients-empty'), null);
+  const failNotice1 = env.doc.querySelector('[data-read-state="unavailable"]');
+  assert.ok(failNotice1 && failNotice1.textContent.includes("delivery status couldn't be checked."));
+  assert.ok(failNotice1.textContent.includes('the rows below show that last check.'));
+  assert.strictEqual(env.doc.querySelectorAll('.registered-client-row').length, 1);
+
+  // 2) When no attention row existed (healthy read fails):
+  await env.load([device('phone')]); // healthy active -> 0 attention rows
+  assert.strictEqual(env.doc.querySelectorAll('.registered-client-row').length, 0);
+  env.context.fetch = async () => ({ ok: false, status: 500 });
+  await vm.runInContext('loadRegisteredClients()', env.context);
+  assert.strictEqual(env.doc.querySelector('.registered-clients-count'), null);
+  assert.strictEqual(env.doc.querySelector('.registered-clients-empty'), null);
+  const failNotice2 = env.doc.querySelector('[data-read-state="unavailable"]');
+  assert.ok(failNotice2 && failNotice2.textContent.includes("delivery status couldn't be checked."));
+  assert.ok(!failNotice2.textContent.includes('the rows below show that last check.'));
+  assert.strictEqual(env.doc.querySelectorAll('.registered-client-row').length, 0);
+
+  // A degraded client with no rejected sources is a row, and the glance action href is still #registeredClientsCard.
+  await env.load([{ ...device('laptop'), capture_state: 'degraded', failing: true, source_delivery: null }]);
+  assert.strictEqual(env.doc.querySelectorAll('.registered-client-row').length, 1);
+  assert.strictEqual(env.verdict().action.href, '#registeredClientsCard');
+
+  // no_capture plus rejected uploads is a row and is not in the count.
+  await env.load([{ ...device('phone', { audio: rejection() }), capture_state: 'no_capture' }]);
+  assert.strictEqual(env.doc.querySelectorAll('.registered-client-row').length, 1);
+  assert.strictEqual(env.doc.querySelector('.registered-clients-count'), null);
+
+  // active plus clock_skew is in the count and is a row.
+  await env.load([{ ...device('phone'), capture_state: 'active', clock_skew: { skew_ms: 5000 } }]);
+  assert.strictEqual(env.doc.querySelectorAll('.registered-client-row').length, 1);
+  assert.ok(env.doc.querySelector('.registered-clients-count'));
+
+  // active with no problem is in the count and is not a row.
+  await env.load([device('phone')]);
+  assert.strictEqual(env.doc.querySelectorAll('.registered-client-row').length, 0);
+  assert.ok(env.doc.querySelector('.registered-clients-count'));
+});
 
 async function runAsyncCases() {
   for (const runCase of asyncCases) await runCase();

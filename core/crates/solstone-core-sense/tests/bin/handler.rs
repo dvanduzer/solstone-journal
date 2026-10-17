@@ -42,6 +42,7 @@ fn main() {
         "OBSERVER_NAME",
         "SEGMENT_META",
         "SOL_QUEUE_WAIT_MS",
+        "SOLSTONE_WORK_PRIORITY",
     ] {
         if let Ok(value) = std::env::var(key) {
             writeln!(log, "{key}={value}").expect("handler environment log write");

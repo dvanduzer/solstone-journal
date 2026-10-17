@@ -118,7 +118,7 @@ pub(crate) fn write_mcp_hold_state(
         ),
         (RegistrationHold::AccountChanged, _) => (
             "account_changed",
-            "this journal can no longer show solstone.me that your address belongs to it, so the address stays off. this can happen if the journal was set up again. ask support in the services portal to reconnect your address to this journal.",
+            "solstone.me ties your address to another copy of this journal, so the address stays off here. this happens when a journal is restored or set up again. bring it back here, and the other copy stops using it.",
         ),
         (RegistrationHold::AddressNotReady, _) => (
             "address_not_ready",

@@ -249,19 +249,48 @@ fn apply_permanent_devices_shell_divergence(expected: &mut Value) {
 }
 
 fn apply_client_capture_projection_rename(expected: &mut Value) {
-    let version = expected["version"]
-        .as_object_mut()
-        .expect("frozen system status contains version");
-    for field in ["current", "latest"] {
-        assert_eq!(
-            version.get(field),
-            Some(&Value::String("1.0.22".to_owned())),
-            "frozen system status contains the v1.0.22 {field} projection"
-        );
-        version.insert(
-            field.to_owned(),
-            Value::String(env!("CARGO_PKG_VERSION").to_owned()),
-        );
+    #[cfg(target_os = "linux")]
+    {
+        let hold_state = solstone_core_update::owner_data_dir()
+            .map(|dir| solstone_core_update::read_hold_state(&dir))
+            .unwrap_or(solstone_core_update::HoldState::Unknown);
+        let hold_str = match hold_state {
+            solstone_core_update::HoldState::Held => "held",
+            solstone_core_update::HoldState::Unheld => "unheld",
+            solstone_core_update::HoldState::Unknown => "unknown",
+        };
+        expected["version"] = json!({
+            "availability": "unknown",
+            "current": null,
+            "platform_version": null,
+            "latest": null,
+            "latest_platform_version": null,
+            "lane": null,
+            "route": null,
+            "hold": hold_str,
+            "target": null,
+            "code": "source-checkout",
+            "message": "this copy is a source checkout. install the released journal to update it.",
+            "components": null,
+        });
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let version = expected["version"]
+            .as_object_mut()
+            .expect("frozen system status contains version");
+        for field in ["current", "latest"] {
+            assert_eq!(
+                version.get(field),
+                Some(&Value::String("1.0.22".to_owned())),
+                "frozen system status contains the v1.0.22 {field} projection"
+            );
+            version.insert(
+                field.to_owned(),
+                Value::String(env!("CARGO_PKG_VERSION").to_owned()),
+            );
+        }
     }
     let capture = expected["capture"]
         .as_object_mut()

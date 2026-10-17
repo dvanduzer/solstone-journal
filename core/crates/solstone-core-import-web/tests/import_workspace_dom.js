@@ -593,6 +593,23 @@ function runImportRowColumns() {
   };
   const gapHtml = vm.runInContext(`renderImportRow(${JSON.stringify(gapRow)})`, context);
   assert.ok(gapHtml.includes('contains gaps'), 'gap chip rendered on has_gaps row');
+
+  const archiveRow = {
+    timestamp: 'a1', status: 'success', imported_at: 1700000000, target_day: null,
+    source_type: 'audio_archive', source_display: 'Audio Archive',
+    saved: 42, remaining: 7, processing: 3, left_out: 2, unavailable_parts: 1,
+  };
+  const archiveHtml = vm.runInContext(`renderImportRow(${JSON.stringify(archiveRow)})`, context);
+  assert.ok(archiveHtml.includes('data-saved="42"'), 'archive row sets data-saved');
+  assert.ok(archiveHtml.includes('data-remaining="7"'), 'archive row sets data-remaining');
+  assert.ok(archiveHtml.includes('data-processing="3"'), 'archive row sets data-processing');
+  assert.ok(archiveHtml.includes('data-left-out="2"'), 'archive row sets data-left-out');
+  assert.ok(archiveHtml.includes('data-unavailable="1"'), 'archive row sets data-unavailable');
+  assert.ok(archiveHtml.includes('42'), 'stats cell includes saved count');
+  assert.ok(archiveHtml.includes('7'), 'stats cell includes remaining count');
+  assert.ok(archiveHtml.includes('3'), 'stats cell includes processing count');
+  assert.ok(archiveHtml.includes('2'), 'stats cell includes left out count');
+
   cases += 1;
 }
 

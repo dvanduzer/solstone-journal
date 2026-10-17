@@ -46,12 +46,14 @@
   }
 
   function plainRow(fields) {
-    const text = [fields.day && global.JournalFormat.day(fields.day), fields.stream && global.JournalFormat.stream(fields.stream), fields.segment && global.JournalFormat.segmentTime(fields.segment)]
-      .map((part) => String(part ?? '').trim())
-      .filter(Boolean)
-      .join(META_SEPARATOR);
+    const day = fields.day ? escapeHtml(global.JournalFormat.day(fields.day)) : '';
+    const stream = fields.stream
+      ? `<span title="${escapeHtml(fields.stream)}">${escapeHtml(global.JournalFormat.stream(fields.stream))}</span>`
+      : '';
+    const segment = fields.segment ? escapeHtml(global.JournalFormat.segmentTime(fields.segment)) : '';
+    const inner = [day, stream, segment].filter(Boolean).join(META_SEPARATOR);
     return '<li class="drawer-evidence-row">' +
-      `<span class="drawer-evidence-title">${escapeHtml(text)}</span>` +
+      `<span class="drawer-evidence-title">${inner}</span>` +
       '</li>';
   }
 
@@ -59,7 +61,7 @@
     const dayHref = `/app/transcripts/${fields.day}`;
     const segmentHref = `/app/transcripts/${fields.day}#${fields.segment}`;
     const streamHtml = fields.stream
-      ? `<span class="ev-meta">${escapeHtml(global.JournalFormat.stream(fields.stream))}</span>`
+      ? `<span class="ev-meta" title="${escapeHtml(fields.stream)}">${escapeHtml(global.JournalFormat.stream(fields.stream))}</span>`
       : '';
     return '<li class="drawer-evidence-row">' +
       `<a class="drawer-evidence-title" href="${escapeHtml(dayHref)}">${escapeHtml(global.JournalFormat.day(fields.day))}</a>` +

@@ -1058,6 +1058,7 @@ fn router_with_roots(
         .route("/favicon.ico", get(favicon))
         .route("/static/{*path}", get(static_asset))
         .route("/api/shell", get(shell_api))
+        .route("/api/streams/labels", get(streams_labels_api))
         .route(
             "/api/system/about",
             get(|| async {
@@ -1484,6 +1485,30 @@ async fn shell_api(
     Json(Value::Object(payload)).into_response()
 }
 
+async fn streams_labels_api(Extension(journal): Extension<Arc<JournalRoot>>) -> Response {
+    let table = solstone_core_home::provenance::load_stream_labels(&journal.0);
+    match table.status {
+        solstone_core_home::provenance::LabelTableStatus::Failed => {
+            Json(serde_json::json!({ "status": "failed" })).into_response()
+        }
+        status => {
+            let status_str = match status {
+                solstone_core_home::provenance::LabelTableStatus::Complete => "complete",
+                solstone_core_home::provenance::LabelTableStatus::Partial => "partial",
+                solstone_core_home::provenance::LabelTableStatus::Failed => unreachable!(),
+            };
+            let labels = solstone_core_home::provenance::rendered_stream_labels(&table);
+            let says = solstone_core_home::provenance::rendered_stream_says(&table);
+            Json(serde_json::json!({
+                "status": status_str,
+                "labels": labels,
+                "says": says,
+            }))
+            .into_response()
+        }
+    }
+}
+
 async fn app_bare(Path(app): Path<String>, include_agents: bool) -> Response {
     if served_app(&app, include_agents).is_some_and(|definition| definition.converted) {
         return Redirect::permanent(&format!("/app/{app}/")).into_response();
@@ -1571,6 +1596,48 @@ mod tests {
         release.send(()).unwrap();
         second.await;
         assert!(slot.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_labels_serve_words_with_what_they_say_and_fail_whole() {
+        let journal = tempfile::TempDir::new_in("/var/tmp").expect("journal root");
+        fs::create_dir_all(journal.path().join("config")).expect("config directory");
+        fs::write(
+            journal.path().join("config/journal.json"),
+            br#"{"setup":{"completed_at":1700000000000}}"#,
+        )
+        .expect("journal config");
+        fs::create_dir_all(journal.path().join("streams")).expect("streams directory");
+        fs::write(
+            journal.path().join("streams/s1.json"),
+            br#"{"name":"s1","kind":"observer","host":null,"platform":null,"created_at":1,"last_day":null,"last_segment":null,"seq":1,"cid":"sha256:1","source":"audio"}"#,
+        )
+        .expect("stream record");
+        let read = |app: axum::Router| async move {
+            let response = app
+                .oneshot(
+                    Request::get("/api/streams/labels")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("router responds");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            serde_json::from_slice::<Value>(&body).expect("json")
+        };
+        let app = super::router_with_hosted_parent(journal.path().to_path_buf(), None, None);
+        let body = read(app.clone()).await;
+        assert_eq!(body["status"], "complete");
+        assert!(body["labels"]["s1"].is_string());
+        assert_eq!(body["says"]["s1"]["what"], "audio");
+        assert_eq!(body["says"]["s1"]["imported"], false);
+        fs::write(journal.path().join("streams/broken.json"), b"{").expect("broken record");
+        let body = read(app).await;
+        assert_eq!(body["status"], "failed");
+        assert!(body.get("labels").is_none() && body.get("says").is_none());
     }
 
     #[test]

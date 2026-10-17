@@ -216,6 +216,7 @@ time = { version = "0.3.54", optional = true }
 tower.workspace = true
 ureq = { workspace = true, features = ["rustls"] }
 zip = { version = "=2.4.2", default-features = false, features = ["deflate"] }
+solstone-core-update = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["signal"] }

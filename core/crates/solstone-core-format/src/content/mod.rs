@@ -509,6 +509,19 @@ pub fn classify(rel: &str) -> ContentResolution {
     if let Some(family) = CONTENT_RESOLVER.resolve(rel) {
         return ContentResolution::Indexed(family);
     }
+    let mut components = rel.split('/');
+    if let (Some(day), Some("import.archive"), Some(segment), Some(name), None) = (
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+    ) && crate::segment::is_date_key(day)
+        && crate::segment::segment_parse(segment).is_some()
+        && crate::audio_archive::is_audio_archive_transcript_name(name)
+    {
+        return ContentResolution::Unindexed(RawPerceptFamily::Audio);
+    }
     match UNINDEXED_RESOLVER.resolve(rel) {
         Some(UnindexedReason::RawPercept(family)) => ContentResolution::Unindexed(family),
         Some(UnindexedReason::IndexedElsewhere) => ContentResolution::IndexedElsewhere,

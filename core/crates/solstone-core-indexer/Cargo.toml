@@ -6,6 +6,14 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+full-tests = []
+
+[[test]]
+name = "status_discovery_roots"
+path = "tests/status_discovery_roots.rs"
+required-features = ["full-tests"]
+
 [lints]
 workspace = true
 

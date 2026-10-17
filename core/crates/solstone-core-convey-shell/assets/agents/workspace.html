@@ -306,6 +306,13 @@
     if (me === 'stopped') return `<div class="lane-body">${row("on, but it isn't working", true)}<div class="notice"><p>${esc(state.owner_state?.detail || "solstone.me isn't working on this journal.")}</p></div>${about}</div>`;
     if (me === 'renewal') return `<div class="lane-body">${row('on, certificate renewal overdue', true)}${address}<div class="notice"><p>the address's certificate is past its renewal window and its renewal hasn't gone through yet. your journal keeps trying on its own. if the certificate expires first, agents will see a warning from their side.</p></div>${about}</div>`;
     if (me === 'lapsed') return `<div class="lane-body">${row("on here, but solstone.me isn't on", true)}<div class="notice"><p>finish turning it on in the services portal, and your journal picks it up on its own. it checks about every five minutes.${next}</p></div><div class="hand"><a class="btn primary" data-solstone-outside href="${esc(state.subscribe_url || PORTAL)}" target="_blank" rel="noopener">open the services portal</a></div></div>`;
+    if (me === 'held' && state.status === 'account_changed') {
+      const back = state.sme_account?.replace_pending
+        ? '<p class="note" data-sme-replace-pending>your journal is asking solstone.me for your address now.</p>'
+        : '<div class="hand"><button class="btn primary" data-action="sme-account-replace">bring my address back</button></div>';
+      const label = state.sme_account?.replace_pending ? 'on, bringing your address back' : 'on, waiting for you';
+      return `<div class="lane-body">${row(label, true)}<div class="notice"><p>${esc(state.owner_state?.detail || "solstone.me ties your address to another copy of this journal, so the address stays off here.")}</p></div>${back}${about}</div>`;
+    }
     if (me === 'held') return `<div class="lane-body">${row('on, not reachable right now', true)}<div class="notice"><p>${esc(state.owner_state?.detail || "solstone.me isn't reachable right now. your journal keeps trying on its own.")}${next}</p></div>${about}</div>`;
     if (me === 'refused') return `<div class="lane-body">${row("on, but solstone.me didn't accept this journal", true)}<div class="notice"><p>if you haven't allowed solstone.me for this journal yet, turn it off and back on to do that. your journal keeps trying on its own, about every five minutes.${next}</p></div></div>`;
     return `<div class="lane-body">${row('on, reachable from anywhere', true)}${address}<p class="note" data-disclosure="relay">${relay}</p>${protection}${about}${portal()}</div>`;
@@ -347,7 +354,9 @@
     const [tone, sentence] = statusLine();
     const lanes = `<section class="lanes"><p class="sectlab">how your agents reach your journal</p><p class="secthint">whichever way an agent uses, it reads only what you let it see.</p><div class="seg3" role="radiogroup" aria-label="how your agents reach your journal">${segment('own', 'your own', hasLan() ? 'by default, agents on this computer reach your journal directly. agents on your wifi or VPN can too, once you turn that on.' : `agents on this computer reach your journal directly.${hasDoor() ? ' the default.' : ''}`, 'sol pbc is never in the path', 'byob', ownTag())}${segment('byo', 'your hostname', 'agents anywhere reach your journal through a public route and DNS you set up.', 'you operate the route', 'byob', byoTag())}${segment('me', 'solstone.me', 'agents anywhere, like Claude on the web, reach your journal at its own address, through a relay sol pbc runs for you.', 'operated by sol pbc', 'oper', meTag())}</div>${lane === 'own' ? ownBody() : lane === 'byo' ? byoBody() : meBody()}</section>`;
     const notices = (state.replay_notices || []).filter(notice => !notice.dismissed).map(notice => `<section class="notice"><p>your journal disconnected ${esc(notice.name)} on ${esc(notice.door)} because the token it uses to stay connected was used twice. connect it again with a new pairing code.</p><button class="btn sm" data-action="dismiss-replay" data-notice="${esc(notice.id)}">dismiss</button></section>`).join('');
-    return `<p class="brandlock"><span class="lockdot" aria-hidden="true"></span>your journal is always private, only yours.</p><h1>agents</h1><p class="status-line"><span class="sdot ${tone}" aria-hidden="true"></span>${sentence}</p>${lanes}${notices}${agentsList()}`;
+    const replaced = state.sme_account?.replaced;
+    const back = replaced ? `<section class="notice success" data-sme-replaced><p>your solstone.me address ${esc(replaced.address)} came back to this journal on ${esc(formatAgentTimestamp(replaced.replaced_at))}. if that wasn't you, tell support in the services portal. if an agent can't reach your journal, connect it again with a new pairing code.</p><button class="btn sm" data-action="dismiss-sme-replaced">dismiss</button></section>` : '';
+    return `<p class="brandlock"><span class="lockdot" aria-hidden="true"></span>your journal is always private, only yours.</p><h1>agents</h1><p class="status-line"><span class="sdot ${tone}" aria-hidden="true"></span>${sentence}</p>${lanes}${back}${notices}${agentsList()}`;
   }
 
   // ---- dialogs -----------------------------------------------------------------------------------
@@ -759,6 +768,8 @@
       else if (action === 'turn-on') await turnOn();
       else if (action === 'turn-off') { await api('/app/agents/api/capability', jsonOptions('PUT', {enabled:false})); dialog = null; await reload(true); }
       else if (action === 'dismiss-enable') { clearTimeout(enablePollTimer); enableOp = null; lastEnableView = ''; render(); }
+      else if (action === 'sme-account-replace') { await api('/app/agents/api/solstone-me/account/replace', ownerOptions('POST')); await reload(true); }
+      else if (action === 'dismiss-sme-replaced') { await api('/app/agents/api/solstone-me/account/notice/dismiss', ownerOptions('POST')); await reload(true); }
       else if (action === 'dismiss-replay') { await api('/app/agents/api/replay-notices/' + encodeURIComponent(target.dataset.notice) + '/dismiss', ownerOptions('POST')); await reload(true); }
       else if (action === 'new-code') { if (connectWay && connectWays().some(([id]) => id === connectWay)) { const known = await pairedBefore(); const res = await api('/app/agents/api/pairing', jsonOptions('POST', {door: connectWay})); pairingCode = res; state.pairing = {expires_at: res.expires_at, generation: res.generation, locked: false, door: res.door}; stopWatch(); render(); startWatch(res, known); } }
       else if (action === 'filter-activity') { const filters = Object.fromEntries(Object.keys(activityFilters).map(key => [key, document.getElementById(`a-${key}`).value])); await applyActivityFilters(filters); }

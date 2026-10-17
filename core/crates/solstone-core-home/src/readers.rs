@@ -180,7 +180,7 @@ pub fn enabled_facet_names(context: &HomeContext) -> Vec<String> {
 /// Collect anticipated activity records across every declared facet.
 pub fn collect_anticipated_activities(context: &HomeContext, day: &str) -> Vec<Value> {
     all_facet_names(context).into_iter().flat_map(|facet| {
-        load_activity_records(context.journal_root(), &facet, day, true).unwrap_or_default().into_iter().filter_map(move |record| {
+        load_activity_records(context.journal_root(), &facet, day, false).unwrap_or_default().into_iter().filter_map(move |record| {
             (record.get("source").and_then(Value::as_str) == Some("anticipated")).then(|| {
                 let participants = record.get("participation").and_then(Value::as_array).into_iter().flatten().filter_map(|entry| {
                     (entry.get("role").and_then(Value::as_str) == Some("attendee")).then(|| entry.get("name").and_then(Value::as_str).unwrap_or("").trim().to_owned()).filter(|name| !name.is_empty())
@@ -286,7 +286,7 @@ pub fn collect_activities(context: &HomeContext, day: &str) -> Vec<Value> {
     let day_records = all_facet_names(context)
         .into_iter()
         .flat_map(|facet| {
-            load_activity_records(context.journal_root(), &facet, day, true)
+            load_activity_records(context.journal_root(), &facet, day, false)
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|record| {
@@ -383,7 +383,7 @@ pub fn collect_top_activities_yesterday(context: &HomeContext) -> Vec<Value> {
     let day_records = enabled_facet_names(context)
         .into_iter()
         .flat_map(|facet| {
-            load_activity_records(context.journal_root(), &facet, &day, true)
+            load_activity_records(context.journal_root(), &facet, &day, false)
                 .unwrap_or_default()
                 .into_iter()
                 .map(move |record| (facet.clone(), record))
@@ -2943,5 +2943,173 @@ mod tests {
             r#"{"reason":"","endpoint":""}"#,
         );
         assert!(transcription_processing_issue(path5, &config_map, Some("byo-cloud")).is_none());
+    }
+
+    #[test]
+    fn readers_filter_hidden_and_label_clock_aligned_rows() {
+        let root = TempDir::new_in("/var/tmp").unwrap();
+        let context = context(root.path());
+        let recent = context.now_ms() - 1;
+        seed_concurrent_streams(root.path(), "20260602");
+        seed_concurrent_streams(root.path(), "20260601");
+        write(root.path(), "facets/work/facet.json", "{}");
+        write(root.path(), "facets/home/facet.json", "{}");
+
+        // Clock-aligned segment keys under device_2 and extro_tmux
+        fs::create_dir_all(root.path().join("chronicle/20260602/device_2/140000_300")).unwrap();
+        fs::create_dir_all(root.path().join("chronicle/20260602/extro_tmux/140000_300")).unwrap();
+
+        // 1. Today records under work
+        let today_work = format!(
+            r#"{{"id":"hid_detected","source":"cogitate","created_at":{recent},"hidden":true,"edits":[{{"actor":"owner:mute","fields":["hidden"],"note":"muted"}}],"description":"Owner hidden detected"}}
+{{"id":"cancelled_plan","source":"anticipated","start":"09:00:00","end":"10:00:00","hidden":true,"cancelled":true,"title":"Cancelled plan"}}
+{{"id":"replaced_plan","source":"anticipated","start":"11:00:00","end":"12:00:00","hidden":true,"edits":[{{"actor":"schedule","fields":["hidden"],"note":"superseded by newer"}}],"title":"Replaced plan"}}
+{{"id":"vis_plan_today","source":"anticipated","start":"10:00:00","end":"11:00:00","hidden":false,"cancelled":false,"title":"Visible plan today"}}
+{{"id":"vis_detected_today","source":"cogitate","created_at":{recent},"segments":["160000_300"],"hidden":false,"description":"Visible detected today"}}
+{{"id":"concurrent_vis","source":"cogitate","created_at":{recent},"segments":["120000_300"],"description":"Visible partner"}}
+{{"id":"concurrent_hid","source":"cogitate","created_at":{recent},"segments":["120100_300"],"hidden":true,"description":"Hidden partner"}}
+{{"id":"shared_dup","source":"cogitate","created_at":{recent},"segments":["150000_300"],"hidden":true,"description":"Hidden copy under work"}}
+{{"id":"clock_aligned_d2","source":"cogitate","created_at":{recent},"segments":["140000_300"],"stream":"device_2","description":"Aligned desktop"}}
+{{"id":"clock_aligned_tmux","source":"cogitate","created_at":{recent},"segments":["140000_300"],"stream":"extro_tmux","description":"Aligned terminal"}}"#
+        );
+        write(
+            root.path(),
+            "facets/work/activities/20260602.jsonl",
+            &today_work,
+        );
+
+        // Under home: visible copy of shared_dup
+        let today_home = format!(
+            r#"{{"id":"shared_dup","source":"cogitate","created_at":{recent},"segments":["150000_300"],"hidden":false,"description":"Visible copy under home"}}"#
+        );
+        write(
+            root.path(),
+            "facets/home/activities/20260602.jsonl",
+            &today_home,
+        );
+
+        // Yesterday records under work
+        let yesterday_work = r#"{"id":"hid_detected_y","source":"cogitate","created_at":1,"hidden":true,"edits":[{"actor":"owner:mute","fields":["hidden"],"note":"muted"}],"description":"Owner hidden detected y"}
+{"id":"cancelled_plan_y","source":"anticipated","start":"09:00:00","end":"10:00:00","hidden":true,"cancelled":true,"title":"Cancelled plan y"}
+{"id":"replaced_plan_y","source":"anticipated","start":"11:00:00","end":"12:00:00","hidden":true,"edits":[{"actor":"schedule","fields":["hidden"],"note":"superseded by newer"}],"title":"Replaced plan y"}
+{"id":"vis_plan_yesterday","source":"anticipated","start":"10:00:00","end":"11:00:00","hidden":false,"cancelled":false,"title":"Visible plan yesterday"}
+{"id":"vis_detected_yesterday","source":"cogitate","created_at":1,"segments":["120000_300"],"hidden":false,"description":"Visible detected yesterday"}"#;
+        write(
+            root.path(),
+            "facets/work/activities/20260601.jsonl",
+            yesterday_work,
+        );
+
+        // Assert absent from collect_anticipated_activities
+        let anticipated_today = collect_anticipated_activities(&context, "20260602");
+        assert!(
+            anticipated_today
+                .iter()
+                .any(|r| r["title"] == "Visible plan today")
+        );
+        assert!(
+            !anticipated_today
+                .iter()
+                .any(|r| r["title"] == "Cancelled plan")
+        );
+        assert!(
+            !anticipated_today
+                .iter()
+                .any(|r| r["title"] == "Replaced plan")
+        );
+        assert!(
+            !anticipated_today
+                .iter()
+                .any(|r| r["title"] == "Owner hidden detected")
+        );
+
+        let anticipated_yesterday = collect_anticipated_activities(&context, "20260601");
+        assert!(
+            anticipated_yesterday
+                .iter()
+                .any(|r| r["title"] == "Visible plan yesterday")
+        );
+        assert!(
+            !anticipated_yesterday
+                .iter()
+                .any(|r| r["title"] == "Cancelled plan y")
+        );
+        assert!(
+            !anticipated_yesterday
+                .iter()
+                .any(|r| r["title"] == "Replaced plan y")
+        );
+
+        // Assert absent from collect_activities (recent list)
+        let recent_activities = collect_activities(&context, "20260602");
+        assert!(
+            recent_activities
+                .iter()
+                .any(|r| r["id"] == "vis_detected_today")
+        );
+        assert!(!recent_activities.iter().any(|r| r["id"] == "hid_detected"));
+        assert!(
+            !recent_activities
+                .iter()
+                .any(|r| r["id"] == "cancelled_plan")
+        );
+        assert!(!recent_activities.iter().any(|r| r["id"] == "replaced_plan"));
+
+        // Assert absent from collect_top_activities_yesterday
+        let yesterday_activities = collect_top_activities_yesterday(&context);
+        assert!(
+            yesterday_activities
+                .iter()
+                .any(|r| r["id"] == "vis_detected_yesterday")
+        );
+        assert!(
+            !yesterday_activities
+                .iter()
+                .any(|r| r["id"] == "hid_detected_y")
+        );
+        assert!(
+            !yesterday_activities
+                .iter()
+                .any(|r| r["id"] == "cancelled_plan_y")
+        );
+        assert!(
+            !yesterday_activities
+                .iter()
+                .any(|r| r["id"] == "replaced_plan_y")
+        );
+
+        // A concurrent pair whose partner is hidden has no source label on the visible row
+        let concurrent_vis = recent_activities
+            .iter()
+            .find(|r| r["id"] == "concurrent_vis")
+            .unwrap();
+        assert_eq!(concurrent_vis.get("source_label"), None);
+
+        // The same id under work and home, one copy hidden, still appears once from the visible copy
+        let shared_dups: Vec<_> = recent_activities
+            .iter()
+            .filter(|r| r["id"] == "shared_dup")
+            .collect();
+        assert_eq!(shared_dups.len(), 1);
+        assert_eq!(shared_dups[0]["facet"], "home");
+
+        // Clock-aligned rows: the same keys under device_2 and extro_tmux, each record carrying stream,
+        // both labeled on the recent list
+        let clock_d2 = recent_activities
+            .iter()
+            .find(|r| r["id"] == "clock_aligned_d2")
+            .unwrap();
+        let clock_tmux = recent_activities
+            .iter()
+            .find(|r| r["id"] == "clock_aligned_tmux")
+            .unwrap();
+        assert_eq!(
+            clock_d2.get("source_label").cloned(),
+            Some(crate::sources::source_phrase("computer", None).into())
+        );
+        assert_eq!(
+            clock_tmux.get("source_label").cloned(),
+            Some(crate::sources::source_phrase("terminal", None).into())
+        );
     }
 }

@@ -94,6 +94,41 @@ mod retained {
         drop(run);
         let _next = solstone_core_journal_io::activity::ActivityLease::try_acquire(root).unwrap();
     }
+
+    #[test]
+    fn offload_off_skips_before_preparation_and_retires_an_earlier_reservation() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("config")).unwrap();
+        std::fs::create_dir_all(temp.path().join("chronicle")).unwrap();
+        std::fs::write(
+            temp.path().join("config/journal.json"),
+            r#"{"backup":{"enabled":true,"mode":"byo"}}"#,
+        )
+        .unwrap();
+        // The empty root reservation a held run leaves behind; recovery retires it.
+        std::fs::create_dir(temp.path().join(".tmp-offload-earlier")).unwrap();
+        let clock = Arc::new(CountClock(AtomicUsize::new(0)));
+        let run = run_cli_offload(temp.path(), clock.clone(), false);
+        assert_eq!(run.phase(), CliRunPhase::Skipped);
+        assert_eq!(
+            run.output(),
+            ("offload_status=skipped reason=offload_off\n", "", 0)
+        );
+        assert_eq!(clock.0.load(Ordering::Relaxed), 0);
+        assert!(run.preparation_custody().is_none());
+        let stages = std::fs::read_dir(temp.path())
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".tmp-offload-")
+            })
+            .count();
+        assert_eq!(stages, 0);
+    }
 }
 
 #[test]

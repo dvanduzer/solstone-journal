@@ -6,14 +6,29 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- on the command line, you can import a folder of Ogg Opus recordings as one archive. use the time zone for Limitless filenames, or a manifest with each recording's time. the import shows its size before saving and lists recordings left out. interrupted runs resume without replacing parts already saved.
+- on linux, solstone update checks for updates and installs them through the installer that owns your copy. the health page shows the same update availability, including when it cannot tell.
+
 ### Changed
 
+- imported recordings waiting to be transcribed now wait behind today's recordings, with newer imports first. audio-folder sync also accepts `.ogg` files.
+- wherever the dashboard shows where something came from, it now names the device or import, like "your mac · screen" or "Apple Health · imported", instead of an internal id.
+- the health page no longer keeps its own list of your devices; it says how many are adding to your journal, shows any that need attention, and links to network, where you manage them. the settings page's devices section is gone for the same reason.
+- on large journals, health takes less time to open after your journal starts. speaker dates and stats also load faster.
 - on the command line, `--timestamp` also takes a date and time with its offset, such as `2025-11-02T01:30:00-07:00`, so a recording from the hour that repeats when daylight saving time ends can be placed at its true time. the `YYYYMMDD_HHMMSS` form works as before.
 
 ### Fixed
 
+- home's cards no longer list activities you've hidden.
+- a plan you hid or edited stays that way when it shows up again in what you share, unless its start time changes.
+- while catching up on older recordings, your journal could think about the same recording over and over. this happened when an earlier version had started a step for it, and that step no longer exists. each recording like this now gets at most one more look, and then it is left alone.
+- after you restore your journal onto a new device, you can bring your solstone.me address back to it in the agents app. before, the address stayed off. your journal tells you when the address has come back, and the other copy stops using it.
 - downloading location accuracy no longer pauses to save its progress after every small piece of the download, which could make it take hours on windows.
 - on linux, installing your journal now retries interrupted downloads and temporary download errors. an incomplete download reports a download failure instead of a signature mismatch.
+- on ubuntu 22.04, the installer points you to Minisign's installation page when the verifier is missing.
+- with media offload turned off, its nightly run no longer reports that offload didn't start or didn't finish. it now notes that offload is off and stops there. nothing was removed, and your media stayed on this computer.
 
 ## [2.0.48] - 2026-10-16
 

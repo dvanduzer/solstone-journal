@@ -892,15 +892,35 @@ fn source_from_path(path: &Path) -> Option<String> {
         .map(str::to_owned)
 }
 fn base_time_us_of_day(path: &Path) -> u64 {
-    segment_from_path(path)
-        .and_then(|segment| segment.get(..6).map(str::to_owned))
+    let base = segment_from_path(path)
+        .and_then(|segment| segment.get(..6).filter(|s| s.is_ascii()).map(str::to_owned))
         .and_then(|time| {
             let h = time[0..2].parse::<u64>().ok()?;
             let m = time[2..4].parse::<u64>().ok()?;
             let s = time[4..6].parse::<u64>().ok()?;
             Some((h * 3600 + m * 60 + s) * 1_000_000)
         })
-        .unwrap_or(0)
+        .unwrap_or(0);
+
+    let offset_us = (|| -> Option<u64> {
+        let parent = path.parent()?;
+        let file_name = path.file_name()?.to_str()?;
+        let placement_file =
+            parent.join(solstone_core_format::audio_archive::AUDIO_ARCHIVE_PLACEMENT_FILENAME);
+        let content = std::fs::read_to_string(placement_file).ok()?;
+        let placement = serde_json::from_str::<
+            solstone_core_format::audio_archive::AudioArchivePlacement,
+        >(&content)
+        .ok()?;
+        let part = placement
+            .parts
+            .iter()
+            .find(|part| part.stored_name == file_name)?;
+        (part.offset_ms >= 0).then(|| (part.offset_ms as u64) * 1_000)
+    })()
+    .unwrap_or(0);
+
+    base + offset_us
 }
 fn segment_from_path(path: &Path) -> Option<String> {
     path.parent()?
@@ -1106,6 +1126,41 @@ where
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn base_time_us_of_day_reads_placement_offset() {
+        let temp = tempfile::tempdir().unwrap();
+        let segment_dir = temp
+            .path()
+            .join("chronicle/20260811/import.archive/120000_300");
+        std::fs::create_dir_all(&segment_dir).unwrap();
+        let raw_file = segment_dir.join("p0000_0123456789abcdef.opus");
+        std::fs::write(&raw_file, b"audio").unwrap();
+
+        let segment_clock = 12 * 3600 * 1_000_000;
+        // Without placement: segment clock only
+        assert_eq!(super::base_time_us_of_day(&raw_file), segment_clock);
+
+        // With placement: segment clock plus 90 seconds in microseconds
+        let placement = serde_json::json!({
+            "version": 1,
+            "parts": [
+                {
+                    "stored_name": "p0000_0123456789abcdef.opus",
+                    "original_occurrence": "rec1",
+                    "origin_ms": 0,
+                    "offset_ms": 90_000,
+                    "length_ms": 1000
+                }
+            ]
+        });
+        std::fs::write(segment_dir.join("placement.json"), placement.to_string()).unwrap();
+
+        assert_eq!(
+            super::base_time_us_of_day(&raw_file),
+            segment_clock + 90 * 1_000_000
+        );
+    }
 
     use chrono::DateTime;
     use serde_json::{Value, json};

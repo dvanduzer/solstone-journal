@@ -2,7 +2,7 @@
 // Copyright (c) 2026 sol pbc
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -10,10 +10,12 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{Map, Value, json};
+use solstone_core_journal_config::work_priority::{WORK_PRIORITY_ENV, WorkBand, WorkPriority};
 use solstone_core_system::lifecycle::HostedServiceParentRuntime;
 use solstone_core_system::process::{
-    Disposition, ManagedLaunchRequest, ManagedProcess, SERVICE_SHUTDOWN_TIMEOUT, SpawnOptions,
-    TerminationError, launch_managed_hosted, launch_managed_request,
+    ChildLaunchContext, Disposition, ManagedLaunchRequest, ManagedProcess,
+    SERVICE_SHUTDOWN_TIMEOUT, SpawnOptions, TerminationError, launch_managed_hosted,
+    launch_managed_request,
 };
 
 use crate::beacon::Health;
@@ -53,6 +55,7 @@ struct Job {
     item: WorkItem,
     spec: HandlerSpec,
     config: Map<String, Value>,
+    priority: WorkPriority,
 }
 struct State {
     segments: HashMap<SegmentKey, SegmentState>,
@@ -151,15 +154,40 @@ impl JobTally {
 }
 
 pub struct SenseDispatcher {
+    archive_admission: Mutex<()>,
     journal: PathBuf,
     state: Arc<Mutex<State>>,
     outbound: mpsc::Sender<Outbound>,
-    pools: HashMap<&'static str, Mutex<WorkerPool>>,
+    queues: HashMap<&'static str, Arc<Mutex<HandlerQueue>>>,
     workers: Mutex<Vec<thread::JoinHandle<()>>>,
     cleanups: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
     admission: Admission,
     batch: BatchContext,
     pub(crate) tally: Arc<JobTally>,
+}
+
+fn archive_pending_files_in(state: &State) -> usize {
+    state
+        .segments
+        .values()
+        .filter(|segment| is_archive(&segment.context))
+        .map(|segment| segment.pending.len())
+        .sum::<usize>()
+        + state
+            .lease_deferred
+            .iter()
+            .filter(|pending| is_archive(&pending.context))
+            .map(|pending| pending.paths.len())
+            .sum::<usize>()
+}
+
+fn is_archive(context: &SegmentContext) -> bool {
+    context
+        .meta
+        .as_ref()
+        .and_then(|m| m.get("audio_archive"))
+        .and_then(Value::as_bool)
+        == Some(true)
 }
 
 impl SenseDispatcher {
@@ -229,6 +257,26 @@ impl SenseDispatcher {
         )
     }
 
+    pub fn new_with_fixture_program_and_admission(
+        journal: PathBuf,
+        verbose: bool,
+        debug: bool,
+        outbound: mpsc::Sender<Outbound>,
+        program: PathBuf,
+        admission: Admission,
+    ) -> Self {
+        Self::new_inner(
+            journal,
+            verbose,
+            debug,
+            outbound,
+            admission,
+            Ok(program),
+            BatchContext::default(),
+            None,
+        )
+    }
+
     /// Construct a dispatcher that uses a built fixture executable. This keeps
     /// the integration test on the real spawn path without changing runtime
     /// command selection.
@@ -239,15 +287,13 @@ impl SenseDispatcher {
         outbound: mpsc::Sender<Outbound>,
         program: PathBuf,
     ) -> Self {
-        Self::new_inner(
+        Self::new_with_fixture_program_and_admission(
             journal,
             verbose,
             debug,
             outbound,
+            program,
             Admission::new(Arc::new(SystemMemoryProbe)),
-            Ok(program),
-            BatchContext::default(),
-            None,
         )
     }
 
@@ -342,7 +388,7 @@ impl SenseDispatcher {
         }));
         let tally = Arc::new(JobTally::new());
         let cleanups = Arc::new(Mutex::new(Vec::new()));
-        let mut pools = HashMap::new();
+        let mut queues = HashMap::new();
         let mut worker_handles = Vec::new();
         for handler in HANDLERS {
             let workers = if handler == "describe" {
@@ -352,10 +398,10 @@ impl SenseDispatcher {
             } else {
                 resolve_concurrency(&read_config(&journal), handler)
             };
-            let mut senders = Vec::with_capacity(workers);
+            let queue = Arc::new(Mutex::new(HandlerQueue::new(workers)));
+            queues.insert(handler, Arc::clone(&queue));
             for _ in 0..workers {
-                let (sender, receiver) = mpsc::channel();
-                senders.push(sender);
+                let queue = Arc::clone(&queue);
                 let state = Arc::clone(&state);
                 let outbound = outbound.clone();
                 let context = WorkerContext {
@@ -371,17 +417,17 @@ impl SenseDispatcher {
                 };
                 let worker = thread::Builder::new()
                     .name(format!("{handler}-worker"))
-                    .spawn(move || worker(receiver, state, outbound, context))
+                    .spawn(move || worker(queue, state, outbound, context))
                     .expect("sense worker thread");
                 worker_handles.push(worker);
             }
-            pools.insert(handler, Mutex::new(WorkerPool { senders, next: 0 }));
         }
         Self {
+            archive_admission: Mutex::new(()),
             journal,
             state,
             outbound,
-            pools,
+            queues,
             workers: Mutex::new(worker_handles),
             cleanups,
             admission,
@@ -390,7 +436,41 @@ impl SenseDispatcher {
         }
     }
 
+    pub(crate) fn journal(&self) -> &Path {
+        &self.journal
+    }
+
+    /// Queued, running and lease-deferred archive files share one admission
+    /// bound. Live files remain free to enter the higher-priority queue.
+    pub fn archive_pending_files(&self) -> usize {
+        archive_pending_files_in(&self.state.lock().expect("sense state"))
+    }
+
     pub fn handle(&self, message: &solstone_core_callosum::CallosumEnvelope) {
+        if message
+            .extra
+            .get("meta")
+            .and_then(|m| m.get("audio_archive"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            let _guard = self.archive_admission.lock().expect("archive admission");
+            let capacity =
+                crate::archive::MAX_PENDING_FILES.saturating_sub(self.archive_pending_files());
+            if capacity == 0 {
+                return;
+            }
+            let mut bounded = message.clone();
+            if let Some(files) = bounded.extra.get_mut("files").and_then(Value::as_array_mut) {
+                files.truncate(capacity);
+            }
+            self.handle_inner(&bounded);
+        } else {
+            self.handle_inner(message);
+        }
+    }
+
+    fn handle_inner(&self, message: &solstone_core_callosum::CallosumEnvelope) {
         if message.tract != "observe" || message.event != "observing" {
             return;
         }
@@ -461,7 +541,13 @@ impl SenseDispatcher {
             .collect();
         {
             let mut state = self.state.lock().expect("sense state");
-            if state.segments.contains_key(&context.key) {
+            if state.stopping
+                || state.segments.contains_key(&context.key)
+                || state
+                    .lease_deferred
+                    .iter()
+                    .any(|pending| pending.context.key == context.key)
+            {
                 return;
             }
             // A batch walk already holds this day's lease for its whole run
@@ -470,7 +556,8 @@ impl SenseDispatcher {
             // would silently drop every batch segment, so only the live
             // service path admits per day; a repair batch and live sensing
             // still exclude each other through the batch-level lease.
-            if !batch && !state.day_leases.contains_key(&context.key.day) {
+            if (!batch || is_archive(&context)) && !state.day_leases.contains_key(&context.key.day)
+            {
                 match crate::lease::acquire_sense_day_lease(&self.journal, &context.key.day) {
                     Ok(Some(lease)) => {
                         state.day_leases.insert(context.key.day.clone(), lease);
@@ -535,9 +622,8 @@ impl SenseDispatcher {
                 held = true;
                 continue;
             }
-            let pending_key = (spec.name.to_owned(), path.clone());
             let mut state = self.state.lock().expect("sense state");
-            if !state.pending_files.insert(pending_key) {
+            if !reserve_pending_file(&mut state.pending_files, spec.name, &path) {
                 continue;
             }
             state
@@ -560,18 +646,69 @@ impl SenseDispatcher {
         }
         for (path, spec) in admitted {
             let handler = spec.name;
+            let inherited = match inherited_priority_text(&self.batch.child_environment.environment)
+            {
+                Ok(inherited) => inherited,
+                Err(error) => {
+                    self.tally.failure();
+                    self.state
+                        .lock()
+                        .expect("sense state")
+                        .health
+                        .failure(&error);
+                    complete(
+                        &self.state,
+                        &self.outbound,
+                        &self.journal,
+                        &context.key,
+                        Some(&path),
+                        Some(error),
+                        None,
+                        self.batch.marker_policy,
+                    );
+                    continue;
+                }
+            };
+            let priority = match classify_sense_priority(
+                &context.key.day,
+                &context.key.segment,
+                context.meta.as_ref(),
+                inherited.as_deref(),
+            ) {
+                Ok(priority) => priority,
+                Err(error) => {
+                    self.tally.failure();
+                    self.state
+                        .lock()
+                        .expect("sense state")
+                        .health
+                        .failure(&error);
+                    complete(
+                        &self.state,
+                        &self.outbound,
+                        &self.journal,
+                        &context.key,
+                        Some(&path),
+                        Some(error),
+                        None,
+                        self.batch.marker_policy,
+                    );
+                    continue;
+                }
+            };
             let item = WorkItem {
                 context: context.clone(),
                 file_path: path.clone(),
                 handler: handler.to_owned(),
                 queued_at: SystemTime::now(),
             };
-            let queued = if let Some(pool) = self.pools.get(handler) {
-                let mut pool = pool.lock().expect("sense worker pool");
-                pool.send(Job {
+            let queued = if let Some(queue) = self.queues.get(handler) {
+                let mut queue = queue.lock().expect("sense handler queue");
+                queue.enqueue(Job {
                     item,
                     spec,
                     config: config.clone(),
+                    priority,
                 })
             } else {
                 false
@@ -638,6 +775,7 @@ impl SenseDispatcher {
     /// tick or two; entries older than `LIVE_DAY_LEASE_RETRY_BUDGET` are
     /// abandoned and reported instead of retried forever.
     fn retry_lease_deferred(&self) {
+        let _guard = self.archive_admission.lock().expect("archive admission");
         let due = {
             let mut state = self.state.lock().expect("sense state");
             if state.lease_deferred.is_empty() {
@@ -722,9 +860,13 @@ impl SenseDispatcher {
     pub fn status(&self) {
         self.retry_lease_deferred();
         let state = self.state.lock().expect("sense state");
-        let fields = state
+        let mut fields = state
             .health
             .beacon(state.pending_files.len(), self.admission.state());
+        fields.insert(
+            "archive_pending_queue_depth".into(),
+            json!(archive_pending_files_in(&state)),
+        );
         let _ = self.outbound.send(Outbound {
             tract: "observe",
             event: "status",
@@ -828,21 +970,153 @@ fn resolve_program_from_current_exe() -> Result<PathBuf, DispatcherResolveError>
     resolve_dispatcher_in(executable.parent().unwrap_or_else(|| Path::new(".")))
 }
 
-struct WorkerPool {
-    senders: Vec<mpsc::Sender<Job>>,
-    next: usize,
+struct HandlerQueue {
+    jobs: Vec<Job>,
+    worker_count: usize,
+    closed: bool,
 }
 
-impl WorkerPool {
-    fn send(&mut self, job: Job) -> bool {
-        let index = self.next % self.senders.len();
-        self.next = self.next.wrapping_add(1);
-        self.senders[index].send(job).is_ok()
+impl HandlerQueue {
+    fn new(worker_count: usize) -> Self {
+        Self {
+            jobs: Vec::new(),
+            worker_count,
+            closed: false,
+        }
+    }
+
+    fn enqueue(&mut self, job: Job) -> bool {
+        if self.closed || self.worker_count == 0 {
+            return false;
+        }
+        self.jobs.push(job);
+        true
+    }
+
+    fn pop_best(&mut self) -> Option<Job> {
+        let best_index = self
+            .jobs
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, job)| job.priority.sort_key())
+            .map(|(index, _)| index)?;
+        Some(self.jobs.remove(best_index))
+    }
+
+    fn requeue_if_preempted(&mut self, job: &mut Option<Job>) -> bool {
+        let Some(current) = job.as_ref() else {
+            return false;
+        };
+        let strictly_better = self
+            .jobs
+            .iter()
+            .any(|queued| queued.priority.sort_key() < current.priority.sort_key());
+        if strictly_better {
+            self.jobs.push(job.take().unwrap());
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(test)]
+    fn close(&mut self) {
+        self.closed = true;
     }
 }
 
+pub(crate) fn reserve_pending_file(
+    pending_files: &mut HashSet<(String, PathBuf)>,
+    handler: &str,
+    path: &Path,
+) -> bool {
+    pending_files.insert((handler.to_owned(), path.to_path_buf()))
+}
+
+fn inherited_priority_text(
+    child_environment: &BTreeMap<OsString, OsString>,
+) -> Result<Option<String>, String> {
+    let key = OsStr::new(WORK_PRIORITY_ENV);
+    if let Some(value) = child_environment.get(key) {
+        value
+            .to_str()
+            .map(|s| Some(s.to_owned()))
+            .ok_or_else(|| format!("{WORK_PRIORITY_ENV} contains invalid UTF-8"))
+    } else {
+        match std::env::var(WORK_PRIORITY_ENV) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                Err(format!("{WORK_PRIORITY_ENV} contains invalid UTF-8"))
+            }
+        }
+    }
+}
+
+fn classify_sense_priority(
+    day: &str,
+    segment: &str,
+    meta: Option<&Map<String, Value>>,
+    inherited: Option<&str>,
+) -> Result<WorkPriority, String> {
+    let date_part = day.parse::<u64>().unwrap_or(0);
+    let time_part = segment
+        .get(..6)
+        .filter(|prefix| prefix.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|prefix| prefix.parse::<u64>().ok())
+        .unwrap_or(0);
+    let source_time = date_part
+        .saturating_mul(1_000_000)
+        .saturating_add(time_part);
+
+    let has_import_id = meta
+        .and_then(|m| m.get("import_id"))
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty());
+
+    if has_import_id {
+        return Ok(WorkPriority {
+            band: WorkBand::Import,
+            source_time,
+        });
+    }
+
+    if let Some(text) = inherited {
+        return text.parse::<WorkPriority>();
+    }
+
+    Ok(WorkPriority {
+        band: WorkBand::Now,
+        source_time,
+    })
+}
+
+fn build_child_environment(
+    segment: &str,
+    meta: Option<&Map<String, Value>>,
+    queued_at: SystemTime,
+    child_launch_context: &ChildLaunchContext,
+    priority: WorkPriority,
+) -> BTreeMap<OsString, OsString> {
+    let mut environment = BTreeMap::<OsString, OsString>::new();
+    environment.insert("SOL_SEGMENT".into(), segment.to_owned().into());
+    if let Some(meta) = meta {
+        environment.insert(
+            "SEGMENT_META".into(),
+            serde_json::to_string(meta).unwrap_or_default().into(),
+        );
+    }
+    environment.insert(
+        "SOL_QUEUE_WAIT_MS".into(),
+        events::queue_wait_ms(queued_at).to_string().into(),
+    );
+    environment.extend(child_launch_context.environment.clone());
+    environment.insert(WORK_PRIORITY_ENV.into(), priority.to_string().into());
+    environment
+}
+
 fn worker(
-    receiver: mpsc::Receiver<Job>,
+    queue: Arc<Mutex<HandlerQueue>>,
     state: Arc<Mutex<State>>,
     outbound: mpsc::Sender<Outbound>,
     context: WorkerContext,
@@ -855,16 +1129,20 @@ fn worker(
         if stopping {
             return;
         }
-        match receiver.recv_timeout(Duration::from_millis(50)) {
-            Ok(job) => run_job(job, &state, &outbound, &context),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        let job = {
+            let mut queue = queue.lock().expect("sense handler queue");
+            queue.pop_best()
+        };
+        match job {
+            Some(job) => run_job(job, &queue, &state, &outbound, &context),
+            None => thread::sleep(Duration::from_millis(50)),
         }
     }
 }
 
 fn run_job(
     job: Job,
+    queue: &Arc<Mutex<HandlerQueue>>,
     state: &Arc<Mutex<State>>,
     outbound: &mpsc::Sender<Outbound>,
     worker_context: &WorkerContext,
@@ -920,6 +1198,14 @@ fn run_job(
     if !admitted {
         return;
     }
+    let mut job_slot = Some(job);
+    {
+        let mut q = queue.lock().expect("sense handler queue");
+        if q.requeue_if_preempted(&mut job_slot) {
+            return;
+        }
+    }
+    let job = job_slot.expect("job was not preempted");
     let command = command_for(
         &job.spec,
         program,
@@ -939,22 +1225,13 @@ fn run_job(
             &segment_context,
         ),
     });
-    let mut environment = BTreeMap::<OsString, OsString>::new();
-    environment.insert(
-        "SOL_SEGMENT".into(),
-        segment_context.key.segment.clone().into(),
+    let environment = build_child_environment(
+        &segment_context.key.segment,
+        segment_context.meta.as_ref(),
+        job.item.queued_at,
+        &worker_context.batch.child_environment,
+        job.priority,
     );
-    if let Some(meta) = &segment_context.meta {
-        environment.insert(
-            "SEGMENT_META".into(),
-            serde_json::to_string(meta).unwrap_or_default().into(),
-        );
-    }
-    environment.insert(
-        "SOL_QUEUE_WAIT_MS".into(),
-        events::queue_wait_ms(job.item.queued_at).to_string().into(),
-    );
-    environment.extend(worker_context.batch.child_environment.environment.clone());
     let hosted_launch_id = format!(
         "sense-{}-{reference}-{}",
         job.item.handler,
@@ -1838,15 +2115,13 @@ mod tests {
         std::fs::write(&file, b"audio").expect("audio");
         let (outbound, receiver) = mpsc::channel();
         let dispatcher = SenseDispatcher::new(temp.path().to_path_buf(), false, false, outbound);
-        let (sender, failed_receiver) = mpsc::channel();
-        drop(failed_receiver);
         dispatcher
-            .pools
+            .queues
             .get("transcribe")
-            .expect("transcribe pool")
+            .expect("transcribe queue")
             .lock()
-            .expect("pool")
-            .senders = vec![sender];
+            .expect("queue")
+            .close();
         let mut message = observing("one", "120000_1");
         message.extra.insert("files".into(), json!(["audio.flac"]));
         dispatcher.handle(&message);
@@ -1956,15 +2231,13 @@ mod tests {
             outbound,
             PathBuf::from("/bin/true"),
         );
-        let (sender, failed_receiver) = mpsc::channel();
-        drop(failed_receiver);
         dispatcher
-            .pools
+            .queues
             .get("transcribe")
-            .expect("transcribe pool")
+            .expect("transcribe queue")
             .lock()
-            .expect("pool")
-            .senders = vec![sender];
+            .expect("queue")
+            .close();
         let mut message = observing("one", "120000_1");
         message
             .extra
@@ -2643,5 +2916,198 @@ mod tests {
             elapsed,
             SERVICE_SHUTDOWN_TIMEOUT
         );
+    }
+
+    fn dummy_spec(name: &'static str) -> HandlerSpec {
+        HandlerSpec {
+            name,
+            patterns: &[],
+            command: vec![name.to_owned()],
+        }
+    }
+
+    fn test_job(handler: &'static str, file: &Path, priority: WorkPriority) -> Job {
+        Job {
+            item: WorkItem {
+                context: SegmentContext {
+                    key: SegmentKey {
+                        day: "20261016".into(),
+                        stream: None,
+                        segment: "120000_1".into(),
+                    },
+                    cid: None,
+                    source: None,
+                    batch: false,
+                    meta: None,
+                },
+                file_path: file.to_path_buf(),
+                handler: handler.to_owned(),
+                queued_at: SystemTime::now(),
+            },
+            spec: dummy_spec(handler),
+            config: Map::new(),
+            priority,
+        }
+    }
+
+    #[test]
+    fn live_now_is_popped_before_import_when_inserted_last() {
+        let mut queue = HandlerQueue::new(1);
+        let import_older = test_job(
+            "transcribe",
+            Path::new("imp1.flac"),
+            "4:20261010080000".parse().unwrap(),
+        );
+        let import_newer = test_job(
+            "transcribe",
+            Path::new("imp2.flac"),
+            "4:20261016120000".parse().unwrap(),
+        );
+        let live_old = test_job(
+            "transcribe",
+            Path::new("live.flac"),
+            "1:20261001010000".parse().unwrap(),
+        );
+
+        assert!(queue.enqueue(import_older));
+        assert!(queue.enqueue(import_newer));
+        assert!(queue.enqueue(live_old));
+
+        let popped = queue.pop_best().expect("job popped");
+        assert_eq!(popped.priority.band, WorkBand::Now);
+        assert_eq!(popped.priority.source_time, 20261001010000);
+    }
+
+    #[test]
+    fn imports_popped_newest_source_time_first() {
+        let mut queue = HandlerQueue::new(1);
+        let import_day1 = test_job(
+            "transcribe",
+            Path::new("imp1.flac"),
+            "4:20261010080000".parse().unwrap(),
+        );
+        let import_day2 = test_job(
+            "transcribe",
+            Path::new("imp2.flac"),
+            "4:20261016120000".parse().unwrap(),
+        );
+
+        assert!(queue.enqueue(import_day1));
+        assert!(queue.enqueue(import_day2));
+
+        let first = queue.pop_best().expect("first job");
+        assert_eq!(first.priority.to_string(), "4:20261016120000");
+
+        let second = queue.pop_best().expect("second job");
+        assert_eq!(second.priority.to_string(), "4:20261010080000");
+    }
+
+    #[test]
+    fn classify_sense_priority_respects_rules() {
+        let meta = Map::from_iter([("import_id".into(), json!("imp123"))]);
+        let p1 =
+            classify_sense_priority("20261016", "153045_12", Some(&meta), Some("1:1")).unwrap();
+        assert_eq!(p1.band, WorkBand::Import);
+        assert_eq!(p1.source_time, 20261016153045);
+
+        let p2 = classify_sense_priority("20261016", "153045_12", None, Some("5:20261003120000"))
+            .unwrap();
+        assert_eq!(p2.band, WorkBand::Completing);
+        assert_eq!(p2.source_time, 20261003120000);
+
+        let err = classify_sense_priority("20261016", "153045_12", None, Some("not-a-priority"))
+            .unwrap_err();
+        assert_eq!(err, "not-a-priority".parse::<WorkPriority>().unwrap_err());
+
+        let p3 = classify_sense_priority("20261016", "153045_12", None, None).unwrap();
+        assert_eq!(p3.band, WorkBand::Now);
+        assert_eq!(p3.source_time, 20261016153045);
+
+        let p_utf8 = classify_sense_priority("20261016", "12345é", None, None).unwrap();
+        assert_eq!(p_utf8.band, WorkBand::Now);
+        assert_eq!(p_utf8.source_time, 20261016000000);
+
+        let meta_utf8 = Map::from_iter([("import_id".into(), json!("imp"))]);
+        let p_utf8_imp =
+            classify_sense_priority("20261016", "12345é", Some(&meta_utf8), None).unwrap();
+        assert_eq!(p_utf8_imp.band, WorkBand::Import);
+        assert_eq!(p_utf8_imp.source_time, 20261016000000);
+    }
+
+    #[test]
+    fn child_environment_sets_priority_and_preserves_keys() {
+        let mut child_launch_context = ChildLaunchContext::default();
+        child_launch_context
+            .environment
+            .insert("LD_LIBRARY_PATH".into(), "/opt/lib".into());
+
+        let repair_priority = "5:20261003120000".parse::<WorkPriority>().unwrap();
+        let env_repair = build_child_environment(
+            "120000_1",
+            None,
+            SystemTime::now(),
+            &child_launch_context,
+            repair_priority,
+        );
+        assert_eq!(
+            env_repair.get(OsStr::new(WORK_PRIORITY_ENV)).unwrap(),
+            "5:20261003120000"
+        );
+        assert_eq!(
+            env_repair.get(OsStr::new("LD_LIBRARY_PATH")).unwrap(),
+            "/opt/lib"
+        );
+
+        let import_priority = "4:20261016153045".parse::<WorkPriority>().unwrap();
+        let env_import = build_child_environment(
+            "153045_12",
+            None,
+            SystemTime::now(),
+            &child_launch_context,
+            import_priority,
+        );
+        assert_eq!(
+            env_import.get(OsStr::new(WORK_PRIORITY_ENV)).unwrap(),
+            "4:20261016153045"
+        );
+        assert_eq!(
+            env_import.get(OsStr::new("LD_LIBRARY_PATH")).unwrap(),
+            "/opt/lib"
+        );
+    }
+
+    #[test]
+    fn reserve_enqueue_dedup_and_pending_length() {
+        let mut pending_files = HashSet::new();
+        let path = Path::new("audio.flac");
+        let handler = "transcribe";
+
+        assert!(reserve_pending_file(&mut pending_files, handler, path));
+        assert_eq!(pending_files.len(), 1);
+
+        assert!(!reserve_pending_file(&mut pending_files, handler, path));
+        assert_eq!(pending_files.len(), 1);
+
+        let mut queue = HandlerQueue::new(1);
+        let job = test_job(handler, path, "1:20261016120000".parse().unwrap());
+        assert!(queue.enqueue(job));
+        assert_eq!(queue.jobs.len(), 1);
+
+        let popped = queue.pop_best();
+        assert!(popped.is_some());
+        assert_eq!(queue.jobs.len(), 0);
+        assert_eq!(pending_files.len(), 1);
+
+        let mut job_slot = popped;
+        let better_job = test_job(
+            handler,
+            Path::new("better.flac"),
+            "1:20261016130000".parse().unwrap(),
+        );
+        assert!(queue.enqueue(better_job));
+        assert!(queue.requeue_if_preempted(&mut job_slot));
+        assert!(job_slot.is_none());
+        assert_eq!(pending_files.len(), 1);
+        assert_eq!(queue.jobs.len(), 2);
     }
 }

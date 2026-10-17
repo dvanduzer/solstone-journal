@@ -869,8 +869,10 @@ areas = ["indexing"]
 platforms = ["linux", "macos", "windows"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
-default_full = false
+default_full = true
 runtime = "none"
+
+features = ["full-tests"]
 
 [[package_suites]]
 id = "package::solstone-core-indexer-query"
@@ -1534,8 +1536,9 @@ platforms = ["linux", "macos", "windows"]
 prerequisites = ["cargo-cache"]
 timeout = "slow"
 serial_group = "local-services"
-default_full = false
+default_full = true
 runtime = "none"
+features = ["full-tests"]
 
 [[package_suites]]
 id = "package::solstone-core-streams-cli"
@@ -1718,8 +1721,9 @@ areas = ["audio"]
 platforms = ["linux", "macos", "windows"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
-default_full = false
+default_full = true
 runtime = "none"
+features = ["full-tests"]
 
 [[package_suites]]
 id = "package::solstone-core-location"
@@ -1811,6 +1815,18 @@ prerequisites = ["cargo-cache"]
 timeout = "standard"
 default_full = false
 runtime = "none"
+
+[[package_suites]]
+id = "package::solstone-core-update"
+package = "solstone-core-update"
+set = "component"
+areas = ["trust", "commands"]
+platforms = ["linux"]
+prerequisites = ["cargo-cache"]
+timeout = "standard"
+runtime = "none"
+default_full = true
+features = ["full-tests"]
 
 [[suites]]
 id = "solstone-core-installation-identity::linux_admission"
@@ -3139,6 +3155,19 @@ prerequisites = ["cargo-cache"]
 timeout = "standard"
 default_full = true
 required_features = []
+runtime = "none"
+
+[[suites]]
+id = "solstone-core-indexer::status_discovery_roots"
+package = "solstone-core-indexer"
+target = "status_discovery_roots"
+set = "component"
+areas = ["indexing"]
+platforms = ["linux", "macos", "windows"]
+prerequisites = ["cargo-cache"]
+timeout = "standard"
+default_full = true
+required_features = ["full-tests"]
 runtime = "none"
 
 [[suites]]
@@ -4922,6 +4951,32 @@ package = "solstone-core-health-web"
 target = "health_web_dom"
 set = "component"
 areas = ["health"]
+platforms = ["linux", "macos"]
+prerequisites = ["cargo-cache"]
+timeout = "standard"
+default_full = true
+required_features = []
+runtime = "none"
+
+[[suites]]
+id = "solstone-core-records-web::search_dom"
+package = "solstone-core-records-web"
+target = "search_dom"
+set = "component"
+areas = ["records"]
+platforms = ["linux", "macos"]
+prerequisites = ["cargo-cache"]
+timeout = "standard"
+default_full = true
+required_features = []
+runtime = "none"
+
+[[suites]]
+id = "solstone-core-facets-web::curation_dom"
+package = "solstone-core-facets-web"
+target = "curation_dom"
+set = "component"
+areas = ["facets"]
 platforms = ["linux", "macos"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"

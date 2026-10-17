@@ -331,7 +331,7 @@ pub(crate) fn evaluate_topics(segment_dir: &Path, sense: &Map<String, Value>) ->
                     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                         continue;
                     };
-                    if name.ends_with("audio.jsonl") || name.ends_with("_transcript.jsonl") {
+                    if name.ends_with("audio.jsonl") || (name.ends_with("_transcript.jsonl") || solstone_core_format::audio_archive::is_audio_archive_transcript_name(name)) {
                         speech_paths.push(path);
                     }
                 }
@@ -1113,5 +1113,21 @@ mod tests {
         assert_eq!(eval.dropped_quotes, 1);
         let md = eval.markdown.unwrap();
         assert_eq!(md, "## Topics\n- Database migration\n## Quotes\n");
+    }
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn archive_quotes_are_checked_against_the_actual_part_transcript() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("p0000_0123456789abcdef.jsonl"),
+            "{}\n{\"start\":\"12:00:10\",\"speaker\":\"Alex\",\"text\":\"The archived recording keeps these exact spoken words\"}\n").unwrap();
+        let evaluation = evaluate_topics(
+            root.path(),
+            json!({"quotes":[{
+                "speaker":"Alex", "text":"The archived recording keeps these exact spoken words"
+            }]})
+            .as_object()
+            .unwrap(),
+        );
+        assert_eq!((evaluation.kept_quotes, evaluation.dropped_quotes), (1, 0));
     }
 }

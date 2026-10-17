@@ -6,6 +6,7 @@
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
 mod action_log;
+mod activity_placement;
 pub mod entity_doctor;
 mod speculative_facets;
 mod store;
@@ -13,6 +14,9 @@ mod trust_lock;
 
 pub use action_log::{
     ActionLogScan, append_action_log, append_action_log_for_day, read_journal_action_rows,
+};
+pub use activity_placement::{
+    ActivityCourse, PlacedRecord, ResolvedSegment, place_activity_records,
 };
 pub use solstone_core_entity::facet_links;
 pub use solstone_core_journal_io::AppendError;
@@ -38,11 +42,11 @@ pub use store::{
     PreparedReviewAttachment, PreparedReviewPromotion, RETIRED_FACETS_FILE, Retired, RetiredFacet,
     RetiredFacetState, RetiredFacets, RetiredFilesSnapshot, ScopedFacetEntity, SeedEntitiesError,
     SeedEntityBaseOutcome, SeedEntityInput, SeedEntityItemResult, SeedEntityOutcome,
-    accept_candidate, activity_is_available, activity_value_or_empty, activity_value_string,
-    activity_value_truthy, add_activity, add_observation, add_observation_for_entity,
-    admit_activity_destination, adopt_moved_activity_rows, allocate_facet_id,
-    allocate_facet_id_locked, anticipation_batch_matches_prompt, append_activity_record,
-    append_edit, append_log, apply_observation_change, assign_new_facet_id,
+    accept_candidate, activity_field_held, activity_is_available, activity_value_or_empty,
+    activity_value_string, activity_value_truthy, add_activity, add_observation,
+    add_observation_for_entity, admit_activity_destination, adopt_moved_activity_rows,
+    allocate_facet_id, allocate_facet_id_locked, anticipation_batch_matches_prompt,
+    append_activity_record, append_edit, append_log, apply_observation_change, assign_new_facet_id,
     assign_new_facet_id_locked, backfill_facet_ids, block_journal_entity, count_observations,
     create_facet, delete_created_entity_if_unreferenced, delete_detected_entity, delete_facet,
     delete_facet_entity_link, delete_journal_entity, delete_journal_entity_after,
@@ -50,10 +54,10 @@ pub use store::{
     ensure_default_facet, extract_spoken_names, facet_declaration_entry, facet_name_is_free,
     facet_slug, facet_write_identity, first_free_facet_name, get_activity_record,
     hold_activity_enrichment, humanize_facet_title, is_speakable, is_well_formed_facet_id,
-    list_declared_facet_names, list_facet_directories, list_facet_entity_directories,
-    load_activity_records, load_all_attached_entities, load_all_facet_relationships,
-    load_all_facet_relationships_across_facets, load_candidates, load_current,
-    load_detected_entities_recent, load_detected_link_days, load_imports,
+    list_activity_day_stems, list_declared_facet_names, list_facet_directories,
+    list_facet_entity_directories, load_activity_records, load_all_attached_entities,
+    load_all_facet_relationships, load_all_facet_relationships_across_facets, load_candidates,
+    load_current, load_detected_entities_recent, load_detected_link_days, load_imports,
     load_observations_for_query, load_recent_entity_names, migrate_custom_activity_icons_to_emoji,
     migrate_event_topic_keys, normalize_observation_content, observation_day_counts,
     observation_summary, observe_declared_facet_inventory, observe_facet_declaration,

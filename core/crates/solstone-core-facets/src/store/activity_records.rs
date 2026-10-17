@@ -167,6 +167,46 @@ fn day_path(root: &Path, facet: &str, day: &str) -> Result<PathBuf, ActivityReco
     contained_path(root, &format!("facets/{facet}/activities/{day}.jsonl")).map_err(Into::into)
 }
 
+pub fn list_activity_day_stems(
+    root: &Path,
+    facet: &str,
+) -> Result<Vec<String>, ActivityRecordStoreError> {
+    let dir = contained_path(root, &format!("facets/{facet}/activities"))
+        .map_err(ActivityRecordStoreError::from)?;
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let entries = std::fs::read_dir(&dir).map_err(|source| ReadError::Io {
+        path: dir.clone(),
+        source,
+    })?;
+    let mut stems = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| ReadError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if let Some(stem) = name_str.strip_suffix(".jsonl")
+            && stem.len() == 8
+            && stem.bytes().all(|b| b.is_ascii_digit())
+        {
+            stems.push(stem.to_owned());
+        }
+    }
+    stems.sort();
+    Ok(stems)
+}
+
 fn read_rows(path: &Path) -> Result<Vec<ActivityRecord>, ActivityRecordStoreError> {
     if !path.exists() {
         return Ok(Vec::new());
@@ -373,6 +413,9 @@ pub fn prepare_anticipation_batch(
         .collect::<Result<_, _>>()?;
     let incoming_ids: std::collections::BTreeSet<&str> =
         incoming.iter().map(|(record, _)| id(record)).collect();
+    let mut any_field_written = false;
+    let mut any_row_appended = false;
+    let mut any_supersede_appended = false;
     for (record, superseded) in incoming {
         let new_id = id(record);
         let exact_match = rows.iter().any(|row| id(row) == new_id);
@@ -380,27 +423,40 @@ pub fn prepare_anticipation_batch(
             if existing.get("source").and_then(Value::as_str) != Some("anticipated") {
                 return Err("conflict: anticipated ID belongs to an owner activity".into());
             }
+            let stored_cancelled = existing.get("cancelled").is_some_and(activity_value_truthy);
+            let incoming_cancelled = record.get("cancelled").is_some_and(activity_value_truthy);
+            let cancel_flip = !stored_cancelled && incoming_cancelled;
+
             let mut changed = Vec::new();
             for (key, value) in record {
                 if matches!(key.as_str(), "edits" | "id") {
                     continue;
                 }
-                if existing.get(key) != Some(value) {
-                    existing.insert(key.clone(), value.clone());
-                    changed.push(key.clone());
+                if existing.get(key) == Some(value) {
+                    continue;
                 }
+                if activity_field_held(existing, key) {
+                    if key == "hidden" && cancel_flip {
+                        // Cancel exception: hidden is not held
+                    } else {
+                        continue;
+                    }
+                }
+                existing.insert(key.clone(), value.clone());
+                changed.push(key.clone());
             }
             if !changed.is_empty() {
-                *existing = append_edit(
-                    existing.clone(),
-                    "schedule",
-                    changed,
-                    "updated by schedule",
-                    timestamp,
-                );
+                let note = if cancel_flip {
+                    "updated by schedule (cancelled on calendar)"
+                } else {
+                    "updated by schedule"
+                };
+                *existing = append_edit(existing.clone(), "schedule", changed, note, timestamp);
+                any_field_written = true;
             }
         } else {
             rows.push(normalize(record.clone()));
+            any_row_appended = true;
         }
         for row in &mut rows {
             if !exact_match
@@ -416,14 +472,20 @@ pub fn prepare_anticipation_batch(
                     &format!("superseded by {new_id}"),
                     timestamp,
                 );
+                any_supersede_appended = true;
             }
         }
     }
-    let mut after = String::new();
-    for row in rows {
-        after.push_str(&serde_json::to_string(&row).map_err(|e| e.to_string())?);
-        after.push('\n');
-    }
+    let after = if !any_field_written && !any_row_appended && !any_supersede_appended {
+        before.clone().unwrap_or_default()
+    } else {
+        let mut after = String::new();
+        for row in rows {
+            after.push_str(&serde_json::to_string(&row).map_err(|e| e.to_string())?);
+            after.push('\n');
+        }
+        after
+    };
     Ok(PreparedAnticipationBatch {
         facet: facet.into(),
         facet_id,
@@ -961,6 +1023,26 @@ fn hidden(record: &ActivityRecord) -> bool {
     record.get("hidden").is_some_and(activity_value_truthy)
 }
 
+pub fn activity_field_held(record: &ActivityRecord, field: &str) -> bool {
+    let Some(edits) = record.get("edits").and_then(Value::as_array) else {
+        return false;
+    };
+    for edit in edits.iter().rev() {
+        let Some(obj) = edit.as_object() else {
+            continue;
+        };
+        let Some(fields) = obj.get("fields").and_then(Value::as_array) else {
+            continue;
+        };
+        let lists_field = fields.iter().any(|f| f.as_str() == Some(field));
+        if lists_field {
+            let actor = obj.get("actor").and_then(Value::as_str).unwrap_or_default();
+            return actor.starts_with("owner:") || actor.starts_with("cli:");
+        }
+    }
+    false
+}
+
 /// Python's `bool(value)` for activity-record compatibility.
 pub fn activity_value_truthy(value: &Value) -> bool {
     match value {
@@ -1416,5 +1498,23 @@ mod tests {
         assert_eq!(normalized["details"], "");
         assert_eq!(normalized["hidden"], true);
         assert_eq!(normalized["edits"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn list_activity_day_stems_filters_and_sorts_day_files() {
+        let root = tempfile::TempDir::new_in("/var/tmp").unwrap();
+        let act_dir = root.path().join("facets/work/activities");
+        std::fs::create_dir_all(&act_dir).unwrap();
+        std::fs::write(act_dir.join("20261002.jsonl"), "").unwrap();
+        std::fs::write(act_dir.join("20261001.jsonl"), "").unwrap();
+        std::fs::write(act_dir.join("activities.jsonl"), "").unwrap();
+        std::fs::write(act_dir.join("20261001.jsonl.lock"), "").unwrap();
+        std::fs::create_dir_all(act_dir.join("20261003.jsonl")).unwrap(); // directory
+
+        let stems = list_activity_day_stems(root.path(), "work").unwrap();
+        assert_eq!(stems, vec!["20261001", "20261002"]);
+
+        let missing = list_activity_day_stems(root.path(), "missing").unwrap();
+        assert!(missing.is_empty());
     }
 }

@@ -633,7 +633,7 @@ fn process_segment(
                 path.file_name()
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| {
-                        name.ends_with("audio.jsonl") || name.ends_with("_transcript.jsonl")
+                        name.ends_with("audio.jsonl") || (name.ends_with("_transcript.jsonl") || solstone_core_format::audio_archive::is_audio_archive_transcript_name(name))
                     })
             })
             .collect::<Vec<_>>();
@@ -2039,5 +2039,59 @@ mod tests {
         );
         assert!(markdown.contains("Good row"));
         assert_eq!(counts.transcripts, 1);
+    }
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn archive_parts_feed_thinking_and_paged_speech_without_metadata_or_other_jsonl() {
+        let root = TempDir::new().unwrap();
+        let directory = root
+            .path()
+            .join(format!("chronicle/{DAY}/import.archive/090000_300"));
+        fs::create_dir_all(&directory).unwrap();
+        for (index, hash) in ["0123456789abcdef", "fedcba9876543210"]
+            .into_iter()
+            .enumerate()
+        {
+            fs::write(directory.join(format!("p0000_{hash}.jsonl")), format!(
+                "{{\"raw\":\"p0000_{hash}.ogg\",\"private_header\":\"not speech\"}}\n{{\"start\":\"09:00:{:02}\",\"text\":\"archived spoken words from occurrence {index}\"}}\n", 1 + index * 9)).unwrap();
+        }
+        fs::write(
+            directory.join("p0000_not-a-real-digest.jsonl"),
+            "{\"start\":\"09:00:00\",\"text\":\"unrelated fixture secret\"}\n",
+        )
+        .unwrap();
+        let (text, counts) = cluster_period(
+            root.path(),
+            DAY,
+            "090000_300",
+            &sources(true, false, only(&[])),
+            Some("import.archive"),
+        );
+        assert_eq!(counts.transcripts, 2);
+        assert!(!is_no_input(&text, &counts));
+        assert!(text.contains("occurrence 0") && text.contains("occurrence 1"));
+        assert!(!text.contains("unrelated fixture secret") && !text.contains("private_header"));
+        let native = solstone_core_journal_io::Segment::resolve_exact(
+            root.path(),
+            DAY,
+            "import.archive",
+            "090000_300",
+        )
+        .unwrap()
+        .unwrap();
+        let page = read_segment_transcript_page(root.path(), &native, None).unwrap();
+        let entries = page
+            .entries
+            .iter()
+            .map(|e| e.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries,
+            vec![
+                "[09:00:01] archived spoken words from occurrence 0",
+                "[09:00:10] archived spoken words from occurrence 1"
+            ]
+        );
+        assert!(page.next.is_none());
     }
 }

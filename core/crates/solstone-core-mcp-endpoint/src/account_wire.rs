@@ -81,8 +81,26 @@ pub(crate) fn build_account_registration_request(
     owner: &McpEndpointOwnerContext,
     wall_unix_seconds: i64,
 ) -> Result<McpAccountRequest, McpAccountWireError> {
+    build_account_registration_request_replacing(owner, wall_unix_seconds, false)
+}
+
+/// Build the address request; `replace_account` carries the owner's request to
+/// move the address's pinned certificate account to this journal's.
+fn build_account_registration_request_replacing(
+    owner: &McpEndpointOwnerContext,
+    wall_unix_seconds: i64,
+    replace_account: bool,
+) -> Result<McpAccountRequest, McpAccountWireError> {
     let acme_account_uri = owner.cached_acme_account_uri();
     let assertion = match acme_account_uri.as_deref() {
+        Some(uri) if replace_account => {
+            solstone_core_sol_link::home_reach::sign_home_reach_assertion_replacing_acme_account(
+                "mcp.bridge.register",
+                &owner.committed,
+                wall_unix_seconds,
+                uri,
+            )
+        }
         Some(uri) => {
             solstone_core_sol_link::home_reach::sign_home_reach_assertion_with_acme_account(
                 "mcp.bridge.register",
@@ -334,6 +352,9 @@ struct McpAccountResponseWire {
     hostname: String,
     bridge_id: String,
     bridge_address: String,
+    /// When the service last moved this address to a new certificate account,
+    /// as reported (verbatim), with its time when it reads as one.
+    acme_account_replaced: Option<(String, Option<DateTime<Utc>>)>,
 }
 
 #[cfg(all(test, not(feature = "full-tests")))]
@@ -625,9 +646,9 @@ struct McpAccountResponseBody {
     bridge_addresses: Vec<String>,
     /// Present once the address's certificate account has been replaced. Any
     /// value is accepted so a formatting change on the service side can never
-    /// fail a mint; the journal does not act on it yet.
+    /// fail a mint; any value counts as a report, and only an RFC 3339 time is
+    /// read as a time.
     #[serde(default)]
-    #[allow(dead_code)]
     acme_account_replaced_at: Option<serde_json::Value>,
 }
 
@@ -724,6 +745,19 @@ fn parse_account_registration_response(
         hostname: response.hostname,
         bridge_id: response.bridge_id,
         bridge_address,
+        acme_account_replaced: response
+            .acme_account_replaced_at
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                let at = value
+                    .as_str()
+                    .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
+                    .map(|at| at.with_timezone(&Utc));
+                let reported = value
+                    .as_str()
+                    .map_or_else(|| value.to_string(), str::to_owned);
+                (reported, at)
+            }),
     })
 }
 
@@ -907,7 +941,11 @@ async fn run_fixed_account_attempt<I: AccountAttemptIo, C: AccountClock>(
     }
     let deadline = clock.monotonic_now() + ACCOUNT_ATTEMPT_TIMEOUT;
     let wall_start = clock.wall_now();
-    let request = build_account_registration_request(owner, wall_start)
+    let click = crate::sme_account_replace::pending_request(
+        owner.journal_path(),
+        DateTime::from_timestamp(wall_start, 0).unwrap_or_else(Utc::now),
+    );
+    let request = build_account_registration_request_replacing(owner, wall_start, click.is_some())
         .map_err(|_| McpAccountError::Request)?;
     let addresses = await_account_phase(shutdown, deadline, clock, io.resolve())
         .await
@@ -944,21 +982,36 @@ async fn run_fixed_account_attempt<I: AccountAttemptIo, C: AccountClock>(
     let (mut reader, mut writer) = tokio::io::split(tls);
     write_account_request(&mut writer, request.body_bytes(), shutdown, deadline, clock).await?;
     let response = read_account_response(&mut reader, shutdown, deadline, clock).await?;
+    // The service answered a request that carried the owner's click, so the
+    // click is spent whatever it said; only a request that never got an answer
+    // keeps it for the next attempt.
+    if let Some(stamp) = click {
+        crate::sme_account_replace::clear_request(owner.journal_path(), stamp);
+    }
     account_deadline_remaining(clock, deadline)?;
     let wall_end = clock.wall_now();
-    let wire =
-        parse_account_registration_response(response.status, &response.headers, &response.body)
-            .map_err(|error| match error {
-                McpAccountResponseWireError::NeedsSubscription => {
-                    McpAccountError::NeedsSubscription
-                }
-                McpAccountResponseWireError::NotAccepted => McpAccountError::NotAccepted,
-                McpAccountResponseWireError::UpdateRequired => McpAccountError::UpdateRequired,
-                McpAccountResponseWireError::AccountChanged => McpAccountError::AccountChanged,
-                McpAccountResponseWireError::AddressNotReady => McpAccountError::AddressNotReady,
-                McpAccountResponseWireError::AddressRefused => McpAccountError::AddressRefused,
-                _ => McpAccountError::Response,
-            })?;
+    let parsed =
+        parse_account_registration_response(response.status, &response.headers, &response.body);
+    if let Ok(wire) = &parsed
+        && let Some((reported, replaced_at)) = &wire.acme_account_replaced
+    {
+        crate::sme_account_replace::observe_replacement(
+            owner.journal_path(),
+            &wire.hostname,
+            reported,
+            *replaced_at,
+            Utc::now(),
+        );
+    }
+    let wire = parsed.map_err(|error| match error {
+        McpAccountResponseWireError::NeedsSubscription => McpAccountError::NeedsSubscription,
+        McpAccountResponseWireError::NotAccepted => McpAccountError::NotAccepted,
+        McpAccountResponseWireError::UpdateRequired => McpAccountError::UpdateRequired,
+        McpAccountResponseWireError::AccountChanged => McpAccountError::AccountChanged,
+        McpAccountResponseWireError::AddressNotReady => McpAccountError::AddressNotReady,
+        McpAccountResponseWireError::AddressRefused => McpAccountError::AddressRefused,
+        _ => McpAccountError::Response,
+    })?;
     validate_account_registration(wire, owner, wall_start, wall_end)
         .map_err(|_| McpAccountError::Response)
 }
@@ -4142,6 +4195,7 @@ mod tests {
             hostname: "aaaqeaye.solstone.me".to_owned(),
             bridge_id: "mcp-bridge-fixture".to_owned(),
             bridge_address: V1_BRIDGE_ADDRESS.to_owned(),
+            acme_account_replaced: None,
         }
     }
 
@@ -4644,6 +4698,7 @@ mod tests {
             hostname: wire.hostname.clone(),
             bridge_id: wire.bridge_id.clone(),
             bridge_address: wire.bridge_address.clone(),
+            acme_account_replaced: wire.acme_account_replaced.clone(),
         }
     }
 
@@ -5114,6 +5169,251 @@ mod tests {
             account_runtime().block_on(request_account_registration(&owner, &mut shutdown)),
             Err(McpAccountError::Cancelled)
         ));
+    }
+
+    fn account_http_registration_response_with(
+        owner: &McpEndpointOwnerContext,
+        replaced_at: Option<&str>,
+    ) -> Vec<u8> {
+        let wire = valid_registration_wire(
+            owner,
+            REGISTRATION_WALL_START,
+            REGISTRATION_WALL_START + 600,
+        );
+        let mut body = serde_json::json!({
+            "token": wire.token,
+            "token_type": "Bearer",
+            "expires_in": wire.expires_in,
+            "expires_at": wire.expires_at,
+            "instance_id": wire.instance_id,
+            "hostname": wire.hostname,
+            "bridge_id": wire.bridge_id,
+            "bridge_addresses": [wire.bridge_address],
+        });
+        if let Some(at) = replaced_at {
+            body["acme_account_replaced_at"] = serde_json::json!(at);
+        }
+        let body = serde_json::to_vec(&body).expect("test response serializes");
+        [
+            format!(
+                "HTTP/1.1 200 OK\r\nCache-Control: no-store\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .into_bytes(),
+            body,
+        ]
+        .concat()
+    }
+
+    fn sent_claims(io: &TestAccountAttemptIo) -> serde_json::Value {
+        let request = io.request_bytes();
+        let start = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("request has one complete header")
+            + 4;
+        let body: serde_json::Value =
+            serde_json::from_slice(&request[start..]).expect("request JSON parses");
+        let payload = body["assertion"]
+            .as_str()
+            .expect("assertion")
+            .split('.')
+            .nth(1)
+            .expect("payload")
+            .to_owned();
+        serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload)
+                .expect("payload encoding"),
+        )
+        .expect("claims")
+    }
+
+    fn click_at_test_time(owner: &McpEndpointOwnerContext) {
+        crate::sme_account_replace::record_request(
+            owner.journal_path(),
+            DateTime::from_timestamp(REGISTRATION_WALL_START, 0).expect("test time"),
+        )
+        .expect("click records");
+    }
+
+    fn click_pending(owner: &McpEndpointOwnerContext) -> bool {
+        crate::sme_account_replace::pending_request(
+            owner.journal_path(),
+            DateTime::from_timestamp(REGISTRATION_WALL_START, 0).expect("test time"),
+        )
+        .is_some()
+    }
+
+    fn attempt_with(
+        owner: &McpEndpointOwnerContext,
+        clock: &TestAccountClock,
+        response: Vec<u8>,
+    ) -> (
+        Result<McpAccountRegistration, McpAccountError>,
+        serde_json::Value,
+    ) {
+        let mut io = TestAccountAttemptIo::success(clock.clone(), response);
+        let (_sender, mut shutdown) = watch::channel(false);
+        let result = account_runtime().block_on(run_fixed_account_attempt(
+            owner,
+            &mut shutdown,
+            &mut io,
+            clock,
+        ));
+        (result, sent_claims(&io))
+    }
+
+    fn refusal_response(status_line: &str, body: &[u8]) -> Vec<u8> {
+        [
+            format!(
+                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes(),
+            body.to_vec(),
+        ]
+        .concat()
+    }
+
+    const ACCOUNT_URI: &str = "https://acme-v02.api.letsencrypt.org/acme/acct/123456";
+    const REPLACED_AT: &str = "2023-11-14T22:13:20Z";
+
+    #[test]
+    fn an_address_request_asks_to_move_the_account_only_after_the_owners_click() {
+        let (_root, owner) = owner_with_pop(&fixed_pop_pkcs8());
+        owner.set_acme_account_uri_for_test(ACCOUNT_URI);
+        let clock = TestAccountClock::new(REGISTRATION_WALL_START);
+
+        // No click: the account URL alone.
+        let (result, claims) = attempt_with(
+            &owner,
+            &clock,
+            account_http_registration_response_with(&owner, None),
+        );
+        result.expect("attempt succeeds");
+        assert_eq!(claims["acme_account_uri"], ACCOUNT_URI);
+        assert_eq!(claims.get("acme_account_replace"), None);
+        assert!(crate::sme_account_replace::read_notice(owner.journal_path()).is_none());
+
+        // The click: the signed request carries it, the answer spends it, and
+        // the reported move is shown with the service's time.
+        click_at_test_time(&owner);
+        let (result, claims) = attempt_with(
+            &owner,
+            &clock,
+            account_http_registration_response_with(&owner, Some(REPLACED_AT)),
+        );
+        result.expect("attempt succeeds");
+        assert_eq!(claims["acme_account_uri"], ACCOUNT_URI);
+        assert_eq!(claims["acme_account_replace"], true);
+        assert!(!click_pending(&owner));
+        let notice = crate::sme_account_replace::read_notice(owner.journal_path()).expect("notice");
+        assert_eq!(notice.address, "aaaqeaye.solstone.me");
+        assert_eq!(notice.replaced_at.to_rfc3339(), "2023-11-14T22:13:20+00:00");
+
+        // Dismissed, the same report on the next success is not shown again,
+        // and the request goes back to the account URL alone.
+        crate::sme_account_replace::dismiss_notice(owner.journal_path()).expect("dismiss");
+        let (result, claims) = attempt_with(
+            &owner,
+            &clock,
+            account_http_registration_response_with(&owner, Some(REPLACED_AT)),
+        );
+        result.expect("attempt succeeds");
+        assert_eq!(claims.get("acme_account_replace"), None);
+        assert!(crate::sme_account_replace::read_notice(owner.journal_path()).is_none());
+    }
+
+    #[test]
+    fn a_move_whose_answer_was_a_refusal_is_still_shown_when_a_later_success_reports_it() {
+        let (_root, owner) = owner_with_pop(&fixed_pop_pkcs8());
+        owner.set_acme_account_uri_for_test(ACCOUNT_URI);
+        let clock = TestAccountClock::new(REGISTRATION_WALL_START);
+        click_at_test_time(&owner);
+        // The service moved the pin, then could not finish the address records.
+        let (result, claims) = attempt_with(
+            &owner,
+            &clock,
+            refusal_response(
+                "HTTP/1.1 503 Service Unavailable",
+                br#"{"error":"hostname_records_unavailable"}"#,
+            ),
+        );
+        assert_eq!(result.err(), Some(McpAccountError::AddressNotReady));
+        assert_eq!(claims["acme_account_replace"], true);
+        assert!(!click_pending(&owner), "an answer spends the click");
+        assert!(crate::sme_account_replace::read_notice(owner.journal_path()).is_none());
+
+        let (result, claims) = attempt_with(
+            &owner,
+            &clock,
+            account_http_registration_response_with(&owner, Some(REPLACED_AT)),
+        );
+        result.expect("attempt succeeds");
+        assert_eq!(claims.get("acme_account_replace"), None);
+        let notice = crate::sme_account_replace::read_notice(owner.journal_path())
+            .expect("the move is shown without a click on the request");
+        assert_eq!(notice.replaced_at.to_rfc3339(), "2023-11-14T22:13:20+00:00");
+    }
+
+    #[test]
+    fn a_success_without_a_replacement_spends_the_click_and_tells_the_owner_nothing() {
+        let (_root, owner) = owner_with_pop(&fixed_pop_pkcs8());
+        owner.set_acme_account_uri_for_test(ACCOUNT_URI);
+        let clock = TestAccountClock::new(REGISTRATION_WALL_START);
+        click_at_test_time(&owner);
+        let (result, _) = attempt_with(
+            &owner,
+            &clock,
+            account_http_registration_response_with(&owner, None),
+        );
+        result.expect("attempt succeeds");
+        assert!(!click_pending(&owner));
+        assert!(crate::sme_account_replace::read_notice(owner.journal_path()).is_none());
+    }
+
+    #[test]
+    fn a_move_refused_because_the_account_changed_under_it_spends_the_click() {
+        let (_root, owner) = owner_with_pop(&fixed_pop_pkcs8());
+        owner.set_acme_account_uri_for_test(ACCOUNT_URI);
+        let clock = TestAccountClock::new(REGISTRATION_WALL_START);
+        click_at_test_time(&owner);
+        let (result, claims) = attempt_with(
+            &owner,
+            &clock,
+            refusal_response(
+                "HTTP/1.1 409 Conflict",
+                br#"{"error":"acme_account_changed"}"#,
+            ),
+        );
+        assert_eq!(result.err(), Some(McpAccountError::AccountChanged));
+        assert_eq!(claims["acme_account_replace"], true);
+        assert!(!click_pending(&owner), "the owner has to ask again");
+        assert!(crate::sme_account_replace::read_notice(owner.journal_path()).is_none());
+    }
+
+    #[test]
+    fn a_click_survives_an_attempt_the_service_never_answered() {
+        let (_root, owner) = owner_with_pop(&fixed_pop_pkcs8());
+        owner.set_acme_account_uri_for_test(ACCOUNT_URI);
+        let clock = TestAccountClock::new(REGISTRATION_WALL_START);
+        click_at_test_time(&owner);
+        let mut io = TestAccountAttemptIo::success(
+            clock.clone(),
+            account_http_registration_response_with(&owner, Some(REPLACED_AT)),
+        );
+        io.connects = VecDeque::from([AccountAttemptPlan::Fail]);
+        let (_sender, mut shutdown) = watch::channel(false);
+        let result = account_runtime().block_on(run_fixed_account_attempt(
+            &owner,
+            &mut shutdown,
+            &mut io,
+            &clock,
+        ));
+        assert_eq!(result.err(), Some(McpAccountError::Connect));
+        assert!(click_pending(&owner));
+        assert!(crate::sme_account_replace::read_notice(owner.journal_path()).is_none());
     }
 
     #[test]

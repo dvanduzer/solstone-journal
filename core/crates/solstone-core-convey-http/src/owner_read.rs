@@ -73,6 +73,9 @@ pub enum OwnerReadRole {
     SourceLink,
     DeviceIngestUpload,
     DeviceIngestSegments,
+    ActivitiesDayView,
+    ActivitiesIndex,
+    ActivitiesMonthStats,
 }
 
 impl OwnerReadRole {
@@ -133,6 +136,9 @@ impl OwnerReadRole {
         Self::BackupStatus,
         Self::BackupOffloadStatus,
         Self::SourceLink,
+        Self::ActivitiesDayView,
+        Self::ActivitiesIndex,
+        Self::ActivitiesMonthStats,
     ];
 
     /// The paired-device sync roles. Kept separate from [`Self::ALL`] because
@@ -209,6 +215,9 @@ impl OwnerReadRole {
             Self::SourceLink => "/source?ref=sol%3A%2F%2F20260901%2F100000_300",
             Self::DeviceIngestUpload => "/app/devices/ingest",
             Self::DeviceIngestSegments => "/app/devices/ingest/segments/20260901",
+            Self::ActivitiesDayView => "/app/activities/api/day/20260901/view",
+            Self::ActivitiesIndex => "/app/activities/api/index",
+            Self::ActivitiesMonthStats => "/app/activities/api/stats/202609",
         }
     }
 }

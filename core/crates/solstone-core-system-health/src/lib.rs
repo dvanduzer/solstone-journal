@@ -93,9 +93,10 @@ pub use scan::{
     scan_day, unclaimed_image_state,
 };
 pub use segment_state::{find_segment_dir, read_segment_data_state};
+pub use solstone_core_processing_record::jsonl_has_row_with_key;
 pub use source::{
-    FilesystemHealthLogSource, FilesystemSegmentSource, HealthLogSource, SegmentSource,
-    day_is_complete, day_is_complete_with,
+    ArchiveFrontierSegmentSource, FilesystemHealthLogSource, FilesystemSegmentSource,
+    HealthLogSource, SegmentSource, day_is_complete, day_is_complete_with,
 };
 pub use sync_copy::{
     ADMISSION_WAIT_UNVERIFIABLE_COPY, HEARTBEAT_WITHOUT_WAIT_MARKER_COPY, SyncRescanDiagnosis,

@@ -303,7 +303,7 @@ pub(crate) fn owner_heard(
                     entry
                         .file_name()
                         .to_str()
-                        .is_some_and(|name| name.ends_with("audio.jsonl"))
+                        .is_some_and(|name| name.ends_with("audio.jsonl") || solstone_core_format::audio_archive::is_audio_archive_transcript_name(name))
                 });
             if !has_audio {
                 continue;

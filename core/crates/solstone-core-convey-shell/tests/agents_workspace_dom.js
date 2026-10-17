@@ -89,6 +89,7 @@ async function boot(state, {enable = null, pairingResponse, journal = null, acti
       }
       if (url === '/app/agents/api/local-door' || url === '/app/agents/api/lan-door' || url === '/app/agents/api/capability' || url === '/app/agents/api/byo') return {changed: true};
       if (url === '/app/agents/api/byo/account' || url === '/app/agents/api/byo/account/replace') return {changed: true};
+      if (url === '/app/agents/api/solstone-me/account/replace' || url === '/app/agents/api/solstone-me/account/notice/dismiss') return {changed: true};
       if (url.startsWith('/app/agents/api/activity')) return activity ? JSON.parse(JSON.stringify(activity)) : {entries: [], counts: {}, examination_complete: true};
       if (url === '/app/agents/api/enable') return {operation: method === 'POST' ? (enable || {phase: 'waiting', portal_url: 'https://services.example/consent'}) : (enable || null)};
       throw new Error(`unexpected request ${method} ${url}`);
@@ -612,6 +613,52 @@ async function test(name, body) {
       await click({lane: 'me'});
       has(view, words, status);
       lacks(view, 'turning on', status);
+    }
+    // 8b'. Only a changed certificate account offers the owner's way back, and only until it is asked.
+    for (const status of ['update_required', 'address_not_ready', 'address_refused', 'needs_subscription', 'not_accepted', 'offline', 'on']) {
+      const {view, click} = await boot(baseState({
+        enabled: true,
+        status,
+        owner_state: {address: 'k7q2m9xa.solstone.me', status, detail: 'words'},
+        ...door({listening: true}),
+      }));
+      await click({lane: 'me'});
+      lacks(view, 'data-action="sme-account-replace"', status);
+    }
+    {
+      const changed = baseState({
+        enabled: true,
+        status: 'account_changed',
+        owner_state: {status: 'account_changed', detail: 'account changed words', next_attempt_at: '2026-09-24T12:05:00Z'},
+        sme_account: {replace_pending: false, replaced: null},
+        ...door({listening: true}),
+      });
+      const {view, click, calls} = await boot(changed);
+      await click({lane: 'me'});
+      has(view, 'account changed words');
+      has(view, 'data-action="sme-account-replace"');
+      has(view, 'bring my address back');
+      lacks(view, 'next check', 'retrying on its own cannot bring the address back');
+      changed.sme_account.replace_pending = true;
+      await click({action: 'sme-account-replace'});
+      assert(calls.some(call => call.url === '/app/agents/api/solstone-me/account/replace' && call.method === 'POST'), 'the click asks the journal');
+      has(view, 'data-sme-replace-pending');
+      lacks(view, 'data-action="sme-account-replace"', 'no second ask while one is waiting');
+    }
+    // 8b''. The journal's notice that the address came back, until the owner dismisses it.
+    {
+      const back = baseState({
+        ...ME_ON,
+        sme_account: {replace_pending: false, replaced: {address: 'k7q2m9xa.solstone.me', replaced_at: '2026-09-24T12:00:00Z'}},
+      });
+      const {view, click, calls} = await boot(back);
+      has(view, 'data-sme-replaced');
+      has(view, 'your solstone.me address k7q2m9xa.solstone.me came back to this journal on ');
+      has(view, "if that wasn't you, tell support in the services portal.");
+      back.sme_account.replaced = null;
+      await click({action: 'dismiss-sme-replaced'});
+      assert(calls.some(call => call.url === '/app/agents/api/solstone-me/account/notice/dismiss' && call.method === 'POST'), 'dismiss reaches the journal');
+      lacks(view, 'data-sme-replaced');
     }
     // 8c. A failed solstone.me shows the journal's own words, never the transient "keeps trying" copy.
     {

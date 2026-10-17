@@ -296,7 +296,8 @@ fn normalized_transcript(segment_dir: &Path) -> String {
                 .and_then(|name| name.to_str())
                 .unwrap_or_default();
             name.ends_with("audio.jsonl")
-                || name.ends_with("_transcript.jsonl")
+                || (name.ends_with("_transcript.jsonl")
+                    || solstone_core_format::audio_archive::is_audio_archive_transcript_name(name))
                 || name.ends_with("_transcript.md")
                 || name == "imported.md"
         })
@@ -761,6 +762,26 @@ mod tests {
             assemble_sensor_state(&segment)["screen"]["monitors"]
                 .get("unknown:unknown")
                 .is_some()
+        );
+    }
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn archive_speech_is_present_in_the_sensor_fingerprint() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root
+            .path()
+            .join("chronicle/20260101/import.archive/120000_300");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("p0000_0123456789abcdef.jsonl"),
+            "{\"raw\":\"p0000_0123456789abcdef.ogg\"}\n{\"start\":\"12:00:10\",\"text\":\"these archived words must reach the change detector\"}\n").unwrap();
+        let state = super::assemble_sensor_state(&directory);
+        assert_eq!(state["transcript"]["present"], true);
+        assert!(state["transcript"]["word_count"].as_u64().unwrap() >= 8);
+        assert!(
+            state["transcript"]["content_hash"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
         );
     }
 }
