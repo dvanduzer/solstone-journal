@@ -146,6 +146,17 @@ func safeScanKey(ctx context.Context, repo *repository.Repository, password stri
 	return winningID, nil
 }
 
+// keyRefusal classifies a failed key scan. As restic's own open does, a
+// prefix without a config holds no repository; that is not a rejected password.
+func keyRefusal(ctx context.Context, be backend.Backend, err error) bridgeResult {
+	if !errors.Is(err, errResourceLimit) {
+		if _, statErr := be.Stat(ctx, backend.Handle{Type: restic.ConfigFile}); be.IsNotExist(statErr) {
+			return bridgeResult{status: StatusFailed, diagnostic: DiagRepoMissing}
+		}
+	}
+	return refusalResult(err, DiagAuthFailed)
+}
+
 func mapPinError(op int32, err error) bridgeResult {
 	diag := DiagInvalidArgument
 	if op == OpRestore {
@@ -258,7 +269,7 @@ func executeOpen(ctx context.Context, req bridgeRequest) (bridgeResult, error) {
 		if ctx.Err() != nil {
 			return bridgeResult{status: StatusCancelled, diagnostic: DiagCancelled}, ctx.Err()
 		}
-		return refusalResult(err, DiagAuthFailed), err
+		return keyRefusal(ctx, be, err), err
 	}
 	unlock, lockCtx, err := lockRepoForRequest(ctx, req, repo, false)
 	if err != nil {
@@ -306,7 +317,7 @@ func executeAddRecoveryKey(ctx context.Context, req bridgeRequest, setWrote func
 		if ctx.Err() != nil {
 			return bridgeResult{status: StatusCancelled, diagnostic: DiagCancelled}, ctx.Err()
 		}
-		return refusalResult(err, DiagAuthFailed), err
+		return keyRefusal(ctx, be, err), err
 	}
 	unlock, lockCtx, err := lockRepoForRequest(ctx, req, repo, false)
 	if err != nil {
@@ -404,7 +415,7 @@ func executeSnapshot(ctx context.Context, req bridgeRequest, setWrote func()) (b
 		if ctx.Err() != nil {
 			return bridgeResult{status: StatusCancelled, diagnostic: DiagCancelled}, ctx.Err()
 		}
-		return refusalResult(err, DiagAuthFailed), err
+		return keyRefusal(ctx, be, err), err
 	}
 	unlock, lockCtx, err := lockRepoForRequest(ctx, req, repo, false)
 	if err != nil {
@@ -492,7 +503,7 @@ func executeListSnapshots(ctx context.Context, req bridgeRequest) (bridgeResult,
 		if ctx.Err() != nil {
 			return bridgeResult{status: StatusCancelled, diagnostic: DiagCancelled}, ctx.Err()
 		}
-		return refusalResult(err, DiagAuthFailed), err
+		return keyRefusal(ctx, be, err), err
 	}
 	unlock, lockCtx, err := lockRepoForRequest(ctx, req, repo, false)
 	if err != nil {
@@ -576,7 +587,7 @@ func executeRestoreWithPublisher(ctx context.Context, req *bridgeRequest, setWro
 		if ctx.Err() != nil {
 			return bridgeResult{status: StatusCancelled, diagnostic: DiagCancelled}, ctx.Err()
 		}
-		return refusalResult(err, DiagAuthFailed), err
+		return keyRefusal(ctx, be, err), err
 	}
 	unlock, lockCtx, err := lockRepo(ctx, repo, false)
 	if err != nil {
@@ -680,7 +691,7 @@ func executeCheck(ctx context.Context, req bridgeRequest) (bridgeResult, error) 
 		if ctx.Err() != nil {
 			return bridgeResult{status: StatusCancelled, diagnostic: DiagCancelled}, ctx.Err()
 		}
-		return refusalResult(err, DiagAuthFailed), err
+		return keyRefusal(ctx, be, err), err
 	}
 	unlock, lockCtx, err := lockRepoForRequest(ctx, req, repo, true)
 	if err != nil {
