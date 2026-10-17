@@ -254,9 +254,7 @@ pub fn resolve_tools_for_platform(
 
     match platform {
         #[cfg(target_os = "ios")]
-        ToolPlatform::IosCallable => {
-            resolve_ios_tools(_runner, &capability.resolved_journal, needs_rclone)
-        }
+        ToolPlatform::IosCallable => resolve_ios_tools(_runner, &capability.resolved_journal),
         ToolPlatform::Desktop => {
             let package = admit_package(executable, needs_rclone)?;
             let restic_path = package.member(RESTIC_MEMBER).map_err(|refusal| {
