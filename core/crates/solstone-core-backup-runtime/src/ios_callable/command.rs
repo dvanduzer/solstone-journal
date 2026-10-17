@@ -157,14 +157,24 @@ pub(super) fn decode(args: &[String]) -> Result<Command, UnsupportedCommand> {
             {
                 return Err(UnsupportedCommand);
             }
-            let selector = absolute_path(selector)?;
+            // The snapshot's own recorded path, matched natively by the same rule.
+            let parts = selector.strip_prefix('/').unwrap_or(selector);
+            if selector.len() > MAX_PATH_BYTES
+                || selector.contains(['\0', '\r', '\n', '\\'])
+                || parts.split('/').count() > 64
+                || parts
+                    .split('/')
+                    .any(|part| part.is_empty() || part == "." || part == "..")
+            {
+                return Err(UnsupportedCommand);
+            }
             if args.next() != Some("--target") {
                 return Err(UnsupportedCommand);
             }
             let target = absolute_path(args.next().ok_or(UnsupportedCommand)?)?;
             Operation::Restore {
                 snapshot: snapshot.to_owned(),
-                selector: selector.to_str().ok_or(UnsupportedCommand)?.to_owned(),
+                selector: selector.to_owned(),
                 target,
             }
         }
