@@ -363,6 +363,9 @@ func runS3Worker(h *callHandle, req bridgeRequest) {
 		if drainErr != nil {
 			pending = true
 		} else {
+			if result.status != StatusOk {
+				owner.noteAttemptFailed()
+			}
 			visible, err := completeS3Owner(owner)
 			if err != nil {
 				if visible {
