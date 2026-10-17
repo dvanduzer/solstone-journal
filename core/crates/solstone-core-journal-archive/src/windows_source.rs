@@ -305,6 +305,7 @@ fn member_from_path(path: &Path) -> Option<ArchiveMemberName> {
 #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 mod tests {
     use std::fs;
+    use std::io::Read;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -396,6 +397,23 @@ mod tests {
         for member in omitted {
             write(&root, member, b"secret control");
         }
+        let new_kept = [
+            ("backup/hosted/note.txt", b"kept hosted note" as &[u8]),
+            ("config/schedules.json", b"kept schedules"),
+            ("awareness/current.json", b"kept awareness"),
+        ];
+        for (member, bytes) in new_kept {
+            write(&root, member, bytes);
+        }
+        let new_omitted = [
+            ("backup/hosted/binding.json", b"omitted binding" as &[u8]),
+            ("config/push-vapid.json", b"omitted vapid"),
+            ("config/push-registry.json", b"omitted push registry"),
+            ("awareness/discovery_clusters.json", b"omitted clusters"),
+        ];
+        for (member, bytes) in new_omitted {
+            write(&root, member, bytes);
+        }
         let source = ArchiveSource::open(&root).unwrap();
         let mut output = std::fs::File::create(root.parent().unwrap().join("copy.zip")).unwrap();
         crate::encode_archive(
@@ -436,6 +454,33 @@ mod tests {
                     .iter()
                     .any(|entry| entry.member_name().as_str() == member),
                 "{member}"
+            );
+        }
+        let copy_zip_path = root.parent().unwrap().join("copy.zip");
+        let mut archive = zip::ZipArchive::new(fs::File::open(&copy_zip_path).unwrap()).unwrap();
+        for (member, expected_bytes) in new_kept {
+            let mut file = archive.by_name(member).unwrap();
+            let mut contents = Vec::new();
+            file.read_to_end(&mut contents).unwrap();
+            assert_eq!(
+                &contents, expected_bytes,
+                "zip content mismatch for {member}"
+            );
+            assert_eq!(
+                fs::read(root.join(member)).unwrap(),
+                expected_bytes,
+                "source file changed on disk for {member}"
+            );
+        }
+        for (member, expected_bytes) in new_omitted {
+            assert!(
+                archive.by_name(member).is_err(),
+                "omitted member {member} found in zip"
+            );
+            assert_eq!(
+                fs::read(root.join(member)).unwrap(),
+                expected_bytes,
+                "source file changed on disk for {member}"
             );
         }
     }

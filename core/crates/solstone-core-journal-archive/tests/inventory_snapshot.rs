@@ -46,15 +46,7 @@ fn inventory_is_frozen_and_has_fixed_root_then_member_order() {
     assert_eq!(source.inventory().day_count(), 1);
     assert_eq!(source.inventory().entity_count(), 1);
     assert_eq!(source.inventory().facet_count(), 1);
-    assert_eq!(
-        source
-            .inventory()
-            .skipped_root_names()
-            .iter()
-            .map(|name| name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["config"]
-    );
+    assert!(source.inventory().skipped_root_names().is_empty());
     assert_eq!(
         source
             .inventory()
@@ -62,7 +54,7 @@ fn inventory_is_frozen_and_has_fixed_root_then_member_order() {
             .iter()
             .map(|name| name.as_str())
             .collect::<Vec<_>>(),
-        vec!["chronicle", "entities", "facets", "imports"]
+        vec!["chronicle", "config", "entities", "facets", "imports"]
     );
 
     write(&root, "chronicle/20260102/later.txt", b"later");
@@ -87,9 +79,9 @@ fn health_durable_files_are_inventoried_and_brain_key_is_not() {
         .collect();
     assert!(members.contains(&"health/pruning-runs/x.jsonl"));
     assert!(!members.contains(&"health/brain.json"));
-    assert!(!members.iter().any(|name| name.starts_with("apps/")));
+    assert!(members.contains(&"apps/observer/x.json"));
     assert!(
-        source
+        !source
             .inventory()
             .skipped_root_names()
             .iter()

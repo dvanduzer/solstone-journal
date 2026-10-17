@@ -175,6 +175,7 @@ fn encodes_empty_and_mixed_sources_with_the_fixed_archive_shape() {
         &mixed_path,
         &[
             "chronicle/",
+            "config/",
             "entities/",
             "facets/",
             "imports/",
@@ -202,29 +203,291 @@ fn encodes_empty_and_mixed_sources_with_the_fixed_archive_shape() {
 }
 
 #[test]
-fn deny_list_zip_includes_new_roots_and_omits_pruned_trees() {
-    let temporary = TempDir::new("encode-deny");
+fn portable_zip_keeps_owner_bytes_and_omits_credentials() {
+    use solstone_core_journal_io::operational_log::{
+        OplogFormat, OplogNameClassification, classify_oplog_name,
+    };
+    use std::ffi::OsStr;
+
+    const LOG_LEAF: &str = "oplog--cortex~1ee11af4ed5d63caf142a30a96ba124b--20260901T164233.381904Z--8f03cabead7e441d83f6c92b2d89a021--daily-think~7df259e6285645a5f9ea769caa484e07.log";
+    const JSONL_LEAF: &str = "oplog--cortex~1ee11af4ed5d63caf142a30a96ba124b--20260901T164233.381904Z--8f03cabead7e441d83f6c92b2d89a021--daily-think~7df259e6285645a5f9ea769caa484e07.jsonl";
+    const MALFORMED_LEAF: &str = "oplog--not-a-name.log";
+
+    assert!(matches!(
+        classify_oplog_name(OsStr::new(LOG_LEAF)),
+        OplogNameClassification::Candidate(Ok(name)) if name.format() == OplogFormat::Log
+    ));
+    assert!(matches!(
+        classify_oplog_name(OsStr::new(JSONL_LEAF)),
+        OplogNameClassification::Candidate(Ok(name)) if name.format() == OplogFormat::Jsonl
+    ));
+    assert!(matches!(
+        classify_oplog_name(OsStr::new(MALFORMED_LEAF)),
+        OplogNameClassification::Candidate(Err(_))
+    ));
+
+    let temporary = TempDir::new("encode-owner-bytes");
     let root = journal(&temporary);
-    write(&root, "chronicle/20260101/a.txt", b"a");
-    write(&root, "identity/partner.md", b"hello");
-    write(&root, "config/journal.json", b"{}");
-    write(&root, "apps/observer/x.json", b"{}");
-    write(&root, "chronicle/20260101/foo.sqlite", b"db");
+
+    let jsonl_leaf_path = format!("chronicle/20260101/health/{JSONL_LEAF}");
+    let malformed_leaf_path = format!("chronicle/20260101/health/{MALFORMED_LEAF}");
+    let nested_log_leaf_path = format!("chronicle/20260101/health/nested/{LOG_LEAF}");
+    let seven_digit_log_path = format!("chronicle/2026010/health/{LOG_LEAF}");
+    let directory_child_log_path = format!("chronicle/20260102/health/{LOG_LEAF}/child.txt");
+
+    let kept_paths: Vec<&str> = vec![
+        "chronicle/20260101/a.txt",
+        "entities/owner/entity.json",
+        "facets/work/facet.json",
+        "facets/work/logs/actions.jsonl",
+        "imports/item/source.bin",
+        "imports/item/peers/original.txt",
+        "imports/item/config/journal.json",
+        "imports/item/stats.json",
+        "imports/item/owner.tmp",
+        "imports/item/owner.lock",
+        "imports/item/owner.key",
+        "streams/main.json",
+        "speakers/keep.txt",
+        "reflections/weekly/note.md",
+        "owner-root/note.txt",
+        "tokens/20260101.jsonl",
+        "solstone/note.txt",
+        "apps/observer/x.json",
+        "apps/support/keep.txt",
+        "awareness/current.json",
+        "awareness/owner_candidate.npz",
+        "awareness/speaker_candidates.json",
+        "awareness/discovery_clusters.resolved.json",
+        "awareness/20260101.jsonl",
+        "config/schedules.json",
+        "config/actions/20260101.jsonl",
+        "health/week-left-out.json",
+        "health/work-intent.json",
+        "health/entity-merge-recovery/item.json",
+        "health/offload/20260101.jsonl",
+        "health/pruning-runs/x.jsonl",
+        "health/retention.log",
+        "logs/facet-heals.jsonl",
+        "talents/example/20260101T000000.jsonl",
+        ".agents/readme.txt",
+        ".claude/readme.txt",
+        ".agents/skills/notes.txt",
+        ".claude/skills/notes.txt",
+        "chronicle/not-a-day/task_log.txt",
+        "chronicle/20260101/nested/task_log.txt",
+        "chronicle/20260101/nested/stats.json",
+        "chronicle/notaday/stats.json",
+        "supervisor.log.1",
+        "supervisor.1a",
+        "supervisor.txt",
+        "chronicle/20260101/supervisor.log",
+        "chronicle/20260101/health/heartbeat.log",
+        &jsonl_leaf_path,
+        &malformed_leaf_path,
+        &nested_log_leaf_path,
+        &seven_digit_log_path,
+        "stats.json/child.txt",
+        "supervisor.log/child.txt",
+        &directory_child_log_path,
+        "backup/hosted/note.txt",
+    ];
+
+    let mut kept_sentinels: Vec<(&str, Vec<u8>)> = Vec::new();
+    for (i, path) in kept_paths.iter().enumerate() {
+        let sentinel = format!("keep-sentinel-{:02x}-{}\n", i, path.replace('/', "_")).into_bytes();
+        write(&root, path, &sentinel);
+        kept_sentinels.push((*path, sentinel));
+    }
+
+    let omitted_log_leaf_path = format!("chronicle/20260101/health/{LOG_LEAF}");
+    let omitted_regular_paths: Vec<&str> = vec![
+        "config/journal.json",
+        "config/push-vapid.json",
+        "config/push-registry.json",
+        "backup/hosted/binding.json",
+        "awareness/discovery_clusters.json",
+        "awareness/activity_state.json",
+        "awareness/activity_state/child.txt",
+        "awareness/activity_settle/child.txt",
+        "health/heartbeat.log",
+        "health/steward.log",
+        "health/service.log",
+        "supervisor.1",
+        "supervisor.12",
+        "task_log.txt",
+        "chronicle/20260101/task_log.txt",
+        "chronicle/20260101/stats.json",
+        &omitted_log_leaf_path,
+        "link/client.json",
+        "mcp-endpoint/pop.ed25519.pk8",
+        "peers/remote/client.key",
+        "imports/archive-merge-work/extract/x",
+        "config/chatgpt-sign-in.json.unreadable-1",
+        "chronicle/20260101/.removing_original",
+    ];
+
+    let mut omitted_sentinels: Vec<(&str, Vec<u8>)> = Vec::new();
+    for (i, path) in omitted_regular_paths.iter().enumerate() {
+        let sentinel = format!("omit-sentinel-{:02x}-{}\n", i, path.replace('/', "_")).into_bytes();
+        write(&root, path, &sentinel);
+        omitted_sentinels.push((*path, sentinel));
+    }
+
+    let outside_dir = temporary.path().join("outside");
+    fs::create_dir_all(&outside_dir).expect("create outside dir");
+
+    let symlink_paths: Vec<&str> = vec![
+        "apps/support/portal",
+        ".agents/skills/journal",
+        ".agents/skills/solstone",
+        ".claude/skills/journal",
+        ".claude/skills/solstone",
+    ];
+
+    let mut symlink_targets: Vec<(&str, std::path::PathBuf, Vec<u8>)> = Vec::new();
+    for (i, link_rel) in symlink_paths.iter().enumerate() {
+        let target_file = outside_dir.join(format!("outside_target_{i}.txt"));
+        let sentinel = format!("omit-symlink-{:02x}-target\n", i).into_bytes();
+        fs::write(&target_file, &sentinel).expect("write outside target");
+        let link_full = root.join(link_rel);
+        fs::create_dir_all(link_full.parent().expect("link parent")).expect("create link parent");
+        std::os::unix::fs::symlink(&target_file, &link_full).expect("create symlink");
+        symlink_targets.push((*link_rel, target_file, sentinel));
+    }
+
     let source = ArchiveSource::open(&root).expect("open source");
-    let path = temporary.path().join("archive.zip");
-    let mut file = File::create(&path).expect("create output");
-    encode_archive(&request(&source), &mut file).expect("encode");
-    let mut archive = ZipArchive::new(File::open(&path).expect("open archive")).expect("parse");
-    let names: Vec<String> = (0..archive.len())
-        .map(|index| archive.by_index(index).expect("member").name().to_owned())
+    let zip_path = temporary.path().join("archive.zip");
+    let mut file = File::create(&zip_path).expect("create zip output");
+    encode_archive(&request(&source), &mut file).expect("encode archive");
+
+    let skipped_names: Vec<&str> = source
+        .inventory()
+        .skipped_root_names()
+        .iter()
+        .map(|s| s.as_str())
         .collect();
-    assert!(names.contains(&"chronicle/".to_owned()));
-    assert!(names.contains(&"identity/".to_owned()));
-    assert!(names.contains(&"chronicle/20260101/a.txt".to_owned()));
-    assert!(names.contains(&"identity/partner.md".to_owned()));
-    assert!(!names.iter().any(|name| name.starts_with("config")));
-    assert!(!names.iter().any(|name| name.starts_with("apps")));
-    assert!(names.iter().any(|name| name.ends_with("foo.sqlite")));
+    assert_eq!(skipped_names, vec!["link", "mcp-endpoint", "peers"]);
+
+    let mut archive =
+        ZipArchive::new(File::open(&zip_path).expect("open zip output")).expect("parse zip output");
+
+    let expected_dir_members = [
+        "chronicle/",
+        "entities/",
+        "facets/",
+        "imports/",
+        "streams/",
+        "speakers/",
+        "reflections/",
+        "owner-root/",
+        "tokens/",
+        "solstone/",
+        "apps/",
+        "awareness/",
+        "config/",
+        "health/",
+        "logs/",
+        "talents/",
+        ".agents/",
+        ".claude/",
+        "backup/",
+        "stats.json/",
+        "supervisor.log/",
+    ];
+    let mut expected_dirs: Vec<String> = expected_dir_members
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    expected_dirs.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+
+    let mut expected_files: Vec<String> = kept_paths.iter().map(|s| (*s).to_owned()).collect();
+    expected_files.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+
+    let mut expected_sequence = expected_dirs;
+    expected_sequence.extend(expected_files);
+    expected_sequence.push("_export.json".to_owned());
+
+    let actual_names: Vec<String> = (0..archive.len())
+        .map(|i| archive.by_index(i).expect("zip member").name().to_owned())
+        .collect();
+
+    assert_eq!(actual_names, expected_sequence);
+
+    for (name, expected_bytes) in &kept_sentinels {
+        let mut member = archive.by_name(name).expect("find kept member in zip");
+        let mut body = Vec::new();
+        member
+            .read_to_end(&mut body)
+            .expect("read kept member body");
+        assert_eq!(&body, expected_bytes, "zip content mismatch for {name}");
+        let on_disk = fs::read(root.join(name)).expect("read source file on disk");
+        assert_eq!(
+            &on_disk, expected_bytes,
+            "source file on disk changed for {name}"
+        );
+    }
+
+    for (name, expected_bytes) in &omitted_sentinels {
+        assert!(
+            archive.by_name(name).is_err(),
+            "omitted member {name} found in zip"
+        );
+        let on_disk = fs::read(root.join(name)).expect("read omitted source on disk");
+        assert_eq!(
+            &on_disk, expected_bytes,
+            "omitted source on disk changed for {name}"
+        );
+    }
+
+    for (link_rel, target_path, expected_bytes) in &symlink_targets {
+        assert!(
+            archive.by_name(link_rel).is_err(),
+            "symlink {link_rel} found in zip"
+        );
+        assert_eq!(
+            fs::read_link(root.join(link_rel)).expect("read symlink"),
+            *target_path
+        );
+        let on_disk = fs::read(target_path).expect("read outside target on disk");
+        assert_eq!(&on_disk, expected_bytes);
+    }
+
+    let mut all_bodies = Vec::new();
+    for i in 0..archive.len() {
+        let mut member = archive.by_index(i).expect("member");
+        let mut body = Vec::new();
+        member.read_to_end(&mut body).expect("read member");
+        all_bodies.push(body);
+    }
+
+    for (name, sentinel) in &omitted_sentinels {
+        for (i, body) in all_bodies.iter().enumerate() {
+            assert!(
+                !body
+                    .windows(sentinel.len())
+                    .any(|w| w == sentinel.as_slice()),
+                "omitted sentinel for {name} leaked into zip member index {i}"
+            );
+        }
+    }
+    for (name, _, sentinel) in &symlink_targets {
+        for (i, body) in all_bodies.iter().enumerate() {
+            assert!(
+                !body
+                    .windows(sentinel.len())
+                    .any(|w| w == sentinel.as_slice()),
+                "symlink target sentinel for {name} leaked into zip member index {i}"
+            );
+        }
+    }
+
+    assert!(actual_names.contains(&"imports/".to_owned()));
+    assert!(actual_names.contains(&"config/".to_owned()));
+    assert!(!actual_names.iter().any(|n| n.starts_with("link")));
+    assert!(!actual_names.iter().any(|n| n.starts_with("mcp-endpoint")));
+    assert!(!actual_names.iter().any(|n| n.starts_with("peers")));
+    assert!(!actual_names.contains(&"config/journal.json".to_owned()));
 }
 
 #[test]

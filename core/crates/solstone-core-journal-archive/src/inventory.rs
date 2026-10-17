@@ -24,17 +24,19 @@ pub(crate) fn build(root: &impl AsFd) -> Result<Inventory, ArchiveError> {
         let name_str = utf8_name(&name, None)?;
         let member = ArchiveMemberName::new(name_str.clone());
         let stat = stat_entry_for_count(root, &name, &member)?;
-        match classify(&stat) {
+        let kind = classify(&stat);
+        if kind == JournalEntryKind::Directory && deny_top_level(&name_str) == DenyAction::TreePrune
+        {
+            inventory
+                .skipped_root_names
+                .push(SkippedRootName::new(name_str));
+            continue;
+        }
+        if deny_member(&name_str, kind == JournalEntryKind::RegularFile) {
+            continue;
+        }
+        match kind {
             JournalEntryKind::Directory => {
-                if deny_top_level(&name_str) == DenyAction::TreePrune {
-                    inventory
-                        .skipped_root_names
-                        .push(SkippedRootName::new(name_str));
-                    continue;
-                }
-                if deny_member(&name_str, false) {
-                    continue;
-                }
                 inventory
                     .included_root_names
                     .push(IncludedRootName::new(name_str));
@@ -52,9 +54,6 @@ pub(crate) fn build(root: &impl AsFd) -> Result<Inventory, ArchiveError> {
                 )?;
             }
             JournalEntryKind::RegularFile => {
-                if deny_member(&name_str, true) {
-                    continue;
-                }
                 count_file(&[], &name, &mut inventory);
                 let file = open_initial_file(root, &name, &member, &stat)?;
                 entries.push(InventoryEntry::new(
@@ -66,7 +65,6 @@ pub(crate) fn build(root: &impl AsFd) -> Result<Inventory, ArchiveError> {
                     },
                 ));
             }
-            JournalEntryKind::Socket if deny_member(member.as_str(), false) => {}
             kind => {
                 return Err(ArchiveError::UnsafeJournalEntry { member, kind });
             }
@@ -101,11 +99,12 @@ fn walk_directory(
         child_components.push(name.clone());
         let member = member_name(&child_components)?;
         let stat = stat_entry_for_count(directory, &name, &member)?;
-        match classify(&stat) {
+        let kind = classify(&stat);
+        if deny_member(member.as_str(), kind == JournalEntryKind::RegularFile) {
+            continue;
+        }
+        match kind {
             JournalEntryKind::Directory => {
-                if deny_member(member.as_str(), false) {
-                    continue;
-                }
                 count_directory(&components, &name, inventory);
                 let (child, proof) = open_initial_directory(directory, &name, &member, &stat)?;
                 let mut child_proofs = directory_proofs.clone();
@@ -117,9 +116,6 @@ fn walk_directory(
                 walk_directory(&child, child_components, child_proofs, entries, inventory)?;
             }
             JournalEntryKind::RegularFile => {
-                if deny_member(member.as_str(), true) {
-                    continue;
-                }
                 count_file(&components, &name, inventory);
                 let file = open_initial_file(directory, &name, &member, &stat)?;
                 entries.push(InventoryEntry::new(
@@ -131,7 +127,6 @@ fn walk_directory(
                     },
                 ));
             }
-            JournalEntryKind::Socket if deny_member(member.as_str(), false) => {}
             kind => {
                 return Err(ArchiveError::UnsafeJournalEntry { member, kind });
             }
@@ -355,7 +350,7 @@ mod membership_tests {
     }
 
     #[test]
-    fn top_level_tree_prunes_drop_config_and_apps() {
+    fn included_owner_roots_keep_apps_and_config_and_prune_peers() {
         let temporary = TempDir::new("ac3");
         let root = journal(&temporary);
         write(&root, "config/journal.json", b"{}");
@@ -369,10 +364,14 @@ mod membership_tests {
         assert_eq!(
             names,
             vec![
+                "apps/observer/x.json".to_owned(),
                 "chronicle/20260101/a.txt".to_owned(),
                 "imports/item/peers/original.txt".to_owned(),
             ]
         );
+        assert!(!names.contains(&"config/journal.json".to_owned()));
+        assert!(!names.contains(&"peers/remote/client.key".to_owned()));
+        assert!(!names.contains(&"peers/remote/client.crt".to_owned()));
         assert_eq!(
             source
                 .inventory()
@@ -380,7 +379,17 @@ mod membership_tests {
                 .iter()
                 .map(|name| name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["apps", "config", "peers"]
+            vec!["peers"]
         );
+        let included = source
+            .inventory()
+            .included_root_names()
+            .iter()
+            .map(|name| name.as_str())
+            .collect::<Vec<_>>();
+        assert!(included.contains(&"apps"));
+        assert!(included.contains(&"chronicle"));
+        assert!(included.contains(&"config"));
+        assert!(included.contains(&"imports"));
     }
 }

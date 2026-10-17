@@ -143,6 +143,28 @@ fn rejects_symlink_fifo_and_socket_without_opening_special_members() {
 
 #[cfg(unix)]
 #[test]
+#[allow(clippy::disallowed_methods)]
+fn rejects_unexcluded_skill_sibling_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let temporary = TempDir::new("unexcluded-skill-symlink");
+    let root = journal(&temporary);
+    directory(&root, ".agents/skills");
+    let outside = temporary.path().join("outside");
+    fs::write(&outside, b"outside").expect("write outside marker");
+    symlink(&outside, root.join(".agents/skills/other")).expect("create symlink");
+
+    assert!(matches!(
+        ArchiveSource::open(&root),
+        Err(ArchiveError::UnsafeJournalEntry {
+            kind: JournalEntryKind::Symlink,
+            ..
+        })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
 #[cfg_attr(
     target_os = "macos",
     ignore = "APFS rejects non-UTF-8 path components before the product boundary"
