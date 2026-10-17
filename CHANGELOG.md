@@ -6,6 +6,10 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- restoring your whole journal from a backup you set up in your own storage now works even after media offload has moved anything into that backup. before, the restore stopped and said "the list of backups is invalid". nothing in your backup was changed.
+
 ## [2.0.49] - 2026-10-17
 
 ### Added

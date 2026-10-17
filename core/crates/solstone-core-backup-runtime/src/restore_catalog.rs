@@ -5,6 +5,7 @@
 
 use chrono::{DateTime, FixedOffset};
 use serde_json::{Map, Value};
+use solstone_core_backup::archive_readback::OFFLOAD_ARCHIVE_TAG;
 
 use crate::ARCHIVE_TAG;
 
@@ -61,7 +62,12 @@ pub(crate) fn select_journal_snapshot(
 fn is_archive(entry: &Map<String, Value>) -> Result<bool, CatalogError> {
     match entry.get("tags") {
         None => Ok(false),
-        Some(Value::Array(tags)) if tags.len() == 1 && tags[0].as_str() == Some(ARCHIVE_TAG) => {
+        // Archives and offloaded media share the repository with journal
+        // snapshots; neither is a journal to restore.
+        Some(Value::Array(tags))
+            if tags.len() == 1
+                && matches!(tags[0].as_str(), Some(tag) if tag == ARCHIVE_TAG || tag == OFFLOAD_ARCHIVE_TAG) =>
+        {
             Ok(true)
         }
         Some(_) => Err(CatalogError::Invalid),
@@ -134,6 +140,16 @@ mod tests {
     }
 
     #[test]
+    fn catalog_skips_offloaded_media_snapshots() {
+        let selected = select_journal_snapshot(Some(&json!([
+            snapshot(FIRST_ID, "2026-01-01T00:00:00Z"),
+            {"id": SECOND_ID, "time": "2026-02-01T00:00:00Z", "paths": ["/journal/chronicle"], "tags": [OFFLOAD_ARCHIVE_TAG]},
+        ])))
+        .unwrap();
+        assert_eq!(selected.id, FIRST_ID);
+    }
+
+    #[test]
     fn catalog_rejects_all_other_tag_shapes() {
         for tags in [
             Value::Null,
@@ -141,6 +157,7 @@ mod tests {
             json!([ARCHIVE_TAG, ARCHIVE_TAG]),
             json!(["different"]),
             json!([ARCHIVE_TAG, "different"]),
+            json!([ARCHIVE_TAG, OFFLOAD_ARCHIVE_TAG]),
             json!(ARCHIVE_TAG),
         ] {
             let mut entry = snapshot(FIRST_ID, "2026-01-01T00:00:00Z");
