@@ -274,6 +274,14 @@ echo === cargo test --locked (agent connector audit record) ===
 cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-mcp-audit --lib || exit /b 1
 echo === cargo test --locked (agent connector routine suite) ===
 cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-mcp-endpoint --lib -- --test-threads=1 || exit /b 1
+cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-home --lib weekly || exit /b 1
+cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-convey-shell --test source_link -- --test-threads=1 || exit /b 1
+call :run_exact_integration "solstone-core-convey-shell" "source_link" "weekly_reflection_source_links" || exit /b 1
+call :run_exact_library "solstone-core-mcp-endpoint" "tools::week::tests::whole_journal_grant_advertises_and_calls_get_week" || exit /b 1
+call :run_exact_library "solstone-core-mcp-endpoint" "tools::week::tests::memory_and_quote_leave_outs_are_independent" || exit /b 1
+call :run_exact_library "solstone-core-mcp-endpoint" "tools::week::tests::navigation_read_failures_refuse_but_malformed_candidates_are_skipped" || exit /b 1
+call :run_exact_library "solstone-core-callosum" "reader::tests::reported_zone_accepts_relative_journal_paths" "full-tests" || exit /b 1
+call :run_exact_library "solstone-core-callosum" "reader::tests::reported_zone_only_reads_bounded_regular_receipts" "full-tests" || exit /b 1
 echo === cargo test --locked (agent connector boundary suite) ===
 cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-mcp-endpoint --lib --features full-tests,test-hooks -- --test-threads=1 || exit /b 1
 cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-segment --lib --features full-tests agent_memory_ -- --test-threads=1 || exit /b 1

@@ -76,6 +76,7 @@ pub enum ToolName {
     GetTranscript,
     ListEntities,
     GetEntity,
+    GetWeek,
     SaveMemory,
     RecallMemory,
 }
@@ -92,6 +93,7 @@ impl ToolName {
             Self::GetTranscript => "get_transcript",
             Self::ListEntities => "list_entities",
             Self::GetEntity => "get_entity",
+            Self::GetWeek => "get_week",
             Self::SaveMemory => "save_memory",
             Self::RecallMemory => "recall_memory",
         }
@@ -109,6 +111,7 @@ impl ToolName {
             Self::GetTranscript,
             Self::ListEntities,
             Self::GetEntity,
+            Self::GetWeek,
             Self::SaveMemory,
             Self::RecallMemory,
         ]
@@ -823,6 +826,7 @@ mod tests {
             ToolName::GetTranscript,
             ToolName::ListEntities,
             ToolName::GetEntity,
+            ToolName::GetWeek,
         ] {
             assert_eq!(ToolName::from_token(tool.token()), Some(tool));
         }

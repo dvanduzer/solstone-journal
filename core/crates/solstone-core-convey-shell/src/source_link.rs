@@ -444,7 +444,8 @@ fn resolve_landing(
                 Ok(LandingOutcome::Redirect(location))
             }
             solstone_core_home::weekly::WeekJudgment::Absent => Ok(LandingOutcome::Absence),
-            solstone_core_home::weekly::WeekJudgment::CantShow => Ok(LandingOutcome::CantShow),
+            solstone_core_home::weekly::WeekJudgment::CantShow
+            | solstone_core_home::weekly::WeekJudgment::Untrusted => Ok(LandingOutcome::CantShow),
             solstone_core_home::weekly::WeekJudgment::CouldntCheck => {
                 Err("weekly reflection couldn't be checked".to_string())
             }

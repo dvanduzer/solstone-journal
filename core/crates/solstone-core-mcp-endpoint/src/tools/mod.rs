@@ -8,12 +8,14 @@ pub(crate) mod facets;
 pub(crate) mod fetch;
 pub(crate) mod search;
 pub(crate) mod transcripts;
+pub(crate) mod week;
 
 pub(crate) use entities::{ValidatedGetEntity, ValidatedListEntities};
 pub(crate) use facets::ValidatedListFacets;
 pub(crate) use fetch::ValidatedFetch;
 pub(crate) use search::ValidatedSearch;
 pub(crate) use transcripts::{ValidatedGetTranscript, ValidatedListTranscripts};
+pub(crate) use week::ValidatedGetWeek;
 
 pub(crate) const MAX_OPAQUE_REFERENCE_BYTES: usize = 2_048;
 pub(crate) const MAX_DAY_BYTES: usize = 32;
@@ -62,6 +64,7 @@ pub(crate) enum ValidatedTool {
     GetTranscript(ValidatedGetTranscript),
     ListEntities(ValidatedListEntities),
     GetEntity(ValidatedGetEntity),
+    GetWeek(ValidatedGetWeek),
 }
 
 /// A public-safe reason to reject or fail one read-only tool call.

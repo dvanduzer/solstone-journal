@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use serde_json::{Map, Value, json};
-use solstone_core_indexer_query::AdmittedCategory;
+use solstone_core_indexer_query::{AdmittedCategory, ConnectionScope};
 
 use crate::permissions::{ConnectionReadSnapshot, PermissionDecision};
 use crate::tools::search::MAX_QUERY_BYTES;
@@ -17,6 +17,7 @@ use crate::tools::{DAY_DESCRIPTION, DAY_PATTERN, MAX_DAY_BYTES, MAX_OPAQUE_REFER
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ToolRequirement {
     pub(crate) read: &'static [AdmittedCategory],
+    pub(crate) whole_journal: bool,
 }
 
 /// Everything schema generation may know about a connection.
@@ -44,12 +45,21 @@ pub(crate) struct ToolEntry {
     pub(crate) audit_name: solstone_core_mcp_audit::ToolName,
 }
 
-const NOTHING: ToolRequirement = ToolRequirement { read: &[] };
+const NOTHING: ToolRequirement = ToolRequirement {
+    read: &[],
+    whole_journal: false,
+};
 const TRANSCRIPTS: ToolRequirement = ToolRequirement {
     read: &[AdmittedCategory::Transcripts],
+    whole_journal: false,
 };
 const ENTITIES: ToolRequirement = ToolRequirement {
     read: &[AdmittedCategory::Entities],
+    whole_journal: false,
+};
+const WEEK: ToolRequirement = ToolRequirement {
+    read: &[AdmittedCategory::Transcripts, AdmittedCategory::Facets],
+    whole_journal: true,
 };
 
 /// The single registry used for advertisement, dispatch, validation, and auditing.
@@ -135,6 +145,15 @@ pub(crate) const TOOLS: &[ToolEntry] = &[
         requires: ENTITIES,
         audit_name: solstone_core_mcp_audit::ToolName::GetEntity,
     },
+    ToolEntry {
+        tool_name: crate::jsonrpc::ToolName::GetWeek,
+        wire_name: "get_week",
+        title: "read a week",
+        description: "read one week. memories are generated and are not the owner's words. quotes are the owner's words. each day state describes that day's memory. leaving an entry off the week page leaves that source visible to the other tools. pass week as the sunday it starts, YYYYMMDD, or omit it for the newest week.",
+        input_schema: week_input_schema,
+        requires: WEEK,
+        audit_name: solstone_core_mcp_audit::ToolName::GetWeek,
+    },
 ];
 
 pub(crate) fn tool_by_wire_name(name: &str) -> Option<&'static ToolEntry> {
@@ -149,11 +168,32 @@ pub(crate) fn find_tool(name: crate::jsonrpc::ToolName) -> &'static ToolEntry {
 }
 
 pub(crate) fn snapshot_allows(snapshot: &ConnectionReadSnapshot, entry: &ToolEntry) -> bool {
-    entry
+    requirement_refusal(snapshot, entry).is_none()
+}
+
+pub(crate) fn requirement_refusal(
+    snapshot: &ConnectionReadSnapshot,
+    entry: &ToolEntry,
+) -> Option<String> {
+    let missing = entry
         .requires
         .read
         .iter()
-        .all(|category| snapshot.categories.contains(category))
+        .filter(|category| !snapshot.categories.contains(category))
+        .map(category_token)
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Some(format!(
+            "this connection does not have the {} category",
+            missing.join(" and ")
+        ));
+    }
+    if entry.requires.whole_journal && !matches!(snapshot.scope, ConnectionScope::WholeJournal) {
+        return Some(
+            "this connection can read a week only with access to the whole journal.".to_owned(),
+        );
+    }
+    None
 }
 
 /// The tool list one connection may see, with each schema naming only what that
@@ -533,6 +573,20 @@ fn transcript_input_schema(_context: &SchemaContext<'_>) -> Value {
         "properties": {
             "reference": { "type": "string", "minLength": 1, "maxLength": MAX_OPAQUE_REFERENCE_BYTES },
             "cursor": { "type": "string", "minLength": 1, "maxLength": MAX_OPAQUE_REFERENCE_BYTES },
+        }
+    })
+}
+
+fn week_input_schema(_context: &SchemaContext<'_>) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "week": {
+                "type": "string",
+                "pattern": "^[0-9]{8}$",
+                "description": "the sunday a week starts, as YYYYMMDD. omit it to read the newest week.",
+            }
         }
     })
 }

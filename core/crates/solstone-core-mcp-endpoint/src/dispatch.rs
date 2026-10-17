@@ -32,12 +32,12 @@ use crate::references::{
     CursorReference, EntityListCursor, EntityReference, EntryReference, FacetListCursor,
     ReferenceCodec, ReferenceKind, ReferenceTarget, SegmentReference, TranscriptListCursor,
 };
-use crate::registry::{ToolEntry, category_token, find_tool, snapshot_allows};
+use crate::registry::{ToolEntry, category_token, find_tool, requirement_refusal};
 use crate::segment_links::{LinkSubject, LiveTranscriptPages, issue_segment_links};
 use crate::tools::{
-    ToolError, ValidatedFetch, ValidatedGetEntity, ValidatedGetTranscript, ValidatedListEntities,
-    ValidatedListFacets, ValidatedListTranscripts, ValidatedSearch, ValidatedTool,
-    execute_after_audit,
+    ToolError, ValidatedFetch, ValidatedGetEntity, ValidatedGetTranscript, ValidatedGetWeek,
+    ValidatedListEntities, ValidatedListFacets, ValidatedListTranscripts, ValidatedSearch,
+    ValidatedTool, execute_after_audit,
 };
 
 /// Upper bound on indexed rows examined to fill one search page after live drops.
@@ -323,18 +323,8 @@ fn scope_refusal(
     entry: &ToolEntry,
     request: &ValidatedTool,
 ) -> Option<String> {
-    if !snapshot_allows(snapshot, entry) {
-        let missing = entry
-            .requires
-            .read
-            .iter()
-            .filter(|category| !snapshot.categories.contains(category))
-            .map(category_token)
-            .collect::<Vec<_>>()
-            .join(" and ");
-        return Some(format!(
-            "this connection does not have the {missing} category"
-        ));
+    if let Some(reason) = requirement_refusal(snapshot, entry) {
+        return Some(reason);
     }
     if !arguments_within_scope(snapshot, request) {
         return Some(
@@ -466,6 +456,9 @@ fn recorded_arguments(validated: &ValidatedTool) -> Map<String, Value> {
                 reference_fingerprint(&request.reference).into(),
             );
         }
+        ValidatedTool::GetWeek(request) => {
+            insert_present(&mut arguments, "week", request.week.as_deref());
+        }
     }
     arguments
 }
@@ -520,6 +513,9 @@ fn validate(entry: &ToolEntry, arguments: Option<&Value>) -> Result<ValidatedToo
         }
         crate::jsonrpc::ToolName::GetEntity => {
             crate::tools::entities::validate_get(arguments).map(ValidatedTool::GetEntity)
+        }
+        crate::jsonrpc::ToolName::GetWeek => {
+            crate::tools::week::validate(arguments).map(ValidatedTool::GetWeek)
         }
         crate::jsonrpc::ToolName::SaveMemory | crate::jsonrpc::ToolName::RecallMemory => {
             return Err(DispatchError::InvalidInput);
@@ -581,6 +577,13 @@ fn audit_permission_snapshot(
     }
 }
 
+fn get_week(journal_root: &Path, request: ValidatedGetWeek) -> Result<Prepared, DispatchError> {
+    let read = crate::tools::week::read_week(journal_root, request.week.as_deref())
+        .map_err(DispatchError::Tool)?;
+    Ok(Prepared::new(read.value, read.count, read.targets)
+        .when_empty("no week to read. this is a complete answer, not an error."))
+}
+
 fn execute_validated(
     journal_root: &Path,
     principal: DispatchPrincipal<'_>,
@@ -603,6 +606,7 @@ fn execute_validated(
             list_entities(journal_root, principal, snapshot, request)
         }
         ValidatedTool::GetEntity(request) => get_entity(journal_root, principal, snapshot, request),
+        ValidatedTool::GetWeek(request) => get_week(journal_root, request),
     }
 }
 
