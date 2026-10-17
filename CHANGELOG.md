@@ -22,6 +22,9 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- security fix: a symbolic link in a recording's metadata could make a transcript page read time-zone information from outside your journal. those links are now refused.
+- transcript reads by your agent now include the recording's reported time zone when its UTC offset differs from your journal's.
+- your agent can continue through facet and entity lists instead of stopping at the first page, and can tell when an entity description was shortened.
 - transcripts warn when a sentence may contain words from more than one speaker.
 - linux: `solstone update` and the status pane now recognize installs made by the public installer.
 

@@ -17,7 +17,9 @@ use solstone_core_journal_io::paths::{
 };
 use solstone_core_transcripts::segment_clock;
 
-use crate::dispatch::{DispatchPrincipal, boundary, codec, segment_assignment_probe_path};
+use crate::dispatch::{
+    DispatchPrincipal, boundary, codec, differing_capture_zone, segment_assignment_probe_path,
+};
 use crate::permissions::ConnectionReadSnapshot;
 use crate::references::{ReferenceTarget, SegmentReference};
 
@@ -69,6 +71,7 @@ pub(crate) fn issue_segment_links(
         return;
     };
     let transcript_boundary = boundary(snapshot, Some(AdmittedCategory::Transcripts), None);
+    let owner_zone = solstone_core_journal_config::owner_zone(journal_root);
 
     let mut day_cache: BTreeMap<String, Vec<Segment>> = BTreeMap::new();
     let mut response_checks = 0;
@@ -112,10 +115,20 @@ pub(crate) fn issue_segment_links(
                     statement_ordinal: None,
                 });
                 if let Ok(token) = codec().mint(principal.connection, snapshot.generation, target) {
-                    subject.segments.push(json!({
+                    let mut link_val = json!({
                         "time": clock.label,
                         "reference": token,
-                    }));
+                    });
+                    if let Some(zone) = differing_capture_zone(
+                        journal_root,
+                        &owner_zone,
+                        &day,
+                        identity.name,
+                        &candidate,
+                    ) {
+                        link_val["capture_zone"] = zone;
+                    }
+                    subject.segments.push(link_val);
                 }
             }
         }

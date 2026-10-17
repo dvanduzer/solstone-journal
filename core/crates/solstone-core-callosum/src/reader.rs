@@ -66,6 +66,10 @@ pub fn read_durable_events(segment_path: &Path) -> Result<DurableEventsReport, C
         Err(source) => return Err(CallosumReadError::Io { path, source }),
     };
 
+    Ok(parse_durable_events(&contents))
+}
+
+fn parse_durable_events(contents: &[u8]) -> DurableEventsReport {
     let mut report = DurableEventsReport::default();
     for line in contents.split(|byte| *byte == b'\n') {
         if line.iter().all(u8::is_ascii_whitespace) {
@@ -77,7 +81,7 @@ pub fn read_durable_events(segment_path: &Path) -> Result<DurableEventsReport, C
             Err(()) => report.unparseable += 1,
         }
     }
-    Ok(report)
+    report
 }
 
 /// Read only device-ingest rows while reporting skipped bus-envelope rows.
@@ -102,13 +106,30 @@ pub fn read_device_ingest_events(
 /// The zone the device reported for this segment, from its latest ingest
 /// receipt that carried one. A segment without receipts, or whose receipts
 /// cannot be read, has no reported zone.
-pub fn read_reported_zone(segment_path: &Path) -> Option<ReportedZone> {
-    read_device_ingest_events(segment_path)
+pub fn read_reported_zone(journal_root: &Path, segment_path: &Path) -> Option<ReportedZone> {
+    // Zone metadata is optional. Refuse symbolic links, nonregular files and oversized
+    // logs without affecting the segment's readable transcript.
+    const MAX_REPORTED_ZONE_BYTES: usize = 1024 * 1024;
+    let absolute_root = std::path::absolute(journal_root).ok()?;
+    let root = solstone_core_journal_io::JournalRoot::open(&absolute_root).ok()?;
+    let relative = segment_path
+        .strip_prefix(journal_root)
         .ok()?
+        .join(EVENTS_FILE);
+    let observed = solstone_core_journal_io::read_relative_file_bounded(
+        &root,
+        &relative,
+        MAX_REPORTED_ZONE_BYTES,
+    )
+    .ok()??;
+    parse_durable_events(&observed.bytes)
         .records
         .iter()
         .rev()
-        .find_map(DeviceIngestEvent::reported_zone)
+        .find_map(|record| match record {
+            DurableEvent::DeviceIngest(event) => event.reported_zone(),
+            DurableEvent::Callosum(_) => None,
+        })
 }
 
 fn classify(line: &[u8]) -> Result<Option<DurableEvent>, ()> {
@@ -322,16 +343,58 @@ mod tests {
         write_events(&segment, lines.as_bytes());
 
         assert_eq!(
-            read_reported_zone(&segment),
+            read_reported_zone(segment.parent().unwrap(), &segment),
             Some(ReportedZone {
                 tz: Some("Asia/Tokyo".to_owned()),
                 utc_offset_seconds: Some(32400),
             })
         );
         assert_eq!(
-            read_reported_zone(&segment_path("reported-zone-absent")),
+            read_reported_zone(
+                segment.parent().unwrap(),
+                &segment_path("reported-zone-absent")
+            ),
             None
         );
         let _ = fs::remove_dir_all(segment);
+    }
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn reported_zone_only_reads_bounded_regular_receipts() {
+        let journal = tempfile::tempdir().unwrap();
+        let segment = journal.path().join("chronicle/20260309/device/120000_1");
+        let row = device_event(json!({"meta":{"tz":"Asia/Tokyo","utc_offset_seconds":32400}}));
+        let line = format!("{row}\n");
+        let mut exact = line.into_bytes();
+        exact.resize(1024 * 1024, b' ');
+        write_events(&segment, &exact);
+        assert_eq!(
+            read_reported_zone(journal.path(), &segment)
+                .unwrap()
+                .utc_offset_seconds,
+            Some(32400)
+        );
+        exact.push(b' ');
+        write_events(&segment, &exact);
+        assert_eq!(read_reported_zone(journal.path(), &segment), None);
+        fs::remove_file(segment.join(EVENTS_FILE)).unwrap();
+        fs::create_dir(segment.join(EVENTS_FILE)).unwrap();
+        assert_eq!(read_reported_zone(journal.path(), &segment), None);
+    }
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn reported_zone_accepts_relative_journal_paths() {
+        let cwd = std::env::current_dir().unwrap();
+        let journal = tempfile::tempdir_in(&cwd).unwrap();
+        let relative_root = journal.path().strip_prefix(&cwd).unwrap();
+        let relative_segment = relative_root.join("chronicle/20260309/device/120000_1");
+        let row = device_event(json!({"meta":{"tz":"Asia/Tokyo","utc_offset_seconds":32400}}));
+        write_events(&relative_segment, format!("{row}\n").as_bytes());
+        assert_eq!(
+            read_reported_zone(relative_root, &relative_segment)
+                .unwrap()
+                .utc_offset_seconds,
+            Some(32400)
+        );
     }
 }
