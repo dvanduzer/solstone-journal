@@ -298,7 +298,7 @@
     },
     attention: {
       state: 'setup needs attention',
-      explanation: "speech recognition isn't ready.",
+      explanation: "local speech recognition isn't ready.",
       summary: 'show recovery steps',
     },
     unavailable: {
@@ -307,6 +307,21 @@
       summary: 'setup details',
     },
   };
+
+  function validSpeechSetup(payload) {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)
+        || typeof payload.applicable !== 'boolean' || typeof payload.visible !== 'boolean') return false;
+    if (!payload.visible) return payload.state == null && payload.tone == null;
+    const nullableText = value => value == null || typeof value === 'string';
+    const nullableBytes = value => value == null || (Number.isSafeInteger(value) && value >= 0);
+    return payload.applicable && typeof payload.state === 'string'
+      && Object.hasOwn(SPEECH_SETUP_COPY, payload.state)
+      && ['neutral', 'calm', 'attention', 'unavailable'].includes(payload.tone)
+      && nullableBytes(payload.bytes_received) && nullableBytes(payload.bytes_total)
+      && nullableText(payload.cause) && nullableText(payload.command)
+      && typeof payload.recovery_representable === 'boolean'
+      && (payload.command == null || (payload.recovery_representable && payload.state !== 'unavailable'));
+  }
 
   function formatSpeechBytes(bytes) {
     if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes < 0) return '';
@@ -333,6 +348,13 @@
   function hideSpeechSetup() {
     const setupEl = document.getElementById('speechSetup');
     if (!setupEl) return;
+    if (document.activeElement?.closest('#speechSetup') === setupEl) {
+      const target = document.querySelector('#brain .card-title') || document.getElementById('brainHealthStatus');
+      if (target) {
+        target.setAttribute('tabindex', '-1');
+        target.focus({ preventScroll: true });
+      }
+    }
     setupEl.hidden = true;
     setupEl.removeAttribute('data-state');
     setupEl.classList.remove(
@@ -380,7 +402,7 @@
     };
 
     const stateEl = document.getElementById('speechSetupState');
-    if (stateEl) {
+    if (stateEl && stateEl.textContent !== copy.state) {
       stateEl.textContent = copy.state;
     }
 
@@ -422,13 +444,14 @@
     }
 
     const summaryEl = document.getElementById('speechSetupSummary');
-    if (summaryEl) {
+    if (summaryEl && summaryEl.textContent !== copy.summary) {
       summaryEl.textContent = copy.summary;
     }
 
     const causeEl = document.getElementById('speechSetupCause');
+    const hasCause = typeof payload.cause === 'string' && payload.cause.trim().length > 0;
     if (causeEl) {
-      if (typeof payload.cause === 'string') {
+      if (hasCause) {
         causeEl.hidden = false;
         causeEl.textContent = payload.cause;
       } else {
@@ -440,7 +463,9 @@
     const instructionEl = document.getElementById('speechSetupInstruction');
     const commandWrapper = document.getElementById('speechSetupCommandWrapper');
     const commandEl = document.getElementById('speechSetupCommand');
-    if (typeof payload.command === 'string') {
+    const hasCommand = payload.recovery_representable && payload.state !== 'unavailable'
+      && typeof payload.command === 'string' && payload.command.trim().length > 0;
+    if (hasCommand) {
       if (instructionEl) instructionEl.hidden = false;
       if (commandWrapper) commandWrapper.hidden = false;
       if (commandEl) {
@@ -455,10 +480,18 @@
         commandEl.textContent = '';
       }
     }
+    const detailsEl = document.getElementById('speechSetupDetails');
+    if (detailsEl) {
+      if (!hasCause && !hasCommand && document.activeElement?.closest('#speechSetupDetails') === detailsEl && stateEl) {
+        stateEl.setAttribute('tabindex', '-1');
+        stateEl.focus({ preventScroll: true });
+      }
+      detailsEl.hidden = !hasCause && !hasCommand;
+    }
   }
 
   let speechReadPending = false;
-  let speechApplicableLatched = false;
+  let speechApplicableLatched = document.getElementById('speechSetup')?.dataset.applicable === 'true';
   let speechAttempt = 0;
 
   async function loadSpeechSetup() {
@@ -495,7 +528,7 @@
       if (settled || attempt !== speechAttempt) return;
       if (!card.isConnected) return;
 
-      if (!payload || typeof payload !== 'object' || typeof payload.applicable !== 'boolean') {
+      if (!validSpeechSetup(payload)) {
         throw new Error('invalid speech-setup payload');
       }
 

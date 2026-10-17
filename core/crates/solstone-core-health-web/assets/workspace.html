@@ -812,6 +812,7 @@ h2.card-title {
   margin: 0.25em 0;
   font-family: var(--font-mono);
   font-size: 0.85em;
+  overflow-wrap: anywhere;
 }
 
 #speechSetupCommandWrapper {
@@ -1566,8 +1567,8 @@ h2.card-title {
       <button id="brainCheckBtn" hidden>check again</button>
     </div>
     <div id="brainHealthStatus" role="status" aria-live="polite"><p class="brain-health-pending">checking processing&hellip;</p></div>
-    <div id="speechSetup" hidden>
-      <p><span>speech recognition</span>: <span id="speechSetupState"></span></p>
+    <div id="speechSetup" data-applicable="{{SPEECH_SETUP_APPLICABLE}}" hidden>
+      <p role="status" aria-live="polite" aria-atomic="true"><span>local speech recognition</span>: <span id="speechSetupState"></span></p>
       <p id="speechSetupExplanation" hidden></p>
       <div id="speechSetupBytes" hidden></div>
       <details id="speechSetupDetails">

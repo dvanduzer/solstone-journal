@@ -1013,6 +1013,7 @@ mod tests {
         // 1. Oneshot equality test
         let app = crate::routes_with_clock(root.to_path_buf(), Clock::fixed(now));
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/app/health/api/speech-setup")
@@ -1036,6 +1037,21 @@ mod tests {
             now,
         );
         assert_eq!(from_endpoint, expected);
+
+        // The first failed browser read still knows whether this host has setup to check.
+        let workspace = app
+            .oneshot(
+                Request::builder()
+                    .uri("/app/health/workspace")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(workspace.status(), 200);
+        let workspace_bytes = to_bytes(workspace.into_body(), 1024 * 1024).await.unwrap();
+        let workspace_html = std::str::from_utf8(&workspace_bytes).unwrap();
+        assert!(workspace_html.contains(&format!("data-applicable=\"{}\"", expected.applicable)));
 
         // 2. LinuxCpp scenarios (injected platform)
         let status_path = root.join("health/providers/parakeet.json");

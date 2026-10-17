@@ -1323,7 +1323,7 @@ test('registered clients card state choices', async () => {
   assert.ok(env.doc.querySelector('.registered-clients-count'));
 });
 
-function createSpeechEnvironment() {
+function createSpeechEnvironment(applicable = true) {
   const source = loadHealthSource();
   const doc = new Document();
   doc.hidden = false;
@@ -1338,11 +1338,12 @@ function createSpeechEnvironment() {
 
   const speechSetup = doc.createElement('div');
   speechSetup.id = 'speechSetup';
+  speechSetup.setAttribute('data-applicable', String(applicable));
   speechSetup.hidden = true;
 
   const stateP = doc.createElement('p');
   const speechLabel = doc.createElement('span');
-  speechLabel.textContent = 'speech recognition';
+  speechLabel.textContent = 'local speech recognition';
   const stateEl = doc.createElement('span');
   stateEl.id = 'speechSetupState';
   stateP.append(speechLabel, doc.createTextNode(': '), stateEl);
@@ -1613,18 +1614,18 @@ test('never settling getJson times out at 10000ms callback, releases guard, and 
   assert.ok(env.speechSetup.classList.contains('speech-setup-tone-neutral'));
 });
 
-test('details.open and summary focus survive byte-only refresh', async () => {
+test('meaningful speech details keep their open state and focus across refresh', async () => {
   const env = createSpeechEnvironment();
   env.context.getJson = async () => ({
     applicable: true,
     visible: true,
-    state: 'downloading',
-    tone: 'neutral',
-    bytes_received: 1000,
-    bytes_total: 5000,
-    cause: null,
+    state: 'paused',
+    tone: 'calm',
+    bytes_received: null,
+    bytes_total: null,
+    cause: 'install_cancelled',
     recovery_representable: true,
-    command: null,
+    command: 'solstone journal install-provider parakeet',
   });
   await vm.runInContext('loadSpeechSetup()', env.context);
 
@@ -1636,19 +1637,19 @@ test('details.open and summary focus survive byte-only refresh', async () => {
   env.context.getJson = async () => ({
     applicable: true,
     visible: true,
-    state: 'downloading',
-    tone: 'neutral',
-    bytes_received: 2500,
-    bytes_total: 5000,
-    cause: null,
+    state: 'paused',
+    tone: 'calm',
+    bytes_received: null,
+    bytes_total: null,
+    cause: 'install_cancelled',
     recovery_representable: true,
-    command: null,
+    command: 'solstone journal install-provider parakeet',
   });
   await vm.runInContext('loadSpeechSetup()', env.context);
 
   assert.strictEqual(env.detailsEl.open, true);
   assert.strictEqual(env.doc.activeElement, env.summaryEl);
-  assert.strictEqual(env.bytesEl.getAttribute('data-received'), '2500');
+  assert.strictEqual(env.detailsEl.hidden, false);
 });
 
 test('applicable: false leaves row hidden and later rejection also leaves it hidden', async () => {
@@ -1759,13 +1760,13 @@ test('after successful applicable visible downloading payload, later getJson res
   assert.strictEqual(env.bytesEl.hidden, true);
 });
 
-test('first load returning {} with no prior success leaves the row hidden', async () => {
+test('first load returning {} on an applicable host shows unavailable', async () => {
   const env = createSpeechEnvironment();
   env.context.getJson = async () => ({});
   await vm.runInContext('loadSpeechSetup()', env.context);
 
-  assert.strictEqual(env.speechSetup.hidden, true);
-  assert.strictEqual(env.speechSetup.getAttribute('data-state'), null);
+  assert.strictEqual(env.speechSetup.hidden, false);
+  assert.strictEqual(env.speechSetup.getAttribute('data-state'), 'unavailable');
 });
 
 test('after successful applicable visible: false payload, later {applicable: 1} paints unavailable and does not leave row hidden', async () => {
@@ -1790,6 +1791,62 @@ test('after successful applicable visible: false payload, later {applicable: 1} 
   assert.strictEqual(env.speechSetup.hidden, false);
   assert.strictEqual(env.speechSetup.getAttribute('data-state'), 'unavailable');
   assert.ok(env.speechSetup.classList.contains('speech-setup-tone-unavailable'));
+});
+
+test('an initial rejected speech read is unavailable on an applicable host', async () => {
+  const env = createSpeechEnvironment();
+  env.context.getJson = async () => { throw new Error('read failed'); };
+  await vm.runInContext('loadSpeechSetup()', env.context);
+  assert.strictEqual(env.speechSetup.hidden, false);
+  assert.strictEqual(env.speechSetup.dataset.state, 'unavailable');
+  assert.strictEqual(env.bytesEl.hidden, true);
+});
+
+test('an initial rejected speech read stays absent on an unsupported host', async () => {
+  const env = createSpeechEnvironment(false);
+  env.context.getJson = async () => { throw new Error('read failed'); };
+  await vm.runInContext('loadSpeechSetup()', env.context);
+  assert.strictEqual(env.speechSetup.hidden, true);
+});
+
+test('malformed visible speech presentations clear progress and become unavailable', async () => {
+  const env = createSpeechEnvironment();
+  const progress = { applicable: true, visible: true, state: 'downloading', tone: 'neutral',
+    bytes_received: 10, bytes_total: 20, cause: null, recovery_representable: true, command: null };
+  for (const bad of [
+    { ...progress, visible: null },
+    { ...progress, state: 'future-state' },
+    { ...progress, state: 'toString' },
+    { ...progress, tone: 'future-tone' },
+    { ...progress, bytes_received: -1 },
+    { ...progress, command: {} },
+  ]) {
+    env.context.getJson = async () => progress;
+    await vm.runInContext('loadSpeechSetup()', env.context);
+    env.context.getJson = async () => bad;
+    await vm.runInContext('loadSpeechSetup()', env.context);
+    assert.strictEqual(env.speechSetup.dataset.state, 'unavailable');
+    assert.strictEqual(env.bytesEl.hidden, true);
+  }
+});
+
+test('empty speech details disappear and resolved setup keeps focus in processing', async () => {
+  const env = createSpeechEnvironment();
+  const paused = { applicable: true, visible: true, state: 'paused', tone: 'calm',
+    bytes_received: null, bytes_total: null, cause: 'install_cancelled', recovery_representable: true,
+    command: 'solstone journal install-provider parakeet' };
+  env.context.getJson = async () => paused;
+  await vm.runInContext('loadSpeechSetup()', env.context);
+  assert.strictEqual(env.detailsEl.hidden, false);
+  env.summaryEl.focus();
+  env.context.getJson = async () => ({ ...paused, state: 'downloading', tone: 'neutral', cause: null, command: null });
+  await vm.runInContext('loadSpeechSetup()', env.context);
+  assert.strictEqual(env.detailsEl.hidden, true);
+  assert.strictEqual(env.doc.activeElement, env.doc.getElementById('speechSetupState'));
+  env.context.getJson = async () => ({ ...paused, visible: false, state: null, tone: null, command: null });
+  await vm.runInContext('loadSpeechSetup()', env.context);
+  assert.strictEqual(env.speechSetup.hidden, true);
+  assert.strictEqual(env.doc.activeElement, env.doc.getElementById('brainHealthStatus'));
 });
 
 async function runAsyncCases() {

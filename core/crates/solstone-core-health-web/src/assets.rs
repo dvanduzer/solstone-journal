@@ -7,14 +7,26 @@ use axum::{
 };
 
 const SHELL: &[u8] = include_bytes!("../../solstone-core-convey-shell/assets/static/shell.html");
-const WORKSPACE: &[u8] = include_bytes!("../assets/workspace.html");
+const WORKSPACE: &str = include_str!("../assets/workspace.html");
 include!(concat!(env!("OUT_DIR"), "/static_assets.rs"));
 
 pub async fn shell() -> Response<Body> {
     asset_response(SHELL, "text/html; charset=utf-8")
 }
 pub async fn workspace() -> Response<Body> {
-    asset_response(WORKSPACE, "text/html; charset=utf-8")
+    use solstone_core_system::stt_backend_choice::{SttRuntimeKind, stt_host_policy};
+    let applicable = matches!(
+        stt_host_policy(std::env::consts::OS, std::env::consts::ARCH).runtime_kind,
+        Some(SttRuntimeKind::LinuxCpp | SttRuntimeKind::MacosCoreml)
+    );
+    let html = WORKSPACE.replace(
+        "{{SPEECH_SETUP_APPLICABLE}}",
+        if applicable { "true" } else { "false" },
+    );
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(Body::from(html))
+        .expect("health workspace response")
 }
 /// Serve any file under the app's static directory, mirroring the reference's
 /// `static_folder`. ⛔ Not one literal path: that narrows a published contract

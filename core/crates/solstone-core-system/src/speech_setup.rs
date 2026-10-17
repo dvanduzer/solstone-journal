@@ -288,8 +288,7 @@ pub fn read_speech_setup(
     // 10. Attention
     let is_attention = status_record.error_code.as_deref() == Some("install_interrupted")
         || status_record.install_state == "failed"
-        || status_record.install_state == "installed"
-        || pin_follow.is_some();
+        || status_record.install_state == "installed";
 
     if is_attention {
         return SpeechSetupPresentation {
@@ -498,16 +497,16 @@ mod tests {
 
         setup_linux_proofs_ready(temp.path());
 
-        // Failed status still hidden when proofs are ready
-        write_install_status(temp.path(), "failed", Some("some_err"), None, None, None);
-
-        for phase in &["starting", "warming", "stopped", "running"] {
-            write_runtime_health(temp.path(), phase, None);
-            let pres = read_speech_setup(temp.path(), "linux", "x86_64", None, now);
-            assert!(pres.applicable);
-            assert!(!pres.visible);
-            assert_eq!(pres.state, None);
-            assert_eq!(pres.command, None);
+        for code in ["some_err", "install_cancelled"] {
+            write_install_status(temp.path(), "failed", Some(code), None, None, None);
+            for phase in &["starting", "warming", "stopped", "running"] {
+                write_runtime_health(temp.path(), phase, None);
+                let pres = read_speech_setup(temp.path(), "linux", "x86_64", None, now);
+                assert!(pres.applicable);
+                assert!(!pres.visible);
+                assert_eq!(pres.state, None);
+                assert_eq!(pres.command, None);
+            }
         }
     }
 
@@ -535,13 +534,13 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 10, 17, 12, 0, 0).unwrap();
 
         setup_macos_sentinel_ready(&home);
-        // Failed install status should still be hidden because sentinel is ready
-        write_install_status(temp.path(), "failed", Some("fail_code"), None, None, None);
-
-        let pres = read_speech_setup(temp.path(), "darwin", "arm64", Some(&home), now);
-        assert!(pres.applicable);
-        assert!(!pres.visible);
-        assert_eq!(pres.command, None);
+        for code in ["fail_code", "install_cancelled"] {
+            write_install_status(temp.path(), "failed", Some(code), None, None, None);
+            let pres = read_speech_setup(temp.path(), "darwin", "arm64", Some(&home), now);
+            assert!(pres.applicable);
+            assert!(!pres.visible);
+            assert_eq!(pres.command, None);
+        }
     }
 
     #[test]
@@ -963,5 +962,40 @@ mod tests {
         assert_eq!(pres.tone, Some(SpeechSetupTone::Unavailable));
         assert_eq!(pres.command, None);
         assert!(!pres.recovery_representable);
+    }
+
+    #[test]
+    fn unknown_follow_reason_does_not_prescribe_reinstall() {
+        let temp = TempDir::new().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 10, 17, 12, 0, 0).unwrap();
+        write_install_status(temp.path(), "idle", None, None, None, None);
+        write_runtime_health(
+            temp.path(),
+            "artifact-not-ready",
+            Some("future-follow-reason"),
+        );
+        let pres = read_speech_setup(temp.path(), "linux", "x86_64", None, now);
+        assert_eq!(pres.state, Some(SpeechSetupState::Unavailable));
+        assert_eq!(pres.command, None);
+        assert!(!pres.recovery_representable);
+    }
+
+    #[test]
+    fn macos_progress_uses_the_shared_active_install_observation() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("mac_home");
+        fs::create_dir_all(&home).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 10, 17, 12, 0, 0).unwrap();
+        write_install_status(temp.path(), "downloading", None, None, Some((10, 20)), None);
+        let lease = solstone_core_local::install::lease::acquire(temp.path(), "parakeet").unwrap();
+        assert!(lease.is_some());
+        let active = read_speech_setup(temp.path(), "darwin", "arm64", Some(&home), now);
+        assert_eq!(active.state, Some(SpeechSetupState::Downloading));
+        assert_eq!(active.bytes_received, Some(10));
+        assert_eq!(active.bytes_total, Some(20));
+        drop(lease);
+        let abandoned = read_speech_setup(temp.path(), "darwin", "arm64", Some(&home), now);
+        assert_eq!(abandoned.state, Some(SpeechSetupState::Attention));
+        assert_eq!(abandoned.cause.as_deref(), Some("install_interrupted"));
     }
 }

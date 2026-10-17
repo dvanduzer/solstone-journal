@@ -136,8 +136,19 @@ fn ac3_replays_all_captured_health_cases_through_the_shell() {
                                 )
                             }
                             Some("workspace") => {
+                                use solstone_core_system::stt_backend_choice::{
+                                    SttRuntimeKind, stt_host_policy,
+                                };
+                                let applicable = matches!(
+                                    stt_host_policy(std::env::consts::OS, std::env::consts::ARCH)
+                                        .runtime_kind,
+                                    Some(SttRuntimeKind::LinuxCpp | SttRuntimeKind::MacosCoreml)
+                                );
                                 wanted =
-                                    Value::String(include_str!("../assets/workspace.html").into())
+                                    Value::String(include_str!("../assets/workspace.html").replace(
+                                        "{{SPEECH_SETUP_APPLICABLE}}",
+                                        if applicable { "true" } else { "false" },
+                                    ))
                             }
                             _ => {}
                         }
