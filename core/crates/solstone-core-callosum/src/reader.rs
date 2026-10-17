@@ -381,7 +381,7 @@ mod tests {
         fs::create_dir(segment.join(EVENTS_FILE)).unwrap();
         assert_eq!(read_reported_zone(journal.path(), &segment), None);
     }
-    #[cfg(feature = "full-tests")]
+    #[cfg(all(test, feature = "full-tests"))]
     #[test]
     fn reported_zone_accepts_relative_journal_paths() {
         const CHILD: &str = "SOLSTONE_TEST_RELATIVE_REPORTED_ZONE";
