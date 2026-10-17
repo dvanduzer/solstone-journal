@@ -618,6 +618,16 @@ async fn offload_config(deps: BackupWebDeps, body: Bytes) -> axum::response::Res
 }
 
 async fn offload_enable(deps: BackupWebDeps) -> axum::response::Response {
+    // Media offload needs the executable archive path, which iOS does not have.
+    // Refuse before any setting changes so the device never shows it as on.
+    if cfg!(target_os = "ios") {
+        return response::error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "that action isn't available in the current state.",
+            "unsupported_platform",
+            "media offload is not available on this device",
+        );
+    }
     let _guard = match admit_write(&deps.operations, AdmitWrite::DuringOperation) {
         Ok(guard) => guard,
         Err(response) => return response,

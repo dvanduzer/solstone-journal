@@ -315,6 +315,8 @@ def main():
             refusals[uri] = operate(phone, uri, kind=kind)
             assert refusals[uri].get('operation', {}).get('phase') != 'done', refusals[uri]
         refusals['/offload/enable'] = owner_raw(phone, 'POST', ROUTE + '/offload/enable')
+        assert refusals['/offload/enable'][0] == 400, refusals['/offload/enable']
+        assert (refusals['/offload/enable'][1] or {}).get('reason_code') == 'unsupported_platform', refusals['/offload/enable']
         offload = owner(phone, 'GET', ROUTE + '/status').get('offload') or {}
         assert offload.get('enabled') is not True, offload
         keys_after = key_ids('keys-after')
