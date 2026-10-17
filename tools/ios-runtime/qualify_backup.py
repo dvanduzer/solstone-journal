@@ -306,12 +306,18 @@ def main():
         check('A6_restart', {'resumed': resumed, 'relaunched': relaunched, 'check_exit': integrity.returncode,
                              'snapshots': [s['id'] for s in final]})
         # A8 last: these must refuse; if one regressed it could not damage the checks above.
-        keys_before = restic.run('keys-before', canonical, 'key', 'list', '--json', '--no-lock').stdout
+        def key_ids(name):
+            listed = json.loads(restic.run(name, canonical, 'key', 'list', '--json', '--no-lock').stdout)
+            return sorted(key['id'] for key in listed)
+        keys_before = key_ids('keys-before')
         refusals = {}
-        for uri, kind in (('/recovery-key/rotate', 'rotate'), ('/offload/enable', None), ('/teardown', 'teardown')):
+        for uri, kind in (('/recovery-key/rotate', 'rotate'), ('/teardown', 'teardown')):
             refusals[uri] = operate(phone, uri, kind=kind)
             assert refusals[uri].get('operation', {}).get('phase') != 'done', refusals[uri]
-        keys_after = restic.run('keys-after', canonical, 'key', 'list', '--json', '--no-lock').stdout
+        refusals['/offload/enable'] = owner_raw(phone, 'POST', ROUTE + '/offload/enable')
+        offload = owner(phone, 'GET', ROUTE + '/status').get('offload') or {}
+        assert offload.get('enabled') is not True, offload
+        keys_after = key_ids('keys-after')
         check('A8_refusals', {'responses': refusals, 'keys_unchanged': keys_before == keys_after})
         assert keys_before == keys_after
         assert len(restic.snapshots('snapshots-a8', canonical)) == len(final)
