@@ -265,6 +265,7 @@ pub fn remove_key<'invocation>(
     )
 }
 
+#[cfg_attr(target_os = "ios", allow(dead_code))] // rotation is refused on iOS
 pub(crate) fn capture_rotation_key_id<'invocation>(
     runner: &dyn ToolRunner,
     destination: &Destination,
@@ -279,6 +280,7 @@ pub(crate) fn capture_rotation_key_id<'invocation>(
         .map(|(id, _)| id)
         .ok_or(RepoError::Failed)
 }
+#[cfg_attr(target_os = "ios", allow(dead_code))] // rotation is refused on iOS
 pub(crate) fn remove_rotation_key<'invocation>(
     runner: &dyn ToolRunner,
     destination: &Destination,
@@ -313,6 +315,7 @@ pub(crate) fn remove_rotation_key<'invocation>(
     }
 }
 
+#[cfg_attr(target_os = "ios", allow(dead_code))] // rotation is refused on iOS
 pub(crate) fn strict_key_list_absence<'invocation>(
     runner: &dyn ToolRunner,
     destination: &Destination,
@@ -329,6 +332,7 @@ pub(crate) fn strict_key_list_absence<'invocation>(
     )
 }
 
+#[cfg_attr(target_os = "ios", allow(dead_code))] // rotation is refused on iOS
 fn strict_key_list<'invocation>(
     runner: &dyn ToolRunner,
     destination: &Destination,

@@ -754,6 +754,7 @@ pub(crate) fn run_restic_with_stdin<'invocation>(
     })
 }
 
+#[cfg_attr(target_os = "ios", allow(dead_code))] // rotation is refused on iOS
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_restic_with_stdin_cancellable<'invocation>(
     runner: &dyn ToolRunner,

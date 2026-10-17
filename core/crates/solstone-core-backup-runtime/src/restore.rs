@@ -309,6 +309,7 @@ pub(crate) const RESTORE_KEEPS_LOCAL: [&str; 2] = [
 
 /// The restic argv that restores one journal snapshot's tree onto `target`.
 pub(crate) fn restore_args(snapshot_id: &str, tree_path: &str, target: &str) -> Vec<String> {
+    #[cfg_attr(target_os = "ios", allow(unused_mut))]
     let mut args = vec![
         "restore".to_owned(),
         format!("{snapshot_id}:{tree_path}"),
