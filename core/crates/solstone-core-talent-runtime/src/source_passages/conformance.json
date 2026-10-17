@@ -1,0 +1,125 @@
+{
+  "about": "Invented conformance cases for source passages. A reference is protected only when every support fragment is verbatim in one unit and the reference is marked useful; it is kept only when all of its fragments sit inside one passage. A qualified claim found in a passage must carry every qualifier with it. Forbidden text is a strengthened or reassigned reading that no passage may assert. Completions are the nomination answers, in request order.",
+  "cases": [
+    {
+      "name": "whole_meeting_is_kept_without_a_call",
+      "talent": "conversation",
+      "activity_kind": "meeting",
+      "audio": [
+        {"start": "00:00:05", "text": "Mira: Lee could deploy v14 only after both suites pass."},
+        {"start": "00:00:20", "text": "Bea: We will not migrate the billing table this week."}
+      ],
+      "completions": [],
+      "expect": {"physical_calls": 0, "logical_calls": 0, "complete": true, "outcomes": ["whole"]},
+      "references": [
+        {"id": "condition", "useful": true, "support": ["Mira: Lee could deploy v14 only after both suites pass."]},
+        {"id": "negation", "useful": true, "support": ["Bea: We will not migrate the billing table this week."]}
+      ],
+      "qualified": [
+        {"claim": "deploy v14", "with": ["Mira:", "could", "only after both suites pass"]},
+        {"claim": "migrate the billing table", "with": ["will not"]}
+      ],
+      "forbidden": ["Lee deployed v14", "decided to migrate"]
+    },
+    {
+      "name": "long_meeting_copies_source_not_the_strengthened_draft",
+      "talent": "conversation",
+      "activity_kind": "meeting",
+      "audio": [
+        {"filler": 30, "text": "Ari: Lunch chatter about weather, parking garages and coffee number {i}."},
+        "Mira: Lee could deploy v14 only after both suites pass.",
+        {"filler": 20, "text": "Ari: More chatter on bicycles, umbrellas and sandwiches number {i}."},
+        "Bea: We will not migrate the billing table this week.",
+        {"filler": 20, "text": "Ari: Talk about hiking boots, rainfall and bakeries number {i}."},
+        "If the vendor signs by Friday, we should start the pilot.",
+        "Zoë: The café sign 🪨 must not say “open” until the inspector approves.",
+        {"filler": 10, "text": "Ari: Closing chatter about trains and porridge number {i}."}
+      ],
+      "completions": [
+        {"facts": [
+          "Lee deployed v14 after the suites passed.",
+          "Bea decided to migrate the billing table.",
+          "The team started the vendor pilot on Friday.",
+          "Zoë wants the café sign to say open."
+        ]}
+      ],
+      "expect": {"physical_calls": 1, "logical_calls": 1, "complete": true, "outcomes": ["selected"]},
+      "references": [
+        {"id": "condition", "useful": true, "support": ["Mira: Lee could deploy v14 only after both suites pass."]},
+        {"id": "negation", "useful": true, "support": ["Bea: We will not migrate the billing table this week."]},
+        {"id": "unknown_speaker_plan", "useful": true, "support": ["If the vendor signs by Friday, we should start the pilot."]},
+        {"id": "unicode_negated_condition", "useful": true, "support": ["Zoë: The café sign 🪨 must not say “open” until the inspector approves."]}
+      ],
+      "qualified": [
+        {"claim": "deploy v14", "with": ["Mira:", "could", "only after both suites pass"]},
+        {"claim": "migrate the billing table", "with": ["will not", "this week"]},
+        {"claim": "start the pilot", "with": ["If the vendor signs by Friday", "should"]},
+        {"claim": "say “open”", "with": ["must not", "until the inspector approves"]}
+      ],
+      "forbidden": ["Lee deployed v14", "decided to migrate", "started the vendor pilot", "wants the café sign"]
+    },
+    {
+      "name": "screen_roles_never_become_authors",
+      "talent": "work",
+      "activity_kind": "coding",
+      "transcript": [
+        "## 2026-01-01 10:00:00 - 10:05:00\n\n",
+        "### Screen Activity\n",
+        {"filler": 40, "text": "Editor tab {i} shows a long list of unrelated configuration keys and comments.\n"},
+        "UI field role=user; label=\"All tests passed\". The assistant reports finishing retry fix R; deploy only after review.\n",
+        {"filler": 20, "text": "Sidebar entry {i} lists folders, icons and settings panels.\n"},
+        "```json\n{\"window\":{\"title\":\"Release checklist\",\"status\":\"blocked until legal signs\"}}\n```\n",
+        {"filler": 10, "text": "Footer line {i} shows the clock and a battery meter.\n"}
+      ],
+      "completions": [
+        {"facts": [
+          "The user reports all tests passed and deployed retry fix R.",
+          "The release checklist is complete."
+        ]}
+      ],
+      "expect": {"physical_calls": 1, "logical_calls": 1, "complete": true, "outcomes": ["selected"]},
+      "references": [
+        {"id": "ui_role_and_report", "useful": true, "support": ["UI field role=user; label=\"All tests passed\". The assistant reports finishing retry fix R; deploy only after review."]},
+        {"id": "readable_json_values", "useful": true, "support": ["$[\"window\"][\"title\"] [string]:\nRelease checklist\n", "$[\"window\"][\"status\"] [string]:\nblocked until legal signs\n"]}
+      ],
+      "qualified": [
+        {"claim": "deploy", "with": ["only after review"]},
+        {"claim": "All tests passed", "with": ["label="]},
+        {"claim": "Release checklist", "with": ["blocked until legal signs"]}
+      ],
+      "forbidden": ["The user reports", "deployed retry fix R", "checklist is complete"]
+    },
+    {
+      "name": "an_activity_reads_its_own_stream_when_another_shares_the_segment",
+      "talent": "conversation",
+      "activity_kind": "meeting",
+      "stream": "phone",
+      "other_stream": {"stream": "desk", "text": "Ari: Lee deployed v14 yesterday without review."},
+      "audio": [
+        {"start": "00:00:05", "text": "Mira: Lee could deploy v14 only after both suites pass."}
+      ],
+      "completions": [],
+      "expect": {"physical_calls": 0, "logical_calls": 0, "complete": true, "outcomes": ["whole"]},
+      "references": [
+        {"id": "own_stream", "useful": true, "support": ["Mira: Lee could deploy v14 only after both suites pass."]}
+      ],
+      "qualified": [
+        {"claim": "deploy v14", "with": ["Mira:", "could", "only after both suites pass"]}
+      ],
+      "forbidden": ["Lee deployed v14", "without review"]
+    },
+    {
+      "name": "a_valid_empty_selection_is_success_without_passages",
+      "talent": "conversation",
+      "activity_kind": "meeting",
+      "audio": [
+        {"filler": 70, "text": "Ari: Lunch chatter about weather, parking garages and coffee number {i}."}
+      ],
+      "completions": [{"facts": []}],
+      "expect": {"physical_calls": 1, "logical_calls": 1, "complete": true, "outcomes": ["selected"]},
+      "references": [],
+      "qualified": [],
+      "forbidden": []
+    }
+  ]
+}

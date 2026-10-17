@@ -11,57 +11,17 @@ use crate::activity_contract::{self, SpanFailure};
 use crate::contract::{GateDecision, resolve_hook};
 use crate::prepare::{PrepareMode, RuntimePaths, prepare, resolve_validated_talent_config};
 use crate::transcript::sources_are_enabled;
-use crate::{DRY_RUN_KEY, ExecutionContext, RuntimeOutcome, generate_contents};
+use crate::{DRY_RUN_KEY, ExecutionContext, PreparedTalent, RuntimeOutcome, generate_contents};
 
 pub fn assemble_prompt_preview(
     request: &PreviewRequest,
     paths: &RuntimePaths,
     context: &ExecutionContext,
 ) -> PromptPreview {
-    let activity = match resolve_activity(request, paths, context) {
-        Ok(activity) => activity,
-        Err(refusal) => return PromptPreview::Refused(refusal),
-    };
-    let mut payload = Map::from_iter([("name".to_owned(), Value::String(request.name.clone()))]);
-    if let Some(day) = &request.day {
-        payload.insert("day".to_owned(), Value::String(day.clone()));
-    }
-    if let Some(segment) = &request.segment {
-        payload.insert("segment".to_owned(), Value::String(segment.clone()));
-    }
-    if let Some(facet) = &request.facet {
-        payload.insert("facet".to_owned(), Value::String(facet.clone()));
-    }
-    if let Some(activity) = activity {
-        let ResolvedActivity {
-            record,
-            span,
-            prompt,
-        } = activity;
-        payload.insert("activity".to_owned(), Value::Object(record));
-        payload.insert(
-            "span".to_owned(),
-            Value::Array(span.into_iter().map(Value::String).collect()),
-        );
-        if let Some(prompt) = prompt {
-            payload.insert("prompt".to_owned(), Value::String(prompt));
-        }
-    }
-
-    let mut prepared = match prepare(payload, paths, context, PrepareMode::Preview) {
+    let mut prepared = match prepare_preview(request, paths, context) {
         Ok(prepared) => prepared,
-        Err(error) => {
-            return preview_failure(request, "activity_talent_unavailable", error.to_string());
-        }
+        Err(preview) => return preview,
     };
-    if let Some(reason) = prepared
-        .config
-        .get("skip_reason")
-        .and_then(Value::as_str)
-        .filter(|reason| !reason.is_empty())
-    {
-        return would_not_run(request, reason);
-    }
 
     let hook = prepared
         .config
@@ -123,6 +83,65 @@ pub fn assemble_prompt_preview(
         loads_sources,
         parts,
     }
+}
+
+/// The talent prepared exactly as its run would be, with its sources loaded,
+/// before any pre-step. A request this would not run, or cannot prepare,
+/// returns the preview that says so.
+pub(crate) fn prepare_preview(
+    request: &PreviewRequest,
+    paths: &RuntimePaths,
+    context: &ExecutionContext,
+) -> Result<PreparedTalent, PromptPreview> {
+    let activity = match resolve_activity(request, paths, context) {
+        Ok(activity) => activity,
+        Err(refusal) => return Err(PromptPreview::Refused(refusal)),
+    };
+    let mut payload = Map::from_iter([("name".to_owned(), Value::String(request.name.clone()))]);
+    if let Some(day) = &request.day {
+        payload.insert("day".to_owned(), Value::String(day.clone()));
+    }
+    if let Some(segment) = &request.segment {
+        payload.insert("segment".to_owned(), Value::String(segment.clone()));
+    }
+    if let Some(facet) = &request.facet {
+        payload.insert("facet".to_owned(), Value::String(facet.clone()));
+    }
+    if let Some(activity) = activity {
+        let ResolvedActivity {
+            record,
+            span,
+            prompt,
+        } = activity;
+        payload.insert("activity".to_owned(), Value::Object(record));
+        payload.insert(
+            "span".to_owned(),
+            Value::Array(span.into_iter().map(Value::String).collect()),
+        );
+        if let Some(prompt) = prompt {
+            payload.insert("prompt".to_owned(), Value::String(prompt));
+        }
+    }
+
+    let prepared = match prepare(payload, paths, context, PrepareMode::Preview) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return Err(preview_failure(
+                request,
+                "activity_talent_unavailable",
+                error.to_string(),
+            ));
+        }
+    };
+    if let Some(reason) = prepared
+        .config
+        .get("skip_reason")
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.is_empty())
+    {
+        return Err(would_not_run(request, reason));
+    }
+    Ok(prepared)
 }
 
 fn preview_failure(

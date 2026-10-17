@@ -11,6 +11,7 @@ no Python think package and `make install` does not install one.
 | `solstone journal supervisor` | Start the local services that feed Convey, Cortex, and background work |
 | `solstone journal cortex` | Talent orchestrator |
 | `solstone journal talent list` / `solstone journal talent show <name>` | List or inspect talent configs; `--prompt` prints the composed prompt |
+| `solstone journal talent passages <name>` | Copy exact passages from an activity's source units ([`SOURCE_PASSAGES.md`](SOURCE_PASSAGES.md)) |
 | `solstone journal brain status` / `solstone journal brain refresh` | Active-brain status and one bounded check |
 | `solstone journal indexer` | Rebuild the search index |
 | `solstone call transcripts read` | Read audio and screen transcripts for a day |
@@ -20,6 +21,7 @@ solstone journal think [--day YYYYMMDD] [--segment HHMMSS_LEN] [--stream NAME] [
 solstone journal supervisor [--no-daily] [--no-cortex] [--no-spl] [--no-convey] [--no-schedule]
 solstone journal talent list [--schedule daily|segment] [--json]
 solstone journal talent show <name> [--prompt] [--day YYYYMMDD] [--segment HHMMSS_LEN] [--full]
+solstone journal talent passages <name> --day YYYYMMDD --facet NAME --activity ID [--json]
 ```
 
 `--refresh` overwrites existing generator output.

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-//! Read-only native implementation of `journal talent` commands.
+//! Native implementation of `journal talent` commands. None writes talent
+//! output; `passages` alone asks the generate boundary for completions, whose
+//! usage the boundary logs.
 
 use std::ffi::OsString;
 use std::io::IsTerminal;
@@ -18,7 +20,9 @@ mod schema;
 mod templates;
 
 pub use compose::{compose_talent, compose_talent_instruction};
-pub use preview::{PreviewRequest, PromptPreview, PromptPreviewRefusal, PromptPreviewer};
+pub use preview::{
+    PassageRun, PreviewRequest, PromptPreview, PromptPreviewRefusal, PromptPreviewer,
+};
 pub use templates::safe_substitute;
 
 mod emit;
@@ -26,6 +30,7 @@ mod last_run;
 mod list;
 mod log;
 mod logs;
+mod passages;
 mod runs;
 mod show;
 
@@ -77,6 +82,7 @@ pub fn run_cli(
         args::Command::Show(options) => {
             show::run(talent_root, apps_root, journal_root, &options, previewer)
         }
+        args::Command::Passages(options) => passages::run(journal_root, &options, previewer),
         args::Command::Log(options) => log::run_log(
             &journal_root.join("talents"),
             &options,

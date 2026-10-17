@@ -35,8 +35,28 @@ pub enum PromptPreview {
     },
 }
 
+/// The outcome of extracting an activity's source passages.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PassageRun {
+    /// The passage document, its readable rendering, and whether every unit
+    /// has its passages.
+    Extracted {
+        document: String,
+        readable: String,
+        complete: bool,
+    },
+    /// The activity could not be prepared; says why, as a preview would.
+    NotPrepared(PromptPreview),
+}
+
 pub trait PromptPreviewer {
     fn preview(&self, journal_root: &Path, request: &PreviewRequest) -> PromptPreview;
+
+    fn passages(&self, _journal_root: &Path, _request: &PreviewRequest) -> PassageRun {
+        PassageRun::NotPrepared(PromptPreview::Failed {
+            error: "source passages are not available here".to_owned(),
+        })
+    }
 }
 
 pub struct UnreachablePreviewer;

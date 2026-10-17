@@ -120,7 +120,7 @@ fn render_runtime_preview(
     }
 }
 
-fn render_preview_refusal(
+pub(crate) fn render_preview_refusal(
     options: &ShowOptions,
     refusal: crate::preview::PromptPreviewRefusal,
 ) -> CliRun {
@@ -202,7 +202,7 @@ fn not_found(name: &str, file: &str, prompt: bool) -> CliRun {
     }
 }
 
-fn failure(message: String) -> CliRun {
+pub(crate) fn failure(message: String) -> CliRun {
     CliRun {
         stdout: String::new(),
         stderr: format!("{message}\n"),

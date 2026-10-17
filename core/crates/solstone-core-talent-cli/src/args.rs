@@ -4,12 +4,13 @@
 use std::ffi::OsString;
 
 pub const HELP: &str = concat!(
-    "usage: solstone journal talent [-h] [-v] [-d] {list,show,logs,log} ...\n\n",
+    "usage: solstone journal talent [-h] [-v] [-d] {list,show,passages,logs,log} ...\n\n",
     "Inspect talent prompt configurations\n\n",
     "positional arguments:\n",
-    "  {list,show,logs,log}\n",
+    "  {list,show,passages,logs,log}\n",
     "    list                List prompts grouped by schedule\n",
     "    show                Show details for a specific prompt\n",
+    "    passages            Copy source passages from an activity's source\n",
     "    logs                Show recent talent run log\n",
     "    log                 Show events for an agent run\n\n",
     "options:\n",
@@ -76,6 +77,24 @@ pub const SHOW_HELP: &str = concat!(
     "  --full                Show full content without truncation\n",
 );
 
+pub const PASSAGES_HELP: &str = concat!(
+    "usage: solstone journal talent passages [-h] [--json] --day YYYYMMDD\n",
+    "                           --facet NAME --activity ID\n",
+    "                           name\n\n",
+    "Copy exact passages from the source an activity talent reads.\n",
+    "A short source unit is kept whole without a model call; a longer one\n",
+    "takes one completion to choose what to copy. No passages are written to\n",
+    "the journal; a completion's usage is logged like any other.\n\n",
+    "positional arguments:\n",
+    "  name                  Activity talent name, such as work or conversation\n\n",
+    "options:\n",
+    "  -h, --help            show this help message and exit\n",
+    "  --json                Output the passage document as JSON\n",
+    "  --day YYYYMMDD        Day of the activity\n",
+    "  --facet NAME          Facet of the activity\n",
+    "  --activity ID         Activity ID\n",
+);
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct ListOptions {
     pub(crate) schedule: Option<String>,
@@ -114,6 +133,15 @@ pub(crate) struct ShowOptions {
     pub(crate) full: bool,
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct PassagesOptions {
+    pub(crate) name: String,
+    pub(crate) json: bool,
+    pub(crate) day: Option<String>,
+    pub(crate) facet: Option<String>,
+    pub(crate) activity: Option<String>,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Command {
     Help(String),
@@ -121,6 +149,7 @@ pub(crate) enum Command {
     Log(LogOptions),
     Logs(LogsOptions),
     Show(ShowOptions),
+    Passages(PassagesOptions),
     Error(String),
 }
 
@@ -155,6 +184,7 @@ pub(crate) fn parse(args: &[OsString]) -> Command {
         "log" => parse_log(&args[index + 1..]),
         "logs" => parse_logs(&args[index + 1..]),
         "show" => parse_show(&args[index + 1..]),
+        "passages" => parse_passages(&args[index + 1..]),
         value if value.starts_with('-') => error(
             "solstone journal talent",
             &format!("unrecognized arguments: {value}"),
@@ -162,7 +192,7 @@ pub(crate) fn parse(args: &[OsString]) -> Command {
         value => error(
             "solstone journal talent",
             &format!(
-                "argument subcommand: invalid choice: '{value}' (choose from 'list', 'show', 'logs', 'log')"
+                "argument subcommand: invalid choice: '{value}' (choose from 'list', 'show', 'passages', 'logs', 'log')"
             ),
         ),
     }
@@ -224,6 +254,73 @@ fn parse_show(args: &[&str]) -> Command {
         );
     }
     Command::Show(options)
+}
+
+fn parse_passages(args: &[&str]) -> Command {
+    const PROGRAM: &str = "solstone journal talent passages";
+    let mut options = PassagesOptions::default();
+    let mut unrecognized = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let (flag, inline) = match args[index].split_once('=') {
+            Some((flag, value)) if flag.starts_with("--") => (flag, Some(value)),
+            _ => (args[index], None),
+        };
+        match flag {
+            "-h" | "--help" => return Command::Help(PASSAGES_HELP.to_owned()),
+            "--json" if inline.is_none() => options.json = true,
+            "--day" | "--facet" | "--activity" => {
+                let value = match inline {
+                    Some(value) => value,
+                    None => {
+                        index += 1;
+                        let Some(value) = args.get(index) else {
+                            return error(
+                                PROGRAM,
+                                &format!("argument {flag}: expected one argument"),
+                            );
+                        };
+                        value
+                    }
+                };
+                let slot = match flag {
+                    "--day" => &mut options.day,
+                    "--facet" => &mut options.facet,
+                    _ => &mut options.activity,
+                };
+                *slot = Some(value.to_owned());
+            }
+            value if value.starts_with('-') => unrecognized.push(args[index]),
+            value if options.name.is_empty() => options.name = value.to_owned(),
+            _ => unrecognized.push(args[index]),
+        }
+        index += 1;
+    }
+    if !unrecognized.is_empty() {
+        return error(
+            PROGRAM,
+            &format!("unrecognized arguments: {}", unrecognized.join(" ")),
+        );
+    }
+    let missing = [
+        ("name", options.name.is_empty()),
+        ("--day", options.day.is_none()),
+        ("--facet", options.facet.is_none()),
+        ("--activity", options.activity.is_none()),
+    ]
+    .into_iter()
+    .filter_map(|(name, missing)| missing.then_some(name))
+    .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return error(
+            PROGRAM,
+            &format!(
+                "the following arguments are required: {}",
+                missing.join(", ")
+            ),
+        );
+    }
+    Command::Passages(options)
 }
 
 fn parse_logs(args: &[&str]) -> Command {
@@ -383,6 +480,7 @@ fn error(program: &str, message: &str) -> Command {
         "solstone journal talent log" => LOG_HELP.lines().next().unwrap_or_default(),
         "solstone journal talent logs" => LOGS_HELP.lines().next().unwrap_or_default(),
         "solstone journal talent show" => SHOW_HELP.lines().next().unwrap_or_default(),
+        "solstone journal talent passages" => PASSAGES_HELP.lines().next().unwrap_or_default(),
         _ => HELP.lines().next().unwrap_or_default(),
     };
     Command::Error(format!("{usage}\n{program}: error: {message}\n"))
@@ -404,7 +502,7 @@ mod tests {
         };
         assert_eq!(
             stderr,
-            "usage: solstone journal talent [-h] [-v] [-d] {list,show,logs,log} ...\nsolstone journal talent: error: unrecognized arguments: --nonsense\n"
+            "usage: solstone journal talent [-h] [-v] [-d] {list,show,passages,logs,log} ...\nsolstone journal talent: error: unrecognized arguments: --nonsense\n"
         );
     }
 
@@ -441,7 +539,7 @@ mod tests {
             assert_eq!(
                 stderr,
                 format!(
-                    "usage: solstone journal talent [-h] [-v] [-d] {{list,show,logs,log}} ...\nsolstone journal talent: error: {expected}\n"
+                    "usage: solstone journal talent [-h] [-v] [-d] {{list,show,passages,logs,log}} ...\nsolstone journal talent: error: {expected}\n"
                 )
             );
         }

@@ -6,6 +6,10 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- `solstone journal talent passages` copies passages from the source an activity's story is written from, word for word, with where each one sits in that source. each short part of the source is kept whole without asking your model anything. each longer part takes one request to your model to choose what to keep, and the passages are still the source's own words. stories are written the same way as before.
+
 ### Changed
 
 - home and your morning briefing now say "plans" for the meetings and deadlines the journal noticed in what you've shared, the same word the activities app uses.

@@ -423,7 +423,7 @@ const PROBES: &[Probe] = &[
         argv: &["--nonsense"],
         expected_exit: 2,
         stderr_anchor: Some(
-            b"usage: solstone journal talent [-h] [-v] [-d] {list,show,logs,log} ...",
+            b"usage: solstone journal talent [-h] [-v] [-d] {list,show,passages,logs,log} ...",
         ),
     },
     Probe {

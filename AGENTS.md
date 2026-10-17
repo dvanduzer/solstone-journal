@@ -440,6 +440,7 @@ Bare links don't motivate clicking. Each entry below says when you actually need
 | `docs/THINK.md` | Understanding the think-layer pipeline (importers, indexer, segment/stream processing) |
 | `docs/CORTEX.md` | Modifying talent execution, cortex lifecycle, talent process management |
 | `docs/GENERATE.md` | The `generate` contract — the record vocabulary for asking the model boundary for one completion, its two framings, and the invariants it guarantees. Read before writing anything that calls a model, or that consumes a completion's outcome. |
+| `docs/SOURCE_PASSAGES.md` | Using or changing source passages: exact, bounded copies of an activity's source with offsets and hashes, the one-completion rule, and what a passage does not claim |
 | `docs/CALLOSUM.md` | Adding a new tract/event, debugging message flow |
 | `docs/CONVEY.md` | Framework-level web changes (as opposed to an individual app) |
 | `docs/CONVEY-FRONTEND.md` | Binding client-side conventions for any Convey workspace, shell chrome, or shared client helper — static shell + per-app workspace architecture, the `/api/shell` contract |

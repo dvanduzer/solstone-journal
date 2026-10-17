@@ -5,11 +5,14 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use solstone_core_talent_cli::preview::{PreviewRequest, PromptPreview, PromptPreviewer};
+use solstone_core_talent_cli::preview::{
+    PassageRun, PreviewRequest, PromptPreview, PromptPreviewer,
+};
 use solstone_core_talent_cli::{CliRun, run_cli};
 use solstone_core_talent_runtime::ExecutionContext;
 use solstone_core_talent_runtime::assemble::assemble_prompt_preview;
 use solstone_core_talent_runtime::prepare::RuntimePaths;
+use solstone_core_talent_runtime::source_passages::activity_passages;
 
 pub(crate) struct CorePromptPreviewer {
     paths: RuntimePaths,
@@ -24,6 +27,32 @@ impl PromptPreviewer for CorePromptPreviewer {
                 journal: journal_root.to_path_buf(),
             },
         )
+    }
+
+    fn passages(&self, journal_root: &Path, request: &PreviewRequest) -> PassageRun {
+        let generate = match solstone_core_generate::OneShotClient::sibling() {
+            Ok(generate) => generate,
+            Err(error) => {
+                return PassageRun::NotPrepared(PromptPreview::Failed {
+                    error: format!("source passages could not reach generate: {error}"),
+                });
+            }
+        };
+        match activity_passages(
+            request,
+            &self.paths,
+            &ExecutionContext {
+                journal: journal_root.to_path_buf(),
+            },
+            &generate,
+        ) {
+            Ok(passages) => PassageRun::Extracted {
+                document: passages.document().to_string(),
+                readable: passages.readable(),
+                complete: passages.extraction.complete(),
+            },
+            Err(preview) => PassageRun::NotPrepared(preview),
+        }
     }
 }
 

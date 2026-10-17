@@ -33,6 +33,7 @@ mod prompt_context;
 pub mod pulse;
 pub mod schedule;
 mod screen_batch;
+pub mod source_passages;
 pub mod speaker_attribution;
 pub mod story;
 mod transcript;

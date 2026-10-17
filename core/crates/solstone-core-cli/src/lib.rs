@@ -670,7 +670,7 @@ pub const BACKFILL_FACET_IDS_HELP: &str = concat!(
 );
 
 pub const TALENT_USAGE: &str =
-    "usage: solstone journal talent [-h] [-v] [-d] {list,show,logs,log} ...\n";
+    "usage: solstone journal talent [-h] [-v] [-d] {list,show,passages,logs,log} ...\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {

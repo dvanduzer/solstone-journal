@@ -9,7 +9,7 @@ use solstone_core_talent_config::{TalentConfig, discover, is_truthy, merge, vali
 
 use crate::{ExecutionContext, PreparedTalent, transcript};
 
-const SPARSE_INPUT_NOTE: &str =
+pub(crate) const SPARSE_INPUT_NOTE: &str =
     "**Input Note:** Limited recordings for this day. Scale analysis to available input.\n\n";
 
 #[derive(Clone, Debug)]

@@ -1,0 +1,109 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 sol pbc
+
+//! Passages for one activity, from the source its talent would read.
+
+use serde_json::{Map, Value, json};
+use solstone_core_generate::GenerateExecutor;
+use solstone_core_talent_cli::preview::{PreviewRequest, PromptPreview, PromptPreviewRefusal};
+
+use super::{Extraction, SourceUnit, document, extract, readable, source_units};
+use crate::ExecutionContext;
+use crate::assemble::prepare_preview;
+use crate::prepare::{RuntimePaths, SPARSE_INPUT_NOTE};
+
+/// One activity's source units and the passages extracted from them.
+#[derive(Debug)]
+pub struct ActivityPassages {
+    pub talent: String,
+    pub day: String,
+    pub facet: String,
+    pub activity: String,
+    pub units: Vec<SourceUnit>,
+    pub extraction: Extraction,
+}
+
+impl ActivityPassages {
+    pub fn document(&self) -> Value {
+        let header = Map::from_iter([
+            ("talent".to_owned(), json!(self.talent)),
+            ("day".to_owned(), json!(self.day)),
+            ("facet".to_owned(), json!(self.facet)),
+            ("activity".to_owned(), json!(self.activity)),
+        ]);
+        document(&self.units, &self.extraction, header)
+    }
+
+    pub fn readable(&self) -> String {
+        readable(&self.units, &self.extraction)
+    }
+}
+
+fn refused(code: &str, recovery: &str) -> PromptPreview {
+    PromptPreview::Refused(PromptPreviewRefusal {
+        code: code.to_owned(),
+        segment: None,
+        recovery: recovery.to_owned(),
+    })
+}
+
+/// Prepare the activity exactly as its talent's run would, then extract
+/// passages from the source that run would read. Nothing in the journal is
+/// written; each nomination completion is recorded by the generate boundary
+/// like any other.
+pub fn activity_passages(
+    request: &PreviewRequest,
+    paths: &RuntimePaths,
+    context: &ExecutionContext,
+    generate: &dyn GenerateExecutor,
+) -> Result<ActivityPassages, PromptPreview> {
+    let (Some(activity), Some(day), Some(facet)) = (
+        request.activity.as_deref(),
+        request.day.as_deref(),
+        request.facet.as_deref(),
+    ) else {
+        return Err(refused(
+            "passages_require_activity",
+            "Pass --day YYYYMMDD, --facet NAME and --activity ID.",
+        ));
+    };
+    let prepared = prepare_preview(request, paths, context)?;
+    if prepared
+        .config
+        .get("hook")
+        .and_then(|hook| hook.get("pre"))
+        .is_some()
+    {
+        // A pre-step can rewrite what the talent reads; passages come only
+        // from the source as loaded.
+        return Err(refused(
+            "activity_prestep_unsupported",
+            "Choose a talent that reads its activity source without a pre-step.",
+        ));
+    }
+    let Some(transcript) = prepared.config.get("transcript").and_then(Value::as_str) else {
+        return Err(refused(
+            "activity_sources_unavailable",
+            "Choose a talent that loads its activity's sources.",
+        ));
+    };
+    let transcript = transcript
+        .strip_prefix(SPARSE_INPUT_NOTE)
+        .unwrap_or(transcript);
+    let kind = prepared
+        .config
+        .get("activity")
+        .and_then(|record| record.get("activity"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let units = source_units(transcript, kind);
+    let extraction = extract(&units, &prepared.name, generate);
+    Ok(ActivityPassages {
+        talent: prepared.name,
+        day: day.to_owned(),
+        facet: facet.to_owned(),
+        activity: activity.to_owned(),
+        units,
+        extraction,
+    })
+}
