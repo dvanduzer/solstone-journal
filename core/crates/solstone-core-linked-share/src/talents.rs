@@ -68,6 +68,7 @@ impl TalentCaller for RuntimeTalents<'_> {
             &self.context,
             self.generate,
             &mut std::io::sink(),
+            &solstone_core_generate::Cancellation::never(),
         );
         match outcome {
             RuntimeOutcome::Finished { output, .. } => serde_json::from_str(&output)

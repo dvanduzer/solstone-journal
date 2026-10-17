@@ -14,6 +14,7 @@ use solstone_core_journal_io::{JsonWriteOptions, LockOptions, hold_lock, write_j
 pub mod daily;
 pub mod input;
 pub mod raw;
+pub use raw::RetryContext;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -186,7 +187,7 @@ pub struct Record {
     pub reason: String,
     pub input: String,
     pub owner: Option<String>,
-    consumed: BTreeSet<String>,
+    pub consumed: BTreeSet<String>,
     pub attempt: Option<Attempt>,
     #[serde(default)]
     failure_count: u32,

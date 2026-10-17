@@ -1945,6 +1945,7 @@ mod tests {
                 &self.context,
                 &solstone_core_generate::OneShotClient::at_path(&self.stub),
                 &mut Vec::new(),
+                &solstone_core_generate::Cancellation::never(),
             );
             let end_state = match &outcome {
                 solstone_core_talent_runtime::RuntimeOutcome::Finished { .. } => {
@@ -3188,6 +3189,7 @@ cat "${0%/*}/response-$kind.json"
                 &worker_context,
                 &solstone_core_generate::OneShotClient::at_path(old_stub),
                 &mut Vec::new(),
+                &solstone_core_generate::Cancellation::never(),
             )
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -3243,6 +3245,7 @@ cat "${0%/*}/response-$kind.json"
             &context,
             &solstone_core_generate::OneShotClient::at_path(new_stub),
             &mut Vec::new(),
+            &solstone_core_generate::Cancellation::never(),
         );
         assert!(
             matches!(

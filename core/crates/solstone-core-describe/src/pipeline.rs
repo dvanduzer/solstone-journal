@@ -318,6 +318,7 @@ fn run_with_decoder(
         let id = match &response {
             GenerateResponse::Generated(g) => g.id.clone(),
             GenerateResponse::Refused(r) => r.id.clone(),
+            GenerateResponse::Cancelled => None,
         }
         .ok_or_else(|| RunError::Internal("session response omitted id".to_owned()))?;
         let Outstanding {
@@ -328,6 +329,10 @@ fn run_with_decoder(
             .ok_or_else(|| RunError::Internal("uncorrelated response".to_owned()))?;
         let duration = submitted_at.elapsed().as_secs_f64();
         match response {
+            GenerateResponse::Cancelled => {
+                let _ = session.close();
+                return Err(RunError::Internal("generate cancelled".to_owned()));
+            }
             GenerateResponse::Generated(generated) => {
                 model.get_or_insert(generated.model.clone());
                 let parsed = serde_json::from_str::<Value>(&generated.text).ok();
@@ -684,12 +689,16 @@ fn extract_category(
         let response_id = match &response {
             GenerateResponse::Generated(generated) => generated.id.as_deref(),
             GenerateResponse::Refused(refusal) => refusal.id.as_deref(),
+            GenerateResponse::Cancelled => None,
         };
         if response_id != Some(id.as_str()) {
             return Err(ExtractionError::Session);
         }
         let duration = submitted_at.elapsed().as_secs_f64();
         let (failure, model) = match response {
+            GenerateResponse::Cancelled => {
+                return Err(ExtractionError::Session);
+            }
             GenerateResponse::Generated(generated) => {
                 let model = generated.model;
                 match extraction::parse_response(

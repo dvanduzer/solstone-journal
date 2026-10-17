@@ -8,7 +8,7 @@ use std::ffi::{CStr, CString, OsStr, c_char};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 mod retirement;
@@ -58,6 +58,7 @@ static SERVING: std::sync::Mutex<Option<ServingInstance>> = std::sync::Mutex::ne
 static GENERATE: std::sync::LazyLock<solstone_core_generate_wire::EndpointRuntime> =
     std::sync::LazyLock::new(solstone_core_generate_wire::EndpointRuntime::default);
 static THINKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static THINKING_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 fn serving(root: &Path, command: &str) -> Result<Value, String> {
     let command: Value = serde_json::from_str(command).map_err(|e| e.to_string())?;
@@ -70,6 +71,9 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
         None
     };
     if matches!(operation, "generate" | "talent") {
+        let generation = THINKING_GENERATION.load(Ordering::SeqCst);
+        let cancelled = move || THINKING_GENERATION.load(Ordering::SeqCst) != generation;
+        let cancellation = solstone_core_generate::Cancellation::from_fn(&cancelled);
         // Thinking runs independently of serving controls and never retains the
         // serving mutex across a provider call.
         let binding = {
@@ -96,8 +100,9 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
             binding
                 .revalidate_canonical_binding()
                 .map_err(|e| solstone_core_generate::ClientError::Decode(e.to_string()))?;
-            let response = solstone_core_generate_wire::respond(request, &GENERATE, root, |_| None)
-                .map_err(solstone_core_generate::ClientError::Decode)?;
+            let response =
+                solstone_core_generate_wire::respond(request, &GENERATE, root, |_| None, &cancellation)
+                    .map_err(solstone_core_generate::ClientError::Decode)?;
             binding
                 .revalidate_canonical_binding()
                 .map_err(|e| solstone_core_generate::ClientError::Decode(e.to_string()))?;
@@ -106,6 +111,9 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
         if operation == "generate" {
             let request = solstone_core_generate_wire::parse_one_shot_request(raw)?;
             let response = generate(&request).map_err(|e| e.to_string())?;
+            if matches!(response, solstone_core_generate::GenerateResponse::Cancelled) {
+                return Err("generate cancelled".into());
+            }
             return serde_json::from_str(&solstone_core_generate::encode_one_shot_response(
                 &response,
             )?)
@@ -132,6 +140,7 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
             &context,
             &generate,
             &mut events,
+            &cancellation,
         );
         return Ok(json!({"outcome":format!("{outcome:?}"),
             "events":String::from_utf8(events).map_err(|e|e.to_string())?}));
@@ -233,16 +242,23 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
         }
         "status" => {
             let Some(current) = server.as_ref() else {
-                return match retirement::admission() {
+                return match retirement::inspect() {
                     retirement::Outcome::Stopped => Err("server stopped".into()),
                     retirement::Outcome::Pending => Ok(json!({"stopping":true,"failed":false})),
                     retirement::Outcome::Failed => Ok(json!({"stopping":true,"failed":true})),
                 };
             };
             if current.retirement.is_some() {
-                Ok(
-                    json!({"stopping":true,"failed":retirement::admission()==retirement::Outcome::Failed,"root_current":current.root.revalidate_canonical_binding().is_ok()}),
-                )
+                let (stopping, failed) = match retirement::inspect() {
+                    retirement::Outcome::Pending => (true, false),
+                    retirement::Outcome::Stopped => (false, false),
+                    retirement::Outcome::Failed => (true, true),
+                };
+                Ok(json!({
+                    "stopping": stopping,
+                    "failed": failed,
+                    "root_current": current.root.revalidate_canonical_binding().is_ok(),
+                }))
             } else {
                 Ok(current.handle()?.status())
             }
@@ -536,6 +552,7 @@ fn run(root: &Path, op: &str, count: usize) -> Result<Value, Box<dyn std::error:
     }
     if op == "cancel" {
         CANCEL.store(true, Ordering::Release);
+        THINKING_GENERATION.fetch_add(1, Ordering::SeqCst);
         return Ok(json!({"cancel_requested":true}));
     }
     if op == "begin" {

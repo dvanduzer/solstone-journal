@@ -49,17 +49,7 @@ public class ServingActivity extends Activity {
             final Messenger target = new Messenger(binder);
             worker = target;
             readyConnection = 0;
-            control.execute(()->{
-                if (!currentConnection(generation, target)) return;
-                try { show(call(target, MainActivity.obj("op", "start", "address", wifiAddress()+":7657", "onnx_library", getApplicationInfo().nativeLibraryDir+"/libonnxruntime.so"))); }
-                catch(Exception e) { show(MainActivity.obj("error", e.toString())); }
-                if (!currentConnection(generation, target)) return;
-                try { show(call(target, MainActivity.obj("op", "audio-enable"))); }
-                catch(Exception e) { show(MainActivity.obj("error", e.toString())); }
-                if (!currentConnection(generation, target)) return;
-                readyConnection = generation;
-                consumeCommand();
-            });
+            connectService(generation, target, false);
         }
         public void onServiceDisconnected(ComponentName name) {
             connectionGeneration.incrementAndGet();
@@ -72,6 +62,56 @@ public class ServingActivity extends Activity {
     };
     boolean currentConnection(long generation, Messenger target) {
         return !destroyed && connectionGeneration.get() == generation && worker == target;
+    }
+    void connectService(final long generation, final Messenger target, final boolean startAlreadySucceeded) {
+        control.execute(() -> {
+            if (!currentConnection(generation, target)) return;
+            try {
+                ServingConnection.Action action = ServingConnection.drive(generation, startAlreadySucceeded, new ServingConnection.Environment() {
+                    public long currentGeneration() {
+                        return connectionGeneration.get();
+                    }
+                    public ServingConnection.Retirement retirement() throws Exception {
+                        JSONObject res = call(target, MainActivity.obj("op", "status"));
+                        JSONObject nat = res.optJSONObject("native");
+                        if (nat != null) {
+                            if (nat.optBoolean("failed", false)) {
+                                return ServingConnection.Retirement.FAILED;
+                            }
+                            if (nat.optBoolean("stopping", false)) {
+                                return ServingConnection.Retirement.PENDING;
+                            }
+                        }
+                        return ServingConnection.Retirement.STOPPED;
+                    }
+                    public boolean start() throws Exception {
+                        JSONObject res = call(target, MainActivity.obj("op", "start",
+                            "address", wifiAddress() + ":7657",
+                            "onnx_library", getApplicationInfo().nativeLibraryDir + "/libonnxruntime.so"));
+                        show(res);
+                        JSONObject nat = res.optJSONObject("native");
+                        return nat != null && nat.optBoolean("ok", false);
+                    }
+                    public boolean enableAudio() throws Exception {
+                        JSONObject res = call(target, MainActivity.obj("op", "audio-enable"));
+                        show(res);
+                        JSONObject nat = res.optJSONObject("native");
+                        return nat != null && nat.optBoolean("ok", false);
+                    }
+                    public void onReady(long gen) {
+                        readyConnection = gen;
+                        consumeCommand();
+                    }
+                });
+                if (action == ServingConnection.Action.RETRY) {
+                    if (currentConnection(generation, target)) {
+                        connectService(generation, target, startAlreadySucceeded);
+                    }
+                }
+            } catch (Exception e) {
+                show(MainActivity.obj("error", e.toString()));
+            }
+        });
     }
     String wifiAddress() throws Exception {
         ConnectivityManager cm = (ConnectivityManager)getSystemService(CONNECTIVITY_SERVICE);
@@ -148,7 +188,16 @@ public class ServingActivity extends Activity {
         status = new TextView(this); status.setTextSize(16);
         for(String op: new String[]{"status", "index", "stop"}) {
             Button button = new Button(this); button.setText(op);
-            button.setOnClickListener(v->control.execute(()->{ try { show(call(MainActivity.obj("op", op))); } catch(Exception e) { show(MainActivity.obj("error", e.toString())); } }));
+            button.setOnClickListener(v->{
+                final long gen = connectionGeneration.get();
+                final Messenger target = worker;
+                control.execute(()->{
+                    if (ServingConnection.decide(gen, connectionGeneration.get(), true, true, true, ServingConnection.Retirement.STOPPED) == ServingConnection.Action.DROP) return;
+                    if (!currentConnection(gen, target)) return;
+                    try { show(call(target, MainActivity.obj("op", op))); }
+                    catch(Exception e) { show(MainActivity.obj("error", e.toString())); }
+                });
+            });
             controls.addView(button);
         }
         controls.addView(status); setContentView(controls);

@@ -524,7 +524,14 @@ mod tests {
         .clone();
         let generate = solstone_core_generate::OneShotClient::at_path(&provider);
         let mut events = Vec::new();
-        let outcome = crate::execute_request(request, &paths, &context, &generate, &mut events);
+        let outcome = crate::execute_request(
+            request,
+            &paths,
+            &context,
+            &generate,
+            &mut events,
+            &solstone_core_generate::Cancellation::never(),
+        );
         assert!(
             matches!(outcome, crate::RuntimeOutcome::Finished { .. }),
             "{outcome:?}"
@@ -602,8 +609,14 @@ mod tests {
         .expect("untyped request object")
         .clone();
         let mut events = Vec::new();
-        let outcome =
-            crate::execute_request(untyped_request, &paths, &context, &generate, &mut events);
+        let outcome = crate::execute_request(
+            untyped_request,
+            &paths,
+            &context,
+            &generate,
+            &mut events,
+            &solstone_core_generate::Cancellation::never(),
+        );
         assert!(
             matches!(outcome, crate::RuntimeOutcome::Finished { .. }),
             "{outcome:?}"

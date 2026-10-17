@@ -288,6 +288,12 @@ fn read_completion(response: GenerateResponse) -> (Result<String, Failure>, Opti
                 model: None,
             }),
         ),
+        GenerateResponse::Cancelled => (
+            Err(Failure::Unavailable {
+                detail: "cancelled".to_owned(),
+            }),
+            None,
+        ),
         GenerateResponse::Generated(generated) => {
             let call = Call {
                 units: Vec::new(),

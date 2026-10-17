@@ -2240,6 +2240,215 @@ mod tests {
         assert_eq!(document, loaded_json);
     }
 
+    fn test_fixture(
+        day: &str,
+        bullets: &[&str],
+        with_segments: bool,
+    ) -> (
+        tempfile::TempDir,
+        crate::prepare::RuntimePaths,
+        ExecutionContext,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let talent_root = root.path().join("talent");
+        let apps_root = root.path().join("apps");
+        let templates_dir = root.path().join("templates");
+        fs::create_dir_all(&talent_root).unwrap();
+        fs::create_dir_all(&apps_root).unwrap();
+        fs::create_dir_all(&templates_dir).unwrap();
+
+        fs::write(
+            talent_root.join("weekly_reflection.md"),
+            r#"{
+  "type": "generate", "max_output_tokens": 1024,
+  "schedule": "weekly",
+  "hook": {
+    "pre": "weekly_reflection",
+    "post": "weekly_reflection"
+  }
+}
+Weekly prompt
+"#,
+        )
+        .unwrap();
+
+        let paths = crate::prepare::RuntimePaths {
+            talent_root,
+            apps_root,
+            templates_dir,
+        };
+        let journal = root.path().join("journal");
+        let context = ExecutionContext {
+            journal: journal.clone(),
+        };
+        fs::create_dir_all(&journal).unwrap();
+        write_denver_journal_config(&journal);
+
+        let day_dir = journal.join("chronicle").join(day);
+        if with_segments {
+            fs::create_dir_all(day_dir.join("default/080000_300")).unwrap();
+        }
+        if !bullets.is_empty() {
+            fs::create_dir_all(day_dir.join("talents")).unwrap();
+            let doc = serde_json::json!({
+                "version": 1,
+                "generated_at": "2026-03-09T07:00:00-06:00",
+                "today": {
+                    "date": day,
+                    "events": [],
+                    "reminders": [],
+                    "schedule_summary": "Quiet day."
+                },
+                "yesterday": bullets,
+            });
+            fs::write(
+                day_dir.join("talents/morning_briefing.json"),
+                serde_json::to_string(&doc).unwrap(),
+            )
+            .unwrap();
+        }
+
+        (root, paths, context)
+    }
+
+    #[test]
+    fn cancellation_before_publication_prevents_commit_and_unavailable() {
+        use solstone_core_generate::{Cancellation, GenerateResponse, GeneratedResponse};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Condvar, Mutex};
+
+        let _guard = pin_stage_now("2026-03-15T18:00:00Z");
+        let (_root, paths, context) = test_fixture("20260308", &["Alpha memory."], true);
+
+        let arrived = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let arrived_clone = Arc::clone(&arrived);
+        let release_clone = Arc::clone(&release);
+
+        let make_response = || {
+            GenerateResponse::Generated(Box::new(GeneratedResponse {
+                id: None,
+                text: r#"{"selections":{"S00":"M000"}}"#.to_owned(),
+                model: "gemini".to_owned(),
+                finish_reason: "stop".to_owned(),
+                usage: serde_json::json!({}),
+                thinking: None,
+                schema_validation: None,
+                input_budget: None,
+                request_budget: None,
+                inference: None,
+                hints_applied: Vec::new(),
+            }))
+        };
+
+        let executor = {
+            let arrived = arrived_clone;
+            let release = release_clone;
+            move |_req: &solstone_core_generate::GenerateRequest| {
+                {
+                    let (lock, cvar) = &*arrived;
+                    let mut flag = lock.lock().unwrap();
+                    *flag = true;
+                    cvar.notify_all();
+                }
+                {
+                    let (lock, cvar) = &*release;
+                    let mut flag = lock.lock().unwrap();
+                    while !*flag {
+                        flag = cvar.wait(flag).unwrap();
+                    }
+                }
+                Ok(make_response())
+            }
+        };
+
+        let cancel_for_thread = Arc::clone(&cancel);
+        let paths_ref = &paths;
+        let context_ref = &context;
+        let (outcome, _out) = std::thread::scope(|s| {
+            let handle = s.spawn(move || {
+                let cancel_fn = move || cancel_for_thread.load(Ordering::SeqCst);
+                let cancellation = Cancellation::from_fn(&cancel_fn);
+                let mut out = Vec::new();
+                let outcome = crate::execute_request(
+                    serde_json::json!({
+                        "name": "weekly_reflection",
+                        "day": "20260308",
+                        "today": "20260316",
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                    paths_ref,
+                    context_ref,
+                    &executor,
+                    &mut out,
+                    &cancellation,
+                );
+                (outcome, out)
+            });
+
+            // Wait for executor to reach generation
+            {
+                let (lock, cvar) = &*arrived;
+                let mut flag = lock.lock().unwrap();
+                while !*flag {
+                    flag = cvar.wait(flag).unwrap();
+                }
+            }
+
+            // Set cancel flag then release the executor
+            cancel.store(true, Ordering::SeqCst);
+            {
+                let (lock, cvar) = &*release;
+                let mut flag = lock.lock().unwrap();
+                *flag = true;
+                cvar.notify_all();
+            }
+
+            handle.join().unwrap()
+        });
+
+        assert!(matches!(outcome, RuntimeOutcome::Cancelled), "{outcome:?}");
+
+        let md_path = context.journal.join("reflections/weekly/20260308.md");
+        let json_path = context.journal.join("reflections/weekly/20260308.json");
+        assert!(!md_path.exists());
+        assert!(!json_path.exists());
+
+        // Same fixture with Cancellation::never() publishes as today
+        let regular_executor =
+            move |_req: &solstone_core_generate::GenerateRequest| Ok(make_response());
+        let mut normal_out = Vec::new();
+        let outcome = crate::execute_request(
+            serde_json::json!({
+                "name": "weekly_reflection",
+                "day": "20260308",
+                "today": "20260316",
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            &paths,
+            &context,
+            &regular_executor,
+            &mut normal_out,
+            &Cancellation::never(),
+        );
+
+        assert!(
+            matches!(outcome, RuntimeOutcome::Finished { .. }),
+            "{outcome:?}"
+        );
+        assert!(md_path.exists());
+        assert!(json_path.exists());
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
+        assert_eq!(doc["selection"]["status"], "model");
+    }
+
     #[cfg(all(test, feature = "full-tests"))]
     mod full_tests {
         use super::*;
@@ -2251,77 +2460,6 @@ mod tests {
         use std::fs;
         use std::path::{Path, PathBuf};
         use tempfile::tempdir;
-
-        fn test_fixture(
-            day: &str,
-            bullets: &[&str],
-            with_segments: bool,
-        ) -> (
-            tempfile::TempDir,
-            crate::prepare::RuntimePaths,
-            ExecutionContext,
-        ) {
-            let root = tempdir().unwrap();
-            let talent_root = root.path().join("talent");
-            let apps_root = root.path().join("apps");
-            let templates_dir = root.path().join("templates");
-            fs::create_dir_all(&talent_root).unwrap();
-            fs::create_dir_all(&apps_root).unwrap();
-            fs::create_dir_all(&templates_dir).unwrap();
-
-            fs::write(
-                talent_root.join("weekly_reflection.md"),
-                r#"{
-  "type": "generate", "max_output_tokens": 1024,
-  "schedule": "weekly",
-  "hook": {
-    "pre": "weekly_reflection",
-    "post": "weekly_reflection"
-  }
-}
-Weekly prompt
-"#,
-            )
-            .unwrap();
-
-            let paths = crate::prepare::RuntimePaths {
-                talent_root,
-                apps_root,
-                templates_dir,
-            };
-            let journal = root.path().join("journal");
-            let context = ExecutionContext {
-                journal: journal.clone(),
-            };
-            fs::create_dir_all(&journal).unwrap();
-            write_denver_journal_config(&journal);
-
-            let day_dir = journal.join("chronicle").join(day);
-            if with_segments {
-                fs::create_dir_all(day_dir.join("default/080000_300")).unwrap();
-            }
-            if !bullets.is_empty() {
-                fs::create_dir_all(day_dir.join("talents")).unwrap();
-                let doc = json!({
-                    "version": 1,
-                    "generated_at": "2026-03-09T07:00:00-06:00",
-                    "today": {
-                        "date": day,
-                        "events": [],
-                        "reminders": [],
-                        "schedule_summary": "Quiet day."
-                    },
-                    "yesterday": bullets,
-                });
-                fs::write(
-                    day_dir.join("talents/morning_briefing.json"),
-                    serde_json::to_string(&doc).unwrap(),
-                )
-                .unwrap();
-            }
-
-            (root, paths, context)
-        }
 
         fn parse_events(output: &[u8]) -> Vec<Value> {
             String::from_utf8_lossy(output)
@@ -2359,6 +2497,7 @@ Weekly prompt
                 &context,
                 &generate,
                 &mut output,
+                &solstone_core_generate::Cancellation::never(),
             );
 
             assert!(
@@ -2427,6 +2566,7 @@ Weekly prompt
                 &context,
                 &generate,
                 &mut output,
+                &solstone_core_generate::Cancellation::never(),
             );
 
             assert!(
@@ -2470,6 +2610,7 @@ Weekly prompt
                 &context,
                 &generate,
                 &mut output,
+                &solstone_core_generate::Cancellation::never(),
             );
 
             assert!(
@@ -2528,6 +2669,7 @@ Weekly prompt
                 &context,
                 &generate,
                 &mut output,
+                &solstone_core_generate::Cancellation::never(),
             );
 
             assert!(
@@ -2589,6 +2731,7 @@ Weekly prompt
                 &context,
                 &generate,
                 &mut output,
+                &solstone_core_generate::Cancellation::never(),
             );
 
             assert!(
@@ -2653,6 +2796,7 @@ Weekly prompt
                 &context,
                 &generate,
                 &mut output,
+                &solstone_core_generate::Cancellation::never(),
             );
 
             assert!(
@@ -2699,6 +2843,7 @@ Weekly prompt
                 &context,
                 &generate,
                 &mut output,
+                &solstone_core_generate::Cancellation::never(),
             );
 
             assert!(
@@ -2750,6 +2895,7 @@ Weekly prompt
                 &context,
                 &generate,
                 &mut output,
+                &solstone_core_generate::Cancellation::never(),
             );
 
             assert!(
@@ -2804,6 +2950,7 @@ Weekly prompt
                 &context,
                 &generate,
                 &mut output,
+                &solstone_core_generate::Cancellation::never(),
             );
 
             assert!(
@@ -2864,6 +3011,7 @@ Weekly prompt
                 &context,
                 &generate,
                 &mut output,
+                &solstone_core_generate::Cancellation::never(),
             );
 
             assert!(
@@ -2915,6 +3063,7 @@ Weekly prompt
                 &context,
                 &generate,
                 &mut output,
+                &solstone_core_generate::Cancellation::never(),
             );
 
             assert!(
@@ -2986,6 +3135,7 @@ Weekly prompt
                 &context,
                 &generate,
                 &mut output,
+                &solstone_core_generate::Cancellation::never(),
             );
 
             assert!(
@@ -3036,6 +3186,7 @@ Weekly prompt
                     &context,
                     &generate,
                     &mut output,
+                    &solstone_core_generate::Cancellation::never(),
                 );
 
                 assert!(
@@ -3083,6 +3234,7 @@ Weekly prompt
                 &context,
                 &generate,
                 &mut output,
+                &solstone_core_generate::Cancellation::never(),
             );
 
             assert!(
@@ -3142,6 +3294,7 @@ Weekly prompt
                 &context,
                 &generate,
                 &mut output,
+                &solstone_core_generate::Cancellation::never(),
             );
 
             assert!(
@@ -3204,6 +3357,7 @@ Weekly prompt
                 &context,
                 &generate,
                 &mut output,
+                &solstone_core_generate::Cancellation::never(),
             );
 
             assert!(
@@ -3260,6 +3414,7 @@ Weekly prompt
                 &context,
                 &generate,
                 &mut output,
+                &solstone_core_generate::Cancellation::never(),
             );
 
             assert!(
@@ -3310,6 +3465,7 @@ Weekly prompt
                 &context,
                 &generate,
                 &mut output,
+                &solstone_core_generate::Cancellation::never(),
             );
 
             assert!(

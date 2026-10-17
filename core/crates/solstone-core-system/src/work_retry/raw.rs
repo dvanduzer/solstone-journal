@@ -16,6 +16,12 @@ pub const UNIT_ENV: &str = "SOLSTONE_RETRY_UNIT";
 pub const CAUSE_ENV: &str = "SOLSTONE_RETRY_CAUSE";
 pub const ATTEMPT_ENV: &str = "SOLSTONE_RETRY_ATTEMPT";
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct RetryContext {
+    pub unit_id: String,
+    pub attempt: Attempt,
+}
+
 pub struct Evidence {
     pub unit: Unit,
     pub reason: String,
@@ -192,12 +198,86 @@ fn selected(
     Ok(Some((unit, attempt)))
 }
 
+/// Read-only eligibility for an output. None when not an exhausted held failure or permission() is None.
+pub fn context_for_output(
+    journal: &Path,
+    output: &Path,
+    handler: &str,
+) -> Result<Option<RetryContext>, String> {
+    let unit = unit_for_output(journal, output, handler)?;
+    let evidence = match inspect_output(journal, output)? {
+        Some(e) => e,
+        None => return Ok(None),
+    };
+    if evidence.unit != unit {
+        return Ok(None);
+    }
+    let record = match super::read(journal, &unit.id()?)? {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    let attempt = match record.permission(&evidence.input, DECLARED_FIXES) {
+        Some(a) => a,
+        None => return Ok(None),
+    };
+    Ok(Some(RetryContext {
+        unit_id: unit.id()?,
+        attempt,
+    }))
+}
+
+/// Preflight with explicit context. True only when unit id matches and permission is still current.
+pub fn waiting_context(
+    journal: &Path,
+    output: &Path,
+    handler: &str,
+    context: &RetryContext,
+) -> bool {
+    let Ok(unit) = unit_for_output(journal, output, handler) else {
+        return false;
+    };
+    let Ok(id) = unit.id() else {
+        return false;
+    };
+    if id != context.unit_id {
+        return false;
+    }
+    context_for_output(journal, output, handler)
+        .is_ok_and(|c| c.as_ref().map(|c| &c.attempt) == Some(&context.attempt))
+}
+
 /// Preflight only. The native writer repeats this under OutputClaims.
 pub fn waiting_from_environment(output: &Path, handler: &str) -> bool {
     let Some(journal) = std::env::var_os(JOURNAL_ENV) else {
         return false;
     };
     selected(Path::new(&journal), output, handler).is_ok_and(|grant| grant.is_some())
+}
+
+/// Never call before acquiring the native output execution claim.
+pub fn consume_context(
+    journal: &Path,
+    output: &Path,
+    handler: &str,
+    context: &RetryContext,
+) -> Result<Option<Attempt>, String> {
+    let unit = unit_for_output(journal, output, handler)?;
+    if unit.id()? != context.unit_id {
+        return Ok(None);
+    }
+    let evidence = inspect_output(journal, output)?.ok_or("native output is no longer held")?;
+    if evidence.unit != unit {
+        return Err("native failure handler changed".into());
+    }
+    super::consume(
+        journal,
+        &unit,
+        &context.attempt,
+        &context.attempt.reason,
+        &evidence.input,
+        DECLARED_FIXES,
+    )?;
+    Ok(Some(context.attempt.clone()))
 }
 
 /// Never call before acquiring the native output execution claim.
@@ -241,12 +321,33 @@ pub fn stamp_failed_input(record: &mut Value, input: &Path) -> Result<(), String
     Ok(())
 }
 
+pub fn stamp_failed_input_from(
+    record: &mut Value,
+    input: &Path,
+    attempt: &Attempt,
+) -> Result<(), String> {
+    stamp_attempt_from(record, attempt)?;
+    if record.get("state").and_then(Value::as_str) == Some("failed") {
+        let hash = super::file_fingerprint(input)?;
+        record
+            .as_object_mut()
+            .ok_or("processing record is not an object")?
+            .insert("input_sha256".into(), Value::String(hash));
+    }
+    Ok(())
+}
+
 /// Bind terminal publication to the selected attempt, including successful output.
 pub fn stamp_attempt(record: &mut Value) -> Result<(), String> {
     if let Ok(value) = std::env::var(ATTEMPT_ENV) {
         let attempt: Attempt = serde_json::from_str(&value).map_err(|e| e.to_string())?;
         record["retry_attempt"] = serde_json::to_value(attempt).map_err(|e| e.to_string())?;
     }
+    Ok(())
+}
+
+pub fn stamp_attempt_from(record: &mut Value, attempt: &Attempt) -> Result<(), String> {
+    record["retry_attempt"] = serde_json::to_value(attempt).map_err(|e| e.to_string())?;
     Ok(())
 }
 

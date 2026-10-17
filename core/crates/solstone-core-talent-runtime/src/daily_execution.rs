@@ -116,7 +116,14 @@ pub(crate) fn execute(
     generate: &dyn solstone_core_generate::GenerateExecutor,
     writer: &mut impl Write,
 ) -> RuntimeOutcome {
-    execute_with_paths(request, context, generate, writer, None)
+    execute_with_paths(
+        request,
+        context,
+        generate,
+        writer,
+        None,
+        &solstone_core_generate::Cancellation::never(),
+    )
 }
 
 pub(crate) fn execute_with_paths(
@@ -125,6 +132,7 @@ pub(crate) fn execute_with_paths(
     generate: &dyn solstone_core_generate::GenerateExecutor,
     writer: &mut impl Write,
     paths: Option<&crate::prepare::RuntimePaths>,
+    cancellation: &solstone_core_generate::Cancellation,
 ) -> RuntimeOutcome {
     let name = request
         .get("name")
@@ -306,6 +314,9 @@ pub(crate) fn execute_with_paths(
             Err(outcome) => return outcome,
         }
     };
+    if cancellation.is_cancelled() {
+        return RuntimeOutcome::Cancelled;
+    }
     // Model execution holds no publication lock. The check below is repeated
     // while holding the authority through every actual owner write and receipt.
     let first_publication = !crate::daily_location::has_owner_actions(&record);

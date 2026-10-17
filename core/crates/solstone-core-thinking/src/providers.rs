@@ -212,6 +212,7 @@ impl OneShotKeyValidator {
                     journal,
                     &config,
                     |_| None,
+                    &solstone_core_generate::Cancellation::never(),
                 )
                 .map_err(ClientError::Decode)
             }
@@ -242,6 +243,9 @@ fn classify_key_probe(result: Result<GenerateResponse, ClientError>) -> Value {
                 json!({"valid":false,"reason_code":reason_code,"error":refusal.detail})
             }
         }
+        Ok(GenerateResponse::Cancelled) => {
+            json!({"valid":false,"reason_code":"cancelled","error":"probe cancelled"})
+        }
         Err(error) => client_failure(error),
     }
 }
@@ -256,6 +260,9 @@ fn classify_model_probe(result: Result<GenerateResponse, ClientError>) -> Value 
                 .map(|value| value.as_wire().to_owned())
                 .unwrap_or_else(|| "provider_response_invalid".to_owned());
             json!({"valid":false,"reason_code":reason_code,"error":refusal.detail})
+        }
+        Ok(GenerateResponse::Cancelled) => {
+            json!({"valid":false,"reason_code":"cancelled","error":"probe cancelled"})
         }
         Err(error) => client_failure(error),
     }

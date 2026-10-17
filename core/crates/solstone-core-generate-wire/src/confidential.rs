@@ -25,7 +25,8 @@ use solstone_core_spp_ratls::{check_nvattest_readiness, resolve_nvattest_dir};
 
 use crate::endpoint::{
     EndpointFailure, EndpointGenerated, EndpointResult, EndpointRuntime, EndpointTransport,
-    EndpointTransportError, endpoint_generate_with,
+    EndpointTransportError, endpoint_generate_internal, endpoint_generate_with, remaining_timeout,
+    thinking_headroom,
 };
 use crate::pool::{PoolAcquisition, PoolKey, RedactedCredential};
 
@@ -447,11 +448,29 @@ where
         (&mut **injected_stream.as_mut().unwrap(), None)
     };
 
-    if need_establish {
+    let started = if need_establish {
+        let started = Instant::now();
+        let budget = crate::transport::request_timeout(
+            request.timeout_s,
+            thinking_headroom(endpoint, config),
+        );
+        let Some(probe_deadline) = remaining_timeout(started, budget) else {
+            return ConfidentialResult::Failed(EndpointFailure {
+                reason_code: Some("local_capacity_exhausted".to_owned()),
+                detail: None,
+            });
+        };
+        if probe_deadline.is_zero() {
+            return ConfidentialResult::Failed(EndpointFailure {
+                reason_code: Some("local_capacity_exhausted".to_owned()),
+                detail: None,
+            });
+        }
         match solstone_core_spp_ratls::send_admission_probe(
             stream_ref,
             &target_host,
             endpoint.credential.as_deref(),
+            probe_deadline,
         ) {
             Ok(()) => {}
             Err(code) => {
@@ -461,7 +480,10 @@ where
                 });
             }
         }
-    }
+        started
+    } else {
+        Instant::now()
+    };
 
     let mut transport = AttestedEndpointTransport {
         stream: stream_ref,
@@ -470,7 +492,7 @@ where
         admission,
     };
 
-    let result = endpoint_generate_with(
+    let result = endpoint_generate_internal(
         request,
         journal_path,
         endpoint,
@@ -478,6 +500,7 @@ where
         runtime,
         &mut transport,
         Instant::now(),
+        started,
     );
 
     if let EndpointResult::Generated(_) = &result
@@ -2211,6 +2234,127 @@ mod tests {
                     .as_deref(),
                 Some("spp")
             );
+        }
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn probe_timeout_prevents_chat_completion_post() {
+        let runtime = EndpointRuntime::default();
+        let path = journal("probe-timeout-prevents-chat");
+        let config_map = active_spp_config();
+        setup_journal(&path, &config_map);
+        let endpoint = endpoint(9099);
+        let chat_body = r#"{"choices":[{"message":{"content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}"#;
+
+        // 1. Probe failure (TimedOut on IO) writes no chat body and fails with local_endpoint_unreachable
+        {
+            let written = Rc::new(RefCell::new(Vec::new()));
+            let written_clone = written.clone();
+            let req = request();
+            let result = confidential_generate_with(
+                ConfidentialCall {
+                    request: &req,
+                    journal_path: &path,
+                    endpoint: &endpoint,
+                    config: &config_map,
+                    runtime: &runtime,
+                    now: UNIX_EPOCH,
+                },
+                |_| NvattestEnsureStatus::AlreadyInstalled,
+                |_, _, _, _| {
+                    Ok(EstablishedChannel::Injected {
+                        verdict: Box::new(verdict()),
+                        stream: Box::new(RecordingChannel::with_initial_read_error(
+                            written_clone,
+                            io::ErrorKind::TimedOut,
+                        )),
+                    })
+                },
+            );
+            assert!(matches!(
+                result,
+                ConfidentialResult::Failed(EndpointFailure {
+                    reason_code: Some(ref code),
+                    ..
+                }) if code == "local_endpoint_unreachable"
+            ));
+            let written_str = String::from_utf8(written.borrow().clone()).unwrap();
+            assert!(written_str.contains("GET /solstone-admission"));
+            assert!(!written_str.contains("POST /v1/chat/completions"));
+            assert!(!written_str.contains("hello"));
+        }
+
+        // 2. A 200 probe proceeds to chat content
+        {
+            let written = Rc::new(RefCell::new(Vec::new()));
+            let written_clone = written.clone();
+            let req = request();
+            let result = confidential_generate_with(
+                ConfidentialCall {
+                    request: &req,
+                    journal_path: &path,
+                    endpoint: &endpoint,
+                    config: &config_map,
+                    runtime: &runtime,
+                    now: UNIX_EPOCH,
+                },
+                |_| NvattestEnsureStatus::AlreadyInstalled,
+                |_, _, _, _| {
+                    Ok(EstablishedChannel::Injected {
+                        verdict: Box::new(verdict()),
+                        stream: Box::new(RecordingChannel::with_probe_and_status(
+                            written_clone,
+                            200,
+                            "OK",
+                            200,
+                            "OK",
+                            chat_body,
+                        )),
+                    })
+                },
+            );
+            assert!(matches!(result, ConfidentialResult::Generated(_)));
+            let written_str = String::from_utf8(written.borrow().clone()).unwrap();
+            assert!(written_str.contains("GET /solstone-admission"));
+            assert!(written_str.contains("POST /v1/chat/completions"));
+        }
+
+        // 3. No-time-left before the probe stays local_capacity_exhausted
+        {
+            let written = Rc::new(RefCell::new(Vec::new()));
+            let mut req = request();
+            req.timeout_s = Some(0.000000001);
+            let result = confidential_generate_with(
+                ConfidentialCall {
+                    request: &req,
+                    journal_path: &path,
+                    endpoint: &endpoint,
+                    config: &config_map,
+                    runtime: &runtime,
+                    now: UNIX_EPOCH,
+                },
+                |_| NvattestEnsureStatus::AlreadyInstalled,
+                |_, _, _, _| {
+                    Ok(EstablishedChannel::Injected {
+                        verdict: Box::new(verdict()),
+                        stream: Box::new(RecordingChannel::with_probe_failure(
+                            written.clone(),
+                            200,
+                            "OK",
+                        )),
+                    })
+                },
+            );
+            assert!(matches!(
+                result,
+                ConfidentialResult::Failed(EndpointFailure {
+                    reason_code: Some(ref code),
+                    ..
+                }) if code == "local_capacity_exhausted"
+            ));
+            assert!(written.borrow().is_empty());
         }
 
         let _ = std::fs::remove_dir_all(path);

@@ -173,6 +173,7 @@ pub struct RefusedResponse {
 pub enum GenerateResponse {
     Generated(Box<GeneratedResponse>),
     Refused(RefusedResponse),
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

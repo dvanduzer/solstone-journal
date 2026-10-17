@@ -46,7 +46,7 @@ public class JournalService extends Service {
                 final boolean isToolStatus = operation.equals("service-tools");
                 final boolean isStop = operation.equals("stop"), isStart = operation.equals("start");
                 final long generation = thinkingAdmission.generation();
-                if (isStop) thinkingAdmission.stop();
+                if (isStop) execution.beginStop(() -> Native.run("", "cancel", 1));
                 final ThinkingAdmission.Ticket ticket = isThinking ? thinkingAdmission.admit() : null;
                 if (isThinking && ticket == null) {
                     respond(reply,id,"{\"ok\":false,\"error\":\"thinking is stopped or busy\"}",0);
@@ -104,8 +104,7 @@ public class JournalService extends Service {
     public void onDestroy() {
         destroyed = true;
         evidence("service_destroyed","last binding released");
-        Native.run("","cancel",1);
-        execution.retire(()->Native.run("","serve:{\"op\":\"stop\"}",1));
+        execution.retire(() -> Native.run("", "cancel", 1), () -> Native.run("", "serve:{\"op\":\"stop\"}", 1));
         super.onDestroy();
     }
 }

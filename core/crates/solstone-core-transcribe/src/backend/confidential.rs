@@ -222,6 +222,7 @@ where
         &mut channel.stream,
         &channel.host,
         endpoint.credential.as_deref(),
+        TRANSCRIBE_TIMEOUT,
     ) {
         return Err(deferred(code, "the confidential admission probe failed"));
     }
@@ -2219,5 +2220,41 @@ mod tests {
         let fp_bytes_after = std::fs::read(&fp_path).unwrap();
         assert_eq!(journal_bytes_before, journal_bytes_after);
         assert_eq!(fp_bytes_before, fp_bytes_after);
+    }
+
+    #[test]
+    fn probe_timeout_prevents_audio_multipart_transmission() {
+        let store = AttestationStateStore::new();
+        let active = active_config();
+        let audio = [0.0_f32; 160];
+        let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let written_clone = written.clone();
+
+        let error = super::transcribe_with(
+            &audio,
+            Path::new("/unused"),
+            &active,
+            &store,
+            |_| NvattestEnsureStatus::AlreadyInstalled,
+            move |_, _, _| {
+                let stream = MockAttestedStream::with_initial_read_error(
+                    std::io::ErrorKind::TimedOut,
+                    written_clone,
+                );
+                Ok((verdict(), stream))
+            },
+        )
+        .unwrap_err();
+
+        assert_deferred_reason(error, "local_endpoint_unreachable");
+        let written_bytes = written.lock().unwrap().clone();
+        let written_str = String::from_utf8_lossy(&written_bytes);
+        assert!(!written_str.contains("POST /v1/audio/transcriptions"));
+        assert!(!written_str.contains("audio/wav"));
+        assert!(
+            !written_bytes
+                .windows(4)
+                .any(|w| w == b"RIFF" || w == b"WAVE")
+        );
     }
 }

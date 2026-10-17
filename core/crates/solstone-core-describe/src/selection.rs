@@ -85,6 +85,7 @@ pub fn select(
     let id = match &response {
         GenerateResponse::Generated(generated) => generated.id.as_deref(),
         GenerateResponse::Refused(refusal) => refusal.id.as_deref(),
+        GenerateResponse::Cancelled => None,
     };
     if id != Some(REQUEST_ID) {
         return Err(SelectionError::Session);
@@ -108,6 +109,7 @@ pub fn select(
             }
             fallback_with_category_caps(frames, max_extractions, overrides)
         }
+        GenerateResponse::Cancelled => return Err(SelectionError::Session),
     };
     Ok(selected)
 }
