@@ -31,22 +31,26 @@ transcribed. That is the bug this contract closes.
 
 ## How the retry actually happens
 
-Retry after a deferral is always **cross-process**. `FileSensor.start()` has no rescan
-loop; there is no in-process retry, no backoff timer, and no attempt counter.
+A deferral writes nothing, so the audio stays on disk without its output and stays owed.
+Nothing counts attempts and nothing gives up.
 
-The re-attempt comes from the daily think run's sense-repair pre-phase, which shells
-out to `solstone journal sense --day <day>`. That builds a *fresh* `FileSensor` whose
-`scan_unprocessed` re-picks any input that still lacks a `.jsonl`. Because the deferral
-path writes nothing, the audio is still there and still lacks its output, so it is
-picked up again on the next pass.
+The re-attempt comes from the supervisor's work discovery
+(`solstone-core/src/supervisor/work_discovery.rs`), which re-checks for owed work at
+least every 60 seconds (`MIN_REST`) and re-picks any input that still lacks its output.
+Older days that make no progress back off, to at most once a day
+(`solstone-core-system/src/catchup.rs`, `apply_no_progress_backoff`), and are still
+retried. So once the missing engine is available (for example after
+`solstone journal install-provider parakeet` publishes its port), deferred audio
+transcribes on the next pass without a restart.
 
-This is why a deferral must not write a placeholder or an empty output — doing so would
+A supervisor started with `--no-daily` does not run work discovery, so a deferral there
+stays put until something else re-runs sensing.
+
+This is why a deferral must not write a placeholder or an empty output: doing so would
 mark the segment done and the audio would never be retried.
 
-`solstone journal transcribe --all` absorbs a deferral per file and moves on to the next one,
-reporting the count in its summary. (`SystemExit` is a `BaseException`, so the batch
-loop has to catch it explicitly — a plain `except Exception` would let one deferred clip
-abort the entire batch.)
+`solstone journal transcribe --all` absorbs a deferral per file, moves on to the next
+one, and reports the count in its summary.
 
 ## Defer vs. fail
 
