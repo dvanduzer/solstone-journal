@@ -381,7 +381,7 @@ fn append_speaker_change_warning(text: &str, line: &str) -> String {
         .and_then(|v| v.get("turn_boundary_suspect").and_then(Value::as_bool))
         == Some(true);
     if suspect && !text.is_empty() {
-        format!("{text} {POSSIBLE_SPEAKER_CHANGE_WITHIN_SENTENCE}")
+        format!("{text} [{POSSIBLE_SPEAKER_CHANGE_WITHIN_SENTENCE}]")
     } else {
         text.to_owned()
     }
@@ -992,7 +992,11 @@ mod tests {
         let flagged_entry = &page.entries[0].text;
         assert!(flagged_entry.contains("Is the gate open? It is open."));
         assert!(flagged_entry.contains("Speaker 1:"));
-        assert!(flagged_entry.contains("possible speaker change within this sentence"));
+        assert!(flagged_entry.contains(super::POSSIBLE_SPEAKER_CHANGE_WITHIN_SENTENCE));
+        assert!(flagged_entry.ends_with(&format!(
+            "[{}]",
+            super::POSSIBLE_SPEAKER_CHANGE_WITHIN_SENTENCE
+        )));
 
         let neighbor_entry = &page.entries[1].text;
         let neighbor_chunks = produce_raw_percept_chunks(
@@ -1001,7 +1005,7 @@ mod tests {
             &serde_json::to_string(&neighbor_line).unwrap(),
         );
         assert_eq!(neighbor_entry, &neighbor_chunks.chunks[0].content);
-        assert!(!neighbor_entry.contains("possible speaker change within this sentence"));
+        assert!(!neighbor_entry.contains(super::POSSIBLE_SPEAKER_CHANGE_WITHIN_SENTENCE));
     }
 
     #[test]

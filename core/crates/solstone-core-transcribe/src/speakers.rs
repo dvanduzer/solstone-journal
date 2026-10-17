@@ -424,6 +424,7 @@ where
         &expected_ids,
         &request_ids,
         sample_rate,
+        full_audio.len() as f64 / f64::from(sample_rate),
     )
 }
 
@@ -970,6 +971,7 @@ fn admitted_statement_ids(
     Ok(admitted)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn accepted_result_from_response(
     raw_path: &Path,
     response: &Value,
@@ -978,6 +980,7 @@ pub(crate) fn accepted_result_from_response(
     expected_ids: &[i64],
     request_ids: &[i64],
     sample_rate: u32,
+    audio_duration_s: f64,
 ) -> Result<SpeakerAnalyzeResult, SpeakerAnalyzeError> {
     let object = response
         .as_object()
@@ -1143,6 +1146,23 @@ pub(crate) fn accepted_result_from_response(
         })?),
         None => None,
     };
+    if let Some(evidence) = &speaker_turn_evidence {
+        // Permit only floating-point serialization roundoff, not a different input.
+        let tolerance = audio_duration_s.abs().max(1.0) * f64::EPSILON * 4.0;
+        if (evidence.audio_duration_s - audio_duration_s).abs() > tolerance
+            || evidence
+                .ranges
+                .iter()
+                .any(|range| range.end_s > audio_duration_s + tolerance)
+        {
+            return Err(SpeakerAnalyzeError::new(
+                raw_path,
+                "payload",
+                "invalid-pyannote-speaker-turn-duration",
+                None,
+            ));
+        }
+    }
     let labels = statement_labels(raw_path, object)?;
     let mut statements = statements_restored.to_vec();
     if let Some(labels) = &labels {
@@ -1162,10 +1182,18 @@ pub(crate) fn accepted_result_from_response(
     }
     if let Some(evidence) = &speaker_turn_evidence {
         for statement in &mut statements {
-            statement.insert("speaker_turn_evidence".to_owned(), evidence.to_value());
             let start_s = optional_finite(statement.get("start"));
             let end_s = optional_finite(statement.get("end"));
-            if evidence.flags_sentence(start_s, end_s) {
+            let mut sentence_evidence = evidence.clone();
+            sentence_evidence.ranges.retain(|range| {
+                matches!((start_s, end_s), (Some(start), Some(end))
+                    if range.end_s >= start && range.start_s <= end)
+            });
+            statement.insert(
+                "speaker_turn_evidence".to_owned(),
+                sentence_evidence.to_value(),
+            );
+            if sentence_evidence.flags_sentence(start_s, end_s) {
                 statement.insert("turn_boundary_suspect".to_owned(), Value::Bool(true));
             }
         }
@@ -1855,6 +1883,7 @@ mod tests {
             ids,
             ids,
             16_000,
+            10.0,
         )
     }
 
@@ -1872,6 +1901,7 @@ mod tests {
             expected_ids,
             request_ids,
             16_000,
+            10.0,
         )
     }
 
@@ -1981,6 +2011,7 @@ mod speaker_turn_adapter_tests {
             &[],
             &[],
             16_000,
+            10.0,
         )
         .expect("accepted");
 
@@ -2010,12 +2041,80 @@ mod speaker_turn_adapter_tests {
             &[],
             &[],
             16_000,
+            10.0,
         )
         .expect("accepted");
 
         assert_eq!(result.statements.len(), 1);
         assert!(result.statements[0].contains_key("speaker_turn_evidence"));
         assert_eq!(result.statements[0]["turn_boundary_suspect"], json!(true));
+    }
+
+    #[test]
+    fn sentence_evidence_retains_only_intersecting_ranges() {
+        let directory = tempfile::tempdir().unwrap();
+        let payload = directory.path().join("payload.f32le");
+        fs::write(&payload, []).unwrap();
+        let mut response = base_response(&payload, &[], 0);
+        response["pyannote"]["speaker_turns"] = json!({
+            "version": SPEAKER_TURN_EVIDENCE_VERSION,
+            "audio_duration_s": 30.0,
+            "ranges": [{"start_s": 2.0, "end_s": 2.0}, {"start_s": 12.0, "end_s": 12.0}],
+        });
+        let statements = vec![
+            statement(1, 0.0, 5.0),
+            statement(2, 10.0, 15.0),
+            statement(3, 20.0, 25.0),
+        ];
+        let result = accepted_result_from_response(
+            Path::new("input.wav"),
+            &response,
+            &payload,
+            &statements,
+            &[],
+            &[],
+            16_000,
+            30.0,
+        )
+        .unwrap();
+        assert_eq!(
+            result.statements[0]["speaker_turn_evidence"]["ranges"],
+            json!([{"start_s": 2.0, "end_s": 2.0}])
+        );
+        assert_eq!(
+            result.statements[1]["speaker_turn_evidence"]["ranges"],
+            json!([{"start_s": 12.0, "end_s": 12.0}])
+        );
+        assert_eq!(
+            result.statements[2]["speaker_turn_evidence"]["ranges"],
+            json!([])
+        );
+        assert!(!result.statements[2].contains_key("turn_boundary_suspect"));
+    }
+
+    #[test]
+    fn helper_turn_duration_must_match_original_audio() {
+        let directory = tempfile::tempdir().unwrap();
+        let payload = directory.path().join("payload.f32le");
+        fs::write(&payload, []).unwrap();
+        let mut response = base_response(&payload, &[], 0);
+        response["pyannote"]["speaker_turns"] = json!({
+            "version": SPEAKER_TURN_EVIDENCE_VERSION,
+            "audio_duration_s": 100.0,
+            "ranges": [{"start_s": 50.0, "end_s": 50.0}],
+        });
+        let error = accepted_result_from_response(
+            Path::new("input.wav"),
+            &response,
+            &payload,
+            &[],
+            &[],
+            &[],
+            16_000,
+            10.0,
+        )
+        .unwrap_err();
+        assert_eq!(error.reason, "invalid-pyannote-speaker-turn-duration");
     }
 
     #[test]
@@ -2086,6 +2185,7 @@ mod speaker_turn_adapter_tests {
                 &[],
                 &[],
                 16_000,
+                10.0,
             )
             .unwrap_err();
             assert_eq!(error.reason, "invalid-pyannote-speaker-turns");

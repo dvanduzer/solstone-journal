@@ -20,6 +20,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- transcripts warn when a sentence may contain words from more than one speaker.
 - linux: `solstone update` and the status pane now recognize installs made by the public installer.
 
 - on linux, if your journal is missing its transcription model, it now downloads the model on its own (about 1 GB) and then transcribes the recordings that were waiting. before, they waited until you ran `solstone journal install-provider parakeet`.

@@ -634,9 +634,17 @@ mod tests {
             "ranges": [{"start_s": 11.0, "end_s": 12.0}],
         });
         let response = helper_response(&payload, Some(turns));
-        let speaker_result =
-            accepted_result_from_response(&raw, &response, &payload, &restored, &[], &[], 16_000)
-                .unwrap();
+        let speaker_result = accepted_result_from_response(
+            &raw,
+            &response,
+            &payload,
+            &restored,
+            &[],
+            &[],
+            16_000,
+            20.0,
+        )
+        .unwrap();
 
         let processing = analyzed_record(5);
         write_full_transcript(write_request(
@@ -708,9 +716,17 @@ mod tests {
             "ranges": [],
         });
         let response = helper_response(&payload, Some(turns));
-        let speaker_result =
-            accepted_result_from_response(&raw, &response, &payload, &statements, &[], &[], 16_000)
-                .unwrap();
+        let speaker_result = accepted_result_from_response(
+            &raw,
+            &response,
+            &payload,
+            &statements,
+            &[],
+            &[],
+            16_000,
+            20.0,
+        )
+        .unwrap();
 
         let processing = analyzed_record(5);
         write_full_transcript(write_request(
@@ -752,9 +768,17 @@ mod tests {
         fs::write(&payload, []).unwrap();
 
         let response = helper_response(&payload, None);
-        let speaker_result =
-            accepted_result_from_response(&raw, &response, &payload, &statements, &[], &[], 16_000)
-                .unwrap();
+        let speaker_result = accepted_result_from_response(
+            &raw,
+            &response,
+            &payload,
+            &statements,
+            &[],
+            &[],
+            16_000,
+            20.0,
+        )
+        .unwrap();
 
         let processing = analyzed_record(5);
         write_full_transcript(write_request(
@@ -813,9 +837,17 @@ mod tests {
             "ranges": [{"start_s": 5.0, "end_s": 5.0}],
         });
         let response = helper_response(&payload, Some(turns));
-        let speaker_result =
-            accepted_result_from_response(&raw, &response, &payload, &statements, &[], &[], 16_000)
-                .unwrap();
+        let speaker_result = accepted_result_from_response(
+            &raw,
+            &response,
+            &payload,
+            &statements,
+            &[],
+            &[],
+            16_000,
+            10.0,
+        )
+        .unwrap();
 
         let processing = analyzed_record(5);
         write_full_transcript(write_request(

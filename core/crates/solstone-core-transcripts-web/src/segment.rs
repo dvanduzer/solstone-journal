@@ -527,7 +527,7 @@ fn audio_chunks(
             });
         let mut markdown = strip_speaker_prefix(&markdown, row.get("speaker"));
         if row.get("turn_boundary_suspect").and_then(Value::as_bool) == Some(true) {
-            markdown = format!("{markdown} {POSSIBLE_SPEAKER_CHANGE_WITHIN_SENTENCE}");
+            markdown = format!("{markdown} [{POSSIBLE_SPEAKER_CHANGE_WITHIN_SENTENCE}]");
         }
         let mut chunk = json!({"type":"audio","time":start,"timestamp":produced.chunks.iter().find(|chunk| chunk.source.as_ref() == Some(row)).and_then(|chunk| chunk.occurrence_time_ms).map_or(0, |value| local_wall_instant(context.zone, value.0)),"markdown":markdown,"sentence_id":sid,"speaker_source":source,"has_embedding":sid.is_some_and(|id| ids.contains(&id)),"speaker_actionable":speakers.state.present && speakers.state.loaded && speakers.state.source.as_deref() == Some(source) && sid.is_some_and(|id| ids.contains(&id)),"source_ref":{"start":start,"source":row.get("source"),"speaker":row.get("speaker")}});
         if let Some((ref audio_url, origin_ms)) = placement_media
@@ -2169,7 +2169,11 @@ mod tests {
         let flagged_chunk = &chunks[0];
         let flagged_markdown = flagged_chunk["markdown"].as_str().expect("markdown string");
         assert!(flagged_markdown.contains("Is the gate open? It is open."));
-        assert!(flagged_markdown.contains("possible speaker change within this sentence"));
+        assert!(flagged_markdown.contains(super::POSSIBLE_SPEAKER_CHANGE_WITHIN_SENTENCE));
+        assert!(flagged_markdown.ends_with(&format!(
+            "[{}]",
+            super::POSSIBLE_SPEAKER_CHANGE_WITHIN_SENTENCE
+        )));
         assert_eq!(flagged_chunk["source_ref"]["speaker"], 1);
 
         let neighbor_chunk = &chunks[1];
@@ -2177,6 +2181,6 @@ mod tests {
             .as_str()
             .expect("markdown string");
         assert_eq!(neighbor_markdown, "Neighbor speech without warning.");
-        assert!(!neighbor_markdown.contains("possible speaker change within this sentence"));
+        assert!(!neighbor_markdown.contains(super::POSSIBLE_SPEAKER_CHANGE_WITHIN_SENTENCE));
     }
 }
