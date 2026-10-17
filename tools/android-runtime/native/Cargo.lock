@@ -4599,6 +4599,7 @@ dependencies = [
  "sha2",
  "solstone-core-journal-io",
  "solstone-core-npy",
+ "solstone-core-speakers",
  "zip",
 ]
 
@@ -4637,6 +4638,7 @@ name = "solstone-core-speakers"
 version = "2.0.49"
 dependencies = [
  "hdbscan",
+ "serde_json",
 ]
 
 [[package]]
@@ -4916,6 +4918,7 @@ dependencies = [
  "solstone-core-segment",
  "solstone-core-sound-tags",
  "solstone-core-speaker-id",
+ "solstone-core-speakers",
  "solstone-core-speakers-analyze",
  "solstone-core-spp-ratls",
  "solstone-core-system",
