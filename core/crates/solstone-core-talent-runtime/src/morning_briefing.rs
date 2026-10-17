@@ -118,7 +118,7 @@ fn build_packet(
         })
         .collect::<Vec<_>>();
     if facets.is_empty() {
-        gaps.push("no active facets available".to_owned());
+        gaps.push("active facets".to_owned());
     }
     let newsletter_facets = facets
         .iter()
@@ -135,7 +135,7 @@ fn build_packet(
     let schedule_facets = if schedule_current {
         facets.as_slice()
     } else {
-        gaps.push("current schedule unavailable".to_owned());
+        gaps.push("the latest plans, which weren't ready".to_owned());
         &[]
     };
     let today = load_activities(
@@ -143,7 +143,7 @@ fn build_packet(
         std::slice::from_ref(&presentation_day),
         context,
         &mut gaps,
-        "no plans today",
+        NO_PLANS_TODAY,
     );
     let forward_days = (1..8)
         .map(|offset| {
@@ -157,7 +157,7 @@ fn build_packet(
         &forward_days,
         context,
         &mut gaps,
-        "no plans in the next 7 days",
+        NO_PLANS_FORWARD,
     );
     let pulse = read_pulse(&home, day, &mut gaps);
     let counts = json!({
@@ -221,17 +221,19 @@ fn load_newsletters(
     gaps: &mut Vec<String>,
 ) -> Vec<(String, String)> {
     let mut newsletters = Vec::new();
-    for (facet, _) in facets {
+    for (facet, title) in facets {
         match read_news_file(&context.journal, facet, &format!("{day}.md")) {
             Ok(Some(content)) if !content.trim().is_empty() => {
                 newsletters.push((facet.clone(), content.trim().to_owned()))
             }
-            Ok(_) => gaps.push(format!("no facet newsletter available for {facet}")),
-            Err(error) => gaps.push(format!("facet newsletter unavailable for {facet}: {error}")),
+            Ok(_) => gaps.push(format!("a newsletter from {title}")),
+            Err(error) => {
+                log::warn!("morning briefing: newsletter for {facet} {day} unreadable: {error}");
+                gaps.push(format!(
+                    "the newsletter from {title}, which couldn't be read"
+                ));
+            }
         }
-    }
-    if !facets.is_empty() && newsletters.is_empty() {
-        gaps.push("no facet newsletters available".into());
     }
     newsletters
 }
@@ -244,7 +246,7 @@ fn load_activities(
 ) -> Vec<Value> {
     let mut values = Vec::new();
     for day in days {
-        for (facet, _) in facets {
+        for (facet, title) in facets {
             match load_activity_records(&context.journal, facet, day, false) {
                 Ok(records) => {
                     for mut record in records.into_iter().filter(|record| {
@@ -261,7 +263,13 @@ fn load_activities(
                         values.push(Value::Object(record));
                     }
                 }
-                Err(error) => gaps.push(format!("plans unavailable for {facet} {day}: {error}")),
+                Err(error) => {
+                    log::warn!("morning briefing: plans for {facet} {day} unreadable: {error}");
+                    gaps.push(format!(
+                        "plans from {title} for {}, which couldn't be read",
+                        spoken_day(day)
+                    ));
+                }
             }
         }
     }
@@ -286,7 +294,7 @@ fn generated_stamp(home: &HomeContext) -> String {
 
 fn read_pulse(home: &HomeContext, day: &str, gaps: &mut Vec<String>) -> String {
     let Some(record) = read_latest(home, day, "pulse", 0) else {
-        gaps.push("pulse surface".into());
+        gaps.push("the latest pulse".into());
         return String::new();
     };
     let mut parts = Vec::new();
@@ -318,7 +326,7 @@ fn read_pulse(home: &HomeContext, day: &str, gaps: &mut Vec<String>) -> String {
     }
     let value = parts.join("\n\n");
     if value.is_empty() {
-        gaps.push("pulse surface".into());
+        gaps.push("the latest pulse".into());
     }
     value
 }
@@ -415,12 +423,17 @@ fn participants(value: &Value) -> String {
     }
     names.join(", ")
 }
+/// Gaps that say a day is empty rather than that a source is missing. The
+/// model still sees them; the owner's note leaves them out, since its counts
+/// already say 0.
+const NO_PLANS_TODAY: &str = "no plans today";
+const NO_PLANS_FORWARD: &str = "no plans in the next 7 days";
+
 fn coverage_preamble(counts: &Value, gaps: &[String], forward: usize) -> String {
     let count = |key: &str| counts[key].as_u64().unwrap_or(0);
     let plural = |n: u64, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
     let mut sentence = format!(
-        "Built from {} source paths, {} today, {} in the next 7 days, {}.",
-        counts["segments"],
+        "This briefing draws on {} for today, {} in the next 7 days and {}.",
         plural(count("anticipated_activities"), "plan", "plans"),
         plural(forward as u64, "plan", "plans"),
         plural(
@@ -429,12 +442,20 @@ fn coverage_preamble(counts: &Value, gaps: &[String], forward: usize) -> String 
             "facet newsletters"
         ),
     );
-    if gaps.is_empty() {
-        sentence.push_str(" No gaps.");
-    } else {
-        sentence.push_str(&format!(" Gaps: {}.", gaps.join("; ")));
+    let missing = gaps
+        .iter()
+        .map(String::as_str)
+        .filter(|gap| *gap != NO_PLANS_TODAY && *gap != NO_PLANS_FORWARD)
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        sentence.push_str(&format!(" Missing: {}.", missing.join("; ")));
     }
     sentence
+}
+/// A `YYYYMMDD` day as an owner reads it, like "October 17".
+fn spoken_day(day: &str) -> String {
+    NaiveDate::parse_from_str(day, "%Y%m%d")
+        .map_or_else(|_| day.to_owned(), |date| date.format("%B %-d").to_string())
 }
 fn string_or(value: Option<&Value>, fallback: &str) -> String {
     value.and_then(Value::as_str).unwrap_or(fallback).to_owned()
@@ -451,13 +472,24 @@ mod tests {
         let one = json!({"segments": 0, "anticipated_activities": 1, "facet_newsletters": 1});
         assert_eq!(
             coverage_preamble(&one, &[], 1),
-            "Built from 0 source paths, 1 plan today, 1 plan in the next 7 days, 1 facet newsletter. No gaps."
+            "This briefing draws on 1 plan for today, 1 plan in the next 7 days and 1 facet newsletter."
         );
         let many = json!({"segments": 4, "anticipated_activities": 0, "facet_newsletters": 2});
         assert_eq!(
-            coverage_preamble(&many, &["no plans today".to_owned()], 3),
-            "Built from 4 source paths, 0 plans today, 3 plans in the next 7 days, 2 facet newsletters. Gaps: no plans today."
+            coverage_preamble(
+                &many,
+                &[NO_PLANS_TODAY.to_owned(), "the latest pulse".to_owned()],
+                3
+            ),
+            "This briefing draws on 0 plans for today, 3 plans in the next 7 days and 2 facet newsletters. Missing: the latest pulse."
         );
+    }
+
+    #[test]
+    fn spoken_day_names_the_month_and_falls_back_to_the_key() {
+        assert_eq!(spoken_day("20261017"), "October 17");
+        assert_eq!(spoken_day("20260301"), "March 1");
+        assert_eq!(spoken_day("notaday"), "notaday");
     }
 
     #[test]
