@@ -340,7 +340,7 @@ func executeRootedRestore(ctx context.Context, req *bridgeRequest, setWrote func
 		return failed(err)
 	}
 	if _, err := safeScanKey(ctx, repo, pw); err != nil {
-		return failed(err)
+		return keyRefusal(ctx, be, err), err
 	}
 	unlock, lockCtx, err := lockRepo(ctx, repo, false)
 	if err != nil {

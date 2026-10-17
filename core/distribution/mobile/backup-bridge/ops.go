@@ -82,6 +82,7 @@ func safeScanKey(ctx context.Context, repo *repository.Repository, password stri
 	var winningID restic.ID
 	found := false
 	resourceRefused := false
+	var unreadable error
 	keyCount := 0
 
 	err := repo.List(ctx, restic.KeyFile, func(id restic.ID, _ int64) error {
@@ -97,6 +98,8 @@ func safeScanKey(ctx context.Context, repo *repository.Repository, password stri
 		if err != nil {
 			if errors.Is(err, errResourceLimit) {
 				resourceRefused = true
+			} else if unreadable == nil {
+				unreadable = err
 			}
 			return nil
 		}
@@ -133,6 +136,11 @@ func safeScanKey(ctx context.Context, repo *repository.Repository, password stri
 	if !found {
 		if resourceRefused {
 			return restic.ID{}, errResourceLimit
+		}
+		// A key that could not be read was never tried, so this is not a
+		// rejected password.
+		if unreadable != nil {
+			return restic.ID{}, unreadable
 		}
 		return restic.ID{}, errNoKeyOpened
 	}

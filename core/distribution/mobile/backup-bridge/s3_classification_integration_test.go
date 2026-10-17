@@ -6,6 +6,7 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -23,14 +24,21 @@ func TestS3OperationsKeyListingFailureIsNotARejectedPassword(t *testing.T) {
 	}{
 		{"unavailable", 503, "provider-fixture-unavailable", DiagIoFailed},
 		{"denied", 403, "<Error><Code>AccessDenied</Code><Message>provider-fixture</Message></Error>", DiagAuthFailed},
+		{"key-unreadable", 503, "provider-fixture-unavailable", DiagIoFailed},
 	} {
 		t.Run(fault.name, func(t *testing.T) {
 			cfg, state := s3TestConfig(), s3OwnerTestDirectory(t)
 			peer := &s3MemoryPeer{cfg: cfg, objects: make(map[string][]byte)}
 			var failing atomic.Bool
 			transport := s3TestTransport(func(req *http.Request) (*http.Response, error) {
-				if failing.Load() && req.Method == http.MethodGet && strings.Contains(req.URL.Query().Get("prefix"), "/keys") {
-					return s3TestResponse(fault.code, fault.body, nil), nil
+				listing := req.URL.Query().Get("list-type") != ""
+				if failing.Load() && req.Method == http.MethodGet {
+					if fault.name == "key-unreadable" && !listing && strings.Contains(req.URL.Path, "/keys/") {
+						return s3TestResponse(fault.code, fault.body, nil), nil
+					}
+					if fault.name != "key-unreadable" && strings.Contains(req.URL.Query().Get("prefix"), "/keys") {
+						return s3TestResponse(fault.code, fault.body, nil), nil
+					}
 				}
 				return peer.RoundTrip(req)
 			})
@@ -71,5 +79,40 @@ func TestRootedRestoreCorruptDataIsNeverReportedAsPasswordOrMissing(t *testing.T
 	r, _, _ := rootedTestWait(t, id, h)
 	if r.status == StatusOk || r.diagnostic == DiagAuthFailed || r.diagnostic == DiagRepoMissing || r.diagnostic == DiagLocked {
 		t.Fatal("corrupt repository restore misreported", r.status, r.diagnostic)
+	}
+}
+
+func TestRootedRestoreFromAnEmptyPrefixIsReportedMissing(t *testing.T) {
+	f := newRootedTestFixture(t, true)
+	empty := *f
+	empty.cfg.prefix = f.cfg.prefix + "-empty"
+	empty.state = s3OwnerTestDirectory(t)
+	target := filepath.Join(f.base, "empty-target")
+	if err := os.Mkdir(target, 0700); err != nil {
+		t.Fatal(err)
+	}
+	id, h := rootedTestStart(t, &empty, rootedTestRequest(t, &empty, target, f.second, f.recovery))
+	if r, _, _ := rootedTestWait(t, id, h); r.status != StatusFailed || r.diagnostic != DiagRepoMissing {
+		t.Fatal("restore from an empty prefix misreported", r.status, r.diagnostic)
+	}
+}
+
+func TestS3MistypedPasswordsNeverExhaustTheDestination(t *testing.T) {
+	cfg, state := s3TestConfig(), s3OwnerTestDirectory(t)
+	peer := &s3MemoryPeer{cfg: cfg, objects: make(map[string][]byte)}
+	run := func(operation int32, password string) bridgeResult {
+		id, handle := s3TestStartOperation(t, cfg, state, "", peer, bridgeRequest{operation: operation, password: []byte(password)})
+		return s3TestWaitOperation(t, id, handle)
+	}
+	if r := run(OpInit, "fixture-password"); r.status != StatusOk {
+		t.Fatal("init", r.status, r.diagnostic)
+	}
+	for attempt := 0; attempt < 2*maxS3OwnerPasswords; attempt++ {
+		if r := run(OpOpen, fmt.Sprintf("mistyped-%02d", attempt)); r.diagnostic != DiagAuthFailed {
+			t.Fatal("mistyped password", attempt, r.status, r.diagnostic)
+		}
+	}
+	if r := run(OpOpen, "fixture-password"); r.status != StatusOk {
+		t.Fatal("destination exhausted by mistyped passwords", r.status, r.diagnostic)
 	}
 }

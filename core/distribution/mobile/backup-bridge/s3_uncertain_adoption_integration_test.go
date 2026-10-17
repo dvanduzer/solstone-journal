@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // A backup interrupted mid-upload leaves its remote effects uncertain. The next
@@ -91,5 +92,31 @@ func TestS3InterruptedBackupIsAdoptedByTheNextBackup(t *testing.T) {
 	}
 	if listed := run(OpListSnapshots); listed.status != StatusOk || listed.snapshotCount != 1 {
 		t.Fatal("unexpected snapshot catalog after adoption", listed.status, listed.diagnostic, listed.snapshotCount)
+	}
+}
+
+// An interrupted check holds an exclusive lock. The next backup removes it
+// before its own work instead of waiting out its lock retry against it.
+func TestS3InterruptedCheckIsAdoptedByABackupWithoutWaiting(t *testing.T) {
+	f := newRootedTestFixture(t, true)
+	var interrupt atomic.Bool
+	transport := s3TestTransport(func(req *http.Request) (*http.Response, error) {
+		if interrupt.Load() && req.Method == http.MethodDelete && strings.Contains(req.URL.Path, "/locks/") {
+			return nil, errS3IO
+		}
+		return f.peer.RoundTrip(req)
+	})
+	interrupt.Store(true)
+	id, handle := s3TestStartOperation(t, f.cfg, f.state, f.workspace, transport, bridgeRequest{operation: OpCheck, password: append([]byte(nil), f.password...)})
+	if r := s3TestWaitOperation(t, id, handle); r.status != StatusRemotePending {
+		t.Fatal("interrupted check not pending", r.status, r.diagnostic)
+	}
+	interrupt.Store(false)
+	source := f.source + "-retained"
+	started := time.Now()
+	id, handle = s3TestStartOperation(t, f.cfg, f.state, f.workspace, transport, bridgeRequest{operation: OpSnapshot, password: append([]byte(nil), f.password...), sourcePath: source, executionOptions: &operationOptions{retryLock: time.Minute}})
+	r := s3TestWaitOperation(t, id, handle)
+	if r.status != StatusOk || time.Since(started) > 30*time.Second {
+		t.Fatal("backup stalled on the adopted exclusive lock", r.status, r.diagnostic, time.Since(started))
 	}
 }

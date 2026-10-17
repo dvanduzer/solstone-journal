@@ -105,6 +105,46 @@ func cleanupS3Locks(request *s3RemoteRequest) error {
 	return result
 }
 
+// removeInheritedS3Locks deletes the locks this attempt adopted from an
+// interrupted one before any repository work, so an adopted lock of the
+// conflicting kind can never stall the operation that would remove it.
+func removeInheritedS3Locks(request *s3RemoteRequest) (err error) {
+	defer func() {
+		if recover() != nil {
+			err = errS3OwnerIO
+		}
+	}()
+	owner := request.owner
+	ids := owner.unacknowledgedLocks()
+	if len(ids) == 0 {
+		return nil
+	}
+	owner.mu.Lock()
+	if owner.closed || owner.cleanupActive || owner.liveID == "" {
+		owner.mu.Unlock()
+		return errS3OwnerInvalid
+	}
+	owner.cleanupActive = true
+	owner.mu.Unlock()
+	defer func() { owner.mu.Lock(); owner.cleanupActive = false; owner.mu.Unlock() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	base, err := request.backend(ctx)
+	if err != nil {
+		return err
+	}
+	be := &s3OperationBackend{s3Backend: base, owner: owner, cleanup: true}
+	defer be.Close()
+	var result error
+	for _, id := range ids {
+		if ctx.Err() != nil {
+			return errors.Join(result, ctx.Err())
+		}
+		result = errors.Join(result, be.Remove(ctx, backend.Handle{Type: backend.LockFile, Name: id}))
+	}
+	return result
+}
+
 func beginS3Owner(owner *s3Owner, operation int32, cfg s3Config, passwords ...[]byte) (err error) {
 	defer func() {
 		if recover() != nil {
@@ -300,6 +340,10 @@ func runS3Worker(h *callHandle, req bridgeRequest) {
 		if errors.Is(err, errResourceLimit) {
 			result.status, result.diagnostic = StatusCapExceeded, DiagCapExceeded
 		}
+	} else if err := removeInheritedS3Locks(req.remote); err != nil {
+		// The adopted locks stay in custody; no repository work runs over them.
+		started = true
+		result = bridgeResult{status: StatusFailed, diagnostic: DiagIoFailed}
 	} else {
 		started = true
 		result = executeS3Operation(h, &req, &wrote)

@@ -50,7 +50,7 @@ func TestOwnedPublicRemotePendingRemainsDurableWithoutSeal(t *testing.T) {
 	if result.status != StatusRemotePending || result.diagnostic != DiagRemotePending || !validS3ID(result.snapshotID) || waited != StatusOk || freed != StatusOk || deletes.Load() < 2 {
 		t.Fatal("actual unacknowledged remote lock did not preserve pending snapshot", result.status, result.diagnostic, waited, freed, deletes.Load())
 	}
-	before := requests.Load()
+	before, deletesBefore := requests.Load(), deletes.Load()
 	id, status = sourceCStart(input, int(held.Fd()), []byte(`[]`), 0)
 	if status != StatusOk || id == 0 {
 		t.Fatal("pending-state worker did not admit local owner", status, id)
@@ -59,7 +59,10 @@ func TestOwnedPublicRemotePendingRemainsDurableWithoutSeal(t *testing.T) {
 	ownedCalls.Lock()
 	sealed, live := ownedCalls.sealed, len(ownedCalls.live)
 	ownedCalls.Unlock()
-	if result.status != StatusRemotePending || waited != StatusOk || freed != StatusOk || requests.Load() != before || sealed || live != 0 {
+	// The next attempt adopts the pending custody and may only try to remove the
+	// adopted lock; while that fails no other credentialed request is made.
+	lockOnly := requests.Load()-before == deletes.Load()-deletesBefore && deletes.Load() > deletesBefore
+	if result.status != StatusRemotePending || waited != StatusOk || freed != StatusOk || !lockOnly || sealed || live != 0 {
 		t.Fatal("durable remote pending reset, sealed, or reached credentialed work", result.status, result.diagnostic, waited, freed, requests.Load()-before, sealed, live)
 	}
 }
