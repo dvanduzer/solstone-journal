@@ -22,6 +22,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- on linux, the installer opens setup in your browser and shows where to add the solstone app. without a desktop, it prints the setup link and an SSH tunnel command for another computer.
+
 - transcripts warn when a sentence may contain words from more than one speaker.
 - linux: `solstone update` and the status pane now recognize installs made by the public installer.
 
