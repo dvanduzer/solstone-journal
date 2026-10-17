@@ -2871,3 +2871,38 @@ mod shared_sidecar_tests {
         assert!(hold_shared_lock(&path, options).is_ok());
     }
 }
+
+#[cfg(all(test, feature = "full-tests"))]
+mod existing_read_lock_tests {
+    use super::*;
+    use crate::test_support::TempDir;
+
+    #[test]
+    fn existing_read_lock_creates_nothing_and_excludes_the_authority_writer() {
+        let temporary = TempDir::new();
+        let protected = temporary.path().join("absent").join("identity");
+        assert!(
+            hold_existing_lock(&protected, LockOptions::default())
+                .unwrap()
+                .is_none()
+        );
+        assert!(fs::read_dir(temporary.path()).unwrap().next().is_none());
+        let immediate = LockOptions {
+            timeout: Duration::ZERO,
+            ..LockOptions::default()
+        };
+        let writer = hold_lock(&protected, LockOptions::default()).unwrap();
+        assert!(matches!(
+            hold_existing_lock(&protected, immediate),
+            Err(LockError::Timeout(_))
+        ));
+        drop(writer);
+        let reader = hold_existing_lock(&protected, immediate).unwrap().unwrap();
+        assert!(matches!(
+            hold_lock(&protected, immediate),
+            Err(LockError::Timeout(_))
+        ));
+        drop(reader);
+        assert!(hold_lock(&protected, immediate).is_ok());
+    }
+}
