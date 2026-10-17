@@ -995,4 +995,167 @@ mod tests {
         assert_eq!(body["search_index"]["state"], "failing");
         assert_eq!(body["search_index"]["observed_failure"], false);
     }
+
+    #[tokio::test]
+    async fn test_speech_setup_endpoint_and_scenarios() {
+        use solstone_core_journal_config::parakeet_coreml::{
+            ParakeetCoremlSentinel, default_parakeet_coreml_cache_dir, parakeet_coreml_model_root,
+            parakeet_coreml_sentinel_path,
+        };
+        use solstone_core_system::speech_setup::{
+            SpeechSetupPresentation, SpeechSetupState, SpeechSetupTone, read_speech_setup,
+        };
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let now = Utc.with_ymd_and_hms(2026, 10, 17, 12, 0, 0).unwrap();
+
+        // 1. Oneshot equality test
+        let app = crate::routes_with_clock(root.to_path_buf(), Clock::fixed(now));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/app/health/api/speech-setup")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body_bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let from_endpoint: SpeechSetupPresentation = serde_json::from_slice(&body_bytes).unwrap();
+
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute());
+        let expected = read_speech_setup(
+            root,
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            home.as_deref(),
+            now,
+        );
+        assert_eq!(from_endpoint, expected);
+
+        // 2. LinuxCpp scenarios (injected platform)
+        let status_path = root.join("health/providers/parakeet.json");
+        fs::create_dir_all(status_path.parent().unwrap()).unwrap();
+        let downloading_record = json!({
+            "schema_version": 1,
+            "provider": "parakeet",
+            "revision": 1,
+            "install_state": "downloading",
+            "attempt_id": "attempt-1",
+            "target_fingerprint_json": "fp",
+            "target_fingerprint_sha256": "sha",
+            "started_at": null,
+            "last_transition_at": null,
+            "last_progress_at": null,
+            "completed_at": null,
+            "progress_bytes_received": 123456,
+            "progress_bytes_total": 987654,
+            "install_error": null,
+            "error_code": null,
+            "owner": null
+        });
+        fs::write(
+            &status_path,
+            serde_json::to_vec(&downloading_record).unwrap(),
+        )
+        .unwrap();
+
+        let lease = solstone_core_local::install::lease::acquire(root, "parakeet").unwrap();
+        assert!(lease.is_some());
+
+        let pres_linux_held = read_speech_setup(root, "linux", "x86_64", None, now);
+        assert!(pres_linux_held.applicable);
+        assert!(pres_linux_held.visible);
+        assert_eq!(pres_linux_held.state, Some(SpeechSetupState::Downloading));
+        assert_eq!(pres_linux_held.tone, Some(SpeechSetupTone::Neutral));
+        assert_eq!(pres_linux_held.bytes_received, Some(123456));
+        assert_eq!(pres_linux_held.bytes_total, Some(987654));
+        assert_eq!(pres_linux_held.command, None);
+        assert!(pres_linux_held.recovery_representable);
+
+        if solstone_core_system::stt_backend_choice::stt_host_policy(
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        )
+        .runtime_kind
+            == Some(solstone_core_system::stt_backend_choice::SttRuntimeKind::LinuxCpp)
+        {
+            let app2 = crate::routes_with_clock(root.to_path_buf(), Clock::fixed(now));
+            let response = app2
+                .oneshot(
+                    Request::builder()
+                        .uri("/app/health/api/speech-setup")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let from_ep: SpeechSetupPresentation = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(from_ep.state, Some(SpeechSetupState::Downloading));
+            assert_eq!(from_ep.bytes_received, Some(123456));
+            assert_eq!(from_ep.bytes_total, Some(987654));
+        }
+
+        drop(lease);
+
+        let pres_linux_dropped = read_speech_setup(root, "linux", "x86_64", None, now);
+        assert!(pres_linux_dropped.applicable);
+        assert!(pres_linux_dropped.visible);
+        assert_eq!(pres_linux_dropped.state, Some(SpeechSetupState::Attention));
+        assert_eq!(pres_linux_dropped.tone, Some(SpeechSetupTone::Attention));
+        assert_eq!(
+            pres_linux_dropped.cause,
+            Some("install_interrupted".to_string())
+        );
+        assert_eq!(pres_linux_dropped.bytes_received, None);
+        assert_eq!(pres_linux_dropped.bytes_total, None);
+        assert_eq!(
+            pres_linux_dropped.command,
+            Some("solstone journal install-provider parakeet".to_string())
+        );
+
+        // 3. MacosCoreml scenario: sentinel accepted + parakeet.json failed -> visible: false
+        let fake_home = temp.path().join("mac_home");
+        let cache_dir = default_parakeet_coreml_cache_dir(&fake_home);
+        let model_root = parakeet_coreml_model_root(&cache_dir);
+        fs::create_dir_all(&model_root).unwrap();
+        fs::write(model_root.join("model_file.bin"), b"test").unwrap();
+
+        let sentinel =
+            ParakeetCoremlSentinel::new(cache_dir, "darwin", "arm64", "0.14.0", "1.0", vec![]);
+        let sentinel_path = parakeet_coreml_sentinel_path(&fake_home);
+        fs::create_dir_all(sentinel_path.parent().unwrap()).unwrap();
+        fs::write(sentinel_path, serde_json::to_vec(&sentinel).unwrap()).unwrap();
+
+        let failed_record = json!({
+            "schema_version": 1,
+            "provider": "parakeet",
+            "revision": 2,
+            "install_state": "failed",
+            "attempt_id": "attempt-2",
+            "target_fingerprint_json": "fp",
+            "target_fingerprint_sha256": "sha",
+            "started_at": null,
+            "last_transition_at": null,
+            "last_progress_at": null,
+            "completed_at": null,
+            "progress_bytes_received": null,
+            "progress_bytes_total": null,
+            "install_error": "network error",
+            "error_code": "download_failed",
+            "owner": null
+        });
+        fs::write(&status_path, serde_json::to_vec(&failed_record).unwrap()).unwrap();
+
+        let pres_macos = read_speech_setup(root, "darwin", "arm64", Some(&fake_home), now);
+        assert!(pres_macos.applicable);
+        assert!(!pres_macos.visible);
+        assert_eq!(pres_macos.command, None);
+    }
 }

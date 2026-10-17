@@ -21,7 +21,8 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use solstone_core_local::install::status::InstallStatus;
 #[cfg(not(windows))]
-use solstone_core_local::install::{lease, manifest, pins, status};
+use solstone_core_local::install::{lease, status};
+use solstone_core_local::install::{manifest, pins};
 
 use super::local_follow::{
     FollowDecision, FollowMemory, LocalInstallerLauncher, install_follow_tail,
@@ -196,8 +197,10 @@ fn parakeet_model_installed_before(journal: &Path) -> bool {
     false
 }
 
-#[cfg(not(windows))]
-fn inspect_parakeet_manifests(journal: &Path, artifact_key: &str) -> (Value, Value, Value) {
+pub(crate) fn inspect_parakeet_manifests(
+    journal: &Path,
+    artifact_key: &str,
+) -> (Value, Value, Value) {
     let paths = pins::parakeet_paths(journal, artifact_key);
 
     let cpu_proof = inspect_server_manifest(&paths, "binary_path_cpu", artifact_key, "cpu");
@@ -208,8 +211,7 @@ fn inspect_parakeet_manifests(journal: &Path, artifact_key: &str) -> (Value, Val
     (cpu_proof, vulkan_proof, model_proof)
 }
 
-#[cfg(not(windows))]
-fn inspect_server_manifest(
+pub(crate) fn inspect_server_manifest(
     paths: &Value,
     binary_path_key: &str,
     artifact_key: &str,
@@ -248,8 +250,7 @@ fn inspect_server_manifest(
     manifest::inspect_manifest_required(&manifest_path, &identity, &[binary_name])
 }
 
-#[cfg(not(windows))]
-fn inspect_model_manifest(paths: &Value) -> Value {
+pub(crate) fn inspect_model_manifest(paths: &Value) -> Value {
     let Some(model_path_str) = paths.get("model_path").and_then(Value::as_str) else {
         return serde_json::json!({
             "status": "missing-or-mismatched",

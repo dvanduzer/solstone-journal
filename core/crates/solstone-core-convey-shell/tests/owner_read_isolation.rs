@@ -307,7 +307,7 @@ fn owner_read_role_classification_table_exhaustiveness() {
             "/app/stats/api/stats/{month}",
             RouteClassification::Moved(OwnerReadRole::StatsMonthStats),
         ),
-        // Health (10 live GET paths in health-web lib.rs:31-42 + journal_data api_router)
+        // Health (11 live GET paths in health-web lib.rs:31-42 + journal_data api_router)
         ("/app/health/", RouteClassification::NoQualifyingWork),
         (
             "/app/health/workspace",
@@ -328,6 +328,10 @@ fn owner_read_role_classification_table_exhaustiveness() {
         (
             "/app/health/api/info",
             RouteClassification::Moved(OwnerReadRole::HealthInfo),
+        ),
+        (
+            "/app/health/api/speech-setup",
+            RouteClassification::Moved(OwnerReadRole::HealthSpeechSetup),
         ),
         (
             "/api/health/summary",
@@ -428,7 +432,7 @@ fn owner_read_role_classification_table_exhaustiveness() {
         ),
     ];
 
-    assert_eq!(table.len(), 94, "Must classify all 94 live GET routes");
+    assert_eq!(table.len(), 95, "Must classify all 95 live GET routes");
 
     let mut distinct_paths = BTreeSet::new();
     for (path, _) in table {
@@ -451,7 +455,7 @@ fn owner_read_role_classification_table_exhaustiveness() {
         moved_roles, all_roles,
         "Moved roles must equal OwnerReadRole::ALL exactly"
     );
-    assert_eq!(moved_roles.len(), 59);
+    assert_eq!(moved_roles.len(), 60);
 
     let ten_measured = [
         OwnerReadRole::SpeakersKnown,

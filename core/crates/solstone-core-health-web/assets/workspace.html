@@ -762,6 +762,62 @@ h2.card-title {
 /* G3-304: the pending line the processing card shows until its read lands. */
 .brain-health-pending { margin: 0; color: var(--ink-soft); }
 
+#speechSetup {
+  margin-top: 0.75em;
+}
+
+#speechSetup.speech-setup-tone-neutral {
+  color: var(--ink);
+}
+
+#speechSetup.speech-setup-tone-calm {
+  color: var(--ink-soft);
+}
+
+#speechSetup.speech-setup-tone-attention {
+  color: var(--danger);
+}
+
+#speechSetup.speech-setup-tone-unavailable {
+  color: var(--ink-faint);
+}
+
+#speechSetupState {
+  font-weight: 500;
+}
+
+#speechSetupExplanation {
+  margin: 0.25em 0;
+  color: var(--ink-soft);
+}
+
+#speechSetupBytes {
+  margin: 0.25em 0;
+  font-size: 0.85em;
+  color: var(--ink-soft);
+}
+
+#speechSetupDetails {
+  margin-top: 0.5em;
+}
+
+#speechSetupSummary {
+  cursor: pointer;
+  color: var(--ink-soft);
+  min-height: 44px;
+  padding: 10px 0;
+}
+
+#speechSetupCause {
+  margin: 0.25em 0;
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+}
+
+#speechSetupCommand {
+  overflow-wrap: anywhere;
+}
+
 .idle-card {
   text-align: left;
   padding: 1.5em;
@@ -1505,6 +1561,17 @@ h2.card-title {
       <button id="brainCheckBtn" hidden>check again</button>
     </div>
     <div id="brainHealthStatus" role="status" aria-live="polite"><p class="brain-health-pending">checking processing&hellip;</p></div>
+    <div id="speechSetup" hidden>
+      <p><span>speech recognition</span>: <span id="speechSetupState"></span></p>
+      <p id="speechSetupExplanation" hidden></p>
+      <div id="speechSetupBytes" hidden></div>
+      <details id="speechSetupDetails">
+        <summary id="speechSetupSummary"></summary>
+        <p id="speechSetupCause" hidden></p>
+        <p id="speechSetupInstruction" hidden>on the computer running your journal:</p>
+        <pre id="speechSetupCommandWrapper" hidden><code id="speechSetupCommand"></code></pre>
+      </details>
+    </div>
   </section>
 
   <!-- Vitals Bar -->

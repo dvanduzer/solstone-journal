@@ -113,6 +113,15 @@ class Element {
   set href(value) { this.setAttribute('href', value); }
   get className() { return this.getAttribute('class') || ''; }
   set className(value) { this.setAttribute('class', value); }
+  get parentNode() { return this.parentElement; }
+  get nextSibling() {
+    if (!this.parentElement) return null;
+    const siblings = this.parentElement.children;
+    const idx = siblings.indexOf(this);
+    return idx >= 0 && idx < siblings.length - 1 ? siblings[idx + 1] : null;
+  }
+  get open() { return this.hasAttribute('open'); }
+  set open(value) { if (value) this.setAttribute('open', ''); else this.removeAttribute('open'); }
   get hidden() { return this.hasAttribute('hidden'); }
   set hidden(value) { if (value) this.setAttribute('hidden', ''); else this.removeAttribute('hidden'); }
   get textContent() {
@@ -174,6 +183,19 @@ class Element {
     this.children = this.children.filter(item => item !== child);
     child.parentElement = null;
     return child;
+  }
+
+  insertBefore(node, child) {
+    if (node.parentElement) node.parentElement.removeChild(node);
+    node.parentElement = this;
+    if (!child) {
+      this.children.push(node);
+    } else {
+      const idx = this.children.indexOf(child);
+      if (idx === -1) this.children.push(node);
+      else this.children.splice(idx, 0, node);
+    }
+    return node;
   }
 
   querySelector(selector) { return queryAll(this, selector)[0] || null; }
@@ -1299,6 +1321,412 @@ test('registered clients card state choices', async () => {
   await env.load([device('phone')]);
   assert.strictEqual(env.doc.querySelectorAll('.registered-client-row').length, 0);
   assert.ok(env.doc.querySelector('.registered-clients-count'));
+});
+
+function createSpeechEnvironment() {
+  const source = loadHealthSource();
+  const doc = new Document();
+  doc.hidden = false;
+
+  const brain = doc.createElement('section');
+  brain.id = 'brain';
+  doc.body.appendChild(brain);
+
+  const brainHealthStatus = doc.createElement('div');
+  brainHealthStatus.id = 'brainHealthStatus';
+  brain.appendChild(brainHealthStatus);
+
+  const speechSetup = doc.createElement('div');
+  speechSetup.id = 'speechSetup';
+  speechSetup.hidden = true;
+
+  const stateP = doc.createElement('p');
+  const speechLabel = doc.createElement('span');
+  speechLabel.textContent = 'speech recognition';
+  const stateEl = doc.createElement('span');
+  stateEl.id = 'speechSetupState';
+  stateP.append(speechLabel, doc.createTextNode(': '), stateEl);
+  speechSetup.appendChild(stateP);
+
+  const expEl = doc.createElement('p');
+  expEl.id = 'speechSetupExplanation';
+  expEl.hidden = true;
+  speechSetup.appendChild(expEl);
+
+  const bytesEl = doc.createElement('div');
+  bytesEl.id = 'speechSetupBytes';
+  bytesEl.hidden = true;
+  speechSetup.appendChild(bytesEl);
+
+  const detailsEl = doc.createElement('details');
+  detailsEl.id = 'speechSetupDetails';
+
+  const summaryEl = doc.createElement('summary');
+  summaryEl.id = 'speechSetupSummary';
+  detailsEl.appendChild(summaryEl);
+
+  const causeEl = doc.createElement('p');
+  causeEl.id = 'speechSetupCause';
+  causeEl.hidden = true;
+  detailsEl.appendChild(causeEl);
+
+  const instructionEl = doc.createElement('p');
+  instructionEl.id = 'speechSetupInstruction';
+  instructionEl.hidden = true;
+  detailsEl.appendChild(instructionEl);
+
+  const commandWrapper = doc.createElement('pre');
+  commandWrapper.id = 'speechSetupCommandWrapper';
+  commandWrapper.hidden = true;
+  const commandEl = doc.createElement('code');
+  commandEl.id = 'speechSetupCommand';
+  commandWrapper.appendChild(commandEl);
+  detailsEl.appendChild(commandWrapper);
+
+  speechSetup.appendChild(detailsEl);
+  brain.appendChild(speechSetup);
+
+  const timers = [];
+  const customSetTimeout = (fn, delay) => {
+    const timer = { fn, delay, active: true };
+    timers.push(timer);
+    return timer;
+  };
+  const customClearTimeout = (timer) => {
+    if (timer) timer.active = false;
+  };
+
+  const loggedErrors = [];
+
+  const context = vm.createContext({
+    document: doc,
+    window: {
+      location: { hash: '' },
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    },
+    console: { warn() {}, error() {}, log() {} },
+    AbortController,
+    CustomEvent: class { constructor(type, detail) { this.type = type; this.detail = detail; } },
+    setTimeout: customSetTimeout,
+    clearTimeout: customClearTimeout,
+    logHealthError: (err, msg) => { loggedErrors.push({ err, msg }); },
+    loadRegisteredClients: () => {},
+    loadBackupStatus: () => {},
+    getJson: async () => ({
+      applicable: true,
+      visible: true,
+      state: 'downloading',
+      tone: 'neutral',
+    }),
+  });
+
+  const speechCode = sourceBlock(source, 'const SPEECH_SETUP_COPY =', 'function clearHealthStateError(');
+  vm.runInContext(speechCode, context);
+
+  return {
+    doc,
+    context,
+    brain,
+    speechSetup,
+    bytesEl,
+    detailsEl,
+    summaryEl,
+    causeEl,
+    timers,
+    loggedErrors,
+    source,
+  };
+}
+
+test('refreshStatusReads records fetch of /app/health/api/speech-setup and does not fetch /app/health/api/state', async () => {
+  const env = createSpeechEnvironment();
+  const fetchedUrls = [];
+  env.context.getJson = async (url) => {
+    fetchedUrls.push(url);
+    return { applicable: false, visible: false };
+  };
+  env.context.fetch = async (url) => {
+    fetchedUrls.push(url);
+    return { ok: true, json: async () => ({}) };
+  };
+  await vm.runInContext('refreshStatusReads()', env.context);
+  assert.ok(fetchedUrls.includes('/app/health/api/speech-setup'));
+  assert.ok(!fetchedUrls.includes('/app/health/api/state'));
+});
+
+test('speech setup stage change updates in place keeping same node', async () => {
+  const env = createSpeechEnvironment();
+  const originalNode = env.speechSetup;
+
+  let currentPayload = {
+    applicable: true,
+    visible: true,
+    state: 'downloading',
+    tone: 'neutral',
+    bytes_received: 1000,
+    bytes_total: 5000,
+    cause: null,
+    recovery_representable: true,
+    command: null,
+  };
+  env.context.getJson = async () => currentPayload;
+
+  await vm.runInContext('loadSpeechSetup()', env.context);
+  assert.strictEqual(env.doc.getElementById('speechSetup'), originalNode);
+  assert.strictEqual(originalNode.hidden, false);
+  assert.strictEqual(originalNode.getAttribute('data-state'), 'downloading');
+  assert.ok(originalNode.classList.contains('speech-setup-tone-neutral'));
+
+  currentPayload = {
+    applicable: true,
+    visible: true,
+    state: 'verifying',
+    tone: 'neutral',
+    bytes_received: 5000,
+    bytes_total: 5000,
+    cause: null,
+    recovery_representable: true,
+    command: null,
+  };
+  await vm.runInContext('loadSpeechSetup()', env.context);
+  assert.strictEqual(env.doc.getElementById('speechSetup'), originalNode);
+  assert.strictEqual(originalNode.hidden, false);
+  assert.strictEqual(originalNode.getAttribute('data-state'), 'verifying');
+  assert.ok(originalNode.classList.contains('speech-setup-tone-neutral'));
+});
+
+test('speech setup visible: false with applicable: true sets hidden on the row', async () => {
+  const env = createSpeechEnvironment();
+  env.context.getJson = async () => ({
+    applicable: true,
+    visible: false,
+    state: null,
+    tone: null,
+    bytes_received: null,
+    bytes_total: null,
+    cause: null,
+    recovery_representable: false,
+    command: null,
+  });
+  await vm.runInContext('loadSpeechSetup()', env.context);
+  assert.strictEqual(env.speechSetup.hidden, true);
+  assert.strictEqual(env.speechSetup.getAttribute('data-state'), null);
+});
+
+test('after applicable visible success, rejected getJson shows unavailable and releases guard', async () => {
+  const env = createSpeechEnvironment();
+  env.context.getJson = async () => ({
+    applicable: true,
+    visible: true,
+    state: 'downloading',
+    tone: 'neutral',
+    bytes_received: 1000,
+    bytes_total: 5000,
+    cause: null,
+    recovery_representable: true,
+    command: null,
+  });
+  await vm.runInContext('loadSpeechSetup()', env.context);
+  assert.strictEqual(env.speechSetup.hidden, false);
+  assert.strictEqual(env.speechSetup.getAttribute('data-state'), 'downloading');
+  assert.strictEqual(env.bytesEl.getAttribute('data-received'), '1000');
+  assert.strictEqual(env.bytesEl.getAttribute('data-total'), '5000');
+
+  let fetchCount = 0;
+  env.context.getJson = async () => {
+    fetchCount++;
+    throw new Error('network down');
+  };
+  await vm.runInContext('loadSpeechSetup()', env.context);
+  assert.strictEqual(fetchCount, 1);
+  assert.strictEqual(env.speechSetup.hidden, false);
+  assert.strictEqual(env.speechSetup.getAttribute('data-state'), 'unavailable');
+  assert.ok(env.speechSetup.classList.contains('speech-setup-tone-unavailable'));
+  assert.strictEqual(env.bytesEl.hasAttribute('data-received'), false);
+  assert.strictEqual(env.bytesEl.hasAttribute('data-total'), false);
+  assert.strictEqual(env.bytesEl.hidden, true);
+
+  await vm.runInContext('loadSpeechSetup()', env.context);
+  assert.strictEqual(fetchCount, 2);
+});
+
+test('never settling getJson times out at 10000ms callback, releases guard, and ignores late resolve', async () => {
+  const env = createSpeechEnvironment();
+  env.context.getJson = async () => ({
+    applicable: true,
+    visible: true,
+    state: 'downloading',
+    tone: 'neutral',
+    bytes_received: 1000,
+    bytes_total: 5000,
+    cause: null,
+    recovery_representable: true,
+    command: null,
+  });
+  await vm.runInContext('loadSpeechSetup()', env.context);
+  assert.strictEqual(env.speechSetup.getAttribute('data-state'), 'downloading');
+
+  let resolvePromise;
+  env.context.getJson = () => new Promise(resolve => { resolvePromise = resolve; });
+
+  const loadPromise = vm.runInContext('loadSpeechSetup()', env.context);
+
+  const timer = env.timers.find(t => t.delay === 10000 && t.active);
+  assert.ok(timer, 'timeout timer with 10000ms delay registered');
+
+  timer.fn();
+
+  assert.strictEqual(env.speechSetup.hidden, false);
+  assert.strictEqual(env.speechSetup.getAttribute('data-state'), 'unavailable');
+  assert.ok(env.speechSetup.classList.contains('speech-setup-tone-unavailable'));
+  assert.strictEqual(env.bytesEl.hidden, true);
+  assert.strictEqual(env.bytesEl.hasAttribute('data-received'), false);
+
+  resolvePromise({
+    applicable: true,
+    visible: true,
+    state: 'downloading',
+    tone: 'neutral',
+    bytes_received: 2000,
+    bytes_total: 5000,
+    cause: null,
+    recovery_representable: true,
+    command: null,
+  });
+  await loadPromise;
+  assert.strictEqual(env.speechSetup.getAttribute('data-state'), 'unavailable');
+
+  env.context.getJson = async () => ({
+    applicable: true,
+    visible: true,
+    state: 'verifying',
+    tone: 'neutral',
+    bytes_received: 5000,
+    bytes_total: 5000,
+    cause: null,
+    recovery_representable: true,
+    command: null,
+  });
+  await vm.runInContext('loadSpeechSetup()', env.context);
+  assert.strictEqual(env.speechSetup.getAttribute('data-state'), 'verifying');
+  assert.ok(env.speechSetup.classList.contains('speech-setup-tone-neutral'));
+});
+
+test('details.open and summary focus survive byte-only refresh', async () => {
+  const env = createSpeechEnvironment();
+  env.context.getJson = async () => ({
+    applicable: true,
+    visible: true,
+    state: 'downloading',
+    tone: 'neutral',
+    bytes_received: 1000,
+    bytes_total: 5000,
+    cause: null,
+    recovery_representable: true,
+    command: null,
+  });
+  await vm.runInContext('loadSpeechSetup()', env.context);
+
+  env.detailsEl.open = true;
+  env.summaryEl.focus();
+  assert.strictEqual(env.detailsEl.open, true);
+  assert.strictEqual(env.doc.activeElement, env.summaryEl);
+
+  env.context.getJson = async () => ({
+    applicable: true,
+    visible: true,
+    state: 'downloading',
+    tone: 'neutral',
+    bytes_received: 2500,
+    bytes_total: 5000,
+    cause: null,
+    recovery_representable: true,
+    command: null,
+  });
+  await vm.runInContext('loadSpeechSetup()', env.context);
+
+  assert.strictEqual(env.detailsEl.open, true);
+  assert.strictEqual(env.doc.activeElement, env.summaryEl);
+  assert.strictEqual(env.bytesEl.getAttribute('data-received'), '2500');
+});
+
+test('applicable: false leaves row hidden and later rejection also leaves it hidden', async () => {
+  const env = createSpeechEnvironment();
+  env.context.getJson = async () => ({
+    applicable: false,
+    visible: false,
+    state: null,
+    tone: null,
+    bytes_received: null,
+    bytes_total: null,
+    cause: null,
+    recovery_representable: false,
+    command: null,
+  });
+  await vm.runInContext('loadSpeechSetup()', env.context);
+  assert.strictEqual(env.speechSetup.hidden, true);
+
+  env.context.getJson = async () => {
+    throw new Error('fetch error');
+  };
+  await vm.runInContext('loadSpeechSetup()', env.context);
+  assert.strictEqual(env.speechSetup.hidden, true);
+});
+
+test('mediaBacklogLine remains after speechSetup in brain card', async () => {
+  const env = createSpeechEnvironment();
+  const mediaBacklog = env.doc.createElement('div');
+  mediaBacklog.id = 'mediaBacklogLine';
+  env.brain.appendChild(mediaBacklog);
+
+  env.context.getJson = async () => ({
+    applicable: true,
+    visible: true,
+    state: 'downloading',
+    tone: 'neutral',
+    bytes_received: 1000,
+    bytes_total: 5000,
+    cause: null,
+    recovery_representable: true,
+    command: null,
+  });
+  await vm.runInContext('loadSpeechSetup()', env.context);
+  assert.strictEqual(env.speechSetup.nextSibling, mediaBacklog);
+  const children = env.brain.children;
+  assert.ok(children.indexOf(env.speechSetup) < children.indexOf(mediaBacklog));
+});
+
+test('initHealth fires health:initial-ready while speech setup read is still pending', async () => {
+  const env = createSpeechEnvironment();
+  let initialReadyFired = false;
+  env.doc.addEventListener('health:initial-ready', () => {
+    initialReadyFired = true;
+  });
+
+  env.context.getJson = () => new Promise(() => {});
+  env.context.requestAnimationFrame = (fn) => fn();
+  env.context.healthInfoReady = Promise.resolve();
+  env.context.registeredClientsReady = Promise.resolve();
+  env.context.loadHealthState = () => Promise.resolve();
+  env.context.loadBackupStatus = () => Promise.resolve();
+  env.context.applyHealthCopy = () => {};
+  env.context.focusBackupDetails = () => {};
+  env.context.focusRecentErrors = () => {};
+  env.context.runRecentErrorsFocus = () => {};
+  env.context.initHealthRealtime = () => {};
+  env.context.healthInitialized = false;
+
+  const initHealthCode = sourceBlock(env.source, 'function initHealth()', "document.addEventListener('workspace:mounted'");
+  vm.runInContext(initHealthCode, env.context);
+
+  vm.runInContext('initHealth()', env.context);
+
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.strictEqual(initialReadyFired, true);
+  assert.strictEqual(vm.runInContext('speechReadPending', env.context), true);
 });
 
 async function runAsyncCases() {

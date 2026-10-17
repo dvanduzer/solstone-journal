@@ -38,6 +38,7 @@ pub use parakeet::{
     PARAKEET_SERVER_PROCESS_NAME, ParakeetLaunchConfig, ParakeetLifecycleSeam, ParakeetPlacement,
     ParakeetProbeSeam, ParakeetRuntimeShared, parakeet_auth_headers, probe_parakeet_cpp_server,
 };
+pub(crate) use parakeet_follow::inspect_parakeet_manifests;
 pub use parakeet_truth::{
     admission_blocked_observation, admission_not_desired_observation, parakeet_platform_can_host,
     platform_cannot_host_not_desired,
@@ -69,4 +70,5 @@ pub use store::{
     FenceKey, FileRuntimeStore, LocalReadySideEffect, LocalRuntimeShared, ReadyProcess,
     ReadyProcessLookup, RuntimeClock, SystemRuntimeClock, read_current_detail,
 };
+pub(crate) use store::{RuntimeHealthObservation, observe_runtime_health};
 pub use wedge::{CortexEventKind, CortexOutcomeEvent, WedgeState, observe_cortex_outcome};

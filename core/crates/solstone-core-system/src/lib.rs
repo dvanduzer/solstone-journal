@@ -31,6 +31,8 @@ pub mod rfdetr;
 pub mod schedule;
 pub mod segment_publication;
 #[cfg(any(unix, windows))]
+pub mod speech_setup;
+#[cfg(any(unix, windows))]
 pub mod status_wire;
 pub mod stt_backend_choice;
 pub mod vulkan_observe;

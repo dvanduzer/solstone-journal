@@ -57,6 +57,8 @@ pub fn routes_with_clock(journal_root: PathBuf, clock: Clock) -> Router {
     let brain_root = journal_root.clone();
     let retry_root = journal_root.clone();
     let work_retry_root = journal_root.clone();
+    let speech_root = journal_root.clone();
+    let speech_clock = clock.clone();
     Router::new()
         .route("/app/health/", get(assets::shell))
         .route("/app/health/workspace", get(assets::workspace))
@@ -71,6 +73,10 @@ pub fn routes_with_clock(journal_root: PathBuf, clock: Clock) -> Router {
         )
         .route("/app/health/api/info", get(move || info(info_root.clone())))
         .route(
+            "/app/health/api/speech-setup",
+            get(move || speech_setup(speech_root.clone(), speech_clock.clone())),
+        )
+        .route(
             "/app/health/api/brain/check",
             post(move || actions::check_brain(brain_root.clone())),
         )
@@ -84,6 +90,23 @@ pub fn routes_with_clock(journal_root: PathBuf, clock: Clock) -> Router {
             post(move |body| actions::retry_work(work_retry_root.clone(), body)),
         )
         .merge(api_router(journal_root))
+}
+
+async fn speech_setup(root: PathBuf, clock: Clock) -> Response {
+    spawn_blocking_response(OwnerReadRole::HealthSpeechSetup, move || {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute());
+        let presentation = solstone_core_system::speech_setup::read_speech_setup(
+            &root,
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            home.as_deref(),
+            clock.now(),
+        );
+        Json(presentation).into_response()
+    })
+    .await
 }
 
 /// Read-only journal-data health routes used by `solstone call health`.

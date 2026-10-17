@@ -4401,6 +4401,7 @@ dependencies = [
  "solstone-core-journal-config",
  "solstone-core-journal-io",
  "solstone-core-journal-stats-cli",
+ "solstone-core-local",
  "solstone-core-reprocess-cli",
  "solstone-core-system",
  "solstone-core-system-health",

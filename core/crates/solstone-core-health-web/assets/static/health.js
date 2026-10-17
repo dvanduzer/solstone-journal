@@ -265,9 +265,293 @@
     }
   }
 
+  const SPEECH_SETUP_COPY = {
+    waiting: {
+      state: 'waiting for setup',
+      explanation: "setup hasn't started yet.",
+      summary: 'setup details',
+    },
+    downloading: {
+      state: 'downloading',
+      explanation: null,
+      summary: 'setup details',
+    },
+    verifying: {
+      state: 'checking the download',
+      explanation: null,
+      summary: 'setup details',
+    },
+    installing: {
+      state: 'installing',
+      explanation: null,
+      summary: 'setup details',
+    },
+    paused: {
+      state: 'setup paused',
+      explanation: 'setup was cancelled.',
+      summary: 'show recovery steps',
+    },
+    cooling: {
+      state: "setup couldn't finish",
+      explanation: 'automatic setup is waiting to try again.',
+      summary: 'show recovery steps',
+    },
+    attention: {
+      state: 'setup needs attention',
+      explanation: "speech recognition isn't ready.",
+      summary: 'show recovery steps',
+    },
+    unavailable: {
+      state: 'status unavailable',
+      explanation: "speech recognition setup couldn't be checked.",
+      summary: 'show recovery steps',
+    },
+  };
+
+  function formatSpeechBytes(bytes) {
+    if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes < 0) return '';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let val = bytes;
+    let idx = 0;
+    while (val >= 1024 && idx < units.length - 1) {
+      val /= 1024;
+      idx += 1;
+    }
+    return idx === 0 ? `${val} B` : `${val.toFixed(1)} ${units[idx]}`;
+  }
+
+  function clearSpeechBytes() {
+    const bytesEl = document.getElementById('speechSetupBytes');
+    if (bytesEl) {
+      bytesEl.hidden = true;
+      bytesEl.textContent = '';
+      bytesEl.removeAttribute('data-received');
+      bytesEl.removeAttribute('data-total');
+    }
+  }
+
+  function hideSpeechSetup() {
+    const setupEl = document.getElementById('speechSetup');
+    if (!setupEl) return;
+    setupEl.hidden = true;
+    setupEl.removeAttribute('data-state');
+    setupEl.classList.remove(
+      'speech-setup-tone-neutral',
+      'speech-setup-tone-calm',
+      'speech-setup-tone-attention',
+      'speech-setup-tone-unavailable'
+    );
+    clearSpeechBytes();
+  }
+
+  function renderSpeechSetup(payload) {
+    const brainCard = document.getElementById('brain');
+    const setupEl = document.getElementById('speechSetup');
+    if (!brainCard || !setupEl) return;
+
+    const mediaBacklog = document.getElementById('mediaBacklogLine');
+    if (mediaBacklog && mediaBacklog.parentNode === brainCard) {
+      if (setupEl.nextSibling !== mediaBacklog) {
+        brainCard.insertBefore(setupEl, mediaBacklog);
+      }
+    }
+
+    setupEl.hidden = false;
+    if (payload.state) {
+      setupEl.setAttribute('data-state', payload.state);
+    } else {
+      setupEl.removeAttribute('data-state');
+    }
+
+    setupEl.classList.remove(
+      'speech-setup-tone-neutral',
+      'speech-setup-tone-calm',
+      'speech-setup-tone-attention',
+      'speech-setup-tone-unavailable'
+    );
+    if (payload.tone) {
+      setupEl.classList.add(`speech-setup-tone-${payload.tone}`);
+    }
+
+    const copy = SPEECH_SETUP_COPY[payload.state] || {
+      state: payload.state || '',
+      explanation: null,
+      summary: 'setup details',
+    };
+
+    const stateEl = document.getElementById('speechSetupState');
+    if (stateEl) {
+      stateEl.textContent = copy.state;
+    }
+
+    const expEl = document.getElementById('speechSetupExplanation');
+    if (expEl) {
+      if (copy.explanation) {
+        expEl.hidden = false;
+        expEl.textContent = copy.explanation;
+      } else {
+        expEl.hidden = true;
+        expEl.textContent = '';
+      }
+    }
+
+    const bytesEl = document.getElementById('speechSetupBytes');
+    if (bytesEl) {
+      const hasReceived = typeof payload.bytes_received === 'number';
+      const hasTotal = typeof payload.bytes_total === 'number';
+      if (hasReceived || hasTotal) {
+        bytesEl.hidden = false;
+        if (hasReceived) bytesEl.setAttribute('data-received', String(payload.bytes_received));
+        else bytesEl.removeAttribute('data-received');
+        if (hasTotal) bytesEl.setAttribute('data-total', String(payload.bytes_total));
+        else bytesEl.removeAttribute('data-total');
+
+        if (hasReceived && hasTotal) {
+          bytesEl.textContent = `${formatSpeechBytes(payload.bytes_received)} of ${formatSpeechBytes(payload.bytes_total)}`;
+        } else if (hasReceived) {
+          bytesEl.textContent = formatSpeechBytes(payload.bytes_received);
+        } else {
+          bytesEl.textContent = formatSpeechBytes(payload.bytes_total);
+        }
+      } else {
+        bytesEl.hidden = true;
+        bytesEl.textContent = '';
+        bytesEl.removeAttribute('data-received');
+        bytesEl.removeAttribute('data-total');
+      }
+    }
+
+    const summaryEl = document.getElementById('speechSetupSummary');
+    if (summaryEl) {
+      summaryEl.textContent = copy.summary;
+    }
+
+    const causeEl = document.getElementById('speechSetupCause');
+    if (causeEl) {
+      if (typeof payload.cause === 'string') {
+        causeEl.hidden = false;
+        causeEl.textContent = payload.cause;
+      } else {
+        causeEl.hidden = true;
+        causeEl.textContent = '';
+      }
+    }
+
+    const instructionEl = document.getElementById('speechSetupInstruction');
+    const commandWrapper = document.getElementById('speechSetupCommandWrapper');
+    const commandEl = document.getElementById('speechSetupCommand');
+    if (typeof payload.command === 'string') {
+      if (instructionEl) instructionEl.hidden = false;
+      if (commandWrapper) commandWrapper.hidden = false;
+      if (commandEl) {
+        commandEl.hidden = false;
+        commandEl.textContent = payload.command;
+      }
+    } else {
+      if (instructionEl) instructionEl.hidden = true;
+      if (commandWrapper) commandWrapper.hidden = true;
+      if (commandEl) {
+        commandEl.hidden = true;
+        commandEl.textContent = '';
+      }
+    }
+  }
+
+  let speechReadPending = false;
+  let speechApplicableLatched = false;
+  let speechAttempt = 0;
+
+  async function loadSpeechSetup() {
+    const card = document.getElementById('brain');
+    if (!card?.isConnected || document.hidden || speechReadPending) return;
+    speechReadPending = true;
+    const attempt = ++speechAttempt;
+    let settled = false;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => {
+      if (settled || attempt !== speechAttempt) return;
+      settled = true;
+      controller.abort();
+      clearSpeechBytes();
+      speechReadPending = false;
+      if (!card.isConnected) return;
+      if (speechApplicableLatched) {
+        renderSpeechSetup({
+          applicable: true,
+          visible: true,
+          state: 'unavailable',
+          tone: 'unavailable',
+          bytes_received: null,
+          bytes_total: null,
+          cause: null,
+          recovery_representable: false,
+          command: null,
+        });
+      }
+    }, 10000);
+
+    try {
+      const payload = await getJson('/app/health/api/speech-setup', { signal: controller.signal });
+      if (settled || attempt !== speechAttempt) return;
+      settled = true;
+      clearTimeout(timeout);
+      speechReadPending = false;
+
+      if (!card.isConnected) return;
+
+      if (!payload || typeof payload !== 'object' || typeof payload.applicable !== 'boolean') {
+        throw new Error('invalid speech-setup payload');
+      }
+
+      if (payload.applicable === false) {
+        speechApplicableLatched = false;
+        hideSpeechSetup();
+        return;
+      }
+
+      speechApplicableLatched = true;
+
+      if (payload.visible === false) {
+        hideSpeechSetup();
+        return;
+      }
+
+      renderSpeechSetup(payload);
+    } catch (error) {
+      if (settled || attempt !== speechAttempt) return;
+      settled = true;
+      clearTimeout(timeout);
+      clearSpeechBytes();
+      speechReadPending = false;
+      if (!card.isConnected) return;
+      logHealthError(error, 'speech setup fetch failed');
+      if (speechApplicableLatched) {
+        renderSpeechSetup({
+          applicable: true,
+          visible: true,
+          state: 'unavailable',
+          tone: 'unavailable',
+          bytes_received: null,
+          bytes_total: null,
+          cause: null,
+          recovery_representable: false,
+          command: null,
+        });
+      } else {
+        hideSpeechSetup();
+      }
+    } finally {
+      clearTimeout(timeout);
+      if (attempt === speechAttempt && !settled) {
+        speechReadPending = false;
+      }
+    }
+  }
+
   function refreshStatusReads() {
     loadRegisteredClients();
     loadBackupStatus();
+    loadSpeechSetup();
   }
 
   function clearHealthStateError() {
@@ -3661,6 +3945,7 @@
     // Do not hold the first Health paint or its existing readiness signal on
     // this independent read. Later reads share the existing visible-tab cycle.
     const backupReady = new Promise(resolve => requestAnimationFrame(() => resolve(loadBackupStatus())));
+    requestAnimationFrame(() => loadSpeechSetup());
     window.addEventListener('hashchange', focusBackupDetails);
     const initialReady = Promise.all([healthInfoReady, registeredClientsReady, loadHealthState()]);
     initialReady.then(() => {

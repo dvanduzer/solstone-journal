@@ -1172,6 +1172,72 @@ pub fn read_current_detail(
     Ok(read_health(&health_record_path(journal_path, provider), provider)?.detail)
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RuntimeHealthObservation {
+    Absent,
+    Unreadable,
+    SetAside,
+    Present { phase: RuntimePhase, detail: Value },
+}
+
+/// Observe the durable runtime health record without repair authority.
+/// This read must leave the file in place.
+pub(crate) fn observe_runtime_health(
+    journal_path: &Path,
+    provider: ProviderName,
+) -> RuntimeHealthObservation {
+    use solstone_core_journal_io::durability::{
+        ArtifactId, DurableObservation, observe_json_durable,
+    };
+
+    let path = health_record_path(journal_path, provider);
+    let value = match observe_json_durable::<Value>(ArtifactId::ProviderRuntimeHealth, &path) {
+        DurableObservation::Absent => return RuntimeHealthObservation::Absent,
+        DurableObservation::Unreadable { .. } => return RuntimeHealthObservation::Unreadable,
+        DurableObservation::Malformed { .. } => return RuntimeHealthObservation::SetAside,
+        DurableObservation::Present(value) => value,
+    };
+
+    let Some(object) = value.as_object() else {
+        return RuntimeHealthObservation::SetAside;
+    };
+    if validate_schema_and_provider(object, provider).is_err() {
+        return RuntimeHealthObservation::SetAside;
+    }
+    let Some(phase) = object
+        .get("phase")
+        .and_then(Value::as_str)
+        .and_then(runtime_phase_from_wire)
+    else {
+        return RuntimeHealthObservation::SetAside;
+    };
+    if validate_optional_reason(object.get("reason_code")).is_err() {
+        return RuntimeHealthObservation::SetAside;
+    }
+    if !object.get("detail").is_none_or(Value::is_object) {
+        return RuntimeHealthObservation::SetAside;
+    }
+    if optional_object(object.get("owner")).is_err() {
+        return RuntimeHealthObservation::SetAside;
+    }
+    if nonnegative(object.get("revision")).is_err() {
+        return RuntimeHealthObservation::SetAside;
+    }
+    if nonnegative(object.get("generation")).is_err() {
+        return RuntimeHealthObservation::SetAside;
+    }
+    if nonnegative(object.get("attempt"))
+        .ok()
+        .and_then(|a| u32::try_from(a).ok())
+        .is_none()
+    {
+        return RuntimeHealthObservation::SetAside;
+    }
+
+    let detail = object.get("detail").cloned().unwrap_or_else(|| json!({}));
+    RuntimeHealthObservation::Present { phase, detail }
+}
+
 fn read_health(path: &Path, provider: ProviderName) -> Result<HealthRecord, RuntimeStoreError> {
     use solstone_core_journal_io::durability::{
         ArtifactId, DurableRead, read_json_durable_validated,
