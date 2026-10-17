@@ -1293,6 +1293,16 @@ pub fn current_setup_facts() -> SetupCatalogFacts {
 /// Shared copy uses named placeholders; measured download facts live in setup state.
 /// This stays callable before a journal exists or a runtime install plan is selected.
 pub fn setup_copy(_facts: &SetupCatalogFacts) -> serde_json::Value {
+    let choices = LANES
+        .into_iter()
+        .map(|mut lane| {
+            // Setup actions use spp; the existing Thinking page uses confidential.
+            if lane.id == "confidential" {
+                lane.id = "spp";
+            }
+            lane
+        })
+        .collect::<Vec<_>>();
     serde_json::json!({
         "schema": "solstone.setup-copy.v1",
         "welcome": {
@@ -1323,6 +1333,7 @@ pub fn setup_copy(_facts: &SetupCatalogFacts) -> serde_json::Value {
         },
         "thinking": {
             "title": "thinking",
+            "choices": choices,
             "default_line": "on your journal's computer · {size}",
             "size_unknown": "download size unavailable",
             "choose_later": "choose thinking when you're ready",
@@ -1400,6 +1411,23 @@ mod tests {
                 .unwrap()
                 .contains("{size}")
         );
+    }
+
+    #[test]
+    fn setup_choice_ids_are_action_ids_and_copy_comes_from_shared_lanes() {
+        let copy = setup_copy(&current_setup_facts());
+        let choices = copy["thinking"]["choices"].as_array().unwrap();
+        let mut ids = choices
+            .iter()
+            .map(|choice| choice["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, ["byo", "local", "spp"]);
+        for (choice, lane) in choices.iter().zip(LANES) {
+            assert_eq!(choice["label"], lane.label);
+            assert_eq!(choice["sub"], lane.sub);
+            assert_eq!(choice["description"], lane.description);
+        }
     }
 
     #[test]
