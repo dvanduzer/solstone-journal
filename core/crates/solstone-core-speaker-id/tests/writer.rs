@@ -805,6 +805,99 @@ fn unknown_schema_is_distinct_from_malformed_request() {
     ));
 }
 
+#[test]
+fn old_request_body_keeps_previous_sentence_keys_and_omits_new_fields() {
+    let directory = TempDir::new();
+    let statements = json!([{
+        "id": 1,
+        "start_offset_us": 100_000,
+        "text": "old sentence text",
+        "speaker": 1,
+    }]);
+    let req = request(&directory, statements, json!([]), json!([]), 0);
+    write(req).expect("write");
+
+    let file_lines = lines(&directory.path().join("segment.jsonl"));
+    assert_eq!(file_lines.len(), 2);
+    let sentence = &file_lines[1];
+    let keys: Vec<&str> = sentence
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["start", "text", "source", "speaker", "sentence_id"]
+    );
+    assert!(sentence.get("speaker_turn_evidence").is_none());
+    assert!(sentence.get("turn_boundary_suspect").is_none());
+}
+
+#[test]
+fn malformed_evidence_object_errors() {
+    let directory = TempDir::new();
+    let statements = json!([{
+        "id": 1,
+        "start_offset_us": 100_000,
+        "text": "hello",
+        "speaker": 1,
+        "speaker_turn_evidence": {
+            "version": "bad-version",
+            "audio_duration_s": 10.0,
+            "ranges": [],
+        },
+    }]);
+    let req = request(&directory, statements, json!([]), json!([]), 0);
+    let error = write(req).unwrap_err();
+    assert_eq!(error.reason(), "invalid-statement");
+}
+
+#[test]
+fn turn_boundary_suspect_false_errors() {
+    let directory = TempDir::new();
+    let statements = json!([{
+        "id": 1,
+        "start_offset_us": 100_000,
+        "text": "hello",
+        "speaker": 1,
+        "turn_boundary_suspect": false,
+    }]);
+    let req = request(&directory, statements, json!([]), json!([]), 0);
+    let error = write(req).unwrap_err();
+    assert_eq!(error.reason(), "invalid-statement");
+}
+
+#[test]
+fn speaker_turn_evidence_null_errors() {
+    let directory = TempDir::new();
+    let statements = json!([{
+        "id": 1,
+        "start_offset_us": 100_000,
+        "text": "hello",
+        "speaker": 1,
+        "speaker_turn_evidence": null,
+    }]);
+    let req = request(&directory, statements, json!([]), json!([]), 0);
+    let error = write(req).unwrap_err();
+    assert_eq!(error.reason(), "invalid-statement");
+}
+
+#[test]
+fn turn_boundary_suspect_null_errors() {
+    let directory = TempDir::new();
+    let statements = json!([{
+        "id": 1,
+        "start_offset_us": 100_000,
+        "text": "hello",
+        "speaker": 1,
+        "turn_boundary_suspect": null,
+    }]);
+    let req = request(&directory, statements, json!([]), json!([]), 0);
+    let error = write(req).unwrap_err();
+    assert_eq!(error.reason(), "invalid-statement");
+}
+
 fn python_splitlines(value: &str) -> Vec<&str> {
     let mut lines = Vec::new();
     let mut start = 0;

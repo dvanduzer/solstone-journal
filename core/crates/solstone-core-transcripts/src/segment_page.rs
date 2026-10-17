@@ -26,6 +26,8 @@ use crate::{next_statement_ordinal, speaker_label_source};
 pub const MAX_TRANSCRIPT_PAGE_BYTES: usize = 64 * 1024;
 /// Largest number of transcript entries returned for one transcript page.
 pub const MAX_TRANSCRIPT_PAGE_ITEMS: usize = 100;
+pub const POSSIBLE_SPEAKER_CHANGE_WITHIN_SENTENCE: &str =
+    "possible speaker change within this sentence";
 
 /// Parsed wall-clock times and formatted display range for a chronicle segment.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -373,16 +375,29 @@ fn complete_lines(bytes: &[u8]) -> Result<Vec<(&str, usize)>, SegmentTranscriptR
     Ok(lines)
 }
 
+fn append_speaker_change_warning(text: &str, line: &str) -> String {
+    let suspect = serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|v| v.get("turn_boundary_suspect").and_then(Value::as_bool))
+        == Some(true);
+    if suspect && !text.is_empty() {
+        format!("{text} {POSSIBLE_SPEAKER_CHANGE_WITHIN_SENTENCE}")
+    } else {
+        text.to_owned()
+    }
+}
+
 fn project_line(segment_origin: &str, name: &str, line: &str) -> String {
     let rel = format!("{segment_origin}/{name}");
     match classify(&rel) {
         ContentResolution::Unindexed(RawPerceptFamily::Audio) => {
-            produce_raw_percept_chunks(RawPerceptFamily::Audio, &rel, line)
+            let text = produce_raw_percept_chunks(RawPerceptFamily::Audio, &rel, line)
                 .chunks
                 .into_iter()
                 .map(|chunk| chunk.content)
                 .collect::<Vec<_>>()
-                .join("\n")
+                .join("\n");
+            append_speaker_change_warning(&text, line)
         }
         ContentResolution::Indexed(Family::AiChat) => {
             let produced = produce_chunks(Family::AiChat, &rel, line);
@@ -415,12 +430,13 @@ fn project_line(segment_origin: &str, name: &str, line: &str) -> String {
                 || (name.ends_with("_transcript.jsonl")
                     || solstone_core_format::audio_archive::is_audio_archive_transcript_name(name))
             {
-                produce_raw_percept_chunks(RawPerceptFamily::Audio, &rel, line)
+                let text = produce_raw_percept_chunks(RawPerceptFamily::Audio, &rel, line)
                     .chunks
                     .into_iter()
                     .map(|chunk| chunk.content)
                     .collect::<Vec<_>>()
-                    .join("\n")
+                    .join("\n");
+                append_speaker_change_warning(&text, line)
             } else {
                 line.to_owned()
             }
@@ -931,5 +947,104 @@ mod tests {
             .unwrap();
         let page = read_segment_transcript_page(root.path(), &segment, None).unwrap();
         assert_eq!(page.entries[0].text, "[00:00:00] **User:** hello");
+    }
+
+    #[test]
+    fn audio_transcript_page_appends_warning_to_flagged_line_only() {
+        let root = tempfile::tempdir().unwrap();
+        let segment_dir = root.path().join("chronicle/20260914/default/090000_300");
+        fs::create_dir_all(&segment_dir).unwrap();
+
+        let flagged_line = serde_json::json!({
+            "start": "00:00:10",
+            "text": "Is the gate open? It is open.",
+            "speaker": 1,
+            "sentence_id": 1,
+            "turn_boundary_suspect": true,
+            "speaker_turn_evidence": {
+                "version": "window-local-turns-v1",
+                "audio_duration_s": 20.0,
+                "ranges": [{"start_s": 11.0, "end_s": 12.0}],
+            },
+        });
+        let neighbor_line = serde_json::json!({
+            "start": "00:00:15",
+            "text": "Neighbor speech without warning.",
+            "speaker": 2,
+            "sentence_id": 2,
+        });
+
+        let audio_content = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&flagged_line).unwrap(),
+            serde_json::to_string(&neighbor_line).unwrap()
+        );
+        fs::write(segment_dir.join("audio.jsonl"), audio_content).unwrap();
+
+        let segment = iter_segments(root.path(), PathOrDay::Day("20260914"))
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        let page = read_segment_transcript_page(root.path(), &segment, None).unwrap();
+        assert_eq!(page.entries.len(), 2);
+
+        let flagged_entry = &page.entries[0].text;
+        assert!(flagged_entry.contains("Is the gate open? It is open."));
+        assert!(flagged_entry.contains("Speaker 1:"));
+        assert!(flagged_entry.contains("possible speaker change within this sentence"));
+
+        let neighbor_entry = &page.entries[1].text;
+        let neighbor_chunks = produce_raw_percept_chunks(
+            RawPerceptFamily::Audio,
+            "chronicle/20260914/default/090000_300/audio.jsonl",
+            &serde_json::to_string(&neighbor_line).unwrap(),
+        );
+        assert_eq!(neighbor_entry, &neighbor_chunks.chunks[0].content);
+        assert!(!neighbor_entry.contains("possible speaker change within this sentence"));
+    }
+
+    #[test]
+    fn produce_raw_percept_chunks_ignores_turn_boundary_suspect_and_speaker_turn_evidence() {
+        let flagged = serde_json::json!({
+            "start": "00:00:10",
+            "text": "Is the gate open? It is open.",
+            "speaker": 1,
+            "sentence_id": 1,
+            "turn_boundary_suspect": true,
+            "speaker_turn_evidence": {
+                "version": "window-local-turns-v1",
+                "audio_duration_s": 20.0,
+                "ranges": [{"start_s": 11.0, "end_s": 12.0}],
+            },
+        });
+        let unflagged = serde_json::json!({
+            "start": "00:00:10",
+            "text": "Is the gate open? It is open.",
+            "speaker": 1,
+            "sentence_id": 1,
+        });
+
+        let rel = "chronicle/20260914/default/090000_300/audio.jsonl";
+        let chunks_flagged = produce_raw_percept_chunks(
+            RawPerceptFamily::Audio,
+            rel,
+            &serde_json::to_string(&flagged).unwrap(),
+        );
+        let chunks_unflagged = produce_raw_percept_chunks(
+            RawPerceptFamily::Audio,
+            rel,
+            &serde_json::to_string(&unflagged).unwrap(),
+        );
+
+        assert_eq!(chunks_flagged.chunks.len(), chunks_unflagged.chunks.len());
+        assert_eq!(
+            chunks_flagged.chunks[0].content,
+            chunks_unflagged.chunks[0].content
+        );
+        assert_eq!(
+            chunks_flagged.chunks[0].occurrence_time_ms,
+            chunks_unflagged.chunks[0].occurrence_time_ms
+        );
     }
 }

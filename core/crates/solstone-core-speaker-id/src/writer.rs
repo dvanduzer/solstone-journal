@@ -13,6 +13,7 @@ use serde_json::{Map, Value};
 use solstone_core_journal_io::{
     AtomicWriteError, AtomicWriteOptions, atomic_replace, write_bytes_exclusive,
 };
+use solstone_core_speakers::SpeakerTurnEvidence;
 
 use crate::ascii_json;
 use crate::npz::NpzMembers;
@@ -180,6 +181,8 @@ struct Statement {
     start_offset_us: i64,
     text: String,
     speaker: Option<Value>,
+    speaker_turn_evidence: Option<SpeakerTurnEvidence>,
+    turn_boundary_suspect: bool,
 }
 
 struct Embeddings {
@@ -454,11 +457,32 @@ fn parse_statements(value: &Value) -> Result<Vec<Statement>, SpeakerTranscriptWr
                     });
                 }
             };
+            let speaker_turn_evidence = match object.get("speaker_turn_evidence") {
+                None => None,
+                Some(value) => Some(SpeakerTurnEvidence::from_value(value).map_err(|error| {
+                    SpeakerTranscriptWriteError::InvalidStatement {
+                        statement_index,
+                        detail: format!("invalid speaker_turn_evidence: {error}"),
+                    }
+                })?),
+            };
+            let turn_boundary_suspect = match object.get("turn_boundary_suspect") {
+                None => false,
+                Some(Value::Bool(true)) => true,
+                Some(_) => {
+                    return Err(SpeakerTranscriptWriteError::InvalidStatement {
+                        statement_index,
+                        detail: "turn_boundary_suspect must be true if present".to_owned(),
+                    });
+                }
+            };
             Ok(Statement {
                 id: id as i32,
                 start_offset_us,
                 text,
                 speaker,
+                speaker_turn_evidence,
+                turn_boundary_suspect,
             })
         })
         .collect()
@@ -738,6 +762,12 @@ fn build_jsonl(
             "sentence_id".to_owned(),
             Value::from(i64::from(statement.id)),
         );
+        if let Some(evidence) = &statement.speaker_turn_evidence {
+            entry.insert("speaker_turn_evidence".to_owned(), evidence.to_value());
+        }
+        if statement.turn_boundary_suspect {
+            entry.insert("turn_boundary_suspect".to_owned(), Value::Bool(true));
+        }
         lines.push(ascii_json::to_string(&Value::Object(entry)));
     }
     Ok(format!("{}\n", lines.join("\n")).into_bytes())

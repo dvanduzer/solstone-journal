@@ -35,6 +35,7 @@ solstone-core-observe-audio = { workspace = true }
 solstone-core-system = { workspace = true }
 solstone-core-system-health = { workspace = true }
 solstone-core-speaker-id = { workspace = true }
+solstone-core-speakers = { workspace = true }
 solstone-core-processing-record = { workspace = true }
 solstone-core-callosum = { workspace = true }
 solstone-core-journal-config = { workspace = true }

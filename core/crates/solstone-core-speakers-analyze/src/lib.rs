@@ -6,7 +6,7 @@
 //! Native one-record speaker analysis command contract.
 //!
 //! Scalar and vector response fields such as `statement_ids`, `durations_s`,
-//! `encoder`, `evidence.*`, `pyannote.window_stats`, and `diarization.*` are
+//! `encoder`, `evidence.*`, `pyannote.window_stats`, `pyannote.speaker_turns`, and `diarization.*` are
 //! written directly to stdout.
 //!
 //! Matrix-valued fields (`statement_embeddings.embeddings` and
@@ -37,10 +37,13 @@ use solstone_core_speakers::discovery::{
 #[cfg(feature = "runtime")]
 use solstone_core_speakers::{
     PYANNOTE_CLASS_COUNT, PYANNOTE_DIARIZE_STRIDE_S, SpeakerEvidence, SpeakerFeatureError,
-    SpeakerSegmentationError, SpeakerWindowStats, admit_statement_features,
-    compute_wespeaker_filterbank_cmn, decide_speaker_evidence, run_pyannote_segmentation_pass,
+    SpeakerSegmentationError, admit_statement_features, compute_wespeaker_filterbank_cmn,
+    decide_speaker_evidence, run_pyannote_segmentation_pass,
 };
-use solstone_core_speakers::{StatementSpan, WESPEAKER_EMBEDDING_SIZE, WESPEAKER_SAMPLE_RATE_HZ};
+use solstone_core_speakers::{
+    SpeakerTurnEvidence, SpeakerWindowStats, StatementSpan, WESPEAKER_EMBEDDING_SIZE,
+    WESPEAKER_SAMPLE_RATE_HZ,
+};
 #[cfg(feature = "runtime")]
 use solstone_core_speakers_onnx::{
     PlatformDescriptor, PyannoteSegmenter, SpeakerOnnxError, WespeakerEmbedder,
@@ -491,9 +494,10 @@ fn analyze_request(request: &Request) -> Result<Value, AnalyzeError> {
             },
         },
         "statement_embeddings": statement_embeddings,
-        "pyannote": {
-            "window_stats": window_stats_value(&pyannote_result.window_stats),
-        },
+        "pyannote": pyannote_response_value(
+            &pyannote_result.window_stats,
+            &pyannote_result.speaker_turns,
+        ),
         "evidence": {
             "speaker_evidence": evidence.speaker_evidence.as_str(),
             "multi_window_fraction": evidence.multi_window_fraction,
@@ -1213,7 +1217,6 @@ fn intervals_value(intervals: &[SpeakerInterval]) -> Value {
     )
 }
 
-#[cfg(feature = "runtime")]
 fn window_stats_value(stats: &[SpeakerWindowStats]) -> Value {
     Value::Array(
         stats
@@ -1227,6 +1230,16 @@ fn window_stats_value(stats: &[SpeakerWindowStats]) -> Value {
             })
             .collect::<Vec<_>>(),
     )
+}
+
+fn pyannote_response_value(
+    window_stats: &[SpeakerWindowStats],
+    speaker_turns: &SpeakerTurnEvidence,
+) -> Value {
+    json!({
+        "window_stats": window_stats_value(window_stats),
+        "speaker_turns": speaker_turns.to_value(),
+    })
 }
 
 #[cfg(feature = "runtime")]
@@ -1419,6 +1432,7 @@ mod tests {
     #[cfg(all(test, not(feature = "full-tests")))]
     mod routine_request {
         use super::*;
+        use solstone_core_speakers::SPEAKER_TURN_EVIDENCE_VERSION;
 
         #[cfg(not(feature = "full-tests"))]
         #[test]
@@ -1517,6 +1531,24 @@ mod tests {
 
             assert_eq!(error.reason(), "unknown-schema");
             assert_eq!(error.exit_code(), 64);
+        }
+
+        #[cfg(not(feature = "full-tests"))]
+        #[test]
+        fn single_and_no_speech_sections_include_speaker_turns() {
+            let empty_evidence = SpeakerTurnEvidence::new(10.0, vec![]);
+            let response = pyannote_response_value(&[], &empty_evidence);
+
+            assert_eq!(
+                response["speaker_turns"]["version"],
+                SPEAKER_TURN_EVIDENCE_VERSION
+            );
+            assert_eq!(response["speaker_turns"]["ranges"], json!([]));
+            assert_eq!(response["speaker_turns"]["audio_duration_s"], 10.0);
+
+            let legacy = json!({ "window_stats": [] });
+            assert!(legacy.get("speaker_turns").is_none());
+            assert_ne!(legacy, response);
         }
     }
 

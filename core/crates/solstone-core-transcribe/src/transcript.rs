@@ -248,6 +248,19 @@ fn native_statement(statement: &Map<String, Value>) -> Result<Value, TranscribeE
     if let Some(speaker) = statement.get("speaker") {
         native.insert("speaker".to_owned(), speaker.clone());
     }
+    if let Some(speaker_turn_evidence) = statement.get("speaker_turn_evidence") {
+        native.insert(
+            "speaker_turn_evidence".to_owned(),
+            speaker_turn_evidence.clone(),
+        );
+    }
+    if statement
+        .get("turn_boundary_suspect")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        native.insert("turn_boundary_suspect".to_owned(), Value::Bool(true));
+    }
     Ok(Value::Object(native))
 }
 
@@ -368,7 +381,10 @@ mod tests {
 
     use super::{FullTranscriptWrite, restore_statement_timestamps, write_full_transcript};
     use crate::processing::analyzed_record;
-    use crate::speakers::{SpeakerAnalyzeResult, SpeakerEmbeddingPayload};
+    use crate::speakers::{
+        SpeakerAnalyzeResult, SpeakerEmbeddingPayload, accepted_result_from_response,
+    };
+    use solstone_core_speakers::SPEAKER_TURN_EVIDENCE_VERSION;
 
     fn result(statements: Vec<Map<String, Value>>) -> SpeakerAnalyzeResult {
         SpeakerAnalyzeResult {
@@ -532,5 +548,292 @@ mod tests {
         .unwrap();
         assert_eq!(response.embedding_row_count, 1);
         assert!(npz.is_file());
+    }
+
+    fn helper_response(payload: &std::path::Path, turns: Option<Value>) -> Value {
+        let mut pyannote = json!({"window_stats": []});
+        if let Some(turns) = turns {
+            pyannote["speaker_turns"] = turns;
+        }
+        json!({
+            "schema": "solstone-speaker-analyze-response-v1",
+            "sample_rate_hz": 16_000,
+            "inputs": {
+                "statement_embedding": {"statement_ids": [], "spans_s": []},
+                "diarization": {"statement_ids": [], "spans_s": []},
+            },
+            "statement_embeddings": {
+                "audio_buffer": "full",
+                "encoder": "wespeaker-resnet34-256",
+                "payload_format": "raw-f32le-row-major-v1",
+                "payload_path": payload,
+                "dtype": "float32-le",
+                "statement_ids": [],
+                "durations_s": [],
+                "shape": [0, 256],
+                "byte_count": 0,
+                "admitted_count": 0,
+                "skipped_count": 0,
+            },
+            "pyannote": pyannote,
+            "evidence": {
+                "speaker_evidence": "none",
+                "multi_window_fraction": 0.0,
+                "mean_window_overlap_share": 0.0,
+                "overlap_fraction": 0.0,
+            },
+            "diarization": {
+                "intervals": null,
+                "valid_intervals": null,
+                "interval_embeddings": null,
+                "cluster_labels": null,
+                "statement_labels": null,
+                "silhouette_k": null,
+                "effective_k": null,
+            },
+        })
+    }
+
+    #[test]
+    fn connected_persistence_reduction_flags_restored_sentence_and_preserves_evidence() {
+        let reduction = AudioReduction {
+            segments: vec![SpeechSegment {
+                original_start_s: 10.0,
+                original_end_s: 14.0,
+                reduced_start_s: 0.0,
+                reduced_end_s: 4.0,
+            }],
+            original_duration_s: 20.0,
+            reduced_duration_s: 4.0,
+        };
+        let restored = restore_statement_timestamps(
+            &[Map::from_iter([
+                ("id".to_owned(), Value::from(1)),
+                ("start".to_owned(), Value::from(0.0)),
+                ("end".to_owned(), Value::from(4.0)),
+                (
+                    "text".to_owned(),
+                    Value::String("Is the gate open? It is open.".to_owned()),
+                ),
+                ("speaker".to_owned(), json!(1)),
+            ])],
+            &reduction,
+        );
+
+        let temporary = tempfile::tempdir().unwrap();
+        let raw = temporary.path().join("clip.wav");
+        let jsonl = temporary.path().join("clip.jsonl");
+        let npz = temporary.path().join("clip.npz");
+        let payload = temporary.path().join("payload.f32le");
+        fs::write(&raw, b"audio").unwrap();
+        fs::write(&payload, []).unwrap();
+
+        let turns = json!({
+            "version": SPEAKER_TURN_EVIDENCE_VERSION,
+            "audio_duration_s": 20.0,
+            "ranges": [{"start_s": 11.0, "end_s": 12.0}],
+        });
+        let response = helper_response(&payload, Some(turns));
+        let speaker_result =
+            accepted_result_from_response(&raw, &response, &payload, &restored, &[], &[], 16_000)
+                .unwrap();
+
+        let processing = analyzed_record(5);
+        write_full_transcript(write_request(
+            &raw,
+            &jsonl,
+            &npz,
+            &speaker_result,
+            &processing,
+        ))
+        .unwrap();
+
+        let content = fs::read_to_string(&jsonl).unwrap();
+        let sentence_line = content.lines().nth(1).unwrap();
+        let parsed: Value = serde_json::from_str(sentence_line).unwrap();
+
+        let keys: Vec<&str> = parsed
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "start",
+                "text",
+                "speaker",
+                "sentence_id",
+                "speaker_turn_evidence",
+                "turn_boundary_suspect",
+            ]
+        );
+        assert_eq!(parsed["start"], "00:00:10");
+        assert_eq!(parsed["text"], "Is the gate open? It is open.");
+        assert_eq!(parsed["speaker"], 1);
+        assert_eq!(parsed["sentence_id"], 1);
+        assert_eq!(parsed["turn_boundary_suspect"], true);
+        assert_eq!(parsed["speaker_turn_evidence"]["audio_duration_s"], 20.0);
+        assert_eq!(
+            parsed["speaker_turn_evidence"]["ranges"],
+            json!([{"start_s": 11.0, "end_s": 12.0}])
+        );
+    }
+
+    #[test]
+    fn connected_persistence_measured_empty_ranges_persists_evidence_without_boolean() {
+        let statements = vec![Map::from_iter([
+            ("id".to_owned(), Value::from(1)),
+            ("start".to_owned(), Value::from(0.0)),
+            ("end".to_owned(), Value::from(4.0)),
+            (
+                "text".to_owned(),
+                Value::String("Is the gate open? It is open.".to_owned()),
+            ),
+            ("speaker".to_owned(), json!(1)),
+        ])];
+
+        let temporary = tempfile::tempdir().unwrap();
+        let raw = temporary.path().join("clip.wav");
+        let jsonl = temporary.path().join("clip.jsonl");
+        let npz = temporary.path().join("clip.npz");
+        let payload = temporary.path().join("payload.f32le");
+        fs::write(&raw, b"audio").unwrap();
+        fs::write(&payload, []).unwrap();
+
+        let turns = json!({
+            "version": SPEAKER_TURN_EVIDENCE_VERSION,
+            "audio_duration_s": 20.0,
+            "ranges": [],
+        });
+        let response = helper_response(&payload, Some(turns));
+        let speaker_result =
+            accepted_result_from_response(&raw, &response, &payload, &statements, &[], &[], 16_000)
+                .unwrap();
+
+        let processing = analyzed_record(5);
+        write_full_transcript(write_request(
+            &raw,
+            &jsonl,
+            &npz,
+            &speaker_result,
+            &processing,
+        ))
+        .unwrap();
+
+        let content = fs::read_to_string(&jsonl).unwrap();
+        let sentence_line = content.lines().nth(1).unwrap();
+        let parsed: Value = serde_json::from_str(sentence_line).unwrap();
+
+        assert_eq!(parsed["speaker_turn_evidence"]["ranges"], json!([]));
+        assert!(parsed.get("turn_boundary_suspect").is_none());
+    }
+
+    #[test]
+    fn connected_persistence_old_helper_without_speaker_turns_omits_both_keys() {
+        let statements = vec![Map::from_iter([
+            ("id".to_owned(), Value::from(1)),
+            ("start".to_owned(), Value::from(0.0)),
+            ("end".to_owned(), Value::from(4.0)),
+            (
+                "text".to_owned(),
+                Value::String("Is the gate open? It is open.".to_owned()),
+            ),
+            ("speaker".to_owned(), json!(1)),
+        ])];
+
+        let temporary = tempfile::tempdir().unwrap();
+        let raw = temporary.path().join("clip.wav");
+        let jsonl = temporary.path().join("clip.jsonl");
+        let npz = temporary.path().join("clip.npz");
+        let payload = temporary.path().join("payload.f32le");
+        fs::write(&raw, b"audio").unwrap();
+        fs::write(&payload, []).unwrap();
+
+        let response = helper_response(&payload, None);
+        let speaker_result =
+            accepted_result_from_response(&raw, &response, &payload, &statements, &[], &[], 16_000)
+                .unwrap();
+
+        let processing = analyzed_record(5);
+        write_full_transcript(write_request(
+            &raw,
+            &jsonl,
+            &npz,
+            &speaker_result,
+            &processing,
+        ))
+        .unwrap();
+
+        let content = fs::read_to_string(&jsonl).unwrap();
+        let sentence_line = content.lines().nth(1).unwrap();
+        let parsed: Value = serde_json::from_str(sentence_line).unwrap();
+
+        assert!(parsed.get("speaker_turn_evidence").is_none());
+        assert!(parsed.get("turn_boundary_suspect").is_none());
+    }
+
+    #[test]
+    fn connected_persistence_boundary_turn_range_at_junction_omits_boolean_for_both() {
+        let statements = vec![
+            Map::from_iter([
+                ("id".to_owned(), Value::from(1)),
+                ("start".to_owned(), Value::from(0.0)),
+                ("end".to_owned(), Value::from(5.0)),
+                (
+                    "text".to_owned(),
+                    Value::String("Is the gate open? It is open.".to_owned()),
+                ),
+                ("speaker".to_owned(), json!(1)),
+            ]),
+            Map::from_iter([
+                ("id".to_owned(), Value::from(2)),
+                ("start".to_owned(), Value::from(5.0)),
+                ("end".to_owned(), Value::from(10.0)),
+                (
+                    "text".to_owned(),
+                    Value::String("Is the gate open? It is open.".to_owned()),
+                ),
+                ("speaker".to_owned(), json!(1)),
+            ]),
+        ];
+
+        let temporary = tempfile::tempdir().unwrap();
+        let raw = temporary.path().join("clip.wav");
+        let jsonl = temporary.path().join("clip.jsonl");
+        let npz = temporary.path().join("clip.npz");
+        let payload = temporary.path().join("payload.f32le");
+        fs::write(&raw, b"audio").unwrap();
+        fs::write(&payload, []).unwrap();
+
+        let turns = json!({
+            "version": SPEAKER_TURN_EVIDENCE_VERSION,
+            "audio_duration_s": 10.0,
+            "ranges": [{"start_s": 5.0, "end_s": 5.0}],
+        });
+        let response = helper_response(&payload, Some(turns));
+        let speaker_result =
+            accepted_result_from_response(&raw, &response, &payload, &statements, &[], &[], 16_000)
+                .unwrap();
+
+        let processing = analyzed_record(5);
+        write_full_transcript(write_request(
+            &raw,
+            &jsonl,
+            &npz,
+            &speaker_result,
+            &processing,
+        ))
+        .unwrap();
+
+        let content = fs::read_to_string(&jsonl).unwrap();
+        let sentence1: Value = serde_json::from_str(content.lines().nth(1).unwrap()).unwrap();
+        let sentence2: Value = serde_json::from_str(content.lines().nth(2).unwrap()).unwrap();
+
+        assert!(sentence1.get("speaker_turn_evidence").is_some());
+        assert!(sentence1.get("turn_boundary_suspect").is_none());
+        assert!(sentence2.get("speaker_turn_evidence").is_some());
+        assert!(sentence2.get("turn_boundary_suspect").is_none());
     }
 }

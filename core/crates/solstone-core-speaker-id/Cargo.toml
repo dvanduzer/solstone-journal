@@ -18,6 +18,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 solstone-core-journal-io.workspace = true
 solstone-core-npy.workspace = true
+solstone-core-speakers.workspace = true
 zip = { version = "=2.4.2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]

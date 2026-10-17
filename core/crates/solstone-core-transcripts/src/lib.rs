@@ -23,9 +23,10 @@ mod speaker_coordinates;
 pub use speaker_coordinates::{next_statement_ordinal, speaker_label_source};
 
 pub use segment_page::{
-    MAX_TRANSCRIPT_PAGE_BYTES, MAX_TRANSCRIPT_PAGE_ITEMS, SegmentClock, SegmentTranscriptCursor,
-    SegmentTranscriptEntry, SegmentTranscriptPage, SegmentTranscriptReadError,
-    SegmentTranscriptVersion, read_segment_transcript_page, segment_clock,
+    MAX_TRANSCRIPT_PAGE_BYTES, MAX_TRANSCRIPT_PAGE_ITEMS, POSSIBLE_SPEAKER_CHANGE_WITHIN_SENTENCE,
+    SegmentClock, SegmentTranscriptCursor, SegmentTranscriptEntry, SegmentTranscriptPage,
+    SegmentTranscriptReadError, SegmentTranscriptVersion, read_segment_transcript_page,
+    segment_clock,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -210,8 +210,9 @@ fn shipping_closure_excludes_speaker_crates() {
     let packages = lock_dependencies();
     let closure = dependency_closure("solstone-core", &packages);
 
+    // The pure speakers crate is in the default closure because sentence turn
+    // evidence is validated there; the ONNX speaker crates stay out.
     for excluded in [
-        "solstone-core-speakers",
         "solstone-core-speakers-onnx",
         "solstone-core-speakers-analyze",
     ] {

@@ -24,6 +24,7 @@ use solstone_core_format::objects::{objects_line, objects_overlay};
 use solstone_core_format::segment::segment_parse;
 use solstone_core_processing_record::vocab;
 use solstone_core_system_health::{DataState, derive_modality_state};
+use solstone_core_transcripts::POSSIBLE_SPEAKER_CHANGE_WITHIN_SENTENCE;
 
 use crate::day::valid_day;
 use crate::segment_media::{SegmentMedia, discover, markdown_files, markdown_only};
@@ -524,7 +525,11 @@ fn audio_chunks(
                     .unwrap_or_default()
                     .to_owned()
             });
-        let mut chunk = json!({"type":"audio","time":start,"timestamp":produced.chunks.iter().find(|chunk| chunk.source.as_ref() == Some(row)).and_then(|chunk| chunk.occurrence_time_ms).map_or(0, |value| local_wall_instant(context.zone, value.0)),"markdown":strip_speaker_prefix(&markdown, row.get("speaker")),"sentence_id":sid,"speaker_source":source,"has_embedding":sid.is_some_and(|id| ids.contains(&id)),"speaker_actionable":speakers.state.present && speakers.state.loaded && speakers.state.source.as_deref() == Some(source) && sid.is_some_and(|id| ids.contains(&id)),"source_ref":{"start":start,"source":row.get("source"),"speaker":row.get("speaker")}});
+        let mut markdown = strip_speaker_prefix(&markdown, row.get("speaker"));
+        if row.get("turn_boundary_suspect").and_then(Value::as_bool) == Some(true) {
+            markdown = format!("{markdown} {POSSIBLE_SPEAKER_CHANGE_WITHIN_SENTENCE}");
+        }
+        let mut chunk = json!({"type":"audio","time":start,"timestamp":produced.chunks.iter().find(|chunk| chunk.source.as_ref() == Some(row)).and_then(|chunk| chunk.occurrence_time_ms).map_or(0, |value| local_wall_instant(context.zone, value.0)),"markdown":markdown,"sentence_id":sid,"speaker_source":source,"has_embedding":sid.is_some_and(|id| ids.contains(&id)),"speaker_actionable":speakers.state.present && speakers.state.loaded && speakers.state.source.as_deref() == Some(source) && sid.is_some_and(|id| ids.contains(&id)),"source_ref":{"start":start,"source":row.get("source"),"speaker":row.get("speaker")}});
         if let Some((ref audio_url, origin_ms)) = placement_media
             && let Some(obj) = chunk.as_object_mut()
         {
@@ -2112,5 +2117,66 @@ mod tests {
         let zone = solstone_core_journal_config::owner_zone(root);
         assert_eq!(chunks[0]["time"], local_time(zone, 1_000));
         assert_eq!(chunks[1]["time"], local_time(zone, 1_792_027_800_000));
+    }
+
+    #[test]
+    fn prepare_segment_audio_chunks_appends_warning_to_flagged_sentence() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let day = "20260101";
+        let stream = "field";
+        let key = "120000_60";
+        let segment_dir = root.join("chronicle").join(day).join(stream).join(key);
+        std::fs::create_dir_all(&segment_dir).unwrap();
+
+        let header = json!({"raw": "audio.wav"});
+        let flagged_row = json!({
+            "start": "12:00:10",
+            "text": "Is the gate open? It is open.",
+            "speaker": 1,
+            "sentence_id": 1,
+            "turn_boundary_suspect": true,
+            "speaker_turn_evidence": {
+                "version": "window-local-turns-v1",
+                "audio_duration_s": 20.0,
+                "ranges": [{"start_s": 11.0, "end_s": 12.0}],
+            },
+        });
+        let neighbor_row = json!({
+            "start": "12:00:15",
+            "text": "Neighbor speech without warning.",
+            "speaker": 2,
+            "sentence_id": 2,
+        });
+
+        std::fs::write(
+            segment_dir.join("audio.jsonl"),
+            format!(
+                "{}\n{}\n{}\n",
+                serde_json::to_string(&header).unwrap(),
+                serde_json::to_string(&flagged_row).unwrap(),
+                serde_json::to_string(&neighbor_row).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        let now = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        let value = super::prepare_segment(root, day, stream, key, now).unwrap();
+
+        let chunks = value["chunks"].as_array().expect("chunks array");
+        assert_eq!(chunks.len(), 2);
+
+        let flagged_chunk = &chunks[0];
+        let flagged_markdown = flagged_chunk["markdown"].as_str().expect("markdown string");
+        assert!(flagged_markdown.contains("Is the gate open? It is open."));
+        assert!(flagged_markdown.contains("possible speaker change within this sentence"));
+        assert_eq!(flagged_chunk["source_ref"]["speaker"], 1);
+
+        let neighbor_chunk = &chunks[1];
+        let neighbor_markdown = neighbor_chunk["markdown"]
+            .as_str()
+            .expect("markdown string");
+        assert_eq!(neighbor_markdown, "Neighbor speech without warning.");
+        assert!(!neighbor_markdown.contains("possible speaker change within this sentence"));
     }
 }

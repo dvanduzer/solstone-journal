@@ -10,6 +10,12 @@ use std::fmt;
 
 pub mod diarization;
 pub mod discovery;
+pub mod speaker_turns;
+
+pub use speaker_turns::{
+    SENTENCE_TURN_INSET_S, SPEAKER_TURN_EVIDENCE_VERSION, SpeakerTurnError, SpeakerTurnEvidence,
+    SpeakerTurnRange,
+};
 
 pub use filterbank::{
     WESPEAKER_EMBEDDING_SIZE, WESPEAKER_FFT_SIZE, WESPEAKER_FRAME_LENGTH_SAMPLES,
@@ -17,13 +23,13 @@ pub use filterbank::{
     compute_wespeaker_filterbank_cmn, row_l2_normalize,
 };
 pub use segmentation::{
-    DIARIZE_MIN_OVERLAP, PYANNOTE_CLASS_COUNT, PYANNOTE_DIARIZE_STRIDE_S,
-    PYANNOTE_FRAMES_PER_WINDOW, PYANNOTE_OVERLAP_CLASSES, PYANNOTE_OVERLAP_STRIDE_S,
-    PYANNOTE_SAMPLE_RATE_HZ, PYANNOTE_SINGLE_SPEAKER_CLASSES, PYANNOTE_WINDOW_S,
-    PyannoteSegmentationPassResult, SLOT_ACTIVE_MIN_SHARE, SPEAKER_EVIDENCE_MULTI_MIN,
-    SPEAKER_EVIDENCE_SINGLE_MAX, SpeakerEvidence, SpeakerEvidenceDecision,
-    SpeakerSegmentationError, SpeakerWindowStats, compute_speaker_window_stats,
-    decide_speaker_evidence, run_pyannote_segmentation_pass,
+    DIARIZE_MIN_OVERLAP, MAX_SAME_WINDOW_TURN_GAP_S, PYANNOTE_CLASS_COUNT,
+    PYANNOTE_DIARIZE_STRIDE_S, PYANNOTE_FRAMES_PER_WINDOW, PYANNOTE_OVERLAP_CLASSES,
+    PYANNOTE_OVERLAP_STRIDE_S, PYANNOTE_SAMPLE_RATE_HZ, PYANNOTE_SINGLE_SPEAKER_CLASSES,
+    PYANNOTE_WINDOW_S, PyannoteSegmentationPassResult, SLOT_ACTIVE_MIN_SHARE,
+    SPEAKER_EVIDENCE_MULTI_MIN, SPEAKER_EVIDENCE_SINGLE_MAX, SpeakerEvidence,
+    SpeakerEvidenceDecision, SpeakerSegmentationError, SpeakerWindowStats,
+    compute_speaker_window_stats, decide_speaker_evidence, run_pyannote_segmentation_pass,
 };
 pub use statements::{
     AdmittedStatement, MIN_STATEMENT_DURATION_S, StatementAdmissionResult, StatementSpan,

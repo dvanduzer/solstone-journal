@@ -5,6 +5,7 @@ use std::borrow::Cow;
 use std::error::Error;
 use std::fmt;
 
+use crate::speaker_turns::{SpeakerTurnEvidence, SpeakerTurnRange};
 use crate::{FeatureMatrix, SpeakerFeatureError};
 
 pub const PYANNOTE_SAMPLE_RATE_HZ: u32 = 16_000;
@@ -19,12 +20,14 @@ pub const SLOT_ACTIVE_MIN_SHARE: f64 = 0.10;
 pub const SPEAKER_EVIDENCE_MULTI_MIN: f64 = 0.05;
 pub const SPEAKER_EVIDENCE_SINGLE_MAX: f64 = 0.05;
 pub const DIARIZE_MIN_OVERLAP: f64 = 0.05;
+pub const MAX_SAME_WINDOW_TURN_GAP_S: f64 = 1.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PyannoteSegmentationPassResult {
     pub overlap_fraction: f64,
     pub avg_log_probs: FeatureMatrix,
     pub window_stats: Vec<SpeakerWindowStats>,
+    pub speaker_turns: SpeakerTurnEvidence,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +187,8 @@ where
             classes: PYANNOTE_CLASS_COUNT,
         },
     )?;
+    let audio_duration_s = audio.len() as f64 / f64::from(sample_rate_hz);
+    let mut turn_ranges: Vec<SpeakerTurnRange> = Vec::new();
     let mut accum = vec![0.0_f64; len];
     let mut counts = vec![0_usize; num_frames];
     let mut window_stats = Vec::with_capacity(starts.len());
@@ -197,6 +202,35 @@ where
             }
         })?;
         validate_window_log_probs(window_index, &log_probs)?;
+
+        let frame_log_probs = crate::diarization::FrameLogProbs::from_row_major(
+            log_probs.data(),
+            PYANNOTE_CLASS_COUNT,
+        )
+        .expect("validated window log-probs data length is multiple of class count");
+        let window_intervals = crate::diarization::find_intervals(frame_log_probs, window_samples);
+        let window_offset_s = start_sample as f64 / f64::from(sample_rate_hz);
+        for pair in window_intervals.windows(2) {
+            let prev = &pair[0];
+            let next = &pair[1];
+            if prev.local_class != next.local_class {
+                let gap_s = next.start_s - prev.end_s;
+                if gap_s <= MAX_SAME_WINDOW_TURN_GAP_S {
+                    let shifted_start_s = prev.end_s + window_offset_s;
+                    let shifted_end_s = next.start_s + window_offset_s;
+                    if shifted_end_s < 0.0 || shifted_start_s > audio_duration_s {
+                        continue;
+                    }
+                    let clamped_start_s = shifted_start_s.max(0.0);
+                    let clamped_end_s = shifted_end_s.min(audio_duration_s);
+                    turn_ranges.push(SpeakerTurnRange {
+                        start_s: clamped_start_s,
+                        end_s: clamped_end_s,
+                    });
+                }
+            }
+        }
+
         let frame_start = frame_start_for_sample(start_sample, samples_per_frame);
         let frame_end = frame_start + log_probs.frames();
         // A validated window has exactly the expected frame count; with starts at or before the
@@ -218,6 +252,17 @@ where
         }
     }
 
+    turn_ranges.sort_by(|a, b| {
+        a.start_s
+            .total_cmp(&b.start_s)
+            .then_with(|| a.end_s.total_cmp(&b.end_s))
+    });
+    turn_ranges.dedup_by(|b, a| {
+        a.start_s.total_cmp(&b.start_s) == std::cmp::Ordering::Equal
+            && a.end_s.total_cmp(&b.end_s) == std::cmp::Ordering::Equal
+    });
+    let speaker_turns = SpeakerTurnEvidence::new(audio_duration_s, turn_ranges);
+
     let avg_log_probs =
         average_accumulated_log_probs(&accum, &counts, num_frames, PYANNOTE_CLASS_COUNT)
             .expect("accumulator shape is constructed from checked dimensions");
@@ -226,6 +271,7 @@ where
         overlap_fraction,
         avg_log_probs,
         window_stats,
+        speaker_turns,
     })
 }
 
@@ -977,5 +1023,279 @@ mod tests {
             diff <= tolerance,
             "{label}: actual={actual} expected={expected} tolerance={tolerance}"
         );
+    }
+
+    fn dominant_window_matrix(classes: &[u8]) -> FeatureMatrix {
+        assert_eq!(classes.len(), PYANNOTE_FRAMES_PER_WINDOW);
+        let mut data = Vec::with_capacity(classes.len() * PYANNOTE_CLASS_COUNT);
+        for class in classes {
+            let mut row = [-10.0_f32; PYANNOTE_CLASS_COUNT];
+            row[usize::from(*class)] = 0.0;
+            data.extend(row);
+        }
+        FeatureMatrix::from_row_major(classes.len(), PYANNOTE_CLASS_COUNT, data).unwrap()
+    }
+
+    #[test]
+    fn turn_detection_one_window_gap_at_max_emits_range() {
+        let samples_per_frame = (PYANNOTE_WINDOW_S as f64 * PYANNOTE_SAMPLE_RATE_HZ as f64)
+            / PYANNOTE_FRAMES_PER_WINDOW as f64;
+        let mut classes = vec![0_u8; PYANNOTE_FRAMES_PER_WINDOW];
+        for c in classes[0..30].iter_mut() {
+            *c = 1;
+        }
+        // 58 silence frames: gap is 58 * 10 / 589 <= 1.0
+        for c in classes[88..118].iter_mut() {
+            *c = 2;
+        }
+        let matrix = dominant_window_matrix(&classes);
+        let audio = vec![0.0_f32; PYANNOTE_WINDOW_S as usize * PYANNOTE_SAMPLE_RATE_HZ as usize];
+
+        let result = run_pyannote_segmentation_pass(
+            &audio,
+            PYANNOTE_SAMPLE_RATE_HZ,
+            PYANNOTE_DIARIZE_STRIDE_S,
+            |_, _| Ok::<FeatureMatrix, Infallible>(matrix.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(result.speaker_turns.ranges.len(), 1);
+        let prev_end = (30.0 * samples_per_frame) / PYANNOTE_SAMPLE_RATE_HZ as f64;
+        let next_start = (88.0 * samples_per_frame) / PYANNOTE_SAMPLE_RATE_HZ as f64;
+        assert_eq!(result.speaker_turns.ranges[0].start_s, prev_end);
+        assert_eq!(result.speaker_turns.ranges[0].end_s, next_start);
+    }
+
+    #[test]
+    fn turn_detection_gap_zero_emits_zero_width_range() {
+        let samples_per_frame = (PYANNOTE_WINDOW_S as f64 * PYANNOTE_SAMPLE_RATE_HZ as f64)
+            / PYANNOTE_FRAMES_PER_WINDOW as f64;
+        let mut classes = vec![0_u8; PYANNOTE_FRAMES_PER_WINDOW];
+        for c in classes[0..30].iter_mut() {
+            *c = 1;
+        }
+        for c in classes[30..60].iter_mut() {
+            *c = 2;
+        }
+        let matrix = dominant_window_matrix(&classes);
+        let audio = vec![0.0_f32; PYANNOTE_WINDOW_S as usize * PYANNOTE_SAMPLE_RATE_HZ as usize];
+
+        let result = run_pyannote_segmentation_pass(
+            &audio,
+            PYANNOTE_SAMPLE_RATE_HZ,
+            PYANNOTE_DIARIZE_STRIDE_S,
+            |_, _| Ok::<FeatureMatrix, Infallible>(matrix.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(result.speaker_turns.ranges.len(), 1);
+        let expected = (30.0 * samples_per_frame) / PYANNOTE_SAMPLE_RATE_HZ as f64;
+        assert_eq!(result.speaker_turns.ranges[0].start_s, expected);
+        assert_eq!(result.speaker_turns.ranges[0].end_s, expected);
+    }
+
+    #[test]
+    fn turn_detection_same_class_runs_emit_no_range() {
+        let mut classes = vec![0_u8; PYANNOTE_FRAMES_PER_WINDOW];
+        for c in classes[0..30].iter_mut() {
+            *c = 1;
+        }
+        for c in classes[40..70].iter_mut() {
+            *c = 1;
+        }
+        let matrix = dominant_window_matrix(&classes);
+        let audio = vec![0.0_f32; PYANNOTE_WINDOW_S as usize * PYANNOTE_SAMPLE_RATE_HZ as usize];
+
+        let result = run_pyannote_segmentation_pass(
+            &audio,
+            PYANNOTE_SAMPLE_RATE_HZ,
+            PYANNOTE_DIARIZE_STRIDE_S,
+            |_, _| Ok::<FeatureMatrix, Infallible>(matrix.clone()),
+        )
+        .unwrap();
+
+        assert!(result.speaker_turns.ranges.is_empty());
+    }
+
+    #[test]
+    fn turn_detection_low_confidence_rows_emit_no_range() {
+        let row1 = [0.59_f32, 0.60, 0.59, 0.59, 0.59, 0.59, 0.59];
+        let row2 = [0.59_f32, 0.59, 0.60, 0.59, 0.59, 0.59, 0.59];
+        let mut data = Vec::with_capacity(PYANNOTE_FRAMES_PER_WINDOW * PYANNOTE_CLASS_COUNT);
+        for _ in 0..40 {
+            data.extend(row1);
+        }
+        for _ in 0..40 {
+            data.extend(row2);
+        }
+        while data.len() < PYANNOTE_FRAMES_PER_WINDOW * PYANNOTE_CLASS_COUNT {
+            data.extend([0.0_f32; PYANNOTE_CLASS_COUNT]);
+        }
+        let matrix =
+            FeatureMatrix::from_row_major(PYANNOTE_FRAMES_PER_WINDOW, PYANNOTE_CLASS_COUNT, data)
+                .unwrap();
+        let audio = vec![0.0_f32; PYANNOTE_WINDOW_S as usize * PYANNOTE_SAMPLE_RATE_HZ as usize];
+
+        let result = run_pyannote_segmentation_pass(
+            &audio,
+            PYANNOTE_SAMPLE_RATE_HZ,
+            PYANNOTE_DIARIZE_STRIDE_S,
+            |_, _| Ok::<FeatureMatrix, Infallible>(matrix.clone()),
+        )
+        .unwrap();
+
+        assert!(result.speaker_turns.ranges.is_empty());
+    }
+
+    #[test]
+    fn turn_detection_twenty_nine_frame_runs_emit_no_range() {
+        let mut classes = vec![0_u8; PYANNOTE_FRAMES_PER_WINDOW];
+        for c in classes[0..29].iter_mut() {
+            *c = 1;
+        }
+        // 1 silence frame
+        for c in classes[30..59].iter_mut() {
+            *c = 2;
+        }
+        let matrix = dominant_window_matrix(&classes);
+        let audio = vec![0.0_f32; PYANNOTE_WINDOW_S as usize * PYANNOTE_SAMPLE_RATE_HZ as usize];
+
+        let result = run_pyannote_segmentation_pass(
+            &audio,
+            PYANNOTE_SAMPLE_RATE_HZ,
+            PYANNOTE_DIARIZE_STRIDE_S,
+            |_, _| Ok::<FeatureMatrix, Infallible>(matrix.clone()),
+        )
+        .unwrap();
+
+        assert!(result.speaker_turns.ranges.is_empty());
+    }
+
+    #[test]
+    fn turn_detection_gap_greater_than_one_second_emits_no_range() {
+        let mut classes = vec![0_u8; PYANNOTE_FRAMES_PER_WINDOW];
+        for c in classes[0..30].iter_mut() {
+            *c = 1;
+        }
+        // 59 silence frames: gap is 59 * 10 / 589 > 1.0
+        for c in classes[89..119].iter_mut() {
+            *c = 2;
+        }
+        let matrix = dominant_window_matrix(&classes);
+        let audio = vec![0.0_f32; PYANNOTE_WINDOW_S as usize * PYANNOTE_SAMPLE_RATE_HZ as usize];
+
+        let result = run_pyannote_segmentation_pass(
+            &audio,
+            PYANNOTE_SAMPLE_RATE_HZ,
+            PYANNOTE_DIARIZE_STRIDE_S,
+            |_, _| Ok::<FeatureMatrix, Infallible>(matrix.clone()),
+        )
+        .unwrap();
+
+        assert!(result.speaker_turns.ranges.is_empty());
+    }
+
+    #[test]
+    fn turn_detection_two_windows_no_cross_window_range() {
+        // 12s audio gives two starts at 0 and 32_000 (with stride 2s)
+        let audio = vec![0.0_f32; 12 * PYANNOTE_SAMPLE_RATE_HZ as usize];
+        let window0_matrix = dominant_window_matrix(&vec![1_u8; PYANNOTE_FRAMES_PER_WINDOW]);
+        let window1_matrix = dominant_window_matrix(&vec![2_u8; PYANNOTE_FRAMES_PER_WINDOW]);
+
+        let result = run_pyannote_segmentation_pass(
+            &audio,
+            PYANNOTE_SAMPLE_RATE_HZ,
+            PYANNOTE_DIARIZE_STRIDE_S,
+            |window_index, _| {
+                if window_index == 0 {
+                    Ok::<FeatureMatrix, Infallible>(window0_matrix.clone())
+                } else {
+                    Ok::<FeatureMatrix, Infallible>(window1_matrix.clone())
+                }
+            },
+        )
+        .unwrap();
+
+        assert!(result.speaker_turns.ranges.is_empty());
+    }
+
+    #[test]
+    fn turn_detection_short_audio_drops_padded_change() {
+        let samples_per_frame = (PYANNOTE_WINDOW_S as f64 * PYANNOTE_SAMPLE_RATE_HZ as f64)
+            / PYANNOTE_FRAMES_PER_WINDOW as f64;
+        // Audio duration is 2.0s
+        let audio = vec![0.0_f32; 2 * PYANNOTE_SAMPLE_RATE_HZ as usize];
+        let mut classes = vec![0_u8; PYANNOTE_FRAMES_PER_WINDOW];
+        // Change 1: in-audio (frames 0..30 class 1, frame 30 silence, frames 31..61 class 2)
+        for c in classes[0..30].iter_mut() {
+            *c = 1;
+        }
+        for c in classes[31..61].iter_mut() {
+            *c = 2;
+        }
+        // Change 2: starting at frame 200 (at ~3.4s, strictly after 2.0s)
+        for c in classes[200..230].iter_mut() {
+            *c = 1;
+        }
+        for c in classes[231..261].iter_mut() {
+            *c = 2;
+        }
+        let matrix = dominant_window_matrix(&classes);
+
+        let result = run_pyannote_segmentation_pass(
+            &audio,
+            PYANNOTE_SAMPLE_RATE_HZ,
+            PYANNOTE_DIARIZE_STRIDE_S,
+            |_, _| Ok::<FeatureMatrix, Infallible>(matrix.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(result.speaker_turns.audio_duration_s, 2.0);
+        assert_eq!(result.speaker_turns.ranges.len(), 1);
+        let expected_start = (30.0 * samples_per_frame) / PYANNOTE_SAMPLE_RATE_HZ as f64;
+        let expected_end = (31.0 * samples_per_frame) / PYANNOTE_SAMPLE_RATE_HZ as f64;
+        assert_eq!(result.speaker_turns.ranges[0].start_s, expected_start);
+        assert_eq!(result.speaker_turns.ranges[0].end_s, expected_end);
+    }
+
+    #[test]
+    fn turn_detection_shifted_window_range_offset() {
+        let samples_per_frame = (PYANNOTE_WINDOW_S as f64 * PYANNOTE_SAMPLE_RATE_HZ as f64)
+            / PYANNOTE_FRAMES_PER_WINDOW as f64;
+        // 11s audio gives window starts at 0 and 16_000 (1.0s offset)
+        let audio = vec![0.0_f32; 11 * PYANNOTE_SAMPLE_RATE_HZ as usize];
+        let window0_matrix = dominant_window_matrix(&vec![0_u8; PYANNOTE_FRAMES_PER_WINDOW]);
+        let mut classes1 = vec![0_u8; PYANNOTE_FRAMES_PER_WINDOW];
+        for c in classes1[0..30].iter_mut() {
+            *c = 1;
+        }
+        for c in classes1[31..61].iter_mut() {
+            *c = 2;
+        }
+        let window1_matrix = dominant_window_matrix(&classes1);
+
+        let result = run_pyannote_segmentation_pass(
+            &audio,
+            PYANNOTE_SAMPLE_RATE_HZ,
+            PYANNOTE_DIARIZE_STRIDE_S,
+            |window_index, _| {
+                if window_index == 0 {
+                    Ok::<FeatureMatrix, Infallible>(window0_matrix.clone())
+                } else {
+                    Ok::<FeatureMatrix, Infallible>(window1_matrix.clone())
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.speaker_turns.audio_duration_s, 11.0);
+        assert_eq!(result.speaker_turns.ranges.len(), 1);
+        let local_start = (30.0 * samples_per_frame) / PYANNOTE_SAMPLE_RATE_HZ as f64;
+        let local_end = (31.0 * samples_per_frame) / PYANNOTE_SAMPLE_RATE_HZ as f64;
+        let range = result.speaker_turns.ranges[0];
+        assert_eq!(range.start_s, local_start + 1.0);
+        assert_eq!(range.end_s, local_end + 1.0);
+        assert!(range.end_s <= 11.0);
+        assert_ne!(range.start_s, local_start);
     }
 }

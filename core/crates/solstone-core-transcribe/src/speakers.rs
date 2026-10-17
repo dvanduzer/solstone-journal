@@ -22,6 +22,7 @@ use std::time::Instant;
 
 use serde_json::{Map, Value, json};
 use solstone_core_observe_audio::{AudioError, write_f32le_exclusive};
+use solstone_core_speakers::SpeakerTurnEvidence;
 #[cfg(unix)]
 use solstone_core_system::lifecycle::{RunId, hosted_child_launch_provenance};
 #[cfg(unix)]
@@ -969,7 +970,7 @@ fn admitted_statement_ids(
     Ok(admitted)
 }
 
-fn accepted_result_from_response(
+pub(crate) fn accepted_result_from_response(
     raw_path: &Path,
     response: &Value,
     payload_path: &Path,
@@ -1135,6 +1136,13 @@ fn accepted_result_from_response(
     let overlap_fraction = fraction(raw_path, evidence, "overlap_fraction")?;
     let speaker_evidence_multi_fraction = fraction(raw_path, evidence, "multi_window_fraction")?;
     fraction(raw_path, evidence, "mean_window_overlap_share")?;
+    let pyannote = required_object(raw_path, object, "pyannote")?;
+    let speaker_turn_evidence = match pyannote.get("speaker_turns") {
+        Some(val) => Some(SpeakerTurnEvidence::from_value(val).map_err(|_| {
+            SpeakerAnalyzeError::new(raw_path, "payload", "invalid-pyannote-speaker-turns", None)
+        })?),
+        None => None,
+    };
     let labels = statement_labels(raw_path, object)?;
     let mut statements = statements_restored.to_vec();
     if let Some(labels) = &labels {
@@ -1149,6 +1157,16 @@ fn accepted_result_from_response(
         for (statement, label) in statements.iter_mut().zip(labels) {
             if let Some(label) = label {
                 statement.insert("speaker".to_owned(), Value::from(*label));
+            }
+        }
+    }
+    if let Some(evidence) = &speaker_turn_evidence {
+        for statement in &mut statements {
+            statement.insert("speaker_turn_evidence".to_owned(), evidence.to_value());
+            let start_s = optional_finite(statement.get("start"));
+            let end_s = optional_finite(statement.get("end"));
+            if evidence.flags_sentence(start_s, end_s) {
+                statement.insert("turn_boundary_suspect".to_owned(), Value::Bool(true));
             }
         }
     }
@@ -1243,6 +1261,11 @@ fn validate_pyannote(
                 ));
             }
         }
+    }
+    if let Some(turns_val) = pyannote.get("speaker_turns") {
+        SpeakerTurnEvidence::from_value(turns_val).map_err(|_| {
+            SpeakerAnalyzeError::new(raw_path, "payload", "invalid-pyannote-speaker-turns", None)
+        })?;
     }
     Ok(())
 }
@@ -1880,5 +1903,192 @@ mod tests {
             "evidence":{"speaker_evidence":"none", "multi_window_fraction":0.0, "mean_window_overlap_share":0.0, "overlap_fraction":0.0},
             "diarization":{"intervals":null,"valid_intervals":null,"interval_embeddings":null,"cluster_labels":null,"statement_labels":null,"silhouette_k":null,"effective_k":null},
         })
+    }
+}
+
+#[cfg(test)]
+mod speaker_turn_adapter_tests {
+    use std::fs;
+    use std::path::Path;
+
+    use serde_json::{Map, Value, json};
+    use solstone_core_speakers::SPEAKER_TURN_EVIDENCE_VERSION;
+
+    use super::{RESPONSE_SCHEMA, accepted_result_from_response};
+
+    fn statement(id: i64, start: f64, end: f64) -> Map<String, Value> {
+        Map::from_iter([
+            ("id".to_owned(), Value::from(id)),
+            ("start".to_owned(), Value::from(start)),
+            ("end".to_owned(), Value::from(end)),
+        ])
+    }
+
+    fn base_response(payload: &Path, ids: &[i64], byte_count: usize) -> Value {
+        let spans = ids.iter().map(|_id| json!([0.0, 0.5])).collect::<Vec<_>>();
+        json!({
+            "schema": RESPONSE_SCHEMA,
+            "sample_rate_hz": 16_000,
+            "inputs": {
+                "statement_embedding": {"statement_ids": ids, "spans_s": spans},
+                "diarization": {"statement_ids": ids, "spans_s": ids.iter().map(|_| json!([0.0, 0.5])).collect::<Vec<_>>()},
+            },
+            "statement_embeddings": {
+                "audio_buffer": "full",
+                "encoder": "wespeaker-resnet34-256",
+                "payload_format": "raw-f32le-row-major-v1",
+                "payload_path": payload,
+                "dtype": "float32-le",
+                "statement_ids": ids,
+                "durations_s": ids.iter().map(|_| 0.5).collect::<Vec<_>>(),
+                "shape": [ids.len(), 256],
+                "byte_count": byte_count,
+                "admitted_count": ids.len(),
+                "skipped_count": 0,
+            },
+            "pyannote": {"window_stats": []},
+            "evidence": {
+                "speaker_evidence": "none",
+                "multi_window_fraction": 0.0,
+                "mean_window_overlap_share": 0.0,
+                "overlap_fraction": 0.0,
+            },
+            "diarization": {
+                "intervals": null,
+                "valid_intervals": null,
+                "interval_embeddings": null,
+                "cluster_labels": null,
+                "statement_labels": null,
+                "silhouette_k": null,
+                "effective_k": null,
+            },
+        })
+    }
+
+    #[test]
+    fn missing_speaker_turns_accepts_and_statements_gain_neither_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let payload = directory.path().join("payload.f32le");
+        fs::write(&payload, []).unwrap();
+        let response = base_response(&payload, &[], 0);
+        let statements = vec![statement(1, 0.0, 1.0)];
+
+        let result = accepted_result_from_response(
+            Path::new("input.wav"),
+            &response,
+            &payload,
+            &statements,
+            &[],
+            &[],
+            16_000,
+        )
+        .expect("accepted");
+
+        assert_eq!(result.statements.len(), 1);
+        assert!(!result.statements[0].contains_key("speaker_turn_evidence"));
+        assert!(!result.statements[0].contains_key("turn_boundary_suspect"));
+    }
+
+    #[test]
+    fn zero_width_inside_audio_is_accepted() {
+        let directory = tempfile::tempdir().unwrap();
+        let payload = directory.path().join("payload.f32le");
+        fs::write(&payload, []).unwrap();
+        let mut response = base_response(&payload, &[], 0);
+        response["pyannote"]["speaker_turns"] = json!({
+            "version": SPEAKER_TURN_EVIDENCE_VERSION,
+            "audio_duration_s": 10.0,
+            "ranges": [{"start_s": 2.0, "end_s": 2.0}],
+        });
+        let statements = vec![statement(1, 0.0, 5.0)];
+
+        let result = accepted_result_from_response(
+            Path::new("input.wav"),
+            &response,
+            &payload,
+            &statements,
+            &[],
+            &[],
+            16_000,
+        )
+        .expect("accepted");
+
+        assert_eq!(result.statements.len(), 1);
+        assert!(result.statements[0].contains_key("speaker_turn_evidence"));
+        assert_eq!(result.statements[0]["turn_boundary_suspect"], json!(true));
+    }
+
+    #[test]
+    fn malformed_speaker_turns_each_return_invalid_pyannote_speaker_turns() {
+        let directory = tempfile::tempdir().unwrap();
+        let payload = directory.path().join("payload.f32le");
+        fs::write(&payload, []).unwrap();
+
+        let malformed_cases = vec![
+            // wrong version
+            json!({
+                "version": "wrong-version",
+                "audio_duration_s": 10.0,
+                "ranges": [],
+            }),
+            // wrong type
+            json!("not-an-object"),
+            json!(42),
+            json!([]),
+            // null
+            Value::Null,
+            // negative
+            json!({
+                "version": SPEAKER_TURN_EVIDENCE_VERSION,
+                "audio_duration_s": 10.0,
+                "ranges": [{"start_s": -1.0, "end_s": 2.0}],
+            }),
+            // inverted
+            json!({
+                "version": SPEAKER_TURN_EVIDENCE_VERSION,
+                "audio_duration_s": 10.0,
+                "ranges": [{"start_s": 5.0, "end_s": 2.0}],
+            }),
+            // nonfinite
+            json!({
+                "version": SPEAKER_TURN_EVIDENCE_VERSION,
+                "audio_duration_s": "1e309",
+                "ranges": [],
+            }),
+            // unsorted
+            json!({
+                "version": SPEAKER_TURN_EVIDENCE_VERSION,
+                "audio_duration_s": 10.0,
+                "ranges": [{"start_s": 5.0, "end_s": 6.0}, {"start_s": 1.0, "end_s": 2.0}],
+            }),
+            // duplicate
+            json!({
+                "version": SPEAKER_TURN_EVIDENCE_VERSION,
+                "audio_duration_s": 10.0,
+                "ranges": [{"start_s": 1.0, "end_s": 2.0}, {"start_s": 1.0, "end_s": 2.0}],
+            }),
+            // out-of-audio
+            json!({
+                "version": SPEAKER_TURN_EVIDENCE_VERSION,
+                "audio_duration_s": 10.0,
+                "ranges": [{"start_s": 1.0, "end_s": 11.0}],
+            }),
+        ];
+
+        for turns in malformed_cases {
+            let mut response = base_response(&payload, &[], 0);
+            response["pyannote"]["speaker_turns"] = turns;
+            let error = accepted_result_from_response(
+                Path::new("input.wav"),
+                &response,
+                &payload,
+                &[],
+                &[],
+                &[],
+                16_000,
+            )
+            .unwrap_err();
+            assert_eq!(error.reason, "invalid-pyannote-speaker-turns");
+        }
     }
 }
