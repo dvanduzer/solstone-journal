@@ -1227,3 +1227,237 @@ pub const THINKING_COPY_PAYLOAD: CopyValue = CopyValue::Object(&[
 pub fn thinking_copy_payload() -> CopyValue {
     THINKING_COPY_PAYLOAD
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SetupCatalogFacts {
+    pub platform: &'static str,
+    pub thinking_download_bytes: Option<u64>,
+    pub speech_download_bytes: Option<u64>,
+}
+
+fn format_size(bytes: u64) -> String {
+    let value = ((bytes as f64 / 1024_f64.powi(3)) * 10.0).round() / 10.0;
+    if value.fract() == 0.0 {
+        format!("{value:.0} gb")
+    } else {
+        format!("{value:.1} gb")
+    }
+}
+
+pub fn current_setup_facts() -> SetupCatalogFacts {
+    let platform = match std::env::consts::OS {
+        "macos" => "mac",
+        "windows" => "windows",
+        "linux" => "linux",
+        other => other,
+    };
+
+    let model_assets = solstone_core_assets::resolve("local-model", None, None);
+    let gguf = model_assets
+        .iter()
+        .find(|a| a.filename == "Qwen3.5-4B-Q4_K_M.gguf");
+    let mmproj = model_assets
+        .iter()
+        .find(|a| a.filename == "mmproj-F16.gguf");
+
+    let model_sum = match (gguf, mmproj) {
+        (Some(g), Some(m)) => Some(g.size_bytes.saturating_add(m.size_bytes)),
+        _ => None,
+    };
+
+    let thinking_download_bytes = match std::env::consts::OS {
+        "windows" => model_sum,
+        "macos" if std::env::consts::ARCH == "aarch64" => {
+            let macos_runtime = solstone_core_assets::resolve(
+                "llama-server-vulkan",
+                Some(solstone_core_assets::Platform::MacosArm64),
+                None,
+            );
+            if macos_runtime.len() == 1 {
+                model_sum.map(|sum| sum.saturating_add(macos_runtime[0].size_bytes))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+
+    let speech_download_bytes = if std::env::consts::OS == "windows" {
+        None
+    } else {
+        let speech_assets = solstone_core_assets::resolve("parakeet-model", None, None);
+        speech_assets
+            .iter()
+            .find(|a| a.filename == "tdt-0.6b-v3-q8_0.gguf")
+            .map(|a| a.size_bytes)
+    };
+
+    SetupCatalogFacts {
+        platform,
+        thinking_download_bytes,
+        speech_download_bytes,
+    }
+}
+
+pub fn setup_copy(facts: &SetupCatalogFacts) -> serde_json::Value {
+    let thinking_default_line = match facts.thinking_download_bytes {
+        Some(bytes) => format!(
+            "run private thinking on this {}. downloads about {}.",
+            facts.platform,
+            format_size(bytes)
+        ),
+        None => format!("run private thinking on this {}.", facts.platform),
+    };
+
+    let speech_download = match facts.speech_download_bytes {
+        Some(bytes) => format!("speech recognition (about {})", format_size(bytes)),
+        None => "speech recognition".to_owned(),
+    };
+
+    let thinking_download = match facts.thinking_download_bytes {
+        Some(bytes) => format!("local model (about {})", format_size(bytes)),
+        None => "local model".to_owned(),
+    };
+
+    serde_json::json!({
+        "schema": "solstone.setup-copy.v1",
+        "welcome": {
+            "title": "welcome to solstone.",
+            "body": "the solstone app takes in what you share with it, and all of it goes into your journal.",
+            "how_it_fits": [
+                "welcome to solstone.",
+                "the solstone app takes in what you share with it, and all of it goes into your journal.",
+                "your journal is always private, only yours."
+            ]
+        },
+        "login": {
+            "label": "name",
+            "help": "choose the name your journal will use for you."
+        },
+        "folder": {
+            "title": "journal folder",
+            "help": format!("where your journal is kept on this {}.", facts.platform),
+            "change": "change folder",
+            "continue": "continue"
+        },
+        "mark": {
+            "title": "your journal mark",
+            "help": "a unique visual mark created for your journal.",
+            "try_another": "try another",
+            "continue": "continue"
+        },
+        "thinking": {
+            "title": "thinking",
+            "default_line": thinking_default_line,
+            "change": "change",
+            "later": "decide later",
+            "continue": "continue"
+        },
+        "downloads": {
+            "speech": speech_download,
+            "thinking": thinking_download,
+            "progress": "downloading…",
+            "cancel": "cancel",
+            "retry": "retry",
+            "error": "download failed. check your connection and try again."
+        },
+        "footer": "solstone keeps your journal on your device."
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setup_copy_contains_required_groups() {
+        let facts = current_setup_facts();
+        let copy = setup_copy(&facts);
+        assert_eq!(copy["schema"], "solstone.setup-copy.v1");
+        assert!(copy.get("welcome").is_some());
+        assert!(copy.get("login").is_some());
+        assert!(copy.get("folder").is_some());
+        assert!(copy.get("mark").is_some());
+        assert!(copy.get("thinking").is_some());
+        assert!(copy.get("downloads").is_some());
+        assert!(copy.get("footer").is_some());
+
+        let welcome = &copy["welcome"];
+        assert_eq!(welcome["title"], "welcome to solstone.");
+        assert_eq!(
+            welcome["body"],
+            "the solstone app takes in what you share with it, and all of it goes into your journal."
+        );
+        let beats = welcome["how_it_fits"]
+            .as_array()
+            .expect("how_it_fits array");
+        assert_eq!(beats.len(), 3);
+        assert_eq!(beats[0], "welcome to solstone.");
+        assert_eq!(
+            beats[1],
+            "the solstone app takes in what you share with it, and all of it goes into your journal."
+        );
+        assert_eq!(beats[2], "your journal is always private, only yours.");
+    }
+
+    #[test]
+    fn setup_copy_is_pure_over_facts() {
+        let facts_with_sizes = SetupCatalogFacts {
+            platform: "testbox",
+            thinking_download_bytes: Some(3_221_225_472), // 3.0 GB
+            speech_download_bytes: Some(1_073_741_824),   // 1.0 GB
+        };
+        let copy = setup_copy(&facts_with_sizes);
+        let thinking = copy["thinking"]["default_line"].as_str().unwrap();
+        assert!(thinking.contains("3 gb") || thinking.contains("3.0 gb"));
+        let speech = copy["downloads"]["speech"].as_str().unwrap();
+        assert!(speech.contains("1 gb") || speech.contains("1.0 gb"));
+
+        let facts_none = SetupCatalogFacts {
+            platform: "testbox",
+            thinking_download_bytes: None,
+            speech_download_bytes: None,
+        };
+        let copy_none = setup_copy(&facts_none);
+        let thinking_none = copy_none["thinking"]["default_line"].as_str().unwrap();
+        assert!(!thinking_none.contains("downloads about"));
+        assert!(!thinking_none.contains("gb"));
+        let speech_none = copy_none["downloads"]["speech"].as_str().unwrap();
+        assert_eq!(speech_none, "speech recognition");
+    }
+
+    #[test]
+    fn thinking_copy_payload_stays_callable_and_unchanged() {
+        let payload = thinking_copy_payload();
+        let value = serde_json::to_value(payload).expect("serializes");
+        assert!(value.is_object());
+        assert!(value.get("heading").is_some());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_facts_omit_thinking_size() {
+        let facts = current_setup_facts();
+        assert_eq!(facts.platform, "linux");
+        assert!(facts.thinking_download_bytes.is_none());
+        assert!(facts.speech_download_bytes.is_some());
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_facts_omit_speech_size() {
+        let facts = current_setup_facts();
+        assert_eq!(facts.platform, "windows");
+        assert!(facts.speech_download_bytes.is_none());
+        assert!(facts.thinking_download_bytes.is_some());
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn macos_arm64_facts_include_both_sizes() {
+        let facts = current_setup_facts();
+        assert_eq!(facts.platform, "mac");
+        assert!(facts.thinking_download_bytes.is_some());
+        assert!(facts.speech_download_bytes.is_some());
+    }
+}

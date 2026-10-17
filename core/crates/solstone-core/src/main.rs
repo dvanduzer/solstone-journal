@@ -595,6 +595,26 @@ fn main() -> ExitCode {
             eprintln!("solstone journal setup: error: {}", error.0);
             ExitCode::from(2)
         }
+        Ok(Command::SetupCopy(args)) => {
+            const USAGE: &str = "usage: solstone journal setup-copy [-h] [--json]\n";
+            let is_help = args.len() == 1 && (args[0] == "--help" || args[0] == "-h");
+            if is_help {
+                print!("{USAGE}");
+                ExitCode::SUCCESS
+            } else if args.len() == 1 && args[0] == "--json" {
+                let facts = solstone_core_thinking_copy::current_setup_facts();
+                let copy = solstone_core_thinking_copy::setup_copy(&facts);
+                let output = format!(
+                    "{}\n",
+                    serde_json::to_string_pretty(&copy).expect("setup copy serializes")
+                );
+                print!("{output}");
+                ExitCode::SUCCESS
+            } else {
+                eprint!("{USAGE}");
+                ExitCode::from(2)
+            }
+        }
         Ok(Command::JournalPath(options)) => match run_journal_path(options) {
             Ok(line) => {
                 println!("{}\t{}", line.label, line.path.display());

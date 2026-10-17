@@ -3546,6 +3546,7 @@ dependencies = [
  "solstone-core-talent-runtime",
  "solstone-core-think-cli",
  "solstone-core-thinking",
+ "solstone-core-thinking-copy",
  "solstone-core-top",
  "solstone-core-transcribe",
  "solstone-core-user-skill",
@@ -4792,6 +4793,7 @@ dependencies = [
  "solstone-core-sol-client",
  "solstone-core-system",
  "solstone-core-system-health",
+ "solstone-core-thinking-copy",
  "windows-sys 0.61.2",
 ]
 
@@ -5939,6 +5941,8 @@ name = "solstone-core-thinking-copy"
 version = "2.0.49"
 dependencies = [
  "serde",
+ "serde_json",
+ "solstone-core-assets",
 ]
 
 [[package]]

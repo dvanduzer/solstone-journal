@@ -22,7 +22,7 @@ use solstone_core_journal_io::{
 };
 
 use crate::ca::{CaError, LocalCa, generate_ca, jid_from_spki, load_ca};
-use crate::mark::{Mark, MarkError, mark_from_jid, mark_words_from_jid};
+use crate::mark::{Mark, MarkError, MarkRenderSpec, mark_from_jid, mark_words_from_jid};
 use crate::publish_checkpoint::PublishCheckpoint;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +32,30 @@ pub struct LinkState {
     pub locked_at: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkState {
+    Locked,
+    Proposed,
+    Unavailable,
+}
+
+impl MarkState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Locked => "locked",
+            Self::Proposed => "proposed",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkSnapshot {
+    pub state: MarkState,
+    pub proposal_id: Option<String>,
+    pub render: Option<MarkRenderSpec>,
+}
+
 #[derive(Debug)]
 pub enum EstablishError {
     Lock(LockError),
@@ -39,6 +63,8 @@ pub enum EstablishError {
     Ca(CaError),
     Mark(MarkError),
     NoCandidate,
+    ProposalConflict,
+    AlreadyLocked,
     State(String),
 }
 
@@ -50,6 +76,8 @@ impl fmt::Display for EstablishError {
             Self::Ca(error) => error.fmt(formatter),
             Self::Mark(error) => error.fmt(formatter),
             Self::NoCandidate => formatter.write_str("no staged link identity candidate exists"),
+            Self::ProposalConflict => formatter.write_str("identity proposal conflict"),
+            Self::AlreadyLocked => formatter.write_str("journal id already locked"),
             Self::State(message) => write!(formatter, "invalid local link state: {message}"),
         }
     }
@@ -62,7 +90,9 @@ impl std::error::Error for EstablishError {
             Self::Publish(error) => Some(error),
             Self::Ca(error) => Some(error),
             Self::Mark(error) => Some(error),
-            Self::NoCandidate | Self::State(_) => None,
+            Self::NoCandidate | Self::ProposalConflict | Self::AlreadyLocked | Self::State(_) => {
+                None
+            }
         }
     }
 }
@@ -121,6 +151,16 @@ fn lock_in_with_interruption(
 
     let candidate = candidate_path(journal_root);
     let ca = load_candidate_for_promotion(&candidate)?;
+    promote_candidate(journal_root, &ca, interruption)
+}
+
+fn promote_candidate(
+    journal_root: &Path,
+    ca: &LocalCa,
+    interruption: &dyn PublishInterruption,
+) -> Result<LinkState, EstablishError> {
+    let bundle = bundle_path(journal_root);
+    let candidate = candidate_path(journal_root);
     let instance_id = jid_from_spki(ca.spki_der())?;
     let home_label = mark_words_from_jid(&instance_id)?;
     let state = LinkState {
@@ -128,9 +168,80 @@ fn lock_in_with_interruption(
         home_label,
         locked_at: now_ms(),
     };
-    publish_bundle(&bundle, &ca, &state, interruption)?;
+    publish_bundle(&bundle, ca, &state, interruption)?;
     discard_candidate_unlocked(&candidate);
     Ok(state)
+}
+
+pub fn read_mark_snapshot(journal_root: &Path) -> Result<MarkSnapshot, EstablishError> {
+    let _lock = hold_lock(identity_lock_path(journal_root), LockOptions::default())?;
+    let bundle = bundle_path(journal_root);
+    if bundle.exists() {
+        let state = load_bundle(&bundle)?;
+        let render = mark_from_jid(&state.instance_id)?.to_render_spec();
+        return Ok(MarkSnapshot {
+            state: MarkState::Locked,
+            proposal_id: Some(state.instance_id),
+            render: Some(render),
+        });
+    }
+
+    let candidate = candidate_path(journal_root);
+    match load_candidate(&candidate) {
+        Ok(ca) => {
+            let instance_id = jid_from_spki(ca.spki_der())?;
+            let render = mark_from_jid(&instance_id)?.to_render_spec();
+            Ok(MarkSnapshot {
+                state: MarkState::Proposed,
+                proposal_id: Some(instance_id),
+                render: Some(render),
+            })
+        }
+        Err(_) => Ok(MarkSnapshot {
+            state: MarkState::Unavailable,
+            proposal_id: None,
+            render: None,
+        }),
+    }
+}
+
+pub fn commit_proposal(
+    journal_root: &Path,
+    proposal_id: &str,
+) -> Result<LinkState, EstablishError> {
+    let _lock = hold_lock(identity_lock_path(journal_root), LockOptions::default())?;
+    let bundle = bundle_path(journal_root);
+    if bundle.exists() {
+        let state = load_bundle(&bundle)?;
+        if state.instance_id == proposal_id {
+            return Ok(state);
+        } else {
+            return Err(EstablishError::ProposalConflict);
+        }
+    }
+
+    let candidate = candidate_path(journal_root);
+    let ca = match load_candidate_for_promotion(&candidate) {
+        Ok(ca) => ca,
+        Err(EstablishError::NoCandidate) => return Err(EstablishError::ProposalConflict),
+        Err(e) => return Err(e),
+    };
+    let candidate_id = jid_from_spki(ca.spki_der())?;
+    if candidate_id != proposal_id {
+        return Err(EstablishError::ProposalConflict);
+    }
+    promote_candidate(journal_root, &ca, &NoopInterruption)
+}
+
+pub fn regenerate_proposal(journal_root: &Path) -> Result<LocalCa, EstablishError> {
+    let _lock = hold_lock(identity_lock_path(journal_root), LockOptions::default())?;
+    let bundle = bundle_path(journal_root);
+    if bundle.exists() {
+        return Err(EstablishError::AlreadyLocked);
+    }
+    let candidate = candidate_path(journal_root);
+    discard_candidate_required(&candidate)?;
+    generate_and_publish_candidate(&candidate)
 }
 
 #[cfg(all(feature = "host", feature = "test-hooks"))]

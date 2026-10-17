@@ -142,6 +142,7 @@ mod relay_admission;
 #[cfg(feature = "host")]
 pub mod session;
 pub mod session_gate;
+mod setup_host;
 pub mod source_link;
 mod speakers;
 mod speakers_attribution;
@@ -1423,8 +1424,9 @@ fn router_with_roots(
             Some(roots) => thinking::router_with_roots(route_journal_root.clone(), roots),
             None => thinking::router(route_journal_root.clone()),
         })
-        .merge(solstone_core_sol_link::http::init_router(
+        .merge(solstone_core_sol_link::http::init_router_with_host(
             journal_root.clone(),
+            Arc::new(setup_host::ConveySetupHost),
         ))
         .merge(solstone_core_facets_web::routes(
             journal_root.clone(),

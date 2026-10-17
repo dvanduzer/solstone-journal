@@ -30,6 +30,7 @@ use crate::wrapper::{
 };
 use crate::wrapper::{is_live_app_owned_child_launcher, wrapper_paths};
 
+#[cfg(test)]
 const LOCAL_MODEL: &str = "local/qwen3.5-4b";
 const LOCAL_INSTALL_HINT: &str = "solstone journal install-provider local";
 const SOL_ALREADY_KEEPS_JOURNAL_NARRATION: &str = "solstone on this Mac already keeps this journal, so setup did not install a background launcher.\nRun solstone journal doctor if something looks wrong.";
@@ -2145,20 +2146,8 @@ fn step_brain(context: &mut SetupContext<'_>) -> Result<StepResult, StepExecutio
                 value: Some(SkipReason::ProviderAlreadyConfigured),
             };
         }
-        if active_provider.is_none() && readiness == LocalProviderReadiness::Unavailable {
-            // Leave the provider unchosen; the owner picks one on the thinking page.
-            return JournalConfigMutation {
-                changed: false,
-                value: None,
-            };
-        }
-        let local = json!({"provider":"local","model":LOCAL_MODEL});
-        let changed = active != Some(&local);
-        if changed {
-            providers.insert("active".into(), local);
-        }
         JournalConfigMutation {
-            changed,
+            changed: false,
             value: None,
         }
     })
@@ -2206,9 +2195,9 @@ fn step_brain(context: &mut SetupContext<'_>) -> Result<StepResult, StepExecutio
         ));
     }
     // Until the owner creates the journal, every Thinking route answers with
-    // the create-your-journal page, so a bootstrap now cannot start. Local is
-    // already chosen above; the owner installs it from the Thinking page,
-    // where creating the journal lands them.
+    // the create-your-journal page, so a bootstrap now cannot start. The owner
+    // installs their chosen provider from the Thinking page, where creating the
+    // journal lands them.
     if !journal_created {
         return Ok(skipped_result(
             StepName::Brain,
@@ -3319,9 +3308,8 @@ mod tests {
             &fs::read(get_journal_config_path(&resolved.journal_path)).unwrap(),
         )
         .unwrap();
-        assert_eq!(
-            config["providers"]["active"],
-            json!({"provider":"local","model":LOCAL_MODEL})
+        assert!(
+            config["providers"].get("active").is_none() || config["providers"]["active"].is_null()
         );
         let (args, resolved, root, home) = fixture("brain-warning", &[]);
         mark_journal_created(&resolved.journal_path);
@@ -3388,9 +3376,8 @@ mod tests {
             &fs::read(get_journal_config_path(&resolved.journal_path)).unwrap(),
         )
         .unwrap();
-        assert_eq!(
-            config["providers"]["active"],
-            json!({"provider":"local","model":LOCAL_MODEL})
+        assert!(
+            config["providers"].get("active").is_none() || config["providers"]["active"].is_null()
         );
     }
 
@@ -3596,10 +3583,7 @@ mod tests {
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             .and_then(|config| config.pointer("/providers/active").cloned());
-        assert_eq!(
-            active,
-            Some(json!({"provider": "local", "model": LOCAL_MODEL}))
-        );
+        assert_eq!(active, None);
         // Windows setup admissions share the real LocalAppData owner gate,
         // even when fixtures supply different home paths.
         drop(setup);
@@ -3724,9 +3708,8 @@ mod tests {
             &fs::read(get_journal_config_path(&resolved.journal_path)).unwrap(),
         )
         .unwrap();
-        assert_eq!(
-            config["providers"]["active"],
-            json!({"provider":"local","model":LOCAL_MODEL})
+        assert!(
+            config["providers"].get("active").is_none() || config["providers"]["active"].is_null()
         );
         assert!(runner.requests.is_empty());
     }
