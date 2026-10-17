@@ -9,17 +9,15 @@
 //! A row that ran alongside another row in its facet from a different stream
 //! names its source, and every other row stays as it was.
 //!
-//! An activity record carries no stream. Its segment keys are directories
-//! under the day's streams, so the source is read from disk. Anything that
-//! cannot be pinned to exactly one stream (a key that is missing, a key that
-//! sits in two streams, or a record whose keys span several streams) gets no
-//! label rather than a guessed one. This module performs no writes.
+//! A record may name its stream. Which stream that is, the span of its
+//! segments, and whether two rows ran alongside each other are decided by
+//! `solstone_core_facets::place_activity_records`. This module turns that
+//! stream into the phrase an owner reads. A row that cannot be pinned to one
+//! named stream gets no label. This module performs no writes.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde_json::{Map, Value};
-use solstone_core_journal_io::{PathOrDay, iter_segments};
 
 use crate::provenance::{LabelTableStatus, load_stream_labels, resolve_stream_label};
 
@@ -41,13 +39,23 @@ pub fn concurrent_source_labels(
     if placed.len() < 2 {
         return vec![None; placed.len()];
     }
-    let key_streams = segment_streams(journal, day);
-    let shapes = placed
+    let placed_records = placed
         .iter()
-        .map(|entry| Shape::of(entry.record, &key_streams))
+        .map(|entry| solstone_core_facets::PlacedRecord {
+            facet: entry.facet,
+            record: entry.record,
+        })
         .collect::<Vec<_>>();
-    let concurrent = (0..placed.len())
-        .map(|index| runs_alongside_another_stream(index, placed, &shapes))
+    let courses = solstone_core_facets::place_activity_records(journal, day, &placed_records);
+    let concurrent = courses
+        .iter()
+        .map(|course| {
+            if course.concurrent {
+                course.stream.clone()
+            } else {
+                None
+            }
+        })
         .collect::<Vec<_>>();
     if concurrent.iter().all(|stream| stream.is_none()) {
         return vec![None; placed.len()];
@@ -73,7 +81,10 @@ pub fn concurrent_source_labels(
             let identity = part.identity();
             let this_id = identity;
             let show_parenthetical = if let Some(this_id_str) = this_id {
-                partners(index, placed, &shapes)
+                courses[index]
+                    .partners
+                    .iter()
+                    .copied()
                     .filter(|&other| words[other] == Some(device_word))
                     .filter_map(|other| {
                         let other_stream = concurrent[other].as_deref()?;
@@ -103,134 +114,6 @@ pub fn source_phrase(kind: &str, device: Option<&str>) -> String {
         Some(device) => format!("from your {kind} ({device})"),
         None => format!("from your {kind}"),
     }
-}
-
-/// Every segment key of the day, with each stream directory that holds it.
-fn segment_streams(journal: &Path, day: &str) -> BTreeMap<String, BTreeSet<String>> {
-    let mut streams: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for segment in iter_segments(journal, PathOrDay::Day(day)).unwrap_or_default() {
-        // A segment directly under the day has no stream of its own.
-        let stream = segment
-            .stream()
-            .directory()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .to_owned();
-        streams
-            .entry(segment.key().to_owned())
-            .or_default()
-            .insert(stream);
-    }
-    streams
-}
-
-/// What the source pass needs from one record.
-struct Shape {
-    /// Every stream its segments sit in, or `None` when any key is missing or
-    /// sits in more than one stream.
-    streams: Option<BTreeSet<String>>,
-    /// Seconds into the day, `[start, end)`, over all its segments.
-    span: Option<(u32, u32)>,
-    id: String,
-}
-
-impl Shape {
-    fn of(record: &Map<String, Value>, key_streams: &BTreeMap<String, BTreeSet<String>>) -> Self {
-        let keys = record
-            .get("segments")
-            .and_then(Value::as_array)
-            .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>())
-            .unwrap_or_default();
-        let streams = if keys.is_empty() {
-            None
-        } else {
-            keys.iter()
-                .map(|key| match key_streams.get(*key) {
-                    Some(found) if found.len() == 1 => found.iter().next().cloned(),
-                    _ => None,
-                })
-                .collect::<Option<BTreeSet<_>>>()
-                .filter(|streams| streams.iter().all(|stream| !stream.is_empty()))
-        };
-        let span = keys.iter().filter_map(|key| segment_span(key)).reduce(
-            |(start, end), (next_start, next_end)| (start.min(next_start), end.max(next_end)),
-        );
-        Self {
-            streams,
-            span,
-            id: record
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-        }
-    }
-
-    fn single_stream(&self) -> Option<&str> {
-        let streams = self.streams.as_ref()?;
-        (streams.len() == 1).then(|| streams.iter().next().map(String::as_str))?
-    }
-}
-
-/// `HHMMSS_<seconds>` as `[start, end)` in seconds into the day.
-fn segment_span(key: &str) -> Option<(u32, u32)> {
-    let (clock, length) = key.split_once('_')?;
-    if clock.len() != 6 || !clock.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let length = length.parse::<u32>().ok()?;
-    let hours = clock[0..2].parse::<u32>().ok()?;
-    let minutes = clock[2..4].parse::<u32>().ok()?;
-    let seconds = clock[4..6].parse::<u32>().ok()?;
-    if hours > 23 || minutes > 59 || seconds > 59 {
-        return None;
-    }
-    let start = hours * 3600 + minutes * 60 + seconds;
-    Some((start, start + length.max(1)))
-}
-
-/// Other records in the same facet whose time overlaps this one. The copies of
-/// one activity written under several facets share an id and are not partners.
-fn partners<'a>(
-    index: usize,
-    placed: &'a [Placed<'_>],
-    shapes: &'a [Shape],
-) -> impl Iterator<Item = usize> + 'a {
-    let own = &shapes[index];
-    (0..placed.len()).filter(move |&other| {
-        if other == index || placed[other].facet != placed[index].facet {
-            return false;
-        }
-        if !own.id.is_empty() && shapes[other].id == own.id {
-            return false;
-        }
-        match (own.span, shapes[other].span) {
-            (Some((start, end)), Some((other_start, other_end))) => {
-                start < other_end && other_start < end
-            }
-            _ => false,
-        }
-    })
-}
-
-/// The record's one stream, when a same-facet record that overlaps it in time
-/// came from somewhere else. Overlap inside one stream (a replayed fragment of
-/// a live record) is not a pair, and a partner whose streams are unknown
-/// cannot show that it came from elsewhere.
-fn runs_alongside_another_stream(
-    index: usize,
-    placed: &[Placed<'_>],
-    shapes: &[Shape],
-) -> Option<String> {
-    let stream = shapes[index].single_stream()?;
-    partners(index, placed, shapes)
-        .any(|other| {
-            shapes[other]
-                .streams
-                .as_ref()
-                .is_some_and(|streams| streams.iter().any(|candidate| candidate != stream))
-        })
-        .then(|| stream.to_owned())
 }
 
 #[cfg(test)]

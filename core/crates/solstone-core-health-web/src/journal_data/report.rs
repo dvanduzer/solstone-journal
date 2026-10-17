@@ -310,7 +310,10 @@ fn add_record(
         edit.get("actor")
             .and_then(Value::as_str)
             .is_some_and(|actor| {
-                actor.starts_with("cli:") || actor.starts_with("owner") || actor.starts_with("user")
+                actor.starts_with("cli:")
+                    || actor == "owner"
+                    || actor.starts_with("owner:")
+                    || actor.starts_with("user")
             })
     }) {
         aggregate.activities_user_edited += 1;
@@ -1323,6 +1326,8 @@ mod tests {
             &[
                 json!({"id":"cli","edits":[{"actor":"cli:health"}]}),
                 json!({"id":"owner","edits":[{"actor":"owner"}]}),
+                json!({"id":"owner_update","edits":[{"actor":"owner:update"}]}),
+                json!({"id":"owner_identity","edits":[{"actor":"owner_identity"}]}),
                 json!({"id":"user","edits":[{"actor":"user:1"}]}),
                 json!({"id":"system","edits":[{"actor":"scheduler"}]}),
             ],
@@ -1334,7 +1339,7 @@ mod tests {
             now(),
         )
         .unwrap();
-        assert_eq!(aggregate.activities_user_edited, 3);
+        assert_eq!(aggregate.activities_user_edited, 4);
     }
 
     #[test]

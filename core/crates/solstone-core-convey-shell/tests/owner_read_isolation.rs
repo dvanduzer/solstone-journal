@@ -404,9 +404,22 @@ fn owner_read_role_classification_table_exhaustiveness() {
             "/source",
             RouteClassification::Moved(OwnerReadRole::SourceLink),
         ),
+        // Activities (3 live GET paths in facets-web activities)
+        (
+            "/app/activities/api/index",
+            RouteClassification::Moved(OwnerReadRole::ActivitiesIndex),
+        ),
+        (
+            "/app/activities/api/stats/{month}",
+            RouteClassification::Moved(OwnerReadRole::ActivitiesMonthStats),
+        ),
+        (
+            "/app/activities/api/day/{day}/view",
+            RouteClassification::Moved(OwnerReadRole::ActivitiesDayView),
+        ),
     ];
 
-    assert_eq!(table.len(), 88, "Must classify all 88 live GET routes");
+    assert_eq!(table.len(), 91, "Must classify all 91 live GET routes");
 
     let mut distinct_paths = BTreeSet::new();
     for (path, _) in table {
@@ -429,7 +442,7 @@ fn owner_read_role_classification_table_exhaustiveness() {
         moved_roles, all_roles,
         "Moved roles must equal OwnerReadRole::ALL exactly"
     );
-    assert_eq!(moved_roles.len(), 56);
+    assert_eq!(moved_roles.len(), 59);
 
     let ten_measured = [
         OwnerReadRole::SpeakersKnown,
