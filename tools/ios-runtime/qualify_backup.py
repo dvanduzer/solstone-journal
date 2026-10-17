@@ -16,7 +16,7 @@ import time
 import wave
 
 from qualify_audio import multipart
-from qualify_serving import Client, Phone, native, provenance, body_for, RECORDS, SOURCE, DAY
+from qualify_serving import Client, Phone, native, provenance, body_for, reconcile, record_uri, RECORDS, SOURCE, DAY
 
 ROUTE = '/app/backup'
 
@@ -110,6 +110,44 @@ def wait_backup(phone, previous_time, seconds=900):
     raise AssertionError('backup did not record a new outcome')
 
 
+def restore_phase(args, phone, restic, repository, storage, canonical, wrong, snapshots, expected, check):
+    """A7: restore the latest snapshot into a separate fresh journal on the same phone."""
+    source_identity = owner(phone, 'GET', '/app/network/api/identity')
+    phone.control('serve-stop')
+    args.suite = args.restore_suite
+    phone.launch()
+    owner(phone, 'GET', '/init/mark')
+    owner(phone, 'POST', '/init/mark/lock', {})
+    owner(phone, 'POST', '/init/finalize', {'name': 'Synthetic iOS restore', 'timezone': 'America/Denver'})
+    fresh_identity = owner(phone, 'GET', '/app/network/api/identity')
+    credentials = {'access_key_id': storage['access_key_id'], 'secret_access_key': storage['secret_access_key']}
+    body = {'repository': repository, 'backend': 's3', 'credentials': credentials}
+    refused = operate(phone, '/restore', {**body, 'recovery_key': wrong}, kind='restore')
+    absent = owner_raw(phone, 'GET', record_uri('backuporiginal'))
+    assert refused.get('operation', {}).get('phase') != 'done', refused
+    assert absent[0] == 404, absent
+    restored = operate(phone, '/restore', {**body, 'recovery_key': canonical}, kind='restore', seconds=1800)
+    status = owner(phone, 'GET', ROUTE + '/status')
+    check('A7_restore', {'wrong_key': refused, 'wrong_key_record_status': absent[0], 'restore': restored,
+                         'last_restore': status.get('last_restore'), 'source_identity': source_identity,
+                         'fresh_identity': fresh_identity, 'snapshots': [s['id'] for s in snapshots]})
+    assert restored.get('operation', {}).get('phase') == 'done', restored
+    assert status['last_restore'].get('status') == 'ok', status['last_restore']
+    for anchor, body_value in expected.items():
+        reconcile(owner(phone, 'GET', record_uri(anchor)), body_value)
+    restored_identity = owner(phone, 'GET', '/app/network/api/identity')
+    phone.control('serve-index')
+    hits = owner(phone, 'GET', '/app/search/api/search?q=lanservingqual%20backupchanged&limit=100')
+    phone.launch()
+    relaunched_identity = owner(phone, 'GET', '/app/network/api/identity')
+    reconcile(owner(phone, 'GET', record_uri('backupchanged')), expected['backupchanged'])
+    check('A7_restored', {'restored_identity': restored_identity, 'relaunched_identity': relaunched_identity,
+                          'search_total': hits.get('total'),
+                          'search_paths': [h['path'] for d in hits.get('days', []) for h in d['results']]})
+    assert hits.get('total') == 1, hits
+    assert relaunched_identity == restored_identity, (relaunched_identity, restored_identity)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--device', required=True)
@@ -123,6 +161,7 @@ def main():
     parser.add_argument('--prefix', required=True, help='Fresh repository prefix inside the owned bucket')
     parser.add_argument('--bulk-mib', type=int, default=24)
     parser.add_argument('--bulk-files', type=int, default=4)
+    parser.add_argument('--restore-suite', help='Fresh second journal for the separate restore phase')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
@@ -276,6 +315,9 @@ def main():
         assert keys_before == keys_after
         assert len(restic.snapshots('snapshots-a8', canonical)) == len(final)
 
+        if args.restore_suite:
+            restore_phase(args, phone, restic, repository, storage, canonical, wrong, final,
+                          {'backuporiginal': first, 'backupchanged': changed_body}, check)
         results['passed'] = True
     except BaseException as error:
         results['passed'] = False
