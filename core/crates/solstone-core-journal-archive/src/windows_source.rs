@@ -401,6 +401,10 @@ mod tests {
             ("backup/hosted/note.txt", b"kept hosted note" as &[u8]),
             ("config/schedules.json", b"kept schedules"),
             ("awareness/current.json", b"kept awareness"),
+            ("link/client-descriptions.json", b"kept owner device labels"),
+            ("tokens/20260101.jsonl", b"kept usage history"),
+            ("apps/owner/data.json", b"kept app data"),
+            ("solstone/apps/owner/data.json", b"kept legacy app data"),
         ];
         for (member, bytes) in new_kept {
             write(&root, member, bytes);
@@ -410,6 +414,11 @@ mod tests {
             ("config/push-vapid.json", b"omitted vapid"),
             ("config/push-registry.json", b"omitted push registry"),
             ("awareness/discovery_clusters.json", b"omitted clusters"),
+            ("link/service-ca.key", b"omitted pairing private key"),
+            (
+                "link/authorized_clients.json",
+                b"omitted client authorization",
+            ),
         ];
         for (member, bytes) in new_omitted {
             write(&root, member, bytes);
@@ -481,6 +490,85 @@ mod tests {
                 fs::read(root.join(member)).unwrap(),
                 expected_bytes,
                 "source file changed on disk for {member}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_export_classifies_installation_paths_with_windows_casing() {
+        let temporary = TempDir::new("reserved-path-casing");
+        let root = temporary.path.join("journal");
+        fs::create_dir(&root).unwrap();
+        const LOG_LEAF: &str = "oplog--cortex~1ee11af4ed5d63caf142a30a96ba124b--20260901T164233.381904Z--8f03cabead7e441d83f6c92b2d89a021--daily-think~7df259e6285645a5f9ea769caa484e07.log";
+        let log_path = format!("Chronicle/20260101/Health/{LOG_LEAF}");
+        let jsonl_path = format!(
+            "Chronicle/20260101/Health/{}",
+            LOG_LEAF.replace(".log", ".jsonl")
+        );
+        let kept = [
+            ("Link/Client-Descriptions.JSON", b"owner labels" as &[u8]),
+            ("Config/Owner-Preferences.JSON", b"owner settings"),
+            ("imports/item/Config/Push-Vapid.JSON", b"owner original"),
+            (
+                "imports/item/.REMOVING_owner-note",
+                b"owner differently cased name",
+            ),
+            (jsonl_path.as_str(), b"owner operational history"),
+            (
+                "Chronicle/20260101/Health/oplog--not-a-name.log",
+                b"owner malformed-name original",
+            ),
+        ];
+        let omitted = [
+            "Config/Journal.JSON",
+            "Config/Push-Vapid.JSON",
+            "Config/Push-Registry.JSON",
+            "Config/ChatGPT-Sign-In.JSON",
+            "Config/.tmp_fixture.tmp",
+            "Link/Service-CA.KEY",
+            "Peers/remote/Client.KEY",
+            "MCP-Endpoint/POP.ed25519.pk8",
+            "Backup/Hosted/Binding.JSON",
+            log_path.as_str(),
+        ];
+        for (member, bytes) in kept {
+            write(&root, member, bytes);
+        }
+        for member in omitted {
+            write(&root, member, b"installation credential");
+        }
+        let source = ArchiveSource::open(&root).unwrap();
+        let path = temporary.path.join("cased.zip");
+        let mut output = fs::File::create(&path).unwrap();
+        crate::encode_archive(
+            &crate::EncodeArchiveRequest {
+                source: &source,
+                solstone_version: "2.0.0",
+                exported_at: "2026-01-01T00:00:00Z",
+                day_window: None,
+            },
+            &mut output,
+        )
+        .unwrap();
+        let mut archive = zip::ZipArchive::new(fs::File::open(path).unwrap()).unwrap();
+        for (member, expected) in kept {
+            let mut body = Vec::new();
+            archive
+                .by_name(member)
+                .unwrap()
+                .read_to_end(&mut body)
+                .unwrap();
+            assert_eq!(body, expected);
+            assert_eq!(fs::read(root.join(member)).unwrap(), expected);
+        }
+        for member in omitted {
+            assert!(
+                archive.by_name(member).is_err(),
+                "credential included: {member}"
+            );
+            assert_eq!(
+                fs::read(root.join(member)).unwrap(),
+                b"installation credential"
             );
         }
     }

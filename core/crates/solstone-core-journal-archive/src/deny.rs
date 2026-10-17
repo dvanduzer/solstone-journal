@@ -11,7 +11,7 @@ use solstone_core_journal_io::operational_log::{
 /// Portable export includes owner trees. It omits installation identity,
 /// service credentials, and the throwaway paths listed here.
 /// Backups keep ordinary configuration through a separate copy policy.
-const PRUNED_ROOTS: &[&str] = &["link", "mcp-endpoint", "peers"];
+const PRUNED_ROOTS: &[&str] = &["mcp-endpoint", "peers"];
 
 const EXTRA_PREFIXES: &[&str] = &[
     "imports/archive-merge-work",
@@ -44,9 +44,14 @@ pub(crate) enum DenyAction {
 }
 
 pub(crate) fn deny_top_level(name: &str) -> DenyAction {
+    let original_name = name;
+    #[cfg(windows)]
+    let name = name.to_ascii_lowercase();
+    #[cfg(windows)]
+    let name = name.as_str();
     if PRUNED_ROOTS.contains(&name) {
         DenyAction::TreePrune
-    } else if copy_excluded(name) {
+    } else if copy_excluded(original_name) {
         DenyAction::Skip
     } else {
         DenyAction::Include
@@ -54,7 +59,27 @@ pub(crate) fn deny_top_level(name: &str) -> DenyAction {
 }
 
 pub(crate) fn deny_member(member: &str, regular_file: bool) -> bool {
-    if copy_excluded(member) {
+    let original_member = member;
+    if copy_excluded(member) || (regular_file && copy_file_excluded(member)) {
+        return true;
+    }
+    #[cfg(windows)]
+    if windows_credential_state(member) {
+        return true;
+    }
+    #[cfg(windows)]
+    let member = member.to_ascii_lowercase();
+    #[cfg(windows)]
+    let member = member.as_str();
+    #[cfg(windows)]
+    if member.starts_with("config/chatgpt-sign-in.json") {
+        return true;
+    }
+    // Device labels are owner settings; all other link state belongs to this installation.
+    if (member == "link" && regular_file)
+        || (member.starts_with("link/")
+            && (member != "link/client-descriptions.json" || !regular_file))
+    {
         return true;
     }
     if PRUNED_ROOTS
@@ -72,9 +97,6 @@ pub(crate) fn deny_member(member: &str, regular_file: bool) -> bool {
     if !regular_file {
         return false;
     }
-    if copy_file_excluded(member) {
-        return true;
-    }
     if OMITTED_REGULAR_FILES.contains(&member) {
         return true;
     }
@@ -84,10 +106,21 @@ pub(crate) fn deny_member(member: &str, regular_file: bool) -> bool {
     if is_generated_leaf(member) {
         return true;
     }
-    if is_canonical_oplog_log(member) {
+    if is_canonical_oplog_log(original_member) {
         return true;
     }
     false
+}
+
+#[cfg(windows)]
+fn windows_credential_state(member: &str) -> bool {
+    let Some((root, tail)) = member.split_once('/') else {
+        return false;
+    };
+    let root = root.to_ascii_lowercase();
+    // Recognize aliases of credential namespaces without changing shared leaf patterns.
+    ["config", "link", "backup"].contains(&root.as_str())
+        && copy_excluded(&format!("{root}/{tail}"))
 }
 
 fn is_root_supervisor_log(member: &str) -> bool {
@@ -118,9 +151,12 @@ fn is_generated_leaf(member: &str) -> bool {
 fn is_canonical_oplog_log(member: &str) -> bool {
     let parts: Vec<&str> = member.split('/').collect();
     if parts.len() == 4
-        && parts[0] == "chronicle"
         && is_eight_digit_day(parts[1])
-        && parts[2] == "health"
+        && if cfg!(windows) {
+            parts[0].eq_ignore_ascii_case("chronicle") && parts[2].eq_ignore_ascii_case("health")
+        } else {
+            parts[0] == "chronicle" && parts[2] == "health"
+        }
     {
         let leaf = parts[3];
         if let OplogNameClassification::Candidate(Ok(name)) = classify_oplog_name(OsStr::new(leaf))
@@ -171,10 +207,11 @@ mod tests {
             "apps",
             "backup",
             "solstone",
+            "link",
         ] {
             assert_eq!(deny_top_level(root), DenyAction::Include, "{root}");
         }
-        for root in ["link", "mcp-endpoint", "peers"] {
+        for root in ["mcp-endpoint", "peers"] {
             assert_eq!(deny_top_level(root), DenyAction::TreePrune, "{root}");
         }
         assert_eq!(deny_top_level("indexer"), DenyAction::Skip);
@@ -194,6 +231,8 @@ mod tests {
             "peers/remote/client.key",
             "mcp-endpoint/pop.ed25519.pk8",
             "link/client.json",
+            "link/service-ca.key",
+            "link",
             ".agents/skills/journal",
             "apps/support/portal/index.html",
             "supervisor.log",
@@ -219,6 +258,7 @@ mod tests {
             "health/retention.log",
             "health/pruning-runs/x.jsonl",
             "entities/cache/entity.json",
+            "link/client-descriptions.json",
             "supervisor.log.1",
             "supervisor.1a",
             "chronicle/20260101/supervisor.log",
@@ -234,6 +274,8 @@ mod tests {
         }
 
         assert!(!deny_member("stats.json", false));
+        assert!(!deny_member("link", false));
+        assert!(deny_member("link/client-descriptions.json", false));
         assert!(!deny_member("supervisor.log", false));
         assert!(!deny_member(&canonical_log_path, false));
     }

@@ -110,24 +110,24 @@ pub(crate) fn write_archive<W: Write + Seek>(
             .collect(),
     };
     if included.is_empty() {
-        #[cfg(any(test, feature = "test-hooks"))]
+        #[cfg(all(unix, any(test, feature = "test-hooks")))]
         crate::encode::test_set_boundary(crate::encode::TestBoundary::RootDirectory);
     }
     for root in &included {
-        #[cfg(any(test, feature = "test-hooks"))]
+        #[cfg(all(unix, any(test, feature = "test-hooks")))]
         crate::encode::test_set_boundary(crate::encode::TestBoundary::RootDirectory);
         zip.add_directory(*root, directory_options(manifest.timestamp))
             .map_err(|source| zip_error(None, source))?;
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(all(unix, any(test, feature = "test-hooks")))]
     let mut test_first_entry = true;
     for entry in source.inventory().entries() {
         if day_window.is_some_and(|window| !window.contains_member(entry.member_name().as_str())) {
             continue;
         }
         let member = entry.member_name();
-        #[cfg(any(test, feature = "test-hooks"))]
+        #[cfg(all(unix, any(test, feature = "test-hooks")))]
         crate::encode::test_before_source_open(member);
         let opened = source
             .open_file(entry)
@@ -137,20 +137,20 @@ pub(crate) fn write_archive<W: Write + Seek>(
         let mut file = opened.into_file();
         #[cfg(windows)]
         let mut file = std::io::Cursor::new(opened.into_bytes());
-        #[cfg(any(test, feature = "test-hooks"))]
+        #[cfg(all(unix, any(test, feature = "test-hooks")))]
         crate::encode::test_set_boundary(if test_first_entry {
             crate::encode::TestBoundary::SourceStart
         } else {
             crate::encode::TestBoundary::MemberTransition
         });
-        #[cfg(any(test, feature = "test-hooks"))]
+        #[cfg(all(unix, any(test, feature = "test-hooks")))]
         {
             test_first_entry = false;
         }
         zip.start_file(member.as_str(), file_options(manifest.timestamp))
             .map_err(|source| zip_error(Some(member), source))?;
         copy_inventoried(&mut file, zip, expected_size, member)?;
-        #[cfg(any(test, feature = "test-hooks"))]
+        #[cfg(all(unix, any(test, feature = "test-hooks")))]
         if crate::encode::test_take_body_write_failure(member) {
             return Err(io_error(
                 Some(member),
@@ -160,11 +160,11 @@ pub(crate) fn write_archive<W: Write + Seek>(
     }
 
     let manifest_member = ArchiveMemberName::new(EXPORT_MANIFEST.to_owned());
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(all(unix, any(test, feature = "test-hooks")))]
     crate::encode::test_set_boundary(crate::encode::TestBoundary::ManifestStart);
     zip.start_file(manifest_member.as_str(), file_options(manifest.timestamp))
         .map_err(|source| zip_error(Some(&manifest_member), source))?;
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(all(unix, any(test, feature = "test-hooks")))]
     crate::encode::test_set_boundary(crate::encode::TestBoundary::ManifestPayload);
     zip.write_all(&manifest.json)
         .map_err(|source| io_error(Some(&manifest_member), source))?;
@@ -194,7 +194,7 @@ fn copy_inventoried<R: Read, W: Write>(
     let mut copied = 0_u64;
     let mut buffer = [0_u8; COPY_BUFFER_SIZE];
     while copied < expected_size {
-        #[cfg(any(test, feature = "test-hooks"))]
+        #[cfg(all(unix, any(test, feature = "test-hooks")))]
         crate::encode::test_before_source_read(member, copied);
         let remaining = expected_size - copied;
         let request = if remaining > COPY_BUFFER_SIZE as u64 {
@@ -208,7 +208,7 @@ fn copy_inventoried<R: Read, W: Write>(
         if count == 0 {
             return Err(changed_error(member));
         }
-        #[cfg(any(test, feature = "test-hooks"))]
+        #[cfg(all(unix, any(test, feature = "test-hooks")))]
         crate::encode::test_set_boundary(crate::encode::TestBoundary::SourcePayload);
         writer
             .write_all(&buffer[..count])
@@ -217,7 +217,7 @@ fn copy_inventoried<R: Read, W: Write>(
     }
 
     let mut probe = [0_u8; 1];
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(all(unix, any(test, feature = "test-hooks")))]
     crate::encode::test_before_source_read(member, copied);
     let count = reader
         .read(&mut probe)

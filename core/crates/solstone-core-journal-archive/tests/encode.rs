@@ -252,6 +252,7 @@ fn portable_zip_keeps_owner_bytes_and_omits_credentials() {
         "reflections/weekly/note.md",
         "owner-root/note.txt",
         "tokens/20260101.jsonl",
+        "link/client-descriptions.json",
         "solstone/note.txt",
         "apps/observer/x.json",
         "apps/support/keep.txt",
@@ -320,6 +321,8 @@ fn portable_zip_keeps_owner_bytes_and_omits_credentials() {
         "chronicle/20260101/stats.json",
         &omitted_log_leaf_path,
         "link/client.json",
+        "link/service-ca.key",
+        "link/authorized_clients.json",
         "mcp-endpoint/pop.ed25519.pk8",
         "peers/remote/client.key",
         "imports/archive-merge-work/extract/x",
@@ -367,7 +370,7 @@ fn portable_zip_keeps_owner_bytes_and_omits_credentials() {
         .iter()
         .map(|s| s.as_str())
         .collect();
-    assert_eq!(skipped_names, vec!["link", "mcp-endpoint", "peers"]);
+    assert_eq!(skipped_names, vec!["mcp-endpoint", "peers"]);
 
     let mut archive =
         ZipArchive::new(File::open(&zip_path).expect("open zip output")).expect("parse zip output");
@@ -382,6 +385,7 @@ fn portable_zip_keeps_owner_bytes_and_omits_credentials() {
         "reflections/",
         "owner-root/",
         "tokens/",
+        "link/",
         "solstone/",
         "apps/",
         "awareness/",
@@ -411,8 +415,6 @@ fn portable_zip_keeps_owner_bytes_and_omits_credentials() {
     let actual_names: Vec<String> = (0..archive.len())
         .map(|i| archive.by_index(i).expect("zip member").name().to_owned())
         .collect();
-
-    assert_eq!(actual_names, expected_sequence);
 
     for (name, expected_bytes) in &kept_sentinels {
         let mut member = archive.by_name(name).expect("find kept member in zip");
@@ -484,10 +486,11 @@ fn portable_zip_keeps_owner_bytes_and_omits_credentials() {
 
     assert!(actual_names.contains(&"imports/".to_owned()));
     assert!(actual_names.contains(&"config/".to_owned()));
-    assert!(!actual_names.iter().any(|n| n.starts_with("link")));
+    assert!(actual_names.contains(&"link/client-descriptions.json".to_owned()));
     assert!(!actual_names.iter().any(|n| n.starts_with("mcp-endpoint")));
     assert!(!actual_names.iter().any(|n| n.starts_with("peers")));
     assert!(!actual_names.contains(&"config/journal.json".to_owned()));
+    assert_eq!(actual_names, expected_sequence);
 }
 
 #[test]

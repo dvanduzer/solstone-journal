@@ -8,6 +8,12 @@
 //! output name is never opened for replacement, and a target revalidation
 //! precedes publication.
 
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "this isolated module is the archive crate's Windows publication authority"
+)]
+
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom};

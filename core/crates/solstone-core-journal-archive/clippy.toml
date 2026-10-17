@@ -1,5 +1,5 @@
-# This crate only inspects an already-open journal capability. Production code
-# must never create, mutate, publish, or remove filesystem state.
+# Archive inventory remains read-only. Only the isolated publication modules
+# may create and remove archive output; they carry their own narrow exceptions.
 disallowed-methods = [
     { path = "std::fs::write", reason = "archive inventory is read-only" },
     { path = "std::fs::create_dir", reason = "archive inventory is read-only" },
@@ -15,11 +15,11 @@ disallowed-methods = [
     { path = "std::fs::File::create_new", reason = "archive inventory is read-only" },
     { path = "std::fs::OpenOptions::open", reason = "archive inventory is read-only" },
     { path = "std::fs::DirBuilder::create", reason = "archive inventory is read-only" },
-    { path = "std::os::unix::fs::symlink", reason = "archive inventory is read-only" },
-    { path = "std::os::unix::fs::chown", reason = "archive inventory is read-only" },
-    { path = "std::os::unix::fs::lchown", reason = "archive inventory is read-only" },
-    { path = "std::os::unix::fs::chroot", reason = "archive inventory is read-only" },
-    { path = "std::os::unix::net::UnixListener::bind", reason = "archive inventory is read-only" },
+    { path = "std::os::unix::fs::symlink", reason = "archive inventory is read-only", allow-invalid = true },
+    { path = "std::os::unix::fs::chown", reason = "archive inventory is read-only", allow-invalid = true },
+    { path = "std::os::unix::fs::lchown", reason = "archive inventory is read-only", allow-invalid = true },
+    { path = "std::os::unix::fs::chroot", reason = "archive inventory is read-only", allow-invalid = true },
+    { path = "std::os::unix::net::UnixListener::bind", reason = "archive inventory is read-only", allow-invalid = true },
     { path = "nix::unistd::mkfifo", reason = "archive inventory is read-only" },
     { path = "nix::unistd::mkfifoat", reason = "archive inventory is read-only" },
     { path = "nix::unistd::mkdir", reason = "archive inventory is read-only", allow-invalid = true },

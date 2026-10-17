@@ -166,7 +166,7 @@ enum Poison {
     },
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(all(unix, any(test, feature = "test-hooks")))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TestBoundary {
     Body,
@@ -184,7 +184,7 @@ pub enum TestBoundary {
     TerminalSeek,
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(all(unix, any(test, feature = "test-hooks")))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TestSinkOperation {
     Write,
@@ -192,14 +192,14 @@ pub enum TestSinkOperation {
     Flush,
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(all(unix, any(test, feature = "test-hooks")))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TestFaultKind {
     Error,
     WriteZero,
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(all(unix, any(test, feature = "test-hooks")))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TestFault {
     pub(crate) boundary: TestBoundary,
@@ -208,7 +208,7 @@ pub(crate) struct TestFault {
     pub(crate) kind: TestFaultKind,
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(all(unix, any(test, feature = "test-hooks")))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TestTraceEvent {
     boundary: TestBoundary,
@@ -217,7 +217,7 @@ struct TestTraceEvent {
     faulted: bool,
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(all(unix, any(test, feature = "test-hooks")))]
 pub(crate) enum TestSourceAction {
     #[cfg(test)]
     RemoveBeforeOpen {
@@ -237,7 +237,7 @@ pub(crate) enum TestSourceAction {
     },
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(all(unix, any(test, feature = "test-hooks")))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TestPreflightOperation {
     Stat,
@@ -245,7 +245,7 @@ pub(crate) enum TestPreflightOperation {
     Position,
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(all(unix, any(test, feature = "test-hooks")))]
 struct TestControl {
     boundary: TestBoundary,
     fault: Option<TestFault>,
@@ -259,7 +259,7 @@ struct TestControl {
     abort_calls: usize,
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(all(unix, any(test, feature = "test-hooks")))]
 impl TestControl {
     const fn new() -> Self {
         Self {
@@ -277,12 +277,12 @@ impl TestControl {
     }
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(all(unix, any(test, feature = "test-hooks")))]
 thread_local! {
     static TEST_CONTROL: RefCell<TestControl> = const { RefCell::new(TestControl::new()) };
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(all(unix, any(test, feature = "test-hooks")))]
 pub(crate) fn install_encode_control(
     fault: Option<TestFault>,
     action: Option<TestSourceAction>,
@@ -297,22 +297,22 @@ pub(crate) fn install_encode_control(
     });
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(all(unix, feature = "test-hooks"))]
 pub(crate) fn encode_injected_operation_fired() -> bool {
     TEST_CONTROL.with(|control| control.borrow().trace.iter().any(|event| event.faulted))
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(all(unix, feature = "test-hooks"))]
 pub(crate) fn reset_encode_control() {
     TEST_CONTROL.with(|control| *control.borrow_mut() = TestControl::new());
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(all(unix, any(test, feature = "test-hooks")))]
 pub(crate) fn test_set_boundary(boundary: TestBoundary) {
     TEST_CONTROL.with(|control| control.borrow_mut().boundary = boundary);
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(all(unix, any(test, feature = "test-hooks")))]
 fn test_sink_result(
     operation: TestSinkOperation,
     requested: usize,
@@ -360,17 +360,17 @@ fn test_sink_result(
     })
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(all(unix, any(test, feature = "test-hooks")))]
 pub(crate) fn test_before_source_open(member: &ArchiveMemberName) {
     test_run_source_action(member, None);
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(all(unix, any(test, feature = "test-hooks")))]
 pub(crate) fn test_before_source_read(member: &ArchiveMemberName, copied: u64) {
     test_run_source_action(member, Some(copied));
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(all(unix, any(test, feature = "test-hooks")))]
 pub(crate) fn test_take_body_write_failure(member: &ArchiveMemberName) -> bool {
     TEST_CONTROL.with(|control| {
         let mut control = control.borrow_mut();
@@ -383,7 +383,7 @@ pub(crate) fn test_take_body_write_failure(member: &ArchiveMemberName) -> bool {
     })
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(all(unix, any(test, feature = "test-hooks")))]
 #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 fn test_run_source_action(member: &ArchiveMemberName, copied: Option<u64>) {
     TEST_CONTROL.with(|control| {
@@ -425,7 +425,7 @@ fn test_run_source_action(member: &ArchiveMemberName, copied: Option<u64>) {
     });
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(all(unix, any(test, feature = "test-hooks")))]
 fn test_before_final_revalidate() {
     test_set_boundary(TestBoundary::FinalRevalidate);
     #[cfg(test)]
@@ -451,30 +451,30 @@ fn test_before_final_revalidate() {
     });
 }
 
-#[cfg(not(any(test, feature = "test-hooks")))]
+#[cfg(not(all(unix, any(test, feature = "test-hooks"))))]
 fn test_before_final_revalidate() {}
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(all(unix, any(test, feature = "test-hooks")))]
 fn test_before_abort() {
     test_set_boundary(TestBoundary::Abort);
     #[cfg(test)]
     TEST_CONTROL.with(|control| control.borrow_mut().abort_calls += 1);
 }
 
-#[cfg(not(any(test, feature = "test-hooks")))]
+#[cfg(not(all(unix, any(test, feature = "test-hooks"))))]
 fn test_before_abort() {}
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(all(unix, any(test, feature = "test-hooks")))]
 fn test_before_finish() {
     test_set_boundary(TestBoundary::Finish);
     #[cfg(test)]
     TEST_CONTROL.with(|control| control.borrow_mut().finish_calls += 1);
 }
 
-#[cfg(not(any(test, feature = "test-hooks")))]
+#[cfg(not(all(unix, any(test, feature = "test-hooks"))))]
 fn test_before_finish() {}
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(all(unix, any(test, feature = "test-hooks")))]
 fn test_take_preflight_fault(operation: TestPreflightOperation) -> bool {
     TEST_CONTROL.with(|control| {
         let mut control = control.borrow_mut();
@@ -572,7 +572,7 @@ impl Write for FileSink<'_> {
         if !self.is_live() {
             return Ok(self.state.borrow_mut().virtual_write(buffer.len()));
         }
-        #[cfg(any(test, feature = "test-hooks"))]
+        #[cfg(all(unix, any(test, feature = "test-hooks")))]
         if let Some(result) = test_sink_result(TestSinkOperation::Write, buffer.len(), Some(buffer))
         {
             return self
@@ -590,7 +590,7 @@ impl Write for FileSink<'_> {
         if !self.is_live() {
             return Ok(());
         }
-        #[cfg(any(test, feature = "test-hooks"))]
+        #[cfg(all(unix, any(test, feature = "test-hooks")))]
         if let Some(result) = test_sink_result(TestSinkOperation::Flush, 0, None) {
             return match result {
                 Ok(_) => Ok(()),
@@ -615,7 +615,7 @@ impl Seek for FileSink<'_> {
         if !self.is_live() {
             return Ok(self.state.borrow_mut().virtual_seek(from));
         }
-        #[cfg(any(test, feature = "test-hooks"))]
+        #[cfg(all(unix, any(test, feature = "test-hooks")))]
         if let Some(result) = test_sink_result(TestSinkOperation::Seek, 0, None) {
             return match result {
                 Ok(_) => unreachable!("seek injection cannot return success"),
@@ -707,7 +707,7 @@ pub fn encode_archive(
         state: &state,
     };
     let mut zip = ZipWriter::new(sink);
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(all(unix, any(test, feature = "test-hooks")))]
     test_set_boundary(TestBoundary::Body);
     let mut pending = crate::writer::write_archive(
         &mut zip,
@@ -834,7 +834,7 @@ fn preflight_writer(file: &File) -> Result<(), EncodeArchiveError> {
 
 #[cfg(unix)]
 fn preflight_writer_unix(file: &File) -> Result<(), EncodeArchiveError> {
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(all(unix, any(test, feature = "test-hooks")))]
     if test_take_preflight_fault(TestPreflightOperation::Stat) {
         return Err(EncodeArchiveError::InvalidWriter {
             reason: "could not stat writer",
@@ -850,7 +850,7 @@ fn preflight_writer_unix(file: &File) -> Result<(), EncodeArchiveError> {
         });
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(all(unix, any(test, feature = "test-hooks")))]
     if test_take_preflight_fault(TestPreflightOperation::Flags) {
         return Err(EncodeArchiveError::InvalidWriter {
             reason: "could not read writer flags",
@@ -877,7 +877,7 @@ fn preflight_writer_unix(file: &File) -> Result<(), EncodeArchiveError> {
             reason: "must be empty",
         });
     }
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(all(unix, any(test, feature = "test-hooks")))]
     if test_take_preflight_fault(TestPreflightOperation::Position) {
         return Err(EncodeArchiveError::InvalidWriter {
             reason: "could not determine writer position",
@@ -897,7 +897,7 @@ fn preflight_writer_unix(file: &File) -> Result<(), EncodeArchiveError> {
 
 #[cfg(windows)]
 fn preflight_writer_windows(file: &File) -> Result<(), EncodeArchiveError> {
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(all(unix, any(test, feature = "test-hooks")))]
     if test_take_preflight_fault(TestPreflightOperation::Stat) {
         return Err(EncodeArchiveError::InvalidWriter {
             reason: "could not stat writer",
@@ -919,7 +919,7 @@ fn preflight_writer_windows(file: &File) -> Result<(), EncodeArchiveError> {
     // with read/write access itself; for another caller, the ZIP write is the
     // authoritative access check. Length and cursor are still checked before
     // ZIP construction so no existing output is accepted.
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(all(unix, any(test, feature = "test-hooks")))]
     if test_take_preflight_fault(TestPreflightOperation::Flags) {
         return Err(EncodeArchiveError::InvalidWriter {
             reason: "could not read writer flags",
@@ -930,7 +930,7 @@ fn preflight_writer_windows(file: &File) -> Result<(), EncodeArchiveError> {
             reason: "must be empty",
         });
     }
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(all(unix, any(test, feature = "test-hooks")))]
     if test_take_preflight_fault(TestPreflightOperation::Position) {
         return Err(EncodeArchiveError::InvalidWriter {
             reason: "could not determine writer position",
