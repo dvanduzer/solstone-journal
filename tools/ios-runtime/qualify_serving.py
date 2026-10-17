@@ -87,7 +87,7 @@ class Phone:
 
     @contextmanager
     def device_file(self, name):
-        assert name in ('evidence.jsonl', 'owner-reply.json')
+        assert name in ('evidence.jsonl', 'owner-reply.json', 'owner-command.json')
         with tempfile.TemporaryDirectory(prefix='receipt-', dir=self.args.output) as temporary:
             downloaded = Path(temporary) / name
             subprocess.run(['xcrun', 'devicectl', 'device', 'copy', 'from', '--device', self.args.device,
@@ -130,6 +130,16 @@ class Phone:
                     reply = self.wait(matches, seconds=20)['value']
                     break
                 except queue.Empty:
+                    # Record what the device actually holds, to tell a lost copy
+                    # from a host that read the command and never answered.
+                    with self.device_file('owner-command.json') as held:
+                        try:
+                            held_id = json.loads(held.read_bytes()).get('id')
+                        except ValueError:
+                            held_id = 'unreadable'
+                    self.log.write(json.dumps({'qualification_resend': identifier, 'attempt': _attempt,
+                                               'device_command_is_current': held_id == identifier}) + '\n')
+                    self.log.flush()
                     continue
         finally:
             command.unlink(missing_ok=True)
