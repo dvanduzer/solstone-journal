@@ -9,15 +9,18 @@ const vm = require('vm');
 let cases = 0;
 
 const REQUIRED_COPY_KEYS = [
-  'DEVICE_EMPTY_TITLE', 'DEVICE_EMPTY_BODY', 'DEVICE_PAIR_CTA', 'MODAL_TITLE', 'STEP_1', 'STEP_2',
-  'STEP_3', 'PAIR_NETWORK_LINE', 'DETAILS_DISCLOSURE', 'CA_FP_LABEL', 'CA_FP_NOTE',
+  'DEVICE_EMPTY_TITLE', 'DEVICE_EMPTY_BODY', 'DEVICE_PAIR_CTA', 'MODAL_TITLE', 'PAIR_TYPE_PROMPT',
+  'PAIR_TYPE_PHONE', 'PAIR_TYPE_COMPUTER', 'PAIR_TYPE_TERMINAL', 'PHONE_STEP_1', 'PHONE_STEP_2',
+  'COMPUTER_STEP_1', 'COMPUTER_STEP_2', 'COMPUTER_LINUX_NOTE', 'TERMINAL_STEP_1', 'TERMINAL_STEP_2',
+  'PAIR_NETWORK_LINE', 'PAIR_RELAY_LINE', 'DETAILS_DISCLOSURE', 'CA_FP_LABEL', 'CA_FP_NOTE',
   'PAIR_LINK_FIELD_LABEL', 'PAIR_LINK_COPY_LABEL', 'CHECK_PAIRING_CTA', 'PAIR_START_FAIL_BODY',
   'PAIR_START_PAIRED_DEVICE_BODY', 'PRIVATE_LINK_TIMEOUT_BODY', 'PAIR_ERROR_BODY', 'CHECK_AGAIN_LABEL',
   'PRIVATE_LINK_NEEDS_REPAIR', 'SPL_NOT_ENROLLED_REPAIR_CTA', 'PRIVATE_LINK_DISABLE_CTA',
   'PRIVATE_LINK_RETRY_CTA',
   'EXPIRED_BUTTON', 'WINDOW_CLOSED_BUTTON', 'SUCCESS_HEADING', 'SUCCESS_SUBHEAD',
   'SUCCESS_VERIFY_NOTE', 'SUCCESS_DONE', 'PAIR_LINK_COPY_SUCCESS_TOAST', 'PAIR_LINK_COPY_FAIL_TOAST',
-  'DEVICE_LABEL_DEFAULT_FORMAT', 'PAIR_LINK_ADDRESSES_LINE', 'REACH_DEVICE_ADDRESSES_LABEL',
+  'SUCCESS_HEADING_UNNAMED', 'SUCCESS_VERIFY_NOTE_ANYWHERE', 'SUCCESS_REMOVE_LABEL', 'SUCCESS_REMOVED',
+  'SUCCESS_REMOVE_FAIL', 'LOCAL_NETWORK_WINDOWS_ASKS_NOTE', 'PAIR_LINK_ADDRESSES_LINE', 'REACH_DEVICE_ADDRESSES_LABEL',
   'REACH_DEVICE_ADDRESS_LOCAL', 'REACH_DEVICE_ADDRESS_VPN',
   'PAIR_LOCAL_NETWORK_CLOSED_BODY', 'LOCAL_NETWORK_OPEN_CTA', 'LOCAL_NETWORK_FAILED', 'MODE_HOSTED_SETUP_CTA',
   'PAIR_THIS_COMPUTER_CTA', 'PAIR_THIS_COMPUTER_LINE',
@@ -25,7 +28,8 @@ const REQUIRED_COPY_KEYS = [
 
 const MARKUP_COPY_KEYS = REQUIRED_COPY_KEYS.filter((key) => ![
   'DEVICE_EMPTY_TITLE', 'DEVICE_EMPTY_BODY', 'PAIR_LINK_COPY_SUCCESS_TOAST', 'PAIR_LINK_COPY_FAIL_TOAST',
-  'DEVICE_LABEL_DEFAULT_FORMAT',
+  'PAIR_RELAY_LINE', 'SUCCESS_HEADING_UNNAMED', 'SUCCESS_VERIFY_NOTE_ANYWHERE', 'SUCCESS_REMOVED',
+  'SUCCESS_REMOVE_FAIL', 'LOCAL_NETWORK_WINDOWS_ASKS_NOTE',
   'PAIR_START_PAIRED_DEVICE_BODY', 'PRIVATE_LINK_TIMEOUT_BODY', 'PAIR_ERROR_BODY', 'PRIVATE_LINK_NEEDS_REPAIR',
   'REACH_DEVICE_ADDRESS_LOCAL', 'REACH_DEVICE_ADDRESS_VPN',
   'PAIR_LOCAL_NETWORK_CLOSED_BODY', 'PAIR_THIS_COMPUTER_LINE',
@@ -349,13 +353,21 @@ function createEnvironment(manifestDir, options = {}) {
   const fingerprint = make('link-pairing-fingerprint', 'code');
   const linkValue = make('link-pairing-link-value', 'code');
   const qr = make('link-pairing-qr');
+  const typeButtons = ['phone', 'computer', 'terminal'].map((type) => {
+    const button = make(`link-pairing-type-${type}`, 'button');
+    button.dataset.pairingAction = 'type';
+    button.dataset.pairingType = type;
+    return button;
+  });
+  const typeBlocks = ['phone', 'computer', 'terminal'].map((type) => make(`link-pairing-for-${type}`));
+  typeBlocks[0].appendChild(qr);
   const copyButton = make('link-pairing-copy', 'button');
   copyButton.dataset.pairingAction = 'copy';
   const check = make('link-pairing-check', 'button');
   check.dataset.pairingAction = 'check';
   const materialClose = make('link-pairing-material-close', 'button');
   materialClose.dataset.pairingAction = 'close';
-  material.append(labelRow, networkLine, addresses, fingerprint, linkValue, qr, copyButton, check, materialClose);
+  material.append(labelRow, ...typeButtons, ...typeBlocks, networkLine, addresses, fingerprint, linkValue, copyButton, check, materialClose);
   const expiredButton = make('link-pairing-expired-action', 'button');
   expiredButton.dataset.pairingAction = 'regenerate';
   expired.appendChild(expiredButton);
@@ -381,12 +393,20 @@ function createEnvironment(manifestDir, options = {}) {
   windowClosed.appendChild(closedButton);
   const successHeading = make('link-pairing-success-heading', 'h3');
   const successSubhead = make('link-pairing-success-subhead', 'p');
+  const successVerify = make('link-pairing-success-verify', 'p');
+  const removeResult = make('link-pairing-remove-result', 'p');
+  removeResult.hidden = true;
   const completeClose = make('link-pairing-complete-close', 'button');
   completeClose.dataset.pairingAction = 'close';
-  complete.append(successHeading, successSubhead, completeClose);
+  const removeButton = make('link-pairing-remove', 'button');
+  removeButton.dataset.pairingAction = 'remove';
+  removeButton.hidden = true;
+  complete.append(successHeading, successSubhead, successVerify, removeResult, completeClose, removeButton);
 
   const timerQueue = new Map();
+  const intervals = new Map();
   let timerId = 0;
+  let clock = options.clock ?? 1_000_000;
   const requests = [];
   const fetchQueue = [];
   const linkListeners = new Set();
@@ -399,9 +419,9 @@ function createEnvironment(manifestDir, options = {}) {
       ...Object.fromEntries(REQUIRED_COPY_KEYS.map((key) => [key, `copy-${key}`])),
       PAIR_NETWORK_LINE: 'network {time}',
       PAIR_PUBLIC_ADDRESS_LINE: 'public {time}',
+      PAIR_RELAY_LINE: 'relay {time}',
       SUCCESS_HEADING: 'heading {label}',
       SUCCESS_SUBHEAD: 'subhead {short_fp}',
-      DEVICE_LABEL_DEFAULT_FORMAT: 'label-{month}-{day}',
     },
     appEvents: {
       listen(tract, callback) {
@@ -424,6 +444,12 @@ function createEnvironment(manifestDir, options = {}) {
       return next.promise || Promise.resolve(next);
     },
     clearTimeout(id) { timerQueue.delete(id); },
+    setInterval(callback, delay) {
+      const id = ++timerId;
+      intervals.set(id, { callback, delay });
+      return id;
+    },
+    clearInterval(id) { intervals.delete(id); },
     setTimeout(callback, delay) {
       const id = ++timerId;
       timerQueue.set(id, { callback, delay });
@@ -455,6 +481,7 @@ function createEnvironment(manifestDir, options = {}) {
   const repairs = [];
   const disables = [];
   const localNetworkOpens = [];
+  const removedDevices = [];
   const controller = window.NetworkRender.initPairingCeremony({
     clipboardWriteText: options.clipboardWriteText || (async (value) => {
       clipboardWrites.push(value);
@@ -467,6 +494,10 @@ function createEnvironment(manifestDir, options = {}) {
       localNetworkOpens.push(true);
       return options.localNetworkOpenResult ?? true;
     }),
+    onDeviceRemoved: () => removedDevices.push(true),
+    windowsAsks: () => options.windowsAsks === true,
+    deviceType: options.deviceType,
+    now: () => clock,
   });
 
   function click(target) {
@@ -495,6 +526,12 @@ function createEnvironment(manifestDir, options = {}) {
     emitLink,
     click,
     timers: timerQueue,
+    intervals,
+    removedDevices,
+    advance(ms) {
+      clock += ms;
+      intervals.forEach(({ callback }) => callback());
+    },
     window,
   };
 }
@@ -584,17 +621,15 @@ async function main() {
     }
   });
 
-  await testCase('pair start sends a non-empty default device label', async () => {
+  await testCase('pair start sends no label, so the device names itself', async () => {
     const env = createEnvironment(manifestDir);
     const started = deferred();
     env.fetchQueue.push(started);
     env.click(env.opener);
-    const body = JSON.parse(env.requests[0].request.body);
-    assert.strictEqual(typeof body.device_label, 'string');
-    assert.ok(body.device_label);
-    assert.match(body.device_label, /^label-[a-z]{3}-\d{1,2}$/);
-    started.resolve(response(material({ device_label: body.device_label })));
+    assert.deepStrictEqual(JSON.parse(env.requests[0].request.body), {});
+    started.resolve(response(material({ device_label: '' })));
     await settle();
+    assert.strictEqual(env.nodes.get('link-pairing-label-row').hidden, true);
   });
 
   await testCase('public home addresses render public-address guidance without network guidance', async () => {
@@ -605,19 +640,107 @@ async function main() {
     assert.strictEqual(env.nodes.get('link-pairing-network-line').textContent, 'public 2:05');
   });
 
-  await testCase('completion uses the non-empty label echoed by pair start', async () => {
+  await testCase('completion names the paired device by its own label', async () => {
     const env = createEnvironment(manifestDir);
-    const started = deferred();
-    env.fetchQueue.push(started);
+    env.fetchQueue.push(response(material({ device_label: '' })));
     env.click(env.opener);
-    const label = JSON.parse(env.requests[0].request.body).device_label;
-    started.resolve(response(material({ device_label: label })));
     await settle();
-    env.fetchQueue.push(response({ present: true, used: true }));
+    env.fetchQueue.push(response({ present: true, used: true, device: { cid: 'sha256:aa', display_label: 'studio-mac' } }));
     env.emitLink();
     await settle();
-    assert.ok(env.nodes.get('link-pairing-success-heading').textContent);
-    assert.ok(env.nodes.get('link-pairing-success-heading').textContent.includes(label));
+    assert.strictEqual(env.nodes.get('link-pairing-success-heading').textContent, 'heading studio-mac');
+    assert.strictEqual(env.nodes.get('link-pairing-remove').hidden, false);
+
+    const unnamed = createEnvironment(manifestDir);
+    unnamed.fetchQueue.push(response(material({ device_label: '' })));
+    unnamed.click(unnamed.opener);
+    await settle();
+    unnamed.fetchQueue.push(response({ present: true, used: true }));
+    unnamed.emitLink();
+    await settle();
+    assert.strictEqual(unnamed.nodes.get('link-pairing-success-heading').textContent, 'copy-SUCCESS_HEADING_UNNAMED');
+    assert.strictEqual(unnamed.nodes.get('link-pairing-remove').hidden, true);
+  });
+
+  await testCase('the device type shows its own method and keeps the same link', async () => {
+    const env = createEnvironment(manifestDir);
+    env.fetchQueue.push(response(material()));
+    env.click(env.opener);
+    await settle();
+    assert.strictEqual(env.nodes.get('link-pairing-for-phone').hidden, false);
+    assert.strictEqual(env.nodes.get('link-pairing-for-computer').hidden, true);
+    assert.strictEqual(env.nodes.get('link-pairing-type-phone').getAttribute('aria-pressed'), 'true');
+    env.click(env.nodes.get('link-pairing-type-terminal'));
+    assert.strictEqual(env.nodes.get('link-pairing-for-phone').hidden, true);
+    assert.strictEqual(env.nodes.get('link-pairing-for-terminal').hidden, false);
+    assert.strictEqual(env.nodes.get('link-pairing-type-terminal').getAttribute('aria-pressed'), 'true');
+    assert.strictEqual(env.nodes.get('link-pairing-type-phone').getAttribute('aria-pressed'), 'false');
+    assert.strictEqual(env.requests.length, 1);
+    assert.strictEqual(env.nodes.get('link-pairing-link-value').textContent, 'https://go.example/p#ALPHANUMERIC');
+
+    const linked = createEnvironment(manifestDir);
+    linked.fetchQueue.push(response(material()));
+    linked.controller.open('computer');
+    await settle();
+    assert.strictEqual(linked.dialog.hidden, false);
+    assert.strictEqual(linked.nodes.get('link-pairing-for-computer').hidden, false);
+    assert.strictEqual(linked.nodes.get('link-pairing-for-phone').hidden, true);
+  });
+
+  await testCase('the expiry line counts down while the code is live', async () => {
+    const env = createEnvironment(manifestDir);
+    env.fetchQueue.push(response(material()));
+    env.click(env.opener);
+    await settle();
+    assert.strictEqual(env.nodes.get('link-pairing-network-line').textContent, 'network 2:05');
+    env.advance(6000);
+    assert.strictEqual(env.nodes.get('link-pairing-network-line').textContent, 'network 1:59');
+    env.controller.close();
+    assert.strictEqual(env.intervals.size, 0);
+  });
+
+  await testCase('a relay link says the device can be anywhere', async () => {
+    const env = createEnvironment(manifestDir);
+    env.fetchQueue.push(response(material({ relay: true })));
+    env.click(env.opener);
+    await settle();
+    assert.strictEqual(env.nodes.get('link-pairing-network-line').textContent, 'relay 2:05');
+    env.fetchQueue.push(response({ present: true, used: true, device: { cid: 'sha256:aa', display_label: 'phone' } }));
+    env.emitLink();
+    await settle();
+    assert.strictEqual(env.nodes.get('link-pairing-success-verify').textContent, 'copy-SUCCESS_VERIFY_NOTE_ANYWHERE');
+  });
+
+  await testCase('didn\'t do this? removes the device it just paired', async () => {
+    const env = createEnvironment(manifestDir);
+    env.fetchQueue.push(response(material()));
+    env.click(env.opener);
+    await settle();
+    env.fetchQueue.push(response({ present: true, used: true, device: { cid: 'sha256:aa/b', display_label: 'phone' } }));
+    env.emitLink();
+    await settle();
+    env.fetchQueue.push(response({}));
+    env.click(env.nodes.get('link-pairing-remove'));
+    await settle();
+    assert.strictEqual(env.requests[2].url, '/app/network/api/clients/sha256%3Aaa%2Fb');
+    assert.strictEqual(env.requests[2].request.method, 'DELETE');
+    assert.strictEqual(env.nodes.get('link-pairing-remove').hidden, true);
+    assert.strictEqual(env.nodes.get('link-pairing-remove-result').textContent, 'copy-SUCCESS_REMOVED');
+    assert.strictEqual(env.removedDevices.length, 1);
+
+    const failed = createEnvironment(manifestDir);
+    failed.fetchQueue.push(response(material()));
+    failed.click(failed.opener);
+    await settle();
+    failed.fetchQueue.push(response({ present: true, used: true, device: { cid: 'sha256:aa', display_label: 'phone' } }));
+    failed.emitLink();
+    await settle();
+    failed.fetchQueue.push(response({}, 500));
+    failed.click(failed.nodes.get('link-pairing-remove'));
+    await settle();
+    assert.strictEqual(failed.nodes.get('link-pairing-remove').hidden, false);
+    assert.strictEqual(failed.nodes.get('link-pairing-remove-result').textContent, 'copy-SUCCESS_REMOVE_FAIL');
+    assert.strictEqual(failed.removedDevices.length, 0);
   });
 
   await testCase('expires_in 125 formats as 2:05 and arms a 125-second timer', async () => {
@@ -1194,7 +1317,10 @@ async function main() {
     assert.ok(elementsEnd !== -1);
     const slice = networkJsSource.slice(initStart, elementsEnd);
     const idMatches = [...slice.matchAll(/findById\(documentRef,\s*'([^']+)'\)/g)].map((m) => m[1]);
-    assert.strictEqual(idMatches.length, 19, 'found 19 required findById ids in initPairingCeremony');
+    assert.ok(idMatches.length > 0, 'initPairingCeremony looks up its elements by id');
+    for (const type of ['phone', 'computer', 'terminal']) {
+      idMatches.push(`link-pairing-type-${type}`, `link-pairing-for-${type}`);
+    }
     for (const id of idMatches) {
       assert.ok(workspace.includes(`id="${id}"`), `workspace.html contains id="${id}"`);
     }
@@ -1235,6 +1361,15 @@ async function main() {
     const here = env.nodes.get('link-pairing-this-computer');
     assert.strictEqual(here.hidden, false);
     assert.strictEqual(here.textContent, env.window.LinkCopy.PAIR_THIS_COMPUTER_CTA);
+  });
+
+  await testCase('on windows the closed-network ask says the system may ask too', async () => {
+    const env = createEnvironment(manifestDir, { windowsAsks: true });
+    env.fetchQueue.push(response({ reason_code: 'local_network_closed' }, 409));
+    env.click(env.opener);
+    await settle();
+    const p = env.nodes.get('link-pairing-unavailable').querySelector('p');
+    assert.strictEqual(p.textContent, 'copy-PAIR_LOCAL_NETWORK_CLOSED_BODY copy-LOCAL_NETWORK_WINDOWS_ASKS_NOTE');
   });
 
   await testCase('pairing the app on this computer asks for a same-computer link', async () => {

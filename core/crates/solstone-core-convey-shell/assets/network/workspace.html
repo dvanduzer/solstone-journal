@@ -219,17 +219,41 @@
       <div id="link-pairing-material" hidden>
         <div id="link-pairing-identity-mark" class="link-mark-display"></div>
         <p id="link-pairing-label-row" hidden><span id="link-device-label" aria-labelledby="link-pairing-dialog-title"></span></p>
-        <ol class="link-pairing-steps">
-          <li data-copy="STEP_1"></li>
-          <li data-copy="STEP_2"></li>
-          <li data-copy="STEP_3"></li>
-        </ol>
+        <div class="link-pairing-type" role="group" aria-labelledby="link-pairing-type-label">
+          <span id="link-pairing-type-label" class="credential-label" data-copy="PAIR_TYPE_PROMPT"></span>
+          <div class="link-pairing-type-options">
+            <button type="button" id="link-pairing-type-phone" data-pairing-action="type" data-pairing-type="phone" aria-pressed="true" data-copy="PAIR_TYPE_PHONE"></button>
+            <button type="button" id="link-pairing-type-computer" data-pairing-action="type" data-pairing-type="computer" aria-pressed="false" data-copy="PAIR_TYPE_COMPUTER"></button>
+            <button type="button" id="link-pairing-type-terminal" data-pairing-action="type" data-pairing-type="terminal" aria-pressed="false" data-copy="PAIR_TYPE_TERMINAL"></button>
+          </div>
+        </div>
         <p id="link-pairing-network-line" class="modal-warning" data-copy="PAIR_NETWORK_LINE"></p>
+        <div id="link-pairing-for-phone">
+          <ol class="link-pairing-steps">
+            <li data-copy="PHONE_STEP_1"></li>
+            <li data-copy="PHONE_STEP_2"></li>
+          </ol>
+          <div id="link-pairing-qr" class="link-pairing-qr"></div>
+        </div>
+        <div id="link-pairing-for-computer" hidden>
+          <ol class="link-pairing-steps">
+            <li data-copy="COMPUTER_STEP_1"></li>
+            <li data-copy="COMPUTER_STEP_2"></li>
+          </ol>
+          <p class="modal-warning" data-copy="COMPUTER_LINUX_NOTE"></p>
+          <div class="command-box"><code>solstone-linux setup &lt; pairing-link.txt</code></div>
+        </div>
+        <div id="link-pairing-for-terminal" hidden>
+          <ol class="link-pairing-steps">
+            <li data-copy="TERMINAL_STEP_1"></li>
+            <li data-copy="TERMINAL_STEP_2"></li>
+          </ol>
+          <div class="command-box"><code>solstone-tmux setup &lt; pairing-link.txt</code></div>
+        </div>
         <div id="link-pairing-addresses" class="link-pairing-addresses" hidden>
           <p data-copy="PAIR_LINK_ADDRESSES_LINE"></p>
           <ul id="link-pairing-addresses-list" class="link-pairing-addresses-list"></ul>
         </div>
-        <div id="link-pairing-qr" class="link-pairing-qr"></div>
         <div class="credential-label" data-copy="PAIR_LINK_FIELD_LABEL"></div>
         <div class="command-box link-pairing-link-box">
           <code id="link-pairing-link-value"></code>
@@ -252,8 +276,8 @@
         <p data-copy="PAIR_START_FAIL_BODY"></p>
         <div class="modal-actions">
           <button type="button" class="modal-primary-btn" data-pairing-action="regenerate" data-copy="CHECK_AGAIN_LABEL"></button>
-          <button type="button" class="modal-primary-btn" data-pairing-action="this-computer" data-copy="PAIR_THIS_COMPUTER_CTA" hidden></button>
           <button type="button" class="modal-primary-btn" data-pairing-action="local-network-open" data-copy="LOCAL_NETWORK_OPEN_CTA" hidden></button>
+          <button type="button" class="modal-primary-btn" data-pairing-action="this-computer" data-copy="PAIR_THIS_COMPUTER_CTA" hidden></button>
           <button type="button" class="modal-primary-btn" data-pairing-action="private-link-repair" data-copy="SPL_NOT_ENROLLED_REPAIR_CTA" hidden></button>
           <button type="button" class="modal-primary-btn" data-pairing-action="private-link-disable" data-copy="PRIVATE_LINK_DISABLE_CTA" hidden></button>
         </div>
@@ -264,8 +288,12 @@
       <div id="link-pairing-complete" hidden>
         <h3 id="link-pairing-success-heading" data-copy="SUCCESS_HEADING"></h3>
         <p id="link-pairing-success-subhead" data-copy="SUCCESS_SUBHEAD"></p>
-        <p class="modal-warning" data-copy="SUCCESS_VERIFY_NOTE"></p>
-        <div class="modal-actions"><button type="button" class="modal-primary-btn" data-pairing-action="close" data-copy="SUCCESS_DONE"></button></div>
+        <p id="link-pairing-success-verify" class="modal-warning" data-copy="SUCCESS_VERIFY_NOTE"></p>
+        <p id="link-pairing-remove-result" role="status" hidden></p>
+        <div class="modal-actions">
+          <button type="button" class="modal-primary-btn" data-pairing-action="close" data-copy="SUCCESS_DONE"></button>
+          <button type="button" id="link-pairing-remove" data-pairing-action="remove" data-copy="SUCCESS_REMOVE_LABEL" hidden></button>
+        </div>
       </div>
     </div>
   </div>
@@ -648,6 +676,35 @@
   padding-left: 1.4em;
   line-height: 1.55;
 }
+.link-pairing-type {
+  margin: 0.75em 0 0.25em;
+}
+.link-pairing-type-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5em;
+  margin-top: 0.4em;
+}
+.link-pairing-type-options button {
+  min-height: 44px;
+  padding: 8px 14px;
+  border: 1.5px solid var(--hairline-2);
+  border-radius: 8px;
+  background: var(--cream-bright);
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+}
+.link-pairing-type-options button[aria-pressed="true"] {
+  border-color: var(--orange);
+  background: var(--paper);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--orange) 14%, transparent);
+  font-weight: 600;
+}
+.link-pairing-type-options button:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
 .link-pairing-qr {
   display: flex;
   justify-content: center;
@@ -974,6 +1031,7 @@
   // While the door is on this computer alone, "your own" lines that promise
   // devices connect straight to it would be false.
   let localNetworkClosed = false;
+  let localNetworkWindowsAsks = false;
   const segByo = document.getElementById('link-seg-byo');
   const segHosted = document.getElementById('link-seg-hosted');
   const modeByoBody = document.getElementById('link-mode-byo-body');
@@ -1713,6 +1771,7 @@
     block.hidden = !applies;
     const wasClosed = localNetworkClosed;
     localNetworkClosed = applies && data.listening_on === 'this_pc';
+    localNetworkWindowsAsks = !!data && data.windows_asks === true;
     applyLocalNetworkToReach();
     if (wasClosed !== localNetworkClosed) refreshStatus();
     if (!applies) return;
@@ -1821,6 +1880,8 @@
       showToast,
       onPrivateLinkRepair: startPrivateLinkSetup,
       onLocalNetworkOpen: () => setLocalNetwork(true),
+      windowsAsks: () => localNetworkWindowsAsks,
+      onDeviceRemoved: () => { if (typeof loadClients === 'function') loadClients(); },
       onPrivateLinkDisable: () => {
         if (!confirm(localNetworkClosed ? window.LinkCopy.PRIVATE_LINK_DISABLE_CONFIRM_CLOSED : window.LinkCopy.PRIVATE_LINK_DISABLE_CONFIRM)) return;
         disablePrivateLink();
@@ -1830,6 +1891,10 @@
     refreshPrivateLinkStatus();
     refreshLocalNetwork();
     loadIdentity();
+    // `?pair=phone|computer|terminal` opens the pair dialog with that device
+    // type chosen, so a setup step can link straight to it.
+    const pairType = new URLSearchParams(location.search).get('pair');
+    if (['phone', 'computer', 'terminal'].includes(pairType)) window.linkPairingCeremony?.open(pairType);
     const identityCopyBtn = document.getElementById('link-identity-id-copy');
     if (identityCopyBtn) {
       identityCopyBtn.addEventListener('click', async () => {

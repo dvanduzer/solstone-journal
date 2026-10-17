@@ -199,9 +199,8 @@ pub(crate) async fn pair_start(
     // A direct link for another device needs the door on the network. On a
     // journal listening on this computer alone, say so rather than mint a link
     // no other device can reach; the relay and same-computer pairing still work.
-    if request.same_machine == Some(false)
-        && !uses_relay_pairing(&root.0, &request)
-        && !crate::local_network::resolve(&root.0).open
+    let relay = uses_relay_pairing(&root.0, &request);
+    if request.same_machine == Some(false) && !relay && !crate::local_network::resolve(&root.0).open
     {
         return refusal(
             "local_network_closed",
@@ -209,7 +208,7 @@ pub(crate) async fn pair_start(
             StatusCode::CONFLICT,
         );
     }
-    let minted = if uses_relay_pairing(&root.0, &request) {
+    let minted = if relay {
         let Some(Extension(pair_windows)) = pair_windows else {
             return pairing_refusal(PairingError::RelayPairingUnavailable);
         };
@@ -227,6 +226,7 @@ pub(crate) async fn pair_start(
             "device_label": response.device_label,
             "ca_fingerprint": response.ca_fingerprint,
             "home_address_is_public": request.configured_home.address.is_some_and(is_public_ipv4),
+            "relay": relay,
             "link_addresses": pair_link_addresses(&response.pair_link),
         }))
         .into_response(),
@@ -293,8 +293,33 @@ pub(crate) async fn nonce_status(
         );
     }
     let nonce = NonceStore::new(&root.0).peek(&query.nonce);
-    Json(json!({"present": nonce.is_some(), "used": nonce.is_some_and(|entry| entry.used)}))
-        .into_response()
+    let mut body =
+        json!({"present": nonce.is_some(), "used": nonce.as_ref().is_some_and(|entry| entry.used)});
+    if let Some(device) = nonce
+        .and_then(|entry| entry.paired_cid)
+        .and_then(|cid| paired_device_summary(&root.0, &cid))
+    {
+        body["device"] = device;
+    }
+    Json(body).into_response()
+}
+
+/// The device a pairing just added, as the owner's dialog names it. Absent when
+/// the ledger no longer holds it (it was removed) or cannot be read.
+fn paired_device_summary(journal_root: &std::path::Path, cid: &str) -> Option<Value> {
+    let AuthorizedClientsRead::Present(entries) =
+        read_authorized_clients(&journal_root.join("link/authorized_clients.json"))
+    else {
+        return None;
+    };
+    let entry = entries.into_iter().find(|entry| entry.fingerprint == cid)?;
+    let descriptions =
+        solstone_core_sol_link::client_description_store::read_descriptions(journal_root).ok();
+    let display_label = solstone_core_sol_link::client_description::current_display_label(
+        &entry,
+        descriptions.as_ref().and_then(|stored| stored.get(cid)),
+    );
+    Some(json!({"cid": entry.fingerprint, "display_label": display_label}))
 }
 
 pub(crate) async fn devices(Extension(root): Extension<Arc<JournalRoot>>) -> Response {
@@ -977,6 +1002,33 @@ mod tests {
         );
         store.consume("nonce", now()).expect("consume");
         assert_eq!(
+            status(app.clone(), "nonce").await,
+            json!({"present":true,"used":true})
+        );
+        // Once pairing records the client, the owner's dialog can name and
+        // remove it; a removed client is no longer described.
+        AuthorizationLedger::new(temporary.path())
+            .add(solstone_core_sol_link::ledger::ClientEntry::new(
+                "sha256:client",
+                "studio-mac",
+                "2026-10-17T00:00:00Z",
+                "instance",
+                solstone_core_sol_link::ledger::ClientRole::Roleless,
+            ))
+            .expect("ledger add");
+        assert!(
+            store
+                .record_paired_client("nonce", "sha256:client")
+                .expect("record")
+        );
+        assert_eq!(
+            status(app.clone(), "nonce").await,
+            json!({"present":true,"used":true,"device":{"cid":"sha256:client","display_label":"studio-mac"}})
+        );
+        AuthorizationLedger::new(temporary.path())
+            .remove("sha256:client")
+            .expect("ledger remove");
+        assert_eq!(
             status(app, "nonce").await,
             json!({"present":true,"used":true})
         );
@@ -1270,12 +1322,14 @@ mod tests {
                 "device_label",
                 "ca_fingerprint",
                 "home_address_is_public",
+                "relay",
                 "link_addresses"
             ]
         );
         assert_eq!(value["expires_in"], 300);
         assert_eq!(value["device_label"], "phone");
         assert_eq!(value["home_address_is_public"], false);
+        assert_eq!(value["relay"], false);
         assert_eq!(value["link_addresses"], json!(["127.0.0.1:7657"]));
         assert!(
             NonceStore::new(temporary.path())
