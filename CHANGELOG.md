@@ -8,6 +8,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- in its first week, a new journal's home page shows a "getting started" card. it shows which of your devices are adding to your journal, the local model and speech model downloads, and your first segment and whether thinking has read it. its next steps are connect an agent, add your phone, and finish choosing where the thinking happens. each step leaves once it's done, and the card leaves when they all are.
 - when a device finishes pairing, the dialog names it by the name the device gave itself, and "didn't do this?" now has a button that unpairs that device straight away.
 - `solstone journal talent passages` copies passages from the source an activity's story is written from, word for word, with where each one sits in that source. each short part of the source is kept whole without asking your model anything. each longer part takes one request to your model to choose what to keep, and the passages are still the source's own words. stories are written the same way as before.
 - health now shows when local speech recognition is missing, installing, paused or needs attention.
@@ -18,7 +19,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - while no device is paired, home keeps "set one up →" next to anything that needs your attention. before, it disappeared whenever anything else showed, which on a new journal was almost always.
 - not having chosen where the thinking happens yet no longer counts as something that needs your attention on home. a note says your journal starts catching up once you choose, and links to the thinking app.
 - the status lines on home, the thinking app and health now say "thinking" where they said "processing", and say why thinking isn't set up in plain words. "processing needs a setup" is now "thinking isn't set up yet", with a reason such as "the local model isn't installed yet". a local model that has stopped now reads "local thinking isn't running".
-- on a computer that can't run local thinking, the thinking app says so in a card of its own instead of a greyed-out option.
+- when your journal's computer can't run local thinking, the thinking app says so in a card of its own instead of a greyed-out option.
 - the agents app now has a place in the side rail.
 - "pair a device" now asks what's joining (a phone, another computer or a terminal) and shows how that device pairs: scan the code, paste the pairing link, or save it as pairing-link.txt. the time left on the code counts down while the dialog is open, and a link that goes through your private network says the device can be anywhere.
 - when your journal is closed to devices on your network, "pair a device" says what opening it means before you choose, and on windows, that windows may ask too.

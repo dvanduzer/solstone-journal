@@ -705,6 +705,59 @@ async function runTests() {
   assert(cantRunEl, 'choose with capability: blocked renders cant_run');
   assert(cantRunEl.querySelector('a[href="/app/thinking/"]'), 'cant_run links to /app/thinking/');
 
+  // Saved setup intention: nothing active yet, but setup saved a choice ->
+  // continue that lane; an active lane (any step but choose) is left alone.
+  for (const [choice, expected, href] of [
+    ['byo', 'byo', '/app/thinking/#byo-setup'],
+    ['spp', 'confidential', '/app/thinking/#confidential-setup'],
+    ['local', 'local', '/app/thinking/#local-setup'],
+  ]) {
+    setState({
+      firstMinutesPayload: {
+        window_open: true,
+        devices_known: true,
+        devices: [],
+        thinking: { step: 'choose' },
+        checks: { phone: true, thinking: false },
+      },
+      setupPayload: { thinking: { choice, capability: 'ok' } },
+      agentsPayload: { connections: [] },
+      agentsSettled: true,
+    });
+    renderPulse(welcomePulse);
+    const saved = surface.querySelector(`[data-thinking-step="${expected}"]`);
+    assert(saved, `saved choice ${choice} continues as ${expected}`);
+    assert(saved.querySelector(`a[href="${href}"]`), `saved choice ${choice} links to ${href}`);
+  }
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      thinking: { step: 'byo' },
+      checks: { phone: true, thinking: false },
+    },
+    setupPayload: { thinking: { choice: 'spp', capability: 'ok' } },
+    agentsPayload: { connections: [] },
+    agentsSettled: true,
+  });
+  renderPulse(welcomePulse);
+  assert(surface.querySelector('[data-thinking-step="byo"]'), 'an active lane wins over the saved setup choice');
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      thinking: { step: 'choose' },
+      checks: { phone: true, thinking: false },
+    },
+    setupPayload: { thinking: { choice: 'later', capability: 'ok' } },
+    agentsPayload: { connections: [] },
+    agentsSettled: true,
+  });
+  renderPulse(welcomePulse);
+  assert(surface.querySelector('[data-thinking-step="choose"]'), 'later stays choose');
+
   // Adjustment 2: step === 'local' and downloads.thinking.state === 'downloading' -> no thinking step
   setState({
     firstMinutesPayload: {
@@ -968,6 +1021,28 @@ async function runTests() {
   await Promise.resolve();
   await Promise.resolve();
   assert(!speechRetryBtn.disabled, 'button re-enabled after non-2xx POST');
+
+  // A missing bundled speech package is a repair, not a download: no retry,
+  // and the journal's own guidance is shown.
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      checks: { phone: false, thinking: true },
+    },
+    setupPayload: {
+      downloads: {
+        speech: { state: 'error', error: { code: 'speech_package_unavailable', detail: 'repair guidance' } },
+      },
+    },
+    agentsPayload: { connections: [] },
+    agentsSettled: true,
+    speechRetryInFlight: false,
+  });
+  renderPulse(welcomePulse);
+  assert(!surface.querySelector('[data-speech-retry]'), 'no retry for a missing speech package');
+  assert(surface.querySelector('[data-speech-guidance]'), 'guidance shown for a missing speech package');
 
   // 7. DOWNLOAD TIMER (15000 ms):
   timerLog.length = 0;

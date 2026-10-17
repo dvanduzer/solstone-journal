@@ -618,9 +618,16 @@
             + bar
             + '</div>';
         } else if (state === 'error' || state === 'cancelled') {
+          // A missing bundled speech package is fixed by repairing the
+          // install, not by downloading again: say what the journal says to
+          // do, and offer no retry.
+          const packageMissing = dl.speech.error?.code === 'speech_package_unavailable';
+          const guidance = packageMissing && typeof dl.speech.error.detail === 'string'
+            ? '<p data-speech-guidance>' + esc(dl.speech.error.detail) + '</p>' : '';
           html += '<div class="pulse-download" data-download="speech" data-download-state="' + esc(state) + '">'
             + '<p>the speech model didn&#39;t finish downloading.</p>'
-            + '<button type="button" data-speech-retry' + (speechRetryInFlight ? ' disabled' : '') + '>try again</button>'
+            + (packageMissing ? guidance
+              : '<button type="button" data-speech-retry' + (speechRetryInFlight ? ' disabled' : '') + '>try again</button>')
             + '</div>';
         }
       }
@@ -657,6 +664,17 @@
     let step = firstMinutesPayload.thinking?.step;
     const capability = setupPayload?.thinking?.capability;
     const thinkingDownloadState = setupPayload?.downloads?.thinking?.state;
+    // Setup saves a choice before any lane is active, so "nothing chosen"
+    // can still have a saved intention behind it: continue that lane. Once a
+    // lane is active the brain decides, so a later change by the owner wins.
+    const savedChoice = setupPayload?.thinking?.choice;
+    if (step === 'choose' && savedChoice === 'byo') {
+      step = 'byo';
+    } else if (step === 'choose' && savedChoice === 'spp') {
+      step = 'confidential';
+    } else if (step === 'choose' && savedChoice === 'local') {
+      step = 'local';
+    }
     if (step === 'choose' && capability === 'blocked') {
       step = 'cant_run';
     }
