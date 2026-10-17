@@ -37,6 +37,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - your agent can continue through facet and entity lists instead of stopping at the first page, and can tell when an entity description was shortened.
 - on linux, the installer opens setup in your browser and shows where to add the solstone app. without a desktop, it prints the setup link and an SSH tunnel command for another computer.
 
+- agent reads leave out activities whose source has changed until your journal indexes them again. activity results also say whether they are hidden, even when a short preview does not.
 - transcripts warn when a sentence may contain words from more than one speaker.
 - linux: `solstone update` and the status pane now recognize installs made by the public installer.
 

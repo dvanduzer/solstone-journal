@@ -4,11 +4,10 @@
 //! Issuer for transcript segment links attached to search and fetch responses.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::Path;
 
-use serde_json::{Value, json};
-use solstone_core_format::content::{ContentResolution, Family, classify, produce_chunks};
+use serde_json::{Map, Value, json};
+use solstone_core_format::content::{ContentResolution, Family, classify};
 use solstone_core_indexer_query::AdmittedCategory;
 use solstone_core_indexer_store::classification::{FacetDeclarationSet, classify_source};
 use solstone_core_journal_io::is_day_key;
@@ -49,10 +48,17 @@ impl TranscriptPageCheck for LiveTranscriptPages {
 
 pub(crate) struct LinkSubject<'a> {
     pub path: &'a str,
+    /// Chunk index the caller admitted. Links use `activity_record`, not this index.
+    #[allow(dead_code)]
     pub idx: i64,
+    /// Indexed prose the caller served. Links do not compare it to a fresh render.
+    #[allow(dead_code)]
     pub text: &'a str,
     pub segments: Vec<Value>,
     pub more_segments: bool,
+    /// Record taken from the activity file after its digest matched the index.
+    /// Activity paths without it yield no links. Other paths ignore it.
+    pub activity_record: Option<&'a Map<String, Value>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -204,45 +210,9 @@ fn resolve_candidates(
         if !is_day_key(day) {
             return Vec::new();
         }
-        let Ok(file_content) = fs::read_to_string(journal_root.join(subject.path)) else {
+        let Some(record) = subject.activity_record else {
             return Vec::new();
         };
-        let mut kept = Vec::new();
-        for line in file_content.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(trimmed) {
-                kept.push((trimmed, map));
-            }
-        }
-        if subject.idx < 0 || subject.idx as usize >= kept.len() {
-            return Vec::new();
-        }
-        let (trimmed_line, record) = &kept[subject.idx as usize];
-        let produced = produce_chunks(Family::Activity, subject.path, trimmed_line);
-        let Some(first_chunk) = produced.chunks.first() else {
-            return Vec::new();
-        };
-        let (Some(rendered_time), Some(indexed_time)) = (
-            extract_time_line(&first_chunk.content),
-            extract_time_line(subject.text),
-        ) else {
-            return Vec::new();
-        };
-        if rendered_time != indexed_time {
-            return Vec::new();
-        }
-        let (Some(rendered_title), Some(indexed_title)) = (
-            extract_title(&first_chunk.content),
-            extract_title(subject.text),
-        ) else {
-            return Vec::new();
-        };
-        if normalize_title(rendered_title) != normalize_title(indexed_title) {
-            return Vec::new();
-        }
 
         let Some(Value::Array(seg_values)) = record.get("segments") else {
             return Vec::new();
@@ -332,21 +302,4 @@ fn get_day_segments<'a>(
                 .unwrap_or_default()
         })
         .as_slice()
-}
-
-fn extract_time_line(text: &str) -> Option<&str> {
-    text.lines().find(|l| l.starts_with("- Time: "))
-}
-
-fn extract_title(text: &str) -> Option<&str> {
-    text.lines().find(|l| l.starts_with("### "))
-}
-
-fn normalize_title(title_line: &str) -> String {
-    let title = title_line.strip_prefix("### ").unwrap_or(title_line);
-    title
-        .split_ascii_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase()
 }

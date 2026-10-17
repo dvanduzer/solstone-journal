@@ -238,3 +238,27 @@ an agent or backups. Backup restoration preserves retry consumption only when th
 matching identity and operation records are restored together. An older backup
 can roll consumption back. windows file publication is checked, but this does
 not promise directory-entry durability across sudden power loss.
+
+## Activity reads
+
+search and fetch check an activity against the file it was indexed from before
+they return its text. an activity is an entry the index recorded as an activity,
+including one indexed from a written shape. the read uses that record and does
+not open a shape file again. an activity result includes `hidden`, true or
+false, taken from that index observation. trust that field. the text can mention
+hidden without the activity being hidden, and a short preview can omit the
+mention entirely.
+
+the check is the whole file. a change to any record in that daily file, including
+one the result did not show, leaves every activity from that file out until the
+next ordinary index update (`scan` or `rescan_file`). a file the index has not
+recorded a match for is left out the same way. definitions in `activities.jsonl`
+follow the same rule. search again after that update if a reference no longer resolves.
+
+the read is at most 4 MiB (4,194,304 bytes). it does not follow a symlink or
+other redirected file, and it refuses a file that is not a regular file, a path
+that leaves the journal, and a file over that budget. any of those, or a file
+that cannot be read or is not valid UTF-8, leaves the activity out.
+
+a write that lands after the check can still change the file. the next read leaves the activity out until
+the journal indexes it again.
