@@ -4463,7 +4463,7 @@ fn list_pagination_walks_and_limits_over_100_items() {
 
     for i in 0..105 {
         let dir_name = format!("dir-{:03}", 105 - i);
-        let facet_id = format!("facet-id-{:03}", i);
+        let facet_id = format!("00000000-0000-4000-8000-{i:012}");
         let title = format!("Title-{:03}", (i * 37) % 105);
         let dir = journal.path().join("facets").join(&dir_name);
         fs::create_dir_all(&dir).unwrap();
@@ -4478,6 +4478,29 @@ fn list_pagination_walks_and_limits_over_100_items() {
         .set_permission(CONNECTION, ReadPermission::default_whole_journal())
         .unwrap();
 
+    // Exercise real admission and outcomes with a distinct synthetic instant
+    // per call; a rapid page walk must not depend on random audit-name collisions.
+    let start = chrono::DateTime::parse_from_rfc3339("2026-03-09T12:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let mut call_number = 0;
+    let mut call = |tool: &str, arguments: Value| {
+        let entry = crate::registry::tool_by_wire_name(tool).unwrap();
+        let now = start + chrono::Duration::seconds(call_number);
+        call_number += 1;
+        crate::dispatch::dispatch_authenticated_tool_call(
+            journal.path(),
+            crate::dispatch::DispatchPrincipal {
+                connection: CONNECTION,
+                agent_identity: CONNECTION,
+            },
+            entry.tool_name,
+            Some(&arguments),
+            now,
+        )
+        .map(|output| output.value)
+    };
+
     let mut current_cursor: Option<String> = None;
     let mut collected_facet_ids = Vec::new();
     loop {
@@ -4486,7 +4509,7 @@ fn list_pagination_walks_and_limits_over_100_items() {
         } else {
             json!({"limit": 1})
         };
-        let page = probe(&journal, "list_facets", args).unwrap();
+        let page = call("list_facets", args).unwrap();
         assert_no_coordinate_keys(&page);
         let facets = page["facets"].as_array().unwrap();
         assert_eq!(facets.len(), 1);
@@ -4498,17 +4521,19 @@ fn list_pagination_walks_and_limits_over_100_items() {
         }
     }
     assert_eq!(collected_facet_ids.len(), 105);
-    let expected_facet_ids: Vec<String> = (0..105).map(|i| format!("facet-id-{:03}", i)).collect();
+    let expected_facet_ids: Vec<String> = (0..105)
+        .map(|i| format!("00000000-0000-4000-8000-{i:012}"))
+        .collect();
     assert_eq!(collected_facet_ids, expected_facet_ids);
 
-    let page1 = probe(&journal, "list_facets", json!({})).unwrap();
+    let page1 = call("list_facets", json!({})).unwrap();
     assert_no_coordinate_keys(&page1);
     assert_eq!(page1["facets"].as_array().unwrap().len(), 100);
     let cur1 = page1["next_cursor"]
         .as_str()
         .expect("next cursor on page 1");
 
-    let page2 = probe(&journal, "list_facets", json!({"cursor": cur1})).unwrap();
+    let page2 = call("list_facets", json!({"cursor": cur1})).unwrap();
     assert_no_coordinate_keys(&page2);
     assert_eq!(page2["facets"].as_array().unwrap().len(), 5);
     assert!(page2.get("next_cursor").is_none());
@@ -4524,19 +4549,14 @@ fn list_pagination_walks_and_limits_over_100_items() {
     }
     assert_eq!(combined_facets, expected_facet_ids);
 
-    let page1_lim100 = probe(&journal, "list_facets", json!({"limit": 100})).unwrap();
+    let page1_lim100 = call("list_facets", json!({"limit": 100})).unwrap();
     assert_no_coordinate_keys(&page1_lim100);
     assert_eq!(page1_lim100["facets"].as_array().unwrap().len(), 100);
     let cur1_lim100 = page1_lim100["next_cursor"]
         .as_str()
         .expect("next cursor on page 1 with limit 100");
 
-    let page2_lim100 = probe(
-        &journal,
-        "list_facets",
-        json!({"cursor": cur1_lim100, "limit": 100}),
-    )
-    .unwrap();
+    let page2_lim100 = call("list_facets", json!({"cursor": cur1_lim100, "limit": 100})).unwrap();
     assert_no_coordinate_keys(&page2_lim100);
     assert_eq!(page2_lim100["facets"].as_array().unwrap().len(), 5);
     assert!(page2_lim100.get("next_cursor").is_none());
@@ -4601,7 +4621,7 @@ fn list_pagination_walks_and_limits_over_100_items() {
 
     let mut expected_entities = Vec::new();
     for f in 0..5 {
-        let f_id = format!("facet-id-{:03}", f);
+        let f_id = format!("00000000-0000-4000-8000-{f:012}");
         for i in (0..105).filter(|i| i % 5 == f) {
             expected_entities.push((f_id.clone(), format!("entity-id-{:03}", i)));
         }
@@ -4616,7 +4636,7 @@ fn list_pagination_walks_and_limits_over_100_items() {
         } else {
             json!({"limit": 1})
         };
-        let page = probe(&journal, "list_entities", args).unwrap();
+        let page = call("list_entities", args).unwrap();
         assert_no_coordinate_keys(&page);
         let entities = page["entities"].as_array().unwrap();
         assert_eq!(entities.len(), 1);
@@ -4631,14 +4651,14 @@ fn list_pagination_walks_and_limits_over_100_items() {
     }
     assert_eq!(collected_entities, expected_entities);
 
-    let ent_page1 = probe(&journal, "list_entities", json!({})).unwrap();
+    let ent_page1 = call("list_entities", json!({})).unwrap();
     assert_no_coordinate_keys(&ent_page1);
     assert_eq!(ent_page1["entities"].as_array().unwrap().len(), 100);
     let ent_cur1 = ent_page1["next_cursor"]
         .as_str()
         .expect("next cursor on ent page 1");
 
-    let ent_page2 = probe(&journal, "list_entities", json!({"cursor": ent_cur1})).unwrap();
+    let ent_page2 = call("list_entities", json!({"cursor": ent_cur1})).unwrap();
     assert_no_coordinate_keys(&ent_page2);
     assert_eq!(ent_page2["entities"].as_array().unwrap().len(), 5);
     assert!(ent_page2.get("next_cursor").is_none());
@@ -4655,15 +4675,14 @@ fn list_pagination_walks_and_limits_over_100_items() {
     }
     assert_eq!(combined_ents, expected_entities);
 
-    let ent_page1_lim100 = probe(&journal, "list_entities", json!({"limit": 100})).unwrap();
+    let ent_page1_lim100 = call("list_entities", json!({"limit": 100})).unwrap();
     assert_no_coordinate_keys(&ent_page1_lim100);
     assert_eq!(ent_page1_lim100["entities"].as_array().unwrap().len(), 100);
     let ent_cur1_lim100 = ent_page1_lim100["next_cursor"]
         .as_str()
         .expect("next cursor on ent page 1 with limit 100");
 
-    let ent_page2_lim100 = probe(
-        &journal,
+    let ent_page2_lim100 = call(
         "list_entities",
         json!({"cursor": ent_cur1_lim100, "limit": 100}),
     )
@@ -4696,7 +4715,7 @@ fn facet_and_entity_ordering_and_scoping() {
     fs::create_dir_all(&f1_dir).unwrap();
     fs::write(
         f1_dir.join("facet.json"),
-        json!({"id": "facet_a", "title": "Zeta", "description": "Desc A"}).to_string(),
+        json!({"id": "10000000-0000-4000-8000-000000000001", "title": "Zeta", "description": "Desc A"}).to_string(),
     )
     .unwrap();
 
@@ -4704,7 +4723,7 @@ fn facet_and_entity_ordering_and_scoping() {
     fs::create_dir_all(&f2_dir).unwrap();
     fs::write(
         f2_dir.join("facet.json"),
-        json!({"id": "facet_b", "title": "Alpha", "description": "Desc B"}).to_string(),
+        json!({"id": "10000000-0000-4000-8000-000000000002", "title": "Alpha", "description": "Desc B"}).to_string(),
     )
     .unwrap();
 
@@ -4797,17 +4816,23 @@ fn facet_and_entity_ordering_and_scoping() {
     let facets_no_details = probe(&journal, "list_facets", json!({})).unwrap();
     let f_arr = facets_no_details["facets"].as_array().unwrap();
     assert_eq!(f_arr.len(), 2);
-    assert_eq!(f_arr[0]["id"], "facet_a");
+    assert_eq!(f_arr[0]["id"], "10000000-0000-4000-8000-000000000001");
     assert_eq!(f_arr[0]["name"], "Zeta");
     assert!(f_arr[0].get("description").is_none());
-    assert_eq!(f_arr[1]["id"], "facet_b");
+    assert_eq!(f_arr[1]["id"], "10000000-0000-4000-8000-000000000002");
     assert_eq!(f_arr[1]["name"], "Alpha");
     assert!(f_arr[1].get("description").is_none());
 
     let facets_lim2 = probe(&journal, "list_facets", json!({"limit": 2})).unwrap();
     assert_eq!(facets_lim2["facets"].as_array().unwrap().len(), 2);
-    assert_eq!(facets_lim2["facets"][0]["id"], "facet_a");
-    assert_eq!(facets_lim2["facets"][1]["id"], "facet_b");
+    assert_eq!(
+        facets_lim2["facets"][0]["id"],
+        "10000000-0000-4000-8000-000000000001"
+    );
+    assert_eq!(
+        facets_lim2["facets"][1]["id"],
+        "10000000-0000-4000-8000-000000000002"
+    );
     assert!(facets_lim2.get("next_cursor").is_none());
 
     PermissionStore::open(journal.path())
@@ -4825,21 +4850,30 @@ fn facet_and_entity_ordering_and_scoping() {
             journal.path(),
             ent_page_lim3["entities"][0]["reference"].as_str().unwrap()
         ),
-        ("facet_a".to_owned(), "entity_other".to_owned())
+        (
+            "10000000-0000-4000-8000-000000000001".to_owned(),
+            "entity_other".to_owned()
+        )
     );
     assert_eq!(
         resolve_entity_reference(
             journal.path(),
             ent_page_lim3["entities"][1]["reference"].as_str().unwrap()
         ),
-        ("facet_a".to_owned(), "entity_shared".to_owned())
+        (
+            "10000000-0000-4000-8000-000000000001".to_owned(),
+            "entity_shared".to_owned()
+        )
     );
     assert_eq!(
         resolve_entity_reference(
             journal.path(),
             ent_page_lim3["entities"][2]["reference"].as_str().unwrap()
         ),
-        ("facet_b".to_owned(), "entity_shared".to_owned())
+        (
+            "10000000-0000-4000-8000-000000000002".to_owned(),
+            "entity_shared".to_owned()
+        )
     );
     assert!(ent_page_lim3.get("next_cursor").is_none());
     let page_lim3_str = ent_page_lim3.to_string();
@@ -4853,11 +4887,17 @@ fn facet_and_entity_ordering_and_scoping() {
     let ref1 = ent_page["entities"][1]["reference"].as_str().unwrap();
     assert_eq!(
         resolve_entity_reference(journal.path(), ref0),
-        ("facet_a".to_owned(), "entity_other".to_owned())
+        (
+            "10000000-0000-4000-8000-000000000001".to_owned(),
+            "entity_other".to_owned()
+        )
     );
     assert_eq!(
         resolve_entity_reference(journal.path(), ref1),
-        ("facet_a".to_owned(), "entity_shared".to_owned())
+        (
+            "10000000-0000-4000-8000-000000000001".to_owned(),
+            "entity_shared".to_owned()
+        )
     );
 
     let next_cur = ent_page["next_cursor"].as_str().unwrap();
@@ -4871,7 +4911,10 @@ fn facet_and_entity_ordering_and_scoping() {
     let ref2 = ent_page2["entities"][0]["reference"].as_str().unwrap();
     assert_eq!(
         resolve_entity_reference(journal.path(), ref2),
-        ("facet_b".to_owned(), "entity_shared".to_owned())
+        (
+            "10000000-0000-4000-8000-000000000002".to_owned(),
+            "entity_shared".to_owned()
+        )
     );
     assert!(ent_page2.get("next_cursor").is_none());
 
@@ -4886,14 +4929,17 @@ fn facet_and_entity_ordering_and_scoping() {
             ReadPermission {
                 categories: vec!["entities".to_owned(), "facets".to_owned()],
                 scope: ReadScope::Facets {
-                    ids: vec!["facet_a".to_owned()],
+                    ids: vec!["10000000-0000-4000-8000-000000000001".to_owned()],
                 },
             },
         )
         .unwrap();
     let scoped_facets = probe(&journal, "list_facets", json!({})).unwrap();
     assert_eq!(scoped_facets["facets"].as_array().unwrap().len(), 1);
-    assert_eq!(scoped_facets["facets"][0]["id"], "facet_a");
+    assert_eq!(
+        scoped_facets["facets"][0]["id"],
+        "10000000-0000-4000-8000-000000000001"
+    );
 
     let scoped_entities = probe(&journal, "list_entities", json!({})).unwrap();
     assert_eq!(scoped_entities["entities"].as_array().unwrap().len(), 2);
@@ -4905,11 +4951,17 @@ fn facet_and_entity_ordering_and_scoping() {
         .unwrap();
     assert_eq!(
         resolve_entity_reference(journal.path(), ref_s0),
-        ("facet_a".to_owned(), "entity_other".to_owned())
+        (
+            "10000000-0000-4000-8000-000000000001".to_owned(),
+            "entity_other".to_owned()
+        )
     );
     assert_eq!(
         resolve_entity_reference(journal.path(), ref_s1),
-        ("facet_a".to_owned(), "entity_shared".to_owned())
+        (
+            "10000000-0000-4000-8000-000000000001".to_owned(),
+            "entity_shared".to_owned()
+        )
     );
 }
 
@@ -4924,7 +4976,7 @@ fn entity_context_and_relationship_error_handling() {
     fs::create_dir_all(&f1_dir).unwrap();
     fs::write(
         f1_dir.join("facet.json"),
-        json!({"id": "facet_1", "title": "Facet 1"}).to_string(),
+        json!({"id": "20000000-0000-4000-8000-000000000001", "title": "Facet 1"}).to_string(),
     )
     .unwrap();
 
@@ -4932,7 +4984,7 @@ fn entity_context_and_relationship_error_handling() {
     fs::create_dir_all(&f2_dir).unwrap();
     fs::write(
         f2_dir.join("facet.json"),
-        json!({"id": "facet_2", "title": "Facet 2"}).to_string(),
+        json!({"id": "20000000-0000-4000-8000-000000000002", "title": "Facet 2"}).to_string(),
     )
     .unwrap();
 
@@ -5001,7 +5053,12 @@ fn entity_context_and_relationship_error_handling() {
         Err(McpProbeError::Unavailable)
     );
 
-    let filtered_f1 = probe(&journal, "list_entities", json!({"facet": "facet_1"})).unwrap();
+    let filtered_f1 = probe(
+        &journal,
+        "list_entities",
+        json!({"facet": "20000000-0000-4000-8000-000000000001"}),
+    )
+    .unwrap();
     assert_eq!(filtered_f1["entities"].as_array().unwrap().len(), 1);
     let r_f1 = filtered_f1["entities"][0]["reference"].as_str().unwrap();
     let g_f1 = probe(&journal, "get_entity", json!({"reference": r_f1})).unwrap();
@@ -5009,7 +5066,11 @@ fn entity_context_and_relationship_error_handling() {
     assert!(!g_f1.to_string().contains("Role in Facet 2"));
 
     assert_eq!(
-        probe(&journal, "list_entities", json!({"facet": "facet_2"})),
+        probe(
+            &journal,
+            "list_entities",
+            json!({"facet": "20000000-0000-4000-8000-000000000002"})
+        ),
         Err(McpProbeError::Unavailable)
     );
 }
@@ -5323,7 +5384,8 @@ fn stable_key_resilience_across_mutations() {
     assert_eq!(p2_again["entities"][0]["name"], "Charlie Renamed");
 
     let p_all = probe(&journal, "list_entities", json!({"limit": 2})).unwrap();
-    let cur_charlie = p_all["next_cursor"].as_str().unwrap();
+    assert!(p_all.get("next_cursor").is_none());
+    let cur_charlie = cur;
     fs::remove_dir_all(journal.path().join("facets/alpha/entities/rel_3")).unwrap();
     let empty_out = dispatch_output(&journal, "list_entities", json!({"cursor": cur_charlie}));
     assert!(empty_out.value["entities"].as_array().unwrap().is_empty());
@@ -5424,7 +5486,7 @@ fn stable_key_resilience_across_mutations() {
     fs::create_dir_all(&f_c_dir).unwrap();
     fs::write(
         f_c_dir.join("facet.json"),
-        json!({"id": "f_c", "title": "Title 2"}).to_string(),
+        json!({"id": "30000000-0000-4000-8000-000000000004", "title": "Title 2"}).to_string(),
     )
     .unwrap();
 
@@ -5432,7 +5494,7 @@ fn stable_key_resilience_across_mutations() {
     fs::create_dir_all(&f_b_dir).unwrap();
     fs::write(
         f_b_dir.join("facet.json"),
-        json!({"id": "f_b", "title": "Title 1"}).to_string(),
+        json!({"id": "30000000-0000-4000-8000-000000000003", "title": "Title 1"}).to_string(),
     )
     .unwrap();
 
@@ -5440,7 +5502,7 @@ fn stable_key_resilience_across_mutations() {
     fs::create_dir_all(&f_a_dir).unwrap();
     fs::write(
         f_a_dir.join("facet.json"),
-        json!({"id": "f_a", "title": "Title 3"}).to_string(),
+        json!({"id": "30000000-0000-4000-8000-000000000002", "title": "Title 3"}).to_string(),
     )
     .unwrap();
 
@@ -5455,7 +5517,7 @@ fn stable_key_resilience_across_mutations() {
         .iter()
         .map(|f| f["id"].as_str().unwrap())
         .collect();
-    assert_eq!(fa_ids, vec!["f_a"]);
+    assert_eq!(fa_ids, vec!["30000000-0000-4000-8000-000000000002"]);
     let cur_fa = p_fa["next_cursor"].as_str().unwrap();
 
     // Removing the anchor facet still returns the later ids, with no duplicate and no skip.
@@ -5472,7 +5534,7 @@ fn stable_key_resilience_across_mutations() {
         .iter()
         .map(|f| f["id"].as_str().unwrap())
         .collect();
-    assert_eq!(fb_ids, vec!["f_b"]);
+    assert_eq!(fb_ids, vec!["30000000-0000-4000-8000-000000000003"]);
     let cur_fb = p_fb["next_cursor"].as_str().unwrap();
 
     let p_fc = probe(
@@ -5487,7 +5549,7 @@ fn stable_key_resilience_across_mutations() {
         .iter()
         .map(|f| f["id"].as_str().unwrap())
         .collect();
-    assert_eq!(fc_ids, vec!["f_c"]);
+    assert_eq!(fc_ids, vec!["30000000-0000-4000-8000-000000000004"]);
     assert!(p_fc.get("next_cursor").is_none());
 
     // Removing the last remaining facet after a cursor that pointed at it is the empty facet result:
@@ -5512,7 +5574,7 @@ fn stable_key_resilience_across_mutations() {
     fs::create_dir_all(&f_before_dir).unwrap();
     fs::write(
         f_before_dir.join("facet.json"),
-        json!({"id": "f_a_new", "title": "Title Before"}).to_string(),
+        json!({"id": "30000000-0000-4000-8000-000000000001", "title": "Title Before"}).to_string(),
     )
     .unwrap();
 
@@ -5532,14 +5594,20 @@ fn stable_key_resilience_across_mutations() {
         .iter()
         .map(|f| f["id"].as_str().unwrap())
         .collect();
-    assert_eq!(fresh_facet_ids, vec!["f_a_new", "f_b"]);
+    assert_eq!(
+        fresh_facet_ids,
+        vec![
+            "30000000-0000-4000-8000-000000000001",
+            "30000000-0000-4000-8000-000000000003"
+        ]
+    );
 
     // An id inserted after the key is present on the continuation. Assert ids, not counts.
     let f_after_dir = facet_mut_journal.path().join("facets/dir_after");
     fs::create_dir_all(&f_after_dir).unwrap();
     fs::write(
         f_after_dir.join("facet.json"),
-        json!({"id": "f_d", "title": "Title After"}).to_string(),
+        json!({"id": "30000000-0000-4000-8000-000000000005", "title": "Title After"}).to_string(),
     )
     .unwrap();
 
@@ -5550,7 +5618,7 @@ fn stable_key_resilience_across_mutations() {
         .iter()
         .map(|f| f["id"].as_str().unwrap())
         .collect();
-    assert_eq!(cont_after_ids, vec!["f_d"]);
+    assert_eq!(cont_after_ids, vec!["30000000-0000-4000-8000-000000000005"]);
 }
 
 #[test]
@@ -5672,4 +5740,56 @@ fn get_entity_description_truncation_scalars() {
     .unwrap();
     assert!(g_none.get("description_truncated").is_none());
     assert!(g_none.get("description").is_none());
+}
+
+#[test]
+fn legacy_duplicate_entity_links_have_one_logical_page_row() {
+    let journal = tempfile::Builder::new()
+        .prefix("entity-link-continuation-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    setup_facets(journal.path());
+    for (folder, id, description) in [
+        ("a-legacy", "entity-one", "Legacy description"),
+        ("entity-one", "entity-one", "Canonical description"),
+        ("z-legacy", "entity-one", "Other legacy description"),
+        ("entity-two", "entity-two", "Second description"),
+    ] {
+        write_entity_fixture(
+            journal.path(),
+            "alpha",
+            folder,
+            id,
+            id,
+            None,
+            Some(description),
+            None,
+        );
+    }
+    PermissionStore::open(journal.path())
+        .set_permission(CONNECTION, ReadPermission::default_whole_journal())
+        .unwrap();
+    let first = probe(&journal, "list_entities", json!({"limit": 1})).unwrap();
+    let reference = first["entities"][0]["reference"].as_str().unwrap();
+    let entity = probe(&journal, "get_entity", json!({"reference": reference})).unwrap();
+    assert_eq!(entity["description"], "Canonical description");
+    let cursor = first["next_cursor"].as_str().unwrap();
+    fs::remove_dir_all(journal.path().join("facets/alpha/entities/entity-one")).unwrap();
+    let continued = probe(
+        &journal,
+        "list_entities",
+        json!({"limit": 1, "cursor": cursor}),
+    )
+    .unwrap();
+    let reference = continued["entities"][0]["reference"].as_str().unwrap();
+    assert_eq!(
+        resolve_entity_reference(journal.path(), reference),
+        (FACET_A.to_owned(), "entity-two".to_owned())
+    );
+    assert!(continued.get("next_cursor").is_none());
+    let fresh = probe(&journal, "list_entities", json!({})).unwrap();
+    assert_eq!(fresh["entities"].as_array().unwrap().len(), 2);
+    let reference = fresh["entities"][0]["reference"].as_str().unwrap();
+    let entity = probe(&journal, "get_entity", json!({"reference": reference})).unwrap();
+    assert_eq!(entity["description"], "Legacy description");
 }

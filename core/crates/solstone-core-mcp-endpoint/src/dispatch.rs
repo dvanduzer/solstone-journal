@@ -1559,8 +1559,21 @@ fn read_scoped_entities(
     journal_root: &Path,
     facet_dir: &str,
 ) -> Result<Vec<solstone_core_facets::ScopedFacetEntity>, DispatchError> {
-    solstone_core_facets::list_scoped_facet_entities(journal_root, facet_dir, false, false)
-        .map_err(|_| DispatchError::Tool(ToolError::FileUnreadable))
+    let mut entities =
+        solstone_core_facets::list_scoped_facet_entities(journal_root, facet_dir, false, false)
+            .map_err(|_| DispatchError::Tool(ToolError::FileUnreadable))?;
+    // Legacy folders can name the same facet relationship. Match the link
+    // owner's preference: the folder named by the entity id, then name order.
+    entities.sort_by(|a, b| {
+        a.entity_id
+            .cmp(&b.entity_id)
+            .then_with(|| {
+                (a.relationship_dir != a.entity_id).cmp(&(b.relationship_dir != b.entity_id))
+            })
+            .then_with(|| a.relationship_dir.cmp(&b.relationship_dir))
+    });
+    entities.dedup_by(|a, b| a.entity_id == b.entity_id);
+    Ok(entities)
 }
 
 fn list_entities(
@@ -1607,20 +1620,15 @@ fn list_entities(
     all_entities.sort_by(|(f_a, item_a), (f_b, item_b)| {
         f_a.cmp(f_b)
             .then_with(|| item_a.entity_id.cmp(&item_b.entity_id))
-            .then_with(|| item_a.relationship_dir.cmp(&item_b.relationship_dir))
     });
 
     if let Some(cursor) = cursor.as_ref() {
         all_entities.retain(|(facet_id, item)| {
-            (
-                facet_id.as_str(),
-                item.entity_id.as_str(),
-                item.relationship_dir.as_str(),
-            ) > (
-                cursor.last_facet_id.as_str(),
-                cursor.last_entity_id.as_str(),
-                cursor.last_relationship_dir.as_str(),
-            )
+            (facet_id.as_str(), item.entity_id.as_str())
+                > (
+                    cursor.last_facet_id.as_str(),
+                    cursor.last_entity_id.as_str(),
+                )
         });
     }
 
@@ -1630,13 +1638,9 @@ fn list_entities(
         .take(request.limit)
         .collect::<Vec<_>>();
 
-    let last_anchor = page.last().map(|(facet_id, item)| {
-        (
-            facet_id.clone(),
-            item.entity_id.clone(),
-            item.relationship_dir.clone(),
-        )
-    });
+    let last_anchor = page
+        .last()
+        .map(|(facet_id, item)| (facet_id.clone(), item.entity_id.clone()));
 
     let mut targets = Vec::new();
     let mut entities = Vec::new();
@@ -1656,7 +1660,7 @@ fn list_entities(
     }
 
     let next_cursor = if has_more {
-        if let Some((last_facet_id, last_entity_id, last_relationship_dir)) = last_anchor {
+        if let Some((last_facet_id, last_entity_id)) = last_anchor {
             Some(
                 codec()
                     .mint(
@@ -1666,7 +1670,6 @@ fn list_entities(
                             facet: request.facet_id.clone(),
                             last_facet_id,
                             last_entity_id,
-                            last_relationship_dir,
                         }),
                     )
                     .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?,

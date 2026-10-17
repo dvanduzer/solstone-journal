@@ -140,7 +140,6 @@ pub(crate) struct EntityListCursor {
     pub facet: Option<String>,
     pub last_facet_id: String,
     pub last_entity_id: String,
-    pub last_relationship_dir: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -389,7 +388,6 @@ mod tests {
                     facet: None,
                     last_facet_id: "facet-1".to_owned(),
                     last_entity_id: "ent-1".to_owned(),
-                    last_relationship_dir: "rel-1".to_owned(),
                 }),
             )
             .unwrap();
