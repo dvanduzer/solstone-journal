@@ -114,6 +114,14 @@ pub(crate) fn issue_segment_links(
             subject_checks += 1;
             *response_checks += 1;
             if let Ok(Some(version)) = checker.check_first_page(journal_root, &candidate) {
+                if !crate::source_release::check_segment_transcript_release(
+                    journal_root,
+                    &day,
+                    identity.stream,
+                    identity.name,
+                ) {
+                    continue;
+                }
                 let target = ReferenceTarget::Segment(SegmentReference {
                     day: day.clone(),
                     stream: identity.stream.to_string(),

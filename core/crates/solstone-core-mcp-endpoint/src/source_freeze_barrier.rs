@@ -4,6 +4,7 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FreezePoint {
     Before,
+    MarkerSampled,
     After,
 }
 
@@ -15,6 +16,7 @@ struct Barrier {
 
 struct TraceState {
     attempted_before: usize,
+    attempted_marker_sampled: usize,
     attempted_after: usize,
     barriers: Vec<Barrier>,
     barriers_fired: usize,
@@ -34,6 +36,10 @@ pub(crate) fn checkpoint(point: FreezePoint) {
             FreezePoint::Before => {
                 state.attempted_before += 1;
                 state.attempted_before
+            }
+            FreezePoint::MarkerSampled => {
+                state.attempted_marker_sampled += 1;
+                state.attempted_marker_sampled
             }
             FreezePoint::After => {
                 state.attempted_after += 1;
@@ -70,6 +76,7 @@ pub(crate) fn run_with_source_freeze_barrier<T>(
         );
         *cell.borrow_mut() = Some(TraceState {
             attempted_before: 0,
+            attempted_marker_sampled: 0,
             attempted_after: 0,
             barriers: vec![Barrier {
                 point,

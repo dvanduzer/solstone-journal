@@ -6282,6 +6282,138 @@ fn setup_freeze_barrier_journal() -> tempfile::TempDir {
     journal
 }
 
+#[cfg(feature = "test-hooks")]
+#[test]
+fn removal_after_marker_sampling_never_advertises_a_tombstone_page() {
+    use crate::source_freeze_barrier::{FreezePoint, run_with_source_freeze_barrier};
+
+    let journal = setup_freeze_barrier_journal();
+    let root = journal.path().to_path_buf();
+    let (result, fired) = run_with_source_freeze_barrier(
+        FreezePoint::MarkerSampled,
+        1,
+        move || {
+            let target = solstone_core_retention::Target {
+                day: DAY.to_owned(),
+                stream: STREAM.to_owned(),
+                dir: SEGMENT.to_owned(),
+            };
+            let outcome = solstone_core_retention::door::remove_segments(
+                &root,
+                &[target],
+                "2026-10-17T12:00:00Z",
+                solstone_core_retention::RemovalReason::OwnerSegmentDelete,
+                "marker-sampling-removal",
+            );
+            assert!(outcome.targets[0].not_removed.is_empty());
+            assert!(
+                root.join(format!("chronicle/{DAY}/{STREAM}/{SEGMENT}/tombstone.json"))
+                    .is_file()
+            );
+        },
+        || probe(&journal, "list_transcripts", json!({"day": DAY})),
+    );
+    assert!(fired, "the removal must run after observing a live marker");
+    let listed = result.unwrap();
+    let transcripts = listed["transcripts"].as_array().unwrap();
+    assert_eq!(transcripts.len(), 1, "only the surviving sibling is live");
+    assert!(
+        transcripts[0]["time"]
+            .as_str()
+            .unwrap()
+            .starts_with("10:00")
+    );
+    let reference = transcripts[0]["reference"].as_str().unwrap();
+    assert!(probe(&journal, "get_transcript", json!({"reference": reference})).is_ok());
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn removal_after_marker_sampling_refuses_an_old_live_empty_reference() {
+    use crate::source_freeze_barrier::{FreezePoint, run_with_source_freeze_barrier};
+
+    let journal = fixture();
+    let root = journal.path().to_path_buf();
+    let segment = root.join(format!("chronicle/{DAY}/{STREAM}/{SEGMENT}"));
+    fs::remove_file(segment.join("meeting_transcript.md")).unwrap();
+    if segment.join("audio.jsonl").exists() {
+        fs::remove_file(segment.join("audio.jsonl")).unwrap();
+    }
+    let list = probe(&journal, "list_transcripts", json!({"day": DAY})).unwrap();
+    let reference = list["transcripts"][0]["reference"].as_str().unwrap();
+    let before = probe(&journal, "get_transcript", json!({"reference": reference})).unwrap();
+    assert!(before["entries"].as_array().unwrap().is_empty());
+    let (result, fired) = run_with_source_freeze_barrier(
+        FreezePoint::MarkerSampled,
+        1,
+        move || {
+            let target = solstone_core_retention::Target {
+                day: DAY.to_owned(),
+                stream: STREAM.to_owned(),
+                dir: SEGMENT.to_owned(),
+            };
+            let outcome = solstone_core_retention::door::remove_segments(
+                &root,
+                &[target],
+                "2026-10-17T12:00:00Z",
+                solstone_core_retention::RemovalReason::OwnerSegmentDelete,
+                "empty-marker-sampling-removal",
+            );
+            assert!(outcome.targets[0].not_removed.is_empty());
+            assert!(segment.join("tombstone.json").is_file());
+        },
+        || probe(&journal, "get_transcript", json!({"reference": reference})),
+    );
+    assert!(fired, "the removal must run after observing a live marker");
+    assert_eq!(result, Err(McpProbeError::Unavailable));
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_tombstone_withholds_all_segment_reads() {
+    let journal = fixture();
+    let search = probe(&journal, "search", json!({"query": "indexed"})).unwrap();
+    let fetch_reference = &search["results"][0]["reference"];
+    let listed = probe(&journal, "list_transcripts", json!({"day": DAY})).unwrap();
+    let transcript_reference = &listed["transcripts"][0]["reference"];
+    let segment = journal
+        .path()
+        .join(format!("chronicle/{DAY}/{STREAM}/{SEGMENT}"));
+    std::os::unix::fs::symlink(
+        segment.join("meeting_transcript.md"),
+        segment.join("tombstone.json"),
+    )
+    .unwrap();
+    assert_eq!(
+        solstone_core_segment::owner_deletion_state(&segment).unwrap(),
+        solstone_core_segment::OwnerDeletionState::Occupied,
+    );
+    assert!(
+        probe(&journal, "search", json!({"query": "indexed"})).unwrap()["results"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        probe(&journal, "list_transcripts", json!({"day": DAY})).unwrap()["transcripts"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        probe(&journal, "fetch", json!({"reference": fetch_reference})),
+        Err(McpProbeError::Unavailable)
+    );
+    assert_eq!(
+        probe(
+            &journal,
+            "get_transcript",
+            json!({"reference": transcript_reference})
+        ),
+        Err(McpProbeError::Unavailable)
+    );
+}
+
 #[test]
 fn removed_segment_marker_matrix_withheld_from_all_read_tools() {
     use crate::references::{ReferenceTarget, SegmentReference};
@@ -6459,12 +6591,18 @@ fn removed_segment_marker_matrix_withheld_from_all_read_tools() {
             .join(DAY)
             .join(STREAM)
             .join(SEGMENT);
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(
-            seg_dir.join("meeting_transcript.md"),
-            seg_dir.join("tombstone.json"),
+        fs::write(
+            seg_dir
+                .parent()
+                .unwrap()
+                .join(format!(".removing_{SEGMENT}")),
+            b"occupied staged coordinate",
         )
         .unwrap();
+        assert_eq!(
+            solstone_core_segment::owner_deletion_state(&seg_dir).unwrap(),
+            solstone_core_segment::OwnerDeletionState::Occupied,
+        );
 
         assert!(
             probe(&journal, "search", json!({"query": "indexed"})).unwrap()["results"]

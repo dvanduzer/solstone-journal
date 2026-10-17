@@ -1986,6 +1986,15 @@ fn list_transcripts(
             } else {
                 None
             };
+            // Freeze the page before the last deletion observation. A removal
+            // can replace the directory while its initial live marker is read.
+            let allowed = allowed
+                && crate::source_release::check_segment_transcript_release(
+                    journal_root,
+                    day,
+                    &stream,
+                    &name,
+                );
             #[cfg(feature = "test-hooks")]
             crate::source_freeze_barrier::checkpoint(
                 crate::source_freeze_barrier::FreezePoint::After,
@@ -2174,6 +2183,13 @@ fn get_transcript(
     } else {
         None
     };
+    let allowed = allowed
+        && crate::source_release::check_segment_transcript_release(
+            journal_root,
+            &reference.day,
+            &reference.stream,
+            &reference.segment,
+        );
     #[cfg(feature = "test-hooks")]
     crate::source_freeze_barrier::checkpoint(crate::source_freeze_barrier::FreezePoint::After);
 
