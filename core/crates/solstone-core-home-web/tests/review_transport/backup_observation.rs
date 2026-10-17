@@ -112,7 +112,7 @@ fn execute(
         runner: &runner,
         http: &Broker,
         clock: &Fixed,
-        restic_path: Some(Path::new("/synthetic/restic")),
+        restic: Some((Path::new("/synthetic/restic")).into()),
         rclone_path: Some(Path::new("/synthetic/rclone")),
         version: "test",
         journal_maintenance: &Maintenance,

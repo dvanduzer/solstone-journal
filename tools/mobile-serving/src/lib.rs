@@ -8,7 +8,11 @@ use axum::{
     http::{Request, header::CONTENT_TYPE},
 };
 use serde_json::{Value, json};
-use solstone_core_convey_shell::{EmbeddedConveyHandle, bind_embedded_device_door_with_routes};
+use solstone_core_convey_shell::EmbeddedConveyHandle;
+#[cfg(target_os = "ios")]
+use solstone_core_convey_shell::bind_embedded_device_door_with_root;
+#[cfg(not(target_os = "ios"))]
+use solstone_core_convey_shell::bind_embedded_device_door_with_routes;
 use solstone_core_journal_io::JournalRoot;
 use std::{
     net::SocketAddrV4,
@@ -154,13 +158,21 @@ impl MobileServing {
             .map_err(|e| e.to_string())?;
         let handle = runtime
             .block_on(async {
-                bind_embedded_device_door_with_routes(
+                #[cfg(target_os = "ios")]
+                let binding = bind_embedded_device_door_with_root(
+                    Arc::clone(&root),
+                    address,
+                    payload_root,
+                    solstone_core_mcp_endpoint::owner_routes(root.canonical_path().to_path_buf()),
+                );
+                #[cfg(not(target_os = "ios"))]
+                let binding = bind_embedded_device_door_with_routes(
                     root.canonical_path().to_path_buf(),
                     address,
                     payload_root,
                     solstone_core_mcp_endpoint::owner_routes(root.canonical_path().to_path_buf()),
-                )
-                .await
+                );
+                binding.await
             })
             .map_err(|e| e.to_string())?;
         let (shutdown, mut stop) = watch::channel(false);
@@ -276,6 +288,23 @@ impl MobileServing {
                     owner: Some(Box::new(self)),
                 });
             }
+        }
+        #[cfg(target_os = "ios")]
+        if self.root.revalidate_canonical_binding().is_err() {
+            self.handle.backup_dependencies().lifetime().request_stop();
+            self.handle.shutdown();
+            if let Some(services) = self
+                .services
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+            {
+                services.shutdown.send_replace(true);
+            }
+            return Err(StartupFailure {
+                message: "embedded journal root changed during startup".into(),
+                owner: Some(Box::new(self)),
+            });
         }
         Ok(self)
     }

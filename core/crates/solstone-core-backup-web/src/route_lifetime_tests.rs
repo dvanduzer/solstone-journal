@@ -652,7 +652,7 @@ fn rotation_after_remove_key_holds_drain_until_local_publish() {
         began.generation,
         move || {
             let tools = solstone_core_backup_runtime::ResolvedTools {
-                restic_path: PathBuf::from("/fixture/bin/restic"),
+                restic: (PathBuf::from("/fixture/bin/restic")).into(),
                 rclone_path: None,
             };
             let runner = lifetime_runner(&worker_deps);
@@ -789,7 +789,7 @@ fn store_rotation(
     stored: &Mutex<Option<solstone_core_backup_runtime::RotationResult>>,
 ) {
     let tools = solstone_core_backup_runtime::ResolvedTools {
-        restic_path: PathBuf::from("/fixture/bin/restic"),
+        restic: (PathBuf::from("/fixture/bin/restic")).into(),
         rclone_path: None,
     };
     let runner = lifetime_runner(deps);

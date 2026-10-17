@@ -141,8 +141,8 @@ pub struct BackupServices<'a> {
     pub runner: &'a dyn ToolRunner,
     pub http: &'a dyn HttpTransport,
     pub clock: &'a dyn Clock,
-    /// A ready pinned restic binary; readiness/install remains phase 1 authority.
-    pub restic_path: Option<&'a Path>,
+    /// Captured execution authority; readiness/install remains resolution authority.
+    pub restic: Option<crate::runner::ResticInvocation<'a>>,
     /// Required only for operated append-only backup/archive sessions.
     pub rclone_path: Option<&'a Path>,
     pub version: &'a str,
@@ -150,8 +150,14 @@ pub struct BackupServices<'a> {
 }
 
 impl BackupServices<'_> {
+    pub fn restic_invocation(&self) -> Result<crate::runner::ResticInvocation<'_>, String> {
+        self.restic.ok_or_else(|| "restic_unavailable".to_owned())
+    }
+
+    /// Archive/offload paths retain executable-only admission.
     pub fn restic_path(&self) -> Result<&Path, String> {
-        self.restic_path
+        self.restic_invocation()?
+            .executable_path()
             .ok_or_else(|| "restic_unavailable".to_owned())
     }
 }
@@ -549,7 +555,7 @@ fn restic(
     timeout: u64,
     max_repack_size: Option<&str>,
 ) -> Result<crate::runner::ResticResult, String> {
-    let restic_path = services.restic_path()?;
+    let restic_path = services.restic_invocation()?;
     let mut full = Vec::new();
     full.append(&mut runtime.global_options.clone());
     let waits_for_repository = matches!(
@@ -2188,7 +2194,8 @@ pub fn admit_prepared_archive<'a>(
         }
         let keys = config.keys()?.ok_or(ArchiveError::NotConfigured)?;
         let restic_path = services
-            .restic_path
+            .restic
+            .and_then(crate::runner::ResticInvocation::executable_path)
             .ok_or(ArchiveError::ToolUnavailable)?
             .to_path_buf();
         let (write, read) = if let Some(binding) = config.binding() {
@@ -2292,7 +2299,9 @@ pub fn admit_prepared_archive_read<'a>(
         operation,
         Some(expected_repository_id),
         services.http,
-        services.restic_path,
+        services
+            .restic
+            .and_then(crate::runner::ResticInvocation::executable_path),
         services.version,
     )
 }
@@ -4070,7 +4079,7 @@ mod tests {
             runner,
             http,
             clock,
-            restic_path: Some(Path::new("/fixture/bin/restic")),
+            restic: Some((Path::new("/fixture/bin/restic")).into()),
             rclone_path: None,
             version: "test",
             journal_maintenance: maintenance,
@@ -5700,8 +5709,11 @@ mod tests {
             ]);
             let mut services = services(&runner, &PanicHttp, &FixedClock, &Maintenance);
             let mut admitted = admit_archive(Arc::clone(&root), &services).unwrap();
-            services.restic_path = Some(Path::new("/replacement/restic"));
-            assert_eq!(services.restic_path, Some(Path::new("/replacement/restic")));
+            services.restic = Some(Path::new("/replacement/restic").into());
+            assert_eq!(
+                services.restic_path().unwrap(),
+                Path::new("/replacement/restic")
+            );
             assert!(Arc::ptr_eq(admitted.journal_root(), &root));
             assert_eq!(admitted.repository_id(), REPOSITORY_ID);
             let result = admitted.archive(&source(journal.path())).unwrap();
@@ -7921,7 +7933,7 @@ mod tests {
         let clock = FixedClock;
         let maintenance = Maintenance;
         let mut services = services(&runner, &http, &clock, &maintenance);
-        services.restic_path = None;
+        services.restic = None;
 
         let result = run_backup(journal.path(), &services);
 

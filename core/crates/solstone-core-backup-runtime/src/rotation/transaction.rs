@@ -548,7 +548,7 @@ mod tests {
             runner,
             http,
             clock,
-            restic_path: Some(Path::new("/fixture/bin/restic")),
+            restic: Some((Path::new("/fixture/bin/restic")).into()),
             rclone_path: None,
             version: "test",
             journal_maintenance: maintenance,
@@ -649,7 +649,7 @@ mod tests {
         let clock = TestClock;
         let maintenance = Maintenance;
         let mut services = services(&runner, &http, &clock, &maintenance);
-        services.restic_path = None;
+        services.restic = None;
         assert_eq!(
             rotate_recovery_key(journal.path(), &services).status,
             "skipped"
@@ -667,7 +667,7 @@ mod tests {
         let clock = TestClock;
         let maintenance = Maintenance;
         let mut services = services(&runner, &http, &clock, &maintenance);
-        services.restic_path = None;
+        services.restic = None;
 
         let result = rotate_recovery_key(journal.path(), &services);
 
@@ -995,7 +995,7 @@ mod tests {
                 runner: &runner,
                 http: &http,
                 clock: &clock,
-                restic_path: Some(Path::new("/fixture/bin/restic")),
+                restic: Some((Path::new("/fixture/bin/restic")).into()),
                 rclone_path: None,
                 version: "test",
                 journal_maintenance: &maintenance,
@@ -1242,7 +1242,7 @@ mod tests {
             runner: &runner,
             http: &Broker,
             clock: &TestClock,
-            restic_path: Some(Path::new("/fixture/bin/restic")),
+            restic: Some((Path::new("/fixture/bin/restic")).into()),
             rclone_path: None,
             version: "test",
             journal_maintenance: &Maintenance,
@@ -1465,7 +1465,7 @@ mod tests {
                 runner: &runner,
                 http: &http,
                 clock: &clock,
-                restic_path: Some(Path::new("/fixture/bin/restic")),
+                restic: Some((Path::new("/fixture/bin/restic")).into()),
                 rclone_path: None,
                 version: "test",
                 journal_maintenance: &maintenance,
@@ -1560,7 +1560,7 @@ mod tests {
             runner,
             http: &http,
             clock: &clock,
-            restic_path: Some(Path::new("/fixture/bin/restic")),
+            restic: Some((Path::new("/fixture/bin/restic")).into()),
             rclone_path: None,
             version: "test",
             journal_maintenance: &maintenance,
@@ -1831,7 +1831,7 @@ mod tests {
             capture_rotation_key_id(&runner, &destination, &prior.daily_key, restic, timeout)
                 .unwrap();
         let mut services = services(&runner, &Http, &TestClock, &Maintenance);
-        services.restic_path = Some(restic);
+        services.restic = Some(restic.into());
         let (failed, attempted, _) = run_with_windows_detailed_atomic_faults(
             [("post-publication-observation", 1, 1117)],
             || rotate_recovery_key(journal.path(), &services),

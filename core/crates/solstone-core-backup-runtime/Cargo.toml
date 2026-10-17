@@ -54,6 +54,10 @@ rustix = { workspace = true, features = ["process"] }
 [target.'cfg(windows)'.dependencies]
 solstone-core-distribution.workspace = true
 
+[target.'cfg(target_os = "ios")'.dependencies]
+plist.workspace = true
+zeroize = "1.8"
+
 [dev-dependencies]
 solstone-core-distribution.workspace = true
 solstone-core-journal-io = { workspace = true, features = ["test-hooks"] }

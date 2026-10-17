@@ -18,6 +18,13 @@ pub fn assemble_backend_env(destination: &Destination) -> Result<Map<String, Val
                 "AWS_SECRET_ACCESS_KEY".to_owned(),
                 Value::String(required(credentials, "secret_access_key")?),
             );
+            #[cfg(target_os = "ios")]
+            {
+                env.insert(
+                    "AWS_DEFAULT_REGION".to_owned(),
+                    Value::String(ios_s3_region(credentials)?),
+                );
+            }
             if let Some(token) = credentials
                 .get("session_token")
                 .and_then(Value::as_str)
@@ -44,6 +51,20 @@ pub fn assemble_backend_env(destination: &Destination) -> Result<Map<String, Val
     }
 }
 
+#[cfg(any(target_os = "ios", test))]
+fn ios_s3_region(credentials: &Map<String, Value>) -> Result<String, BackupError> {
+    let region = required(credentials, "region")?;
+    if region.is_empty()
+        || region.len() > 64
+        || !region
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(BackupError::InvalidDestinationShape);
+    }
+    Ok(region)
+}
+
 fn required(credentials: &Map<String, Value>, key: &'static str) -> Result<String, BackupError> {
     credentials
         .get(key)
@@ -56,6 +77,24 @@ fn required(credentials: &Map<String, Value>, key: &'static str) -> Result<Strin
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn ios_region_requires_exact_explicit_configured_value() {
+        let value = serde_json::from_value(json!({"region":"us-west-004"})).unwrap();
+        assert_eq!(ios_s3_region(&value).unwrap(), "us-west-004");
+        for region in [
+            json!(null),
+            json!(""),
+            json!("UPPER"),
+            json!("a b"),
+            json!("a\nb"),
+            json!("a".repeat(65)),
+        ] {
+            let credentials = serde_json::from_value(json!({"region":region})).unwrap();
+            assert!(ios_s3_region(&credentials).is_err());
+        }
+        assert!(ios_s3_region(&Map::new()).is_err());
+    }
 
     #[test]
     fn s3_projects_exact_required_environment_without_session_token() {

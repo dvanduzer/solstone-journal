@@ -11,7 +11,7 @@ settings:
     CODE_SIGN_ENTITLEMENTS: Shared/Serving.entitlements
     DEVELOPMENT_TEAM: 7QCG8V4M6H
     SWIFT_OBJC_BRIDGING_HEADER: Shared/Bridge.h
-    OTHER_LDFLAGS: $(RUST_LIB) -lc++ -lz -liconv -framework Foundation -framework
+    OTHER_LDFLAGS: $(RUST_LIB) $(BACKUP_LIB) -lc++ -lz -liconv -framework CoreFoundation -framework Foundation -framework
       Security -framework SystemConfiguration -framework Metal -framework MetalKit -framework Accelerate
     ENABLE_DEBUG_DYLIB: false
     OTHER_CODE_SIGN_FLAGS: --keychain /Users/jer/Library/Keychains/sol-signing.keychain-db
@@ -29,6 +29,9 @@ targets:
       type: folder
       buildPhase: resources
     - path: Resources/AudioModels
+      type: folder
+      buildPhase: resources
+    - path: Resources/BackupRuntime
       type: folder
       buildPhase: resources
     settings:
@@ -50,6 +53,9 @@ targets:
     - Helper
     - Shared
     - path: Resources/JournalPayload
+      type: folder
+      buildPhase: resources
+    - path: Resources/BackupRuntime
       type: folder
       buildPhase: resources
     dependencies:

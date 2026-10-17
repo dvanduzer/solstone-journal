@@ -127,6 +127,18 @@ impl BackupWebDeps {
         Self::production(journal_root, cache)
     }
 
+    #[cfg(target_os = "ios")]
+    pub fn with_ios_root(
+        root: Arc<solstone_core_journal_io::JournalRoot>,
+    ) -> Result<Self, solstone_core_journal_io::JournalRootError> {
+        root.revalidate_canonical_binding()?;
+        let mut deps = Self::new(root.canonical_path().to_path_buf());
+        deps.runner = Arc::new(
+            solstone_core_backup_runtime::ios_callable::IosRootToolRunner::new(root, deps.runner)?,
+        );
+        Ok(deps)
+    }
+
     fn production(journal_root: PathBuf, cache: SharedMeasurementCache) -> Self {
         Self {
             journal_root,
@@ -728,7 +740,7 @@ fn init_and_enable(
     destination: &Destination,
     daily_key: &str,
     recovery_key: &str,
-    restic_path: &Path,
+    restic_path: solstone_core_backup_runtime::ResticInvocation<'_>,
 ) -> Result<(), String> {
     init_repository(
         runner,
@@ -770,7 +782,7 @@ fn services<'a>(
         runner,
         http: deps.http.as_ref(),
         clock: deps.clock.as_ref(),
-        restic_path: Some(&tools.restic_path),
+        restic: Some(tools.restic.invocation()),
         rclone_path: tools.rclone_path.as_deref(),
         version: deps.version,
         journal_maintenance: deps.journal_maintenance.as_ref(),
@@ -846,7 +858,7 @@ async fn enable_backup(deps: BackupWebDeps) -> axum::response::Response {
             &destination,
             &keys.daily_key,
             &keys.recovery_key,
-            &tools.restic_path,
+            tools.restic.invocation(),
         ) {
             return Terminal::error(reason);
         }
@@ -993,7 +1005,13 @@ async fn set_backup_destination(deps: BackupWebDeps, body: Bytes) -> axum::respo
         }
     };
     let runner = lifetime_runner(&deps);
-    match validate_destination(&runner, &destination, &password, &tools.restic_path, None) {
+    match validate_destination(
+        &runner,
+        &destination,
+        &password,
+        tools.restic.invocation(),
+        None,
+    ) {
         Ok(status) => destination_status_response(
             &deps,
             status.reachable,
@@ -1535,6 +1553,11 @@ pub(crate) fn consume_hosted(
     binding: HostedBinding,
     restore_key: Option<String>,
 ) -> Terminal {
+    // The separately reviewed callable operated transport is not installed yet.
+    // Keep a returned binding in custody, but refuse before fetching credentials.
+    if cfg!(target_os = "ios") {
+        return Terminal::error("restic_unavailable");
+    }
     if kind != "enable_hosted"
         && let Some(reason) =
             solstone_core_backup_runtime::restore::restore_pending_rotation_refusal(
@@ -1572,7 +1595,7 @@ pub(crate) fn consume_hosted(
             &destination,
             &keys.daily_key,
             &keys.recovery_key,
-            &tools.restic_path,
+            tools.restic.invocation(),
         ) {
             return Terminal::error(reason);
         }
@@ -1583,7 +1606,7 @@ pub(crate) fn consume_hosted(
             &destination,
             &keys.daily_key,
             &keys.recovery_key,
-            &tools.restic_path,
+            tools.restic.invocation(),
             None,
         ));
         if set_mode(&deps.journal_root, "operated").is_err()

@@ -329,7 +329,7 @@ mod tests {
                 runner: self,
                 http: self,
                 clock: self,
-                restic_path: Some(Path::new("/unused/restic")),
+                restic: Some((Path::new("/unused/restic")).into()),
                 rclone_path: None,
                 version: "test",
                 journal_maintenance: self,

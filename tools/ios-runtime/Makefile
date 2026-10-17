@@ -13,21 +13,26 @@ APPRAISAL_NATIVE_DIR := $(BUILD_ROOT)/appraisal-native
 APPRAISAL_RESOURCES := $(BUILD_ROOT)/appraisal-resources
 APPRAISAL_BUILD_RECORD := $(BUILD_ROOT)/appraisal-native-build.json
 NVAT_LIB := $(APPRAISAL_NATIVE_DIR)/libnvat-all.a
+BACKUP_NATIVE_WORK ?= $(BUILD_ROOT)/backup-native-work
+BACKUP_LIB := $(BUILD_ROOT)/backup-native/librestic_bridge.a
+BACKUP_RESOURCES := Resources/BackupRuntime
 APP := $(BUILD_ROOT)/derived/Build/Products/Debug-iphoneos/JournalRuntimeDev.app
-.PHONY: build rust appraisal-rust appraisal-native payload project finalize install run check
+.PHONY: build rust appraisal-rust appraisal-native backup-native payload project finalize install run check
 rust:
 	IPHONEOS_DEPLOYMENT_TARGET=26.0 cargo build --locked --manifest-path native/Cargo.toml $(if $(AUDIO_MODELS_DIR),--features audio,) --target aarch64-apple-ios --target-dir $(BUILD_ROOT)/rust
 appraisal-rust:
 	IPHONEOS_DEPLOYMENT_TARGET=26.0 cargo build --locked --manifest-path appraisal-helper/Cargo.toml --target aarch64-apple-ios --target-dir $(BUILD_ROOT)/appraisal-rust
 appraisal-native:
 	python3 build_gpu_appraisal.py --work-dir $(APPRAISAL_NATIVE_WORK) --cache-dir $(CACHE_DIR) --output-lib $(NVAT_LIB) --resource-dir $(APPRAISAL_RESOURCES) --build-record $(APPRAISAL_BUILD_RECORD) --jobs $(JOBS)
+backup-native:
+	python3 build_backup.py --work-dir $(BACKUP_NATIVE_WORK) --cache-dir $(CACHE_DIR) --output-lib $(BACKUP_LIB) --resource-dir $(BACKUP_RESOURCES) --jobs $(JOBS)
 payload:
 	AUDIO_MODELS_DIR='$(AUDIO_MODELS_DIR)' python3 package_payload.py
-project: payload
+project: payload backup-native
 	xcodegen generate
 build: rust appraisal-rust appraisal-native project
-	xcodebuild -project JournalRuntimeDev.xcodeproj -scheme JournalRuntimeDev -configuration Debug -destination '$(DESTINATION)' -derivedDataPath $(BUILD_ROOT)/derived -allowProvisioningUpdates RUST_LIB=$(RUST_LIB) APPRAISAL_LIB=$(APPRAISAL_LIB) NVAT_LIB=$(NVAT_LIB) build
-	python3 finalize.py $(BUILD_ROOT) --nvattest-lib $(NVAT_LIB) --appraisal-build-record $(APPRAISAL_BUILD_RECORD) --appraisal-resources $(APPRAISAL_RESOURCES)
+	xcodebuild -project JournalRuntimeDev.xcodeproj -scheme JournalRuntimeDev -configuration Debug -destination '$(DESTINATION)' -derivedDataPath $(BUILD_ROOT)/derived -allowProvisioningUpdates RUST_LIB=$(RUST_LIB) APPRAISAL_LIB=$(APPRAISAL_LIB) NVAT_LIB=$(NVAT_LIB) BACKUP_LIB=$(BACKUP_LIB) build
+	python3 finalize.py $(BUILD_ROOT) --nvattest-lib $(NVAT_LIB) --appraisal-build-record $(APPRAISAL_BUILD_RECORD) --appraisal-resources $(APPRAISAL_RESOURCES) --backup-lib $(BACKUP_LIB) --backup-work $(BACKUP_NATIVE_WORK)
 install: build
 	@test -n "$(DEVICE)" || (echo "Set DEVICE to a connected device identifier"; exit 2)
 	xcrun devicectl device install app --device $(DEVICE) $(APP)

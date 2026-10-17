@@ -53,7 +53,7 @@ fn services(work: &NoWork) -> BackupServices<'_> {
         runner: work,
         http: work,
         clock: &FixedClock,
-        restic_path: None,
+        restic: None,
         rclone_path: None,
         version: "fixture",
         journal_maintenance: work,

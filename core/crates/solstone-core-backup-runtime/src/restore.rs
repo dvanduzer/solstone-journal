@@ -200,7 +200,7 @@ fn restic(
         .revalidate_for_target()
         .map_err(|_| RESTORE_REASON_DESTINATION_ADMISSION_FAILED)?;
     let restic_path = services
-        .restic_path()
+        .restic_invocation()
         .map_err(|_| RESTORE_REASON_RESTIC_UNAVAILABLE)?;
     run_restic(
         services.runner,
@@ -324,6 +324,11 @@ pub fn restore_journal(
     destination: Destination,
     entered_recovery_key: &str,
 ) -> RestoreOutcome {
+    // iOS still needs retained-root post-work and panic-fallback ownership.
+    // Callable backup readiness does not admit this whole restore orchestration.
+    if cfg!(target_os = "ios") {
+        return unrecorded_outcome(error_draft(RESTORE_REASON_RESTIC_UNAVAILABLE));
+    }
     let admitted = match crate::destination_admission::admit_restore_destination(journal) {
         Ok(admitted) => admitted,
         Err(_) => {
@@ -875,7 +880,7 @@ mod tests {
             runner,
             http: &HTTP,
             clock,
-            restic_path: Some(Path::new("/fixture/restic")),
+            restic: Some((Path::new("/fixture/restic")).into()),
             rclone_path: None,
             version: "test",
             journal_maintenance: maintenance,
@@ -935,7 +940,7 @@ mod tests {
         let maintenance = Maintenance;
         let recorder = Recorder::new();
         let mut runtime = services(&runner, &clock, &maintenance);
-        runtime.restic_path = None;
+        runtime.restic = None;
 
         let outcome = restore_journal(
             journal.path(),

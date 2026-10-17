@@ -636,7 +636,10 @@ fn android_service_tools_process_lifecycle_and_env_isolation() {
         &LiveAndroidAuthority,
     )
     .unwrap();
-    assert_eq!(resolved.restic_path, restic_full);
+    assert_eq!(
+        resolved.restic.executable_path().unwrap().to_path_buf(),
+        restic_full
+    );
     assert_eq!(resolved.rclone_path, None);
 
     let resolved_restic = resolve_restic_member_for_platform(
@@ -656,7 +659,10 @@ fn android_service_tools_process_lifecycle_and_env_isolation() {
         &LiveAndroidAuthority,
     )
     .unwrap();
-    assert_eq!(non_operated.restic_path, restic_full);
+    assert_eq!(
+        non_operated.restic.executable_path().unwrap().to_path_buf(),
+        restic_full
+    );
     assert_eq!(non_operated.rclone_path, None);
 
     // Operated mode needs rclone:
@@ -682,7 +688,14 @@ fn android_service_tools_process_lifecycle_and_env_isolation() {
         &LiveAndroidAuthority,
     )
     .unwrap();
-    assert_eq!(resolved_operated.restic_path, restic_full);
+    assert_eq!(
+        resolved_operated
+            .restic
+            .executable_path()
+            .unwrap()
+            .to_path_buf(),
+        restic_full
+    );
     assert_eq!(resolved_operated.rclone_path, Some(rclone_full.clone()));
 
     let resolved_op = resolve_operational_tools_for_platform(
@@ -694,7 +707,10 @@ fn android_service_tools_process_lifecycle_and_env_isolation() {
         &LiveAndroidAuthority,
     )
     .unwrap();
-    assert_eq!(resolved_op.restic_path, restic_full);
+    assert_eq!(
+        resolved_op.restic.executable_path().unwrap().to_path_buf(),
+        restic_full
+    );
     assert_eq!(resolved_op.rclone_path, Some(rclone_full));
 
     let verifier_command = exercise_verifier_construction(other_temp.path(), resource_temp.path());

@@ -26,8 +26,35 @@ static ROOT: Mutex<Option<JournalRoot>> = Mutex::new(None);
 static QUERY: Mutex<Option<OwnerIndex>> = Mutex::new(None);
 static SERVING: Mutex<Option<journal_mobile_serving::MobileServing>> = Mutex::new(None);
 static PAYLOAD: Mutex<Option<PathBuf>> = Mutex::new(None);
+#[cfg(target_os = "ios")]
+static BACKUP_ADMISSION_DIAGNOSTIC: Mutex<&'static str> = Mutex::new("not_attempted");
 static GENERATE: LazyLock<solstone_core_generate_wire::EndpointRuntime> =
     LazyLock::new(solstone_core_generate_wire::EndpointRuntime::default);
+
+#[cfg(target_os = "ios")]
+#[unsafe(no_mangle)]
+pub extern "C" fn journal_ios_backup_admit() -> bool {
+    let result = solstone_core_backup_runtime::ios_callable::admit_ios_backup_at_startup();
+    if let Ok(mut diagnostic) = BACKUP_ADMISSION_DIAGNOSTIC.lock() {
+        *diagnostic = result
+            .as_ref()
+            .map(|_| "admitted")
+            .unwrap_or_else(|reason| reason);
+    }
+    result.is_ok()
+}
+
+#[cfg(target_os = "ios")]
+#[unsafe(no_mangle)]
+pub extern "C" fn journal_ios_backup_admission_diagnostic() -> *mut c_char {
+    let diagnostic = BACKUP_ADMISSION_DIAGNOSTIC
+        .lock()
+        .map(|value| *value)
+        .unwrap_or("diagnostic_unavailable");
+    CString::new(diagnostic)
+        .expect("fixed admission reason has no NUL")
+        .into_raw()
+}
 
 // The development host has no desktop logger. Retain existing door warnings
 // so a dropped TLS carrier can be correlated with its server-side cause.
