@@ -31,8 +31,10 @@ per-request metadata and header validation, or `server/discover`.
 Tools are advertised from the connection's current grant. With transcripts,
 entities and facets enabled, the set is `list_facets`, `search`, `fetch`,
 `list_transcripts`, `get_transcript`, `list_entities`, `get_entity`,
-`save_memory` and `recall_memory`. An absent or narrower read grant exposes
-fewer tools. Own-memory access is described below.
+`save_memory` and `recall_memory`. `get_week` is advertised only for a
+whole-journal grant that also has transcripts and facets. Chosen facets do not
+see it. An absent or narrower read grant exposes fewer tools. Own-memory access
+is described below.
 
 <a id="doors"></a>
 

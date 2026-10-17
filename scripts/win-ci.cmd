@@ -274,6 +274,7 @@ echo === cargo test --locked (agent connector audit record) ===
 cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-mcp-audit --lib || exit /b 1
 echo === cargo test --locked (agent connector routine suite) ===
 cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-mcp-endpoint --lib -- --test-threads=1 || exit /b 1
+cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-home --lib weekly || exit /b 1
 echo === cargo test --locked (agent connector boundary suite) ===
 cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-mcp-endpoint --lib --features full-tests,test-hooks -- --test-threads=1 || exit /b 1
 cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-segment --lib --features full-tests agent_memory_ -- --test-threads=1 || exit /b 1

@@ -57,6 +57,10 @@ async function boot(state, {enable = null, pairingResponse, journal = null, acti
     addEventListener(name, listener) { (this.listeners[name] ||= []).push(listener); },
     querySelector(selector) {
       if (selector === '.modal' && this._html.includes('<div class="modal"')) return {remove: () => { this._html = this._html.slice(0, this._html.indexOf('<div class="modal"')); }};
+      if (selector === '.modal-card:last-of-type' && this._html.includes('modal-card')) {
+        const view = this;
+        return {insertAdjacentHTML(_position, text) { view._html += text; }};
+      }
       return null;
     },
     insertAdjacentHTML(_, text) { this._html += text; },
@@ -517,13 +521,23 @@ async function test(name, body) {
   }
 
   await test('the enable notice can be dismissed and the activity filter asks for activity', async () => {
-    const {view, click, calls} = await boot(baseState({enabled: false, ...door({listening: true})}), {enable: {phase: 'error'}});
+    const activity = {entries: [
+      {agent_identity: 'test-agent', timestamp: '2026-09-24T12:01:30Z', tool: 'get_transcript', outcome: 'served', request: {arguments: {}}, result: {targets: ['20260308/room/120000_1']}},
+      {agent_identity: 'test-agent', timestamp: '2026-09-24T12:02:30Z', tool: 'get_week', outcome: 'served', request: {arguments: {}}, result: {targets: ['week:20260308']}},
+    ], counts: {served: 2}, examination_complete: true};
+    const {view, click, calls, fields} = await boot(baseState({enabled: false, ...door({listening: true})}), {enable: {phase: 'error'}, activity});
     await click({lane: 'me'});
     has(view, 'data-action="dismiss-enable"');
     await click({action: 'dismiss-enable'});
     lacks(view, 'data-action="dismiss-enable"');
+    fields['a-tool'].value = 'get_week';
     await click({action: 'filter-activity'});
-    assert(calls.some(call => call.url.startsWith('/app/agents/api/activity') && call.method === 'GET'), 'filter asks for activity');
+    assert(calls.some(call => call.url.startsWith('/app/agents/api/activity?tool=get_week') && call.method === 'GET'), 'filter asks for get_week');
+    has(view, '<option>get_week</option>');
+    await click({activityIndex: '0'});
+    has(view, 'href="/app/transcripts/20260308"');
+    await click({activityIndex: '1'});
+    has(view, 'href="/app/home/week/20260308"');
   });
 
   await test('connect dialog open pairing states and code door attribute', async () => {
