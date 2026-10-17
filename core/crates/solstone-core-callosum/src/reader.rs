@@ -384,9 +384,27 @@ mod tests {
     #[cfg(feature = "full-tests")]
     #[test]
     fn reported_zone_accepts_relative_journal_paths() {
-        let cwd = std::env::current_dir().unwrap();
-        let journal = tempfile::tempdir_in(&cwd).unwrap();
-        let relative_root = journal.path().strip_prefix(&cwd).unwrap();
+        const CHILD: &str = "SOLSTONE_TEST_RELATIVE_REPORTED_ZONE";
+        if std::env::var_os(CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "reader::tests::reported_zone_accepts_relative_journal_paths",
+                    "--nocapture",
+                ])
+                .current_dir(directory.path())
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            assert_eq!(
+                fs::read(directory.path().join("relative-zone-verified")).unwrap(),
+                b"passed"
+            );
+            return;
+        }
+        let relative_root = std::path::Path::new("journal");
         let relative_segment = relative_root.join("chronicle/20260309/device/120000_1");
         let row = device_event(json!({"meta":{"tz":"Asia/Tokyo","utc_offset_seconds":32400}}));
         write_events(&relative_segment, format!("{row}\n").as_bytes());
@@ -396,5 +414,6 @@ mod tests {
                 .utc_offset_seconds,
             Some(32400)
         );
+        fs::write("relative-zone-verified", b"passed").unwrap();
     }
 }
