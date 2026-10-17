@@ -515,8 +515,9 @@ fn guard_outgoing_vulkan_keys_pinned_by_historical_releases_not_head() {
 
 #[test]
 fn guard_selected_b11669_keys_are_pinned_by_head_and_any_release_owners() {
-    // 2.0.48 shipped these two. Its snapshot is closed, so its ownership is
-    // required here rather than derived from the snapshot under test.
+    // 2.0.48 shipped these two and 2.0.49 all five. Their snapshots are closed,
+    // so their ownership is required here rather than derived from the
+    // snapshot under test.
     let released_in_2_0_48 = [
         "assets/llama-server-vulkan/b11669/llama-b11669-bin-macos-arm64.tar.gz",
         "runtimes/llama-cuda13/b11669/llama-b11669-bin-linux-cuda13-arm64-sol1.tar.gz",
@@ -540,6 +541,10 @@ fn guard_selected_b11669_keys_are_pinned_by_head_and_any_release_owners() {
                 "2.0.48 must retain its b11669 key: {key}"
             );
         }
+        assert!(
+            owners.contains(&PinOwner::Release("2.0.49".to_owned())),
+            "2.0.49 must retain its b11669 key: {key}"
+        );
         owners.push(PinOwner::HeadUnreleased);
         assert_eq!(
             assess_prune_with_current_support(key).unwrap(),
