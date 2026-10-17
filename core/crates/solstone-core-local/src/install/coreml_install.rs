@@ -385,6 +385,148 @@ pub fn check_parakeet_coreml_install(
     check_parakeet_coreml_install_with_platform(home_dir, config, os_name, arch)
 }
 
+/// Whether the CoreML model is installed at `cache_dir`: a valid sentinel for
+/// that directory and every file it lists, at its recorded size. It does not
+/// hash, so it is cheap enough to ask before each transcription. A model from
+/// an earlier catalog still counts; following pins is the boot refresh's job.
+/// Only darwin/arm64 runs CoreML, so that is the platform the sentinel must name.
+pub fn parakeet_coreml_installed(home_dir: &Path, cache_dir: &Path) -> bool {
+    parakeet_coreml_installed_on(home_dir, cache_dir, "darwin", "arm64")
+}
+
+fn parakeet_coreml_installed_on(
+    home_dir: &Path,
+    cache_dir: &Path,
+    os_name: &str,
+    arch: &str,
+) -> bool {
+    let Some(sentinel) = read_valid_parakeet_coreml_sentinel(home_dir, os_name, arch) else {
+        return false;
+    };
+    if sentinel.cache_dir() != cache_dir {
+        return false;
+    }
+    let model_root = parakeet_coreml_model_root(cache_dir);
+    if sentinel.files().is_empty() {
+        // An older sentinel lists no files; the boot refresh adopts it.
+        return fs::read_dir(&model_root).is_ok_and(|mut entries| entries.next().is_some());
+    }
+    sentinel.files().iter().all(|file| {
+        fs::metadata(model_root.join(&file.file))
+            .is_ok_and(|meta| meta.is_file() && meta.len() == file.size_bytes)
+    })
+}
+
+/// How long a failed self-heal waits before the next attempt may start, the
+/// same persisted cooldown the linux provider follow honours.
+pub const COREML_HEAL_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+
+/// What one self-heal pass found or did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoremlHeal {
+    AlreadyInstalled,
+    Installed,
+    OwnerCancelled,
+    CoolingDown,
+    InstallRunning,
+    Failed(String),
+}
+
+/// Install the CoreML model when it is missing, recording the attempt in the
+/// journal's `parakeet` install status (`health/providers/parakeet.json`) under
+/// the journal's `parakeet` install lease, as the linux installer does.
+pub fn heal_missing_parakeet_coreml(
+    journal: &Path,
+    home_dir: &Path,
+    config: &JournalConfigRead,
+) -> Result<CoremlHeal, String> {
+    let installed =
+        parakeet_coreml_installed(home_dir, &parakeet_coreml_cache_dir(config, home_dir));
+    let rows = rows().map_err(|error| error.to_string())?;
+    let catalog_version = shared_catalog_version(&rows).map_err(|error| error.to_string())?;
+    heal_with(
+        journal,
+        installed,
+        catalog_version,
+        chrono::Utc::now(),
+        || install_parakeet_coreml_model(home_dir, config, false),
+    )
+}
+
+fn heal_with(
+    journal: &Path,
+    installed: bool,
+    catalog_version: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    install: impl FnOnce() -> Result<PathBuf, CoremlInstallError>,
+) -> Result<CoremlHeal, String> {
+    use super::{lease, status};
+
+    let record = status::read_status(journal, "parakeet").map_err(|error| error.to_string())?;
+    if installed {
+        // A model installed some other way (setup, or by hand) clears a failure.
+        if record.install_state == "failed" {
+            status::transition(record, "idle", None, None)
+                .and_then(|next| status::write_status(journal, next))
+                .map_err(|error| error.to_string())?;
+        }
+        return Ok(CoremlHeal::AlreadyInstalled);
+    }
+    if record.install_state == "failed" {
+        if record.error_code.as_deref() == Some("install_cancelled") {
+            return Ok(CoremlHeal::OwnerCancelled);
+        }
+        let cooling = record
+            .last_transition_at
+            .as_deref()
+            .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
+            .and_then(|at| (now - at.with_timezone(&chrono::Utc)).to_std().ok())
+            .is_some_and(|since| since < COREML_HEAL_COOLDOWN);
+        if cooling {
+            return Ok(CoremlHeal::CoolingDown);
+        }
+    }
+    let Some(_lease) = lease::acquire(journal, "parakeet").map_err(|error| error.to_string())?
+    else {
+        return Ok(CoremlHeal::InstallRunning);
+    };
+    let fingerprint_json = serde_json::json!({
+        "catalog_version": catalog_version,
+        "provider": "parakeet",
+        "variant": "coreml",
+    })
+    .to_string();
+    let fingerprint_sha256 = format!("{:x}", Sha256::digest(fingerprint_json.as_bytes()));
+    let state = status::begin_or_replace(
+        journal,
+        "parakeet",
+        fingerprint_json,
+        fingerprint_sha256,
+        None,
+        "downloading",
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    let (next, outcome) = match install() {
+        Ok(_) => (
+            status::transition(state, "installed", None, None),
+            CoremlHeal::Installed,
+        ),
+        Err(error) => (
+            status::transition(
+                state,
+                "failed",
+                Some(error.to_string()),
+                Some(error.reason_code.clone()),
+            ),
+            CoremlHeal::Failed(error.to_string()),
+        ),
+    };
+    next.and_then(|next| status::write_status(journal, next))
+        .map_err(|error| error.to_string())?;
+    Ok(outcome)
+}
+
 fn fetch_runtime_member(
     query: &solstone_core_assets::RuntimeFetchQuery<'_>,
     destination: &Path,
@@ -1241,6 +1383,178 @@ mod tests {
             backend: None,
             extracted_binary_sha256: None,
         }
+    }
+
+    fn stage_installed(home: &Path, cache: &Path, bytes: &[u8]) {
+        fs::create_dir_all(cache).unwrap();
+        let target = parakeet_coreml_model_root(cache);
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("model.bin"), bytes).unwrap();
+        let sentinel = ParakeetCoremlSentinel::new(
+            cache.to_path_buf(),
+            "darwin",
+            "arm64",
+            FLUIDAUDIO_VERSION,
+            "test",
+            vec![ParakeetCoremlFile {
+                file: "model.bin".to_owned(),
+                sha256: format!("{:x}", Sha256::digest(bytes)),
+                size_bytes: bytes.len() as u64,
+            }],
+        );
+        write_sentinel(&parakeet_coreml_sentinel_path(home), &sentinel).unwrap();
+    }
+
+    #[test]
+    fn installed_means_a_sentinel_for_this_cache_and_its_files_at_their_sizes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().join("home");
+        let cache = temporary.path().join("cache");
+        let other = temporary.path().join("other");
+        fs::create_dir_all(&other).unwrap();
+        assert!(!parakeet_coreml_installed_on(
+            &home, &cache, "darwin", "arm64"
+        ));
+
+        stage_installed(&home, &cache, b"model-bytes");
+        assert!(parakeet_coreml_installed_on(
+            &home, &cache, "darwin", "arm64"
+        ));
+        assert!(!parakeet_coreml_installed_on(
+            &home, &other, "darwin", "arm64"
+        ));
+
+        fs::write(
+            parakeet_coreml_model_root(&cache).join("model.bin"),
+            b"short",
+        )
+        .unwrap();
+        assert!(!parakeet_coreml_installed_on(
+            &home, &cache, "darwin", "arm64"
+        ));
+        fs::remove_file(parakeet_coreml_model_root(&cache).join("model.bin")).unwrap();
+        assert!(!parakeet_coreml_installed_on(
+            &home, &cache, "darwin", "arm64"
+        ));
+    }
+
+    fn parakeet_status(journal: &Path) -> super::super::status::InstallStatus {
+        super::super::status::read_status(journal, "parakeet").unwrap()
+    }
+
+    #[test]
+    fn heal_installs_a_missing_model_and_records_it_in_the_journal() {
+        let journal = tempfile::tempdir().unwrap();
+        let mut calls = 0;
+        let outcome = heal_with(journal.path(), false, "v1", chrono::Utc::now(), || {
+            calls += 1;
+            Ok(PathBuf::from("/model"))
+        })
+        .unwrap();
+        assert_eq!(outcome, CoremlHeal::Installed);
+        assert_eq!(calls, 1);
+        let record = parakeet_status(journal.path());
+        assert_eq!(record.install_state, "installed");
+        assert!(
+            record
+                .target_fingerprint_json
+                .as_deref()
+                .is_some_and(|json| json.contains("\"coreml\""))
+        );
+    }
+
+    #[test]
+    fn a_failed_heal_is_recorded_and_waits_out_the_cooldown() {
+        let journal = tempfile::tempdir().unwrap();
+        let outcome = heal_with(journal.path(), false, "v1", chrono::Utc::now(), || {
+            Err(CoremlInstallError::new(
+                "download_failed",
+                "network down",
+                65,
+            ))
+        })
+        .unwrap();
+        assert!(matches!(outcome, CoremlHeal::Failed(_)));
+        let record = parakeet_status(journal.path());
+        assert_eq!(record.install_state, "failed");
+        assert_eq!(record.error_code.as_deref(), Some("download_failed"));
+
+        let soon = chrono::Utc::now() + chrono::Duration::minutes(1);
+        let outcome = heal_with(journal.path(), false, "v1", soon, || {
+            panic!("no attempt inside the cooldown")
+        })
+        .unwrap();
+        assert_eq!(outcome, CoremlHeal::CoolingDown);
+
+        let later = chrono::Utc::now() + chrono::Duration::minutes(31);
+        let outcome = heal_with(journal.path(), false, "v1", later, || {
+            Ok(PathBuf::from("/model"))
+        })
+        .unwrap();
+        assert_eq!(outcome, CoremlHeal::Installed);
+    }
+
+    #[test]
+    fn heal_holds_for_an_owner_cancel_and_a_running_install() {
+        use super::super::{lease, status};
+        let journal = tempfile::tempdir().unwrap();
+        let begun = status::begin_or_replace(
+            journal.path(),
+            "parakeet",
+            "{}".to_owned(),
+            "0".repeat(64),
+            None,
+            "downloading",
+            None,
+        )
+        .unwrap();
+        let cancelled = status::transition(
+            begun,
+            "failed",
+            Some("cancelled".to_owned()),
+            Some("install_cancelled".to_owned()),
+        )
+        .unwrap();
+        status::write_status(journal.path(), cancelled).unwrap();
+        let later = chrono::Utc::now() + chrono::Duration::hours(2);
+        assert_eq!(
+            heal_with(journal.path(), false, "v1", later, || panic!(
+                "owner cancelled"
+            ))
+            .unwrap(),
+            CoremlHeal::OwnerCancelled
+        );
+
+        let other = tempfile::tempdir().unwrap();
+        let _held = lease::acquire(other.path(), "parakeet").unwrap().unwrap();
+        assert_eq!(
+            heal_with(other.path(), false, "v1", chrono::Utc::now(), || {
+                panic!("an install is already running")
+            })
+            .unwrap(),
+            CoremlHeal::InstallRunning
+        );
+    }
+
+    #[test]
+    fn a_model_installed_another_way_clears_a_recorded_failure() {
+        let journal = tempfile::tempdir().unwrap();
+        heal_with(journal.path(), false, "v1", chrono::Utc::now(), || {
+            Err(CoremlInstallError::new(
+                "download_failed",
+                "network down",
+                65,
+            ))
+        })
+        .unwrap();
+        let outcome = heal_with(journal.path(), true, "v1", chrono::Utc::now(), || {
+            panic!("already installed")
+        })
+        .unwrap();
+        assert_eq!(outcome, CoremlHeal::AlreadyInstalled);
+        let record = parakeet_status(journal.path());
+        assert_eq!(record.install_state, "idle");
+        assert_eq!(record.error_code, None);
     }
 
     #[test]

@@ -6,9 +6,11 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use solstone_core_journal_io::{AtomicWriteOptions, atomic_replace};
+use solstone_core_local::install::coreml_install::CoremlHeal;
 
 /// Result of observing and updating the admitted boot record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +154,53 @@ pub(crate) fn refresh_installed_assets_with_platform(
     {
         log::error!("parakeet coreml refresh failed: {error}");
     }
+
+    heal_parakeet_coreml_until_settled(
+        || {
+            solstone_core_local::install::coreml_install::heal_missing_parakeet_coreml(
+                journal, &home_path, &config,
+            )
+        },
+        std::thread::sleep,
+    );
+}
+
+/// Waits between self-heal passes, the same steps as the linux provider follow.
+const COREML_HEAL_WAITS: [Duration; 4] = [
+    Duration::from_secs(30 * 60),
+    Duration::from_secs(2 * 60 * 60),
+    Duration::from_secs(8 * 60 * 60),
+    Duration::from_secs(24 * 60 * 60),
+];
+
+/// Parakeet is the default speech recognizer on macOS too, so a missing CoreML
+/// model is installed rather than left for the owner to notice. Transcription
+/// defers its audio until then. Retries until installed or the owner cancels.
+fn heal_parakeet_coreml_until_settled(
+    mut heal: impl FnMut() -> Result<CoremlHeal, String>,
+    mut sleep: impl FnMut(Duration),
+) {
+    for attempt in 0.. {
+        match heal() {
+            Ok(CoremlHeal::AlreadyInstalled) => return,
+            Ok(CoremlHeal::Installed) => {
+                log::warn!("parakeet coreml model was not installed; installed it");
+                return;
+            }
+            Ok(CoremlHeal::OwnerCancelled) => {
+                log::warn!(
+                    "parakeet coreml model is not installed; the owner cancelled its install"
+                );
+                return;
+            }
+            Ok(CoremlHeal::CoolingDown | CoremlHeal::InstallRunning) => {}
+            Ok(CoremlHeal::Failed(error)) => {
+                log::warn!("parakeet coreml model is not installed; its install failed: {error}");
+            }
+            Err(error) => log::warn!("parakeet coreml self-heal could not run: {error}"),
+        }
+        sleep(COREML_HEAL_WAITS[attempt.min(COREML_HEAL_WAITS.len() - 1)]);
+    }
 }
 
 #[cfg(test)]
@@ -224,6 +273,37 @@ mod tests {
             None
         });
         assert_eq!(called.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn coreml_heal_retries_on_the_follow_steps_until_settled() {
+        let mut outcomes = vec![
+            Ok(CoremlHeal::Installed),
+            Ok(CoremlHeal::CoolingDown),
+            Err("journal unreadable".to_owned()),
+            Ok(CoremlHeal::InstallRunning),
+            Ok(CoremlHeal::Failed("network".to_owned())),
+            Ok(CoremlHeal::Failed("network".to_owned())),
+        ];
+        let mut waits = Vec::new();
+        heal_parakeet_coreml_until_settled(|| outcomes.pop().unwrap(), |wait| waits.push(wait));
+        assert!(outcomes.is_empty());
+        assert_eq!(
+            waits,
+            [
+                COREML_HEAL_WAITS[0],
+                COREML_HEAL_WAITS[1],
+                COREML_HEAL_WAITS[2],
+                COREML_HEAL_WAITS[3],
+                COREML_HEAL_WAITS[3],
+            ]
+        );
+
+        for settled in [CoremlHeal::AlreadyInstalled, CoremlHeal::OwnerCancelled] {
+            let mut slept = false;
+            heal_parakeet_coreml_until_settled(|| Ok(settled.clone()), |_| slept = true);
+            assert!(!slept);
+        }
     }
 
     #[test]

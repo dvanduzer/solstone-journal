@@ -66,6 +66,16 @@ fn transcribe_with_installed_helper(
     let _admission =
         solstone_core_local::install::coreml_install::hold_parakeet_coreml_read_admission(home)
             .map_err(|error| deferred("coreml_models_updating", error.to_string()))?;
+    // A missing model is installed by the supervisor's self-heal; the audio waits for it.
+    if !solstone_core_local::install::coreml_install::parakeet_coreml_installed(home, cache_dir) {
+        return Err(deferred(
+            "coreml_model_missing",
+            format!(
+                "Parakeet CoreML model is not installed yet: {}",
+                cache_dir.display()
+            ),
+        ));
+    }
     transcribe_with_helper(audio, helper, cache_dir, model_version, timeout)
 }
 
@@ -1086,6 +1096,24 @@ mod tests {
             panic!("expected deferred CoreML error");
         };
         assert_eq!(reason, expected_reason);
+    }
+
+    #[test]
+    fn a_missing_model_defers_before_the_helper_runs() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().join("home");
+        let cache =
+            solstone_core_journal_config::parakeet_coreml::default_parakeet_coreml_cache_dir(&home);
+        let error = super::transcribe_with_installed_helper(
+            &[0.0],
+            &temporary.path().join("no-helper-here"),
+            &home,
+            &cache,
+            "v3",
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert_deferred_reason(error, "coreml_model_missing");
     }
 
     fn assert_failure_reason(error: TranscribeError, expected_reason: &str) {
