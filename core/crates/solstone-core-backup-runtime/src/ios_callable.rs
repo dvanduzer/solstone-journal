@@ -508,11 +508,12 @@ pub(crate) fn run(
         command::Operation::ListSnapshots => 5,
         command::Operation::Restore { .. } => unreachable!("restore dispatched above"),
         command::Operation::Check(mode) => {
+            // The native check modes: structure 1, all data 2, one data group 3.
             match mode {
-                command::CheckRead::Structure => {}
-                command::CheckRead::All => options.check_read_mode = 1,
+                command::CheckRead::Structure => options.check_read_mode = 1,
+                command::CheckRead::All => options.check_read_mode = 2,
                 command::CheckRead::Group { group, groups } => {
-                    options.check_read_mode = 2;
+                    options.check_read_mode = 3;
                     options.group = *group;
                     options.groups = *groups;
                 }
