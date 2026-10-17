@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
-const BUNDLE_SEMVER: &str = "2.0.0";
+const BUNDLE_SEMVER: &str = "2.0.1";
 const BUNDLE_DIRECTORY: &str = "docs/openapi/pairing-contract";
 const AUTHORITY_PATH: &str =
     "core/crates/solstone-core-repository-contracts/src/contracts/pairing_contract_authority.json";
@@ -497,7 +497,7 @@ fn generated_bundle_matches_committed_files() {
 fn under_bumped_manifest_semver_is_rejected() {
     let expected = expected_bundle();
     let expected_manifest = &expected["manifest.json"];
-    for wrong_semver in ["1.0.0", "1.9.9"] {
+    for wrong_semver in ["2.0.0", "1.9.9"] {
         let mut manifest: Value =
             serde_json::from_slice(expected_manifest).expect("parse manifest");
         manifest["bundle_semver"] = Value::String(wrong_semver.to_owned());

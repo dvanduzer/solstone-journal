@@ -378,10 +378,10 @@ fn discovers_an_injected_bind_paired_stream_call_in_a_fixture_tree() {
 
 #[test]
 fn pairing_bundle_pin_matches_the_shipped_bundle() {
-    assert_eq!(super::pairing_contract_bundle::bundle_semver(), "2.0.0");
+    assert_eq!(super::pairing_contract_bundle::bundle_semver(), "2.0.1");
     assert_eq!(
         super::pairing_contract_bundle::authority_digest(),
-        "e0b07805a0e2f309e3d5f6e1443db076624274169088265866f90d91265a8cd4"
+        "db35b5be244abbaea138751b109a07c3055ac72e578acfe0d872da02c9c7d6d3"
     );
 }
 

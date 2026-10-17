@@ -34,7 +34,7 @@
             }
           },
           "400": {
-            "description": "Pairing request invalid, including invalid pairing identity fields",
+            "description": "Pairing request invalid",
             "content": {
               "application/json": {
                 "schema": {
@@ -64,13 +64,13 @@
           "client_label": {
             "type": "string",
             "minLength": 1,
-            "description": "Pairer-supplied label. Valid on the wire iff the UTF-8 byte length is 1-253 (no charset restriction). Empty, wrong JSON type, or more than 253 UTF-8 bytes is refused before nonce consume. JSON Schema minLength counts characters; the byte bound is x-max-utf8-bytes.",
+            "description": "Pairer-supplied label. Valid on the wire iff the UTF-8 byte length is 1-253 (no charset restriction). An empty value, a wrong JSON type, or more than 253 UTF-8 bytes is ignored: the ceremony proceeds without the label. JSON Schema minLength counts characters; the byte bound is x-max-utf8-bytes.",
             "x-max-utf8-bytes": 253
           },
           "platform": {
             "type": "string",
             "enum": ["linux", "macos", "windows", "ios", "android"],
-            "description": "Closed pairer-supplied platform vocabulary. Empty string, wrong JSON type, or any other value is refused before nonce consume. There is no present-empty read-back state."
+            "description": "Closed pairer-supplied platform vocabulary. An empty string, a wrong JSON type, or any other value is ignored: the ceremony proceeds without the platform. There is no present-empty read-back state."
           }
         }
       },

@@ -1,7 +1,7 @@
 {
   "audited_consumer_revisions": [],
   "bundle_schema_identity": "solstone.pairing-contract-bundle.schema.v1",
-  "bundle_semver": "2.0.0",
+  "bundle_semver": "2.0.1",
   "component_closure": [
     "Error",
     "PairRequest",
@@ -19,7 +19,7 @@
     },
     {
       "path": "projection.openapi.json",
-      "sha256": "2da034975310653cd3671fa5b5e652993479c58c5cc4e9e215bc41546687d220"
+      "sha256": "3b82b57026023b47a3d03f1a5c5760deb0bb97e082c61603f4ba34c1043a6898"
     },
     {
       "path": "vectors.json",
@@ -32,7 +32,7 @@
       "id": "openapi.pairing_contract_authority",
       "path": "core/crates/solstone-core-repository-contracts/src/contracts/pairing_contract_authority.json",
       "role": "openapi_source",
-      "sha256": "e0b07805a0e2f309e3d5f6e1443db076624274169088265866f90d91265a8cd4"
+      "sha256": "db35b5be244abbaea138751b109a07c3055ac72e578acfe0d872da02c9c7d6d3"
     }
   ],
   "openapi_document_version": "1.0.0",
