@@ -1100,6 +1100,48 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "full-tests", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn update_recognizes_payloads_from_promoted_linux_containers() {
+        use solstone_core_update::{PackageProbe, RealPackageProbe};
+
+        let root = promotion_root("update-ownership");
+        let request = linux_request(root.path(), "linux-x86_64", "amd64", "x86_64");
+        super::promote(&request).expect("production promotion");
+        let tar = fs::read(request.dest.join(format!("{}.tar.gz", request.basename))).unwrap();
+        let containers = [
+            ("tar", crate::tar::tar_members(&tar).unwrap()),
+            (
+                "deb",
+                crate::deb::deb_members(&request.dest.join(format!("{}.deb", request.basename)))
+                    .unwrap(),
+            ),
+            (
+                "rpm",
+                crate::rpm::rpm_members(&request.dest.join(format!("{}.rpm", request.basename)))
+                    .unwrap(),
+            ),
+        ];
+        for (name, members) in containers {
+            let installed = root.path().join(name);
+            super::materialize_members(&installed, &members).unwrap();
+            let executable = installed.join("bin/solstone-core");
+            assert!(
+                RealPackageProbe.payload_matches(&executable, &request.version),
+                "{name}"
+            );
+            assert!(
+                !RealPackageProbe.payload_matches(&executable, "0.0.0"),
+                "{name}: wrong version"
+            );
+            fs::write(&executable, b"modified").unwrap();
+            assert!(
+                !RealPackageProbe.payload_matches(&executable, &request.version),
+                "{name}: changed executable"
+            );
+        }
+    }
+
     #[test]
     fn self_check_seams_fail_promote_and_check_installed_names_the_share_flip() {
         use crate::container_seam::{ContainerSeam, ContainerSeamKind};

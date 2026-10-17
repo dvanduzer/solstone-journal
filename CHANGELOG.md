@@ -19,6 +19,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- linux: `solstone update` and the status pane now recognize installs made by the public installer.
+
 - on linux, if your journal is missing its transcription model, it now downloads the model on its own (about 1 GB) and then transcribes the recordings that were waiting. before, they waited until you ran `solstone journal install-provider parakeet`.
 - on mac, if your journal is missing its transcription model, it now downloads the model on its own (about 500 MB) and then transcribes the recordings that were waiting. before, each recording failed to transcribe, with a message telling you to run `solstone journal install-models --force --variant coreml`.
 - in the activities app, today's column now ends at the right hour, with its line at the current time. before, it ran far past the end of the day.

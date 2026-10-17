@@ -26,7 +26,7 @@ impl PackageProbe for RealPackageProbe {
             .then(|| version.to_owned())
     }
     fn payload_matches(&self, executable: &Path, version: &str) -> bool {
-        use solstone_core_installed_payload::{posix, verify_pinned_signature};
+        use solstone_core_installed_payload::posix;
         if version != env!("CARGO_PKG_VERSION") {
             return false;
         }
@@ -36,14 +36,9 @@ impl PackageProbe for RealPackageProbe {
         let Some(root) = posix::bin_parent_root(&executable) else {
             return false;
         };
-        let manifest = root.join(posix::INSTALLED_PAYLOAD_MANIFEST);
-        let signature = root.join(posix::INSTALLED_PAYLOAD_SIGNATURE);
-        let (Ok(bytes), Ok(sig)) = (fs::read(&manifest), fs::read(&signature)) else {
-            return false;
-        };
-        if verify_pinned_signature(&bytes, &signature, &sig).is_err() {
-            return false;
-        }
+        // POSIX promotion embeds this manifest in release archives.
+        // Ownership checks its identity and executable digest; the installer
+        // remains responsible for authenticating release inputs.
         let Ok(package) = posix::InstalledPackage::admit(
             &root,
             version,
