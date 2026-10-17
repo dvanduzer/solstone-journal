@@ -3,6 +3,7 @@
 
 //! Native event-mode observation dispatcher.
 
+pub mod archive;
 pub mod batch;
 pub mod beacon;
 pub mod config;

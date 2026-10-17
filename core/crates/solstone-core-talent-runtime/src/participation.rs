@@ -362,8 +362,11 @@ fn transcript_sentences(
         .filter_map(Result::ok)
         .filter_map(|entry| entry.file_name().into_string().ok())
         .filter(|name| {
-            name.strip_suffix(".jsonl")
-                .is_some_and(|stem| stem == "audio" || stem.ends_with("_audio"))
+            name.strip_suffix(".jsonl").is_some_and(|stem| {
+                stem == "audio"
+                    || stem.ends_with("_audio")
+                    || solstone_core_format::audio_archive::is_audio_archive_part_stem(stem)
+            })
         })
         .collect::<Vec<_>>();
     names.sort();

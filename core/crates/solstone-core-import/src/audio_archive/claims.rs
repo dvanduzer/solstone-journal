@@ -20,6 +20,95 @@ use super::record::ArchiveStore;
 const CLAIM_DB_FILENAME: &str = "audio-archive-claims.sqlite";
 pub const DEFAULT_WRITE_BUSY_TIMEOUT: Duration = Duration::from_millis(2000);
 
+/// Look up one archive without enumerating previous runs. The run record remains authoritative.
+/// Missing state is read-only; a damaged living run must not silently become a new run.
+pub fn read_matching_archive_run(
+    journal: &Path,
+    archive_identity: &str,
+) -> Result<Option<String>, AudioArchiveError> {
+    let path = claim_db_path(journal);
+    if !path.try_exists()? {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| map_read_sqlite(&path, error))?;
+    conn.busy_timeout(DEFAULT_WRITE_BUSY_TIMEOUT)
+        .map_err(|error| map_read_sqlite(&path, error))?;
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='audio_archive_run'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| map_read_sqlite(&path, error))?
+        .is_some();
+    if !exists {
+        return Ok(None);
+    }
+    let import_id: Option<String> = conn
+        .query_row(
+            "SELECT import_id FROM audio_archive_run WHERE archive_identity=?",
+            [archive_identity],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| map_read_sqlite(&path, error))?;
+    let Some(import_id) = import_id else {
+        return Ok(None);
+    };
+    crate::timestamp::validate_timestamp(&import_id).map_err(|error| {
+        AudioArchiveError::ClaimDatabaseCorrupt(format!("invalid archive run ID: {error}"))
+    })?;
+    match fs::symlink_metadata(journal.join("imports").join(&import_id)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(metadata) if !metadata.file_type().is_dir() => {
+            return Err(AudioArchiveError::ClaimDatabaseCorrupt(format!(
+                "run {import_id} is not a directory"
+            )));
+        }
+        Ok(_) => {}
+    }
+    let settings = ArchiveStore::open(journal, &import_id, false)?.settings()?;
+    Ok((settings.archive_identity == archive_identity).then_some(import_id))
+}
+
+/// Record the latest admitted run for this archive in the indexed lookup accelerator.
+pub(crate) fn record_archive_run(
+    journal: &Path,
+    import_id: &str,
+    archive_identity: &str,
+) -> Result<(), AudioArchiveError> {
+    let path = claim_db_path(journal);
+    let was_missing = !path.try_exists()?;
+    // Publication has already created the private imports directory and run record.
+    let conn = Connection::open(&path).map_err(map_sqlite)?;
+    #[cfg(unix)]
+    if was_missing {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    let _ = was_missing;
+    conn.busy_timeout(DEFAULT_WRITE_BUSY_TIMEOUT)
+        .map_err(map_sqlite)?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS audio_archive_run (
+            archive_identity TEXT PRIMARY KEY NOT NULL,
+            import_id TEXT NOT NULL
+        )",
+    )
+    .map_err(map_sqlite)?;
+    conn.execute(
+        "INSERT INTO audio_archive_run(archive_identity,import_id) VALUES(?,?)
+         ON CONFLICT(archive_identity) DO UPDATE SET import_id=excluded.import_id",
+        params![archive_identity, import_id],
+    )
+    .map_err(map_sqlite)?;
+    Ok(())
+}
+
 /// Register owed discovery before a tile can become visible. Run-owned state stays authoritative.
 pub fn register_pending_tile(
     journal: &Path,
@@ -34,12 +123,43 @@ pub fn register_pending_tile(
         discovery_order INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(import_id,day,segment_key));
         CREATE INDEX IF NOT EXISTS audio_archive_pending_time ON audio_archive_pending_tile(discovery_order,day DESC,segment_key DESC,import_id);
-        CREATE INDEX IF NOT EXISTS audio_archive_pending_run ON audio_archive_pending_tile(import_id,discovery_order,day DESC,segment_key DESC);")?;
+        CREATE INDEX IF NOT EXISTS audio_archive_pending_run ON audio_archive_pending_tile(import_id,discovery_order,day DESC,segment_key DESC);
+        CREATE INDEX IF NOT EXISTS audio_archive_pending_day ON audio_archive_pending_tile(day);")?;
     conn.execute(
         "INSERT OR IGNORE INTO audio_archive_pending_tile(import_id,day,segment_key) VALUES(?,?,?)",
         params![import_id, day, segment],
     )?;
     Ok(())
+}
+
+/// Read-only indexed day barrier. Pending archive work holds day publication
+/// without walking an archive stream or every run record.
+pub fn archive_day_has_pending(journal: &Path, day: &str) -> Result<bool, AudioArchiveError> {
+    let path = claim_db_path(journal);
+    if !path.try_exists()? {
+        return Ok(false);
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.busy_timeout(DEFAULT_WRITE_BUSY_TIMEOUT)?;
+    if conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='audio_archive_pending_tile'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_none()
+    {
+        return Ok(false);
+    }
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM audio_archive_pending_tile WHERE day=? LIMIT 1",
+            [day],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 /// Bounded indexed discovery, independent of the number of prior imports and members.

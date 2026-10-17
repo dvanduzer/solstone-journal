@@ -1183,10 +1183,24 @@ function renderImportRow(imp) {
   const sourceCell = sourceDisplayText
     ? renderSourceDisplay(imp.source_type || '', sourceDisplayText, sourceDisplayText)
     : '—';
-  const statsText = formatImportStats(imp.entries_written, imp.entities_seeded);
+  let statsText = formatImportStats(imp.entries_written, imp.entities_seeded);
+  const isArchive = imp.source_type === 'audio_archive' || imp.saved !== undefined;
+  if (isArchive) {
+    const saved = imp.saved ?? 0;
+    const remaining = imp.remaining ?? 0;
+    const processing = imp.processing ?? 0;
+    const leftOut = imp.left_out ?? 0;
+    statsText = `${saved} parts saved · ${remaining} left to save · ${processing} waiting to process · ${imp.processed_parts ?? 0} processed · ${leftOut} members left out`;
+    if (imp.rejected_parts) statsText += ` · ${imp.rejected_parts} parts rejected`;
+    if (imp.unavailable_parts) statsText += ` · ${imp.unavailable_parts} unavailable`;
+  }
   const encodedId = encodeURIComponent(imp.timestamp);
 
-  let html = `<tr data-import-id="${escapeHtml(imp.timestamp)}" data-source-type="${escapeHtml(imp.source_type || '')}" tabindex="0" role="link" data-import-link="/app/import/${encodedId}">`;
+  let html = `<tr data-import-id="${escapeHtml(imp.timestamp)}" data-source-type="${escapeHtml(imp.source_type || '')}"`;
+  if (isArchive) {
+    html += ` data-saved="${imp.saved ?? 0}" data-remaining="${imp.remaining ?? 0}" data-left-out="${imp.left_out ?? 0}" data-processing="${imp.processing ?? 0}" data-unavailable="${imp.unavailable_parts ?? 0}"`;
+  }
+  html += ` tabindex="0" role="link" data-import-link="/app/import/${encodedId}">`;
   // 'imported to' leads: it is the column that varies, and it is the fact the
   // owner came for. 'imported at' is constant across a bulk import, so it sits
   // last rather than first (G3-209).

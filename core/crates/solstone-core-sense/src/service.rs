@@ -148,6 +148,7 @@ where
     F: Future<Output = T> + Send + 'static,
 {
     connection.start();
+    let (archive_stop, archive_worker) = crate::archive::start(Arc::clone(&dispatcher));
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     let mut outbound_interval = tokio::time::interval(Duration::from_millis(10));
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -167,11 +168,14 @@ where
             }
         }
     };
+    let _ = archive_stop.send(());
     let stopping_dispatcher = Arc::clone(&dispatcher);
-    let service_runner_stopped =
-        tokio::task::spawn_blocking(move || stopping_dispatcher.stop_and_wait())
-            .await
-            .unwrap_or(false);
+    let service_runner_stopped = tokio::task::spawn_blocking(move || {
+        let workers_stopped = stopping_dispatcher.stop_and_wait();
+        archive_worker.join().is_ok() && workers_stopped
+    })
+    .await
+    .unwrap_or(false);
     drain(&connection, &receiver);
     connection.stop().await;
     ServiceLoopOutcome {

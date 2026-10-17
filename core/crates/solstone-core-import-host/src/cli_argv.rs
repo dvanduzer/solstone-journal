@@ -260,6 +260,25 @@ fn run_after_parse(
         ParsedCommand::Sync { backend, options } => {
             rendered(run_sync(&backend, &options, journal_path))
         }
+        ParsedCommand::AudioArchive(options) => rendered(crate::audio_archive::run_audio_archive(
+            options,
+            journal_path,
+        )),
+        ParsedCommand::AudioArchiveStatus { run_id, json } => rendered(
+            crate::audio_archive::run_audio_archive_status(&run_id, json, journal_path),
+        ),
+        ParsedCommand::AudioArchiveMembers {
+            run_id,
+            offset,
+            limit,
+            json,
+        } => rendered(crate::audio_archive::run_audio_archive_members(
+            &run_id,
+            offset,
+            limit,
+            json,
+            journal_path,
+        )),
         ParsedCommand::Import(options) => run_import(options, journal_path),
     }
 }
@@ -1754,14 +1773,39 @@ struct Options {
     preview_zone: Option<String>,
     preview_stamp: Option<String>,
     fallback_timestamp: Option<String>,
+    audio_archive: Option<PathBuf>,
+    source_zone: Option<String>,
+    resume: Option<String>,
+    audio_archive_status: Option<String>,
+    audio_archive_members: Option<String>,
+    offset: Option<u64>,
+    limit: Option<u32>,
 }
 
 enum ParsedCommand {
     Help,
-    ListImporters { json: bool },
+    ListImporters {
+        json: bool,
+    },
     Backends,
-    Connect { backend: String },
-    Sync { backend: String, options: Options },
+    Connect {
+        backend: String,
+    },
+    Sync {
+        backend: String,
+        options: Options,
+    },
+    AudioArchive(crate::audio_archive::AudioArchiveDispatchOptions),
+    AudioArchiveStatus {
+        run_id: String,
+        json: bool,
+    },
+    AudioArchiveMembers {
+        run_id: String,
+        offset: u64,
+        limit: Option<u32>,
+        json: bool,
+    },
     Import(Options),
 }
 
@@ -1816,6 +1860,76 @@ fn parse_arguments(args: &[String]) -> Result<ParsedCommand, String> {
             return Err(format!("unrecognized arguments: {}", extras.join(" ")));
         }
     }
+    if let Some(audio_archive) = options.audio_archive {
+        if !positionals.is_empty() {
+            return Err(format!("unrecognized arguments: {}", positionals.join(" ")));
+        }
+        if options.offset.is_some() || options.limit.is_some() {
+            return Err("unrecognized arguments: --offset/--limit are only valid with --audio-archive-members".to_owned());
+        }
+        if options.audio_archive_status.is_some() || options.audio_archive_members.is_some() {
+            return Err("unrecognized arguments: conflicting audio archive commands".to_owned());
+        }
+        return Ok(ParsedCommand::AudioArchive(
+            crate::audio_archive::AudioArchiveDispatchOptions {
+                path: audio_archive,
+                source_zone: options.source_zone,
+                resume: options.resume,
+                dry_run: options.dry_run,
+                json: options.json,
+            },
+        ));
+    }
+    if let Some(run_id) = options.audio_archive_status {
+        if !positionals.is_empty() {
+            return Err(format!("unrecognized arguments: {}", positionals.join(" ")));
+        }
+        if options.offset.is_some() || options.limit.is_some() {
+            return Err("unrecognized arguments: --offset/--limit are only valid with --audio-archive-members".to_owned());
+        }
+        if options.resume.is_some()
+            || options.source_zone.is_some()
+            || options.audio_archive_members.is_some()
+        {
+            return Err("unrecognized arguments: conflicting audio archive flags".to_owned());
+        }
+        return Ok(ParsedCommand::AudioArchiveStatus {
+            run_id,
+            json: options.json,
+        });
+    }
+    if let Some(run_id) = options.audio_archive_members {
+        if !positionals.is_empty() {
+            return Err(format!("unrecognized arguments: {}", positionals.join(" ")));
+        }
+        if options.resume.is_some() || options.source_zone.is_some() {
+            return Err("unrecognized arguments: conflicting audio archive flags".to_owned());
+        }
+        return Ok(ParsedCommand::AudioArchiveMembers {
+            run_id,
+            offset: options.offset.unwrap_or(0),
+            limit: options.limit,
+            json: options.json,
+        });
+    }
+
+    if options.offset.is_some() || options.limit.is_some() {
+        return Err(
+            "unrecognized arguments: --offset/--limit are only valid with --audio-archive-members"
+                .to_owned(),
+        );
+    }
+    if options.resume.is_some() {
+        return Err(
+            "unrecognized arguments: --resume is only valid with --audio-archive".to_owned(),
+        );
+    }
+    if options.source_zone.is_some() {
+        return Err(
+            "unrecognized arguments: --source-zone is only valid with --audio-archive".to_owned(),
+        );
+    }
+
     if options.list_importers {
         return Ok(ParsedCommand::ListImporters { json: options.json });
     }
@@ -1849,6 +1963,13 @@ fn takes_value(argument: &str) -> bool {
             | "--connect"
             | "--date-from"
             | "--date-to"
+            | "--audio-archive"
+            | "--source-zone"
+            | "--resume"
+            | "--audio-archive-status"
+            | "--audio-archive-members"
+            | "--offset"
+            | "--limit"
     )
 }
 
@@ -1875,6 +1996,25 @@ fn assign_value(options: &mut Options, name: &str, value: &str) -> Result<(), St
         }
         "--facet" => options.facet = Some(value.to_owned()),
         "--setting" => options.setting = Some(value.to_owned()),
+        "--audio-archive" => options.audio_archive = Some(PathBuf::from(value)),
+        "--source-zone" => options.source_zone = Some(value.to_owned()),
+        "--resume" => options.resume = Some(value.to_owned()),
+        "--audio-archive-status" => options.audio_archive_status = Some(value.to_owned()),
+        "--audio-archive-members" => options.audio_archive_members = Some(value.to_owned()),
+        "--offset" => {
+            options.offset = Some(
+                value
+                    .parse()
+                    .map_err(|_| format!("argument --offset: invalid int value: '{value}'"))?,
+            )
+        }
+        "--limit" => {
+            options.limit = Some(
+                value
+                    .parse()
+                    .map_err(|_| format!("argument --limit: invalid int value: '{value}'"))?,
+            )
+        }
         _ => return Err(format!("unrecognized arguments: {name}={value}")),
     }
     Ok(())

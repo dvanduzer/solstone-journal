@@ -91,6 +91,7 @@ pub struct ImportProjection {
     pub attempt_id: Option<String>,
     pub raw_metadata: Option<Value>,
     pub raw_publication: Option<Value>,
+    pub archive_status: Option<crate::audio_archive::AudioArchiveStatus>,
 }
 
 impl ImportProjection {
@@ -98,7 +99,8 @@ impl ImportProjection {
     /// publication record. Rows from the other importers keep their recorded shape.
     #[must_use]
     pub fn is_native(&self) -> bool {
-        self.attempt.is_some()
+        self.archive_status.is_some()
+            || self.attempt.is_some()
             || self
                 .raw_publication
                 .as_ref()
@@ -164,6 +166,9 @@ impl ImportProjection {
         map.insert("has_gaps".to_owned(), Value::Bool(self.has_gaps));
         if let Some(failed) = self.attempt.as_ref().and_then(|facts| facts.input_failures) {
             map.insert("input_failures".to_owned(), serde_json::json!(failed));
+        }
+        if let Some(status) = &self.archive_status {
+            overlay_archive_status(&mut map, status);
         }
         map
     }
@@ -318,8 +323,71 @@ impl ImportProjection {
                 serde_json::to_value(a).unwrap_or(Value::Null)
             }),
         );
+        if let Some(status) = &self.archive_status {
+            overlay_archive_status(&mut map, status);
+            map.insert(
+                "archive_status".to_owned(),
+                serde_json::to_value(status).unwrap_or(Value::Null),
+            );
+        }
         map
     }
+}
+
+fn overlay_archive_status(
+    map: &mut Map<String, Value>,
+    status: &crate::audio_archive::AudioArchiveStatus,
+) {
+    map.insert(
+        "source_display".to_owned(),
+        Value::String("audio archive".to_owned()),
+    );
+    map.insert("saved".to_owned(), serde_json::json!(status.saved_parts));
+    map.insert(
+        "saved_tiles".to_owned(),
+        serde_json::json!(status.saved_tiles),
+    );
+    map.insert(
+        "saved_parts".to_owned(),
+        serde_json::json!(status.saved_parts),
+    );
+    map.insert(
+        "remaining".to_owned(),
+        serde_json::json!(
+            status
+                .total_parts
+                .saturating_sub(status.saved_parts)
+                .saturating_sub(status.rejected_parts)
+        ),
+    );
+    map.insert(
+        "left_out".to_owned(),
+        serde_json::json!(status.size.left_out.values().sum::<usize>()),
+    );
+    map.insert(
+        "left_out_counts".to_owned(),
+        serde_json::json!(status.size.left_out),
+    );
+    map.insert(
+        "processing".to_owned(),
+        serde_json::json!(status.pending_processing),
+    );
+    map.insert(
+        "processed_parts".to_owned(),
+        serde_json::json!(status.processed_parts),
+    );
+    map.insert(
+        "unavailable_parts".to_owned(),
+        serde_json::json!(status.unavailable_parts),
+    );
+    map.insert(
+        "rejected_parts".to_owned(),
+        serde_json::json!(status.rejected_parts),
+    );
+    map.insert(
+        "save_complete".to_owned(),
+        serde_json::json!(status.save_complete),
+    );
 }
 
 /// Project an import directory's durable records into an authoritative `ImportProjection`.
@@ -374,6 +442,18 @@ fn project(
             Err(_) => (None, None, true),
         };
 
+    let archive_record_path = import_dir.join(crate::audio_archive::AUDIO_ARCHIVE_RECORD_FILENAME);
+    let (archive_status, archive_corrupted) = if archive_record_path.is_file() {
+        match crate::audio_archive::ArchiveStore::open(journal_root, import_id, false)
+            .and_then(|store| store.status())
+        {
+            Ok(status) => (Some(status), false),
+            Err(_) => (None, true),
+        }
+    } else {
+        (None, false)
+    };
+
     let imported_path = import_dir.join("imported.json");
     let (imported_raw_value, imported_json_corrupted) =
         if path_lexists(&imported_path).unwrap_or(false) {
@@ -404,8 +484,11 @@ fn project(
 
     let attempt_read = metadata.as_ref().map(read_attempt_facts);
     let attempt_corrupted = matches!(attempt_read, Some(AttemptRead::Malformed));
-    let is_corrupted =
-        metadata_corrupted || imported_json_corrupted || attempt_corrupted || manifest_corrupted;
+    let is_corrupted = metadata_corrupted
+        || imported_json_corrupted
+        || attempt_corrupted
+        || manifest_corrupted
+        || archive_corrupted;
 
     let publication = imported_raw_value
         .as_ref()
@@ -451,14 +534,18 @@ fn project(
 
     // Determine source_type and display name
     let raw_pub_obj = imported_raw_value.as_ref().and_then(Value::as_object);
-    let source_type = derive_source_type(
+    let mut source_type = derive_source_type(
         metadata.as_ref(),
         publication.as_ref(),
         raw_pub_obj,
         manifest_value.as_ref(),
         &content_manifest_lines,
     );
-    let source_display = derive_source_display(&source_type);
+    let mut source_display = derive_source_display(&source_type);
+    if archive_status.is_some() {
+        source_type = "audio_archive".to_owned();
+        source_display = "audio archive".to_owned();
+    }
 
     // Extract metadata fields
     let task_id = metadata
@@ -645,6 +732,18 @@ fn project(
             })
         });
 
+    let status = if let Some(status_facts) = &archive_status {
+        if status_facts.save_complete && status_facts.pending_processing == 0 {
+            ProjectionStatus::Success
+        } else if status_facts.save_complete {
+            ProjectionStatus::Running
+        } else {
+            status
+        }
+    } else {
+        status
+    };
+
     ImportProjection {
         import_id: import_id.to_owned(),
         source_type,
@@ -679,6 +778,7 @@ fn project(
         attempt_id: attempt_id_str,
         raw_metadata,
         raw_publication,
+        archive_status,
     }
 }
 
@@ -778,6 +878,7 @@ fn derive_source_display(source_type: &str) -> String {
         "oura" => "Oura".to_owned(),
         "plaud" => "Plaud".to_owned(),
         "audio" => "audio".to_owned(),
+        "audio_archive" => "audio archive".to_owned(),
         _ => {
             let mut chars = source_type.chars();
             match chars.next() {
@@ -1799,6 +1900,7 @@ mod tests {
             attempt_id: None,
             raw_metadata: None,
             raw_publication: None,
+            archive_status: None,
         };
 
         let map = projection.to_json_map();

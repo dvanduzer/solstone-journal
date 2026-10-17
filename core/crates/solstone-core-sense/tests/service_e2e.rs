@@ -1144,3 +1144,84 @@ fn memory_release_runs_live_work_and_leaves_the_import_eligible() {
 
     assert!(dispatcher.stop_and_wait());
 }
+
+#[cfg(feature = "full-tests")]
+#[test]
+fn archive_file_bound_includes_lease_deferred_work_and_does_not_limit_live_admission() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join("config")).unwrap();
+    std::fs::write(
+        temp.path().join("config/journal.json"),
+        br#"{"providers":{"active":{"provider":"openai"}},"memory":{"floor_mib":1}}"#,
+    )
+    .unwrap();
+    let held = solstone_core_sense::lease::acquire_sense_day_lease(temp.path(), "20261010")
+        .unwrap()
+        .unwrap();
+    let directory = temp.path().join("chronicle/20261010/stream1/100000_300");
+    std::fs::create_dir_all(&directory).unwrap();
+    let files: Vec<_> = (0..100).map(|index| format!("part-{index}.flac")).collect();
+    for file in &files {
+        std::fs::write(directory.join(file), b"audio").unwrap();
+    }
+    let probe = Arc::new(TestMemoryProbe {
+        available: std::sync::atomic::AtomicU64::new(0),
+    });
+    let (outbound, receiver) = mpsc::channel();
+    let dispatcher = SenseDispatcher::new_with_fixture_program_and_admission(
+        temp.path().into(),
+        false,
+        false,
+        outbound,
+        PathBuf::from(env!("CARGO_BIN_EXE_solstone-core-sense-test-handler")),
+        solstone_core_sense::memory::Admission::new(probe),
+    );
+    let refs: Vec<_> = files.iter().map(String::as_str).collect();
+    let mut event =
+        make_observing_envelope("20261010", "100000_300", &refs, true, Some("archive1"));
+    event.extra.insert(
+        "meta".into(),
+        json!({"import_id":"archive1","audio_archive":true}),
+    );
+    dispatcher.handle(&event);
+    assert_eq!(dispatcher.archive_pending_files(), 64);
+    dispatcher.handle(&event);
+    dispatcher.status();
+    assert_eq!(
+        dispatcher.archive_pending_files(),
+        64,
+        "a contended day is admitted once"
+    );
+    drop(held);
+    dispatcher.status();
+    assert_eq!(
+        dispatcher.archive_pending_files(),
+        64,
+        "the bound survives lease acquisition"
+    );
+    let live = temp.path().join("chronicle/20261001/stream1/010000_1");
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::write(live.join("audio.flac"), b"audio").unwrap();
+    dispatcher.handle(&make_observing_envelope(
+        "20261001",
+        "010000_1",
+        &["audio.flac"],
+        false,
+        None,
+    ));
+    assert_eq!(dispatcher.archive_pending_files(), 64);
+    for _ in receiver.try_iter() {}
+    dispatcher.status();
+    let status = loop {
+        let event = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        if event.event == "status" {
+            break event;
+        }
+    };
+    assert_eq!(
+        status.fields["pending_queue_depth"], 65,
+        "live admission remains available"
+    );
+    assert_eq!(status.fields["archive_pending_queue_depth"], 64);
+    assert!(dispatcher.stop_and_wait());
+}

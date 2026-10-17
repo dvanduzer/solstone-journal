@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::Path;
 
 use serde_json::Value;
 use solstone_core_entity::IdentityObservation;
+use solstone_core_format::audio_archive::{
+    AUDIO_ARCHIVE_PLACEMENT_FILENAME, AudioArchivePlacement,
+};
 
 use super::candidates::EdgeResolver;
 use super::{
@@ -293,7 +296,22 @@ fn select_transcript_stem(
 ) -> Result<Option<String>, EdgeError> {
     let mut npz_stems = Vec::new();
     let mut jsonl_stems = Vec::new();
+    let mut placement_stems = HashSet::new();
     if segment_dir.is_dir() {
+        let placement_path = segment_dir.join(AUDIO_ARCHIVE_PLACEMENT_FILENAME);
+        if let Some(placement) = fs::read(&placement_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<AudioArchivePlacement>(&bytes).ok())
+        {
+            for part in placement.parts {
+                if let Some(stem) = Path::new(&part.stored_name)
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                {
+                    placement_stems.insert(stem.to_string());
+                }
+            }
+        }
         for entry in fs::read_dir(segment_dir).map_err(|error| {
             EdgeError::Io(format!(
                 "speaker transcript directory read failed for {}: {error}",
@@ -322,7 +340,7 @@ fn select_transcript_stem(
             let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
                 continue;
             };
-            if !is_qualifying_audio_stem(stem) {
+            if !is_qualifying_audio_stem(stem) && !placement_stems.contains(stem) {
                 continue;
             }
             match path.extension().and_then(|extension| extension.to_str()) {
@@ -1135,6 +1153,86 @@ mod tests {
             extracted.warnings,
             vec!["speaker edge transcript duplicate sentence_id 3 for 20260808/default/120000_300"]
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn select_transcript_stem_qualifies_placement_part() {
+        let root = temp_root("placement-transcript-stem");
+        let composite_id = "20260808/default/120000_300";
+        let segment_dir = root.join("chronicle").join(composite_id);
+        fs::create_dir_all(&segment_dir).unwrap();
+        let placement_json = json!({
+            "version": 1,
+            "parts": [{
+                "stored_name": "p0000_0123456789abcdef.opus",
+                "original_occurrence": "occ-1",
+                "origin_ms": 0,
+                "offset_ms": 0,
+                "length_ms": 1000
+            }]
+        });
+        fs::write(
+            segment_dir.join("placement.json"),
+            serde_json::to_vec(&placement_json).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            segment_dir.join("p0000_0123456789abcdef.jsonl"),
+            "header\n{\"sentence_id\":1,\"text\":\"hello\"}\n",
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+        let stem = select_transcript_stem(&segment_dir, composite_id, &mut warnings).unwrap();
+        assert_eq!(stem, Some("p0000_0123456789abcdef".to_string()));
+        assert!(warnings.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn select_transcript_stem_unresolved_when_placement_has_multiple_parts() {
+        let root = temp_root("placement-transcript-stems-multiple");
+        let composite_id = "20260808/default/120000_300";
+        let segment_dir = root.join("chronicle").join(composite_id);
+        fs::create_dir_all(&segment_dir).unwrap();
+        let placement_json = json!({
+            "version": 1,
+            "parts": [
+                {
+                    "stored_name": "p0000_0123456789abcdef.opus",
+                    "original_occurrence": "occ-1",
+                    "origin_ms": 0,
+                    "offset_ms": 0,
+                    "length_ms": 1000
+                },
+                {
+                    "stored_name": "p0001_fedcba9876543210.opus",
+                    "original_occurrence": "occ-2",
+                    "origin_ms": 1000,
+                    "offset_ms": 1000,
+                    "length_ms": 1000
+                }
+            ]
+        });
+        fs::write(
+            segment_dir.join("placement.json"),
+            serde_json::to_vec(&placement_json).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            segment_dir.join("p0000_0123456789abcdef.jsonl"),
+            "header\n{\"sentence_id\":1,\"text\":\"hello\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            segment_dir.join("p0001_fedcba9876543210.jsonl"),
+            "header\n{\"sentence_id\":2,\"text\":\"world\"}\n",
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+        let stem = select_transcript_stem(&segment_dir, composite_id, &mut warnings).unwrap();
+        assert_eq!(stem, None);
+        assert!(!warnings.is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -5761,7 +5761,11 @@ body.presentation-mode .tr-screen-text { font-size: 16px; padding: 12px 16px; bo
         html += renderScreenGroup(item, idx);
       } else if (item.type === 'audio') {
         const timeStr = item.time || '';
-        html += `<div class="tr-entry tr-entry-audio" data-idx="${idx}" data-type="audio" data-timestamp="${item.timestamp}" role="listitem" tabindex="0" aria-label="play from ${timeStr}">`;
+        let audioAttrs = '';
+        if (item.audio_url && item.audio_origin !== undefined) {
+          audioAttrs = ` data-audio-url="${escapeHtml(item.audio_url)}" data-audio-origin="${item.audio_origin}"`;
+        }
+        html += `<div class="tr-entry tr-entry-audio" data-idx="${idx}" data-type="audio" data-timestamp="${item.timestamp}"${audioAttrs} role="listitem" tabindex="0" aria-label="play from ${timeStr}">`;
         html += `<div class="tr-entry-time">${timeStr}</div>`;
         html += '<div class="tr-entry-content">';
         html += '<span class="sr-only">audio: </span>';
@@ -5863,7 +5867,19 @@ body.presentation-mode .tr-screen-text { font-size: 16px; padding: 12px 16px; bo
     targetEl.querySelectorAll('.tr-entry-audio').forEach(entry => {
       entry.addEventListener('click', e => {
         if (e.target.closest('[data-action="speaker-picker"]')) return;
-        if (paneAudioEl && segmentData?.audio_file) {
+        if (!paneAudioEl) return;
+        const audioUrl = entry.dataset.audioUrl;
+        const audioOrigin = entry.dataset.audioOrigin;
+        if (audioUrl && audioOrigin !== undefined) {
+          const timestamp = parseInt(entry.dataset.timestamp, 10);
+          const origin = parseInt(audioOrigin, 10);
+          const offsetSec = Math.max(0, (timestamp - origin) / 1000);
+          if (paneAudioEl.getAttribute('src') !== audioUrl && paneAudioEl.src !== audioUrl) {
+            paneAudioEl.src = audioUrl;
+          }
+          paneAudioEl.currentTime = offsetSec;
+          paneAudioEl.play();
+        } else if (segmentData?.audio_file) {
           const timestamp = parseInt(entry.dataset.timestamp, 10);
           const baseTimestamp = chunks[0]?.timestamp || timestamp;
           const offsetSec = (timestamp - baseTimestamp) / 1000;
@@ -5890,13 +5906,27 @@ body.presentation-mode .tr-screen-text { font-size: 16px; padding: 12px 16px; bo
       let activeEntry = null;
 
       paneAudioEl.addEventListener('timeupdate', () => {
-        const currentMs = baseTimestamp + (paneAudioEl.currentTime * 1000);
+        const currentSrc = paneAudioEl.getAttribute('src') || paneAudioEl.src || paneAudioEl.querySelector('source')?.getAttribute('src') || '';
         const entries = targetEl.querySelectorAll('.tr-entry-audio[data-timestamp]');
         let best = null;
         for (const el of entries) {
-          const ts = parseInt(el.dataset.timestamp, 10);
-          if (ts <= currentMs) best = el;
-          else break;
+          const elUrl = el.dataset.audioUrl;
+          const elOrigin = el.dataset.audioOrigin;
+          if (elUrl && elOrigin !== undefined) {
+            if (currentSrc && !currentSrc.endsWith(elUrl) && currentSrc !== elUrl) {
+              continue;
+            }
+            const ts = parseInt(el.dataset.timestamp, 10);
+            const origin = parseInt(elOrigin, 10);
+            const currentMs = origin + (paneAudioEl.currentTime * 1000);
+            if (ts <= currentMs) best = el;
+            else if (best) break;
+          } else {
+            const currentMs = baseTimestamp + (paneAudioEl.currentTime * 1000);
+            const ts = parseInt(el.dataset.timestamp, 10);
+            if (ts <= currentMs) best = el;
+            else break;
+          }
         }
         if (best === activeEntry) return;
         if (activeEntry) activeEntry.classList.remove('tr-entry-active');

@@ -250,7 +250,8 @@ fn transcript_files(segment: &Path) -> Result<Vec<PathBuf>, SegmentTranscriptRea
 fn is_transcript_name(name: &str) -> bool {
     name == "audio.jsonl"
         || name.ends_with("_audio.jsonl")
-        || name.ends_with("_transcript.jsonl")
+        || (name.ends_with("_transcript.jsonl")
+            || solstone_core_format::audio_archive::is_audio_archive_transcript_name(name))
         || name == "imported.md"
         || name.ends_with("_transcript.md")
         || name == "workout.json"
@@ -411,7 +412,8 @@ fn project_line(segment_origin: &str, name: &str, line: &str) -> String {
                     .join("\n")
             } else if name == "audio.jsonl"
                 || name.ends_with("_audio.jsonl")
-                || name.ends_with("_transcript.jsonl")
+                || (name.ends_with("_transcript.jsonl")
+                    || solstone_core_format::audio_archive::is_audio_archive_transcript_name(name))
             {
                 produce_raw_percept_chunks(RawPerceptFamily::Audio, &rel, line)
                     .chunks

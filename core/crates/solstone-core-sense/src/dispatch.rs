@@ -154,6 +154,7 @@ impl JobTally {
 }
 
 pub struct SenseDispatcher {
+    archive_admission: Mutex<()>,
     journal: PathBuf,
     state: Arc<Mutex<State>>,
     outbound: mpsc::Sender<Outbound>,
@@ -163,6 +164,30 @@ pub struct SenseDispatcher {
     admission: Admission,
     batch: BatchContext,
     pub(crate) tally: Arc<JobTally>,
+}
+
+fn archive_pending_files_in(state: &State) -> usize {
+    state
+        .segments
+        .values()
+        .filter(|segment| is_archive(&segment.context))
+        .map(|segment| segment.pending.len())
+        .sum::<usize>()
+        + state
+            .lease_deferred
+            .iter()
+            .filter(|pending| is_archive(&pending.context))
+            .map(|pending| pending.paths.len())
+            .sum::<usize>()
+}
+
+fn is_archive(context: &SegmentContext) -> bool {
+    context
+        .meta
+        .as_ref()
+        .and_then(|m| m.get("audio_archive"))
+        .and_then(Value::as_bool)
+        == Some(true)
 }
 
 impl SenseDispatcher {
@@ -398,6 +423,7 @@ impl SenseDispatcher {
             }
         }
         Self {
+            archive_admission: Mutex::new(()),
             journal,
             state,
             outbound,
@@ -410,7 +436,41 @@ impl SenseDispatcher {
         }
     }
 
+    pub(crate) fn journal(&self) -> &Path {
+        &self.journal
+    }
+
+    /// Queued, running and lease-deferred archive files share one admission
+    /// bound. Live files remain free to enter the higher-priority queue.
+    pub fn archive_pending_files(&self) -> usize {
+        archive_pending_files_in(&self.state.lock().expect("sense state"))
+    }
+
     pub fn handle(&self, message: &solstone_core_callosum::CallosumEnvelope) {
+        if message
+            .extra
+            .get("meta")
+            .and_then(|m| m.get("audio_archive"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            let _guard = self.archive_admission.lock().expect("archive admission");
+            let capacity =
+                crate::archive::MAX_PENDING_FILES.saturating_sub(self.archive_pending_files());
+            if capacity == 0 {
+                return;
+            }
+            let mut bounded = message.clone();
+            if let Some(files) = bounded.extra.get_mut("files").and_then(Value::as_array_mut) {
+                files.truncate(capacity);
+            }
+            self.handle_inner(&bounded);
+        } else {
+            self.handle_inner(message);
+        }
+    }
+
+    fn handle_inner(&self, message: &solstone_core_callosum::CallosumEnvelope) {
         if message.tract != "observe" || message.event != "observing" {
             return;
         }
@@ -481,7 +541,13 @@ impl SenseDispatcher {
             .collect();
         {
             let mut state = self.state.lock().expect("sense state");
-            if state.segments.contains_key(&context.key) {
+            if state.stopping
+                || state.segments.contains_key(&context.key)
+                || state
+                    .lease_deferred
+                    .iter()
+                    .any(|pending| pending.context.key == context.key)
+            {
                 return;
             }
             // A batch walk already holds this day's lease for its whole run
@@ -490,7 +556,8 @@ impl SenseDispatcher {
             // would silently drop every batch segment, so only the live
             // service path admits per day; a repair batch and live sensing
             // still exclude each other through the batch-level lease.
-            if !batch && !state.day_leases.contains_key(&context.key.day) {
+            if (!batch || is_archive(&context)) && !state.day_leases.contains_key(&context.key.day)
+            {
                 match crate::lease::acquire_sense_day_lease(&self.journal, &context.key.day) {
                     Ok(Some(lease)) => {
                         state.day_leases.insert(context.key.day.clone(), lease);
@@ -708,6 +775,7 @@ impl SenseDispatcher {
     /// tick or two; entries older than `LIVE_DAY_LEASE_RETRY_BUDGET` are
     /// abandoned and reported instead of retried forever.
     fn retry_lease_deferred(&self) {
+        let _guard = self.archive_admission.lock().expect("archive admission");
         let due = {
             let mut state = self.state.lock().expect("sense state");
             if state.lease_deferred.is_empty() {
@@ -792,9 +860,13 @@ impl SenseDispatcher {
     pub fn status(&self) {
         self.retry_lease_deferred();
         let state = self.state.lock().expect("sense state");
-        let fields = state
+        let mut fields = state
             .health
             .beacon(state.pending_files.len(), self.admission.state());
+        fields.insert(
+            "archive_pending_queue_depth".into(),
+            json!(archive_pending_files_in(&state)),
+        );
         let _ = self.outbound.send(Outbound {
             tract: "observe",
             event: "status",

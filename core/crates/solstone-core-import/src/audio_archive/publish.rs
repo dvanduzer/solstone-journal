@@ -23,7 +23,8 @@ use solstone_core_segment::output_attempt::SegmentMutation;
 use solstone_core_segment::{ImportSource, Kind, StreamHints, advance_unbound_stream};
 
 use super::claims::{
-    DEFAULT_WRITE_BUSY_TIMEOUT, find_held_members, insert_tile_claims, register_pending_tile,
+    DEFAULT_WRITE_BUSY_TIMEOUT, find_held_members, insert_tile_claims, record_archive_run,
+    register_pending_tile,
 };
 use super::plan::{
     AudioArchiveMemberInput, AudioArchivePlan, AudioArchiveSettings, AudioArchiveSize,
@@ -55,10 +56,29 @@ pub enum ArchiveFault {
 }
 
 pub type EmitObservedFn = Box<dyn Fn(&str, &str, &str) + Send + Sync>;
+pub type ArchiveProgressFn =
+    Arc<dyn Fn(&AudioArchiveProgress) -> Result<(), AudioArchiveError> + Send + Sync>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveProgressPhase {
+    Admitted,
+    Saved,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AudioArchiveProgress {
+    pub import_id: String,
+    pub phase: ArchiveProgressPhase,
+    pub status: super::AudioArchiveStatus,
+}
+
+#[derive(Default)]
 pub struct AudioArchivePublishSeams {
     pub fault: Option<ArchiveFault>,
     pub emit_observed: Option<EmitObservedFn>,
     pub heartbeat_spawner: Option<HeartbeatSpawner>,
+    pub progress: Option<ArchiveProgressFn>,
 }
 
 /// The host stages only this part, verifying its original source against `member`.
@@ -124,33 +144,6 @@ fn publication_action(saved: bool, intent: bool, stage: bool) -> PublicationActi
         PublicationAction::PublishStaged
     } else {
         PublicationAction::RecoverSaved
-    }
-}
-
-#[cfg(test)]
-mod publication_policy_tests {
-    use super::*;
-    #[test]
-    fn saved_record_and_consumed_stage_both_forbid_new_publication() {
-        assert_eq!(
-            publication_action(true, false, false),
-            PublicationAction::KeepSaved
-        );
-        assert_eq!(
-            publication_action(false, true, false),
-            PublicationAction::RecoverSaved
-        );
-    }
-    #[test]
-    fn interrupted_private_staging_is_distinct_from_a_complete_unpublished_stage() {
-        assert_eq!(
-            publication_action(false, false, true),
-            PublicationAction::Stage
-        );
-        assert_eq!(
-            publication_action(false, true, true),
-            PublicationAction::PublishStaged
-        );
     }
 }
 
@@ -349,13 +342,15 @@ pub fn publish_audio_archive(
             attempt_id = facts.attempt_id;
         }
     }
+    record_archive_run(journal, &import_id, &options.settings.archive_identity)?;
     let _heartbeat = start_run_heartbeat(journal, &import_id, generation, &attempt_id, &seams);
-    check_fault(&seams, ArchiveFault::AfterRecordFirstSaved)?;
     let mut store = ArchiveStore::open(journal, &import_id, true)?;
     let settings = store.settings()?;
-    let plan_size = store.status()?.size;
+    let initial_status = store.status()?;
+    let plan_size = initial_status.size.clone();
+    report_progress(&seams, &store, &import_id, ArchiveProgressPhase::Admitted)?;
+    check_fault(&seams, ArchiveFault::AfterRecordFirstSaved)?;
     let mut tiles_saved = 0;
-    let mut parts_saved = 0;
     let coordinates = store.tile_coordinates()?;
     if options.import_id.is_some() {
         // Complete consumed-stage bookkeeping before any retry can reject other parts.
@@ -363,6 +358,9 @@ pub fn publish_audio_archive(
             if store.tile_phase(day, key)? == 1 {
                 recover_published_tile(journal, &import_id, &mut store, day, key)?;
             }
+        }
+        if store.status()?.saved_parts > initial_status.saved_parts {
+            report_progress(&seams, &store, &import_id, ArchiveProgressPhase::Saved)?;
         }
     }
     for (day, key) in coordinates {
@@ -443,6 +441,7 @@ pub fn publish_audio_archive(
                 &key,
                 &settings.stream,
             )?;
+            continue;
         } else {
             if action == PublicationAction::Stage {
                 // Nothing with this stage has been published. A partial pre-intent stage is disposable.
@@ -556,7 +555,7 @@ pub fn publish_audio_archive(
             recover_or_publish_tile(journal, &import_id, &mut store, &day, &key, true, &seams)?;
         }
         tiles_saved += 1;
-        parts_saved += parts.len();
+        report_progress(&seams, &store, &import_id, ArchiveProgressPhase::Saved)?;
         if seams
             .as_ref()
             .is_some_and(|seams| seams.fault == Some(ArchiveFault::BetweenMultiTileParts))
@@ -578,6 +577,7 @@ pub fn publish_audio_archive(
         }
     }
     store.finish_saving()?;
+    let final_status = store.status()?;
     record_completed_attempt(journal, &import_id, generation, now_ms(), None, None)
         .map_err(|error| AudioArchiveError::Other(error.to_string()))?;
     let record = read_audio_archive(journal, &import_id)?
@@ -585,10 +585,30 @@ pub fn publish_audio_archive(
     Ok(AudioArchivePublishResult {
         import_id,
         plan_size,
-        tiles_saved,
-        parts_saved,
+        tiles_saved: final_status
+            .saved_tiles
+            .saturating_sub(initial_status.saved_tiles) as usize,
+        parts_saved: final_status
+            .saved_parts
+            .saturating_sub(initial_status.saved_parts) as usize,
         record,
     })
+}
+
+fn report_progress(
+    seams: &Option<AudioArchivePublishSeams>,
+    store: &ArchiveStore,
+    import_id: &str,
+    phase: ArchiveProgressPhase,
+) -> Result<(), AudioArchiveError> {
+    if let Some(progress) = seams.as_ref().and_then(|seams| seams.progress.as_ref()) {
+        progress(&AudioArchiveProgress {
+            import_id: import_id.to_owned(),
+            phase,
+            status: store.status()?,
+        })?;
+    }
+    Ok(())
 }
 
 fn stage_path(journal: &Path, id: &str, day: &str, key: &str) -> PathBuf {
@@ -984,6 +1004,7 @@ mod crash_tests {
             fault: Some(ArchiveFault::AfterClaimAndIntent),
             emit_observed: None,
             heartbeat_spawner: Some(|_, _| Ok(std::thread::spawn(|| {}))),
+            progress: None,
         };
         let fixed_ts = validate_timestamp("20260114_210000").unwrap();
         let res = publish_audio_archive(
@@ -1030,5 +1051,32 @@ mod crash_tests {
             .join(&part.stored_name);
         assert!(staged_path.is_file());
         assert_eq!(std::fs::read(&staged_path).unwrap(), member_bytes);
+    }
+}
+
+#[cfg(test)]
+mod publication_policy_tests {
+    use super::*;
+    #[test]
+    fn saved_record_and_consumed_stage_both_forbid_new_publication() {
+        assert_eq!(
+            publication_action(true, false, false),
+            PublicationAction::KeepSaved
+        );
+        assert_eq!(
+            publication_action(false, true, false),
+            PublicationAction::RecoverSaved
+        );
+    }
+    #[test]
+    fn interrupted_private_staging_is_distinct_from_a_complete_unpublished_stage() {
+        assert_eq!(
+            publication_action(false, false, true),
+            PublicationAction::Stage
+        );
+        assert_eq!(
+            publication_action(false, true, true),
+            PublicationAction::PublishStaged
+        );
     }
 }

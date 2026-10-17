@@ -137,6 +137,36 @@ pub struct Segment {
 }
 
 impl Segment {
+    /// Resolve one exact native coordinate without enumerating its stream.
+    pub fn resolve_exact(
+        journal: &Path,
+        day: &str,
+        stream: &str,
+        key: &str,
+    ) -> Result<Option<Self>, crate::ExactLookupError> {
+        Ok(crate::resolve_segment_locator_exact(
+            journal,
+            day,
+            stream,
+            key,
+            if stream == DEFAULT_STREAM {
+                crate::SegmentLayout::Direct
+            } else {
+                crate::SegmentLayout::Named
+            },
+        )?
+        .map(|path| Self {
+            stream: if stream == DEFAULT_STREAM {
+                StreamLocation::Direct
+            } else {
+                StreamLocation::Named(stream.into())
+            },
+            name: key.into(),
+            key: key.into(),
+            path,
+        }))
+    }
+
     /// Stream layout of this segment.
     #[must_use]
     pub fn stream(&self) -> &StreamLocation {
@@ -568,6 +598,16 @@ pub fn segment_path(
 
 /// Iterate direct segment directories in Python-compatible name order.
 pub fn iter_segments(journal: &Path, day: PathOrDay<'_>) -> Result<Vec<Segment>, PathError> {
+    iter_segments_with_stream_filter(journal, day, |_| true)
+}
+
+/// Filter named streams before entering their directories. Direct segments
+/// remain included; indexed callers can resolve selected named entries exactly.
+pub fn iter_segments_with_stream_filter(
+    journal: &Path,
+    day: PathOrDay<'_>,
+    include: impl Fn(&OsStr) -> bool,
+) -> Result<Vec<Segment>, PathError> {
     let day_dir = match day {
         PathOrDay::Day(day) => day_path(journal, day, false)?,
         PathOrDay::Directory(path) => path.to_path_buf(),
@@ -591,7 +631,7 @@ pub fn iter_segments(journal: &Path, day: PathOrDay<'_>) -> Result<Vec<Segment>,
             });
             continue;
         }
-        if entry_name == OsStr::new("health") {
+        if entry_name == OsStr::new("health") || !include(&entry_name) {
             continue;
         }
         for segment_entry in

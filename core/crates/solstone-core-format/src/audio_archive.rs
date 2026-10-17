@@ -35,6 +35,23 @@ pub struct AudioArchivePlacementPart {
     pub length_ms: i64,
 }
 
+/// Canonical archive part stem, independent of the original container suffix.
+pub fn is_audio_archive_part_stem(stem: &str) -> bool {
+    let bytes = stem.as_bytes();
+    bytes.len() == 22
+        && bytes[0] == b'p'
+        && bytes[5] == b'_'
+        && bytes[1..5].iter().all(u8::is_ascii_digit)
+        && bytes[6..].iter().all(u8::is_ascii_hexdigit)
+}
+
+/// Audio sidecar produced by the journal's native archive materializer.
+/// Arbitrary JSONL files are not transcript inputs.
+pub fn is_audio_archive_transcript_name(name: &str) -> bool {
+    name.strip_suffix(".jsonl")
+        .is_some_and(is_audio_archive_part_stem)
+}
+
 fn deserialize_stored_name<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<String, D::Error> {
@@ -294,5 +311,34 @@ mod tests {
 
         let deserialized: AudioArchivePlacement = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, placement);
+    }
+    #[test]
+    fn archive_transcript_names_are_strict_and_raw_speech_stays_unindexed() {
+        use crate::content::{ContentResolution, RawPerceptFamily, classify};
+        let name = "p0001_0123456789abcdef.jsonl";
+        assert!(is_audio_archive_transcript_name(name));
+        for bad in [
+            "p001_0123456789abcdef.jsonl",
+            "p0001_0123456789abcdeg.jsonl",
+            "p0001_0123456789abcdef.ogg.jsonl",
+            "../p0001_0123456789abcdef.jsonl",
+            "p0001_0123456789abcdef.json",
+        ] {
+            assert!(!is_audio_archive_transcript_name(bad));
+        }
+        assert_eq!(
+            classify(&format!("20260101/import.archive/120000_300/{name}")),
+            ContentResolution::Unindexed(RawPerceptFamily::Audio)
+        );
+        for prefix in [
+            "facets/import.archive/120000_300",
+            "20260101/import.archive/bad",
+            "20260101/other/120000_300",
+        ] {
+            assert_eq!(
+                classify(&format!("{prefix}/{name}")),
+                ContentResolution::Unrecognized
+            );
+        }
     }
 }

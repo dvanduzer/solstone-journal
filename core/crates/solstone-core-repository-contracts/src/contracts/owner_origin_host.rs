@@ -30,9 +30,24 @@ struct AllowlistRow {
 
 const ALLOWLIST: &[AllowlistRow] = &[
     AllowlistRow {
+        path: "core/crates/solstone-core-update/src/fetch.rs",
+        marker: "UPDATE_ORIGIN",
+        reason: "native updater version origin",
+    },
+    AllowlistRow {
+        path: "core/crates/solstone-core-update/src/fetch.rs",
+        marker: "NATIVE_BOOTSTRAP_URL",
+        reason: "native updater's fixed installer URL; redirects stay on its selected host",
+    },
+    AllowlistRow {
+        path: "core/crates/solstone-core-update/src/fetch.rs",
+        marker: "NATIVE_HOST",
+        reason: "native updater's expected host for initial URL and every redirect",
+    },
+    AllowlistRow {
         path: "core/crates/solstone-core-artifact-download/src/lib.rs",
         marker: "OWNER_ORIGIN_HOST",
-        reason: "only production owner-host literal",
+        reason: "shared artifact downloader owner-host constant",
     },
     AllowlistRow {
         path: "core/crates/solstone-core-journal-app/src/update.rs",

@@ -32,6 +32,35 @@ impl SegmentSource for FilesystemSegmentSource {
     }
 }
 
+/// Discovery scans ordinary streams and only the selected archive coordinates.
+/// The selection comes from the durable bounded import frontier.
+pub struct ArchiveFrontierSegmentSource<'a> {
+    pub selected: &'a [(String, String)],
+}
+
+impl SegmentSource for ArchiveFrontierSegmentSource<'_> {
+    fn segments(
+        &self,
+        journal: &std::path::Path,
+        day: &str,
+    ) -> Result<Vec<solstone_core_journal_io::Segment>, HealthError> {
+        let mut segments = solstone_core_journal_io::iter_segments_with_stream_filter(
+            journal,
+            solstone_core_journal_io::PathOrDay::Day(day),
+            |stream| stream != std::ffi::OsStr::new("import.archive"),
+        )?;
+        for (stream, key) in self.selected {
+            if let Some(segment) =
+                solstone_core_journal_io::Segment::resolve_exact(journal, day, stream, key)
+                    .map_err(|error| HealthError::Source(error.to_string()))?
+            {
+                segments.push(segment);
+            }
+        }
+        Ok(segments)
+    }
+}
+
 pub trait HealthLogSource {
     fn health_log_paths(&self, day: &str) -> Result<Vec<PathBuf>, HealthError>;
 }

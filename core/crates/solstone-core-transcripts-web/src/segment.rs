@@ -14,6 +14,9 @@ use chrono::{DateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
+use solstone_core_format::audio_archive::{
+    AUDIO_ARCHIVE_PLACEMENT_FILENAME, AudioArchivePlacement,
+};
 use solstone_core_format::content::{
     Family, RawPerceptFamily, produce_chunks, produce_raw_percept_chunks, talent_projection_map,
 };
@@ -132,10 +135,32 @@ fn prepare_segment(
         .map(|entry| entry.path())
         .collect::<Vec<_>>();
     files.sort();
+    let placement = fs::read(dir.join(AUDIO_ARCHIVE_PLACEMENT_FILENAME))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<AudioArchivePlacement>(&bytes).ok())
+        .filter(|p| !p.parts.is_empty());
+    let placement_part_stems: std::collections::HashSet<String> = placement
+        .as_ref()
+        .map(|p| {
+            p.parts
+                .iter()
+                .filter_map(|part| {
+                    Path::new(&part.stored_name)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(str::to_owned)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let has_audio_transcript = files.iter().any(|path| {
         path.file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with("audio.jsonl"))
+            .is_some_and(|name| {
+                name.ends_with("audio.jsonl")
+                    || (name.ends_with(".jsonl")
+                        && placement_part_stems.contains(name.trim_end_matches(".jsonl")))
+            })
     });
     let mut speakers = load(&dir, root, now, has_audio_transcript);
     let mut warnings = std::mem::take(&mut speakers.warnings);
@@ -153,7 +178,10 @@ fn prepare_segment(
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if name.ends_with("audio.jsonl") {
+        let is_audio = name.ends_with("audio.jsonl")
+            || (name.ends_with(".jsonl")
+                && placement_part_stems.contains(name.trim_end_matches(".jsonl")));
+        if is_audio {
             has_jsonl.insert("audio".into(), true);
             match read_entries(path) {
                 Ok(entries) => {
@@ -161,7 +189,15 @@ fn prepare_segment(
                         records.insert("audio".into(), processing_record(&entries));
                     }
                     duration = duration.max(audio_duration(&entries, key));
-                    audio_chunks(&mut chunks, &mut media, &speakers, &context, name, &entries);
+                    audio_chunks(
+                        &mut chunks,
+                        &mut media,
+                        &speakers,
+                        &context,
+                        name,
+                        &entries,
+                        placement.as_ref(),
+                    );
                 }
                 Err(error) => warnings.push(warning("audio", path, error, now)),
             }
@@ -412,6 +448,7 @@ fn audio_chunks(
     context: &SegmentContext<'_>,
     name: &str,
     entries: &[Map<String, Value>],
+    placement: Option<&AudioArchivePlacement>,
 ) {
     let source = name.trim_end_matches(".jsonl");
     let ids = embedding_ids(context.dir, source);
@@ -433,14 +470,44 @@ fn audio_chunks(
         crate::segment_media::segment_rel(context.day, context.stream, context.key)
     );
     let produced = produce_raw_percept_chunks(RawPerceptFamily::Audio, &rel, &text);
-    if let Some(raw) = entries
+    let header_raw = entries
         .iter()
         .find(|entry| !entry.contains_key("start") && entry.contains_key("raw"))
         .and_then(|entry| entry.get("raw"))
-        .and_then(Value::as_str)
-    {
+        .and_then(Value::as_str);
+    if let Some(raw) = header_raw {
         media.register_audio(context.day, context.stream, context.key, context.dir, raw);
     }
+    let placement_media = header_raw.and_then(|raw| {
+        placement.and_then(|p| {
+            p.parts
+                .iter()
+                .find(|part| part.stored_name == raw)
+                .map(|part| {
+                    let segment_clock_ms = segment_parse(context.key)
+                        .map(|start| {
+                            day_timestamp(
+                                context.zone,
+                                context.day,
+                                &format!(
+                                    "{:02}:{:02}:{:02}",
+                                    start.hour, start.minute, start.second
+                                ),
+                                0,
+                            )
+                        })
+                        .unwrap_or(0);
+                    let origin_ms = segment_clock_ms + part.offset_ms;
+                    let audio_url = crate::segment_media::audio_url(
+                        context.day,
+                        context.stream,
+                        context.key,
+                        raw,
+                    );
+                    (audio_url, origin_ms)
+                })
+        })
+    });
     for (index, row) in entries.iter().enumerate() {
         let Some(start) = row.get("start").and_then(Value::as_str) else {
             continue;
@@ -458,6 +525,13 @@ fn audio_chunks(
                     .to_owned()
             });
         let mut chunk = json!({"type":"audio","time":start,"timestamp":produced.chunks.iter().find(|chunk| chunk.source.as_ref() == Some(row)).and_then(|chunk| chunk.occurrence_time_ms).map_or(0, |value| local_wall_instant(context.zone, value.0)),"markdown":strip_speaker_prefix(&markdown, row.get("speaker")),"sentence_id":sid,"speaker_source":source,"has_embedding":sid.is_some_and(|id| ids.contains(&id)),"speaker_actionable":speakers.state.present && speakers.state.loaded && speakers.state.source.as_deref() == Some(source) && sid.is_some_and(|id| ids.contains(&id)),"source_ref":{"start":start,"source":row.get("source"),"speaker":row.get("speaker")}});
+        if let Some((ref audio_url, origin_ms)) = placement_media
+            && let Some(obj) = chunk.as_object_mut()
+        {
+            obj.insert("audio_url".into(), json!(audio_url));
+            obj.insert("audio_file".into(), json!(audio_url));
+            obj.insert("audio_origin".into(), json!(origin_ms));
+        }
         if let Some(label) = sid
             .and_then(|id| speakers.labels.get(&id))
             .filter(|_| speakers.state.source.as_deref() == Some(source))

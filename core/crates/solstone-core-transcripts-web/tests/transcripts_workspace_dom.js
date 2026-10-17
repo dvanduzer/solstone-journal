@@ -189,17 +189,23 @@ class Element {
     this._textContent = '';
     this.clientHeight = 0;
     this.clientWidth = 0;
+    this.currentTime = 0;
   }
 
   get id() { return this.getAttribute('id') || ''; }
   set id(value) { this.setAttribute('id', value); }
   get href() { return this.getAttribute('href') || ''; }
   set href(value) { this.setAttribute('href', value); }
+  get src() { return this.getAttribute('src') || ''; }
+  set src(value) { this.setAttribute('src', value); }
   get className() { return this.getAttribute('class') || ''; }
   set className(value) { this.setAttribute('class', value); }
   get hidden() { return this.hasAttribute('hidden'); }
   set hidden(value) { if (value) this.setAttribute('hidden', ''); else this.removeAttribute('hidden'); }
   get firstChild() { return this.children[0] || null; }
+  play() { this._playing = true; }
+  pause() { this._playing = false; }
+  scrollIntoView() {}
 
   get textContent() {
     if (this.children.length > 0) {
@@ -826,6 +832,7 @@ async function createEnvironment(
               status: 200,
               json: async () => ({
                 chunks: payloadOverride?.chunks ?? [],
+                audio_file: payloadOverride?.audio_file,
                 data_state: dataState,
                 holds_location: payloadOverride?.holds_location,
                 location_readings: payloadOverride?.location_readings,
@@ -1986,6 +1993,85 @@ test('protected_video markdown chunk rendered in transcript panel and replaced o
     (el.textContent || '').includes('PROTECTED_VIDEO_SENTINEL_9f3c')
   );
   assert.strictEqual(remainingEntries.length, 0);
+});
+
+test('audio archive placement parts switch audio source and seek relative to part origin', async () => {
+  const env = await createEnvironment();
+  const pills = getZoomPills(env.doc);
+  pills[0].dispatchEvent({ type: 'click' });
+
+  const raw1 = '/app/transcripts/api/serve_file/20200115/room/114500_300/p0000_0123456789abcdef.opus';
+  const raw2 = '/app/transcripts/api/serve_file/20200115/room/114500_300/p0001_fedcba9876543210.opus';
+
+  const chunks = [
+    {
+      type: 'audio',
+      time: '11:45:10',
+      timestamp: 10000,
+      audio_url: raw1,
+      audio_origin: 0,
+      markdown: 'part 1 line 1',
+    },
+    {
+      type: 'audio',
+      time: '11:47:30',
+      timestamp: 150000,
+      audio_url: raw2,
+      audio_origin: 100000,
+      markdown: 'part 2 line 1 after gap',
+    },
+  ];
+
+  await env.releasePendingSegmentGets('analyzed', {
+    audio_file: raw1,
+    chunks,
+  });
+
+  const audioElement = env.doc.querySelector('audio[data-role="segment-audio"]');
+  assert.ok(audioElement, 'audio element exists');
+
+  const entries = env.doc.querySelectorAll('.tr-entry-audio');
+  assert.strictEqual(entries.length, 2);
+
+  // Click first entry
+  entries[0].dispatchEvent({ type: 'click' });
+  assert.strictEqual(audioElement.src, raw1);
+  assert.strictEqual(audioElement.currentTime, 10);
+
+  // Click second entry (later entry after gap)
+  entries[1].dispatchEvent({ type: 'click' });
+  assert.strictEqual(audioElement.src, raw2);
+  assert.strictEqual(audioElement.currentTime, 50);
+
+  // No placement fixture keeps the old chunks[0] seek
+  pills[1].dispatchEvent({ type: 'click' });
+  const legacyChunks = [
+    {
+      type: 'audio',
+      time: '11:55:10',
+      timestamp: 20000,
+      markdown: 'legacy line 1',
+    },
+    {
+      type: 'audio',
+      time: '11:55:40',
+      timestamp: 50000,
+      markdown: 'legacy line 2',
+    },
+  ];
+
+  const legacyRaw = '/app/transcripts/api/serve_file/20200115/room/115500_300/audio.opus';
+  await env.releasePendingSegmentGets('analyzed', {
+    audio_file: legacyRaw,
+    chunks: legacyChunks,
+  });
+
+  const legacyEntries = env.doc.querySelectorAll('.tr-entry-audio');
+  assert.strictEqual(legacyEntries.length, 2);
+
+  const legacyAudioElement = env.doc.querySelector('audio[data-role="segment-audio"]');
+  legacyEntries[1].dispatchEvent({ type: 'click' });
+  assert.strictEqual(legacyAudioElement.currentTime, 30);
 });
 
 async function run() {

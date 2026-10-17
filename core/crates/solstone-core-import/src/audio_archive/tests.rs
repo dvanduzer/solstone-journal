@@ -23,6 +23,75 @@ const UTC_ZONE: Tz = Tz::UTC;
 
 #[cfg(feature = "full-tests")]
 #[test]
+fn archive_run_lookup_is_read_only_when_absent_and_survives_publication_interruption() {
+    let temp = TempDir::new().unwrap();
+    let journal = temp.path();
+    let identity = default_settings().archive_identity;
+    assert_eq!(read_matching_archive_run(journal, &identity).unwrap(), None);
+    assert!(!journal.join("imports").exists());
+    let (member, bytes) = storage_member(231, "2026-01-14T21:00:00Z", 7500);
+    let materials = HashMap::from([(member.sha256.clone(), bytes)]);
+    assert!(matches!(
+        storage_publish(
+            journal,
+            None,
+            &[member],
+            &materials,
+            Some(ArchiveFault::AfterRecordFirstSaved)
+        ),
+        Err(AudioArchiveError::Fault(
+            ArchiveFault::AfterRecordFirstSaved
+        ))
+    ));
+    let id = storage_run(journal);
+    // Unrelated incomplete runs are deliberately not opened by this keyed lookup.
+    fs::create_dir(journal.join("imports/20200101_010101")).unwrap();
+    let lookup_path = claim_db_path(journal);
+    let before = fs::read(&lookup_path).unwrap();
+    let modified = fs::metadata(&lookup_path).unwrap().modified().unwrap();
+    assert_eq!(
+        read_matching_archive_run(journal, &identity).unwrap(),
+        Some(id.clone())
+    );
+    assert_eq!(
+        read_matching_archive_run(journal, "another-archive").unwrap(),
+        None
+    );
+    assert_eq!(fs::read(&lookup_path).unwrap(), before);
+    assert_eq!(
+        fs::metadata(&lookup_path).unwrap().modified().unwrap(),
+        modified
+    );
+    fs::remove_dir_all(journal.join("imports").join(&id)).unwrap();
+    assert_eq!(read_matching_archive_run(journal, &identity).unwrap(), None);
+    assert!(claim_db_path(journal).is_file());
+}
+
+#[cfg(feature = "full-tests")]
+#[test]
+fn archive_run_lookup_does_not_hide_a_damaged_living_run_or_inherit_a_replacement() {
+    let temp = TempDir::new().unwrap();
+    let journal = temp.path();
+    let identity = default_settings().archive_identity;
+    let (member, bytes) = storage_member(232, "2026-01-14T21:00:00Z", 7500);
+    let materials = HashMap::from([(member.sha256.clone(), bytes)]);
+    let result = storage_publish(journal, None, &[member], &materials, None).unwrap();
+    let path = record::audio_archive_record_path(journal, &result.import_id);
+    fs::remove_file(&path).unwrap();
+    assert!(read_matching_archive_run(journal, &identity).is_err());
+    let mut replacement = result.record;
+    replacement.settings.archive_identity = "different-archive".to_owned();
+    save_audio_archive_record(journal, &result.import_id, &replacement).unwrap();
+    assert_eq!(read_matching_archive_run(journal, &identity).unwrap(), None);
+    claims::record_archive_run(journal, &result.import_id, "different-archive").unwrap();
+    assert_eq!(
+        read_matching_archive_run(journal, "different-archive").unwrap(),
+        Some(result.import_id)
+    );
+}
+
+#[cfg(feature = "full-tests")]
+#[test]
 fn retry_rechecks_another_runs_ownership_of_previously_rejected_member() {
     struct Unreadable;
     impl AudioArchiveMaterializer for Unreadable {
@@ -177,6 +246,7 @@ fn restored_source_resume_fills_only_rejected_unpublished_parts() {
                 fault,
                 emit_observed: None,
                 heartbeat_spawner: None,
+                progress: None,
             }),
         );
         if fault.is_some() {
@@ -715,6 +785,7 @@ fn storage_publish(
             fault,
             emit_observed: None,
             heartbeat_spawner: Some(|_, _| Ok(std::thread::spawn(|| {}))),
+            progress: None,
         }),
     )
 }
@@ -1330,6 +1401,7 @@ fn publication_and_fault_seams() {
         fault: Some(ArchiveFault::AfterRecordFirstSaved),
         emit_observed: None,
         heartbeat_spawner: Some(|_, _| Ok(std::thread::spawn(|| {}))),
+        progress: None,
     };
 
     let res = publish_audio_archive(
@@ -1356,6 +1428,7 @@ fn publication_and_fault_seams() {
         fault: None,
         emit_observed: None,
         heartbeat_spawner: Some(|_, _| Ok(std::thread::spawn(|| {}))),
+        progress: None,
     };
     let clean_res = publish_audio_archive(
         journal,
@@ -1608,6 +1681,7 @@ fn each_archive_fault_and_resume_publishes_raw() {
             fault: Some(fault),
             emit_observed: None,
             heartbeat_spawner: Some(|_, _| Ok(std::thread::spawn(|| {}))),
+            progress: None,
         };
         let res = publish_audio_archive(
             t.path(),
@@ -1628,6 +1702,7 @@ fn each_archive_fault_and_resume_publishes_raw() {
         fault: Some(ArchiveFault::AfterClaimAndIntent),
         emit_observed: None,
         heartbeat_spawner: Some(|_, _| Ok(std::thread::spawn(|| {}))),
+        progress: None,
     };
     let res = publish_audio_archive(
         journal,
@@ -1660,6 +1735,7 @@ fn each_archive_fault_and_resume_publishes_raw() {
         fault: None,
         emit_observed: None,
         heartbeat_spawner: Some(|_, _| Ok(std::thread::spawn(|| {}))),
+        progress: None,
     };
     let resume_res = publish_audio_archive(
         journal,
@@ -1726,6 +1802,7 @@ fn between_multi_tile_parts_fault_semantics() {
         fault: Some(ArchiveFault::BetweenMultiTileParts),
         emit_observed: None,
         heartbeat_spawner: Some(|_, _| Ok(std::thread::spawn(|| {}))),
+        progress: None,
     };
 
     let res = publish_audio_archive(
@@ -1826,6 +1903,7 @@ fn resume_settings_mismatch_leaves_record_unchanged() {
         fault: Some(ArchiveFault::AfterRecordFirstSaved),
         emit_observed: None,
         heartbeat_spawner: Some(|_, _| Ok(std::thread::spawn(|| {}))),
+        progress: None,
     };
     let _ = publish_audio_archive(
         journal,
@@ -1945,7 +2023,8 @@ fn delete_chronicle_raw_and_resume_does_not_recreate() {
     )
     .unwrap();
 
-    assert_eq!(resume_res.tiles_saved, 1);
+    assert_eq!(resume_res.tiles_saved, 0);
+    assert_eq!(resume_res.parts_saved, 0);
     assert!(!raw_path.exists());
 
     let frontier = update_archive_frontier(journal, &clean.import_id).unwrap();
@@ -2171,6 +2250,7 @@ fn emit_seam_invoked_once_per_finished_tile() {
         fault: Some(ArchiveFault::AfterClaimAndIntent),
         emit_observed: Some(emit_fn),
         heartbeat_spawner: Some(|_, _| Ok(std::thread::spawn(|| {}))),
+        progress: None,
     };
 
     let res = publish_audio_archive(
@@ -2198,6 +2278,7 @@ fn emit_seam_invoked_once_per_finished_tile() {
         fault: None,
         emit_observed: Some(emit_clean),
         heartbeat_spawner: Some(|_, _| Ok(std::thread::spawn(|| {}))),
+        progress: None,
     };
 
     let temp_clean = TempDir::new().unwrap();
@@ -2269,6 +2350,7 @@ fn before_tile_publish_resume_publishes_one_complete_tile() {
         fault: Some(ArchiveFault::BeforeTilePublish),
         emit_observed: None,
         heartbeat_spawner: Some(|_, _| Ok(std::thread::spawn(|| {}))),
+        progress: None,
     };
 
     let res = publish_audio_archive(
@@ -2323,6 +2405,7 @@ fn before_tile_publish_resume_publishes_one_complete_tile() {
         fault: None,
         emit_observed: None,
         heartbeat_spawner: Some(|_, _| Ok(std::thread::spawn(|| {}))),
+        progress: None,
     };
     let clean_res = publish_audio_archive(
         journal,
@@ -2386,6 +2469,7 @@ fn after_publish_before_saved_mark_delete_raw_resume() {
         fault: Some(ArchiveFault::AfterPublishBeforeSavedMark),
         emit_observed: None,
         heartbeat_spawner: Some(|_, _| Ok(std::thread::spawn(|| {}))),
+        progress: None,
     };
 
     let res = publish_audio_archive(
@@ -2436,6 +2520,7 @@ fn after_publish_before_saved_mark_delete_raw_resume() {
         fault: None,
         emit_observed: None,
         heartbeat_spawner: Some(|_, _| Ok(std::thread::spawn(|| {}))),
+        progress: None,
     };
     let clean_res = publish_audio_archive(
         journal,
@@ -2864,7 +2949,8 @@ fn publication_candidate_file_does_not_refuse_and_resume_does_not_recreate() {
     )
     .unwrap();
 
-    assert_eq!(resume_res.tiles_saved, 1);
+    assert_eq!(resume_res.tiles_saved, 0);
+    assert_eq!(resume_res.parts_saved, 0);
     assert!(!raw_path.exists());
     assert_eq!(
         resume_res.record.parts[0].outcome,
@@ -3228,6 +3314,63 @@ fn publication_without_notification_is_recovered_by_discovery_without_rewriting_
                 .unwrap()
                 .tiles
                 .is_empty()
+        );
+    }
+}
+
+#[cfg(feature = "full-tests")]
+#[test]
+fn archive_progress_precedes_chronicle_and_only_counts_durable_saves() {
+    use std::sync::{Arc, Mutex};
+    for fault in [
+        Some(ArchiveFault::AfterRecordFirstSaved),
+        Some(ArchiveFault::AfterTileBytesStaged),
+        Some(ArchiveFault::AfterSavedMarkBeforeEmit),
+        None,
+    ] {
+        let root = TempDir::new().unwrap();
+        let (member, bytes) = storage_member(991, "2026-01-14T21:00:00Z", 7500);
+        let materials = HashMap::from([(member.sha256.clone(), bytes)]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let journal = root.path().to_path_buf();
+        let result = publish_audio_archive(
+            root.path(),
+            AudioArchivePublishOptions {
+                import_id: None,
+                members: vec![member],
+                materializer: &materials,
+                owner_zone: NY,
+                settings: default_settings(),
+                source_timestamp: None,
+            },
+            Some(AudioArchivePublishSeams {
+                fault,
+                heartbeat_spawner: Some(|_, _| Ok(std::thread::spawn(|| {}))),
+                emit_observed: None,
+                progress: Some(Arc::new(move |event| {
+                    if event.phase == ArchiveProgressPhase::Admitted {
+                        assert!(!journal.join("chronicle").exists());
+                        assert_eq!(event.status.size.members, 1);
+                        assert_eq!(event.status.saved_parts, 0);
+                    } else {
+                        assert_eq!(event.status.saved_parts, 1);
+                        assert!(journal.join("chronicle").is_dir());
+                    }
+                    captured.lock().unwrap().push(event.phase);
+                    Ok(())
+                })),
+            }),
+        );
+        assert_eq!(result.is_ok(), fault.is_none());
+        let events = events.lock().unwrap();
+        assert_eq!(events[0], ArchiveProgressPhase::Admitted);
+        let saved = fault.is_none() || fault == Some(ArchiveFault::AfterSavedMarkBeforeEmit);
+        assert_eq!(events.len(), if saved { 2 } else { 1 });
+        assert!(
+            archive_day_has_pending(root.path(), "20260114").unwrap()
+                == (fault != Some(ArchiveFault::AfterRecordFirstSaved)
+                    && fault != Some(ArchiveFault::AfterTileBytesStaged))
         );
     }
 }

@@ -4,6 +4,7 @@
 //! Host-native import adapters, including FFmpeg-backed audio operations.
 
 pub mod audio;
+pub mod audio_archive;
 pub mod audio_publication;
 pub mod cli_argv;
 pub mod import_publication;

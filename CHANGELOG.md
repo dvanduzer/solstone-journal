@@ -8,10 +8,12 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- on the command line, you can import a folder of Ogg Opus recordings as one archive. use the time zone for Limitless filenames, or a manifest with each recording's time. the import shows its size before saving and lists recordings left out. interrupted runs resume without replacing parts already saved.
 - on linux, solstone update checks for updates and installs them through the installer that owns your copy. the health page shows the same update availability, including when it cannot tell.
 
 ### Changed
 
+- imported recordings waiting to be transcribed now wait behind today's recordings, with newer imports first. audio-folder sync also accepts `.ogg` files.
 - wherever the dashboard shows where something came from, it now names the device or import, like "your mac · screen" or "Apple Health · imported", instead of an internal id.
 - the health page no longer keeps its own list of your devices; it says how many are adding to your journal, shows any that need attention, and links to network, where you manage them. the settings page's devices section is gone for the same reason.
 - on large journals, health takes less time to open after your journal starts. speaker dates and stats also load faster.

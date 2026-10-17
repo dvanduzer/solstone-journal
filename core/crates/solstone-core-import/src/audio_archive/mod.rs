@@ -17,7 +17,8 @@ pub mod publish;
 pub mod record;
 
 pub use claims::{
-    DEFAULT_WRITE_BUSY_TIMEOUT, claim_db_path, find_held_members, insert_tile_claims,
+    DEFAULT_WRITE_BUSY_TIMEOUT, archive_day_has_pending, claim_db_path, find_held_members,
+    insert_tile_claims, read_matching_archive_run,
 };
 pub use frontier::{
     AudioArchiveFrontier, FrontierPart, FrontierTile, FrontierUnavailablePart, PendingArchiveBatch,
@@ -31,7 +32,8 @@ pub use plan::{
     SourceRejection, apply_held_members, plan_audio_archive,
 };
 pub use publish::{
-    ArchiveFault, AudioArchiveMaterializer, AudioArchivePublishOptions, AudioArchivePublishResult,
+    ArchiveFault, ArchiveProgressFn, ArchiveProgressPhase, AudioArchiveMaterializer,
+    AudioArchiveProgress, AudioArchivePublishOptions, AudioArchivePublishResult,
     AudioArchivePublishSeams, EmitObservedFn, prepare_audio_archive_plan, publish_audio_archive,
 };
 pub use record::{
