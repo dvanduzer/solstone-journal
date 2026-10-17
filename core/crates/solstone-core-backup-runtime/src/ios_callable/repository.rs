@@ -137,6 +137,9 @@ fn destination(repository: &str, region: &str) -> Result<Destination, Repository
         path.to_owned()
     };
     let (bucket, prefix) = path.split_once('/').ok_or(RepositoryRefusal)?;
+    // restic cleans the prefix, so the operated `users/<account>/<instance>/`
+    // names the same objects as its form without the trailing slash.
+    let prefix = prefix.strip_suffix('/').unwrap_or(prefix);
     if !printable(region, 64, false)
         || !region
             .bytes()
