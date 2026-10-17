@@ -224,7 +224,32 @@ impl ExecuteError {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_call<'a>(
+    authority: &AdmittedIosBackupAuthority,
+    args: &[String],
+    repository: &'a str,
+    password: &str,
+    next_password: Option<&str>,
+    env: Option<&'a BTreeMap<String, Option<String>>>,
+    cancellation: Option<&ArchiveCancellation>,
+) -> Result<repository::Repository<'a>, RunnerError> {
+    let validated = validate_call_shape(
+        authority,
+        args,
+        repository,
+        password,
+        next_password,
+        env,
+        cancellation,
+    );
+    if let Err(error) = &validated {
+        log::warn!("ios backup call refused before the bridge: {error}");
+    }
+    validated
+}
+
+fn validate_call_shape<'a>(
     authority: &AdmittedIosBackupAuthority,
     args: &[String],
     repository: &'a str,
@@ -449,7 +474,22 @@ fn execute(
     let cancelled = || cancellation.is_some_and(ArchiveCancellation::is_cancelled);
     // All surrounding captured authorities, buffers, directories and the actual
     // caller's lifetime remain live until actual wait/result/free returns.
-    Ok(call.wait(timeout, Some(&cancelled), metadata))
+    let completed = call.wait(timeout, Some(&cancelled), metadata);
+    if completed.fields.status != 0 {
+        // The bridge's diagnostic is a bounded code, never a credential or path.
+        let end = completed
+            .fields
+            .diagnostic
+            .iter()
+            .position(|byte| *byte == 0);
+        let diagnostic = std::str::from_utf8(&completed.fields.diagnostic[..end.unwrap_or(0)])
+            .unwrap_or("unprintable");
+        log::warn!(
+            "ios backup operation {operation} failed: status {} diagnostic {diagnostic}",
+            completed.fields.status
+        );
+    }
+    Ok(completed)
 }
 
 #[allow(clippy::too_many_arguments)]
