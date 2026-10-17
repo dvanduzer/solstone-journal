@@ -2624,14 +2624,16 @@
 
   function renderGlance() {
     const brain = state.providers.brain || {};
-    setText('thinkingIntro', brain.state === 'ready' ? 'your model is ready. you can change it in setup.' : 'choose or check your model in setup.');
+    setText('thinkingIntro', brain.state === 'ready' ? 'your model is ready. you can change it in setup.'
+      : brain.reason_code === 'thinking_engine_not_chosen' ? 'choose where the thinking happens. your journal keeps everything until you do.'
+      : 'choose or check your model in setup.');
     const glance = $('brainGlance');
     const glanceLabel = $('thinkingActiveLane');
     const identity = brain.identity || {};
     const evidence = brain.evidence || {};
     if (glance) glance.classList.toggle('none', brain.state === 'unknown' && !brain.reason_code);
     if (glanceLabel) glanceLabel.hidden = false;
-    setText('thinkingActiveLane', 'brain health');
+    setText('thinkingActiveLane', 'right now');
     setText('thinkingActiveValue', brain.headline || '');
 
     renderBrainAction(brain.action || null);
@@ -2942,23 +2944,26 @@
     setText('localLaneTitle', laneDisplayLabel(localLane));
     setText('confidentialLaneTitle', laneDisplayLabel(confidentialLane));
     setText('byoLaneTitle', laneDisplayLabel(byoLane));
-    setText(
-      'forkHint',
-      brain.kind === 'none'
-        ? 'pick one: use local when it is ready, or bring your own.'
-        : 'one at a time. the one with the dot is active right now.',
-    );
-
     const local = localReadiness();
     const localCard = $('lane-local');
     const localActive = brain.kind === 'local';
     const gpuBlocked = localIsGpuBlocked();
     const endpointOverride = localEndpointConfigured();
+    setText(
+      'forkHint',
+      brain.kind !== 'none' ? 'one at a time. the one with the dot is active right now.'
+        : gpuBlocked ? 'pick one of these, or choose later.'
+        : 'pick one: use local when it is ready, or bring your own.',
+    );
+    // A computer that can't run local thinking gets a plain card saying so,
+    // in place of a local option it could never pick.
+    setHidden('localCantRun', !(gpuBlocked && !localActive));
     setCardActive('local', localActive);
     $('localLaneStatus')?.removeAttribute('data-tone');
     if (localCard) {
-      localCard.classList.toggle('greyed', gpuBlocked || endpointOverride);
-      localCard.setAttribute('aria-disabled', gpuBlocked ? 'true' : 'false');
+      localCard.hidden = gpuBlocked && !localActive;
+      localCard.classList.toggle('greyed', endpointOverride);
+      localCard.setAttribute('aria-disabled', 'false');
     }
     if (localActive) {
       setPill('localLanePill', 'active', 'hot');

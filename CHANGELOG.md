@@ -13,6 +13,11 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- while no device is paired, home keeps "set one up →" next to anything that needs your attention. before, it disappeared whenever anything else showed, which on a new journal was almost always.
+- not having chosen where the thinking happens yet no longer counts as something that needs your attention on home. a note says your journal starts catching up once you choose, and links to the thinking app.
+- the status lines on home, the thinking app and health now say "thinking" where they said "processing", and say why thinking isn't set up in plain words. "processing needs a setup" is now "thinking isn't set up yet", with a reason such as "the local model isn't installed yet". a local model that has stopped now reads "local thinking isn't running".
+- on a computer that can't run local thinking, the thinking app says so in a card of its own instead of a greyed-out option.
+- the agents app now has a place in the side rail.
 - journal exports now keep your settings, saved connections and credentials, along with app data and other journal files that were previously left out. processing logs, rebuildable indexes and caches, locks and temporary files stay out. merging keeps the receiving journal's settings and connections.
 
 - home and your morning briefing now say "plans" for the meetings and deadlines the journal noticed in what you've shared, the same word the activities app uses.

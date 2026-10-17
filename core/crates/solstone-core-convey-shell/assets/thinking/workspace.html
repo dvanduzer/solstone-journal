@@ -176,6 +176,21 @@
       box-shadow: inset 0 0 0 1px var(--orange);
     }
 
+    .thinking-workspace .cant-run {
+      display: grid;
+      gap: 6px;
+    }
+
+    .thinking-workspace .cant-run h3 {
+      color: var(--ink);
+      font-size: 1.05rem;
+      margin: 0;
+    }
+
+    .thinking-workspace .cant-run p {
+      margin: 0;
+    }
+
     .thinking-workspace .lane.greyed {
       cursor: default;
       background: var(--cream-bright);
@@ -1136,8 +1151,13 @@
       </div>
 
       <div class="panelbody">
-        <h2>how processing runs</h2>
+        <h2>where the thinking happens</h2>
         <p class="micro" id="forkHint">one at a time. the one with the dot is active right now.</p>
+      </div>
+
+      <div class="notice cant-run" id="localCantRun" role="note" hidden>
+        <h3>this computer can't run local thinking</h3>
+        <p>it needs supported hardware. <a class="textlink" href="https://support.solstone.app/kb/solstone-memory-and-local-models" target="_blank" rel="noopener noreferrer">minimum requirements ↗</a></p>
       </div>
 
       <section class="lanegrid" aria-label="thinking options">
