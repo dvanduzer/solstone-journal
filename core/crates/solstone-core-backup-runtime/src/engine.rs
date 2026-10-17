@@ -1454,6 +1454,12 @@ pub fn run_prune(journal: &Path, services: &BackupServices<'_>) -> PruneResult {
         ARCHIVE_TAG.into(),
         "--keep-tag".into(),
         OFFLOAD_ARCHIVE_TAG.into(),
+        // A repository holds one journal, so rotation spans every machine name
+        // and journal path its snapshots were taken under. restic's default
+        // host+paths grouping leaves an older name's or path's snapshots in a
+        // group that is never rotated again.
+        "--group-by".into(),
+        "tags".into(),
         "--prune".into(),
     ];
     let result = match restic(
@@ -6530,6 +6536,14 @@ mod tests {
                 forget.argv
             );
         }
+        assert!(
+            forget
+                .argv
+                .windows(2)
+                .any(|pair| pair == ["--group-by", "tags"]),
+            "rotation must not split one journal's snapshots by machine name or path: {:?}",
+            forget.argv
+        );
     }
 
     #[test]
