@@ -14,7 +14,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- setup saves your mark and thinking choice once, shows and controls speech and local-thinking downloads, and prints setup copy without a journal.
+- setup commits the journal mark you see and saves your thinking choice. finishing setup again keeps your completion time and settings.
 - while no device is paired, home keeps "set one up →" next to anything that needs your attention. before, it disappeared whenever anything else showed, which on a new journal was almost always.
 - not having chosen where the thinking happens yet no longer counts as something that needs your attention on home. a note says your journal starts catching up once you choose, and links to the thinking app.
 - the status lines on home, the thinking app and health now say "thinking" where they said "processing", and say why thinking isn't set up in plain words. "processing needs a setup" is now "thinking isn't set up yet", with a reason such as "the local model isn't installed yet". a local model that has stopped now reads "local thinking isn't running".

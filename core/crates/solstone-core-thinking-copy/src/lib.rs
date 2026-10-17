@@ -28,21 +28,21 @@ pub struct ConfidentialLaneDetail {
 pub const LANES: [Lane; 3] = [
     Lane {
         id: "local",
-        label: "Local",
-        sub: "on your device",
-        description: "a model runs right on this computer. nothing leaves this machine to be processed.",
+        label: "local",
+        sub: "on your journal's computer",
+        description: "model requests stay on your journal's computer.",
     },
     Lane {
         id: "confidential",
-        label: "Confidential processing",
-        sub: "operated by sol pbc",
+        label: "confidential processing",
+        sub: "paid · sign-in required",
         description: "sol pbc runs the model on confidential GPUs.",
     },
     Lane {
         id: "byo",
         label: "your own model",
         sub: "your key, or your own endpoint",
-        description: "bring a provider key (Claude, Gemini, or GPT) or point processing at your own endpoint. the key stays in your journal; sol pbc is never in the path.",
+        description: "your journal sends model requests to the provider or endpoint you choose. provider keys stay in your journal.",
     },
 ];
 
@@ -1235,15 +1235,6 @@ pub struct SetupCatalogFacts {
     pub speech_download_bytes: Option<u64>,
 }
 
-fn format_size(bytes: u64) -> String {
-    let value = ((bytes as f64 / 1024_f64.powi(3)) * 10.0).round() / 10.0;
-    if value.fract() == 0.0 {
-        format!("{value:.0} gb")
-    } else {
-        format!("{value:.1} gb")
-    }
-}
-
 pub fn current_setup_facts() -> SetupCatalogFacts {
     let platform = match std::env::consts::OS {
         "macos" => "mac",
@@ -1299,26 +1290,9 @@ pub fn current_setup_facts() -> SetupCatalogFacts {
     }
 }
 
-pub fn setup_copy(facts: &SetupCatalogFacts) -> serde_json::Value {
-    let thinking_default_line = match facts.thinking_download_bytes {
-        Some(bytes) => format!(
-            "run private thinking on this {}. downloads about {}.",
-            facts.platform,
-            format_size(bytes)
-        ),
-        None => format!("run private thinking on this {}.", facts.platform),
-    };
-
-    let speech_download = match facts.speech_download_bytes {
-        Some(bytes) => format!("speech recognition (about {})", format_size(bytes)),
-        None => "speech recognition".to_owned(),
-    };
-
-    let thinking_download = match facts.thinking_download_bytes {
-        Some(bytes) => format!("local model (about {})", format_size(bytes)),
-        None => "local model".to_owned(),
-    };
-
+/// Shared copy uses named placeholders; measured download facts live in setup state.
+/// This stays callable before a journal exists or a runtime install plan is selected.
+pub fn setup_copy(_facts: &SetupCatalogFacts) -> serde_json::Value {
     serde_json::json!({
         "schema": "solstone.setup-copy.v1",
         "welcome": {
@@ -1331,37 +1305,43 @@ pub fn setup_copy(facts: &SetupCatalogFacts) -> serde_json::Value {
             ]
         },
         "login": {
-            "label": "name",
-            "help": "choose the name your journal will use for you."
+            "label": "start your journal when you sign in",
+            "help": "start automatically after you sign in to your journal's computer."
         },
         "folder": {
             "title": "journal folder",
-            "help": format!("where your journal is kept on this {}.", facts.platform),
+            "help": "where your journal is kept on your journal's computer.",
             "change": "change folder",
             "continue": "continue"
         },
         "mark": {
             "title": "your journal mark",
             "help": "a unique visual mark created for your journal.",
+            "permanence": "continue makes this your journal's mark for good.",
             "try_another": "try another",
             "continue": "continue"
         },
         "thinking": {
             "title": "thinking",
-            "default_line": thinking_default_line,
+            "default_line": "on your journal's computer · {size}",
+            "size_unknown": "download size unavailable",
+            "choose_later": "choose thinking when you're ready",
             "change": "change",
             "later": "decide later",
             "continue": "continue"
         },
         "downloads": {
-            "speech": speech_download,
-            "thinking": thinking_download,
+            "speech": "speech recognition",
+            "thinking": "local thinking",
             "progress": "downloading…",
             "cancel": "cancel",
-            "retry": "retry",
-            "error": "download failed. check your connection and try again."
+            "retry": "try again",
+            "error": "download failed. try again.",
+            "idle": "not started",
+            "complete": "ready",
+            "cancelled": "cancelled"
         },
-        "footer": "solstone keeps your journal on your device."
+        "footer": "your journal is kept on your journal's computer. thinking uses the option you choose."
     })
 }
 
@@ -1402,28 +1382,24 @@ mod tests {
 
     #[test]
     fn setup_copy_is_pure_over_facts() {
-        let facts_with_sizes = SetupCatalogFacts {
+        let with_sizes = SetupCatalogFacts {
             platform: "testbox",
-            thinking_download_bytes: Some(3_221_225_472), // 3.0 GB
-            speech_download_bytes: Some(1_073_741_824),   // 1.0 GB
+            thinking_download_bytes: Some(123),
+            speech_download_bytes: Some(456),
         };
-        let copy = setup_copy(&facts_with_sizes);
-        let thinking = copy["thinking"]["default_line"].as_str().unwrap();
-        assert!(thinking.contains("3 gb") || thinking.contains("3.0 gb"));
-        let speech = copy["downloads"]["speech"].as_str().unwrap();
-        assert!(speech.contains("1 gb") || speech.contains("1.0 gb"));
-
-        let facts_none = SetupCatalogFacts {
-            platform: "testbox",
+        let without_sizes = SetupCatalogFacts {
+            platform: "otherbox",
             thinking_download_bytes: None,
             speech_download_bytes: None,
         };
-        let copy_none = setup_copy(&facts_none);
-        let thinking_none = copy_none["thinking"]["default_line"].as_str().unwrap();
-        assert!(!thinking_none.contains("downloads about"));
-        assert!(!thinking_none.contains("gb"));
-        let speech_none = copy_none["downloads"]["speech"].as_str().unwrap();
-        assert_eq!(speech_none, "speech recognition");
+        let copy = setup_copy(&with_sizes);
+        assert_eq!(copy, setup_copy(&without_sizes));
+        assert!(
+            copy["thinking"]["default_line"]
+                .as_str()
+                .unwrap()
+                .contains("{size}")
+        );
     }
 
     #[test]
