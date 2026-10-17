@@ -4248,6 +4248,7 @@ dependencies = [
  "solstone-core-convey-http",
  "solstone-core-facets",
  "solstone-core-format",
+ "solstone-core-home",
  "solstone-core-indexer-query",
  "solstone-core-indexer-store",
  "solstone-core-journal-config",
