@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use solstone_core_segment::{StreamAllocationBase, list_stream_records};
+use solstone_core_sol_link::Platform;
 use solstone_core_sol_link::client_description_store::read_descriptions;
 use solstone_core_sol_link::ledger::{AuthorizedClientsRead, ClientEntry, read_authorized_clients};
 
@@ -266,6 +267,16 @@ fn read_fact(value: Option<&str>) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+pub(crate) fn resolve_client_platform(
+    reported_platform: Option<&str>,
+    ledger_platform: Option<Platform>,
+    allocation_platform_input: Option<&str>,
+) -> Option<String> {
+    read_fact(reported_platform)
+        .or_else(|| ledger_platform.and_then(|plat| read_fact(Some(plat.as_wire()))))
+        .or_else(|| read_fact(allocation_platform_input))
+}
+
 /// The platform a bound stream's facts report, first of: the client's reported
 /// description, the pairing ledger hint, the record's allocation when it was
 /// named from the platform.
@@ -274,23 +285,16 @@ fn bound_platform(
     description: Option<&solstone_core_sol_link::client_description::StoredClientDescription>,
     ledger_entry: Option<&ClientEntry>,
 ) -> Option<String> {
-    if let Some(reported) = read_fact(
-        description
-            .and_then(|d| d.reported.as_ref())
-            .and_then(|r| r.platform.as_deref()),
-    ) {
-        return Some(reported);
-    }
-    if let Some(plat) = ledger_entry.and_then(|e| e.platform) {
-        return Some(plat.as_wire().to_owned());
-    }
-    read_fact(
-        record
-            .allocation
-            .as_ref()
-            .filter(|a| a.base == StreamAllocationBase::Platform)
-            .map(|a| a.base_input.as_str()),
-    )
+    let reported = description
+        .and_then(|d| d.reported.as_ref())
+        .and_then(|r| r.platform.as_deref());
+    let ledger_platform = ledger_entry.and_then(|e| e.platform);
+    let allocation_platform_input = record
+        .allocation
+        .as_ref()
+        .filter(|a| a.base == StreamAllocationBase::Platform)
+        .map(|a| a.base_input.as_str());
+    resolve_client_platform(reported, ledger_platform, allocation_platform_input)
 }
 
 /// An unbound record's platform: the bound sources when it carries a cid, then

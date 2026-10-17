@@ -1,0 +1,1166 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 sol pbc
+
+const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
+const vm = require('vm');
+
+const manifestDir = process.argv[2];
+if (!manifestDir) throw new Error('manifest directory required');
+
+function decodeHtml(str) {
+  return String(str ?? '')
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+}
+
+class DOMNode {
+  constructor(ownerDoc) {
+    this.ownerDocument = ownerDoc;
+    this.parentNode = null;
+    this.children = [];
+    this._listeners = {};
+  }
+
+  appendChild(child) {
+    if (child.parentNode) child.parentNode.removeChild(child);
+    child.parentNode = this;
+    this.children.push(child);
+    return child;
+  }
+
+  removeChild(child) {
+    const idx = this.children.indexOf(child);
+    if (idx !== -1) {
+      this.children.splice(idx, 1);
+      child.parentNode = null;
+    }
+    return child;
+  }
+
+  insertBefore(newChild, refChild) {
+    if (newChild.parentNode) newChild.parentNode.removeChild(newChild);
+    const idx = this.children.indexOf(refChild);
+    if (idx === -1) {
+      return this.appendChild(newChild);
+    }
+    newChild.parentNode = this;
+    this.children.splice(idx, 0, newChild);
+    return newChild;
+  }
+
+  addEventListener(type, fn) {
+    if (!this._listeners[type]) this._listeners[type] = [];
+    this._listeners[type].push(fn);
+  }
+
+  removeEventListener(type, fn) {
+    if (!this._listeners[type]) return;
+    this._listeners[type] = this._listeners[type].filter(l => l !== fn);
+  }
+
+  dispatchEvent(event) {
+    event.target = this;
+    let curr = this;
+    while (curr) {
+      event.currentTarget = curr;
+      const list = curr._listeners?.[event.type] || [];
+      for (const fn of list) {
+        fn.call(curr, event);
+        if (event._stopPropagation) break;
+      }
+      if (event._stopPropagation) break;
+      curr = curr.parentNode;
+    }
+  }
+}
+
+class DOMElement extends DOMNode {
+  constructor(tagName, ownerDoc) {
+    super(ownerDoc);
+    this.tagName = tagName.toUpperCase();
+    this.attributes = Object.create(null);
+    const self = this;
+    this.dataset = new Proxy(this.attributes, {
+      get(target, prop) {
+        const attr = 'data-' + String(prop).replace(/([A-Z])/g, '-$1').toLowerCase();
+        return target[attr];
+      },
+      set(target, prop, value) {
+        const attr = 'data-' + String(prop).replace(/([A-Z])/g, '-$1').toLowerCase();
+        target[attr] = String(value);
+        return true;
+      }
+    });
+    this.classList = {
+      contains(cls) {
+        const list = (self.attributes['class'] || '').split(/\s+/).filter(Boolean);
+        return list.includes(cls);
+      },
+      add(...classes) {
+        const set = new Set((self.attributes['class'] || '').split(/\s+/).filter(Boolean));
+        classes.forEach(c => set.add(c));
+        self.attributes['class'] = Array.from(set).join(' ');
+      },
+      remove(...classes) {
+        const set = new Set((self.attributes['class'] || '').split(/\s+/).filter(Boolean));
+        classes.forEach(c => set.delete(c));
+        self.attributes['class'] = Array.from(set).join(' ');
+      }
+    };
+  }
+
+  get id() { return this.attributes['id'] || ''; }
+  set id(val) { this.attributes['id'] = String(val); }
+
+  get className() { return this.attributes['class'] || ''; }
+  set className(val) { this.attributes['class'] = String(val); }
+
+  get disabled() {
+    return this.hasAttribute('disabled') || this._disabled === true;
+  }
+  set disabled(val) {
+    this._disabled = Boolean(val);
+    if (val) {
+      this.setAttribute('disabled', '');
+    } else {
+      this.removeAttribute('disabled');
+    }
+  }
+
+  getAttribute(name) {
+    return this.attributes[name] ?? null;
+  }
+
+  setAttribute(name, val) {
+    this.attributes[name] = String(val);
+  }
+
+  hasAttribute(name) {
+    return Object.prototype.hasOwnProperty.call(this.attributes, name);
+  }
+
+  removeAttribute(name) {
+    delete this.attributes[name];
+  }
+
+  remove() {
+    if (this.parentNode) {
+      this.parentNode.removeChild(this);
+    }
+  }
+
+  closest(selector) {
+    let curr = this;
+    while (curr && curr instanceof DOMElement) {
+      if (matches(curr, selector)) return curr;
+      curr = curr.parentNode;
+    }
+    return null;
+  }
+
+  click() {
+    const event = {
+      type: 'click',
+      target: this,
+      defaultPrevented: false,
+      preventDefault() { this.defaultPrevented = true; },
+      stopPropagation() { this._stopPropagation = true; },
+    };
+    this.dispatchEvent(event);
+  }
+
+  get innerHTML() {
+    return this.children.map(c => c.outerHTML !== undefined ? c.outerHTML : (c.nodeValue || '')).join('');
+  }
+
+  set innerHTML(html) {
+    this.children.slice().forEach(c => this.removeChild(c));
+    parseHtmlFragment(html, this);
+  }
+
+  get outerHTML() {
+    const tag = this.tagName.toLowerCase();
+    const attrs = Object.keys(this.attributes)
+      .map(k => ` ${k}="${this.attributes[k].replace(/"/g, '&quot;')}"`)
+      .join('');
+    if (['br', 'img', 'input', 'hr', 'progress'].includes(tag)) {
+      return `<${tag}${attrs}>${this.innerHTML}</${tag}>`;
+    }
+    return `<${tag}${attrs}>${this.innerHTML}</${tag}>`;
+  }
+
+  set outerHTML(html) {
+    if (!this.parentNode) return;
+    const parent = this.parentNode;
+    const temp = new DOMElement('div', this.ownerDocument);
+    parseHtmlFragment(html, temp);
+    const newChildren = temp.children.slice();
+    newChildren.forEach(c => parent.insertBefore(c, this));
+    parent.removeChild(this);
+  }
+
+  insertAdjacentHTML(position, html) {
+    const temp = new DOMElement('div', this.ownerDocument);
+    parseHtmlFragment(html, temp);
+    const newChildren = temp.children.slice();
+    if (position === 'afterend') {
+      if (!this.parentNode) return;
+      const nextSibling = this.parentNode.children[this.parentNode.children.indexOf(this) + 1] || null;
+      if (nextSibling) {
+        newChildren.forEach(c => this.parentNode.insertBefore(c, nextSibling));
+      } else {
+        newChildren.forEach(c => this.parentNode.appendChild(c));
+      }
+    } else if (position === 'beforeend') {
+      newChildren.forEach(c => this.appendChild(c));
+    } else if (position === 'beforebegin') {
+      if (!this.parentNode) return;
+      newChildren.forEach(c => this.parentNode.insertBefore(c, this));
+    } else if (position === 'afterbegin') {
+      const firstChild = this.children[0] || null;
+      if (firstChild) {
+        newChildren.forEach(c => this.insertBefore(c, firstChild));
+      } else {
+        newChildren.forEach(c => this.appendChild(c));
+      }
+    }
+  }
+
+  querySelector(selector) {
+    return findFirst(this, selector);
+  }
+
+  querySelectorAll(selector) {
+    const list = [];
+    findAll(this, selector, list);
+    return list;
+  }
+}
+
+class DOMTextNode extends DOMNode {
+  constructor(text, ownerDoc) {
+    super(ownerDoc);
+    this.nodeValue = text;
+  }
+  get innerHTML() { return this.nodeValue; }
+}
+
+function parseHtmlFragment(html, rootElement) {
+  const doc = rootElement.ownerDocument;
+  const tagRegex = /<\/?([a-zA-Z0-9_-]+)((?:\s+[^>]*?)?)\/?>|([^<]+)/g;
+  let match;
+  let current = rootElement;
+  const voidTags = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
+
+  while ((match = tagRegex.exec(html)) !== null) {
+    const [fullToken, tagName, rawAttrs, text] = match;
+    if (text !== undefined) {
+      if (text.length > 0) {
+        current.appendChild(new DOMTextNode(decodeHtml(text), doc));
+      }
+      continue;
+    }
+    if (fullToken.startsWith('</')) {
+      if (current.parentNode && current !== rootElement) {
+        current = current.parentNode;
+      }
+      continue;
+    }
+    const isSelfClosing = fullToken.endsWith('/>') || voidTags.has(tagName.toLowerCase());
+    const el = new DOMElement(tagName, doc);
+    if (rawAttrs) {
+      const attrRegex = /([a-zA-Z0-9_-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/g;
+      let attrMatch;
+      while ((attrMatch = attrRegex.exec(rawAttrs)) !== null) {
+        const name = attrMatch[1];
+        const val = attrMatch[2] ?? attrMatch[3] ?? attrMatch[4] ?? '';
+        el.setAttribute(name, decodeHtml(val));
+      }
+    }
+    current.appendChild(el);
+    if (!isSelfClosing) {
+      current = el;
+    }
+  }
+}
+
+function matches(element, selector) {
+  if (!(element instanceof DOMElement)) return false;
+  selector = selector.trim();
+  const idMatch = selector.match(/^#([a-zA-Z0-9_-]+)$/);
+  if (idMatch) return element.id === idMatch[1];
+
+  const classMatch = selector.match(/^\.([a-zA-Z0-9_-]+)$/);
+  if (classMatch) return element.classList.contains(classMatch[1]);
+
+  const tagMatch = selector.match(/^[a-zA-Z0-9_-]+$/);
+  if (tagMatch) return element.tagName.toLowerCase() === selector.toLowerCase();
+
+  // Support optional tag followed by one or more [attr="val"] or [attr] selectors
+  const tagAndAttrsMatch = selector.match(/^([a-zA-Z0-9_-]+)?(\[[^\]]+\])+$/);
+  if (tagAndAttrsMatch) {
+    const tag = tagAndAttrsMatch[1];
+    if (tag && element.tagName.toLowerCase() !== tag.toLowerCase()) return false;
+    const attrRegex = /\[([a-zA-Z0-9_-]+)(?:="([^"]*)")?\]/g;
+    let m;
+    while ((m = attrRegex.exec(selector)) !== null) {
+      const name = m[1];
+      const expected = m[2];
+      if (!element.hasAttribute(name)) return false;
+      if (expected !== undefined && element.getAttribute(name) !== expected) return false;
+    }
+    return true;
+  }
+
+  return false;
+}
+
+function findFirst(root, selector) {
+  for (const child of root.children) {
+    if (child instanceof DOMElement) {
+      if (matches(child, selector)) return child;
+      const found = findFirst(child, selector);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+function findAll(root, selector, acc) {
+  for (const child of root.children) {
+    if (child instanceof DOMElement) {
+      if (matches(child, selector)) acc.push(child);
+      findAll(child, selector, acc);
+    }
+  }
+}
+
+class DOMDocument extends DOMNode {
+  constructor() {
+    super(null);
+    this.ownerDocument = this;
+    this.readyState = 'complete';
+  }
+  createElement(tag) { return new DOMElement(tag, this); }
+  createTextNode(text) { return new DOMTextNode(text, this); }
+  querySelector(sel) { return findFirst(this, sel); }
+  querySelectorAll(sel) { const l = []; findAll(this, sel, l); return l; }
+  getElementById(id) { return findFirst(this, '#' + id); }
+}
+
+let source = fs.readFileSync(path.join(manifestDir, 'assets/home.js'), 'utf8');
+source = source.replace(
+  '  window.toggleBriefingCard = toggleBriefingCard;\n',
+  `  window.__home_test = {
+    renderPulse,
+    renderNeedsYou,
+    renderNarrative,
+    readFirstMinutes,
+    readSetup,
+    readAgents,
+    handleSpeechRetry,
+    updateGettingStartedSurface,
+    initHome,
+    setSurface: (s) => { surface = s; },
+    getSurface: () => surface,
+    setRoot: (r) => { root = r; wireInteractions(); },
+    getState: () => ({
+      firstMinutesPayload,
+      firstMinutesClosed,
+      setupPayload,
+      agentsPayload,
+      agentsSettled,
+      downloadTimer,
+      speechRetryInFlight,
+    }),
+    setState: (st) => {
+      if ('firstMinutesPayload' in st) firstMinutesPayload = st.firstMinutesPayload;
+      if ('firstMinutesClosed' in st) firstMinutesClosed = st.firstMinutesClosed;
+      if ('setupPayload' in st) setupPayload = st.setupPayload;
+      if ('agentsPayload' in st) agentsPayload = st.agentsPayload;
+      if ('agentsSettled' in st) agentsSettled = st.agentsSettled;
+      if ('downloadTimer' in st) downloadTimer = st.downloadTimer;
+      if ('speechRetryInFlight' in st) speechRetryInFlight = st.speechRetryInFlight;
+    },
+  };
+  window.toggleBriefingCard = toggleBriefingCard;\n`,
+);
+
+const doc = new DOMDocument();
+const rootEl = doc.createElement('div');
+rootEl.setAttribute('data-home-root', '');
+doc.appendChild(rootEl);
+const surface = doc.createElement('div');
+surface.setAttribute('data-pulse-surface', '');
+rootEl.appendChild(surface);
+
+const apiRequests = [];
+let apiResolver = null;
+const activeTimers = new Map();
+let nextTimerId = 1;
+const timerLog = [];
+
+const win = {
+  document: doc,
+  location: { href: '/app/home/', pathname: '/app/home/' },
+  addEventListener(type, fn) { doc.addEventListener(type, fn); },
+  removeEventListener(type, fn) { doc.removeEventListener(type, fn); },
+  dispatchEvent(event) { doc.dispatchEvent(event); },
+  sessionStorage: {
+    getItem() { return '{}'; },
+    setItem() {},
+    removeItem() {},
+  },
+  apiJson(url, options) {
+    const record = {
+      url,
+      method: options?.method || 'GET',
+      noAuthRedirect: options?.noAuthRedirect,
+      body: options?.body ? JSON.parse(options.body) : undefined,
+    };
+    apiRequests.push(record);
+    if (apiResolver) {
+      return apiResolver(url, options, record);
+    }
+    return Promise.resolve({});
+  },
+  setTimeout(fn, delay) {
+    const id = nextTimerId++;
+    activeTimers.set(id, { fn, delay });
+    timerLog.push({ id, delay });
+    return id;
+  },
+  clearTimeout(id) {
+    activeTimers.delete(id);
+  },
+  JournalFormat: {
+    day: (d) => d,
+    time: (t) => t,
+    timestamp: (ts) => ts,
+  },
+  SurfaceState: {
+    loading: () => '<div>loading</div>',
+    error: () => '<div>error</div>',
+    serverMessageFrom: () => '',
+  },
+  AppServices: {
+    renderMarkdown: (m) => m,
+  },
+  convey: {
+    copyToClipboard(cmd) {
+      win.__copied = cmd;
+    },
+  },
+};
+win.window = win;
+doc.defaultView = win;
+
+vm.runInNewContext(source, {
+  window: win,
+  document: doc,
+  console,
+  Date,
+  sessionStorage: win.sessionStorage,
+  setTimeout: (fn, delay) => win.setTimeout(fn, delay),
+  clearTimeout: (id) => win.clearTimeout(id),
+}, { filename: 'home.js' });
+const {
+  renderPulse,
+  renderNeedsYou,
+  renderNarrative,
+  readFirstMinutes,
+  readSetup,
+  readAgents,
+  handleSpeechRetry,
+  updateGettingStartedSurface,
+  initHome,
+  setSurface,
+  setRoot,
+  getState,
+  setState,
+} = win.__home_test;
+
+assert(renderPulse, 'renderPulse exported');
+setSurface(surface);
+setRoot(rootEl);
+
+async function runTests() {
+  // 1. STEP 1 BASELINE TEST:
+  // Render welcome state pulse with needs items when getting started is not visible.
+  // Assert that welcome surface is directly under vitals, and welcome needs anchors after welcome.
+  const welcomePulse = {
+    home_state: 'welcome',
+    health_glance: { verdict: 'calm', severity: 'neutral', headline: 'devices quiet' },
+    narrative_content: null,
+    needs_you_items: [{ title: 'voice setup', kind: 'speech_setup' }],
+    today: '20261017',
+    now: '2026-10-17T12:00:00Z',
+    segment_count: 0,
+    activities: [],
+  };
+
+  setState({ firstMinutesPayload: null, setupPayload: null, agentsPayload: null, agentsSettled: false });
+  renderPulse(welcomePulse);
+
+  const vitalsEl = surface.querySelector('[data-home-surface="vitals"]');
+  const welcomeEl = surface.querySelector('[data-home-surface="welcome"]');
+  const needsEl = surface.querySelector('[data-home-surface="needs"]');
+
+  assert(vitalsEl, 'vitals card present');
+  assert(welcomeEl, 'welcome card present');
+  assert(needsEl, 'needs card present');
+
+  const vitalsIndex = surface.children.indexOf(vitalsEl);
+  const welcomeIndex = surface.children.indexOf(welcomeEl);
+  const needsIndex = surface.children.indexOf(needsEl);
+
+  assert.strictEqual(welcomeIndex, vitalsIndex + 1, "today's welcome surface is directly under vitals");
+  assert.strictEqual(needsIndex, welcomeIndex + 1, 'welcome needs card anchors after welcome');
+
+  // Live update of needs via renderNeedsYou
+  renderNeedsYou(welcomePulse);
+  const needsAfter = surface.querySelector('[data-home-surface="needs"]');
+  assert(needsAfter, 'needs card still present after renderNeedsYou');
+  assert.strictEqual(
+    surface.children.indexOf(needsAfter),
+    surface.children.indexOf(welcomeEl) + 1,
+    'welcome needs card remains anchored after welcome after live update'
+  );
+
+  // 2. DEVICE STATES & PHONE CHECK:
+  for (const st of ['awaiting_first', 'receiving', 'quiet', 'other']) {
+    setState({
+      firstMinutesPayload: {
+        window_open: true,
+        devices_known: true,
+        devices: [{ name: 'TestDevice', state: st, last_added_label: '2 minutes ago' }],
+        checks: { phone: false, thinking: true },
+      },
+      agentsPayload: { connections: [] },
+      agentsSettled: true,
+    });
+    renderPulse(welcomePulse);
+    const devEl = surface.querySelector(`[data-device-state="${st}"]`);
+    assert(devEl, `device state ${st} rendered with [data-device-state="${st}"]`);
+  }
+
+  // No device element when devices is empty or devices_known is false
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: false,
+      devices: [{ name: 'TestDevice', state: 'receiving' }],
+      checks: { phone: false, thinking: true },
+    },
+    agentsPayload: { connections: [] },
+    agentsSettled: true,
+  });
+  renderPulse(welcomePulse);
+  assert(!surface.querySelector('[data-device-state]'), 'no device element when devices_known is false');
+
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      checks: { phone: false, thinking: true },
+    },
+    agentsPayload: { connections: [] },
+    agentsSettled: true,
+  });
+  renderPulse(welcomePulse);
+  assert(!surface.querySelector('[data-device-state]'), 'no device element when devices is empty');
+
+  // Phone check:
+  // checks.phone === null: no phone step rendered
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      checks: { phone: null, thinking: false },
+    },
+    agentsPayload: { connections: [] },
+    agentsSettled: true,
+  });
+  renderPulse(welcomePulse);
+  assert(!surface.querySelector('[data-phone-step]'), 'no phone step when checks.phone is null');
+
+  // checks.phone === false: phone step and link rendered
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      checks: { phone: false, thinking: true },
+    },
+    agentsPayload: { connections: [] },
+    agentsSettled: true,
+  });
+  renderPulse(welcomePulse);
+  const phoneStepEl = surface.querySelector('[data-phone-step]');
+  assert(phoneStepEl, 'phone step rendered when checks.phone is false');
+  assert(phoneStepEl.querySelector('a[href="/app/network/#devices"]'), 'phone step links to /app/network/#devices');
+
+  // checks.phone === true: no phone step
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      checks: { phone: true, thinking: false },
+    },
+    agentsPayload: { connections: [] },
+    agentsSettled: true,
+  });
+  renderPulse(welcomePulse);
+  assert(!surface.querySelector('[data-phone-step]'), 'no phone step when checks.phone is true');
+
+  // 3. FIRST SEGMENT:
+  for (const th of ['read', 'pending', 'none']) {
+    setState({
+      firstMinutesPayload: {
+        window_open: true,
+        devices_known: true,
+        devices: [],
+        first_segment: {
+          start_at: '2026-10-10T12:00:00Z',
+          href: '/app/transcripts/20261010?stream=phone#120000_300',
+          thinking: th,
+        },
+        checks: { phone: false, thinking: true },
+      },
+      agentsPayload: { connections: [] },
+      agentsSettled: true,
+    });
+    renderPulse(welcomePulse);
+    const segEl = surface.querySelector(`[data-segment-thinking="${th}"]`);
+    assert(segEl, `segment thinking ${th} rendered with [data-segment-thinking="${th}"]`);
+    assert(segEl.querySelector('a[href="/app/transcripts/20261010?stream=phone#120000_300"]'), 'segment links to payload href');
+  }
+
+  // first_segment null: no segment element
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      first_segment: null,
+      checks: { phone: false, thinking: true },
+    },
+    agentsPayload: { connections: [] },
+    agentsSettled: true,
+  });
+  renderPulse(welcomePulse);
+  assert(!surface.querySelector('[data-segment-thinking]'), 'no segment element when first_segment is null');
+
+  // 4. THINKING STEPS & CLIENT ADJUSTMENTS:
+  const thinkingExpectedLinks = {
+    choose: '/app/thinking/',
+    cant_run: '/app/thinking/',
+    byo: '/app/thinking/#byo-setup',
+    confidential: '/app/thinking/#confidential-setup',
+    local: '/app/thinking/#local-setup',
+  };
+
+  for (const [st, href] of Object.entries(thinkingExpectedLinks)) {
+    setState({
+      firstMinutesPayload: {
+        window_open: true,
+        devices_known: true,
+        devices: [],
+        thinking: { step: st },
+        checks: { phone: true, thinking: false },
+      },
+      agentsPayload: { connections: [] },
+      agentsSettled: true,
+      setupPayload: null,
+    });
+    renderPulse(welcomePulse);
+    const thStepEl = surface.querySelector(`[data-thinking-step="${st}"]`);
+    assert(thStepEl, `thinking step ${st} rendered with [data-thinking-step="${st}"]`);
+    assert(thStepEl.querySelector(`a[href="${href}"]`), `thinking step ${st} links to ${href}`);
+  }
+
+  // Adjustment 1: step === 'choose' and thinking.capability === 'blocked' -> cant_run
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      thinking: { step: 'choose' },
+      checks: { phone: true, thinking: false },
+    },
+    setupPayload: { thinking: { capability: 'blocked' } },
+    agentsPayload: { connections: [] },
+    agentsSettled: true,
+  });
+  renderPulse(welcomePulse);
+  const cantRunEl = surface.querySelector('[data-thinking-step="cant_run"]');
+  assert(cantRunEl, 'choose with capability: blocked renders cant_run');
+  assert(cantRunEl.querySelector('a[href="/app/thinking/"]'), 'cant_run links to /app/thinking/');
+
+  // Adjustment 2: step === 'local' and downloads.thinking.state === 'downloading' -> no thinking step
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      thinking: { step: 'local' },
+      checks: { phone: false, thinking: false },
+    },
+    setupPayload: {
+      downloads: { thinking: { state: 'downloading', bytes_done: 1e9, bytes_total: 2e9 } },
+    },
+    agentsPayload: { connections: [] },
+    agentsSettled: true,
+  });
+  renderPulse(welcomePulse);
+  assert(!surface.querySelector('[data-thinking-step]'), 'local step with thinking downloading renders no thinking step');
+
+  // 5. AGENTS:
+  // Non-200 agents read (failed): agent step hidden, check done.
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      checks: { phone: true, thinking: true },
+    },
+    agentsPayload: { failed: true },
+    agentsSettled: true,
+  });
+  renderPulse(welcomePulse);
+  // All checks done -> card not visible, welcome rendered
+  assert(!surface.querySelector('[data-home-surface="getting-started"]'), 'card hides when agent check done and others done');
+  assert(surface.querySelector('[data-home-surface="welcome"]'), 'welcome card restored');
+
+  // Non-empty connections: hidden, check done
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      checks: { phone: true, thinking: true },
+    },
+    agentsPayload: { connections: [{ id: 'agent-1' }] },
+    agentsSettled: true,
+  });
+  renderPulse(welcomePulse);
+  assert(!surface.querySelector('[data-home-surface="getting-started"]'), 'non-empty connections counts check done');
+
+  // Empty connections []: shown, check not done
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      checks: { phone: true, thinking: true },
+    },
+    agentsPayload: { connections: [] },
+    agentsSettled: true,
+  });
+  renderPulse(welcomePulse);
+  const agentStepEl = surface.querySelector('[data-agent-step]');
+  assert(agentStepEl, 'empty connections renders agent step');
+  assert(agentStepEl.querySelector('a[href="/app/agents/"]'), 'agent step links to /app/agents/');
+
+  // connections not an array: hidden, check NOT done (card stays if open)
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      checks: { phone: true, thinking: true },
+    },
+    agentsPayload: { connections: null },
+    agentsSettled: true,
+  });
+  renderPulse(welcomePulse);
+  assert(surface.querySelector('[data-home-surface="getting-started"]'), 'card stays when connections not an array');
+  assert(!surface.querySelector('[data-agent-step]'), 'agent step hidden when connections not an array');
+
+  // Command block:
+  // local_door enabled and listening and address is string
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      checks: { phone: true, thinking: true },
+    },
+    agentsPayload: {
+      connections: [],
+      local_door: { enabled: true, listening: true, address: '127.0.0.1:8000' },
+    },
+    agentsSettled: true,
+  });
+  renderPulse(welcomePulse);
+  assert(surface.querySelector('[data-agent-command]'), '[data-agent-command] present when door enabled + listening + address string');
+
+  // door not enabled or not listening or not string
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      checks: { phone: true, thinking: true },
+    },
+    agentsPayload: {
+      connections: [],
+      local_door: { enabled: false, listening: true, address: '127.0.0.1:8000' },
+    },
+    agentsSettled: true,
+  });
+  renderPulse(welcomePulse);
+  assert(!surface.querySelector('[data-agent-command]'), 'no agent command when door not enabled');
+
+  // 6. DOWNLOADS:
+  // Absent when downloads is missing or setup is 403
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      checks: { phone: false, thinking: true },
+    },
+    setupPayload: null,
+    agentsPayload: { connections: [] },
+    agentsSettled: true,
+  });
+  renderPulse(welcomePulse);
+  assert(!surface.querySelector('[data-download]'), 'no download lines when setupPayload is null');
+
+  // Present for thinking and speech with downloading, error, cancelled
+  for (const kind of ['thinking', 'speech']) {
+    for (const dlState of ['downloading', 'error', 'cancelled']) {
+      setState({
+        firstMinutesPayload: {
+          window_open: true,
+          devices_known: true,
+          devices: [],
+          checks: { phone: false, thinking: true },
+        },
+        setupPayload: {
+          downloads: {
+            [kind]: {
+              state: dlState,
+              bytes_done: 1.2e9,
+              bytes_total: 3.4e9,
+            },
+          },
+        },
+        agentsPayload: { connections: [] },
+        agentsSettled: true,
+      });
+      renderPulse(welcomePulse);
+      const dlEl = surface.querySelector(`[data-download="${kind}"][data-download-state="${dlState}"]`);
+      assert(dlEl, `${kind} download in ${dlState} state rendered`);
+      if (dlState === 'downloading') {
+        assert(dlEl.querySelector(`[data-download-bar="${kind}"]`), `bar rendered for ${kind} downloading`);
+      }
+    }
+  }
+
+  // idle and complete omit the line
+  for (const st of ['idle', 'complete']) {
+    setState({
+      firstMinutesPayload: {
+        window_open: true,
+        devices_known: true,
+        devices: [],
+        checks: { phone: false, thinking: true },
+      },
+      setupPayload: {
+        downloads: {
+          thinking: { state: st, bytes_done: 0, bytes_total: 100 },
+          speech: { state: st, bytes_done: 0, bytes_total: 100 },
+        },
+      },
+      agentsPayload: { connections: [] },
+      agentsSettled: true,
+    });
+    renderPulse(welcomePulse);
+    assert(!surface.querySelector('[data-download]'), `download line omitted for ${st} state`);
+  }
+
+  // Bar only when bytes_total > 0 and both finite
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      checks: { phone: false, thinking: true },
+    },
+    setupPayload: {
+      downloads: {
+        thinking: { state: 'downloading', bytes_done: NaN, bytes_total: 1e9 },
+      },
+    },
+    agentsPayload: { connections: [] },
+    agentsSettled: true,
+  });
+  renderPulse(welcomePulse);
+  assert(!surface.querySelector('[data-download-bar="thinking"]'), 'no bar when bytes_done is NaN');
+
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      checks: { phone: false, thinking: true },
+    },
+    setupPayload: {
+      downloads: {
+        thinking: { state: 'downloading', bytes_done: 10, bytes_total: 0 },
+      },
+    },
+    agentsPayload: { connections: [] },
+    agentsSettled: true,
+  });
+  renderPulse(welcomePulse);
+  assert(!surface.querySelector('[data-download-bar="thinking"]'), 'no bar when bytes_total is 0');
+
+  // Speech retry button re-enables after non-2xx POST:
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      checks: { phone: false, thinking: true },
+    },
+    setupPayload: {
+      downloads: {
+        speech: { state: 'error' },
+      },
+    },
+    agentsPayload: { connections: [] },
+    agentsSettled: true,
+    speechRetryInFlight: false,
+  });
+  renderPulse(welcomePulse);
+  const speechRetryBtn = surface.querySelector('[data-speech-retry]');
+  assert(speechRetryBtn, 'speech retry button present');
+  assert(!speechRetryBtn.disabled, 'speech retry button initially enabled');
+
+  apiRequests.length = 0;
+  apiResolver = (url, options) => {
+    if (url === '/init/api/action') {
+      return Promise.reject(new Error('500 server error'));
+    }
+    return Promise.resolve({});
+  };
+
+  speechRetryBtn.click();
+  assert(speechRetryBtn.disabled, 'button disabled while request in flight');
+  assert.strictEqual(apiRequests.length, 1);
+  assert.strictEqual(apiRequests[0].url, '/init/api/action');
+  assert.strictEqual(apiRequests[0].method, 'POST');
+  assert.strictEqual(apiRequests[0].noAuthRedirect, true);
+  assert.deepStrictEqual(apiRequests[0].body, { action: 'retry_speech_download' });
+
+  // Flush rejection
+  await Promise.resolve();
+  await Promise.resolve();
+  assert(!speechRetryBtn.disabled, 'button re-enabled after non-2xx POST');
+
+  // 7. DOWNLOAD TIMER (15000 ms):
+  timerLog.length = 0;
+  activeTimers.clear();
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      checks: { phone: false, thinking: true },
+    },
+    setupPayload: {
+      downloads: { thinking: { state: 'downloading', bytes_done: 1, bytes_total: 10 } },
+    },
+    agentsPayload: { connections: [] },
+    agentsSettled: true,
+    downloadTimer: null,
+  });
+
+  // Re-read setup should schedule a 15000ms timer
+  apiResolver = (url) => {
+    if (url === '/init/api/state') {
+      return Promise.resolve({
+        downloads: { thinking: { state: 'downloading', bytes_done: 2, bytes_total: 10 } },
+      });
+    }
+    return Promise.resolve({});
+  };
+  await readSetup();
+  assert(timerLog.some(t => t.delay === 15000), '15000ms timer scheduled while downloading');
+  assert(getState().downloadTimer !== null, 'downloadTimer is active');
+
+  // Later setup read with nothing downloading clears timer
+  apiResolver = (url) => {
+    if (url === '/init/api/state') {
+      return Promise.resolve({
+        downloads: { thinking: { state: 'complete' } },
+      });
+    }
+    return Promise.resolve({});
+  };
+  await readSetup();
+  assert(getState().downloadTimer === null, 'downloadTimer cleared when download finished');
+
+  // 8. WINDOW CLOSED LATCHING:
+  apiResolver = (url) => {
+    if (url === '/app/home/api/first-minutes') {
+      return Promise.resolve({ window_open: false });
+    }
+    return Promise.resolve({});
+  };
+  setState({ firstMinutesClosed: false });
+  await readFirstMinutes();
+  assert.strictEqual(getState().firstMinutesClosed, true, 'firstMinutesClosed latched on window_open: false');
+
+  apiRequests.length = 0;
+  // Further calls do not request first-minutes, setup, or agents
+  await readFirstMinutes();
+  await readSetup();
+  await readAgents();
+  doc.dispatchEvent({ type: 'visibilitychange' });
+  assert.strictEqual(apiRequests.length, 0, 'no requests made after window_open: false latched');
+
+  // 9. NEXT HEADING:
+  // Absent when no step remains
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      thinking: { step: 'none' },
+      checks: { phone: true, thinking: true },
+    },
+    setupPayload: null,
+    agentsPayload: { connections: null }, // agents step hidden, but check not done
+    agentsSettled: true,
+    firstMinutesClosed: false,
+  });
+  renderPulse(welcomePulse);
+  assert(surface.querySelector('[data-home-surface="getting-started"]'), 'card shown for open agent check');
+  assert(!surface.querySelector('[data-getting-started-next]'), '[data-getting-started-next] absent when no step remains');
+
+  // Present when at least one step remains
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      thinking: { step: 'choose' },
+      checks: { phone: true, thinking: false },
+    },
+    setupPayload: null,
+    agentsPayload: { connections: [{ id: 'a' }] },
+    agentsSettled: true,
+    firstMinutesClosed: false,
+  });
+  renderPulse(welcomePulse);
+  assert(surface.querySelector('[data-getting-started-next]'), '[data-getting-started-next] present when a step remains');
+
+  // 10. CARD / WELCOME SWAP & RECOVERY:
+  // Card removed and welcome restored under vitals when later read fails
+  setState({
+    firstMinutesPayload: null,
+    setupPayload: null,
+    agentsPayload: null,
+    agentsSettled: true,
+    firstMinutesClosed: false,
+  });
+  updateGettingStartedSurface();
+  assert(!surface.querySelector('[data-home-surface="getting-started"]'), 'card removed on read failure');
+  const restoredWelcome = surface.querySelector('[data-home-surface="welcome"]');
+  assert(restoredWelcome, 'welcome restored on read failure');
+  assert.strictEqual(
+    surface.children.indexOf(restoredWelcome),
+    surface.children.indexOf(surface.querySelector('[data-home-surface="vitals"]')) + 1,
+    'restored welcome is directly under vitals'
+  );
+
+  // Response {} does not throw and does not latch
+  apiResolver = () => Promise.resolve({});
+  setState({ firstMinutesClosed: false });
+  await readFirstMinutes();
+  assert.strictEqual(getState().firstMinutesClosed, false, '{} does not latch firstMinutesClosed');
+
+  // 11. ACTIVE DAY CARD PLACEMENT & SECTION DEFAULTS:
+  const activePulse = {
+    home_state: 'active',
+    health_glance: { verdict: 'calm', severity: 'neutral', headline: 'devices quiet' },
+    narrative_content: 'Some summary text',
+    needs_you_items: [],
+    today: '20261017',
+    now: '2026-10-17T12:00:00Z',
+    segment_count: 5,
+    activities: [{ id: 1 }],
+  };
+
+  // Card shown
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      thinking: { step: 'choose' },
+      checks: { phone: false, thinking: false },
+    },
+    setupPayload: null,
+    agentsPayload: { connections: [] },
+    agentsSettled: true,
+    firstMinutesClosed: false,
+  });
+  renderPulse(activePulse);
+
+  const activeVitals = surface.querySelector('[data-home-surface="vitals"]');
+  const activeGS = surface.querySelector('[data-home-surface="getting-started"]');
+  assert(activeVitals, 'active vitals present');
+  assert(activeGS, 'active getting-started present');
+  assert.strictEqual(
+    surface.children.indexOf(activeGS),
+    surface.children.indexOf(activeVitals) + 1,
+    'card directly under vitals on active day'
+  );
+
+  // Live insertions via renderNarrative and renderNeedsYou keep card directly under vitals
+  renderNarrative(activePulse);
+  assert.strictEqual(
+    surface.children.indexOf(surface.querySelector('[data-home-surface="getting-started"]')),
+    surface.children.indexOf(surface.querySelector('[data-home-surface="vitals"]')) + 1,
+    'card remains directly under vitals after renderNarrative'
+  );
+
+  renderNeedsYou(activePulse);
+  assert.strictEqual(
+    surface.children.indexOf(surface.querySelector('[data-home-surface="getting-started"]')),
+    surface.children.indexOf(surface.querySelector('[data-home-surface="vitals"]')) + 1,
+    'card remains directly under vitals after renderNeedsYou'
+  );
+
+  // Live day section defaults: narrative, today, needs have data-section-collapsed="false"
+  const narrEl = surface.querySelector('#pulse-narrative');
+  assert.strictEqual(narrEl?.getAttribute('data-section-collapsed'), 'false', 'narrative section collapsed is false on live day with card shown');
+
+  // Also when card is hidden
+  setState({
+    firstMinutesPayload: null,
+  });
+  renderPulse(activePulse);
+  const narrElHidden = surface.querySelector('#pulse-narrative');
+  assert.strictEqual(narrElHidden?.getAttribute('data-section-collapsed'), 'false', 'narrative section collapsed is false on live day with card hidden');
+
+  console.log('all getting_started_render acceptance assertions passed');
+}
+
+runTests().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
