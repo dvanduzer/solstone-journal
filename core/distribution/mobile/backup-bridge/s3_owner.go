@@ -570,8 +570,16 @@ func (owner *s3Owner) begin(operation int32, cfg s3Config, passwords ...[]byte) 
 	if owner.closed || owner.sealing || operation < OpInit || operation > OpCheck {
 		return errS3OwnerInvalid
 	}
-	if owner.record.Active != nil && owner.record.Active.MayHaveWritten {
-		return errS3OwnerPending
+	// A prior attempt that may have written stays in custody: this attempt
+	// adopts its recorded lock IDs and cannot complete until each is removed.
+	// Only attempts whose other remote effects are content-addressed restic
+	// objects may be adopted; uncertain key or config writes stay pending.
+	inherited := []string{}
+	if prior := owner.record.Active; prior != nil && prior.MayHaveWritten {
+		if !adoptsUncertainty(prior.Operation) || !adoptsUncertainty(operation) {
+			return errS3OwnerPending
+		}
+		inherited = append(inherited, prior.Locks...)
 	}
 	destination, err := s3DestinationFor(cfg)
 	if err != nil || destination != owner.destination {
@@ -609,7 +617,7 @@ func (owner *s3Owner) begin(operation int32, cfg s3Config, passwords ...[]byte) 
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return errS3OwnerIO
 	}
-	record.Active = &s3OwnerIntent{ID: hex.EncodeToString(nonce[:]), Operation: operation, Locks: []string{}}
+	record.Active = &s3OwnerIntent{ID: hex.EncodeToString(nonce[:]), Operation: operation, MayHaveWritten: owner.record.Active != nil && owner.record.Active.MayHaveWritten, Locks: inherited}
 	record.Complete = nil
 	if len(record.Credentials) > maxS3OwnerCredentials || len(record.Passwords) > maxS3OwnerPasswords {
 		return errResourceLimit
@@ -622,6 +630,17 @@ func (owner *s3Owner) begin(operation int32, cfg s3Config, passwords ...[]byte) 
 		owner.liveID = record.Active.ID
 	}
 	return err
+}
+
+// adoptsUncertainty reports whether an attempt's possible remote writes are
+// limited to content-addressed data, index or snapshot objects and owned locks.
+func adoptsUncertainty(operation int32) bool {
+	switch operation {
+	case OpOpen, OpSnapshot, OpListSnapshots, OpRestore, OpCheck:
+		return true
+	default:
+		return false
+	}
 }
 
 // noteSave is write-ahead admission, not a claim that any request was sent.

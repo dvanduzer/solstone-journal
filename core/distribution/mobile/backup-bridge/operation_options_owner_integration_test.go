@@ -131,8 +131,8 @@ func TestOperationOptionsPendingAndUncertainOwnerOutcomesArePreserved(t *testing
 			if reopened.record.Active == nil || !reopened.record.Active.MayHaveWritten || len(reopened.record.Active.Locks) == 0 {
 				t.Fatal("pending lock custody was lost")
 			}
+			original := append([]string(nil), reopened.record.Active.Locks...)
 			s3OwnerTestClose(t, reopened)
-			before := requests.Load()
 			changed := f.cfg
 			changed.secret = "changed-synthetic-secret"
 			newSource := filepath.Join(f.base, "new-journal-root")
@@ -148,8 +148,23 @@ func TestOperationOptionsPendingAndUncertainOwnerOutcomesArePreserved(t *testing
 					request.sourcePath = newSource
 				}
 				id, handle := s3TestStartOperation(t, changed, f.state, f.workspace, transport, request)
-				if result := s3TestWaitOperation(t, id, handle); result.status != StatusRemotePending || requests.Load() != before {
-					t.Fatal("retry/changed credentials/journal root bypassed same pending owner namespace", result.status)
+				// The later attempt adopts the pending lock custody. While the lock
+				// still cannot be removed it stays pending and keeps that lock.
+				if result := s3TestWaitOperation(t, id, handle); result.status != StatusRemotePending {
+					t.Fatal("retry/changed credentials/journal root completed over an unremoved pending lock", result.status)
+				}
+				still := s3OwnerTestOpen(t, f.state, f.cfg)
+				kept := still.record.Active != nil && still.record.Active.MayHaveWritten
+				for _, id := range original {
+					found := false
+					for _, retained := range still.record.Active.Locks {
+						found = found || retained == id
+					}
+					kept = kept && found
+				}
+				s3OwnerTestClose(t, still)
+				if !kept {
+					t.Fatal("adopting attempt dropped the pending lock custody")
 				}
 			}
 		})
