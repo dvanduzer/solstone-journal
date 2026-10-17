@@ -107,35 +107,21 @@ pub(crate) async fn register_with_directory(
 }
 
 async fn register_with_directory_inner(key: Vec<u8>, production: bool) -> Result<String, String> {
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let client_config = std::sync::Arc::new(
-        rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .map_err(|e| e.to_string())?
-        .with_root_certificates(root_store)
-        .with_no_client_auth(),
-    );
     let directory_url = if production {
-        rustls_acme::acme::LETS_ENCRYPT_PRODUCTION_DIRECTORY
+        instant_acme::LetsEncrypt::Production.url()
     } else {
-        rustls_acme::acme::LETS_ENCRYPT_STAGING_DIRECTORY
+        instant_acme::LetsEncrypt::Staging.url()
     };
-    let directory = rustls_acme::acme::Directory::discover(&client_config, directory_url)
+    let client = crate::acme_http::McpEndpointHttpClient::new();
+    let pkcs8_der = rustls::pki_types::PrivatePkcs8KeyDer::from(key);
+    let instant_key =
+        instant_acme::Key::from_pkcs8_der(pkcs8_der.clone_key()).map_err(|e| e.to_string())?;
+    let pki_key = rustls::pki_types::PrivateKeyDer::Pkcs8(pkcs8_der);
+    let (account, _creds) = instant_acme::Account::builder_with_http(Box::new(client))
+        .create_from_key((instant_key, pki_key), directory_url.to_string())
         .await
         .map_err(|e| e.to_string())?;
-    let empty_contact: [String; 0] = [];
-    let account = rustls_acme::acme::Account::create_with_keypair(
-        &client_config,
-        directory,
-        empty_contact.iter(),
-        &key,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    Ok(account.kid)
+    Ok(account.id().to_owned())
 }
 
 #[cfg(all(test, not(feature = "full-tests")))]

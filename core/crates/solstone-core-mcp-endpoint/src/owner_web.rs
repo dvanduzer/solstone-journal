@@ -584,6 +584,7 @@ pub(crate) fn state_value_with_iface(
                             crate::tls::McpEndpointTlsService::for_byo_cert_directory(
                                 cert_dir,
                                 h.clone(),
+                                cfg.generation,
                             ) {
                         service.ordinary_certificate_is_active()
                     } else {
@@ -1123,33 +1124,19 @@ pub async fn register_acme_account(key_der: &[u8]) -> Result<String, String> {
             return registrar(key_der);
         }
     }
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let client_config = Arc::new(
-        rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .map_err(|e| e.to_string())?
-        .with_root_certificates(root_store)
-        .with_no_client_auth(),
-    );
-    let directory = rustls_acme::acme::Directory::discover(
-        &client_config,
-        rustls_acme::acme::LETS_ENCRYPT_PRODUCTION_DIRECTORY,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    let empty_contact: [String; 0] = [];
-    let account = rustls_acme::acme::Account::create_with_keypair(
-        &client_config,
-        directory,
-        empty_contact.iter(),
-        key_der,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    Ok(account.kid)
+    let client = crate::acme_http::McpEndpointHttpClient::new();
+    let pkcs8_der = rustls::pki_types::PrivatePkcs8KeyDer::from(key_der.to_vec());
+    let instant_key =
+        instant_acme::Key::from_pkcs8_der(pkcs8_der.clone_key()).map_err(|e| e.to_string())?;
+    let pki_key = rustls::pki_types::PrivateKeyDer::Pkcs8(pkcs8_der);
+    let (account, _creds) = instant_acme::Account::builder_with_http(Box::new(client))
+        .create_from_key(
+            (instant_key, pki_key),
+            instant_acme::LetsEncrypt::Production.url().to_string(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(account.id().to_owned())
 }
 
 async fn register_byo_account(Extension(journal): Extension<Arc<PathBuf>>) -> Response {

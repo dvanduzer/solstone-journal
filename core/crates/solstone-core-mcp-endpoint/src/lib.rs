@@ -19,6 +19,8 @@ use solstone_core_journal_io::journal_root::JournalRoot;
 
 #[allow(dead_code)]
 mod account_wire;
+pub(crate) mod acme_http;
+pub(crate) mod acme_lifecycle;
 mod activity;
 mod audit;
 #[cfg(all(test, feature = "full-tests"))]

@@ -203,7 +203,8 @@ impl ByoServiceRuntime {
         let account_dir = unix::open_byo_account_directory(byo_dir, &hostname).ok()?;
         let cert_dir = unix::open_byo_cert_directory(byo_dir, &hostname, generation).ok()?;
         let tls_service =
-            McpEndpointTlsService::for_byo_cert_directory(cert_dir, hostname.clone()).ok()?;
+            McpEndpointTlsService::for_byo_cert_directory(cert_dir, hostname.clone(), generation)
+                .ok()?;
         let tls_service = Arc::new(tls_service);
         let oauth = Arc::new(OAuthRuntime::new_byo(journal_root, &hostname, generation));
         let sessions = Arc::new(SessionTable::new());
@@ -397,9 +398,28 @@ impl ByoServiceRuntime {
             let tls_clone = Arc::clone(&self.tls_service);
             let mut acme_shutdown = self.service_shutdown_rx.clone();
             let acme_task = tokio::spawn(async move {
-                let _ = tls_clone
-                    .run_byo_acme_renewal(acc_dir_clone, &mut acme_shutdown)
-                    .await;
+                let mut backoff = 30_u64;
+                loop {
+                    match tls_clone
+                        .run_byo_acme_renewal(&acc_dir_clone, &mut acme_shutdown)
+                        .await
+                    {
+                        Ok(()) => break,
+                        Err(_err) => {
+                            log::error!("BYO ACME renewal failed");
+                            tokio::select! {
+                                changed = acme_shutdown.changed() => {
+                                    if changed.is_err() || *acme_shutdown.borrow() {
+                                        break;
+                                    }
+                                }
+                                _ = tokio::time::sleep(Duration::from_secs(backoff)) => {
+                                    backoff = (backoff * 2).min(3600);
+                                }
+                            }
+                        }
+                    }
+                }
             });
 
             // Ingress accept task
@@ -1112,9 +1132,10 @@ mod full_tests {
         let tls_service = crate::tls::McpEndpointTlsService::for_byo_cert_directory(
             cert_dir,
             "mcp.example.com".to_string(),
+            1,
         )
         .unwrap();
-        crate::tls::set_test_now_override(Some(base_now));
+        let _clock = crate::tls::lock_test_clock(Some(base_now));
         tls_service
             .install_ordinary_certificate(vec![cert_der.clone()], key_der, not_before, not_after)
             .unwrap();
@@ -1194,13 +1215,14 @@ mod full_tests {
         let tls_service = crate::tls::McpEndpointTlsService::for_byo_cert_directory(
             cert_dir,
             "mcp.example.com".to_string(),
+            1,
         )
         .unwrap();
 
         let base_now = 1700000000_i64;
         let not_before = base_now - 1000;
         let not_after = base_now + 1000;
-        crate::tls::set_test_now_override(Some(base_now));
+        let _clock = crate::tls::lock_test_clock(Some(base_now));
 
         let keypair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
         let mut params =
@@ -1430,8 +1452,8 @@ mod windows_full_tests {
         let cert = params.self_signed(&key).unwrap();
         let cert_der = cert.der().to_vec();
         let cert_dir = unix::open_byo_cert_directory(&byo_dir, HOST, 1).unwrap();
-        crate::tls::set_test_now_override(Some(base_now));
-        crate::tls::McpEndpointTlsService::for_byo_cert_directory(cert_dir, HOST.to_string())
+        let _clock = crate::tls::lock_test_clock(Some(base_now));
+        crate::tls::McpEndpointTlsService::for_byo_cert_directory(cert_dir, HOST.to_string(), 1)
             .unwrap()
             .install_ordinary_certificate(
                 vec![cert_der.clone()],

@@ -23,6 +23,7 @@ arc-swap = "1.9.1"
 axum.workspace = true
 async-trait = "0.1.89"
 base64 = "0.22.1"
+bytes.workspace = true
 chrono = { workspace = true, features = ["serde"] }
 futures = "0.3.31"
 hickory-resolver = { version = "0.24", default-features = false, features = ["tokio-runtime"] }
@@ -33,7 +34,10 @@ rcgen.workspace = true
 ring.workspace = true
 sha2.workspace = true
 subtle.workspace = true
-rustls-acme = { version = "0.15.4", default-features = false, features = ["ring", "tokio", "webpki-roots"] }
+instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "time"] }
+hyper.workspace = true
+hyper-util = { workspace = true, features = ["client-legacy", "http1"] }
+tower.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -76,7 +80,6 @@ solstone-core-indexer-store = { workspace = true, features = ["test-fixtures"] }
 syn = { version = "2.0.119", features = ["full", "visit"] }
 tempfile = "3.24.0"
 tokio = { workspace = true, features = ["macros", "test-util"] }
-tower.workspace = true
 
 # This opt-in target exercises the public bootstrap boundary through its real
 # cross-crate, process-shaped call path with thread-local read hooks.

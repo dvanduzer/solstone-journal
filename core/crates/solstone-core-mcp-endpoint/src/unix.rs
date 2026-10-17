@@ -31,6 +31,7 @@ use crate::{McpEndpointBootstrapError, McpEndpointOwnerContext};
 const ENDPOINT_DIRECTORY: &str = "mcp-endpoint";
 const TLS_DIRECTORY: &str = "tls";
 const TLS_STATE_FILE: &str = "state.json";
+const TLS_RENEWAL_FILE: &str = "renewal.json";
 const TLS_STAGING_ACCOUNT_FILE: &str = "account-staging.pk8";
 const TLS_PRODUCTION_ACCOUNT_FILE: &str = "account-production.pk8";
 const CREATE_LOCK: &str = ".create.lock";
@@ -41,6 +42,7 @@ const MAX_POP_PKCS8_DER_BYTES: u64 = 512;
 const POP_PKCS8_READ_LIMIT: u64 = MAX_POP_PKCS8_DER_BYTES + 1;
 pub(crate) const MAX_TLS_STATE_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_TLS_ACME_ACCOUNT_BYTES: usize = 1024;
+pub(crate) const MAX_TLS_RENEWAL_BYTES: usize = 8192;
 
 const DIRECTORY_OPEN_FLAGS: OFlag = OFlag::O_RDONLY
     .union(OFlag::O_DIRECTORY)
@@ -229,6 +231,15 @@ pub(crate) fn open_tls_state_directory(root: &JournalRoot) -> io::Result<TlsStat
 /// state; the caller receives no bytes on any failed check.
 pub(crate) fn read_tls_state_bytes(directory: &TlsStateDirectory) -> io::Result<Option<Vec<u8>>> {
     read_tls_named_bytes(directory, OsStr::new(TLS_STATE_FILE), MAX_TLS_STATE_BYTES)
+}
+
+/// Read the renewal schedule file bounded at 8192 bytes.
+pub(crate) fn read_tls_renewal_bytes(directory: &TlsStateDirectory) -> io::Result<Option<Vec<u8>>> {
+    read_tls_named_bytes(
+        directory,
+        OsStr::new(TLS_RENEWAL_FILE),
+        MAX_TLS_RENEWAL_BYTES,
+    )
 }
 
 /// Load the bounded persistent ACME account key for exactly one certificate
@@ -577,6 +588,19 @@ pub(crate) fn persist_tls_acme_account_bytes(
         OsStr::new(acme_account_file_name(production)),
         bytes,
         MAX_TLS_ACME_ACCOUNT_BYTES,
+    )
+}
+
+/// Persist the renewal schedule file bounded at 8192 bytes.
+pub(crate) fn persist_tls_renewal_bytes(
+    directory: &TlsStateDirectory,
+    bytes: &[u8],
+) -> io::Result<()> {
+    persist_tls_named_bytes(
+        directory,
+        OsStr::new(TLS_RENEWAL_FILE),
+        bytes,
+        MAX_TLS_RENEWAL_BYTES,
     )
 }
 
