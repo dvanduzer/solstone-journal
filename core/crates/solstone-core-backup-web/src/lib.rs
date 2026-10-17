@@ -948,8 +948,15 @@ fn destination_from_payload(payload: &Map<String, Value>) -> Destination {
     } else {
         ["account_id", "account_key"].as_slice()
     };
+    // An optional S3 signing region is kept for clients that cannot discover it.
+    let optional = if backend == "s3" {
+        ["region"].as_slice()
+    } else {
+        [].as_slice()
+    };
     let credentials = required
         .iter()
+        .chain(optional)
         .filter_map(|key| {
             source
                 .get(*key)
