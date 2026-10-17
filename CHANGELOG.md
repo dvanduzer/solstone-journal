@@ -22,6 +22,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- an agent reading an activity now checks that the activity file still matches what was indexed. if the file changed, or the index has not recorded that match yet, the activity is left out until the next ordinary index update. a hidden activity is marked hidden, including when the preview is too short to show that.
 - transcripts warn when a sentence may contain words from more than one speaker.
 - linux: `solstone update` and the status pane now recognize installs made by the public installer.
 

@@ -692,6 +692,107 @@ pub fn read_indexed_entry(
     })
 }
 
+/// Indexed activity text, the file digest that produced it, and its stored
+/// hidden flag. Owner search results do not carry the digest.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ActivityObservation {
+    pub content: String,
+    pub digest: [u8; 32],
+    pub hidden: bool,
+}
+
+/// Read one activity chunk and its proof in a single statement.
+///
+/// Missing proof, a malformed proof, an oversized entry, or a missing proof
+/// table is `Ok(None)`. The caller withholds the activity. Real index errors
+/// still propagate. This does not open the source file.
+pub fn read_activity_observation(
+    journal: &Path,
+    boundary: QueryBoundary,
+    path: &str,
+    idx: i64,
+    row_id: i64,
+    max_bytes: u64,
+) -> Result<Option<ActivityObservation>, IndexAccessError> {
+    let reader = match open_index_reader(journal, &boundary) {
+        Ok(reader) => reader,
+        Err(IndexAccessError::Absent { .. } | IndexAccessError::Empty { .. }) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut clause = String::from(
+        "chunks.rowid=? AND chunks.path=? AND chunks.idx=? AND NOT (\
+         chunks.path LIKE '________/chat/%/chat.jsonl' OR \
+         chunks.path LIKE 'chronicle/________/chat/%/chat.jsonl')",
+    );
+    let mut values = vec![
+        Value::Integer(i64::try_from(max_bytes).unwrap_or(i64::MAX)),
+        Value::Integer(row_id),
+        Value::Text(path.to_string()),
+        Value::Integer(idx),
+    ];
+    if let QueryBoundary::Connection(connection_boundary) = &boundary {
+        let mut plan = SqlPlan {
+            where_clause: clause,
+            params: Vec::new(),
+            has_live_match_expression: false,
+        };
+        append_connection_prefilter(&mut plan, connection_boundary);
+        clause = plan.where_clause;
+        values.extend(plan.params.into_iter().map(Value::Text));
+    }
+    let found = reader.connection.query_row(
+        &format!(
+            "SELECT length(CAST(chunks.content AS BLOB)),
+                    CASE WHEN length(CAST(chunks.content AS BLOB)) <= ? THEN chunks.content ELSE NULL END,
+                    activity_provenance.digest,
+                    activity_provenance.hidden
+             FROM chunks
+             LEFT JOIN activity_provenance ON activity_provenance.rowid = chunks.rowid
+             WHERE {clause} LIMIT 1"
+        ),
+        params_from_iter(values.iter()),
+        |row| {
+            Ok((
+                row.get::<_, Option<i64>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<Vec<u8>>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        },
+    );
+    let found = match found {
+        Ok(row) => Some(row),
+        Err(error) if activity_provenance_missing(&error) => return Ok(None),
+        Err(error) => {
+            return match error {
+                Error::QueryReturnedNoRows => Ok(None),
+                other => Err(reader.classify(other)),
+            };
+        }
+    };
+    let Some((_, Some(content), Some(digest), Some(hidden))) = found else {
+        return Ok(None);
+    };
+    if hidden != 0 && hidden != 1 {
+        return Ok(None);
+    }
+    let Ok(digest) = <[u8; 32]>::try_from(digest.as_slice()) else {
+        return Ok(None);
+    };
+    Ok(Some(ActivityObservation {
+        content,
+        digest,
+        hidden: hidden == 1,
+    }))
+}
+
+fn activity_provenance_missing(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::SqliteFailure(_, Some(message)) if message.contains("no such table")
+    )
+}
+
 /// The indexed entries one source file produced, in file order, inside a
 /// connection's boundary.
 pub struct IndexedPathEntries {

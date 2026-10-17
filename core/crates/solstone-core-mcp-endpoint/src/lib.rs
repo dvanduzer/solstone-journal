@@ -20,6 +20,7 @@ use solstone_core_journal_io::journal_root::JournalRoot;
 #[allow(dead_code)]
 mod account_wire;
 mod activity;
+mod activity_admit;
 mod audit;
 #[cfg(all(test, feature = "full-tests"))]
 mod boundary_tests;

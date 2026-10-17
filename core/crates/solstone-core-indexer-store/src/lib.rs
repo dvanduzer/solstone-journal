@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
+mod activity_provenance;
 pub mod chunk_sources;
 pub mod classification;
 pub mod classification_batch;

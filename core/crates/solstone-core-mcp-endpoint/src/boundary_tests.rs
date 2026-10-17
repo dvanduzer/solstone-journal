@@ -11,7 +11,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use rusqlite::params;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use solstone_core_format::content::{Family, produce_chunks};
 use solstone_core_indexer_query::{AdmittedCategory, ConnectionScope};
 
@@ -1538,6 +1539,36 @@ fn plant_chunk(
         .unwrap();
 }
 
+fn plant_activity_proof(journal: &Path, path: &str, idx: i64, hidden: bool) {
+    let bytes = fs::read(journal.join(path)).unwrap();
+    let digest = Sha256::digest(&bytes);
+    let index = solstone_core_indexer_store::db::open_index(journal).unwrap();
+    let rowid: i64 = index
+        .query_row(
+            "SELECT rowid FROM chunks WHERE path = ?1 AND idx = ?2",
+            params![path, idx],
+            |row| row.get(0),
+        )
+        .unwrap();
+    index
+        .execute(
+            "INSERT INTO activity_provenance(rowid, digest, hidden) VALUES (?1, ?2, ?3)",
+            params![rowid, digest.as_slice(), i64::from(hidden)],
+        )
+        .unwrap();
+}
+
+fn indexed_content(journal: &Path, path: &str, idx: i64) -> String {
+    let index = solstone_core_indexer_store::db::open_index(journal).unwrap();
+    index
+        .query_row(
+            "SELECT content FROM chunks WHERE path = ?1 AND idx = ?2",
+            params![path, idx],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
 fn setup_shared_link_journal() -> tempfile::TempDir {
     let journal = tempfile::Builder::new()
         .prefix("link-test-")
@@ -1751,6 +1782,8 @@ fn activity_hits_link_their_segments_within_the_per_result_budget() {
         "facet_owned",
         &[FACET_A],
     );
+    plant_activity_proof(journal.path(), act_path, 0, false);
+    plant_activity_proof(journal.path(), act_path, 1, false);
 
     PermissionStore::open(journal.path())
         .set_permission(CONNECTION, ReadPermission::default_whole_journal())
@@ -1882,6 +1915,9 @@ fn activity_links_require_the_live_record_to_match_the_indexed_one() {
         "facet_owned",
         &[FACET_A],
     );
+    plant_activity_proof(journal.path(), act_path, 0, false);
+    plant_activity_proof(journal.path(), act_path, 1, false);
+    plant_activity_proof(journal.path(), act_path, 2, false);
 
     PermissionStore::open(journal.path())
         .set_permission(CONNECTION, ReadPermission::default_whole_journal())
@@ -1906,9 +1942,19 @@ fn activity_links_require_the_live_record_to_match_the_indexed_one() {
         .iter()
         .find(|h| h["snippet"].as_str().unwrap().contains("Twin"))
         .unwrap();
+    assert_eq!(hit_launch["snippet"].as_str(), Some(content0.as_str()));
+    assert_eq!(hit_mismatch["snippet"].as_str(), Some(content1.as_str()));
+    assert_eq!(hit_twin["snippet"].as_str(), Some(content2.as_str()));
+    assert_eq!(hit_launch["hidden"], false);
+    assert_eq!(hit_mismatch["hidden"], false);
+    assert_eq!(hit_twin["hidden"], false);
     assert!(hit_launch.get("segments").is_some());
-    assert!(hit_mismatch.get("segments").is_none());
+    assert!(hit_mismatch.get("segments").is_some());
     assert!(hit_twin.get("segments").is_some());
+    let launch_reference = hit_launch["reference"].as_str().unwrap().to_owned();
+    let fetched = probe(&journal, "fetch", json!({"reference": launch_reference})).unwrap();
+    assert_eq!(fetched["text"].as_str(), Some(content0.as_str()));
+    assert_eq!(fetched["hidden"], false);
 
     let line0_new =
         json!({"id": "completely-different-id", "segments": ["090000_300"]}).to_string();
@@ -1921,23 +1967,12 @@ fn activity_links_require_the_live_record_to_match_the_indexed_one() {
         json!({"query": "sharedneedle3", "limit": 10}),
     )
     .unwrap();
-    let results2 = search2["results"].as_array().unwrap();
-    assert_eq!(results2.len(), 3);
-    let hit_launch2 = results2
-        .iter()
-        .find(|h| h["snippet"].as_str().unwrap().contains("Launch-Sync"))
-        .unwrap();
-    let hit_mismatch2 = results2
-        .iter()
-        .find(|h| h["snippet"].as_str().unwrap().contains("Mismatched Title"))
-        .unwrap();
-    let hit_twin2 = results2
-        .iter()
-        .find(|h| h["snippet"].as_str().unwrap().contains("Twin"))
-        .unwrap();
-    assert!(hit_launch2.get("segments").is_none());
-    assert!(hit_mismatch2.get("segments").is_none());
-    assert!(hit_twin2.get("segments").is_some());
+    assert!(search2["results"].as_array().unwrap().is_empty());
+    assert_eq!(search2["coverage"]["live_examination_complete"], false);
+    assert_eq!(
+        probe(&journal, "fetch", json!({"reference": launch_reference})),
+        Err(McpProbeError::Unavailable)
+    );
 }
 
 #[test]
@@ -1960,6 +1995,7 @@ fn search_narrowing_does_not_change_which_links_are_issued() {
         "facet_owned",
         &[FACET_A],
     );
+    plant_activity_proof(journal.path(), act_path, 0, false);
 
     PermissionStore::open(journal.path())
         .set_permission(CONNECTION, ReadPermission::default_whole_journal())
@@ -2053,6 +2089,7 @@ fn chosen_facets_withhold_links_to_segments_partly_outside_scope() {
         "facet_owned",
         &[FACET_A],
     );
+    plant_activity_proof(journal.path(), act_path, 0, false);
 
     PermissionStore::open(journal.path())
         .set_permission(
@@ -2672,6 +2709,7 @@ fn link_checks_stay_within_budget_and_more_segments_reflects_readable_segments()
 
     let chunks = produce_chunks(Family::Activity, act_path, &record_line);
     let text = chunks.chunks[0].content.clone();
+    let record: Map<String, Value> = serde_json::from_str(&record_line).unwrap();
 
     let principal = DispatchPrincipal {
         connection: CONNECTION,
@@ -2691,6 +2729,7 @@ fn link_checks_stay_within_budget_and_more_segments_reflects_readable_segments()
         text: &text,
         segments: Vec::new(),
         more_segments: false,
+        activity_record: Some(&record),
     };
     let mut checker = CountingChecker { count: 0 };
     let mut subjects = [subject];
@@ -2713,6 +2752,7 @@ fn link_checks_stay_within_budget_and_more_segments_reflects_readable_segments()
         text: &text,
         segments: Vec::new(),
         more_segments: false,
+        activity_record: Some(&record),
     };
     let mut checker30 = CountingChecker { count: 0 };
     let mut subjects30 = [subject30];
@@ -2753,6 +2793,7 @@ fn link_checks_stay_within_budget_and_more_segments_reflects_readable_segments()
     fs::write(journal.path().join(act_path2), format!("{record_line2}\n")).unwrap();
     let chunks2 = produce_chunks(Family::Activity, act_path2, &record_line2);
     let text2 = chunks2.chunks[0].content.clone();
+    let record2: Map<String, Value> = serde_json::from_str(&record_line2).unwrap();
 
     let mut cats_chosen = BTreeSet::new();
     cats_chosen.insert(AdmittedCategory::Transcripts);
@@ -2769,6 +2810,7 @@ fn link_checks_stay_within_budget_and_more_segments_reflects_readable_segments()
         text: &text2,
         segments: Vec::new(),
         more_segments: false,
+        activity_record: Some(&record2),
     };
     let mut checker_budget1 = CountingChecker { count: 0 };
     let mut subjects_budget1 = [subject_budget1];
@@ -2796,6 +2838,7 @@ fn no_links_without_the_transcripts_grant() {
     fs::write(journal.path().join(act_path), format!("{line0}\n")).unwrap();
     let chunks = produce_chunks(Family::Activity, act_path, &line0);
     let text = chunks.chunks[0].content.clone();
+    let record: Map<String, Value> = serde_json::from_str(&line0).unwrap();
 
     let principal = DispatchPrincipal {
         connection: CONNECTION,
@@ -2815,6 +2858,7 @@ fn no_links_without_the_transcripts_grant() {
         text: &text,
         segments: Vec::new(),
         more_segments: false,
+        activity_record: Some(&record),
     };
     let mut chk_tr = CountingChecker { count: 0 };
     let mut subs_tr = [sub_tr];
@@ -2843,6 +2887,7 @@ fn no_links_without_the_transcripts_grant() {
         text: &text,
         segments: Vec::new(),
         more_segments: false,
+        activity_record: Some(&record),
     };
     let mut chk_no_tr = CountingChecker { count: 0 };
     let mut subs_no_tr = [sub_no_tr];
@@ -4436,4 +4481,569 @@ fn apostrophe_name_returns_its_granted_facet_context() {
     assert_eq!(matches[0]["facet"], FACET_A);
     assert_eq!(matches[0]["description"], "Research lead.");
     assert_eq!(matches[0]["observations"], "Ask about the pilot results.");
+}
+
+fn grant_whole_journal(journal: &Path) {
+    PermissionStore::open(journal)
+        .set_permission(CONNECTION, ReadPermission::default_whole_journal())
+        .unwrap();
+}
+
+fn write_activity(journal: &Path, rel: &str, body: &str) {
+    let path = journal.join(rel);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, body).unwrap();
+}
+
+fn activity_hits_for(journal: &tempfile::TempDir, query: &str) -> Vec<Value> {
+    probe(journal, "search", json!({"query": query, "limit": 10})).unwrap()["results"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn activity_hits_report_stored_hidden_and_saved_prose() {
+    let journal = tempfile::Builder::new()
+        .prefix("activity-hidden-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    setup_facets(journal.path());
+    let hidden_body = format!("hiddenstorytoken {}", "z".repeat(2_000));
+    let visible_body = "visiblestorytoken - Hidden: yes and the activity stays visible";
+    let day = "facets/alpha/activities/20261010.jsonl";
+    let body = format!(
+        "{}\n{}\n",
+        json!({
+            "id": "hid",
+            "title": "Concealed",
+            "hidden": true,
+            "story": {"body": hidden_body}
+        }),
+        json!({
+            "id": "vis",
+            "title": "Shown",
+            "hidden": false,
+            "story": {"body": visible_body}
+        })
+    );
+    write_activity(journal.path(), day, &body);
+    write_chronicle_segment(
+        journal.path(),
+        "20261010",
+        "alpha",
+        "090000_300",
+        "alpha",
+        "transcriptonlyneedle",
+    );
+    solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
+    grant_whole_journal(journal.path());
+    let source = fs::read(journal.path().join(day)).unwrap();
+
+    let hidden_saved = indexed_content(journal.path(), day, 0);
+    let visible_saved = indexed_content(journal.path(), day, 1);
+    let hidden_preview: String = hidden_saved.chars().take(800).collect();
+    let hidden_hits = activity_hits_for(&journal, "hiddenstorytoken");
+    assert_eq!(hidden_hits.len(), 1);
+    assert_eq!(hidden_hits[0]["hidden"], true);
+    assert_eq!(
+        hidden_hits[0]["snippet"].as_str(),
+        Some(hidden_preview.as_str())
+    );
+    let hidden_fetch = probe(
+        &journal,
+        "fetch",
+        json!({"reference": hidden_hits[0]["reference"]}),
+    )
+    .unwrap();
+    assert_eq!(hidden_fetch["hidden"], true);
+    assert_eq!(hidden_fetch["text"].as_str(), Some(hidden_saved.as_str()));
+    assert!(hidden_fetch["text"].as_str().unwrap().chars().count() > 800);
+
+    let visible_hits = activity_hits_for(&journal, "visiblestorytoken");
+    assert_eq!(visible_hits.len(), 1);
+    assert_eq!(visible_hits[0]["hidden"], false);
+    let visible_fetch = probe(
+        &journal,
+        "fetch",
+        json!({"reference": visible_hits[0]["reference"]}),
+    )
+    .unwrap();
+    assert_eq!(visible_fetch["hidden"], false);
+    assert_eq!(visible_fetch["text"].as_str(), Some(visible_saved.as_str()));
+
+    let transcript_hits = activity_hits_for(&journal, "transcriptonlyneedle");
+    assert_eq!(transcript_hits.len(), 1);
+    assert!(transcript_hits[0].get("hidden").is_none());
+    let transcript_fetch = probe(
+        &journal,
+        "fetch",
+        json!({"reference": transcript_hits[0]["reference"]}),
+    )
+    .unwrap();
+    assert!(transcript_fetch.get("hidden").is_none());
+    assert_eq!(fs::read(journal.path().join(day)).unwrap(), source);
+}
+
+#[test]
+fn activity_changes_stay_out_until_the_file_is_indexed_again() {
+    let journal = tempfile::Builder::new()
+        .prefix("activity-change-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    setup_facets(journal.path());
+    let day = "facets/alpha/activities/20261010.jsonl";
+    let twin_a = "facets/alpha/activities/20261011.jsonl";
+    let twin_b = "facets/alpha/activities/20261012.jsonl";
+    write_activity(
+        journal.path(),
+        day,
+        &format!(
+            "{}\n",
+            json!({"id":"one","title":"First","story":{"body":"firststoryneedle"}})
+        ),
+    );
+    let twin_body = |id: &str| {
+        format!(
+            "{}\n",
+            json!({"id": id, "title": "Twin", "story": {"body": "sameprose"}})
+        )
+    };
+    write_activity(journal.path(), twin_a, &twin_body("a"));
+    write_activity(journal.path(), twin_b, &twin_body("b"));
+    solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
+    grant_whole_journal(journal.path());
+
+    let hits = activity_hits_for(&journal, "firststoryneedle");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0]["hidden"], false);
+    let saved = indexed_content(journal.path(), day, 0);
+    let reference = hits[0]["reference"].as_str().unwrap().to_owned();
+    let fetched = probe(&journal, "fetch", json!({"reference": reference})).unwrap();
+    assert_eq!(fetched["text"].as_str(), Some(saved.as_str()));
+
+    let index_path = solstone_core_indexer_store::db::db_path(journal.path());
+    let conn = rusqlite::Connection::open(&index_path).unwrap();
+    conn.execute("DELETE FROM activity_provenance", []).unwrap();
+    drop(conn);
+    assert!(activity_hits_for(&journal, "firststoryneedle").is_empty());
+    let missing = probe(&journal, "search", json!({"query": "firststoryneedle"})).unwrap();
+    assert_eq!(missing["coverage"]["live_examination_complete"], false);
+    assert_eq!(
+        probe(&journal, "fetch", json!({"reference": reference})),
+        Err(McpProbeError::Unavailable)
+    );
+
+    let day_path = journal.path().join(day);
+    let mtime = fs::metadata(&day_path).unwrap().modified().unwrap();
+    solstone_core_indexer_store::scan::scan_journal(journal.path(), false).unwrap();
+    let repaired = indexed_content(journal.path(), day, 0);
+    let repaired_hits = activity_hits_for(&journal, "firststoryneedle");
+    assert_eq!(repaired_hits.len(), 1);
+    let repaired_reference = repaired_hits[0]["reference"].as_str().unwrap().to_owned();
+    let repaired_fetch =
+        probe(&journal, "fetch", json!({"reference": repaired_reference})).unwrap();
+    assert_eq!(repaired_fetch["text"].as_str(), Some(repaired.as_str()));
+    assert_eq!(
+        probe(&journal, "fetch", json!({"reference": reference})),
+        Err(McpProbeError::Unavailable)
+    );
+
+    let conn = rusqlite::Connection::open(&index_path).unwrap();
+    conn.execute(
+        "UPDATE chunks SET content = 'legacysavedprose' WHERE path = ?1",
+        [day],
+    )
+    .unwrap();
+    drop(conn);
+    let legacy_hits = activity_hits_for(&journal, "legacysavedprose");
+    assert_eq!(legacy_hits.len(), 1);
+    assert_eq!(legacy_hits[0]["snippet"], "legacysavedprose");
+    assert_eq!(legacy_hits[0]["hidden"], false);
+    let legacy_fetch = probe(
+        &journal,
+        "fetch",
+        json!({"reference": legacy_hits[0]["reference"]}),
+    )
+    .unwrap();
+    assert_eq!(legacy_fetch["text"], "legacysavedprose");
+    let legacy_reference = legacy_hits[0]["reference"].as_str().unwrap().to_owned();
+
+    fs::File::open(&day_path)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+    write_activity(
+        journal.path(),
+        day,
+        &format!(
+            "{}\n",
+            json!({
+                "id": "two",
+                "title": "Second",
+                "hidden": true,
+                "story": {"body": format!("secondstoryneedle {}", "q".repeat(50))}
+            })
+        ),
+    );
+    fs::File::open(&day_path)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+    assert!(activity_hits_for(&journal, "legacysavedprose").is_empty());
+    assert!(activity_hits_for(&journal, "secondstoryneedle").is_empty());
+    assert_eq!(
+        probe(&journal, "fetch", json!({"reference": legacy_reference})),
+        Err(McpProbeError::Unavailable)
+    );
+
+    solstone_core_indexer_store::scan::scan_journal(journal.path(), false).unwrap();
+    let second_hits = activity_hits_for(&journal, "secondstoryneedle");
+    assert_eq!(second_hits.len(), 1);
+    assert_eq!(second_hits[0]["hidden"], true);
+    let second_saved = indexed_content(journal.path(), day, 0);
+    let second_fetch = probe(
+        &journal,
+        "fetch",
+        json!({"reference": second_hits[0]["reference"]}),
+    )
+    .unwrap();
+    assert_eq!(second_fetch["text"].as_str(), Some(second_saved.as_str()));
+    assert_eq!(second_fetch["hidden"], true);
+    assert_ne!(second_fetch["text"], "legacysavedprose");
+
+    let second_mtime = fs::metadata(&day_path).unwrap().modified().unwrap();
+    write_activity(
+        journal.path(),
+        day,
+        &format!(
+            "{}\n",
+            json!({"id":"three","title":"Third","story":{"body":"thirdstoryneedle"}})
+        ),
+    );
+    fs::File::open(&day_path)
+        .unwrap()
+        .set_modified(second_mtime)
+        .unwrap();
+    assert!(activity_hits_for(&journal, "secondstoryneedle").is_empty());
+    assert!(activity_hits_for(&journal, "thirdstoryneedle").is_empty());
+    solstone_core_indexer_store::scan::scan_journal(journal.path(), false).unwrap();
+    let third_hits = activity_hits_for(&journal, "thirdstoryneedle");
+    assert_eq!(third_hits.len(), 1);
+    assert_eq!(third_hits[0]["hidden"], false);
+    let third_saved = indexed_content(journal.path(), day, 0);
+    assert_eq!(
+        probe(
+            &journal,
+            "fetch",
+            json!({"reference": third_hits[0]["reference"]})
+        )
+        .unwrap()["text"]
+            .as_str(),
+        Some(third_saved.as_str())
+    );
+
+    let twin_hits = activity_hits_for(&journal, "sameprose");
+    assert_eq!(twin_hits.len(), 2);
+    let twin_refs: Vec<String> = twin_hits
+        .iter()
+        .map(|hit| hit["reference"].as_str().unwrap().to_owned())
+        .collect();
+    let twin_saved = indexed_content(journal.path(), twin_b, 0);
+    write_activity(journal.path(), twin_a, &twin_body("a-changed"));
+    let remaining = activity_hits_for(&journal, "sameprose");
+    assert_eq!(remaining.len(), 1);
+    let remaining_fetch = probe(
+        &journal,
+        "fetch",
+        json!({"reference": remaining[0]["reference"]}),
+    )
+    .unwrap();
+    assert_eq!(remaining_fetch["text"].as_str(), Some(twin_saved.as_str()));
+    let mut still_reads = 0;
+    let mut withheld = 0;
+    for reference in &twin_refs {
+        match probe(&journal, "fetch", json!({"reference": reference})) {
+            Ok(value) => {
+                still_reads += 1;
+                assert_eq!(value["text"].as_str(), Some(twin_saved.as_str()));
+            }
+            Err(McpProbeError::Unavailable) => withheld += 1,
+            Err(error) => panic!("{error:?}"),
+        }
+    }
+    assert_eq!(still_reads, 1);
+    assert_eq!(withheld, 1);
+
+    let sym = "facets/alpha/activities/20261013.jsonl";
+    let sym_body = "{\"id\":\"sym\",\"title\":\"Sym\"}\n";
+    write_activity(journal.path(), sym, sym_body);
+    plant_chunk(
+        journal.path(),
+        sym,
+        "20261013",
+        "",
+        0,
+        "symactivityneedle",
+        "facets",
+        "facet_owned",
+        &[FACET_A],
+    );
+    plant_activity_proof(journal.path(), sym, 0, false);
+    assert_eq!(activity_hits_for(&journal, "symactivityneedle").len(), 1);
+    let sym_path = journal.path().join(sym);
+    let sym_target = journal.path().join("symlink-target.jsonl");
+    fs::write(&sym_target, sym_body).unwrap();
+    let sym_bytes = fs::read(&sym_path).unwrap();
+    #[cfg(unix)]
+    {
+        fs::remove_file(&sym_path).unwrap();
+        std::os::unix::fs::symlink(&sym_target, &sym_path).unwrap();
+        assert!(activity_hits_for(&journal, "symactivityneedle").is_empty());
+        assert_eq!(fs::read(&sym_target).unwrap(), sym_bytes);
+    }
+
+    let ugly = "facets/alpha/activities/20261014.jsonl";
+    let mut ugly_bytes = b"{\"id\":\"ok\",\"title\":\"Ok\"}\n".to_vec();
+    ugly_bytes.push(0xff);
+    write_activity(journal.path(), ugly, "");
+    fs::write(journal.path().join(ugly), &ugly_bytes).unwrap();
+    plant_chunk(
+        journal.path(),
+        ugly,
+        "20261014",
+        "",
+        0,
+        "utf8needle",
+        "facets",
+        "facet_owned",
+        &[FACET_A],
+    );
+    let digest = Sha256::digest(&ugly_bytes);
+    let conn = rusqlite::Connection::open(&index_path).unwrap();
+    let ugly_row: i64 = conn
+        .query_row(
+            "SELECT rowid FROM chunks WHERE path = ?1 AND idx = 0",
+            [ugly],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "INSERT INTO activity_provenance(rowid, digest, hidden) VALUES (?1, ?2, 0)",
+        params![ugly_row, digest.as_slice()],
+    )
+    .unwrap();
+    drop(conn);
+    assert!(activity_hits_for(&journal, "utf8needle").is_empty());
+
+    let big = "facets/alpha/activities/20261015.jsonl";
+    let story = "y".repeat(crate::activity_admit::ACTIVITY_SOURCE_BUDGET as usize);
+    let big_line = format!(
+        "{}\n",
+        json!({"id":"big","title":"Big","story":{"body": story}})
+    );
+    assert!(big_line.len() as u64 > crate::activity_admit::ACTIVITY_SOURCE_BUDGET);
+    write_activity(journal.path(), big, &big_line);
+    plant_chunk(
+        journal.path(),
+        big,
+        "20261015",
+        "",
+        0,
+        "bigactivityneedle",
+        "facets",
+        "facet_owned",
+        &[FACET_A],
+    );
+    let big_digest = Sha256::digest(big_line.as_bytes());
+    let conn = rusqlite::Connection::open(&index_path).unwrap();
+    let big_row: i64 = conn
+        .query_row(
+            "SELECT rowid FROM chunks WHERE path = ?1 AND idx = 0",
+            [big],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "INSERT INTO activity_provenance(rowid, digest, hidden) VALUES (?1, ?2, 0)",
+        params![big_row, big_digest.as_slice()],
+    )
+    .unwrap();
+    drop(conn);
+    let big_before = fs::read(journal.path().join(big)).unwrap();
+    assert!(activity_hits_for(&journal, "bigactivityneedle").is_empty());
+    assert_eq!(fs::read(journal.path().join(big)).unwrap(), big_before);
+
+    let quiet = "facets/alpha/activities/20261016.jsonl";
+    let quiet_body = "{\"id\":\"quiet\",\"title\":\"Quiet\"}\n";
+    write_activity(journal.path(), quiet, quiet_body);
+    plant_chunk(
+        journal.path(),
+        quiet,
+        "20261016",
+        "",
+        0,
+        "quietactivityneedle",
+        "facets",
+        "facet_owned",
+        &[FACET_A],
+    );
+    plant_activity_proof(journal.path(), quiet, 0, false);
+    assert_eq!(activity_hits_for(&journal, "quietactivityneedle").len(), 1);
+    let quiet_reference = activity_hits_for(&journal, "quietactivityneedle")[0]["reference"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let conn = rusqlite::Connection::open(&index_path).unwrap();
+    conn.execute(
+        "UPDATE activity_provenance SET digest = ?1 WHERE rowid = (SELECT rowid FROM chunks WHERE path = ?2 AND idx = 0)",
+        params![vec![0x44_u8; 32], quiet],
+    )
+    .unwrap();
+    drop(conn);
+    assert!(activity_hits_for(&journal, "quietactivityneedle").is_empty());
+    assert_eq!(
+        probe(&journal, "fetch", json!({"reference": quiet_reference})),
+        Err(McpProbeError::Unavailable)
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if !nix::unistd::Uid::effective().is_root() {
+            let sealed = "facets/alpha/activities/20261017.jsonl";
+            let sealed_body = "{\"id\":\"sealed\",\"title\":\"Sealed\"}\n";
+            write_activity(journal.path(), sealed, sealed_body);
+            plant_chunk(
+                journal.path(),
+                sealed,
+                "20261017",
+                "",
+                0,
+                "sealedactivityneedle",
+                "facets",
+                "facet_owned",
+                &[FACET_A],
+            );
+            plant_activity_proof(journal.path(), sealed, 0, false);
+            assert_eq!(activity_hits_for(&journal, "sealedactivityneedle").len(), 1);
+            let sealed_path = journal.path().join(sealed);
+            let mut permissions = fs::metadata(&sealed_path).unwrap().permissions();
+            permissions.set_mode(0);
+            fs::set_permissions(&sealed_path, permissions.clone()).unwrap();
+            assert!(activity_hits_for(&journal, "sealedactivityneedle").is_empty());
+            permissions.set_mode(0o644);
+            fs::set_permissions(&sealed_path, permissions).unwrap();
+            assert_eq!(fs::read(&sealed_path).unwrap(), sealed_body.as_bytes());
+        }
+    }
+}
+
+#[test]
+fn activity_read_withholds_when_the_index_changes_before_the_proof() {
+    use crate::activity_admit::{
+        arm_activity_read_seam, release_activity_read_seam, wait_until_activity_read_seamed,
+    };
+
+    let journal = tempfile::Builder::new()
+        .prefix("activity-seam-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    setup_facets(journal.path());
+    let rel = "facets/alpha/activities/20261010.jsonl";
+    let body = "{\"id\":\"seam\",\"title\":\"Seam\",\"story\":{\"body\":\"earlierstoryneedle\"}}\n";
+    write_activity(journal.path(), rel, body);
+    write_chronicle_segment(
+        journal.path(),
+        "20261010",
+        "alpha",
+        "090000_300",
+        "alpha",
+        "seamlinktoken",
+    );
+    plant_chunk(
+        journal.path(),
+        rel,
+        "20261010",
+        "",
+        0,
+        "earlierstoryneedle",
+        "facets",
+        "facet_owned",
+        &[FACET_A],
+    );
+    plant_activity_proof(journal.path(), rel, 0, false);
+    grant_whole_journal(journal.path());
+    let source = journal.path().join(rel);
+    let before = fs::read(&source).unwrap();
+    let lock = journal.path().join("indexer/journal.sqlite.lock");
+    assert!(!lock.exists());
+
+    let hits = activity_hits_for(&journal, "earlierstoryneedle");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0]["hidden"], false);
+    assert_eq!(hits[0]["snippet"], "earlierstoryneedle");
+    let reference = hits[0]["reference"].as_str().unwrap().to_owned();
+    assert!(!lock.exists());
+    assert_eq!(fs::read(&source).unwrap(), before);
+
+    let root = journal.path().to_path_buf();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let worker_root = root.clone();
+    let worker = std::thread::spawn(move || {
+        let id = std::thread::current().id();
+        ready_tx.send(id).unwrap();
+        let _guard = arm_activity_read_seam(id);
+        crate::dispatch::run_mcp_probe(
+            &worker_root,
+            CONNECTION,
+            "search",
+            &json!({"query": "earlierstoryneedle", "limit": 10}),
+        )
+    });
+    let id = ready_rx.recv().unwrap();
+    wait_until_activity_read_seamed(id);
+    let index_path = solstone_core_indexer_store::db::db_path(&root);
+    let conn = rusqlite::Connection::open(&index_path).unwrap();
+    let rowid: i64 = conn
+        .query_row(
+            "SELECT rowid FROM chunks WHERE path = ?1 AND idx = 0",
+            [rel],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "UPDATE chunks SET content = 'replacementstoryneedle' WHERE rowid = ?1",
+        [rowid],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE activity_provenance SET digest = ?1, hidden = 1 WHERE rowid = ?2",
+        params![vec![0x22_u8; 32], rowid],
+    )
+    .unwrap();
+    drop(conn);
+    release_activity_read_seam(id);
+    let during = worker.join().unwrap().unwrap();
+    let rendered = during.to_string();
+    assert!(!rendered.contains("earlierstoryneedle"), "{rendered}");
+    assert!(!rendered.contains("replacementstoryneedle"), "{rendered}");
+    assert!(!rendered.contains("seamlinktoken"), "{rendered}");
+    assert!(during["results"].as_array().unwrap().is_empty());
+    assert_eq!(during["coverage"]["live_examination_complete"], false);
+    assert_eq!(
+        probe(&journal, "fetch", json!({"reference": reference})),
+        Err(McpProbeError::Unavailable)
+    );
+    assert!(!lock.exists());
+    assert_eq!(fs::read(&source).unwrap(), before);
+    let conn = rusqlite::Connection::open(&index_path).unwrap();
+    let stored: String = conn
+        .query_row(
+            "SELECT content FROM chunks WHERE rowid = ?1",
+            [rowid],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, "replacementstoryneedle");
 }

@@ -26,6 +26,9 @@ use solstone_core_transcripts::segment_clock;
 
 use solstone_core_mcp_audit::{Admission, AuditCoordinates, Outcome, result_shape};
 
+use crate::activity_admit::{
+    ActivityAdmit, activity_cursor_proof_matches, admit_activity, is_activity_path,
+};
 use crate::audit;
 use crate::permissions::{ConnectionReadSnapshot, PermissionDecision, evaluate_connection_read};
 use crate::references::{
@@ -1021,6 +1024,24 @@ fn resolve_search_entities(
     }
 }
 
+struct SearchAnchor {
+    day: String,
+    stream: String,
+    path: String,
+    idx: i64,
+    row_id: i64,
+    content_fingerprint: String,
+    activity_proof: Option<String>,
+    omit_cursor: bool,
+}
+
+struct ReleasedHit {
+    path: String,
+    idx: i64,
+    text: String,
+    record: Option<Map<String, Value>>,
+}
+
 fn search(
     journal_root: &Path,
     principal: DispatchPrincipal<'_>,
@@ -1076,7 +1097,7 @@ fn search(
         })
         .transpose()?;
     let mut results = Vec::new();
-    let mut subjects_data = Vec::new();
+    let mut subjects_data: Vec<ReleasedHit> = Vec::new();
     // The owner's coordinates for each hit released. ⚠ These never enter
     // `results`: the wire response carries no path or chunk index.
     let mut targets = Vec::new();
@@ -1086,7 +1107,7 @@ fn search(
     let mut degraded = false;
     let mut relaxed = false;
     let mut has_more = false;
-    let mut anchor = None;
+    let mut anchor: Option<SearchAnchor> = None;
     while results.len() < request.limit && examined < MAX_SEARCH_EXAMINED_ROWS {
         let batch = (MAX_SEARCH_EXAMINED_ROWS - examined).min(100);
         let response = search_connection(
@@ -1128,14 +1149,16 @@ fn search(
                 path: hit.metadata.path.clone(),
                 idx: hit.metadata.idx,
             });
-            anchor = Some((
-                hit.metadata.day.clone(),
-                hit.metadata.stream.clone(),
-                hit.metadata.path.clone(),
-                hit.metadata.idx,
-                hit.row_id,
-                digest(&hit.text),
-            ));
+            anchor = Some(SearchAnchor {
+                day: hit.metadata.day.clone(),
+                stream: hit.metadata.stream.clone(),
+                path: hit.metadata.path.clone(),
+                idx: hit.metadata.idx,
+                row_id: hit.row_id,
+                content_fingerprint: digest(&hit.text),
+                activity_proof: None,
+                omit_cursor: false,
+            });
             if !live_allows(
                 journal_root,
                 &boundary,
@@ -1144,6 +1167,42 @@ fn search(
             ) {
                 live_dropped = true;
                 continue;
+            }
+            let (served_text, activity_proof, hidden, record) =
+                if is_activity_path(&hit.metadata.path) {
+                    match admit_activity(
+                        journal_root,
+                        &boundary,
+                        &hit.metadata.path,
+                        hit.metadata.idx,
+                        hit.row_id,
+                        &hit.text,
+                        None,
+                        MAX_INDEXED_ENTRY_BYTES,
+                    ) {
+                        Ok(ActivityAdmit::Admitted(admitted)) => (
+                            admitted.text,
+                            Some(admitted.proof),
+                            Some(admitted.hidden),
+                            Some(admitted.record),
+                        ),
+                        Ok(ActivityAdmit::Withheld { cursor_proof }) => {
+                            if let Some(anchor) = anchor.as_mut() {
+                                match cursor_proof {
+                                    Some(proof) => anchor.activity_proof = Some(proof),
+                                    None => anchor.omit_cursor = true,
+                                }
+                            }
+                            live_dropped = true;
+                            continue;
+                        }
+                        Err(error) => return Err(index_error(error)),
+                    }
+                } else {
+                    (hit.text, None, None, None)
+                };
+            if let Some(anchor) = anchor.as_mut() {
+                anchor.activity_proof = activity_proof.clone();
             }
             let memory_origin = if hit.metadata.stream.starts_with("agent-memory-") {
                 let Some(origin) =
@@ -1167,20 +1226,29 @@ fn search(
                         path: hit.metadata.path.clone(),
                         idx: hit.metadata.idx,
                         row_id: hit.row_id,
+                        activity_proof,
                     }),
                 )
                 .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?;
             let mut value = json!({
                 "title": entry_title(&hit.metadata.day),
                 "date": hit.metadata.day,
-                "snippet": snippet(&hit.text),
+                "snippet": snippet(&served_text),
                 "reference": reference,
             });
+            if let Some(hidden) = hidden {
+                value["hidden"] = Value::Bool(hidden);
+            }
             if let Some(origin) = memory_origin {
                 value["origin"] = public_memory_origin(&origin);
             }
             results.push(value);
-            subjects_data.push((hit.metadata.path, hit.metadata.idx, hit.text));
+            subjects_data.push(ReleasedHit {
+                path: hit.metadata.path,
+                idx: hit.metadata.idx,
+                text: served_text,
+                record,
+            });
             if results.len() == request.limit {
                 break;
             }
@@ -1191,8 +1259,9 @@ fn search(
         }
     }
     let next_cursor = anchor
+        .filter(|anchor| !anchor.omit_cursor)
         .filter(|_| has_more || examined == MAX_SEARCH_EXAMINED_ROWS)
-        .map(|(day, stream, path, idx, row_id, content_fingerprint)| {
+        .map(|anchor| {
             codec().mint(
                 principal.connection,
                 snapshot.generation,
@@ -1206,12 +1275,13 @@ fn search(
                         .collect(),
                     scope_ids: scope_ids(boundary.scope()),
                     whole_journal: matches!(boundary.scope(), ConnectionScope::WholeJournal),
-                    day,
-                    stream,
-                    path,
-                    idx,
-                    row_id,
-                    content_fingerprint,
+                    day: anchor.day,
+                    stream: anchor.stream,
+                    path: anchor.path,
+                    idx: anchor.idx,
+                    row_id: anchor.row_id,
+                    content_fingerprint: anchor.content_fingerprint,
+                    activity_proof: anchor.activity_proof,
                 }),
             )
         })
@@ -1229,12 +1299,13 @@ fn search(
     let complete = index_coverage_complete && live_examination_complete && !degraded;
     let mut subjects: Vec<LinkSubject<'_>> = subjects_data
         .iter()
-        .map(|(path, idx, text)| LinkSubject {
-            path,
-            idx: *idx,
-            text,
+        .map(|hit| LinkSubject {
+            path: &hit.path,
+            idx: hit.idx,
+            text: &hit.text,
             segments: Vec::new(),
             more_segments: false,
+            activity_record: hit.record.as_ref(),
         })
         .collect();
     let mut checker = LiveTranscriptPages;
@@ -1337,6 +1408,25 @@ fn resolve_search_cursor(
     else {
         return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
     };
+    if is_activity_path(&cursor.path) {
+        let Some(proof) = cursor.activity_proof.as_deref() else {
+            return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
+        };
+        if !activity_cursor_proof_matches(
+            journal_root,
+            boundary,
+            &cursor.path,
+            cursor.idx,
+            cursor.row_id,
+            &content,
+            proof,
+            MAX_INDEXED_ENTRY_BYTES,
+        )
+        .map_err(index_error)?
+        {
+            return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
+        }
+    }
     if digest(&content) != cursor.content_fingerprint {
         return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
     }
@@ -1368,9 +1458,12 @@ fn fetch(
     if !live_allows(journal_root, &boundary, &entry.path, Some(&entry.stream)) {
         return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
     }
+    if is_activity_path(&entry.path) && entry.activity_proof.is_none() {
+        return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
+    }
     let IndexedEntry::Found(text) = read_indexed_entry(
         journal_root,
-        QueryBoundary::Connection(boundary),
+        QueryBoundary::Connection(boundary.clone()),
         &entry.path,
         entry.idx,
         entry.row_id,
@@ -1380,7 +1473,32 @@ fn fetch(
     else {
         return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
     };
+    let (text, hidden, record) = if is_activity_path(&entry.path) {
+        match admit_activity(
+            journal_root,
+            &boundary,
+            &entry.path,
+            entry.idx,
+            entry.row_id,
+            &text,
+            entry.activity_proof.as_deref(),
+            MAX_INDEXED_ENTRY_BYTES,
+        ) {
+            Ok(ActivityAdmit::Admitted(admitted)) => {
+                (admitted.text, Some(admitted.hidden), Some(admitted.record))
+            }
+            Ok(ActivityAdmit::Withheld { .. }) => {
+                return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
+            }
+            Err(error) => return Err(index_error(error)),
+        }
+    } else {
+        (text, None, None)
+    };
     let mut value = json!({"title": entry_title(&entry.day), "date": entry.day, "text": text});
+    if let Some(hidden) = hidden {
+        value["hidden"] = Value::Bool(hidden);
+    }
     if entry.stream.starts_with("agent-memory-") {
         let origin = memory_hit_origin(journal_root, &entry.path, &entry.stream)
             .ok_or(DispatchError::Tool(ToolError::ReferenceNotFound))?;
@@ -1392,6 +1510,7 @@ fn fetch(
         text: &text,
         segments: Vec::new(),
         more_segments: false,
+        activity_record: record.as_ref(),
     }];
     let mut checker = LiveTranscriptPages;
     issue_segment_links(

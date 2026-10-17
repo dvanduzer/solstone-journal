@@ -9,6 +9,7 @@ use rusqlite::{
 };
 
 use crate::StoreError;
+use crate::activity_provenance::{CREATE_ACTIVITY_PROVENANCE, delete_activity_provenance};
 use crate::chunk_sources::{
     CHUNK_SOURCES_LOOKUP_PATHS, CREATE_CHUNK_SOURCE_READINESS, CREATE_CHUNK_SOURCES,
     CREATE_CHUNK_SOURCES_PATH_INDEX, chunk_path_lookup_ready, delete_chunk_source_rowids,
@@ -255,6 +256,7 @@ pub(crate) fn reset_index_admitted(
         }
     }
     tx.execute("DROP TABLE IF EXISTS chunk_sources", [])?;
+    tx.execute("DROP TABLE IF EXISTS activity_provenance", [])?;
     tx.execute("DROP TABLE IF EXISTS chunk_source_readiness", [])?;
     tx.execute("DROP INDEX IF EXISTS edges_path", [])?;
     tx.execute("DROP INDEX IF EXISTS idx_edges_src", [])?;
@@ -310,6 +312,7 @@ pub fn prune_chunks_by_stream(
             .query_map([stream], |row| row.get::<_, i64>(0))?
             .collect::<Result<Vec<_>, _>>()?
     };
+    delete_activity_provenance(&tx, &chunk_rowids)?;
     delete_chunk_source_rowids(&tx, &chunk_rowids)?;
     let chunks = tx.execute("DELETE FROM chunks WHERE stream=?", [stream])? as u64;
     tx.execute("DELETE FROM memory_originals WHERE stream=?", [stream])?;
@@ -363,6 +366,7 @@ pub fn prune_by_paths(
         };
         delete_chunk_classifications_by_predicate(&tx, &pred)?;
         let chunk_rowids = select_prune_predicate_rowids(&tx, "chunks", &pred)?;
+        delete_activity_provenance(&tx, &chunk_rowids)?;
         delete_chunk_source_rowids(&tx, &chunk_rowids)?;
         counts.chunks += execute_prune_predicate(&tx, "chunks", &pred)?;
         execute_prune_predicate(&tx, "memory_originals", &pred)?;
@@ -405,6 +409,7 @@ pub(crate) fn prune_authored_chat_paths_admitted(
             .query_map([], |row| row.get::<_, i64>(0))?
             .collect::<Result<Vec<_>, _>>()?
     };
+    delete_activity_provenance(&tx, &chunk_rowids)?;
     delete_chunk_source_rowids(&tx, &chunk_rowids)?;
     let chunks = tx.execute(
         &format!("DELETE FROM chunks WHERE {AUTHORED_CHAT_PATH_PREDICATE}"),
@@ -548,6 +553,7 @@ fn create_schema(conn: &Connection) -> Result<(), StoreError> {
     conn.execute(CREATE_CHUNK_CLASSIFICATION_FACETS, [])?;
     conn.execute(CREATE_CHUNK_CLASSIFICATION_FACETS_INDEX, [])?;
     conn.execute(CREATE_CHUNK_CLASSIFICATION_BACKFILL, [])?;
+    conn.execute(CREATE_ACTIVITY_PROVENANCE, [])?;
     conn.execute(
         "REPLACE INTO edge_files(path, mtime) VALUES (?, ?)",
         params![EDGES_SCHEMA_PATH, EDGES_SCHEMA_VERSION],
