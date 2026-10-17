@@ -128,7 +128,9 @@ int main(int argc, char **argv) {
     options = (restic_operation_options_v1){.version = 2, .check_read_mode = 2, .reserved1 = 2};
     if (local_refuses(&request, &options, 1) || remote_refuses(&remote, &options, 1)) return 29;
     options.reserved1 = 1;
-    if (local_refuses(&request, &options, 1)) return 29;
+    if (local_refuses(&request, &options, 1)) return 30;
+    options.reserved1 = 0;
+    if (local_refuses(&request, &options, 1)) return 31;
     /* A valid remote shape really publishes a handle. Cancel and join it; the
        reserved .invalid fixture has no provider or usable credentials. */
     options = (restic_operation_options_v1){.version = 1, .check_read_mode = 1};
