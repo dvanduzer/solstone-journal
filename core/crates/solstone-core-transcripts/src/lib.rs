@@ -10,8 +10,8 @@ use chrono::{Duration, NaiveDate, NaiveDateTime};
 use serde_json::{Map, Value};
 use solstone_core_format::agent_memory::{Coordinate, Origin, SourceKey};
 use solstone_core_format::content::{
-    Family, RawPerceptFamily, iter_talent_text_projections, produce_chunks,
-    produce_raw_percept_chunks, produce_screen_talent_raw_screen_chunks,
+    Family, RawPerceptFamily, iter_talent_text_projections, parse_raw_percept_records,
+    produce_chunks, produce_raw_percept_chunks_by_shape, produce_screen_talent_raw_screen_chunks,
 };
 use solstone_core_format::segment::segment_parse;
 use solstone_core_journal_io::paths::{PathOrDay, StreamLocation, iter_segments};
@@ -112,6 +112,8 @@ pub struct ScreenCut {
 pub struct ScreenTranscript {
     pub text: String,
     pub cuts: Vec<ScreenCut>,
+    /// What each rendered entry was rendered from, in transcript order.
+    pub sources: Vec<Option<EntrySource>>,
 }
 
 impl ScreenTranscript {
@@ -119,8 +121,29 @@ impl ScreenTranscript {
         Self {
             text,
             cuts: Vec::new(),
+            sources: Vec::new(),
         }
     }
+}
+
+/// A raw producer file larger than this keeps no [`EntrySource`]: nothing
+/// that reads one needs a file this large, and a long cluster should not hold
+/// every record twice.
+pub const ENTRY_SOURCE_MAX_BYTES: usize = 64 * 1024;
+
+/// The producer file behind one transcript entry, from the same bytes the
+/// entry was rendered from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntrySource {
+    pub stream: Option<String>,
+    /// The file's name in its segment directory.
+    pub file: String,
+    /// Every record the file parsed to, in file order.
+    pub records: Vec<Map<String, Value>>,
+    /// Non-empty lines that were not JSON objects, which render nothing.
+    pub unparsed_lines: usize,
+    /// Each rendered chunk beside the record it was rendered from.
+    pub chunks: Vec<(String, Map<String, Value>)>,
 }
 
 impl std::ops::Deref for ScreenTranscript {
@@ -177,12 +200,14 @@ struct Entry {
     output_name: Option<String>,
     screen_cuts: Vec<ScreenCut>,
     memory_origin: Option<Origin>,
+    source: Option<EntrySource>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct RawContent {
     text: String,
     screen_cuts: Vec<ScreenCut>,
+    source: Option<EntrySource>,
 }
 
 impl std::ops::Deref for RawContent {
@@ -657,7 +682,7 @@ fn process_segment(
                 PerceptProjection::Generic,
                 speakers,
             ) {
-                entries.push(entry(
+                let mut transcript = entry(
                     start,
                     end,
                     segment,
@@ -665,7 +690,9 @@ fn process_segment(
                     content.text,
                     stream.clone(),
                     None,
-                ));
+                );
+                transcript.source = content.source;
+                entries.push(transcript);
             }
         }
         let mut markdown = files
@@ -782,6 +809,7 @@ fn process_segment(
                     None,
                 );
                 projected.screen_cuts = content.screen_cuts;
+                projected.source = content.source;
                 entries.push(projected);
             }
         }
@@ -891,6 +919,7 @@ fn process_segment(
                             output_name: Some(projection.stem),
                             screen_cuts: Vec::new(),
                             memory_origin: None,
+                            source: None,
                         });
                     }
                 }
@@ -942,6 +971,7 @@ fn raw_content_with_speakers(
     // Unlike solstone/think/cluster.py:173, the formatter skips malformed JSONL lines
     // individually (content/mod.rs:500-513), preserving valid body rows rather than
     // reducing what native reads from the file.
+    let mut source = None;
     let (header, chunks, error, tmux_chunk_indices) = match (family, projection) {
         (RawPerceptFamily::RawScreen, PerceptProjection::ScreenTalent) => {
             let produced = produce_screen_talent_raw_screen_chunks(&rel, &text);
@@ -953,7 +983,21 @@ fn raw_content_with_speakers(
             )
         }
         _ => {
-            let produced = produce_raw_percept_chunks(family, &rel, &text);
+            let (records, unparsed_lines) = parse_raw_percept_records(&text);
+            let produced = produce_raw_percept_chunks_by_shape(family, Some(&rel), &records);
+            if text.len() <= ENTRY_SOURCE_MAX_BYTES {
+                source = Some(EntrySource {
+                    stream: segment.record_stream().map(str::to_owned),
+                    file: name.to_owned(),
+                    chunks: produced
+                        .chunks
+                        .iter()
+                        .filter_map(|chunk| Some((chunk.content.clone(), chunk.source.clone()?)))
+                        .collect(),
+                    records,
+                    unparsed_lines,
+                });
+            }
             (produced.header, produced.chunks, produced.error, Vec::new())
         }
     };
@@ -992,6 +1036,7 @@ fn raw_content_with_speakers(
     Some(RawContent {
         text: rendered,
         screen_cuts,
+        source,
     })
 }
 
@@ -1108,6 +1153,7 @@ fn entry(
         output_name,
         screen_cuts: Vec::new(),
         memory_origin: None,
+        source: None,
     }
 }
 
@@ -1152,6 +1198,7 @@ fn groups_to_markdown(mut entries: Vec<Entry>) -> ScreenTranscript {
     groups.sort_by_key(|group| group[0].segment_start);
     let mut lines = Vec::new();
     let mut pending_cuts = Vec::new();
+    let mut sources = Vec::new();
     for group in groups {
         let first = &group[0];
         lines.push(format!(
@@ -1187,6 +1234,7 @@ fn groups_to_markdown(mut entries: Vec<Entry>) -> ScreenTranscript {
                 )),
                 _ => continue,
             }
+            sources.push(entry.source);
             let trimmed = if entry.prefix == "memory_original" {
                 entry.content.as_str()
             } else {
@@ -1244,7 +1292,11 @@ fn groups_to_markdown(mut entries: Vec<Entry>) -> ScreenTranscript {
         .collect::<Vec<_>>();
     cuts.sort_by_key(|cut| cut.byte_offset);
     cuts.dedup_by_key(|cut| cut.byte_offset);
-    ScreenTranscript { text, cuts }
+    ScreenTranscript {
+        text,
+        cuts,
+        sources,
+    }
 }
 
 fn day_dir(root: &Path, day: &str) -> PathBuf {

@@ -133,7 +133,7 @@
             "APP_ONOFF_SUB_HOSTED": "on, reachable from anywhere",
             "BRANDLOCK_LINE": "your journal is always private, only yours.",
             "CA_FP_LABEL": "fingerprint",
-            "CA_FP_NOTE": "your device checks this when it scans the code, so no one on your wifi can pretend to be your journal.",
+            "CA_FP_NOTE": "your device checks this when it connects, so no one in between can pretend to be your journal.",
             "CHECK_AGAIN_LABEL": "check again",
             "CHECK_PAIRING_CTA": "check pairing",
             "COMPUTER_LINUX_NOTE": "on linux, save the link as pairing-link.txt and run:",

@@ -3812,6 +3812,7 @@ dependencies = [
  "serde",
  "serde_json",
  "solstone-core-brain",
+ "solstone-core-callosum",
  "solstone-core-entities",
  "solstone-core-entity",
  "solstone-core-facets",
@@ -3821,6 +3822,7 @@ dependencies = [
  "solstone-core-journal-stats-cli",
  "solstone-core-segment",
  "solstone-core-sol-link",
+ "solstone-core-speaker-id",
  "solstone-core-speaker-resolve",
  "solstone-core-system",
  "solstone-core-system-health",
@@ -4081,6 +4083,7 @@ dependencies = [
  "solstone-core-sol-client",
  "solstone-core-system",
  "solstone-core-system-health",
+ "solstone-core-thinking-copy",
  "windows-sys 0.61.2",
 ]
 
@@ -4893,6 +4896,8 @@ name = "solstone-core-thinking-copy"
 version = "2.0.49"
 dependencies = [
  "serde",
+ "serde_json",
+ "solstone-core-assets",
 ]
 
 [[package]]

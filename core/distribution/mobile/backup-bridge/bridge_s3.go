@@ -381,7 +381,7 @@ func startS3OperationWithDirectories(request *C.restic_s3_request, options *C.re
 	if request == nil {
 		return C.int32_t(StatusInvalidArgument)
 	}
-	ownedOptions, status := parseCOperationOptions(int32(request.operation), options)
+	ownedOptions, status := parseCRemoteOperationOptions(int32(request.operation), options)
 	if status != StatusOk {
 		return C.int32_t(status)
 	}
@@ -412,6 +412,9 @@ func startS3OperationWithDirectories(request *C.restic_s3_request, options *C.re
 	}
 	req.executionOptions = ownedOptions
 	req.snapshotSelection = selection
+	if ownedOptions.appendOnly {
+		req.remote.cfg.appendOnly = true
+	}
 	id, status := startBridgeCall(req)
 	if status == StatusOk {
 		*outID = C.uint64_t(id)

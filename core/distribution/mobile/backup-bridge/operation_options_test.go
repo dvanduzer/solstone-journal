@@ -37,7 +37,8 @@ func TestOperationOptionsRejectIncompatibleAuthority(t *testing.T) {
 			}
 		}
 	}
-	for _, fields := range [][3]uint32{{0, 0, 0}, {2, 0, 0}, {1, 1, 0}, {1, 0, 1}} {
+	// Version 2 adds only the append-only bit in reserved1.
+	for _, fields := range [][3]uint32{{0, 0, 0}, {3, 0, 0}, {1, 1, 0}, {1, 0, 1}, {2, 2, 0}, {2, 0, 1}} {
 		if got, status := parseOperationOptions(OpOpen, fields[0], checkReadNone, 0, 0, 0, fields[1], fields[2]); got != nil || status != StatusInvalidArgument {
 			t.Fatal("version/reserved field accepted", fields)
 		}
