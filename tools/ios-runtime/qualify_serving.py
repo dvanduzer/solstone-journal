@@ -122,6 +122,10 @@ class Phone:
             # the device. The host consumes each ID once, so resending the same
             # command until it is consumed never replays it.
             for _attempt in range(8):
+                if _attempt:
+                    # A resend of the identical file is again not delivered, so
+                    # vary its size; the host identifies a command by ID alone.
+                    command.write_text(data + ' ' * _attempt)
                 subprocess.run(['xcrun', 'devicectl', 'device', 'copy', 'to', '--device', self.args.device,
                                 '--domain-type', 'appDataContainer', '--domain-identifier', BUNDLE,
                                 '--source', str(command), '--destination', 'Documents/owner-command.json'],
