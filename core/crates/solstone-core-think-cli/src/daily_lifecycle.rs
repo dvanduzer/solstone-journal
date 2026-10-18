@@ -106,15 +106,27 @@ pub(crate) fn run(
     timeout: Option<Duration>,
     sense_child_environment: &solstone_core_system::process::ChildLaunchContext,
 ) -> Result<ModeResult, String> {
-    run_with_phase_process(
-        context,
-        log,
-        args,
-        default_segment_workers,
-        timeout,
-        &NativePhaseProcessRunner,
-        sense_child_environment,
-    )
+    if let Some(runner) = context.phase_runner.as_deref() {
+        run_with_phase_process(
+            context,
+            log,
+            args,
+            default_segment_workers,
+            timeout,
+            runner,
+            sense_child_environment,
+        )
+    } else {
+        run_with_phase_process(
+            context,
+            log,
+            args,
+            default_segment_workers,
+            timeout,
+            &NativePhaseProcessRunner,
+            sense_child_environment,
+        )
+    }
 }
 
 fn run_with_phase_process(
@@ -167,6 +179,7 @@ fn run_with_phase_process(
     // night).  Any doubt counts as work.
     let day_had_work = !lifecycle_blockers.is_empty() || force_all_repairs;
     let daily_did_work = std::cell::Cell::new(false);
+    let halted = std::cell::Cell::new(false);
     let PhaseOutcomes {
         mut total,
         mut day_scoped,
@@ -187,129 +200,162 @@ fn run_with_phase_process(
             "journal_stats" => Some(PhaseBudget::aggregate(STATS_PHASE_TIMEOUT)),
             _ => None,
         },
-        |phase, phase_log| match phase {
-            "sense_batch" if args.daily_only => ModeResult::default(),
-            "segment_repair" if args.daily_only => {
-                // Recheck at the phase boundary; a newly arrived segment must
-                // not be processed as part of a lower-priority daily task.
-                match solstone_core_system_health::day_segments_ready(
-                    &context.journal,
-                    &context.day,
-                ) {
-                    Ok(true) => {
-                        segment_outcome.replace(SegmentPhaseOutcome {
-                            result: ModeResult::default(),
-                            blockers: Some(BTreeSet::new()),
-                        });
-                        ModeResult::default()
-                    }
-                    Ok(false) => {
-                        let result =
-                            failed_phase("segment_repair", "segment prerequisites changed");
-                        segment_outcome.replace(SegmentPhaseOutcome {
-                            result: result.clone(),
-                            blockers: None,
-                        });
-                        result
-                    }
-                    Err(error) => {
-                        let result = failed_phase("segment_repair", error);
-                        segment_outcome.replace(SegmentPhaseOutcome {
-                            result: result.clone(),
-                            blockers: None,
-                        });
-                        result
-                    }
-                }
+        |phase, phase_log| {
+            if halted.get() {
+                return failed_phase(phase, "thinking cancelled");
             }
-            "sense_batch" => {
-                let request = solstone_core_sense::batch::BatchRequest {
-                    day: context.day.clone(),
-                    jobs: args.jobs,
-                    reprocess: None,
-                    segment: None,
-                    stream: args.stream.clone(),
-                    dry_run: false,
-                    verbose: args.verbose,
-                    debug: args.debug,
-                };
-                match solstone_core_sense::batch::run_batch_for_whole_day_with_environment_and_timeout(
-                    &context.journal,
-                    &request,
-                    sense_child_environment,
-                    Some(SENSE_PHASE_TIMEOUT),
-                ) {
-                    Ok(()) => succeeded_phase("sense_batch"),
-                    Err(solstone_core_sense::batch::BatchError::TimedOut { .. }) => {
-                        timed_out_phase("sense_batch", None)
-                    }
-                    Err(error) => failed_phase("sense_batch", error),
-                }
-            }
-            "segment_repair" => {
-                let refresh = force_all_repairs;
-                let jobs = args.jobs;
-                let repair_timeout = timeout;
-                let repair_skip_talents = skip_talents.clone();
-                // `run_repair_batch_with_activity` already honours the
-                // segment timeout and must finish its durable activity tail
-                // before the later daily/index/stats phases may observe it.
-                segment_outcome.replace(run_segment_repair_phase(
-                    context,
-                    phase_log,
-                    refresh,
-                    jobs,
-                    segment_workers,
-                    repair_timeout,
-                    repair_skip_talents,
-                    args.no_activity_prompts,
-                    refresh,
-                ));
-                segment_outcome.borrow().result.clone()
-            }
-            "daily" => {
-                daily_result = match daily::run(
-                    context,
-                    phase_log,
-                    args.stream.as_deref(),
-                    args.from_scratch,
-                    args.jobs,
-                ) {
-                    Ok(mut result) => {
-                        if let Err(error) = refresh_daily_terminal_fold(context, &mut result) {
-                            merge_mode_result(
-                                &mut result,
-                                failed_phase("daily_completion_input", error),
-                            );
+            match phase {
+                "sense_batch" if args.daily_only => ModeResult::default(),
+                "segment_repair" if args.daily_only => {
+                    // Recheck at the phase boundary; a newly arrived segment must
+                    // not be processed as part of a lower-priority daily task.
+                    match solstone_core_system_health::day_segments_ready(
+                        &context.journal,
+                        &context.day,
+                    ) {
+                        Ok(true) => {
+                            segment_outcome.replace(SegmentPhaseOutcome {
+                                result: ModeResult::default(),
+                                blockers: Some(BTreeSet::new()),
+                            });
+                            ModeResult::default()
                         }
-                        result
+                        Ok(false) => {
+                            let result =
+                                failed_phase("segment_repair", "segment prerequisites changed");
+                            segment_outcome.replace(SegmentPhaseOutcome {
+                                result: result.clone(),
+                                blockers: None,
+                            });
+                            result
+                        }
+                        Err(error) => {
+                            let result = failed_phase("segment_repair", error);
+                            segment_outcome.replace(SegmentPhaseOutcome {
+                                result: result.clone(),
+                                blockers: None,
+                            });
+                            result
+                        }
                     }
-                    Err(error) => failed_phase("daily", error),
-                };
-                daily_did_work.set(daily_result.success != 0 || daily_result.failed != 0);
-                daily_result.clone()
+                }
+                "sense_batch" => {
+                    let request = solstone_core_sense::batch::BatchRequest {
+                        day: context.day.clone(),
+                        jobs: args.jobs,
+                        reprocess: None,
+                        segment: None,
+                        stream: args.stream.clone(),
+                        dry_run: false,
+                        verbose: args.verbose,
+                        debug: args.debug,
+                    };
+                    let ran = if let Some(executor) = &context.sense_executor {
+                        solstone_core_sense::batch::run_batch_with_executor(
+                            &context.journal,
+                            &request,
+                            sense_child_environment,
+                            Some(SENSE_PHASE_TIMEOUT),
+                            std::sync::Arc::clone(executor),
+                            solstone_core_sense::dispatch::BatchMarkerPolicy::EnclosedWholeDay,
+                        )
+                    } else {
+                        solstone_core_sense::batch::run_batch_for_whole_day_with_environment_and_timeout(
+                        &context.journal,
+                        &request,
+                        sense_child_environment,
+                        Some(SENSE_PHASE_TIMEOUT),
+                    )
+                    };
+                    match ran {
+                        Ok(()) => succeeded_phase("sense_batch"),
+                        Err(solstone_core_sense::batch::BatchError::TimedOut { .. }) => {
+                            timed_out_phase("sense_batch", None)
+                        }
+                        Err(error) => failed_phase("sense_batch", error),
+                    }
+                }
+                "segment_repair" => {
+                    let refresh = force_all_repairs;
+                    let jobs = args.jobs;
+                    let repair_timeout = timeout;
+                    let repair_skip_talents = skip_talents.clone();
+                    // `run_repair_batch_with_activity` already honours the
+                    // segment timeout and must finish its durable activity tail
+                    // before the later daily/index/stats phases may observe it.
+                    segment_outcome.replace(run_segment_repair_phase(
+                        context,
+                        phase_log,
+                        refresh,
+                        jobs,
+                        segment_workers,
+                        repair_timeout,
+                        repair_skip_talents,
+                        args.no_activity_prompts,
+                        refresh,
+                    ));
+                    segment_outcome.borrow().result.clone()
+                }
+                "daily" => {
+                    daily_result = match daily::run(
+                        context,
+                        phase_log,
+                        args.stream.as_deref(),
+                        args.from_scratch,
+                        args.jobs,
+                    ) {
+                        Ok(mut result) => {
+                            if let Err(error) = refresh_daily_terminal_fold(context, &mut result) {
+                                merge_mode_result(
+                                    &mut result,
+                                    failed_phase("daily_completion_input", error),
+                                );
+                            }
+                            result
+                        }
+                        Err(error) => failed_phase("daily", error),
+                    };
+                    daily_did_work.set(daily_result.success != 0 || daily_result.failed != 0);
+                    daily_result.clone()
+                }
+                "indexer" => {
+                    if context.checkpoint().is_err() {
+                        halted.set(true);
+                        return failed_phase("indexer", "thinking cancelled");
+                    }
+                    let command = journal_command(&["indexer", "--rescan"]);
+                    let result = run_process_phase(
+                        phase_process,
+                        "indexer",
+                        command,
+                        context,
+                        INDEXER_PHASE_TIMEOUT,
+                    );
+                    if context.checkpoint().is_err() {
+                        halted.set(true);
+                    }
+                    result
+                }
+                "journal_stats" => {
+                    if context.checkpoint().is_err() {
+                        halted.set(true);
+                        return failed_phase("journal_stats", "thinking cancelled");
+                    }
+                    let command = journal_command(&["journal-stats"]);
+                    let result = run_process_phase(
+                        phase_process,
+                        "journal_stats",
+                        command,
+                        context,
+                        STATS_PHASE_TIMEOUT,
+                    );
+                    if context.checkpoint().is_err() {
+                        halted.set(true);
+                    }
+                    result
+                }
+                _ => unreachable!("required phase registry is closed"),
             }
-            "indexer" => {
-                let command = journal_command(&["indexer", "--rescan"]);
-                run_process_phase(
-                    phase_process,
-                    "indexer",
-                    command,
-                    context,
-                    INDEXER_PHASE_TIMEOUT,
-                )
-            }
-            "journal_stats" => {
-                let command = journal_command(&["journal-stats"]);
-                run_process_phase(
-                    phase_process,
-                    "journal_stats",
-                    command,
-                    context,
-                    STATS_PHASE_TIMEOUT,
-                )
-            }
-            _ => unreachable!("required phase registry is closed"),
         },
         |phase| match phase {
             "daily" => daily_dependency_skip(&segment_outcome.borrow()),
@@ -783,6 +829,11 @@ fn maybe_finalize_completion(
             return;
         }
     };
+    if let Err(error) = context.checkpoint() {
+        merge_mode_result(total, failed_phase("daily_completion", error));
+        log_completion_fold(log, context, false, false, daily, segment_blockers);
+        return;
+    }
     match publish_daily_marker_if_current(
         &context.journal,
         &context.day,

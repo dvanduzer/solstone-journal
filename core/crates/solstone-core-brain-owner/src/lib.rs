@@ -71,6 +71,8 @@ pub enum OwnerRefreshOutcome {
     OperationalFailure {
         message: String,
     },
+    /// The caller stopped before the refresh or abandon writer.
+    Cancelled,
 }
 
 pub trait OwnerProbe {
@@ -160,6 +162,7 @@ pub fn refresh(
     options: &OwnerRefreshOptions,
     probe: &impl OwnerProbe,
     spp: &impl OwnerSppPrerequisite,
+    cancelled: &dyn Fn() -> bool,
 ) -> OwnerRefreshOutcome {
     let now = Utc::now();
     if options.expected_fingerprint.is_some() && options.expect_active_fingerprint_absent {
@@ -240,7 +243,7 @@ pub fn refresh(
     let checking_config = match read_journal_config(journal) {
         Ok(read) => read.config.unwrap_or_default(),
         Err(_) => {
-            return abandon_probe_failure(journal, &config, permit, now);
+            return abandon_probe_failure(journal, &config, permit, now, cancelled);
         }
     };
     let key = load_existing_fingerprint_key(journal);
@@ -267,7 +270,7 @@ pub fn refresh(
         checking_view.provider.as_deref(),
         checking_view.model.as_deref(),
     ) else {
-        return abandon_probe_failure(journal, &checking_config, permit, now);
+        return abandon_probe_failure(journal, &checking_config, permit, now, cancelled);
     };
 
     let outcome = probe_outcome(
@@ -282,6 +285,10 @@ pub fn refresh(
     let finish_bundled_runtime_fingerprint = (lane == "bundled")
         .then(|| probe.bundled_runtime_fingerprint(journal, &checking_config))
         .flatten();
+    if cancelled() {
+        drop(permit);
+        return OwnerRefreshOutcome::Cancelled;
+    }
     if finish_refresh(
         journal,
         permit,
@@ -304,7 +311,12 @@ fn abandon_probe_failure(
     fallback_config: &Map<String, Value>,
     permit: solstone_core_brain::BrainRefreshPermit,
     now: DateTime<Utc>,
+    cancelled: &dyn Fn() -> bool,
 ) -> OwnerRefreshOutcome {
+    if cancelled() {
+        drop(permit);
+        return OwnerRefreshOutcome::Cancelled;
+    }
     if abandon_refresh(journal, permit, "probe_internal_error", Map::new(), now).is_err() {
         return OwnerRefreshOutcome::LostFence {
             view: transient_view("lost_fence", &empty_view()),
@@ -323,6 +335,7 @@ pub fn renew_prerequisites(
     expected_fingerprint: Option<&str>,
     probe: &impl OwnerProbe,
     spp: &impl OwnerSppPrerequisite,
+    cancelled: &dyn Fn() -> bool,
 ) -> OwnerRefreshOutcome {
     let now = Utc::now();
     let config = match read_journal_config(journal) {
@@ -374,6 +387,10 @@ pub fn renew_prerequisites(
             }
 
             let component = spp.assess(journal, &checking_config, now);
+            if cancelled() {
+                drop(permit);
+                return OwnerRefreshOutcome::Cancelled;
+            }
             if finish_prerequisite_renewal(journal, permit, component, Utc::now(), None).is_err() {
                 return OwnerRefreshOutcome::LostFence {
                     view: transient_view("lost_fence", &empty_view()),
@@ -394,6 +411,7 @@ pub fn renew_prerequisites(
             },
             probe,
             spp,
+            cancelled,
         ),
     }
 }
@@ -977,6 +995,7 @@ fn bundled_runtime_readiness(
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use std::sync::Mutex;
 
     fn test_owner_view(state: &str, reason: Option<&str>, component: Option<&str>) -> OwnerView {
         OwnerView {
@@ -1245,6 +1264,159 @@ mod tests {
         assert!(!mismatch.contains_key("runtime_reason"));
     }
 
+    fn cloud_journal() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().expect("temp journal");
+        std::fs::create_dir_all(temp.path().join("config")).expect("config dir");
+        std::fs::write(
+            temp.path().join("config/journal.json"),
+            br#"{"env":{"GOOGLE_API_KEY":"test-key"},"providers":{"active":{"provider":"google","model":"gemini-test"}}}"#,
+        )
+        .expect("config");
+        temp
+    }
+
+    type AfterPermit = Box<dyn Fn(&Path) + Send + Sync>;
+
+    struct StaticProbe {
+        generate: Mutex<Box<dyn FnMut() -> Result<GenerateResponse, ClientError> + Send>>,
+        after_permit: Option<AfterPermit>,
+    }
+
+    impl OwnerProbe for StaticProbe {
+        fn bundled_runtime_fingerprint(&self, _: &Path, _: &Map<String, Value>) -> Option<String> {
+            None
+        }
+
+        fn assess_bundled_runtime(
+            &self,
+            _: &Path,
+            _: Option<&str>,
+        ) -> BundledRuntimePrerequisiteAssessment {
+            BundledRuntimePrerequisiteAssessment {
+                reason_code: None,
+                desired_fingerprint_sha256: None,
+                phase: None,
+                runtime_reason: None,
+            }
+        }
+
+        fn execute_generate(
+            &self,
+            _: &GenerateRequest,
+            _: &Path,
+            _: &Map<String, Value>,
+        ) -> Result<GenerateResponse, ClientError> {
+            (self.generate.lock().expect("probe lock"))()
+        }
+
+        fn after_permit_acquired(&self, journal: &Path) {
+            if let Some(hook) = &self.after_permit {
+                hook(journal);
+            }
+        }
+    }
+
+    struct NoSpp;
+
+    impl OwnerSppPrerequisite for NoSpp {
+        fn assess(&self, _: &Path, _: &Map<String, Value>, _: DateTime<Utc>) -> Value {
+            panic!("SPP assess must not run");
+        }
+    }
+
+    fn refresh_options() -> OwnerRefreshOptions {
+        OwnerRefreshOptions {
+            expected_fingerprint: None,
+            expected_active_fingerprint: false,
+            expect_active_fingerprint_absent: false,
+        }
+    }
+
+    fn brain_record(journal: &Path) -> Value {
+        let bytes = std::fs::read(brain_state_path(journal)).expect("brain record");
+        serde_json::from_slice(&bytes).expect("brain json")
+    }
+
+    #[test]
+    fn cancelled_before_finish_leaves_the_ready_projection_unwritten() {
+        let temp = cloud_journal();
+        let probe = StaticProbe {
+            generate: Mutex::new(Box::new(|| {
+                Ok(GenerateResponse::Generated(Box::new(generated_response(
+                    "OK",
+                    "stop",
+                    json!({}),
+                    None,
+                ))))
+            })),
+            after_permit: None,
+        };
+        let outcome = refresh(temp.path(), &refresh_options(), &probe, &NoSpp, &|| true);
+        assert!(matches!(outcome, OwnerRefreshOutcome::Cancelled));
+        let record = brain_record(temp.path());
+        assert_eq!(record["aggregate_state"], "checking");
+        assert_ne!(record["aggregate_state"], "ready");
+    }
+
+    #[test]
+    fn cancelled_before_abandon_leaves_abandon_evidence_unwritten() {
+        let temp = cloud_journal();
+        let probe = StaticProbe {
+            generate: Mutex::new(Box::new(|| {
+                panic!("generate must not run after a failed reread")
+            })),
+            after_permit: Some(Box::new(|journal| {
+                // A missing file is a successful empty read and loses the fence.
+                // Corrupt bytes are the reread that reaches abandon.
+                std::fs::write(journal.join("config/journal.json"), b"{").expect("corrupt config");
+            })),
+        };
+        let outcome = refresh(temp.path(), &refresh_options(), &probe, &NoSpp, &|| true);
+        assert!(matches!(outcome, OwnerRefreshOutcome::Cancelled));
+        let record = brain_record(temp.path());
+        assert_eq!(record["aggregate_state"], "checking");
+        assert_ne!(record["reason_code"], "probe_internal_error");
+    }
+
+    #[test]
+    fn stale_and_lost_fence_return_once_without_a_ready_record() {
+        let temp = cloud_journal();
+        let stale = refresh(
+            temp.path(),
+            &OwnerRefreshOptions {
+                expected_fingerprint: Some("fingerprint".to_owned()),
+                expected_active_fingerprint: false,
+                expect_active_fingerprint_absent: true,
+            },
+            &StaticProbe {
+                generate: Mutex::new(Box::new(|| panic!("stale refresh must not generate"))),
+                after_permit: None,
+            },
+            &NoSpp,
+            &|| false,
+        );
+        assert!(matches!(
+            stale,
+            OwnerRefreshOutcome::StaleExpectedFingerprint { .. }
+        ));
+        assert!(!brain_state_path(temp.path()).exists());
+
+        let probe = StaticProbe {
+            generate: Mutex::new(Box::new(|| panic!("lost fence must not generate"))),
+            after_permit: Some(Box::new(|journal| {
+                std::fs::write(
+                    journal.join("config/journal.json"),
+                    br#"{"env":{"GOOGLE_API_KEY":"other-key"},"providers":{"active":{"provider":"openai","model":"other"}}}"#,
+                )
+                .expect("rewrite config");
+            })),
+        };
+        let lost = refresh(temp.path(), &refresh_options(), &probe, &NoSpp, &|| false);
+        assert!(matches!(lost, OwnerRefreshOutcome::LostFence { .. }));
+        let record = brain_record(temp.path());
+        assert_ne!(record["aggregate_state"], "ready");
+    }
+
     #[cfg(all(test, feature = "full-tests"))]
     mod full {
         use super::*;
@@ -1368,6 +1540,7 @@ mod tests {
                 },
                 &probe,
                 &PanicSpp,
+                &|| false,
             );
             assert!(
                 matches!(outcome, OwnerRefreshOutcome::PersistedReady { ref view } if owner_exit_code(view) == 0)
@@ -1436,6 +1609,7 @@ mod tests {
                     },
                     &probe,
                     &PanicSpp,
+                    &|| false,
                 );
                 assert!(
                     matches!(outcome, OwnerRefreshOutcome::PersistedNonReady { ref view, .. } if owner_exit_code(view) != 0)
@@ -1474,6 +1648,7 @@ mod tests {
                 },
                 &probe,
                 &PanicSpp,
+                &|| false,
             );
             assert!(
                 matches!(outcome, OwnerRefreshOutcome::PersistedNonReady { ref view, .. } if owner_exit_code(view) == 1)
@@ -1514,6 +1689,7 @@ mod tests {
                 },
                 &probe,
                 &PanicSpp,
+                &|| false,
             );
             assert!(
                 matches!(outcome1, OwnerRefreshOutcome::PersistedReady { ref view } if owner_exit_code(view) == 0)
@@ -1537,6 +1713,7 @@ mod tests {
                 },
                 &stale_probe,
                 &PanicSpp,
+                &|| false,
             );
             assert!(
                 matches!(outcome2, OwnerRefreshOutcome::StaleExpectedFingerprint { ref view } if owner_exit_code(view) == 3)
@@ -1600,6 +1777,7 @@ mod tests {
                 },
                 &probe,
                 &PanicSpp,
+                &|| false,
             );
 
             assert!(
@@ -1627,6 +1805,7 @@ mod tests {
                 },
                 &probe2,
                 &PanicSpp,
+                &|| false,
             );
 
             assert!(
@@ -1692,7 +1871,7 @@ mod tests {
                 captured_path: Mutex::new(None),
             };
 
-            let outcome = renew_prerequisites(temp.path(), None, &probe, &PanicSpp);
+            let outcome = renew_prerequisites(temp.path(), None, &probe, &PanicSpp, &|| false);
             assert!(
                 matches!(outcome, OwnerRefreshOutcome::PersistedReady { ref view } if owner_exit_code(view) == 0)
             );
@@ -1763,6 +1942,7 @@ mod tests {
                 },
                 &NoGenerateProbe,
                 &RefusingSpp,
+                &|| false,
             );
             assert!(
                 matches!(outcome, OwnerRefreshOutcome::PersistedNonReady { ref view, .. } if view.aggregate_state != "ready")
@@ -1802,6 +1982,7 @@ mod tests {
                     },
                     &probe,
                     &PanicSpp,
+                    &|| false,
                 );
                 // This is the actual worker result observer, not an unrelated channel.
                 assert!(result_tx.send(outcome.clone()).is_err());
@@ -1823,6 +2004,7 @@ mod tests {
                 },
                 &competing,
                 &PanicSpp,
+                &|| false,
             );
 
             release_tx.send(()).unwrap();
@@ -1881,6 +2063,7 @@ mod tests {
                     },
                     &probe,
                     &PanicSpp,
+                    &|| false,
                 )
             }));
 
@@ -1981,11 +2164,73 @@ mod tests {
                 view.fingerprint_sha256.as_deref(),
                 &probe,
                 &ReadySpp,
+                &|| false,
             );
             assert!(matches!(result, OwnerRefreshOutcome::PersistedReady { .. }));
             let after: Value =
                 serde_json::from_slice(&std::fs::read(brain_state_path(temp.path())).unwrap())
                     .unwrap();
+            assert_eq!(
+                after["evidence"]["generate"],
+                before["evidence"]["generate"]
+            );
+            assert_eq!(
+                after["evidence"]["configuration"],
+                before["evidence"]["configuration"]
+            );
+            assert!(probe.captured_requests.lock().unwrap().is_empty());
+            assert!(!probe_file_lease_held(&brain_refresh_lease_path(temp.path())).unwrap());
+        }
+
+        #[test]
+        fn cancelled_started_renewal_does_not_finish() {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(temp.path().join("config")).unwrap();
+            let config = json!({"providers":{"active":{"provider":"local","model":"local/qwen3.5-4b"},"local":{"endpoint_url":"https://example.invalid/v1","served_model_id":"model","credential":"secret"}},"services":{"confidential":{"endpoint_url":"https://example.invalid/v1","served_model_id":"model","credential_fingerprint_sha256":"2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b"}}});
+            std::fs::write(
+                temp.path().join("config/journal.json"),
+                serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap();
+            let now = Utc::now();
+            let component = json!({"status":"ok","observed_at":now.to_rfc3339(),"expires_at":(now + Duration::days(1)).to_rfc3339()});
+            let permit = begin_refresh(temp.path(), now, None, None, false, None)
+                .unwrap()
+                .unwrap();
+            finish_refresh(
+                temp.path(),
+                permit,
+                json!({"configuration":component,"lane_prerequisites":component,"generate":component}),
+                Utc::now(),
+                None,
+            )
+            .unwrap();
+            let before: Value =
+                serde_json::from_slice(&std::fs::read(brain_state_path(temp.path())).unwrap())
+                    .unwrap();
+            let view = owner_view(temp.path(), config.as_object().unwrap(), Utc::now());
+            assert_eq!(view.aggregate_state, "ready");
+            struct ReadySpp;
+            impl OwnerSppPrerequisite for ReadySpp {
+                fn assess(&self, _: &Path, _: &Map<String, Value>, now: DateTime<Utc>) -> Value {
+                    json!({"status":"ok","observed_at":now.to_rfc3339(),"expires_at":(now + Duration::days(1)).to_rfc3339()})
+                }
+            }
+            let probe = TestProbe::new("a".repeat(64), |_, _, _| {
+                panic!("a stopped renewal must not execute Generate")
+            });
+            let result = renew_prerequisites(
+                temp.path(),
+                view.fingerprint_sha256.as_deref(),
+                &probe,
+                &ReadySpp,
+                &|| true,
+            );
+            assert!(matches!(result, OwnerRefreshOutcome::Cancelled));
+            let after: Value =
+                serde_json::from_slice(&std::fs::read(brain_state_path(temp.path())).unwrap())
+                    .unwrap();
+            assert_eq!(after["aggregate_state"], "checking");
             assert_eq!(
                 after["evidence"]["generate"],
                 before["evidence"]["generate"]

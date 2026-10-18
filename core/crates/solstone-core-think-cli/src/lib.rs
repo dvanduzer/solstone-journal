@@ -52,6 +52,7 @@ pub mod test_support {
         crate::dispatch::runtime()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn reserve_daily_attempt(
         journal: &Path,
         identity: &solstone_core_journal_io::DailyUnitIdentity,
@@ -63,6 +64,7 @@ pub mod test_support {
         from_scratch: bool,
         retry: bool,
         now_ms: i64,
+        checkpoint: &dyn Fn() -> Result<(), String>,
     ) -> Result<(), String> {
         crate::daily::reserve_daily_attempt(
             journal,
@@ -75,6 +77,7 @@ pub mod test_support {
             from_scratch,
             retry,
             now_ms,
+            checkpoint,
         )
         .map_err(|error| error.to_string())
     }
@@ -712,6 +715,13 @@ fn execute_parsed_command(
     };
     let outcome = logged_mode_outcome(log, run, result);
     if let Some(id) = &parsed.work_intent {
+        if let Err(error) = context.checkpoint() {
+            return Ok(CliRun {
+                stdout: String::new(),
+                stderr: format!("{error}\n"),
+                exit_code: 1,
+            });
+        }
         let success = outcome.as_ref().is_ok_and(|run| run.exit_code == 0);
         if let Err(error) = solstone_core_system::work_intent::finish_from_scratch(
             &context.journal,
@@ -1859,6 +1869,121 @@ mod tests {
             }),
             "expected talent.skip with no_thinking_engine in weekly oplog"
         );
+        let pages = fs::read_dir(journal.path().join("reflections/weekly"))
+            .map(|entries| entries.filter_map(|entry| entry.ok()).count())
+            .unwrap_or(0);
+        assert_eq!(pages, 0);
+    }
+
+    #[test]
+    fn reserve_checkpoint_failure_leaves_attempt_day_absent() {
+        let journal = tempdir().unwrap();
+        let identity =
+            solstone_core_journal_io::DailyUnitIdentity::new("20261012", "summary", None);
+        let error = crate::daily::reserve_daily_attempt(
+            journal.path(),
+            &identity,
+            "rev",
+            "digest",
+            &Value::Null,
+            "20261012",
+            "use",
+            false,
+            false,
+            1,
+            &|| Err("stopped".into()),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "stopped");
+        assert!(
+            solstone_core_journal_io::load_daily_unit_record(journal.path(), &identity)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cancelled_from_scratch_leaves_the_intent_claimed() {
+        let journal = tempdir().unwrap();
+        let day = "20261012";
+        let intent =
+            solstone_core_system::work_intent::register(journal.path(), day, true).unwrap();
+        let roots = tempdir().unwrap();
+        fs::create_dir_all(roots.path().join("talent")).unwrap();
+        fs::create_dir_all(roots.path().join("apps")).unwrap();
+
+        struct IdleCortex;
+        impl context::CortexBoundary for IdleCortex {
+            fn dispatch(
+                &self,
+                _: &tokio::runtime::Runtime,
+                _: &solstone_core_cortex_client::CortexRequest,
+            ) -> Result<String, context::DispatchFailure> {
+                Err(context::DispatchFailure::Unavailable)
+            }
+            fn dispatch_prepared(
+                &self,
+                _: &tokio::runtime::Runtime,
+                _: &solstone_core_cortex_client::CortexRequest,
+                _: Option<&str>,
+                _: &mut (dyn FnMut(&str) -> std::io::Result<()> + Send),
+            ) -> Result<String, context::DispatchFailure> {
+                Err(context::DispatchFailure::Unavailable)
+            }
+            fn wait(
+                &self,
+                _: &tokio::runtime::Runtime,
+                _: &[String],
+                _: Option<std::time::Duration>,
+            ) -> Result<solstone_core_cortex_client::WaitForUsesReport, String> {
+                Err("unavailable".into())
+            }
+        }
+        struct IdleIndex;
+        impl context::IndexBoundary for IdleIndex {
+            fn rescan_file(
+                &self,
+                _: &Path,
+                _: &Path,
+            ) -> Result<solstone_core_indexer_store::scan::RescanFileStatus, String> {
+                Err("unavailable".into())
+            }
+        }
+
+        let context = context::ThinkContext::hosted(
+            journal.path(),
+            day.to_owned(),
+            journal.path().join("chronicle").join(day),
+            1,
+            roots.path().join("talent"),
+            roots.path().join("apps"),
+            Arc::new(IdleCortex),
+            Arc::new(IdleIndex),
+            Arc::new(|| 1),
+            None,
+            Arc::new(|| true),
+        );
+        let run = run_hosted_command(
+            &context,
+            &[
+                "--day".into(),
+                day.into(),
+                "--from-scratch".into(),
+                "--work-intent".into(),
+                intent.id.clone(),
+            ],
+            &solstone_core_system::process::ChildLaunchContext::default(),
+        );
+        assert_ne!(run.exit_code, 0);
+        let stored = solstone_core_system::work_intent::read(journal.path())
+            .unwrap()
+            .remove(day)
+            .unwrap();
+        assert_eq!(
+            stored.state,
+            solstone_core_system::work_intent::IntentState::Claimed
+        );
+        assert_eq!(stored.id, intent.id);
     }
 
     #[test]

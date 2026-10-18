@@ -53,6 +53,32 @@ pub fn refresh_discovery_cache(
     })
 }
 
+/// Map clustering labels onto the helper's integer encoding.
+///
+/// Noise and a label that does not fit `i64` are `-1`.
+pub fn labels_as_i64(labels: &[Option<usize>]) -> Vec<i64> {
+    labels
+        .iter()
+        .map(|label| match label {
+            Some(value) => i64::try_from(*value).unwrap_or(-1),
+            None => -1,
+        })
+        .collect()
+}
+
+/// Refresh the discovery cache with a caller-supplied clustering function.
+///
+/// [`refresh_discovery_cache`] keeps the desktop helper. A hosted app passes
+/// the in-process kernel and [`labels_as_i64`].
+pub fn refresh_discovery_with_cluster(
+    root: &Path,
+    cluster: impl FnOnce(
+        Vec<Vec<f32>>,
+    ) -> Result<Vec<i64>, crate::discovery_helper::DiscoveryHelperError>,
+) -> Result<DiscoveryRefresh, DiscoveryRefreshError> {
+    refresh_with_cluster(root, cluster)
+}
+
 fn refresh_with_cluster(
     root: &Path,
     cluster: impl FnOnce(
@@ -435,5 +461,33 @@ fn layout_name(layout: SegmentLayout) -> &'static str {
     match layout {
         SegmentLayout::Direct => "direct",
         SegmentLayout::Named => "named",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn labels_as_i64_maps_noise_and_overflow_to_minus_one() {
+        let mut labels = vec![None, Some(0), Some(7)];
+        let mut expected = vec![-1_i64, 0, 7];
+        if usize::BITS > 63 {
+            labels.push(Some(usize::MAX));
+            expected.push(-1);
+        }
+        assert_eq!(labels_as_i64(&labels), expected);
+    }
+
+    #[test]
+    fn empty_journal_returns_before_clustering() {
+        let root = tempfile::tempdir().expect("temp journal");
+        let outcome = refresh_discovery_with_cluster(root.path(), |_| {
+            panic!("cluster must not run before owner admission");
+        });
+        assert!(matches!(
+            outcome,
+            Ok(DiscoveryRefresh::IdentityInvalid | DiscoveryRefresh::NoConfirmedOwner)
+        ));
     }
 }

@@ -12,7 +12,7 @@ use solstone_core_callosum::{
     CallosumConnectionPhase, CallosumEnvelope, CallosumReceiveEvent, CallosumSocketConnection,
 };
 use solstone_core_journal_io::JournalRoot;
-use solstone_core_maintenance::EmbeddedBackupRoutine;
+use solstone_core_maintenance::{CliRun, EmbeddedBackupRoutine};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -43,8 +43,92 @@ fn routine(envelope: &CallosumEnvelope) -> Option<EmbeddedBackupRoutine> {
     match command[4].as_str()? {
         "backup:run" => Some(EmbeddedBackupRoutine::Run),
         "backup:verify" => Some(EmbeddedBackupRoutine::Verify),
+        "backup:prune" => Some(EmbeddedBackupRoutine::Prune),
         _ => None,
     }
+}
+
+/// One terminal disposition for an embedded backup maintenance run.
+///
+/// Bus submit, permit release, and task completion are not this disposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackupDisposition {
+    Success,
+    Refusal,
+    Failure,
+}
+
+/// Classify a finished backup command from its `CliRun`, root binding, and
+/// any status the backup writer already recorded.
+pub(crate) fn classify_backup_run(
+    run: &CliRun,
+    root_bound: bool,
+    recorded_status: Option<&str>,
+) -> BackupDisposition {
+    if !root_bound {
+        return BackupDisposition::Refusal;
+    }
+    if let Some(status) = recorded_status {
+        return match status {
+            "ok" | "skipped" | "cleared_superseded" => BackupDisposition::Success,
+            "refused" => BackupDisposition::Refusal,
+            _ => BackupDisposition::Failure,
+        };
+    }
+    if run.exit_code == 0 {
+        BackupDisposition::Success
+    } else if run
+        .stdout
+        .split_whitespace()
+        .any(|token| token == "reason=refused")
+    {
+        BackupDisposition::Refusal
+    } else {
+        BackupDisposition::Failure
+    }
+}
+
+pub(crate) fn backup_terminal(
+    root: &JournalRoot,
+    routine: EmbeddedBackupRoutine,
+    run: &CliRun,
+) -> BackupDisposition {
+    let root_bound = root.revalidate_canonical_binding().is_ok();
+    let recorded = root_bound.then(|| recorded_status(root, routine)).flatten();
+    classify_backup_run(run, root_bound, recorded.as_deref())
+}
+
+pub(crate) fn log_backup_terminal(disposition: BackupDisposition, exit_code: i32) {
+    match disposition {
+        BackupDisposition::Success => {}
+        BackupDisposition::Refusal => {
+            log::warn!("embedded backup maintenance refused");
+        }
+        BackupDisposition::Failure => {
+            log::warn!("embedded backup maintenance failed (exit {exit_code})");
+        }
+    }
+}
+
+fn recorded_status(root: &JournalRoot, routine: EmbeddedBackupRoutine) -> Option<String> {
+    let key = match routine {
+        EmbeddedBackupRoutine::Run => "last_backup",
+        EmbeddedBackupRoutine::Verify => "last_verification",
+        EmbeddedBackupRoutine::Prune => "last_prune",
+    };
+    let config = solstone_core_backup::get_backup_config(root.canonical_path()).ok()?;
+    let record = config.get(key)?.as_object()?;
+    let status = record.get("status")?;
+    if status.is_null() {
+        return None;
+    }
+    let status = status.as_str()?;
+    if status == "error"
+        && record.get("error_reason").and_then(|value| value.as_str()) == Some("refused")
+    {
+        return Some("refused".to_owned());
+    }
+    Some(status.to_owned())
 }
 
 struct CancelledRunner<'a> {
@@ -125,12 +209,8 @@ fn execute(
         &http,
         &deps.executable,
     );
-    if outcome.exit_code != 0 || root.revalidate_canonical_binding().is_err() {
-        log::warn!(
-            "embedded backup maintenance finished with refusal (exit {})",
-            outcome.exit_code
-        );
-    }
+    let disposition = backup_terminal(root, routine, &outcome);
+    log_backup_terminal(disposition, outcome.exit_code);
 }
 
 async fn run_with_executor(
@@ -238,11 +318,12 @@ mod tests {
             .unwrap()
     }
     #[test]
-    fn only_the_two_normal_backup_maintenance_requests_are_admitted() {
+    fn only_the_normal_backup_maintenance_requests_are_admitted() {
         let prefix = ["solstone", "journal", "maintenance", "run"];
         for (name, expected) in [
             ("backup:run", EmbeddedBackupRoutine::Run),
             ("backup:verify", EmbeddedBackupRoutine::Verify),
+            ("backup:prune", EmbeddedBackupRoutine::Prune),
         ] {
             let mut command = prefix.to_vec();
             command.push(name);
@@ -278,6 +359,84 @@ mod tests {
         ]));
         other.event = "status".into();
         assert_eq!(routine(&other), None);
+    }
+
+    fn run(exit_code: i32, stdout: &str) -> CliRun {
+        CliRun {
+            stdout: stdout.to_owned(),
+            stderr: String::new(),
+            exit_code,
+        }
+    }
+
+    #[test]
+    fn backup_disposition_follows_binding_and_recorded_status() {
+        assert_eq!(
+            classify_backup_run(&run(0, ""), true, None),
+            BackupDisposition::Success
+        );
+        assert_eq!(
+            classify_backup_run(&run(1, "reason=refused"), true, None),
+            BackupDisposition::Refusal
+        );
+        assert_eq!(
+            classify_backup_run(&run(1, "reason=missing"), true, None),
+            BackupDisposition::Failure
+        );
+        assert_eq!(
+            classify_backup_run(&run(0, ""), false, Some("ok")),
+            BackupDisposition::Refusal
+        );
+        for status in ["ok", "skipped", "cleared_superseded"] {
+            assert_eq!(
+                classify_backup_run(&run(1, ""), true, Some(status)),
+                BackupDisposition::Success
+            );
+        }
+        assert_eq!(
+            classify_backup_run(&run(0, ""), true, Some("refused")),
+            BackupDisposition::Refusal
+        );
+        assert_eq!(
+            classify_backup_run(&run(0, ""), true, Some("error")),
+            BackupDisposition::Failure
+        );
+    }
+
+    #[test]
+    fn recorded_backup_error_is_a_failure_and_a_refused_reason_is_a_refusal() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("config")).unwrap();
+        std::fs::write(root.path().join("config/journal.json"), "{}").unwrap();
+        solstone_core_backup::record_backup_result(
+            root.path(),
+            "error",
+            json!(null),
+            json!(null),
+            json!("tool"),
+            None,
+            None,
+        )
+        .unwrap();
+        let journal = JournalRoot::open(root.path()).unwrap();
+        assert_eq!(
+            backup_terminal(&journal, EmbeddedBackupRoutine::Run, &run(1, "")),
+            BackupDisposition::Failure
+        );
+        solstone_core_backup::record_backup_result(
+            root.path(),
+            "error",
+            json!(null),
+            json!(null),
+            json!("refused"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            backup_terminal(&journal, EmbeddedBackupRoutine::Run, &run(0, "")),
+            BackupDisposition::Refusal
+        );
     }
 
     #[cfg(feature = "full-tests")]

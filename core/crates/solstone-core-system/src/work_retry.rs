@@ -890,4 +890,77 @@ mod tests {
                 .is_none()
         );
     }
+
+    #[test]
+    fn failing_checkpoint_leaves_consumed_unset_and_finish_keeps_it() {
+        let root = tempfile::tempdir().unwrap();
+        let unit = unit();
+        let id = unit.id().unwrap();
+        observe_held(root.path(), &unit, "schema_invalid", "input-a").unwrap();
+        request(root.path(), &unit).unwrap();
+        let first = read(root.path(), &id)
+            .unwrap()
+            .unwrap()
+            .permission("input-a", &[])
+            .unwrap();
+        assert!(
+            consume_checked(
+                root.path(),
+                &unit,
+                &first,
+                "schema_invalid",
+                "input-a",
+                &[],
+                &|| Err("stopped".into()),
+            )
+            .is_err()
+        );
+        assert!(
+            !read(root.path(), &id)
+                .unwrap()
+                .unwrap()
+                .consumed
+                .contains(&first.cause)
+        );
+        consume_checked(
+            root.path(),
+            &unit,
+            &first,
+            "schema_invalid",
+            "input-a",
+            &[],
+            &|| Ok(()),
+        )
+        .unwrap();
+        assert!(
+            consume_checked(
+                root.path(),
+                &unit,
+                &first,
+                "schema_invalid",
+                "input-a",
+                &[],
+                &|| Ok(()),
+            )
+            .is_err()
+        );
+        assert!(
+            finish_checked(root.path(), &unit, &first, Some("schema_invalid"), &|| Err(
+                "stopped".into()
+            ),)
+            .is_err()
+        );
+        let held = read(root.path(), &id).unwrap().unwrap();
+        assert!(held.consumed.contains(&first.cause));
+        assert!(held.attempt.is_some());
+        finish_checked(root.path(), &unit, &first, Some("schema_invalid"), &|| {
+            Ok(())
+        })
+        .unwrap();
+        observe_held_checked(root.path(), &unit, "schema_invalid", "input-a", &|| Ok(())).unwrap();
+        let restored = read(root.path(), &id).unwrap().unwrap();
+        assert!(restored.consumed.contains(&first.cause));
+        assert!(restored.held);
+        assert!(restored.attempt.is_none());
+    }
 }

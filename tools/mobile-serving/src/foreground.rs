@@ -3,15 +3,16 @@
 
 //! App-owned processing using the maintained discovery, Sense, think and schedule owners.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
 use serde_json::{Map, Value};
+use solstone_core_backup_web::BackupWebDeps;
 use solstone_core_cortex::{CallableCortex, CallableRoots};
 use solstone_core_cortex_client::{
     CortexRequest, CortexRequestClient, CortexRequestPolicy, WaitForUsesReport,
@@ -39,7 +40,25 @@ use solstone_core_think_cli::planner::{
 use solstone_core_think_cli::{CortexBoundary, DispatchFailure, IndexBoundary, ThinkContext};
 
 static HOST_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_LOCK: Mutex<()> = Mutex::new(());
 type Checkpoint = Arc<dyn Fn() -> bool + Send + Sync>;
+
+#[path = "scheduled_commands.rs"]
+mod scheduled_commands;
+
+const MAINTENANCE_ROUTINE_IDS: &[&str] = &[
+    "speakers:discover-voices",
+    "speakers:candidate-pair-suggestions",
+    "speakers:name-variants",
+    "speakers:consolidate-pool",
+    "speakers:backfill-pool",
+    "backup:run",
+    "backup:verify",
+    "backup:prune",
+    "health:mark-raw",
+    "health:prune-logs",
+];
 
 struct NoProcesses;
 impl ProcessStateProbe for NoProcesses {
@@ -219,9 +238,13 @@ impl CortexBoundary for HostCortexBoundary {
 
 struct HostScheduleSink {
     queue: TaskQueue,
+    journal: PathBuf,
 }
 impl ScheduleSubmissionSink for HostScheduleSink {
     fn submit(&self, request: ScheduledRequest) -> bool {
+        if !admit_command(&self.journal, request.cmd.as_wire()) {
+            return true;
+        }
         !matches!(
             self.queue.submit(ExecutionRequest::Scheduled(request)),
             solstone_core_system::queue::SubmitOutcome::Rejected
@@ -229,6 +252,7 @@ impl ScheduleSubmissionSink for HostScheduleSink {
     }
 }
 struct HostQueueSink {
+    queue: Arc<OnceLock<TaskQueue>>,
     schedule_engine: Arc<Mutex<ScheduleEngine>>,
     flush: Arc<Mutex<FlushState>>,
     cancelled: Checkpoint,
@@ -277,19 +301,28 @@ impl TaskQueueEventSink for HostQueueSink {
                     }
                 }
             }
-            let parts = reference.split(':').collect::<Vec<_>>();
-            if parts.len() >= 3
-                && parts[0] == "sched"
-                && let Ok(engine) = self.schedule_engine.lock()
-            {
-                if (self.cancelled)() {
-                    return;
-                }
+            if (self.cancelled)() {
+                return;
+            }
+            let Some(queue) = self.queue.get() else {
+                log::warn!("foreground schedule stopped before its queue was installed");
+                return;
+            };
+            let Some(name) = queue
+                .history()
+                .into_iter()
+                .rev()
+                .find(|record| record.reference == reference)
+                .and_then(|record| record.scheduler_name)
+            else {
+                return;
+            };
+            if let Ok(engine) = self.schedule_engine.lock() {
                 let ended_at = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map_or(0., |d| d.as_secs_f64());
                 let _ = engine.record_completion(
-                    parts[1],
+                    &name,
                     ended_at,
                     if exit_code == 0 { "success" } else { "failed" },
                     &reference,
@@ -304,59 +337,110 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)
 }
-fn admit_argv(args: &[String]) -> Option<Vec<String>> {
+fn strip_launcher(args: &[String]) -> Vec<String> {
     let mut args = args.to_vec();
     while args
         .first()
-        .is_some_and(|s| s == "solstone" || s == "journal")
+        .is_some_and(|arg| arg == "solstone" || arg == "journal")
     {
         args.remove(0);
     }
-    if args.first().map(String::as_str) != Some("think") {
-        return None;
-    }
-    args.remove(0);
-    if args.iter().any(|arg| {
-        matches!(
-            arg.as_str(),
-            "--weekly" | "--daily-only" | "--refresh" | "--from-scratch" | "--segments"
-        )
-    }) {
-        return None;
-    }
-    let has = |flag: &str| args.iter().any(|arg| arg == flag);
-    let value = |flag: &str| {
-        args.iter()
-            .position(|arg| arg == flag)
-            .and_then(|i| args.get(i + 1))
-    };
-    if has("--cadence")
-        || (has("--settle") && value("--stream").is_some())
-        || (has("--segment") && value("--day").is_some() && value("--stream").is_some())
-        || (has("--activity") && value("--day").is_some() && value("--facet").is_some())
-        || (value("--retry-unit").is_some_and(|v| !v.is_empty())
-            && value("--retry-cause").is_some()
-            && value("--day").is_some())
+    args
+}
+
+fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.windows(2)
+        .find(|pair| pair[0] == flag)
+        .map(|pair| pair[1].as_str())
+}
+
+fn has_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|arg| arg == flag)
+}
+
+fn think_admitted(args: &[String]) -> bool {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--refresh" | "--segments"))
     {
-        Some(args)
-    } else {
-        None
+        return false;
+    }
+    if has_flag(args, "--from-scratch") {
+        return flag_value(args, "--day").is_some()
+            && flag_value(args, "--work-intent").is_some_and(|id| !id.is_empty())
+            && !has_flag(args, "--weekly")
+            && !has_flag(args, "--daily-only");
+    }
+    if has_flag(args, "--weekly") {
+        return true;
+    }
+    if has_flag(args, "--daily-only") {
+        return flag_value(args, "--day").is_some();
+    }
+    has_flag(args, "--cadence")
+        || (has_flag(args, "--settle") && flag_value(args, "--stream").is_some())
+        || (has_flag(args, "--segment")
+            && flag_value(args, "--day").is_some()
+            && flag_value(args, "--stream").is_some())
+        || (has_flag(args, "--activity")
+            && flag_value(args, "--day").is_some()
+            && flag_value(args, "--facet").is_some())
+        || (flag_value(args, "--retry-unit").is_some_and(|id| !id.is_empty())
+            && flag_value(args, "--retry-cause").is_some()
+            && flag_value(args, "--day").is_some())
+}
+
+fn exact_command(args: &[String]) -> bool {
+    match args {
+        [command] if command == "heartbeat" || command == "facet-candidates" => true,
+        [command, verb] if command == "brain" && verb == "refresh" => true,
+        [command, flag] if command == "indexer" && flag == "--rebuild-edges" => true,
+        [command, verb, id]
+            if command == "maintenance"
+                && verb == "run"
+                && MAINTENANCE_ROUTINE_IDS.contains(&id.as_str()) =>
+        {
+            true
+        }
+        _ => false,
     }
 }
+
+fn admit_argv(args: &[String]) -> Option<Vec<String>> {
+    let args = strip_launcher(args);
+    let [command, rest @ ..] = args.as_slice() else {
+        return None;
+    };
+    if command != "think" || !think_admitted(rest) {
+        return None;
+    }
+    Some(rest.to_vec())
+}
+
 fn admit_command(journal: &Path, raw: &[String]) -> bool {
-    let Some(args) = admit_argv(raw) else {
+    let args = strip_launcher(raw);
+    let [command, rest @ ..] = args.as_slice() else {
         return false;
     };
-    if let Some(i) = args.iter().position(|arg| arg == "--retry-unit") {
-        let Some(id) = args.get(i + 1) else {
+    if command == "think" {
+        if !think_admitted(rest) {
             return false;
-        };
-        return matches!(
-            solstone_core_system::work_retry::read(journal, id),
-            Ok(Some(record)) if !matches!(record.unit, solstone_core_system::work_retry::Unit::Daily { .. })
-        );
+        }
+        if let Some(id) = flag_value(rest, "--retry-unit") {
+            return matches!(
+                solstone_core_system::work_retry::read(journal, id),
+                Ok(Some(record)) if matches!(
+                    record.unit,
+                    solstone_core_system::work_retry::Unit::Raw { .. }
+                        | solstone_core_system::work_retry::Unit::Segment { .. }
+                        | solstone_core_system::work_retry::Unit::Activity { .. }
+                        | solstone_core_system::work_retry::Unit::Daily { .. }
+                )
+            );
+        }
+        return true;
     }
-    true
+    exact_command(&args)
 }
 
 #[cfg(feature = "audio")]
@@ -475,6 +559,7 @@ impl SenseExecutor for HostSenseExecutor {
 
 struct HostedCommand {
     journal: PathBuf,
+    root: Arc<JournalRoot>,
     talent_root: PathBuf,
     apps_root: PathBuf,
     templates_dir: PathBuf,
@@ -482,11 +567,14 @@ struct HostedCommand {
     cancelled: Checkpoint,
     cortex_owner: Arc<CallableCortex>,
     failed: Arc<AtomicBool>,
+    backup: BackupWebDeps,
     #[cfg(feature = "audio")]
     audio_state: Arc<Mutex<Option<AudioConfig>>>,
 }
 pub struct ForegroundProcessingHost {
     journal: PathBuf,
+    /// Held so the canonical root stays bound until the host drops.
+    #[allow(dead_code)]
     root: Arc<JournalRoot>,
     queue: TaskQueue,
     schedule_engine: Arc<Mutex<ScheduleEngine>>,
@@ -505,29 +593,36 @@ pub struct ForegroundProcessingHost {
 }
 
 impl ForegroundProcessingHost {
-    pub fn open(journal: &Path, payload: &Path) -> Result<Self, String> {
+    pub fn open(journal: &Path, payload: &Path, backup: BackupWebDeps) -> Result<Self, String> {
         let now = ScheduleNow::in_zone(
             Utc::now(),
             solstone_core_journal_config::owner_zone(journal),
         );
-        Self::open_internal(journal, payload, now, None)
+        Self::open_internal(journal, payload, now, None, backup)
     }
-    pub fn open_at(journal: &Path, payload: &Path, now: ScheduleNow) -> Result<Self, String> {
-        Self::open_internal(journal, payload, now, None)
+    pub fn open_at(
+        journal: &Path,
+        payload: &Path,
+        now: ScheduleNow,
+        backup: BackupWebDeps,
+    ) -> Result<Self, String> {
+        Self::open_internal(journal, payload, now, None, backup)
     }
     pub fn open_with_executor(
         journal: &Path,
         payload: &Path,
         now: ScheduleNow,
         executor: Arc<dyn GenerateExecutor + Send + Sync>,
+        backup: BackupWebDeps,
     ) -> Result<Self, String> {
-        Self::open_internal(journal, payload, now, Some(executor))
+        Self::open_internal(journal, payload, now, Some(executor), backup)
     }
     fn open_internal(
         journal: &Path,
         payload: &Path,
         now: ScheduleNow,
         executor: Option<Arc<dyn GenerateExecutor + Send + Sync>>,
+        backup: BackupWebDeps,
     ) -> Result<Self, String> {
         let root = Arc::new(JournalRoot::open(journal).map_err(|e| e.to_string())?);
         Self::open_bound(
@@ -537,6 +632,7 @@ impl ForegroundProcessingHost {
             executor,
             Arc::new(|| false),
             Arc::new(AtomicBool::new(false)),
+            backup,
         )
     }
     pub fn open_with_cancellation(
@@ -544,12 +640,13 @@ impl ForegroundProcessingHost {
         payload: &Path,
         external: Checkpoint,
         stop: Arc<AtomicBool>,
+        backup: BackupWebDeps,
     ) -> Result<Self, String> {
         let now = ScheduleNow::in_zone(
             Utc::now(),
             solstone_core_journal_config::owner_zone(root.canonical_path()),
         );
-        Self::open_bound(root, payload, now, None, external, stop)
+        Self::open_bound(root, payload, now, None, external, stop, backup)
     }
     fn open_bound(
         root: Arc<JournalRoot>,
@@ -558,6 +655,7 @@ impl ForegroundProcessingHost {
         executor: Option<Arc<dyn GenerateExecutor + Send + Sync>>,
         external: Checkpoint,
         stop: Arc<AtomicBool>,
+        backup: BackupWebDeps,
     ) -> Result<Self, String> {
         if HOST_ACTIVE
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -599,13 +697,36 @@ impl ForegroundProcessingHost {
                 .map_err(|e| e.to_string())?;
             let (mut engine, _) =
                 ScheduleEngine::init(&config, &state, now).map_err(|e| e.to_string())?;
-            engine.register_defaults().map_err(|e| e.to_string())?;
+            let mut fresh = BTreeSet::new();
+            match engine.register_defaults() {
+                Ok(added) => fresh.extend(added),
+                Err(error) => log::warn!("foreground schedule defaults: {error}"),
+            }
+            match solstone_core_maintenance::schedule_sync::sync(
+                &config,
+                solstone_core_maintenance::registry::routines(),
+            ) {
+                Ok(summary) => {
+                    fresh.extend(
+                        summary
+                            .added
+                            .iter()
+                            .map(|id| solstone_core_maintenance::schedule_sync::schedule_name(id)),
+                    );
+                    match ScheduleEngine::init(&config, &state, now) {
+                        Ok((reloaded, _)) => engine = reloaded,
+                        Err(error) => log::warn!("foreground schedule reload: {error}"),
+                    }
+                }
+                Err(error) => log::warn!("foreground schedule sync: {error}"),
+            }
             let schedule_engine = Arc::new(Mutex::new(engine));
             let flush = Arc::new(Mutex::new(FlushState::default()));
             #[cfg(feature = "audio")]
             let audio_state = Arc::new(Mutex::new(None));
             let hosted = Arc::new(HostedCommand {
                 journal: journal.clone(),
+                root: Arc::clone(&root),
                 talent_root: payload.join("solstone/talent"),
                 apps_root: payload.join("solstone/apps"),
                 templates_dir: payload.join("solstone/think/templates"),
@@ -613,6 +734,7 @@ impl ForegroundProcessingHost {
                 cancelled: Arc::clone(&cancelled),
                 cortex_owner,
                 failed: Arc::clone(&failed),
+                backup,
                 #[cfg(feature = "audio")]
                 audio_state: Arc::clone(&audio_state),
             });
@@ -620,6 +742,7 @@ impl ForegroundProcessingHost {
                 Arc::new(move |args, stop| Self::execute_command(&hosted, args, stop));
             let admitted_journal = journal.clone();
             let admitted_cancelled = Arc::clone(&cancelled);
+            let queue_slot = Arc::new(OnceLock::new());
             let queue = TaskQueue::with_callable_worker_and_admission(
                 TaskQueueOptions {
                     #[cfg(windows)]
@@ -628,6 +751,7 @@ impl ForegroundProcessingHost {
                     cap_resolver: Arc::new(DefaultCapResolver::default()),
                     process_state_probe: Arc::new(NoProcesses),
                     queue_sink: Some(Arc::new(HostQueueSink {
+                        queue: Arc::clone(&queue_slot),
                         schedule_engine: Arc::clone(&schedule_engine),
                         flush: Arc::clone(&flush),
                         cancelled: Arc::clone(&cancelled),
@@ -643,6 +767,18 @@ impl ForegroundProcessingHost {
                     !admitted_cancelled() && admit_command(&admitted_journal, args)
                 }),
             );
+            if queue_slot.set(queue.clone()).is_err() {
+                log::warn!("foreground schedule queue was already installed");
+            } else if let Ok(mut engine) = schedule_engine.lock() {
+                engine.catch_up(
+                    now,
+                    &HostScheduleSink {
+                        queue: queue.clone(),
+                        journal: journal.clone(),
+                    },
+                    &fresh,
+                );
+            }
             let discovery_checkpoint = Arc::clone(&cancelled);
             let discovery = WorkDiscovery::new_with_talent_roots_and_checkpoint(
                 journal.clone(),
@@ -692,7 +828,9 @@ impl ForegroundProcessingHost {
         if !admit_command(&hosted.journal, raw) || (hosted.cancelled)() || control.is_cancelled() {
             return 1;
         }
-        let args = admit_argv(raw).expect("admitted command");
+        let Some(args) = admit_argv(raw) else {
+            return scheduled_commands::run(hosted, &strip_launcher(raw));
+        };
         let value = |flag: &str| {
             args.iter()
                 .position(|arg| arg == flag)
@@ -765,6 +903,47 @@ impl ForegroundProcessingHost {
                 deadline: Instant::now() + Duration::from_secs(480),
             },
         )
+    }
+    /// One discovery wake, then the host queue. Joining stops callable workers,
+    /// so it waits until a command submitted by this wake has finished.
+    ///
+    /// Analysis stays deferred until this pass publishes. The pass admits a
+    /// daily retry and then reads that unit again under the execution claim;
+    /// the command must not be between its own claims during that read.
+    #[cfg(all(test, not(feature = "full-tests")))]
+    pub fn deliver_discovery_once(&self) {
+        let finished = self.queue.history().len();
+        let promised = discovery_promise(&self.journal);
+        hold_analysis(&self.journal, true);
+        if let Some(discovery) = self.discovery.lock().unwrap().as_ref() {
+            discovery.request();
+        }
+        for _ in 0..1_000_000 {
+            if self.queue.history().len() > finished {
+                break;
+            }
+            if discovery_promise(&self.journal).is_some_and(|promise| Some(promise) != promised) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        hold_analysis(&self.journal, false);
+        self.queue.resume_processing();
+        if self
+            .queue
+            .any_reference(|reference| reference.starts_with("supervisor-"))
+        {
+            for _ in 0..1_000_000 {
+                if self.queue.history().len() > finished {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
+        self.queue.resume_processing();
+        self.queue
+            .join_callable_workers()
+            .expect("callable workers");
     }
     fn executor(&self) -> Arc<HostSenseExecutor> {
         Arc::new(HostSenseExecutor {
@@ -847,6 +1026,7 @@ impl ForegroundProcessingHost {
                             now,
                             &HostScheduleSink {
                                 queue: queue.clone(),
+                                journal: journal.clone(),
                             },
                         ) {
                             log::warn!("foreground schedule: {error}");
@@ -866,6 +1046,7 @@ impl ForegroundProcessingHost {
             now,
             &HostScheduleSink {
                 queue: self.queue.clone(),
+                journal: self.journal.clone(),
             },
         )
     }
@@ -963,6 +1144,7 @@ impl ForegroundProcessingHost {
                 &ChildLaunchContext::default(),
                 None,
                 executor.clone(),
+                solstone_core_sense::dispatch::BatchMarkerPolicy::AdvanceStream,
             ) {
                 Ok(()) | Err(solstone_core_sense::batch::BatchError::LeaseContended { .. }) => {}
                 Err(solstone_core_sense::batch::BatchError::WorkerJoin) => {
@@ -1008,6 +1190,43 @@ impl ForegroundProcessingHost {
         Ok(())
     }
 }
+
+#[cfg(all(test, not(feature = "full-tests")))]
+fn discovery_promise(journal: &Path) -> Option<i64> {
+    solstone_core_system::work_inventory::read(journal)
+        .ok()
+        .flatten()
+        .and_then(|report| report.next_pass_ms)
+}
+
+#[cfg(all(test, not(feature = "full-tests")))]
+fn hold_analysis(journal: &Path, held: bool) {
+    let path = journal.join("config/journal.json");
+    let mut value: Value =
+        serde_json::from_slice(&fs::read(&path).expect("journal config")).expect("journal config");
+    let processing = value
+        .as_object_mut()
+        .expect("journal config object")
+        .entry("processing")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let processing = processing.as_object_mut().expect("processing object");
+    processing.insert("history_confirmed".into(), Value::Bool(true));
+    if held {
+        processing.insert("mode".into(), Value::String("deferred".into()));
+        processing.insert(
+            "gate".into(),
+            serde_json::json!({
+                "time_window": {"enabled": true, "start": "00:00", "end": "00:00"},
+                "display_powersave": {"enabled": false}
+            }),
+        );
+    } else {
+        processing.remove("mode");
+        processing.remove("gate");
+    }
+    fs::write(&path, serde_json::to_vec(&value).expect("journal config")).expect("journal config");
+}
+
 impl Drop for ForegroundProcessingHost {
     fn drop(&mut self) {
         let _ = self.shutdown();
@@ -1107,7 +1326,9 @@ mod tests {
         }
     }
 
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    fn backup_deps(journal: &Path) -> BackupWebDeps {
+        BackupWebDeps::new(journal.to_path_buf())
+    }
 
     fn setup_test_journal() -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
@@ -1142,6 +1363,7 @@ mod tests {
             &payload,
             start_time,
             Arc::new(StubGenerateExecutor),
+            backup_deps(temp.path()),
         )
         .unwrap();
 
@@ -1201,6 +1423,7 @@ mod tests {
             &payload,
             now,
             Arc::new(StubGenerateExecutor),
+            backup_deps(temp.path()),
         )
         .unwrap();
 
@@ -1299,6 +1522,7 @@ mod tests {
             &payload,
             now,
             Arc::new(StubGenerateExecutor),
+            backup_deps(temp.path()),
         )
         .unwrap();
 
@@ -1347,6 +1571,7 @@ mod tests {
             &payload,
             now,
             Arc::new(StubGenerateExecutor),
+            backup_deps(temp.path()),
         )
         .unwrap();
 
@@ -1410,6 +1635,7 @@ mod tests {
                 chrono_tz::UTC,
             ),
             Arc::new(StubGenerateExecutor),
+            backup_deps(temp.path()),
         )
         .unwrap();
         assert_ne!(
@@ -1455,6 +1681,7 @@ mod tests {
             &payload,
             now,
             Arc::new(StubGenerateExecutor),
+            backup_deps(temp.path()),
         )
         .unwrap();
 
@@ -1534,6 +1761,7 @@ mod tests {
             &payload,
             now,
             Arc::new(StubGenerateExecutor),
+            backup_deps(temp.path()),
         )
         .unwrap();
 
@@ -1625,6 +1853,7 @@ mod tests {
             &payload,
             now,
             Arc::new(StubGenerateExecutor),
+            backup_deps(temp.path()),
         )
         .unwrap();
 
@@ -1647,26 +1876,9 @@ mod tests {
     }
 
     #[test]
-    fn retry_daily_unit_exits_before_run_and_leaves_permission_file_unchanged() {
+    fn missing_daily_retry_permission_stays_refused() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let (temp, payload) = setup_test_journal();
-
-        let unit = Unit::Daily {
-            day: "20261012".into(),
-            talent: "sense".into(),
-            facet: None,
-        };
-        let id = unit.id().unwrap();
-
-        work_retry::observe_held(temp.path(), &unit, "generate-wire-failed", "sense_input")
-            .unwrap();
-
-        let retry_file = temp
-            .path()
-            .join("health/work-retry")
-            .join(format!("{id}.json"));
-        let before_bytes = fs::read(&retry_file).unwrap();
-
         let now = ScheduleNow::in_zone(
             Utc.with_ymd_and_hms(2026, 10, 17, 12, 0, 0).unwrap(),
             chrono_tz::UTC,
@@ -1676,50 +1888,35 @@ mod tests {
             &payload,
             now,
             Arc::new(StubGenerateExecutor),
+            backup_deps(temp.path()),
         )
         .unwrap();
-
+        let id = "missing-daily-permission";
         let exit_code = host.execute_worker_command(&[
             "think".into(),
             "--day".into(),
             "20261012".into(),
             "--retry-unit".into(),
-            id.clone(),
+            id.into(),
             "--retry-cause".into(),
             "owner:unused".into(),
         ]);
-        assert_ne!(exit_code, 0, "daily retry command must exit non-zero");
-
-        let after_bytes = fs::read(&retry_file).unwrap();
-        assert_eq!(
-            before_bytes, after_bytes,
-            "retry file bytes must remain identical"
-        );
-
-        let record = work_retry::read(temp.path(), &id).unwrap().unwrap();
-        assert!(record.held, "record must still be held");
-        assert!(
-            record.attempt.is_none(),
-            "record attempt must still be None"
-        );
-
+        assert_ne!(exit_code, 0);
+        assert!(work_retry::read(temp.path(), id).unwrap().is_none());
         let health_dir = temp.path().join("chronicle/20261012/health");
         let oplogs = if health_dir.exists() {
             fs::read_dir(&health_dir)
                 .unwrap()
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    let name = e.file_name().to_string_lossy().to_string();
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    let name = entry.file_name().to_string_lossy().to_string();
                     name.contains("oplog") || name.contains("think")
                 })
                 .count()
         } else {
             0
         };
-        assert_eq!(
-            oplogs, 0,
-            "chronicle/20261012/health must contain no think oplog"
-        );
+        assert_eq!(oplogs, 0);
     }
     fn wait_for_file(path: &Path) {
         let deadline = std::time::Instant::now() + Duration::from_secs(8);
@@ -1747,6 +1944,7 @@ mod tests {
             &payload,
             ScheduleNow::in_zone(Utc::now(), chrono_tz::UTC),
             Arc::new(StubGenerateExecutor),
+            backup_deps(temp.path()),
         )
         .unwrap();
         // Isolate the Sense loop: discovery must not supply a second execution.
@@ -1790,6 +1988,7 @@ mod tests {
             &payload,
             ScheduleNow::in_zone(Utc::now(), chrono_tz::UTC),
             Arc::new(executor),
+            backup_deps(temp.path()),
         )
         .unwrap();
         host.run_sense_pass().unwrap();
@@ -1839,6 +2038,7 @@ mod tests {
             &payload,
             ScheduleNow::in_zone(Utc::now(), chrono_tz::UTC),
             Arc::new(executor),
+            backup_deps(temp.path()),
         )
         .unwrap();
         host.discovery
@@ -1873,5 +2073,703 @@ mod tests {
             root.upgrade().is_none(),
             "original root may drop only after actual drain"
         );
+    }
+}
+
+#[cfg(all(test, feature = "processing", not(feature = "full-tests")))]
+mod processing_proofs {
+    use super::*;
+    use chrono::TimeZone;
+    use serde_json::json;
+    use solstone_core_backup::Destination;
+    use solstone_core_journal_io::operational_log::fold_oplogs;
+    use solstone_core_maintenance::registry::routines;
+    use solstone_core_maintenance::schedule_sync::{
+        expected_entry, host_unscheduled, schedule_name,
+    };
+    use solstone_core_system::partition::canonical_journal_command;
+    use solstone_core_system::work_retry::{self, Unit};
+
+    fn wait_until(mut ready: impl FnMut() -> bool) {
+        for _ in 0..100_000 {
+            if ready() {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        assert!(ready());
+    }
+
+    fn owned(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_owned()).collect()
+    }
+
+    fn journal_fixture() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let payload = temp.path().join("journal-payload");
+        fs::create_dir_all(payload.join("solstone/talent")).unwrap();
+        fs::create_dir_all(payload.join("solstone/apps")).unwrap();
+        fs::create_dir_all(payload.join("solstone/think/templates")).unwrap();
+        fs::create_dir_all(temp.path().join("config")).unwrap();
+        fs::write(
+            temp.path().join("config/journal.json"),
+            json!({
+                "identity": { "timezone": "UTC" },
+                "processing": { "history_confirmed": true }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        (temp, payload)
+    }
+
+    fn open_host(journal: &Path, payload: &Path, now: DateTimeUtc) -> ForegroundProcessingHost {
+        ForegroundProcessingHost::open_at(
+            journal,
+            payload,
+            ScheduleNow::in_zone(now, chrono_tz::UTC),
+            BackupWebDeps::new(journal.to_path_buf()),
+        )
+        .unwrap()
+    }
+
+    type DateTimeUtc = chrono::DateTime<Utc>;
+
+    fn quiet_entries() -> Map<String, Value> {
+        let mut entries = Map::new();
+        for (name, tail, every, max_runtime) in [
+            ("heartbeat", &["heartbeat"][..], "daily", "10m"),
+            (
+                "weekly-agents",
+                &["think", "--weekly", "-v"][..],
+                "weekly",
+                "30m",
+            ),
+            ("cadence", &["think", "--cadence"][..], "5m", "10m"),
+            ("brain", &["brain", "refresh"][..], "daily", "5m"),
+            (
+                "facet-candidates",
+                &["facet-candidates"][..],
+                "weekly",
+                "10m",
+            ),
+            (
+                "rebuild-edges",
+                &["indexer", "--rebuild-edges"][..],
+                "weekly",
+                "10m",
+            ),
+        ] {
+            entries.insert(
+                name.to_owned(),
+                json!({
+                    "cmd": canonical_journal_command(tail.iter().copied()),
+                    "every": every,
+                    "enabled": false,
+                    "max_runtime": max_runtime,
+                }),
+            );
+        }
+        for descriptor in routines() {
+            let mut entry = expected_entry(descriptor);
+            entry["enabled"] = json!(false);
+            entries.insert(schedule_name(descriptor.id), entry);
+        }
+        entries
+    }
+
+    fn write_schedules(journal: &Path, entries: Map<String, Value>) {
+        let mut raw = Map::new();
+        raw.insert("daily_time".into(), json!("00:15"));
+        raw.insert("weekly_time".into(), json!("03:15"));
+        raw.extend(entries);
+        fs::write(
+            journal.join("config/schedules.json"),
+            serde_json::to_vec_pretty(&Value::Object(raw)).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_scheduler_state(journal: &Path, state: Value) {
+        fs::create_dir_all(journal.join("health")).unwrap();
+        fs::write(
+            journal.join("health/scheduler.json"),
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn read_json(path: &Path) -> Value {
+        serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+    }
+
+    fn scheduler_field(journal: &Path, name: &str, field: &str) -> Option<String> {
+        let path = journal.join("health/scheduler.json");
+        let bytes = fs::read(&path).ok()?;
+        serde_json::from_slice::<Value>(&bytes)
+            .ok()?
+            .get(name)?
+            .get(field)?
+            .as_str()
+            .map(str::to_owned)
+    }
+
+    fn heartbeat_events(journal: &Path, event: &str) -> usize {
+        let root = JournalRoot::open(journal).unwrap();
+        let today = chrono::Local::now().date_naive();
+        let previous = today.pred_opt().unwrap();
+        fold_oplogs(
+            root,
+            &[previous, today],
+            |count: &mut usize, entry, input| {
+                if entry.name().source().display_slug() != "heartbeat"
+                    || entry.name().run().display_slug() != "pass"
+                {
+                    return Ok(());
+                }
+                for line in std::io::BufRead::lines(std::io::BufReader::new(input)) {
+                    let line = line?;
+                    let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                        continue;
+                    };
+                    if value.get("event").and_then(Value::as_str) == Some(event) {
+                        *count += 1;
+                    }
+                }
+                Ok(())
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn routed_commands_match_the_closed_set() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = root.path();
+        assert!(!MAINTENANCE_ROUTINE_IDS.is_empty());
+        let admitted = [
+            &["think", "--cadence"][..],
+            &["think", "--settle", "--stream", "notes"][..],
+            &[
+                "think",
+                "--day",
+                "20261012",
+                "--segment",
+                "120000_1",
+                "--stream",
+                "notes",
+            ][..],
+            &[
+                "think",
+                "--day",
+                "20261012",
+                "--segment",
+                "120000_1",
+                "--stream",
+                "notes",
+                "--repair-segment",
+            ][..],
+            &[
+                "think",
+                "--day",
+                "20261012",
+                "--activity",
+                "stand",
+                "--facet",
+                "work",
+            ][..],
+            &["think", "--day", "20261012", "--daily-only"][..],
+            &[
+                "think",
+                "--day",
+                "20261012",
+                "--from-scratch",
+                "--work-intent",
+                "abc",
+            ][..],
+            &["think", "--weekly"][..],
+            &["think", "--weekly", "-v"][..],
+            &["brain", "refresh"][..],
+            &["heartbeat"][..],
+            &["facet-candidates"][..],
+            &["indexer", "--rebuild-edges"][..],
+        ];
+        for args in admitted {
+            assert!(admit_command(journal, &owned(args)), "{args:?}");
+            let mut prefixed = vec!["solstone".to_owned(), "journal".to_owned()];
+            prefixed.extend(owned(args));
+            assert!(admit_command(journal, &prefixed), "{args:?}");
+        }
+        for id in MAINTENANCE_ROUTINE_IDS {
+            assert!(admit_command(journal, &owned(&["maintenance", "run", id])));
+        }
+        let daily = Unit::Daily {
+            day: "20261012".into(),
+            talent: "summary".into(),
+            facet: None,
+        };
+        work_retry::observe_held(journal, &daily, "schema_invalid", "input").unwrap();
+        work_retry::request(journal, &daily).unwrap();
+        let daily_id = daily.id().unwrap();
+        assert!(admit_command(
+            journal,
+            &owned(&[
+                "think",
+                "--day",
+                "20261012",
+                "--retry-unit",
+                &daily_id,
+                "--retry-cause",
+                "owner:unused",
+            ])
+        ));
+        let raw = Unit::Raw {
+            day: "20261012".into(),
+            stream: "notes".into(),
+            segment: "120000_1".into(),
+            handler: "describe".into(),
+            output: "screen.jsonl".into(),
+            direct: false,
+        };
+        work_retry::observe_held(journal, &raw, "generate-wire-failed", "screen.jsonl").unwrap();
+        assert!(admit_command(
+            journal,
+            &owned(&[
+                "think",
+                "--day",
+                "20261012",
+                "--retry-unit",
+                &raw.id().unwrap(),
+                "--retry-cause",
+                "input",
+            ])
+        ));
+        for args in [
+            &["maintenance", "run", "backup:offload"][..],
+            &["think", "--day", "20261012", "--refresh"][..],
+            &["think", "--weekly", "--refresh"][..],
+            &["think", "--segments"][..],
+            &["describe"][..],
+            &["describe", "sample.png"][..],
+            &["think", "--day", "20261012"][..],
+            &["think", "--day", "20261012", "--from-scratch"][..],
+            &[
+                "think",
+                "--day",
+                "20261012",
+                "--from-scratch",
+                "--work-intent",
+                "",
+            ][..],
+            &[
+                "think",
+                "--day",
+                "20261012",
+                "--retry-unit",
+                "missing",
+                "--retry-cause",
+                "owner:unused",
+            ][..],
+        ] {
+            assert!(!admit_command(journal, &owned(args)), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn direct_commands_cover_heartbeat_recency_and_empty_skips() {
+        let _lock = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (temp, payload) = journal_fixture();
+        let now = Utc.with_ymd_and_hms(2026, 10, 17, 12, 0, 0).unwrap();
+        let host = open_host(temp.path(), &payload, now);
+        assert_eq!(host.execute_worker_command(&owned(&["heartbeat"])), 0);
+        assert_eq!(heartbeat_events(temp.path(), "pass"), 1);
+        assert_eq!(heartbeat_events(temp.path(), "pass.outcome"), 1);
+        assert_eq!(host.execute_worker_command(&owned(&["heartbeat"])), 0);
+        assert_eq!(heartbeat_events(temp.path(), "pass"), 1);
+        assert_eq!(heartbeat_events(temp.path(), "pass.outcome"), 1);
+        assert_eq!(
+            host.execute_worker_command(&owned(&["facet-candidates"])),
+            0
+        );
+        assert!(!temp.path().join("facets/review-candidates.jsonl").exists());
+        assert_eq!(
+            host.execute_worker_command(&owned(&["maintenance", "run", "health:mark-raw"])),
+            0
+        );
+        assert_eq!(
+            host.execute_worker_command(&owned(&[
+                "maintenance",
+                "run",
+                "speakers:discover-voices"
+            ])),
+            0
+        );
+    }
+
+    #[test]
+    fn unsupported_offload_does_not_complete() {
+        let _lock = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (temp, payload) = journal_fixture();
+        let mut entries = quiet_entries();
+        let name = schedule_name("backup:offload");
+        entries.get_mut(&name).unwrap()["enabled"] = json!(true);
+        entries.insert(
+            "custom-shell".into(),
+            json!({
+                "cmd": ["echo", "divergent"],
+                "every": "daily",
+                "enabled": true,
+                "max_runtime": "1m",
+            }),
+        );
+        entries.insert("broken".into(), json!("not-an-entry"));
+        write_schedules(temp.path(), entries);
+        let now = Utc.with_ymd_and_hms(2026, 10, 17, 12, 0, 0).unwrap();
+        let host = open_host(temp.path(), &payload, now);
+        let schedules = read_json(&temp.path().join("config/schedules.json"));
+        let removed = host_unscheduled().contains(&"backup:offload");
+        if removed {
+            assert!(schedules.get(&name).is_none());
+        } else {
+            assert_eq!(schedules[&name]["enabled"], json!(true));
+            assert!(scheduler_field(temp.path(), &name, "last_status").is_none());
+        }
+        assert_eq!(
+            schedules["custom-shell"]["cmd"],
+            json!(["echo", "divergent"])
+        );
+        assert_eq!(schedules["broken"], json!("not-an-entry"));
+        assert!(scheduler_field(temp.path(), "custom-shell", "last_status").is_none());
+        assert!(host.queue().history().is_empty());
+        drop(host);
+    }
+
+    #[test]
+    fn second_open_runs_a_due_entry_and_skips_a_name_added_then() {
+        let _lock = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (temp, payload) = journal_fixture();
+        let start = Utc.with_ymd_and_hms(2026, 10, 17, 12, 0, 0).unwrap();
+        let mut entries = quiet_entries();
+        entries.insert(
+            "heartbeat".into(),
+            json!({
+                "cmd": canonical_journal_command(["heartbeat"]),
+                "every": "5m",
+                "enabled": true,
+                "max_runtime": "10m",
+            }),
+        );
+        write_schedules(temp.path(), entries);
+        write_scheduler_state(
+            temp.path(),
+            json!({"heartbeat": {"last_run": start.timestamp() as f64}}),
+        );
+        let first = open_host(temp.path(), &payload, start);
+        assert!(scheduler_field(temp.path(), "heartbeat", "last_status").is_none());
+        drop(first);
+        let mut schedules = read_json(&temp.path().join("config/schedules.json"));
+        schedules.as_object_mut().unwrap().remove("cadence");
+        fs::write(
+            temp.path().join("config/schedules.json"),
+            serde_json::to_vec_pretty(&schedules).unwrap(),
+        )
+        .unwrap();
+        let later = start + chrono::Duration::minutes(6);
+        let second = open_host(temp.path(), &payload, later);
+        wait_until(|| {
+            scheduler_field(temp.path(), "heartbeat", "last_status") == Some("success".into())
+        });
+        let reference = scheduler_field(temp.path(), "heartbeat", "last_ref").unwrap();
+        assert!(reference.starts_with("sched:heartbeat:"));
+        assert!(scheduler_field(temp.path(), "cadence", "last_status").is_none());
+        let schedules = read_json(&temp.path().join("config/schedules.json"));
+        assert!(schedules.get("cadence").is_some());
+        assert_eq!(
+            schedules["maintenance:speakers:consolidate-pool"]["enabled"],
+            json!(false)
+        );
+        drop(second);
+    }
+
+    #[test]
+    fn backup_and_speaker_discovery_record_full_names() {
+        let _lock = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (temp, payload) = journal_fixture();
+        let mut entries = quiet_entries();
+        for id in ["backup:run", "speakers:discover-voices"] {
+            let name = schedule_name(id);
+            entries.get_mut(&name).unwrap()["enabled"] = json!(true);
+        }
+        write_schedules(temp.path(), entries);
+        solstone_core_backup::generate_and_store_keys(temp.path()).unwrap();
+        solstone_core_backup::set_destination(
+            temp.path(),
+            &Destination {
+                repository: temp.path().join("backup-repo").display().to_string(),
+                backend: "s3".into(),
+                credentials: Map::new(),
+            },
+        )
+        .unwrap();
+        solstone_core_backup::set_enabled(temp.path(), true).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 10, 17, 12, 0, 0).unwrap();
+        let host = open_host(temp.path(), &payload, now);
+        wait_until(|| {
+            scheduler_field(temp.path(), "maintenance:backup:run", "last_status").is_some()
+                && scheduler_field(
+                    temp.path(),
+                    "maintenance:speakers:discover-voices",
+                    "last_status",
+                )
+                .is_some()
+        });
+        assert_eq!(
+            scheduler_field(
+                temp.path(),
+                "maintenance:speakers:discover-voices",
+                "last_status"
+            )
+            .as_deref(),
+            Some("success")
+        );
+        assert_eq!(
+            scheduler_field(temp.path(), "maintenance:backup:run", "last_status").as_deref(),
+            Some("failed")
+        );
+        assert!(
+            scheduler_field(temp.path(), "maintenance:backup:run", "last_ref")
+                .unwrap()
+                .starts_with("sched:maintenance:backup:run:")
+        );
+        assert!(
+            scheduler_field(
+                temp.path(),
+                "maintenance:speakers:discover-voices",
+                "last_ref"
+            )
+            .unwrap()
+            .starts_with("sched:maintenance:speakers:discover-voices:")
+        );
+        drop(host);
+    }
+
+    #[test]
+    fn weekly_schedule_succeeds_without_a_reflection_file() {
+        let _lock = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (temp, payload) = journal_fixture();
+        fs::write(
+            temp.path().join("config/journal.json"),
+            json!({
+                "identity": { "timezone": "UTC" },
+                "processing": { "history_confirmed": true },
+                "providers": { "active": { "provider": "local" } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut entries = quiet_entries();
+        entries.get_mut("weekly-agents").unwrap()["enabled"] = json!(true);
+        write_schedules(temp.path(), entries);
+        let now = Utc.with_ymd_and_hms(2026, 10, 17, 12, 0, 0).unwrap();
+        let host = open_host(temp.path(), &payload, now);
+        wait_until(|| {
+            scheduler_field(temp.path(), "weekly-agents", "last_status") == Some("success".into())
+        });
+        let reflections = temp.path().join("reflections/weekly");
+        let pages = fs::read_dir(&reflections)
+            .map(|entries| entries.filter_map(|entry| entry.ok()).count())
+            .unwrap_or(0);
+        assert_eq!(pages, 0);
+        drop(host);
+    }
+
+    fn enable_only(journal: &Path, name: &str) {
+        let mut entries = quiet_entries();
+        entries.get_mut(name).unwrap()["enabled"] = json!(true);
+        write_schedules(journal, entries);
+    }
+
+    #[test]
+    fn due_facet_candidates_succeed_without_a_review_file() {
+        let _lock = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (temp, payload) = journal_fixture();
+        enable_only(temp.path(), "facet-candidates");
+        let now = Utc.with_ymd_and_hms(2026, 10, 17, 12, 0, 0).unwrap();
+        let host = open_host(temp.path(), &payload, now);
+        wait_until(|| {
+            scheduler_field(temp.path(), "facet-candidates", "last_status")
+                == Some("success".into())
+        });
+        assert!(!temp.path().join("facets/review-candidates.jsonl").exists());
+        drop(host);
+    }
+
+    #[test]
+    fn due_rebuild_edges_records_the_edge_index() {
+        let _lock = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (temp, payload) = journal_fixture();
+        enable_only(temp.path(), "rebuild-edges");
+        let now = Utc.with_ymd_and_hms(2026, 10, 17, 12, 0, 0).unwrap();
+        let host = open_host(temp.path(), &payload, now);
+        wait_until(|| scheduler_field(temp.path(), "rebuild-edges", "last_status").is_some());
+        let status = scheduler_field(temp.path(), "rebuild-edges", "last_status");
+        let reference = scheduler_field(temp.path(), "rebuild-edges", "last_ref").unwrap();
+        assert!(reference.starts_with("sched:rebuild-edges:"));
+        if status.as_deref() == Some("success") {
+            assert!(solstone_core_indexer_store::db::db_path(temp.path()).is_file());
+        } else {
+            assert_ne!(status.as_deref(), Some("success"));
+        }
+        drop(host);
+    }
+
+    #[test]
+    fn cancelled_brain_schedule_leaves_no_record() {
+        let _lock = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (temp, payload) = journal_fixture();
+        enable_only(temp.path(), "brain");
+        let start = Utc.with_ymd_and_hms(2026, 10, 17, 12, 0, 0).unwrap();
+        write_scheduler_state(
+            temp.path(),
+            json!({"brain": {"last_run": start.timestamp() as f64}}),
+        );
+        let host = open_host(temp.path(), &payload, start);
+        assert!(scheduler_field(temp.path(), "brain", "last_status").is_none());
+        host.request_stop();
+        let later = Utc.with_ymd_and_hms(2026, 10, 18, 12, 0, 0).unwrap();
+        host.check_schedule(ScheduleNow::in_zone(later, chrono_tz::UTC))
+            .unwrap();
+        assert!(!temp.path().join("health/brain.json").exists());
+        assert!(scheduler_field(temp.path(), "brain", "last_status").is_none());
+        assert!(
+            host.queue()
+                .history()
+                .iter()
+                .all(|record| record.exit_status != "success")
+        );
+        drop(host);
+    }
+
+    #[test]
+    fn discovered_daily_retry_consumes_permission_once() {
+        let _lock = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (temp, payload) = journal_fixture();
+        fs::write(
+            temp.path().join("config/journal.json"),
+            json!({
+                "identity": { "timezone": "UTC" },
+                "processing": { "history_confirmed": true },
+                "providers": { "active": { "provider": "local" } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let talent = payload.join("solstone/apps/entities/talent");
+        fs::create_dir_all(&talent).unwrap();
+        fs::write(
+            talent.join("entities_review.md"),
+            "{\n\"type\":\"generate\",\"schedule\":\"daily\",\"priority\":56,\"multi_facet\":true,\"always\":true,\"output\":\"json\",\"hook\":{\"pre\":\"entities:entities_review\",\"post\":\"entities:entities_review\"},\"max_output_tokens\":64\n}\nReview.\n",
+        )
+        .unwrap();
+        fs::create_dir_all(temp.path().join("facets/work")).unwrap();
+        fs::write(
+            temp.path().join("facets/work/facet.json"),
+            "{\"id\":\"11111111-1111-4111-8111-111111111111\"}\n",
+        )
+        .unwrap();
+        let today = solstone_core_system::daily_coverage::local_day(temp.path(), Utc::now());
+        fs::create_dir_all(temp.path().join("chronicle").join(&today)).unwrap();
+        let unit = Unit::Daily {
+            day: today.clone(),
+            talent: "entities:entities_review".into(),
+            facet: Some("work".into()),
+        };
+        let evidence = work_retry::daily::evidence_with_roots(
+            temp.path(),
+            &unit,
+            &payload.join("solstone/talent"),
+            &payload.join("solstone/apps"),
+        )
+        .unwrap();
+        assert_ne!(
+            evidence.revision_under(&evidence.contract),
+            "stale-revision"
+        );
+        let identity = solstone_core_journal_io::DailyUnitIdentity::new(
+            &today,
+            "entities:entities_review",
+            Some("work".into()),
+        );
+        let mut record = solstone_core_journal_io::DailyUnitRecord::new(
+            identity,
+            "stale-revision",
+            evidence.contract.clone(),
+        );
+        record.status = solstone_core_journal_io::DailyUnitStatus::Capped;
+        record.reason_code = Some("daily_failed".into());
+        solstone_core_journal_io::save_daily_unit_record(temp.path(), &record).unwrap();
+        write_schedules(temp.path(), quiet_entries());
+        let now = Utc.with_ymd_and_hms(2026, 10, 17, 12, 0, 0).unwrap();
+        let host = open_host(temp.path(), &payload, now);
+        assert!(host.queue().history().is_empty());
+        host.deliver_discovery_once();
+        let history = host.queue().history();
+        assert_eq!(
+            history.len(),
+            1,
+            "status={:?}",
+            history.first().map(|record| record.exit_status.as_str())
+        );
+        let command = &history[0].command;
+        let unit_id = unit.id().unwrap();
+        assert!(
+            command
+                .windows(2)
+                .any(|pair| { pair[0] == "--retry-unit" && pair[1] == unit_id })
+        );
+        assert!(command.iter().all(|arg| arg != "--from-scratch"));
+        assert!(command.iter().all(|arg| arg != "--work-intent"));
+        let cause = command
+            .windows(2)
+            .find(|pair| pair[0] == "--retry-cause")
+            .map(|pair| pair[1].clone())
+            .unwrap();
+        let stored = work_retry::read(temp.path(), &unit_id).unwrap().unwrap();
+        assert!(stored.owner.is_none());
+        assert_eq!(
+            stored
+                .consumed
+                .iter()
+                .filter(|item| *item == &cause)
+                .count(),
+            1,
+            "cause={cause} consumed={:?} status={} cmd={command:?}",
+            stored.consumed,
+            history[0].exit_status
+        );
+        let consumed = stored.consumed.clone();
+        host.deliver_discovery_once();
+        let again = work_retry::read(temp.path(), &unit_id).unwrap().unwrap();
+        assert_eq!(again.consumed, consumed);
+        assert_eq!(host.queue().history().len(), 1);
+        drop(host);
     }
 }

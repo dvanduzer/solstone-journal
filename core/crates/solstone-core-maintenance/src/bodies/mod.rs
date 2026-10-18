@@ -2,5 +2,5 @@
 // Copyright (c) 2026 sol pbc
 
 pub(crate) mod backup;
-pub(crate) mod health;
+pub mod health;
 pub(crate) mod speakers;

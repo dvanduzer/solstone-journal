@@ -272,13 +272,20 @@ pub(crate) fn execute_with_paths(
                 None => work_retry::daily::evidence(&context.journal, &unit)?,
             };
             let input = evidence.retry_revision_under(work_retry::daily::INPUT_CONTRACT);
-            work_retry::consume(
+            work_retry::consume_checked(
                 &context.journal,
                 &unit,
                 &attempt,
                 &attempt.reason,
                 &input,
                 work_retry::DECLARED_FIXES,
+                &|| {
+                    if cancellation.is_cancelled() {
+                        Err("thinking cancelled".into())
+                    } else {
+                        Ok(())
+                    }
+                },
             )
         })();
         if let Err(error) = permission {

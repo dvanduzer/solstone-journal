@@ -5,7 +5,8 @@
 
 #[cfg(any(not(test), feature = "full-tests"))]
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 #[cfg(any(not(test), feature = "full-tests"))]
 use std::thread;
 use std::time::Duration;
@@ -37,6 +38,15 @@ pub(crate) trait PhaseProcessRunner {
 
 pub(crate) struct NativePhaseProcessRunner;
 
+/// In-process indexer and journal-stats phases for a hosted think context.
+///
+/// The desktop runner stays [`NativePhaseProcessRunner`]. This one does not spawn.
+pub(crate) struct HostedPhaseRunner {
+    pub(crate) talent_root: PathBuf,
+    pub(crate) apps_root: PathBuf,
+    pub(crate) cancel_checkpoint: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
 impl PhaseProcessRunner for NativePhaseProcessRunner {
     fn run(
         &self,
@@ -54,6 +64,52 @@ impl PhaseProcessRunner for NativePhaseProcessRunner {
         {
             let _ = (phase, command, journal, day, timeout);
             PhaseProcessOutcome::Exited(0)
+        }
+    }
+}
+
+impl PhaseProcessRunner for HostedPhaseRunner {
+    fn run(
+        &self,
+        phase: &'static str,
+        command: Vec<String>,
+        journal: &Path,
+        day: &str,
+        timeout: Duration,
+    ) -> PhaseProcessOutcome {
+        let _ = (command, day, timeout);
+        match phase {
+            "indexer" => {
+                if (self.cancel_checkpoint)() {
+                    return PhaseProcessOutcome::Exited(1);
+                }
+                match solstone_core_indexer_store::scan::scan_journal(journal, false) {
+                    Ok(_) => PhaseProcessOutcome::Exited(0),
+                    Err(_) => PhaseProcessOutcome::Exited(1),
+                }
+            }
+            "journal_stats" => {
+                if (self.cancel_checkpoint)() {
+                    return PhaseProcessOutcome::Exited(1);
+                }
+                let backlog = solstone_core_journal_stats_cli::FilesystemBacklogViewReader;
+                let documents = solstone_core_journal_stats_cli::FilesystemDocumentWriter;
+                let run = solstone_core_journal_stats_cli::run_cli(
+                    &[],
+                    journal,
+                    chrono::Utc::now(),
+                    &self.talent_root,
+                    &self.apps_root,
+                    &backlog,
+                    &documents,
+                );
+                if run.exit_code == 0 {
+                    PhaseProcessOutcome::Exited(0)
+                } else {
+                    PhaseProcessOutcome::Exited(1)
+                }
+            }
+            _ => PhaseProcessOutcome::Exited(1),
         }
     }
 }
@@ -110,6 +166,71 @@ fn run_owned_process(
             return PhaseProcessOutcome::TimedOut { cleanup_error };
         }
         thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(test)]
+mod hosted_tests {
+    use super::*;
+
+    fn runner(cancel: bool) -> HostedPhaseRunner {
+        let root = PathBuf::from("payload");
+        HostedPhaseRunner {
+            talent_root: root.join("talent"),
+            apps_root: root.join("apps"),
+            cancel_checkpoint: Arc::new(move || cancel),
+        }
+    }
+
+    #[test]
+    fn cancelled_hosted_phases_do_not_write() {
+        let journal = tempfile::tempdir().expect("journal");
+        let runner = runner(true);
+        for phase in ["indexer", "journal_stats"] {
+            let outcome = runner.run(
+                phase,
+                Vec::new(),
+                journal.path(),
+                "20261018",
+                Duration::from_secs(1),
+            );
+            assert!(matches!(outcome, PhaseProcessOutcome::Exited(1)));
+        }
+        assert!(!journal.path().join("indexer").exists());
+        assert!(
+            !journal
+                .path()
+                .join("chronicle")
+                .read_dir()
+                .map(|mut entries| entries.next().is_some())
+                .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn open_hosted_indexer_accepts_an_empty_journal() {
+        let journal = tempfile::tempdir().expect("journal");
+        let outcome = runner(false).run(
+            "indexer",
+            Vec::new(),
+            journal.path(),
+            "20261018",
+            Duration::from_secs(1),
+        );
+        assert!(matches!(outcome, PhaseProcessOutcome::Exited(0)));
+    }
+
+    #[test]
+    fn unknown_hosted_phase_fails_closed() {
+        let journal = tempfile::tempdir().expect("journal");
+        let outcome = runner(false).run(
+            "sense_batch",
+            Vec::new(),
+            journal.path(),
+            "20261018",
+            Duration::from_secs(1),
+        );
+        assert!(matches!(outcome, PhaseProcessOutcome::Exited(1)));
     }
 }
 

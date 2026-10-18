@@ -247,6 +247,7 @@ pub fn run_cli_with_discovery_generation(
 pub enum EmbeddedBackupRoutine {
     Run,
     Verify,
+    Prune,
 }
 
 /// Run an app-owned backup maintenance request through the production command
@@ -262,9 +263,20 @@ pub fn run_embedded_backup(
     http: &dyn HttpTransport,
     executable: &Path,
 ) -> CliRun {
+    // iOS has no forget/prune worker. Refuse before tool resolution, unlock,
+    // key neutralization, or the prune record.
+    #[cfg(target_os = "ios")]
+    if matches!(routine, EmbeddedBackupRoutine::Prune) {
+        return CliRun {
+            stdout: "backup prune: error reason=refused detail=prune is not available\n".to_owned(),
+            stderr: String::new(),
+            exit_code: 1,
+        };
+    }
     let id = match routine {
         EmbeddedBackupRoutine::Run => "backup:run",
         EmbeddedBackupRoutine::Verify => "backup:verify",
+        EmbeddedBackupRoutine::Prune => "backup:prune",
     };
     run_cli_with_deps(
         &["run".to_owned(), id.to_owned()],
@@ -2554,5 +2566,32 @@ mod resolution_tests {
             Some(code::RESTART_TO_FINISH_UPDATE)
         );
         assert!(runner.programs.borrow().is_empty());
+    }
+
+    #[cfg(target_os = "ios")]
+    #[test]
+    fn ios_prune_refuses_before_tool_resolution() {
+        struct RefuseRunner;
+        impl ToolRunner for RefuseRunner {
+            fn run(&self, _: &ToolRequest<'_>) -> io::Result<ToolOutput> {
+                panic!("ios prune must not run a tool");
+            }
+        }
+        struct RefuseHttp;
+        impl HttpTransport for RefuseHttp {
+            fn execute(&self, _: &HttpRequest) -> Result<HttpResponse, HttpError> {
+                panic!("ios prune must not call http");
+            }
+        }
+        let journal = tempfile::tempdir().expect("journal");
+        let run = run_embedded_backup(
+            journal.path(),
+            EmbeddedBackupRoutine::Prune,
+            &RefuseRunner,
+            &RefuseHttp,
+            Path::new("unused"),
+        );
+        assert_ne!(run.exit_code, 0);
+        assert!(run.stderr.is_empty());
     }
 }

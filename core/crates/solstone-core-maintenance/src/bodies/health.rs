@@ -44,7 +44,7 @@ struct PruneError {
     hint: Option<String>,
 }
 
-pub(crate) fn run(id: &str, args: &[String], journal: &Path, services: &HealthServices) -> CliRun {
+pub fn run(id: &str, args: &[String], journal: &Path, services: &HealthServices) -> CliRun {
     match id {
         "health:mark-raw" if args.is_empty() => mark_raw(journal, services),
         "health:mark-raw" => usage_error("health:mark-raw", args, ""),
