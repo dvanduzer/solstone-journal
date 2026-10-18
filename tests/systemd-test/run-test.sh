@@ -321,7 +321,7 @@ UNIT
         # the same state transition as an owner, instead of manufacturing
         # setup.completed_at in the journal fixture.
         log "local-thinking-install: complete loopback onboarding ceremony"
-        docker exec -u "$TEST_USER" "$CONTAINER" bash -lc '
+        docker exec -e LOCAL_THINKING_EXPECT="$LOCAL_THINKING_EXPECT" -u "$TEST_USER" "$CONTAINER" bash -lc '
             set -euo pipefail
             port=$(cat "$HOME/journal/health/convey.port")
             origin="http://127.0.0.1:${port}"
@@ -334,8 +334,19 @@ UNIT
             curl --fail-with-body --silent --show-error \
                 -X POST -H "Content-Type: application/json" -d "{\"proposal_id\":\"${proposal_id}\"}" \
                 "$origin/init/mark/lock" >/tmp/init-mark-lock.json
+            # Finishing setup with "local" starts the local install itself and
+            # is refused where local thinking cannot run, so finish with
+            # "later" and drive the install through the portal below. Where
+            # the refusal is expected, first prove setup refuses "local".
+            if [ "$LOCAL_THINKING_EXPECT" = "refusal" ]; then
+                code=$(curl --silent --output /tmp/init-finalize-local.json --write-out "%{http_code}" \
+                    -X POST -H "Content-Type: application/json" -d "{\"lane\":\"local\"}" \
+                    "$origin/init/finalize")
+                test "$code" = 400
+                grep -q local_unavailable /tmp/init-finalize-local.json
+            fi
             curl --fail-with-body --silent --show-error \
-                -X POST -H "Content-Type: application/json" -d "{\"lane\":\"local\"}" \
+                -X POST -H "Content-Type: application/json" -d "{\"lane\":\"later\"}" \
                 "$origin/init/finalize" >/tmp/init-finalize.json
         '
 
