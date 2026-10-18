@@ -606,7 +606,10 @@ pub(super) fn publish(
     let ledger_path = ledger.sealed_ledger_path(generation);
     if ledger_path.exists() {
         let existing_bytes = fs::read(&ledger_path)?;
-        if spools.existing_ledger_matches(&existing_bytes)? {
+        let Some(matches) = spools.existing_ledger_matches(&existing_bytes, authority)? else {
+            return Ok(PublicationOutcome::BudgetExpired);
+        };
+        if matches {
             #[cfg(test)]
             if LEGACY_LEDGER_MUTATION_FAULT.with(|fault| fault.get()) {
                 fs::write(&ledger_path, b"[]")?;

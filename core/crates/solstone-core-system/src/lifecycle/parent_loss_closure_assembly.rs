@@ -8,6 +8,9 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 
+#[path = "parent_loss_closure_legacy.rs"]
+mod legacy;
+
 #[derive(Serialize, Deserialize)]
 struct RunCommit {
     schema: u32,
@@ -513,10 +516,6 @@ pub(super) fn merge(
         {
             return Err(unverifiable_admission());
         }
-        // Large finalization gets a fresh slice rather than competing with the last merge segment.
-        if all_ids.len() > RECOVERY_BATCH_LIMIT {
-            return Ok(None);
-        }
     }
     let mut spools = Spools {
         dir: dir.to_owned(),
@@ -547,6 +546,44 @@ pub(super) fn merge(
 }
 
 impl Spools {
+    fn read_span(
+        &self,
+        file: &mut fs::File,
+        sealed: bool,
+        span: &Span,
+    ) -> Result<Vec<u8>, ParentLossLedgerError> {
+        let (start, end, expected) = if sealed {
+            (span.sealed_start, span.sealed_end, &span.sealed_digest)
+        } else {
+            (
+                span.admission_start,
+                span.admission_end,
+                &span.admission_digest,
+            )
+        };
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = vec![0; (end - start) as usize];
+        file.read_exact(&mut bytes)?;
+        #[cfg(test)]
+        ASSEMBLY_SPOOL_READ_BYTES.with(|count| count.set(count.get() + bytes.len()));
+        let expected_rows = if sealed {
+            span.sealed_rows
+        } else {
+            span.last_row - span.first_row
+        };
+        if digest_bytes(&bytes) != *expected
+            || bytes
+                .split(|b| *b == b'\n')
+                .filter(|row| !row.is_empty())
+                .count()
+                != expected_rows
+        {
+            reset(&self.dir)?;
+            return Err(unverifiable_admission());
+        }
+        Ok(bytes)
+    }
+
     /// Each buffer is authenticated against a separate writer commit before it
     /// supplies output bytes. Do not mint a final digest from a mutable reread.
     fn consume(
@@ -565,36 +602,7 @@ impl Spools {
             return Err(unverifiable_admission());
         }
         for span in &self.commit.spans {
-            let (start, end, expected) = if sealed {
-                (span.sealed_start, span.sealed_end, &span.sealed_digest)
-            } else {
-                (
-                    span.admission_start,
-                    span.admission_end,
-                    &span.admission_digest,
-                )
-            };
-            let mut bytes = vec![0; (end - start) as usize];
-            file.read_exact(&mut bytes)?;
-            #[cfg(test)]
-            ASSEMBLY_SPOOL_READ_BYTES.with(|count| count.set(count.get() + bytes.len()));
-            if digest_bytes(&bytes) != *expected {
-                reset(&self.dir)?;
-                return Err(unverifiable_admission());
-            }
-            let actual_rows = bytes
-                .split(|b| *b == b'\n')
-                .filter(|row| !row.is_empty())
-                .count();
-            let expected_rows = if sealed {
-                span.sealed_rows
-            } else {
-                span.last_row - span.first_row
-            };
-            if actual_rows != expected_rows {
-                reset(&self.dir)?;
-                return Err(unverifiable_admission());
-            }
+            let bytes = self.read_span(&mut file, sealed, span)?;
             consume(&bytes)?;
         }
         Ok(())
@@ -658,43 +666,13 @@ impl Spools {
     pub(super) fn existing_ledger_matches(
         &self,
         existing: &[u8],
-    ) -> Result<bool, ParentLossLedgerError> {
-        // Keep one immutable legacy byte snapshot through comparison and staging.
-        // A valid non-array root was inequality in the original whole-Value comparator.
-        if existing.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'[') {
-            let _: serde_json::Value = serde_json::from_slice(existing)?;
-            return Ok(false);
-        }
-        let mut expected_rows = Vec::new();
-        let mut ordinal = 0;
-        self.consume(true, |bytes| {
-            for row in bytes.split(|b| *b == b'\n').filter(|r| !r.is_empty()) {
-                let id = self
-                    .sealed_ids
-                    .get(ordinal)
-                    .ok_or_else(unverifiable_admission)?;
-                let prefix = format!("{{\"launch_id\":{},", serde_json::to_string(id)?);
-                if !row.starts_with(prefix.as_bytes()) {
-                    return Err(unverifiable_admission());
-                }
-                ordinal += 1;
-            }
-            // Only compact row bytes are retained; no whole-ledger Value tree.
-            expected_rows.extend(
-                bytes
-                    .split(|b| *b == b'\n')
-                    .filter(|r| !r.is_empty())
-                    .map(<[u8]>::to_vec),
-            );
-            Ok(())
-        })?;
-        if ordinal != self.sealed_ids.len() {
-            return Err(unverifiable_admission());
-        }
-        json_array_matches(existing, &expected_rows)
+        authority: &ClosingAuthority<'_>,
+    ) -> Result<Option<bool>, ParentLossLedgerError> {
+        legacy::compare(self, existing, authority.deadline)
     }
 }
 
+#[cfg(test)]
 fn json_array_matches(
     existing: &[u8],
     expected_rows: &[Vec<u8>],
