@@ -58,10 +58,11 @@ The dominant activity type observed:
 - **idle**: No meaningful activity
 
 ### activity_summary
-Start with a past-tense verb and name no subject at all. Say what was done, never who did it: never begin with "I", "You", "We", "The user", "The owner", "The person", or "This person". This text is shown to the owner on their own dashboard. In the text you write: Never write "capture" in any form; never say the software watches, observes, records, monitors, tracks, listens, sees, hears or surveils, in any voice, including the passive ("was recorded", "were captured"); attach every claim to what the journal holds.
+Start with a past-tense verb without an owner subject such as "I", "You", "We", "The user", "The owner", "The person", or "This person". Preserve who did what inside the sentence. When speech reports another person's action, keep that person's name and the fact that it was reported: "Reported that Maya checked the irrigation pump." Do not turn it into "Checked the irrigation pump." An unnamed voice does not establish that the owner spoke or performed the described action. This text is shown to the owner on their own dashboard. In the text you write: Never write "capture" in any form; never say the software watches, observes, records, monitors, tracks, listens, sees, hears or surveils, in any voice, including the passive ("was recorded", "were captured"); attach every claim to what the journal holds.
 - Good: "Debugged the retry handling in the ingest worker."
 - Good: "Sent the invoice to Sam, then opened the launch checklist."
 - Wrong: "The user navigated between the hub and a project workspace." — it names a subject.
+- A document, receipt or image establishes its contents, not that the owner bought the items, calculated a total or carried out a plan. Keep visible facts distinct from reported needs and completed actions. Do not infer an action from a document's presence.
 - Write the product name in lowercase: "solstone", never "Solstone" or "the Solstone system".
 
 Use action verbs and be specific — name the tools, people, projects, and actions. Ban passive words: never use "reviewing", "monitoring", "tracking", "checking", "observing", "maintaining", "managing." Use instead: wrote, sent, discussed, created, switched to, typed, said, decided, asked, proposed.
@@ -107,7 +108,7 @@ Up to 8 short passages of spoken words from the transcript that someone would mo
 ### facets
 Classify into the owner's configured facets. Always include at least one facet — pick the closest configured facet. If multiple facets fit, include the dominant one as `level: high` and others at `level: medium` or `level: low`. For each:
 - `facet`: The facet ID slug — MUST be one of the configured facets listed in the input
-- `activity`: 1-sentence description of what was done for this facet, written the same way as `activity_summary` above — start with a past-tense verb, name no subject. Good: "Refined the sense prompt and re-ran the segment." Wrong: "The user reviewed the sense prompt." This string is rendered verbatim in the owner's recent activity list.
+- `activity`: 1-sentence description of what was done for this facet, written the same way as `activity_summary` above. Start with a past-tense verb without an owner subject; preserve named people, reported actions and document contents. Good: "Reported that Maya checked the irrigation pump." Wrong: "Checked the irrigation pump." when only Maya's action was reported. This string is rendered verbatim in the owner's recent activity list.
 - `level`: "high" (primary focus), "medium" (significant), "low" (brief/peripheral)
 
 **Facet assignment rules:** Do not invent facet IDs that are not in the configured journal facet list. The array always has at least one entry — pick the closest configured facet even when the match is loose, and use `level: low` to signal weak fit. If a better new name is warranted, put it only in `speculative_facet`, not in `facets[]`.

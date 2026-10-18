@@ -16,7 +16,15 @@ use super::Refusal;
 unsafe extern "C" {
     fn journal_ios_backup_private_root() -> *mut c_char;
     fn journal_ios_backup_private_root_free(value: *mut c_char);
+    // From the Go archive, which only the app links (`ios-linked-bridge`).
+    #[cfg(feature = "ios-linked-bridge")]
     fn sb_s3_owner_file_policy(fd: i32, directory: i32, apply: i32) -> i32;
+}
+
+/// Without the linked archive no policy can be verified, so storage refuses.
+#[cfg(not(feature = "ios-linked-bridge"))]
+unsafe fn sb_s3_owner_file_policy(_: i32, _: i32, _: i32) -> i32 {
+    1
 }
 
 fn policy(directory: &impl AsFd, apply: bool) -> Result<(), Refusal> {
