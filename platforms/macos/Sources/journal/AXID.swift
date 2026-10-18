@@ -53,12 +53,23 @@ enum AXID {
             static let thinkingLater = "journal.ritual.thinking.later"
             static let thinkingChoiceState = "journal.ritual.thinking.choice.state"
             static let thinkingErrorState = "journal.ritual.thinking.error.state"
+            static func thinkingChoice(_ choice: String) -> String? {
+                guard choice.range(
+                    of: #"^[a-z0-9]+(?:-[a-z0-9]+)*$"#,
+                    options: .regularExpression
+                ) != nil else {
+                    return nil
+                }
+                return "journal.ritual.thinking.choice.\(choice)"
+            }
             static let downloadSpeechState = "journal.ritual.download.speech.state"
             static let downloadThinkingState = "journal.ritual.download.thinking.state"
             static let downloadSpeechRetry = "journal.ritual.download.speech.retry"
             static let downloadThinkingRetry = "journal.ritual.download.thinking.retry"
-            static let downloadSpeechCancel = "journal.ritual.download.speech.cancel"
             static let downloadThinkingCancel = "journal.ritual.download.thinking.cancel"
+            static let operationPendingState = "journal.ritual.operation.pending.state"
+            static let operationErrorState = "journal.ritual.operation.error.state"
+            static let outboundState = "journal.ritual.outbound.state"
             static let handoffErrorState = "journal.ritual.handoff.error.state"
             static let handoffRetry = "journal.ritual.handoff.retry"
         }

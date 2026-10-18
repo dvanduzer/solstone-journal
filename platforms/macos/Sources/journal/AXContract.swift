@@ -50,8 +50,10 @@ enum AXContract {
         AXID.Journal.Ritual.downloadThinkingState,
         AXID.Journal.Ritual.downloadSpeechRetry,
         AXID.Journal.Ritual.downloadThinkingRetry,
-        AXID.Journal.Ritual.downloadSpeechCancel,
         AXID.Journal.Ritual.downloadThinkingCancel,
+        AXID.Journal.Ritual.operationPendingState,
+        AXID.Journal.Ritual.operationErrorState,
+        AXID.Journal.Ritual.outboundState,
         AXID.Journal.Ritual.handoffErrorState,
         AXID.Journal.Ritual.handoffRetry,
         AXID.Journal.Adopt.root,
@@ -166,6 +168,11 @@ enum AXContract {
                 template: "journal.devices.row.fingerprint-{fingerprint}.revoke",
                 key: "DeviceRow.fingerprint",
                 runtime: true
+            ),
+            ParameterizedIdentifier(
+                template: "journal.ritual.thinking.choice.{choice}",
+                key: "ThinkingChoice.id",
+                runtime: true
             )
         ].sorted { $0.template < $1.template }
     }
@@ -181,6 +188,8 @@ enum AXContract {
             "JournalDevicesCopiedState": JournalDevicesCopiedState.axTokens,
             "JournalFirstRunRouteState": JournalFirstRunRouteState.axTokens,
             "JournalAdoptState": JournalAdoptState.axTokens,
+            "JournalRitualOperationToken": JournalRitualOperationToken.axTokens,
+            "JournalOutboundToken": JournalOutboundToken.axTokens,
             "UpdateActivity": UpdateActivity.axTokens,
             "FrequencyOption": FrequencyOption.allCases.map(\.rawValue),
             "UpdateStatus": UpdateStatus.axTokens
@@ -205,6 +214,9 @@ enum AXContract {
             AXID.Journal.Ritual.downloadSpeechState: .freeform,
             AXID.Journal.Ritual.downloadThinkingState: .freeform,
             AXID.Journal.Ritual.handoffErrorState: .freeform,
+            AXID.Journal.Ritual.operationPendingState: .enum("JournalRitualOperationToken"),
+            AXID.Journal.Ritual.operationErrorState: .enum("JournalRitualOperationToken"),
+            AXID.Journal.Ritual.outboundState: .enum("JournalOutboundToken"),
             AXID.Journal.Adopt.statusState: .enum("JournalAdoptState"),
             AXID.Journal.Adopt.messageState: .freeform,
             AXID.Journal.Adopt.locationPathState: .freeform,

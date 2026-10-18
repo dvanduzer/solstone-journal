@@ -27,6 +27,11 @@
         "template" : "journal.devices.row.fingerprint-{fingerprint}.revoke"
       },
       {
+        "key" : "ThinkingChoice.id",
+        "runtime" : true,
+        "template" : "journal.ritual.thinking.choice.{choice}"
+      },
+      {
         "expansions" : [
           "home",
           "journal",
@@ -94,7 +99,6 @@
       "journal.journal.diskUsage.state",
       "journal.journal.location.path.state",
       "journal.ritual.browser.reopen",
-      "journal.ritual.download.speech.cancel",
       "journal.ritual.download.speech.retry",
       "journal.ritual.download.speech.state",
       "journal.ritual.download.thinking.cancel",
@@ -115,6 +119,9 @@
       "journal.ritual.mark.regenerate",
       "journal.ritual.nameLocation.continue",
       "journal.ritual.nameLocation.error.state",
+      "journal.ritual.operation.error.state",
+      "journal.ritual.operation.pending.state",
+      "journal.ritual.outbound.state",
       "journal.ritual.root",
       "journal.ritual.route.state",
       "journal.ritual.setup.error.state",
@@ -245,6 +252,18 @@
     },
     "journal.ritual.nameLocation.error.state" : {
       "kind" : "freeform"
+    },
+    "journal.ritual.operation.error.state" : {
+      "kind" : "enum",
+      "vocabulary" : "JournalRitualOperationToken"
+    },
+    "journal.ritual.operation.pending.state" : {
+      "kind" : "enum",
+      "vocabulary" : "JournalRitualOperationToken"
+    },
+    "journal.ritual.outbound.state" : {
+      "kind" : "enum",
+      "vocabulary" : "JournalOutboundToken"
     },
     "journal.ritual.route.state" : {
       "kind" : "enum",
@@ -380,6 +399,22 @@
       "healthy",
       "stopped",
       "unknown"
+    ],
+    "JournalOutboundToken" : [
+      "none",
+      "delivering",
+      "delivered",
+      "failed"
+    ],
+    "JournalRitualOperationToken" : [
+      "none",
+      "setup",
+      "mark",
+      "thinking_save",
+      "thinking_finalize",
+      "thinking_download",
+      "speech_download",
+      "outbound"
     ],
     "JournalRunDisplay" : [
       "starting",

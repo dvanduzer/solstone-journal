@@ -39,6 +39,24 @@ enum JournalAdoptState: CaseIterable {
     case failed
 }
 
+enum JournalRitualOperationToken: CaseIterable {
+    case none
+    case setup
+    case mark
+    case thinkingSave
+    case thinkingFinalize
+    case thinkingDownload
+    case speechDownload
+    case outbound
+}
+
+enum JournalOutboundToken: CaseIterable {
+    case none
+    case delivering
+    case delivered
+    case failed
+}
+
 extension JournalSidebarTabState {
     static let axTokens = ["selected", "unselected"]
 
@@ -129,6 +147,39 @@ extension JournalFirstRunRouteState {
         case .finishInBrowser: return "finish_in_browser"
         case .adopting: return "adopting"
         case .home: return "home"
+        }
+    }
+}
+
+extension JournalRitualOperationToken {
+    static let axTokens = [
+        "none", "setup", "mark", "thinking_save", "thinking_finalize",
+        "thinking_download", "speech_download", "outbound",
+    ]
+
+    var axToken: String {
+        switch self {
+        case .none: return "none"
+        case .setup: return "setup"
+        case .mark: return "mark"
+        case .thinkingSave: return "thinking_save"
+        case .thinkingFinalize: return "thinking_finalize"
+        case .thinkingDownload: return "thinking_download"
+        case .speechDownload: return "speech_download"
+        case .outbound: return "outbound"
+        }
+    }
+}
+
+extension JournalOutboundToken {
+    static let axTokens = ["none", "delivering", "delivered", "failed"]
+
+    var axToken: String {
+        switch self {
+        case .none: return "none"
+        case .delivering: return "delivering"
+        case .delivered: return "delivered"
+        case .failed: return "failed"
         }
     }
 }

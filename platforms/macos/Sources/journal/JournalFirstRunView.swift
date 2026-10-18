@@ -31,6 +31,24 @@ struct JournalFirstRunView: View {
             }
         }
         .frame(minWidth: 720, minHeight: 500)
+        .overlay {
+            AXStateCompanion(
+                id: AXID.Journal.Ritual.operationPendingState,
+                value: model.pendingOperation.axToken
+            )
+        }
+        .overlay {
+            AXStateCompanion(
+                id: AXID.Journal.Ritual.operationErrorState,
+                value: model.operationError.axToken
+            )
+        }
+        .overlay {
+            AXStateCompanion(
+                id: AXID.Journal.Ritual.outboundState,
+                value: model.outbound.axToken
+            )
+        }
     }
 
     private var decidingView: some View {
@@ -124,9 +142,11 @@ struct JournalFirstRunView: View {
             Text(JournalFirstRunCopy.setupSubtitle)
                 .foregroundStyle(.secondary)
 
-            ProgressView()
-                .controlSize(.large)
-                .accessibilityIdentifier(AXID.Journal.Ritual.setupProgress)
+            if model.errorMessage == nil {
+                ProgressView()
+                    .controlSize(.large)
+                    .accessibilityIdentifier(AXID.Journal.Ritual.setupProgress)
+            }
 
             Text(model.currentStep ?? JournalFirstRunCopy.setupTitle)
                 .foregroundStyle(.secondary)
@@ -314,7 +334,7 @@ struct JournalFirstRunView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 if let mark = model.validatedMark {
-                    JournalMarkView(mark: mark, isConfirmed: model.setupState?.mark.state == "locked")
+                    JournalMarkView(mark: mark, isConfirmed: model.setupState?.mark.state == .locked)
                 } else {
                     Text(model.markFailure ?? copy.mark.error)
                         .foregroundStyle(.red)
@@ -328,7 +348,7 @@ struct JournalFirstRunView: View {
                     id: AXID.Journal.Ritual.markErrorState,
                     value: model.markFailure ?? ""
                 )
-                if model.setupState?.mark.state == "locked" {
+                if model.validatedMark != nil {
                     Text(copy.mark.permanence)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -396,7 +416,8 @@ struct JournalFirstRunView: View {
                                     .foregroundStyle(.secondary)
                             }
                         }
-                        .disabled(choice.id == "local" && model.setupState?.thinking.capability != "ok")
+                        .disabled(choice.id == "local" && model.setupState?.thinking.capability != .ok)
+                        .modifier(ThinkingChoiceIdentifier(choiceID: choice.id))
                     }
                     Button {
                         Task { await model.saveThinking("later") }
@@ -407,7 +428,7 @@ struct JournalFirstRunView: View {
                 }
                 AXStateCompanion(
                     id: AXID.Journal.Ritual.thinkingChoiceState,
-                    value: model.setupState?.thinking.saved == true ? (model.setupState?.thinking.choice ?? "") : ""
+                    value: model.setupState?.thinking.saved == true ? (model.setupState?.thinking.choice?.rawValue ?? "") : ""
                 )
                 AXStateCompanion(
                     id: AXID.Journal.Ritual.thinkingErrorState,
@@ -452,12 +473,15 @@ struct JournalFirstRunView: View {
     @ViewBuilder
     private func savedThinking(_ copy: JournalSetupCopy) -> some View {
         let choice = model.setupState?.thinking.choice
-        if choice == "later" {
+        if choice == .later {
             Text(copy.thinking.later)
-        } else if let row = copy.thinking.choices.first(where: { $0.id == choice }) {
+        } else if let row = copy.thinking.choices.first(where: { $0.id == choice?.rawValue }) {
             Text(row.label)
-            Text(row.sub)
-                .foregroundStyle(.secondary)
+            if let description = model.selectedThinkingDescription {
+                Text(description)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 
@@ -480,12 +504,11 @@ struct JournalFirstRunView: View {
                 title: copy.downloads.speech,
                 job: model.setupState?.downloads.speech,
                 canRetry: model.showsSpeechRetry,
-                canCancel: model.showsSpeechCancel,
                 retryID: AXID.Journal.Ritual.downloadSpeechRetry,
-                cancelID: AXID.Journal.Ritual.downloadSpeechCancel,
+                cancelID: nil,
                 stateID: AXID.Journal.Ritual.downloadSpeechState,
                 retry: { await model.retrySpeechDownload() },
-                cancel: { await model.cancelSpeechDownload() }
+                cancel: {}
             )
             downloadRow(
                 title: copy.downloads.thinking,
@@ -505,57 +528,60 @@ struct JournalFirstRunView: View {
         title: String,
         job: JournalSetupState.Job?,
         canRetry: Bool,
-        canCancel: Bool,
+        canCancel: Bool = false,
         retryID: String,
-        cancelID: String,
+        cancelID: String?,
         stateID: String,
         retry: @escaping () async -> Void,
         cancel: @escaping () async -> Void
     ) -> some View {
-        let wire = job?.state ?? ""
+        let wire = job?.state.rawValue ?? ""
+        let retryLabel = model.setupCopy?.downloads.retry ?? ""
+        let cancelLabel = model.setupCopy?.downloads.cancel ?? ""
         return VStack(alignment: .leading, spacing: 4) {
             Text(title)
-            Text(model.downloadLabel(for: wire))
-                .foregroundStyle(.secondary)
             if let job {
-                Text(byteLine(done: job.bytesDone, total: job.bytesTotal))
-                    .font(.system(.caption, design: .monospaced))
+                Text(model.downloadLabel(for: job.state))
                     .foregroundStyle(.secondary)
+                if let progress = model.downloadProgressText(for: job) {
+                    Text(progress)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
             }
             AXStateCompanion(id: stateID, value: wire)
-            if canCancel {
+            if canCancel, let cancelID {
                 Button {
                     Task { await cancel() }
                 } label: {
-                    Text(model.setupCopy?.downloads.cancel ?? "")
+                    Text(cancelLabel)
                 }
                 .accessibilityIdentifier(cancelID)
+                .accessibilityLabel("\(title) \(cancelLabel)")
             }
             if canRetry {
                 Button {
                     Task { await retry() }
                 } label: {
-                    Text(model.setupCopy?.downloads.retry ?? "")
+                    Text(retryLabel)
                 }
                 .accessibilityIdentifier(retryID)
+                .accessibilityLabel("\(title) \(retryLabel)")
             }
         }
     }
 
-    private func byteLine(done: UInt64, total: UInt64?) -> String {
-        if let total {
-            return "\(done) \(total)"
-        }
-        return "\(done)"
-    }
-
     private func ritualCard<Content: View>(@ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 18) {
-            content()
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                content()
+            }
+            .padding(32)
+            .frame(maxWidth: 620, alignment: .leading)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .frame(maxWidth: .infinity)
         }
-        .padding(32)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .frame(maxWidth: 620, maxHeight: .infinity, alignment: .center)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func chooseJournalLocation() {
@@ -567,6 +593,18 @@ struct JournalFirstRunView: View {
         panel.directoryURL = model.journalRoot.deletingLastPathComponent()
         if panel.runModal() == .OK, let url = panel.url {
             model.journalRoot = url.standardizedFileURL
+        }
+    }
+}
+
+private struct ThinkingChoiceIdentifier: ViewModifier {
+    let choiceID: String
+
+    func body(content: Content) -> some View {
+        if let identifier = AXID.Journal.Ritual.thinkingChoice(choiceID) {
+            content.accessibilityIdentifier(identifier)
+        } else {
+            content
         }
     }
 }

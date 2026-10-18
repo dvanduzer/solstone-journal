@@ -79,6 +79,33 @@ struct JournalNetworkStatus: Decodable, Equatable, Sendable {
     }
 }
 
+enum JournalMarkWireState: String, Codable, Equatable, Sendable {
+    case locked
+    case proposed
+    case unavailable
+}
+
+enum JournalThinkingChoice: String, Codable, Equatable, Sendable {
+    case local
+    case byo
+    case spp
+    case later
+}
+
+enum JournalThinkingCapability: String, Codable, Equatable, Sendable {
+    case ok
+    case blocked
+    case unknown
+}
+
+enum JournalDownloadJobState: String, Codable, Equatable, Sendable {
+    case idle
+    case downloading
+    case complete
+    case cancelled
+    case error
+}
+
 struct JournalSetupState: Decodable, Equatable, Sendable {
     var schema: String
     var journalPath: String
@@ -89,7 +116,7 @@ struct JournalSetupState: Decodable, Equatable, Sendable {
 
     struct Mark: Decodable, Equatable, Sendable {
         var render: JournalMark?
-        var state: String
+        var state: JournalMarkWireState
         var proposalID: String?
 
         enum CodingKeys: String, CodingKey {
@@ -98,7 +125,7 @@ struct JournalSetupState: Decodable, Equatable, Sendable {
             case proposalID = "proposal_id"
         }
 
-        init(render: JournalMark?, state: String, proposalID: String?) {
+        init(render: JournalMark?, state: JournalMarkWireState, proposalID: String?) {
             self.render = render
             self.state = state
             self.proposalID = proposalID
@@ -106,9 +133,9 @@ struct JournalSetupState: Decodable, Equatable, Sendable {
     }
 
     struct Thinking: Decodable, Equatable, Sendable {
-        var choice: String?
+        var choice: JournalThinkingChoice?
         var saved: Bool
-        var capability: String
+        var capability: JournalThinkingCapability
         var downloadBytes: UInt64?
 
         enum CodingKeys: String, CodingKey {
@@ -118,7 +145,12 @@ struct JournalSetupState: Decodable, Equatable, Sendable {
             case downloadBytes = "download_bytes"
         }
 
-        init(choice: String?, saved: Bool, capability: String, downloadBytes: UInt64?) {
+        init(
+            choice: JournalThinkingChoice?,
+            saved: Bool,
+            capability: JournalThinkingCapability,
+            downloadBytes: UInt64?
+        ) {
             self.choice = choice
             self.saved = saved
             self.capability = capability
@@ -132,7 +164,7 @@ struct JournalSetupState: Decodable, Equatable, Sendable {
     }
 
     struct Job: Decodable, Equatable, Sendable {
-        var state: String
+        var state: JournalDownloadJobState
         var attemptID: String?
         var bytesDone: UInt64
         var bytesTotal: UInt64?
@@ -147,7 +179,7 @@ struct JournalSetupState: Decodable, Equatable, Sendable {
         }
 
         init(
-            state: String,
+            state: JournalDownloadJobState,
             attemptID: String?,
             bytesDone: UInt64,
             bytesTotal: UInt64?,

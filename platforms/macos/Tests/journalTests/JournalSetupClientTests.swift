@@ -19,7 +19,8 @@ struct JournalSetupClientTests {
         #expect(state.downloads.speech.bytesTotal == nil)
         #expect(state.downloads.thinking.bytesTotal == nil)
         #expect(state.downloads.speech.bytesDone == 0)
-        #expect(state.downloads.speech.state == "complete")
+        #expect(state.mark.state == .proposed)
+        #expect(state.downloads.speech.state == .complete)
         #expect(state.schema == JournalSetupClient.successSchema)
     }
 
@@ -38,6 +39,33 @@ struct JournalSetupClientTests {
 
         await #expect(throws: JournalSetupClientError.unexpectedResponseURL) {
             try await client.state()
+        }
+    }
+
+    @Test func unknownMarkJobAndCapabilityFailWhileNullBytesStayNull() async throws {
+        let proposed = ObserverURLProtocolStore()
+        proposed.enqueue(body: stateBody(markState: "proposed"))
+        let proposedState = try await makeClient(store: proposed).state()
+        #expect(proposedState.mark.state == .proposed)
+        #expect(proposedState.thinking.downloadBytes == nil)
+        #expect(proposedState.downloads.speech.bytesTotal == nil)
+
+        let proposal = ObserverURLProtocolStore()
+        proposal.enqueue(body: stateBody(markState: "proposal"))
+        await #expect(throws: JournalSetupClientError.decoding) {
+            try await makeClient(store: proposal).state()
+        }
+
+        let job = ObserverURLProtocolStore()
+        job.enqueue(body: stateBody(speechState: "paused"))
+        await #expect(throws: JournalSetupClientError.decoding) {
+            try await makeClient(store: job).state()
+        }
+
+        let capability = ObserverURLProtocolStore()
+        capability.enqueue(body: stateBody(capability: "maybe"))
+        await #expect(throws: JournalSetupClientError.decoding) {
+            try await makeClient(store: capability).state()
         }
     }
 
@@ -92,10 +120,12 @@ struct JournalSetupClientTests {
         schema: String = "solstone.setup-state.v1",
         downloadBytes: String = "null",
         bytesTotal: String = "null",
-        speechState: String = "complete"
+        speechState: String = "complete",
+        markState: String = "proposed",
+        capability: String = "ok"
     ) -> String {
         """
-        {"schema":"\(schema)","journal_path":"/journal","done":false,"copy":{"heading":"ignored"},"mark":{"render":null,"state":"proposal","proposal_id":"proposal-1"},"thinking":{"choice":null,"saved":false,"capability":"ok","download_bytes":\(downloadBytes)},"downloads":{"speech":{"state":"\(speechState)","attempt_id":null,"bytes_done":0,"bytes_total":\(bytesTotal)},"thinking":{"state":"idle","attempt_id":null,"bytes_done":0,"bytes_total":null}}}
+        {"schema":"\(schema)","journal_path":"/journal","done":false,"copy":{"heading":"ignored"},"mark":{"render":null,"state":"\(markState)","proposal_id":"proposal-1"},"thinking":{"choice":null,"saved":false,"capability":"\(capability)","download_bytes":\(downloadBytes)},"downloads":{"speech":{"state":"\(speechState)","attempt_id":null,"bytes_done":0,"bytes_total":\(bytesTotal)},"thinking":{"state":"idle","attempt_id":null,"bytes_done":0,"bytes_total":null}}}
         """
     }
 }

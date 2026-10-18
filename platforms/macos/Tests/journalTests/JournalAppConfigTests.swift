@@ -49,11 +49,13 @@ struct JournalAppConfigTests {
             loginItemEligibility: { false }
         )
 
-        config.applyLaunchAtLoginPreference()
+        let applied = config.applyLaunchAtLoginPreference()
 
+        #expect(applied == .deferred)
         #expect(config.launchAtLoginEnabled)
         #expect(loginItems.registerCalls == 0)
         #expect(loginItems.unregisterCalls == 0)
+        #expect(fixture.defaults.object(forKey: "launchAtLoginEnabled") == nil)
 
         config.setLaunchAtLoginEnabled(false)
         #expect(loginItems.unregisterCalls == 1)
@@ -62,6 +64,7 @@ struct JournalAppConfigTests {
     @Test func reportingFailureDoesNotStoreWhenRegisterThrows() {
         let fixture = makeDefaults()
         defer { fixture.clear() }
+        fixture.defaults.set(false, forKey: "launchAtLoginEnabled")
         let loginItems = ThrowingLoginItemManager()
         let config = JournalAppConfig(defaults: fixture.defaults, loginItemManager: loginItems)
 
@@ -69,14 +72,15 @@ struct JournalAppConfigTests {
             try config.setLaunchAtLoginEnabledReportingFailure(true)
         }
 
-        #expect(fixture.defaults.object(forKey: "launchAtLoginEnabled") == nil)
-        #expect(config.launchAtLoginEnabled)
+        #expect(fixture.defaults.bool(forKey: "launchAtLoginEnabled") == false)
+        #expect(!config.launchAtLoginEnabled)
         #expect(loginItems.registerCalls == 1)
     }
 
     @Test func ineligibleEnablePersistsWithoutRegister() throws {
         let fixture = makeDefaults()
         defer { fixture.clear() }
+        fixture.defaults.set(false, forKey: "launchAtLoginEnabled")
         let loginItems = FakeLoginItemManager()
         let config = JournalAppConfig(
             defaults: fixture.defaults,
@@ -84,11 +88,67 @@ struct JournalAppConfigTests {
             loginItemEligibility: { false }
         )
 
-        try config.setLaunchAtLoginEnabledReportingFailure(true)
+        let result = try config.setLaunchAtLoginEnabledReportingFailure(true)
 
-        #expect(config.launchAtLoginEnabled)
+        #expect(result == .deferred)
+        #expect(!config.launchAtLoginEnabled)
         #expect(loginItems.registerCalls == 0)
-        #expect(fixture.defaults.object(forKey: "launchAtLoginEnabled") as? Bool == true)
+        #expect(fixture.defaults.bool(forKey: "launchAtLoginEnabled") == false)
+    }
+
+    @Test func thrownUnregisterDoesNotWrite() {
+        let fixture = makeDefaults()
+        defer { fixture.clear() }
+        fixture.defaults.set(true, forKey: "launchAtLoginEnabled")
+        let loginItems = UnregisterThrowingLoginItemManager()
+        let config = JournalAppConfig(defaults: fixture.defaults, loginItemManager: loginItems)
+
+        let result = config.setLaunchAtLoginEnabled(false)
+
+        #expect(result == .failed)
+        #expect(config.launchAtLoginEnabled)
+        #expect(fixture.defaults.bool(forKey: "launchAtLoginEnabled") == true)
+        #expect(loginItems.unregisterCalls == 1)
+    }
+
+    @Test func unchangedValueDoesNotWriteOrRegister() {
+        let fixture = makeDefaults()
+        defer { fixture.clear() }
+        let loginItems = FakeLoginItemManager()
+        let config = JournalAppConfig(defaults: fixture.defaults, loginItemManager: loginItems)
+
+        #expect(config.setLaunchAtLoginEnabled(true) == .unchanged)
+        #expect(loginItems.registerCalls == 0)
+        #expect(loginItems.unregisterCalls == 0)
+        #expect(fixture.defaults.object(forKey: "launchAtLoginEnabled") == nil)
+
+        fixture.defaults.set(false, forKey: "launchAtLoginEnabled")
+        #expect(config.setLaunchAtLoginEnabled(false) == .unchanged)
+        #expect(loginItems.unregisterCalls == 0)
+        #expect(fixture.defaults.bool(forKey: "launchAtLoginEnabled") == false)
+    }
+
+    @Test func startupApplyFailureDoesNotWriteAndIsNotSuccess() {
+        let fixture = makeDefaults()
+        defer { fixture.clear() }
+        let loginItems = ThrowingLoginItemManager()
+        let config = JournalAppConfig(defaults: fixture.defaults, loginItemManager: loginItems)
+
+        let enabled = config.applyLaunchAtLoginPreference()
+
+        #expect(enabled == .failed)
+        #expect(enabled != .applied)
+        #expect(fixture.defaults.object(forKey: "launchAtLoginEnabled") == nil)
+        #expect(config.launchAtLoginEnabled)
+        #expect(loginItems.registerCalls == 1)
+
+        fixture.defaults.set(false, forKey: "launchAtLoginEnabled")
+        let unregistering = UnregisterThrowingLoginItemManager()
+        let disabled = JournalAppConfig(defaults: fixture.defaults, loginItemManager: unregistering)
+            .applyLaunchAtLoginPreference()
+        #expect(disabled == .failed)
+        #expect(fixture.defaults.bool(forKey: "launchAtLoginEnabled") == false)
+        #expect(unregistering.unregisterCalls == 1)
     }
 
     @Test func cachedIconMarkJSONRoundTripsValidatedMark() throws {
@@ -171,4 +231,16 @@ private final class ThrowingLoginItemManager: LoginItemManaging {
     }
 
     func unregister() throws {}
+}
+
+@MainActor
+private final class UnregisterThrowingLoginItemManager: LoginItemManaging {
+    private(set) var unregisterCalls = 0
+
+    func register() throws {}
+
+    func unregister() throws {
+        unregisterCalls += 1
+        throw CocoaError(.fileWriteUnknown)
+    }
 }

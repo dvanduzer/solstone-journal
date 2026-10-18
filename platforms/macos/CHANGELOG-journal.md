@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- the journal app can run the first part of setup and hand the rest to the solstone app. current setup still finishes in the browser.
+- this prepares native setup. current setup still finishes in the browser.
 
 ## [2.0.49 (build 91)] - 2026-10-17
 

@@ -126,6 +126,7 @@ struct JournalFirstRunModelTests {
         #expect(fixture.model.errorMessage == nil)
         #expect(fixture.routes.contains(.ritual(.finishInBrowser)))
         #expect(fixture.browser.opened.count == 1)
+        #expect(fixture.setupRunner.skipModelInstallFlags == [false])
     }
 
     @Test(.timeLimit(.minutes(1))) func terminationWhileWaitingStopsPollingAndNeverLandsHome() async throws {
@@ -188,7 +189,7 @@ struct JournalFirstRunModelTests {
             discoveryQualificationTimeout: 0.05
         )
 
-        await fixture.model.decideLaunchRoute()
+        await fixture.model.reconcileActivation()
 
         #expect(fixture.model.route == .ritual(.nameLocation))
         #expect(fixture.model.journalRoot == root.standardizedFileURL)
@@ -198,6 +199,7 @@ struct JournalFirstRunModelTests {
 
         #expect(handoffStore.consumeCount == 1)
         #expect(fixture.setupRunner.calls == 1)
+        #expect(fixture.setupRunner.skipModelInstallFlags == [false])
         #expect(fixture.setupRunner.rootsSnapshot == [root.standardizedFileURL])
     }
 
@@ -218,7 +220,7 @@ struct JournalFirstRunModelTests {
             discoveryQualificationTimeout: 0.05
         )
 
-        await fixture.model.decideLaunchRoute()
+        await fixture.model.reconcileActivation()
 
         #expect(fixture.model.route == .ritual(.nameLocation))
         #expect(fixture.model.journalRoot == defaultJournalRoot())
@@ -239,7 +241,7 @@ struct JournalFirstRunModelTests {
             journalFileReader: fileReader,
             discoveryQualificationTimeout: 0.05
         )
-        await fixture.model.decideLaunchRoute()
+        await fixture.model.reconcileActivation()
 
         // Completion is the timeout proof: the stalled probe only returns on
         // cancellation, so reaching these asserts means qualification was cut off.
@@ -259,13 +261,14 @@ struct JournalFirstRunModelTests {
             handoffStore: handoffStore
         )
 
-        await fixture.model.decideLaunchRoute()
+        await fixture.model.reconcileActivation()
 
         #expect(fixture.model.route == .adopting)
         #expect(fixture.config.journalRoot == root.standardizedFileURL)
         #expect(handoffStore.consumeCount == 0)
         #expect(fixture.model.errorMessage != nil)
         #expect(fixture.setupRunner.rootsSnapshot == [root.standardizedFileURL])
+        #expect(fixture.setupRunner.skipModelInstallFlags == [false])
         #expect(await trace.snapshot() == ["setup", "supervisor"])
     }
 
@@ -284,7 +287,7 @@ struct JournalFirstRunModelTests {
             handoffStore: handoffStore
         )
 
-        await fixture.model.decideLaunchRoute()
+        await fixture.model.reconcileActivation()
 
         #expect(fixture.model.route == .adopting)
         #expect(fixture.config.journalRoot == root.standardizedFileURL)
@@ -305,10 +308,10 @@ struct JournalFirstRunModelTests {
             handoffStore: handoffStore
         )
 
-        await fixture.model.decideLaunchRoute()
+        await fixture.model.reconcileActivation()
         #expect(handoffStore.consumeCount == 0)
 
-        await fixture.model.decideLaunchRoute()
+        await fixture.model.reconcileActivation()
 
         #expect(fixture.model.route == .home)
         #expect(handoffStore.consumeCount == 1)
@@ -316,6 +319,7 @@ struct JournalFirstRunModelTests {
             root.standardizedFileURL,
             root.standardizedFileURL,
         ])
+        #expect(fixture.setupRunner.skipModelInstallFlags == [false, false])
         #expect(await trace.snapshot() == [
             "setup",
             "supervisor",
@@ -337,7 +341,7 @@ struct JournalFirstRunModelTests {
             handoffStore: handoffStore
         )
 
-        await fixture.model.decideLaunchRoute()
+        await fixture.model.reconcileActivation()
 
         #expect(fixture.model.route == .ritual(.nameLocation))
         #expect(fixture.model.route != .adopting)
@@ -362,13 +366,56 @@ struct JournalFirstRunModelTests {
             handoffStore: handoffStore
         )
 
-        await fixture.model.decideLaunchRoute()
+        await fixture.model.reconcileActivation()
 
         #expect(fixture.model.route == .ritual(.nameLocation))
         #expect(fixture.model.journalRoot == defaultJournalRoot())
         #expect(fixture.config.journalRoot == nil)
         #expect(handoffStore.consumeCount == 1)
         #expect(fixture.model.errorMessage == nil)
+    }
+
+    @Test func qualifiedDiscoveryAndAdoptSkipModelInstall() async throws {
+        let copy = try loadQualifiedSetupCopy()
+        let discoveryRoot = try makeTemporaryDirectory()
+        let discoveryStore = FakeFirstRunHandoffStore(handoff: discoveryHandoff(root: discoveryRoot))
+        let fileReader = FakeFirstRunJournalFileReader()
+        fileReader.directories = [
+            discoveryRoot.standardizedFileURL.path,
+            discoveryRoot.appendingPathComponent("config", isDirectory: true).path,
+        ]
+        let discovery = makeModel(
+            startResults: [true],
+            probeResults: [.incomplete],
+            handoffStore: discoveryStore,
+            journalFileReader: fileReader,
+            discoveryQualificationTimeout: 0.05,
+            localSetupCapability: { true },
+            loadSetupCopy: { copy },
+            peer: QualifiedPeer()
+        )
+
+        await discovery.model.reconcileActivation()
+        #expect(discovery.model.route == .ritual(.nameLocation))
+        await discovery.model.continueFromNameLocation()
+        #expect(discovery.setupRunner.skipModelInstallFlags == [true])
+        #expect(discovery.browser.opened.isEmpty)
+
+        let adoptRoot = try makeTemporaryDirectory()
+        let adoptStore = FakeFirstRunHandoffStore(handoff: migrationHandoff(root: adoptRoot))
+        let adopt = makeModel(
+            startResults: [true],
+            probeResults: [.incomplete],
+            handoffStore: adoptStore,
+            localSetupCapability: { true },
+            loadSetupCopy: { copy },
+            peer: QualifiedPeer()
+        )
+
+        await adopt.model.reconcileActivation()
+        #expect(adopt.setupRunner.skipModelInstallFlags == [true])
+        #expect(adopt.browser.opened.isEmpty)
+        #expect(adopt.model.route != .ritual(.finishInBrowser))
     }
 
 }
@@ -544,6 +591,24 @@ private func defaultJournalRoot() -> URL {
     FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("journal", isDirectory: true)
         .standardizedFileURL
+}
+
+private func loadQualifiedSetupCopy() throws -> JournalSetupCopy {
+    let url = URL(filePath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .appendingPathComponent("JournalRuntimeTests/Fixtures/setup-copy.json")
+    return try JournalSetupCopy.decodeQualified(Data(contentsOf: url))
+}
+
+@MainActor
+private final class QualifiedPeer: JournalSetupPeerResolving {
+    func resolve() -> URL? { URL(fileURLWithPath: "/Applications/Solstone.app") }
+    func verify(_ url: URL) async -> Bool {
+        _ = url
+        return true
+    }
+    func launch(_ url: URL) async throws {}
 }
 
 private func discoveryHandoff(root: URL) -> JournalHandoff {

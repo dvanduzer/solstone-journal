@@ -15,7 +15,7 @@ extension JournalFirstRunModelTests {
         defer { world.refresh.release() }
         try writeStep1(world.fixture.mailbox)
 
-        await world.fixture.model.decideLaunchRoute()
+        await world.fixture.model.reconcileActivation()
 
         #expect(world.fixture.browser.opened == [JournalFirstRunModel.defaultInitPageURL])
         #expect(world.fixture.model.reopenCount == 0)
@@ -24,14 +24,14 @@ extension JournalFirstRunModelTests {
         #expect(world.loads.calls == 0)
         #expect(world.peer.resolveCount == 0)
         #expect(world.peer.launched.isEmpty)
-        #expect(world.fixture.continuation.load() == nil)
+        #expect(world.fixture.continuation.loadContinuation() == .missing)
     }
 
     @Test func qualifiedFreshLaunchShowsWelcomeThenFolderWithoutBrowser() async throws {
         let world = try makeSetupWorld()
         defer { world.refresh.release() }
 
-        await world.fixture.model.decideLaunchRoute()
+        await world.fixture.model.reconcileActivation()
         #expect(world.fixture.model.route == .ritual(.welcome))
         world.fixture.model.continueFromWelcome()
 
@@ -45,24 +45,25 @@ extension JournalFirstRunModelTests {
         let suite = "app.solstone.journal.first-run.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defaults.removePersistentDomain(forName: suite)
+        defaults.set(false, forKey: "launchAtLoginEnabled")
         let config = JournalAppConfig(defaults: defaults, loginItemManager: ThrowingLoginItems())
         let world = try makeSetupWorld(config: config)
         defer { world.refresh.release() }
 
-        await world.fixture.model.decideLaunchRoute()
+        await world.fixture.model.reconcileActivation()
         world.fixture.model.setWelcomeLaunchAtLogin(true)
 
         #expect(world.fixture.model.route == .ritual(.welcome))
         #expect(world.fixture.model.loginFailure?.isEmpty == false)
-        #expect(defaults.object(forKey: "launchAtLoginEnabled") == nil)
-        #expect(world.fixture.model.launchAtLoginEnabled)
+        #expect(defaults.bool(forKey: "launchAtLoginEnabled") == false)
+        #expect(!world.fixture.model.launchAtLoginEnabled)
         expectQuietLaunch(world)
     }
 
     @Test func folderContinueIsTheOnlyRootWriteAndSkipsModelInstall() async throws {
         let world = try makeSetupWorld()
         defer { world.refresh.release() }
-        await world.fixture.model.decideLaunchRoute()
+        await world.fixture.model.reconcileActivation()
         world.fixture.model.continueFromWelcome()
         #expect(world.fixture.config.journalRoot == nil)
         world.fixture.model.journalRoot = world.root
@@ -83,11 +84,11 @@ extension JournalFirstRunModelTests {
             to: world.fixture.mailbox.directory.appendingPathComponent("journal-setup-handoff.json")
         )
 
-        await world.fixture.model.decideLaunchRoute()
+        await world.fixture.model.reconcileActivation()
 
         #expect(world.fixture.model.route == .ritual(.welcome))
         #expect(world.fixture.config.journalRoot == nil)
-        #expect(world.fixture.continuation.load() == nil)
+        #expect(world.fixture.continuation.loadContinuation() == .missing)
         expectQuietLaunch(world)
     }
 
@@ -97,34 +98,34 @@ extension JournalFirstRunModelTests {
         let hinted = world.root.deletingLastPathComponent().appendingPathComponent("hinted", isDirectory: true)
         try writeStep1(world.fixture.mailbox, rootHint: hinted)
 
-        await world.fixture.model.decideLaunchRoute()
+        await world.fixture.model.reconcileActivation()
 
         #expect(world.fixture.config.journalRoot?.standardizedFileURL.path == world.root.standardizedFileURL.path)
         #expect(world.fixture.model.journalRoot.standardizedFileURL.path == world.root.standardizedFileURL.path)
-        #expect(world.fixture.continuation.load(matching: world.root) != nil)
-        #expect(world.fixture.continuation.load(matching: hinted) == nil)
+        #expect(world.fixture.continuation.ready(matching: world.root) != nil)
+        #expect(world.fixture.continuation.ready(matching: hinted) == nil)
         #expect(world.peer.launched.isEmpty)
         expectQuietLaunch(world)
     }
 
     @Test func completedOwnerWithoutIntentOrStep1LandsHome() async throws {
-        let world = try makeSetupWorld(configureRoot: true, done: true)
+        let world = try makeSetupWorld(configureRoot: true, done: true, probes: [.complete])
         defer { world.refresh.release() }
 
-        await world.fixture.model.decideLaunchRoute()
+        await world.fixture.model.reconcileActivation()
 
         #expect(world.fixture.model.route == .home)
-        #expect(world.fixture.continuation.load() == nil)
+        #expect(world.fixture.continuation.loadContinuation() == .missing)
         #expect(world.peer.launched.isEmpty)
         expectQuietLaunch(world)
     }
 
     @Test func validStep1OnCompletedJournalLaunchesVerifiedPeer() async throws {
-        let world = try makeSetupWorld(configureRoot: true, done: true)
+        let world = try makeSetupWorld(configureRoot: true, done: true, probes: [.complete])
         defer { world.refresh.release() }
         try writeStep1(world.fixture.mailbox)
 
-        await world.fixture.model.decideLaunchRoute()
+        await world.fixture.model.reconcileActivation()
 
         guard case .ready(let handoff) = world.fixture.mailbox.loadStep5() else {
             Issue.record("expected step 5")
@@ -147,10 +148,10 @@ extension JournalFirstRunModelTests {
         let second = UUID()
         try writeStep1(world.fixture.mailbox, id: first)
         world.fixture.model.onBeforeStep1Commit = {
-            try? writeStep1(world.fixture.mailbox, id: second)
+            _ = try? writeStep1(world.fixture.mailbox, id: second)
         }
 
-        await world.fixture.model.decideLaunchRoute()
+        await world.fixture.model.reconcileActivation()
 
         guard case .ready(let handoff) = world.fixture.mailbox.loadStep1() else {
             Issue.record("expected the replacement handoff")
@@ -158,52 +159,72 @@ extension JournalFirstRunModelTests {
         }
         #expect(handoff.handoffID == second)
         #expect(try world.fixture.mailbox.readStep1Receipt() == nil)
-        #expect(world.fixture.model.handoffError?.isEmpty == false)
-        #expect(world.fixture.model.route == .ritual(.thinking))
+        #expect(world.fixture.model.handoffError == nil)
+        #expect(world.fixture.model.route == .ritual(.folder))
         #expect(world.peer.launched.isEmpty)
         #expect(world.client.actions.isEmpty)
         expectQuietLaunch(world)
     }
 
-    @Test func continuationInProgressDoesNotRewind() async throws {
-        let world = try makeSetupWorld(configureRoot: true)
+    @Test func acceptedReplayRepublishesOnlyAndNewHandoffGetsAFreshContinuation() async throws {
+        let world = try makeSetupWorld(configureRoot: true, probes: [.complete])
         defer { world.refresh.release() }
-        let pending = UUID()
-        try world.fixture.continuation.save(root: world.root, pending: pending)
-        try writeAcceptedReceipt(world.fixture.mailbox, id: UUID(), step: 1)
-        try writeStep1(world.fixture.mailbox, id: UUID())
-        let before = continuationBytes(world.fixture.continuation)
+        let first = UUID()
+        try seedContinuation(world.fixture.continuation, root: world.root, step1: first)
+        try removeContinuationFile(world.fixture.continuation)
+        try writeStep1(world.fixture.mailbox, id: first)
 
-        await world.fixture.model.decideLaunchRoute()
+        await world.fixture.model.reconcileActivation()
 
-        #expect(continuationBytes(world.fixture.continuation) == before)
-        #expect(world.fixture.config.journalRoot?.standardizedFileURL.path == world.root.standardizedFileURL.path)
-        #expect(world.fixture.model.journalRoot.standardizedFileURL.path == world.root.standardizedFileURL.path)
-        #expect(world.fixture.model.route == .ritual(.thinking))
-        #expect(world.fixture.model.handoffError?.isEmpty == false)
+        #expect(world.fixture.continuation.loadContinuation() == .missing)
+        #expect(world.fixture.continuation.acceptance(of: first) == .accepted)
         #expect(world.peer.launched.isEmpty)
+        #expect(world.fixture.mailbox.loadStep5() == .missing)
+        #expect(try world.fixture.mailbox.readStep1Receipt()?.handoffID == first)
+        #expect(world.fixture.config.journalRoot?.standardizedFileURL.path == world.root.standardizedFileURL.path)
+
+        let second = UUID()
+        let oldPending = UUID()
+        try writeAcceptedReceipt(world.fixture.mailbox, id: oldPending, step: 5)
+        try writeStep1(world.fixture.mailbox, id: second)
+        await world.fixture.model.reconcileActivation()
+
+        guard case .ready(let record) = world.fixture.continuation.loadContinuation() else {
+            Issue.record("expected a fresh continuation")
+            return
+        }
+        #expect(record.step1HandoffID == second)
+        #expect(record.pendingStep5HandoffID != oldPending)
+        #expect(world.fixture.continuation.acceptance(of: first) == .accepted)
+        #expect(world.peer.launched == [setupPeerURL])
         expectQuietLaunch(world)
     }
 
     @Test func onlyAcceptedAndRepublishedAdvance() async throws {
         let fresh = try makeSetupWorld()
         defer { fresh.refresh.release() }
-        try writeStep1(fresh.fixture.mailbox)
-        await fresh.fixture.model.decideLaunchRoute()
-        #expect(fresh.fixture.model.route == .ritual(.welcome))
+        let freshID = try writeStep1(fresh.fixture.mailbox)
+        await fresh.fixture.model.reconcileActivation()
+        #expect(fresh.fixture.model.route == .ritual(.folder))
         #expect(fresh.fixture.config.journalRoot == nil)
-        #expect(fresh.fixture.continuation.load() == nil)
+        guard case .ready(let rootless) = fresh.fixture.continuation.loadContinuation() else {
+            Issue.record("expected a rootless continuation")
+            return
+        }
+        #expect(rootless.journalRootPath == nil)
+        #expect(rootless.step1HandoffID == freshID)
+        #expect(fresh.peer.launched.isEmpty)
         expectQuietLaunch(fresh)
 
         let republished = try makeSetupWorld(configureRoot: true)
         defer { republished.refresh.release() }
         let id = UUID()
         let pending = UUID()
-        try republished.fixture.continuation.save(root: republished.root, pending: pending)
+        try seedContinuation(republished.fixture.continuation, root: republished.root, pending: pending, step1: id)
         try writeStep1(republished.fixture.mailbox, id: id)
         try writeAcceptedReceipt(republished.fixture.mailbox, id: id, step: 1)
         let before = continuationBytes(republished.fixture.continuation)
-        await republished.fixture.model.decideLaunchRoute()
+        await republished.fixture.model.reconcileActivation()
         #expect(continuationBytes(republished.fixture.continuation) == before)
         #expect(republished.fixture.model.route == .ritual(.mark))
         #expect(republished.fixture.model.handoffError == nil)
@@ -212,17 +233,24 @@ extension JournalFirstRunModelTests {
     }
 
     @Test func intentIsSavedBeforeFinalizeAndFailedWriteSkipsPost() async throws {
-        let world = try makeSetupWorld(configureRoot: true, markState: "locked", saved: true, choice: "local")
+        let world = try makeSetupWorld(
+            configureRoot: true,
+            markState: "locked",
+            saved: true,
+            choice: "local",
+            probes: [.incomplete, .complete]
+        )
         defer { world.refresh.release() }
         let seen = Flag()
         let store = world.fixture.continuation
         let root = world.root
+        try seedContinuation(store, root: root)
         world.client.setHook { action in
             if case .finalize = action {
-                seen.set(store.load(matching: root) != nil)
+                seen.set(store.ready(matching: root)?.pendingStep5HandoffID != nil)
             }
         }
-        await world.fixture.model.decideLaunchRoute()
+        await world.fixture.model.reconcileActivation()
         let done = setupState(root: world.root, done: true, markState: "locked", saved: true, choice: "local")
         world.client.setGets([done])
         world.client.setPerforms([done])
@@ -231,7 +259,6 @@ extension JournalFirstRunModelTests {
 
         #expect(seen.value)
         #expect(world.client.actions == [.finalize(timezone: TimeZone.autoupdatingCurrent.identifier)])
-        #expect(world.fixture.model.canFinalizeThinking)
         #expect(world.peer.launched == [setupPeerURL])
         guard case .ready = world.fixture.mailbox.loadStep5() else {
             Issue.record("expected step 5 after finalize")
@@ -239,16 +266,22 @@ extension JournalFirstRunModelTests {
         }
         expectQuietLaunch(world)
 
+        let gate = FailWrites()
         let failing = try makeSetupWorld(
             configureRoot: true,
             markState: "locked",
             saved: true,
             choice: "local",
-            continuationReplace: { _, _ in throw CocoaError(.fileWriteUnknown) }
+            continuationReplace: { data, url in
+                if gate.fail { throw CocoaError(.fileWriteUnknown) }
+                try data.write(to: url, options: .atomic)
+            }
         )
         defer { failing.refresh.release() }
-        await failing.fixture.model.decideLaunchRoute()
+        try seedContinuation(failing.fixture.continuation, root: failing.root)
+        await failing.fixture.model.reconcileActivation()
         #expect(failing.fixture.model.canFinalizeThinking)
+        gate.fail = true
         await failing.fixture.model.finalizeThinking()
         #expect(failing.client.actions.isEmpty)
         #expect(failing.peer.launched.isEmpty)
@@ -257,12 +290,12 @@ extension JournalFirstRunModelTests {
     }
 
     @Test func pendingStep5IdentifierIsReused() async throws {
-        let world = try makeSetupWorld(configureRoot: true, done: true)
+        let world = try makeSetupWorld(configureRoot: true, done: true, probes: [.complete])
         defer { world.refresh.release() }
         let pending = UUID()
-        try world.fixture.continuation.save(root: world.root, pending: pending)
+        try seedContinuation(world.fixture.continuation, root: world.root, pending: pending)
 
-        await world.fixture.model.decideLaunchRoute()
+        await world.fixture.model.reconcileActivation()
 
         guard case .ready(let handoff) = world.fixture.mailbox.loadStep5() else {
             Issue.record("expected step 5")
@@ -274,32 +307,35 @@ extension JournalFirstRunModelTests {
     }
 
     @Test func matchingReceiptRemovesIntentAndReopenDoesNotLaunch() async throws {
-        let world = try makeSetupWorld(configureRoot: true, done: true)
+        let world = try makeSetupWorld(configureRoot: true, done: true, supervisorLive: true, probes: [.complete])
         defer { world.refresh.release() }
         let pending = UUID()
-        try world.fixture.continuation.save(root: world.root, pending: pending)
+        let step1 = try seedContinuation(world.fixture.continuation, root: world.root, pending: pending)
         try writeAcceptedReceipt(world.fixture.mailbox, id: pending, step: 5)
 
-        await world.fixture.model.decideLaunchRoute()
-        #expect(world.fixture.continuation.load() == nil)
+        await world.fixture.model.reconcileActivation()
+        #expect(world.fixture.continuation.loadContinuation() == .missing)
+        #expect(world.fixture.continuation.acceptance(of: step1) == .accepted)
         #expect(world.fixture.model.route == .home)
         #expect(world.peer.launched.isEmpty)
         #expect(await supervisorCount(world.trace) == 0)
 
-        await world.fixture.model.decideLaunchRoute()
+        await world.fixture.model.reconcileActivation()
         #expect(world.peer.launched.isEmpty)
         #expect(world.fixture.model.route == .home)
         expectQuietLaunch(world)
     }
 
     @Test func retryBeforeReceiptDoesNotShowMarkOrRestartLiveSupervisor() async throws {
-        let world = try makeSetupWorld(configureRoot: true, done: true, startResults: [false])
+        let world = try makeSetupWorld(configureRoot: true, done: true, startResults: [false], probes: [.complete])
         defer { world.refresh.release() }
-        try world.fixture.continuation.save(root: world.root, pending: UUID())
+        let pending = UUID()
+        try seedContinuation(world.fixture.continuation, root: world.root, pending: pending)
 
-        await world.fixture.model.decideLaunchRoute()
-        #expect(world.fixture.model.route == .ritual(.thinking))
-        #expect(world.fixture.model.handoffError?.isEmpty == false)
+        await world.fixture.model.reconcileActivation()
+        #expect(world.fixture.model.route != .ritual(.mark))
+        #expect(world.fixture.model.handoffError == nil)
+        #expect(world.fixture.model.errorMessage?.isEmpty == false)
         #expect(world.client.actions.isEmpty)
         #expect(await supervisorCount(world.trace) == 1)
 
@@ -308,6 +344,11 @@ extension JournalFirstRunModelTests {
 
         #expect(world.fixture.model.route != .ritual(.mark))
         #expect(world.peer.launched == [setupPeerURL])
+        guard case .ready(let handoff) = world.fixture.mailbox.loadStep5() else {
+            Issue.record("expected the stored pending id")
+            return
+        }
+        #expect(handoff.handoffID == pending)
         #expect(await supervisorCount(world.trace) == 1)
         #expect(!world.client.actions.contains { action in
             if case .regenerateMark = action { return true }
@@ -317,29 +358,51 @@ extension JournalFirstRunModelTests {
         expectQuietLaunch(world)
     }
 
-    @Test func lostFinalizeDeliversStep5OnNextDecide() async throws {
-        let world = try makeSetupWorld(configureRoot: true, done: true)
-        defer { world.refresh.release() }
-        try world.fixture.continuation.save(root: world.root, pending: nil)
-        #expect(world.fixture.mailbox.loadStep5() == .missing)
+    @Test func lostFinalizeDoesNotDeliverWithoutPendingOrCommitment() async throws {
+        let missingPending = try makeSetupWorld(configureRoot: true, probes: [.complete])
+        defer { missingPending.refresh.release() }
+        try seedContinuation(missingPending.fixture.continuation, root: missingPending.root)
+        await missingPending.fixture.model.reconcileActivation()
+        #expect(missingPending.fixture.mailbox.loadStep5() == .missing)
+        #expect(missingPending.peer.launched.isEmpty)
 
-        await world.fixture.model.decideLaunchRoute()
+        let uncommitted = try makeSetupWorld(configureRoot: true, probes: [.complete])
+        defer { uncommitted.refresh.release() }
+        try seedContinuation(uncommitted.fixture.continuation, root: uncommitted.root, pending: UUID())
+        uncommitted.identity.resolution = .uncommitted(instanceID: setupInstanceID)
+        await uncommitted.fixture.model.reconcileActivation()
+        #expect(uncommitted.fixture.mailbox.loadStep5() == .missing)
+        #expect(uncommitted.peer.launched.isEmpty)
 
-        guard case .ready = world.fixture.mailbox.loadStep5() else {
-            Issue.record("expected step 5")
-            return
-        }
-        #expect(world.peer.launched == [setupPeerURL])
-        #expect(world.fixture.model.route != .ritual(.mark))
-        expectQuietLaunch(world)
+        let absent = try makeSetupWorld(configureRoot: true, probes: [.complete])
+        defer { absent.refresh.release() }
+        try seedContinuation(absent.fixture.continuation, root: absent.root, pending: UUID())
+        absent.identity.resolution = .absent
+        await absent.fixture.model.reconcileActivation()
+        #expect(absent.fixture.mailbox.loadStep5() == .missing)
+
+        let failed = try makeSetupWorld(configureRoot: true, probes: [.complete])
+        defer { failed.refresh.release() }
+        try seedContinuation(failed.fixture.continuation, root: failed.root, pending: UUID())
+        failed.identity.resolution = .failed(.timeout)
+        await failed.fixture.model.reconcileActivation()
+        #expect(failed.fixture.mailbox.loadStep5() == .missing)
+
+        let badFingerprint = try makeSetupWorld(configureRoot: true, probes: [.complete])
+        defer { badFingerprint.refresh.release() }
+        try seedContinuation(badFingerprint.fixture.continuation, root: badFingerprint.root, pending: UUID())
+        badFingerprint.client.setNetwork(JournalNetworkStatus(caFingerprint: "zz", instanceID: setupInstanceID))
+        await badFingerprint.fixture.model.reconcileActivation()
+        #expect(badFingerprint.fixture.mailbox.loadStep5() == .missing)
+        #expect(badFingerprint.peer.launched.isEmpty)
     }
 
     @Test func savedIntentWithIncompleteSetupDoesNotLaunch() async throws {
         let world = try makeSetupWorld(configureRoot: true, done: false)
         defer { world.refresh.release() }
-        try world.fixture.continuation.save(root: world.root, pending: UUID())
+        try seedContinuation(world.fixture.continuation, root: world.root, pending: UUID())
 
-        await world.fixture.model.decideLaunchRoute()
+        await world.fixture.model.reconcileActivation()
 
         #expect(world.fixture.model.route == .ritual(.mark))
         #expect(world.peer.launched.isEmpty)
@@ -355,15 +418,15 @@ extension JournalFirstRunModelTests {
             URL(fileURLWithPath: "/Applications/Selection.app"),
             URL(fileURLWithPath: "/Applications/Launch.app"),
         ]
-        let world = try makeSetupWorld(configureRoot: true, done: true, peer: peer)
+        let world = try makeSetupWorld(configureRoot: true, done: true, probes: [.complete], peer: peer)
         defer { world.refresh.release() }
         try writeStep1(world.fixture.mailbox)
 
-        await world.fixture.model.decideLaunchRoute()
+        await world.fixture.model.reconcileActivation()
 
         #expect(world.peer.launched.isEmpty)
         #expect(world.peer.resolveCount == 3)
-        #expect(world.fixture.continuation.load(matching: world.root) != nil)
+        #expect(world.fixture.continuation.ready(matching: world.root) != nil)
         #expect(world.fixture.model.handoffError?.isEmpty == false)
         #expect(world.fixture.browser.opened.isEmpty)
         expectQuietLaunch(world)
@@ -373,14 +436,14 @@ extension JournalFirstRunModelTests {
         let incapable = try makeSetupWorld(capability: false, configureRoot: true)
         defer { incapable.refresh.release() }
         try writeStep1(incapable.fixture.mailbox)
-        await incapable.fixture.model.decideLaunchRoute()
+        await incapable.fixture.model.reconcileActivation()
         #expect(incapable.fixture.browser.opened == [JournalFirstRunModel.defaultInitPageURL])
         #expect(incapable.loads.calls == 0)
         #expect(incapable.peer.resolveCount == 0)
 
         let missingCopy = try makeSetupWorld(configureRoot: true, provideCopy: false)
         defer { missingCopy.refresh.release() }
-        await missingCopy.fixture.model.decideLaunchRoute()
+        await missingCopy.fixture.model.reconcileActivation()
         #expect(missingCopy.loads.calls == 1)
         #expect(missingCopy.peer.resolveCount == 0)
         #expect(missingCopy.fixture.browser.opened == [JournalFirstRunModel.defaultInitPageURL])
@@ -390,7 +453,7 @@ extension JournalFirstRunModelTests {
         absent.queue = [nil]
         let missingPeer = try makeSetupWorld(configureRoot: true, peer: absent)
         defer { missingPeer.refresh.release() }
-        await missingPeer.fixture.model.decideLaunchRoute()
+        await missingPeer.fixture.model.reconcileActivation()
         #expect(missingPeer.peer.resolveCount == 1)
         #expect(missingPeer.peer.verifyCount == 0)
         #expect(missingPeer.fixture.browser.opened == [JournalFirstRunModel.defaultInitPageURL])
@@ -400,11 +463,11 @@ extension JournalFirstRunModelTests {
         unverified.verifySticky = false
         let rejectedPeer = try makeSetupWorld(configureRoot: true, peer: unverified)
         defer { rejectedPeer.refresh.release() }
-        await rejectedPeer.fixture.model.decideLaunchRoute()
+        await rejectedPeer.fixture.model.reconcileActivation()
         #expect(rejectedPeer.peer.verifyCount == 1)
         #expect(rejectedPeer.fixture.browser.opened == [JournalFirstRunModel.defaultInitPageURL])
         #expect(rejectedPeer.peer.launched.isEmpty)
-        #expect(rejectedPeer.fixture.continuation.load() == nil)
+        #expect(rejectedPeer.fixture.continuation.loadContinuation() == .missing)
         #expect(incapable.fixture.openJournalCalls == 0)
         #expect(incapable.fixture.backupOpens == 0)
         #expect(incapable.fixture.model.reopenCount == 0)
@@ -416,7 +479,8 @@ extension JournalFirstRunModelTests {
     @Test func lateResponseDoesNotChangeRootStepOrProposal() async throws {
         let world = try makeSetupWorld(configureRoot: true)
         defer { world.refresh.release() }
-        await world.fixture.model.decideLaunchRoute()
+        try seedContinuation(world.fixture.continuation, root: world.root)
+        await world.fixture.model.reconcileActivation()
         let gate = PerformGate()
         world.client.gate = gate
         world.client.setHold(true)
@@ -425,7 +489,7 @@ extension JournalFirstRunModelTests {
         let root = world.fixture.model.journalRoot
         let route = world.fixture.model.route
         let proposal = world.fixture.model.displayedProposalID
-        world.fixture.model.advanceSetupRevision()
+        world.fixture.model.advanceEpoch()
         world.client.setPerforms([
             setupState(root: world.root.deletingLastPathComponent(), proposalID: "proposal-2")
         ])
@@ -442,7 +506,8 @@ extension JournalFirstRunModelTests {
     @Test func proposalConflictWaitsForStateAndDoesNotCommitTheRefresh() async throws {
         let world = try makeSetupWorld(configureRoot: true)
         defer { world.refresh.release() }
-        await world.fixture.model.decideLaunchRoute()
+        try seedContinuation(world.fixture.continuation, root: world.root)
+        await world.fixture.model.reconcileActivation()
         world.client.setGets([setupState(root: world.root, proposalID: "proposal-2")])
         world.client.setError(.server(.init(
             error: "conflict",
@@ -460,32 +525,42 @@ extension JournalFirstRunModelTests {
         expectQuietLaunch(world)
     }
 
-    @Test func lockedMarkHasNoRegenerate() async throws {
-        let world = try makeSetupWorld(configureRoot: true, markState: "locked", saved: false)
-        defer { world.refresh.release() }
-        await world.fixture.model.decideLaunchRoute()
+    @Test func lockedMarkHasNoRegenerateAndProposedMarkValidates() async throws {
+        let locked = try makeSetupWorld(configureRoot: true, markState: "locked", saved: false)
+        defer { locked.refresh.release() }
+        try seedContinuation(locked.fixture.continuation, root: locked.root)
+        await locked.fixture.model.reconcileActivation()
 
-        #expect(world.fixture.model.route == .ritual(.thinking))
-        #expect(!world.fixture.model.showsMarkRegenerate)
-        await world.fixture.model.regenerateDisplayedMark()
-        #expect(world.client.actions.isEmpty)
-        expectQuietLaunch(world)
+        #expect(locked.fixture.model.route == .ritual(.thinking))
+        #expect(!locked.fixture.model.showsMarkRegenerate)
+        await locked.fixture.model.regenerateDisplayedMark()
+        #expect(locked.client.actions.isEmpty)
+
+        let proposed = try makeSetupWorld(configureRoot: true)
+        defer { proposed.refresh.release() }
+        try seedContinuation(proposed.fixture.continuation, root: proposed.root)
+        await proposed.fixture.model.reconcileActivation()
+        #expect(proposed.fixture.model.route == .ritual(.mark))
+        #expect(proposed.fixture.model.validatedMark != nil)
+        #expect(proposed.fixture.model.showsMarkRegenerate)
+        expectQuietLaunch(proposed)
     }
 
     @Test func doubleContinueCannotCommitASecondIdentifier() async throws {
         let world = try makeSetupWorld(configureRoot: true)
         defer { world.refresh.release() }
-        await world.fixture.model.decideLaunchRoute()
+        try seedContinuation(world.fixture.continuation, root: world.root)
+        await world.fixture.model.reconcileActivation()
         let gate = PerformGate()
         world.client.gate = gate
         world.client.setHold(true)
         let task = Task { await world.fixture.model.commitDisplayedMark() }
         await gate.waitUntilEntered()
-        let revision = world.fixture.model.revision
+        let epoch = world.fixture.model.epoch
 
         await world.fixture.model.commitDisplayedMark()
 
-        #expect(world.fixture.model.revision == revision)
+        #expect(world.fixture.model.epoch == epoch)
         #expect(world.client.actions.count == 1)
         world.client.setHold(false)
         gate.release()
@@ -503,7 +578,8 @@ extension JournalFirstRunModelTests {
                 capabilityName: capability
             )
             defer { world.refresh.release() }
-            await world.fixture.model.decideLaunchRoute()
+            try seedContinuation(world.fixture.continuation, root: world.root)
+            await world.fixture.model.reconcileActivation()
             #expect(!world.fixture.model.offersLocalReady)
             await world.fixture.model.saveThinking("local")
             #expect(world.client.actions.isEmpty)
@@ -514,7 +590,8 @@ extension JournalFirstRunModelTests {
     @Test func saveThinkingLocalIsTheLocalSave() async throws {
         let world = try makeSetupWorld(configureRoot: true, markState: "locked", saved: false, capabilityName: "ok")
         defer { world.refresh.release() }
-        await world.fixture.model.decideLaunchRoute()
+        try seedContinuation(world.fixture.continuation, root: world.root)
+        await world.fixture.model.reconcileActivation()
         #expect(world.fixture.model.offersLocalReady)
         world.client.setPerforms([
             setupState(root: world.root, markState: "locked", saved: true, choice: "local")
@@ -534,12 +611,14 @@ extension JournalFirstRunModelTests {
             saved: true,
             choice: "later",
             speech: "idle",
-            thinkingDownload: "idle"
+            thinkingDownload: "idle",
+            probes: [.incomplete, .incomplete]
         )
         defer { world.refresh.release() }
-        await world.fixture.model.decideLaunchRoute()
+        await world.fixture.model.reconcileActivation()
+        await world.fixture.model.continueFromFolder()
         #expect(world.fixture.model.canFinalizeThinking)
-        #expect(world.fixture.model.setupState?.downloads.speech.state == "idle")
+        #expect(world.fixture.model.setupState?.downloads.speech.state == .idle)
         let done = setupState(
             root: world.root,
             done: true,
@@ -555,14 +634,17 @@ extension JournalFirstRunModelTests {
         await world.fixture.model.finalizeThinking()
 
         #expect(world.client.actions == [.finalize(timezone: TimeZone.autoupdatingCurrent.identifier)])
-        #expect(world.peer.launched == [setupPeerURL])
+        #expect(world.peer.launched.isEmpty)
+        #expect(world.fixture.mailbox.loadStep5() == .missing)
+        #expect(world.fixture.setupRunner.skipModelInstallFlags == [true])
         expectQuietLaunch(world)
     }
 
     @Test func speechAdmissionPendingRefreshesWithoutFailing() async throws {
         let world = try makeSetupWorld(configureRoot: true, speech: "error")
         defer { world.refresh.release() }
-        await world.fixture.model.decideLaunchRoute()
+        try seedContinuation(world.fixture.continuation, root: world.root)
+        await world.fixture.model.reconcileActivation()
         #expect(world.fixture.model.showsSpeechRetry)
         world.client.setGets([setupState(root: world.root, speech: "idle")])
         world.client.setError(.server(.init(
@@ -576,7 +658,8 @@ extension JournalFirstRunModelTests {
         #expect(world.fixture.model.handoffError == nil)
         #expect(world.fixture.model.markFailure == nil)
         #expect(world.fixture.model.errorMessage == nil)
-        #expect(world.fixture.model.setupState?.downloads.speech.state == "idle")
+        #expect(world.fixture.model.operationError == .none)
+        #expect(world.fixture.model.setupState?.downloads.speech.state == .idle)
         #expect(world.fixture.setupRunner.calls == 0)
         #expect(world.client.actions == [.retrySpeechDownload])
         expectQuietLaunch(world)
@@ -585,7 +668,8 @@ extension JournalFirstRunModelTests {
     @Test func refreshDoesNotRetryIdleSpeech() async throws {
         let world = try makeSetupWorld(configureRoot: true, speech: "idle", supervisorLive: true)
         defer { world.refresh.release() }
-        await world.fixture.model.decideLaunchRoute()
+        try seedContinuation(world.fixture.continuation, root: world.root)
+        await world.fixture.model.reconcileActivation()
         #expect(world.fixture.model.isRefreshLoopRunning)
         let before = world.client.stateCalls
         world.refresh.release()
@@ -597,14 +681,17 @@ extension JournalFirstRunModelTests {
         #expect(world.client.stateCalls > before)
         #expect(world.client.actions.isEmpty)
         #expect(!world.fixture.model.showsSpeechRetry)
+        let epoch = world.fixture.model.epoch
         await world.fixture.model.prepareForTermination()
+        #expect(world.fixture.model.epoch > epoch)
         #expect(!world.fixture.model.isRefreshLoopRunning)
     }
 
     @Test func speechRetryIsNotOfferedForIdle() async throws {
         let world = try makeSetupWorld(configureRoot: true, speech: "idle")
         defer { world.refresh.release() }
-        await world.fixture.model.decideLaunchRoute()
+        try seedContinuation(world.fixture.continuation, root: world.root)
+        await world.fixture.model.reconcileActivation()
 
         #expect(!world.fixture.model.showsSpeechRetry)
         await world.fixture.model.retrySpeechDownload()
@@ -612,18 +699,18 @@ extension JournalFirstRunModelTests {
         expectQuietLaunch(world)
     }
 
-    @Test func cancelSendsTheDisplayedAttemptIdentifier() async throws {
+    @Test func thinkingCancelCarriesRenderedAttemptAndSpeechHasNoCancel() async throws {
         let world = try makeSetupWorld(
             configureRoot: true,
             thinkingDownload: "downloading",
             thinkingAttempt: "attempt-9"
         )
         defer { world.refresh.release() }
-        await world.fixture.model.decideLaunchRoute()
+        try seedContinuation(world.fixture.continuation, root: world.root)
+        await world.fixture.model.reconcileActivation()
         #expect(world.fixture.model.showsThinkingCancel)
 
         await world.fixture.model.cancelThinkingDownload()
-        await world.fixture.model.cancelSpeechDownload()
 
         #expect(world.client.actions == [.cancelThinkingDownload(attemptID: "attempt-9")])
         expectQuietLaunch(world)
@@ -632,11 +719,357 @@ extension JournalFirstRunModelTests {
     @Test func windowFreeTerminationCancelsRefreshAndClosingDoesNot() async throws {
         let world = try makeSetupWorld(configureRoot: true, supervisorLive: true, attachWindow: false)
         defer { world.refresh.release() }
-        await world.fixture.model.decideLaunchRoute()
+        try seedContinuation(world.fixture.continuation, root: world.root)
+        await world.fixture.model.reconcileActivation()
 
         #expect(world.fixture.model.isRefreshLoopRunning)
+        let epoch = world.fixture.model.epoch
         await world.fixture.model.prepareForTermination()
+        #expect(world.fixture.model.epoch > epoch)
         #expect(!world.fixture.model.isRefreshLoopRunning)
+    }
+
+    @Test func liveSupervisorKeepsRootAndLaunchesWithoutRestart() async throws {
+        let world = try makeSetupWorld(
+            configureRoot: true,
+            done: true,
+            supervisorLive: true,
+            startResults: [false],
+            probes: [.complete]
+        )
+        defer { world.refresh.release() }
+        let root = world.fixture.config.journalRoot
+        try writeStep1(world.fixture.mailbox)
+
+        await world.fixture.model.reconcileActivation()
+
+        #expect(world.fixture.config.journalRoot?.standardizedFileURL.path == root?.standardizedFileURL.path)
+        #expect(world.peer.launched == [setupPeerURL])
+        #expect(world.fixture.mailbox.loadStep5() != .missing)
+        #expect(await supervisorCount(world.trace) == 0)
+        #expect(world.fixture.model.route == .home)
+        expectQuietLaunch(world)
+    }
+
+    @Test func rootlessContinuationBindsTheSelectedRootBeforeSetup() async throws {
+        let world = try makeSetupWorld(probes: [.incomplete])
+        defer { world.refresh.release() }
+        let id = try writeStep1(world.fixture.mailbox)
+        await world.fixture.model.reconcileActivation()
+        #expect(world.fixture.model.route == .ritual(.folder))
+        guard case .ready(let before) = world.fixture.continuation.loadContinuation() else {
+            Issue.record("expected a rootless continuation")
+            return
+        }
+        #expect(before.journalRootPath == nil)
+        #expect(before.step1HandoffID == id)
+
+        world.fixture.model.journalRoot = world.root
+        await world.fixture.model.continueFromFolder()
+
+        #expect(world.fixture.continuation.ready(matching: world.root)?.step1HandoffID == id)
+        #expect(world.fixture.setupRunner.skipModelInstallFlags == [true])
+        #expect(world.peer.launched.isEmpty)
+        expectQuietLaunch(world)
+    }
+
+    @Test func orphanReceiptIsAFreshAccept() async throws {
+        let world = try makeSetupWorld(configureRoot: true, probes: [.incomplete])
+        defer { world.refresh.release() }
+        let id = try writeStep1(world.fixture.mailbox)
+        try writeAcceptedReceipt(world.fixture.mailbox, id: id, step: 1)
+        #expect(world.fixture.continuation.acceptance(of: id) == .notAccepted)
+
+        await world.fixture.model.reconcileActivation()
+
+        #expect(world.fixture.continuation.acceptance(of: id) == .accepted)
+        #expect(world.fixture.mailbox.loadStep1() == .missing)
+        #expect(world.fixture.model.route == .ritual(.mark))
+        #expect(world.peer.launched.isEmpty)
+        expectQuietLaunch(world)
+    }
+
+    @Test func progressWriteFailureLeavesThePayloadAndWritesNeitherRecord() async throws {
+        let gate = FailWrites()
+        let world = try makeSetupWorld(
+            configureRoot: true,
+            continuationReplace: { data, url in
+                if gate.fail { throw CocoaError(.fileWriteUnknown) }
+                try data.write(to: url, options: .atomic)
+            }
+        )
+        defer { world.refresh.release() }
+        let id = try writeStep1(world.fixture.mailbox)
+        gate.fail = true
+
+        await world.fixture.model.reconcileActivation()
+
+        guard case .ready(let handoff) = world.fixture.mailbox.loadStep1() else {
+            Issue.record("expected the payload to remain")
+            return
+        }
+        #expect(handoff.handoffID == id)
+        #expect(world.fixture.continuation.loadContinuation() == .missing)
+        #expect(world.fixture.continuation.loadLedger() == .missing)
+        #expect(try world.fixture.mailbox.readStep1Receipt() == nil)
+        #expect(world.peer.launched.isEmpty)
+        #expect(world.fixture.model.handoffError?.isEmpty == false)
+        expectQuietLaunch(world)
+    }
+
+    @Test func sameURLFinalVerifyFailureDoesNotWriteOrLaunch() async throws {
+        let peer = ScriptedPeer()
+        peer.queue = [setupPeerURL]
+        peer.verifyQueue = [true, true, false]
+        let world = try makeSetupWorld(configureRoot: true, done: true, probes: [.complete], peer: peer)
+        defer { world.refresh.release() }
+        try writeStep1(world.fixture.mailbox)
+
+        await world.fixture.model.reconcileActivation()
+
+        #expect(world.peer.launched.isEmpty)
+        #expect(world.peer.resolveCount == 3)
+        #expect(world.fixture.mailbox.loadStep5() == .missing)
+        #expect(world.fixture.model.handoffError?.isEmpty == false)
+        expectQuietLaunch(world)
+    }
+
+    @Test func refreshDuringAnActionDoesNotApplyAfterSuccess() async throws {
+        let world = try makeSetupWorld(configureRoot: true, supervisorLive: true, probes: [.incomplete])
+        defer { world.refresh.release() }
+        try seedContinuation(world.fixture.continuation, root: world.root)
+        await world.fixture.model.reconcileActivation()
+        #expect(world.fixture.model.displayedProposalID == "proposal-1")
+        let stateGate = PerformGate()
+        world.client.setStateGate(stateGate)
+        world.client.setHoldState(true)
+        world.client.setGets([setupState(root: world.root, proposalID: "proposal-3")])
+        world.client.setPerforms([setupState(root: world.root, proposalID: "proposal-2")])
+        world.refresh.release()
+        await stateGate.waitUntilEntered()
+
+        await world.fixture.model.commitDisplayedMark()
+        stateGate.release()
+
+        #expect(world.fixture.model.displayedProposalID == "proposal-2")
+        expectQuietLaunch(world)
+    }
+
+    @Test func oldRootPayloadIsDropped() async throws {
+        let world = try makeSetupWorld(configureRoot: true, supervisorLive: true, probes: [.incomplete])
+        defer { world.refresh.release() }
+        try seedContinuation(world.fixture.continuation, root: world.root)
+        await world.fixture.model.reconcileActivation()
+        let other = world.root.deletingLastPathComponent().appendingPathComponent("other-root", isDirectory: true)
+        world.client.setGets([setupState(root: other, proposalID: "proposal-9")])
+        let before = world.client.stateCalls
+        world.refresh.release()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while world.client.stateCalls == before, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        #expect(world.client.stateCalls > before)
+        #expect(world.fixture.model.displayedProposalID == "proposal-1")
+        #expect(world.fixture.model.journalRoot.standardizedFileURL.path == world.root.standardizedFileURL.path)
+    }
+
+    @Test func cancellationDuringFinalizeDoesNotWriteOrLaunch() async throws {
+        let world = try makeSetupWorld(
+            configureRoot: true,
+            markState: "locked",
+            saved: true,
+            choice: "local",
+            probes: [.incomplete]
+        )
+        defer { world.refresh.release() }
+        try seedContinuation(world.fixture.continuation, root: world.root)
+        await world.fixture.model.reconcileActivation()
+        let holder = TaskHolder()
+        world.client.setHook { _ in holder.task?.cancel() }
+        let task = Task { await world.fixture.model.finalizeThinking() }
+        holder.task = task
+        await task.value
+
+        #expect(world.fixture.mailbox.loadStep5() == .missing)
+        #expect(world.peer.launched.isEmpty)
+    }
+
+    @Test func cancellationAfterFinalVerifyDoesNotWriteOrLaunch() async throws {
+        let peer = ScriptedPeer()
+        peer.queue = [setupPeerURL]
+        peer.verifyQueue = [true, true, false]
+        let world = try makeSetupWorld(configureRoot: true, probes: [.complete], peer: peer)
+        defer { world.refresh.release() }
+        let holder = TaskHolder()
+        peer.onVerify = { count in
+            if count == 3 { holder.task?.cancel() }
+        }
+        try writeStep1(world.fixture.mailbox)
+        let task = Task { await world.fixture.model.reconcileActivation() }
+        holder.task = task
+        await task.value
+
+        #expect(world.peer.verifyCount == 3)
+        #expect(world.fixture.mailbox.loadStep5() == .missing)
+        #expect(world.peer.launched.isEmpty)
+        #expect(world.fixture.model.handoffError == nil)
+        #expect(world.fixture.model.outbound != .failed)
+        #expect(world.fixture.model.operationError != .outbound)
+    }
+
+    @Test func terminationDuringFinalVerifyDoesNotSetOutboundFailure() async throws {
+        let peer = ScriptedPeer()
+        peer.queue = [setupPeerURL]
+        peer.verifyQueue = [true, true, false]
+        let world = try makeSetupWorld(configureRoot: true, probes: [.complete], peer: peer)
+        defer { world.refresh.release() }
+        peer.onVerify = { count in
+            if count == 3 {
+                await world.fixture.model.prepareForTermination()
+            }
+        }
+        try writeStep1(world.fixture.mailbox)
+
+        await world.fixture.model.reconcileActivation()
+
+        #expect(world.peer.verifyCount == 3)
+        #expect(world.fixture.mailbox.loadStep5() == .missing)
+        #expect(world.peer.launched.isEmpty)
+        #expect(world.fixture.model.handoffError == nil)
+        #expect(world.fixture.model.outbound != .failed)
+        #expect(world.fixture.model.operationError != .outbound)
+    }
+
+    @Test func refreshBeforeAutomaticRegenerateDoesNotReplaceProposal() async throws {
+        let world = try makeSetupWorld(configureRoot: true, supervisorLive: true, probes: [.incomplete])
+        defer { world.refresh.release() }
+        try seedContinuation(world.fixture.continuation, root: world.root)
+        await world.fixture.model.reconcileActivation()
+        #expect(world.fixture.model.displayedProposalID == "proposal-1")
+
+        let commitGate = PerformGate()
+        let regenerateGate = PerformGate()
+        world.client.gate = commitGate
+        world.client.setHold(true)
+        world.client.setPerforms([
+            marklessUnavailableState(root: world.root),
+            setupState(root: world.root, proposalID: "proposal-regenerated"),
+        ])
+        let client = world.client
+        client.setHook { action in
+            if case .regenerateMark = action {
+                client.gate = regenerateGate
+            }
+        }
+        let commit = Task { await world.fixture.model.commitDisplayedMark() }
+        await commitGate.waitUntilEntered()
+        commitGate.release()
+        await regenerateGate.waitUntilEntered()
+
+        let stateGate = PerformGate()
+        world.client.setStateGate(stateGate)
+        world.client.setHoldState(true)
+        world.client.setGets([setupState(root: world.root, proposalID: "proposal-stale")])
+        world.refresh.release()
+        await stateGate.waitUntilEntered()
+        await world.fixture.model.regenerateDisplayedMark()
+        #expect(world.client.actions.filter {
+            if case .regenerateMark = $0 { return true }
+            return false
+        }.count == 1)
+
+        regenerateGate.release()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while world.fixture.model.displayedProposalID != "proposal-regenerated", ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let calls = world.client.stateCalls
+        stateGate.release()
+        while world.client.stateCalls == calls, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        #expect(world.client.stateCalls > calls)
+        #expect(world.fixture.model.displayedProposalID == "proposal-regenerated")
+        await commit.value
+        expectQuietLaunch(world)
+    }
+
+    @Test func overlappingReconcileRunsOneBodyThenOneFollowUp() async throws {
+        let world = try makeSetupWorld()
+        defer { world.refresh.release() }
+        let gate = PerformGate()
+        world.loads.armHold(gate)
+        let first = Task { await world.fixture.model.reconcileActivation() }
+        await gate.waitUntilEntered()
+        let second = Task { await world.fixture.model.reconcileActivation() }
+        await Task.yield()
+        #expect(world.loads.maxConcurrent == 1)
+        gate.release()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while world.loads.calls < 2, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(world.loads.calls == 2)
+        #expect(world.loads.maxConcurrent == 1)
+        gate.release()
+        await first.value
+        await second.value
+        #expect(world.loads.calls == 2)
+        #expect(world.loads.maxConcurrent == 1)
+    }
+
+    @Test func unknownSizeKeepsTheCallerTemplate() async throws {
+        var copy = try loadSetupFixtureCopy()
+        copy.thinking.defaultLine = "keep {size} end"
+        copy.thinking.sizeUnknown = "size-token"
+        let world = try makeSetupWorld(copy: copy)
+        defer { world.refresh.release() }
+
+        await world.fixture.model.reconcileActivation()
+
+        #expect(world.fixture.model.thinkingSizeLine == "keep size-token end")
+    }
+
+    @Test func selectedChoiceDescriptionIsAvailable() async throws {
+        let copy = try loadSetupFixtureCopy()
+        let world = try makeSetupWorld(
+            configureRoot: true,
+            markState: "locked",
+            saved: true,
+            choice: "local",
+            copy: copy
+        )
+        defer { world.refresh.release() }
+        try seedContinuation(world.fixture.continuation, root: world.root)
+        await world.fixture.model.reconcileActivation()
+
+        let expected = copy.thinking.choices.first { $0.id == "local" }?.description
+        #expect(expected?.isEmpty == false)
+        #expect(world.fixture.model.selectedThinkingDescription == expected)
+    }
+
+    @Test func downloadProgressUsesFileCountsOnlyForActiveTotals() async throws {
+        let world = try makeSetupWorld()
+        defer { world.refresh.release() }
+        func formatted(_ bytes: UInt64) -> String {
+            ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+        }
+        let downloading = JournalSetupState.Job(
+            state: .downloading, attemptID: "attempt", bytesDone: 10, bytesTotal: 40
+        )
+        #expect(world.fixture.model.downloadProgressText(for: downloading) == "\(formatted(10)) / \(formatted(40))")
+        let complete = JournalSetupState.Job(
+            state: .complete, attemptID: nil, bytesDone: 40, bytesTotal: 40
+        )
+        #expect(world.fixture.model.downloadProgressText(for: complete) == "\(formatted(40)) / \(formatted(40))")
+        let idle = JournalSetupState.Job(state: .idle, attemptID: nil, bytesDone: 0, bytesTotal: 40)
+        #expect(world.fixture.model.downloadProgressText(for: idle) == nil)
+        let stale = JournalSetupState.Job(state: .downloading, attemptID: "", bytesDone: 10, bytesTotal: 40)
+        #expect(world.fixture.model.downloadProgressText(for: stale) == nil)
+        let missingTotal = JournalSetupState.Job(state: .complete, attemptID: nil, bytesDone: 1, bytesTotal: nil)
+        #expect(world.fixture.model.downloadProgressText(for: missingTotal) == nil)
     }
 }
 
@@ -650,6 +1083,7 @@ private struct SetupWorld {
     var loads: CopyLoads
     var live: LiveSwitch
     var trace: FirstRunTrace
+    var identity: ScriptedIdentity
 }
 
 @MainActor
@@ -658,7 +1092,7 @@ private func makeSetupWorld(
     configureRoot: Bool = false,
     provideCopy: Bool = true,
     done: Bool = false,
-    markState: String = "proposal",
+    markState: String = "proposed",
     saved: Bool = false,
     choice: String? = nil,
     capabilityName: String = "ok",
@@ -668,9 +1102,12 @@ private func makeSetupWorld(
     proposalID: String = "proposal-1",
     supervisorLive: Bool = false,
     startResults: [Bool] = [],
+    probes: [JournalInitSetupProbe] = [.incomplete, .complete],
     attachWindow: Bool = true,
     peer suppliedPeer: ScriptedPeer? = nil,
     config suppliedConfig: JournalAppConfig? = nil,
+    copy suppliedCopy: JournalSetupCopy? = nil,
+    downloadBytes: UInt64? = nil,
     continuationReplace: (@Sendable (Data, URL) throws -> Void)? = nil
 ) throws -> SetupWorld {
     let root = FileManager.default.temporaryDirectory
@@ -680,7 +1117,7 @@ private func makeSetupWorld(
     if configureRoot {
         config.journalRoot = root
     }
-    let copy = try loadSetupFixtureCopy()
+    let copy = try suppliedCopy ?? loadSetupFixtureCopy()
     let loads = CopyLoads()
     let peer = suppliedPeer ?? {
         let created = ScriptedPeer()
@@ -700,7 +1137,8 @@ private func makeSetupWorld(
             capability: capabilityName,
             speech: speech,
             thinkingDownload: thinkingDownload,
-            thinkingAttempt: thinkingAttempt
+            thinkingAttempt: thinkingAttempt,
+            downloadBytes: downloadBytes
         )
     ])
     let identity = ScriptedIdentity()
@@ -720,10 +1158,14 @@ private func makeSetupWorld(
         trace: trace,
         config: config,
         startResults: startResults,
-        probeResults: [.incomplete, .complete],
+        probeResults: probes,
         localSetupCapability: { capability },
         loadSetupCopy: {
-            loads.bump()
+            loads.enter()
+            if let gate = loads.holdGate() {
+                await gate.enterAndWait()
+            }
+            loads.leave()
             return provideCopy ? copy : nil
         },
         peer: peer,
@@ -743,30 +1185,66 @@ private func makeSetupWorld(
         root: root,
         loads: loads,
         live: live,
-        trace: trace
+        trace: trace,
+        identity: identity
+    )
+}
+
+private func marklessUnavailableState(root: URL) -> JournalSetupState {
+    JournalSetupState(
+        journalPath: root.standardizedFileURL.path,
+        done: false,
+        mark: .init(render: nil, state: .unavailable, proposalID: nil),
+        thinking: .init(choice: nil, saved: false, capability: .unknown, downloadBytes: nil),
+        downloads: .init(
+            speech: .init(state: .idle, attemptID: nil, bytesDone: 0, bytesTotal: nil),
+            thinking: .init(state: .idle, attemptID: nil, bytesDone: 0, bytesTotal: nil)
+        )
     )
 }
 
 private func setupState(
     root: URL,
     done: Bool = false,
-    markState: String = "proposal",
+    markState: String = "proposed",
     proposalID: String? = "proposal-1",
     saved: Bool = false,
     choice: String? = nil,
     capability: String = "ok",
     speech: String = "idle",
     thinkingDownload: String = "idle",
-    thinkingAttempt: String? = nil
+    thinkingAttempt: String? = nil,
+    downloadBytes: UInt64? = nil,
+    speechTotal: UInt64? = nil,
+    thinkingTotal: UInt64? = nil
 ) -> JournalSetupState {
     JournalSetupState(
         journalPath: root.standardizedFileURL.path,
         done: done,
-        mark: .init(render: .uiTestSample, state: markState, proposalID: proposalID),
-        thinking: .init(choice: choice, saved: saved, capability: capability, downloadBytes: nil),
+        mark: .init(
+            render: .uiTestSample,
+            state: JournalMarkWireState(rawValue: markState) ?? .proposed,
+            proposalID: proposalID
+        ),
+        thinking: .init(
+            choice: choice.flatMap(JournalThinkingChoice.init(rawValue:)),
+            saved: saved,
+            capability: JournalThinkingCapability(rawValue: capability) ?? .unknown,
+            downloadBytes: downloadBytes
+        ),
         downloads: .init(
-            speech: .init(state: speech, attemptID: nil, bytesDone: 0, bytesTotal: nil),
-            thinking: .init(state: thinkingDownload, attemptID: thinkingAttempt, bytesDone: 0, bytesTotal: nil)
+            speech: .init(
+                state: JournalDownloadJobState(rawValue: speech) ?? .idle,
+                attemptID: nil,
+                bytesDone: 0,
+                bytesTotal: speechTotal
+            ),
+            thinking: .init(
+                state: JournalDownloadJobState(rawValue: thinkingDownload) ?? .idle,
+                attemptID: thinkingAttempt,
+                bytesDone: 0,
+                bytesTotal: thinkingTotal
+            )
         )
     )
 }
@@ -779,14 +1257,16 @@ private func loadSetupFixtureCopy() throws -> JournalSetupCopy {
     return try JournalSetupCopy.decodeQualified(Data(contentsOf: url))
 }
 
-private func writeStep1(_ mailbox: SetupMailboxStore, id: UUID = UUID(), rootHint: URL? = nil) throws {
+@discardableResult
+private func writeStep1(_ mailbox: SetupMailboxStore, id: UUID = UUID(), rootHint: URL? = nil) throws -> UUID {
     if let rootHint {
         let handoff = SetupHandoff(handoffID: id, stepIndex: 1, journalRootPath: rootHint.path)
         let data = try JSONEncoder().encode(handoff)
         try data.write(to: mailbox.directory.appendingPathComponent("journal-setup-handoff.json"))
-        return
+        return id
     }
     try mailbox.writeStep1(handoffID: id)
+    return id
 }
 
 private func writeAcceptedReceipt(_ mailbox: SetupMailboxStore, id: UUID, step: Int) throws {
@@ -798,6 +1278,50 @@ private func writeAcceptedReceipt(_ mailbox: SetupMailboxStore, id: UUID, step: 
 private func continuationBytes(_ store: JournalSetupContinuationStore) -> Data? {
     let url = store.directory.appendingPathComponent(JournalSetupContinuationStore.fileName)
     return try? Data(contentsOf: url)
+}
+
+@discardableResult
+private func seedContinuation(
+    _ store: JournalSetupContinuationStore,
+    root: URL?,
+    pending: UUID? = nil,
+    step1: UUID = UUID()
+) throws -> UUID {
+    try store.storeProgress(step1: step1, journalRootPath: root?.standardizedFileURL.path)
+    if let pending {
+        let object: [String: Any] = [
+            "journalRootPath": root?.standardizedFileURL.path as Any? ?? NSNull(),
+            "pendingStep5HandoffID": pending.uuidString.lowercased(),
+            "schema": JournalSetupContinuationStore.schema,
+            "step1HandoffID": step1.uuidString.lowercased(),
+        ]
+        let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        try data.write(
+            to: store.directory.appendingPathComponent(JournalSetupContinuationStore.fileName),
+            options: .atomic
+        )
+    }
+    return step1
+}
+
+private func removeContinuationFile(_ store: JournalSetupContinuationStore) throws {
+    let url = store.directory.appendingPathComponent(JournalSetupContinuationStore.fileName)
+    if FileManager.default.fileExists(atPath: url.path) {
+        try FileManager.default.removeItem(at: url)
+    }
+}
+
+private final class FailWrites: @unchecked Sendable {
+    var fail = false
+}
+
+private final class TaskHolder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Task<Void, Never>?
+    var task: Task<Void, Never>? {
+        get { lock.withLock { stored } }
+        set { lock.withLock { stored = newValue } }
+    }
 }
 
 private func supervisorCount(_ trace: FirstRunTrace) async -> Int {
@@ -826,6 +1350,7 @@ private final class ScriptedPeer: JournalSetupPeerResolving {
     private(set) var launched: [URL] = []
     private(set) var resolveCount = 0
     private(set) var verifyCount = 0
+    var onVerify: (@MainActor (Int) async -> Void)?
 
     func resolve() -> URL? {
         resolveCount += 1
@@ -839,6 +1364,7 @@ private final class ScriptedPeer: JournalSetupPeerResolving {
     func verify(_ url: URL) async -> Bool {
         _ = url
         verifyCount += 1
+        await onVerify?(verifyCount)
         if !verifyQueue.isEmpty {
             return verifyQueue.removeFirst()
         }
@@ -858,8 +1384,10 @@ private final class ScriptedSetupClient: JournalSetupClienting, @unchecked Senda
     private var getsCount = 0
     private var thrown: JournalSetupClientError?
     private var hold = false
+    private var holdState = false
     private var network = JournalNetworkStatus(caFingerprint: nil, instanceID: nil)
     private var hook: (@Sendable (JournalSetupAction) -> Void)?
+    private var stateGateStorage: PerformGate?
     var gate: PerformGate?
 
     var actions: [JournalSetupAction] { lock.withLock { recorded } }
@@ -869,10 +1397,16 @@ private final class ScriptedSetupClient: JournalSetupClienting, @unchecked Senda
     func setPerforms(_ values: [JournalSetupState]) { lock.withLock { performs = values } }
     func setError(_ error: JournalSetupClientError?) { lock.withLock { thrown = error } }
     func setHold(_ value: Bool) { lock.withLock { hold = value } }
+    func setHoldState(_ value: Bool) { lock.withLock { holdState = value } }
+    func setStateGate(_ gate: PerformGate?) { lock.withLock { stateGateStorage = gate } }
     func setNetwork(_ value: JournalNetworkStatus) { lock.withLock { network = value } }
     func setHook(_ hook: (@Sendable (JournalSetupAction) -> Void)?) { lock.withLock { self.hook = hook } }
 
     func state() async throws -> JournalSetupState {
+        let gate: PerformGate? = lock.withLock { holdState ? stateGateStorage : nil }
+        if gate != nil {
+            await gate?.enterAndWait()
+        }
         let value: JournalSetupState? = lock.withLock {
             getsCount += 1
             guard !gets.isEmpty else { return nil }
@@ -1015,8 +1549,33 @@ private final class PerformGate: @unchecked Sendable {
 private final class CopyLoads: @unchecked Sendable {
     private let lock = NSLock()
     private var count = 0
+    private var current = 0
+    private var maxSeen = 0
+    private var hold = false
+    private var gate: PerformGate?
     var calls: Int { lock.withLock { count } }
-    func bump() { lock.withLock { count += 1 } }
+    var maxConcurrent: Int { lock.withLock { maxSeen } }
+    func armHold(_ gate: PerformGate) {
+        lock.withLock {
+            hold = true
+            self.gate = gate
+        }
+    }
+    func holdGate() -> PerformGate? {
+        lock.withLock { hold ? gate : nil }
+    }
+    func enter() {
+        lock.withLock {
+            current += 1
+            count += 1
+            maxSeen = max(maxSeen, current)
+        }
+    }
+    func leave() {
+        lock.withLock {
+            current = max(0, current - 1)
+        }
+    }
 }
 
 private final class LiveSwitch: @unchecked Sendable {
