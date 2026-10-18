@@ -32,6 +32,7 @@ socket2.workspace = true
 [[test]]
 name = "attested_channels"
 path = "tests/attested_channels.rs"
+required-features = ["full-tests"]
 
 [[example]]
 name = "qualification_probe"
