@@ -1915,4 +1915,50 @@ mod tests {
             extract_needed_members("entry", &colliding, "archive.zip", &needed).unwrap_err();
         assert!(error.to_string().contains("duplicate member"), "{error}");
     }
+
+    #[test]
+    fn zip2_unicode_override_keeps_its_utf8_identity_and_content() {
+        use crate::zip_names::fixtures::{Member, build_zip};
+        use solstone_core_journal_io::zip2_name::crc32_ieee;
+        let raw = b"raw.txt";
+        let name = "é.txt";
+        let mut extra = 0x7075_u16.to_le_bytes().to_vec();
+        extra.extend_from_slice(&((5 + name.len()) as u16).to_le_bytes());
+        extra.push(1);
+        extra.extend_from_slice(&crc32_ieee(raw).to_le_bytes());
+        extra.extend_from_slice(name.as_bytes());
+        let bytes = build_zip(&[Member {
+            name: raw.to_vec(),
+            flags: 0,
+            extra,
+            data: b"unicode payload".to_vec(),
+        }]);
+        let members = collect_archive_members("entry", &bytes, "archive.zip").unwrap();
+        assert_eq!(members.keys().collect::<Vec<_>>(), [&name.to_owned()]);
+        let needed = BTreeSet::from([name]);
+        let extracted = extract_needed_members("entry", &bytes, "archive.zip", &needed).unwrap();
+        assert_eq!(extracted[name], b"unicode payload");
+    }
+
+    #[test]
+    fn zip9_lost_raw_member_is_refused_before_collection_or_extraction() {
+        use crate::zip_names::fixtures::{Member, UTF8_FLAG, build_zip};
+        let bytes = build_zip(&[
+            Member {
+                name: "é.txt".as_bytes().to_vec(),
+                flags: 0,
+                extra: vec![],
+                data: b"first".to_vec(),
+            },
+            Member {
+                name: "é.txt".as_bytes().to_vec(),
+                flags: UTF8_FLAG,
+                extra: vec![],
+                data: b"second".to_vec(),
+            },
+        ]);
+        assert!(collect_archive_members("entry", &bytes, "archive.zip").is_err());
+        let needed = BTreeSet::from(["é.txt"]);
+        assert!(extract_needed_members("entry", &bytes, "archive.zip", &needed).is_err());
+    }
 }

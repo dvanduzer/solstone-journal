@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
 use solstone_core_entity::{is_admissible_person, load_all_journal_entities};
-use solstone_core_journal_io::zip2_name::{Zip2NameFailure, prove_zip2_names};
+use solstone_core_journal_io::zip2_name::{Zip2NameFailure, prove_zip2_directory};
 use solstone_core_npy::parse_npy;
 use zip::ZipArchive;
 
@@ -305,8 +305,9 @@ fn prove_open_zip<R: Read + Seek>(
             })?;
         coords.push((entry.header_start(), entry.central_header_start()));
     }
+    let central_start = archive.central_directory_start();
     let mut reader = archive.into_inner();
-    let names = prove_zip2_names(&mut reader, &coords)?;
+    let names = prove_zip2_directory(&mut reader, central_start, &coords)?;
     let archive = ZipArchive::new(reader).map_err(|error| Zip2NameFailure::Unreadable {
         detail: error.to_string(),
     })?;

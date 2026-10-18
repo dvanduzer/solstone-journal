@@ -128,6 +128,7 @@ def velopack_notice_row(license_bytes: bytes) -> dict:
         "name": "velopack",
         "version": "1.2.0",
         "source": "path+core/vendor/velopack",
+        "patched_tree_sha256": patched_velopack_tree_sha256(ROOT / "core/vendor/velopack"),
         "license_expression": "MIT",
         "notice_references": [
             {
@@ -143,6 +144,24 @@ def velopack_notice_row(license_bytes: bytes) -> dict:
     }
 
 
+def owned_manifests() -> set[Path]:
+    workspace = tomllib.loads((ROOT / "core/Cargo.toml").read_text())["workspace"]
+    return {
+        (ROOT / "core" / member / "Cargo.toml").resolve()
+        for member in [*workspace.get("members", []), *[
+            item for item in workspace.get("exclude", [])
+            if item == "crates/solstone-core-service-legacy-evidence"
+        ]]
+    }
+
+
+def path_bindings(identities: list[str]) -> dict[str, str]:
+    if VELOPACK_IDENTITY not in identities:
+        return {}
+    prove_velopack_provenance()
+    return {VELOPACK_IDENTITY: patched_velopack_tree_sha256(ROOT / "core/vendor/velopack")}
+
+
 def closure(target: str, triple: str) -> tuple[list[str], dict[str, dict]]:
     inventory = tomllib.loads((DIST / "inventory.toml").read_text())
     roots = {
@@ -155,7 +174,7 @@ def closure(target: str, triple: str) -> tuple[list[str], dict[str, dict]]:
         "--locked", "--offline", "--format-version", "1", "--filter-platform", triple,
         *shipped_feature_arguments(ROOT),
     ]
-    result = subprocess.run(command, capture_output=True, check=False)
+    result = subprocess.run(command, capture_output=True, check=False, timeout=300)
     if result.returncode:
         raise RuntimeError(
             f"{target}: cargo metadata exited {result.returncode}: "
@@ -177,6 +196,7 @@ def closure(target: str, triple: str) -> tuple[list[str], dict[str, dict]]:
             if any(kind["kind"] != "dev" for kind in dep["dep_kinds"]):
                 pending.append(dep["pkg"])
     external = {}
+    owned = owned_manifests()
     for key in seen:
         package = packages[key]
         if package["source"]:
@@ -189,7 +209,16 @@ def closure(target: str, triple: str) -> tuple[list[str], dict[str, dict]]:
                     f"path-patched velopack must be 1.2.0, got {package['version']}"
                 )
             prove_velopack_provenance()
+            if Path(package["manifest_path"]).resolve() != (ROOT / "core/vendor/velopack/Cargo.toml").resolve():
+                raise RuntimeError("velopack does not resolve to the reviewed vendor path")
             external[VELOPACK_IDENTITY] = package
+            continue
+        manifest = Path(package["manifest_path"]).resolve()
+        if manifest in owned:
+            continue
+        if package["name"] == "ffmpeg-sys-next" and manifest == (ROOT / "core/vendor/ffmpeg-sys-next/Cargo.toml").resolve():
+            continue
+        raise RuntimeError(f"unaccounted no-source dependency: {package['name']}@{package['version']}")
     return sorted(external), external
 
 
@@ -305,7 +334,7 @@ def write(target: str, triple: str, old_index: dict, known_texts: dict[str, byte
     for identity in identities:
         package = metadata[identity]
         if identity == VELOPACK_IDENTITY:
-            row = source_rows.get(identity) or velopack_notice_row(prove_velopack_provenance())
+            row = velopack_notice_row(prove_velopack_provenance())
         else:
             row = source_rows.get(identity) or new_registry_row(identity, package)
         if row.get("notice_status") not in (None, "texts-acquired"):
@@ -340,6 +369,7 @@ def write(target: str, triple: str, old_index: dict, known_texts: dict[str, byte
         "shipped_feature_arguments": shipped_feature_arguments(ROOT),
         "cargo_lock_sha256": digest(LOCK.read_bytes()),
         "notices_sha256": digest(notices),
+        "path_dependency_trees": path_bindings(identities),
         "packages": selected,
         "notice_texts": text_index,
     }
@@ -361,6 +391,7 @@ def check(target: str, triple: str) -> None:
         or index.get("shipped_feature_arguments") != shipped_feature_arguments(ROOT)
         or index["cargo_lock_sha256"] != digest(LOCK.read_bytes())
         or index["notices_sha256"] != digest(notices)
+        or index.get("path_dependency_trees", {}) != path_bindings(identities)
         or [package["identity"] for package in index["packages"]] != identities
     ):
         raise RuntimeError(f"{target}: Rust notices are missing or stale; regenerate with --write")

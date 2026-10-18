@@ -4,7 +4,7 @@
 use std::io::{Read, Seek};
 use std::path::Path;
 
-use solstone_core_journal_io::zip2_name::{Zip2NameFailure, prove_zip2_names};
+use solstone_core_journal_io::zip2_name::{Zip2NameFailure, prove_zip2_directory};
 use zip::ZipArchive;
 
 use crate::ImportSourcesError;
@@ -21,8 +21,9 @@ pub(crate) fn prove_open_zip<R: Read + Seek>(
             })?;
         coords.push((entry.header_start(), entry.central_header_start()));
     }
+    let central_start = archive.central_directory_start();
     let mut reader = archive.into_inner();
-    let names = prove_zip2_names(&mut reader, &coords)?;
+    let names = prove_zip2_directory(&mut reader, central_start, &coords)?;
     let archive = ZipArchive::new(reader).map_err(|error| Zip2NameFailure::Unreadable {
         detail: error.to_string(),
     })?;

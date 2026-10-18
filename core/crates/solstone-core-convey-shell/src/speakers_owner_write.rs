@@ -56,7 +56,17 @@ pub(crate) async fn detect(
     match detect_owner_candidate(&root.0, force) {
         Ok(mut value) => {
             if matches!(value["status"].as_str(), Some("no_cluster" | "low_quality")) {
-                let count = manual_count(&root.0, admitted_principal_id(&root.0).as_deref());
+                let count = match manual_count(&root.0, admitted_principal_id(&root.0).as_deref()) {
+                    Ok(count) => count,
+                    Err(error) => {
+                        return err(
+                            "speaker_command_failed",
+                            "that speaker command didn't finish.",
+                            &error.to_string(),
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                        );
+                    }
+                };
                 value["manual_tags_count"] = json!(count);
                 value["can_build_from_tags"] = json!(count >= MIN_STATEMENTS);
             }
@@ -722,10 +732,14 @@ fn owner_identity_invalid() -> Response {
         StatusCode::BAD_REQUEST,
     )
 }
-fn manual_count(root: &Path, principal: Option<&str>) -> usize {
+fn manual_count(
+    root: &Path,
+    principal: Option<&str>,
+) -> Result<usize, solstone_core_journal_io::zip2_name::Zip2NameFailure> {
     principal
         .map(|id| crate::speakers_quality::count_manual_owner_tags(root, id))
-        .unwrap_or_default()
+        .transpose()
+        .map(|count| count.unwrap_or_default())
 }
 async fn optional_json(request: Request) -> Value {
     let bytes = to_bytes(request.into_body(), usize::MAX)

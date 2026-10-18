@@ -8,7 +8,7 @@ use std::io::{Read, Seek};
 use std::path::Path;
 
 use serde_json::Value;
-use solstone_core_journal_io::zip2_name::{Zip2NameFailure, prove_zip2_names};
+use solstone_core_journal_io::zip2_name::{Zip2NameFailure, prove_zip2_directory};
 use solstone_core_npy::parse_npy;
 use zip::ZipArchive;
 
@@ -168,13 +168,28 @@ pub(crate) fn npz_row_count(path: &Path, name: &str) -> Result<Option<usize>, Zi
 
 type ProvedArchive = (ZipArchive<File>, Vec<String>);
 
+/// Preserve legacy optional entity reads while refusing unproved member names.
+pub(crate) fn entity_voiceprints_for_read(
+    root: &Path,
+    entity_id: &str,
+) -> Result<Option<solstone_core_entity::VoiceprintArchive>, Zip2NameFailure> {
+    match solstone_core_entity::try_load_entity_voiceprints_file(root, entity_id) {
+        Ok(archive) => Ok(archive),
+        Err(solstone_core_entity::VoiceprintOperationError::Npz(
+            solstone_core_entity::VoiceprintNpzError::NameProof(failure),
+        )) => Err(failure),
+        Err(_) => Ok(None),
+    }
+}
+
 fn open_archive(path: &Path) -> Result<Option<ProvedArchive>, Zip2NameFailure> {
     let Ok(file) = File::open(path) else {
         return Ok(None);
     };
-    let archive = ZipArchive::new(file).map_err(|error| Zip2NameFailure::Unreadable {
-        detail: error.to_string(),
-    })?;
+    let archive = match ZipArchive::new(file) {
+        Ok(archive) => archive,
+        Err(_) => return Ok(None),
+    };
     Ok(Some(prove_open_zip(archive)?))
 }
 
@@ -190,8 +205,9 @@ fn prove_open_zip<R: Read + Seek>(
             })?;
         coords.push((entry.header_start(), entry.central_header_start()));
     }
+    let central_start = archive.central_directory_start();
     let mut reader = archive.into_inner();
-    let names = prove_zip2_names(&mut reader, &coords)?;
+    let names = prove_zip2_directory(&mut reader, central_start, &coords)?;
     let archive = ZipArchive::new(reader).map_err(|error| Zip2NameFailure::Unreadable {
         detail: error.to_string(),
     })?;
@@ -314,11 +330,11 @@ fn unicode_from_utf32(bytes: &[u8]) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use solstone_core_journal_io::zip2_name::crc32_ieee;
 
-    fn colliding(name: &str, data: &[u8]) -> Vec<u8> {
+    pub(crate) fn colliding(name: &str, data: &[u8]) -> Vec<u8> {
         const UTF8_FLAG: u16 = 1 << 11;
         let flagged = "é".as_bytes();
         stored_zip(&[

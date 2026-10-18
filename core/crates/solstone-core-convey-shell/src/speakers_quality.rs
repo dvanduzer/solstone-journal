@@ -38,6 +38,10 @@ pub async fn quality(Extension(root): Extension<Arc<JournalRoot>>) -> Response {
                 StatusCode::BAD_REQUEST,
             )
             .into_response(),
+            Err(QualityError::Archive(error)) => error_envelope(
+                "speaker_command_failed", "that speaker command didn't finish.", error,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ).into_response(),
             Err(QualityError::Catalog(error)) => error_envelope(
                 "speaker_command_failed",
                 "that speaker command didn't finish.",
@@ -54,6 +58,7 @@ pub async fn quality(Extension(root): Extension<Arc<JournalRoot>>) -> Response {
 enum QualityError {
     IdentityInvalid,
     Catalog(CatalogBuildError),
+    Archive(String),
 }
 
 fn quality_status(root: &Path) -> Result<QualityStatus, QualityError> {
@@ -86,7 +91,8 @@ fn quality_status(root: &Path) -> Result<QualityStatus, QualityError> {
         corrections_window_count: counters.corrections_window_count,
         unreadable_files: counters.unreadable_files,
         empty_labels_without_skipped_segments: counters.empty_labels_without_skipped_segments,
-        owner_voice: owner_voice_state(root, &principal_id),
+        owner_voice: owner_voice_state(root, &principal_id)
+            .map_err(|error| QualityError::Archive(error.to_string()))?,
     })
 }
 
@@ -321,35 +327,33 @@ pub(crate) fn principal_folder(root: &Path, principal_id: &str) -> String {
         .unwrap_or_else(|| principal_id.to_owned())
 }
 
-fn owner_voice_state(root: &Path, principal_id: &str) -> OwnerVoice {
+fn owner_voice_state(
+    root: &Path,
+    principal_id: &str,
+) -> Result<OwnerVoice, solstone_core_journal_io::zip2_name::Zip2NameFailure> {
     let voiceprint = solstone_core_speaker_resolve::owner_voice::voiceprint_state(root);
     let status = voiceprint
         .get("status")
         .and_then(Value::as_str)
         .map(str::to_owned)
         .unwrap_or_else(|| "none".to_owned());
-    let manual_stats = manual_owner_tag_stats(root, principal_id);
+    let manual_stats = manual_owner_tag_stats(root, principal_id)?;
     if let Ok(path) =
         solstone_core_speaker_resolve::owner_centroid::owner_centroid_file(root, principal_id)
+        && let Some(centroid) = owner_centroid_summary(&path)?
     {
-        match owner_centroid_summary(&path) {
-            Ok(Some(centroid)) => {
-                return OwnerVoice {
-                    bootstrap_state: "bootstrapped",
-                    status,
-                    centroid_saved: true,
-                    evidence_tier: Some(centroid.evidence_tier),
-                    evidence_count: centroid.cluster_size,
-                    manual_tag_lookup_error_count: manual_stats.lookup_error_count,
-                    built_at: centroid.created_at,
-                    refreshed_at: Some(centroid.last_refreshed_at),
-                };
-            }
-            Ok(None) => {}
-            Err(_) => {}
-        }
+        return Ok(OwnerVoice {
+            bootstrap_state: "bootstrapped",
+            status,
+            centroid_saved: true,
+            evidence_tier: Some(centroid.evidence_tier),
+            evidence_count: centroid.cluster_size,
+            manual_tag_lookup_error_count: manual_stats.lookup_error_count,
+            built_at: centroid.created_at,
+            refreshed_at: Some(centroid.last_refreshed_at),
+        });
     }
-    OwnerVoice {
+    Ok(OwnerVoice {
         bootstrap_state: "pre_bootstrap",
         status,
         centroid_saved: false,
@@ -361,7 +365,7 @@ fn owner_voice_state(root: &Path, principal_id: &str) -> OwnerVoice {
         manual_tag_lookup_error_count: manual_stats.lookup_error_count,
         built_at: None,
         refreshed_at: None,
-    }
+    })
 }
 
 #[derive(Default)]
@@ -371,27 +375,33 @@ pub(crate) struct ManualOwnerTagStats {
     pub(crate) lookup_error_count: usize,
 }
 
-pub(crate) fn count_manual_owner_tags(root: &Path, principal_id: &str) -> usize {
-    manual_owner_tag_stats(root, principal_id).manual_tags_count
+pub(crate) fn count_manual_owner_tags(
+    root: &Path,
+    principal_id: &str,
+) -> Result<usize, solstone_core_journal_io::zip2_name::Zip2NameFailure> {
+    Ok(manual_owner_tag_stats(root, principal_id)?.manual_tags_count)
 }
 
-pub(crate) fn manual_owner_tag_stats(root: &Path, principal_id: &str) -> ManualOwnerTagStats {
+pub(crate) fn manual_owner_tag_stats(
+    root: &Path,
+    principal_id: &str,
+) -> Result<ManualOwnerTagStats, solstone_core_journal_io::zip2_name::Zip2NameFailure> {
     let Some(path) =
         solstone_core_entity::entity_voiceprints_path(root, &principal_folder(root, principal_id))
             .ok()
     else {
-        return ManualOwnerTagStats {
+        return Ok(ManualOwnerTagStats {
             manual_tags_count: 0,
             streams_represented: 0,
             lookup_error_count: 0,
-        };
+        });
     };
-    let Ok(Some(voiceprints)) = load_voiceprints(&path) else {
-        return ManualOwnerTagStats {
+    let Some(voiceprints) = load_voiceprints(&path)? else {
+        return Ok(ManualOwnerTagStats {
             manual_tags_count: 0,
             streams_represented: 0,
             lookup_error_count: 0,
-        };
+        });
     };
     let mut latest =
         BTreeMap::<(String, String, String, String, String, i64), (i64, usize, Value)>::new();
@@ -452,11 +462,11 @@ pub(crate) fn manual_owner_tag_stats(root: &Path, principal_id: &str) -> ManualO
             ManualOwnerTagResolution::NotTagged => {}
         }
     }
-    ManualOwnerTagStats {
+    Ok(ManualOwnerTagStats {
         manual_tags_count,
         streams_represented: streams.len(),
         lookup_error_count,
-    }
+    })
 }
 
 fn value_as_i64(value: Option<&Value>) -> Option<i64> {
@@ -563,6 +573,30 @@ mod tests {
     use super::{quality_status, quality_tier_for_label};
     use crate::speakers_npz::owner_centroid_summary;
     use std::path::Path;
+
+    #[test]
+    fn manual_owner_reads_report_unproved_names_instead_of_empty_counts() {
+        let root = tempfile::tempdir().unwrap();
+        let entity = root.path().join("entities/person");
+        std::fs::create_dir_all(&entity).unwrap();
+        std::fs::write(
+            entity.join("entity.json"),
+            br#"{"id":"person","type":"Person","is_principal":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            super::count_manual_owner_tags(root.path(), "person").unwrap(),
+            0
+        );
+        std::fs::write(
+            entity.join("voiceprints.npz"),
+            crate::speakers_npz::tests::colliding("embeddings.npy", b"x"),
+        )
+        .unwrap();
+        assert!(super::manual_owner_tag_stats(root.path(), "person").is_err());
+        assert!(super::count_manual_owner_tags(root.path(), "person").is_err());
+        assert!(super::owner_voice_state(root.path(), "person").is_err());
+    }
 
     #[test]
     fn empty_journal_has_pre_bootstrap_quality() {

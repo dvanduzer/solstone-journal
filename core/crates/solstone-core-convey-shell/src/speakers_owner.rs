@@ -61,6 +61,7 @@ pub async fn status(Extension(root): Extension<Arc<JournalRoot>>) -> Response {
     .await
 }
 
+#[derive(Debug)]
 enum OwnerStatusError {
     IdentityInvalid,
     Catalog(CatalogBuildError),
@@ -112,11 +113,12 @@ fn owner_setup_status(root: &Path) -> Result<Value, OwnerStatusError> {
         None
     };
     drop(lock);
-    let manual_stats = manual_owner_tag_stats(root, &principal_id);
+    let manual_stats = manual_owner_tag_stats(root, &principal_id)
+        .map_err(|error| OwnerStatusError::Failed(error.to_string()))?;
     if status == "confirmed" {
         return confirmed_status(root, &principal_id, &manual_stats, centroid);
     }
-    let diagnostics = diagnostics(root, &manual_stats).map_err(OwnerStatusError::Catalog)?;
+    let diagnostics = diagnostics(root, &manual_stats)?;
 
     Ok(match status {
         "candidate" => {
@@ -298,7 +300,7 @@ struct Diagnostics {
 fn diagnostics(
     root: &Path,
     manual_stats: &ManualOwnerTagStats,
-) -> Result<Diagnostics, CatalogBuildError> {
+) -> Result<Diagnostics, OwnerStatusError> {
     let (segments_available, embeddings_available) = owner_embedding_inventory(root)?;
     Ok(Diagnostics {
         manual_tags_count: manual_stats.manual_tags_count,
@@ -349,10 +351,10 @@ fn manual_fallback(diagnostics: &Diagnostics, manual_stats: &ManualOwnerTagStats
     })
 }
 
-fn owner_embedding_inventory(root: &Path) -> Result<(usize, usize), CatalogBuildError> {
+fn owner_embedding_inventory(root: &Path) -> Result<(usize, usize), OwnerStatusError> {
     let mut segments_available = 0;
     let mut embeddings_available = 0;
-    for segment in catalog_journal(root)? {
+    for segment in catalog_journal(root).map_err(OwnerStatusError::Catalog)? {
         let sources = audio_embedding_sources(&segment.path);
         if sources.is_empty() {
             continue;
@@ -365,7 +367,7 @@ fn owner_embedding_inventory(root: &Path) -> Result<(usize, usize), CatalogBuild
             embeddings_available +=
                 match npz_row_count(&segment.path.join(format!("{source}.npz")), "embeddings") {
                     Ok(count) => count.unwrap_or_default(),
-                    Err(_) => 0,
+                    Err(error) => return Err(OwnerStatusError::Failed(error.to_string())),
                 };
         }
     }
@@ -393,7 +395,8 @@ mod tests {
         };
 
         // 1. centroid: None -> intra_cosine_p25 is null and streams is empty
-        let res_no_centroid = confirmed_status(root, principal_id, &manual_stats, None);
+        let res_no_centroid = confirmed_status(root, principal_id, &manual_stats, None)
+            .expect("readable voiceprints");
         assert_eq!(res_no_centroid["status"], "confirmed");
         assert!(res_no_centroid["centroid_metadata"]["intra_cosine_p25"].is_null());
         assert_eq!(res_no_centroid["centroid_metadata"]["streams"], json!([]));
@@ -443,7 +446,8 @@ mod tests {
 
         // 2. centroid: Some(...) with real voiceprint -> number and streams from file
         let res_with_centroid =
-            confirmed_status(root, principal_id, &manual_stats, Some(centroid_summary));
+            confirmed_status(root, principal_id, &manual_stats, Some(centroid_summary))
+                .expect("readable voiceprints");
         assert_eq!(res_with_centroid["status"], "confirmed");
         assert!(res_with_centroid["centroid_metadata"]["intra_cosine_p25"].is_number());
         assert_eq!(
@@ -464,7 +468,8 @@ mod tests {
             evidence_intra_cosine_p25: Some(0.4),
         };
         let res_corrupted =
-            confirmed_status(root, principal_id, &manual_stats, Some(centroid_summary2));
+            confirmed_status(root, principal_id, &manual_stats, Some(centroid_summary2))
+                .expect("readable voiceprints");
         assert!(res_corrupted["centroid_metadata"]["intra_cosine_p25"].is_null());
         assert_eq!(res_corrupted["centroid_metadata"]["streams"], json!([]));
 
@@ -481,7 +486,8 @@ mod tests {
             evidence_intra_cosine_p25: Some(0.4),
         };
         let res_deleted =
-            confirmed_status(root, principal_id, &manual_stats, Some(centroid_summary3));
+            confirmed_status(root, principal_id, &manual_stats, Some(centroid_summary3))
+                .expect("readable voiceprints");
         assert!(res_deleted["centroid_metadata"]["intra_cosine_p25"].is_null());
         assert_eq!(res_deleted["centroid_metadata"]["streams"], json!([]));
     }

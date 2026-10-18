@@ -601,17 +601,18 @@ def _workspace_existing_deps_only(
 
 
 def declared_workspace_crates(repo: Path) -> frozenset[str]:
-    """Every crate `core/Cargo.toml`'s `[workspace]` table declares, as a
-    member or an exclude, by its own `[package].name`.
+    """Workspace members and explicitly owned excluded evidence code.
 
-    The same checkable definition of sol pbc's own crates the Windows producer
-    uses for the no-`source` rows of the lock: a lock row without a source
-    that is not declared here could be a patched third-party crate, so it is
-    never admitted as a new workspace crate.
+    An arbitrary workspace exclusion does not establish first-party ownership.
+    Keep this classification consistent with the Windows producer and the
+    target-notice selector; unknown no-source packages remain unqualified.
     """
     workspace = tomllib.loads((repo / "core/Cargo.toml").read_text())["workspace"]
     names = set()
-    for path in [*workspace.get("members", []), *workspace.get("exclude", [])]:
+    for path in [*workspace.get("members", []), *[
+        item for item in workspace.get("exclude", [])
+        if item == "crates/solstone-core-service-legacy-evidence"
+    ]]:
         manifest = repo / "core" / path / "Cargo.toml"
         names.add(tomllib.loads(manifest.read_text())["package"]["name"])
     return frozenset(names)
@@ -671,7 +672,7 @@ def workspace_version_or_existing_dependency_edge_delta(
         raise RefreshError(
             f"the workspace package set changed (a crate was added: {undeclared}) "
             "and core/Cargo.toml does not declare it as a workspace member or "
-            "exclude; scope this as engineering work instead"
+            "an explicitly owned exclusion; scope this as engineering work instead"
         )
     for name in added_workspace:
         if not _added_workspace_crate_edges_resolve(

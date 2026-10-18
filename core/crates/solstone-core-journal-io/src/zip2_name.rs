@@ -78,6 +78,57 @@ pub fn crc32_ieee(data: &[u8]) -> u32 {
     !crc
 }
 
+/// Check the raw central-directory census before proving exposed member names.
+///
+/// ZIP9 may collapse members while constructing its index. Walk only the central
+/// records from its public directory offset; do not infer a complete population
+/// from the surviving entries. Refuse any lost or unexplained coordinate.
+pub fn prove_zip2_directory<R: Read + Seek>(
+    reader: &mut R,
+    central_start: u64,
+    entries: &[(u64, u64)],
+) -> Result<Vec<String>, Zip2NameFailure> {
+    let unreadable = |detail: String| Zip2NameFailure::Unreadable { detail };
+    let file_end = reader
+        .seek(SeekFrom::End(0))
+        .map_err(|error| unreadable(error.to_string()))?;
+    let mut remaining: std::collections::BTreeSet<u64> =
+        entries.iter().map(|entry| entry.1).collect();
+    if remaining.len() != entries.len() {
+        return Err(unreadable("repeated exposed central coordinate".to_owned()));
+    }
+    let mut cursor = central_start;
+    let mut count = 0;
+    loop {
+        let signature =
+            read_at(reader, cursor, 4).map_err(|error| unreadable(error.to_string()))?;
+        if signature != CENTRAL_SIGNATURE {
+            break;
+        }
+        if !remaining.remove(&cursor) {
+            return Err(unreadable(
+                "raw central member was lost from the ZIP index".to_owned(),
+            ));
+        }
+        let header = read_at(reader, cursor, CENTRAL_HEADER_LEN)
+            .map_err(|error| unreadable(error.to_string()))?;
+        let name_len = u16::from_le_bytes([header[28], header[29]]) as u64;
+        let extra_len = u16::from_le_bytes([header[30], header[31]]) as u64;
+        let comment_len = u16::from_le_bytes([header[32], header[33]]) as u64;
+        cursor = cursor
+            .checked_add(CENTRAL_HEADER_LEN as u64 + name_len + extra_len + comment_len)
+            .filter(|next| *next <= file_end)
+            .ok_or_else(|| unreadable("central record extends beyond archive".to_owned()))?;
+        count += 1;
+    }
+    if count != entries.len() || !remaining.is_empty() {
+        return Err(unreadable(
+            "raw and exposed central populations disagree".to_owned(),
+        ));
+    }
+    prove_zip2_names(reader, entries)
+}
+
 /// Prove zip 2.4.2 member identities from archive bytes at the given offsets.
 ///
 /// `entries` is `(header_start, central_header_start)` in zip index order.
@@ -140,16 +191,21 @@ fn prove_one<R: Read + Seek>(
         read_at(reader, extra_at, extra_len).map_err(|error| Zip2NameFailure::Unreadable {
             detail: format!("central extra at {extra_at}: {error}"),
         })?;
-    apply_unicode_path_extras(index, &mut raw, &extra)?;
-    decode_identity(index, flags, &raw)
+    let overridden = apply_unicode_path_extras(index, &mut raw, &extra)?;
+    decode_identity(
+        index,
+        if overridden { flags | UTF8_FLAG } else { flags },
+        &raw,
+    )
 }
 
 fn apply_unicode_path_extras(
     index: usize,
     raw: &mut Vec<u8>,
     extra: &[u8],
-) -> Result<(), Zip2NameFailure> {
+) -> Result<bool, Zip2NameFailure> {
     let mut offset = 0;
+    let mut overridden = false;
     while offset + 4 <= extra.len() {
         let id = u16::from_le_bytes([extra[offset], extra[offset + 1]]);
         let len = u16::from_le_bytes([extra[offset + 2], extra[offset + 3]]) as usize;
@@ -184,8 +240,9 @@ fn apply_unicode_path_extras(
         }
         raw.clear();
         raw.extend_from_slice(payload);
+        overridden = true;
     }
-    Ok(())
+    Ok(overridden)
 }
 
 fn decode_identity(index: usize, flags: u16, raw: &[u8]) -> Result<String, Zip2NameFailure> {

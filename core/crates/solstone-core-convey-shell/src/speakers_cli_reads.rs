@@ -159,7 +159,11 @@ pub async fn review(
                 StatusCode::NOT_FOUND,
             );
         };
-        let embedded = embedded_sentence_ids(&segment.join(format!("{source}.npz")));
+        let embedded = match embedded_sentence_ids(&segment.join(format!("{source}.npz"))) {
+            Ok(embedded) => embedded,
+            Err(error) => return err("speaker_command_failed", "that speaker command didn't finish.",
+                &error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
+        };
         let labels = labels_by_sentence(&segment);
         let admitted_speaker_ids = journal_entities(&root.0)
             .iter()
@@ -247,10 +251,21 @@ pub async fn status(Extension(root): Extension<Arc<JournalRoot>>) -> Response {
                 );
             }
         };
+        let speakers = match speakers_section(&root.0, &entities, &admitted_speaker_ids) {
+            Ok(speakers) => speakers,
+            Err(detail) => {
+                return err(
+                    "speaker_command_failed",
+                    "that speaker command didn't finish.",
+                    &detail.to_string(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                );
+            }
+        };
         Json(json!({
             "embeddings": embeddings_section(&segments),
             "owner": owner,
-            "speakers": speakers_section(&root.0, &entities, &admitted_speaker_ids),
+            "speakers": speakers,
             "pool": pool_section(&root.0),
             "clusters": clusters_section(&root.0),
             "imports": imports_section(&segments),
@@ -351,13 +366,13 @@ fn active_speaker_label<'a>(
     label.filter(|label| label_has_admitted_speaker(label, admitted_speaker_ids))
 }
 
-fn embedded_sentence_ids(path: &Path) -> BTreeSet<i64> {
-    // A malformed or absent NPZ means no sentence is embedded; this mirrors the
-    // browser reader's conservative presentation behavior.
-    match crate::speakers_npz::load_segment_embeddings(path) {
-        Ok(Some(data)) => data.statement_ids.into_iter().map(i64::from).collect(),
-        Ok(None) | Err(_) => BTreeSet::new(),
-    }
+fn embedded_sentence_ids(
+    path: &Path,
+) -> Result<BTreeSet<i64>, solstone_core_journal_io::zip2_name::Zip2NameFailure> {
+    Ok(match crate::speakers_npz::load_segment_embeddings(path)? {
+        Some(data) => data.statement_ids.into_iter().map(i64::from).collect(),
+        None => BTreeSet::new(),
+    })
 }
 
 fn read_json(path: &Path) -> Option<Value> {
@@ -481,13 +496,13 @@ fn speakers_section(
     root: &Path,
     entities: &BTreeMap<String, Value>,
     admitted_speaker_ids: &BTreeSet<String>,
-) -> Value {
+) -> Result<Value, solstone_core_journal_io::zip2_name::Zip2NameFailure> {
     let mut speakers = Vec::new();
     for (id, entity) in entities {
         if !admitted_speaker_ids.contains(id) {
             continue;
         }
-        let Some(archive) = solstone_core_entity::load_entity_voiceprints_file(root, id) else {
+        let Some(archive) = crate::speakers_npz::entity_voiceprints_for_read(root, id)? else {
             continue;
         };
         let metadata = archive
@@ -515,7 +530,7 @@ fn speakers_section(
             .max();
         speakers.push(json!({"entity_id":id,"name":entity.get("name").cloned().unwrap_or_else(|| json!(id)),"embedding_count":archive.rows,"segment_count":segments.len(),"streams":streams,"last_seen_ts":last_seen,"intra_cosine_p25":Value::Null}));
     }
-    Value::Array(speakers)
+    Ok(Value::Array(speakers))
 }
 
 fn pool_section(root: &Path) -> Value {
@@ -965,6 +980,45 @@ mod tests {
     };
 
     #[test]
+    fn sentence_embedding_read_reports_unproved_names_instead_of_no_embeddings() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("audio.npz");
+        assert!(super::embedded_sentence_ids(&archive).unwrap().is_empty());
+        fs::write(
+            &archive,
+            crate::speakers_npz::tests::colliding("embeddings.npy", b"x"),
+        )
+        .unwrap();
+        assert!(super::embedded_sentence_ids(&archive).is_err());
+    }
+
+    #[test]
+    fn speakers_status_reports_unproved_names_instead_of_omitting_the_person() {
+        let root = tempfile::tempdir().unwrap();
+        let entity = root.path().join("entities/person");
+        fs::create_dir_all(&entity).unwrap();
+        let value = json!({"id":"person","type":"Person"});
+        fs::write(entity.join("entity.json"), value.to_string()).unwrap();
+        let entities = BTreeMap::from([("person".to_owned(), value)]);
+        let admitted = BTreeSet::from(["person".to_owned()]);
+        assert_eq!(
+            speakers_section(root.path(), &entities, &admitted).unwrap(),
+            json!([])
+        );
+        fs::write(entity.join("voiceprints.npz"), b"not a zip").unwrap();
+        assert_eq!(
+            speakers_section(root.path(), &entities, &admitted).unwrap(),
+            json!([])
+        );
+        fs::write(
+            entity.join("voiceprints.npz"),
+            crate::speakers_npz::tests::colliding("embeddings.npy", b"x"),
+        )
+        .unwrap();
+        assert!(speakers_section(root.path(), &entities, &admitted).is_err());
+    }
+
+    #[test]
     fn invalid_speakers_are_unassigned_in_cli_read_projections() {
         let root = std::env::temp_dir().join(format!(
             "solstone-cli-read-admission-{}",
@@ -1025,7 +1079,7 @@ mod tests {
         }];
         let admitted = BTreeSet::from(["person".to_owned()]);
 
-        let speakers = speakers_section(&root, &entities, &admitted);
+        let speakers = speakers_section(&root, &entities, &admitted).unwrap();
         assert_eq!(speakers.as_array().map(Vec::len), Some(1));
         assert_eq!(speakers[0]["entity_id"], "person");
 

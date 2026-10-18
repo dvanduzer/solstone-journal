@@ -5228,13 +5228,11 @@ mod tests {
                 data: b"b".to_vec(),
             },
         ]);
-        let (_tree, run) = extract_named(&zip9_pair).expect("zip9 pair is not a collision");
-        let extracted = if run.join("é").is_file() {
-            fs::read(run.join("é")).unwrap()
-        } else {
-            fs::read(run.join("├⌐")).unwrap()
-        };
-        assert!(extracted == b"a" || extracted == b"b", "{extracted:?}");
+        // These raw names differ under ZIP2, but ZIP9 collapses their raw keys.
+        // Refuse before extraction rather than silently publishing one member.
+        let (error, run_state) = extract_error(&zip9_pair);
+        assert!(matches!(error, ImportSourcesError::ArchiveInvalid { .. }));
+        assert_eq!(run_state, PathBuf::from("gone"));
 
         let collision = build_zip(&[
             Member {

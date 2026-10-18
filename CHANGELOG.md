@@ -8,7 +8,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- direct ZIP readers and the Windows Velopack 1.2.0 updater use zip 9.0.3.
+- archive imports now refuse conflicting file names.
 
 ## [2.0.50] - 2026-10-18
 

@@ -20,7 +20,7 @@ use solstone_core_journal_io::hold_lock;
 use solstone_core_journal_io::path_lexists;
 use solstone_core_journal_io::read_bytes;
 use solstone_core_journal_io::remove_file;
-use solstone_core_journal_io::zip2_name::{Zip2NameFailure, prove_zip2_names};
+use solstone_core_journal_io::zip2_name::{Zip2NameFailure, prove_zip2_directory};
 use solstone_core_npy::{NpyBlob, parse_npy, write_npy};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
@@ -82,6 +82,7 @@ impl VoiceprintArchive {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VoiceprintNpzError {
     Archive(String),
+    NameProof(Zip2NameFailure),
     Invalid(String),
     EmbeddingWidth { found: usize },
 }
@@ -90,6 +91,7 @@ impl fmt::Display for VoiceprintNpzError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Archive(message) | Self::Invalid(message) => formatter.write_str(message),
+            Self::NameProof(failure) => write!(formatter, "invalid voiceprint archive: {failure}"),
             Self::EmbeddingWidth { found } => write!(
                 formatter,
                 "embeddings.npy width {found} does not match {EMBEDDING_WIDTH}"
@@ -734,9 +736,8 @@ pub(crate) fn read_voiceprints_npz(bytes: &[u8]) -> Result<VoiceprintArchive, Vo
     let archive = ZipArchive::new(Cursor::new(bytes)).map_err(|error| {
         VoiceprintNpzError::Archive(format!("invalid voiceprint archive: {error}"))
     })?;
-    let (mut archive, mut names) = prove_open_zip(archive).map_err(|failure| {
-        VoiceprintNpzError::Archive(format!("invalid voiceprint archive: {failure}"))
-    })?;
+    let (mut archive, mut names) =
+        prove_open_zip(archive).map_err(VoiceprintNpzError::NameProof)?;
     let original_names = names.clone();
     names.sort();
     if names
@@ -843,8 +844,9 @@ fn prove_open_zip<R: Read + std::io::Seek>(
             })?;
         coords.push((entry.header_start(), entry.central_header_start()));
     }
+    let central_start = archive.central_directory_start();
     let mut reader = archive.into_inner();
-    let names = prove_zip2_names(&mut reader, &coords)?;
+    let names = prove_zip2_directory(&mut reader, central_start, &coords)?;
     let archive = ZipArchive::new(reader).map_err(|error| Zip2NameFailure::Unreadable {
         detail: error.to_string(),
     })?;
@@ -1253,7 +1255,7 @@ mod tests {
         let colliding = colliding_member("embeddings.npy", b"not-npy");
         assert!(matches!(
             read_voiceprints_npz(&colliding),
-            Err(VoiceprintNpzError::Archive(_))
+            Err(VoiceprintNpzError::NameProof(_))
         ));
     }
 }
