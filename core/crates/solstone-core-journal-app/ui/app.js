@@ -411,6 +411,14 @@ function syncDownloadWatch(watch) {
 }
 
 let thinkingChoicesOpen = false;
+let flowFocus = null;
+let paneFocus = null;
+
+function continueThinking(choice) {
+  let timezone = null;
+  try { timezone = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch { /* the journal can place the day */ }
+  return call('flow', { intent: 'continue-thinking', choice, timezone });
+}
 let homeLanded = false;
 
 function stepSequence(view) {
@@ -493,7 +501,7 @@ function thinkingChoiceNodes(view) {
         disabled: Boolean(view.busy) || view.authoritative === false,
         on: { click: () => {
           if (view.authoritative === false) return;
-          call('flow', { intent: 'choose-thinking', choice: 'later' });
+          continueThinking('later');
         } },
       }, document.createTextNode(thinkingCopy.later)));
     }
@@ -523,7 +531,7 @@ function thinkingChoiceNodes(view) {
         disabled: Boolean(view.busy) || view.authoritative === false,
         on: { click: () => {
           if (view.authoritative === false) return;
-          call('flow', { intent: 'choose-thinking', choice: 'later' });
+          continueThinking('later');
         } },
       }, document.createTextNode(thinkingCopy.later)));
     }
@@ -548,7 +556,7 @@ function thinkingChoiceNodes(view) {
         disabled: Boolean(view.busy) || view.authoritative === false,
         on: { click: () => {
           if (view.authoritative === false) return;
-          call('flow', { intent: 'choose-thinking', choice: 'later' });
+          continueThinking('later');
         } },
       }, document.createTextNode(thinkingCopy.later)));
     }
@@ -558,7 +566,7 @@ function thinkingChoiceNodes(view) {
       disabled: Boolean(view.busy) || view.authoritative === false,
       on: { click: () => {
         if (view.authoritative === false) return;
-        call('flow', { intent: 'choose-thinking', choice: 'local' });
+        continueThinking('local');
       } },
     }, document.createTextNode(thinkingCopy.continue || COPY.continueButton)));
     return nodes;
@@ -590,7 +598,7 @@ function thinkingChoiceNodes(view) {
       disabled: Boolean(view.busy) || view.authoritative === false,
       on: { click: () => {
         if (view.authoritative === false) return;
-        call('flow', { intent: 'choose-thinking', choice: 'later' });
+        continueThinking('later');
       } },
     }, document.createTextNode(thinkingCopy.later)));
   }
@@ -660,11 +668,11 @@ function renderFlow(view) {
     return;
   }
 
-  let savedTag = null;
-  let savedText = null;
+  if (view.phase !== previousPhase) flowFocus = null;
   if (view.phase === previousPhase && focused && root.contains(focused)) {
-    savedTag = focused.tagName;
-    savedText = focused.textContent.trim();
+    flowFocus = { tag: focused.tagName, text: focused.textContent.trim() };
+  } else if (focused && focused !== document.body) {
+    flowFocus = null;
   }
 
   root.replaceChildren();
@@ -863,7 +871,9 @@ function renderFlow(view) {
       markCopy.title ? el('h1', {}, document.createTextNode(markCopy.title)) : el('h1', {}, document.createTextNode('')),
       markCopy.help ? el('p', { class: 'muted' }, document.createTextNode(markCopy.help)) : null,
       markMissing
-        ? (markCopy.error ? el('p', { class: 'error' }, document.createTextNode(markCopy.error)) : null)
+        ? (view.busy
+          ? el('progress', { 'aria-label': markCopy.title || COPY.setupTitle })
+          : (markCopy.error ? el('p', { class: 'error' }, document.createTextNode(markCopy.error)) : null))
         : markBox,
       markCopy.permanence ? el('p', { class: 'faint' }, document.createTextNode(markCopy.permanence)) : null,
       view.error ? el('p', { class: 'error' }, document.createTextNode(view.error)) : null,
@@ -877,9 +887,7 @@ function renderFlow(view) {
       disabled: Boolean(view.busy) || view.authoritative === false,
       on: { click: () => {
         if (view.authoritative === false) return;
-        let tz = null;
-        try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch { /* the journal can place the day */ }
-        call('flow', { intent: 'finalize', timezone: tz });
+        continueThinking(view.thinking_choice);
       } },
     }, document.createTextNode(thinkingCopy.continue || COPY.continueButton)) : null;
     const actions = [];
@@ -909,13 +917,12 @@ function renderFlow(view) {
       heading.tabIndex = -1;
       heading.focus();
     }
-  } else if (savedTag) {
-    const candidate = [...card.querySelectorAll(savedTag.toLowerCase())].find(
-      el => el.textContent.trim() === savedText && !el.disabled
+  } else if (flowFocus) {
+    const candidate = [...card.querySelectorAll(flowFocus.tag.toLowerCase())].find(
+      el => el.textContent.trim() === flowFocus.text && !el.disabled
     );
-    if (candidate) {
-      candidate.focus();
-    }
+    if (candidate) candidate.focus();
+    if (candidate || !view.busy) flowFocus = null;
   }
 }
 
@@ -1732,18 +1739,19 @@ function render(force = false) {
   const focused = document.activeElement;
   const keepFocus = focused && pane.contains(focused) && focused.tagName === 'INPUT';
   if (keepFocus) return; // don't pull a field out from under the owner's typing
-  let savedTag = null;
-  let savedText = null;
+  if (paneFocus?.pane !== state.pane) paneFocus = null;
   if (focused && pane.contains(focused)) {
-    savedTag = focused.tagName;
-    savedText = focused.textContent.trim();
+    paneFocus = { pane: state.pane, tag: focused.tagName, text: focused.textContent.trim() };
+  } else if (focused && focused !== document.body) {
+    paneFocus = null;
   }
   pane.replaceChildren(...[panes[state.pane]()].flat().filter(Boolean));
-  if (savedTag) {
-    const candidate = [...pane.querySelectorAll(savedTag.toLowerCase())].find(
-      el => el.textContent.trim() === savedText && !el.disabled
+  if (paneFocus) {
+    const candidate = [...pane.querySelectorAll(paneFocus.tag.toLowerCase())].find(
+      el => el.textContent.trim() === paneFocus.text && !el.disabled
     );
     if (candidate) candidate.focus();
+    if (candidate || !state.flow?.busy) paneFocus = null;
   }
   // The pairing panel replaces the list in place, so the button the owner
   // pressed is gone: start them at the panel's heading.

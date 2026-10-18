@@ -16,7 +16,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- on windows, the journal window finishes welcome and how it fits, your folder, the mark you see, and where thinking runs, then shows home once, thinking downloads show their progress on that step and at home, speech already in the app is repaired or reinstalled rather than downloaded again, a failed model check stays in the check's own words until a later check succeeds, and a later update leaves the page and the pairing dialog you already have open.
+- on windows, setup stays in the journal window through choosing your mark and where thinking runs, then reaches home. thinking download progress and model recovery stay available there.
 - browser setup confirms the journal mark you see, then saves where thinking runs.
 - setup commits the journal mark you see and saves your thinking choice. it opens home, with links to finish setting up your own model or confidential processing. finishing setup again keeps your completion time and settings.
 - while no device is paired, home keeps "set one up →" next to anything that needs your attention. before, it disappeared whenever anything else showed, which on a new journal was almost always.

@@ -37,7 +37,40 @@ function glyphShapes(svg) {
     `<svg xmlns="${SVG_NS}">${svg}</svg>`, 'image/svg+xml');
   if (doc.querySelector('parsererror')) return [];
   const allowed = new Set(['path', 'circle', 'rect', 'line', 'polyline', 'polygon', 'ellipse']);
-  return [...doc.documentElement.children].filter(el => allowed.has(el.localName));
+  return [...doc.documentElement.children].filter(el => {
+    if (!allowed.has(el.localName)) return false;
+    // Use WebView2's geometry parser before the portable fixture fallback;
+    // M/m may contain implicit line segments without another command letter.
+    if (typeof el.getTotalLength === 'function') {
+      try { const length = el.getTotalLength(); return Number.isFinite(length) && length > 0; }
+      catch { return false; }
+    }
+    const value = name => el.getAttribute(name)?.trim() || '';
+    const number = name => Number(value(name));
+    const positive = name => Number.isFinite(number(name)) && number(name) > 0;
+    let hasGeometry = false;
+    switch (el.localName) {
+      case 'path': {
+        const path = value('d');
+        const numbers = path.match(/[+-]?(?:\d*\.\d+|\d+\.?\d*)(?:[eE][+-]?\d+)?/g) || [];
+        hasGeometry = /^[Mm]/.test(path) && numbers.every(n => Number.isFinite(Number(n))) &&
+          (/[LlHhVvCcSsQqTtAa]/.test(path) || numbers.length >= 4);
+        break;
+      }
+      case 'circle': hasGeometry = positive('r'); break;
+      case 'ellipse': hasGeometry = positive('rx') && positive('ry'); break;
+      case 'rect': hasGeometry = positive('width') && positive('height'); break;
+      case 'line': hasGeometry = number('x1') !== number('x2') || number('y1') !== number('y2'); break;
+      case 'polyline':
+      case 'polygon': {
+        const points = value('points').split(/[\s,]+/).filter(Boolean).map(Number);
+        hasGeometry = points.length >= 4 && points.length % 2 === 0 && points.every(Number.isFinite);
+        break;
+      }
+    }
+    if (!hasGeometry) return false;
+    return true;
+  });
 }
 
 function glyphSvgElement(svg, hex) {

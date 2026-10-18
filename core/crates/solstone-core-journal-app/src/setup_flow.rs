@@ -105,6 +105,10 @@ pub enum Event {
         proposal_id: String,
     },
     ChooseThinking(String),
+    ContinueThinking {
+        choice: String,
+        timezone: Option<String>,
+    },
     StartThinkingDownloadClicked,
     CancelThinkingDownloadClicked {
         attempt_id: String,
@@ -148,6 +152,8 @@ pub struct Session {
     pub setup_failed: bool,
     pub setup_running: bool,
     pub authoritative: bool,
+    pub initial_mark_pending: bool,
+    pub continue_after_save: Option<(String, Option<String>)>,
     pub error: Option<String>,
 }
 
@@ -171,6 +177,8 @@ impl Default for Session {
             setup_failed: false,
             setup_running: false,
             authoritative: false,
+            initial_mark_pending: false,
+            continue_after_save: None,
             error: None,
         }
     }
@@ -256,6 +264,8 @@ pub fn withhold_remote(
         }
         session.busy = false;
         session.inflight = None;
+        session.authoritative = false;
+        session.continue_after_save = None;
         if session.phase == Phase::Opening && session.snapshot.is_none() && session.task_installed {
             session.resting = true;
         }
@@ -331,6 +341,13 @@ pub fn event_from_intent(intent: &str, args: &Value) -> Result<Event, String> {
             proposal_id: arg_string(args, "proposal_id"),
         },
         "choose-thinking" | "chooseThinking" => Event::ChooseThinking(arg_string(args, "choice")),
+        "continue-thinking" => Event::ContinueThinking {
+            choice: arg_string(args, "choice"),
+            timezone: args
+                .get("timezone")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        },
         "start-thinking-download" | "startThinkingDownload" => Event::StartThinkingDownloadClicked,
         "cancel-thinking-download" | "cancelThinkingDownload" => {
             Event::CancelThinkingDownloadClicked {
@@ -748,6 +765,7 @@ pub fn reduce(session: &Session, event: &Event) -> Step {
             }
             next.setup_failed = false;
             next.setup_running = true;
+            next.initial_mark_pending = true;
             next.phase = Phase::Setup;
             next.generation += 1;
             next.inflight = Some(next.generation);
@@ -839,6 +857,17 @@ pub fn reduce(session: &Session, event: &Event) -> Step {
             match result {
                 Ok(state) => {
                     apply_snapshot(&mut next, &mut effects, state);
+                    if next.authoritative && next.initial_mark_pending {
+                        next.initial_mark_pending = false;
+                        if !state.get("done").and_then(Value::as_bool).unwrap_or(false)
+                            && state.pointer("/mark/state").and_then(Value::as_str)
+                                == Some("unavailable")
+                        {
+                            let first_mark = reduce(&next, &Event::RegenerateMarkClicked);
+                            next = first_mark.session;
+                            effects.extend(first_mark.effects);
+                        }
+                    }
                 }
                 Err(err) => {
                     next.authoritative = false;
@@ -857,9 +886,21 @@ pub fn reduce(session: &Session, event: &Event) -> Step {
             }
             next.inflight = None;
             next.busy = false;
+            let continuation = next.continue_after_save.take();
             match result {
                 Ok(state) => {
                     apply_snapshot(&mut next, &mut effects, state);
+                    if let Some((choice, timezone)) = continuation
+                        && next.authoritative
+                        && next.phase == Phase::Thinking
+                        && state.pointer("/thinking/saved").and_then(Value::as_bool) == Some(true)
+                        && state.pointer("/thinking/choice").and_then(Value::as_str)
+                            == Some(choice.as_str())
+                    {
+                        let finalized = reduce(&next, &Event::FinalizeClicked { timezone });
+                        next = finalized.session;
+                        effects.extend(finalized.effects);
+                    }
                 }
                 Err(payload) => {
                     next.error = Some(payload.message.clone());
@@ -963,6 +1004,28 @@ pub fn reduce(session: &Session, event: &Event) -> Step {
             effects.push(Effect::PostAction(SetupAction::SaveThinking {
                 choice: choice.clone(),
             }));
+        }
+        Event::ContinueThinking { choice, timezone } => {
+            let saved_choice_matches = next.snapshot.as_ref().is_some_and(|state| {
+                state.pointer("/thinking/saved").and_then(Value::as_bool) == Some(true)
+                    && state.pointer("/thinking/choice").and_then(Value::as_str)
+                        == Some(choice.as_str())
+            });
+            if saved_choice_matches {
+                return reduce(
+                    &next,
+                    &Event::FinalizeClicked {
+                        timezone: timezone.clone(),
+                    },
+                );
+            }
+            let mut saving = reduce(&next, &Event::ChooseThinking(choice.clone()));
+            if saving.effects.iter().any(|effect| {
+                matches!(effect, Effect::PostAction(SetupAction::SaveThinking { .. }))
+            }) {
+                saving.session.continue_after_save = Some((choice.clone(), timezone.clone()));
+            }
+            return saving;
         }
         Event::StartThinkingDownloadClicked => {
             if !next.authoritative
@@ -1170,6 +1233,81 @@ fn nonblank(text: Option<&str>) -> bool {
     text.is_some_and(|text| !text.trim().is_empty())
 }
 
+fn path_has_geometry(path: &str) -> bool {
+    let mut drawing = false;
+    for segment in svgtypes::PathParser::from(path) {
+        match segment {
+            Ok(svgtypes::PathSegment::MoveTo { .. } | svgtypes::PathSegment::ClosePath { .. }) => {}
+            Ok(_) => drawing = true,
+            Err(_) => return false,
+        }
+    }
+    drawing
+}
+
+fn svg_has_geometry(svg: &str) -> bool {
+    use quick_xml::events::Event as XmlEvent;
+    let wrapped = format!("<svg>{svg}</svg>");
+    let mut reader = quick_xml::Reader::from_str(&wrapped);
+    let mut depth = 0_usize;
+    let mut geometry = false;
+    loop {
+        let (element, starts) = match reader.read_event() {
+            Ok(XmlEvent::Start(element)) => (element, true),
+            Ok(XmlEvent::Empty(element)) => (element, false),
+            Ok(XmlEvent::End(_)) => {
+                depth = depth.saturating_sub(1);
+                continue;
+            }
+            Ok(XmlEvent::Eof) => return depth == 0 && geometry,
+            Err(_) | Ok(XmlEvent::DocType(_) | XmlEvent::Decl(_)) => return false,
+            Ok(_) => continue,
+        };
+        if depth == 1 {
+            let mut attrs = std::collections::BTreeMap::new();
+            for attribute in element.attributes() {
+                let Ok(attribute) = attribute else {
+                    return false;
+                };
+                let Ok(value) = attribute.decoded_and_normalized_value(
+                    quick_xml::XmlVersion::Implicit1_0,
+                    reader.decoder(),
+                ) else {
+                    return false;
+                };
+                attrs.insert(attribute.key.as_ref().to_vec(), value.into_owned());
+            }
+            let text = |key: &[u8]| attrs.get(key).map(String::as_str).unwrap_or("");
+            let number = |key: &[u8]| text(key).parse::<f64>().ok().filter(|n| n.is_finite());
+            let positive = |key: &[u8]| number(key).is_some_and(|n| n > 0.0);
+            geometry |= match element.name().as_ref() {
+                b"path" => path_has_geometry(text(b"d")),
+                b"circle" => positive(b"r"),
+                b"ellipse" => positive(b"rx") && positive(b"ry"),
+                b"rect" => positive(b"width") && positive(b"height"),
+                b"line" => {
+                    number(b"x1").unwrap_or(0.0) != number(b"x2").unwrap_or(0.0)
+                        || number(b"y1").unwrap_or(0.0) != number(b"y2").unwrap_or(0.0)
+                }
+                b"polyline" | b"polygon" => text(b"points")
+                    .split(|c: char| c.is_whitespace() || c == ',')
+                    .filter(|part| !part.is_empty())
+                    .map(str::parse::<f64>)
+                    .collect::<Result<Vec<_>, _>>()
+                    .is_ok_and(|points| {
+                        points.len() >= 4
+                            && points.len() % 2 == 0
+                            && points.iter().all(|n| n.is_finite())
+                    }),
+                _ => false,
+            };
+        }
+        if starts {
+            depth += 1;
+        }
+    }
+}
+
 fn admit_mark_render(render: &Value) -> Result<(), ()> {
     let obj = render.as_object().ok_or(())?;
     let icon1 = obj.get("icon1").and_then(Value::as_object).ok_or(())?;
@@ -1179,13 +1317,13 @@ fn admit_mark_render(render: &Value) -> Result<(), ()> {
         return Err(());
     }
     for w in words {
-        if w.as_str().unwrap_or("").is_empty() {
+        if w.as_str().unwrap_or("").trim().is_empty() {
             return Err(());
         }
     }
     for icon in [icon1, icon2] {
         let svg = icon.get("svg").and_then(Value::as_str).unwrap_or("");
-        if svg.is_empty() {
+        if !svg_has_geometry(svg) {
             return Err(());
         }
         let rot = icon.get("rot").and_then(Value::as_i64).ok_or(())?;
@@ -1194,7 +1332,7 @@ fn admit_mark_render(render: &Value) -> Result<(), ()> {
         }
         let color = icon.get("color").and_then(Value::as_object).ok_or(())?;
         let color_name = color.get("name").and_then(Value::as_str).unwrap_or("");
-        if color_name.is_empty() {
+        if color_name.trim().is_empty() {
             return Err(());
         }
         let hex = color.get("hex").and_then(Value::as_str).unwrap_or("");
@@ -1532,7 +1670,7 @@ mod tests {
             vec![Effect::CheckModels { generation: 1 }, Effect::FetchState,]
         );
 
-        // A fresh unavailable mark waits. The owner asks for the first proposal.
+        // Folder Continue carries one first-proposal intent through setup.
         let unseeded_state = setup_state();
         let step = reduce(
             &session,
@@ -1543,15 +1681,13 @@ mod tests {
         );
         session = step.session;
         assert_eq!(session.phase, Phase::Mark);
-        assert!(step.effects.is_empty());
-        assert!(session.inflight.is_none());
-
-        let step = reduce(&session, &Event::RegenerateMarkClicked);
-        session = step.session;
         assert_eq!(
             step.effects,
             vec![Effect::PostAction(SetupAction::RegenerateMark)]
         );
+        assert!(session.inflight.is_some());
+        assert!(!session.initial_mark_pending);
+        assert_eq!(view(&session)["busy"], true);
 
         let mut state_with_prop = setup_state();
         state_with_prop["mark"]["state"] = json!("proposed");
@@ -1598,8 +1734,14 @@ mod tests {
         session = step.session;
         assert_eq!(session.phase, Phase::Thinking);
 
-        // Choosing local with capability ok posts only SaveThinking, does not start download
-        let step = reduce(&session, &Event::ChooseThinking("local".into()));
+        // One Continue saves the stated local choice, then finalizes only its admitted result.
+        let step = reduce(
+            &session,
+            &Event::ContinueThinking {
+                choice: "local".into(),
+                timezone: Some("America/Denver".into()),
+            },
+        );
         session = step.session;
         assert_eq!(
             step.effects,
@@ -1626,20 +1768,13 @@ mod tests {
         let v = view(&session);
         assert_eq!(v["can_finalize"], true);
 
-        // Finalize clicked
-        let step = reduce(
-            &session,
-            &Event::FinalizeClicked {
-                timezone: Some("America/Denver".into()),
-            },
-        );
-        session = step.session;
         assert_eq!(
             step.effects,
             vec![Effect::PostAction(SetupAction::Finalize {
                 timezone: Some("America/Denver".into()),
             })]
         );
+        assert!(session.continue_after_save.is_none());
 
         // Failed finalize stays off Home
         let failed_step = reduce(
@@ -3278,5 +3413,242 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Effect::PostAction(_) | Effect::Browser(_)))
         );
+    }
+    #[test]
+    fn status_failure_revokes_authority_until_new_state_and_owner_click() {
+        let mut session = Session::default();
+        let mut effects = vec![];
+        let mut state = setup_state();
+        state["mark"]["state"] = json!("locked");
+        apply_snapshot(&mut session, &mut effects, &state);
+        let mut pending = reduce(&session, &Event::RetryState);
+        assert!(withhold_remote(&mut pending.session, &mut pending.effects, None).is_err());
+        assert!(!pending.session.authoritative);
+        assert!(pending.effects.is_empty());
+        assert!(
+            reduce(&pending.session, &Event::ChooseThinking("local".into()))
+                .effects
+                .is_empty()
+        );
+        assert!(
+            reduce(&pending.session, &Event::FinalizeClicked { timezone: None })
+                .effects
+                .is_empty()
+        );
+        let retry = reduce(&pending.session, &Event::RetryState);
+        let recovered = reduce(
+            &retry.session,
+            &Event::StateLoaded {
+                generation: retry.session.inflight.unwrap(),
+                result: Ok(state),
+            },
+        );
+        assert!(recovered.session.authoritative);
+        assert!(recovered.effects.is_empty());
+        assert!(matches!(
+            reduce(
+                &recovered.session,
+                &Event::ContinueThinking {
+                    choice: "local".into(),
+                    timezone: None,
+                }
+            )
+            .effects
+            .as_slice(),
+            [Effect::PostAction(SetupAction::SaveThinking { .. })]
+        ));
+    }
+
+    #[test]
+    fn first_mark_intent_preserves_existing_proposals_and_refresh_is_read_only() {
+        for mark in ["unavailable", "proposed", "locked"] {
+            let mut state = setup_state();
+            state["mark"]["state"] = json!(mark);
+            if mark != "unavailable" {
+                state["mark"]["proposal_id"] = json!("existing-proposal");
+                state["mark"]["render"] = sample_render();
+            }
+            let existing = Session {
+                initial_mark_pending: true,
+                inflight: Some(1),
+                ..Default::default()
+            };
+            let loaded = reduce(
+                &existing,
+                &Event::StateLoaded {
+                    generation: 1,
+                    result: Ok(state.clone()),
+                },
+            );
+            if mark == "unavailable" {
+                assert!(matches!(
+                    loaded.effects.as_slice(),
+                    [Effect::PostAction(SetupAction::RegenerateMark)]
+                ));
+            } else {
+                assert!(loaded.effects.is_empty());
+            }
+            let ordinary = Session {
+                inflight: Some(1),
+                ..Default::default()
+            };
+            let read = reduce(
+                &ordinary,
+                &Event::StateLoaded {
+                    generation: 1,
+                    result: Ok(state),
+                },
+            );
+            assert!(read.effects.is_empty());
+            assert!(!read.session.initial_mark_pending);
+        }
+    }
+
+    #[test]
+    fn continue_intent_stops_on_error_stale_malformed_or_changed_selection() {
+        let mut initial = setup_state();
+        initial["mark"]["state"] = json!("locked");
+        let mut session = Session::default();
+        apply_snapshot(&mut session, &mut vec![], &initial);
+        let saving = reduce(
+            &session,
+            &Event::ContinueThinking {
+                choice: "later".into(),
+                timezone: None,
+            },
+        );
+        let generation = saving.session.inflight.unwrap();
+        let mut saved = initial.clone();
+        saved["thinking"]["saved"] = json!(true);
+        saved["thinking"]["choice"] = json!("later");
+        saved["remaining_required_steps"] = json!([]);
+        let stale = reduce(
+            &saving.session,
+            &Event::ActionCompleted {
+                generation: generation + 1,
+                result: Ok(saved.clone()),
+            },
+        );
+        assert!(stale.effects.is_empty());
+        assert_eq!(stale.session, saving.session);
+        let mut changed = saved.clone();
+        changed["thinking"]["choice"] = json!("byo");
+        for response in [json!({}), changed] {
+            let stopped = reduce(
+                &saving.session,
+                &Event::ActionCompleted {
+                    generation,
+                    result: Ok(response),
+                },
+            );
+            assert!(stopped.effects.is_empty());
+            assert!(stopped.session.continue_after_save.is_none());
+        }
+        let failed = reduce(
+            &saving.session,
+            &Event::ActionCompleted {
+                generation,
+                result: Err(ActionErrorPayload {
+                    reason_code: None,
+                    message: "save refused".into(),
+                    is_transport: true,
+                }),
+            },
+        );
+        assert!(failed.session.continue_after_save.is_none());
+        assert_eq!(failed.effects, vec![Effect::FetchState]);
+        let reconciled = reduce(
+            &failed.session,
+            &Event::StateLoaded {
+                generation: failed.session.inflight.unwrap(),
+                result: Ok(saved.clone()),
+            },
+        );
+        assert!(reconciled.effects.is_empty());
+        let complete = reduce(
+            &saving.session,
+            &Event::ActionCompleted {
+                generation,
+                result: Ok(saved),
+            },
+        );
+        assert_eq!(
+            complete.effects,
+            vec![Effect::PostAction(SetupAction::Finalize { timezone: None })]
+        );
+    }
+
+    #[test]
+    fn empty_or_stripped_glyphs_never_admit_a_mark() {
+        for svg in [
+            "<path/>",
+            "<path d=\"\"/>",
+            "<path d=\"M0 0\"/>",
+            "<circle/>",
+            "<rect width=\"0\" height=\"1\"/>",
+            "<script>draw</script>",
+            "<path",
+        ] {
+            let mut render = sample_render();
+            render["icon1"]["svg"] = json!(svg);
+            assert!(admit_mark_render(&render).is_err(), "{svg}");
+        }
+        assert!(admit_mark_render(&sample_render()).is_ok());
+    }
+    #[test]
+    fn matching_saved_local_continues_without_rechecking_current_capability() {
+        for capability in ["blocked", "unknown"] {
+            let mut state = setup_state();
+            state["mark"]["state"] = json!("locked");
+            state["thinking"]["saved"] = json!(true);
+            state["thinking"]["choice"] = json!("local");
+            state["thinking"]["capability"] = json!(capability);
+            state["remaining_required_steps"] = json!([]);
+            state["downloads"]["thinking"]["state"] = json!("error");
+            state["downloads"]["thinking"]["error"] =
+                json!({"code": "download_failed", "detail": "download failed"});
+            let mut session = Session::default();
+            apply_snapshot(&mut session, &mut vec![], &state);
+            assert!(session.authoritative);
+            let continued = reduce(
+                &session,
+                &Event::ContinueThinking {
+                    choice: "local".into(),
+                    timezone: None,
+                },
+            );
+            assert_eq!(
+                continued.effects,
+                vec![Effect::PostAction(SetupAction::Finalize { timezone: None })]
+            );
+            assert!(continued.session.continue_after_save.is_none());
+            let mut other_saved = state;
+            other_saved["thinking"]["choice"] = json!("byo");
+            apply_snapshot(&mut session, &mut vec![], &other_saved);
+            let refused = reduce(
+                &session,
+                &Event::ContinueThinking {
+                    choice: "local".into(),
+                    timezone: None,
+                },
+            );
+            assert!(refused.effects.is_empty());
+        }
+    }
+    #[test]
+    fn unchanged_catalog_geometry_is_admitted_including_implicit_lines() {
+        let catalog: std::collections::BTreeMap<String, String> = serde_json::from_str(
+            include_str!("../../solstone-core-sol-link/assets/mark_assets/glyphs.json"),
+        )
+        .unwrap();
+        assert!(catalog.contains_key("drum"));
+        for (name, svg) in catalog {
+            assert!(svg_has_geometry(&svg), "catalog glyph rejected: {name}");
+        }
+        for path in ["m2 2 8 8", "m22 2-8 8", "M20 4 8.12 15.88"] {
+            assert!(path_has_geometry(path), "{path}");
+        }
+        assert!(!path_has_geometry("M0 0"));
+        assert!(!path_has_geometry("M0 0L"));
     }
 }

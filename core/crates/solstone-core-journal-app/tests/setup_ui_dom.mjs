@@ -789,8 +789,8 @@ if (!buttons().some(b => b.textContent.trim() === 'Continue')) throw new Error('
 if (inbox.length !== 0) throw new Error(`inbox not empty: ${JSON.stringify(inbox)}`);
 click('Continue');
 const chosen = inbox.shift();
-if (chosen?.cmd !== 'flow' || chosen?.args?.intent !== 'choose-thinking' || chosen?.args?.choice !== 'local') {
-  throw new Error(`expected choose-thinking local, got: ${JSON.stringify(chosen)}`);
+if (chosen?.cmd !== 'flow' || chosen?.args?.intent !== 'continue-thinking' || chosen?.args?.choice !== 'local') {
+  throw new Error(`expected continue-thinking local, got: ${JSON.stringify(chosen)}`);
 }
 pass('unsaved capable thinking shows the local line and continue saves local');
 
@@ -820,8 +820,8 @@ if (!buttons().some(b => b.textContent.trim() === 'Byo lane')) throw new Error('
 if (!buttons().some(b => b.textContent.trim() === 'Later')) throw new Error('Later not visible');
 click('Later');
 const laterMsg = inbox.shift();
-if (laterMsg?.cmd !== 'flow' || laterMsg?.args?.intent !== 'choose-thinking' || laterMsg?.args?.choice !== 'later') {
-  throw new Error(`expected choose-thinking later, got: ${JSON.stringify(laterMsg)}`);
+if (laterMsg?.cmd !== 'flow' || laterMsg?.args?.intent !== 'continue-thinking' || laterMsg?.args?.choice !== 'later') {
+  throw new Error(`expected continue-thinking later, got: ${JSON.stringify(laterMsg)}`);
 }
 pass('unsaved blocked shows choose later');
 
@@ -890,9 +890,9 @@ pass('empty mark does not commit');
 
 // 8. malformed mark does not commit
 const badMarks = [
-  { words: ['only-one'], icon1: { svg: '<path d="M1 1"/>', color: { name: 'c', hex: '#112233' }, rot: 0 }, icon2: { svg: '<circle cx="1" cy="1" r="1"/>', color: { name: 'c', hex: '#445566' }, rot: 0 } },
-  { words: ['bad', 'hex'], icon1: { svg: '<path d="M1 1"/>', color: { name: 'c', hex: 'not-hex' }, rot: 0 }, icon2: { svg: '<circle cx="1" cy="1" r="1"/>', color: { name: 'c', hex: '#445566' }, rot: 0 } },
-  { words: ['empty', 'color'], icon1: { svg: '<path d="M1 1"/>', color: { name: '', hex: '#112233' }, rot: 0 }, icon2: { svg: '<circle cx="1" cy="1" r="1"/>', color: { name: 'c', hex: '#445566' }, rot: 0 } },
+  { words: ['only-one'], icon1: { svg: '<path d="M1 1L5 5"/>', color: { name: 'c', hex: '#112233' }, rot: 0 }, icon2: { svg: '<circle cx="1" cy="1" r="1"/>', color: { name: 'c', hex: '#445566' }, rot: 0 } },
+  { words: ['bad', 'hex'], icon1: { svg: '<path d="M1 1L5 5"/>', color: { name: 'c', hex: 'not-hex' }, rot: 0 }, icon2: { svg: '<circle cx="1" cy="1" r="1"/>', color: { name: 'c', hex: '#445566' }, rot: 0 } },
+  { words: ['empty', 'color'], icon1: { svg: '<path d="M1 1L5 5"/>', color: { name: '', hex: '#112233' }, rot: 0 }, icon2: { svg: '<circle cx="1" cy="1" r="1"/>', color: { name: 'c', hex: '#445566' }, rot: 0 } },
 ];
 for (const bm of badMarks) {
   paint(view({
@@ -908,7 +908,7 @@ pass('malformed mark does not commit');
 // 9. literal mark shows both glyphs and both words and commits the painted id
 const validRender = {
   words: ['oak', 'river'],
-  icon1: { svg: '<path d="M1 1"/>', color: { name: 'c1', hex: '#112233' }, rot: 0 },
+  icon1: { svg: '<path d="M1 1L5 5"/>', color: { name: 'c1', hex: '#112233' }, rot: 0 },
   icon2: { svg: '<circle cx="1" cy="1" r="1"/>', color: { name: 'c2', hex: '#445566' }, rot: 45 },
 };
 paint(view({
@@ -943,11 +943,50 @@ paint(view({
 click('Keep');
 if (inbox.some(m => m.args?.intent === 'commit-mark')) throw new Error('stripped mark committed');
 pass('mark whose glyphs strip does not commit');
+for (const svg of ['<path/>', '<path d=""/>', '<path d="M0 0"/>', '<circle r="0"/>']) {
+  paint(view({ phase: 'mark', step: 3,
+    mark: { proposal_id: 'empty-glyph', state: 'proposed', render: {
+      ...validRender, icon1: { ...validRender.icon1, svg },
+    } },
+  }));
+  click('Keep');
+  if (inbox.some(m => m.args?.intent === 'commit-mark')) throw new Error(`empty geometry committed: ${svg}`);
+}
+pass('empty geometry never enables commit');
+const catalog = JSON.parse(readFileSync(join(here, '../../solstone-core-sol-link/assets/mark_assets/glyphs.json'), 'utf8'));
+const markModule = await import('../ui/mark.js');
+if (!catalog.drum) throw new Error('catalog control missing drum');
+for (const [name, svg] of Object.entries(catalog)) {
+  const render = { ...validRender,
+    icon1: { ...validRender.icon1, svg }, icon2: { ...validRender.icon2, svg },
+  };
+  if (!markModule.displayableMark(render)) throw new Error(`catalog glyph rejected: ${name}`);
+  const card = document.createElement('div');
+  markModule.renderMarkCard(card, render);
+  const expected = new DOMParser().parseFromString(`<svg>${svg}</svg>`, 'image/svg+xml').documentElement.children;
+  for (const tag of ['path', 'circle', 'rect', 'line', 'polyline', 'polygon', 'ellipse']) {
+    const originals = [...expected].filter(shape => shape.localName === tag);
+    const copies = [...card.querySelectorAll(tag)];
+    if (copies.length !== originals.length * 2) throw new Error(`catalog shapes changed: ${name}/${tag}`);
+    if (tag === 'path' && copies.some((shape, index) => shape.getAttribute('d') !== originals[index % originals.length].getAttribute('d'))) {
+      throw new Error(`catalog path changed: ${name}`);
+    }
+  }
+}
+pass('unchanged canonical catalog keeps every drawing shape and path');
+
+paint(view({ phase: 'mark', step: 3, busy: true,
+  mark: { proposal_id: null, state: 'unavailable', render: null },
+}));
+if (!query(root(), 'progress')) throw new Error('first mark creation has no loading indicator');
+if (root().textContent.includes('mark-err')) throw new Error('first mark creation shows the expected absence as an error');
+pass('first mark creation stays loading');
+
 
 // 11. committed identity sets the icon
 const identityMark = {
   words: ['mountain', 'sky'],
-  icon1: { svg: '<path d="M 1 1"/>', color: { name: 'blue', hex: '#112233' }, rot: 0 },
+  icon1: { svg: '<path d="M 1 1 L 8 8"/>', color: { name: 'blue', hex: '#112233' }, rot: 0 },
   icon2: { svg: '<circle cx="1" cy="1" r="1"/>', color: { name: 'teal', hex: '#445566' }, rot: 45 },
 };
 identityPlan.push({
@@ -1017,6 +1056,10 @@ paint(view({
 const changeBtn = buttons().find(b => b.textContent.trim() === 'Change');
 if (!changeBtn) throw new Error('Change button not found');
 changeBtn.focus();
+paint(view({
+  phase: 'thinking', step: 4, thinking_saved: true, thinking_choice: 'local', busy: true,
+  downloads: { thinking: { state: 'downloading', bytes_done: 5, bytes_total: 100 } },
+}));
 paint(view({
   phase: 'thinking',
   step: 4,
@@ -1100,7 +1143,7 @@ paint(view({
 }));
 if (!buttons().some(b => b.textContent.trim() === 'try again')) throw new Error('thinking missing try again on unauthoritative');
 click('Continue');
-if (inbox.some(m => m.args?.intent === 'choose-thinking')) throw new Error('unauthoritative thinking choose-thinking posted');
+if (inbox.some(m => ['choose-thinking', 'continue-thinking'].includes(m.args?.intent))) throw new Error('unauthoritative thinking action posted');
 click('try again');
 const retryThinkMsg = inbox.shift();
 if (retryThinkMsg?.cmd !== 'flow' || retryThinkMsg?.args?.intent !== 'retry-state') {
