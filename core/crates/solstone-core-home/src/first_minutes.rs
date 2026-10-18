@@ -115,7 +115,10 @@ fn candidate_instant(
         offset.fix().local_minus_utc()
     };
     let utc_naive = wall - TimeDelta::seconds(i64::from(offset_seconds));
-    Some(chrono::DateTime::from_naive_utc_and_offset(utc_naive, chrono::Utc))
+    Some(chrono::DateTime::from_naive_utc_and_offset(
+        utc_naive,
+        chrono::Utc,
+    ))
 }
 
 pub fn winning_segment(input: &FirstMinutesInput) -> Option<WinningSegment> {
@@ -484,10 +487,7 @@ pub fn project_first_minutes(input: &FirstMinutesInput) -> Value {
             clients_len > 0 || unassessed_len > 0
         };
 
-        if !devices_known
-            || !has_devices
-            || input.bound_streams.is_none()
-        {
+        if !devices_known || !has_devices || input.bound_streams.is_none() {
             (serde_json::json!({"state": "none"}), Value::Null)
         } else if let Some(segs) = &input.segments {
             if segs.is_empty() {
@@ -528,12 +528,7 @@ pub fn project_first_minutes(input: &FirstMinutesInput) -> Value {
 
                     let mut heard_proof = None;
                     for ac in &audio_candidates {
-                        if ac
-                            .candidate
-                            .data_state
-                            .0
-                            .get("audio")
-                            .map(String::as_str)
+                        if ac.candidate.data_state.0.get("audio").map(String::as_str)
                             != Some("analyzed")
                         {
                             continue;
@@ -1751,9 +1746,10 @@ mod tests {
         );
 
         // 9. fresh boundary
-        let start_ms = chrono::DateTime::parse_from_rfc3339(out["proof"]["start_at"].as_str().unwrap())
-            .unwrap()
-            .timestamp_millis();
+        let start_ms =
+            chrono::DateTime::parse_from_rfc3339(out["proof"]["start_at"].as_str().unwrap())
+                .unwrap()
+                .timestamp_millis();
         let mut input = base_input();
         input.segment_words = Box::new(|_| Some("words".into()));
 
@@ -1942,7 +1938,8 @@ mod tests {
         let temp = tempfile::tempdir_in("/var/tmp").unwrap();
         let seg_dir = temp.path();
 
-        let header = "{\"_solstone_processing\":{\"state\":\"analyzed\",\"kind\":\"transcript\"}}\n";
+        let header =
+            "{\"_solstone_processing\":{\"state\":\"analyzed\",\"kind\":\"transcript\"}}\n";
 
         // Case 1: clip_audio.jsonl + screen.jsonl + talents/ child
         std::fs::write(
@@ -2010,13 +2007,8 @@ mod tests {
         // Case 5: rows carrying start, speaker, emotion, beside *_transcript.md
         let temp5 = tempfile::tempdir_in("/var/tmp").unwrap();
         let seg5 = temp5.path();
-        let extra_row =
-            "{\"start\":\"12:00:00\",\"speaker\":1,\"emotion\":\"neutral\",\"text\":\"only speech\"}\n";
-        std::fs::write(
-            seg5.join("audio.jsonl"),
-            format!("{header}{extra_row}"),
-        )
-        .unwrap();
+        let extra_row = "{\"start\":\"12:00:00\",\"speaker\":1,\"emotion\":\"neutral\",\"text\":\"only speech\"}\n";
+        std::fs::write(seg5.join("audio.jsonl"), format!("{header}{extra_row}")).unwrap();
         std::fs::write(
             seg5.join("clip_transcript.md"),
             "Different markdown contents",
@@ -2077,7 +2069,8 @@ mod tests {
         )
         .unwrap();
 
-        let header = "{\"_solstone_processing\":{\"state\":\"analyzed\",\"kind\":\"transcript\"}}\n";
+        let header =
+            "{\"_solstone_processing\":{\"state\":\"analyzed\",\"kind\":\"transcript\"}}\n";
 
         // Paired segment
         let paired_seg_dir = journal.join("chronicle/20261010/paired_stream/120000_300");
