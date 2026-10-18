@@ -79,7 +79,8 @@ pub fn state_for_render_case(name: &str) -> TopState {
                     ("agents_total".into(), json!(3)),
                     ("current_agents".into(), json!(["b", "a"])),
                 ]);
-                state.brain_health = Some(json!({"lines":["Brain Health — OK", "  memory good"]}));
+                state.brain_health =
+                    Some(json!({"lines":["Thinking Health — OK", "  memory good"]}));
             }
         }
         "think-failed" | "brain-supplied" => {
@@ -90,7 +91,8 @@ pub fn state_for_render_case(name: &str) -> TopState {
                 ("failed_names".into(), json!(["agent-x"])),
             ]);
             if name == "brain-supplied" {
-                state.brain_health = Some(json!({"lines":["Brain Health — DEGRADED", "  item"]}));
+                state.brain_health =
+                    Some(json!({"lines":["Thinking Health — DEGRADED", "  item"]}));
             }
         }
         "observe-idle" | "observe-tmux-yellow" | "observe-tmux-yellow-upper" => {

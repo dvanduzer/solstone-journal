@@ -2010,7 +2010,7 @@ mod tests {
         )
         .await
         .0;
-        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 9);
+        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 10);
 
         // Control: while the grant has not moved, nothing is flagged.
         let fresh = post_json_with_headers(
@@ -2188,7 +2188,7 @@ mod tests {
         )
         .await
         .0;
-        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 9);
+        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 10);
         let search = post_json_with_headers(
             &mut client,
             &token.token,

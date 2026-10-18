@@ -8,6 +8,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- agents that can see the whole journal, and that have transcripts and facets, can read one week with `get_week`. memories on that page are generated. quotes are the owner's words. leaving an entry off the week page leaves that source visible to search and transcripts.
 - in its first week, a new journal's home page shows a "getting started" card. it shows which of your devices are adding to your journal, the local model and speech model downloads, and your first segment and whether thinking has read it. say a sentence out loud near one of your devices, and the card shows it as text once it's written out. its next steps are connect an agent, add your phone, and finish choosing where the thinking happens. each step leaves once it's done, and the card leaves when they all are and something you said has shown up as text.
 - when a device finishes pairing, the dialog names it by the name the device gave itself, and "didn't do this?" now has a button that unpairs that device straight away.
 - `solstone journal talent passages` copies passages from the source an activity's story is written from, word for word, with where each one sits in that source. each short part of the source is kept whole without asking your model anything. each longer part takes one request to your model to choose what to keep, and the passages are still the source's own words. stories are written the same way as before.
@@ -15,6 +16,9 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- certificates for solstone.me and your own domain now follow the issuer's renewal schedule, including after a journal restart.
+- browser setup confirms the journal mark you see, then saves where thinking runs.
+- the reason under every thinking status now reads in plain words in the thinking app, health and `solstone journal top`, and `solstone journal top` and `solstone journal brain refresh` call it thinking, not brain. on a page opened from another device, the thinking app and health now say "your journal's computer", so it's clear which machine they mean.
 - setup commits the journal mark you see and saves your thinking choice. it opens home, with links to finish setting up your own model or confidential processing. finishing setup again keeps your completion time and settings.
 - while no device is paired, home keeps "set one up →" next to anything that needs your attention. before, it disappeared whenever anything else showed, which on a new journal was almost always.
 - not having chosen where the thinking happens yet no longer counts as something that needs your attention on home. a note says your journal starts catching up once you choose, and links to the thinking app.
@@ -34,8 +38,14 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- agent search and transcript reads now leave out deleted recordings without waiting for the search index to catch up.
+- security fix: a symbolic link in a recording's metadata could make a transcript page read time-zone information from outside your journal. those links are now refused.
+- transcript reads by your agent now include the recording's reported time zone when its UTC offset differs from your journal's.
+- your agent can continue through facet and entity lists instead of stopping at the first page, and can tell when an entity description was shortened.
+- when thinking can't connect to its model, or the model answers in a way your journal can't use, the thinking app and health now say so. before, both showed "probe internal error".
 - on linux, the installer opens setup in your browser and shows where to add the solstone app. without a desktop, it prints the setup link and an SSH tunnel command for another computer.
 
+- agent reads leave out activities whose source has changed until your journal indexes them again. activity results also say whether they are hidden, even when a short preview does not.
 - transcripts warn when a sentence may contain words from more than one speaker.
 - linux: `solstone update` and the status pane now recognize installs made by the public installer.
 

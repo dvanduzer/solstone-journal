@@ -98,6 +98,16 @@ pub fn processing_headline_for_reason(reason: &str) -> Option<&'static str> {
     Some(headline(aggregate, Some(reason), false))
 }
 
+/// Owner words for an active lane id, the same names the web pages use.
+pub fn lane_label(lane: &str) -> &str {
+    match lane {
+        "bundled" | "local" => "local thinking",
+        "byo-cloud" | "byo-endpoint" | "byo" => "your own model",
+        "spp" | "confidential" => "confidential processing",
+        other => other,
+    }
+}
+
 /// Owner words for a brain reason code.
 pub fn brain_reason_text(reason: Option<&str>) -> String {
     match reason {
@@ -110,10 +120,40 @@ pub fn brain_reason_text(reason: Option<&str>) -> String {
         Some("endpoint_configuration_incomplete") => {
             "your endpoint isn't fully set up yet".to_owned()
         }
-        Some("configuration_invalid") => "configuration invalid".to_owned(),
-        Some("stale_expected_fingerprint") => "stale expected fingerprint".to_owned(),
-        Some("lost_fence") => "refresh fence lost".to_owned(),
-        Some("busy") => "check already running".to_owned(),
+        Some("configuration_invalid") => "the thinking settings need fixing".to_owned(),
+        Some("stale_expected_fingerprint" | "brain_record_stale" | "brain_config_changed") => {
+            "the last check is out of date".to_owned()
+        }
+        Some("lost_fence" | "brain_run_superseded") => "the check was cut short".to_owned(),
+        Some("busy") => "a check is already running".to_owned(),
+        Some("brain_record_missing") => "not checked yet".to_owned(),
+        Some(
+            "brain_record_invalid" | "brain_record_unavailable" | "fingerprint_key_unavailable",
+        ) => "the last check can't be read".to_owned(),
+        Some("brain_check_interrupted") => "the last check was interrupted".to_owned(),
+        Some("brain_refresh_timeout") => "the last check didn't finish".to_owned(),
+        Some("probe_internal_error") => "the check couldn't finish".to_owned(),
+        Some("probe_output_starved") => "the model didn't answer the check".to_owned(),
+        Some("attestation_expired") => "your journal needs to verify the service again".to_owned(),
+        Some("brain_check_in_progress") => "checking now".to_owned(),
+        Some("attestation_rejected") => "the service didn't pass verification".to_owned(),
+        Some("endpoint_unreachable") => "couldn't connect to the model".to_owned(),
+        Some("endpoint_contract_failed") => "the model didn't answer the way it should".to_owned(),
+        Some("network_unreachable") => "couldn't connect to the provider".to_owned(),
+        Some("model_not_found") => "the model wasn't found".to_owned(),
+        Some("provider_key_invalid") => "the key was refused".to_owned(),
+        Some("provider_quota_exceeded") => "the provider's usage limit was reached".to_owned(),
+        Some("provider_request_rejected") => "the request was turned down".to_owned(),
+        Some("provider_response_invalid") => "the answer couldn't be read".to_owned(),
+        Some("provider_unavailable") => "the model isn't available right now".to_owned(),
+        Some("local_server_unhealthy") => "the local model stopped responding".to_owned(),
+        Some("local_runtime_fingerprint_mismatch") => {
+            "the local model changed since it was checked".to_owned()
+        }
+        Some("local_runtime_state_invalid" | "local_runtime_state_unavailable") => {
+            "the local model's status can't be read".to_owned()
+        }
+        Some("local_runtime_state_stale") => "the local model's status is out of date".to_owned(),
         Some("attestation_not_verified" | "online_check_unreachable") => {
             "couldn't reach the service to verify it".to_owned()
         }
@@ -243,7 +283,7 @@ mod tests {
             chrono::Utc.with_ymd_and_hms(2026, 1, 1, 1, 1, 0).unwrap(),
         );
         assert_eq!(view.headline, "thinking needs attention");
-        assert_eq!(view.reason_text, "configuration invalid");
+        assert_ne!(view.reason_text, "configuration_invalid".replace('_', " "));
         assert_eq!(view.failing_component.as_deref(), Some("generate"));
         assert_eq!(view.evidence.age_text.as_deref(), Some("1h"));
     }

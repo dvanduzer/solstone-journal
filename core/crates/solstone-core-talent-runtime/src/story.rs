@@ -67,11 +67,11 @@ pub(crate) fn source_body(
             || text.chars().count() > MAX_QUOTE_CHARS
             || text
                 .chars()
-                .any(|c| c == '“' || c == '”' || (c.is_control() && c != '\n'))
+                .any(|c| matches!(c, '"' | '“' | '”') || (c.is_control() && c != '\n'))
         {
             return None;
         }
-        body.push(format!("{framing}: “{text}”"));
+        body.push(format!("{framing}: \"{text}\""));
     }
     let body = body.join(" ");
     (body.chars().count() <= MAX_SOURCE_BODY_CHARS).then_some(body)

@@ -26,18 +26,21 @@ use solstone_core_transcripts::segment_clock;
 
 use solstone_core_mcp_audit::{Admission, AuditCoordinates, Outcome, result_shape};
 
+use crate::activity_admit::{
+    ActivityAdmit, ActivityCursorProof, activity_cursor_proof_matches, admit_activity,
+};
 use crate::audit;
 use crate::permissions::{ConnectionReadSnapshot, PermissionDecision, evaluate_connection_read};
 use crate::references::{
     CursorReference, EntityListCursor, EntityReference, EntryReference, FacetListCursor,
     ReferenceCodec, ReferenceKind, ReferenceTarget, SegmentReference, TranscriptListCursor,
 };
-use crate::registry::{ToolEntry, category_token, find_tool, snapshot_allows};
+use crate::registry::{ToolEntry, category_token, find_tool, requirement_refusal};
 use crate::segment_links::{LinkSubject, LiveTranscriptPages, issue_segment_links};
 use crate::tools::{
-    ToolError, ValidatedFetch, ValidatedGetEntity, ValidatedGetTranscript, ValidatedListEntities,
-    ValidatedListFacets, ValidatedListTranscripts, ValidatedSearch, ValidatedTool,
-    execute_after_audit,
+    ToolError, ValidatedFetch, ValidatedGetEntity, ValidatedGetTranscript, ValidatedGetWeek,
+    ValidatedListEntities, ValidatedListFacets, ValidatedListTranscripts, ValidatedSearch,
+    ValidatedTool, execute_after_audit,
 };
 
 /// Upper bound on indexed rows examined to fill one search page after live drops.
@@ -323,18 +326,8 @@ fn scope_refusal(
     entry: &ToolEntry,
     request: &ValidatedTool,
 ) -> Option<String> {
-    if !snapshot_allows(snapshot, entry) {
-        let missing = entry
-            .requires
-            .read
-            .iter()
-            .filter(|category| !snapshot.categories.contains(category))
-            .map(category_token)
-            .collect::<Vec<_>>()
-            .join(" and ");
-        return Some(format!(
-            "this connection does not have the {missing} category"
-        ));
+    if let Some(reason) = requirement_refusal(snapshot, entry) {
+        return Some(reason);
     }
     if !arguments_within_scope(snapshot, request) {
         return Some(
@@ -466,6 +459,9 @@ fn recorded_arguments(validated: &ValidatedTool) -> Map<String, Value> {
                 reference_fingerprint(&request.reference).into(),
             );
         }
+        ValidatedTool::GetWeek(request) => {
+            insert_present(&mut arguments, "week", request.week.as_deref());
+        }
     }
     arguments
 }
@@ -520,6 +516,9 @@ fn validate(entry: &ToolEntry, arguments: Option<&Value>) -> Result<ValidatedToo
         }
         crate::jsonrpc::ToolName::GetEntity => {
             crate::tools::entities::validate_get(arguments).map(ValidatedTool::GetEntity)
+        }
+        crate::jsonrpc::ToolName::GetWeek => {
+            crate::tools::week::validate(arguments).map(ValidatedTool::GetWeek)
         }
         crate::jsonrpc::ToolName::SaveMemory | crate::jsonrpc::ToolName::RecallMemory => {
             return Err(DispatchError::InvalidInput);
@@ -581,6 +580,13 @@ fn audit_permission_snapshot(
     }
 }
 
+fn get_week(journal_root: &Path, request: ValidatedGetWeek) -> Result<Prepared, DispatchError> {
+    let read = crate::tools::week::read_week(journal_root, request.week.as_deref())
+        .map_err(DispatchError::Tool)?;
+    Ok(Prepared::new(read.value, read.count, read.targets)
+        .when_empty("no week to read. this is a complete answer, not an error."))
+}
+
 fn execute_validated(
     journal_root: &Path,
     principal: DispatchPrincipal<'_>,
@@ -603,6 +609,7 @@ fn execute_validated(
             list_entities(journal_root, principal, snapshot, request)
         }
         ValidatedTool::GetEntity(request) => get_entity(journal_root, principal, snapshot, request),
+        ValidatedTool::GetWeek(request) => get_week(journal_root, request),
     }
 }
 
@@ -1029,6 +1036,17 @@ fn resolve_search_entities(
     }
 }
 
+struct SearchAnchor {
+    day: String,
+    stream: String,
+    path: String,
+    idx: i64,
+    row_id: i64,
+    content_fingerprint: String,
+    activity_proof: Option<String>,
+    omit_cursor: bool,
+}
+
 fn search(
     journal_root: &Path,
     principal: DispatchPrincipal<'_>,
@@ -1094,7 +1112,7 @@ fn search(
     let mut degraded = false;
     let mut relaxed = false;
     let mut has_more = false;
-    let mut anchor = None;
+    let mut anchor: Option<SearchAnchor> = None;
     while results.len() < request.limit && examined < MAX_SEARCH_EXAMINED_ROWS {
         let batch = (MAX_SEARCH_EXAMINED_ROWS - examined).min(100);
         let response = search_connection(
@@ -1136,14 +1154,16 @@ fn search(
                 path: hit.metadata.path.clone(),
                 idx: hit.metadata.idx,
             });
-            anchor = Some((
-                hit.metadata.day.clone(),
-                hit.metadata.stream.clone(),
-                hit.metadata.path.clone(),
-                hit.metadata.idx,
-                hit.row_id,
-                digest(&hit.text),
-            ));
+            anchor = Some(SearchAnchor {
+                day: hit.metadata.day.clone(),
+                stream: hit.metadata.stream.clone(),
+                path: hit.metadata.path.clone(),
+                idx: hit.metadata.idx,
+                row_id: hit.row_id,
+                content_fingerprint: digest(&hit.text),
+                activity_proof: None,
+                omit_cursor: false,
+            });
             if !live_allows(
                 journal_root,
                 &boundary,
@@ -1152,6 +1172,39 @@ fn search(
             ) {
                 live_dropped = true;
                 continue;
+            }
+            let (served_text, activity_proof, hidden, record) = match admit_activity(
+                journal_root,
+                &boundary,
+                &hit.metadata.path,
+                hit.metadata.idx,
+                hit.row_id,
+                Some(&hit.text),
+                None,
+                false,
+                MAX_INDEXED_ENTRY_BYTES,
+            ) {
+                Ok(ActivityAdmit::NotActivity(text)) => (text, None, None, None),
+                Ok(ActivityAdmit::Admitted(admitted)) => (
+                    admitted.text,
+                    Some(admitted.proof),
+                    Some(admitted.hidden),
+                    Some(admitted.record),
+                ),
+                Ok(ActivityAdmit::Withheld { cursor_proof }) => {
+                    if let Some(anchor) = anchor.as_mut() {
+                        match cursor_proof {
+                            Some(proof) => anchor.activity_proof = Some(proof),
+                            None => anchor.omit_cursor = true,
+                        }
+                    }
+                    live_dropped = true;
+                    continue;
+                }
+                Err(error) => return Err(index_error(error)),
+            };
+            if let Some(anchor) = anchor.as_mut() {
+                anchor.activity_proof = activity_proof.clone();
             }
             let memory_origin = if hit.metadata.stream.starts_with("agent-memory-") {
                 let Some(origin) =
@@ -1176,9 +1229,10 @@ fn search(
             let mut single_subject = [LinkSubject {
                 path: &hit.metadata.path,
                 idx: hit.metadata.idx,
-                text: &hit.text,
+                text: &served_text,
                 segments: Vec::new(),
                 more_segments: false,
+                activity_record: record.as_ref(),
             }];
             let mut checker = LiveTranscriptPages;
             if allowed {
@@ -1214,15 +1268,19 @@ fn search(
                         path: hit.metadata.path.clone(),
                         idx: hit.metadata.idx,
                         row_id: hit.row_id,
+                        activity_proof,
                     }),
                 )
                 .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?;
             let mut value = json!({
                 "title": entry_title(&hit.metadata.day),
                 "date": hit.metadata.day,
-                "snippet": snippet(&hit.text),
+                "snippet": snippet(&served_text),
                 "reference": reference,
             });
+            if let Some(hidden) = hidden {
+                value["hidden"] = Value::Bool(hidden);
+            }
             if let Some(origin) = memory_origin {
                 value["origin"] = public_memory_origin(&origin);
             }
@@ -1243,8 +1301,9 @@ fn search(
         }
     }
     let next_cursor = anchor
+        .filter(|anchor| !anchor.omit_cursor)
         .filter(|_| has_more || examined == MAX_SEARCH_EXAMINED_ROWS)
-        .map(|(day, stream, path, idx, row_id, content_fingerprint)| {
+        .map(|anchor| {
             codec().mint(
                 principal.connection,
                 snapshot.generation,
@@ -1258,12 +1317,13 @@ fn search(
                         .collect(),
                     scope_ids: scope_ids(boundary.scope()),
                     whole_journal: matches!(boundary.scope(), ConnectionScope::WholeJournal),
-                    day,
-                    stream,
-                    path,
-                    idx,
-                    row_id,
-                    content_fingerprint,
+                    day: anchor.day,
+                    stream: anchor.stream,
+                    path: anchor.path,
+                    idx: anchor.idx,
+                    row_id: anchor.row_id,
+                    content_fingerprint: anchor.content_fingerprint,
+                    activity_proof: anchor.activity_proof,
                 }),
             )
         })
@@ -1360,6 +1420,24 @@ fn resolve_search_cursor(
     else {
         return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
     };
+    match activity_cursor_proof_matches(
+        journal_root,
+        boundary,
+        &cursor.path,
+        cursor.idx,
+        cursor.row_id,
+        &content,
+        cursor.activity_proof.as_deref().unwrap_or(""),
+        MAX_INDEXED_ENTRY_BYTES,
+    )
+    .map_err(index_error)?
+    {
+        ActivityCursorProof::NotActivity => {}
+        ActivityCursorProof::Matches => {}
+        ActivityCursorProof::Reject => {
+            return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
+        }
+    }
     if digest(&content) != cursor.content_fingerprint {
         return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
     }
@@ -1391,19 +1469,25 @@ fn fetch(
     if !live_allows(journal_root, &boundary, &entry.path, Some(&entry.stream)) {
         return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
     }
-    let IndexedEntry::Found(text) = read_indexed_entry(
+    let (text, hidden, record) = match admit_activity(
         journal_root,
-        QueryBoundary::Connection(boundary),
+        &boundary,
         &entry.path,
         entry.idx,
         entry.row_id,
+        None,
+        entry.activity_proof.as_deref(),
+        true,
         MAX_INDEXED_ENTRY_BYTES,
     )
     .map_err(index_error)?
-    else {
-        return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
+    {
+        ActivityAdmit::Admitted(a) => (a.text, Some(a.hidden), Some(a.record)),
+        ActivityAdmit::NotActivity(text) => (text, None, None),
+        ActivityAdmit::Withheld { .. } => {
+            return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
+        }
     };
-
     #[cfg(feature = "test-hooks")]
     crate::source_freeze_barrier::checkpoint(crate::source_freeze_barrier::FreezePoint::Before);
     let allowed = crate::source_release::check_indexed_source_release(journal_root, &entry.path);
@@ -1413,6 +1497,7 @@ fn fetch(
         text: &text,
         segments: Vec::new(),
         more_segments: false,
+        activity_record: record.as_ref(),
     }];
     let mut checker = LiveTranscriptPages;
     let mut response_checks = 0;
@@ -1436,6 +1521,9 @@ fn fetch(
     }
 
     let mut value = json!({"title": entry_title(&entry.day), "date": entry.day, "text": text});
+    if let Some(hidden) = hidden {
+        value["hidden"] = Value::Bool(hidden);
+    }
     if entry.stream.starts_with("agent-memory-") {
         let origin = memory_hit_origin(journal_root, &entry.path, &entry.stream)
             .ok_or(DispatchError::Tool(ToolError::ReferenceNotFound))?;
@@ -1589,8 +1677,21 @@ fn read_scoped_entities(
     journal_root: &Path,
     facet_dir: &str,
 ) -> Result<Vec<solstone_core_facets::ScopedFacetEntity>, DispatchError> {
-    solstone_core_facets::list_scoped_facet_entities(journal_root, facet_dir, false, false)
-        .map_err(|_| DispatchError::Tool(ToolError::FileUnreadable))
+    let mut entities =
+        solstone_core_facets::list_scoped_facet_entities(journal_root, facet_dir, false, false)
+            .map_err(|_| DispatchError::Tool(ToolError::FileUnreadable))?;
+    // Legacy folders can name the same facet relationship. Match the link
+    // owner's preference: the folder named by the entity id, then name order.
+    entities.sort_by(|a, b| {
+        a.entity_id
+            .cmp(&b.entity_id)
+            .then_with(|| {
+                (a.relationship_dir != a.entity_id).cmp(&(b.relationship_dir != b.entity_id))
+            })
+            .then_with(|| a.relationship_dir.cmp(&b.relationship_dir))
+    });
+    entities.dedup_by(|a, b| a.entity_id == b.entity_id);
+    Ok(entities)
 }
 
 fn list_entities(
@@ -1637,20 +1738,15 @@ fn list_entities(
     all_entities.sort_by(|(f_a, item_a), (f_b, item_b)| {
         f_a.cmp(f_b)
             .then_with(|| item_a.entity_id.cmp(&item_b.entity_id))
-            .then_with(|| item_a.relationship_dir.cmp(&item_b.relationship_dir))
     });
 
     if let Some(cursor) = cursor.as_ref() {
         all_entities.retain(|(facet_id, item)| {
-            (
-                facet_id.as_str(),
-                item.entity_id.as_str(),
-                item.relationship_dir.as_str(),
-            ) > (
-                cursor.last_facet_id.as_str(),
-                cursor.last_entity_id.as_str(),
-                cursor.last_relationship_dir.as_str(),
-            )
+            (facet_id.as_str(), item.entity_id.as_str())
+                > (
+                    cursor.last_facet_id.as_str(),
+                    cursor.last_entity_id.as_str(),
+                )
         });
     }
 
@@ -1660,13 +1756,9 @@ fn list_entities(
         .take(request.limit)
         .collect::<Vec<_>>();
 
-    let last_anchor = page.last().map(|(facet_id, item)| {
-        (
-            facet_id.clone(),
-            item.entity_id.clone(),
-            item.relationship_dir.clone(),
-        )
-    });
+    let last_anchor = page
+        .last()
+        .map(|(facet_id, item)| (facet_id.clone(), item.entity_id.clone()));
 
     let mut targets = Vec::new();
     let mut entities = Vec::new();
@@ -1686,7 +1778,7 @@ fn list_entities(
     }
 
     let next_cursor = if has_more {
-        if let Some((last_facet_id, last_entity_id, last_relationship_dir)) = last_anchor {
+        if let Some((last_facet_id, last_entity_id)) = last_anchor {
             Some(
                 codec()
                     .mint(
@@ -1696,7 +1788,6 @@ fn list_entities(
                             facet: request.facet_id.clone(),
                             last_facet_id,
                             last_entity_id,
-                            last_relationship_dir,
                         }),
                     )
                     .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?,
@@ -1986,6 +2077,15 @@ fn list_transcripts(
             } else {
                 None
             };
+            // Freeze the page before the last deletion observation. A removal
+            // can replace the directory while its initial live marker is read.
+            let allowed = allowed
+                && crate::source_release::check_segment_transcript_release(
+                    journal_root,
+                    day,
+                    &stream,
+                    &name,
+                );
             #[cfg(feature = "test-hooks")]
             crate::source_freeze_barrier::checkpoint(
                 crate::source_freeze_barrier::FreezePoint::After,
@@ -2034,7 +2134,9 @@ fn list_transcripts(
                 "time": time_str,
                 "reference": reference,
             });
-            if let Some(zone) = differing_capture_zone(&owner_zone, day, &name, &segment) {
+            if let Some(zone) =
+                differing_capture_zone(journal_root, &owner_zone, day, &name, &segment)
+            {
                 seg_val["capture_zone"] = zone;
             }
             segments.push(seg_val);
@@ -2174,6 +2276,13 @@ fn get_transcript(
     } else {
         None
     };
+    let allowed = allowed
+        && crate::source_release::check_segment_transcript_release(
+            journal_root,
+            &reference.day,
+            &reference.stream,
+            &reference.segment,
+        );
     #[cfg(feature = "test-hooks")]
     crate::source_freeze_barrier::checkpoint(crate::source_freeze_barrier::FreezePoint::After);
 
@@ -2220,21 +2329,26 @@ fn get_transcript(
     if page.untimed {
         response_val["untimed"] = Value::Bool(true);
     }
-    if let Some(zone) =
-        differing_capture_zone(&owner_zone, &reference.day, &reference.segment, &segment)
-    {
+    if let Some(zone) = differing_capture_zone(
+        journal_root,
+        &owner_zone,
+        &reference.day,
+        &reference.segment,
+        &segment,
+    ) {
         response_val["capture_zone"] = zone;
     }
     Ok(Prepared::new(response_val, count, vec![target]).when_empty(GET_TRANSCRIPT_EMPTY))
 }
 
 pub(crate) fn differing_capture_zone(
+    journal_root: &Path,
     owner: &solstone_core_journal_config::Tz,
     day: &str,
     key: &str,
     segment: &Segment,
 ) -> Option<Value> {
-    let reported = solstone_core_callosum::read_reported_zone(segment.path())?;
+    let reported = solstone_core_callosum::read_reported_zone(journal_root, segment.path())?;
     let view = solstone_core_journal_config::capture_zone_view(
         day,
         key,

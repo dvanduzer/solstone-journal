@@ -792,7 +792,8 @@ mod tests {
                 entry.wire_name
             );
         }
-        assert_eq!(crate::registry::TOOLS.len(), 9);
+        assert_eq!(crate::registry::TOOLS.len(), 10);
+        assert!(crate::registry::tool_by_wire_name("get_week").is_some());
         assert!(crate::registry::tool_by_wire_name("list_activity").is_none());
         assert!(crate::registry::tool_by_wire_name("get_agent_interaction").is_none());
     }

@@ -29,7 +29,7 @@
   .agents .check small{display:block}
   .agents .outcome.empty{padding:4px 8px;text-align:left}.agents .activity-row .outcome{flex:none;align-self:flex-start}
   .agents .door-lan{margin-top:16px;border-top:1px solid var(--hairline)}.agents .fp{font-size:.8rem;line-height:1.55;word-spacing:.12em;overflow-wrap:anywhere}.agents .addr-preview code{color:var(--muted)}
-  .agents .seg3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.agents .ways{display:grid;grid-template-columns:1fr;gap:10px}.agents .byo-setup{overflow-wrap:anywhere}
+  .agents .seg3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.agents .ways{display:grid;grid-template-columns:1fr;gap:10px}.agents .byo-setup{overflow-wrap:anywhere}.agents .byo-setup .onlab{margin-top:14px}.agents .cmd-block{max-height:16rem;overflow:auto;white-space:pre;font-size:.74rem;line-height:1.35;padding:10px;border:1px solid var(--border, #e5dccb);border-radius:8px;margin:8px 0}.agents .records{width:100%;border-collapse:collapse;margin:8px 0}.agents .cmd-block code{background:none;padding:0;border:0}.agents .records td:first-child,.agents .records th:first-child{white-space:nowrap;width:3.5em}.agents .records td:last-child{white-space:nowrap;width:1%}.agents .records td,.agents .records th{text-align:left;padding:6px 8px;border-bottom:1px solid var(--border, #e5dccb);vertical-align:top;font-size:.85rem}
   .agents .picks{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 4px}.agents .pick{appearance:none;border:1.5px solid var(--hairline-2);border-radius:999px;background:var(--cream-bright);color:var(--ink);font:inherit;font-size:.86rem;font-weight:600;padding:5px 12px;cursor:pointer}.agents .pick.is{border-color:var(--orange);background:var(--paper)}.agents .pick:focus-visible{outline:2px solid var(--focus);outline-offset:2px}.agents .hint{margin:8px 0 0}.agents .hint .cmd{white-space:nowrap}
   .agents .watch{display:flex;align-items:center;gap:.55em;margin:10px 0 0;font-size:.86rem}.agents .sdot.pulse{animation:agents-pulse 1.6s ease-in-out infinite}@keyframes agents-pulse{50%{opacity:.35}}@media(prefers-reduced-motion:reduce){.agents .sdot.pulse{animation:none}}
   .agents .first{margin-top:14px}.agents .first .ag-row{cursor:default}.agents .first .ag-row:hover{background:none}.agents .first time{font-size:.8rem;color:var(--muted);white-space:nowrap}.agents .first .none{padding:16px}.agents .first .none p{margin:0;font-size:.88rem;color:var(--muted)}
@@ -65,11 +65,18 @@
   let watch = null;
   let watchTimer = null;
   let watchView = '';
+  let byoSetupOpen = false;
+  let byoCommands = null;
+  let byoOutsideChecked = false;
+  let byoRemovedMessage = null;
+  let byoRelayCheck = null;
+  let byoDnsResult = null;
+  let byoOutsideResult = null;
 
   async function api(path, options) { return window.apiJson(path, options); }
   function jsonOptions(method, body) { return {method, headers:{'content-type':'application/json'}, body:JSON.stringify(body)}; }
   function ownerOptions(method) { return {method}; }
-  function notify(message) { window.AppServices?.notifications?.show?.({title:'agents', body:message}); }
+  function notify(message) { window.AppServices?.notifications?.show?.({title:'agents', message}); }
   // A journal that serves agents on this computer reports local_door; one that doesn't, doesn't.
   function hasDoor() { return Boolean(state?.local_door); }
   function doorAddress() { return state?.local_door?.address || LOCAL_DOOR_ADDRESS; }
@@ -84,14 +91,25 @@
   function meAddress() { return state?.owner_state?.address || state?.certificate?.hostname || ''; }
   function meEndpoint() { return `https://${meAddress()}/mcp`; }
   function byoEndpoint() { return `https://${state?.byo?.hostname}/mcp`; }
-  function byoReady() { return Boolean(state?.byo?.enabled && state?.byo?.socket_listening && state?.byo?.certificate_active); }
+  function byoReady() {
+    const b = state?.byo;
+    if (!b || !b.enabled || !b.socket_listening || !b.certificate_active) return false;
+    if (b.relay) return b.relay.state === 'connected';
+    return true;
+  }
+  async function loadByoCommands() {
+    try {
+      byoCommands = await api('/app/agents/api/byo/relay/commands');
+      if (lane === 'byo') render();
+    } catch (_) {}
+  }
   function pending() { return Boolean(enableOp && (enableOp.phase === 'waiting' || enableOp.phase === 'starting')); }
   function usesConsentFlow() { return !state.owner_state?.address || state.owner_state?.status === 'not_accepted'; }
   function frame(title, lead, body) { return `<h1>${esc(title)}</h1>${lead ? `<p class="lead">${lead}</p>` : ''}${body}`; }
   function errorPage(message) { view.innerHTML = frame('agents could not open.', `<span class="error notice">${esc(message)}</span>`, `<button class="btn" data-action="reload">try again</button>`); }
   function laneChip(connection) {
     if (connection.kind !== 'oauth') return '';
-    const label = connection.door === 'byo' ? 'your hostname' : connection.door === 'lan' ? 'your network' : connection.door === 'local' ? 'this computer' : connection.door === 'relay' || !hasDoor() ? 'solstone.me' : '';
+    const label = connection.door === 'byo' ? 'your domain' : connection.door === 'lan' ? 'your network' : connection.door === 'local' ? 'this computer' : connection.door === 'relay' || !hasDoor() ? 'solstone.me' : '';
     return label ? `<span class="chip">${label}</span>` : '';
   }
   function permissionLine(permission) {
@@ -225,41 +243,138 @@
     const b = state?.byo;
     if (!b) return ['', 'not available'];
     if (!b.hostname) return ['', 'not set up'];
+    if (b.relay && ['unreachable', 'auth_refused', 'forward_refused', 'host_key_changed'].includes(b.relay.state)) return ['warn', 'needs attention'];
     if (!b.enabled) return ['', 'off'];
     if (byoReady()) return ['on', 'ready here'];
     return ['warn', 'needs setup'];
+  }
+  const BYO_RELAY_COPY = {
+    relay_ok: () => 'connected to your server.',
+    relay_connecting: () => 'connecting to your server…',
+    relay_unreachable: (b) => `your journal can't reach your server at ${b.relay?.address || 'that address'}. check the address, and that your server accepts SSH.`,
+    relay_auth_refused: () => "your server didn't accept your journal's login. paste the command on it again.",
+    relay_forward_refused: () => "your server didn't let your journal use port 443. something else on it may be using that port, or the command didn't finish.",
+    relay_host_key_changed: () => "your server's identity changed since your journal last connected. if you rebuilt it, choose \"trust it again\". if you didn't, check that the address is still your server's.",
+    relay_not_configured: () => "save your server's address first.",
+  };
+  const BYO_RELAY_STATE_CODE = {connected:'relay_ok', connecting:'relay_connecting', unreachable:'relay_unreachable', auth_refused:'relay_auth_refused', forward_refused:'relay_forward_refused', host_key_changed:'relay_host_key_changed'};
+  const BYO_OUTSIDE_COPY = {
+    outside_ok: 'your address reaches your journal through your server. this check runs from this computer, so if an agent still can\'t connect, check your server\'s firewall.',
+    outside_unreachable: "your address doesn't reach your journal yet. check that port 443 is open on your server and in your provider's firewall.",
+    outside_wrong_certificate: 'something else answered at your address, not your journal. check that the A record points at your server and that no proxy or CDN is in front of it.',
+    outside_not_ready: "your journal doesn't have its certificate yet.",
+  };
+  const BYO_DNS_COPY = {
+    unchecked:'not checked yet', cname:'this name is a CNAME. replace it with an A record for your server.', no_address:'no A record found yet. DNS changes can take a few minutes.',
+    caa_missing:'CAA record not found yet. DNS changes can take a few minutes.', lookup_error:"your journal couldn't check DNS just now. it tries again.", lookup_timeout:'the DNS check took too long. it tries again.',
+  };
+  // These verdicts can come from a CAA record on a parent name, so the fix named is always the record at this exact name.
+  const BYO_CAA_MISMATCH = ['issuewild', 'extra_issue', 'other_ca', 'account_uri', 'validation_method'];
+  function byoCaaMismatchLine(host) { return `the CAA record that applies to ${host} doesn't match the one shown here. add the record shown here at ${host} itself, not at the domain above it, and remove any other CAA record at ${host}. if it's already there, copy it again.`; }
+  function byoNonPublic(addr) {
+    const a = String(addr).toLowerCase();
+    if (a.includes(':')) return a === '::1' || a.startsWith('fc') || a.startsWith('fd') || a.startsWith('fe8') || a.startsWith('fe9') || a.startsWith('fea') || a.startsWith('feb');
+    const [o1, o2] = a.split('.').map(Number);
+    return o1 === 10 || o1 === 127 || (o1 === 172 && o2 >= 16 && o2 <= 31) || (o1 === 192 && o2 === 168) || (o1 === 169 && o2 === 254) || (o1 === 100 && o2 >= 64 && o2 <= 127);
+  }
+  function byoDiagnosticLines(b, dns) {
+    const lines = [];
+    const addrs = (dns?.addresses || b.dns_addresses || []).join(', ');
+    const diags = dns?.diagnostics || b.diagnostics || [];
+    if (diags.includes('address_mismatch')) lines.push(`this name points at ${addrs || 'no address yet'}. it should have one A record, for your server at ${b.relay?.address || 'your server'}, and no other A or AAAA records. if your DNS host offers a proxy or CDN for this name, turn it off.`);
+    if (diags.includes('non_public_address')) {
+      const all = dns?.addresses || b.dns_addresses || [];
+      const bad = all.filter(byoNonPublic);
+      const lead = bad.length < all.length ? 'this name also points at' : 'this name points at';
+      lines.push(`${lead} ${bad.join(', ') || 'an address'}, which isn't on the internet. remove that record. Claude won't connect to a name that has one.`);
+    }
+    return lines;
+  }
+  function byoRecordsFound(b, dns) {
+    const verdict = dns?.verdict || b.dns_verdict;
+    const diags = dns?.diagnostics || b.diagnostics || [];
+    return verdict === 'admitted' && !diags.includes('address_mismatch') && !diags.includes('non_public_address');
+  }
+  function byoRelayTrouble(b) {
+    return Boolean(b.relay && b.enabled && b.socket_listening && ['unreachable', 'auth_refused', 'forward_refused', 'host_key_changed'].includes(b.relay.state));
   }
   function byoBody() {
     const b = state?.byo;
     if (!b) return `<div class="lane-body"><p class="note">${relayAvailable() ? "this isn't available in this version of your journal yet." : "this isn't available on windows yet."}</p></div>`;
     const host = b.hostname || '';
-    const caa = b.account_uri ? `0 issue "letsencrypt.org; accounturi=${b.account_uri}; validationmethods=tls-alpn-01"` : '';
-    const action = {
-      set_hostname:'set your hostname', register_account:'register this journal with the certificate authority',
-      account_key_lost:'replace the certificate registration and publish its new CAA record', publish_caa:'check the A/AAAA and CAA records',
-      enable:'turn on this route', socket_blocked:b.socket_blocker === 'port_in_use' ? 'free the local address: another program is using it, or windows has reserved it' : 'clear the socket problem',
-      issue_certificate:'wait for the certificate; it comes through your public route', none:'check reachability from your agent',
-    }[b.next_action] || 'check the setup';
-    const setup = `<div class="field"><label for="byo-hostname">your public hostname</label><input id="byo-hostname" autocomplete="off" spellcheck="false" placeholder="journal.example.com" value="${esc(host)}"></div><div class="button-row"><button class="btn" data-action="byo-save">save hostname</button>${host ? '<button class="btn danger" data-action="byo-remove">remove hostname</button>' : ''}</div>`;
-    if (!host) return `<div class="lane-body byo-setup"><p class="note">use a public DNS name you control. your journal serves HTTPS through a connection you set up. once your public route is reachable, anyone on the internet can reach its address, but an agent reads nothing until you pair it. the certificate puts your hostname in public certificate logs permanently. a tunnel that ends HTTPS can read your agent's traffic and reuse its credential to reach your journal. for agents on this computer or your network, use "your own" above.</p>${setup}</div>`;
-    const register = b.account_uri ? '' : `<p class="note">register this journal with Let's Encrypt before you publish CAA. the private key for that registration stays in your journal.</p><div class="button-row"><button class="btn primary" data-action="byo-register">register with Let's Encrypt</button></div>`;
-    const dns = b.account_uri ? `<dl class="lane-row"><dt>certificate registration</dt><dd><code>${esc(b.account_uri)}</code></dd></dl><p class="note">publish a direct A or AAAA record for this hostname, with no CNAME. publish this exact CAA issue record at the hostname or the nearest parent domain that has CAA records, with no other issue permission:</p><p><code>${esc(caa)}</code> <button class="btn sm" data-copy="${esc(caa)}">copy</button></p><p class="note">keep control of the hostname, its DNS and this certificate registration. CAA restricts new certificates; it does not cancel one issued before you published it. someone who changes your DNS can take over this address between your journal's checks.</p>` : '';
-    const loopback = b.ingress === 'loopback';
+    const removed = byoRemovedMessage ? `<div class="notice"><p>${esc(byoRemovedMessage)}</p>${byoCommands?.remove ? `<p class="note">on your server, paste this as an admin to undo the setup:</p><pre class="cmd-block"><code>${esc(byoCommands.remove)}</code></pre><button class="btn sm" data-copy="${esc(byoCommands.remove)}">copy</button>` : ''}</div>` : '';
+    if (!host && !byoSetupOpen) {
+      return `<div class="lane-body byo-setup">${removed}<p class="onlab">what you need</p><ol class="legs"><li><span class="step">1</span><span>a domain or subdomain whose DNS lets you add an A record and a CAA record</span></li><li><span class="step">2</span><span>a Linux server on the internet with a public IPv4 address, an SSH login with admin rights, and port 443 open. any provider works.</span></li><li><span class="step">3</span><span>this computer on and online when your agents connect</span></li></ol><div class="hand"><button class="btn primary" data-action="byo-setup">set it up</button></div></div>`;
+    }
+
     const sshCommand = `ssh -N -R 443:${b.socket_path} you@your-server`;
-    const socket = !b.account_uri ? '' : loopback
-      ? `<p class="note">on a public server you control, forward TCP port 443 through OpenSSH to this address on your journal computer. keep the encrypted bytes intact; do not set up HTTPS termination in the forwarder.</p><dl class="lane-row"><dt>local address</dt><dd><code>${esc(b.socket_path)}</code><button class="btn sm" data-copy="${esc(b.socket_path)}">copy</button></dd></dl><dl class="lane-row"><dt>from this computer</dt><dd><code>${esc(sshCommand)}</code><button class="btn sm" data-copy="${esc(sshCommand)}">copy</button></dd></dl><p class="note">the server's OpenSSH must let this forward listen publicly on port 443: set GatewayPorts to yes, and use a login that may listen on that port. keep this public server and your journal's folder under your control. someone who can read the folder and redirect your hostname can impersonate your journal.</p>`
-      : `<p class="note">on a public server you control, forward TCP port 443 through OpenSSH to this socket on your journal computer. keep the encrypted bytes intact; do not set up HTTPS termination in the forwarder.</p><dl class="lane-row"><dt>local socket</dt><dd><code>${esc(b.socket_path)}</code><button class="btn sm" data-copy="${esc(b.socket_path)}">copy</button></dd></dl><p class="note">the SSH process must run under the same login as your journal to reach this socket. keep this public server and your journal's folder under your control. someone who can read the folder and redirect this address can impersonate your journal.</p>`;
-    const dnsResult = {
-      unchecked:'not checked', admitted:'verified', cname:'remove the CNAME', no_address:'add a direct A or AAAA record',
-      caa_missing:'add the CAA record', issuewild:'remove wildcard issuance', extra_issue:'remove extra certificate issuers',
-      other_ca:'allow only your specified certificate authority', account_uri:'the registration in CAA does not match this journal',
-      validation_method:'CAA must allow only TLS-ALPN-01', lookup_error:'DNS could not be checked', lookup_timeout:'DNS check timed out',
-    }[b.dns_verdict] || 'not checked';
-    const status = `<dl class="lane-row"><dt>DNS policy</dt><dd>${esc(dnsResult)}</dd></dl><dl class="lane-row"><dt>${loopback ? 'local address' : 'socket'}</dt><dd>${b.socket_listening ? 'listening here' : 'closed here'}</dd></dl><dl class="lane-row"><dt>certificate</dt><dd>${b.certificate_active ? 'active here' : 'not active'}</dd></dl><p class="note"><strong>next:</strong> ${esc(action)}. these checks cannot show whether the public route reaches this journal; test from the agent's network.</p>`;
-    const toggle = b.enabled ? '<button class="btn danger" data-action="byo-off">turn off public route</button>' : b.account_uri ? '<button class="btn primary" data-action="byo-on">turn on public route</button>' : '';
-    const ready = byoReady() ? `<dl class="lane-row"><dt>agent URL</dt><dd><code>${esc(byoEndpoint())}</code><button class="btn sm" data-copy="${esc(byoEndpoint())}">copy</button></dd></dl>` : '';
-    const replace = b.next_action === 'account_key_lost' ? '<button class="btn danger" data-action="byo-replace">replace certificate registration</button>' : '';
-    return `<div class="lane-body byo-setup"><p class="note">to use this address without sol pbc's relay, set up your own public server, DNS and OpenSSH. when the route is ready, your journal presents the certificate and opens the encrypted requests. once your public route is reachable, anyone on the internet can reach its address, but an agent reads nothing until you pair it. the certificate puts your hostname in public certificate logs permanently. a tunnel that ends HTTPS can read your agent's traffic and reuse its credential to reach your journal.</p>${setup}${register}${dns}${socket}${status}${ready}<div class="button-row">${toggle}${replace}</div></div>`;
+    const manualSocket = b.ingress === 'loopback'
+      ? `<p class="note">on a public server you control, forward TCP port 443 through OpenSSH to this address on your journal computer, keeping the encrypted bytes intact.</p><dl class="lane-row"><dt>local address</dt><dd><code>${esc(b.socket_path || '')}</code></dd></dl><dl class="lane-row"><dt>from this computer</dt><dd><code>${esc(sshCommand)}</code><button class="btn sm" data-copy="${esc(sshCommand)}">copy</button></dd></dl><p class="note">the server's OpenSSH must let this forward listen publicly on port 443: set GatewayPorts to yes, and use a login that may listen on that port.</p><dl class="lane-row"><dt>local address</dt><dd>${b.socket_listening ? 'listening here' : 'closed here'}</dd></dl>`
+      : `<p class="note">on a public server you control, forward TCP port 443 through OpenSSH to this socket on your journal computer, keeping the encrypted bytes intact. the SSH process must run under the same login as your journal.</p><dl class="lane-row"><dt>local socket</dt><dd><code>${esc(b.socket_path || '')}</code></dd></dl><dl class="lane-row"><dt>socket</dt><dd>${b.socket_listening ? 'listening here' : 'closed here'}</dd></dl>`;
+    const manual = host ? `<details><summary>forward port 443 yourself instead</summary>${manualSocket}</details>` : '';
+
+    // 1 · your journal's address
+    const step1 = host
+      ? `<p class="onlab">your journal's address</p><p><code>${esc(host)}</code> <button class="btn sm danger" data-action="byo-remove">remove</button></p>`
+      : `<div class="field"><label for="byo-hostname">your journal's address</label><input id="byo-hostname" autocomplete="off" spellcheck="false" placeholder="journal.example.com" value=""></div><p class="note">this address goes into public certificate logs for good.</p><div class="button-row"><button class="btn primary" data-action="byo-save">next</button></div>`;
+    if (!host) return `<div class="lane-body byo-setup">${removed}${step1}</div>`;
+
+    const keyLost = b.next_action === 'account_key_lost' ? `<div class="notice error"><p>your journal lost its certificate registration. replace it, then update the CAA record to the new line below.</p><button class="btn danger" data-action="byo-replace">replace certificate registration</button></div>` : '';
+    const socketBlocked = b.next_action === 'socket_blocked' ? `<div class="notice error"><p>${b.socket_blocker === 'port_in_use' ? 'free the local address: another program is using it, or windows has reserved it' : 'clear the socket problem'}</p></div>` : '';
+
+    // 2 · your server
+    const rAddr = b.relay?.address || '';
+    const rPort = b.relay?.port || 22;
+    const relayCode = byoRelayCheck || (b.relay && b.relay.state && b.relay.state !== 'none' ? BYO_RELAY_STATE_CODE[b.relay.state] : null);
+    const relayLine = relayCode && BYO_RELAY_COPY[relayCode] ? `<p class="${relayCode === 'relay_ok' ? 'note' : 'notice'}">${esc(BYO_RELAY_COPY[relayCode](b))}</p>${relayCode === 'relay_host_key_changed' ? '<button class="btn sm" data-action="byo-relay-trust-again">trust it again</button>' : ''}` : '';
+    const command = (b.relay && byoCommands?.setup) ? `<p class="note">on your server, paste this as an admin. it adds a login that can only pass your journal's connections through, and lets programs on the server use port 443 and up without admin rights.</p><pre class="cmd-block"><code>${esc(byoCommands.setup)}</code></pre><p><button class="btn sm" data-copy="${esc(byoCommands.setup)}">copy</button> <span class="meta">it prints "ready" when it's done.</span></p><div class="button-row"><button class="btn" data-action="byo-relay-check">check</button></div>${relayLine}` : '';
+    const step2 = `<p class="onlab">your server</p><div class="field"><label for="byo-relay-address">your server's IPv4 address</label><input id="byo-relay-address" autocomplete="off" spellcheck="false" placeholder="203.0.113.24" value="${esc(rAddr)}"></div><details${rPort !== 22 ? ' open' : ''}><summary>your server uses another SSH port</summary><div class="field"><label for="byo-relay-port">SSH port</label><input id="byo-relay-port" autocomplete="off" spellcheck="false" inputmode="numeric" value="${esc(String(rPort))}"></div></details><div class="button-row"><button class="btn${b.relay ? '' : ' primary'}" data-action="byo-relay-save">${b.relay ? 'save' : 'next'}</button></div>${command}`;
+
+    // 3 · two records at your DNS host
+    let step3 = '';
+    if (b.relay && b.account_uri) {
+      const dns = byoDnsResult;
+      const found = byoRecordsFound(b, dns);
+      const verdict = dns?.verdict || b.dns_verdict || 'unchecked';
+      const status = found
+        ? '<li><span class="step">✓</span><span>both records found</span></li>'
+        : (() => {
+            const addrs = dns?.addresses || b.dns_addresses || [];
+            const diagLines = byoDiagnosticLines(b, dns);
+            const aOk = addrs.length > 0 && addrs.every(a => a === rAddr) && !diagLines.length;
+            const verdictLine = BYO_CAA_MISMATCH.includes(verdict) ? byoCaaMismatchLine(host) : (BYO_DNS_COPY[verdict] || (verdict === 'admitted' ? '' : 'not checked yet'));
+            return (aOk ? '<li><span class="step">✓</span><span>A record points at your server</span></li>' : '') + [...diagLines, verdictLine].filter(Boolean).map(line => `<li><span class="step">!</span><span>${esc(line)}</span></li>`).join('');
+          })();
+      step3 = `<p class="onlab">two records at your DNS host</p><p>add these two records for <code>${esc(host)}</code>:</p><table class="records"><tr><th>type</th><th>value</th><th></th></tr><tr><td>A</td><td><code>${esc(rAddr)}</code></td><td><button class="btn sm" data-copy="${esc(rAddr)}">copy</button></td></tr><tr><td>CAA</td><td><code>${esc(b.caa_record || '')}</code></td><td><button class="btn sm" data-copy="${esc(b.caa_record || '')}">copy</button></td></tr></table><p class="note">if your DNS host's form has separate fields, use flags 0, tag issue, and the text between the quotes as the value. if it offers a proxy or CDN for this name, turn it off. the CAA record lets only your journal get a certificate for this exact name, though whoever can change your domain's DNS can still get one that covers it.</p><ul class="legs">${status}</ul><div class="button-row"><button class="btn sm" data-action="byo-dns-check">check</button></div>`;
+    }
+
+    // 4 · turn it on
+    let step4 = '';
+    if (b.relay && b.account_uri) {
+      if (!b.enabled) {
+        step4 = `<p class="onlab">turn it on</p><div class="button-row"><button class="btn primary" data-action="byo-on">turn it on</button></div>`;
+      } else {
+        const ready = byoReady();
+        const outside = byoOutsideResult;
+        const legs = [
+          ['both records found', byoRecordsFound(b, byoDnsResult) || b.socket_listening],
+          ['connected to your server', b.relay?.state === 'connected'],
+          ['getting the certificate. its key never leaves this computer.', Boolean(b.certificate_active)],
+          ['checking your address from the outside', outside === 'outside_ok'],
+        ];
+        const legsHtml = `<ol class="legs">${legs.map(([title, done], i) => `<li class="${done ? 'done' : ''}"><span class="step">${done ? '✓' : i + 1}</span><span>${esc(title)}</span></li>`).join('')}</ol>`;
+        const outsideLine = outside && BYO_OUTSIDE_COPY[outside] ? `<p class="${outside === 'outside_ok' ? 'note' : 'notice'}">${esc(BYO_OUTSIDE_COPY[outside])}</p>` : '';
+        const trouble = byoRelayTrouble(b) ? `<div class="notice error"><p>${esc(BYO_RELAY_COPY[BYO_RELAY_STATE_CODE[b.relay.state]](b))}</p>${b.relay.state === 'host_key_changed' ? '<button class="btn sm" data-action="byo-relay-trust-again">trust it again</button>' : ''}</div>` : '';
+        const readyHtml = ready
+          ? `<p><span class="tag on">ready</span> <strong>${esc(host)} is ready.</strong> agents anywhere can reach your journal at <code>${esc(byoEndpoint())}</code>. an agent reads nothing until you connect it and choose what it may see.</p><div class="button-row"><button class="btn primary" data-action="connect">connect an agent</button><button class="btn sm" data-action="byo-outside-check">check again</button></div>`
+          : `<p class="onlab">turning on ${esc(host)}</p>`;
+        step4 = `${trouble}${readyHtml}${legsHtml}${outsideLine}${ready ? '' : '<p class="note">you can leave this page. your journal keeps going on its own, and reconnects to your server on its own after sleep or a network change.</p>'}<div class="button-row"><button class="btn danger" data-action="byo-off">turn off</button></div>`;
+      }
+    }
+
+    // Once ready, the result leads and the setup steps fold away for reference.
+    if (byoReady() && !byoRelayTrouble(b)) return `<div class="lane-body byo-setup">${keyLost}${socketBlocked}${step4}${step1}<details><summary>your server and DNS records</summary>${step2}${step3}</details>${manual}</div>`;
+    return `<div class="lane-body byo-setup">${keyLost}${socketBlocked}${step1}${step2}${step3}${step4}${manual}</div>`;
   }
 
   // ---- solstone.me: agents anywhere, operated by sol pbc ------------------------------------------
@@ -352,11 +467,17 @@
   }
   function home() {
     const [tone, sentence] = statusLine();
-    const lanes = `<section class="lanes"><p class="sectlab">how your agents reach your journal</p><p class="secthint">whichever way an agent uses, it reads only what you let it see.</p><div class="seg3" role="radiogroup" aria-label="how your agents reach your journal">${segment('own', 'your own', hasLan() ? 'by default, agents on this computer reach your journal directly. agents on your wifi or VPN can too, once you turn that on.' : `agents on this computer reach your journal directly.${hasDoor() ? ' the default.' : ''}`, 'sol pbc is never in the path', 'byob', ownTag())}${segment('byo', 'your hostname', 'agents anywhere reach your journal through a public route and DNS you set up.', 'you operate the route', 'byob', byoTag())}${segment('me', 'solstone.me', 'agents anywhere, like Claude on the web, reach your journal at its own address, through a relay sol pbc runs for you.', 'operated by sol pbc', 'oper', meTag())}</div>${lane === 'own' ? ownBody() : lane === 'byo' ? byoBody() : meBody()}</section>`;
+    const lanes = `<section class="lanes"><p class="sectlab">how your agents reach your journal</p><p class="secthint">whichever way an agent uses, it reads only what you let it see.</p><div class="seg3" role="radiogroup" aria-label="how your agents reach your journal">${segment('own', 'your own', hasLan() ? 'by default, agents on this computer reach your journal directly. agents on your wifi or VPN can too, once you turn that on.' : `agents on this computer reach your journal directly.${hasDoor() ? ' the default.' : ''}`, 'sol pbc is never in the path', 'byob', ownTag())}${segment('byo', 'your own domain', 'agents anywhere reach your journal at an address on a domain you own.', 'sol pbc is never in the path', 'byob', byoTag())}${segment('me', 'solstone.me', 'agents anywhere, like Claude on the web, reach your journal at its own address, through a relay sol pbc runs for you.', 'operated by sol pbc', 'oper', meTag())}</div>${lane === 'own' ? ownBody() : lane === 'byo' ? byoBody() : meBody()}</section>`;
+    const moveOffNotice = (byoReady() && (meState() === 'on' || meState() === 'renewal')) ? (() => {
+      const relayConns = (state.connections || []).filter(c => c.door === 'relay');
+      if (!relayConns.length) return '';
+      const names = relayConns.map(c => c.name).join(', ');
+      return `<section class="notice"><p>you also have solstone.me on. ${relayConns.length} agent${relayConns.length === 1 ? '' : 's'} connect${relayConns.length === 1 ? 's' : ''} through it: ${esc(names)}. connect each one at your domain and remove its old connector, then turn solstone.me off. while it's on, sol pbc and Cloudflare, who control the solstone.me name today, could in principle stand in for your journal at that address. sol pbc doesn't.</p><div class="button-row">${relayConns.map(c => `<button class="btn sm" data-move-byo="${esc(c.id)}">connect ${esc(c.name)} at your domain</button>`).join('')}<button class="btn sm" data-action="me-off">turn off solstone.me</button></div><p class="note">your solstone.me address stays yours either way. turning it off here changes nothing in the services portal. manage it there, and if you come back it's the same address.</p></section>`;
+    })() : '';
     const notices = (state.replay_notices || []).filter(notice => !notice.dismissed).map(notice => `<section class="notice"><p>your journal disconnected ${esc(notice.name)} on ${esc(notice.door)} because the token it uses to stay connected was used twice. connect it again with a new pairing code.</p><button class="btn sm" data-action="dismiss-replay" data-notice="${esc(notice.id)}">dismiss</button></section>`).join('');
     const replaced = state.sme_account?.replaced;
     const back = replaced ? `<section class="notice success" data-sme-replaced><p>your solstone.me address ${esc(replaced.address)} came back to this journal on ${esc(formatAgentTimestamp(replaced.replaced_at))}. if that wasn't you, tell support in the services portal. if an agent can't reach your journal, connect it again with a new pairing code.</p><button class="btn sm" data-action="dismiss-sme-replaced">dismiss</button></section>` : '';
-    return `<p class="brandlock"><span class="lockdot" aria-hidden="true"></span>your journal is always private, only yours.</p><h1>agents</h1><p class="status-line"><span class="sdot ${tone}" aria-hidden="true"></span>${sentence}</p>${lanes}${back}${notices}${agentsList()}`;
+    return `<p class="brandlock"><span class="lockdot" aria-hidden="true"></span>your journal is always private, only yours.</p><h1>agents</h1><p class="status-line"><span class="sdot ${tone}" aria-hidden="true"></span>${sentence}</p>${lanes}${moveOffNotice}${back}${notices}${agentsList()}`;
   }
 
   // ---- dialogs -----------------------------------------------------------------------------------
@@ -366,7 +487,7 @@
     if (ownState() === 'on') ways.push(['local', 'on this computer']);
     if (meState() === 'on' || meState() === 'renewal') ways.push(['relay', 'anywhere through solstone.me']);
     if (hasLan() && lanState() === 'on' && lanOpen().length > 0) ways.push(['lan', 'on another computer on your wifi or VPN']);
-    if (byoReady()) ways.push(['byo', 'anywhere through your hostname']);
+    if (byoReady()) ways.push(['byo', 'anywhere, at your own domain']);
     return ways;
   }
   const AGENT_NAMES = {tiles: 'Tiles', chatgpt: 'ChatGPT', claude: 'Claude', 'claude-code': 'Claude Code', codex: 'Codex', 'gemini-cli': 'Gemini CLI', 'grok-build': 'Grok Build', other: 'another agent'};
@@ -404,7 +525,7 @@
     if (!watch || watch.phase === 'waiting') return `<p class="watch meta" role="status" data-connect-phase="waiting"><span class="sdot a pulse" aria-hidden="true"></span>waiting for your agent. this updates when it connects.</p>`;
     return `<p class="watch meta" role="status" data-connect-phase="entered"><span class="sdot g" aria-hidden="true"></span>this code is no longer open. if you entered it, finish on your journal's page in your browser.</p>`;
   }
-  function doorName(door) { return {local: 'on this computer', lan: 'on your network', relay: 'through solstone.me', byo: 'through your hostname'}[door] || ''; }
+  function doorName(door) { return {local: 'on this computer', lan: 'on your network', relay: 'through solstone.me', byo: 'through your own domain'}[door] || ''; }
   function requestSummary(entry) {
     const args = entry.request?.arguments || {};
     const text = Object.entries(args).map(([key, value]) => `${key}: ${typeof value === 'string' ? value : JSON.stringify(value)}`).join(' · ');
@@ -449,7 +570,7 @@
       addresses.push(`<div class="addr"><span>an agent anywhere, through solstone.me</span><div><code>${esc(meEndpoint())}</code><button class="btn sm" data-copy="${esc(meEndpoint())}">copy</button></div></div>`);
     }
 
-    const doorLabel = {local: 'this computer', relay: 'solstone.me', lan: 'your network', byo: 'your hostname'};
+    const doorLabel = {local: 'this computer', relay: 'solstone.me', lan: 'your network', byo: 'your domain'};
     const openPairingKind = !state.pairing
       ? 'none'
       : !state.pairing.door
@@ -476,7 +597,7 @@
       local: ' this code works only for an agent on this computer.',
       relay: ' this code works only through solstone.me.',
       lan: ' this code works only for an agent on your network.',
-      byo: ' this code works only at your hostname.',
+      byo: ' this code works only at your own domain.',
     }[pairingCode?.door] || '';
 
     const ended = watch && WATCH_ENDED[watch.phase];
@@ -494,7 +615,7 @@
     const where = `<details><summary>certificate fingerprint</summary><p>your journal's certificate for these addresses has this SHA-256 fingerprint:</p><p><code class="fp">${esc(fingerprint())}</code></p><p>your browser shows it in the certificate's details.</p></details>`;
     const step3 = connectWay === 'lan'
       ? `<div class="mstep"><span class="n">3</span><div><p>the browser on that computer opens your journal's page. it may warn about the certificate unless you have trusted your journal's LAN CA there. choose what the agent may see, enter the code on that page and connect.</p>${fingerprint() ? where : ''}</div></div>`
-      : `<div class="mstep"><span class="n">3</span><div><p>your browser opens your journal's page.${connectWay === 'byo' ? ' check the address is your hostname.' : connectWay === 'relay' ? ` check the address starts with <code>https://${esc(meAddress())}/</code>.` : ''} choose what the agent may see, enter the code on that page and connect.</p></div></div>`;
+      : `<div class="mstep"><span class="n">3</span><div><p>your browser opens your journal's page.${connectWay === 'byo' ? ` check the address starts with <code>https://${esc(state?.byo?.hostname || '')}/</code>.` : connectWay === 'relay' ? ` check the address starts with <code>https://${esc(meAddress())}/</code>.` : ''} choose what the agent may see, enter the code on that page and connect.</p></div></div>`;
     return `<div class="modal" data-close-modal><article class="modal-card" role="dialog" aria-modal="true" aria-label="connect an agent" data-open-pairing="${openPairingKind}">${close}${choice}${step1}${step2}${step3}<p class="meta">didn't expect that page? close it. nothing connects until you enter the code.</p></article></div>`;
   }
   function confirmDialog(kind) {
@@ -526,7 +647,7 @@
     const entries = activity?.entries || [];
     const counts = activity?.counts || {};
     const atLeast = activity && !activity.examination_complete ? 'at least ' : '';
-    return frame('activity', 'what your agents asked and how each request ended. recorded in your journal. the content that was released isn\'t copied here; each entry points at it.', `<a class="back" href="#" data-route="home">← agents</a><section class="card summary">${Object.entries(outcomeLabel).map(([key,label]) => `<span><strong>${atLeast}${counts[key] || 0}</strong>${label}</span>`).join('')}</section><div class="toolbar section"><div class="field"><label for="a-outcome">how it ended</label><select id="a-outcome"><option value="">any way</option>${Object.entries(outcomeLabel).map(([key,label]) => `<option value="${key}">${label}</option>`).join('')}</select></div><div class="field"><label for="a-tool">what it did</label><select id="a-tool"><option value="">any tool</option>${['save_memory','recall_memory','list_facets','search','fetch','list_transcripts','get_transcript','list_entities','get_entity'].map(tool => `<option>${tool}</option>`).join('')}</select></div><button class="btn" data-action="filter-activity">apply</button></div><section class="card section">${entries.length ? entries.map((entry,index) => `<button class="row activity-row" style="width:100%;text-align:left;background:none;border-left:0;border-right:0;border-bottom:0;font:inherit" data-activity-index="${index}"><time class="meta">${esc(formatAgentTimestamp(entry.timestamp))}</time><span class="row-main"><span class="quote">${esc(entry.agent_identity)} used ${esc(entry.tool)}</span><small>${esc(entry.reason || 'open for request and result details')}</small></span><span class="outcome ${esc(entry.outcome)}">${esc(outcomeLabel[entry.outcome])}</span></button>`).join('') : `<div class="empty"><h3>nothing matches these filters.</h3></div>`}</section>${activity && !activity.examination_complete ? `<div class="notice">only the first 100 matching requests are shown. these counts are minimums.</div>` : ''}`);
+    return frame('activity', 'what your agents asked and how each request ended. recorded in your journal. the content that was released isn\'t copied here; each entry points at it.', `<a class="back" href="#" data-route="home">← agents</a><section class="card summary">${Object.entries(outcomeLabel).map(([key,label]) => `<span><strong>${atLeast}${counts[key] || 0}</strong>${label}</span>`).join('')}</section><div class="toolbar section"><div class="field"><label for="a-outcome">how it ended</label><select id="a-outcome"><option value="">any way</option>${Object.entries(outcomeLabel).map(([key,label]) => `<option value="${key}">${label}</option>`).join('')}</select></div><div class="field"><label for="a-tool">what it did</label><select id="a-tool"><option value="">any tool</option>${['save_memory','recall_memory','list_facets','search','fetch','list_transcripts','get_transcript','list_entities','get_entity','get_week'].map(tool => `<option>${tool}</option>`).join('')}</select></div><button class="btn" data-action="filter-activity">apply</button></div><section class="card section">${entries.length ? entries.map((entry,index) => `<button class="row activity-row" style="width:100%;text-align:left;background:none;border-left:0;border-right:0;border-bottom:0;font:inherit" data-activity-index="${index}"><time class="meta">${esc(formatAgentTimestamp(entry.timestamp))}</time><span class="row-main"><span class="quote">${esc(entry.agent_identity)} used ${esc(entry.tool)}</span><small>${esc(entry.reason || 'open for request and result details')}</small></span><span class="outcome ${esc(entry.outcome)}">${esc(outcomeLabel[entry.outcome])}</span></button>`).join('') : `<div class="empty"><h3>nothing matches these filters.</h3></div>`}</section>${activity && !activity.examination_complete ? `<div class="notice">only the first 100 matching requests are shown. these counts are minimums.</div>` : ''}`);
   }
 
   function activityDetail(entry) {
@@ -542,6 +663,7 @@
       if (entity) return `/app/entities/?entity=${encodeURIComponent(entity[1])}`;
       if (coordinate.startsWith('entity:')) return `/app/entities/?entity=${encodeURIComponent(coordinate.slice(7))}`;
       if (coordinate.startsWith('facet:')) return `/app/settings/?facet=${encodeURIComponent(coordinate.slice(6))}`;
+      if (coordinate.startsWith('week:')) return `/app/home/week/${encodeURIComponent(coordinate.slice(5))}`;
       const day = coordinate.match(/^(\d{8})\//)?.[1];
       if (day) return `/app/transcripts/${encodeURIComponent(day)}`;
       return '/app/search/';
@@ -682,6 +804,18 @@
     if (!quiet || !state) view.innerHTML = '<p class="lead">loading agents…</p>';
     try {
       state = await api('/app/agents/api/state');
+      if (state?.byo?.hostname && !byoCommands) {
+        loadByoCommands();
+      }
+      if (byoReady()) {
+        if (!byoOutsideChecked) {
+          byoOutsideChecked = true;
+          api('/app/agents/api/byo/outside-check', ownerOptions('POST')).then(res => { byoOutsideResult = res?.code || null; if (lane === 'byo') render(); }).catch(() => {});
+        }
+      } else {
+        byoOutsideChecked = false;
+        byoOutsideResult = null;
+      }
       if (relayAvailable() && !state.enabled && usesConsentFlow()) await checkEnableOp();
       else enableOp = null;
       render();
@@ -739,6 +873,7 @@
     if (target.dataset.lane) { lane = target.dataset.lane; render(); return; }
     if (target.dataset.way) { connectWay = target.dataset.way; pairingCode = null; stopWatch(); render(); return; }
     if (target.dataset.agent) { agentChoice = target.dataset.agent; render(); return; }
+    if (target.dataset.moveByo) { const moving = (state.connections || []).find(c => String(c.id) === target.dataset.moveByo); const kind = Object.keys(AGENT_NAMES).find(k => AGENT_NAMES[k].toLowerCase() === String(moving?.name || '').toLowerCase()); stopWatch(); dialog = 'connect'; connectWay = 'byo'; agentChoice = kind || null; pairingCode = null; render(); return; }
     if (target.dataset.route) { event.preventDefault(); if (target.dataset.route === 'activity') await loadActivity(); else { route = {name: target.dataset.route}; render(); } return; }
     if (target.dataset.activityConnection) { await loadActivity(target.dataset.activityConnection); return; }
     if (target.dataset.connection) { const [kind,id] = target.dataset.connection.split(':'); route = {name:'connection', connection: state.connections.find(item => item.kind === kind && item.id === id)}; render(); return; }
@@ -760,10 +895,15 @@
       else if (action === 'me-off' || action === 'own-off' || action === 'lan-off') { dialog = action; render(); }
       else if (action === 'lan-on' || action === 'lan-door-off') { await api('/app/agents/api/lan-door', jsonOptions('PUT', {enabled: action === 'lan-on'})); dialog = null; await reload(true); }
       else if (action === 'own-on' || action === 'door-off') { await api('/app/agents/api/local-door', jsonOptions('PUT', {enabled: action === 'own-on'})); dialog = null; await reload(true); }
-      else if (action === 'byo-save') { const hostname = document.getElementById('byo-hostname').value.trim(); if (!hostname) { notify('enter a public hostname first'); return; } if (state.byo?.hostname && state.byo.hostname !== hostname && !confirm('changing your hostname disconnects agents paired at the old address. continue?')) return; await api('/app/agents/api/byo', jsonOptions('PUT', {hostname, enabled:false})); await reload(true); }
-      else if (action === 'byo-register') { await api('/app/agents/api/byo/account', ownerOptions('POST')); await reload(true); }
+      else if (action === 'byo-setup') { byoSetupOpen = true; render(); }
+      else if (action === 'byo-save') { const hostname = document.getElementById('byo-hostname').value.trim(); if (!hostname) { notify("enter your journal's address first"); return; } if (state.byo?.hostname && state.byo.hostname !== hostname && !confirm("changing your journal's address disconnects agents paired at the old address. continue?")) return; await api('/app/agents/api/byo', jsonOptions('PUT', {hostname, enabled:false})); await api('/app/agents/api/byo/account', ownerOptions('POST')); await reload(true); }
+      else if (action === 'byo-relay-save') { const address = document.getElementById('byo-relay-address').value.trim(); const port = parseInt(document.getElementById('byo-relay-port').value.trim(), 10) || 22; await api('/app/agents/api/byo/relay', jsonOptions('PUT', {address, port})); byoRelayCheck = null; await loadByoCommands(); await reload(true); }
+      else if (action === 'byo-relay-check') { const res = await api('/app/agents/api/byo/relay/check', ownerOptions('POST')); byoRelayCheck = res?.code || null; render(); }
+      else if (action === 'byo-relay-trust-again') { await api('/app/agents/api/byo/relay/trust-again', ownerOptions('POST')); byoRelayCheck = null; await reload(true); }
+      else if (action === 'byo-dns-check') { byoDnsResult = await api('/app/agents/api/byo/dns-check', ownerOptions('POST')); render(); }
+      else if (action === 'byo-outside-check') { const res = await api('/app/agents/api/byo/outside-check', ownerOptions('POST')); byoOutsideResult = res?.code || null; render(); }
       else if (action === 'byo-on' || action === 'byo-off') { await api('/app/agents/api/byo', jsonOptions('PUT', {enabled:action === 'byo-on'})); await reload(true); }
-      else if (action === 'byo-remove') { if (!confirm('remove this hostname? agents paired through it lose access, even if you add the same hostname again.')) return; await api('/app/agents/api/byo', ownerOptions('DELETE')); await reload(true); }
+      else if (action === 'byo-remove') { if (!confirm("remove your journal's address? agents paired through it lose access, even if you add the same address again.")) return; await api('/app/agents/api/byo', ownerOptions('DELETE')); byoRemovedMessage = "delete the A record at your DNS host first, then the CAA record, or both together. don't leave the A record pointing at a server you no longer have."; byoRelayCheck = null; byoDnsResult = null; byoOutsideResult = null; byoSetupOpen = false; await reload(true); }
       else if (action === 'byo-replace') { if (!confirm("replace this journal's certificate registration? the public route will turn off and you must publish a new CAA record before turning it on again.")) return; await api('/app/agents/api/byo/account/replace', ownerOptions('POST')); await reload(true); }
       else if (action === 'turn-on') await turnOn();
       else if (action === 'turn-off') { await api('/app/agents/api/capability', jsonOptions('PUT', {enabled:false})); dialog = null; await reload(true); }
@@ -781,8 +921,11 @@
   reload();
   window.setInterval(() => {
     if (route.name !== 'home' || dialog) return;
+    if (lane === 'byo' && state?.byo?.hostname && state?.byo?.account_uri && !byoReady()) {
+      api('/app/agents/api/byo/dns-check', ownerOptions('POST')).then(res => { byoDnsResult = res; if (lane === 'byo' && !dialog) render(); }).catch(() => {});
+    }
     if (pending()) pollEnable();
     else if ((state?.enabled && state?.status !== 'on') || (state?.local_door && !state.local_door.listening) || state?.lan_door?.enabled || state?.byo?.enabled) reload(true);
-  }, 10000);
+  }, 20000);
 })();
 </script>

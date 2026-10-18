@@ -128,11 +128,12 @@ fn render_lines(snapshot: &Value) -> Vec<String> {
         .get("headline")
         .and_then(Value::as_str)
         .unwrap_or("thinking status unavailable");
-    let mut lines = vec!["Brain Health".to_owned(), format!("  {headline}")];
+    let mut lines = vec!["Thinking Health".to_owned(), format!("  {headline}")];
     let identity = snapshot.get("identity").and_then(Value::as_object);
     let lane = identity
         .and_then(|value| value.get("lane"))
-        .and_then(Value::as_str);
+        .and_then(Value::as_str)
+        .map(solstone_core_brain::lane_label);
     let provider = identity
         .and_then(|value| value.get("provider"))
         .and_then(Value::as_str);
@@ -188,7 +189,7 @@ fn render_lines(snapshot: &Value) -> Vec<String> {
 fn fallback() -> Value {
     json!({
         "snapshot":{"state":"unknown","headline":"thinking status unavailable","reason_code":"brain_record_unavailable"},
-        "lines":["Brain Health","  thinking status unavailable"]
+        "lines":["Thinking Health","  thinking status unavailable"]
     })
 }
 
@@ -324,7 +325,7 @@ mod tests {
         assert_eq!(value["snapshot"]["reason_code"], "brain_record_unavailable");
         assert_eq!(
             value["lines"],
-            json!(["Brain Health", "  thinking status unavailable"])
+            json!(["Thinking Health", "  thinking status unavailable"])
         );
     }
 }

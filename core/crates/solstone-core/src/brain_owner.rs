@@ -91,7 +91,7 @@ fn journal() -> Result<(PathBuf, Map<String, Value>), ExitCode> {
     })?;
     let config = solstone_core_brain::read_journal_config(&line.path)
         .map_err(|error| {
-            eprintln!("brain failed: could not read journal config: {error}");
+            eprintln!("thinking check failed: could not read journal config: {error}");
             ExitCode::from(EXIT_UNAVAILABLE)
         })?
         .config

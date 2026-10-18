@@ -1325,7 +1325,6 @@ fn portable_export_and_merge_preserve_colliding_owner_names() {
             "imports/.health-dedupe.sqlite.rebuild-journal",
             "chronicle/20260101/indexer/indexer.sqlite",
             "health/brain-fingerprint.key",
-            "mcp-endpoint/pop.ed25519.pk8",
             "config/.tmp_123_4.tmp",
         ];
         for (name, bytes) in kept
@@ -1341,6 +1340,11 @@ fn portable_export_and_merge_preserve_colliding_owner_names() {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, bytes).unwrap();
         }
+        let credential_name = "mcp-endpoint/pop.ed25519.pk8";
+        let source_credential = b"synthetic exported owner credential";
+        let source_credential_path = source.join(credential_name);
+        fs::create_dir_all(source_credential_path.parent().unwrap()).unwrap();
+        fs::write(&source_credential_path, source_credential).unwrap();
         let archive = tree.path.join("portable.zip");
         let source = ArchiveSource::open(&source).unwrap();
         encode_archive(
@@ -1359,12 +1363,27 @@ fn portable_export_and_merge_preserve_colliding_owner_names() {
             zip.by_name(name).unwrap().read_to_end(&mut actual).unwrap();
             assert_eq!(&actual, bytes, "{name}");
         }
+        let mut exported_credential = Vec::new();
+        zip.by_name(credential_name)
+            .unwrap()
+            .read_to_end(&mut exported_credential)
+            .unwrap();
+        assert_eq!(exported_credential, source_credential);
         for name in omitted {
             assert!(zip.by_name(name).is_err(), "{name}");
         }
         drop(zip);
+        let target_credential = target.join(credential_name);
+        let receiving_credential = b"synthetic receiving owner credential";
+        fs::create_dir_all(target_credential.parent().unwrap()).unwrap();
+        fs::write(&target_credential, receiving_credential).unwrap();
         let merged = merge_journal_archive(&archive, &target, &options(&tree), None).unwrap();
         assert_eq!(merged.merge_summary.entities_created, 1, "{merged:?}");
+        assert_eq!(fs::read(&target_credential).unwrap(), receiving_credential);
+        assert_eq!(
+            fs::read(&source_credential_path).unwrap(),
+            source_credential
+        );
         for (name, bytes) in &kept {
             let actual =
                 fs::read(target.join(name)).unwrap_or_else(|error| panic!("{name}: {error}"));

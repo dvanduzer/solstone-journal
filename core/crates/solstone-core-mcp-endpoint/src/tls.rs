@@ -9,7 +9,6 @@
 //! a certificate path or recover a private key from the opaque service.
 
 use std::fmt;
-use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,7 +16,6 @@ use std::time::{Duration as StdDuration, Instant};
 
 use arc_swap::ArcSwapOption;
 use base64::Engine as _;
-use futures::StreamExt as _;
 use rcgen::{
     CertificateParams, CustomExtension, DistinguishedName, KeyPair, KeyUsagePurpose,
     PKCS_ECDSA_P256_SHA256,
@@ -29,9 +27,6 @@ use ring::signature::{
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
-use rustls_acme::{
-    AccountCache, AcmeConfig, CertCache, EventError, OrderError, ResolvesServerCertAcme,
-};
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use solstone_core_journal_config::McpEndpointCertificateEnvironment;
@@ -52,23 +47,37 @@ const ACME_IDENTIFIER_OID: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 1, 31];
 /// [`mcp_endpoint_server_config`].
 pub struct McpEndpointTlsService {
     resolver: Arc<McpEndpointCertificateResolver>,
-    #[allow(dead_code)] // Reserved for the same-crate ACME lifecycle owner.
     store: Option<Arc<CertificateStateStore>>,
     force_staging_renewal: bool,
+    #[cfg(test)]
+    pub(crate) last_publication_error: Arc<std::sync::Mutex<Option<McpEndpointTlsError>>>,
+    #[cfg(test)]
+    test_install_shutdown: Arc<std::sync::Mutex<Option<tokio::sync::watch::Sender<bool>>>>,
+    #[cfg(test)]
+    pub(crate) custom_http_client: Arc<std::sync::Mutex<Option<Arc<dyn instant_acme::HttpClient>>>>,
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) custom_picker:
+        Arc<std::sync::Mutex<Option<Arc<dyn Fn(i64, i64) -> i64 + Send + Sync>>>>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) custom_directory_url: Arc<std::sync::Mutex<Option<String>>>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) extra_trust_roots:
+        Arc<std::sync::Mutex<Option<Vec<rustls::pki_types::CertificateDer<'static>>>>>,
+    #[cfg(test)]
+    pub(crate) custom_order_key: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
 }
 
-struct CertificateStateStore {
-    directory: TlsStateDirectory,
-    #[allow(dead_code)] // Read by the same-crate ordinary-certificate installer.
-    environment: McpEndpointCertificateEnvironment,
+pub(crate) struct CertificateStateStore {
+    pub(crate) directory: TlsStateDirectory,
+    pub(crate) environment: McpEndpointCertificateEnvironment,
+    pub(crate) generation: Option<u64>,
 }
 
 struct McpEndpointCertificateResolver {
     hostname: String,
     ordinary: ArcSwapOption<ActiveOrdinaryCertificate>,
     challenge: ArcSwapOption<ActiveChallengeCertificate>,
-    acme: ArcSwapOption<ResolvesServerCertAcme>,
-    #[allow(dead_code)] // Consumed by the same-crate challenge lifecycle owner.
     next_challenge_generation: AtomicU64,
 }
 
@@ -83,7 +92,28 @@ pub static TEST_NOW_OVERRIDE: std::sync::RwLock<Option<time::OffsetDateTime>> =
     std::sync::RwLock::new(None);
 
 #[cfg(test)]
-#[allow(dead_code)]
+pub(crate) static TEST_CLOCK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) struct TestClockGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for TestClockGuard {
+    fn drop(&mut self) {
+        set_test_now_override(None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn lock_test_clock(timestamp: Option<i64>) -> TestClockGuard {
+    let guard = TEST_CLOCK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    set_test_now_override(timestamp);
+    TestClockGuard { _guard: guard }
+}
+
+#[cfg(test)]
 pub(crate) fn set_test_now_override(timestamp: Option<i64>) {
     if let Ok(mut guard) = TEST_NOW_OVERRIDE.write() {
         *guard = timestamp.and_then(|ts| time::OffsetDateTime::from_unix_timestamp(ts).ok());
@@ -111,7 +141,6 @@ struct ActiveChallengeCertificate {
 ///
 /// It clears only its own generation. Dropping an old guard therefore cannot
 /// withdraw a challenge installed by a later issuance attempt.
-#[allow(dead_code)] // Constructed by the ACME lifecycle owner in this crate.
 pub(crate) struct McpEndpointChallengeGuard {
     resolver: Arc<McpEndpointCertificateResolver>,
     generation: u64,
@@ -132,17 +161,6 @@ impl fmt::Display for McpEndpointCertificateLifecycleError {
 
 impl std::error::Error for McpEndpointCertificateLifecycleError {}
 
-struct McpEndpointAcmeCache {
-    service: McpEndpointTlsService,
-    production: bool,
-    force_staging_renewal: bool,
-}
-
-struct McpEndpointAcmeResolverGuard {
-    resolver: Arc<McpEndpointCertificateResolver>,
-    installed: Arc<ResolvesServerCertAcme>,
-}
-
 /// Payload-free failure from local TLS state validation or activation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum McpEndpointTlsError {
@@ -158,6 +176,81 @@ impl fmt::Debug for McpEndpointCertificateResolver {
 }
 
 impl McpEndpointTlsService {
+    pub(crate) fn force_staging_renewal(&self) -> bool {
+        self.force_staging_renewal
+    }
+
+    pub(crate) fn effective_http_client(&self) -> Arc<dyn instant_acme::HttpClient> {
+        #[cfg(test)]
+        if let Ok(guard) = self.custom_http_client.lock()
+            && let Some(client) = guard.as_ref()
+        {
+            return Arc::clone(client);
+        }
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Ok(guard) = self.extra_trust_roots.lock()
+            && let Some(roots) = guard.as_ref()
+        {
+            return Arc::new(crate::acme_http::McpEndpointHttpClient::with_extra_roots(
+                roots.clone(),
+            ));
+        }
+        Arc::new(crate::acme_http::McpEndpointHttpClient::default())
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn set_custom_http_client(&self, client: Arc<dyn instant_acme::HttpClient>) {
+        if let Ok(mut guard) = self.custom_http_client.lock() {
+            *guard = Some(client);
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn set_custom_picker(&self, picker: Arc<dyn Fn(i64, i64) -> i64 + Send + Sync>) {
+        if let Ok(mut guard) = self.custom_picker.lock() {
+            *guard = Some(picker);
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[allow(dead_code)]
+    pub(crate) fn set_custom_directory_url(&self, url: String) {
+        if let Ok(mut guard) = self.custom_directory_url.lock() {
+            *guard = Some(url);
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[allow(dead_code)]
+    pub(crate) fn set_extra_trust_roots(
+        &self,
+        roots: Vec<rustls::pki_types::CertificateDer<'static>>,
+    ) {
+        if let Ok(mut guard) = self.extra_trust_roots.lock() {
+            *guard = Some(roots);
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[allow(dead_code)]
+    pub(crate) fn effective_directory_url(&self) -> Option<String> {
+        self.custom_directory_url
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn effective_picker(&self) -> Option<Arc<dyn Fn(i64, i64) -> i64 + Send + Sync>> {
+        self.custom_picker
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
     pub(crate) fn ordinary_certificate_is_active(&self) -> bool {
         let now_ts = current_epoch_seconds();
         self.resolver
@@ -168,8 +261,50 @@ impl McpEndpointTlsService {
                 now_ts < ordinary.not_after && Instant::now() < ordinary.expires_at
             })
     }
+
+    pub(crate) fn active_ordinary_leaf_der(&self) -> Option<Vec<u8>> {
+        let now_ts = current_epoch_seconds();
+        let ordinary = self.resolver.ordinary.load_full()?;
+        if now_ts < ordinary.not_after && Instant::now() < ordinary.expires_at {
+            ordinary.key.cert.first().map(|c| c.as_ref().to_vec())
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn authorized_hostname(&self) -> &str {
         &self.resolver.hostname
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn set_custom_order_key(&self, key: Vec<u8>) {
+        if let Ok(mut guard) = self.custom_order_key.lock() {
+            *guard = Some(key);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn lifecycle_copy(&self) -> Self {
+        Self {
+            resolver: Arc::clone(&self.resolver),
+            store: self.store.as_ref().map(Arc::clone),
+            force_staging_renewal: self.force_staging_renewal,
+            #[cfg(test)]
+            last_publication_error: Arc::clone(&self.last_publication_error),
+            #[cfg(test)]
+            test_install_shutdown: Arc::clone(&self.test_install_shutdown),
+            #[cfg(test)]
+            custom_http_client: Arc::clone(&self.custom_http_client),
+            #[cfg(test)]
+            custom_picker: Arc::clone(&self.custom_picker),
+            #[cfg(any(test, feature = "test-hooks"))]
+            custom_directory_url: Arc::clone(&self.custom_directory_url),
+            #[cfg(any(test, feature = "test-hooks"))]
+            extra_trust_roots: Arc::clone(&self.extra_trust_roots),
+            #[cfg(test)]
+            custom_order_key: Arc::clone(&self.custom_order_key),
+        }
     }
 
     /// Construct TLS state for an account-authorized hostname and activate a
@@ -191,6 +326,7 @@ impl McpEndpointTlsService {
             directory: unix::open_tls_state_directory(&journal_root)
                 .map_err(|_| McpEndpointTlsError::State)?,
             environment,
+            generation: None,
         });
         let service = Self::empty(hostname, Some(Arc::clone(&store)), force_staging_renewal);
         if let Some(bytes) =
@@ -212,23 +348,35 @@ impl McpEndpointTlsService {
     pub(crate) fn for_byo_cert_directory(
         cert_directory: unix::TlsStateDirectory,
         hostname: String,
+        generation: u64,
+    ) -> Result<Self, McpEndpointTlsError> {
+        Self::for_byo_cert_directory_in_environment(
+            cert_directory,
+            hostname,
+            generation,
+            McpEndpointCertificateEnvironment::Production,
+        )
+    }
+
+    fn for_byo_cert_directory_in_environment(
+        cert_directory: unix::TlsStateDirectory,
+        hostname: String,
+        generation: u64,
+        environment: McpEndpointCertificateEnvironment,
     ) -> Result<Self, McpEndpointTlsError> {
         if !is_exact_authorized_hostname(&hostname, &hostname) {
             return Err(McpEndpointTlsError::State);
         }
         let store = Arc::new(CertificateStateStore {
             directory: cert_directory,
-            environment: McpEndpointCertificateEnvironment::Production,
+            environment,
+            generation: Some(generation),
         });
         let service = Self::empty(hostname, Some(Arc::clone(&store)), false);
         if let Some(bytes) =
             unix::read_tls_state_bytes(&store.directory).map_err(|_| McpEndpointTlsError::State)?
         {
-            match classify_stored_state(
-                &bytes,
-                &service.resolver.hostname,
-                McpEndpointCertificateEnvironment::Production,
-            )? {
+            match classify_stored_state(&bytes, &service.resolver.hostname, environment)? {
                 StoredCertificateClassification::Same(decoded) => {
                     if certificate_is_current(&decoded)? {
                         let active = activate_decoded_stored_state(decoded)?;
@@ -258,18 +406,30 @@ impl McpEndpointTlsService {
                 hostname,
                 ordinary: ArcSwapOption::empty(),
                 challenge: ArcSwapOption::empty(),
-                acme: ArcSwapOption::empty(),
                 next_challenge_generation: AtomicU64::new(0),
             }),
             store,
             force_staging_renewal,
+            #[cfg(test)]
+            last_publication_error: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            test_install_shutdown: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            custom_http_client: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            custom_picker: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "test-hooks"))]
+            custom_directory_url: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "test-hooks"))]
+            extra_trust_roots: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            custom_order_key: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
     /// Validate, persist, reopen, revalidate, then activate a newly issued
     /// ordinary certificate. A persistence or reopen failure leaves the prior
     /// still-valid key active.
-    #[allow(dead_code)] // The lifecycle owner is added separately from TLS state.
     pub(crate) fn install_ordinary_certificate(
         &self,
         certificate_chain: Vec<Vec<u8>>,
@@ -298,12 +458,20 @@ impl McpEndpointTlsService {
             .ok_or(McpEndpointTlsError::State)?;
         let active = validate_stored_state(&reopened, &self.resolver.hostname, store.environment)?;
         self.resolver.ordinary.store(Some(Arc::new(active)));
+        #[cfg(test)]
+        if let Some(shutdown) = self
+            .test_install_shutdown
+            .lock()
+            .expect("test install hook")
+            .as_ref()
+        {
+            shutdown.send_replace(true);
+        }
         Ok(())
     }
 
     /// Install a short-lived RFC 8737 certificate for one ACME key-authorization
     /// digest. The certificate and private key exist only in this process.
-    #[allow(dead_code)] // The lifecycle owner is added separately from TLS state.
     pub(crate) fn install_acme_challenge(
         &self,
         key_authorization_digest: [u8; 32],
@@ -368,111 +536,153 @@ impl McpEndpointTlsService {
             store.environment,
             McpEndpointCertificateEnvironment::Production
         );
-        let cache = McpEndpointAcmeCache {
-            service: self.lifecycle_copy(),
-            production,
-            force_staging_renewal: self.force_staging_renewal,
-        };
-        let mut state = AcmeConfig::new([self.resolver.hostname.as_str()])
-            .cache(cache)
-            .directory_lets_encrypt(production)
-            .state();
-        let _resolver_guard = McpEndpointAcmeResolverGuard {
-            resolver: Arc::clone(&self.resolver),
-            installed: state.resolver(),
-        };
-        self.resolver
-            .acme
-            .store(Some(Arc::clone(&_resolver_guard.installed)));
 
-        let mut retry_count = 0_u32;
-        loop {
-            tokio::select! {
+        let client = self.effective_http_client();
+        let picker = {
+            #[cfg(test)]
+            {
+                self.effective_picker()
+            }
+            #[cfg(not(test))]
+            {
+                None
+            }
+        };
+
+        let reg_default_dir = if production {
+            instant_acme::LetsEncrypt::Production.url()
+        } else {
+            instant_acme::LetsEncrypt::Staging.url()
+        };
+        #[cfg(any(test, feature = "test-hooks"))]
+        let reg_dir = self
+            .effective_directory_url()
+            .unwrap_or_else(|| reg_default_dir.to_string());
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        let reg_dir = reg_default_dir.to_string();
+
+        let account_kid = loop {
+            let reg_dir = reg_dir.clone();
+            let register_client = Arc::clone(&client);
+            let establish_fut =
+                crate::sme_account::establish_account_uri(&store.directory, production, |key| {
+                    let register_client = Arc::clone(&register_client);
+                    let reg_dir = reg_dir.clone();
+                    async move {
+                        let pkcs8_der = rustls::pki_types::PrivatePkcs8KeyDer::from(key);
+                        let instant_key = instant_acme::Key::from_pkcs8_der(pkcs8_der.clone_key())
+                            .map_err(|e| e.to_string())?;
+                        let pki_key = rustls::pki_types::PrivateKeyDer::Pkcs8(pkcs8_der);
+                        let (account, _creds) = instant_acme::Account::builder_with_http(Box::new(
+                            crate::acme_http::ArcHttpClient(register_client),
+                        ))
+                        .create_from_key((instant_key, pki_key), reg_dir)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                        Ok(account.id().to_owned())
+                    }
+                });
+
+            let establish_res = tokio::select! {
                 changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow_and_update() {
+                    if changed.is_err() || *shutdown.borrow() {
                         return Ok(());
                     }
+                    continue;
                 }
-                event = state.next() => match event {
-                    Some(Ok(_)) => { retry_count = 0; },
-                    Some(Err(error)) if persistent_acme_state_error(&error) => {
-                        return Err(McpEndpointCertificateLifecycleError::State);
-                    }
-                    Some(Err(error)) => {
-                        if acme_rate_limited(&error) {
-                            let delay = 1_i64 << retry_count.min(16);
-                            if let Some(root) = journal_root {
-                                crate::owner_state::write_mcp_rate_limit_state(
-                                    root,
-                                    &self.resolver.hostname,
-                                    chrono::Utc::now() + chrono::Duration::seconds(delay),
-                                );
+                res = establish_fut => res,
+            };
+
+            match establish_res {
+                Ok(uri) => break uri,
+                Err(_e) => {
+                    log::error!("failed to establish ACME account URI");
+                    tokio::select! {
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                return Ok(());
                             }
                         }
-                        retry_count = retry_count.saturating_add(1);
-                    },
-                    None => return Err(McpEndpointCertificateLifecycleError::State),
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(
+                            crate::acme_lifecycle::INITIAL_ISSUE_BACKOFF_SECONDS,
+                        )) => {}
+                    }
                 }
             }
-        }
+        };
+
+        let account_bytes = unix::read_tls_acme_account_bytes(&store.directory, production)
+            .map_err(|_| McpEndpointCertificateLifecycleError::State)?
+            .ok_or(McpEndpointCertificateLifecycleError::State)?;
+
+        let params = crate::acme_lifecycle::RenewalLoopParams {
+            journal_root,
+            directory: &store.directory,
+            environment: store.environment,
+            hostname: &self.resolver.hostname,
+            generation: store.generation,
+            account_kid,
+            account_key_pkcs8: account_bytes,
+            tls_service: self,
+            shutdown,
+            http_client: client,
+            picker,
+        };
+
+        crate::acme_lifecycle::run_renewal_lifecycle(params).await
     }
 
     pub(crate) async fn run_byo_acme_renewal(
         &self,
-        account_dir: unix::TlsStateDirectory,
+        account_dir: &unix::TlsStateDirectory,
         shutdown: &mut tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), McpEndpointCertificateLifecycleError> {
         if *shutdown.borrow() || shutdown.has_changed().is_err() {
             return Ok(());
         }
-        let _store = self
+        let store = self
             .store
             .as_ref()
             .ok_or(McpEndpointCertificateLifecycleError::State)?;
-        let cache = ByoAccountCache {
-            account_dir,
-            service: self.lifecycle_copy(),
-        };
-        let mut state = AcmeConfig::new([self.resolver.hostname.as_str()])
-            .cache(cache)
-            .directory_lets_encrypt(true)
-            .state();
-        let _resolver_guard = McpEndpointAcmeResolverGuard {
-            resolver: Arc::clone(&self.resolver),
-            installed: state.resolver(),
-        };
-        self.resolver
-            .acme
-            .store(Some(Arc::clone(&_resolver_guard.installed)));
 
-        let mut retry_count = 0_u32;
-        loop {
-            tokio::select! {
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow_and_update() {
-                        return Ok(());
-                    }
-                }
-                event = state.next() => match event {
-                    Some(Ok(_)) => { retry_count = 0; },
-                    Some(Err(error)) if persistent_acme_state_error(&error) => {
-                        return Err(McpEndpointCertificateLifecycleError::State);
-                    }
-                    Some(Err(_)) => {
-                        retry_count = retry_count.saturating_add(1);
-                    },
-                    None => return Err(McpEndpointCertificateLifecycleError::State),
-                }
+        let uri = unix::read_byo_account_uri(account_dir)
+            .map_err(|_| McpEndpointCertificateLifecycleError::State)?
+            .ok_or(McpEndpointCertificateLifecycleError::State)?;
+
+        let account_bytes = unix::read_byo_account_key(account_dir)
+            .map_err(|_| McpEndpointCertificateLifecycleError::State)?
+            .ok_or(McpEndpointCertificateLifecycleError::State)?;
+
+        validate_acme_account_key(&account_bytes)
+            .map_err(|_| McpEndpointCertificateLifecycleError::State)?;
+
+        let client = self.effective_http_client();
+        let picker = {
+            #[cfg(test)]
+            {
+                self.effective_picker()
             }
-        }
-    }
+            #[cfg(not(test))]
+            {
+                None
+            }
+        };
 
-    fn lifecycle_copy(&self) -> Self {
-        Self {
-            resolver: Arc::clone(&self.resolver),
-            store: self.store.as_ref().map(Arc::clone),
-            force_staging_renewal: self.force_staging_renewal,
-        }
+        let params = crate::acme_lifecycle::RenewalLoopParams {
+            journal_root: None,
+            directory: &store.directory,
+            environment: store.environment,
+            hostname: &self.resolver.hostname,
+            generation: store.generation,
+            account_kid: uri,
+            account_key_pkcs8: account_bytes,
+            tls_service: self,
+            shutdown,
+            http_client: client,
+            picker,
+        };
+
+        crate::acme_lifecycle::run_renewal_lifecycle(params).await
     }
 
     #[cfg(all(test, not(feature = "full-tests")))]
@@ -494,217 +704,10 @@ impl McpEndpointTlsService {
     }
 }
 
-fn acme_rate_limited<EC: std::fmt::Debug, EA: std::fmt::Debug>(error: &EventError<EC, EA>) -> bool {
-    match error {
-        EventError::Order(OrderError::BadOrder(order)) => order
-            .error
-            .as_ref()
-            .and_then(|problem| problem.typ.as_deref())
-            .is_some_and(|kind| kind.ends_with(":rateLimited")),
-        _ => false,
-    }
-}
-
-fn persistent_acme_state_error(error: &EventError<io::Error, io::Error>) -> bool {
-    matches!(
-        error,
-        EventError::CertCacheLoad(_)
-            | EventError::AccountCacheLoad(_)
-            | EventError::CertCacheStore(_)
-            | EventError::AccountCacheStore(_)
-            | EventError::CachedCertParse(_)
-    )
-}
-
-impl Drop for McpEndpointAcmeResolverGuard {
-    fn drop(&mut self) {
-        let current = self.resolver.acme.load_full();
-        if current
-            .as_ref()
-            .is_some_and(|resolver| Arc::ptr_eq(resolver, &self.installed))
-        {
-            let _ = self.resolver.acme.compare_and_swap(&current, None);
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl CertCache for McpEndpointAcmeCache {
-    type EC = io::Error;
-
-    async fn load_cert(
-        &self,
-        _domains: &[String],
-        _directory_url: &str,
-    ) -> Result<Option<Vec<u8>>, Self::EC> {
-        if self.force_staging_renewal {
-            return Ok(None);
-        }
-        let store = self
-            .service
-            .store
-            .as_ref()
-            .ok_or_else(|| io::Error::other("MCP endpoint TLS state is unavailable"))?;
-        let Some(bytes) = unix::read_tls_state_bytes(&store.directory)? else {
-            return Ok(None);
-        };
-        match classify_stored_state(&bytes, &self.service.resolver.hostname, store.environment)
-            .map_err(|_| io::Error::other("MCP endpoint certificate state is invalid"))?
-        {
-            StoredCertificateClassification::Same(decoded) => {
-                Ok(Some(stored_state_to_pem(decoded)))
-            }
-            StoredCertificateClassification::Foreign => Ok(None),
-        }
-    }
-
-    async fn store_cert(
-        &self,
-        _domains: &[String],
-        _directory_url: &str,
-        certificate: &[u8],
-    ) -> Result<(), Self::EC> {
-        let issued = issued_pem_parts(certificate)
-            .map_err(|_| io::Error::other("ACME returned an invalid certificate bundle"))?;
-        self.service
-            .install_ordinary_certificate(
-                issued.certificate_chain,
-                issued.private_key,
-                issued.not_before,
-                issued.not_after,
-            )
-            .map_err(|_| io::Error::other("ACME certificate state could not be activated"))
-    }
-}
-
-#[async_trait::async_trait]
-impl AccountCache for McpEndpointAcmeCache {
-    type EA = io::Error;
-
-    async fn load_account(
-        &self,
-        _contact: &[String],
-        _directory_url: &str,
-    ) -> Result<Option<Vec<u8>>, Self::EA> {
-        let store = self
-            .service
-            .store
-            .as_ref()
-            .ok_or_else(|| io::Error::other("MCP endpoint TLS state is unavailable"))?;
-        let account = unix::read_tls_acme_account_bytes(&store.directory, self.production)?;
-        if let Some(account) = account.as_deref() {
-            validate_acme_account_key(account)
-                .map_err(|_| io::Error::other("MCP endpoint ACME account state is invalid"))?;
-        }
-        Ok(account)
-    }
-
-    async fn store_account(
-        &self,
-        _contact: &[String],
-        _directory_url: &str,
-        account: &[u8],
-    ) -> Result<(), Self::EA> {
-        validate_acme_account_key(account)
-            .map_err(|_| io::Error::other("ACME returned an invalid account key"))?;
-        let store = self
-            .service
-            .store
-            .as_ref()
-            .ok_or_else(|| io::Error::other("MCP endpoint TLS state is unavailable"))?;
-        unix::persist_tls_acme_account_bytes(&store.directory, self.production, account)
-    }
-}
-
-// The owner-hostname door's certificate cache.
-pub(crate) struct ByoAccountCache {
-    pub(crate) account_dir: unix::TlsStateDirectory,
-    pub(crate) service: McpEndpointTlsService,
-}
-
-#[async_trait::async_trait]
-impl CertCache for ByoAccountCache {
-    type EC = io::Error;
-
-    async fn load_cert(
-        &self,
-        _domains: &[String],
-        _directory_url: &str,
-    ) -> Result<Option<Vec<u8>>, Self::EC> {
-        let store = self
-            .service
-            .store
-            .as_ref()
-            .ok_or_else(|| io::Error::other("MCP endpoint TLS state is unavailable"))?;
-        let Some(bytes) = unix::read_tls_state_bytes(&store.directory)? else {
-            return Ok(None);
-        };
-        match classify_stored_state(
-            &bytes,
-            &self.service.resolver.hostname,
-            McpEndpointCertificateEnvironment::Production,
-        )
-        .map_err(|_| io::Error::other("MCP endpoint certificate state is invalid"))?
-        {
-            StoredCertificateClassification::Same(decoded) => {
-                Ok(Some(stored_state_to_pem(decoded)))
-            }
-            StoredCertificateClassification::Foreign => Ok(None),
-        }
-    }
-
-    async fn store_cert(
-        &self,
-        _domains: &[String],
-        _directory_url: &str,
-        certificate: &[u8],
-    ) -> Result<(), Self::EC> {
-        let issued = issued_pem_parts(certificate)
-            .map_err(|_| io::Error::other("ACME returned an invalid certificate bundle"))?;
-        self.service
-            .install_ordinary_certificate(
-                issued.certificate_chain,
-                issued.private_key,
-                issued.not_before,
-                issued.not_after,
-            )
-            .map_err(|_| io::Error::other("ACME certificate state could not be activated"))
-    }
-}
-
-#[async_trait::async_trait]
-impl AccountCache for ByoAccountCache {
-    type EA = io::Error;
-
-    async fn load_account(
-        &self,
-        _contact: &[String],
-        _directory_url: &str,
-    ) -> Result<Option<Vec<u8>>, Self::EA> {
-        let uri = unix::read_byo_account_uri(&self.account_dir)?;
-        if uri.is_none() {
-            return Err(io::Error::other("account not registered"));
-        }
-        let account = unix::read_byo_account_key(&self.account_dir)?;
-        let Some(account_bytes) = account else {
-            return Err(io::Error::other("account key missing"));
-        };
-        validate_acme_account_key(&account_bytes)
-            .map_err(|_| io::Error::other("MCP endpoint ACME account key is invalid"))?;
-        Ok(Some(account_bytes))
-    }
-
-    async fn store_account(
-        &self,
-        _contact: &[String],
-        _directory_url: &str,
-        account: &[u8],
-    ) -> Result<(), Self::EA> {
-        validate_acme_account_key(account)
-            .map_err(|_| io::Error::other("ACME returned an invalid account key"))?;
-        unix::persist_byo_account_key(&self.account_dir, account)
-    }
-}
+#[cfg(all(test, feature = "full-tests"))]
+#[cfg(unix)]
+#[path = "acme_process_tests.rs"]
+mod acme_test_driver;
 
 impl Drop for McpEndpointChallengeGuard {
     fn drop(&mut self) {
@@ -748,9 +751,6 @@ impl ResolvesServerCert for McpEndpointCertificateResolver {
         if is_acme_attempt(&alpn) {
             if !is_only_acme_alpn(&alpn) {
                 return None;
-            }
-            if let Some(resolver) = self.acme.load_full() {
-                return resolver.resolve(hello);
             }
             return self
                 .challenge
@@ -854,18 +854,11 @@ where
     Ok(())
 }
 
-struct DecodedStoredCertificateState {
-    certificate_chain: Vec<Vec<u8>>,
-    private_key: Vec<u8>,
-    not_before: i64,
-    not_after: i64,
-}
-
-struct IssuedCertificate {
-    certificate_chain: Vec<Vec<u8>>,
-    private_key: Vec<u8>,
-    not_before: i64,
-    not_after: i64,
+pub(crate) struct DecodedStoredCertificateState {
+    pub(crate) certificate_chain: Vec<Vec<u8>>,
+    pub(crate) private_key: Vec<u8>,
+    pub(crate) not_before: i64,
+    pub(crate) not_after: i64,
 }
 
 fn validate_stored_state(
@@ -880,12 +873,12 @@ fn validate_stored_state(
     activate_decoded_stored_state(decoded)
 }
 
-enum StoredCertificateClassification {
+pub(crate) enum StoredCertificateClassification {
     Same(DecodedStoredCertificateState),
     Foreign,
 }
 
-fn classify_stored_state(
+pub(crate) fn classify_stored_state(
     bytes: &[u8],
     expected_hostname: &str,
     expected_environment: McpEndpointCertificateEnvironment,
@@ -1030,49 +1023,6 @@ fn activate_decoded_stored_state(
     })
 }
 
-fn stored_state_to_pem(state: DecodedStoredCertificateState) -> Vec<u8> {
-    let mut blocks = Vec::with_capacity(state.certificate_chain.len() + 1);
-    blocks.push(pem::Pem::new("PRIVATE KEY", state.private_key));
-    blocks.extend(
-        state
-            .certificate_chain
-            .into_iter()
-            .map(|certificate| pem::Pem::new("CERTIFICATE", certificate)),
-    );
-    pem::encode_many(&blocks).into_bytes()
-}
-
-fn issued_pem_parts(certificate: &[u8]) -> Result<IssuedCertificate, McpEndpointTlsError> {
-    let blocks = pem::parse_many(certificate).map_err(|_| McpEndpointTlsError::State)?;
-    let (private_key, certificates) = blocks.split_first().ok_or(McpEndpointTlsError::State)?;
-    if private_key.tag() != "PRIVATE KEY" || certificates.is_empty() {
-        return Err(McpEndpointTlsError::State);
-    }
-    if certificates
-        .iter()
-        .any(|block| block.tag() != "CERTIFICATE")
-    {
-        return Err(McpEndpointTlsError::State);
-    }
-    let chain = certificates
-        .iter()
-        .map(|certificate| certificate.contents().to_vec())
-        .collect::<Vec<_>>();
-    let (remainder, leaf) =
-        parse_x509_certificate(&chain[0]).map_err(|_| McpEndpointTlsError::State)?;
-    if !remainder.is_empty() {
-        return Err(McpEndpointTlsError::State);
-    }
-    let not_before = leaf.validity().not_before.timestamp();
-    let not_after = leaf.validity().not_after.timestamp();
-    Ok(IssuedCertificate {
-        certificate_chain: chain,
-        private_key: private_key.contents().to_vec(),
-        not_before,
-        not_after,
-    })
-}
-
 pub(crate) fn validate_acme_account_key(bytes: &[u8]) -> Result<(), McpEndpointTlsError> {
     if bytes.is_empty() || bytes.len() > unix::MAX_TLS_ACME_ACCOUNT_BYTES {
         return Err(McpEndpointTlsError::State);
@@ -1089,7 +1039,6 @@ pub(crate) fn validate_acme_account_key(bytes: &[u8]) -> Result<(), McpEndpointT
     .map_err(|_| McpEndpointTlsError::State)
 }
 
-#[allow(dead_code)] // Called by the same-crate ACME lifecycle owner.
 fn build_acme_challenge_key(
     hostname: &str,
     key_authorization_digest: &[u8; 32],
@@ -1121,7 +1070,6 @@ fn build_acme_challenge_key(
     )))
 }
 
-#[allow(dead_code)] // Called by the same-crate ACME lifecycle owner.
 fn der_octet_string(value: &[u8; 32]) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(34);
     encoded.extend_from_slice(&[0x04, 0x20]);
@@ -1166,81 +1114,46 @@ fn is_only_acme_alpn(protocols: &[&[u8]]) -> bool {
     protocols == [ACME_TLS_ALPN]
 }
 
-#[cfg(all(test, not(feature = "full-tests")))]
-// These exercise the owner state layer through Unix file modes.
+#[cfg(test)]
 #[cfg(unix)]
-mod tests {
-    use std::fs;
+pub(crate) mod test_helpers {
     use std::io::Cursor;
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
 
-    use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+    use base64::Engine;
+    use rustls::pki_types::{CertificateDer, ServerName};
     use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConnection};
-    use solstone_core_journal_io::journal_root::JournalRoot;
-    use tempfile::TempDir;
 
-    use super::*;
+    pub(crate) const HOSTNAME: &str = "ab12cd34.solstone.me";
 
-    const HOSTNAME: &str = "ab12cd34.solstone.me";
+    #[cfg(feature = "full-tests")]
+    pub(crate) fn mint_test_leaf(
+        not_before: i64,
+        not_after: i64,
+    ) -> (Vec<u8>, Vec<u8>, CertificateDer<'static>) {
+        use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
+        use time::OffsetDateTime;
 
-    fn fixture_key() -> (Arc<CertifiedKey>, CertificateDer<'static>) {
-        let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("fixture key");
-        let certificate = CertificateParams::new(vec![HOSTNAME.to_owned()])
-            .expect("fixture params")
-            .self_signed(&key_pair)
-            .expect("fixture certificate");
-        let cert = CertificateDer::from(certificate.der().to_vec());
-        let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
-        let signing_key = rustls::crypto::ring::sign::any_supported_type(&private_key)
-            .expect("fixture signing key");
-        (
-            Arc::new(CertifiedKey::new(vec![cert.clone()], signing_key)),
-            cert,
-        )
-    }
-
-    fn state_fixture() -> (Vec<Vec<u8>>, Vec<u8>, i64, i64, CertificateDer<'static>) {
-        let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("state key");
-        let now = OffsetDateTime::now_utc();
-        let mut params = CertificateParams::new(vec![HOSTNAME.to_owned()]).expect("state params");
-        params.not_before = now - Duration::minutes(1);
-        params.not_after = now + Duration::hours(1);
-        let not_before = params.not_before.unix_timestamp();
-        let not_after = params.not_after.unix_timestamp();
-        let certificate = params.self_signed(&key_pair).expect("state certificate");
+        let keypair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("leaf key");
+        let mut params = CertificateParams::new(vec![HOSTNAME.to_owned()]).expect("params");
+        params.use_authority_key_identifier_extension = true;
+        params.not_before = OffsetDateTime::from_unix_timestamp(not_before).expect("not_before");
+        params.not_after = OffsetDateTime::from_unix_timestamp(not_after).expect("not_after");
+        let certificate = params.self_signed(&keypair).expect("certificate");
         let der = certificate.der().to_vec();
-        (
-            vec![der.clone()],
-            key_pair.serialize_der(),
-            not_before,
-            not_after,
-            CertificateDer::from(der),
+        let key_der = keypair.serialize_der();
+        (der.clone(), key_der, CertificateDer::from(der))
+    }
+
+    #[cfg_attr(not(feature = "full-tests"), allow(dead_code))]
+    pub(crate) fn pem_from_der(der: &[u8]) -> String {
+        format!(
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+            base64::engine::general_purpose::STANDARD.encode(der)
         )
     }
 
-    fn expired_state_fixture() -> (Vec<Vec<u8>>, Vec<u8>, i64, i64) {
-        let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("expired state key");
-        let now = OffsetDateTime::now_utc();
-        let mut params =
-            CertificateParams::new(vec![HOSTNAME.to_owned()]).expect("expired state params");
-        params.not_before = now - Duration::hours(2);
-        params.not_after = now - Duration::hours(1);
-        let not_before = params.not_before.unix_timestamp();
-        let not_after = params.not_after.unix_timestamp();
-        let certificate = params
-            .self_signed(&key_pair)
-            .expect("expired state certificate");
-        (
-            vec![certificate.der().to_vec()],
-            key_pair.serialize_der(),
-            not_before,
-            not_after,
-        )
-    }
-
-    fn trusted_client_config(
+    pub(crate) fn trusted_client_config(
         certificate: CertificateDer<'static>,
         alpn: Vec<Vec<u8>>,
     ) -> Arc<ClientConfig> {
@@ -1257,7 +1170,7 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct AcmeTestVerifier;
+    pub(crate) struct AcmeTestVerifier;
 
     impl rustls::client::danger::ServerCertVerifier for AcmeTestVerifier {
         fn verify_server_cert(
@@ -1298,7 +1211,7 @@ mod tests {
         }
     }
 
-    fn acme_test_client_config(alpn: Vec<Vec<u8>>) -> Arc<ClientConfig> {
+    pub(crate) fn acme_test_client_config(alpn: Vec<Vec<u8>>) -> Arc<ClientConfig> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut config = ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13])
@@ -1310,7 +1223,7 @@ mod tests {
         Arc::new(config)
     }
 
-    fn complete_handshake(
+    pub(crate) fn complete_handshake(
         client: &mut ClientConnection,
         server: &mut ServerConnection,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1334,8 +1247,644 @@ mod tests {
         Err("fixture handshake did not converge".into())
     }
 
+    #[allow(clippy::type_complexity)]
+    pub(crate) enum ScriptedHandler {
+        Sync(
+            Arc<
+                dyn Fn(&str, &str, &[u8]) -> axum::http::Response<axum::body::Body>
+                    + Send
+                    + Sync
+                    + 'static,
+            >,
+        ),
+        #[cfg(feature = "full-tests")]
+        Async(
+            Arc<
+                dyn Fn(
+                        String,
+                        String,
+                        Vec<u8>,
+                    ) -> std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<Output = axum::http::Response<axum::body::Body>>
+                                + Send,
+                        >,
+                    > + Send
+                    + Sync
+                    + 'static,
+            >,
+        ),
+    }
+
+    #[cfg_attr(not(feature = "full-tests"), allow(dead_code))]
+    pub(crate) struct ScriptedHttpClient {
+        #[allow(clippy::type_complexity)]
+        pub(crate) requests: Arc<std::sync::Mutex<Vec<(String, String, Vec<u8>)>>>,
+        pub(crate) handler: ScriptedHandler,
+    }
+
+    #[cfg_attr(not(feature = "full-tests"), allow(dead_code))]
+    impl ScriptedHttpClient {
+        #[allow(clippy::type_complexity)]
+        pub(crate) fn new<F>(
+            handler: F,
+        ) -> (
+            Arc<Self>,
+            Arc<std::sync::Mutex<Vec<(String, String, Vec<u8>)>>>,
+        )
+        where
+            F: Fn(&str, &str, &[u8]) -> axum::http::Response<axum::body::Body>
+                + Send
+                + Sync
+                + 'static,
+        {
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            (
+                Arc::new(Self {
+                    requests: Arc::clone(&requests),
+                    handler: ScriptedHandler::Sync(Arc::new(handler)),
+                }),
+                requests,
+            )
+        }
+
+        #[cfg(feature = "full-tests")]
+        #[allow(clippy::type_complexity)]
+        pub(crate) fn new_async<F, Fut>(
+            handler: F,
+        ) -> (
+            Arc<Self>,
+            Arc<std::sync::Mutex<Vec<(String, String, Vec<u8>)>>>,
+        )
+        where
+            F: Fn(String, String, Vec<u8>) -> Fut + Send + Sync + 'static,
+            Fut: std::future::Future<Output = axum::http::Response<axum::body::Body>>
+                + Send
+                + 'static,
+        {
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let wrapped = Arc::new(move |m: String, u: String, b: Vec<u8>| {
+                Box::pin(handler(m, u, b))
+                    as std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<Output = axum::http::Response<axum::body::Body>>
+                                + Send,
+                        >,
+                    >
+            });
+            (
+                Arc::new(Self {
+                    requests: Arc::clone(&requests),
+                    handler: ScriptedHandler::Async(wrapped),
+                }),
+                requests,
+            )
+        }
+    }
+
+    #[cfg_attr(not(feature = "full-tests"), allow(dead_code))]
+    impl instant_acme::HttpClient for ScriptedHttpClient {
+        fn request(
+            &self,
+            req: axum::http::Request<instant_acme::BodyWrapper<bytes::Bytes>>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<instant_acme::BytesResponse, instant_acme::Error>,
+                    > + Send,
+            >,
+        > {
+            let (parts, mut body) = req.into_parts();
+            let method = parts.method.to_string();
+            let uri = parts.uri.to_string();
+            let requests = Arc::clone(&self.requests);
+            let handler = match &self.handler {
+                ScriptedHandler::Sync(h) => ScriptedHandler::Sync(Arc::clone(h)),
+                #[cfg(feature = "full-tests")]
+                ScriptedHandler::Async(h) => ScriptedHandler::Async(Arc::clone(h)),
+            };
+            Box::pin(async move {
+                use hyper::body::Body;
+                let frame =
+                    futures::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx))
+                        .await;
+                let body_bytes = frame
+                    .and_then(|f| f.ok())
+                    .and_then(|f| f.into_data().ok())
+                    .unwrap_or_default();
+                if let Ok(mut reqs) = requests.lock() {
+                    reqs.push((method.clone(), uri.clone(), body_bytes.to_vec()));
+                }
+                let response = match handler {
+                    ScriptedHandler::Sync(h) => h(&method, &uri, &body_bytes),
+                    #[cfg(feature = "full-tests")]
+                    ScriptedHandler::Async(h) => h(method, uri, body_bytes.to_vec()).await,
+                };
+                Ok(instant_acme::BytesResponse::from(response))
+            })
+        }
+    }
+
+    #[cfg_attr(not(feature = "full-tests"), allow(dead_code))]
+    #[derive(Default, Clone)]
+    pub(crate) struct AcmeServerGates {
+        #[cfg(feature = "full-tests")]
+        pub hold_authz: Option<Arc<tokio::sync::Notify>>,
+        #[cfg(feature = "full-tests")]
+        pub hold_cert: Option<Arc<tokio::sync::Notify>>,
+        pub reject_replaces_once: Option<Arc<std::sync::atomic::AtomicBool>>,
+        pub resume_problem: Option<(u16, String)>,
+        pub resume_already_valid: bool,
+        pub before_new_order_response: Option<Arc<dyn Fn() + Send + Sync>>,
+    }
+
+    struct MockAcmeState {
+        effective_acct_string: String,
+        ari_status_cell: std::sync::atomic::AtomicU16,
+        finalized: std::sync::atomic::AtomicBool,
+        directory_url: String,
+        has_ari: bool,
+        ari_window: (i64, i64),
+        cert_pem: String,
+        expected_replaces: Option<String>,
+        on_challenge: Option<Arc<dyn Fn() + Send + Sync>>,
+    }
+
+    #[cfg_attr(not(feature = "full-tests"), allow(dead_code))]
+    #[allow(clippy::collapsible_if)]
+    fn handle_mock_acme_sync(
+        method: &str,
+        uri: &str,
+        body: &[u8],
+        state: &MockAcmeState,
+        gates: &AcmeServerGates,
+    ) -> axum::http::Response<axum::body::Body> {
+        if method == "GET" && uri == state.directory_url {
+            let json = if state.has_ari {
+                serde_json::json!({
+                    "newNonce": "https://acme.example/new-nonce",
+                    "newAccount": "https://acme.example/new-account",
+                    "newOrder": "https://acme.example/new-order",
+                    "renewalInfo": "https://acme.example/ari"
+                })
+            } else {
+                serde_json::json!({
+                    "newNonce": "https://acme.example/new-nonce",
+                    "newAccount": "https://acme.example/new-account",
+                    "newOrder": "https://acme.example/new-order"
+                })
+            };
+            return axum::http::Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(json.to_string()))
+                .unwrap();
+        }
+        if (method == "HEAD" || method == "GET") && uri.ends_with("/new-nonce") {
+            return axum::http::Response::builder()
+                .status(200)
+                .header("replay-nonce", "test-nonce-1")
+                .header("content-type", "text/plain")
+                .body(axum::body::Body::empty())
+                .unwrap();
+        }
+        if method == "POST" && uri.ends_with("/new-account") {
+            let json = serde_json::json!({
+                "status": "valid",
+                "orders": format!("{}/orders", state.effective_acct_string)
+            });
+            return axum::http::Response::builder()
+                .status(201)
+                .header("location", state.effective_acct_string.as_str())
+                .header("replay-nonce", "test-nonce-account")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(json.to_string()))
+                .unwrap();
+        }
+        if method == "GET" && uri.starts_with("https://acme.example/ari/") {
+            let status = state
+                .ari_status_cell
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if status == 503 {
+                state
+                    .ari_status_cell
+                    .store(200, std::sync::atomic::Ordering::SeqCst);
+                return axum::http::Response::builder()
+                    .status(503)
+                    .header("retry-after", "120")
+                    .header("content-type", "application/problem+json")
+                    .body(axum::body::Body::from(
+                        r#"{"type":"urn:ietf:params:acme:error:serverInternal"}"#,
+                    ))
+                    .unwrap();
+            }
+            let window = if let Some(ref exp_rep) = state.expected_replaces {
+                if uri.ends_with(exp_rep) {
+                    state.ari_window
+                } else {
+                    (state.ari_window.0 + 100_000, state.ari_window.1 + 100_000)
+                }
+            } else {
+                state.ari_window
+            };
+            let start_dt = time::OffsetDateTime::from_unix_timestamp(window.0)
+                .unwrap()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap();
+            let end_dt = time::OffsetDateTime::from_unix_timestamp(window.1)
+                .unwrap()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap();
+            let json = serde_json::json!({
+                "suggestedWindow": {
+                    "start": start_dt,
+                    "end": end_dt
+                }
+            });
+            return axum::http::Response::builder()
+                .status(200)
+                .header("retry-after", "3600")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(json.to_string()))
+                .unwrap();
+        }
+        if method == "POST" && uri.ends_with("/new-order") {
+            if let Some(ref hook) = gates.before_new_order_response {
+                hook();
+            }
+            if let Ok(jws) = serde_json::from_slice::<serde_json::Value>(body) {
+                if let Some(payload_b64) = jws.get("payload").and_then(|v| v.as_str()) {
+                    if let Ok(payload_bytes) =
+                        base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload_b64)
+                    {
+                        if let Ok(order_payload) =
+                            serde_json::from_slice::<serde_json::Value>(&payload_bytes)
+                        {
+                            if let Some(ref flag) = gates.reject_replaces_once {
+                                if order_payload.get("replaces").is_some()
+                                    && flag.swap(false, std::sync::atomic::Ordering::SeqCst)
+                                {
+                                    let problem = serde_json::json!({
+                                        "type": "urn:ietf:params:acme:error:alreadyReplaced",
+                                        "detail": "already replaced",
+                                        "status": 409
+                                    });
+                                    return axum::http::Response::builder()
+                                        .status(409)
+                                        .header("replay-nonce", "test-nonce-conflict")
+                                        .header("content-type", "application/problem+json")
+                                        .body(axum::body::Body::from(problem.to_string()))
+                                        .unwrap();
+                                }
+                            }
+                            if let Some(ref exp_rep) = state.expected_replaces {
+                                let actual_rep =
+                                    order_payload.get("replaces").and_then(|v| v.as_str());
+                                assert_eq!(
+                                    actual_rep,
+                                    Some(exp_rep.as_str()),
+                                    "replaces mismatch in new-order"
+                                );
+                            } else if gates.reject_replaces_once.is_none() {
+                                assert!(
+                                    order_payload.get("replaces").is_none(),
+                                    "unexpected replaces in new-order"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            let mut json = serde_json::json!({
+                "status": "pending",
+                "expires": "2030-01-01T00:00:00Z",
+                "identifiers": [{ "type": "dns", "value": "ab12cd34.solstone.me" }],
+                "authorizations": ["https://acme.example/authz/1"],
+                "finalize": "https://acme.example/order/1/finalize",
+                "error": null,
+                "certificate": null
+            });
+            if let Some(ref exp_rep) = state.expected_replaces {
+                json["replaces"] = serde_json::Value::String(exp_rep.clone());
+            }
+            return axum::http::Response::builder()
+                .status(201)
+                .header("location", "https://acme.example/order/1")
+                .header("replay-nonce", "test-nonce-order")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(json.to_string()))
+                .unwrap();
+        }
+        if method == "POST" && uri == "https://acme.example/authz/1" {
+            let json = serde_json::json!({
+                "status": "pending",
+                "identifier": { "type": "dns", "value": "ab12cd34.solstone.me" },
+                "challenges": [
+                    {
+                        "type": "tls-alpn-01",
+                        "url": "https://acme.example/chall/1",
+                        "token": "dGVzdC10b2tlbg",
+                        "status": "pending",
+                        "error": null
+                    }
+                ]
+            });
+            return axum::http::Response::builder()
+                .status(200)
+                .header("replay-nonce", "test-nonce-authz")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(json.to_string()))
+                .unwrap();
+        }
+        if method == "POST" && uri == "https://acme.example/chall/1" {
+            if let Some(ref hook) = state.on_challenge {
+                hook();
+            }
+            let json = serde_json::json!({
+                "type": "tls-alpn-01",
+                "url": "https://acme.example/chall/1",
+                "status": "valid",
+                "token": "dGVzdC10b2tlbg",
+                "error": null
+            });
+            return axum::http::Response::builder()
+                .status(200)
+                .header("replay-nonce", "test-nonce-chall")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(json.to_string()))
+                .unwrap();
+        }
+        if method == "POST"
+            && (uri == "https://acme.example/order/1" || uri.ends_with("/order/existing"))
+        {
+            if let Some((status, ref err_type)) = gates.resume_problem {
+                let problem = serde_json::json!({
+                    "type": err_type,
+                    "detail": "resume",
+                    "status": status
+                });
+                return axum::http::Response::builder()
+                    .status(status)
+                    .header("replay-nonce", "test-nonce-order-problem")
+                    .header("content-type", "application/problem+json")
+                    .body(axum::body::Body::from(problem.to_string()))
+                    .unwrap();
+            }
+            if gates.resume_already_valid {
+                let mut json = serde_json::json!({
+                    "status": "valid",
+                    "expires": "2030-01-01T00:00:00Z",
+                    "identifiers": [{ "type": "dns", "value": "ab12cd34.solstone.me" }],
+                    "authorizations": ["https://acme.example/authz/1"],
+                    "finalize": "https://acme.example/order/1/finalize",
+                    "error": null,
+                    "certificate": "https://acme.example/cert/1"
+                });
+                if let Some(ref exp_rep) = state.expected_replaces {
+                    json["replaces"] = serde_json::Value::String(exp_rep.clone());
+                }
+                return axum::http::Response::builder()
+                    .status(200)
+                    .header("replay-nonce", "test-nonce-refresh")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(json.to_string()))
+                    .unwrap();
+            }
+            let is_fin = state.finalized.load(std::sync::atomic::Ordering::SeqCst);
+            let mut json = if is_fin {
+                serde_json::json!({
+                    "status": "valid",
+                    "expires": "2030-01-01T00:00:00Z",
+                    "identifiers": [{ "type": "dns", "value": "ab12cd34.solstone.me" }],
+                    "authorizations": ["https://acme.example/authz/1"],
+                    "finalize": "https://acme.example/order/1/finalize",
+                    "error": null,
+                    "certificate": "https://acme.example/cert/1"
+                })
+            } else {
+                serde_json::json!({
+                    "status": "ready",
+                    "expires": "2030-01-01T00:00:00Z",
+                    "identifiers": [{ "type": "dns", "value": "ab12cd34.solstone.me" }],
+                    "authorizations": ["https://acme.example/authz/1"],
+                    "finalize": "https://acme.example/order/1/finalize",
+                    "error": null,
+                    "certificate": null
+                })
+            };
+            if let Some(ref exp_rep) = state.expected_replaces {
+                json["replaces"] = serde_json::Value::String(exp_rep.clone());
+            }
+            return axum::http::Response::builder()
+                .status(200)
+                .header("replay-nonce", "test-nonce-refresh")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(json.to_string()))
+                .unwrap();
+        }
+        if method == "POST" && uri.ends_with("/finalize") {
+            state
+                .finalized
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut json = serde_json::json!({
+                "status": "valid",
+                "expires": "2030-01-01T00:00:00Z",
+                "identifiers": [{ "type": "dns", "value": "ab12cd34.solstone.me" }],
+                "authorizations": ["https://acme.example/authz/1"],
+                "finalize": "https://acme.example/order/1/finalize",
+                "error": null,
+                "certificate": "https://acme.example/cert/1"
+            });
+            if let Some(ref exp_rep) = state.expected_replaces {
+                json["replaces"] = serde_json::Value::String(exp_rep.clone());
+            }
+            return axum::http::Response::builder()
+                .status(200)
+                .header("replay-nonce", "test-nonce-fin")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(json.to_string()))
+                .unwrap();
+        }
+        if method == "POST" && uri.ends_with("/cert/1") {
+            return axum::http::Response::builder()
+                .status(200)
+                .header("replay-nonce", "test-nonce-cert")
+                .header("content-type", "application/pem-certificate-chain")
+                .body(axum::body::Body::from(state.cert_pem.clone()))
+                .unwrap();
+        }
+        panic!("unexpected mock ACME request: {method} {uri}");
+    }
+
+    #[cfg_attr(not(feature = "full-tests"), allow(dead_code))]
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+    pub(crate) fn mock_acme_server(
+        directory_url: String,
+        has_ari: bool,
+        ari_status: u16,
+        ari_window: (i64, i64),
+        cert_pem: String,
+        expected_replaces: Option<String>,
+        on_challenge: Option<Arc<dyn Fn() + Send + Sync>>,
+        account_url: Option<&str>,
+    ) -> (
+        Arc<ScriptedHttpClient>,
+        Arc<std::sync::Mutex<Vec<(String, String, Vec<u8>)>>>,
+    ) {
+        let state = Arc::new(MockAcmeState {
+            effective_acct_string: account_url
+                .unwrap_or("https://acme-staging-v02.api.letsencrypt.org/acme/acct/1")
+                .to_string(),
+            ari_status_cell: std::sync::atomic::AtomicU16::new(ari_status),
+            finalized: std::sync::atomic::AtomicBool::new(false),
+            directory_url,
+            has_ari,
+            ari_window,
+            cert_pem,
+            expected_replaces,
+            on_challenge,
+        });
+        let state_clone = Arc::clone(&state);
+        let gates = AcmeServerGates::default();
+        let (client, requests) = ScriptedHttpClient::new(move |method, uri, body| {
+            handle_mock_acme_sync(method, uri, body, &state_clone, &gates)
+        });
+        (client, requests)
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+    pub(crate) fn mock_acme_server_gated(
+        directory_url: String,
+        has_ari: bool,
+        ari_status: u16,
+        ari_window: (i64, i64),
+        cert_pem: String,
+        expected_replaces: Option<String>,
+        on_challenge: Option<Arc<dyn Fn() + Send + Sync>>,
+        account_url: Option<&str>,
+        gates: AcmeServerGates,
+    ) -> (
+        Arc<ScriptedHttpClient>,
+        Arc<std::sync::Mutex<Vec<(String, String, Vec<u8>)>>>,
+    ) {
+        let state = Arc::new(MockAcmeState {
+            effective_acct_string: account_url
+                .unwrap_or("https://acme-staging-v02.api.letsencrypt.org/acme/acct/1")
+                .to_string(),
+            ari_status_cell: std::sync::atomic::AtomicU16::new(ari_status),
+            finalized: std::sync::atomic::AtomicBool::new(false),
+            directory_url,
+            has_ari,
+            ari_window,
+            cert_pem,
+            expected_replaces,
+            on_challenge,
+        });
+        let state_clone = Arc::clone(&state);
+        let (client, requests) = ScriptedHttpClient::new_async(move |method, uri, body| {
+            let state = Arc::clone(&state_clone);
+            let gates = gates.clone();
+            let body_vec = body.to_vec();
+            let method_str = method.to_string();
+            let uri_str = uri.to_string();
+            Box::pin(async move {
+                if method_str == "POST"
+                    && uri_str == "https://acme.example/authz/1"
+                    && let Some(ref notify) = gates.hold_authz
+                {
+                    notify.notified().await;
+                }
+                if method_str == "POST"
+                    && uri_str.ends_with("/cert/1")
+                    && let Some(ref notify) = gates.hold_cert
+                {
+                    notify.notified().await;
+                }
+                handle_mock_acme_sync(&method_str, &uri_str, &body_vec, &state, &gates)
+            })
+        });
+        (client, requests)
+    }
+}
+
+#[cfg(all(test, not(feature = "full-tests")))]
+// These exercise the owner state layer through Unix file modes.
+#[cfg(unix)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+
+    use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+    use rustls::{ClientConnection, ServerConnection};
+    use solstone_core_journal_io::journal_root::JournalRoot;
+    use tempfile::TempDir;
+
+    use super::test_helpers::*;
+    use super::*;
+
+    fn fixture_key() -> (Arc<CertifiedKey>, CertificateDer<'static>) {
+        let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("fixture key");
+        let certificate = CertificateParams::new(vec![HOSTNAME.to_owned()])
+            .expect("fixture params")
+            .self_signed(&key_pair)
+            .expect("fixture certificate");
+        let cert = CertificateDer::from(certificate.der().to_vec());
+        let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+        let signing_key = rustls::crypto::ring::sign::any_supported_type(&private_key)
+            .expect("fixture signing key");
+        (
+            Arc::new(CertifiedKey::new(vec![cert.clone()], signing_key)),
+            cert,
+        )
+    }
+
+    fn state_fixture() -> (Vec<Vec<u8>>, Vec<u8>, i64, i64, CertificateDer<'static>) {
+        let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("state key");
+        let now = OffsetDateTime::from_unix_timestamp(current_epoch_seconds()).unwrap();
+        let mut params = CertificateParams::new(vec![HOSTNAME.to_owned()]).expect("state params");
+        params.use_authority_key_identifier_extension = true;
+        params.not_before = now - Duration::minutes(1);
+        params.not_after = now + Duration::hours(1);
+        let not_before = params.not_before.unix_timestamp();
+        let not_after = params.not_after.unix_timestamp();
+        let certificate = params.self_signed(&key_pair).expect("state certificate");
+        let der = certificate.der().to_vec();
+        (
+            vec![der.clone()],
+            key_pair.serialize_der(),
+            not_before,
+            not_after,
+            CertificateDer::from(der),
+        )
+    }
+
+    fn expired_state_fixture() -> (Vec<Vec<u8>>, Vec<u8>, i64, i64) {
+        let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("expired state key");
+        let now = OffsetDateTime::now_utc();
+        let mut params =
+            CertificateParams::new(vec![HOSTNAME.to_owned()]).expect("expired state params");
+        params.use_authority_key_identifier_extension = true;
+        params.not_before = now - Duration::hours(2);
+        params.not_after = now - Duration::hours(1);
+        let not_before = params.not_before.unix_timestamp();
+        let not_after = params.not_after.unix_timestamp();
+        let certificate = params
+            .self_signed(&key_pair)
+            .expect("expired state certificate");
+        (
+            vec![certificate.der().to_vec()],
+            key_pair.serialize_der(),
+            not_before,
+            not_after,
+        )
+    }
+
     #[test]
     fn config_is_tls13_and_advertises_the_exact_two_protocols() {
+        let _clock = lock_test_clock(None);
         let service = McpEndpointTlsService::empty_for_test(HOSTNAME.to_owned());
         let config = mcp_endpoint_server_config(&service);
         assert_eq!(
@@ -1346,6 +1895,7 @@ mod tests {
 
     #[test]
     fn reconnect_authority_must_match_the_existing_tls_hostname() {
+        let _clock = lock_test_clock(None);
         let service = McpEndpointTlsService::empty_for_test(HOSTNAME.to_owned());
         assert!(service.matches_authorized_hostname(HOSTNAME));
         assert!(!service.matches_authorized_hostname("other.solstone.me"));
@@ -1354,6 +1904,7 @@ mod tests {
 
     #[test]
     fn resolver_never_has_a_default_certificate_without_exact_sni() {
+        let _clock = lock_test_clock(None);
         let service = McpEndpointTlsService::empty_for_test(HOSTNAME.to_owned());
         service.install_ordinary_for_test(fixture_key().0);
         assert!(is_exact_authorized_hostname(HOSTNAME, HOSTNAME));
@@ -1374,6 +1925,7 @@ mod tests {
 
     #[test]
     fn acme_attempt_requires_one_exact_protocol_and_an_active_generation() {
+        let _clock = lock_test_clock(None);
         let service = McpEndpointTlsService::empty_for_test(HOSTNAME.to_owned());
         let first = service
             .install_acme_challenge([1; 32])
@@ -1393,6 +1945,7 @@ mod tests {
 
     #[test]
     fn ordinary_install_is_owner_only_durable_and_reloads_before_activation() {
+        let _clock = lock_test_clock(None);
         let root = TempDir::new().expect("state root");
         let (chain, private_key, not_before, not_after, certificate) = state_fixture();
         let service = McpEndpointTlsService::for_authorized_hostname(
@@ -1440,6 +1993,7 @@ mod tests {
 
     #[test]
     fn expired_state_is_not_served_but_is_retained_for_acme_recovery() {
+        let _clock = lock_test_clock(None);
         let root = TempDir::new().expect("state root");
         let (chain, private_key, not_before, not_after) = expired_state_fixture();
         let service = McpEndpointTlsService::for_authorized_hostname(
@@ -1473,24 +2027,19 @@ mod tests {
         .expect("expired state is structurally valid");
         assert!(recovered.resolver.ordinary.load_full().is_none());
 
-        let cache = McpEndpointAcmeCache {
-            service: recovered.lifecycle_copy(),
-            production: false,
-            force_staging_renewal: false,
-        };
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let pem = runtime
-            .block_on(CertCache::load_cert(&cache, &[], "staging"))
-            .expect("expired certificate cache load")
-            .expect("expired certificate remains available to ACME");
-        assert!(pem.starts_with(b"-----BEGIN PRIVATE KEY-----"));
+        let store = recovered.store.as_ref().expect("state store");
+        let bytes = unix::read_tls_state_bytes(&store.directory)
+            .expect("read state")
+            .expect("expired certificate state remains on disk");
+        assert!(matches!(
+            classify_stored_state(&bytes, HOSTNAME, McpEndpointCertificateEnvironment::Staging),
+            Ok(StoredCertificateClassification::Same(_))
+        ));
     }
 
     #[test]
     fn forced_staging_renewal_withholds_an_otherwise_current_cached_certificate() {
+        let _clock = lock_test_clock(None);
         let root = TempDir::new().expect("state root");
         let (chain, private_key, not_before, not_after, _) = state_fixture();
         let ordinary = McpEndpointTlsService::for_authorized_hostname(
@@ -1511,21 +2060,7 @@ mod tests {
             true,
         )
         .expect("forced service opens current state");
-        let cache = McpEndpointAcmeCache {
-            service: forced.lifecycle_copy(),
-            production: false,
-            force_staging_renewal: true,
-        };
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        assert!(
-            runtime
-                .block_on(CertCache::load_cert(&cache, &[], "staging"))
-                .expect("forced staging cache load")
-                .is_none()
-        );
+        assert!(forced.force_staging_renewal());
         assert!(
             forced.resolver.ordinary.load_full().is_some(),
             "the last current certificate remains available during reissuance"
@@ -1543,6 +2078,7 @@ mod tests {
 
     #[test]
     fn acme_account_state_is_environment_scoped_and_owner_only() {
+        let _clock = lock_test_clock(None);
         let root = TempDir::new().expect("state root");
         let service = McpEndpointTlsService::for_authorized_hostname(
             Arc::new(JournalRoot::open(root.path()).expect("journal root")),
@@ -1574,6 +2110,7 @@ mod tests {
 
     #[test]
     fn renewal_honors_a_preexisting_shutdown_without_acme_work() {
+        let _clock = lock_test_clock(None);
         let root = TempDir::new().expect("state root");
         let service = McpEndpointTlsService::for_authorized_hostname(
             Arc::new(JournalRoot::open(root.path()).expect("journal root")),
@@ -1601,6 +2138,7 @@ mod tests {
 
     #[test]
     fn state_parser_rejects_duplicate_unknown_and_environment_mismatch() {
+        let _clock = lock_test_clock(None);
         let duplicate = br#"{
             "environment":"staging","environment":"staging",
             "hostname":"ab12cd34.solstone.me","certificate_chain":[],
@@ -1631,6 +2169,7 @@ mod tests {
 
     #[test]
     fn staging_state_is_foreign_under_production() {
+        let _clock = lock_test_clock(None);
         let root = TempDir::new().expect("state root");
         let (chain, private_key, not_before, not_after, _) = state_fixture();
         let staging_service = McpEndpointTlsService::for_authorized_hostname(
@@ -1659,31 +2198,24 @@ mod tests {
             "foreign staging state must not be served under production"
         );
 
-        let cache = McpEndpointAcmeCache {
-            service: prod_service.lifecycle_copy(),
-            production: true,
-            force_staging_renewal: false,
-        };
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        assert!(
-            runtime
-                .block_on(CertCache::load_cert(&cache, &[], "production"))
-                .expect("foreign state load_cert is a clean miss, not an error")
-                .is_none()
-        );
-
         let after_bytes = fs::read(&state_path).expect("read state after prod open");
         assert_eq!(
             before_bytes, after_bytes,
             "foreign state file must not be rewritten on open or miss"
         );
+        assert!(matches!(
+            classify_stored_state(
+                &after_bytes,
+                HOSTNAME,
+                McpEndpointCertificateEnvironment::Production
+            ),
+            Ok(StoredCertificateClassification::Foreign)
+        ));
     }
 
     #[test]
     fn production_install_activates_and_reuses_under_production() {
+        let _clock = lock_test_clock(None);
         let root = TempDir::new().expect("state root");
         let (chain, private_key, not_before, not_after, certificate) = state_fixture();
         let service = McpEndpointTlsService::for_authorized_hostname(
@@ -1724,25 +2256,11 @@ mod tests {
         )
         .expect("second production reopen");
         assert!(second_reload.resolver.ordinary.load_full().is_some());
-
-        let cache = McpEndpointAcmeCache {
-            service: second_reload.lifecycle_copy(),
-            production: true,
-            force_staging_renewal: false,
-        };
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let pem = runtime
-            .block_on(CertCache::load_cert(&cache, &[], "production"))
-            .expect("load production cert")
-            .expect("production cert is available to ACME");
-        assert!(pem.starts_with(b"-----BEGIN PRIVATE KEY-----"));
     }
 
     #[test]
     fn production_state_is_foreign_under_explicit_staging() {
+        let _clock = lock_test_clock(None);
         let root = TempDir::new().expect("state root");
         let (chain, private_key, not_before, not_after, _) = state_fixture();
         let prod_service = McpEndpointTlsService::for_authorized_hostname(
@@ -1771,28 +2289,21 @@ mod tests {
             "foreign production state must not be served under staging"
         );
 
-        let cache = McpEndpointAcmeCache {
-            service: staging_service.lifecycle_copy(),
-            production: false,
-            force_staging_renewal: false,
-        };
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        assert!(
-            runtime
-                .block_on(CertCache::load_cert(&cache, &[], "staging"))
-                .expect("foreign state load_cert is a clean miss, not an error")
-                .is_none()
-        );
-
         let after_bytes = fs::read(&state_path).expect("read state after staging open");
         assert_eq!(before_bytes, after_bytes);
+        assert!(matches!(
+            classify_stored_state(
+                &after_bytes,
+                HOSTNAME,
+                McpEndpointCertificateEnvironment::Staging
+            ),
+            Ok(StoredCertificateClassification::Foreign)
+        ));
     }
 
     #[test]
     fn corrupt_state_is_integrity_failure_under_production() {
+        let _clock = lock_test_clock(None);
         let root = TempDir::new().expect("state root");
         let service = McpEndpointTlsService::for_authorized_hostname(
             Arc::new(JournalRoot::open(root.path()).expect("journal root")),
@@ -1814,26 +2325,11 @@ mod tests {
             ),
             Err(McpEndpointTlsError::State)
         ));
-
-        let cache = McpEndpointAcmeCache {
-            service: service.lifecycle_copy(),
-            production: true,
-            force_staging_renewal: false,
-        };
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        assert!(
-            runtime
-                .block_on(CertCache::load_cert(&cache, &[], "production"))
-                .is_err(),
-            "corrupt state must fail load_cert, never return miss"
-        );
     }
 
     #[test]
     fn hostname_mismatched_state_is_integrity_failure_under_production() {
+        let _clock = lock_test_clock(None);
         let root = TempDir::new().expect("state root");
         let (chain, private_key, not_before, not_after, _) = state_fixture();
         let service = McpEndpointTlsService::for_authorized_hostname(
@@ -1869,26 +2365,11 @@ mod tests {
             ),
             Err(McpEndpointTlsError::State)
         ));
-
-        let cache = McpEndpointAcmeCache {
-            service: service.lifecycle_copy(),
-            production: true,
-            force_staging_renewal: false,
-        };
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        assert!(
-            runtime
-                .block_on(CertCache::load_cert(&cache, &[], "production"))
-                .is_err(),
-            "hostname mismatch must fail load_cert, never return miss"
-        );
     }
 
     #[test]
     fn tls_permissions_failure_is_integrity_failure_under_production() {
+        let _clock = lock_test_clock(None);
         let root = TempDir::new().expect("state root");
         let (chain, private_key, not_before, not_after, _) = state_fixture();
         let service = McpEndpointTlsService::for_authorized_hostname(
@@ -1915,26 +2396,11 @@ mod tests {
             ),
             Err(McpEndpointTlsError::State)
         ));
-
-        let cache = McpEndpointAcmeCache {
-            service: service.lifecycle_copy(),
-            production: true,
-            force_staging_renewal: false,
-        };
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        assert!(
-            runtime
-                .block_on(CertCache::load_cert(&cache, &[], "production"))
-                .is_err(),
-            "invalid permissions must fail load_cert, never return miss"
-        );
     }
 
     #[test]
     fn expired_foreign_state_is_not_served_and_yields_cache_miss_under_production() {
+        let _clock = lock_test_clock(None);
         let root = TempDir::new().expect("state root");
         let (chain, private_key, not_before, not_after) = expired_state_fixture();
         let service = McpEndpointTlsService::for_authorized_hostname(
@@ -1969,26 +2435,19 @@ mod tests {
         .expect("expired foreign state is structurally valid and opens cleanly");
         assert!(prod_service.resolver.ordinary.load_full().is_none());
 
-        let cache = McpEndpointAcmeCache {
-            service: prod_service.lifecycle_copy(),
-            production: true,
-            force_staging_renewal: false,
-        };
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        assert!(
-            runtime
-                .block_on(CertCache::load_cert(&cache, &[], "production"))
-                .expect("expired foreign cert load_cert")
-                .is_none(),
-            "expired foreign cert is a cache miss and must not be returned to ACME"
-        );
+        assert!(matches!(
+            classify_stored_state(
+                &encoded,
+                HOSTNAME,
+                McpEndpointCertificateEnvironment::Production
+            ),
+            Ok(StoredCertificateClassification::Foreign)
+        ));
     }
 
     #[test]
     fn unknown_environment_string_is_integrity_failure() {
+        let _clock = lock_test_clock(None);
         let root = TempDir::new().expect("state root");
         let (chain, private_key, not_before, not_after, _) = state_fixture();
         let service = McpEndpointTlsService::for_authorized_hostname(
@@ -2023,26 +2482,11 @@ mod tests {
             ),
             Err(McpEndpointTlsError::State)
         ));
-
-        let cache = McpEndpointAcmeCache {
-            service: service.lifecycle_copy(),
-            production: true,
-            force_staging_renewal: false,
-        };
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        assert!(
-            runtime
-                .block_on(CertCache::load_cert(&cache, &[], "production"))
-                .is_err(),
-            "unknown environment string must fail load_cert"
-        );
     }
 
     #[test]
     fn challenge_certificate_has_exact_rfc8737_identifier_and_only_negotiates_acme() {
+        let _clock = lock_test_clock(None);
         let service = McpEndpointTlsService::empty_for_test(HOSTNAME.to_owned());
         let digest = [0x5a; 32];
         let guard = service
@@ -2086,6 +2530,7 @@ mod tests {
 
     #[test]
     fn ordinary_http11_handshake_succeeds_but_h2_only_fails() {
+        let _clock = lock_test_clock(None);
         let service = McpEndpointTlsService::empty_for_test(HOSTNAME.to_owned());
         let (key, certificate) = fixture_key();
         service.install_ordinary_for_test(key);
@@ -2112,6 +2557,7 @@ mod tests {
 
     #[test]
     fn hot_swap_changes_the_per_handshake_key_without_rebuilding_the_resolver() {
+        let _clock = lock_test_clock(None);
         let service = McpEndpointTlsService::empty_for_test(HOSTNAME.to_owned());
         service.install_ordinary_for_test(fixture_key().0);
         let first = service
@@ -2126,5 +2572,1900 @@ mod tests {
             .load_full()
             .expect("second active ordinary key");
         assert!(!Arc::ptr_eq(&first, &second));
+    }
+
+    #[tokio::test]
+    async fn publication_failure_records_error_and_backs_off() {
+        let _clock = lock_test_clock(None);
+        let root = TempDir::new().expect("state root");
+        let journal_root = Arc::new(JournalRoot::open(root.path()).expect("journal root"));
+        let service = McpEndpointTlsService::for_authorized_hostname(
+            Arc::clone(&journal_root),
+            HOSTNAME.to_owned(),
+            McpEndpointCertificateEnvironment::Staging,
+            false,
+        )
+        .expect("service");
+
+        let (chain, private_key, not_before, not_after, _) = state_fixture();
+        service
+            .install_ordinary_certificate(chain, private_key, not_before, not_after)
+            .expect("install initial cert");
+
+        let store = service.store.as_ref().unwrap();
+        let sched = crate::acme_lifecycle::RenewalScheduleRecord {
+            environment: McpEndpointCertificateEnvironment::Staging,
+            hostname: HOSTNAME.to_string(),
+            generation: None,
+            leaf_aki: "YWtp".to_string(),
+            leaf_serial: "c2VyaWFs".to_string(),
+            renew_at: 1_700_000_000,
+            window_start: None,
+            window_end: None,
+            ari_retry_at: None,
+            ari_unavailable_since: None,
+            issue_retry_at: None,
+            issue_backoff_seconds: None,
+            order_url: None,
+            order_replaces: None,
+            omit_replaces: None,
+            replaces_submitted: None,
+        };
+
+        // Make directory read-only so persist fails
+        let tls_dir = root.path().join("mcp-endpoint/tls");
+        fs::set_permissions(&tls_dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let persist_res =
+            crate::acme_lifecycle::persist_schedule(&store.directory, &service, &sched);
+        assert_eq!(persist_res, Err(McpEndpointTlsError::State));
+
+        let err = service.last_publication_error.lock().unwrap().take();
+        assert_eq!(err, Some(McpEndpointTlsError::State));
+
+        // Restore permissions for clean tempdir drop
+        fs::set_permissions(&tls_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+#[cfg(unix)]
+mod full_tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use tempfile::TempDir;
+
+    use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
+    use rustls::pki_types::ServerName;
+    use rustls::{ClientConnection, ServerConnection};
+    use solstone_core_journal_io::journal_root::JournalRoot;
+
+    use super::test_helpers::*;
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn hand_built_bytes_reload_and_preserve() {
+        let _clock = lock_test_clock(None);
+        let now = current_epoch_seconds();
+
+        let root = TempDir::new().expect("root");
+        let journal_root = Arc::new(JournalRoot::open(root.path()).expect("journal root"));
+
+        // Call for_authorized_hostname once on empty journal to admit and create mcp-endpoint/tls
+        let initial_service = McpEndpointTlsService::for_authorized_hostname(
+            Arc::clone(&journal_root),
+            HOSTNAME.to_owned(),
+            McpEndpointCertificateEnvironment::Staging,
+            false,
+        )
+        .expect("initial service");
+        drop(initial_service);
+
+        let tls_dir = root.path().join("mcp-endpoint/tls");
+        let acc_keypair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let raw_pkcs8 = acc_keypair.serialize_der();
+        let account_file = tls_dir.join("account-staging.pk8");
+        fs::write(&account_file, &raw_pkcs8).unwrap();
+        fs::set_permissions(&account_file, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let (leaf_der, leaf_key, cert_der) = mint_test_leaf(now - 1000, now + 10_000);
+        let state_json = format!(
+            r#"{{"environment":"staging","hostname":"ab12cd34.solstone.me","certificate_chain":["{}"],"private_key":"{}","not_before":{},"not_after":{}}}"#,
+            base64::engine::general_purpose::STANDARD.encode(&leaf_der),
+            base64::engine::general_purpose::STANDARD.encode(&leaf_key),
+            now - 1000,
+            now + 10_000
+        );
+        let state_file = tls_dir.join("state.json");
+        fs::write(&state_file, state_json).unwrap();
+        fs::set_permissions(&state_file, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let service = McpEndpointTlsService::for_authorized_hostname(
+            Arc::clone(&journal_root),
+            HOSTNAME.to_owned(),
+            McpEndpointCertificateEnvironment::Staging,
+            false,
+        )
+        .expect("reopen");
+
+        let mut client = ClientConnection::new(
+            trusted_client_config(cert_der, vec![HTTP11_ALPN.to_vec()]),
+            ServerName::try_from(HOSTNAME.to_owned()).expect("server name"),
+        )
+        .unwrap();
+        let mut server = ServerConnection::new(mcp_endpoint_server_config(&service)).unwrap();
+        complete_handshake(&mut client, &mut server).expect("handshake");
+
+        let pk8_after = fs::read(&account_file).unwrap();
+        assert_eq!(pk8_after, raw_pkcs8);
+
+        // Separately, write a BYO account.uri and assert read_byo_account_uri returns those exact bytes
+        let byo_dir = unix::open_byo_directory(&journal_root).unwrap();
+        let acc_dir = unix::open_byo_account_directory(&byo_dir, HOSTNAME).unwrap();
+        let uri_file = root
+            .path()
+            .join("mcp-endpoint/byo/accounts")
+            .join(HOSTNAME)
+            .join("account.uri");
+        let raw_uri = "https://acme.example/byo-custom-uri";
+        fs::write(&uri_file, raw_uri).unwrap();
+        fs::set_permissions(&uri_file, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let read_uri = unix::read_byo_account_uri(&acc_dir).unwrap();
+        assert_eq!(read_uri.as_deref(), Some(raw_uri));
+    }
+
+    fn new_order_has_replaces(body: &[u8]) -> Option<bool> {
+        let jws: serde_json::Value = serde_json::from_slice(body).ok()?;
+        let payload_b64 = jws.get("payload")?.as_str()?;
+        let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload_b64)
+            .ok()?;
+        let order_payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
+        Some(order_payload.get("replaces").is_some())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn operated_lane_ari_renewal_timing_and_replacement() {
+        let now = 1_700_000_000_i64;
+        let _clock = lock_test_clock(Some(now));
+
+        let root = TempDir::new().expect("state root");
+        let journal_root = Arc::new(JournalRoot::open(root.path()).expect("journal root"));
+        let service = McpEndpointTlsService::for_authorized_hostname(
+            Arc::clone(&journal_root),
+            HOSTNAME.to_owned(),
+            McpEndpointCertificateEnvironment::Staging,
+            false,
+        )
+        .expect("service");
+
+        let (pred_der, pred_key, pred_cert) = mint_test_leaf(now - 1000, now + 10_000);
+        service
+            .install_ordinary_certificate(
+                vec![pred_der.clone()],
+                pred_key,
+                now - 1000,
+                now + 10_000,
+            )
+            .expect("install initial cert");
+
+        let leaf_info =
+            crate::acme_lifecycle::extract_leaf_cert_info(&pred_der).expect("leaf info");
+        let expected_replaces = format!(
+            "{}.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&leaf_info.aki),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&leaf_info.raw_serial)
+        );
+
+        let (succ_der, succ_key, succ_cert) = mint_test_leaf(now + 1200, now + 20_000);
+        let new_cert_pem = pem_from_der(&succ_der);
+        service.set_custom_order_key(succ_key);
+
+        let service_ref = service.lifecycle_copy();
+        let challenge_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let challenge_observed_clone = Arc::clone(&challenge_observed);
+        let challenge_hook = Arc::new(move || {
+            assert!(
+                service_ref.resolver.challenge.load_full().is_some(),
+                "challenge must be active during validation"
+            );
+            challenge_observed_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let (mock_client, requests) = mock_acme_server(
+            "https://acme.example/dir".to_string(),
+            true,
+            200,
+            (now + 1000, now + 2000),
+            new_cert_pem,
+            Some(expected_replaces),
+            Some(challenge_hook),
+            None,
+        );
+
+        service.set_custom_http_client(mock_client);
+        service.set_custom_directory_url("https://acme.example/dir".to_string());
+        service.set_custom_picker(Arc::new(|start, _| start + 200)); // picks now + 1200
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let service_task = service.lifecycle_copy();
+        let root_path = root.path().to_path_buf();
+        let handle = tokio::spawn(async move {
+            service_task
+                .run_acme_renewal_with_owner_state(&root_path, &mut shutdown_rx)
+                .await
+        });
+
+        // Advance 50ms to allow initial ARI check and schedule persistence
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let schedule_path = root.path().join("mcp-endpoint/tls/renewal.json");
+        assert!(schedule_path.exists(), "renewal.json was persisted");
+        let sched_bytes = fs::read(&schedule_path).expect("read renewal.json");
+        let sched: crate::acme_lifecycle::RenewalScheduleRecord =
+            serde_json::from_slice(&sched_bytes).expect("parse schedule");
+        assert_eq!(sched.renew_at, now + 1200);
+
+        // Advance virtual time to a moment before the picked instant: now + 1199
+        set_test_now_override(Some(now + 1199));
+        tokio::time::advance(tokio::time::Duration::from_secs(1199)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // No new-order before the picked instant
+        {
+            let reqs = requests.lock().unwrap();
+            assert!(!reqs.iter().any(|(_, uri, _)| uri.ends_with("/new-order")));
+        }
+        let active_before = service.resolver.ordinary.load_full().expect("active cert");
+        assert_eq!(active_before.key.cert[0], pred_cert);
+
+        // Advance virtual time to the picked instant: now + 1200
+        set_test_now_override(Some(now + 1200));
+        tokio::time::advance(tokio::time::Duration::from_secs(1)).await;
+
+        for _ in 0..50 {
+            let found = requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, uri, _)| uri.ends_with("/cert/1"));
+            if found {
+                break;
+            }
+            tokio::time::advance(tokio::time::Duration::from_millis(250)).await;
+        }
+
+        // Assert exactly one new-order whose payload still has replaces
+        {
+            let reqs = requests.lock().unwrap();
+            let new_order_count = reqs
+                .iter()
+                .filter(|(_, uri, _)| uri.ends_with("/new-order"))
+                .count();
+            assert_eq!(new_order_count, 1, "expected exactly one new-order request");
+            assert!(
+                reqs.iter().any(|(_, uri, _)| uri.ends_with("/cert/1")),
+                "cert was downloaded"
+            );
+        }
+        assert!(
+            challenge_observed.load(std::sync::atomic::Ordering::SeqCst),
+            "challenge was observed during validation"
+        );
+        assert!(
+            service.resolver.challenge.load_full().is_none(),
+            "challenge is cleared after task completes"
+        );
+
+        // Verify new certificate is now active in ordinary slot
+        let active = service.resolver.ordinary.load_full().expect("active cert");
+        assert_eq!(active.key.cert[0], succ_cert);
+
+        // Verify in-memory handshake
+        let mut client = ClientConnection::new(
+            acme_test_client_config(vec![HTTP11_ALPN.to_vec()]),
+            ServerName::try_from(HOSTNAME.to_owned()).expect("fixture hostname"),
+        )
+        .expect("client");
+        let mut server =
+            ServerConnection::new(mcp_endpoint_server_config(&service)).expect("server");
+        complete_handshake(&mut client, &mut server).expect("handshake succeeds");
+        assert_eq!(client.alpn_protocol(), Some(HTTP11_ALPN));
+
+        // Stop renewal
+        shutdown_tx.send(true).unwrap();
+        let res = handle.await.expect("join handle");
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn operated_lane_directory_without_ari_renews_at_backstop() {
+        let now = 1_700_000_000_i64;
+        let _clock = lock_test_clock(Some(now));
+
+        let root = TempDir::new().expect("state root");
+        let journal_root = Arc::new(JournalRoot::open(root.path()).expect("journal root"));
+        let service = McpEndpointTlsService::for_authorized_hostname(
+            Arc::clone(&journal_root),
+            HOSTNAME.to_owned(),
+            McpEndpointCertificateEnvironment::Staging,
+            false,
+        )
+        .expect("service");
+
+        // Lifetime 90_000s, not_before = now, not_after = now + 90_000
+        // Backstop = not_after - lifetime / 3 = now + 60_000
+        let (pred_der, pred_key, pred_cert) = mint_test_leaf(now, now + 90_000);
+        service
+            .install_ordinary_certificate(vec![pred_der], pred_key, now, now + 90_000)
+            .expect("install cert");
+
+        let (succ_der, succ_key, succ_cert) = mint_test_leaf(now + 60_000, now + 150_000);
+        let new_cert_pem = pem_from_der(&succ_der);
+        service.set_custom_order_key(succ_key);
+
+        let (mock_client, requests) = mock_acme_server(
+            "https://acme.example/dir".to_string(),
+            false, // no ARI
+            200,
+            (0, 0),
+            new_cert_pem,
+            None, // no replaces
+            None,
+            None,
+        );
+
+        service.set_custom_http_client(mock_client);
+        service.set_custom_directory_url("https://acme.example/dir".to_string());
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let service_task = service.lifecycle_copy();
+        let root_path = root.path().to_path_buf();
+        let handle = tokio::spawn(async move {
+            service_task
+                .run_acme_renewal_with_owner_state(&root_path, &mut shutdown_rx)
+                .await
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let schedule_path = root.path().join("mcp-endpoint/tls/renewal.json");
+        assert!(schedule_path.exists());
+        let sched_bytes = fs::read(&schedule_path).expect("read renewal.json");
+        let sched: crate::acme_lifecycle::RenewalScheduleRecord =
+            serde_json::from_slice(&sched_bytes).expect("parse schedule");
+        assert_eq!(sched.renew_at, now + 60_000);
+
+        // Before backstop: now + 59_999
+        set_test_now_override(Some(now + 59_999));
+        tokio::time::advance(tokio::time::Duration::from_secs(59_999)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        {
+            let reqs = requests.lock().unwrap();
+            assert!(!reqs.iter().any(|(_, uri, _)| uri.ends_with("/new-order")));
+        }
+        let active_before = service.resolver.ordinary.load_full().expect("active cert");
+        assert_eq!(active_before.key.cert[0], pred_cert);
+
+        // At backstop: now + 60_000
+        set_test_now_override(Some(now + 60_000));
+        tokio::time::advance(tokio::time::Duration::from_secs(1)).await;
+
+        for _ in 0..50 {
+            let found = requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, uri, _)| uri.ends_with("/cert/1"));
+            if found {
+                break;
+            }
+            tokio::time::advance(tokio::time::Duration::from_millis(250)).await;
+        }
+
+        let active = service.resolver.ordinary.load_full().expect("active cert");
+        assert_eq!(active.key.cert[0], succ_cert);
+
+        {
+            let reqs = requests.lock().unwrap();
+            let new_orders = reqs
+                .iter()
+                .filter(|(_, uri, _)| uri.ends_with("/new-order"))
+                .count();
+            assert_eq!(new_orders, 1);
+        }
+
+        shutdown_tx.send(true).unwrap();
+        let res = handle.await.expect("join");
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ari_503_temporary_failure_applies_retry_after() {
+        let now = 1_700_000_000_i64;
+        let _clock = lock_test_clock(Some(now));
+
+        let root = TempDir::new().expect("state root");
+        let journal_root = Arc::new(JournalRoot::open(root.path()).expect("journal root"));
+        let service = McpEndpointTlsService::for_authorized_hostname(
+            Arc::clone(&journal_root),
+            HOSTNAME.to_owned(),
+            McpEndpointCertificateEnvironment::Staging,
+            false,
+        )
+        .expect("service");
+
+        let (pred_der, pred_key, _) = mint_test_leaf(now - 1000, now + 10_000);
+        service
+            .install_ordinary_certificate(vec![pred_der], pred_key, now - 1000, now + 10_000)
+            .expect("install initial cert");
+
+        let (succ_der, _, _) = mint_test_leaf(now + 2000, now + 10_000);
+        let new_cert_pem = pem_from_der(&succ_der);
+
+        let (mock_client, _) = mock_acme_server(
+            "https://acme.example/dir".to_string(),
+            true,
+            503, // first attempt fails with 503
+            (now + 2000, now + 4000),
+            new_cert_pem,
+            None,
+            None,
+            None,
+        );
+
+        service.set_custom_http_client(mock_client);
+        service.set_custom_directory_url("https://acme.example/dir".to_string());
+        service.set_custom_picker(Arc::new(|start, _| start + 100));
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let service_task = service.lifecycle_copy();
+        let root_path = root.path().to_path_buf();
+        let handle = tokio::spawn(async move {
+            service_task
+                .run_acme_renewal_with_owner_state(&root_path, &mut shutdown_rx)
+                .await
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let schedule_path = root.path().join("mcp-endpoint/tls/renewal.json");
+        assert!(schedule_path.exists());
+        let sched_bytes = fs::read(&schedule_path).expect("read renewal.json");
+        let sched: crate::acme_lifecycle::RenewalScheduleRecord =
+            serde_json::from_slice(&sched_bytes).expect("parse schedule");
+        assert_eq!(sched.ari_retry_at, Some(now + 120));
+
+        // Advance 120s past 503 retry_after
+        set_test_now_override(Some(now + 120));
+        tokio::time::advance(tokio::time::Duration::from_secs(120)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let sched_bytes2 = fs::read(&schedule_path).expect("read renewal.json after retry");
+        let sched2: crate::acme_lifecycle::RenewalScheduleRecord =
+            serde_json::from_slice(&sched_bytes2).expect("parse schedule");
+        assert_eq!(sched2.renew_at, now + 2100);
+
+        shutdown_tx.send(true).unwrap();
+        let res = handle.await.expect("join");
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn renewal_json_reload_with_order_url_resumes() {
+        let now = 1_700_000_000_i64;
+        let _clock = lock_test_clock(Some(now));
+
+        let root = TempDir::new().expect("state root");
+        let journal_root = Arc::new(JournalRoot::open(root.path()).expect("journal root"));
+        let service = McpEndpointTlsService::for_authorized_hostname(
+            Arc::clone(&journal_root),
+            HOSTNAME.to_owned(),
+            McpEndpointCertificateEnvironment::Staging,
+            false,
+        )
+        .expect("service");
+
+        let (pred_der, pred_key, _) = mint_test_leaf(now - 1000, now + 10_000);
+        service
+            .install_ordinary_certificate(
+                vec![pred_der.clone()],
+                pred_key,
+                now - 1000,
+                now + 10_000,
+            )
+            .expect("install initial cert");
+
+        let (succ_der, succ_key, succ_cert) = mint_test_leaf(now - 50, now + 10_000);
+        let new_cert_pem = pem_from_der(&succ_der);
+        service.set_custom_order_key(succ_key);
+
+        let leaf_info =
+            crate::acme_lifecycle::extract_leaf_cert_info(&pred_der).expect("leaf info");
+
+        // Pre-create renewal.json with existing order_url
+        let rec = crate::acme_lifecycle::RenewalScheduleRecord {
+            environment: McpEndpointCertificateEnvironment::Staging,
+            hostname: HOSTNAME.to_string(),
+            generation: None,
+            leaf_aki: base64::engine::general_purpose::STANDARD.encode(&leaf_info.aki),
+            leaf_serial: base64::engine::general_purpose::STANDARD.encode(&leaf_info.raw_serial),
+            renew_at: now - 50,
+            window_start: Some(now - 100),
+            window_end: Some(now + 100),
+            ari_retry_at: None,
+            ari_unavailable_since: None,
+            issue_retry_at: None,
+            issue_backoff_seconds: None,
+            order_url: Some("https://acme.example/order/existing".to_string()),
+            order_replaces: None,
+            omit_replaces: None,
+            replaces_submitted: None,
+        };
+        let sched_bytes = serde_json::to_vec(&rec).unwrap();
+        let store = service.store.as_ref().unwrap();
+        unix::persist_tls_renewal_bytes(&store.directory, &sched_bytes).unwrap();
+
+        let (mock_client, requests) = mock_acme_server(
+            "https://acme.example/dir".to_string(),
+            true,
+            200,
+            (now + 1000, now + 2000),
+            new_cert_pem,
+            None,
+            None,
+            None,
+        );
+
+        service.set_custom_http_client(mock_client);
+        service.set_custom_directory_url("https://acme.example/dir".to_string());
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let service_task = service.lifecycle_copy();
+        let root_path = root.path().to_path_buf();
+        let handle = tokio::spawn(async move {
+            service_task
+                .run_acme_renewal_with_owner_state(&root_path, &mut shutdown_rx)
+                .await
+        });
+
+        for _ in 0..50 {
+            let found = requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, uri, _)| uri.ends_with("/cert/1"));
+            if found {
+                break;
+            }
+            tokio::time::advance(tokio::time::Duration::from_millis(250)).await;
+        }
+
+        // Verify order/existing was polled directly and new-order was never called
+        {
+            let reqs = requests.lock().unwrap();
+            assert!(
+                reqs.iter()
+                    .any(|(_, uri, _)| uri.contains("/order/existing"))
+            );
+            assert!(!reqs.iter().any(|(_, uri, _)| uri.ends_with("/new-order")));
+        }
+
+        let active = service.resolver.ordinary.load_full().expect("active cert");
+        assert_eq!(active.key.cert[0], succ_cert);
+
+        shutdown_tx.send(true).unwrap();
+        let res = handle.await.expect("join");
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn byo_lane_renewal_with_account_key_and_uri() {
+        let now = 1_700_000_000_i64;
+        let _clock = lock_test_clock(Some(now));
+
+        let root = TempDir::new().expect("byo root");
+        let journal_root = JournalRoot::open(root.path()).expect("journal root");
+        let byo_dir = unix::open_byo_directory(&journal_root).unwrap();
+        let acc_dir = unix::open_byo_account_directory(&byo_dir, HOSTNAME).unwrap();
+        let cert_dir = unix::open_byo_cert_directory(&byo_dir, HOSTNAME, 1).unwrap();
+
+        let acc_keypair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let account_pk8_path = root
+            .path()
+            .join("mcp-endpoint/byo/accounts")
+            .join(HOSTNAME)
+            .join("account.pk8");
+        fs::write(&account_pk8_path, acc_keypair.serialize_der()).unwrap();
+        fs::set_permissions(&account_pk8_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let account_uri_path = root
+            .path()
+            .join("mcp-endpoint/byo/accounts")
+            .join(HOSTNAME)
+            .join("account.uri");
+        fs::write(&account_uri_path, "https://acme.example/account/byo-1").unwrap();
+        fs::set_permissions(&account_uri_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let service =
+            McpEndpointTlsService::for_byo_cert_directory(cert_dir, HOSTNAME.to_string(), 1)
+                .expect("service");
+
+        let (pred_der, pred_key, pred_cert) = mint_test_leaf(now - 1000, now + 10_000);
+        service
+            .install_ordinary_certificate(
+                vec![pred_der.clone()],
+                pred_key,
+                now - 1000,
+                now + 10_000,
+            )
+            .expect("install initial cert");
+
+        let leaf_info =
+            crate::acme_lifecycle::extract_leaf_cert_info(&pred_der).expect("leaf info");
+        let expected_replaces = format!(
+            "{}.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&leaf_info.aki),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&leaf_info.raw_serial)
+        );
+
+        let (succ_der, succ_key, succ_cert) = mint_test_leaf(now + 1200, now + 20_000);
+        let new_cert_pem = pem_from_der(&succ_der);
+        service.set_custom_order_key(succ_key);
+
+        let (mock_client, requests) = mock_acme_server(
+            "https://acme.example/dir".to_string(),
+            true,
+            200,
+            (now + 1000, now + 2000),
+            new_cert_pem,
+            Some(expected_replaces),
+            None,
+            None,
+        );
+
+        service.set_custom_http_client(mock_client);
+        service.set_custom_directory_url("https://acme.example/dir".to_string());
+        service.set_custom_picker(Arc::new(|start, _| start + 200)); // renew_at = now + 1200
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let service_task = service.lifecycle_copy();
+        let handle = tokio::spawn(async move {
+            service_task
+                .run_byo_acme_renewal(&acc_dir, &mut shutdown_rx)
+                .await
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let active = service.resolver.ordinary.load_full().expect("active cert");
+        assert_eq!(active.key.cert[0], pred_cert);
+        let sched_path = root
+            .path()
+            .join("mcp-endpoint/byo/certs")
+            .join(HOSTNAME)
+            .join("1/renewal.json");
+        assert!(sched_path.exists());
+        let sched_bytes = fs::read(&sched_path).expect("read renewal.json");
+        let sched: crate::acme_lifecycle::RenewalScheduleRecord =
+            serde_json::from_slice(&sched_bytes).expect("parse schedule");
+        assert_eq!(sched.renew_at, now + 1200);
+
+        // Advance to now + 1200
+        set_test_now_override(Some(now + 1200));
+        tokio::time::advance(tokio::time::Duration::from_secs(1200)).await;
+
+        for _ in 0..50 {
+            let found = requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, uri, _)| uri.ends_with("/cert/1"));
+            if found {
+                break;
+            }
+            tokio::time::advance(tokio::time::Duration::from_millis(250)).await;
+        }
+
+        let active_after = service
+            .resolver
+            .ordinary
+            .load_full()
+            .expect("active cert after renewal");
+        assert_eq!(active_after.key.cert[0], succ_cert);
+
+        shutdown_tx.send(true).unwrap();
+        let res = handle.await.expect("join");
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn saved_window_later_next_ari_earlier_shifts_renew_at() {
+        let now = 1_700_000_000_i64;
+        let _clock = lock_test_clock(Some(now));
+
+        let root = TempDir::new().expect("state root");
+        let journal_root = Arc::new(JournalRoot::open(root.path()).expect("journal root"));
+        let service = McpEndpointTlsService::for_authorized_hostname(
+            Arc::clone(&journal_root),
+            HOSTNAME.to_owned(),
+            McpEndpointCertificateEnvironment::Staging,
+            false,
+        )
+        .expect("service");
+
+        let (pred_der, pred_key, pred_cert) = mint_test_leaf(now - 1000, now + 10_000);
+        service
+            .install_ordinary_certificate(
+                vec![pred_der.clone()],
+                pred_key,
+                now - 1000,
+                now + 10_000,
+            )
+            .expect("install initial cert");
+
+        let leaf_info =
+            crate::acme_lifecycle::extract_leaf_cert_info(&pred_der).expect("leaf info");
+        let expected_replaces = format!(
+            "{}.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&leaf_info.aki),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&leaf_info.raw_serial)
+        );
+
+        let (succ_der, succ_key, succ_cert) = mint_test_leaf(now + 600, now + 20_000);
+        let new_cert_pem = pem_from_der(&succ_der);
+        service.set_custom_order_key(succ_key);
+
+        // Pre-create renewal.json with a later saved window: [now + 3000, now + 5000], renew_at = now + 4000
+        // and ari_retry_at = Some(now + 100)
+        let rec = crate::acme_lifecycle::RenewalScheduleRecord {
+            environment: McpEndpointCertificateEnvironment::Staging,
+            hostname: HOSTNAME.to_string(),
+            generation: None,
+            leaf_aki: base64::engine::general_purpose::STANDARD.encode(&leaf_info.aki),
+            leaf_serial: base64::engine::general_purpose::STANDARD.encode(&leaf_info.raw_serial),
+            renew_at: now + 4000,
+            window_start: Some(now + 3000),
+            window_end: Some(now + 5000),
+            ari_retry_at: Some(now + 100),
+            ari_unavailable_since: None,
+            issue_retry_at: None,
+            issue_backoff_seconds: None,
+            order_url: None,
+            order_replaces: None,
+            omit_replaces: None,
+            replaces_submitted: None,
+        };
+        let sched_bytes = serde_json::to_vec(&rec).unwrap();
+        let store = service.store.as_ref().unwrap();
+        unix::persist_tls_renewal_bytes(&store.directory, &sched_bytes).unwrap();
+
+        // The next ARI response returns an earlier window: [now + 500, now + 1000]
+        let (mock_client, requests) = mock_acme_server(
+            "https://acme.example/dir".to_string(),
+            true,
+            200,
+            (now + 500, now + 1000),
+            new_cert_pem,
+            Some(expected_replaces),
+            None,
+            None,
+        );
+
+        service.set_custom_http_client(mock_client);
+        service.set_custom_directory_url("https://acme.example/dir".to_string());
+        service.set_custom_picker(Arc::new(|start, _| start + 100)); // picks now + 600
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let service_task = service.lifecycle_copy();
+        let root_path = root.path().to_path_buf();
+        let handle = tokio::spawn(async move {
+            service_task
+                .run_acme_renewal_with_owner_state(&root_path, &mut shutdown_rx)
+                .await
+        });
+
+        // Advance 100s to let it wake up, query ARI, and update schedule to earlier window
+        set_test_now_override(Some(now + 100));
+        tokio::time::advance(tokio::time::Duration::from_secs(100)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let schedule_path = root.path().join("mcp-endpoint/tls/renewal.json");
+        let sched_bytes2 = fs::read(&schedule_path).expect("read renewal.json after ari");
+        let sched2: crate::acme_lifecycle::RenewalScheduleRecord =
+            serde_json::from_slice(&sched_bytes2).expect("parse schedule");
+        assert_eq!(sched2.renew_at, now + 600);
+
+        // Advance to a moment before the new instant: now + 599
+        set_test_now_override(Some(now + 599));
+        tokio::time::advance(tokio::time::Duration::from_secs(499)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let active = service.resolver.ordinary.load_full().expect("active cert");
+        assert_eq!(active.key.cert[0], pred_cert);
+        {
+            let reqs = requests.lock().unwrap();
+            assert!(!reqs.iter().any(|(_, uri, _)| uri.ends_with("/new-order")));
+        }
+
+        // Advance 1 second to now + 600
+        set_test_now_override(Some(now + 600));
+        tokio::time::advance(tokio::time::Duration::from_secs(1)).await;
+
+        for _ in 0..50 {
+            let found = requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, uri, _)| uri.ends_with("/cert/1"));
+            if found {
+                break;
+            }
+            tokio::time::advance(tokio::time::Duration::from_millis(250)).await;
+        }
+
+        let active_after = service.resolver.ordinary.load_full().expect("active cert");
+        assert_eq!(active_after.key.cert[0], succ_cert);
+        {
+            let reqs = requests.lock().unwrap();
+            assert!(reqs.iter().any(|(_, uri, _)| uri.ends_with("/new-order")));
+        }
+
+        shutdown_tx.send(true).unwrap();
+        let res = handle.await.expect("join");
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ari_window_later_than_backstop_waits_for_picked_instant() {
+        let now = 1_700_000_000_i64;
+        let _clock = lock_test_clock(Some(now));
+
+        let root = TempDir::new().expect("state root");
+        let journal_root = Arc::new(JournalRoot::open(root.path()).expect("journal root"));
+        let service = McpEndpointTlsService::for_authorized_hostname(
+            Arc::clone(&journal_root),
+            HOSTNAME.to_owned(),
+            McpEndpointCertificateEnvironment::Staging,
+            false,
+        )
+        .expect("service");
+
+        // Lifetime = 9000, not_after = now + 6000, not_before = now - 3000
+        // Backstop = not_after - lifetime/3 = (now + 6000) - 3000 = now + 3000
+        let not_before = now - 3000;
+        let not_after = now + 6000;
+        let (pred_der, pred_key, pred_cert) = mint_test_leaf(not_before, not_after);
+
+        service
+            .install_ordinary_certificate(vec![pred_der.clone()], pred_key, not_before, not_after)
+            .expect("install initial cert");
+
+        let leaf_info =
+            crate::acme_lifecycle::extract_leaf_cert_info(&pred_der).expect("leaf info");
+        let expected_replaces = format!(
+            "{}.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&leaf_info.aki),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&leaf_info.raw_serial)
+        );
+
+        let (succ_der, succ_key, succ_cert) = mint_test_leaf(now + 4000, now + 20_000);
+        let new_cert_pem = pem_from_der(&succ_der);
+        service.set_custom_order_key(succ_key);
+
+        // Suggested window is [now + 4000, now + 5000], which is later than backstop (now + 3000)
+        let (mock_client, requests) = mock_acme_server(
+            "https://acme.example/dir".to_string(),
+            true,
+            200,
+            (now + 4000, now + 5000),
+            new_cert_pem,
+            Some(expected_replaces),
+            None,
+            None,
+        );
+
+        service.set_custom_http_client(mock_client);
+        service.set_custom_directory_url("https://acme.example/dir".to_string());
+        service.set_custom_picker(Arc::new(|start, _| start + 200)); // picks now + 4200
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let service_task = service.lifecycle_copy();
+        let root_path = root.path().to_path_buf();
+        let handle = tokio::spawn(async move {
+            service_task
+                .run_acme_renewal_with_owner_state(&root_path, &mut shutdown_rx)
+                .await
+        });
+
+        // Let initial ARI exchange run and save schedule
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let schedule_path = root.path().join("mcp-endpoint/tls/renewal.json");
+        assert!(schedule_path.exists());
+        let sched_bytes = fs::read(&schedule_path).expect("read renewal.json");
+        let sched: crate::acme_lifecycle::RenewalScheduleRecord =
+            serde_json::from_slice(&sched_bytes).expect("parse schedule");
+        assert_eq!(sched.renew_at, now + 4200);
+
+        // Advance only to the backstop: now + 3000
+        set_test_now_override(Some(now + 3000));
+        tokio::time::advance(tokio::time::Duration::from_secs(3000)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Assert no new-order has been sent
+        {
+            let reqs = requests.lock().unwrap();
+            assert!(!reqs.iter().any(|(_, uri, _)| uri.ends_with("/new-order")));
+        }
+        let active = service.resolver.ordinary.load_full().expect("active cert");
+        assert_eq!(active.key.cert[0], pred_cert);
+
+        // Advance to the picked instant: now + 4200
+        set_test_now_override(Some(now + 4200));
+        tokio::time::advance(tokio::time::Duration::from_secs(1200)).await;
+
+        for _ in 0..50 {
+            let found = requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, uri, _)| uri.ends_with("/cert/1"));
+            if found {
+                break;
+            }
+            tokio::time::advance(tokio::time::Duration::from_millis(250)).await;
+        }
+
+        // Assert exactly one new-order whose payload still has replaces
+        {
+            let reqs = requests.lock().unwrap();
+            let new_order_count = reqs
+                .iter()
+                .filter(|(_, uri, _)| uri.ends_with("/new-order"))
+                .count();
+            assert_eq!(new_order_count, 1, "expected exactly one new-order request");
+        }
+        let active_after = service.resolver.ordinary.load_full().expect("active cert");
+        assert_eq!(active_after.key.cert[0], succ_cert);
+
+        shutdown_tx.send(true).unwrap();
+        let res = handle.await.expect("join");
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_renewal_loop_cleanly() {
+        let _clock = lock_test_clock(None);
+        let root = TempDir::new().expect("state root");
+        let journal_root = Arc::new(JournalRoot::open(root.path()).expect("journal root"));
+        let service = McpEndpointTlsService::for_authorized_hostname(
+            Arc::clone(&journal_root),
+            HOSTNAME.to_owned(),
+            McpEndpointCertificateEnvironment::Staging,
+            false,
+        )
+        .expect("service");
+
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(true);
+        let res = service.run_acme_renewal(&mut shutdown_rx).await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lifecycle_driver_registers_on_its_directory_and_persists_issuance_before_activation() {
+        let now = 1_700_000_000_i64;
+        let _clock = lock_test_clock(Some(now));
+
+        struct CustomHostGuard;
+        impl Drop for CustomHostGuard {
+            fn drop(&mut self) {
+                crate::sme_account::set_custom_directory_host(None);
+            }
+        }
+        let _guard = CustomHostGuard;
+        crate::sme_account::set_custom_directory_host(Some("acme.example"));
+
+        assert!(crate::sme_account::account_uri_has_expected_shape(
+            "https://acme-v02.api.letsencrypt.org/acme/acct/1",
+            true
+        ));
+        assert!(crate::sme_account::account_uri_has_expected_shape(
+            "https://acme-staging-v02.api.letsencrypt.org/acme/acct/1",
+            false
+        ));
+        assert!(!crate::sme_account::account_uri_has_expected_shape(
+            "https://acme.example/acme/acct/7",
+            true
+        ));
+        assert!(!crate::sme_account::account_uri_has_expected_shape(
+            "https://acme.example/acme/acct/7",
+            false
+        ));
+
+        let root = TempDir::new().expect("state root");
+        let journal_root = Arc::new(JournalRoot::open(root.path()).expect("journal root"));
+        let service = McpEndpointTlsService::for_authorized_hostname(
+            Arc::clone(&journal_root),
+            HOSTNAME.to_owned(),
+            McpEndpointCertificateEnvironment::Staging,
+            false,
+        )
+        .expect("service");
+
+        let (pred_der, pred_key, pred_cert) = mint_test_leaf(now, now + 90_000);
+        service
+            .install_ordinary_certificate(vec![pred_der], pred_key, now, now + 90_000)
+            .expect("install initial cert");
+
+        set_test_now_override(Some(now + 60_000));
+        tokio::time::advance(tokio::time::Duration::from_secs(60_000)).await;
+
+        let (succ_der, succ_key, succ_cert) = mint_test_leaf(now + 60_000, now + 150_000);
+        let new_cert_pem = pem_from_der(&succ_der);
+        service.set_custom_order_key(succ_key);
+
+        let hold_cert = Arc::new(tokio::sync::Notify::new());
+        let gates = AcmeServerGates {
+            hold_cert: Some(Arc::clone(&hold_cert)),
+            ..Default::default()
+        };
+
+        let (mock_client, requests) = mock_acme_server_gated(
+            "https://acme.example/dir".to_string(),
+            false,
+            200,
+            (0, 0),
+            new_cert_pem,
+            None,
+            None,
+            Some("https://acme.example/acme/acct/7"),
+            gates,
+        );
+
+        service.set_custom_http_client(mock_client);
+        service.set_custom_directory_url("https://acme.example/dir".to_string());
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let service_task = service.lifecycle_copy();
+        let root_path = root.path().to_path_buf();
+        let handle = tokio::spawn(async move {
+            service_task
+                .run_acme_renewal_with_owner_state(&root_path, &mut shutdown_rx)
+                .await
+        });
+
+        for _ in 0..50 {
+            let found = requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, uri, _)| uri.ends_with("/cert/1"));
+            if found {
+                break;
+            }
+            tokio::time::advance(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        let tls_dir = root.path().join("mcp-endpoint/tls");
+        let issuance_path = tls_dir.join("issuance.json");
+        assert!(issuance_path.exists());
+        let issuance_bytes = fs::read(&issuance_path).expect("read issuance.json");
+        let issuance_json: serde_json::Value =
+            serde_json::from_slice(&issuance_bytes).expect("parse issuance.json");
+        assert_eq!(
+            issuance_json["order_url"].as_str(),
+            Some("https://acme.example/order/1")
+        );
+        let saved_pkcs8 = issuance_json["private_key"].as_str().unwrap().to_string();
+
+        let active_during = service.resolver.ordinary.load_full().expect("active cert");
+        assert_eq!(active_during.key.cert[0], pred_cert);
+
+        hold_cert.notify_one();
+
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            let current = service.resolver.ordinary.load_full().unwrap();
+            if current.key.cert[0] == succ_cert {
+                break;
+            }
+            tokio::time::advance(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        let active_after = service.resolver.ordinary.load_full().expect("active cert");
+        assert_eq!(active_after.key.cert[0], succ_cert);
+
+        let state_bytes = fs::read(tls_dir.join("state.json")).expect("read state.json");
+        let state_json: serde_json::Value =
+            serde_json::from_slice(&state_bytes).expect("parse state.json");
+        assert_eq!(
+            state_json["private_key"].as_str().unwrap(),
+            saved_pkcs8.as_str()
+        );
+        assert!(!issuance_path.exists());
+
+        shutdown_tx.send(true).unwrap();
+        let res = handle.await.expect("join");
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lifecycle_driver_resumes_valid_order_after_restart() {
+        let now = 1_700_000_000_i64;
+        let _clock = lock_test_clock(Some(now));
+
+        let root = TempDir::new().expect("state root");
+        let journal_root = Arc::new(JournalRoot::open(root.path()).expect("journal root"));
+        let service = McpEndpointTlsService::for_authorized_hostname(
+            Arc::clone(&journal_root),
+            HOSTNAME.to_owned(),
+            McpEndpointCertificateEnvironment::Staging,
+            false,
+        )
+        .expect("service");
+
+        let (pred_der, pred_key, pred_cert) = mint_test_leaf(now, now + 90_000);
+        service
+            .install_ordinary_certificate(vec![pred_der], pred_key, now, now + 90_000)
+            .expect("install initial cert");
+
+        set_test_now_override(Some(now + 60_000));
+        tokio::time::advance(tokio::time::Duration::from_secs(60_000)).await;
+
+        let (succ_der, succ_key, succ_cert) = mint_test_leaf(now + 60_000, now + 150_000);
+        let new_cert_pem = pem_from_der(&succ_der);
+        service.set_custom_order_key(succ_key);
+
+        let hold_cert = Arc::new(tokio::sync::Notify::new());
+        let gates = AcmeServerGates {
+            hold_cert: Some(Arc::clone(&hold_cert)),
+            ..Default::default()
+        };
+
+        let (mock_client1, requests1) = mock_acme_server_gated(
+            "https://acme.example/dir".to_string(),
+            false,
+            200,
+            (0, 0),
+            new_cert_pem.clone(),
+            None,
+            None,
+            None,
+            gates,
+        );
+
+        service.set_custom_http_client(mock_client1);
+        service.set_custom_directory_url("https://acme.example/dir".to_string());
+
+        let (shutdown1_tx, mut shutdown1_rx) = tokio::sync::watch::channel(false);
+        let service_task1 = service.lifecycle_copy();
+        let root_path = root.path().to_path_buf();
+        let root_path1 = root_path.clone();
+        let handle1 = tokio::spawn(async move {
+            service_task1
+                .run_acme_renewal_with_owner_state(&root_path1, &mut shutdown1_rx)
+                .await
+        });
+
+        for _ in 0..50 {
+            let found = requests1
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, uri, _)| uri.ends_with("/cert/1"));
+            if found {
+                break;
+            }
+            tokio::time::advance(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        assert!(
+            requests1
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, uri, _)| uri.ends_with("/cert/1"))
+        );
+
+        shutdown1_tx.send(true).unwrap();
+        let res1 = handle1.await.expect("join 1");
+        assert!(res1.is_ok());
+
+        let tls_dir = root.path().join("mcp-endpoint/tls");
+        let issuance_path = tls_dir.join("issuance.json");
+        assert!(issuance_path.exists());
+        let issuance_bytes = fs::read(&issuance_path).expect("read issuance.json");
+        let issuance_json: serde_json::Value =
+            serde_json::from_slice(&issuance_bytes).expect("parse issuance.json");
+        let saved_pkcs8 = issuance_json["private_key"].as_str().unwrap().to_string();
+
+        let sched_path = tls_dir.join("renewal.json");
+        let sched_bytes = fs::read(&sched_path).expect("read renewal.json");
+        let sched: crate::acme_lifecycle::RenewalScheduleRecord =
+            serde_json::from_slice(&sched_bytes).expect("parse renewal.json");
+        assert_eq!(
+            sched.order_url,
+            Some("https://acme.example/order/1".to_string())
+        );
+
+        let active1 = service.resolver.ordinary.load_full().expect("active cert");
+        assert_eq!(active1.key.cert[0], pred_cert);
+
+        // Second service on same directory
+        let service2 = McpEndpointTlsService::for_authorized_hostname(
+            Arc::clone(&journal_root),
+            HOSTNAME.to_owned(),
+            McpEndpointCertificateEnvironment::Staging,
+            true,
+        )
+        .expect("service2");
+
+        let active2_before = service2
+            .resolver
+            .ordinary
+            .load_full()
+            .expect("active cert 2");
+        assert_eq!(active2_before.key.cert[0], pred_cert);
+
+        let gates2 = AcmeServerGates {
+            resume_already_valid: true,
+            ..Default::default()
+        };
+
+        let (mock_client2, requests2) = mock_acme_server_gated(
+            "https://acme.example/dir".to_string(),
+            false,
+            200,
+            (0, 0),
+            new_cert_pem,
+            None,
+            None,
+            None,
+            gates2,
+        );
+
+        service2.set_custom_http_client(mock_client2);
+        service2.set_custom_directory_url("https://acme.example/dir".to_string());
+
+        let (shutdown2_tx, mut shutdown2_rx) = tokio::sync::watch::channel(false);
+        let service_task2 = service2.lifecycle_copy();
+        let handle2 = tokio::spawn(async move {
+            service_task2
+                .run_acme_renewal_with_owner_state(&root_path, &mut shutdown2_rx)
+                .await
+        });
+
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            let current = service2.resolver.ordinary.load_full().unwrap();
+            if current.key.cert[0] == succ_cert {
+                break;
+            }
+            tokio::time::advance(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        let active2_after = service2
+            .resolver
+            .ordinary
+            .load_full()
+            .expect("active cert 2");
+        assert_eq!(active2_after.key.cert[0], succ_cert);
+
+        let state_bytes2 = fs::read(tls_dir.join("state.json")).expect("read state.json 2");
+        let state_json2: serde_json::Value =
+            serde_json::from_slice(&state_bytes2).expect("parse state.json 2");
+        assert_eq!(
+            state_json2["private_key"].as_str().unwrap(),
+            saved_pkcs8.as_str()
+        );
+
+        {
+            let reqs = requests2.lock().unwrap();
+            assert!(!reqs.iter().any(|(_, uri, _)| uri.ends_with("/new-order")));
+            assert!(!reqs.iter().any(|(_, uri, _)| uri.ends_with("/finalize")));
+        }
+
+        shutdown2_tx.send(true).unwrap();
+        let res2 = handle2.await.expect("join 2");
+        assert!(res2.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn authorization_fetch_shutdown_does_not_finalize() {
+        let now = 1_700_000_000_i64;
+        let _clock = lock_test_clock(Some(now));
+
+        let root = TempDir::new().expect("state root");
+        let journal_root = Arc::new(JournalRoot::open(root.path()).expect("journal root"));
+        let service = McpEndpointTlsService::for_authorized_hostname(
+            Arc::clone(&journal_root),
+            HOSTNAME.to_owned(),
+            McpEndpointCertificateEnvironment::Staging,
+            false,
+        )
+        .expect("service");
+
+        let (pred_der, pred_key, pred_cert) = mint_test_leaf(now, now + 90_000);
+        service
+            .install_ordinary_certificate(vec![pred_der], pred_key, now, now + 90_000)
+            .expect("install initial cert");
+
+        set_test_now_override(Some(now + 60_000));
+        tokio::time::advance(tokio::time::Duration::from_secs(60_000)).await;
+
+        let (succ_der, succ_key, _) = mint_test_leaf(now + 60_000, now + 150_000);
+        let new_cert_pem = pem_from_der(&succ_der);
+        service.set_custom_order_key(succ_key);
+
+        let hold_authz = Arc::new(tokio::sync::Notify::new());
+        let gates = AcmeServerGates {
+            hold_authz: Some(Arc::clone(&hold_authz)),
+            ..Default::default()
+        };
+
+        let (mock_client, requests) = mock_acme_server_gated(
+            "https://acme.example/dir".to_string(),
+            false,
+            200,
+            (0, 0),
+            new_cert_pem,
+            None,
+            None,
+            None,
+            gates,
+        );
+
+        service.set_custom_http_client(mock_client);
+        service.set_custom_directory_url("https://acme.example/dir".to_string());
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let service_task = service.lifecycle_copy();
+        let root_path = root.path().to_path_buf();
+        let handle = tokio::spawn(async move {
+            service_task
+                .run_acme_renewal_with_owner_state(&root_path, &mut shutdown_rx)
+                .await
+        });
+
+        let mut authz_seen = false;
+        for _ in 0..50 {
+            if requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, uri, _)| uri == "https://acme.example/authz/1")
+            {
+                authz_seen = true;
+                break;
+            }
+            tokio::time::advance(tokio::time::Duration::from_millis(50)).await;
+        }
+        assert!(authz_seen);
+
+        shutdown_tx.send(true).unwrap();
+        let res = handle.await.expect("join");
+        assert!(res.is_ok());
+
+        {
+            let reqs = requests.lock().unwrap();
+            assert!(!reqs.iter().any(|(_, uri, _)| uri.ends_with("/finalize")));
+        }
+
+        let active = service.resolver.ordinary.load_full().expect("active cert");
+        assert_eq!(active.key.cert[0], pred_cert);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unrecorded_issuance_does_not_order_and_keeps_the_leaf() {
+        let now = 1_700_000_000_i64;
+        let _clock = lock_test_clock(Some(now));
+
+        let root = TempDir::new().expect("state root");
+        let journal_root = Arc::new(JournalRoot::open(root.path()).expect("journal root"));
+        let service = McpEndpointTlsService::for_authorized_hostname(
+            Arc::clone(&journal_root),
+            HOSTNAME.to_owned(),
+            McpEndpointCertificateEnvironment::Staging,
+            false,
+        )
+        .expect("service");
+
+        let (pred_der, pred_key, pred_cert) = mint_test_leaf(now, now + 90_000);
+        service
+            .install_ordinary_certificate(vec![pred_der], pred_key, now, now + 90_000)
+            .expect("install initial cert");
+
+        set_test_now_override(Some(now + 60_000));
+        tokio::time::advance(tokio::time::Duration::from_secs(60_000)).await;
+
+        let (succ_der, succ_key, _) = mint_test_leaf(now + 60_000, now + 150_000);
+        let new_cert_pem = pem_from_der(&succ_der);
+        service.set_custom_order_key(succ_key);
+
+        struct FaultGuard;
+        impl Drop for FaultGuard {
+            fn drop(&mut self) {
+                crate::acme_lifecycle::FAIL_SCHEDULE_WRITE.set(false);
+            }
+        }
+        let _guard = FaultGuard;
+        // Inject at renewal publication, after the account/storage admission
+        // boundary; changing directory permissions can refuse that boundary first.
+        crate::acme_lifecycle::FAIL_SCHEDULE_WRITE.set(true);
+
+        let (mock_client1, requests1) = mock_acme_server(
+            "https://acme.example/dir".to_string(),
+            false,
+            200,
+            (0, 0),
+            new_cert_pem.clone(),
+            None,
+            None,
+            None,
+        );
+
+        service.set_custom_http_client(mock_client1);
+        service.set_custom_directory_url("https://acme.example/dir".to_string());
+
+        let (shutdown1_tx, mut shutdown1_rx) = tokio::sync::watch::channel(false);
+        let service_task1 = service.lifecycle_copy();
+        let root_path = root.path().to_path_buf();
+        let root_path1 = root_path.clone();
+        let handle1 = tokio::spawn(async move {
+            service_task1
+                .run_acme_renewal_with_owner_state(&root_path1, &mut shutdown1_rx)
+                .await
+        });
+
+        tokio::time::advance(tokio::time::Duration::from_secs(1)).await;
+        for _ in 0..50 {
+            if requests1
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, uri, _)| uri.contains("/dir"))
+                || handle1.is_finished()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        if handle1.is_finished() {
+            panic!(
+                "renewal task exited before publication fault: {:?}",
+                handle1.await
+            );
+        }
+
+        {
+            let reqs = requests1.lock().unwrap();
+            assert!(reqs.iter().any(|(_, uri, _)| uri.contains("/dir")));
+            assert!(!reqs.iter().any(|(_, uri, _)| uri.ends_with("/new-order")));
+        }
+        let active1 = service
+            .resolver
+            .ordinary
+            .load_full()
+            .expect("active cert 1");
+        assert_eq!(active1.key.cert[0], pred_cert);
+
+        shutdown1_tx.send(true).unwrap();
+        let res1 = handle1.await.expect("join 1");
+        assert!(res1.is_ok());
+
+        crate::acme_lifecycle::FAIL_SCHEDULE_WRITE.set(false);
+
+        let gates2 = AcmeServerGates {
+            before_new_order_response: Some(Arc::new(move || {
+                crate::acme_lifecycle::FAIL_SCHEDULE_WRITE.set(true);
+            })),
+            ..Default::default()
+        };
+
+        let (mock_client2, requests2) = mock_acme_server_gated(
+            "https://acme.example/dir".to_string(),
+            false,
+            200,
+            (0, 0),
+            new_cert_pem,
+            None,
+            None,
+            None,
+            gates2,
+        );
+
+        service.set_custom_http_client(mock_client2);
+
+        let (shutdown2_tx, mut shutdown2_rx) = tokio::sync::watch::channel(false);
+        let service_task2 = service.lifecycle_copy();
+        let handle2 = tokio::spawn(async move {
+            service_task2
+                .run_acme_renewal_with_owner_state(&root_path, &mut shutdown2_rx)
+                .await
+        });
+
+        tokio::time::advance(tokio::time::Duration::from_secs(1)).await;
+
+        {
+            let reqs = requests2.lock().unwrap();
+            assert!(reqs.iter().any(|(_, uri, _)| uri.ends_with("/new-order")));
+            assert!(!reqs.iter().any(|(_, uri, _)| uri.contains("/authz/")));
+        }
+        let active2 = service
+            .resolver
+            .ordinary
+            .load_full()
+            .expect("active cert 2");
+        assert_eq!(active2.key.cert[0], pred_cert);
+
+        crate::acme_lifecycle::FAIL_SCHEDULE_WRITE.set(false);
+
+        shutdown2_tx.send(true).unwrap();
+        let res2 = handle2.await.expect("join 2");
+        assert!(res2.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn already_replaced_does_not_repeat_replaces_across_restart() {
+        let now = 1_700_000_000_i64;
+        let _clock = lock_test_clock(Some(now));
+
+        let root = TempDir::new().expect("state root");
+        let journal_root = Arc::new(JournalRoot::open(root.path()).expect("journal root"));
+        let service = McpEndpointTlsService::for_authorized_hostname(
+            Arc::clone(&journal_root),
+            HOSTNAME.to_owned(),
+            McpEndpointCertificateEnvironment::Staging,
+            false,
+        )
+        .expect("service");
+
+        let (pred_der, pred_key, pred_cert) = mint_test_leaf(now - 1000, now + 10_000);
+        service
+            .install_ordinary_certificate(
+                vec![pred_der.clone()],
+                pred_key,
+                now - 1000,
+                now + 10_000,
+            )
+            .expect("install initial cert");
+
+        let leaf_info =
+            crate::acme_lifecycle::extract_leaf_cert_info(&pred_der).expect("leaf info");
+        let expected_replaces = format!(
+            "{}.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&leaf_info.aki),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&leaf_info.raw_serial)
+        );
+
+        let (succ_der, succ_key, _) = mint_test_leaf(now + 600, now + 20_000);
+        let new_cert_pem = pem_from_der(&succ_der);
+        service.set_custom_order_key(succ_key);
+
+        let gates1 = AcmeServerGates {
+            reject_replaces_once: Some(Arc::new(AtomicBool::new(true))),
+            ..Default::default()
+        };
+
+        let (mock_client1, requests1) = mock_acme_server_gated(
+            "https://acme.example/dir".to_string(),
+            true,
+            200,
+            (now - 500, now - 100), // ARI window already behind now
+            new_cert_pem.clone(),
+            Some(expected_replaces.clone()),
+            None,
+            None,
+            gates1,
+        );
+
+        service.set_custom_http_client(mock_client1);
+        service.set_custom_directory_url("https://acme.example/dir".to_string());
+        service.set_custom_picker(Arc::new(|start, _| start));
+
+        let (shutdown1_tx, mut shutdown1_rx) = tokio::sync::watch::channel(false);
+        let service_task1 = service.lifecycle_copy();
+        let root_path = root.path().to_path_buf();
+        let root_path1 = root_path.clone();
+        let handle1 = tokio::spawn(async move {
+            service_task1
+                .run_acme_renewal_with_owner_state(&root_path1, &mut shutdown1_rx)
+                .await
+        });
+
+        let tls_dir = root.path().join("mcp-endpoint/tls");
+        let sched_path = tls_dir.join("renewal.json");
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            if let Ok(bytes) = fs::read(&sched_path)
+                && let Ok(sched) =
+                    serde_json::from_slice::<crate::acme_lifecycle::RenewalScheduleRecord>(&bytes)
+                && sched.omit_replaces == Some(true)
+                && sched.order_url.is_none()
+            {
+                break;
+            }
+            tokio::time::advance(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        let sched_bytes1 = fs::read(&sched_path).expect("read renewal.json after first loop");
+        let sched1: crate::acme_lifecycle::RenewalScheduleRecord =
+            serde_json::from_slice(&sched_bytes1).expect("parse renewal.json after first loop");
+        assert_eq!(sched1.omit_replaces, Some(true));
+        assert!(sched1.order_url.is_none());
+
+        let account_path = tls_dir.join("account-staging.pk8");
+        let account_bytes_before = fs::read(&account_path).expect("read account pk8");
+
+        // Shutdown during the backoff wait without advancing past issue_retry_at
+        shutdown1_tx.send(true).unwrap();
+        let res1 = handle1.await.expect("join 1");
+        assert!(res1.is_ok());
+
+        // Second service, same journal
+        let service2 = McpEndpointTlsService::for_authorized_hostname(
+            Arc::clone(&journal_root),
+            HOSTNAME.to_owned(),
+            McpEndpointCertificateEnvironment::Staging,
+            false,
+        )
+        .expect("service2");
+
+        // Advance frozen clock and tokio time by 30s so retry is due
+        set_test_now_override(Some(now + 30));
+        tokio::time::advance(tokio::time::Duration::from_secs(30)).await;
+
+        let hold_authz2 = Arc::new(tokio::sync::Notify::new());
+        let gates2 = AcmeServerGates {
+            hold_authz: Some(Arc::clone(&hold_authz2)),
+            ..Default::default()
+        };
+
+        let (mock_client2, requests2) = mock_acme_server_gated(
+            "https://acme.example/dir".to_string(),
+            true,
+            200,
+            (now - 500, now - 100),
+            new_cert_pem,
+            None,
+            None,
+            None,
+            gates2,
+        );
+
+        service2.set_custom_http_client(mock_client2);
+        service2.set_custom_directory_url("https://acme.example/dir".to_string());
+        service2.set_custom_picker(Arc::new(|start, _| start));
+
+        let (shutdown2_tx, mut shutdown2_rx) = tokio::sync::watch::channel(false);
+        let service_task2 = service2.lifecycle_copy();
+        let handle2 = tokio::spawn(async move {
+            service_task2
+                .run_acme_renewal_with_owner_state(&root_path, &mut shutdown2_rx)
+                .await
+        });
+
+        for _ in 0..50 {
+            let found = requests2
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, uri, _)| uri == "https://acme.example/authz/1");
+            if found {
+                break;
+            }
+            tokio::time::advance(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        let mut req2_has_new_order_without_replaces = false;
+        {
+            let reqs2 = requests2.lock().unwrap();
+            for (_, uri, body) in reqs2.iter() {
+                if uri.ends_with("/new-order") && new_order_has_replaces(body) == Some(false) {
+                    req2_has_new_order_without_replaces = true;
+                }
+            }
+        }
+        assert!(req2_has_new_order_without_replaces);
+
+        let mut total_replaces = 0;
+        for reqs_lock in [&requests1, &requests2] {
+            let reqs = reqs_lock.lock().unwrap();
+            for (_, uri, body) in reqs.iter() {
+                if uri.ends_with("/new-order") && new_order_has_replaces(body) == Some(true) {
+                    total_replaces += 1;
+                }
+            }
+        }
+        assert_eq!(total_replaces, 1);
+
+        let account_bytes_after = fs::read(&account_path).expect("read account pk8 2");
+        assert_eq!(account_bytes_before, account_bytes_after);
+
+        let active2 = service2
+            .resolver
+            .ordinary
+            .load_full()
+            .expect("active cert 2");
+        assert_eq!(active2.key.cert[0], pred_cert);
+
+        shutdown2_tx.send(true).unwrap();
+        let res2 = handle2.await.expect("join 2");
+        assert!(res2.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resume_transport_error_keeps_order_url() {
+        let now = 1_700_000_000_i64;
+        let _clock = lock_test_clock(Some(now));
+
+        let root = TempDir::new().expect("state root");
+        let journal_root = Arc::new(JournalRoot::open(root.path()).expect("journal root"));
+        let service = McpEndpointTlsService::for_authorized_hostname(
+            Arc::clone(&journal_root),
+            HOSTNAME.to_owned(),
+            McpEndpointCertificateEnvironment::Staging,
+            false,
+        )
+        .expect("service");
+
+        let (pred_der, pred_key, _) = mint_test_leaf(now - 1000, now + 10_000);
+        service
+            .install_ordinary_certificate(
+                vec![pred_der.clone()],
+                pred_key,
+                now - 1000,
+                now + 10_000,
+            )
+            .expect("install initial cert");
+
+        let leaf_info =
+            crate::acme_lifecycle::extract_leaf_cert_info(&pred_der).expect("leaf info");
+
+        let rec = crate::acme_lifecycle::RenewalScheduleRecord {
+            environment: McpEndpointCertificateEnvironment::Staging,
+            hostname: HOSTNAME.to_string(),
+            generation: None,
+            leaf_aki: base64::engine::general_purpose::STANDARD.encode(&leaf_info.aki),
+            leaf_serial: base64::engine::general_purpose::STANDARD.encode(&leaf_info.raw_serial),
+            renew_at: now - 50,
+            window_start: Some(now - 100),
+            window_end: Some(now + 100),
+            ari_retry_at: None,
+            ari_unavailable_since: None,
+            issue_retry_at: None,
+            issue_backoff_seconds: None,
+            order_url: Some("https://acme.example/order/existing".to_string()),
+            order_replaces: None,
+            omit_replaces: None,
+            replaces_submitted: None,
+        };
+        let sched_bytes = serde_json::to_vec(&rec).unwrap();
+        let store = service.store.as_ref().unwrap();
+        unix::persist_tls_renewal_bytes(&store.directory, &sched_bytes).unwrap();
+
+        let gates1 = AcmeServerGates {
+            resume_problem: Some((500, "urn:ietf:params:acme:error:serverInternal".to_string())),
+            ..Default::default()
+        };
+
+        let (mock_client1, requests1) = mock_acme_server_gated(
+            "https://acme.example/dir".to_string(),
+            false,
+            200,
+            (0, 0),
+            "".to_string(),
+            None,
+            None,
+            None,
+            gates1,
+        );
+
+        service.set_custom_http_client(mock_client1);
+        service.set_custom_directory_url("https://acme.example/dir".to_string());
+
+        let (shutdown1_tx, mut shutdown1_rx) = tokio::sync::watch::channel(false);
+        let service_task1 = service.lifecycle_copy();
+        let root_path = root.path().to_path_buf();
+        let root_path1 = root_path.clone();
+        let handle1 = tokio::spawn(async move {
+            service_task1
+                .run_acme_renewal_with_owner_state(&root_path1, &mut shutdown1_rx)
+                .await
+        });
+
+        let sched_path = root.path().join("mcp-endpoint/tls/renewal.json");
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            if let Ok(bytes) = fs::read(&sched_path)
+                && let Ok(sched) =
+                    serde_json::from_slice::<crate::acme_lifecycle::RenewalScheduleRecord>(&bytes)
+                && sched.issue_retry_at.is_some()
+            {
+                break;
+            }
+            tokio::time::advance(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        let sched_bytes1 = fs::read(&sched_path).expect("read renewal.json after 500 loop");
+        let sched1: crate::acme_lifecycle::RenewalScheduleRecord =
+            serde_json::from_slice(&sched_bytes1).expect("parse renewal.json after 500 loop");
+        assert_eq!(
+            sched1.order_url,
+            Some("https://acme.example/order/existing".to_string())
+        );
+        assert!(sched1.issue_retry_at.is_some() && sched1.issue_retry_at.unwrap() > now);
+
+        {
+            let reqs = requests1.lock().unwrap();
+            assert!(!reqs.iter().any(|(_, uri, _)| uri.ends_with("/new-order")));
+        }
+
+        shutdown1_tx.send(true).unwrap();
+        let res1 = handle1.await.expect("join 1");
+        assert!(res1.is_ok());
+
+        // Part 2: 404
+        unix::persist_tls_renewal_bytes(&store.directory, &sched_bytes).unwrap();
+
+        let gates2 = AcmeServerGates {
+            resume_problem: Some((404, "urn:ietf:params:acme:error:notFound".to_string())),
+            ..Default::default()
+        };
+
+        let (mock_client2, requests2) = mock_acme_server_gated(
+            "https://acme.example/dir".to_string(),
+            false,
+            200,
+            (0, 0),
+            "".to_string(),
+            None,
+            None,
+            None,
+            gates2,
+        );
+
+        service.set_custom_http_client(mock_client2);
+
+        let (shutdown2_tx, mut shutdown2_rx) = tokio::sync::watch::channel(false);
+        let service_task2 = service.lifecycle_copy();
+        let handle2 = tokio::spawn(async move {
+            service_task2
+                .run_acme_renewal_with_owner_state(&root_path, &mut shutdown2_rx)
+                .await
+        });
+
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            if let Ok(bytes) = fs::read(&sched_path)
+                && let Ok(sched) =
+                    serde_json::from_slice::<crate::acme_lifecycle::RenewalScheduleRecord>(&bytes)
+                && sched.order_url.is_none()
+                && sched.issue_retry_at.is_some()
+            {
+                break;
+            }
+            tokio::time::advance(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        let sched_bytes2 = fs::read(&sched_path).expect("read renewal.json after 404 loop");
+        let sched2: crate::acme_lifecycle::RenewalScheduleRecord =
+            serde_json::from_slice(&sched_bytes2).expect("parse renewal.json after 404 loop");
+        assert!(sched2.order_url.is_none());
+        assert!(sched2.issue_retry_at.is_some() && sched2.issue_retry_at.unwrap() > now);
+
+        {
+            let reqs = requests2.lock().unwrap();
+            assert!(!reqs.iter().any(|(_, uri, _)| uri.ends_with("/new-order")));
+        }
+
+        shutdown2_tx.send(true).unwrap();
+        let res2 = handle2.await.expect("join 2");
+        assert!(res2.is_ok());
     }
 }

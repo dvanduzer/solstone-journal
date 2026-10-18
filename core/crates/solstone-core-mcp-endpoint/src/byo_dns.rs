@@ -212,8 +212,46 @@ fn parse_caa_issue_value(value: &str) -> Option<(String, HashMap<String, String>
 }
 
 #[cfg(test)]
-pub static TEST_VERDICT_OVERRIDE: std::sync::RwLock<Option<DnsVerdict>> =
+pub static TEST_VERDICT_OVERRIDE: std::sync::RwLock<Option<(DnsVerdict, Vec<String>)>> =
     std::sync::RwLock::new(None);
+
+#[cfg(all(test, feature = "test-hooks"))]
+pub struct ByoTestSeam {
+    pub tick_hold: std::sync::atomic::AtomicBool,
+    pub tick_notify: tokio::sync::Notify,
+    pub outside_check_addr_override: std::sync::RwLock<Option<std::net::SocketAddr>>,
+    pub relay_dial_addr_override: std::sync::RwLock<Option<std::net::SocketAddr>>,
+    pub acme_spawn_observer: std::sync::RwLock<Option<tokio::sync::mpsc::UnboundedSender<()>>>,
+    pub dns_lookup_stall: std::sync::atomic::AtomicBool,
+    pub dns_stall_notify: tokio::sync::Notify,
+    pub check_hold: std::sync::atomic::AtomicBool,
+    pub check_release: tokio::sync::Notify,
+    pub relay_forward_ready: tokio::sync::Notify,
+    pub client_handle_exit: std::sync::atomic::AtomicU8,
+    pub ingress_dial_hold: std::sync::atomic::AtomicBool,
+    pub ingress_dial_release: tokio::sync::Notify,
+    pub ingress_dial_entered: std::sync::atomic::AtomicUsize,
+    pub ingress_dial_connected: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(all(test, feature = "test-hooks"))]
+pub static BYO_TEST_SEAM: ByoTestSeam = ByoTestSeam {
+    tick_hold: std::sync::atomic::AtomicBool::new(false),
+    tick_notify: tokio::sync::Notify::const_new(),
+    outside_check_addr_override: std::sync::RwLock::new(None),
+    relay_dial_addr_override: std::sync::RwLock::new(None),
+    acme_spawn_observer: std::sync::RwLock::new(None),
+    dns_lookup_stall: std::sync::atomic::AtomicBool::new(false),
+    dns_stall_notify: tokio::sync::Notify::const_new(),
+    check_hold: std::sync::atomic::AtomicBool::new(false),
+    check_release: tokio::sync::Notify::const_new(),
+    relay_forward_ready: tokio::sync::Notify::const_new(),
+    client_handle_exit: std::sync::atomic::AtomicU8::new(0),
+    ingress_dial_hold: std::sync::atomic::AtomicBool::new(false),
+    ingress_dial_release: tokio::sync::Notify::const_new(),
+    ingress_dial_entered: std::sync::atomic::AtomicUsize::new(0),
+    ingress_dial_connected: std::sync::atomic::AtomicUsize::new(0),
+};
 
 #[cfg(not(windows))]
 fn load_system_resolver_config() -> Result<
@@ -295,19 +333,38 @@ fn resolver_config_from_nameservers(
 }
 
 /// Real DNS resolution with 5s timeout using hickory-resolver.
-pub async fn resolve_byo_dns(hostname: &str, account_uri: &str, now: DateTime<Utc>) -> DnsVerdict {
+pub async fn resolve_byo_dns(
+    hostname: &str,
+    account_uri: &str,
+    now: DateTime<Utc>,
+) -> (DnsVerdict, Vec<String>) {
     #[cfg(test)]
     {
         if let Ok(guard) = TEST_VERDICT_OVERRIDE.read()
-            && let Some(ref verdict) = *guard
+            && let Some((ref verdict, ref addrs)) = *guard
         {
-            return verdict.clone();
+            return (verdict.clone(), addrs.clone());
+        }
+    }
+
+    #[cfg(all(test, feature = "test-hooks"))]
+    {
+        if BYO_TEST_SEAM
+            .dns_lookup_stall
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            BYO_TEST_SEAM.dns_stall_notify.notified().await;
         }
     }
 
     let (res_config, res_opts) = match load_system_resolver_config() {
         Ok(pair) => pair,
-        Err(_) => return DnsVerdict::new(DnsVerdictCode::LookupError, now),
+        Err(_) => {
+            return (
+                DnsVerdict::new(DnsVerdictCode::LookupError, now),
+                Vec::new(),
+            );
+        }
     };
 
     let lookup_future = async {
@@ -318,6 +375,13 @@ pub async fn resolve_byo_dns(hostname: &str, account_uri: &str, now: DateTime<Ut
 
         // Query target A, AAAA, CNAME, CAA
         let target_records = query_host_records(&resolver, &lower_host).await?;
+        let mut addresses = Vec::new();
+        for a in &target_records.a {
+            addresses.push(a.to_string());
+        }
+        for aaaa in &target_records.aaaa {
+            addresses.push(aaaa.to_string());
+        }
         map.insert(lower_host.clone(), target_records);
 
         // Query ancestor CAA
@@ -329,14 +393,77 @@ pub async fn resolve_byo_dns(hostname: &str, account_uri: &str, now: DateTime<Ut
             entry.caa = caa_records;
         }
 
-        Ok::<_, String>(map)
+        Ok::<_, String>((map, addresses))
     };
 
     match tokio::time::timeout(Duration::from_secs(5), lookup_future).await {
-        Ok(Ok(records)) => evaluate_byo_dns_policy(hostname, account_uri, &records, now),
-        Ok(Err(_)) => DnsVerdict::new(DnsVerdictCode::LookupError, now),
-        Err(_) => DnsVerdict::new(DnsVerdictCode::LookupTimeout, now),
+        Ok(Ok((records, addresses))) => {
+            let verdict = evaluate_byo_dns_policy(hostname, account_uri, &records, now);
+            (verdict, addresses)
+        }
+        Ok(Err(_)) => (
+            DnsVerdict::new(DnsVerdictCode::LookupError, now),
+            Vec::new(),
+        ),
+        Err(_) => (
+            DnsVerdict::new(DnsVerdictCode::LookupTimeout, now),
+            Vec::new(),
+        ),
     }
+}
+
+/// Pure diagnostic evaluator for BYO relay and DNS address alignment.
+pub fn compute_byo_diagnostics(
+    relay_address: Option<Ipv4Addr>,
+    dns_addresses: &[String],
+) -> Vec<&'static str> {
+    let mut diagnostics = Vec::new();
+    let mut has_non_public = false;
+    let mut a_records = Vec::new();
+    let mut aaaa_count = 0usize;
+
+    for s in dns_addresses {
+        if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+            match ip {
+                std::net::IpAddr::V4(v4) => {
+                    a_records.push(v4);
+                    let oct = v4.octets();
+                    let is_cgnat = oct[0] == 100 && (64..=127).contains(&oct[1]);
+                    if v4.is_loopback()
+                        || v4.is_private()
+                        || v4.is_link_local()
+                        || v4.is_broadcast()
+                        || oct == [255, 255, 255, 255]
+                        || is_cgnat
+                    {
+                        has_non_public = true;
+                    }
+                }
+                std::net::IpAddr::V6(v6) => {
+                    aaaa_count += 1;
+                    let seg = v6.segments();
+                    let is_unique_local = (seg[0] & 0xfe00) == 0xfc00;
+                    let is_link_local = (seg[0] & 0xffc0) == 0xfe80;
+                    if v6.is_loopback() || is_unique_local || is_link_local {
+                        has_non_public = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(relay_ip) = relay_address {
+        let is_exact_match = a_records.len() == 1 && a_records[0] == relay_ip && aaaa_count == 0;
+        if !is_exact_match {
+            diagnostics.push("address_mismatch");
+        }
+    }
+
+    if has_non_public {
+        diagnostics.push("non_public_address");
+    }
+
+    diagnostics
 }
 
 async fn query_host_records(
@@ -695,5 +822,98 @@ mod tests {
             evaluate_byo_dns_policy(HOST, URI, &map, now).code,
             DnsVerdictCode::ValidationMethod
         );
+    }
+
+    #[test]
+    fn diagnostics_address_mismatch_positive_cases() {
+        let relay = Some(Ipv4Addr::new(198, 51, 100, 1));
+
+        // 1. Missing relay A
+        let d1 = compute_byo_diagnostics(relay, &["93.184.216.34".to_string()]);
+        assert_eq!(d1, vec!["address_mismatch"]);
+
+        // 2. Extra A
+        let d2 = compute_byo_diagnostics(
+            relay,
+            &["198.51.100.1".to_string(), "198.51.100.2".to_string()],
+        );
+        assert_eq!(d2, vec!["address_mismatch"]);
+
+        // 3. AAAA-only
+        let d3 = compute_byo_diagnostics(relay, &["2001:db8::1".to_string()]);
+        assert_eq!(d3, vec!["address_mismatch"]);
+
+        // 4. Public AAAA beside a matching A
+        let d4 = compute_byo_diagnostics(
+            relay,
+            &["198.51.100.1".to_string(), "2001:db8::1".to_string()],
+        );
+        assert_eq!(d4, vec!["address_mismatch"]);
+
+        // 5. Configured relay and empty address list (e.g. no A)
+        let d5 = compute_byo_diagnostics(relay, &[]);
+        assert_eq!(d5, vec!["address_mismatch"]);
+    }
+
+    #[test]
+    fn diagnostics_non_fires() {
+        let relay = Some(Ipv4Addr::new(198, 51, 100, 1));
+
+        // Exact match
+        let d1 = compute_byo_diagnostics(relay, &["198.51.100.1".to_string()]);
+        assert!(d1.is_empty());
+
+        // No relay configured with public addresses
+        let d2 = compute_byo_diagnostics(
+            None,
+            &["93.184.216.34".to_string(), "2001:db8::1".to_string()],
+        );
+        assert!(d2.is_empty());
+
+        // No relay configured with empty addresses
+        let d3 = compute_byo_diagnostics(None, &[]);
+        assert!(d3.is_empty());
+    }
+
+    #[test]
+    fn diagnostics_non_public_address_cases() {
+        // Private IPv4
+        let d1 = compute_byo_diagnostics(None, &["192.168.1.1".to_string()]);
+        assert_eq!(d1, vec!["non_public_address"]);
+
+        // CGNAT IPv4
+        let d2 = compute_byo_diagnostics(None, &["100.64.0.1".to_string()]);
+        assert_eq!(d2, vec!["non_public_address"]);
+
+        // Loopback IPv6
+        let d3 = compute_byo_diagnostics(None, &["::1".to_string()]);
+        assert_eq!(d3, vec!["non_public_address"]);
+
+        // Unique local IPv6
+        let d4 = compute_byo_diagnostics(None, &["fd00::1".to_string()]);
+        assert_eq!(d4, vec!["non_public_address"]);
+
+        // Public IPv4 and public IPv6 do not fire
+        let d5 = compute_byo_diagnostics(
+            None,
+            &["93.184.216.34".to_string(), "2001:db8::1".to_string()],
+        );
+        assert!(d5.is_empty());
+    }
+
+    #[test]
+    fn diagnostics_both_codes_together() {
+        let relay = Some(Ipv4Addr::new(198, 51, 100, 1));
+
+        // Private IP that doesn't match relay
+        let d1 = compute_byo_diagnostics(relay, &["192.168.1.1".to_string()]);
+        assert_eq!(d1, vec!["address_mismatch", "non_public_address"]);
+
+        // CGNAT IP beside matching relay
+        let d2 = compute_byo_diagnostics(
+            relay,
+            &["198.51.100.1".to_string(), "100.64.0.1".to_string()],
+        );
+        assert_eq!(d2, vec!["address_mismatch", "non_public_address"]);
     }
 }

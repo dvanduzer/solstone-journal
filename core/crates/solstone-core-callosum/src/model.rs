@@ -75,7 +75,7 @@ impl DeviceIngestEvent {
             .meta
             .get("utc_offset_seconds")
             .and_then(Value::as_i64)
-            .filter(|offset| offset.abs() <= MAX_OFFSET_SECONDS)
+            .filter(|offset| (-MAX_OFFSET_SECONDS..=MAX_OFFSET_SECONDS).contains(offset))
             .and_then(|offset| i32::try_from(offset).ok());
         (tz.is_some() || utc_offset_seconds.is_some()).then_some(ReportedZone {
             tz,
@@ -168,6 +168,8 @@ mod tests {
             json!({"utc_offset_seconds": "32400"}),
             json!({"utc_offset_seconds": 32400.5}),
             json!({"utc_offset_seconds": 64801}),
+            json!({"utc_offset_seconds": i64::MIN}),
+            json!({"utc_offset_seconds": i64::MAX}),
             json!({"started_at": "2026-09-29T12:14:00Z"}),
         ] {
             assert_eq!(event(meta.clone()).reported_zone(), None, "{meta}");

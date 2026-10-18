@@ -389,7 +389,7 @@ fn prepare_segment(
         "capture_zone": crate::capture_zone::capture_zone_view(
             day,
             key,
-            solstone_core_callosum::read_reported_zone(&dir),
+            solstone_core_callosum::read_reported_zone(root, &dir),
             &zone,
         ),
         "media_sizes": media.media_sizes,

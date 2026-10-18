@@ -4,10 +4,12 @@
 //! Home getting-started first-minutes pure projection and reader.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use chrono::{Offset, TimeDelta, TimeZone};
 use chrono_tz::Tz;
 use serde_json::Value;
+use solstone_core_sol_link::http::{SetupProgress, SetupProgressError};
 
 use crate::HomeContext;
 
@@ -621,7 +623,55 @@ pub fn project_first_minutes(input: &FirstMinutesInput) -> Value {
     })
 }
 
-pub fn read_first_minutes(context: &HomeContext) -> Value {
+/// Reads the journal's setup download progress and whether local thinking can
+/// run. Production reads the same records `/init/api/state` does.
+type SetupProgressReader = fn(&Path) -> Result<SetupProgress, SetupProgressError>;
+
+/// The setup facts the card shows: download progress and local capability from
+/// the setup reader, the saved thinking choice from the journal config, and
+/// whether this browser may take setup actions. A setup reader that fails
+/// leaves the progress facts unknown and keeps the saved choice.
+fn project_setup(
+    progress: Result<SetupProgress, SetupProgressError>,
+    saved_choice: Option<&str>,
+    actions: bool,
+) -> Value {
+    let (downloads, capability) = match progress {
+        Ok(progress) => (
+            serde_json::to_value(progress.downloads).expect("setup downloads serialize"),
+            Value::String(progress.thinking.capability),
+        ),
+        Err(error) => {
+            log::warn!("getting started could not read setup progress: {error}");
+            (Value::Null, Value::Null)
+        }
+    };
+    let choice = saved_choice.filter(|choice| matches!(*choice, "local" | "byo" | "spp" | "later"));
+    serde_json::json!({
+        "downloads": downloads,
+        "thinking": {
+            "capability": capability,
+            "choice": choice,
+        },
+        "actions": actions,
+    })
+}
+
+/// `setup_actions` says whether the requesting browser may take setup actions;
+/// they answer only on the journal's own computer.
+pub fn read_first_minutes(context: &HomeContext, setup_actions: bool) -> Value {
+    read_first_minutes_with(
+        context,
+        setup_actions,
+        solstone_core_sol_link::http::read_setup_progress,
+    )
+}
+
+fn read_first_minutes_with(
+    context: &HomeContext,
+    setup_actions: bool,
+    read_progress: SetupProgressReader,
+) -> Value {
     let config_path = context.journal_root().join("config/journal.json");
     let Ok(bytes) = std::fs::read(&config_path) else {
         return serde_json::json!({"window_open": false});
@@ -742,7 +792,10 @@ pub fn read_first_minutes(context: &HomeContext) -> Value {
                                         )
                                     {
                                         if let Some(zone) =
-                                            solstone_core_callosum::read_reported_zone(&segment_dir)
+                                            solstone_core_callosum::read_reported_zone(
+                                                context.journal_root(),
+                                                &segment_dir,
+                                            )
                                         {
                                             (zone.tz, zone.utc_offset_seconds)
                                         } else {
@@ -835,7 +888,17 @@ pub fn read_first_minutes(context: &HomeContext) -> Value {
         input.earliest_progress = progress;
     }
 
-    project_first_minutes(&input)
+    let saved_choice = value
+        .get("setup")
+        .and_then(|setup| setup.get("thinking_choice"))
+        .and_then(Value::as_str);
+    let mut out = project_first_minutes(&input);
+    out["setup"] = project_setup(
+        read_progress(context.journal_root()),
+        saved_choice,
+        setup_actions,
+    );
+    out
 }
 
 #[cfg(test)]
@@ -847,6 +910,137 @@ mod tests {
 
     fn no_segment_words() -> SegmentWordsReader {
         Box::new(|_| None)
+    }
+
+    fn no_setup_progress(_: &Path) -> Result<SetupProgress, SetupProgressError> {
+        Err(SetupProgressError {
+            code: "status_unreadable",
+            detail: "not read in this test".into(),
+        })
+    }
+
+    fn fixed_setup_progress(_: &Path) -> Result<SetupProgress, SetupProgressError> {
+        use solstone_core_sol_link::http::{
+            SetupDownloadError, SetupDownloadTask, SetupDownloads, SetupProgressThinking,
+        };
+        Ok(SetupProgress {
+            downloads: SetupDownloads {
+                speech: SetupDownloadTask {
+                    state: "error".into(),
+                    attempt_id: Some("speech-1".into()),
+                    bytes_done: 5,
+                    bytes_total: Some(10),
+                    error: Some(SetupDownloadError {
+                        code: "install_failed".into(),
+                        detail: "interrupted".into(),
+                    }),
+                },
+                thinking: SetupDownloadTask {
+                    state: "downloading".into(),
+                    attempt_id: Some("local-1".into()),
+                    bytes_done: 3,
+                    bytes_total: Some(9),
+                    error: None,
+                },
+            },
+            thinking: SetupProgressThinking {
+                capability: "blocked".into(),
+            },
+        })
+    }
+
+    #[test]
+    fn setup_projection_carries_progress_choice_and_actions() {
+        let out = project_setup(fixed_setup_progress(Path::new("/")), Some("byo"), true);
+        assert_eq!(
+            out,
+            json!({
+                "downloads": {
+                    "speech": {
+                        "state": "error",
+                        "attempt_id": "speech-1",
+                        "bytes_done": 5,
+                        "bytes_total": 10,
+                        "error": {"code": "install_failed", "detail": "interrupted"},
+                    },
+                    "thinking": {
+                        "state": "downloading",
+                        "attempt_id": "local-1",
+                        "bytes_done": 3,
+                        "bytes_total": 9,
+                        "error": null,
+                    },
+                },
+                "thinking": {"capability": "blocked", "choice": "byo"},
+                "actions": true,
+            })
+        );
+
+        // A failed read leaves progress unknown and still continues the saved choice.
+        let failed = project_setup(no_setup_progress(Path::new("/")), Some("spp"), false);
+        assert_eq!(
+            failed,
+            json!({
+                "downloads": null,
+                "thinking": {"capability": null, "choice": "spp"},
+                "actions": false,
+            })
+        );
+
+        // Only the choices setup saves are continued.
+        for (saved, expected) in [
+            (Some("local"), json!("local")),
+            (Some("later"), json!("later")),
+            (Some("cloud"), Value::Null),
+            (Some(""), Value::Null),
+            (None, Value::Null),
+        ] {
+            let out = project_setup(no_setup_progress(Path::new("/")), saved, false);
+            assert_eq!(out["thinking"]["choice"], expected, "{saved:?}");
+        }
+    }
+
+    #[test]
+    fn reader_projects_setup_only_while_the_window_is_open() {
+        let temp = tempfile::tempdir_in("/var/tmp").unwrap();
+        let journal = temp.path();
+        let completed_at = 1_000_000_000_000i64;
+        std::fs::create_dir_all(journal.join("config")).unwrap();
+        std::fs::write(
+            journal.join("config/journal.json"),
+            json!({
+                "identity": {"timezone": "UTC"},
+                "setup": {"completed_at": completed_at, "thinking_choice": "spp"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let open = HomeContext::with_zone(
+            journal,
+            chrono::DateTime::from_timestamp_millis(completed_at + 86_400_000).unwrap(),
+            Tz::UTC,
+        );
+        let out = read_first_minutes_with(&open, false, fixed_setup_progress);
+        assert_eq!(out["window_open"], true);
+        assert_eq!(out["setup"]["thinking"]["choice"], "spp");
+        assert_eq!(out["setup"]["thinking"]["capability"], "blocked");
+        assert_eq!(
+            out["setup"]["downloads"]["thinking"]["state"],
+            "downloading"
+        );
+        assert_eq!(out["setup"]["actions"], false);
+        let local = read_first_minutes_with(&open, true, fixed_setup_progress);
+        assert_eq!(local["setup"]["actions"], true);
+
+        let closed = HomeContext::with_zone(
+            journal,
+            chrono::DateTime::from_timestamp_millis(completed_at + 604_800_000).unwrap(),
+            Tz::UTC,
+        );
+        assert_eq!(
+            read_first_minutes_with(&closed, true, fixed_setup_progress),
+            json!({"window_open": false})
+        );
     }
 
     #[test]
@@ -1127,7 +1321,7 @@ mod tests {
 
     #[test]
     fn reader_closed_window_proof() {
-        let temp = tempfile::tempdir_in("/var/tmp").unwrap();
+        let temp = tempfile::tempdir().unwrap();
         let journal = temp.path();
 
         // 1. config/journal.json: {"identity":{"timezone":"UTC"},"setup":{"completed_at":1000000000000}}
@@ -1192,7 +1386,7 @@ mod tests {
             chrono::DateTime::from_timestamp_millis(now_closed_exact).unwrap(),
         );
         assert_eq!(
-            read_first_minutes(&ctx_closed_exact),
+            read_first_minutes_with(&ctx_closed_exact, false, no_setup_progress),
             json!({"window_open": false})
         );
 
@@ -1202,12 +1396,12 @@ mod tests {
             chrono::DateTime::from_timestamp_millis(now_closed_more).unwrap(),
         );
         assert_eq!(
-            read_first_minutes(&ctx_closed_more),
+            read_first_minutes_with(&ctx_closed_more, false, no_setup_progress),
             json!({"window_open": false})
         );
 
         // Missing completed_at on copy of journal
-        let temp_missing = tempfile::tempdir_in("/var/tmp").unwrap();
+        let temp_missing = tempfile::tempdir().unwrap();
         let journal_missing = temp_missing.path();
         std::fs::create_dir_all(journal_missing.join("config")).unwrap();
         std::fs::write(
@@ -1220,12 +1414,12 @@ mod tests {
             chrono::DateTime::from_timestamp_millis(completed_at + 86_400_000).unwrap(),
         );
         assert_eq!(
-            read_first_minutes(&ctx_missing),
+            read_first_minutes_with(&ctx_missing, false, no_setup_progress),
             json!({"window_open": false})
         );
 
         // Non-numeric completed_at on copy of journal
-        let temp_nonnum = tempfile::tempdir_in("/var/tmp").unwrap();
+        let temp_nonnum = tempfile::tempdir().unwrap();
         let journal_nonnum = temp_nonnum.path();
         std::fs::create_dir_all(journal_nonnum.join("config")).unwrap();
         std::fs::write(
@@ -1239,7 +1433,7 @@ mod tests {
             chrono::DateTime::from_timestamp_millis(completed_at + 86_400_000).unwrap(),
         );
         assert_eq!(
-            read_first_minutes(&ctx_nonnum),
+            read_first_minutes_with(&ctx_nonnum, false, no_setup_progress),
             json!({"window_open": false})
         );
 
@@ -1249,7 +1443,7 @@ mod tests {
             journal,
             chrono::DateTime::from_timestamp_millis(now_open_ms).unwrap(),
         );
-        let out_open = read_first_minutes(&ctx_open);
+        let out_open = read_first_minutes_with(&ctx_open, false, no_setup_progress);
         assert_eq!(out_open["window_open"], true);
         assert_eq!(out_open["devices"][0]["name"], "Pocket");
         assert_eq!(
@@ -1935,7 +2129,7 @@ mod tests {
 
     #[test]
     fn test_read_segment_words_filesystem() {
-        let temp = tempfile::tempdir_in("/var/tmp").unwrap();
+        let temp = tempfile::tempdir().unwrap();
         let seg_dir = temp.path();
 
         let header =
@@ -1963,7 +2157,7 @@ mod tests {
         assert_eq!(read_segment_words(seg_dir), Some("clip speech".into()));
 
         // Case 2: audio.jsonl then mic_audio.jsonl concatenate in filename order
-        let temp2 = tempfile::tempdir_in("/var/tmp").unwrap();
+        let temp2 = tempfile::tempdir().unwrap();
         let seg2 = temp2.path();
         std::fs::write(
             seg2.join("mic_audio.jsonl"),
@@ -1981,7 +2175,7 @@ mod tests {
         );
 
         // Case 3: Sibling audio jsonl with bad UTF-8 skipped
-        let temp3 = tempfile::tempdir_in("/var/tmp").unwrap();
+        let temp3 = tempfile::tempdir().unwrap();
         let seg3 = temp3.path();
         std::fs::write(
             seg3.join("audio.jsonl"),
@@ -1992,7 +2186,7 @@ mod tests {
         assert_eq!(read_segment_words(seg3), Some("readable audio".into()));
 
         // Case 4: corrected "" and text "hello" -> hello; whitespace corrected falls through; non-empty corrected wins
-        let temp4 = tempfile::tempdir_in("/var/tmp").unwrap();
+        let temp4 = tempfile::tempdir().unwrap();
         let seg4 = temp4.path();
         let row1 = "{\"corrected\":\"\",\"text\":\"hello\"}\n";
         let row2 = "{\"corrected\":\"   \",\"text\":\"world\"}\n";
@@ -2005,7 +2199,7 @@ mod tests {
         assert_eq!(read_segment_words(seg4), Some("hello world fixed".into()));
 
         // Case 5: rows carrying start, speaker, emotion, beside *_transcript.md
-        let temp5 = tempfile::tempdir_in("/var/tmp").unwrap();
+        let temp5 = tempfile::tempdir().unwrap();
         let seg5 = temp5.path();
         let extra_row = "{\"start\":\"12:00:00\",\"speaker\":1,\"emotion\":\"neutral\",\"text\":\"only speech\"}\n";
         std::fs::write(seg5.join("audio.jsonl"), format!("{header}{extra_row}")).unwrap();
@@ -2019,7 +2213,7 @@ mod tests {
 
     #[test]
     fn test_paired_streams_read_first_minutes() {
-        let temp = tempfile::tempdir_in("/var/tmp").unwrap();
+        let temp = tempfile::tempdir().unwrap();
         let journal = temp.path();
 
         let completed_at = 1_000_000_000_000i64;
@@ -2096,7 +2290,7 @@ mod tests {
             chrono::DateTime::from_timestamp_millis(now_ms).unwrap(),
             Tz::UTC,
         );
-        let out = read_first_minutes(&ctx);
+        let out = read_first_minutes_with(&ctx, false, no_setup_progress);
 
         assert_eq!(out["window_open"], true);
         assert_eq!(out["proof"]["state"], "heard");

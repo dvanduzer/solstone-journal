@@ -5,7 +5,6 @@
   const PULSE_URL = '/app/home/api/pulse';
   const BRIEFING_URL = '/app/home/api/briefing';
   const FIRST_MINUTES_URL = '/app/home/api/first-minutes';
-  const SETUP_STATE_URL = '/init/api/state';
   const AGENTS_STATE_URL = '/app/agents/api/state';
   const SETUP_ACTION_URL = '/init/api/action';
   const SECTION_STATE_KEY = 'pulse-section-state';
@@ -62,7 +61,6 @@
   let agentsPayload = null;
   let agentsSettled = false;
   let firstMinutesRequest = null;
-  let setupRequest = null;
   let agentsRequest = null;
   let downloadTimer = null;
   let speechRetryInFlight = false;
@@ -673,9 +671,14 @@
                 + guidance + '</div>';
             }
           } else {
+            // Setup actions answer only on the journal's own computer, so a
+            // linked device sees the line without a button it can't use.
+            const retry = setupPayload.actions === true
+              ? '<button type="button" data-speech-retry' + (speechRetryInFlight ? ' disabled' : '') + '>try again</button>'
+              : '';
             html += '<div class="pulse-download" data-download="speech" data-download-state="' + esc(state) + '">'
               + '<p>the speech model didn&#39;t finish downloading.</p>'
-              + '<button type="button" data-speech-retry' + (speechRetryInFlight ? ' disabled' : '') + '>try again</button>'
+              + retry
               + '</div>';
           }
         }
@@ -796,7 +799,6 @@
           downloadTimer = null;
           if (!firstMinutesClosed) {
             readFirstMinutes();
-            readSetup();
           }
         }, 15000);
       }
@@ -815,15 +817,20 @@
         .then(function (data) {
           if (!data || typeof data.window_open !== 'boolean') {
             firstMinutesPayload = null;
+            setupPayload = null;
           } else if (data.window_open === false) {
             firstMinutesClosed = true;
             firstMinutesPayload = null;
+            setupPayload = null;
             if (downloadTimer) {
               clearTimeout(downloadTimer);
               downloadTimer = null;
             }
           } else {
             firstMinutesPayload = data;
+            // Setup progress and the saved choice come with first minutes,
+            // which a linked device can read; `/init/api/state` stays local.
+            setupPayload = isPlainObject(data.setup) ? data.setup : null;
           }
           scheduleOrClearDownloadTimer();
           updateGettingStartedSurface();
@@ -831,6 +838,7 @@
         })
         .catch(function () {
           firstMinutesPayload = null;
+          setupPayload = null;
           scheduleOrClearDownloadTimer();
           updateGettingStartedSurface();
           return null;
@@ -840,30 +848,6 @@
         });
     }
     return firstMinutesRequest;
-  }
-
-  function readSetup() {
-    if (firstMinutesClosed) return Promise.resolve(null);
-    if (typeof window.apiJson !== 'function') return Promise.resolve(null);
-    if (!setupRequest) {
-      setupRequest = window.apiJson(SETUP_STATE_URL, { noAuthRedirect: true })
-        .then(function (data) {
-          setupPayload = isPlainObject(data) ? data : null;
-          scheduleOrClearDownloadTimer();
-          updateGettingStartedSurface();
-          return data;
-        })
-        .catch(function () {
-          setupPayload = null;
-          scheduleOrClearDownloadTimer();
-          updateGettingStartedSurface();
-          return null;
-        })
-        .finally(function () {
-          setupRequest = null;
-        });
-    }
-    return setupRequest;
   }
 
   function readAgents() {
@@ -912,7 +896,7 @@
     })
       .then(function () {
         speechRetryInFlight = false;
-        readSetup();
+        readFirstMinutes();
       })
       .catch(function () {
         speechRetryInFlight = false;
@@ -1637,7 +1621,6 @@
   function refreshVitals() {
     if (!firstMinutesClosed) {
       readFirstMinutes();
-      readSetup();
     }
     if (!vitalsRequest) {
       vitalsRequest = readVitals().finally(function () { vitalsRequest = null; });
@@ -1975,7 +1958,6 @@
   function refreshChangedPulse() {
     if (!firstMinutesClosed) {
       readFirstMinutes();
-      readSetup();
     }
     if (trailingPulseRefresh) return trailingPulseRefresh;
     const pending = [pulseRequest, vitalsRequest, narrativeRequest].filter(Boolean);
@@ -2032,7 +2014,6 @@
     wireRealtime();
     loadPulse();
     readFirstMinutes();
-    readSetup();
     readAgents();
   }
 

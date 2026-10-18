@@ -171,7 +171,7 @@ pub fn refresh(
         Ok(read) => read.config.unwrap_or_default(),
         Err(error) => {
             return OwnerRefreshOutcome::OperationalFailure {
-                message: format!("brain failed: could not read journal config: {error}"),
+                message: format!("thinking check failed: could not read journal config: {error}"),
             };
         }
     };
@@ -230,7 +230,7 @@ pub fn refresh(
         }
         Err(error) => {
             return OwnerRefreshOutcome::OperationalFailure {
-                message: format!("brain refresh failed: {error}"),
+                message: format!("thinking check failed: {error}"),
             };
         }
     };
@@ -329,7 +329,7 @@ pub fn renew_prerequisites(
         Ok(read) => read.config.unwrap_or_default(),
         Err(error) => {
             return OwnerRefreshOutcome::OperationalFailure {
-                message: format!("brain failed: could not read journal config: {error}"),
+                message: format!("thinking check failed: could not read journal config: {error}"),
             };
         }
     };
@@ -663,6 +663,13 @@ fn generated_response_has_reasoning(response: &GeneratedResponse) -> bool {
 }
 
 fn map_provider_reason(component: &str, reason: Option<&str>) -> String {
+    // The local endpoint wire names its two failures with a `local_` prefix;
+    // the brain contract knows them without it.
+    let reason = reason.map(|reason| match reason {
+        "local_endpoint_unreachable" => "endpoint_unreachable",
+        "local_endpoint_contract_failed" => "endpoint_contract_failed",
+        other => other,
+    });
     match reason {
         Some(reason) if is_valid_evidence_reason(component, reason) => reason.to_owned(),
         _ => "probe_internal_error".to_owned(),
@@ -833,15 +840,20 @@ pub fn json_text(view: &OwnerView) -> String {
 
 pub fn human_text(view: &OwnerView) -> String {
     if view.transient == Some("busy") {
-        return "Brain busy: check already running".to_owned();
+        return format!(
+            "Thinking busy: {}",
+            solstone_core_brain::brain_reason_text(Some("busy"))
+        );
     }
     if view.aggregate_state == "ready" {
         let identity = match (&view.provider, &view.model, &view.lane) {
             (Some(provider), Some(model), lane) => format!(
                 "{} {provider}/{model}",
-                lane.as_deref().unwrap_or("unknown")
+                lane.as_deref()
+                    .map(solstone_core_brain::lane_label)
+                    .unwrap_or("unknown")
             ),
-            (_, _, Some(lane)) => lane.clone(),
+            (_, _, Some(lane)) => solstone_core_brain::lane_label(lane).to_owned(),
             _ => "unknown".to_owned(),
         };
         let age = view
@@ -849,7 +861,7 @@ pub fn human_text(view: &OwnerView) -> String {
             .as_ref()
             .map(|value| format!(", checked {value} ago"))
             .unwrap_or_default();
-        return format!("Brain ready: {identity}{age}");
+        return format!("Thinking ready: {identity}{age}");
     }
     let reason = solstone_core_brain::brain_reason_text(view.reason_code.as_deref());
     let component = view
@@ -857,7 +869,7 @@ pub fn human_text(view: &OwnerView) -> String {
         .as_ref()
         .map(|value| format!(" ({value})"))
         .unwrap_or_default();
-    format!("Brain {}: {reason}{component}", view.aggregate_state)
+    format!("Thinking {}: {reason}{component}", view.aggregate_state)
 }
 
 pub fn owner_exit_code(view: &OwnerView) -> u8 {
@@ -1020,15 +1032,15 @@ mod tests {
         ready.checked_age = Some("59s".to_owned());
         assert_eq!(
             human_text(&ready),
-            "Brain ready: byo-cloud openai/gpt, checked 59s ago"
+            "Thinking ready: your own model openai/gpt, checked 59s ago"
         );
 
         ready.provider = None;
         ready.model = None;
         ready.checked_age = None;
-        assert_eq!(human_text(&ready), "Brain ready: byo-cloud");
+        assert_eq!(human_text(&ready), "Thinking ready: your own model");
         ready.lane = None;
-        assert_eq!(human_text(&ready), "Brain ready: unknown");
+        assert_eq!(human_text(&ready), "Thinking ready: unknown");
 
         assert_eq!(
             human_text(&test_owner_view(
@@ -1036,11 +1048,11 @@ mod tests {
                 Some("provider_response_invalid"),
                 Some("generate"),
             )),
-            "Brain unhealthy: provider response invalid (generate)"
+            "Thinking unhealthy: the answer couldn't be read (generate)"
         );
         assert_eq!(
             human_text(&test_owner_view("unknown", None, None)),
-            "Brain unknown: ok"
+            "Thinking unknown: ok"
         );
         assert_eq!(
             human_text(&test_owner_view(
@@ -1048,14 +1060,14 @@ mod tests {
                 Some("brain_check_in_progress"),
                 None
             )),
-            "Brain checking: brain check in progress"
+            "Thinking checking: checking now"
         );
         assert_eq!(
             human_text(&transient_view(
                 "busy",
                 &test_owner_view("checking", None, None)
             )),
-            "Brain busy: check already running"
+            "Thinking busy: a check is already running"
         );
     }
 
@@ -1084,6 +1096,15 @@ mod tests {
         assert_eq!(
             map_provider_reason("generate", Some("not-in-contract")),
             "probe_internal_error"
+        );
+        // The local endpoint wire's own names reach the contract's codes.
+        assert_eq!(
+            map_provider_reason("generate", Some("local_endpoint_unreachable")),
+            "endpoint_unreachable"
+        );
+        assert_eq!(
+            map_provider_reason("generate", Some("local_endpoint_contract_failed")),
+            "endpoint_contract_failed"
         );
     }
 

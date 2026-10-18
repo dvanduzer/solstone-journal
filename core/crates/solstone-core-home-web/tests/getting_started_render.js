@@ -361,7 +361,6 @@ source = source.replace(
     renderNeedsYou,
     renderNarrative,
     readFirstMinutes,
-    readSetup,
     readAgents,
     handleSpeechRetry,
     updateGettingStartedSurface,
@@ -474,7 +473,6 @@ const {
   renderNeedsYou,
   renderNarrative,
   readFirstMinutes,
-  readSetup,
   readAgents,
   handleSpeechRetry,
   updateGettingStartedSurface,
@@ -991,6 +989,7 @@ async function runTests() {
       downloads: {
         speech: { state: 'error' },
       },
+      actions: true,
     },
     agentsPayload: { connections: [] },
     agentsSettled: true,
@@ -1046,6 +1045,89 @@ async function runTests() {
   assert.strictEqual(surface.querySelector('[data-download="speech"]').querySelectorAll('p').length, 1,
     'a missing speech package shows only the guidance, no download line');
 
+  // A linked device reads the same progress but can't take setup actions:
+  // the speech line shows without its retry, and the bars still render.
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      checks: { phone: false, thinking: true },
+    },
+    setupPayload: {
+      downloads: {
+        speech: { state: 'error', error: { code: 'install_failed', detail: '' } },
+        thinking: { state: 'downloading', bytes_done: 1, bytes_total: 4 },
+      },
+      actions: false,
+    },
+    agentsPayload: { connections: [] },
+    agentsSettled: true,
+    speechRetryInFlight: false,
+  });
+  renderPulse(welcomePulse);
+  assert(surface.querySelector('[data-download="speech"][data-download-state="error"]'),
+    'linked device: speech error line shown');
+  assert(!surface.querySelector('[data-speech-retry]'), 'linked device: no speech retry');
+  assert(surface.querySelector('[data-download-bar="thinking"]'), 'linked device: thinking bar rendered');
+
+  // Progress, capability and the saved choice arrive with first minutes, for
+  // a Localhost home and a linked-device home alike; nothing reads
+  // /init/api/state.
+  for (const actions of [true, false]) {
+    apiRequests.length = 0;
+    setState({ firstMinutesClosed: false, firstMinutesPayload: null, setupPayload: null, downloadTimer: null });
+    apiResolver = (url) => {
+      if (url === '/app/home/api/first-minutes') {
+        return Promise.resolve({
+          window_open: true,
+          devices_known: true,
+          devices: [],
+          thinking: { step: 'choose' },
+          checks: { phone: true, thinking: false },
+          setup: {
+            downloads: {
+              speech: { state: 'downloading', bytes_done: 2, bytes_total: 8 },
+              thinking: { state: 'idle', bytes_done: 0, bytes_total: 9 },
+            },
+            thinking: { capability: 'ok', choice: 'byo' },
+            actions,
+          },
+        });
+      }
+      return Promise.resolve({});
+    };
+    await readFirstMinutes();
+    assert(surface.querySelector('[data-download-bar="speech"]'), `speech bar from first minutes (actions ${actions})`);
+    const continued = surface.querySelector('[data-thinking-step="byo"]');
+    assert(continued, `saved choice from first minutes continues own model (actions ${actions})`);
+    assert(continued.querySelector('a[href="/app/thinking/#byo-setup"]'), 'own-model continuation links to its setup');
+    assert(getState().downloadTimer !== null, 'a download from first minutes arms the refresh timer');
+    assert(apiRequests.every(r => r.url !== '/init/api/state'), 'no /init/api/state read');
+  }
+
+  // Capability from first minutes: an unchosen lane on a computer that can't
+  // run local thinking says so.
+  setState({ firstMinutesClosed: false, firstMinutesPayload: null, setupPayload: null, downloadTimer: null });
+  apiResolver = (url) => {
+    if (url === '/app/home/api/first-minutes') {
+      return Promise.resolve({
+        window_open: true,
+        devices_known: true,
+        devices: [],
+        thinking: { step: 'choose' },
+        checks: { phone: true, thinking: false },
+        setup: { downloads: null, thinking: { capability: 'blocked', choice: null }, actions: false },
+      });
+    }
+    return Promise.resolve({});
+  };
+  await readFirstMinutes();
+  assert(surface.querySelector('[data-thinking-step="cant_run"]'), 'capability from first minutes renders cant_run');
+  assert(!surface.querySelector('[data-download]'), 'unknown progress renders no download line');
+  activeTimers.clear();
+  setState({ downloadTimer: null });
+
   // 7. DOWNLOAD TIMER (15000 ms):
   timerLog.length = 0;
   activeTimers.clear();
@@ -1064,29 +1146,40 @@ async function runTests() {
     downloadTimer: null,
   });
 
-  // Re-read setup should schedule a 15000ms timer
+  // Re-read first minutes should schedule a 15000ms timer
   apiResolver = (url) => {
-    if (url === '/init/api/state') {
+    if (url === '/app/home/api/first-minutes') {
       return Promise.resolve({
-        downloads: { thinking: { state: 'downloading', bytes_done: 2, bytes_total: 10 } },
+        window_open: true,
+        setup: { downloads: { thinking: { state: 'downloading', bytes_done: 2, bytes_total: 10 } } },
       });
     }
     return Promise.resolve({});
   };
-  await readSetup();
+  await readFirstMinutes();
   assert(timerLog.some(t => t.delay === 15000), '15000ms timer scheduled while downloading');
   assert(getState().downloadTimer !== null, 'downloadTimer is active');
 
-  // Later setup read with nothing downloading clears timer
+  // The timer refreshes first minutes alone
+  apiRequests.length = 0;
+  const armed = [...activeTimers.values()].find(t => t.delay === 15000);
+  setState({ downloadTimer: null });
+  armed.fn();
+  assert.deepStrictEqual(apiRequests.map(r => r.url), ['/app/home/api/first-minutes'],
+    'the download timer re-reads first minutes only');
+  await readFirstMinutes(); // joins the timer's in-flight read
+
+  // Later read with nothing downloading clears timer
   apiResolver = (url) => {
-    if (url === '/init/api/state') {
+    if (url === '/app/home/api/first-minutes') {
       return Promise.resolve({
-        downloads: { thinking: { state: 'complete' } },
+        window_open: true,
+        setup: { downloads: { thinking: { state: 'complete' } } },
       });
     }
     return Promise.resolve({});
   };
-  await readSetup();
+  await readFirstMinutes();
   assert(getState().downloadTimer === null, 'downloadTimer cleared when download finished');
 
   // 8. WINDOW CLOSED LATCHING:
@@ -1103,7 +1196,6 @@ async function runTests() {
   apiRequests.length = 0;
   // Further calls do not request first-minutes, setup, or agents
   await readFirstMinutes();
-  await readSetup();
   await readAgents();
   doc.dispatchEvent({ type: 'visibilitychange' });
   assert.strictEqual(apiRequests.length, 0, 'no requests made after window_open: false latched');
@@ -1416,15 +1508,15 @@ async function runTests() {
   activeTimers.clear();
   setState({ firstMinutesClosed: false, downloadTimer: null, firstMinutesPayload: null, setupPayload: null });
 
-  // 1. readSetup resolves first with no download and does not arm timer
+  // 1. a first-minutes read with no download and no pending proof does not arm timer
   apiResolver = (url) => {
-    if (url === '/init/api/state') {
-      return Promise.resolve({ downloads: { thinking: { state: 'idle' } } });
+    if (url === '/app/home/api/first-minutes') {
+      return Promise.resolve({ window_open: true, setup: { downloads: { thinking: { state: 'idle' } } } });
     }
     return Promise.resolve({});
   };
-  await readSetup();
-  assert.strictEqual(getState().downloadTimer, null, 'readSetup with no download does not arm timer');
+  await readFirstMinutes();
+  assert.strictEqual(getState().downloadTimer, null, 'no download and no pending proof does not arm timer');
 
   // 2. following readFirstMinutes with proof.state: "waiting" arms 15000ms timer
   timerLog.length = 0;
@@ -1442,15 +1534,19 @@ async function runTests() {
   const timerAfterWaiting = getState().downloadTimer;
   assert(timerAfterWaiting !== null, 'downloadTimer is active for waiting proof');
 
-  // 3. later readSetup with no download leaves timer armed
+  // 3. a later read still waiting, with no download, leaves the timer armed
   apiResolver = (url) => {
-    if (url === '/init/api/state') {
-      return Promise.resolve({ downloads: { thinking: { state: 'idle' } } });
+    if (url === '/app/home/api/first-minutes') {
+      return Promise.resolve({
+        window_open: true,
+        proof: { state: 'waiting' },
+        setup: { downloads: { thinking: { state: 'idle' } } },
+      });
     }
     return Promise.resolve({});
   };
-  await readSetup();
-  assert.strictEqual(getState().downloadTimer, timerAfterWaiting, 'later setup read leaves timer armed');
+  await readFirstMinutes();
+  assert.strictEqual(getState().downloadTimer, timerAfterWaiting, 'later read with no download leaves timer armed');
 
   // 4. transcribing arms timer
   timerLog.length = 0;
