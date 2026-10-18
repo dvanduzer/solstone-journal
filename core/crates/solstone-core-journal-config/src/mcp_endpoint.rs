@@ -3,6 +3,8 @@
 
 //! Journal-local MCP endpoint capability.
 
+use std::net::Ipv4Addr;
+
 use serde_json::Value;
 
 use crate::JournalConfigRead;
@@ -430,6 +432,82 @@ pub fn byo_hostname_config(read: &JournalConfigRead) -> ByoHostnameConfigStatus 
         return ByoHostnameConfigStatus::None;
     };
     byo_hostname_config_from_map(config)
+}
+
+/// Tri-state configuration status for BYO SSH relay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByoRelayConfig {
+    Absent,
+    Valid { address: Ipv4Addr, port: u16 },
+    Invalid,
+}
+
+/// Returns true if the IPv4 address is eligible as a public relay endpoint.
+///
+/// Refuses loopback, private, link-local, shared (CGNAT), multicast,
+/// unspecified, and broadcast ranges. Permits documentation
+/// and benchmarking ranges.
+pub fn is_public_relay_address(addr: Ipv4Addr) -> bool {
+    let octets = addr.octets();
+    let is_shared_cgnat = octets[0] == 100 && (64..=127).contains(&octets[1]);
+    !addr.is_loopback()
+        && !addr.is_private()
+        && !addr.is_link_local()
+        && !is_shared_cgnat
+        && !addr.is_multicast()
+        && !addr.is_unspecified()
+        && addr != Ipv4Addr::new(255, 255, 255, 255)
+}
+
+/// Read the BYO relay configuration status from a journal config map.
+pub fn byo_relay_config_from_map(config: &serde_json::Map<String, Value>) -> ByoRelayConfig {
+    let Some(endpoint) = config.get("mcp_endpoint") else {
+        return ByoRelayConfig::Absent;
+    };
+    let Some(endpoint) = endpoint.as_object() else {
+        return ByoRelayConfig::Absent;
+    };
+    let Some(relay) = endpoint.get("byo_relay") else {
+        return ByoRelayConfig::Absent;
+    };
+    if relay.is_null() {
+        return ByoRelayConfig::Absent;
+    }
+    let Some(relay_obj) = relay.as_object() else {
+        return ByoRelayConfig::Invalid;
+    };
+    let Some(addr_val) = relay_obj.get("address") else {
+        return ByoRelayConfig::Invalid;
+    };
+    let Some(addr_str) = addr_val.as_str() else {
+        return ByoRelayConfig::Invalid;
+    };
+    let Ok(addr) = addr_str.parse::<Ipv4Addr>() else {
+        return ByoRelayConfig::Invalid;
+    };
+    if !is_public_relay_address(addr) {
+        return ByoRelayConfig::Invalid;
+    }
+    let port = match relay_obj.get("port") {
+        None | Some(Value::Null) => 22,
+        Some(Value::Number(n)) => match n.as_u64() {
+            Some(p) if (1..=65535).contains(&p) => p as u16,
+            _ => return ByoRelayConfig::Invalid,
+        },
+        _ => return ByoRelayConfig::Invalid,
+    };
+    ByoRelayConfig::Valid {
+        address: addr,
+        port,
+    }
+}
+
+/// Read the BYO relay configuration status from journal config.
+pub fn byo_relay_config(read: &JournalConfigRead) -> ByoRelayConfig {
+    let Some(config) = read.config.as_ref() else {
+        return ByoRelayConfig::Absent;
+    };
+    byo_relay_config_from_map(config)
 }
 
 /// Transition function for mutating BYO hostname configuration.
@@ -1110,5 +1188,151 @@ mod tests {
                 generation: 4,
             }
         );
+    }
+
+    #[test]
+    fn test_byo_relay_config_absent() {
+        assert_eq!(byo_relay_config(&read(None)), ByoRelayConfig::Absent);
+
+        let empty = Map::new();
+        assert_eq!(byo_relay_config_from_map(&empty), ByoRelayConfig::Absent);
+
+        let no_relay = config_with_endpoint(json!({}));
+        assert_eq!(byo_relay_config_from_map(&no_relay), ByoRelayConfig::Absent);
+
+        let null_relay = config_with_endpoint(json!({ "byo_relay": null }));
+        assert_eq!(
+            byo_relay_config_from_map(&null_relay),
+            ByoRelayConfig::Absent
+        );
+    }
+
+    #[test]
+    fn test_byo_relay_config_valid() {
+        let explicit = config_with_endpoint(json!({
+            "byo_relay": {
+                "address": "198.51.100.1",
+                "port": 2222
+            }
+        }));
+        assert_eq!(
+            byo_relay_config_from_map(&explicit),
+            ByoRelayConfig::Valid {
+                address: "198.51.100.1".parse().unwrap(),
+                port: 2222,
+            }
+        );
+
+        let default_port = config_with_endpoint(json!({
+            "byo_relay": {
+                "address": "198.51.100.1"
+            }
+        }));
+        assert_eq!(
+            byo_relay_config_from_map(&default_port),
+            ByoRelayConfig::Valid {
+                address: "198.51.100.1".parse().unwrap(),
+                port: 22,
+            }
+        );
+
+        let null_port = config_with_endpoint(json!({
+            "byo_relay": {
+                "address": "198.51.100.1",
+                "port": null
+            }
+        }));
+        assert_eq!(
+            byo_relay_config_from_map(&null_port),
+            ByoRelayConfig::Valid {
+                address: "198.51.100.1".parse().unwrap(),
+                port: 22,
+            }
+        );
+
+        for doc_ip in ["192.0.2.1", "198.51.100.254", "203.0.113.42", "198.18.0.1"] {
+            let doc_cfg = config_with_endpoint(json!({
+                "byo_relay": { "address": doc_ip }
+            }));
+            assert_eq!(
+                byo_relay_config_from_map(&doc_cfg),
+                ByoRelayConfig::Valid {
+                    address: doc_ip.parse().unwrap(),
+                    port: 22,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn test_byo_relay_config_invalid_addresses() {
+        let rejected = [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.1.1",
+            "100.64.0.1",
+            "224.0.0.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "not-an-ip",
+            "",
+        ];
+        for ip in rejected {
+            let cfg = config_with_endpoint(json!({
+                "byo_relay": { "address": ip, "port": 22 }
+            }));
+            assert_eq!(
+                byo_relay_config_from_map(&cfg),
+                ByoRelayConfig::Invalid,
+                "expected rejection for {}",
+                ip
+            );
+        }
+
+        let non_string = config_with_endpoint(json!({
+            "byo_relay": { "address": 12345 }
+        }));
+        assert_eq!(
+            byo_relay_config_from_map(&non_string),
+            ByoRelayConfig::Invalid
+        );
+
+        let missing_addr = config_with_endpoint(json!({
+            "byo_relay": { "port": 22 }
+        }));
+        assert_eq!(
+            byo_relay_config_from_map(&missing_addr),
+            ByoRelayConfig::Invalid
+        );
+    }
+
+    #[test]
+    fn test_byo_relay_config_invalid_ports() {
+        for bad_port in [json!(0), json!(65536), json!(-1), json!("22"), json!(22.5)] {
+            let cfg = config_with_endpoint(json!({
+                "byo_relay": { "address": "198.51.100.1", "port": bad_port }
+            }));
+            assert_eq!(
+                byo_relay_config_from_map(&cfg),
+                ByoRelayConfig::Invalid,
+                "expected rejection for bad port {}",
+                bad_port
+            );
+        }
+    }
+
+    #[test]
+    fn test_byo_relay_config_wrong_types() {
+        for wrong in [json!("string"), json!(123), json!(true), json!([])] {
+            let cfg = config_with_endpoint(json!({ "byo_relay": wrong }));
+            assert_eq!(
+                byo_relay_config_from_map(&cfg),
+                ByoRelayConfig::Invalid,
+                "expected rejection for wrong type {}",
+                wrong
+            );
+        }
     }
 }

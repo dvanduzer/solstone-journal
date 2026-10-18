@@ -42,6 +42,7 @@ solstone-core-callosum.workspace = true
 solstone-core-convey-http.workspace = true
 solstone-core-indexer-query.workspace = true
 rusqlite.workspace = true
+russh.workspace = true
 solstone-core-indexer-store.workspace = true
 solstone-core-journal-io.workspace = true
 solstone-core-format.workspace = true

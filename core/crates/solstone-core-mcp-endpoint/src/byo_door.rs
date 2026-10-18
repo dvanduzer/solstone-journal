@@ -24,7 +24,8 @@ use crate::unix;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use solstone_core_journal_config::{
-    ByoHostnameConfigStatus, byo_hostname_config, read_journal_config,
+    ByoHostnameConfigStatus, ByoRelayConfig, byo_hostname_config, byo_relay_config,
+    read_journal_config,
 };
 use solstone_core_journal_io::journal_root::JournalRoot;
 use solstone_core_journal_io::{JsonWriteOptions, write_json};
@@ -62,6 +63,10 @@ pub struct ByoDoorState {
     pub socket_path: Option<String>,
     pub socket_blocker: Option<ByoSocketBlocker>,
     pub next_action: Option<String>,
+    pub relay_state: String,
+    pub relay_detail: Option<String>,
+    pub relay_observed_at: Option<DateTime<Utc>>,
+    pub dns_addresses: Vec<String>,
     pub observed_at: DateTime<Utc>,
 }
 
@@ -174,6 +179,37 @@ struct ByoBoundResources {
     ingress_task: tokio::task::JoinHandle<()>,
     acme_task: Option<tokio::task::JoinHandle<()>>,
     ingress_bound: ingress::Bound,
+    tunnel_task: Option<tokio::task::JoinHandle<()>>,
+    tunnel_shutdown_tx: Option<watch::Sender<bool>>,
+    tunnel_status_rx: Option<watch::Receiver<crate::byo_relay::RelayStatus>>,
+    tunnel_channel_abort_handles: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
+    active_relay: Option<(std::net::Ipv4Addr, u16)>,
+}
+
+fn spawn_acme_task(
+    tls_service: Arc<McpEndpointTlsService>,
+    account_dir: unix::TlsStateDirectory,
+    mut shutdown: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    #[cfg(all(test, feature = "test-hooks"))]
+    {
+        let observer = crate::byo_dns::BYO_TEST_SEAM
+            .acme_spawn_observer
+            .read()
+            .unwrap()
+            .clone();
+        if let Some(tx) = observer {
+            let _ = tx.send(());
+            return tokio::spawn(async move {
+                let _ = shutdown.changed().await;
+            });
+        }
+    }
+    tokio::spawn(async move {
+        let _ = tls_service
+            .run_byo_acme_renewal(account_dir, &mut shutdown)
+            .await;
+    })
 }
 
 struct ByoServiceRuntime {
@@ -189,6 +225,7 @@ struct ByoServiceRuntime {
     service_shutdown_rx: watch::Receiver<bool>,
     bound_resources: Option<ByoBoundResources>,
     last_dns_verdict: Option<crate::byo_dns::DnsVerdict>,
+    last_dns_addresses: Vec<String>,
     last_dns_account_uri: Option<String>,
     last_dns_check: tokio::time::Instant,
 }
@@ -224,6 +261,7 @@ impl ByoServiceRuntime {
             service_shutdown_rx,
             bound_resources: None,
             last_dns_verdict: None,
+            last_dns_addresses: Vec::new(),
             last_dns_account_uri: None,
             last_dns_check: tokio::time::Instant::now() - Duration::from_secs(120),
         })
@@ -232,7 +270,15 @@ impl ByoServiceRuntime {
     /// Withdraw the ingress. It returns once the accept task has ended, so the
     /// listener is closed before any state written after it says so.
     async fn unbind_ingress(&mut self, byo_dir: &unix::ByoDirectory) {
-        if let Some(res) = self.bound_resources.take() {
+        if let Some(mut res) = self.bound_resources.take() {
+            if let Some(ref tx) = res.tunnel_shutdown_tx {
+                let _ = tx.send(true);
+            }
+            if let Some(h) = res.tunnel_task.take() {
+                let _ = h.await;
+            }
+            drop(res.tunnel_status_rx.take());
+
             // Close accepted keep-alive streams too. Otherwise a client could
             // start another MCP request after CAA drift withdrew the ingress.
             let _ = self.service_shutdown_tx.send(true);
@@ -290,6 +336,10 @@ impl ByoServiceRuntime {
                     socket_path: None,
                     socket_blocker: None,
                     next_action: next_action_account,
+                    relay_state: "none".to_string(),
+                    relay_detail: None,
+                    relay_observed_at: None,
+                    dns_addresses: Vec::new(),
                     observed_at: Utc::now(),
                 },
             );
@@ -303,6 +353,7 @@ impl ByoServiceRuntime {
             // A replacement ACME account has no inherited CAA verdict.
             self.unbind_ingress(byo_dir).await;
             self.last_dns_verdict = None;
+            self.last_dns_addresses.clear();
             self.last_dns_account_uri = Some(uri_str.clone());
             write_byo_door_state(
                 journal_root,
@@ -319,15 +370,89 @@ impl ByoServiceRuntime {
                     socket_path: None,
                     socket_blocker: None,
                     next_action: Some("publish_caa".to_string()),
+                    relay_state: "none".to_string(),
+                    relay_detail: None,
+                    relay_observed_at: None,
+                    dns_addresses: Vec::new(),
                     observed_at: Utc::now(),
                 },
             );
         }
-        if self.last_dns_check.elapsed() >= Duration::from_secs(60)
+
+        let target_relay = match read_journal_config(journal_root) {
+            Ok(cfg) => match byo_relay_config(&cfg) {
+                ByoRelayConfig::Valid { address, port } => Some((address, port)),
+                _ => None,
+            },
+            Err(_) => None,
+        };
+
+        #[cfg(all(test, feature = "test-hooks"))]
+        let dns_due = self.last_dns_check.elapsed() >= Duration::from_secs(60)
             || self.last_dns_verdict.is_none()
-        {
-            let verdict = resolve_byo_dns(&self.hostname, &uri_str, Utc::now()).await;
+            || crate::byo_dns::TEST_VERDICT_OVERRIDE
+                .read()
+                .unwrap()
+                .is_some();
+        #[cfg(not(all(test, feature = "test-hooks")))]
+        let dns_due = self.last_dns_check.elapsed() >= Duration::from_secs(60)
+            || self.last_dns_verdict.is_none();
+        if dns_due {
+            if self
+                .bound_resources
+                .as_ref()
+                .is_some_and(|r| r.tunnel_task.is_some())
+            {
+                let (relay_state, relay_detail, relay_observed_at) = self
+                    .bound_resources
+                    .as_ref()
+                    .and_then(|r| r.tunnel_status_rx.as_ref())
+                    .map(|rx| {
+                        let s = rx.borrow().clone();
+                        (s.state.to_string(), s.detail, s.observed_at)
+                    })
+                    .unwrap_or_else(|| ("none".to_string(), None, None));
+
+                let cert_active = self.tls_service.ordinary_certificate_is_active();
+                let next_action = if cert_active {
+                    Some("none".to_string())
+                } else {
+                    Some("issue_certificate".to_string())
+                };
+
+                write_byo_door_state(
+                    journal_root,
+                    &ByoDoorState {
+                        hostname: Some(self.hostname.clone()),
+                        enabled: true,
+                        generation: self.generation,
+                        account_uri: Some(uri_str.clone()),
+                        caa: self
+                            .last_dns_verdict
+                            .as_ref()
+                            .map(|v| v.code.as_str().to_string()),
+                        dns_verdict: self
+                            .last_dns_verdict
+                            .as_ref()
+                            .map(|v| v.code.as_str().to_string()),
+                        dns_observed_at: self.last_dns_verdict.as_ref().map(|v| v.observed_at),
+                        socket_listening: true,
+                        certificate_active: cert_active,
+                        socket_path: Some(ingress_address.to_string()),
+                        socket_blocker: None,
+                        next_action,
+                        relay_state,
+                        relay_detail,
+                        relay_observed_at,
+                        dns_addresses: self.last_dns_addresses.clone(),
+                        observed_at: Utc::now(),
+                    },
+                );
+            }
+
+            let (verdict, addresses) = resolve_byo_dns(&self.hostname, &uri_str, Utc::now()).await;
             self.last_dns_verdict = Some(verdict);
+            self.last_dns_addresses = addresses;
             self.last_dns_account_uri = Some(uri_str.clone());
             self.last_dns_check = tokio::time::Instant::now();
         }
@@ -353,6 +478,10 @@ impl ByoServiceRuntime {
                     socket_path: None,
                     socket_blocker: None,
                     next_action: Some("publish_caa".to_string()),
+                    relay_state: "none".to_string(),
+                    relay_detail: None,
+                    relay_observed_at: None,
+                    dns_addresses: self.last_dns_addresses.clone(),
                     observed_at: Utc::now(),
                 },
             );
@@ -386,21 +515,16 @@ impl ByoServiceRuntime {
                             socket_path: None,
                             socket_blocker: blocker,
                             next_action: Some("socket_blocked".to_string()),
+                            relay_state: "none".to_string(),
+                            relay_detail: None,
+                            relay_observed_at: None,
+                            dns_addresses: self.last_dns_addresses.clone(),
                             observed_at: Utc::now(),
                         },
                     );
                     return;
                 }
             };
-
-            // ACME renewal task
-            let tls_clone = Arc::clone(&self.tls_service);
-            let mut acme_shutdown = self.service_shutdown_rx.clone();
-            let acme_task = tokio::spawn(async move {
-                let _ = tls_clone
-                    .run_byo_acme_renewal(acc_dir_clone, &mut acme_shutdown)
-                    .await;
-            });
 
             // Ingress accept task
             let ingress_root = Arc::new(journal_root.to_path_buf());
@@ -457,12 +581,107 @@ impl ByoServiceRuntime {
                 }
             });
 
+            let acme_task = if target_relay.is_none() {
+                Some(spawn_acme_task(
+                    Arc::clone(&self.tls_service),
+                    acc_dir_clone,
+                    self.service_shutdown_rx.clone(),
+                ))
+            } else {
+                None
+            };
+
             self.bound_resources = Some(ByoBoundResources {
                 ingress_task,
-                acme_task: Some(acme_task),
+                acme_task,
                 ingress_bound,
+                tunnel_task: None,
+                tunnel_shutdown_tx: None,
+                tunnel_status_rx: None,
+                tunnel_channel_abort_handles: Arc::new(std::sync::Mutex::new(Vec::new())),
+                active_relay: None,
             });
         }
+
+        if let Some(ref mut res) = self.bound_resources {
+            let tunnel_needs_restart = if res.active_relay != target_relay {
+                true
+            } else if let (Some((_addr, _port)), Some(rx)) =
+                (res.active_relay, res.tunnel_status_rx.as_ref())
+            {
+                if rx.borrow().state == "host_key_changed" {
+                    crate::byo_relay::known_host_file_is_absent(journal_root)
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if tunnel_needs_restart {
+                if let Some(ref tx) = res.tunnel_shutdown_tx.take() {
+                    let _ = tx.send(true);
+                }
+                if let Some(h) = res.tunnel_task.take() {
+                    let _ = h.await;
+                }
+                res.tunnel_status_rx = None;
+                res.active_relay = None;
+
+                if let Some((addr, port)) = target_relay {
+                    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                    let (status_tx, status_rx) = watch::channel(crate::byo_relay::RelayStatus {
+                        state: "connecting",
+                        detail: None,
+                        observed_at: Some(Utc::now()),
+                    });
+                    let abort_handles = Arc::new(std::sync::Mutex::new(Vec::new()));
+                    let task = tokio::spawn(crate::byo_relay::run_byo_relay_tunnel(
+                        journal_root.to_path_buf(),
+                        addr,
+                        port,
+                        shutdown_rx,
+                        status_tx,
+                        Arc::clone(&abort_handles),
+                    ));
+                    res.tunnel_task = Some(task);
+                    res.tunnel_shutdown_tx = Some(shutdown_tx);
+                    res.tunnel_status_rx = Some(status_rx);
+                    res.tunnel_channel_abort_handles = abort_handles;
+                    res.active_relay = Some((addr, port));
+                }
+            }
+
+            if res.acme_task.is_none() {
+                let should_spawn = if target_relay.is_none() {
+                    true
+                } else if let Some(ref rx) = res.tunnel_status_rx {
+                    rx.borrow().state == "connected"
+                } else {
+                    false
+                };
+
+                if should_spawn
+                    && let Ok(acc_dir) = unix::open_byo_account_directory(byo_dir, &self.hostname)
+                {
+                    res.acme_task = Some(spawn_acme_task(
+                        Arc::clone(&self.tls_service),
+                        acc_dir,
+                        self.service_shutdown_rx.clone(),
+                    ));
+                }
+            }
+        }
+
+        let (relay_state, relay_detail, relay_observed_at) = self
+            .bound_resources
+            .as_ref()
+            .and_then(|r| r.tunnel_status_rx.as_ref())
+            .map(|rx| {
+                let s = rx.borrow().clone();
+                (s.state.to_string(), s.detail, s.observed_at)
+            })
+            .unwrap_or_else(|| ("none".to_string(), None, None));
 
         let cert_active = self.tls_service.ordinary_certificate_is_active();
         let next_action = if cert_active {
@@ -486,6 +705,10 @@ impl ByoServiceRuntime {
                 socket_path: Some(ingress_address.to_string()),
                 socket_blocker: None,
                 next_action,
+                relay_state,
+                relay_detail,
+                relay_observed_at,
+                dns_addresses: self.last_dns_addresses.clone(),
                 observed_at: Utc::now(),
             },
         );
@@ -506,6 +729,10 @@ fn disabled_state(hostname: Option<String>, enabled: bool, generation: u64) -> B
         socket_path: None,
         socket_blocker: None,
         next_action: None,
+        relay_state: "none".to_string(),
+        relay_detail: None,
+        relay_observed_at: None,
+        dns_addresses: Vec::new(),
         observed_at: Utc::now(),
     }
 }
@@ -665,13 +892,28 @@ pub async fn run_byo_door_async(
         let cutover = cutover_listener.accept();
         #[cfg(windows)]
         let cutover = std::future::pending::<CutoverAccept>();
+
+        #[cfg(all(test, feature = "test-hooks"))]
+        let tick_held = crate::byo_dns::BYO_TEST_SEAM
+            .tick_hold
+            .load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(all(test, feature = "test-hooks")))]
+        let _tick_held = false;
+
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     break;
                 }
             }
-            _ = poll_interval.tick() => {
+            _ = async {
+                #[cfg(all(test, feature = "test-hooks"))]
+                if tick_held {
+                    crate::byo_dns::BYO_TEST_SEAM.tick_notify.notified().await;
+                    return;
+                }
+                poll_interval.tick().await;
+            } => {
                 if *shutdown.borrow() {
                     break;
                 }
@@ -717,13 +959,27 @@ pub async fn run_single_byo_service(
 
     let mut poll_interval = tokio::time::interval(Duration::from_millis(500));
     loop {
+        #[cfg(all(test, feature = "test-hooks"))]
+        let tick_held = crate::byo_dns::BYO_TEST_SEAM
+            .tick_hold
+            .load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(all(test, feature = "test-hooks")))]
+        let _tick_held = false;
+
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     break;
                 }
             }
-            _ = poll_interval.tick() => {
+            _ = async {
+                #[cfg(all(test, feature = "test-hooks"))]
+                if tick_held {
+                    crate::byo_dns::BYO_TEST_SEAM.tick_notify.notified().await;
+                    return;
+                }
+                poll_interval.tick().await;
+            } => {
                 if *shutdown.borrow() {
                     break;
                 }
@@ -777,6 +1033,10 @@ mod tests {
                 socket_path: Some("/var/tmp/ingress.sock".to_string()),
                 socket_blocker: None,
                 next_action: None,
+                relay_state: "none".to_string(),
+                relay_detail: None,
+                relay_observed_at: None,
+                dns_addresses: Vec::new(),
                 observed_at: Utc::now(),
             },
         );
@@ -808,6 +1068,10 @@ mod tests {
                 socket_path: None,
                 socket_blocker: Some(ByoSocketBlocker::Symlink),
                 next_action: Some("fix_dns".to_string()),
+                relay_state: "none".to_string(),
+                relay_detail: None,
+                relay_observed_at: None,
+                dns_addresses: Vec::new(),
                 observed_at: Utc::now(),
             },
         );
@@ -1005,10 +1269,13 @@ mod full_tests {
         // 3. DNS fixture unset or not admitted -> run_single_byo_service does not create ingress.sock
         {
             if let Ok(mut g) = crate::byo_dns::TEST_VERDICT_OVERRIDE.write() {
-                *g = Some(DnsVerdict {
-                    code: DnsVerdictCode::CaaMissing,
-                    observed_at: Utc::now(),
-                });
+                *g = Some((
+                    DnsVerdict {
+                        code: DnsVerdictCode::CaaMissing,
+                        observed_at: Utc::now(),
+                    },
+                    Vec::new(),
+                ));
             }
             let (shutdown_send, shutdown_recv) = watch::channel(false);
             let root_clone = journal_path.clone();
@@ -1039,10 +1306,13 @@ mod full_tests {
         // 4. Fresh admitted DNS fixture -> run_single_byo_service binds mode 0o600 under 0o700 directory
         {
             if let Ok(mut g) = crate::byo_dns::TEST_VERDICT_OVERRIDE.write() {
-                *g = Some(DnsVerdict {
-                    code: DnsVerdictCode::Admitted,
-                    observed_at: Utc::now(),
-                });
+                *g = Some((
+                    DnsVerdict {
+                        code: DnsVerdictCode::Admitted,
+                        observed_at: Utc::now(),
+                    },
+                    vec!["198.51.100.1".to_string()],
+                ));
             }
             let (shutdown_send, shutdown_recv) = watch::channel(false);
             let root_clone = journal_path.clone();
@@ -1120,10 +1390,13 @@ mod full_tests {
             .unwrap();
 
         if let Ok(mut g) = crate::byo_dns::TEST_VERDICT_OVERRIDE.write() {
-            *g = Some(DnsVerdict {
-                code: DnsVerdictCode::Admitted,
-                observed_at: Utc::now(),
-            });
+            *g = Some((
+                DnsVerdict {
+                    code: DnsVerdictCode::Admitted,
+                    observed_at: Utc::now(),
+                },
+                vec!["198.51.100.1".to_string()],
+            ));
         }
 
         let (shutdown_send, shutdown_recv) = watch::channel(false);
@@ -1255,10 +1528,13 @@ mod full_tests {
 
         // Admitted DNS
         if let Ok(mut g) = crate::byo_dns::TEST_VERDICT_OVERRIDE.write() {
-            *g = Some(DnsVerdict {
-                code: DnsVerdictCode::Admitted,
-                observed_at: Utc::now(),
-            });
+            *g = Some((
+                DnsVerdict {
+                    code: DnsVerdictCode::Admitted,
+                    observed_at: Utc::now(),
+                },
+                vec!["198.51.100.1".to_string()],
+            ));
         }
 
         let (shutdown_send, shutdown_recv) = watch::channel(false);
@@ -1358,10 +1634,13 @@ mod windows_full_tests {
     }
 
     fn set_dns(code: DnsVerdictCode) {
-        *crate::byo_dns::TEST_VERDICT_OVERRIDE.write().unwrap() = Some(DnsVerdict {
-            code,
-            observed_at: Utc::now(),
-        });
+        *crate::byo_dns::TEST_VERDICT_OVERRIDE.write().unwrap() = Some((
+            DnsVerdict {
+                code,
+                observed_at: Utc::now(),
+            },
+            vec!["198.51.100.1".to_string()],
+        ));
     }
 
     fn register_account(byo_dir: &unix::ByoDirectory) {

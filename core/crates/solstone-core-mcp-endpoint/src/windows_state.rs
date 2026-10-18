@@ -295,6 +295,70 @@ pub(crate) fn delete_byo_account_pair(dir: &TlsStateDirectory) -> io::Result<()>
     Ok(())
 }
 
+pub(crate) const BYO_RELAY_DIR: &str = "relay";
+pub(crate) const BYO_RELAY_CLIENT_KEY_FILE: &str = "client-key";
+pub(crate) const BYO_RELAY_KNOWN_HOST_FILE: &str = "known-host";
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ExclusiveCreate {
+    Created,
+    Present(Vec<u8>),
+}
+
+pub(crate) fn create_exclusive_or_read(
+    dir: &TlsStateDirectory,
+    name: &str,
+    bytes: &[u8],
+) -> io::Result<ExclusiveCreate> {
+    require_real_directory(&dir.path)?;
+    let path = dir.path.join(name);
+    match write_bytes_exclusive(
+        &path,
+        bytes,
+        AtomicWriteOptions {
+            mode: Some(FILE_MODE),
+        },
+    ) {
+        Ok(()) => Ok(ExclusiveCreate::Created),
+        Err(AtomicWriteError::Io { source, .. })
+            if source.kind() == io::ErrorKind::AlreadyExists =>
+        {
+            let existing = read_bounded(&path, 64 * 1024)?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "file missing on re-read")
+            })?;
+            Ok(ExclusiveCreate::Present(existing))
+        }
+        Err(e) => Err(io::Error::other(e)),
+    }
+}
+
+pub(crate) fn open_byo_relay_directory(byo_dir: &ByoDirectory) -> io::Result<TlsStateDirectory> {
+    require_real_directory(&byo_dir.path)?;
+    let path = open_real_directory(&byo_dir.path.join(BYO_RELAY_DIR))?;
+    Ok(TlsStateDirectory { path })
+}
+
+pub(crate) fn read_byo_relay_client_key(dir: &TlsStateDirectory) -> io::Result<Option<Vec<u8>>> {
+    read_bounded(&dir.path.join(BYO_RELAY_CLIENT_KEY_FILE), 64 * 1024)
+}
+
+pub(crate) fn read_byo_relay_known_host(dir: &TlsStateDirectory) -> io::Result<Option<Vec<u8>>> {
+    read_bounded(&dir.path.join(BYO_RELAY_KNOWN_HOST_FILE), 64 * 1024)
+}
+
+pub(crate) fn persist_byo_relay_known_host(
+    dir: &TlsStateDirectory,
+    bytes: &[u8],
+) -> io::Result<()> {
+    persist_bounded(dir, BYO_RELAY_KNOWN_HOST_FILE, bytes, 64 * 1024)
+}
+
+pub(crate) fn delete_byo_relay_known_host(dir: &TlsStateDirectory) -> io::Result<()> {
+    require_real_directory(&dir.path)?;
+    let _ = fs::remove_file(dir.path.join(BYO_RELAY_KNOWN_HOST_FILE));
+    Ok(())
+}
+
 /// A canonical hostname as one directory name. Hostnames reach here already
 /// canonicalized; this refuses anything Windows would not keep as an ordinary
 /// name in that directory: a character outside letters, digits, `-` and `.`,

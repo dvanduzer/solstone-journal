@@ -29,6 +29,10 @@ mod bridge_pop;
 mod bridge_session;
 pub mod byo_dns;
 pub mod byo_door;
+mod byo_relay;
+#[cfg(unix)]
+#[cfg(all(test, feature = "full-tests"))]
+mod byo_relay_tests;
 mod dispatch;
 mod http1;
 mod jsonrpc;

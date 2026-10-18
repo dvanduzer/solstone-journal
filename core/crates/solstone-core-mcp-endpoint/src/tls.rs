@@ -168,6 +168,17 @@ impl McpEndpointTlsService {
                 now_ts < ordinary.not_after && Instant::now() < ordinary.expires_at
             })
     }
+
+    pub(crate) fn active_ordinary_leaf_der(&self) -> Option<Vec<u8>> {
+        let now_ts = current_epoch_seconds();
+        let ordinary = self.resolver.ordinary.load_full()?;
+        if now_ts < ordinary.not_after && Instant::now() < ordinary.expires_at {
+            ordinary.key.cert.first().map(|c| c.as_ref().to_vec())
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn authorized_hostname(&self) -> &str {
         &self.resolver.hostname
     }
