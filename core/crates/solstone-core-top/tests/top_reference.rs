@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use solstone_core_top::TopState;
 
 const FIXTURE: &str = include_str!("../../../fixtures/top_reference.json");
-const EXPECTED_SHA256: &str = "10a424f5de70b4a009f0b13f07d0e4e8c093b92471453d594d9efdaab69ac9b9";
+const EXPECTED_SHA256: &str = "6e8e624c890186dc27055d740fadcecdd73bc657cbc33206d24a0ff7d8ced13c";
 
 #[test]
 fn retained_top_reference_digest_schema_and_event_order_are_stable() {

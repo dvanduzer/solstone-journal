@@ -2490,8 +2490,8 @@
 
   function localUnreadyCopy() {
     if (localAwaitingConfirmation()) return "installed. waiting for processing to confirm it's ready.";
-    if (!state.localAvailability) return 'checking whether this computer can run a local model.';
-    return "couldn't tell whether this computer can run a local model.";
+    if (!state.localAvailability) return "checking whether your journal's computer can run a local model.";
+    return "couldn't tell whether your journal's computer can run a local model.";
   }
 
   // What the main view's local card says when local is blocked, by reason. The
@@ -2499,8 +2499,8 @@
   // installed") or, with local selected, a bare issue code. The card's link
   // leads to local setup, which says what to do next.
   const localLaneBlocked = {
-    setup: 'not set up on this computer yet.',
-    ineligible: "installed, but it won't start on this computer.",
+    setup: "not set up on your journal's computer yet.",
+    ineligible: "installed, but it won't start on your journal's computer.",
     check: "couldn't check local setup.",
     unhealthy: "local thinking isn't ready yet.",
     other: "couldn't get local thinking ready.",
@@ -2980,7 +2980,7 @@
       setPill('localLanePill', 'unavailable', 'bad');
       const desc = $('localLaneDescription');
       if (desc) {
-        desc.textContent = "this computer can't run a local model yet. it needs a supported GPU. ";
+        desc.textContent = "your journal's computer can't run a local model yet. it needs a supported GPU. ";
         const link = document.createElement('a');
         link.className = 'textlink';
         link.href = 'https://support.solstone.app/kb/solstone-memory-and-local-models';
@@ -3529,7 +3529,7 @@
       return {
         pill: 'off',
         title: 'local',
-        sub: 'this computer can run a local model',
+        sub: "your journal's computer can run a local model",
         message: '',
         notice: copy.glance?.local?.detail || '',
         activate: true,
@@ -3543,9 +3543,9 @@
       return {
         pill: 'unavailable',
         title: 'local',
-        sub: "this computer can't run one yet",
+        sub: "your journal's computer can't run one yet",
         message: '',
-        notice: `this computer doesn't have a supported GPU, so a local model would be too slow to use. you can still use ${activeLaneLabel('byo')}.`,
+        notice: `your journal's computer doesn't have a supported GPU, so a local model would be too slow to use. you can still use ${activeLaneLabel('byo')}.`,
         activate: false,
         bootstrap: false,
         tone: 'bad',
@@ -3647,7 +3647,7 @@
       return {
         pill: 'unavailable',
         title: 'local',
-        sub: 'this computer needs more memory for local thinking',
+        sub: "your journal's computer needs more memory for local thinking",
         message: '',
         notice: `you can still use ${activeLaneLabel('byo')}.`,
         activate: false,

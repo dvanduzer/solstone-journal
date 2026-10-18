@@ -18,6 +18,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - certificates for solstone.me and your own domain now follow the issuer's renewal schedule, including after a journal restart.
 - browser setup confirms the journal mark you see, then saves where thinking runs.
+- the reason under every thinking status now reads in plain words in the thinking app, health and `solstone journal top`, and `solstone journal top` and `solstone journal brain refresh` call it thinking, not brain. on a page opened from another device, the thinking app and health now say "your journal's computer", so it's clear which machine they mean.
 - setup commits the journal mark you see and saves your thinking choice. it opens home, with links to finish setting up your own model or confidential processing. finishing setup again keeps your completion time and settings.
 - while no device is paired, home keeps "set one up →" next to anything that needs your attention. before, it disappeared whenever anything else showed, which on a new journal was almost always.
 - not having chosen where the thinking happens yet no longer counts as something that needs your attention on home. a note says your journal starts catching up once you choose, and links to the thinking app.
@@ -41,6 +42,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - security fix: a symbolic link in a recording's metadata could make a transcript page read time-zone information from outside your journal. those links are now refused.
 - transcript reads by your agent now include the recording's reported time zone when its UTC offset differs from your journal's.
 - your agent can continue through facet and entity lists instead of stopping at the first page, and can tell when an entity description was shortened.
+- when thinking can't connect to its model, or the model answers in a way your journal can't use, the thinking app and health now say so. before, both showed "probe internal error".
 - on linux, the installer opens setup in your browser and shows where to add the solstone app. without a desktop, it prints the setup link and an SSH tunnel command for another computer.
 
 - agent reads leave out activities whose source has changed until your journal indexes them again. activity results also say whether they are hidden, even when a short preview does not.

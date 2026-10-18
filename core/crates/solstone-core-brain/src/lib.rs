@@ -29,8 +29,8 @@ pub use inspect::{
     load_existing_fingerprint_key, probe_file_lease_held, project_brain_state,
 };
 pub use presentation::{
-    BrainEvidencePresentation, BrainPresentation, brain_reason_text, present_brain_inspection,
-    processing_headline_for_reason,
+    BrainEvidencePresentation, BrainPresentation, brain_reason_text, lane_label,
+    present_brain_inspection, processing_headline_for_reason,
 };
 pub use record::{
     BrainStateRecord, ValidationError, evidence_component_for_reason, is_valid_evidence_reason,

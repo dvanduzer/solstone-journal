@@ -429,7 +429,7 @@
                 },
                 "progressing": false,
                 "reason_code": "brain_record_missing",
-                "reason_text": "brain record missing",
+                "reason_text": "not checked yet",
                 "state": "unknown"
               },
               "hostname": "corpus-host"
@@ -721,7 +721,7 @@
                 },
                 "progressing": false,
                 "reason_code": "brain_record_missing",
-                "reason_text": "brain record missing",
+                "reason_text": "not checked yet",
                 "state": "unknown"
               },
               "hostname": "corpus-host"
@@ -991,7 +991,7 @@
                 },
                 "progressing": false,
                 "reason_code": "brain_record_missing",
-                "reason_text": "brain record missing",
+                "reason_text": "not checked yet",
                 "state": "unknown"
               },
               "hostname": "corpus-host"
@@ -1248,7 +1248,7 @@
                 },
                 "progressing": false,
                 "reason_code": "brain_record_missing",
-                "reason_text": "brain record missing",
+                "reason_text": "not checked yet",
                 "state": "unknown"
               },
               "hostname": "corpus-host"
@@ -1506,7 +1506,7 @@
                 },
                 "progressing": false,
                 "reason_code": "brain_record_missing",
-                "reason_text": "brain record missing",
+                "reason_text": "not checked yet",
                 "state": "unknown"
               },
               "hostname": "corpus-host"

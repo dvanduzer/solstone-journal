@@ -1669,7 +1669,7 @@ fn brain_owner_short_paths_are_poison_clean_through_the_real_dispatcher() {
         .expect("run brain status")
         .expect("brain status completes");
     assert_eq!(status.status.code(), Some(2));
-    assert!(status.stdout.starts_with(b"Brain unknown:"));
+    assert!(status.stdout.starts_with(b"Thinking unknown:"));
     assert!(
         !context.poison_marker.exists(),
         "status reached poisoned interpreter"
@@ -1684,7 +1684,10 @@ fn brain_owner_short_paths_are_poison_clean_through_the_real_dispatcher() {
     .expect("run stale brain refresh")
     .expect("stale brain refresh completes");
     assert_eq!(stale.status.code(), Some(3));
-    assert_eq!(stale.stdout, b"Brain unknown: stale expected fingerprint\n");
+    assert_eq!(
+        stale.stdout,
+        b"Thinking unknown: the last check is out of date\n"
+    );
     assert!(
         !context.poison_marker.exists(),
         "stale refresh reached poisoned interpreter"

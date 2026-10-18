@@ -50,7 +50,7 @@ pub const LANES: [Lane; 3] = [
 
 /// Availability message when the current device has no admitted hardware check.
 pub const CONFIDENTIAL_NOT_ON_PLATFORM: &str =
-    "confidential processing isn't available on this computer yet.";
+    "confidential processing isn't available on your journal's computer yet.";
 
 pub const CONFIDENTIAL_LANE_DETAIL: ConfidentialLaneDetail = ConfidentialLaneDetail {
     heading: "confidential processing",
@@ -350,7 +350,7 @@ pub const THINKING_COPY_PAYLOAD: CopyValue = CopyValue::Object(&[
                     (
                         "detail",
                         CopyValue::String(
-                            "runs right on this computer. nothing leaves this machine to be processed",
+                            "runs right on your journal's computer. nothing leaves it to be processed",
                         ),
                     ),
                 ]),
@@ -870,7 +870,7 @@ pub const THINKING_COPY_PAYLOAD: CopyValue = CopyValue::Object(&[
             (
                 "to_local_note",
                 CopyValue::String(
-                    "processing will run right on this computer. your {current} setup stays saved. switch back anytime.",
+                    "processing will run right on your journal's computer. your {current} setup stays saved. switch back anytime.",
                 ),
             ),
             (
@@ -927,7 +927,7 @@ pub const THINKING_COPY_PAYLOAD: CopyValue = CopyValue::Object(&[
             ),
             (
                 "gpu_memory_unknown",
-                CopyValue::String("couldn't check GPU memory on this computer."),
+                CopyValue::String("couldn't check GPU memory on your journal's computer."),
             ),
             (
                 "gpu_unavailable",
@@ -951,7 +951,7 @@ pub const THINKING_COPY_PAYLOAD: CopyValue = CopyValue::Object(&[
             ),
             (
                 "unsupported_failed",
-                CopyValue::String("this local model isn't supported on this computer."),
+                CopyValue::String("this local model isn't supported on your journal's computer."),
             ),
             (
                 "disk_failed",
@@ -961,7 +961,9 @@ pub const THINKING_COPY_PAYLOAD: CopyValue = CopyValue::Object(&[
             ),
             (
                 "memory_failed",
-                CopyValue::String("this computer doesn't have enough memory for local thinking."),
+                CopyValue::String(
+                    "your journal's computer doesn't have enough memory for local thinking.",
+                ),
             ),
             (
                 "unidentified_failed",
@@ -992,7 +994,9 @@ pub const THINKING_COPY_PAYLOAD: CopyValue = CopyValue::Object(&[
                             ("verdict", CopyValue::String("checking local setup")),
                             (
                                 "reason",
-                                CopyValue::String("checking the selected model and this computer."),
+                                CopyValue::String(
+                                    "checking the selected model and your journal's computer.",
+                                ),
                             ),
                         ]),
                     ),
@@ -1033,7 +1037,9 @@ pub const THINKING_COPY_PAYLOAD: CopyValue = CopyValue::Object(&[
                             ("verdict", CopyValue::String("local thinking is waiting")),
                             (
                                 "reason",
-                                CopyValue::String("it will start when this computer is ready."),
+                                CopyValue::String(
+                                    "it will start when your journal's computer is ready.",
+                                ),
                             ),
                         ]),
                     ),
@@ -1043,12 +1049,14 @@ pub const THINKING_COPY_PAYLOAD: CopyValue = CopyValue::Object(&[
                             ("pill", CopyValue::String("unavailable")),
                             (
                                 "verdict",
-                                CopyValue::String("this computer can't run this local model"),
+                                CopyValue::String(
+                                    "your journal's computer can't run this local model",
+                                ),
                             ),
                             (
                                 "reason",
                                 CopyValue::String(
-                                    "local thinking needs supported hardware on this computer.",
+                                    "local thinking needs supported hardware on your journal's computer.",
                                 ),
                             ),
                         ]),
@@ -1077,7 +1085,7 @@ pub const THINKING_COPY_PAYLOAD: CopyValue = CopyValue::Object(&[
                             (
                                 "reason",
                                 CopyValue::String(
-                                    "couldn't read GPU memory on this computer. try checking again in a moment.",
+                                    "couldn't read GPU memory on your journal's computer. try checking again in a moment.",
                                 ),
                             ),
                         ]),
@@ -1200,7 +1208,7 @@ pub const THINKING_COPY_PAYLOAD: CopyValue = CopyValue::Object(&[
                             ("verdict", CopyValue::String("local thinking is ready")),
                             (
                                 "reason",
-                                CopyValue::String("a model is running on this computer."),
+                                CopyValue::String("a model is running on your journal's computer."),
                             ),
                         ]),
                     ),

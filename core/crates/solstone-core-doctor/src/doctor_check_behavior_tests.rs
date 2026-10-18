@@ -1653,7 +1653,7 @@ fn brain_ready_and_checking_records_are_healthy() {
     assert_eq!(row.status, Status::Ok, "{}", row.detail);
     assert_eq!(
         row.detail,
-        "checking on thinking; state=checking; reason=brain check in progress; component=none; evidence_age=unknown"
+        "checking on thinking; state=checking; reason=checking now; component=none; evidence_age=unknown"
     );
 }
 
@@ -1696,7 +1696,7 @@ fn brain_fresh_clock_preserves_future_and_expiry_warnings() {
     let row = (entry.runner)(&future).unwrap();
     assert_eq!(row.status, Status::Warn, "{}", row.detail);
     assert!(
-        row.detail.contains("brain record invalid"),
+        row.detail.contains("the last check can't be read"),
         "{}",
         row.detail
     );

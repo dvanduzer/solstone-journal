@@ -356,7 +356,7 @@ fn brain_section(out: &mut String, state: &TopState, width: usize, style: &dyn T
         (BrainHealthState::Checking, _) => {
             out.push_str("  ");
             out.push_str(style.bold());
-            out.push_str("Brain Health");
+            out.push_str("Thinking Health");
             out.push_str(style.normal());
             out.push('\n');
             out.push_str(style.dim());
@@ -367,7 +367,7 @@ fn brain_section(out: &mut String, state: &TopState, width: usize, style: &dyn T
         (BrainHealthState::Unavailable { message, .. }, _) => {
             out.push_str("  ");
             out.push_str(style.bold());
-            out.push_str("Brain Health");
+            out.push_str("Thinking Health");
             out.push_str(style.normal());
             out.push('\n');
             out.push_str(style.dim());
@@ -385,7 +385,7 @@ fn brain_section(out: &mut String, state: &TopState, width: usize, style: &dyn T
         _ => {
             out.push_str("  ");
             out.push_str(style.bold());
-            out.push_str("Brain Health");
+            out.push_str("Thinking Health");
             out.push_str(style.normal());
             out.push('\n');
             out.push_str(style.dim());
