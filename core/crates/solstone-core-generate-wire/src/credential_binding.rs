@@ -1060,6 +1060,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(path);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn admitted_root_witness_blocks_rename_until_dropped() {
+        let path = planted_openai("witness-rename-lifetime");
+        let before = std::fs::read(path.join("config/journal.json")).expect("config");
+        let key_before = std::fs::read(path.join("health/brain-fingerprint.key")).expect("key");
+        let witness = capture_root_witness(&path).expect("root witness");
+        assert!(
+            witness.credential.get().is_some(),
+            "credential witness captured"
+        );
+        let moved = path.with_file_name(format!(
+            "{}-moved",
+            path.file_name().expect("name").to_string_lossy()
+        ));
+        let error = std::fs::rename(&path, &moved).expect_err("live witness retains its root");
+        assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error}");
+        assert!(path.is_dir());
+        assert!(!moved.exists());
+        assert_eq!(
+            std::fs::read(path.join("config/journal.json")).expect("config"),
+            before
+        );
+        assert_eq!(
+            std::fs::read(path.join("health/brain-fingerprint.key")).expect("key"),
+            key_before
+        );
+        assert!(!path.join("config/actions").exists());
+
+        drop(witness);
+        std::fs::rename(&path, &moved).expect("rename after whole witness drops");
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read(moved.join("config/journal.json")).expect("moved config"),
+            before
+        );
+        assert_eq!(
+            std::fs::read(moved.join("health/brain-fingerprint.key")).expect("moved key"),
+            key_before
+        );
+        assert!(!moved.join("config/actions").exists());
+        std::fs::remove_dir_all(moved).expect("cleanup moved journal");
+    }
+
+    #[cfg(unix)]
     #[test]
     fn retain_after_admitted_root_rename_creates_nothing() {
         let path = planted_openai("retain-rename");
@@ -1175,6 +1220,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(path);
     }
 
+    #[cfg(unix)]
     #[test]
     fn retain_after_replacement_at_the_admitted_path_leaves_both_journals() {
         let path = planted_openai("retain-replace");
