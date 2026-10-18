@@ -37,6 +37,14 @@ supports a need that remains open; an empty action list is fine.
 Each segment's activity is a generated synopsis, not proof that the owner did
 the action. Use its supporting quotes and entity contexts to preserve who did
 what. A missing subject or missing supporting evidence never means "you".
+An unknown speaker label does not establish who spoke. A mentioned name alone
+does not identify the speaker. Attribute each action separately: a named
+person's completed action does not make them
+the speaker, reporter or requester of neighboring statements. Summarize an
+unattributed need as a reported need, without assigning it to that person or
+the owner. If a generated synopsis conflicts with supplied supporting evidence,
+use that evidence. Preserve independently explicit attribution from quotes or
+entity contexts; a bounded quote selection need not contain every such fact.
 Keep reported actions, document contents, open needs and completed actions
 distinct. A receipt shows the listed items and amounts; it does not establish
 that the owner purchased them or calculated the total. Related entries do not

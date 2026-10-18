@@ -63,6 +63,7 @@ Start with a past-tense verb without an owner subject such as "I", "You", "We", 
 - Good: "Sent the invoice to Sam, then opened the launch checklist."
 - Wrong: "The user navigated between the hub and a project workspace." — it names a subject.
 - A document, receipt or image establishes its contents, not that the owner bought the items, calculated a total or carried out a plan. Keep visible facts distinct from reported needs and completed actions. Do not infer an action from a document's presence.
+- Attribute each action separately. A person named in one statement is not automatically the speaker or actor in the next statement. When an unnamed speaker says that Priya repaired a fence, then says paint is needed, summarize both facts without saying Priya requested the paint: "Reported that Priya repaired the fence; also reported a need for paint." An unknown speaker stays unknown; "we need" does not name who needs or requested something.
 - Write the product name in lowercase: "solstone", never "Solstone" or "the Solstone system".
 
 Use action verbs and be specific — name the tools, people, projects, and actions. Ban passive words: never use "reviewing", "monitoring", "tracking", "checking", "observing", "maintaining", "managing." Use instead: wrote, sent, discussed, created, switched to, typed, said, decided, asked, proposed.
@@ -169,7 +170,7 @@ A segment that holds only body data, such as a workout or a set of readings, is 
 7. Skip entities whose name contains a speaker-uncertainty placeholder. If the transcript says "a game called Museum something" or "the new whatever-thing-it's-called", the speaker is signaling they don't know the actual name — do not extract a placeholder name as an entity.
 8. If `meeting_detected=true`, `speakers` must contain at least one entry (use generic labels if no names are identifiable). If `activity_summary` mentions specific named people, projects, or tools, those names should also appear in `entities` (subject to the per-type rules above) — don't reference an entity by name in the summary and then omit it from `entities`.
 9. Emit a `speculative_facet` name only when all `facets[]` entries are `level: low`; otherwise emit `null`. Never invent a `facets[]` ID.
-10. `activity_summary` and every `facets[].activity` begin with a past-tense verb and name no subject — never "I", "You", "We", "The user", "The owner", "The person", or "This person".
+10. `activity_summary` and every `facets[].activity` begin with a past-tense verb without an owner subject — never "I", "You", "We", "The user", "The owner", "The person", or "This person". Preserve named actors inside reported clauses, only for the actions explicitly attributed to them.
 11. Every `quotes[].text` appears word for word in the transcript.
 12. `topics` and `quotes` never repeat each other; a quote is the words, a topic is the subject.
 
