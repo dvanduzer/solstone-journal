@@ -217,6 +217,7 @@ pub mod test_hooks {
             CoremlAdmission::Fixture,
             publish,
             write,
+            &mut |_, _| {},
         )
     }
 
@@ -796,6 +797,7 @@ pub fn run_local_with_gpu_admission(
         lease,
         None,
         admission_warning,
+        |_| {},
     )
 }
 
@@ -853,11 +855,33 @@ fn run_parakeet(object: &Map<String, Value>) -> Result<Value, DispatchError> {
     run(object, RunKind::Parakeet)
 }
 
-pub fn install_parakeet_with_lease(
+pub(crate) fn admit_parakeet_attempt(
+    journal: &Path,
+    _lease: &lease::InstallLease,
+    fingerprint_json: String,
+    fingerprint_sha256: String,
+    state: &str,
+    on_admitted: impl FnOnce(&status::InstallStatus),
+) -> Result<status::InstallStatus, status::StatusError> {
+    let written = status::begin_or_replace(
+        journal,
+        "parakeet",
+        fingerprint_json,
+        fingerprint_sha256,
+        None,
+        state,
+        None,
+    )?;
+    on_admitted(&written);
+    Ok(written)
+}
+
+pub fn install_parakeet_with_lease_admitted(
     journal: &Path,
     os_name: &str,
     arch: &str,
     lease: lease::InstallLease,
+    on_admitted: impl FnOnce(&status::InstallStatus),
 ) -> Result<Value, DispatchError> {
     let mut object = Map::new();
     object.insert(
@@ -871,7 +895,17 @@ pub fn install_parakeet_with_lease(
         lease,
         Some((os_name, arch)),
         None,
+        on_admitted,
     )
+}
+
+pub fn install_parakeet_with_lease(
+    journal: &Path,
+    os_name: &str,
+    arch: &str,
+    lease: lease::InstallLease,
+) -> Result<Value, DispatchError> {
+    install_parakeet_with_lease_admitted(journal, os_name, arch, lease, |_| {})
 }
 
 fn run(object: &Map<String, Value>, kind: RunKind) -> Result<Value, DispatchError> {
@@ -887,7 +921,7 @@ fn run(object: &Map<String, Value>, kind: RunKind) -> Result<Value, DispatchErro
             lease::BUSY_EXIT_CODE,
         ));
     };
-    run_with_lease(object, kind, journal, lease, None, None)
+    run_with_lease(object, kind, journal, lease, None, None, |_| {})
 }
 
 fn run_with_lease(
@@ -897,6 +931,7 @@ fn run_with_lease(
     lease: lease::InstallLease,
     parakeet_platform: Option<(&str, &str)>,
     admission_warning: Option<String>,
+    on_admitted: impl FnOnce(&status::InstallStatus),
 ) -> Result<Value, DispatchError> {
     let provider = kind.status_provider();
     let resolved = (|| {
@@ -913,24 +948,18 @@ fn run_with_lease(
     let resolved = match resolved {
         Ok(resolved) => resolved,
         Err(error) => {
-            if kind == RunKind::Local {
-                let code = error
-                    .envelope
-                    .error
-                    .as_ref()
-                    .map_or("install_failed", |e| e.reason_code.as_str());
-                let message = error
-                    .envelope
-                    .error
-                    .as_ref()
-                    .map_or("install failed", |e| e.message.as_str());
-                status::record_terminal_refusal_with_lease(
-                    &journal, provider, code, message, &lease,
-                )
-                .map_err(|write_error| {
-                    failure("state", "terminal_write_failed", write_error, 74)
-                })?;
-            }
+            let code = error
+                .envelope
+                .error
+                .as_ref()
+                .map_or("install_failed", |e| e.reason_code.as_str());
+            let message = error
+                .envelope
+                .error
+                .as_ref()
+                .map_or("install failed", |e| e.message.as_str());
+            status::record_terminal_refusal_with_lease(&journal, provider, code, message, &lease)
+                .map_err(|write_error| failure("state", "terminal_write_failed", write_error, 74))?;
             return Err(error);
         }
     };
@@ -953,6 +982,7 @@ fn run_with_lease(
         admission_warning,
     )
     .map_err(|error| failure("state", "begin_failed", error, 74))?;
+    on_admitted(&state);
     let start = Instant::now();
     let result = match kind {
         RunKind::Local => run_local_install(object, &mut state, start),
@@ -1359,6 +1389,107 @@ pub fn local_backend_choice_present(
     local_backend_choice_with(journal, nvidia_probe, false)
 }
 
+pub fn local_thinking_catalog_plan(
+    journal: &Path,
+    nvidia_probe: Option<crate::NvidiaProbe>,
+) -> Option<Vec<pins::ThinkingDownloadRow>> {
+    let key = pins::platform_key();
+    if key == "x86_64-windows" {
+        return pins::thinking_download_rows(crate::Backend::Vulkan, &key);
+    }
+    match local_backend_choice_present(journal, nvidia_probe) {
+        crate::BackendSelection::Selected(choice) => {
+            pins::thinking_download_rows(choice.backend, &key)
+        }
+        crate::BackendSelection::IntegrityBlocked => None,
+    }
+}
+
+pub fn inspect_parakeet_manifests(journal: &Path, artifact_key: &str) -> (Value, Value, Value) {
+    let paths = pins::parakeet_paths(journal, artifact_key);
+
+    let cpu_proof = inspect_server_manifest(&paths, "binary_path_cpu", artifact_key, "cpu");
+    let vulkan_proof =
+        inspect_server_manifest(&paths, "binary_path_vulkan", artifact_key, "vulkan");
+    let model_proof = inspect_model_manifest(&paths);
+
+    (cpu_proof, vulkan_proof, model_proof)
+}
+
+pub fn inspect_server_manifest(
+    paths: &Value,
+    binary_path_key: &str,
+    artifact_key: &str,
+    backend: &str,
+) -> Value {
+    let Some(binary_path_str) = paths.get(binary_path_key).and_then(Value::as_str) else {
+        return serde_json::json!({
+            "status": "missing-or-mismatched",
+            "reason_code": "manifest_missing",
+            "cache_hit": false
+        });
+    };
+    let binary_path = Path::new(binary_path_str);
+    let Some(manifest_dir) = binary_path.parent() else {
+        return serde_json::json!({
+            "status": "missing-or-mismatched",
+            "reason_code": "manifest_missing",
+            "cache_hit": false
+        });
+    };
+    let Some(identity) = pins::parakeet_backend_identity(artifact_key, backend) else {
+        return serde_json::json!({
+            "status": "missing-or-mismatched",
+            "reason_code": "manifest_missing",
+            "cache_hit": false
+        });
+    };
+    let Some((_, _, _, binary_name)) = pins::parakeet_backend_pin(artifact_key, backend) else {
+        return serde_json::json!({
+            "status": "missing-or-mismatched",
+            "reason_code": "manifest_missing",
+            "cache_hit": false
+        });
+    };
+    let manifest_path = manifest::artifact_manifest_path(manifest_dir);
+    manifest::inspect_manifest_required(&manifest_path, &identity, &[binary_name])
+}
+
+pub fn inspect_model_manifest(paths: &Value) -> Value {
+    let Some(model_path_str) = paths.get("model_path").and_then(Value::as_str) else {
+        return serde_json::json!({
+            "status": "missing-or-mismatched",
+            "reason_code": "manifest_missing",
+            "cache_hit": false
+        });
+    };
+    let model_path = Path::new(model_path_str);
+    let Some(manifest_dir) = model_path.parent() else {
+        return serde_json::json!({
+            "status": "missing-or-mismatched",
+            "reason_code": "manifest_missing",
+            "cache_hit": false
+        });
+    };
+    let identity = pins::parakeet_model_identity();
+    let filename = identity
+        .get("filename")
+        .and_then(Value::as_str)
+        .unwrap_or(pins::PARAKEET_MODEL.1);
+    let manifest_path = manifest::artifact_manifest_path(manifest_dir);
+    manifest::inspect_manifest_required(&manifest_path, &identity, &[filename])
+}
+
+pub fn parakeet_manifests_ready(journal: &Path, os: &str, arch: &str) -> bool {
+    let Ok(artifact_key) = pins::parakeet_artifact_key(os, arch) else {
+        return false;
+    };
+    let (cpu, vulkan, model) = inspect_parakeet_manifests(journal, &artifact_key);
+    cpu.get("status").and_then(Value::as_str) == Some("ready")
+        && vulkan.get("status").and_then(Value::as_str) == Some("ready")
+        && model.get("status").and_then(Value::as_str) == Some("ready")
+}
+
 fn local_backend_choice_with(
     journal: &Path,
     nvidia_probe: Option<crate::NvidiaProbe>,
@@ -1496,6 +1627,111 @@ fn resolved_fingerprint(target: Value) -> Result<Value, DispatchError> {
     }))
 }
 
+fn local_model_download_bytes(model_id: &str) -> Result<u64, DispatchError> {
+    let identity = pins::model_identity(model_id)
+        .ok_or_else(|| failure("model", "unsupported_model", model_id, 65))?;
+    ["filename", "mmproj_filename"]
+        .into_iter()
+        .filter_map(|key| identity[key].as_str())
+        .map(|filename| {
+            select_artifact("local-model", None, None, None, Some(filename))
+                .map(|row| row.size_bytes)
+        })
+        .sum()
+}
+
+fn parakeet_download_bytes(key: &str) -> Result<u64, DispatchError> {
+    let mut total = select_artifact(
+        "parakeet-model",
+        None,
+        None,
+        None,
+        Some(pins::PARAKEET_MODEL.1),
+    )?
+    .size_bytes;
+    for backend in [AssetBackend::Cpu, AssetBackend::Vulkan] {
+        total += select_artifact(
+            "parakeet-server",
+            Some(artifact_platform(key)?),
+            Some(backend),
+            Some(key),
+            None,
+        )?
+        .size_bytes;
+    }
+    Ok(total)
+}
+
+fn fetch_install_member(
+    journal: &Path,
+    state: &mut status::InstallStatus,
+    artifact: &Artifact,
+    destination: &Path,
+    completed: u64,
+    total: u64,
+    error_code: &str,
+) -> Result<(), DispatchError> {
+    fetch_install_member_with(
+        journal,
+        state,
+        artifact,
+        destination,
+        completed,
+        total,
+        |query, destination, progress| {
+            fetch_runtime_member(query, destination, progress, error_code)
+        },
+    )
+}
+
+fn fetch_install_member_with(
+    journal: &Path,
+    state: &mut status::InstallStatus,
+    artifact: &Artifact,
+    destination: &Path,
+    completed: u64,
+    total: u64,
+    fetch: impl FnOnce(
+        &solstone_core_assets::RuntimeFetchQuery<'_>,
+        &Path,
+        &mut dyn FnMut(u64, Option<u64>),
+    ) -> Result<bool, DispatchError>,
+) -> Result<(), DispatchError> {
+    let query = solstone_core_assets::RuntimeFetchQuery {
+        unit: Some(artifact.unit),
+        origin_key: Some(artifact.origin_key),
+        ..Default::default()
+    };
+    let mut at = Instant::now();
+    let mut progress_error = None;
+    fetch(&query, destination, &mut |received, _| {
+        if progress_error.is_none() {
+            match status::bump_progress(
+                state.clone(),
+                Some(completed.saturating_add(received)),
+                Some(total),
+                &mut at,
+            )
+            .and_then(|next| {
+                next.map(|next| status::write_status(journal, next))
+                    .transpose()
+            }) {
+                Ok(Some(written)) => *state = written,
+                Ok(None) => {}
+                Err(error) => progress_error = Some(error),
+            }
+        }
+    })?;
+    if let Some(error) = progress_error {
+        return Err(failure("state", "status_write_failed", error, 74));
+    }
+    state.progress_bytes_received = Some(completed.saturating_add(artifact.size_bytes));
+    state.progress_bytes_total = Some(total);
+    *state = status::write_status(journal, state.clone())
+        .map_err(|error| failure("state", "status_write_failed", error, 74))?;
+    Ok(())
+}
+
 fn run_local_install(
     object: &Map<String, Value>,
     status_value: &mut status::InstallStatus,
@@ -1531,6 +1767,7 @@ fn run_local_install(
             )
         })?
         .to_owned();
+    let model_bytes = local_model_download_bytes(&model_id)?;
     let root = pins::cache_root(&journal);
     if key == "x86_64-windows" {
         let pkg = windows_engine::verified_windows_llama_package().map_err(|err| match err {
@@ -1558,7 +1795,7 @@ fn run_local_install(
             &[model_file, projector_file],
         );
         if model_proof["status"] != "ready" {
-            install_model(&journal, &model_id, status_value)?;
+            install_model(&journal, &model_id, status_value, 0, model_bytes)?;
         }
         return Ok(json!({
             "backend": "vulkan",
@@ -1624,32 +1861,20 @@ fn run_local_install(
     fs::create_dir_all(&staging)
         .map_err(|error| failure("io", "staging_create_failed", error, 74))?;
     let archive_path = staging.join(&filename);
-    let mut progress_at = Instant::now();
     *status_value = status::write_status(
         &journal,
         status::transition(status_value.clone(), "downloading", None, None)
             .map_err(|error| failure("state", "transition_failed", error, 74))?,
     )
     .map_err(|error| failure("state", "status_write_failed", error, 74))?;
-    let query = solstone_core_assets::RuntimeFetchQuery {
-        unit: Some(artifact.unit),
-        origin_key: Some(artifact.origin_key),
-        ..Default::default()
-    };
-    fetch_runtime_member(
-        &query,
+    let total_bytes = artifact.size_bytes + model_bytes;
+    fetch_install_member(
+        &journal,
+        status_value,
+        artifact,
         &archive_path,
-        |received, total| {
-            if let Ok(Some(next)) = status::bump_progress(
-                status_value.clone(),
-                Some(received),
-                total,
-                &mut progress_at,
-            ) && let Ok(written) = status::write_status(&journal, next)
-            {
-                *status_value = written;
-            }
-        },
+        0,
+        total_bytes,
         "download_failed",
     )?;
     archive::extract_tar_gz(&archive_path, &staging)
@@ -1692,7 +1917,13 @@ fn run_local_install(
         status_value.attempt_id.as_deref(),
         &exclude_names,
     )?;
-    install_model(&journal, &model_id, status_value)?;
+    install_model(
+        &journal,
+        &model_id,
+        status_value,
+        artifact.size_bytes,
+        total_bytes,
+    )?;
     Ok(
         json!({"backend":backend,"binary_path":install_dir.join("llama-server"),"model_id":model_id}),
     )
@@ -1803,6 +2034,8 @@ fn run_parakeet_install(
         .as_str()
         .ok_or_else(|| failure("state", "fingerprint_malformed", "artifact_key missing", 74))?
         .to_owned();
+    let total_bytes = parakeet_download_bytes(&key)?;
+    let mut completed_bytes = 0;
     let mut binaries = Vec::new();
     for backend in ["cpu", "vulkan"] {
         let (release, filename, _digest, binary_name) =
@@ -1832,34 +2065,22 @@ fn run_parakeet_install(
         fs::create_dir_all(&staging)
             .map_err(|error| failure("io", "staging_create_failed", error, 74))?;
         let archive_path = staging.join(filename);
-        let mut progress_at = Instant::now();
         *status_value = status::write_status(
             journal,
             status::transition(status_value.clone(), "downloading", None, None)
                 .map_err(|error| failure("state", "transition_failed", error, 74))?,
         )
         .map_err(|error| failure("state", "status_write_failed", error, 74))?;
-        let query = solstone_core_assets::RuntimeFetchQuery {
-            unit: Some(artifact.unit),
-            origin_key: Some(artifact.origin_key),
-            ..Default::default()
-        };
-        fetch_runtime_member(
-            &query,
+        fetch_install_member(
+            journal,
+            status_value,
+            artifact,
             &archive_path,
-            |received, total| {
-                if let Ok(Some(next)) = status::bump_progress(
-                    status_value.clone(),
-                    Some(received),
-                    total,
-                    &mut progress_at,
-                ) && let Ok(written) = status::write_status(journal, next)
-                {
-                    *status_value = written;
-                }
-            },
+            completed_bytes,
+            total_bytes,
             "download_failed",
         )?;
+        completed_bytes += artifact.size_bytes;
         archive::extract_tar_gz(&archive_path, &staging)
             .map_err(|error| failure("archive", "extract_failed", error, 65))?;
         let binary = find_file(&staging, binary_name).ok_or_else(|| {
@@ -1897,13 +2118,15 @@ fn run_parakeet_install(
             .map_err(|error| failure("io", "publish_failed", error, 74))?;
         binaries.push(json!({"backend": backend, "binary_path": install_dir.join(binary_name)}));
     }
-    let model_path = install_parakeet_model(journal, status_value)?;
+    let model_path = install_parakeet_model(journal, status_value, completed_bytes, total_bytes)?;
     Ok(json!({"artifact_key": key, "binaries": binaries, "model_path": model_path}))
 }
 
 fn install_parakeet_model(
     journal: &Path,
     status_value: &mut status::InstallStatus,
+    completed_bytes: u64,
+    total_bytes: u64,
 ) -> Result<PathBuf, DispatchError> {
     let (repo, filename, revision, ..) = pins::PARAKEET_MODEL;
     let artifact = select_artifact("parakeet-model", None, None, None, Some(filename))?;
@@ -1914,50 +2137,21 @@ fn install_parakeet_model(
     fs::create_dir_all(&model_dir)
         .map_err(|error| failure("io", "model_dir_create_failed", error, 74))?;
     let dest = model_dir.join(filename);
-    let mut downloading = status::transition(status_value.clone(), "downloading", None, None)
-        .map_err(|error| failure("state", "transition_failed", error, 74))?;
-    // Earlier runtime downloads share this provider status. Do not display
-    // their byte count under the speech model's name before its first chunk.
-    downloading.progress_bytes_received = None;
-    downloading.progress_bytes_total = None;
-    *status_value = status::write_status(journal, downloading)
-        .map_err(|error| failure("state", "status_write_failed", error, 74))?;
-    let mut progress_at = Instant::now();
-    let mut progress_error = None;
-    let query = solstone_core_assets::RuntimeFetchQuery {
-        unit: Some(artifact.unit),
-        origin_key: Some(artifact.origin_key),
-        ..Default::default()
-    };
-    fetch_runtime_member(
-        &query,
+    *status_value = status::write_status(
+        journal,
+        status::transition(status_value.clone(), "downloading", None, None)
+            .map_err(|error| failure("state", "transition_failed", error, 74))?,
+    )
+    .map_err(|error| failure("state", "status_write_failed", error, 74))?;
+    fetch_install_member(
+        journal,
+        status_value,
+        artifact,
         &dest,
-        |received, total| {
-            if progress_error.is_some() {
-                return;
-            }
-            match status::bump_progress(
-                status_value.clone(),
-                Some(received),
-                total,
-                &mut progress_at,
-            )
-            .and_then(|next| {
-                next.map(|next| status::write_status(journal, next))
-                    .transpose()
-            }) {
-                Ok(Some(written)) => *status_value = written,
-                Ok(None) => {}
-                Err(error) => progress_error = Some(error),
-            }
-        },
+        completed_bytes,
+        total_bytes,
         "model_download_failed",
     )?;
-    if let Some(error) = progress_error {
-        return Err(failure("state", "status_write_failed", error, 74));
-    }
-    status_value.progress_bytes_received = Some(artifact.size_bytes);
-    status_value.progress_bytes_total = Some(artifact.size_bytes);
     *status_value = status::write_status(
         journal,
         status::transition(status_value.clone(), "verifying", None, None)
@@ -1995,6 +2189,8 @@ fn install_model(
     journal: &Path,
     model_id: &str,
     status_value: &mut status::InstallStatus,
+    completed_bytes: u64,
+    total_bytes: u64,
 ) -> Result<(), DispatchError> {
     #[cfg(any(test, feature = "test-hooks"))]
     TEST_INSTALL_MODEL_COUNT.with(|count| count.set(count.get() + 1));
@@ -2013,68 +2209,29 @@ fn install_model(
     ) {
         files.push(name);
     }
-    const MODEL_BYTES_TOTAL: u64 = 3_413_361_504;
-    let mut progress_at = Instant::now();
-    let mut cumulative_bytes: u64 = 0;
+    let mut cumulative_bytes = completed_bytes;
 
     for name in files {
         status::assert_current(journal, status_value)
             .map_err(|error| failure("state", "attempt_superseded", error, 74))?;
         let artifact = select_artifact("local-model", None, None, None, Some(name))?;
         let dest = root.join(name);
-        let base_bytes = cumulative_bytes;
-        let mut progress_error = None;
-        let query = solstone_core_assets::RuntimeFetchQuery {
-            unit: Some("local-model"),
-            origin_key: Some(artifact.origin_key),
-            ..Default::default()
-        };
-        let fetched = fetch_runtime_member(
-            &query,
+        fetch_install_member(
+            journal,
+            status_value,
+            artifact,
             &dest,
-            |received, _file_total| {
-                let current_received = base_bytes.saturating_add(received);
-                if progress_error.is_none() {
-                    match status::bump_progress(
-                        status_value.clone(),
-                        Some(current_received),
-                        Some(MODEL_BYTES_TOTAL),
-                        &mut progress_at,
-                    )
-                    .and_then(|next| {
-                        next.map(|next| status::write_status(journal, next))
-                            .transpose()
-                    }) {
-                        Ok(Some(written)) => *status_value = written,
-                        Ok(None) => {}
-                        Err(error) => progress_error = Some(error),
-                    }
-                }
-            },
+            cumulative_bytes,
+            total_bytes,
             "model_download_failed",
         )?;
-
-        if let Some(error) = progress_error {
-            return Err(failure("state", "status_write_failed", error, 74));
-        }
-        cumulative_bytes = cumulative_bytes.saturating_add(artifact.size_bytes);
-        if !fetched
-            && let Some(next) = status::bump_progress(
-                status_value.clone(),
-                Some(cumulative_bytes),
-                Some(MODEL_BYTES_TOTAL),
-                &mut progress_at,
-            )
-            .map_err(|error| failure("state", "progress_failed", error, 74))?
-        {
-            *status_value = status::write_status(journal, next)
-                .map_err(|error| failure("state", "status_write_failed", error, 74))?;
-        }
+        cumulative_bytes += artifact.size_bytes;
     }
+
     // Verification begins only after every pinned file has completed its fetch.
     // Preserve the exact final byte count even if the last callback was coalesced.
     status_value.progress_bytes_received = Some(cumulative_bytes);
-    status_value.progress_bytes_total = Some(MODEL_BYTES_TOTAL);
+    status_value.progress_bytes_total = Some(total_bytes);
 
     status::assert_current(journal, status_value)
         .map_err(|error| failure("state", "attempt_superseded", error, 74))?;

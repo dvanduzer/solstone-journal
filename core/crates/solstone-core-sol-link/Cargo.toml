@@ -32,6 +32,7 @@ host = [
     "dep:solstone-core-journal-config",
     "dep:solstone-core-journal-config-write",
     "dep:solstone-core-journal-io",
+    "dep:solstone-core-local",
     "dep:solstone-core-thinking-copy",
     "dep:time",
     "dep:x509-parser",
@@ -60,6 +61,7 @@ solstone-core-journal-config = { workspace = true, optional = true }
 solstone-core-journal-config-write = { workspace = true, optional = true }
 sha2 = { version = "0.10.9", optional = true }
 solstone-core-journal-io = { workspace = true, optional = true }
+solstone-core-local = { workspace = true, optional = true }
 solstone-core-ingest-contract = { workspace = true }
 solstone-core-sol-client = { workspace = true }
 solstone-core-thinking-copy = { workspace = true, optional = true }
@@ -90,6 +92,7 @@ windows-sys = { workspace = true, features = [
 
 [dev-dependencies]
 rcgen = { workspace = true }
+tempfile = "3.24.0"
 tower = { workspace = true }
 
 [[test]]

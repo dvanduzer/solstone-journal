@@ -149,7 +149,7 @@ pub(crate) fn refresh_installed_assets_with_platform(
 
     if let Err(error) =
         solstone_core_local::install::coreml_install::refresh_installed_parakeet_coreml(
-            &home_path, &config,
+            journal, &home_path, &config,
         )
     {
         log::error!("parakeet coreml refresh failed: {error}");

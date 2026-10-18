@@ -6,6 +6,8 @@
 use serde::Serialize;
 use serde::ser::{SerializeMap, Serializer};
 
+pub use solstone_core_assets::Platform;
+
 #[derive(Clone, Copy, Serialize)]
 pub struct Lane {
     pub id: &'static str,
@@ -1356,6 +1358,84 @@ pub fn setup_copy(_facts: &SetupCatalogFacts) -> serde_json::Value {
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DownloadMember {
+    Catalog {
+        unit: &'static str,
+        platform: Option<solstone_core_assets::Platform>,
+        backend: Option<solstone_core_assets::Backend>,
+        filename: Option<&'static str>,
+    },
+    Packaged,
+}
+
+pub fn sum_download_bytes(members: &[DownloadMember]) -> Option<u64> {
+    if members.is_empty() {
+        return None;
+    }
+    let mut total: u64 = 0;
+    for member in members {
+        match member {
+            DownloadMember::Packaged => {}
+            DownloadMember::Catalog {
+                unit,
+                platform,
+                backend,
+                filename,
+            } => {
+                let artifacts = solstone_core_assets::resolve(unit, *platform, *backend);
+                let mut matched = false;
+                for artifact in artifacts {
+                    if filename.is_none_or(|f| artifact.filename == f) {
+                        matched = true;
+                        total = total.checked_add(artifact.size_bytes)?;
+                    }
+                }
+                if !matched {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(total)
+}
+
+pub fn speech_catalog_members(
+    platform: Option<solstone_core_assets::Platform>,
+) -> Vec<DownloadMember> {
+    match platform {
+        Some(solstone_core_assets::Platform::MacosArm64) => vec![DownloadMember::Catalog {
+            unit: "parakeet-coreml",
+            platform,
+            backend: None,
+            filename: None,
+        }],
+        Some(
+            solstone_core_assets::Platform::LinuxX64 | solstone_core_assets::Platform::LinuxArm64,
+        ) => vec![
+            DownloadMember::Catalog {
+                unit: "parakeet-server",
+                platform,
+                backend: Some(solstone_core_assets::Backend::Cpu),
+                filename: None,
+            },
+            DownloadMember::Catalog {
+                unit: "parakeet-server",
+                platform,
+                backend: Some(solstone_core_assets::Backend::Vulkan),
+                filename: None,
+            },
+            DownloadMember::Catalog {
+                unit: "parakeet-model",
+                platform: None,
+                backend: None,
+                filename: Some("tdt-0.6b-v3-q8_0.gguf"),
+            },
+        ],
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1463,5 +1543,137 @@ mod tests {
         assert_eq!(facts.platform, "mac");
         assert!(facts.thinking_download_bytes.is_some());
         assert!(facts.speech_download_bytes.is_some());
+    }
+
+    #[test]
+    fn cuda_and_vulkan_selection_sum_different_runtime_and_same_model_rows() {
+        use solstone_core_assets::{Platform, resolve};
+
+        let cuda_runtime = DownloadMember::Catalog {
+            unit: "llama-server-cuda",
+            platform: Some(Platform::LinuxX64),
+            backend: None,
+            filename: None,
+        };
+        let vulkan_runtime = DownloadMember::Catalog {
+            unit: "llama-server-vulkan",
+            platform: Some(Platform::LinuxX64),
+            backend: None,
+            filename: Some("llama-b11669-bin-ubuntu-vulkan-x64.tar.gz"),
+        };
+        let model_1 = DownloadMember::Catalog {
+            unit: "local-model",
+            platform: None,
+            backend: None,
+            filename: Some("Qwen3.5-4B-Q4_K_M.gguf"),
+        };
+        let model_2 = DownloadMember::Catalog {
+            unit: "local-model",
+            platform: None,
+            backend: None,
+            filename: Some("mmproj-F16.gguf"),
+        };
+
+        let cuda_members = vec![cuda_runtime, model_1.clone(), model_2.clone()];
+        let vulkan_members = vec![vulkan_runtime, model_1, model_2];
+
+        let cuda_sum = sum_download_bytes(&cuda_members).expect("cuda sum resolves");
+        let vulkan_sum = sum_download_bytes(&vulkan_members).expect("vulkan sum resolves");
+
+        assert_ne!(cuda_sum, vulkan_sum);
+
+        let expected_cuda_runtime: u64 =
+            resolve("llama-server-cuda", Some(Platform::LinuxX64), None)
+                .iter()
+                .map(|a| a.size_bytes)
+                .sum();
+        let expected_vulkan_runtime: u64 =
+            resolve("llama-server-vulkan", Some(Platform::LinuxX64), None)
+                .iter()
+                .filter(|a| a.filename == "llama-b11669-bin-ubuntu-vulkan-x64.tar.gz")
+                .map(|a| a.size_bytes)
+                .sum();
+        let expected_models: u64 = resolve("local-model", None, None)
+            .iter()
+            .filter(|a| a.filename == "Qwen3.5-4B-Q4_K_M.gguf" || a.filename == "mmproj-F16.gguf")
+            .map(|a| a.size_bytes)
+            .sum();
+
+        assert_eq!(cuda_sum, expected_cuda_runtime + expected_models);
+        assert_eq!(vulkan_sum, expected_vulkan_runtime + expected_models);
+
+        let mut with_packaged = cuda_members.clone();
+        with_packaged.push(DownloadMember::Packaged);
+        assert_eq!(sum_download_bytes(&with_packaged), Some(cuda_sum));
+    }
+
+    #[test]
+    fn mac_speech_members_are_parakeet_coreml_and_sum_matches_resolve() {
+        use solstone_core_assets::{Platform, resolve};
+
+        let members = speech_catalog_members(Some(Platform::MacosArm64));
+        assert_eq!(members.len(), 1);
+        match &members[0] {
+            DownloadMember::Catalog {
+                unit,
+                platform,
+                backend,
+                filename,
+            } => {
+                assert_eq!(*unit, "parakeet-coreml");
+                assert_eq!(*platform, Some(Platform::MacosArm64));
+                assert_eq!(*backend, None);
+                assert_eq!(*filename, None);
+            }
+            _ => panic!("expected catalog member"),
+        }
+
+        let total = sum_download_bytes(&members).expect("sum resolves");
+        let expected: u64 = resolve("parakeet-coreml", Some(Platform::MacosArm64), None)
+            .iter()
+            .map(|a| a.size_bytes)
+            .sum();
+        assert_eq!(total, expected);
+    }
+
+    #[test]
+    fn missing_filename_yields_none_not_partial_sum() {
+        let valid_model = DownloadMember::Catalog {
+            unit: "local-model",
+            platform: None,
+            backend: None,
+            filename: Some("Qwen3.5-4B-Q4_K_M.gguf"),
+        };
+        let missing_model = DownloadMember::Catalog {
+            unit: "local-model",
+            platform: None,
+            backend: None,
+            filename: Some("missing-file-does-not-exist.gguf"),
+        };
+
+        assert!(sum_download_bytes(std::slice::from_ref(&valid_model)).is_some());
+        assert_eq!(sum_download_bytes(&[valid_model, missing_model]), None);
+    }
+}
+
+#[cfg(test)]
+mod speech_catalog_tests {
+    use super::*;
+    use solstone_core_assets::{Backend, Platform, resolve};
+
+    #[test]
+    fn linux_speech_total_includes_both_selected_runtimes_and_the_model() {
+        for platform in [Platform::LinuxX64, Platform::LinuxArm64] {
+            let selected = [Backend::Cpu, Backend::Vulkan]
+                .into_iter()
+                .flat_map(|backend| resolve("parakeet-server", Some(platform), Some(backend)))
+                .chain(resolve("parakeet-model", None, None));
+            let expected = selected.map(|row| row.size_bytes).sum::<u64>();
+            assert_eq!(
+                sum_download_bytes(&speech_catalog_members(Some(platform))),
+                Some(expected)
+            );
+        }
+        assert_eq!(sum_download_bytes(&speech_catalog_members(None)), None);
     }
 }

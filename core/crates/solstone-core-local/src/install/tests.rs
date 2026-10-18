@@ -4224,8 +4224,14 @@ mod runtime_fetch_seam_tests {
             without_runtime_fetch_unit("local-model", || {
                 let model_root = temp("bundled-refusal-model");
                 let mut status_val = test_status(&model_root);
-                let err =
-                    install_model(&model_root, "local/qwen3.5-4b", &mut status_val).unwrap_err();
+                let err = install_model(
+                    &model_root,
+                    "local/qwen3.5-4b",
+                    &mut status_val,
+                    0,
+                    crate::install::local_model_download_bytes("local/qwen3.5-4b").unwrap(),
+                )
+                .unwrap_err();
                 assert_eq!(err.exit_code, 65);
                 assert_eq!(
                     err.envelope.error.as_ref().unwrap().reason_code,
@@ -4492,7 +4498,13 @@ mod runtime_fetch_seam_tests {
             with_fake_runtime_fetch(&fake, || {
                 let root = temp("pos-twin-windows");
                 let mut status_val = test_status(&root);
-                if let Err(err) = install_model(&root, "local/qwen3.5-4b", &mut status_val) {
+                if let Err(err) = install_model(
+                    &root,
+                    "local/qwen3.5-4b",
+                    &mut status_val,
+                    0,
+                    crate::install::local_model_download_bytes("local/qwen3.5-4b").unwrap(),
+                ) {
                     assert_ne!(
                         err.envelope.error.as_ref().unwrap().reason_code,
                         "component_packaged"
@@ -4524,7 +4536,14 @@ mod runtime_fetch_seam_tests {
         without_runtime_fetch_unit("local-model", || {
             with_fake_runtime_fetch(&fake, || {
                 let mut status_val = test_status(&root);
-                let err = install_model(&root, "local/qwen3.5-4b", &mut status_val).unwrap_err();
+                let err = install_model(
+                    &root,
+                    "local/qwen3.5-4b",
+                    &mut status_val,
+                    0,
+                    crate::install::local_model_download_bytes("local/qwen3.5-4b").unwrap(),
+                )
+                .unwrap_err();
                 assert_eq!(err.exit_code, 65);
                 assert_eq!(
                     err.envelope.error.as_ref().unwrap().reason_code,
@@ -4537,7 +4556,13 @@ mod runtime_fetch_seam_tests {
         let twin_root = temp("model-twin");
         with_fake_runtime_fetch(&fake, || {
             let mut status_val = test_status(&twin_root);
-            let _ = install_model(&twin_root, "local/qwen3.5-4b", &mut status_val);
+            let _ = install_model(
+                &twin_root,
+                "local/qwen3.5-4b",
+                &mut status_val,
+                0,
+                crate::install::local_model_download_bytes("local/qwen3.5-4b").unwrap(),
+            );
 
             let mmproj_art =
                 select_artifact("local-model", None, None, None, Some("mmproj-F16.gguf")).unwrap();
@@ -5362,4 +5387,120 @@ fn dispatch_run_local_preserves_configured_gpu_selection() {
         }
         fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+#[cfg(all(feature = "runtime-fetch-test", feature = "test-hooks"))]
+#[test]
+fn shared_install_progress_uses_real_cumulative_fetch_bytes() {
+    use super::test_hooks::{RuntimeFetchLoopback, with_runtime_fetch_loopback};
+    use sha2::Digest;
+    use std::io::{Read, Write};
+    let root = tempfile::tempdir().unwrap();
+    let journal = root.path();
+    let _lease = lease::acquire(journal, "parakeet").unwrap().unwrap();
+    let mut state = status::begin_or_replace(
+        journal,
+        "parakeet",
+        "{}".into(),
+        "test".into(),
+        None,
+        "downloading",
+        None,
+    )
+    .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let (chunk_seen, chunk_seen_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        for bytes in [b"first".as_slice(), b"second".as_slice()] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                bytes.len()
+            )
+            .unwrap();
+            if bytes == b"second" {
+                std::thread::sleep(status::PROGRESS_COALESCE_SECONDS + Duration::from_millis(50));
+                stream.write_all(&bytes[..3]).unwrap();
+                stream.flush().unwrap();
+                chunk_seen_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                stream.write_all(&bytes[3..]).unwrap();
+            } else {
+                stream.write_all(bytes).unwrap();
+            }
+        }
+    });
+    with_runtime_fetch_loopback(
+        RuntimeFetchLoopback {
+            base_url,
+            allowed_hosts: vec!["127.0.0.1".into()],
+            allow_http: true,
+        },
+        || {
+            let mut completed = 0;
+            for (filename, bytes) in [("one", b"first".as_slice()), ("two", b"second".as_slice())] {
+                let artifact = Artifact {
+                    unit: "parakeet-server",
+                    version: "test",
+                    filename,
+                    sha256: Box::leak(
+                        format!("{:x}", sha2::Sha256::digest(bytes)).into_boxed_str(),
+                    ),
+                    size_bytes: bytes.len() as u64,
+                    upstream_url: "https://invalid.test",
+                    origin_key: filename,
+                    artifact_key: None,
+                    platform: None,
+                    backend: None,
+                    extracted_binary_sha256: None,
+                };
+                super::fetch_install_member_with(
+                    journal,
+                    &mut state,
+                    &artifact,
+                    &journal.join(filename),
+                    completed,
+                    11,
+                    |query, destination, progress| {
+                        assert_eq!(query.origin_key, Some(filename));
+                        let handle = solstone_core_assets::runtime_fetch_handle_fixture(
+                            artifact.unit,
+                            artifact.origin_key,
+                            artifact.sha256,
+                            artifact.size_bytes,
+                        );
+                        solstone_core_artifact_download::download_runtime_fetch(
+                            &handle,
+                            destination,
+                            &mut |received, total| {
+                                progress(received, total);
+                                if filename == "two" && received == 3 {
+                                    let observed =
+                                        status::read_status(journal, "parakeet").unwrap();
+                                    assert_eq!(
+                                        observed.progress_bytes_received,
+                                        Some(8),
+                                        "the live callback includes the completed first member"
+                                    );
+                                    assert_eq!(observed.progress_bytes_total, Some(11));
+                                    chunk_seen.send(()).unwrap();
+                                }
+                            },
+                        )
+                        .map_err(|error| super::failure("download", "download_failed", error, 65))
+                    },
+                )
+                .unwrap();
+                completed += artifact.size_bytes;
+                let observed = status::read_status(journal, "parakeet").unwrap();
+                assert_eq!(observed.progress_bytes_received, Some(completed));
+                assert_eq!(observed.progress_bytes_total, Some(11));
+            }
+        },
+    );
+    server.join().unwrap();
 }

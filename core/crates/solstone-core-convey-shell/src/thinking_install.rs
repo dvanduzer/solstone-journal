@@ -65,17 +65,38 @@ fn admit(journal: &Path, model: &str, automatic: bool) -> Result<Value, String> 
     if automatic && current.error_code.as_deref() == Some("install_cancelled") {
         return Err("install_cancelled".into());
     }
+    let observed_attempt_id = current.attempt_id.clone();
+    let observed_revision = current.revision;
+
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
     let parent = executable
         .parent()
         .ok_or("installer directory unavailable")?;
-    let binary = solstone_core_journal_cli::sibling_native_in_dir(parent, "solstone-core")
-        .map_err(|e| e.to_string())?;
-    launch_installer(
+    let binary = match solstone_core_journal_cli::sibling_native_in_dir(parent, "solstone-core") {
+        Ok(binary) => binary,
+        Err(err) => {
+            let message = err.to_string();
+            let write_res = status::record_terminal_refusal_if_unchanged(
+                journal,
+                "local",
+                observed_attempt_id.as_deref(),
+                observed_revision,
+                "installer_missing",
+                &message,
+            );
+            if let Err(error) = write_res {
+                return Err(error.to_string());
+            }
+            return Err(message);
+        }
+    };
+    launch_installer_with_observed(
         journal,
         model,
         installer_request(journal, &binary),
         INSTALLER_STARTUP_TIMEOUT,
+        observed_attempt_id.as_deref(),
+        observed_revision,
     )
 }
 
@@ -106,11 +127,33 @@ fn installer_request(journal: &Path, binary: &Path) -> ManagedLaunchRequest {
     }
 }
 
-fn launch_installer(
+#[allow(dead_code)]
+pub(crate) fn launch_installer(
     journal: &Path,
     model: &str,
     request: ManagedLaunchRequest,
     admission_timeout: Duration,
+) -> Result<Value, String> {
+    let (observed_attempt_id, observed_revision) = status::read_status(journal, "local")
+        .map(|s| (s.attempt_id, s.revision))
+        .unwrap_or((None, 0));
+    launch_installer_with_observed(
+        journal,
+        model,
+        request,
+        admission_timeout,
+        observed_attempt_id.as_deref(),
+        observed_revision,
+    )
+}
+
+fn launch_installer_with_observed(
+    journal: &Path,
+    model: &str,
+    request: ManagedLaunchRequest,
+    admission_timeout: Duration,
+    observed_attempt_id: Option<&str>,
+    observed_revision: u64,
 ) -> Result<Value, String> {
     // Linux arms the installer's parent-death SIGKILL against the *thread* that
     // forked it, so that thread has to outlive the child. The portal reaches here
@@ -120,14 +163,34 @@ fn launch_installer(
     // forks, admits, and then reaps, so the fork's parent thread and the child's
     // reaper are the same thread by construction.
     let (admitted, admission) = std::sync::mpsc::sync_channel(1);
+    let refusal_journal = journal;
     let journal = journal.to_owned();
     let model = model.to_owned();
+    let observed_attempt = observed_attempt_id.map(ToOwned::to_owned);
     std::thread::Builder::new()
         .name("local-install".into())
-        .spawn(move || admit_installer(&journal, &model, request, admission_timeout, &admitted))
-        .map_err(|e| e.to_string())?;
+        .spawn(move || {
+            admit_installer(
+                &journal,
+                &model,
+                request,
+                admission_timeout,
+                &admitted,
+                observed_attempt.as_deref(),
+                observed_revision,
+            )
+        })
+        .map_err(|error| {
+            persist_local_refusal(
+                refusal_journal,
+                observed_attempt_id,
+                observed_revision,
+                "installer_launch_failed",
+                error.to_string(),
+            )
+        })?;
     admission
-        .recv()
+        .recv_timeout(admission_timeout + STOP_TIMEOUT + Duration::from_secs(1))
         .map_err(|_| "installer admission unavailable".to_owned())?
 }
 
@@ -139,6 +202,8 @@ fn admit_installer(
     request: ManagedLaunchRequest,
     admission_timeout: Duration,
     admitted: &std::sync::mpsc::SyncSender<Result<Value, String>>,
+    observed_attempt_id: Option<&str>,
+    observed_revision: u64,
 ) {
     // A bounded owner operation, not a hosted service generation. Managed launch
     // retains exact identity, canonical operational logs and child-tree cleanup.
@@ -151,14 +216,43 @@ fn admit_installer(
     let child = match launched {
         Ok(child) => child,
         Err(error) => {
-            let _ = admitted.send(Err(error.to_string()));
+            let message = error.to_string();
+            let write_res = status::record_terminal_refusal_if_unchanged(
+                journal,
+                "local",
+                observed_attempt_id,
+                observed_revision,
+                "installer_launch_failed",
+                &message,
+            );
+            if let Err(error) = write_res {
+                let _ = admitted.send(Err(error.to_string()));
+                return;
+            }
+            let _ = admitted.send(Err(message));
             return;
         }
     };
     #[cfg(windows)]
-    windows::admit(child, journal, model, admission_timeout, admitted);
+    windows::admit(
+        child,
+        journal,
+        model,
+        admission_timeout,
+        admitted,
+        observed_attempt_id,
+        observed_revision,
+    );
     #[cfg(not(windows))]
-    admit_portable(child, journal, model, admission_timeout, admitted);
+    admit_portable(
+        child,
+        journal,
+        model,
+        admission_timeout,
+        admitted,
+        observed_attempt_id,
+        observed_revision,
+    );
 }
 
 #[cfg(not(windows))]
@@ -168,6 +262,8 @@ fn admit_portable(
     model: &str,
     admission_timeout: Duration,
     admitted: &std::sync::mpsc::SyncSender<Result<Value, String>>,
+    observed_attempt_id: Option<&str>,
+    observed_revision: u64,
 ) {
     let Some(identity) = child.exact_identity().map(|launched| launched.instance) else {
         let _ = admitted.send(Err("installer identity unavailable".into()));
@@ -228,18 +324,52 @@ fn admit_portable(
                 )));
                 return;
             }
-            let _ = admitted.send(Err(format!("installer exited before admission ({code})")));
+            let error = persist_local_refusal(
+                journal,
+                observed_attempt_id,
+                observed_revision,
+                "installer_exited",
+                format!("installer exited before admission ({code})"),
+            );
+            let _ = admitted.send(Err(error));
             return;
         }
         if Instant::now() >= deadline {
             let outcome = match child.terminate_exact(STOP_TIMEOUT) {
-                Ok(()) => Err("installer admission timed out".to_owned()),
-                Err(error) => Err(format!("installer admission cleanup failed: {error}")),
+                Ok(()) => "installer admission timed out".to_owned(),
+                Err(error) => format!("installer admission cleanup failed: {error}"),
             };
-            let _ = admitted.send(outcome);
+            let write_res = status::record_terminal_refusal_if_unchanged(
+                journal,
+                "local",
+                observed_attempt_id,
+                observed_revision,
+                "installer_admission_timeout",
+                &outcome,
+            );
+            if let Err(error) = write_res {
+                let _ = admitted.send(Err(error.to_string()));
+                return;
+            }
+            let _ = admitted.send(Err(outcome));
             return;
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn persist_local_refusal(
+    journal: &Path,
+    attempt: Option<&str>,
+    revision: u64,
+    code: &str,
+    detail: String,
+) -> String {
+    match status::record_terminal_refusal_if_unchanged(
+        journal, "local", attempt, revision, code, &detail,
+    ) {
+        Ok(_) => detail,
+        Err(error) => error.to_string(),
     }
 }
 
@@ -720,11 +850,20 @@ mod tests {
             Err(err) => {
                 assert_ne!(err, "install_cancelled");
                 let current_after_explicit = status::read_status(journal.path(), "local").unwrap();
-                assert_eq!(
+                assert_eq!(current_after_explicit.install_state, "failed");
+                assert!(matches!(
+                    current_after_explicit.error_code.as_deref(),
+                    Some("installer_missing") | Some("installer_launch_failed")
+                ));
+                assert_ne!(
                     current_after_explicit.attempt_id.as_deref(),
                     Some("attempt-old")
                 );
-                assert!(!lease::is_held(journal.path(), "local").unwrap());
+                let released = lease::acquire(journal.path(), "local").unwrap();
+                assert!(
+                    released.is_some(),
+                    "refused start must release its lease within the admission probe window"
+                );
             }
             Ok(_) => {
                 if let Ok(st) = status::read_status(journal.path(), "local")

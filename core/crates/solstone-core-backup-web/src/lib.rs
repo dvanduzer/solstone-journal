@@ -1570,11 +1570,6 @@ pub(crate) fn consume_hosted(
     binding: HostedBinding,
     restore_key: Option<String>,
 ) -> Terminal {
-    // The separately reviewed callable operated transport is not installed yet.
-    // Keep a returned binding in custody, but refuse before fetching credentials.
-    if cfg!(target_os = "ios") {
-        return Terminal::error("restic_unavailable");
-    }
     if kind != "enable_hosted"
         && let Some(reason) =
             solstone_core_backup_runtime::restore::restore_pending_rotation_refusal(

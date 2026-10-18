@@ -65,7 +65,15 @@ pub fn prepare(
     )
     .map_err(PrepareFailure::Refusal)?;
     for (key, value) in request {
-        if !value.is_null() && key != "unavailable_selection" && key != "_memory_sources" {
+        if !value.is_null()
+            && !matches!(
+                key.as_str(),
+                "unavailable_selection"
+                    | "_memory_sources"
+                    | crate::story::SOURCE_BODY_KEY
+                    | crate::story::INPUT_WHOLE_KEY
+            )
+        {
             composed.insert(key, value);
         }
     }
@@ -126,6 +134,7 @@ pub fn prepare(
         });
     }
     let sources = composed.get("sources").and_then(Value::as_object).cloned();
+    let mut entry_sources = Vec::new();
     if composed
         .get("day")
         .and_then(Value::as_str)
@@ -147,6 +156,7 @@ pub fn prepare(
         );
         let mut transcript = loaded.text;
         let counts = loaded.counts;
+        entry_sources = loaded.sources;
         let mut screen_cuts = loaded.screen_cuts;
         composed.insert("transcript".to_owned(), Value::String(transcript.clone()));
         composed.insert("source_counts".to_owned(), Value::from(counts));
@@ -283,6 +293,14 @@ pub fn prepare(
         );
     }
     validate_config(&composed).map_err(PrepareFailure::Refusal)?;
+    if mode == PrepareMode::Execute
+        && let Some(body) = crate::story::source_body(&name, &composed, &entry_sources)
+    {
+        composed.insert(
+            crate::story::SOURCE_BODY_KEY.to_owned(),
+            Value::String(body),
+        );
+    }
     Ok(PreparedTalent {
         name,
         config: composed,

@@ -1080,7 +1080,7 @@ prerequisites = ["cargo-cache"]
 timeout = "standard"
 default_full = true
 runtime = "none"
-features = ["full-tests", "runtime-fetch-test"]
+features = ["full-tests", "runtime-fetch-test", "test-hooks"]
 
 [[package_suites]]
 id = "package::solstone-core-maintenance"
