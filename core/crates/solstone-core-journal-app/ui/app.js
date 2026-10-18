@@ -43,6 +43,11 @@ const COPY = {
   copiedAbout: 'copied',
   copyAboutFailed: "couldn't copy. select the text and copy it.",
   diskUsed: 'disk used',
+  browserTitle: 'finish setting up in your browser',
+  browserLine: 'this window moves on when you finish.',
+  openBrowser: 'open the setup page',
+  browserFailed: "your browser didn't open.",
+  modelsMissing: 'repair or reinstall the journal app, then restart your journal.',
   modelsDownloading: 'downloading…',
   devicesTitle: 'devices',
   yourDevices: 'your devices',
@@ -183,7 +188,7 @@ window.journalApp = {
       const entry = waiting.get(message.id);
       if (!entry) return;
       waiting.delete(message.id);
-      if (entry.cmd === 'flow') {
+      if (entry.cmd === 'flow' && state.init?.setup_sequence_enabled === true) {
         if (message.ok) {
           renderFlow(message.value);
         } else {
@@ -226,6 +231,8 @@ const state = {
   pane: 'home',
   message: null,
   flow: null,
+  modelsMissing: false,
+  downloadingModels: false,
 };
 
 const $ = id => document.getElementById(id);
@@ -305,7 +312,8 @@ async function retrySyncSignIn() {
   try {
     const status = await call('status');
     state.status = status;
-    const on = status?.service?.starts_at_sign_in ?? true;
+    const on = status?.service?.starts_at_sign_in;
+    if (typeof on !== 'boolean') throw new Error("couldn't read journal status");
     await call('syncSignInLaunch', { on });
     syncRetryNeeded = false;
     state.message = null;
@@ -330,11 +338,15 @@ async function serviceAction(action) {
   }
   state.pending = null;
   render();
-  if (action === 'start' || action === 'restart') {
+  if (state.init?.setup_sequence_enabled === true && (action === 'start' || action === 'restart')) {
     call('flow', { intent: 'retry-state' }).catch(() => {});
     return;
   }
   if (display() !== 'running') return;
+  if (state.init?.setup_sequence_enabled !== true && !await firstRunDone()) {
+    waitForFirstRun();
+    return;
+  }
   await loadJournalFacts();
 }
 
@@ -391,6 +403,163 @@ function startPolling() {
   }, 3000);
 }
 
+function renderFirstRun(step) {
+  const root = $('firstrun');
+  root.replaceChildren();
+  const card = el('div', { class: 'firstrun-card' });
+  root.append(card);
+  if (step === 'location') {
+    const locationInput = el('input', { type: 'text', value: firstRun.location, 'aria-label': COPY.location });
+    locationInput.addEventListener('change', async () => {
+      firstRun.location = locationInput.value;
+      firstRun.holdsJournal = await call('holdsJournal', { path: firstRun.location });
+      renderFirstRun('location');
+    });
+    put(card,
+      el('h1', {}, COPY.locationTitle),
+      el('div', { class: 'field' },
+        el('h2', {}, COPY.location),
+        el('div', { class: 'row' }, locationInput,
+          el('button', { type: 'button', on: { click: async () => {
+            const picked = await call('pickFolder', { start: firstRun.location });
+            if (picked) {
+              firstRun.location = picked.path;
+              firstRun.holdsJournal = picked.holds_journal;
+              renderFirstRun('location');
+            }
+          } } }, COPY.chooseLocation)),
+        firstRun.holdsJournal ? el('p', { class: 'faint' }, COPY.journalFound) : null),
+      firstRun.error ? el('p', { class: 'error' }, firstRun.error) : null,
+      el('div', { class: 'actions' },
+        el('button', { type: 'button', class: 'primary', on: { click: runSetup } }, COPY.continueButton)),
+    );
+    locationInput.focus();
+  } else if (step === 'setup') {
+    put(card,
+      el('h1', {}, COPY.setupTitle),
+      el('p', { class: 'muted' }, COPY.setupSubtitle),
+      // Only the steps that do something on Windows have words; the rest
+      // pass by unseen.
+      el('div', {}, el('ul', { class: 'steps' }, firstRun.steps.filter(item => COPY.steps[item.step]).map(item =>
+        el('li', { class: item.state }, COPY.steps[item.step])))),
+      firstRun.error ? failure(COPY.setupStopped, firstRun.error) : null,
+      firstRun.error ? el('div', { class: 'actions centered' },
+        el('button', { type: 'button', on: { click: runSetup } }, COPY.tryAgain)) : null,
+    );
+  } else if (step === 'browser') {
+    put(card,
+      el('h1', {}, COPY.browserTitle),
+      el('p', { class: 'muted' }, COPY.browserLine),
+      firstRun.error ? el('p', { class: 'error', role: 'alert' }, firstRun.error) : null,
+      el('div', { class: 'actions centered' },
+        el('button', { type: 'button', on: { click: openFirstRunPage } }, COPY.openBrowser)),
+    );
+  }
+  show('firstrun');
+}
+
+function beginFirstRun(journalPath) {
+  firstRun.location = journalPath || state.init.default_location;
+  firstRun.error = null;
+  call('holdsJournal', { path: firstRun.location }).then(holds => {
+    firstRun.holdsJournal = holds;
+    renderFirstRun('location');
+  });
+  renderFirstRun('location');
+}
+
+async function runSetup() {
+  if (!firstRun.location.trim()) return;
+  firstRun.adopted = firstRun.holdsJournal;
+  firstRun.steps = [];
+  firstRun.error = null;
+  renderFirstRun('setup');
+  try {
+    const result = await call('setup', { path: firstRun.location });
+    state.status = result.status;
+    setModelsMissing(result.models_missing != null);
+  } catch (error) {
+    firstRun.error = error.message;
+    renderFirstRun('setup');
+    return;
+  }
+  await routeAfterSetup();
+}
+
+// The same reading of the journal's first run the Mac app makes.
+async function routeAfterSetup() {
+  let probe;
+  try {
+    probe = await call('initProbe', { port: port() });
+  } catch (error) {
+    firstRun.error = error.message;
+    renderFirstRun('setup');
+    return;
+  }
+  if (probe === 'complete') {
+    try { await landLegacyHome(); } catch { waitForFirstRun(); }
+    return;
+  }
+  waitForFirstRun();
+}
+
+// A completed reading is required; a failed probe keeps browser setup available.
+async function firstRunDone() {
+  return await call('initProbe').catch(() => 'incomplete') === 'complete';
+}
+
+// The rest of the first run is the journal's own page, the one every journal
+// shows, in the owner's browser. The window waits until the journal says it
+// is done, then lands home. A sign-in start opens the page only once the
+// owner opens the window.
+const firstRunWait = { timer: null, opened: false, checking: false };
+
+function waitForFirstRun() {
+  firstRun.error = null;
+  renderFirstRun('browser');
+  if (firstRunWait.timer === null) firstRunWait.timer = setInterval(checkFirstRunDone, 2000);
+  if (!firstRunWait.opened && state.init.launch !== 'sign-in') openFirstRunPage();
+}
+
+async function openFirstRunPage() {
+  firstRunWait.opened = true;
+  firstRun.error = null;
+  try {
+    await call('open', { target: 'init', base: state.status?.base });
+  } catch {
+    firstRun.error = COPY.browserFailed;
+  }
+  if (firstRunWait.timer !== null) renderFirstRun('browser');
+}
+
+async function checkFirstRunDone() {
+  if (firstRunWait.checking || firstRunWait.timer === null) return;
+  firstRunWait.checking = true;
+  try {
+    if (await call('initProbe', { port: port() }) === 'complete' && firstRunWait.timer !== null) {
+      await landLegacyHome();
+      clearInterval(firstRunWait.timer);
+      firstRunWait.timer = null;
+    }
+  } catch { /* the next check asks again */ } finally {
+    firstRunWait.checking = false;
+  }
+}
+
+async function landLegacyHome() {
+  if (firstRun.adopted) state.message = COPY.adoptLandingLine;
+  state.pane = 'home';
+  await refreshStatus(true);
+  const on = state.status?.service?.starts_at_sign_in;
+  if (state.status?.service?.installed === true && typeof on === 'boolean') {
+    await syncAppRunEntry(on);
+  }
+  show('main');
+  startPolling();
+  await loadJournalFacts();
+}
+
+
 // --- first-run flow: the window finishes setup ----------------------------
 
 const firstRun = {
@@ -398,6 +567,7 @@ const firstRun = {
   holdsJournal: false,
   steps: [],
   adopted: false,
+  error: null,
 };
 
 let downloadWatchTimer = null;
@@ -949,7 +1119,7 @@ function landHome(view) {
 }
 
 listeners.flow.push(({ view }) => {
-  renderFlow(view);
+  if (state.init?.setup_sequence_enabled === true) renderFlow(view);
 });
 
 listeners.setup.push(({ progress }) => {
@@ -964,7 +1134,9 @@ listeners.setup.push(({ progress }) => {
     const item = firstRun.steps.find(entry => entry.step === progress.step);
     if (item) item.state = 'failed';
   }
-  if (state.flow?.phase === 'setup') {
+  if (state.init?.setup_sequence_enabled !== true) {
+    renderFirstRun('setup');
+  } else if (state.flow?.phase === 'setup') {
     renderFlow(state.flow);
   }
 });
@@ -1138,20 +1310,21 @@ const panes = {
         type: 'button',
         'data-intent': 'open-journal',
         disabled: Boolean(state.flow?.busy),
-        on: { click: () => call('flow', { intent: 'open-journal' }) }
+        on: { click: () => state.init?.setup_sequence_enabled === true
+          ? call('flow', { intent: 'open-journal' }) : openPage('journal') }
       }, COPY.openJournal);
     } else if (key === 'stopped' || key === 'not-running') {
       offer = el('button', { type: 'button', on: { click: () => serviceAction('start') } }, COPY.start);
     } else {
       offer = el('button', { type: 'button', on: { click: () => openPane('run') } }, COPY.runStateLink);
     }
-    const continueBtn = el('button', {
+    const continueBtn = state.init?.setup_sequence_enabled === true ? el('button', {
       type: 'button',
       class: 'primary',
       'data-intent': 'continue-solstone',
       disabled: state.flow?.authoritative !== true || Boolean(state.flow?.busy),
       on: { click: () => call('flow', { intent: 'continue-solstone' }) }
-    }, COPY.continueInSolstone);
+    }, COPY.continueInSolstone) : null;
     const downloadBtn = state.flow?.solstone_download ? el('button', {
       type: 'button',
       'data-intent': 'download-solstone',
@@ -1173,7 +1346,10 @@ const panes = {
       flowError(),
       speechBlock(),
       thinkingBlock(),
-      modelsBlock(),
+      state.init?.setup_sequence_enabled === true ? modelsBlock() :
+        state.modelsMissing ? el('div', { class: 'notice' },
+          el('p', {}, COPY.modelsMissing),
+          el('button', { type: 'button', disabled: state.downloadingModels, on: { click: downloadModels } }, COPY.tryAgain)) : null,
       el('p', { class: 'muted' }, COPY.homeLine),
       el('div', { class: 'actions' }, continueBtn, downloadBtn, offer),
     ];
@@ -1251,6 +1427,27 @@ const panes = {
     return renderUpdates();
   },
 };
+
+function setModelsMissing(missing) {
+  state.modelsMissing = missing;
+  try {
+    if (missing) localStorage.setItem('modelsMissing', '1'); else localStorage.removeItem('modelsMissing');
+  } catch { /* the notice still shows for this run */ }
+}
+
+async function downloadModels() {
+  state.downloadingModels = true;
+  render();
+  try {
+    await call('installModels');
+    setModelsMissing(false);
+    state.message = null;
+  } catch (error) {
+    state.message = error.message;
+  }
+  state.downloadingModels = false;
+  render();
+}
 
 // --- devices and pairing --------------------------------------------------
 
@@ -1737,11 +1934,27 @@ listeners.update.push(({ view }) => {
 });
 
 listeners.shown.push(async () => {
+  if (state.init?.setup_sequence_enabled !== true && firstRunWait.timer !== null) {
+    if (!firstRunWait.opened) await openFirstRunPage();
+    await checkFirstRunDone();
+    return;
+  }
   if (!$('main').hidden) {
     await refreshStatus();
     if (display() === 'running') await loadJournalFacts();
+    if (state.init?.setup_sequence_enabled !== true) await recheckModels();
   }
 });
+
+async function recheckModels() {
+  if (state.downloadingModels) return;
+  try {
+    const ready = await call('modelsReady');
+    setModelsMissing(ready !== true);
+    render();
+  } catch { /* retain the last required-asset reading */ }
+}
+
 
 function render(force = false) {
   if ($('main').hidden) return;
@@ -1808,6 +2021,20 @@ async function continueStartup() {
   // it back only if the owner had it running.
   if (state.init.launch === 'plain' && !['running', 'starting'].includes(display()) && state.status?.set_up) {
     await serviceAction('start');
+  }
+
+  if (state.init?.setup_sequence_enabled !== true) {
+    if (!state.status?.set_up) {
+      beginFirstRun(state.status?.service?.journal);
+      return;
+    }
+    if (display() === 'running' && !await firstRunDone()) {
+      waitForFirstRun();
+      return;
+    }
+    await landLegacyHome();
+    await recheckModels();
+    return;
   }
 
   if (!booted) {

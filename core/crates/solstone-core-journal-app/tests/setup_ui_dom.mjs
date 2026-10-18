@@ -9,6 +9,11 @@ import { fileURLToPath } from 'node:url';
 // page up when that reply is a refusal; Node would stop the process.
 process.on('unhandledRejection', () => {});
 
+const darkResume = process.argv.includes('--dark-resume');
+const dark = process.argv.includes('--dark') || darkResume;
+let darkProbe = 'incomplete';
+let darkStatus = darkResume ? { ...statusBody('running', true), set_up: true, service: { ...statusBody('running', true).service, starts_at_sign_in: false } } : null;
+
 const here = dirname(fileURLToPath(import.meta.url));
 const html = readFileSync(join(here, '../ui/index.html'), 'utf8');
 
@@ -351,10 +356,12 @@ globalThis.DOMParser = class {
 globalThis.document = document;
 globalThis.window = globalThis;
 
+const intervals = new Map();
 const realSetInterval = globalThis.setInterval.bind(globalThis);
 globalThis.setInterval = (fn, ms, ...args) => {
   const timer = realSetInterval(fn, ms, ...args);
   timer.unref?.();
+  intervals.set(timer, fn);
   return timer;
 };
 
@@ -496,11 +503,20 @@ window.chrome = {
             about: 'about',
             default_location: 'C:\\journal',
             mark: cachedSeedMark(),
+            setup_sequence_enabled: !dark,
             flow: null,
           },
         });
         return;
       }
+      if (dark && cmd === 'setup') {
+        const status = darkStatus = { ...statusBody('running', true), set_up: true };
+        send(id, true, { value: { status, models_missing: null } });
+        return;
+      }
+      if (dark && cmd === 'initProbe') { send(id, true, { value: darkProbe }); return; }
+      if (dark && cmd === 'modelsReady') { send(id, true, { value: true }); return; }
+      if (dark && cmd === 'open') { send(id, true, { value: null }); return; }
       if (cmd === 'status') {
         const planned = statusPlan.shift();
         if (planned && planned.fail) {
@@ -508,7 +524,7 @@ window.chrome = {
         } else if (planned) {
           send(id, true, { value: planned });
         } else {
-          send(id, true, { value: statusBody('not-running', false) });
+          send(id, true, { value: darkStatus || statusBody('not-running', false) });
         }
         return;
       }
@@ -669,6 +685,57 @@ if (calls.some(c => c.cmd === 'flow' && c.args?.intent === 'start-setup') || cal
   throw new Error('initial status failure called start-setup or open');
 }
 pass('initial status failure then retry');
+
+if (darkResume) {
+  await flush(); await flush();
+  if (!root().textContent.includes('finish setting up in your browser')) throw new Error('incomplete sign-in resume skipped browser setup');
+  if (calls.some(c => c.cmd === 'open')) throw new Error('sign-in launch opened a browser before owner activation');
+  window.journalApp.receive({ type: 'shown' });
+  await flush(); await flush();
+  if (!calls.some(c => c.cmd === 'open' && c.args?.target === 'init')) throw new Error('owner activation did not open pending browser setup');
+  syncPlan.push({ fail: 'Run removal failed' });
+  darkProbe = 'complete';
+  for (const callback of intervals.values()) await callback();
+  await flush(); await flush();
+  if (!$('pane').textContent.includes('Run removal failed')) throw new Error('OFF registration failure was hidden');
+  if (!calls.some(c => c.cmd === 'syncSignInLaunch' && c.args?.on === false) || calls.some(c => c.cmd === 'syncSignInLaunch' && c.args?.on === true)) throw new Error('resume changed saved OFF intent');
+  click('try again');
+  await flush(); await flush();
+  if ($('pane').textContent.includes('Run removal failed')) throw new Error('registration retry did not clear recovered error');
+  if (calls.some(c => c.cmd === 'flow')) throw new Error('dark resume admitted new flow');
+  pass('dark sign-in waits for owner shown');
+  pass('dark OFF registration error and retry');
+  console.log(`DOM CASES: ${passed} passed`);
+  process.exit(0);
+}
+
+if (dark) {
+  if (!root().textContent.includes("let's create your journal on this PC")) throw new Error('dark startup lost folder selection');
+  if (calls.some(c => c.cmd === 'flow')) throw new Error('dark startup admitted new flow');
+  click('continue');
+  await flush(); await flush();
+  if (!root().textContent.includes('finish setting up in your browser')) throw new Error('dark setup did not retain browser step');
+  click('open the setup page');
+  await flush();
+  if (!calls.some(c => c.cmd === 'open' && c.args?.target === 'init')) throw new Error('browser step did not request init');
+  darkProbe = 'complete';
+  statusPlan.push({ fail: 'completion status unavailable' });
+  for (const callback of intervals.values()) await callback();
+  await flush();
+  if (!visible(root()) || visible($('main'))) throw new Error('completion status failure left a false Home');
+  pass('dark completion status failure retains retry');
+  for (const callback of intervals.values()) await callback();
+  await flush(); await flush();
+  if (!visible($('main'))) throw new Error('completed browser setup did not reach Home');
+  if (buttons().some(b => b.getAttribute('data-intent') === 'continue-solstone')) throw new Error('dark Home offered continuation');
+  click('open your journal');
+  await flush();
+  if (!calls.some(c => c.cmd === 'open' && c.args?.target === 'journal')) throw new Error('dark Home lost ordinary journal open');
+  if (calls.some(c => c.cmd === 'flow')) throw new Error('dark path admitted new flow');
+  pass('dark browser setup recovers and retains ordinary Home open');
+  console.log(`DOM CASES: ${passed} passed`);
+  process.exit(0);
+}
 
 if (root().getAttribute('data-phase') !== 'welcome') {
   throw new Error(`boot did not paint welcome (${root().getAttribute('data-phase')}) ${root().textContent}`);

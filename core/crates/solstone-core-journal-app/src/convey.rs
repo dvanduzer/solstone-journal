@@ -38,6 +38,13 @@ impl From<String> for Refusal {
     }
 }
 
+/// What `GET /init` says about the first run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InitProbe {
+    Complete,
+    Incomplete,
+}
+
 impl Convey {
     pub fn new(port: Option<u16>) -> Self {
         let agent: Agent = Agent::config_builder()
@@ -138,6 +145,20 @@ impl Convey {
                     .map(str::to_owned)
             });
         (true, version)
+    }
+    /// `/init` redirects once the first run is finished, as the Mac app reads it.
+    pub fn init_probe(&self) -> Result<InitProbe, String> {
+        let response = self
+            .agent
+            .get(format!("{}/init", self.base))
+            .header("Accept", "text/html")
+            .call()
+            .map_err(|error| error.to_string())?;
+        match response.status().as_u16() {
+            300..=399 => Ok(InitProbe::Complete),
+            200 => Ok(InitProbe::Incomplete),
+            status => Err(format!("your journal answered {status}")),
+        }
     }
 }
 

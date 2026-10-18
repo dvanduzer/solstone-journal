@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+/// Release activation follows native qualification in a separate commit.
+pub const SETUP_SEQUENCE_ENABLED: bool = false;
+
 pub const APP_HOME_PATH: &str = "/app/home";
 pub const APP_ORIGIN: &str = "https://journal.localhost";
 
@@ -482,6 +485,17 @@ pub fn admit_models_job(session: &mut Session, effects: &mut Vec<Effect>, job: M
         }
     }
     true
+}
+
+pub fn legacy_setup_argv(journal: &Path) -> Vec<String> {
+    vec![
+        "setup".into(),
+        "--jsonl".into(),
+        "--yes".into(),
+        "--accept-existing-journal".into(),
+        "--journal".into(),
+        journal.display().to_string(),
+    ]
 }
 
 pub fn setup_argv(journal: &Path, task_installed: bool, start_at_sign_in: bool) -> Vec<String> {
@@ -3970,5 +3984,28 @@ mod tests {
 
         let dl_off_home = reduce(&session, &Event::DownloadSolstoneClicked);
         assert!(dl_off_home.effects.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod release_activation_tests {
+    use super::*;
+    #[test]
+    fn browser_first_setup_preserves_published_arguments() {
+        let args = legacy_setup_argv(Path::new("C:/owner journal"));
+        assert_eq!(
+            args,
+            [
+                "setup",
+                "--jsonl",
+                "--yes",
+                "--accept-existing-journal",
+                "--journal",
+                "C:/owner journal"
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg.starts_with("--initial-")
+            || arg == "--skip-models"
+            || arg == "--skip-brain"));
     }
 }

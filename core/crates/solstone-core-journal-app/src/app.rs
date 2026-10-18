@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-use crate::convey::{Convey, Refusal};
+use crate::convey::{Convey, InitProbe, Refusal};
 use crate::prefs::{self, CheckInterval};
 use crate::shell;
 use crate::status::{ServiceStatus, run_display};
@@ -79,6 +79,7 @@ fn convey_route_allowed(method: &str, path: &str) -> bool {
 fn journal_page(name: &str) -> Option<&'static str> {
     Some(match name {
         "journal" => crate::setup_flow::APP_HOME_PATH,
+        "init" if !crate::setup_flow::SETUP_SEQUENCE_ENABLED => "/init",
         "backup" => "/app/backup",
         "devices" => "/app/network",
         _ => return None,
@@ -135,6 +136,9 @@ fn journal_port() -> Option<u16> {
 }
 
 fn dispatch_effect(context: &Context, effect: &crate::setup_flow::Effect, port: Option<u16>) {
+    if !crate::setup_flow::SETUP_SEQUENCE_ENABLED {
+        return;
+    }
     match effect {
         crate::setup_flow::Effect::FetchCopy => {
             let proxy = context.proxy.clone();
@@ -489,6 +493,7 @@ fn handle(context: &Context, window: &Window, message: &str) {
                 // The mark the owner locked in, as the app last drew it, so a
                 // stopped journal still shows its own mark.
                 "mark": prefs::load().icon_mark,
+                "setup_sequence_enabled": crate::setup_flow::SETUP_SEQUENCE_ENABLED,
                 "flow": crate::setup_flow::view(&context.session.borrow()),
             })),
         ),
@@ -529,6 +534,12 @@ fn handle(context: &Context, window: &Window, message: &str) {
             };
             context.reply(&id, shell::set_sign_in_launch(on).map(|()| Value::Null));
         }
+        "installModels" if !crate::setup_flow::SETUP_SEQUENCE_ENABLED => {
+            context.spawn(id, || journal::install_models().map(|()| Value::Null));
+        }
+        "modelsReady" if !crate::setup_flow::SETUP_SEQUENCE_ENABLED => {
+            context.spawn(id, || Ok(json!(journal::models_ready())));
+        }
         "installModels" => {
             let session = context.session.borrow().clone();
             let step = crate::setup_flow::reduce(
@@ -559,9 +570,45 @@ fn handle(context: &Context, window: &Window, message: &str) {
             let path = PathBuf::from(text("path").unwrap_or_default());
             context.reply(&id, Ok(json!(journal::holds_a_journal(&path))));
         }
+        "setup" if !crate::setup_flow::SETUP_SEQUENCE_ENABLED => {
+            let Some(path) = text("path").filter(|path| !path.trim().is_empty()) else {
+                context.reply(&id, Err("choose where your journal lives".to_owned()));
+                return;
+            };
+            let proxy = context.proxy.clone();
+            context.spawn(id, move || {
+                let args = crate::setup_flow::legacy_setup_argv(Path::new(&path));
+                let models_missing = journal::setup(&args, |progress| {
+                    let message = json!({"type": "setup", "progress": progress});
+                    proxy.send_event(UserEvent::Script(format!(
+                        "window.journalApp.receive({message});"
+                    )));
+                })?;
+                Ok(json!({"status": read_status()?, "models_missing": models_missing}))
+            });
+        }
+        "initProbe" if !crate::setup_flow::SETUP_SEQUENCE_ENABLED => {
+            context.spawn(id, move || {
+                let port =
+                    journal_port().ok_or_else(|| "the journal isn't answering".to_owned())?;
+                Convey::new(Some(port)).init_probe().map(|probe| {
+                    json!(match probe {
+                        InitProbe::Complete => "complete",
+                        InitProbe::Incomplete => "incomplete",
+                    })
+                })
+            });
+        }
         "convey" => {
             let method = text("method").unwrap_or_else(|| "GET".to_owned());
             let path = text("path").unwrap_or_default();
+            if !crate::setup_flow::SETUP_SEQUENCE_ENABLED && path.starts_with("/init/") {
+                context.reply(
+                    &id,
+                    Err("native setup actions are unavailable in this build".into()),
+                );
+                return;
+            }
             let renderer_port = args
                 .get("port")
                 .and_then(Value::as_u64)
@@ -620,6 +667,19 @@ fn handle(context: &Context, window: &Window, message: &str) {
                 } else {
                     Err("that folder isn't there".to_owned())
                 }
+            } else if !crate::setup_flow::SETUP_SEQUENCE_ENABLED
+                && matches!(target.as_str(), "journal" | "init")
+            {
+                journal_port()
+                    .ok_or_else(|| "the journal isn't answering".to_owned())
+                    .and_then(|port| {
+                        let path = if target == "init" {
+                            "/init"
+                        } else {
+                            crate::setup_flow::APP_HOME_PATH
+                        };
+                        shell::open(&format!("http://127.0.0.1:{port}{path}"))
+                    })
             } else if target == "journal" {
                 let session = context.session.borrow().clone();
                 let mut step = crate::setup_flow::reduce(
@@ -659,6 +719,12 @@ fn handle(context: &Context, window: &Window, message: &str) {
                 Err("that page isn't one the app opens".to_owned())
             };
             context.reply(&id, result.map(|()| Value::Null));
+        }
+        "flow" if !crate::setup_flow::SETUP_SEQUENCE_ENABLED => {
+            context.reply(
+                &id,
+                Err("setup sequence is unavailable in this build".to_owned()),
+            );
         }
         "flow" => {
             let intent = text("intent").unwrap_or_default();
@@ -857,6 +923,9 @@ pub fn run(launch: Launch, update_feed: Option<String>) {
         WindowEvent::User(UserEvent::Ipc(message)) => handle(&context, &looped, &message),
         WindowEvent::User(UserEvent::Script(script)) => page.run_script(&script),
         WindowEvent::User(UserEvent::Flow(flow_event)) => {
+            if !crate::setup_flow::SETUP_SEQUENCE_ENABLED {
+                return;
+            }
             let session = context.session.borrow().clone();
             let step = crate::setup_flow::reduce(&session, &flow_event);
             run_turn(&context, step, |view| {
@@ -872,7 +941,7 @@ pub fn run(launch: Launch, update_feed: Option<String>) {
             page.focus();
             page.run_script("window.journalApp.receive({type:'shown'});");
             let is_home = context.session.borrow().phase == crate::setup_flow::Phase::Home;
-            if is_home {
+            if crate::setup_flow::SETUP_SEQUENCE_ENABLED && is_home {
                 let session = context.session.borrow().clone();
                 let step = crate::setup_flow::reduce(
                     &session,

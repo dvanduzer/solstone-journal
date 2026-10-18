@@ -6,6 +6,9 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+The new setup sequence is prepared but remains off in this build. The setup
+entries below describe the sequence after activation.
+
 ### Added
 
 - when you first set up your journal on windows, you can choose whether it starts when you sign in. leaving that choice out keeps the current default, and setting up your journal again keeps your existing choice.

@@ -17,23 +17,27 @@ fn setup_ui_dom_contract() {
         ),
         Ok(_) => {}
     }
-    let output = Command::new("node")
-        .arg(format!(
+    for mode in [None, Some("--dark"), Some("--dark-resume")] {
+        let mut command = Command::new("node");
+        command.arg(format!(
             "{}/tests/setup_ui_dom.mjs",
             env!("CARGO_MANIFEST_DIR")
-        ))
-        .output()
-        .expect("setup ui DOM harness starts");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
-        "setup ui DOM harness failed:\nstdout:\n{}\nstderr:\n{}",
-        stdout,
-        String::from_utf8_lossy(&output.stderr),
-    );
-    assert!(
-        stdout.starts_with("DOM CASES: ") && stdout.contains(" passed"),
-        "setup ui DOM harness did not report its internal case count:\n{stdout}"
-    );
-    println!("{}", stdout.trim());
+        ));
+        if let Some(mode) = mode {
+            command.arg(mode);
+        }
+        let output = command.output().expect("setup ui DOM harness starts");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "setup ui DOM harness failed:\nstdout:\n{}\nstderr:\n{}",
+            stdout,
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            stdout.starts_with("DOM CASES: ") && stdout.contains(" passed"),
+            "setup ui DOM harness did not report its internal case count:\n{stdout}"
+        );
+        println!("{}", stdout.trim());
+    }
 }
