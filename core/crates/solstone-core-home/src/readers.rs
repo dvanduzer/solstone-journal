@@ -726,6 +726,7 @@ pub fn newsletter_attempts_from_think_logs(context: &HomeContext, day: &str) -> 
 
 /// Read serialized root backlog data without generating it.
 pub fn load_backlog_source(context: &HomeContext) -> BacklogSource {
+    let saved_lane = solstone_core_journal_config::saved_thinking_lane(context.journal_root());
     let path = context.journal_root().join("stats.json");
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -739,6 +740,7 @@ pub fn load_backlog_source(context: &HomeContext) -> BacklogSource {
                 backlog: None,
                 validity,
                 generated_at: None,
+                saved_lane,
             };
         }
         Err(_) => {
@@ -746,6 +748,7 @@ pub fn load_backlog_source(context: &HomeContext) -> BacklogSource {
                 backlog: None,
                 validity: BacklogValidity::Unparseable,
                 generated_at: None,
+                saved_lane,
             };
         }
     };
@@ -756,6 +759,7 @@ pub fn load_backlog_source(context: &HomeContext) -> BacklogSource {
                 backlog: None,
                 validity: BacklogValidity::Unparseable,
                 generated_at: None,
+                saved_lane,
             };
         }
     };
@@ -764,6 +768,7 @@ pub fn load_backlog_source(context: &HomeContext) -> BacklogSource {
             backlog: None,
             validity: BacklogValidity::Malformed,
             generated_at: None,
+            saved_lane,
         };
     };
     let generated_at = object
@@ -775,16 +780,19 @@ pub fn load_backlog_source(context: &HomeContext) -> BacklogSource {
             backlog: None,
             validity: BacklogValidity::NoBacklogKey,
             generated_at,
+            saved_lane,
         },
         Some(Value::Object(backlog)) => BacklogSource {
             backlog: Some(backlog.clone()),
             validity: BacklogValidity::Valid,
             generated_at,
+            saved_lane,
         },
         _ => BacklogSource {
             backlog: None,
             validity: BacklogValidity::Malformed,
             generated_at,
+            saved_lane,
         },
     }
 }
@@ -1487,10 +1495,52 @@ mod tests {
         let root = TempDir::new().unwrap();
         let context = context(root.path());
         // No way to think chosen: the nightly run that writes the summary is off.
+        let blank = load_backlog_source(&context);
         assert_eq!(
-            load_backlog_source(&context).validity,
-            BacklogValidity::NotYet(solstone_core_system_health::NotYet::AwaitingEngine)
+            blank.validity,
+            BacklogValidity::NotYet(solstone_core_system_health::NotYet::AwaitingEngine(None))
         );
+        assert_eq!(blank.saved_lane, None);
+
+        // With thinking_choice "byo" and no provider and no stats.json:
+        // validity is NotYet(AwaitingEngine(Some(Byo))) and saved_lane is Some(Byo).
+        write(
+            root.path(),
+            "config/journal.json",
+            r#"{"setup":{"thinking_choice":"byo"}}"#,
+        );
+        let byo_source = load_backlog_source(&context);
+        assert_eq!(
+            byo_source.validity,
+            BacklogValidity::NotYet(solstone_core_system_health::NotYet::AwaitingEngine(Some(
+                solstone_core_journal_config::SavedLane::Byo
+            )))
+        );
+        assert_eq!(
+            byo_source.saved_lane,
+            Some(solstone_core_journal_config::SavedLane::Byo)
+        );
+
+        // With that same choice and a real stats.json, validity is not NotYet and saved_lane is still Some(Byo).
+        write(
+            root.path(),
+            "stats.json",
+            r#"{"generated_at":"x","backlog":{"days":[]}}"#,
+        );
+        let with_stats = load_backlog_source(&context);
+        assert_ne!(
+            with_stats.validity,
+            BacklogValidity::NotYet(solstone_core_system_health::NotYet::AwaitingEngine(Some(
+                solstone_core_journal_config::SavedLane::Byo
+            )))
+        );
+        assert_eq!(with_stats.validity, BacklogValidity::Valid);
+        assert_eq!(
+            with_stats.saved_lane,
+            Some(solstone_core_journal_config::SavedLane::Byo)
+        );
+        fs::remove_file(root.path().join("stats.json")).unwrap();
+
         // A way to think, and the journal's first night long past: missing is missing.
         write(
             root.path(),
@@ -2695,6 +2745,7 @@ mod tests {
             backlog: None,
             validity: BacklogValidity::Valid,
             generated_at: None,
+            saved_lane: None,
         };
 
         let glance = crate::health_glance::build_health_glance(
@@ -2794,6 +2845,7 @@ mod tests {
             backlog: Some(json!({"stuck_days": 0}).as_object().unwrap().clone()),
             validity: BacklogValidity::Valid,
             generated_at: Some(now.to_rfc3339()),
+            saved_lane: None,
         };
         let ready_brain = json!({
             "state": "ready",

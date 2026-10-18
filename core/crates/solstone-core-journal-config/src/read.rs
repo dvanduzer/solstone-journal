@@ -221,6 +221,43 @@ pub fn no_thinking_engine_chosen(journal: &Path) -> bool {
         .is_some_and(|provider| !provider.trim().is_empty())
 }
 
+/// A thinking lane saved during setup before an engine is running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SavedLane {
+    Byo,
+    Spp,
+    Local,
+}
+
+impl SavedLane {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Byo => "byo",
+            Self::Spp => "spp",
+            Self::Local => "local",
+        }
+    }
+}
+
+/// Return the thinking lane saved during setup, if one was chosen and remains valid.
+pub fn saved_thinking_lane(journal: &Path) -> Option<SavedLane> {
+    let Ok(read) = read_journal_config(journal) else {
+        return None;
+    };
+    let config = read.config?;
+    let choice = config
+        .get("setup")
+        .and_then(Value::as_object)
+        .and_then(|setup| setup.get("thinking_choice"))
+        .and_then(Value::as_str)?;
+    match choice {
+        "byo" => Some(SavedLane::Byo),
+        "spp" => Some(SavedLane::Spp),
+        "local" => Some(SavedLane::Local),
+        _ => None,
+    }
+}
+
 /// Return whether tier-8 entity typo auto-acceptance is enabled.
 pub fn entity_tier8_typo_acceptance_enabled(config: Option<&Map<String, Value>>) -> bool {
     let Some(config) = config else {
@@ -481,6 +518,47 @@ mod tests {
             br#"{"providers":{"active":{"provider":"anthropic"}}}"#,
         );
         assert!(!no_thinking_engine_chosen(temp.path()));
+    }
+
+    #[test]
+    fn saved_thinking_lane_detects_known_choices_and_ignores_others() {
+        let temp = TempDir::new();
+        // absent file
+        assert_eq!(saved_thinking_lane(temp.path()), None);
+
+        // unreadable bytes (invalid JSON)
+        write_config(temp.path(), b"not json");
+        assert_eq!(saved_thinking_lane(temp.path()), None);
+
+        // missing setup
+        write_config(temp.path(), br#"{"providers":{}}"#);
+        assert_eq!(saved_thinking_lane(temp.path()), None);
+
+        // "later"
+        write_config(temp.path(), br#"{"setup":{"thinking_choice":"later"}}"#);
+        assert_eq!(saved_thinking_lane(temp.path()), None);
+
+        // other string
+        write_config(temp.path(), br#"{"setup":{"thinking_choice":"custom"}}"#);
+        assert_eq!(saved_thinking_lane(temp.path()), None);
+
+        // padded tokens
+        write_config(temp.path(), br#"{"setup":{"thinking_choice":" local "}}"#);
+        assert_eq!(saved_thinking_lane(temp.path()), None);
+        write_config(temp.path(), br#"{"setup":{"thinking_choice":"byo "}}"#);
+        assert_eq!(saved_thinking_lane(temp.path()), None);
+
+        // "byo"
+        write_config(temp.path(), br#"{"setup":{"thinking_choice":"byo"}}"#);
+        assert_eq!(saved_thinking_lane(temp.path()), Some(SavedLane::Byo));
+
+        // "spp"
+        write_config(temp.path(), br#"{"setup":{"thinking_choice":"spp"}}"#);
+        assert_eq!(saved_thinking_lane(temp.path()), Some(SavedLane::Spp));
+
+        // "local"
+        write_config(temp.path(), br#"{"setup":{"thinking_choice":"local"}}"#);
+        assert_eq!(saved_thinking_lane(temp.path()), Some(SavedLane::Local));
     }
 
     #[test]

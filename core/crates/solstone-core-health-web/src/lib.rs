@@ -143,7 +143,7 @@ async fn state(root: PathBuf, clock: Clock) -> Response {
                 }
                 // Nothing catches search up until processing is set up; the
                 // verdict above already says so.
-                Some(solstone_core_system_health::NotYet::AwaitingEngine) => {
+                Some(solstone_core_system_health::NotYet::AwaitingEngine(_)) => {
                     search_index.text = String::new();
                 }
                 None => {}

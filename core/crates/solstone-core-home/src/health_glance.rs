@@ -69,7 +69,7 @@ pub fn build_health_glance(
         BacklogValidity::NotYet(not_yet) => Some(not_yet),
         // No way to think chosen is a choice still ahead, never a fault: it
         // rides as the note even when a summary from earlier exists.
-        _ if engine_not_chosen(brain) => Some(NotYet::AwaitingEngine),
+        _ if engine_not_chosen(brain) => Some(NotYet::AwaitingEngine(backlog.saved_lane)),
         _ => None,
     };
     if let Some(not_yet) = not_yet {
@@ -532,6 +532,7 @@ mod tests {
             backlog: Some(json!({"stuck_days": 0}).as_object().unwrap().clone()),
             validity: BacklogValidity::Valid,
             generated_at: Some(ten_min_future.to_rfc3339()),
+            saved_lane: None,
         };
         let glance_ten = build_health_glance(
             &json!({"status": "active"}),
@@ -554,6 +555,7 @@ mod tests {
             backlog: Some(json!({"stuck_days": 0}).as_object().unwrap().clone()),
             validity: BacklogValidity::Valid,
             generated_at: Some(two_min_future.to_rfc3339()),
+            saved_lane: None,
         };
         let glance_two = build_health_glance(
             &json!({"status": "active"}),
@@ -572,6 +574,7 @@ mod tests {
             backlog: Some(json!({"stuck_days":0}).as_object().unwrap().clone()),
             validity: BacklogValidity::Valid,
             generated_at: Some("2026-05-14T12:00:00+00:00".to_owned()),
+            saved_lane: None,
         }
     }
 
@@ -963,6 +966,7 @@ mod tests {
             backlog: None,
             validity: BacklogValidity::Missing,
             generated_at: None,
+            saved_lane: None,
         };
         let backlog_over_invalid = build_health_glance(
             &invalid_active,
@@ -1087,6 +1091,7 @@ mod tests {
                 backlog: Some(json!({"stuck_days":0}).as_object().unwrap().clone()),
                 validity: BacklogValidity::Valid,
                 generated_at: Some(at.to_rfc3339()),
+                saved_lane: None,
             };
             build_health_glance(&awaiting, None, &backlog, &Value::Null, at, None)
         };
@@ -1181,6 +1186,7 @@ mod tests {
             backlog: None,
             validity: BacklogValidity::NotYet(kind),
             generated_at: None,
+            saved_lane: None,
         }
     }
 
@@ -1192,6 +1198,7 @@ mod tests {
     /// and never lets a delivering device turn home green.
     #[test]
     fn first_night_is_a_calm_note_never_a_count_and_never_green() {
+        use solstone_core_journal_config::SavedLane;
         use solstone_core_system_health::{NOT_YET_ENGINE, NOT_YET_FIRST_NIGHT, NotYet};
         let note = |glance: &Value| glance["note"]["text"].as_str().map(str::to_owned);
 
@@ -1211,12 +1218,27 @@ mod tests {
         let empty = json!({"status": "no_clients", "registry": "registry_empty"});
         let blocked = json!({"state": "blocked", "reason_code": "thinking_engine_not_chosen",
             "headline": "thinking isn't set up yet"});
-        let no_engine = not_yet_glance(&empty, &blocked, &not_yet(NotYet::AwaitingEngine));
+        let no_engine = not_yet_glance(&empty, &blocked, &not_yet(NotYet::AwaitingEngine(None)));
         assert_eq!(no_engine["verdict"], "calm");
         assert!(no_engine["issues"].as_array().unwrap().is_empty());
         assert_eq!(no_engine["cta"]["href"], "/app/network/#devices");
         assert_eq!(note(&no_engine).as_deref(), Some(NOT_YET_ENGINE));
         assert_eq!(no_engine["note"]["href"], "/app/thinking/");
+
+        for (lane, expected_href) in [
+            (SavedLane::Byo, "/app/thinking/#byo-setup"),
+            (SavedLane::Spp, "/app/thinking/#confidential-setup"),
+            (SavedLane::Local, "/app/thinking/#local-setup"),
+        ] {
+            let mut backlog_with_not_yet = not_yet(NotYet::AwaitingEngine(Some(lane)));
+            backlog_with_not_yet.saved_lane = None;
+            let glance = not_yet_glance(&empty, &blocked, &backlog_with_not_yet);
+            assert_eq!(
+                note(&glance).as_deref(),
+                Some(NotYet::AwaitingEngine(Some(lane)).text())
+            );
+            assert_eq!(glance["note"]["href"], expected_href);
+        }
 
         // A summary from earlier exists, and still no way to think is chosen:
         // the same note, never an issue.
@@ -1224,6 +1246,17 @@ mod tests {
         assert!(unchosen_later["issues"].as_array().unwrap().is_empty());
         assert_eq!(note(&unchosen_later).as_deref(), Some(NOT_YET_ENGINE));
         assert_eq!(unchosen_later["verdict"], "calm");
+
+        // Summary exists (Valid backlog) and brain reason_code == "thinking_engine_not_chosen":
+        // href and text follow backlog.saved_lane
+        let mut byo_backlog = fresh_backlog();
+        byo_backlog.saved_lane = Some(SavedLane::Byo);
+        let byo_glance = not_yet_glance(&active, &blocked, &byo_backlog);
+        assert_eq!(
+            note(&byo_glance).as_deref(),
+            Some(NotYet::AwaitingEngine(Some(SavedLane::Byo)).text())
+        );
+        assert_eq!(byo_glance["note"]["href"], "/app/thinking/#byo-setup");
 
         // A blocked lane that needs a step is still the ask it was.
         let key_missing = json!({"state": "blocked", "reason_code": "provider_key_missing",
@@ -1253,6 +1286,7 @@ mod tests {
             backlog: None,
             validity: BacklogValidity::Missing,
             generated_at: None,
+            saved_lane: None,
         };
         let amber = not_yet_glance(&active, &Value::Null, &missing);
         assert_eq!(amber["verdict"], "attention");

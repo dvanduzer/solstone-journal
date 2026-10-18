@@ -603,7 +603,7 @@
       href = '/app/thinking/#confidential-setup';
       linkText = 'finish →';
     } else if (step === 'local') {
-      title = 'finish setting up thinking';
+      title = 'finish setting up local thinking';
       href = '/app/thinking/#local-setup';
       linkText = 'finish →';
     } else {
@@ -1475,6 +1475,7 @@
     return {
       exists: Boolean(pulse.briefing_exists),
       phase: pulse.briefing_phase || 'eod',
+      saved_lane: pulse.briefing_saved_lane ?? null,
       summary: pulse.briefing_summary || '',
       meta: pulse.briefing_meta || null,
       sections: isPlainObject(pulse.briefing_sections) ? pulse.briefing_sections : {},
@@ -1505,6 +1506,12 @@
     first_night_empty: 'your first briefing is due the morning after something goes into your journal.'
   });
 
+  const BRIEFING_AWAITING_ENGINE_LANES = Object.assign(Object.create(null), {
+    byo: 'morning briefings start once your own model is set up.',
+    spp: 'morning briefings start once confidential processing is set up.',
+    local: 'morning briefings start once local thinking is set up.'
+  });
+
   function briefingPlaceholderHtml(data, pulseContext) {
     if (data.exists) return '';
     // A briefing that was never prepared used to render nothing at all from ten
@@ -1514,6 +1521,10 @@
         + "your morning briefing wasn't prepared. "
         + '<a class="pulse-briefing-status-link" href="/app/thinking/#runs/' + esc(pulseContext?.briefing_analysis_day || '') + '/morning_briefing">see the run →</a>'
         + '</div>';
+    }
+    if (data.phase === 'awaiting_engine') {
+      const text = BRIEFING_AWAITING_ENGINE_LANES[data.saved_lane] || BRIEFING_NOT_YET.awaiting_engine;
+      return '<div class="pulse-briefing-placeholder">' + esc(text) + '</div>';
     }
     const notYet = BRIEFING_NOT_YET[data.phase];
     if (notYet) return '<div class="pulse-briefing-placeholder">' + esc(notYet) + '</div>';

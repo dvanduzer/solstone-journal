@@ -8,6 +8,7 @@ pub struct BacklogSource {
     pub backlog: Option<serde_json::Map<String, Value>>,
     pub validity: BacklogValidity,
     pub generated_at: Option<String>,
+    pub saved_lane: Option<solstone_core_journal_config::SavedLane>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

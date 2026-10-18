@@ -6,6 +6,7 @@
     "needs_deduped": [],
     "needs_shared_count": 0,
     "phase": "awaiting_engine",
+    "saved_lane": null,
     "sections": {},
     "summary": null
   },
@@ -23,6 +24,7 @@
     "briefing_needs_deduped": [],
     "briefing_needs_shared_count": 0,
     "briefing_phase": "awaiting_engine",
+    "briefing_saved_lane": null,
     "briefing_sections": {},
     "briefing_summary": null,
     "connections": {

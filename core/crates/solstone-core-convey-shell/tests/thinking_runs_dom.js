@@ -418,6 +418,7 @@ async function main() {
 
   // Brain Glance & Lane nodes
   make('brainGlance');
+  make('thinkingIntro');
   make('thinkingActiveLane');
   make('thinkingActiveValue');
   make('thinkingActiveDetail');
@@ -2335,6 +2336,31 @@ async function main() {
   assert.strictEqual(nodes.get('chatgptGlancePlanLabel').textContent, 'SENTINEL_PLAN', 'plan label sentinel shown');
   assert.strictEqual(nodes.get('chatgptGlanceReminder').textContent, 'SENTINEL_REMINDER', 'reminder sentinel shown');
   assert.strictEqual(nodes.get('brainCheckAction').hidden, false, 'brainCheckAction remains visible when configured true');
+
+  // thinkingIntro with savedLane
+  thinking.state.providers.brain = {
+    state: 'blocked',
+    reason_code: 'thinking_engine_not_chosen',
+  };
+  thinking.state.savedLane = null;
+  thinking.renderGlance();
+  const unchosenIntro = nodes.get('thinkingIntro').textContent;
+  assert.strictEqual(unchosenIntro, 'choose where the thinking happens. your journal keeps everything until you do.');
+
+  thinking.state.savedLane = 'later';
+  thinking.renderGlance();
+  assert.strictEqual(nodes.get('thinkingIntro').textContent, unchosenIntro);
+
+  thinking.state.savedLane = 'byo';
+  thinking.renderGlance();
+  assert.notStrictEqual(nodes.get('thinkingIntro').textContent, unchosenIntro);
+
+  thinking.state.providers.brain = {
+    state: 'blocked',
+    reason_code: 'other_reason',
+  };
+  thinking.renderGlance();
+  assert.strictEqual(nodes.get('thinkingIntro').textContent, 'choose or check your model in setup.');
 
   // 13. S4 Reopen tab: reopenChatGptTab opens authorizeUrl in new window with opener null, no API requests
   thinking.state.chatgpt.attempt = { id: 'attempt_reopen', authorizeUrl: 'https://auth.openai.com/reopen' };

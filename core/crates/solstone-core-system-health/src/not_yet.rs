@@ -12,6 +12,7 @@
 use std::path::Path;
 
 use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime};
+use solstone_core_journal_config::SavedLane;
 
 use crate::freshness::{BacklogStatusEvaluation, SummaryFreshness, UnfinishedActivitiesAggregate};
 
@@ -23,6 +24,10 @@ pub const NOT_YET_FIRST_NIGHT: &str =
     "you'll see whether your journal is caught up after its first night.";
 pub const NOT_YET_ENGINE: &str =
     "your journal starts catching up once you choose where the thinking happens.";
+const NOT_YET_ENGINE_BYO: &str = "your journal starts catching up once your own model is set up.";
+const NOT_YET_ENGINE_SPP: &str =
+    "your journal starts catching up once confidential processing is set up.";
+const NOT_YET_ENGINE_LOCAL: &str = "your journal starts catching up once local thinking is set up.";
 pub const NOT_YET_SEARCH: &str = "search catches up overnight.";
 
 /// Why the nightly catch-up hasn't had its first chance yet.
@@ -30,7 +35,7 @@ pub const NOT_YET_SEARCH: &str = "search catches up overnight.";
 pub enum NotYet {
     /// No way to think is chosen, so the nightly run is off on purpose
     /// (the supervisor skips it: `no_thinking_engine_chosen`).
-    AwaitingEngine,
+    AwaitingEngine(Option<SavedLane>),
     /// A way to think is chosen and the journal's first overnight window is
     /// still ahead, with no catch-up finished yet.
     FirstNight,
@@ -39,7 +44,10 @@ pub enum NotYet {
 impl NotYet {
     pub const fn text(self) -> &'static str {
         match self {
-            Self::AwaitingEngine => NOT_YET_ENGINE,
+            Self::AwaitingEngine(None) => NOT_YET_ENGINE,
+            Self::AwaitingEngine(Some(SavedLane::Byo)) => NOT_YET_ENGINE_BYO,
+            Self::AwaitingEngine(Some(SavedLane::Spp)) => NOT_YET_ENGINE_SPP,
+            Self::AwaitingEngine(Some(SavedLane::Local)) => NOT_YET_ENGINE_LOCAL,
             Self::FirstNight => NOT_YET_FIRST_NIGHT,
         }
     }
@@ -47,14 +55,17 @@ impl NotYet {
     /// Where the note leads: the fix when there is one, the detail otherwise.
     pub const fn href(self) -> &'static str {
         match self {
-            Self::AwaitingEngine => "/app/thinking/",
+            Self::AwaitingEngine(None) => "/app/thinking/",
+            Self::AwaitingEngine(Some(SavedLane::Byo)) => "/app/thinking/#byo-setup",
+            Self::AwaitingEngine(Some(SavedLane::Spp)) => "/app/thinking/#confidential-setup",
+            Self::AwaitingEngine(Some(SavedLane::Local)) => "/app/thinking/#local-setup",
             Self::FirstNight => "/app/health/#backlogVerdict",
         }
     }
 
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::AwaitingEngine => "awaiting_engine",
+            Self::AwaitingEngine(_) => "awaiting_engine",
             Self::FirstNight => "first_night",
         }
     }
@@ -68,7 +79,7 @@ pub fn not_yet_rule(
     local_now: NaiveDateTime,
 ) -> Option<NotYet> {
     if !engine_chosen {
-        return Some(NotYet::AwaitingEngine);
+        return Some(NotYet::AwaitingEngine(None));
     }
     if daily_catchup_finished {
         return None;
@@ -86,7 +97,9 @@ pub fn not_yet_rule(
 /// listing its days.
 pub fn journal_not_yet(journal: &Path, local_now: NaiveDateTime) -> Option<NotYet> {
     if solstone_core_journal_config::no_thinking_engine_chosen(journal) {
-        return Some(NotYet::AwaitingEngine);
+        return Some(NotYet::AwaitingEngine(
+            solstone_core_journal_config::saved_thinking_lane(journal),
+        ));
     }
     if crate::catchup_state::read_daily_catchup_finished(journal) {
         return None;
@@ -149,11 +162,11 @@ mod tests {
     fn no_engine_is_awaiting_engine_on_any_day() {
         assert_eq!(
             not_yet_rule(false, false, day("20260901"), at("20260923", 15, 0)),
-            Some(NotYet::AwaitingEngine)
+            Some(NotYet::AwaitingEngine(None))
         );
         assert_eq!(
             not_yet_rule(false, true, day("20260901"), at("20260923", 15, 0)),
-            Some(NotYet::AwaitingEngine)
+            Some(NotYet::AwaitingEngine(None))
         );
     }
 
@@ -237,7 +250,112 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         assert_eq!(
             summary_not_yet(temp.path(), at("20260923", 15, 0)),
-            Some(NotYet::AwaitingEngine)
+            Some(NotYet::AwaitingEngine(None))
+        );
+    }
+
+    #[test]
+    fn awaiting_engine_variants_and_hrefs() {
+        assert_eq!(NotYet::AwaitingEngine(None).text(), NOT_YET_ENGINE);
+        assert_eq!(NotYet::AwaitingEngine(None).href(), "/app/thinking/");
+        assert_eq!(NotYet::AwaitingEngine(None).as_str(), "awaiting_engine");
+
+        for (lane, expected_href) in [
+            (SavedLane::Byo, "/app/thinking/#byo-setup"),
+            (SavedLane::Spp, "/app/thinking/#confidential-setup"),
+            (SavedLane::Local, "/app/thinking/#local-setup"),
+        ] {
+            let not_yet = NotYet::AwaitingEngine(Some(lane));
+            assert_ne!(not_yet.text(), NOT_YET_ENGINE);
+            assert_eq!(not_yet.href(), expected_href);
+            assert_eq!(not_yet.as_str(), "awaiting_engine");
+        }
+    }
+
+    #[test]
+    fn saved_thinking_lane_is_reflected_in_journal_and_summary_not_yet() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("config")).unwrap();
+
+        for (choice, expected_lane) in [
+            ("byo", SavedLane::Byo),
+            ("spp", SavedLane::Spp),
+            ("local", SavedLane::Local),
+        ] {
+            // Saved choice + no provider + no stats.json
+            std::fs::write(
+                root.join("config/journal.json"),
+                format!(r#"{{"setup":{{"thinking_choice":"{choice}"}}}}"#),
+            )
+            .unwrap();
+            assert_eq!(
+                summary_not_yet(root, at("20260923", 15, 0)),
+                Some(NotYet::AwaitingEngine(Some(expected_lane)))
+            );
+            assert_eq!(
+                journal_not_yet(root, at("20260923", 15, 0)),
+                Some(NotYet::AwaitingEngine(Some(expected_lane)))
+            );
+
+            // Saved choice + whitespace provider
+            std::fs::write(
+                root.join("config/journal.json"),
+                format!(
+                    r#"{{"setup":{{"thinking_choice":"{choice}"}},"providers":{{"active":{{"provider":"   "}}}}}}"#
+                ),
+            )
+            .unwrap();
+            assert_eq!(
+                summary_not_yet(root, at("20260923", 15, 0)),
+                Some(NotYet::AwaitingEngine(Some(expected_lane)))
+            );
+
+            // Saved choice + non-empty active provider: not AwaitingEngine
+            std::fs::write(
+                root.join("config/journal.json"),
+                format!(
+                    r#"{{"setup":{{"thinking_choice":"{choice}"}},"providers":{{"active":{{"provider":"anthropic"}}}}}}"#
+                ),
+            )
+            .unwrap();
+            let reading = summary_not_yet(root, at("20260923", 15, 0));
+            assert_ne!(reading, Some(NotYet::AwaitingEngine(Some(expected_lane))));
+            assert_ne!(reading, Some(NotYet::AwaitingEngine(None)));
+            assert_eq!(reading, Some(NotYet::FirstNight));
+
+            // stats.json present: summary_not_yet is None even with saved lane and no provider
+            std::fs::write(
+                root.join("config/journal.json"),
+                format!(r#"{{"setup":{{"thinking_choice":"{choice}"}}}}"#),
+            )
+            .unwrap();
+            std::fs::write(root.join("stats.json"), b"{}").unwrap();
+            assert_eq!(summary_not_yet(root, at("20260923", 15, 0)), None);
+            std::fs::remove_file(root.join("stats.json")).unwrap();
+        }
+
+        // "later", missing setup, unreadable config -> AwaitingEngine(None)
+        std::fs::write(
+            root.join("config/journal.json"),
+            br#"{"setup":{"thinking_choice":"later"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            summary_not_yet(root, at("20260923", 15, 0)),
+            Some(NotYet::AwaitingEngine(None))
+        );
+
+        std::fs::write(root.join("config/journal.json"), br#"{}"#).unwrap();
+        assert_eq!(
+            summary_not_yet(root, at("20260923", 15, 0)),
+            Some(NotYet::AwaitingEngine(None))
+        );
+
+        std::fs::write(root.join("config/journal.json"), b"bad json").unwrap();
+        assert_eq!(
+            summary_not_yet(root, at("20260923", 15, 0)),
+            Some(NotYet::AwaitingEngine(None))
         );
     }
 

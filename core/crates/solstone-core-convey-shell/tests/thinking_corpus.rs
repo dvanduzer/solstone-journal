@@ -168,6 +168,14 @@ fn corpus() -> Value {
                     }
                 }
             }
+            if case["path"] == "/app/thinking/api/state" {
+                if let Some(object) = case.get_mut("json").and_then(Value::as_object_mut) {
+                    if object.contains_key("providers") {
+                        object.insert("saved_lane".into(), Value::Null);
+                        projected = true;
+                    }
+                }
+            }
             if let Some(setup) = case
                 .pointer_mut("/json/copy/byo_setup")
                 .and_then(Value::as_object_mut)

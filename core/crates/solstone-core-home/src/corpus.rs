@@ -388,11 +388,13 @@ fn backlog(name: &str) -> BacklogSource {
             backlog: None,
             validity: BacklogValidity::Missing,
             generated_at: None,
+            saved_lane: None,
         },
         "unparseable" => BacklogSource {
             backlog: None,
             validity: BacklogValidity::Unparseable,
             generated_at: None,
+            saved_lane: None,
         },
         "valid_fresh_clear" => valid(
             json!({"stuck_days":0,"degraded":false}),
@@ -416,6 +418,7 @@ fn valid(value: Value, generated_at: Option<&str>) -> BacklogSource {
         backlog: value.as_object().cloned(),
         validity: BacklogValidity::Valid,
         generated_at: generated_at.map(str::to_owned),
+        saved_lane: None,
     }
 }
 fn capture(name: &str) -> Value {
