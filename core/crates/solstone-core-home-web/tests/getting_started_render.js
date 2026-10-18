@@ -1234,6 +1234,283 @@ async function runTests() {
   const narrElHidden = surface.querySelector('#pulse-narrative');
   assert.strictEqual(narrElHidden?.getAttribute('data-section-collapsed'), 'false', 'narrative section collapsed is false on live day with card hidden');
 
+  // 12. SAY A SENTENCE LAYER (PROOF) TESTS:
+  const shownStates = ['waiting', 'no_audio', 'transcribing', 'nothing_heard', 'failed', 'heard'];
+  for (const st of shownStates) {
+    const proofObj = {
+      state: st,
+      start_at: '2026-10-10T12:00:00Z',
+      href: st === 'failed' ? '/app/health/' : (st === 'heard' ? '/app/transcripts/20261010?stream=phone#120000_300' : undefined),
+      text: st === 'heard' ? 'hello test speech' : undefined,
+      fresh: st === 'heard' ? true : undefined,
+    };
+    setState({
+      firstMinutesPayload: {
+        window_open: true,
+        devices_known: true,
+        devices: [],
+        first_segment: {
+          start_at: '2026-10-10T12:00:00Z',
+          href: '/app/transcripts/20261010?stream=phone#120000_300',
+          thinking: 'read',
+        },
+        checks: { phone: false, thinking: true, heard: false },
+        proof: proofObj,
+      },
+      setupPayload: null,
+      agentsPayload: { connections: [] },
+      agentsSettled: true,
+      firstMinutesClosed: false,
+    });
+    updateGettingStartedSurface();
+
+    const gsCard = surface.querySelector('[data-home-surface="getting-started"]');
+    assert(gsCard, 'getting-started card present for state ' + st);
+    const proofEl = gsCard.querySelector('[data-proof-state="' + st + '"]');
+    assert(proofEl, 'data-proof-state="' + st + '" present inside card');
+
+    const segThinkingEl = gsCard.querySelector('[data-segment-thinking]');
+    const nextEl = gsCard.querySelector('[data-getting-started-next]');
+    assert(segThinkingEl, 'segment-thinking present');
+    assert(nextEl, 'getting-started-next present');
+
+    const segIdx = gsCard.children.indexOf(segThinkingEl);
+    const proofIdx = gsCard.children.indexOf(proofEl);
+    const nextIdx = gsCard.children.indexOf(nextEl);
+    assert(segIdx < proofIdx, 'proof element sits after segment-thinking for ' + st);
+    assert(proofIdx < nextIdx, 'proof element sits before getting-started-next for ' + st);
+
+    if (st === 'failed') {
+      const a = proofEl.querySelector('a');
+      assert(a, 'failed state has anchor');
+      assert.strictEqual(a.getAttribute('href'), '/app/health/', 'failed anchor points to /app/health/');
+    } else if (st === 'heard') {
+      const a = proofEl.querySelector('a');
+      assert(a, 'heard state has anchor');
+      assert.strictEqual(a.getAttribute('href'), proofObj.href, 'heard anchor matches payload href');
+    } else {
+      assert.strictEqual(proofEl.querySelector('a'), null, 'no anchor inside proof element for ' + st);
+    }
+  }
+
+  // Fresh heard vs not-fresh heard and XSS escaping
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      checks: { phone: false, thinking: true },
+      proof: {
+        state: 'heard',
+        start_at: '2026-10-10T12:00:00Z',
+        href: '/app/transcripts/test',
+        text: '<img src=x onerror=alert(1)>',
+        fresh: true,
+      },
+    },
+    setupPayload: null,
+    agentsPayload: { connections: [] },
+    agentsSettled: true,
+    firstMinutesClosed: false,
+  });
+  updateGettingStartedSurface();
+  const freshGsCard = surface.querySelector('[data-home-surface="getting-started"]');
+  const freshProofEl = freshGsCard.querySelector('[data-proof-state="heard"]');
+  assert(freshProofEl, 'fresh heard proof element present');
+  assert(freshProofEl.querySelector('q'), 'fresh heard has q element');
+  assert.strictEqual(freshProofEl.querySelector('img'), null, 'XSS img not rendered in DOM');
+
+  // Not fresh heard: has link, no q
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      checks: { phone: false, thinking: true },
+      proof: {
+        state: 'heard',
+        start_at: '2026-10-10T12:00:00Z',
+        href: '/app/transcripts/test',
+        text: 'stale speech',
+        fresh: false,
+      },
+    },
+    setupPayload: null,
+    agentsPayload: { connections: [] },
+    agentsSettled: true,
+    firstMinutesClosed: false,
+  });
+  updateGettingStartedSurface();
+  const staleGsCard = surface.querySelector('[data-home-surface="getting-started"]');
+  const staleProofEl = staleGsCard.querySelector('[data-proof-state="heard"]');
+  assert(staleProofEl, 'stale heard proof element present');
+  assert(staleProofEl.querySelector('a'), 'stale heard has link');
+  assert.strictEqual(staleProofEl.querySelector('q'), null, 'stale heard has no q element');
+
+  // none and missing proof render no data-proof-state
+  for (const pr of [{ state: 'none' }, undefined]) {
+    setState({
+      firstMinutesPayload: {
+        window_open: true,
+        devices_known: true,
+        devices: [],
+        checks: { phone: false, thinking: true },
+        proof: pr,
+      },
+      setupPayload: null,
+      agentsPayload: { connections: [] },
+      agentsSettled: true,
+      firstMinutesClosed: false,
+    });
+    updateGettingStartedSurface();
+    const c = surface.querySelector('[data-home-surface="getting-started"]');
+    assert(c, 'card present');
+    assert.strictEqual(c.querySelector('[data-proof-state="none"]'), null, 'none state has no proof element');
+    assert.strictEqual(c.querySelector('[data-proof-state]'), null, 'no proof element when state is none or missing');
+  }
+
+  // Visibility: phone true, thinking true, agents done
+  // checks.heard: null hides card
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      checks: { phone: true, thinking: true, heard: null },
+      proof: { state: 'none' },
+    },
+    setupPayload: null,
+    agentsPayload: { connections: [{ id: 'agent-1' }] },
+    agentsSettled: true,
+    firstMinutesClosed: false,
+  });
+  updateGettingStartedSurface();
+  assert.strictEqual(
+    surface.querySelector('[data-home-surface="getting-started"]'),
+    null,
+    'checks.heard null hides card when other checks done'
+  );
+
+  // checks.heard: false shows card
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      checks: { phone: true, thinking: true, heard: false },
+      proof: { state: 'waiting' },
+    },
+    setupPayload: null,
+    agentsPayload: { connections: [{ id: 'agent-1' }] },
+    agentsSettled: true,
+    firstMinutesClosed: false,
+  });
+  updateGettingStartedSurface();
+  assert(
+    surface.querySelector('[data-home-surface="getting-started"]'),
+    'checks.heard false shows card even when other checks done'
+  );
+
+  // Timer tests at end of runTests
+  timerLog.length = 0;
+  activeTimers.clear();
+  setState({ firstMinutesClosed: false, downloadTimer: null, firstMinutesPayload: null, setupPayload: null });
+
+  // 1. readSetup resolves first with no download and does not arm timer
+  apiResolver = (url) => {
+    if (url === '/init/api/state') {
+      return Promise.resolve({ downloads: { thinking: { state: 'idle' } } });
+    }
+    return Promise.resolve({});
+  };
+  await readSetup();
+  assert.strictEqual(getState().downloadTimer, null, 'readSetup with no download does not arm timer');
+
+  // 2. following readFirstMinutes with proof.state: "waiting" arms 15000ms timer
+  timerLog.length = 0;
+  apiResolver = (url) => {
+    if (url === '/app/home/api/first-minutes') {
+      return Promise.resolve({
+        window_open: true,
+        proof: { state: 'waiting' },
+      });
+    }
+    return Promise.resolve({});
+  };
+  await readFirstMinutes();
+  assert(timerLog.some(t => t.delay === 15000), '15000ms timer scheduled on waiting proof');
+  const timerAfterWaiting = getState().downloadTimer;
+  assert(timerAfterWaiting !== null, 'downloadTimer is active for waiting proof');
+
+  // 3. later readSetup with no download leaves timer armed
+  apiResolver = (url) => {
+    if (url === '/init/api/state') {
+      return Promise.resolve({ downloads: { thinking: { state: 'idle' } } });
+    }
+    return Promise.resolve({});
+  };
+  await readSetup();
+  assert.strictEqual(getState().downloadTimer, timerAfterWaiting, 'later setup read leaves timer armed');
+
+  // 4. transcribing arms timer
+  timerLog.length = 0;
+  setState({ firstMinutesClosed: false, downloadTimer: null, firstMinutesPayload: null });
+  apiResolver = (url) => {
+    if (url === '/app/home/api/first-minutes') {
+      return Promise.resolve({
+        window_open: true,
+        proof: { state: 'transcribing', start_at: '2026-10-10T12:00:00Z' },
+      });
+    }
+    return Promise.resolve({});
+  };
+  await readFirstMinutes();
+  assert(timerLog.some(t => t.delay === 15000), '15000ms timer scheduled for transcribing');
+  assert(getState().downloadTimer !== null, 'downloadTimer is active for transcribing');
+
+  // 5. heard with fresh: true arms timer
+  timerLog.length = 0;
+  setState({ firstMinutesClosed: false, downloadTimer: null, firstMinutesPayload: null });
+  apiResolver = (url) => {
+    if (url === '/app/home/api/first-minutes') {
+      return Promise.resolve({
+        window_open: true,
+        proof: {
+          state: 'heard',
+          start_at: '2026-10-10T12:00:00Z',
+          href: '/app/transcripts/test',
+          text: 'fresh text',
+          fresh: true,
+        },
+      });
+    }
+    return Promise.resolve({});
+  };
+  await readFirstMinutes();
+  assert(timerLog.some(t => t.delay === 15000), '15000ms timer scheduled for fresh heard');
+  assert(getState().downloadTimer !== null, 'downloadTimer is active for fresh heard');
+
+  // 6. heard with fresh: false leaves downloadTimer null
+  timerLog.length = 0;
+  setState({ firstMinutesClosed: false, downloadTimer: null, firstMinutesPayload: null });
+  apiResolver = (url) => {
+    if (url === '/app/home/api/first-minutes') {
+      return Promise.resolve({
+        window_open: true,
+        proof: {
+          state: 'heard',
+          start_at: '2026-10-10T12:00:00Z',
+          href: '/app/transcripts/test',
+          text: 'stale text',
+          fresh: false,
+        },
+      });
+    }
+    return Promise.resolve({});
+  };
+  await readFirstMinutes();
+  assert.strictEqual(getState().downloadTimer, null, 'heard with fresh false leaves downloadTimer null');
+
   console.log('all getting_started_render acceptance assertions passed');
 }
 

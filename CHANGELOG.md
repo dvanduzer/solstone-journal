@@ -9,7 +9,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - agents that can see the whole journal, and that have transcripts and facets, can read one week with `get_week`. memories on that page are generated. quotes are the owner's words. leaving an entry off the week page leaves that source visible to search and transcripts.
-- in its first week, a new journal's home page shows a "getting started" card. it shows which of your devices are adding to your journal, the local model and speech model downloads, and your first segment and whether thinking has read it. its next steps are connect an agent, add your phone, and finish choosing where the thinking happens. each step leaves once it's done, and the card leaves when they all are.
+- in its first week, a new journal's home page shows a "getting started" card. it shows which of your devices are adding to your journal, the local model and speech model downloads, and your first segment and whether thinking has read it. say a sentence out loud near one of your devices, and the card shows it as text once it's written out. its next steps are connect an agent, add your phone, and finish choosing where the thinking happens. each step leaves once it's done, and the card leaves when they all are and something you said has shown up as text.
 - when a device finishes pairing, the dialog names it by the name the device gave itself, and "didn't do this?" now has a button that unpairs that device straight away.
 - `solstone journal talent passages` copies passages from the source an activity's story is written from, word for word, with where each one sits in that source. each short part of the source is kept whole without asking your model anything. each longer part takes one request to your model to choose what to keep, and the passages are still the source's own words. stories are written the same way as before.
 - health now shows when local speech recognition is missing, installing, paused or needs attention.
@@ -31,6 +31,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - when today has no activities yet, the activities app still shows today's hours, with a line at the current time.
 - the note at the top of your morning briefing says what it drew on in plain words, and names anything that was missing. it no longer counts "source paths", which always read 0.
 - the first-run setup page opens with how your journal, the solstone app and thinking fit together. its thinking section now asks where the thinking happens and says your journal stays on your computer whichever you pick.
+- when an activity's whole source is short and is one imported AI conversation or one line from a speaker your journal doesn't recognize, its story now quotes that source word for word. it says which messages were yours and which were your agent's, and the date each message was sent. topics and relationships are written as before, and it takes no extra request to your thinking provider. stories already written stay as they are.
 
 ### Fixed
 

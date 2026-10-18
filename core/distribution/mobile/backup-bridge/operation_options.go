@@ -26,10 +26,13 @@ type operationOptions struct {
 	checkMode uint32
 	group     uint32
 	groups    uint32
+	// appendOnly makes every non-lock S3 write create-only (version 2 only).
+	appendOnly bool
 }
 
 func parseOperationOptions(operation int32, version, mode uint32, retryMillis uint64, group, groups, reserved1, reserved2 uint32) (*operationOptions, int32) {
-	if version != 1 || reserved1 != 0 || reserved2 != 0 {
+	// Version 2 adds reserved1 bit 0: an append-only (create-only) destination.
+	if version < 1 || version > 2 || reserved2 != 0 || reserved1 > 1 || version == 1 && reserved1 != 0 {
 		return nil, StatusInvalidArgument
 	}
 	if retryMillis > maxRetryLockMillis || groups > 256 {
@@ -62,7 +65,7 @@ func parseOperationOptions(operation int32, version, mode uint32, retryMillis ui
 			return nil, StatusInvalidArgument
 		}
 	}
-	return &operationOptions{retryLock: time.Duration(retryMillis) * time.Millisecond, checkMode: mode, group: group, groups: groups}, StatusOk
+	return &operationOptions{retryLock: time.Duration(retryMillis) * time.Millisecond, checkMode: mode, group: group, groups: groups, appendOnly: reserved1 == 1}, StatusOk
 }
 
 // Keep the pinned SDK's retry-budget semantics, including its final acquisition

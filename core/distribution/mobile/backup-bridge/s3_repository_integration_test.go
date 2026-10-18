@@ -95,6 +95,10 @@ func (peer *s3MemoryPeer) RoundTrip(req *http.Request) (*http.Response, error) {
 		if err != nil {
 			return nil, err
 		}
+		// Like R2 and S3, a create-only write never replaces an object.
+		if _, exists := peer.objects[key]; exists && req.Header.Get("If-None-Match") == "*" {
+			return s3TestResponse(412, "<Error><Code>PreconditionFailed</Code></Error>", nil), nil
+		}
 		peer.objects[key] = append([]byte(nil), value...)
 		return s3TestResponse(200, "", nil), nil
 	case http.MethodDelete:
