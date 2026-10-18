@@ -479,6 +479,9 @@ ci-full-prep: ci-full-prep-cargo ci-full-prep-onnx ci-full-prep-pdf ci-full-prep
 ci-full-prep-cargo: ci-prep-ffmpeg
 	@$(REQUIRE_CARGO)
 	cargo fetch --manifest-path $(RUST_MANIFEST) --locked
+	@set -eu; for manifest in $(MOBILE_LOCK_MANIFESTS); do \
+		cargo fetch --manifest-path "$$manifest" --locked; \
+	done
 	cargo check --manifest-path $(RUST_MANIFEST) --workspace $(RUST_HOST_EXCLUDES) --lib --bins --locked
 	cargo test --manifest-path $(RUST_MANIFEST) --workspace $(RUST_ROUTINE_EXCLUDES) --lib --bins --no-run --locked
 	cargo check --manifest-path $(RUST_MANIFEST) $(RUST_NATIVE_ROUTINE_PACKAGES) --lib --bins --locked
@@ -1477,13 +1480,14 @@ ci-under-poison:
 
 # Resolve the standalone mobile graphs too: workspace-only CI cannot see their
 # local dependency edges drift. Locked metadata checks without building a target.
+MOBILE_LOCK_MANIFESTS := \
+	tools/mobile-serving/Cargo.toml \
+	tools/ios-runtime/native/Cargo.toml \
+	tools/ios-runtime/appraisal-helper/Cargo.toml \
+	tools/mobile-serving/client/Cargo.toml
 .PHONY: check-mobile-lockfiles
 check-mobile-lockfiles:
-	@set -eu; for manifest in \
-		tools/mobile-serving/Cargo.toml \
-		tools/ios-runtime/native/Cargo.toml \
-		tools/ios-runtime/appraisal-helper/Cargo.toml \
-		tools/mobile-serving/client/Cargo.toml; do \
+	@set -eu; for manifest in $(MOBILE_LOCK_MANIFESTS); do \
 		printf 'Checking locked mobile graph: %s\n' "$$manifest"; \
 		cargo metadata --manifest-path "$$manifest" --locked --offline --format-version 1 >/dev/null; \
 	done
