@@ -10,6 +10,8 @@ use std::path::Path;
 use chrono::NaiveDate;
 use serde_json::{Map, Value, json};
 
+use crate::story::MAX_STORY_BODY_CHARS;
+
 const MAX_ACTIVITY_RECORDS: usize = 12;
 const MAX_NARRATIVES_PER_ACTIVITY: usize = 4;
 const MAX_ATTACHED_ENTITY_RECORDS: usize = 12;
@@ -17,7 +19,6 @@ const MAX_DETECTED_ENTITY_RECORDS: usize = 12;
 const MAX_TITLE_CHARS: usize = 220;
 const MAX_DESCRIPTION_CHARS: usize = 700;
 const MAX_DETAILS_CHARS: usize = 1200;
-const MAX_STORY_BODY_CHARS: usize = 1800;
 const MAX_NARRATIVE_CHARS: usize = 2400;
 const MAX_ENTITY_TEXT_CHARS: usize = 1200;
 const MAX_PRIOR_NEWSLETTER_CHARS: usize = 4000;

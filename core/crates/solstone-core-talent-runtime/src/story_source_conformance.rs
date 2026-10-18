@@ -265,3 +265,119 @@ fn every_story_source_case_stores_and_returns_one_story() {
         }
     }
 }
+
+/// Multi-message Unicode source with a correction at its end. Every message
+/// fits the individual quote limit; only the assembled reader budget varies.
+fn source_at_reader_boundary(chars: usize) -> (Value, String) {
+    let mut case = cases().remove(0);
+    let correction = "I cancelled the Cobalt dispatch. Zero packs were sent.";
+    let mut texts = vec!["é".repeat(340); 4];
+    texts.push(correction.to_owned());
+    let body = |texts: &[String]| {
+        texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                let who = if i % 2 == 0 { "You" } else { "Your agent" };
+                format!("{who} said in a message dated 2026-01-01T09:00:0{i}.000Z: \"{text}\"")
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let padding = chars.checked_sub(body(&texts).chars().count()).unwrap();
+    texts[4] = format!("{}{correction}", "é".repeat(padding));
+    assert!(texts.iter().all(|text| text.chars().count() <= 400));
+    let expected = body(&texts);
+    assert_eq!(expected.chars().count(), chars);
+    let mut rows = vec![json!({"imported":{"id":"invented-boundary"}})];
+    rows.extend(texts.iter().enumerate().map(|(i, text)| {
+        json!({"start":format!("00:00:0{i}"),"speaker":if i % 2 == 0 {"You"} else {"Assistant"},"text":text,"source":"import","source_ms":1767258000000_i64+i as i64*1000})
+    }));
+    case["files"] = json!({"conversation_transcript.jsonl":rows});
+    case["response"] = json!({"body":correction,"topics":[],"confidence":0.8,"relations":[]});
+    (case, expected)
+}
+
+#[test]
+fn source_words_fit_the_reader_budget_whole_or_keep_the_ordinary_body() {
+    for chars in [
+        crate::story::MAX_STORY_BODY_CHARS,
+        crate::story::MAX_STORY_BODY_CHARS + 1,
+    ] {
+        let (case, quoted) = source_at_reader_boundary(chars);
+        let result = run(&case);
+        let RuntimeOutcome::Finished { output, .. } = result.outcome else {
+            panic!("Story did not finish");
+        };
+        let expected = if chars == crate::story::MAX_STORY_BODY_CHARS {
+            quoted
+        } else {
+            assert_eq!(
+                output, result.response,
+                "fallback returns the completion unchanged"
+            );
+            case["response"]["body"].as_str().unwrap().to_owned()
+        };
+        assert_eq!(result.record["story"]["body"], expected);
+    }
+}
+
+#[test]
+fn a_long_source_correction_survives_into_the_native_newsletter_packet() {
+    let (case, quoted) = source_at_reader_boundary(2039);
+    let root = tempfile::tempdir().unwrap();
+    let (paths, context) = journal(root.path(), &case);
+    let story = Scripted {
+        text: case["response"].to_string(),
+        input_budget: None,
+        requests: Mutex::new(Vec::new()),
+    };
+    let request = json!({"name":"conversation","day":DAY,"facet":FACET,"activity":activity(&case),"span":[SEGMENT]});
+    let outcome = execute_request(
+        request.as_object().unwrap().clone(),
+        &paths,
+        &context,
+        &story,
+        &mut Vec::new(),
+        &solstone_core_generate::Cancellation::never(),
+    );
+    assert!(matches!(outcome, RuntimeOutcome::Finished { .. }));
+    let payload = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../payload/solstone");
+    fs::copy(
+        payload.join("talent/facet_newsletter.md"),
+        paths.talent_root.join("facet_newsletter.md"),
+    )
+    .unwrap();
+    let newsletter = Scripted {
+        text: "No activity".to_owned(),
+        input_budget: None,
+        requests: Mutex::new(Vec::new()),
+    };
+    execute_request(
+        json!({"name":"facet_newsletter","day":DAY,"facet":FACET})
+            .as_object()
+            .unwrap()
+            .clone(),
+        &paths,
+        &context,
+        &newsletter,
+        &mut Vec::new(),
+        &solstone_core_generate::Cancellation::never(),
+    );
+    let requests = newsletter.requests.into_inner().unwrap();
+    assert_eq!(requests.len(), 1);
+    let packet = requests[0]
+        .contents
+        .iter()
+        .filter_map(|part| match part {
+            solstone_core_generate::ContentPart::Text { text } => Some(text.as_str()),
+            solstone_core_generate::ContentPart::Image { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(packet.contains(case["response"]["body"].as_str().unwrap()));
+    assert!(
+        !packet.contains(&quoted),
+        "the over-budget quotation keeps the ordinary summary"
+    );
+}
