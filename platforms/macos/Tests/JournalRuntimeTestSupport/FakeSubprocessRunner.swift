@@ -42,8 +42,15 @@ public final class FakeSubprocessRunner: SubprocessRunning, @unchecked Sendable 
     private let lock = NSLock()
     private var responses: [String: [Response]] = [:]
     private var recordedInvocations: [SubprocessInvocation] = []
+    private var recordedCancelCount = 0
 
     public init() {}
+
+    public var cancelCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedCancelCount
+    }
 
     public var invocations: [SubprocessInvocation] {
         lock.lock()
@@ -98,6 +105,9 @@ public final class FakeSubprocessRunner: SubprocessRunning, @unchecked Sendable 
     }
 
     public func cancelAll() {
+        lock.lock()
+        recordedCancelCount += 1
+        lock.unlock()
     }
 
     private func nextResponse(executable: URL, arguments: [String], environment: [String: String]?, timeout: Duration?) -> Response {

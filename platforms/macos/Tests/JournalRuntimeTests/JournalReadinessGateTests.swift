@@ -238,6 +238,48 @@ struct JournalReadinessGateTests {
         #expect(attempts.identities().allSatisfy { $0.generation == 2 })
         #expect(attempts.identities().count == 3)
     }
+
+    @Test func liveSupervisorReaderAcceptsMatchingStartTime() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try writeMarkerFiles(root: root, pid: 42, startTime: 10)
+        var asked: [pid_t] = []
+        let matched = liveSupervisorMatchesReadyFiles(journalRoot: root) { pid in
+            asked.append(pid)
+            return 10
+        }
+        #expect(matched)
+        #expect(asked == [42])
+    }
+
+    @Test func liveSupervisorReaderRejectsPidMismatch() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try writeMarkerFiles(root: root, pid: 42, startTime: 10)
+        try Data("99\n".utf8).write(to: root.appendingPathComponent("health/supervisor.pid"))
+        let matched = liveSupervisorMatchesReadyFiles(journalRoot: root) { _ in 10 }
+        #expect(!matched)
+    }
+
+    @Test func liveSupervisorReaderRejectsStartTimeMismatch() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try writeMarkerFiles(root: root, pid: 42, startTime: 10)
+        let matched = liveSupervisorMatchesReadyFiles(journalRoot: root) { _ in 100 }
+        #expect(!matched)
+    }
+
+    @Test func liveSupervisorReaderRejectsMissingFile() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var asked = 0
+        let matched = liveSupervisorMatchesReadyFiles(journalRoot: root) { _ in
+            asked += 1
+            return 10
+        }
+        #expect(!matched)
+        #expect(asked == 0)
+    }
 }
 
 private final class ReadinessAcceptanceRecorder: @unchecked Sendable {
@@ -251,6 +293,13 @@ private final class ReadinessAcceptanceRecorder: @unchecked Sendable {
     func identities() -> [SupervisedChildIdentity] {
         lock.withLock { values }
     }
+}
+
+private func makeTemporaryDirectory() throws -> URL {
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent("journal-readiness-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    return url
 }
 
 private func writeMarkerFiles(
