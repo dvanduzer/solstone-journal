@@ -15,12 +15,47 @@ struct JournalSetupContinuation: Equatable, Sendable {
     var step1HandoffID: UUID
     var journalRootPath: String?
     var pendingStep5HandoffID: UUID?
+    var activeStep1Aliases: [UUID] = []
 }
 
 struct JournalSetupLocalContinuation: Equatable, Sendable {
     var localHandoffID: UUID
     var journalRootPath: String
     var pendingStep5HandoffID: UUID?
+    var activeStep1Aliases: [UUID] = []
+}
+
+enum JournalSetupActiveContinuation: Equatable, Sendable {
+    case incoming(JournalSetupContinuation)
+    case local(JournalSetupLocalContinuation)
+
+    var owner: UUID {
+        switch self {
+        case .incoming(let record): record.step1HandoffID
+        case .local(let record): record.localHandoffID
+        }
+    }
+
+    var rootPath: String? {
+        switch self {
+        case .incoming(let record): record.journalRootPath
+        case .local(let record): record.journalRootPath
+        }
+    }
+
+    var pending: UUID? {
+        switch self {
+        case .incoming(let record): record.pendingStep5HandoffID
+        case .local(let record): record.pendingStep5HandoffID
+        }
+    }
+
+    var acceptedInputs: [UUID] {
+        switch self {
+        case .incoming(let record): [record.step1HandoffID] + record.activeStep1Aliases
+        case .local(let record): record.activeStep1Aliases
+        }
+    }
 }
 
 struct JournalSetupAcceptanceLedger: Equatable, Sendable {
@@ -40,6 +75,7 @@ enum JournalSetupContinuationError: Error, Equatable {
     case notReady
     case invalidRoot
     case conflictingRoot
+    case conflictingRecords
 }
 
 struct JournalSetupContinuationStore: Sendable {
@@ -55,13 +91,15 @@ struct JournalSetupContinuationStore: Sendable {
     private let replace: @Sendable (Data, URL) throws -> Void
     private let read: @Sendable (URL) throws -> Data
     private let lock: @Sendable (URL, @Sendable () throws -> Void) throws -> Bool
+    private let remove: @Sendable (URL) throws -> Void
     private let shared = Shared()
 
     init(
         directory: URL? = nil,
         replace: @escaping @Sendable (Data, URL) throws -> Void = journalSetupContinuationReplace,
         read: @escaping @Sendable (URL) throws -> Data = { try Data(contentsOf: $0) },
-        lock: @escaping @Sendable (URL, @Sendable () throws -> Void) throws -> Bool = journalSetupContinuationLock
+        lock: @escaping @Sendable (URL, @Sendable () throws -> Void) throws -> Bool = journalSetupContinuationLock,
+        remove: @escaping @Sendable (URL) throws -> Void = { try FileManager.default.removeItem(at: $0) }
     ) {
         self.directory = directory ?? ExpectedExitMarker
             .markerURL(for: ExpectedExitMarker.journalMarkerDiscriminator)
@@ -69,6 +107,7 @@ struct JournalSetupContinuationStore: Sendable {
         self.replace = replace
         self.read = read
         self.lock = lock
+        self.remove = remove
     }
 
     func loadContinuation() -> JournalSetupRecordLoad<JournalSetupContinuation> {
@@ -133,159 +172,170 @@ struct JournalSetupContinuationStore: Sendable {
         try withContinuationLock(body)
     }
 
-    /// Writes the continuation first, then the acceptance ledger. A ledger failure restores the
-    /// previous continuation. An id already in a readable ledger is a duplicate and is not rewritten.
+    /// Both formats share one effective obligation under the stable continuation lock.
+    func loadActive() throws -> JournalSetupActiveContinuation? {
+        try withContinuationLock { try activeUnlocked() }
+    }
+
+    private func activeUnlocked() throws -> JournalSetupActiveContinuation? {
+        let incoming = loadContinuation()
+        let local = loadLocal()
+        if case .failed = incoming { throw JournalSetupContinuationError.failedRecord }
+        if case .failed = local { throw JournalSetupContinuationError.failedRecord }
+        switch (incoming, local) {
+        case (.ready, .ready): throw JournalSetupContinuationError.conflictingRecords
+        case (.ready(let record), .missing): return .incoming(record)
+        case (.missing, .ready(let record)): return .local(record)
+        default: return nil
+        }
+    }
+
+    /// Persist membership first. A failed ledger write retains every accepted input for recovery.
     func storeProgress(step1: UUID, journalRootPath: String?) throws {
-        if let journalRootPath {
-            guard Self.isAbsoluteRoot(journalRootPath) else {
-                throw JournalSetupContinuationError.invalidRoot
-            }
+        if let journalRootPath, !Self.isAbsoluteRoot(journalRootPath) {
+            throw JournalSetupContinuationError.invalidRoot
         }
         try withContinuationLock {
-            let continuationLoad = loadContinuation()
-            let ledgerLoad = loadLedger()
-            if case .failed = continuationLoad {
-                throw JournalSetupContinuationError.failedRecord
-            }
-            if case .failed = ledgerLoad {
-                throw JournalSetupContinuationError.failedRecord
-            }
-            if case .ready(let ledger) = ledgerLoad, ledger.acceptedStep1HandoffIDs.contains(step1) {
+            let active = try activeUnlocked()
+            let ledger = try ledgerUnlocked()
+            if ledger.contains(step1), !(active?.acceptedInputs.contains(step1) ?? false) {
                 shared.mutex.lock()
                 shared.duplicate = true
                 shared.mutex.unlock()
                 return
             }
-
-            let previous = try previousContinuationBytes(continuationLoad)
-            var pending: UUID?
-            if case .ready(let existing) = continuationLoad, existing.step1HandoffID == step1 {
-                pending = existing.pendingStep5HandoffID
-            }
-            let record = JournalSetupContinuation(
-                step1HandoffID: step1,
-                journalRootPath: journalRootPath,
-                pendingStep5HandoffID: pending
-            )
-            try writeContinuation(record)
-            do {
-                var ids: [UUID] = []
-                if case .ready(let ledger) = ledgerLoad {
-                    ids = ledger.acceptedStep1HandoffIDs
+            let joined: JournalSetupActiveContinuation
+            switch active {
+            case .incoming(var record):
+                try validateRoot(existing: record.journalRootPath, proposed: journalRootPath)
+                if record.journalRootPath == nil { record.journalRootPath = journalRootPath }
+                if !([record.step1HandoffID] + record.activeStep1Aliases).contains(step1) {
+                    record.activeStep1Aliases.append(step1)
                 }
-                ids.append(step1)
-                try writeLedger(JournalSetupAcceptanceLedger(acceptedStep1HandoffIDs: ids))
-            } catch {
-                restoreContinuation(previous)
-                throw error
+                joined = .incoming(record)
+            case .local(var record):
+                try validateRoot(existing: record.journalRootPath, proposed: journalRootPath)
+                if !record.activeStep1Aliases.contains(step1) { record.activeStep1Aliases.append(step1) }
+                joined = .local(record)
+            case nil:
+                joined = .incoming(JournalSetupContinuation(
+                    step1HandoffID: step1, journalRootPath: journalRootPath, pendingStep5HandoffID: nil
+                ))
             }
+            if joined != active { try writeActive(joined) }
+            try coverInputs(joined.acceptedInputs, existing: ledger)
         }
     }
 
     func bindRoot(step1: UUID, root: URL) throws {
         let path = root.standardizedFileURL.path
-        guard Self.isAbsoluteRoot(path) else {
-            throw JournalSetupContinuationError.invalidRoot
-        }
+        guard Self.isAbsoluteRoot(path) else { throw JournalSetupContinuationError.invalidRoot }
         try withContinuationLock {
-            guard case .ready(let record) = loadContinuation(), record.step1HandoffID == step1 else {
+            guard let active = try activeUnlocked(), active.owner == step1 else {
                 throw JournalSetupContinuationError.notReady
             }
-            var updated = record
-            updated.journalRootPath = path
-            try writeContinuation(updated)
+            try validateRoot(existing: active.rootPath, proposed: path)
+            if case .incoming(var record) = active, record.journalRootPath == nil {
+                record.journalRootPath = path
+                try writeContinuation(record)
+            }
         }
     }
 
-    /// Mints or reuses the pending step 5 id on the step 1 or local record that owns `step1`.
     func mintPending(step1: UUID) throws -> UUID {
         try withContinuationLock {
-            if case .ready(let record) = loadContinuation(), record.step1HandoffID == step1 {
-                guard record.journalRootPath != nil else {
-                    throw JournalSetupContinuationError.notReady
-                }
-                if let pending = record.pendingStep5HandoffID {
-                    return pending
-                }
-                let pending = UUID()
-                var updated = record
-                updated.pendingStep5HandoffID = pending
-                try writeContinuation(updated)
-                return pending
+            guard let active = try activeUnlocked(), active.owner == step1, active.rootPath != nil else {
+                throw JournalSetupContinuationError.notReady
             }
-            if case .ready(let record) = loadLocal(), record.localHandoffID == step1 {
-                if let pending = record.pendingStep5HandoffID {
-                    return pending
-                }
-                let pending = UUID()
-                var updated = record
-                updated.pendingStep5HandoffID = pending
-                try writeLocal(updated)
-                return pending
+            if let pending = active.pending { return pending }
+            let pending = UUID()
+            switch active {
+            case .incoming(var record):
+                record.pendingStep5HandoffID = pending
+                try writeContinuation(record)
+            case .local(var record):
+                record.pendingStep5HandoffID = pending
+                try writeLocal(record)
             }
-            throw JournalSetupContinuationError.notReady
+            return pending
         }
     }
 
-    func pendingStep5(ownedBy handoff: UUID) -> UUID? {
-        if case .ready(let record) = loadContinuation(), record.step1HandoffID == handoff {
-            return record.pendingStep5HandoffID
-        }
-        if case .ready(let record) = loadLocal(), record.localHandoffID == handoff {
-            return record.pendingStep5HandoffID
-        }
-        return nil
+    func pendingStep5(ownedBy handoff: UUID) throws -> UUID? {
+        guard let active = try loadActive(), active.owner == handoff else { return nil }
+        return active.pending
     }
 
-    /// Writes only the local continuation. The acceptance ledger and the mailbox stay untouched.
-    /// A ready local record for the same root is returned as-is. A different root, a failed local
-    /// record, or a failed step 1 continuation is refused and left on disk.
+    /// Reuses either active format; no second obligation can be created alongside it.
     func storeLocal(root: URL) throws -> UUID {
         let path = root.standardizedFileURL.path
-        guard Self.isAbsoluteRoot(path) else {
-            throw JournalSetupContinuationError.invalidRoot
-        }
+        guard Self.isAbsoluteRoot(path) else { throw JournalSetupContinuationError.invalidRoot }
         return try withContinuationLock {
-            if case .failed = loadContinuation() {
-                throw JournalSetupContinuationError.failedRecord
-            }
-            switch loadLocal() {
-            case .failed:
-                throw JournalSetupContinuationError.failedRecord
-            case .ready(let existing):
-                guard Self.standardizedPath(existing.journalRootPath) == path else {
-                    throw JournalSetupContinuationError.conflictingRoot
+            if let active = try activeUnlocked() {
+                try validateRoot(existing: active.rootPath, proposed: path)
+                if case .incoming(var record) = active, record.journalRootPath == nil {
+                    record.journalRootPath = path
+                    try writeContinuation(record)
                 }
-                return existing.localHandoffID
-            case .missing:
-                let record = JournalSetupLocalContinuation(
-                    localHandoffID: UUID(),
-                    journalRootPath: path,
-                    pendingStep5HandoffID: nil
-                )
-                try writeLocal(record)
-                return record.localHandoffID
+                return active.owner
             }
+            let record = JournalSetupLocalContinuation(
+                localHandoffID: UUID(), journalRootPath: path, pendingStep5HandoffID: nil
+            )
+            try writeLocal(record)
+            return record.localHandoffID
         }
     }
 
-    /// Deletes only the record whose pending step 5 still matches and whose handoff id is unchanged.
+    func repairActiveAcceptance() throws {
+        try withContinuationLock {
+            guard let active = try activeUnlocked() else { return }
+            try coverInputs(active.acceptedInputs, existing: ledgerUnlocked())
+        }
+    }
+
     func retire(matchingPendingStep5 pending: UUID) throws {
         try withContinuationLock {
-            try retireRecord(
-                pending: pending,
-                load: { self.loadContinuation() },
-                handoffID: { $0.step1HandoffID },
-                pendingID: { $0.pendingStep5HandoffID },
-                url: continuationURL
-            )
-            try retireRecord(
-                pending: pending,
-                load: { self.loadLocal() },
-                handoffID: { $0.localHandoffID },
-                pendingID: { $0.pendingStep5HandoffID },
-                url: localURL
-            )
+            guard let first = try activeUnlocked(), first.pending == pending else { return }
+            let ledger = try ledgerUnlocked()
+            guard first.acceptedInputs.allSatisfy({ ledger.contains($0) }) else {
+                throw JournalSetupContinuationError.failedRecord
+            }
+            guard try activeUnlocked() == first else { return }
+            let url: URL
+            switch first {
+            case .incoming: url = continuationURL
+            case .local: url = localURL
+            }
+            try remove(url)
+        }
+    }
+
+    private func validateRoot(existing: String?, proposed: String?) throws {
+        if let existing, let proposed,
+           Self.standardizedPath(existing) != Self.standardizedPath(proposed) {
+            throw JournalSetupContinuationError.conflictingRoot
+        }
+    }
+
+    private func ledgerUnlocked() throws -> [UUID] {
+        switch loadLedger() {
+        case .failed: throw JournalSetupContinuationError.failedRecord
+        case .missing: return []
+        case .ready(let record): return record.acceptedStep1HandoffIDs
+        }
+    }
+
+    private func coverInputs(_ inputs: [UUID], existing: [UUID]) throws {
+        var ids = existing
+        for input in inputs where !ids.contains(input) { ids.append(input) }
+        if ids != existing { try writeLedger(JournalSetupAcceptanceLedger(acceptedStep1HandoffIDs: ids)) }
+    }
+
+    private func writeActive(_ active: JournalSetupActiveContinuation) throws {
+        switch active {
+        case .incoming(let record): try writeContinuation(record)
+        case .local(let record): try writeLocal(record)
         }
     }
 
@@ -342,19 +392,6 @@ struct JournalSetupContinuationStore: Sendable {
         return decode(data)
     }
 
-    private func previousContinuationBytes(
-        _ load: JournalSetupRecordLoad<JournalSetupContinuation>
-    ) throws -> Data? {
-        switch load {
-        case .missing:
-            return nil
-        case .failed:
-            throw JournalSetupContinuationError.failedRecord
-        case .ready:
-            return try read(continuationURL)
-        }
-    }
-
     private func writeContinuation(_ record: JournalSetupContinuation) throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try replace(Self.encodeContinuation(record), continuationURL)
@@ -365,41 +402,9 @@ struct JournalSetupContinuationStore: Sendable {
         try replace(Self.encodeLocal(record), localURL)
     }
 
-    private func retireRecord<Value>(
-        pending: UUID,
-        load: () -> JournalSetupRecordLoad<Value>,
-        handoffID: (Value) -> UUID,
-        pendingID: (Value) -> UUID?,
-        url: URL
-    ) throws {
-        guard case .ready(let first) = load(), pendingID(first) == pending else {
-            return
-        }
-        guard case .ready(let second) = load(),
-              handoffID(second) == handoffID(first),
-              pendingID(second) == pending else {
-            return
-        }
-        do {
-            try FileManager.default.removeItem(at: url)
-        } catch let error as CocoaError where error.code == .fileNoSuchFile {
-            return
-        }
-    }
-
     private func writeLedger(_ ledger: JournalSetupAcceptanceLedger) throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try replace(Self.encodeLedger(ledger), acceptanceURL)
-    }
-
-    private func restoreContinuation(_ previous: Data?) {
-        if let previous {
-            try? replace(previous, continuationURL)
-            return
-        }
-        if FileManager.default.fileExists(atPath: continuationURL.path) {
-            try? FileManager.default.removeItem(at: continuationURL)
-        }
     }
 
     private static func isAbsoluteRoot(_ path: String) -> Bool {
@@ -426,7 +431,7 @@ struct JournalSetupContinuationStore: Sendable {
 
     private static func decodeContinuation(_ data: Data) -> JournalSetupRecordLoad<JournalSetupContinuation> {
         guard let object = jsonObject(data, allowed: [
-            "schema", "step1HandoffID", "journalRootPath", "pendingStep5HandoffID",
+            "schema", "step1HandoffID", "journalRootPath", "pendingStep5HandoffID", "activeStep1Aliases",
         ]) else {
             return .failed
         }
@@ -456,16 +461,18 @@ struct JournalSetupContinuationStore: Sendable {
         } else {
             pending = nil
         }
+        guard let aliases = decodeAliases(object), !aliases.contains(step1) else { return .failed }
         return .ready(JournalSetupContinuation(
             step1HandoffID: step1,
             journalRootPath: root,
-            pendingStep5HandoffID: pending
+            pendingStep5HandoffID: pending,
+            activeStep1Aliases: aliases
         ))
     }
 
     private static func decodeLocal(_ data: Data) -> JournalSetupRecordLoad<JournalSetupLocalContinuation> {
         guard let object = jsonObject(data, allowed: [
-            "schema", "localHandoffID", "journalRootPath", "pendingStep5HandoffID",
+            "schema", "localHandoffID", "journalRootPath", "pendingStep5HandoffID", "activeStep1Aliases",
         ]) else {
             return .failed
         }
@@ -487,11 +494,21 @@ struct JournalSetupContinuationStore: Sendable {
         } else {
             return .failed
         }
+        guard let aliases = decodeAliases(object) else { return .failed }
         return .ready(JournalSetupLocalContinuation(
             localHandoffID: localID,
             journalRootPath: path,
-            pendingStep5HandoffID: pending
+            pendingStep5HandoffID: pending,
+            activeStep1Aliases: aliases
         ))
+    }
+
+    private static func decodeAliases(_ object: [String: Any]) -> [UUID]? {
+        guard let raw = object["activeStep1Aliases"] else { return [] }
+        guard let items = raw as? [Any] else { return nil }
+        let ids = items.compactMap { uuid($0) }
+        guard ids.count == items.count, Set(ids).count == ids.count else { return nil }
+        return ids
     }
 
     private static func decodeLedger(_ data: Data) -> JournalSetupRecordLoad<JournalSetupAcceptanceLedger> {
@@ -528,6 +545,7 @@ struct JournalSetupContinuationStore: Sendable {
         var object: [String: Any] = [
             "schema": schema,
             "step1HandoffID": record.step1HandoffID.uuidString.lowercased(),
+            "activeStep1Aliases": record.activeStep1Aliases.map { $0.uuidString.lowercased() },
         ]
         if let root = record.journalRootPath {
             object["journalRootPath"] = root
@@ -545,6 +563,7 @@ struct JournalSetupContinuationStore: Sendable {
     private static func encodeLocal(_ record: JournalSetupLocalContinuation) throws -> Data {
         var object: [String: Any] = [
             "schema": localSchema,
+            "activeStep1Aliases": record.activeStep1Aliases.map { $0.uuidString.lowercased() },
             "localHandoffID": record.localHandoffID.uuidString.lowercased(),
             "journalRootPath": record.journalRootPath,
         ]

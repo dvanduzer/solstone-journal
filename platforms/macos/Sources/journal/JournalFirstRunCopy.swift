@@ -21,6 +21,7 @@ enum JournalFirstRunCopy {
     static let loginItemChangeFailed = "start at login couldn't be changed."
     static let loginItemUnavailable = "start at login isn't available from this app location."
     static let handoffNotDelivered = "couldn't continue setup in the solstone app."
+    static let thinkingFailed = "couldn't finish this step. try again."
 
     static let all = [
         nameLocationTitle,
@@ -41,5 +42,6 @@ enum JournalFirstRunCopy {
         loginItemChangeFailed,
         loginItemUnavailable,
         handoffNotDelivered,
+        thinkingFailed,
     ]
 }

@@ -68,45 +68,47 @@ struct JournalSetupContinuationStoreTests {
         #expect(try Data(contentsOf: ledgerURL) == duplicate)
     }
 
-    @Test func ledgerWriteFailureRestoresContinuationAndDuplicateDoesNotRewrite() throws {
+    @Test func ledgerFailureRetainsMembershipAndSupersedingInputRepairsEveryAlias() throws {
         let directory = try makeDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let gate = WriteGate()
-        let store = JournalSetupContinuationStore(directory: directory) { data, url in
+        let store = JournalSetupContinuationStore(directory: directory, replace: { data, url in
             if gate.fail && url.lastPathComponent == JournalSetupContinuationStore.acceptanceFileName {
                 throw CocoaError(.fileWriteUnknown)
             }
             try data.write(to: url, options: .atomic)
-        }
-        let absolute = directory.appendingPathComponent("journal", isDirectory: true).standardizedFileURL.path
-        let first = UUID()
+        })
+        let root = directory.appendingPathComponent("journal", isDirectory: true)
+        let owner = try store.storeLocal(root: root)
+        let pending = try store.mintPending(step1: owner)
+        let first = UUID(), second = UUID()
         gate.fail = true
         #expect(throws: CocoaError.self) {
-            try store.storeProgress(step1: first, journalRootPath: absolute)
+            try store.storeProgress(step1: first, journalRootPath: root.path)
         }
-        #expect(store.loadContinuation() == .missing)
-        #expect(store.loadLedger() == .missing)
-        #expect(!FileManager.default.fileExists(
-            atPath: directory.appendingPathComponent(JournalSetupContinuationStore.fileName).path
-        ))
-
+        guard case .ready(let retained) = store.loadLocal() else {
+            Issue.record("ledger failure must retain the original obligation")
+            return
+        }
+        #expect(retained.localHandoffID == owner)
+        #expect(retained.pendingStep5HandoffID == pending)
+        #expect(retained.activeStep1Aliases == [first])
+        #expect(store.acceptance(of: first) == .notAccepted)
+        #expect(throws: JournalSetupContinuationError.failedRecord) {
+            try store.retire(matchingPendingStep5: pending)
+        }
         gate.fail = false
-        try store.storeProgress(step1: first, journalRootPath: absolute)
-        let before = try Data(contentsOf: directory.appendingPathComponent(JournalSetupContinuationStore.fileName))
-        let second = UUID()
-        gate.fail = true
-        #expect(throws: CocoaError.self) {
-            try store.storeProgress(step1: second, journalRootPath: absolute)
-        }
-        #expect(try Data(contentsOf: directory.appendingPathComponent(JournalSetupContinuationStore.fileName)) == before)
-        #expect(store.acceptance(of: second) == .notAccepted)
+        try store.storeProgress(step1: second, journalRootPath: root.path)
         #expect(store.acceptance(of: first) == .accepted)
-
-        gate.fail = false
+        #expect(store.acceptance(of: second) == .accepted)
+        #expect(store.loadContinuation() == .missing)
+        #expect(try store.mintPending(step1: owner) == pending)
+        try store.retire(matchingPendingStep5: pending)
+        #expect(try store.loadActive() == nil)
         store.prepareAcceptanceAttempt()
-        try store.storeProgress(step1: first, journalRootPath: absolute)
+        try store.storeProgress(step1: first, journalRootPath: root.path)
         #expect(store.lastStoreWasDuplicate)
-        #expect(try Data(contentsOf: directory.appendingPathComponent(JournalSetupContinuationStore.fileName)) == before)
+        #expect(try store.loadActive() == nil)
     }
 
     @Test func rootlessIntentReloadsBindMintsOnceAndRetireIsConditional() throws {
@@ -133,19 +135,79 @@ struct JournalSetupContinuationStoreTests {
 
         let other = UUID()
         try reloaded.storeProgress(step1: other, journalRootPath: root.standardizedFileURL.path)
-        let replacement = try reloaded.mintPending(step1: other)
-        try reloaded.retire(matchingPendingStep5: pending)
-        guard case .ready(let kept) = reloaded.loadContinuation() else {
-            Issue.record("an older pending id must not retire the active continuation")
+        guard case .ready(let joined) = reloaded.loadContinuation() else {
+            Issue.record("new input must join the effective obligation")
             return
         }
-        #expect(kept.step1HandoffID == other)
-        #expect(kept.pendingStep5HandoffID == replacement)
-        #expect(reloaded.acceptance(of: step1) == .accepted)
-
-        try reloaded.retire(matchingPendingStep5: replacement)
+        #expect(joined.step1HandoffID == step1)
+        #expect(joined.activeStep1Aliases == [other])
+        #expect(joined.pendingStep5HandoffID == pending)
+        #expect(try reloaded.storeLocal(root: root) == step1)
+        #expect(reloaded.loadLocal() == .missing)
+        try reloaded.retire(matchingPendingStep5: pending)
         #expect(reloaded.loadContinuation() == .missing)
-        #expect(reloaded.acceptance(of: other) == .accepted)
+        try reloaded.storeProgress(step1: UUID(), journalRootPath: root.path)
+        let nextOwner = try #require(try reloaded.loadActive()).owner
+        let replacement = try reloaded.mintPending(step1: nextOwner)
+        #expect(replacement != pending)
+        try reloaded.retire(matchingPendingStep5: pending)
+        #expect(try reloaded.loadActive()?.pending == replacement)
+        #expect(reloaded.acceptance(of: step1) == .accepted)
+    }
+
+    @Test func retirementRequiresOriginalOwnerAndEveryAliasButNotSyntheticLocalOwner() throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = JournalSetupContinuationStore(directory: directory)
+        let root = directory.appendingPathComponent("journal")
+        let original = UUID(), alias = UUID()
+        try store.storeProgress(step1: original, journalRootPath: root.path)
+        try store.storeProgress(step1: alias, journalRootPath: root.path)
+        let pending = try store.mintPending(step1: original)
+        let ledger = directory.appendingPathComponent(JournalSetupContinuationStore.acceptanceFileName)
+        let before = try Data(contentsOf: directory.appendingPathComponent(JournalSetupContinuationStore.fileName))
+        for omitted in [original, alias] {
+            let ids = [original, alias].filter { $0 != omitted }.map { $0.uuidString.lowercased() }
+            try JSONSerialization.data(withJSONObject: ["schema": JournalSetupContinuationStore.acceptanceSchema,
+                "acceptedStep1HandoffIDs": ids]).write(to: ledger, options: .atomic)
+            #expect(throws: JournalSetupContinuationError.failedRecord) {
+                try store.retire(matchingPendingStep5: pending)
+            }
+            #expect(try Data(contentsOf: directory.appendingPathComponent(JournalSetupContinuationStore.fileName)) == before)
+        }
+        try store.repairActiveAcceptance()
+        try store.retire(matchingPendingStep5: pending)
+        let local = try store.storeLocal(root: root)
+        let localPending = try store.mintPending(step1: local)
+        #expect(store.acceptance(of: local) == .notAccepted)
+        try store.retire(matchingPendingStep5: localPending)
+        #expect(try store.loadActive() == nil)
+    }
+
+    @Test func conflictingFilesAndDeletionFailurePreserveTheObligation() throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = JournalSetupContinuationStore(directory: directory)
+        let root = directory.appendingPathComponent("journal")
+        let local = try store.storeLocal(root: root)
+        let pending = try store.mintPending(step1: local)
+        let failedDelete = JournalSetupContinuationStore(directory: directory, remove: { _ in
+            throw CocoaError(.fileWriteNoPermission)
+        })
+        #expect(throws: CocoaError.self) { try failedDelete.retire(matchingPendingStep5: pending) }
+        #expect(try store.loadActive()?.pending == pending)
+        let incomingURL = directory.appendingPathComponent(JournalSetupContinuationStore.fileName)
+        let bytes = try JSONSerialization.data(withJSONObject: continuationObject(JournalSetupContinuation(
+            step1HandoffID: UUID(), journalRootPath: root.path, pendingStep5HandoffID: UUID()
+        )))
+        try bytes.write(to: incomingURL, options: .atomic)
+        #expect(throws: JournalSetupContinuationError.conflictingRecords) { try store.loadActive() }
+        #expect(throws: JournalSetupContinuationError.conflictingRecords) { try store.storeLocal(root: root) }
+        #expect(throws: JournalSetupContinuationError.conflictingRecords) {
+            try store.storeProgress(step1: UUID(), journalRootPath: root.path)
+        }
+        #expect(try Data(contentsOf: incomingURL) == bytes)
+        #expect(store.loadLocal() != .missing)
     }
 
     @Test func mailboxCallUnderTheContinuationLockIsRefusedAndRereadMismatchDoesNotDelete() throws {

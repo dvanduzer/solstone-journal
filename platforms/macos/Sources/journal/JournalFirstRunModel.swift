@@ -90,6 +90,7 @@ final class JournalFirstRunModel {
     var speechFailure: String?
     var nativeFolderSetup = false
     var choosingThinking = false
+    private(set) var draftThinkingChoice: JournalThinkingChoice?
     private(set) var reopenCount = 0
     private(set) var setupCopy: JournalSetupCopy?
     private(set) var setupState: JournalSetupState?
@@ -97,6 +98,7 @@ final class JournalFirstRunModel {
     private(set) var epoch: UInt64 = 0
     private(set) var pendingOperation: JournalRitualOperationToken = .none
     private(set) var operationError: JournalRitualOperationToken = .none
+    private(set) var userOperationInFlight = false
     private(set) var outbound: JournalOutboundToken = .none
 
     @ObservationIgnored private var setupTask: Task<JournalSetupResult, Error>?
@@ -107,6 +109,9 @@ final class JournalFirstRunModel {
     @ObservationIgnored private var nativeQualified = false
     @ObservationIgnored private var didAutoRegenerate = false
     @ObservationIgnored private var suppressRootEpoch = false
+    @ObservationIgnored private var wholeOperationDepth = 0
+    @ObservationIgnored private var actionEpoch: UInt64?
+    @ObservationIgnored private var activationDrainScheduled = false
     @ObservationIgnored private var activationRunning = false
     @ObservationIgnored private var activationFollowUp = false
     @ObservationIgnored private var activationWaiters: [CheckedContinuation<Void, Never>] = []
@@ -178,7 +183,8 @@ final class JournalFirstRunModel {
 
     /// Launch and reopen share this chain. A second call waits and runs one follow-up body.
     func reconcileActivation() async {
-        if activationRunning {
+        guard !isTerminating else { return }
+        if activationRunning || wholeOperationDepth > 0 {
             activationFollowUp = true
             await withCheckedContinuation { continuation in
                 activationWaiters.append(continuation)
@@ -188,16 +194,35 @@ final class JournalFirstRunModel {
         activationRunning = true
         defer {
             activationRunning = false
-            let waiters = activationWaiters
-            activationWaiters.removeAll()
-            for waiter in waiters {
-                waiter.resume()
-            }
+            if wholeOperationDepth == 0 || isTerminating { settleActivationWaiters() }
         }
         repeat {
             activationFollowUp = false
             await reconcileActivationBody()
-        } while activationFollowUp && !isTerminating && !Task.isCancelled
+        } while activationFollowUp && wholeOperationDepth == 0 && !isTerminating && !Task.isCancelled
+    }
+
+    private func settleActivationWaiters() {
+        let waiters = activationWaiters
+        activationWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+
+    private func finishWholeOperation() {
+        precondition(wholeOperationDepth > 0)
+        wholeOperationDepth -= 1
+        guard wholeOperationDepth == 0 else { return }
+        userOperationInFlight = false
+        if isTerminating {
+            settleActivationWaiters()
+        } else if activationFollowUp, !activationRunning, !activationDrainScheduled {
+            activationDrainScheduled = true
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.activationDrainScheduled = false
+                await self.reconcileActivation()
+            }
+        }
     }
 
     private func reconcileActivationBody() async {
@@ -206,15 +231,13 @@ final class JournalFirstRunModel {
         pendingDiscoveryHandoff = nil
         didAutoRegenerate = false
         guard stillCurrent(captured) else { return }
-        if let preserved = config.journalRoot?.standardizedFileURL {
-            assignRoot(preserved)
-        }
         if await qualifyForNativeSetup() {
             nativeQualified = true
             guard stillCurrent(captured) else { return }
             await reconcileQualified(captured: captured)
             return
         }
+        if let preserved = config.journalRoot?.standardizedFileURL { assignRoot(preserved) }
         nativeQualified = false
         setupCopy = nil
         guard stillCurrent(captured) else { return }
@@ -234,6 +257,7 @@ final class JournalFirstRunModel {
     private func noteSelectedRootChange(from oldValue: URL) {
         guard journalRoot.standardizedFileURL.path != oldValue.standardizedFileURL.path else { return }
         guard !suppressRootEpoch else { return }
+        draftThinkingChoice = nil
         epoch &+= 1
     }
 
@@ -333,6 +357,8 @@ final class JournalFirstRunModel {
         config.journalRoot = journalRoot.standardizedFileURL
         if nativeQualified {
             guard beginUserAction(.setup) else { return }
+
+            defer { finishWholeOperation() }
             await runQualifiedSetup(skipModelInstall: true, captured: epoch, actionOpen: true)
             return
         }
@@ -357,6 +383,7 @@ final class JournalFirstRunModel {
 
     func prepareForTermination() async {
         isTerminating = true
+        settleActivationWaiters()
         epoch &+= 1
         stopRefresh()
         browserWaitTask?.cancel()
@@ -595,6 +622,12 @@ final class JournalFirstRunModel {
         return JournalMark.validate(render)
     }
 
+    var canCommitDisplayedMark: Bool {
+        guard handoffError == nil, setupState?.mark.state == .proposed,
+              validatedMark != nil, let displayedProposalID, !displayedProposalID.isEmpty else { return false }
+        return setupState?.mark.proposalID == displayedProposalID
+    }
+
     var offersLocalReady: Bool {
         guard handoffError == nil, case .ritual(.thinking) = route else { return false }
         guard setupState?.thinking.saved == false else { return false }
@@ -605,6 +638,39 @@ final class JournalFirstRunModel {
         handoffError == nil
             && setupState?.mark.state == .locked
             && setupState?.thinking.saved == true
+    }
+
+    var displayedThinkingChoice: JournalThinkingChoice? {
+        if let draftThinkingChoice { return draftThinkingChoice }
+        if setupState?.thinking.saved == true { return setupState?.thinking.choice }
+        return setupState?.thinking.capability == .ok ? .local : nil
+    }
+
+    var canContinueThinking: Bool {
+        guard handoffError == nil, setupState?.mark.state == .locked,
+              let choice = displayedThinkingChoice else { return false }
+        return choice != .local || setupState?.thinking.capability == .ok
+    }
+
+    func selectThinking(_ raw: String) {
+        guard !userOperationInFlight, !isTerminating, let choice = JournalThinkingChoice(rawValue: raw),
+              choice != .local || setupState?.thinking.capability == .ok else { return }
+        draftThinkingChoice = choice
+        choosingThinking = false
+    }
+
+    func continueThinking() async {
+        guard wholeOperationDepth == 0, !isTerminating,
+              canContinueThinking, let choice = displayedThinkingChoice else { return }
+        wholeOperationDepth += 1
+        userOperationInFlight = true
+        defer { finishWholeOperation() }
+        let root = journalRoot.standardizedFileURL
+        if setupState?.thinking.saved != true || setupState?.thinking.choice != choice {
+            guard await saveThinking(choice.rawValue, continuing: true), journalRoot.standardizedFileURL == root,
+                  setupState?.thinking.saved == true, setupState?.thinking.choice == choice else { return }
+        }
+        await finalizeThinking(continuing: true)
     }
 
     var showsMarkRegenerate: Bool {
@@ -630,7 +696,7 @@ final class JournalFirstRunModel {
     var showsThinkingCancel: Bool { canCancel(setupState?.downloads.thinking) }
 
     var selectedThinkingDescription: String? {
-        guard let choice = setupState?.thinking.choice else { return nil }
+        guard let choice = displayedThinkingChoice else { return nil }
         return setupCopy?.thinking.choices.first { $0.id == choice.rawValue }?.description
     }
 
@@ -638,7 +704,7 @@ final class JournalFirstRunModel {
         guard let copy = setupCopy else { return "" }
         let replacement: String
         if let bytes = setupState?.thinking.downloadBytes {
-            replacement = ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+            replacement = ByteCountFormatter.string(fromByteCount: Int64(clamping: bytes), countStyle: .file)
         } else {
             replacement = copy.thinking.sizeUnknown
         }
@@ -657,7 +723,6 @@ final class JournalFirstRunModel {
     }
 
     func downloadProgressText(for job: JournalSetupState.Job) -> String? {
-        guard let total = job.bytesTotal else { return nil }
         switch job.state {
         case .complete:
             break
@@ -665,6 +730,9 @@ final class JournalFirstRunModel {
             guard let attempt = job.attemptID, !attempt.isEmpty else { return nil }
         case .idle, .cancelled, .error:
             return nil
+        }
+        guard let total = job.bytesTotal, total > 0 else {
+            return formattedByteCount(job.bytesDone)
         }
         return "\(formattedByteCount(job.bytesDone)) / \(formattedByteCount(total))"
     }
@@ -684,29 +752,23 @@ final class JournalFirstRunModel {
 
     func continueFromFolder() async {
         guard beginUserAction(.setup) else { return }
+
+        defer { finishWholeOperation() }
         let captured = epoch
         let root = journalRoot.standardizedFileURL
-        assignRoot(root)
-        config.journalRoot = root
-        nativeFolderSetup = true
-        switch continuation.loadContinuation() {
-        case .failed:
+        do {
+            if let active = try continuation.loadActive() {
+                try continuation.bindRoot(step1: active.owner, root: root)
+            }
+        } catch {
             if failUserAction(captured, operation: .setup) {
                 errorMessage = JournalFirstRunCopy.setupProgressNotSaved
             }
             return
-        case .ready(let record) where record.journalRootPath == nil:
-            do {
-                try continuation.bindRoot(step1: record.step1HandoffID, root: root)
-            } catch {
-                if failUserAction(captured, operation: .setup) {
-                    errorMessage = JournalFirstRunCopy.setupProgressNotSaved
-                }
-                return
-            }
-        case .ready, .missing:
-            break
         }
+        assignRoot(root)
+        config.journalRoot = root
+        nativeFolderSetup = true
         guard stillCurrent(captured) else {
             _ = endUserAction(captured)
             return
@@ -717,6 +779,8 @@ final class JournalFirstRunModel {
     func retrySetup() async {
         if nativeQualified {
             guard beginUserAction(.setup) else { return }
+
+            defer { finishWholeOperation() }
             await runQualifiedSetup(skipModelInstall: true, captured: epoch, actionOpen: true)
         } else {
             await runSetupThenStartSupervisor()
@@ -725,38 +789,19 @@ final class JournalFirstRunModel {
 
     func retryHandoff() async {
         guard beginUserAction(.outbound) else { return }
+
+        defer { finishWholeOperation() }
         let captured = epoch
         handoffError = nil
-        if case .ready(let record) = continuation.loadContinuation(),
-           record.pendingStep5HandoffID != nil,
-           let path = record.journalRootPath {
-            let root = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
-            await deliverStep5(root: root, step1: record.step1HandoffID, captured: captured, mintIfNeeded: false)
-            if actionInFlight {
-                _ = endUserAction(captured)
-            }
-            return
-        }
-        if case .ready(let local) = continuation.loadLocal(),
-           local.pendingStep5HandoffID != nil {
-            let root = URL(fileURLWithPath: local.journalRootPath, isDirectory: true).standardizedFileURL
-            await deliverStep5(root: root, step1: local.localHandoffID, captured: captured, mintIfNeeded: false)
-            if actionInFlight {
-                _ = endUserAction(captured)
-            }
-            return
-        }
-        if case .ready(let handoff) = mailbox.loadStep1() {
-            _ = endUserAction(captured)
-            await acceptStep1(handoff, captured: epoch)
-            return
-        }
         _ = endUserAction(captured)
+        await reconcileQualified(captured: epoch)
     }
 
     func commitDisplayedMark() async {
-        guard let proposalID = displayedProposalID, !proposalID.isEmpty else { return }
+        guard canCommitDisplayedMark, let proposalID = displayedProposalID else { return }
         guard beginUserAction(.mark) else { return }
+
+        defer { finishWholeOperation() }
         let captured = epoch
         do {
             let state = try await setupClient.perform(.commitMark(proposalID: proposalID))
@@ -773,38 +818,43 @@ final class JournalFirstRunModel {
         await regenerateMark(userInitiated: true)
     }
 
-    func saveThinking(_ choice: String) async {
-        if choice == "local", setupState?.thinking.capability != .ok { return }
-        guard beginUserAction(.thinkingSave) else { return }
+    @discardableResult
+    func saveThinking(_ choice: String, continuing: Bool = false) async -> Bool {
+        if choice == "local", setupState?.thinking.capability != .ok { return false }
+        guard beginUserAction(.thinkingSave, continuing: continuing) else { return false }
+
+        defer { finishWholeOperation() }
         let captured = epoch
         do {
             let state = try await setupClient.perform(.saveThinking(choice: choice))
-            guard endUserAction(captured) else { return }
+            guard stateIsConsistent(state, root: journalRoot), state.thinking.saved,
+                  state.thinking.choice?.rawValue == choice else {
+                if failUserAction(captured, operation: .thinkingSave) {
+                    thinkingFailure = JournalFirstRunCopy.thinkingFailed
+                }
+                return false
+            }
+            guard endUserAction(captured) else { return false }
             choosingThinking = false
-            guard stateIsConsistent(state, root: journalRoot) else { return }
             presentInteractiveState(state)
+            return true
         } catch {
             await handleActionError(error, captured: captured, operation: .thinkingSave, conflictStaysOnMark: false)
+            return false
         }
     }
 
-    func finalizeThinking() async {
+    func finalizeThinking(continuing: Bool = false) async {
         guard canFinalizeThinking else { return }
-        guard beginUserAction(.thinkingFinalize) else { return }
+        guard beginUserAction(.thinkingFinalize, continuing: continuing) else { return }
+
+        defer { finishWholeOperation() }
         let captured = epoch
         let root = journalRoot.standardizedFileURL
         let handoffID: UUID
         do {
-            if case .ready(let record) = continuation.loadContinuation(),
-               let path = record.journalRootPath,
-               samePath(path, root) {
-                _ = try continuation.mintPending(step1: record.step1HandoffID)
-                handoffID = record.step1HandoffID
-            } else {
-                let localID = try continuation.storeLocal(root: root)
-                _ = try continuation.mintPending(step1: localID)
-                handoffID = localID
-            }
+            handoffID = try continuation.storeLocal(root: root)
+            _ = try continuation.mintPending(step1: handoffID)
         } catch {
             if failUserAction(captured, operation: .thinkingFinalize) {
                 thinkingFailure = JournalFirstRunCopy.setupProgressNotSaved
@@ -825,9 +875,18 @@ final class JournalFirstRunModel {
             do {
                 probe = try await initClient.probeSetupComplete()
             } catch {
+                if stillCurrent(next) {
+                    failedOperationToken(.thinkingFinalize)
+                    thinkingFailure = JournalFirstRunCopy.thinkingFailed
+                }
                 return
             }
-            guard stillCurrent(next), probe == .complete else { return }
+            guard stillCurrent(next) else { return }
+            guard probe == .complete else {
+                failedOperationToken(.thinkingFinalize)
+                thinkingFailure = JournalFirstRunCopy.thinkingFailed
+                return
+            }
             await deliverStep5(root: root, step1: handoffID, captured: next, mintIfNeeded: false)
         } catch {
             await handleActionError(error, captured: captured, operation: .thinkingFinalize, conflictStaysOnMark: false)
@@ -840,6 +899,8 @@ final class JournalFirstRunModel {
               let attemptID = job.attemptID,
               !attemptID.isEmpty else { return }
         guard beginUserAction(.thinkingDownload) else { return }
+
+        defer { finishWholeOperation() }
         let captured = epoch
         do {
             let state = try await setupClient.perform(.cancelThinkingDownload(attemptID: attemptID))
@@ -855,6 +916,8 @@ final class JournalFirstRunModel {
     func retrySpeechDownload() async {
         guard showsSpeechRetry else { return }
         guard beginUserAction(.speechDownload) else { return }
+
+        defer { finishWholeOperation() }
         let captured = epoch
         do {
             let state = try await setupClient.perform(.retrySpeechDownload)
@@ -870,6 +933,8 @@ final class JournalFirstRunModel {
     func retryThinkingDownload() async {
         guard showsThinkingRetry else { return }
         guard beginUserAction(.thinkingDownload) else { return }
+
+        defer { finishWholeOperation() }
         let captured = epoch
         do {
             let state = try await setupClient.perform(.startThinkingDownload)
@@ -895,108 +960,71 @@ final class JournalFirstRunModel {
     }
 
     private func reconcileQualified(captured: UInt64) async {
-        retireMatchingStep5Receipt()
-        guard stillCurrent(captured) else { return }
-        switch mailbox.loadStep1() {
-        case .ready(let handoff):
-            await acceptStep1(handoff, captured: captured)
-            return
-        case .malformed, .missing:
-            break
-        }
-        guard stillCurrent(captured) else { return }
-        if await resumeContinuation(allowDelivery: true, allowMint: true, captured: captured) {
+        let receipt: SetupHandoffReceipt?
+        do {
+            _ = try continuation.loadActive()
+            try continuation.assertMailboxAllowed()
+            let loaded = try mailbox.readStep5Receipt()
+            receipt = loaded?.schema == SetupHandoffReceipt.schemaV1 && loaded?.stepIndex == 5 ? loaded : nil
+        } catch {
+            presentPersistenceFailure()
             return
         }
         guard stillCurrent(captured) else { return }
-        if await resumeLocal(allowDelivery: true, allowMint: true, captured: captured) {
+        if case .ready(let handoff) = mailbox.loadStep1() {
+            guard await acceptStep1(handoff, captured: captured) else { return }
+        }
+        guard stillCurrent(captured) else { return }
+        do {
+            try continuation.repairActiveAcceptance()
+            if let receipt { try continuation.retire(matchingPendingStep5: receipt.handoffID) }
+        } catch {
+            presentPersistenceFailure()
             return
         }
+        guard stillCurrent(captured) else { return }
+        if await resumeActive(allowDelivery: true, allowMint: true, captured: captured) { return }
         guard stillCurrent(captured) else { return }
         await routeWithoutIntent(captured: captured)
     }
 
-    private func retireMatchingStep5Receipt() {
-        do {
-            try continuation.assertMailboxAllowed()
-            guard let receipt = try mailbox.readStep5Receipt(),
-                  receipt.schema == SetupHandoffReceipt.schemaV1,
-                  receipt.stepIndex == 5 else {
-                return
-            }
-            try continuation.retire(matchingPendingStep5: receipt.handoffID)
-        } catch {
-            return
-        }
-    }
-
-    private func acceptStep1(_ handoff: SetupHandoff, captured: UInt64) async {
+    /// Only accepts input. Routing and retirement belong to the caller's receipt snapshot.
+    private func acceptStep1(_ handoff: SetupHandoff, captured: UInt64) async -> Bool {
         onBeforeStep1Commit?()
-        guard stillCurrent(captured) else { return }
-        if let configured = config.journalRoot?.standardizedFileURL {
-            assignRoot(configured)
-        }
-        switch continuation.loadContinuation() {
-        case .failed:
-            presentPersistenceFailure()
-            return
-        case .missing, .ready:
-            break
-        }
-        if continuation.acceptance(of: handoff.handoffID) == .unreadable {
-            presentPersistenceFailure()
-            return
-        }
-        let alreadyAccepted = continuation.acceptance(of: handoff.handoffID) == .accepted
-        continuation.prepareAcceptanceAttempt()
+        guard stillCurrent(captured) else { return false }
         do {
+            _ = try continuation.loadActive()
+            guard continuation.acceptance(of: handoff.handoffID) != .unreadable else {
+                throw JournalSetupContinuationError.failedRecord
+            }
+            continuation.prepareAcceptanceAttempt()
             try continuation.assertMailboxAllowed()
-        } catch {
-            presentPersistenceFailure()
-            return
-        }
-        let rootPath = config.journalRoot?.standardizedFileURL.path
-        let step1 = handoff.handoffID
-        let continuationStore = continuation
-        let result: SetupCommitResult
-        do {
-            result = try mailbox.commitStep1(
+            let rootPath = config.journalRoot?.standardizedFileURL.path
+            let step1 = handoff.handoffID
+            let continuationStore = continuation
+            let result = try mailbox.commitStep1(
                 loadedID: step1,
-                alreadyAccepted: alreadyAccepted,
+                alreadyAccepted: continuation.acceptance(of: step1) == .accepted,
                 refuseNewAcceptance: false,
                 storeProgress: {
                     try continuationStore.storeProgress(step1: step1, journalRootPath: rootPath)
                 }
             )
-        } catch {
-            guard stillCurrent(captured) else { return }
-            presentPersistenceFailure()
-            return
-        }
-        guard stillCurrent(captured) else { return }
-        let duplicate = continuation.lastStoreWasDuplicate
-        switch result {
-        case .republished:
-            await finishReplay(captured: captured)
-        case .accepted where duplicate:
-            await finishReplay(captured: captured)
-        case .accepted:
-            if await resumeContinuation(allowDelivery: true, allowMint: true, captured: captured) {
-                return
+            guard stillCurrent(captured) else { return false }
+            switch result {
+            case .accepted, .republished: return true
+            case .rejected(.superseded):
+                await presentSuperseded(captured: captured)
+                return false
+            case .lockTimeout:
+                presentPersistenceFailure()
+                return false
+            default: return false
             }
-            await routeWithoutIntent(captured: captured)
-        case .rejected(.superseded):
-            await presentSuperseded(captured: captured)
-        default:
-            return
+        } catch {
+            if stillCurrent(captured) { presentPersistenceFailure() }
+            return false
         }
-    }
-
-    private func finishReplay(captured: UInt64) async {
-        if await resumeContinuation(allowDelivery: false, allowMint: false, captured: captured) {
-            return
-        }
-        await routeWithoutIntent(captured: captured)
     }
 
     private func presentSuperseded(captured: UInt64) async {
@@ -1021,48 +1049,25 @@ final class JournalFirstRunModel {
         }
     }
 
-    /// Returns true when a continuation record was present, including a failed one.
-    private func resumeContinuation(allowDelivery: Bool, allowMint: Bool, captured: UInt64) async -> Bool {
-        switch continuation.loadContinuation() {
-        case .missing:
-            return false
-        case .failed:
-            presentPersistenceFailure()
-            return true
-        case .ready(let record):
-            guard let path = record.journalRootPath else {
+    /// A failed or conflicting active selection is handled, never treated as absence.
+    private func resumeActive(allowDelivery: Bool, allowMint: Bool, captured: UInt64) async -> Bool {
+        do {
+            guard let active = try continuation.loadActive() else { return false }
+            guard let path = active.rootPath else {
                 showWelcome()
                 return true
             }
+            if let configured = config.journalRoot,
+               configured.standardizedFileURL.path != JournalSetupContinuationStore.standardizedPath(path) {
+                throw JournalSetupContinuationError.conflictingRoot
+            }
             await resumeOwned(
-                handoffID: record.step1HandoffID,
-                rootPath: path,
-                pending: record.pendingStep5HandoffID,
-                allowDelivery: allowDelivery,
-                allowMint: allowMint,
-                captured: captured
+                handoffID: active.owner, rootPath: path, pending: active.pending,
+                allowDelivery: allowDelivery, allowMint: allowMint, captured: captured
             )
             return true
-        }
-    }
-
-    /// Returns true when a local continuation was present, including a failed one.
-    private func resumeLocal(allowDelivery: Bool, allowMint: Bool, captured: UInt64) async -> Bool {
-        switch continuation.loadLocal() {
-        case .missing:
-            return false
-        case .failed:
+        } catch {
             presentPersistenceFailure()
-            return true
-        case .ready(let record):
-            await resumeOwned(
-                handoffID: record.localHandoffID,
-                rootPath: record.journalRootPath,
-                pending: record.pendingStep5HandoffID,
-                allowDelivery: allowDelivery,
-                allowMint: allowMint,
-                captured: captured
-            )
             return true
         }
     }
@@ -1284,26 +1289,13 @@ final class JournalFirstRunModel {
             }
             let probe = try await initClient.probeSetupComplete()
             let ok = stillCurrent(captured)
-            if actionOpen {
-                epoch &+= 1
-                pendingOperation = .none
-                actionInFlight = false
-            }
+            if actionOpen { _ = endUserAction(captured) }
             guard ok else { return }
             let next = epoch
             switch probe {
             case .complete:
-                if case .ready(let record) = continuation.loadContinuation(),
-                   record.journalRootPath != nil {
-                    await deliverStep5(
-                        root: root,
-                        step1: record.step1HandoffID,
-                        captured: next,
-                        mintIfNeeded: record.pendingStep5HandoffID == nil
-                    )
-                } else {
-                    await landHomeIfCurrent(next)
-                }
+                if await resumeActive(allowDelivery: true, allowMint: true, captured: next) { return }
+                await landHomeIfCurrent(next)
             case .incomplete:
                 await presentServerStep(root: root, captured: next)
             }
@@ -1354,19 +1346,19 @@ final class JournalFirstRunModel {
             return
         }
         let pending: UUID
-        if mintIfNeeded {
-            do {
+        do {
+            if mintIfNeeded {
                 pending = try continuation.mintPending(step1: step1)
-            } catch {
-                guard stillCurrent(captured) else { return }
-                presentPersistenceFailure()
+            } else if let existing = try continuation.pendingStep5(ownedBy: step1) {
+                pending = existing
+            } else {
+                outbound = .none
+                if pendingOperation == .outbound { pendingOperation = .none }
                 return
             }
-        } else if let existing = continuation.pendingStep5(ownedBy: step1) {
-            pending = existing
-        } else {
-            outbound = .none
-            if pendingOperation == .outbound { pendingOperation = .none }
+        } catch {
+            guard stillCurrent(captured) else { return }
+            presentPersistenceFailure()
             return
         }
         guard stillCurrent(captured) else { return }
@@ -1429,6 +1421,8 @@ final class JournalFirstRunModel {
 
     private func regenerateMark(userInitiated _: Bool) async {
         guard beginUserAction(.mark) else { return }
+
+        defer { finishWholeOperation() }
         await sendRegenerate(captured: epoch)
     }
 
@@ -1520,7 +1514,7 @@ final class JournalFirstRunModel {
         case .mark:
             markFailure = setupCopy?.mark.error ?? ""
         case .thinkingSave, .thinkingFinalize:
-            thinkingFailure = readableMessage(for: error)
+            thinkingFailure = JournalFirstRunCopy.thinkingFailed
         case .thinkingDownload:
             thinkingFailure = downloadFailureText(for: error)
         case .speechDownload:
@@ -1549,7 +1543,7 @@ final class JournalFirstRunModel {
         case .thinkingSave, .thinkingFinalize, .thinkingDownload:
             thinkingFailure = thinkingEnvelopeMessage(envelope)
         case .speechDownload:
-            break
+            speechFailure = firstNonEmpty(envelope.detail, envelope.error) ?? setupCopy?.downloads.error
         case .setup:
             errorMessage = firstNonEmpty(envelope.detail, envelope.error) ?? readableMessage(for: JournalSetupClientError.server(envelope))
         case .outbound:
@@ -1619,10 +1613,14 @@ final class JournalFirstRunModel {
         return await startSupervisor(root)
     }
 
-    private func beginUserAction(_ operation: JournalRitualOperationToken) -> Bool {
-        guard !actionInFlight, !isTerminating else { return false }
+    private func beginUserAction(_ operation: JournalRitualOperationToken, continuing: Bool = false) -> Bool {
+        guard !actionInFlight, !isTerminating,
+              wholeOperationDepth == 0 || (continuing && wholeOperationDepth == 1) else { return false }
+        wholeOperationDepth += 1
+        userOperationInFlight = true
         actionInFlight = true
         epoch &+= 1
+        actionEpoch = epoch
         pendingOperation = operation
         if operationError == operation {
             operationError = .none
@@ -1646,8 +1644,10 @@ final class JournalFirstRunModel {
 
     @discardableResult
     private func endUserAction(_ captured: UInt64) -> Bool {
+        guard actionEpoch == captured else { return false }
         let ok = stillCurrent(captured)
-        epoch &+= 1
+        if ok { epoch &+= 1 }
+        actionEpoch = nil
         pendingOperation = .none
         actionInFlight = false
         return ok
@@ -1655,8 +1655,10 @@ final class JournalFirstRunModel {
 
     @discardableResult
     private func failUserAction(_ captured: UInt64, operation: JournalRitualOperationToken) -> Bool {
+        guard actionEpoch == captured else { return false }
         let ok = stillCurrent(captured)
-        epoch &+= 1
+        if ok { epoch &+= 1 }
+        actionEpoch = nil
         pendingOperation = .none
         actionInFlight = false
         if ok {
@@ -1711,7 +1713,7 @@ final class JournalFirstRunModel {
         do {
             let state = try await setupClient.state()
             guard stillCurrent(captured) else { return }
-            guard !actionInFlight else { return }
+            guard !actionInFlight, wholeOperationDepth == 0 else { return }
             guard journalRoot.standardizedFileURL.path == root.path else { return }
             guard stateIsConsistent(state, root: root) else { return }
             applyRefreshedState(state)
@@ -1756,6 +1758,6 @@ final class JournalFirstRunModel {
     }
 
     private func formattedByteCount(_ bytes: UInt64) -> String {
-        ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+        ByteCountFormatter.string(fromByteCount: Int64(clamping: bytes), countStyle: .file)
     }
 }
