@@ -13,6 +13,18 @@ protocol LoginItemManaging: AnyObject {
     func unregister() throws
 }
 
+enum LaunchAtLoginUpdate: Equatable {
+    case unchanged
+    case applied
+    case deferred
+    case failed
+}
+
+enum LaunchAtLoginIssue: Equatable {
+    case deferred
+    case failed
+}
+
 @MainActor
 final class LiveJournalLoginItemManager: LoginItemManaging {
     private static let watchdogPlistName = "app.solstone.journal.watchdog.plist"
@@ -44,6 +56,7 @@ final class JournalAppConfig {
     private let defaults: UserDefaults
     private let loginItemManager: any LoginItemManaging
     private let loginItemEligibility: () -> Bool
+    private(set) var launchAtLoginIssue: LaunchAtLoginIssue?
 
     init(
         defaults: UserDefaults = UserDefaults(suiteName: suiteName) ?? .standard,
@@ -60,6 +73,7 @@ final class JournalAppConfig {
         self.defaults = defaults
         self.loginItemManager = loginItemManager
         self.loginItemEligibility = loginItemEligibility
+        self.launchAtLoginIssue = nil
     }
 
     var journalRoot: URL? {
@@ -87,9 +101,63 @@ final class JournalAppConfig {
         return defaults.bool(forKey: Keys.launchAtLoginEnabled)
     }
 
-    func setLaunchAtLoginEnabled(_ enabled: Bool) {
+    var launchAtLoginFailureSentence: String? {
+        switch launchAtLoginIssue {
+        case .deferred:
+            return JournalFirstRunCopy.loginItemUnavailable
+        case .failed:
+            return JournalFirstRunCopy.loginItemChangeFailed
+        case nil:
+            return nil
+        }
+    }
+
+    @discardableResult
+    func setLaunchAtLoginEnabled(_ enabled: Bool) -> LaunchAtLoginUpdate {
+        if enabled == launchAtLoginEnabled {
+            return .unchanged
+        }
+        if enabled, !loginItemEligibility() {
+            launchAtLoginIssue = .deferred
+            return .deferred
+        }
+        do {
+            if enabled {
+                try loginItemManager.register()
+            } else {
+                try loginItemManager.unregister()
+            }
+        } catch {
+            launchAtLoginIssue = .failed
+            return .failed
+        }
         defaults.set(enabled, forKey: Keys.launchAtLoginEnabled)
-        applyLaunchAtLoginPreference()
+        launchAtLoginIssue = nil
+        return .applied
+    }
+
+    @discardableResult
+    func setLaunchAtLoginEnabledReportingFailure(_ enabled: Bool) throws -> LaunchAtLoginUpdate {
+        if enabled == launchAtLoginEnabled {
+            return .unchanged
+        }
+        if enabled, !loginItemEligibility() {
+            launchAtLoginIssue = .deferred
+            return .deferred
+        }
+        do {
+            if enabled {
+                try loginItemManager.register()
+            } else {
+                try loginItemManager.unregister()
+            }
+        } catch {
+            launchAtLoginIssue = .failed
+            throw error
+        }
+        defaults.set(enabled, forKey: Keys.launchAtLoginEnabled)
+        launchAtLoginIssue = nil
+        return .applied
     }
 
     var iconMarkAppliedAtLeastOnce: Bool {
@@ -117,20 +185,28 @@ final class JournalAppConfig {
         defaults.set(data, forKey: Keys.journalIconCachedMarkJSON)
     }
 
-    func applyLaunchAtLoginPreference() {
+    @discardableResult
+    func applyLaunchAtLoginPreference() -> LaunchAtLoginUpdate {
         do {
             if launchAtLoginEnabled {
                 // A quarantined app can execute from AppTranslocation while its
                 // bundled login item resolves the original download. Registering
                 // there would let the watchdog relaunch a different identity
                 // after an ordinary quit, so transient locations never enroll.
-                guard loginItemEligibility() else { return }
+                guard loginItemEligibility() else {
+                    launchAtLoginIssue = .deferred
+                    return .deferred
+                }
                 try loginItemManager.register()
             } else {
                 try loginItemManager.unregister()
             }
         } catch {
+            launchAtLoginIssue = .failed
             Logger.journalApp.error("journal login item update failed: \(error.localizedDescription, privacy: .public)")
+            return .failed
         }
+        launchAtLoginIssue = nil
+        return .applied
     }
 }

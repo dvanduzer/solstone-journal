@@ -126,6 +126,7 @@ struct JournalFirstRunModelTests {
         #expect(fixture.model.errorMessage == nil)
         #expect(fixture.routes.contains(.ritual(.finishInBrowser)))
         #expect(fixture.browser.opened.count == 1)
+        #expect(fixture.setupRunner.skipModelInstallFlags == [false])
     }
 
     @Test(.timeLimit(.minutes(1))) func terminationWhileWaitingStopsPollingAndNeverLandsHome() async throws {
@@ -188,7 +189,7 @@ struct JournalFirstRunModelTests {
             discoveryQualificationTimeout: 0.05
         )
 
-        await fixture.model.decideLaunchRoute()
+        await fixture.model.reconcileActivation()
 
         #expect(fixture.model.route == .ritual(.nameLocation))
         #expect(fixture.model.journalRoot == root.standardizedFileURL)
@@ -198,6 +199,7 @@ struct JournalFirstRunModelTests {
 
         #expect(handoffStore.consumeCount == 1)
         #expect(fixture.setupRunner.calls == 1)
+        #expect(fixture.setupRunner.skipModelInstallFlags == [false])
         #expect(fixture.setupRunner.rootsSnapshot == [root.standardizedFileURL])
     }
 
@@ -218,7 +220,7 @@ struct JournalFirstRunModelTests {
             discoveryQualificationTimeout: 0.05
         )
 
-        await fixture.model.decideLaunchRoute()
+        await fixture.model.reconcileActivation()
 
         #expect(fixture.model.route == .ritual(.nameLocation))
         #expect(fixture.model.journalRoot == defaultJournalRoot())
@@ -239,7 +241,7 @@ struct JournalFirstRunModelTests {
             journalFileReader: fileReader,
             discoveryQualificationTimeout: 0.05
         )
-        await fixture.model.decideLaunchRoute()
+        await fixture.model.reconcileActivation()
 
         // Completion is the timeout proof: the stalled probe only returns on
         // cancellation, so reaching these asserts means qualification was cut off.
@@ -259,13 +261,14 @@ struct JournalFirstRunModelTests {
             handoffStore: handoffStore
         )
 
-        await fixture.model.decideLaunchRoute()
+        await fixture.model.reconcileActivation()
 
         #expect(fixture.model.route == .adopting)
         #expect(fixture.config.journalRoot == root.standardizedFileURL)
         #expect(handoffStore.consumeCount == 0)
         #expect(fixture.model.errorMessage != nil)
         #expect(fixture.setupRunner.rootsSnapshot == [root.standardizedFileURL])
+        #expect(fixture.setupRunner.skipModelInstallFlags == [false])
         #expect(await trace.snapshot() == ["setup", "supervisor"])
     }
 
@@ -284,7 +287,7 @@ struct JournalFirstRunModelTests {
             handoffStore: handoffStore
         )
 
-        await fixture.model.decideLaunchRoute()
+        await fixture.model.reconcileActivation()
 
         #expect(fixture.model.route == .adopting)
         #expect(fixture.config.journalRoot == root.standardizedFileURL)
@@ -305,10 +308,10 @@ struct JournalFirstRunModelTests {
             handoffStore: handoffStore
         )
 
-        await fixture.model.decideLaunchRoute()
+        await fixture.model.reconcileActivation()
         #expect(handoffStore.consumeCount == 0)
 
-        await fixture.model.decideLaunchRoute()
+        await fixture.model.reconcileActivation()
 
         #expect(fixture.model.route == .home)
         #expect(handoffStore.consumeCount == 1)
@@ -316,6 +319,7 @@ struct JournalFirstRunModelTests {
             root.standardizedFileURL,
             root.standardizedFileURL,
         ])
+        #expect(fixture.setupRunner.skipModelInstallFlags == [false, false])
         #expect(await trace.snapshot() == [
             "setup",
             "supervisor",
@@ -337,7 +341,7 @@ struct JournalFirstRunModelTests {
             handoffStore: handoffStore
         )
 
-        await fixture.model.decideLaunchRoute()
+        await fixture.model.reconcileActivation()
 
         #expect(fixture.model.route == .ritual(.nameLocation))
         #expect(fixture.model.route != .adopting)
@@ -362,13 +366,104 @@ struct JournalFirstRunModelTests {
             handoffStore: handoffStore
         )
 
-        await fixture.model.decideLaunchRoute()
+        await fixture.model.reconcileActivation()
 
         #expect(fixture.model.route == .ritual(.nameLocation))
         #expect(fixture.model.journalRoot == defaultJournalRoot())
         #expect(fixture.config.journalRoot == nil)
         #expect(handoffStore.consumeCount == 1)
         #expect(fixture.model.errorMessage == nil)
+    }
+
+    @Test func qualifiedDiscoveryAndAdoptSkipModelInstall() async throws {
+        let copy = try loadQualifiedSetupCopy()
+        let discoveryRoot = try makeTemporaryDirectory()
+        let discoveryStore = FakeFirstRunHandoffStore(handoff: discoveryHandoff(root: discoveryRoot))
+        let fileReader = FakeFirstRunJournalFileReader()
+        fileReader.directories = [
+            discoveryRoot.standardizedFileURL.path,
+            discoveryRoot.appendingPathComponent("config", isDirectory: true).path,
+        ]
+        let discovery = makeModel(
+            startResults: [true],
+            probeResults: [.incomplete],
+            handoffStore: discoveryStore,
+            journalFileReader: fileReader,
+            discoveryQualificationTimeout: 0.05,
+            localSetupCapability: { true },
+            loadSetupCopy: { copy },
+            peer: QualifiedPeer()
+        )
+
+        await discovery.model.reconcileActivation()
+        #expect(discovery.model.route == .ritual(.nameLocation))
+        await discovery.model.continueFromNameLocation()
+        #expect(discovery.setupRunner.skipModelInstallFlags == [true])
+        #expect(discovery.browser.opened.isEmpty)
+
+        let adoptRoot = try makeTemporaryDirectory()
+        let adoptStore = FakeFirstRunHandoffStore(handoff: migrationHandoff(root: adoptRoot))
+        let adopt = makeModel(
+            startResults: [true],
+            probeResults: [.incomplete],
+            handoffStore: adoptStore,
+            localSetupCapability: { true },
+            loadSetupCopy: { copy },
+            peer: QualifiedPeer()
+        )
+
+        await adopt.model.reconcileActivation()
+        #expect(adopt.setupRunner.skipModelInstallFlags == [true])
+        #expect(adopt.browser.opened.isEmpty)
+        #expect(adopt.model.route != .ritual(.finishInBrowser))
+    }
+
+    @Test func qualifiedAdoptProbeFailureRetriesWithoutInstallingModelsOrOpeningTheBrowser() async throws {
+        let copy = try loadQualifiedSetupCopy()
+        let adoptRoot = try makeTemporaryDirectory()
+        let adoptStore = FakeFirstRunHandoffStore(handoff: migrationHandoff(root: adoptRoot))
+        let adopt = makeModel(
+            startResults: [true],
+            probeResults: [.incomplete],
+            probeErrors: [URLError(.cannotConnectToHost)],
+            handoffStore: adoptStore,
+            localSetupCapability: { true },
+            loadSetupCopy: { copy },
+            peer: QualifiedPeer()
+        )
+
+        await adopt.model.reconcileActivation()
+        #expect(adopt.model.route == .adopting)
+        #expect(adopt.model.errorMessage != nil)
+        #expect(adoptStore.consumeCount == 0)
+        #expect(adopt.setupRunner.skipModelInstallFlags == [true])
+        #expect(adopt.browser.opened.isEmpty)
+
+        await adopt.model.retryAdopt()
+        #expect(adopt.setupRunner.skipModelInstallFlags == [true, true])
+        #expect(adopt.browser.opened.isEmpty)
+        #expect(adopt.model.route != .ritual(.finishInBrowser))
+        #expect(adopt.model.route != .ritual(.nameLocation))
+        #expect(adoptStore.consumeCount == 1)
+    }
+
+    @Test func unqualifiedAdoptRetryKeepsModelInstall() async throws {
+        let root = try makeTemporaryDirectory()
+        let handoffStore = FakeFirstRunHandoffStore(handoff: migrationHandoff(root: root))
+        let fixture = makeModel(
+            startResults: [true],
+            probeResults: [],
+            setupError: JournalSetupRunnerError.setupFailed(
+                errorCode: "fixture",
+                message: "fixture setup failed"
+            ),
+            handoffStore: handoffStore
+        )
+
+        await fixture.model.reconcileActivation()
+        await fixture.model.retryAdopt()
+
+        #expect(fixture.setupRunner.skipModelInstallFlags == [false, false])
     }
 
 }
@@ -381,6 +476,10 @@ struct FirstRunModelFixture {
     let initClient: FakeInitClient
     let browser: FakeBrowser
     let routeLog: RouteLog
+    let mailbox: SetupMailboxStore
+    let continuation: JournalSetupContinuationStore
+    var openJournalCalls = 0
+    var backupOpens = 0
 
     @MainActor var routes: [JournalFirstRunRoute] { routeLog.routes }
 }
@@ -432,7 +531,20 @@ func makeModel(
     fetchIdentity: JournalWindowModel.IdentityFetch? = nil,
     onIdentityMark: JournalWindowModel.IdentityMarkObserver? = nil,
     opens: Bool = true,
-    browserPollInterval: Duration = .milliseconds(1)
+    browserPollInterval: Duration = .milliseconds(1),
+    localSetupCapability: @escaping @Sendable () -> Bool = { false },
+    loadSetupCopy: @escaping @Sendable () async -> JournalSetupCopy? = { nil },
+    peer injectedPeer: (any JournalSetupPeerResolving)? = nil,
+    setupClient: any JournalSetupClienting = SilentSetupClient(),
+    identity: any JournalIdentityResolving = SilentIdentity(),
+    mailbox injectedMailbox: SetupMailboxStore? = nil,
+    continuation injectedContinuation: JournalSetupContinuationStore? = nil,
+    supervisorIsLive: @escaping @MainActor (URL) -> Bool = { _ in false },
+    externalSupervisorIsLive: @escaping @Sendable (URL) -> Bool = { _ in false },
+    refreshSleep: @escaping @Sendable () async -> Void = {
+        try? await Task.sleep(for: .seconds(60))
+    },
+    attachWindow: Bool = true
 ) -> FirstRunModelFixture {
     let config = config ?? makeConfig()
     let supervisor = JournalSupervisor()
@@ -457,6 +569,11 @@ func makeModel(
     let initClient = injectedInitClient ?? fakeInitClient
     let starts = StartSequence(trace: trace, results: startResults)
     let browser = FakeBrowser(result: opens)
+    let peer = injectedPeer ?? SilentPeer()
+    let mailbox = injectedMailbox ?? SetupMailboxStore(directory: makeIsolatedDirectory("mailbox"))
+    let continuation = injectedContinuation ?? JournalSetupContinuationStore(
+        directory: makeIsolatedDirectory("continuation")
+    )
     let model = JournalFirstRunModel(
         config: config,
         setupRunner: setupRunner,
@@ -469,7 +586,17 @@ func makeModel(
         discoveryQualificationTimeout: discoveryQualificationTimeout,
         openURL: { browser.open($0) },
         browserPollInterval: browserPollInterval,
-        windowModel: windowModel
+        windowModel: attachWindow ? windowModel : nil,
+        supervisorIsLive: supervisorIsLive,
+        externalSupervisorIsLive: externalSupervisorIsLive,
+        loadSetupCopy: loadSetupCopy,
+        localSetupCapability: localSetupCapability,
+        peer: peer,
+        setupClient: setupClient,
+        identity: identity,
+        mailbox: mailbox,
+        continuation: continuation,
+        refreshSleep: refreshSleep
     )
     let routeLog = RouteLog()
     routeLog.track(model)
@@ -480,8 +607,17 @@ func makeModel(
         setupRunner: setupRunner,
         initClient: fakeInitClient,
         browser: browser,
-        routeLog: routeLog
+        routeLog: routeLog,
+        mailbox: mailbox,
+        continuation: continuation
     )
+}
+
+private func makeIsolatedDirectory(_ name: String) -> URL {
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent("journal-first-run-\(name)-\(UUID().uuidString)", isDirectory: true)
+    try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    return url
 }
 
 @MainActor
@@ -503,6 +639,24 @@ private func defaultJournalRoot() -> URL {
     FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("journal", isDirectory: true)
         .standardizedFileURL
+}
+
+private func loadQualifiedSetupCopy() throws -> JournalSetupCopy {
+    let url = URL(filePath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .appendingPathComponent("JournalRuntimeTests/Fixtures/setup-copy.json")
+    return try JournalSetupCopy.decodeQualified(Data(contentsOf: url))
+}
+
+@MainActor
+private final class QualifiedPeer: JournalSetupPeerResolving {
+    func resolve() -> URL? { URL(fileURLWithPath: "/Applications/Solstone.app") }
+    func verify(_ url: URL) async -> Bool {
+        _ = url
+        return true
+    }
+    func launch(_ url: URL) async throws {}
 }
 
 private func discoveryHandoff(root: URL) -> JournalHandoff {
@@ -565,9 +719,11 @@ final class FakeSetupRunner: JournalSetupRunning, @unchecked Sendable {
     private let error: Error?
     private let lock = NSLock()
     private var roots: [URL] = []
+    private var skipFlags: [Bool] = []
 
     var calls: Int { lock.withLock { roots.count } }
     var rootsSnapshot: [URL] { lock.withLock { roots } }
+    var skipModelInstallFlags: [Bool] { lock.withLock { skipFlags } }
 
     init(trace: FirstRunTrace, error: Error? = nil) {
         self.trace = trace
@@ -577,10 +733,14 @@ final class FakeSetupRunner: JournalSetupRunning, @unchecked Sendable {
     func run(
         journalRoot: URL,
         skipService: Bool,
+        skipModelInstall: Bool,
         progress: @escaping @Sendable (JournalSetupProgressEvent) async -> Void
     ) async throws -> JournalSetupResult {
         _ = skipService
-        lock.withLock { roots.append(journalRoot.standardizedFileURL) }
+        lock.withLock {
+            roots.append(journalRoot.standardizedFileURL)
+            skipFlags.append(skipModelInstall)
+        }
         await trace.append("setup")
         if let error {
             throw error
@@ -737,8 +897,13 @@ private actor CancellationAwareSetupRunner: JournalSetupRunning {
         for await _ in entry.stream { return }
     }
 
-    func run(journalRoot: URL, skipService: Bool,
-             progress: @escaping @Sendable (JournalSetupProgressEvent) async -> Void) async throws -> JournalSetupResult {
+    func run(
+        journalRoot: URL,
+        skipService: Bool,
+        skipModelInstall: Bool,
+        progress: @escaping @Sendable (JournalSetupProgressEvent) async -> Void
+    ) async throws -> JournalSetupResult {
+        _ = skipModelInstall
         entered = true
         entry.continuation.yield(())
         entry.continuation.finish()
@@ -750,4 +915,29 @@ private actor CancellationAwareSetupRunner: JournalSetupRunning {
         }
         throw CancellationError()
     }
+}
+
+@MainActor
+final class SilentPeer: JournalSetupPeerResolving {
+    func resolve() -> URL? { nil }
+    func verify(_ url: URL) async -> Bool { false }
+    func launch(_ url: URL) async throws {}
+}
+
+final class SilentSetupClient: JournalSetupClienting, @unchecked Sendable {
+    func state() async throws -> JournalSetupState {
+        throw JournalSetupClientError.decoding
+    }
+
+    func perform(_ action: JournalSetupAction) async throws -> JournalSetupState {
+        throw JournalSetupClientError.decoding
+    }
+
+    func networkStatus() async throws -> JournalNetworkStatus {
+        JournalNetworkStatus(caFingerprint: nil, instanceID: nil)
+    }
+}
+
+final class SilentIdentity: JournalIdentityResolving, @unchecked Sendable {
+    func resolveIdentity(baseURL: String) async -> JournalIdentityResolution { .absent }
 }

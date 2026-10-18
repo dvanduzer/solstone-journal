@@ -8,7 +8,7 @@ import PackageDescription
 // runtime this repository builds. The shared Mac libraries (core types, the journal mark,
 // updates and the watchdog) come from solstone-macos at one exact commit; bump the revision
 // and Package.resolved together, never to a branch or tag.
-let supportRevision = "6a6da2bfedb062156d1e2a7e8a7c5eec2ba57608"
+let supportRevision = "583564171a2c48196981fa379895cd5676c43996"
 
 let package = Package(
     name: "SolstoneJournalMac",

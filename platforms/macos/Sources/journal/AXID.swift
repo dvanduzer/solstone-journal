@@ -38,6 +38,40 @@ enum AXID {
             static let setupErrorState = "journal.ritual.setup.error.state"
             static let setupRetry = "journal.ritual.setup.retry"
             static let browserReopen = "journal.ritual.browser.reopen"
+            static let welcomeContinue = "journal.ritual.welcome.continue"
+            static let loginToggle = "journal.ritual.login.toggle"
+            static let loginFailureState = "journal.ritual.login.failure.state"
+            static let folderField = "journal.ritual.folder.field"
+            static let folderChoose = "journal.ritual.folder.choose"
+            static let folderContinue = "journal.ritual.folder.continue"
+            static let markContinue = "journal.ritual.mark.continue"
+            static let markRegenerate = "journal.ritual.mark.regenerate"
+            static let markProposalState = "journal.ritual.mark.proposal.state"
+            static let markErrorState = "journal.ritual.mark.error.state"
+            static let thinkingContinue = "journal.ritual.thinking.continue"
+            static let thinkingChange = "journal.ritual.thinking.change"
+            static let thinkingLater = "journal.ritual.thinking.later"
+            static let thinkingChoiceState = "journal.ritual.thinking.choice.state"
+            static let thinkingErrorState = "journal.ritual.thinking.error.state"
+            static func thinkingChoice(_ choice: String) -> String? {
+                guard choice.range(
+                    of: #"^[a-z0-9]+(?:-[a-z0-9]+)*$"#,
+                    options: .regularExpression
+                ) != nil else {
+                    return nil
+                }
+                return "journal.ritual.thinking.choice.\(choice)"
+            }
+            static let downloadSpeechState = "journal.ritual.download.speech.state"
+            static let downloadThinkingState = "journal.ritual.download.thinking.state"
+            static let downloadSpeechRetry = "journal.ritual.download.speech.retry"
+            static let downloadThinkingRetry = "journal.ritual.download.thinking.retry"
+            static let downloadThinkingCancel = "journal.ritual.download.thinking.cancel"
+            static let operationPendingState = "journal.ritual.operation.pending.state"
+            static let operationErrorState = "journal.ritual.operation.error.state"
+            static let outboundState = "journal.ritual.outbound.state"
+            static let handoffErrorState = "journal.ritual.handoff.error.state"
+            static let handoffRetry = "journal.ritual.handoff.retry"
         }
 
         enum Adopt {

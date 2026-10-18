@@ -306,6 +306,11 @@ struct JournalSettingsWindow: View {
                 id: AXID.Journal.Startup.launchAtLoginState,
                 value: (model.launchAtLoginEnabled ? JournalEnabledState.enabled : .disabled).axToken
             )
+            if let failure = model.launchAtLoginFailure, !failure.isEmpty {
+                Text(failure)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 

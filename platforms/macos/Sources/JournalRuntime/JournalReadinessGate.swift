@@ -72,11 +72,11 @@ public struct JournalReadinessGate: JournalReadinessChecking {
         journalRoot: URL,
         identityProvider: @escaping @Sendable () async -> SupervisedChildIdentity?
     ) async -> SupervisedChildIdentity? {
-        guard let marker = readReadyMarker(
+        guard let marker = readSupervisorReadyMarker(
             from: journalRoot.appendingPathComponent("health/supervisor.ready")
         ),
-            let recordedPID = readPositivePID(from: journalRoot.appendingPathComponent("health/supervisor.pid")),
-            let recordedStartTime = readDouble(from: journalRoot.appendingPathComponent("health/supervisor.start_time")),
+            let recordedPID = readSupervisorPositivePID(from: journalRoot.appendingPathComponent("health/supervisor.pid")),
+            let recordedStartTime = readSupervisorDouble(from: journalRoot.appendingPathComponent("health/supervisor.start_time")),
             let identity = await identityProvider() else {
             return nil
         }
@@ -98,47 +98,73 @@ public struct JournalReadinessGate: JournalReadinessChecking {
         return identity
     }
 
-    private struct ReadyMarker: Decodable {
-        let pid: pid_t
-        let readyAt: Double
-        let startTime: Double
+}
 
-        private enum CodingKeys: String, CodingKey {
-            case pid
-            case readyAt = "ready_at"
-            case startTime = "start_time"
-        }
-    }
+private struct SupervisorReadyMarker: Decodable {
+    let pid: pid_t
+    let readyAt: Double
+    let startTime: Double
 
-    private func readReadyMarker(from url: URL) -> ReadyMarker? {
-        guard let data = try? Data(contentsOf: url),
-              let marker = try? JSONDecoder().decode(ReadyMarker.self, from: data),
-              marker.pid > 0,
-              marker.readyAt.isFinite,
-              marker.startTime.isFinite else {
-            return nil
-        }
-        return marker
+    private enum CodingKeys: String, CodingKey {
+        case pid
+        case readyAt = "ready_at"
+        case startTime = "start_time"
     }
+}
 
-    private func readPositivePID(from url: URL) -> pid_t? {
-        guard let value = readInt32(from: url), value > 0 else {
-            return nil
-        }
-        return pid_t(value)
+private func readSupervisorReadyMarker(from url: URL) -> SupervisorReadyMarker? {
+    guard let data = try? Data(contentsOf: url),
+          let marker = try? JSONDecoder().decode(SupervisorReadyMarker.self, from: data),
+          marker.pid > 0,
+          marker.readyAt.isFinite,
+          marker.startTime.isFinite else {
+        return nil
     }
+    return marker
+}
 
-    private func readInt32(from url: URL) -> Int32? {
-        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
-        return Int32(text.trimmingCharacters(in: .whitespacesAndNewlines))
+private func readSupervisorPositivePID(from url: URL) -> pid_t? {
+    guard let text = try? String(contentsOf: url, encoding: .utf8),
+          let value = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)),
+          value > 0 else {
+        return nil
     }
+    return pid_t(value)
+}
 
-    private func readDouble(from url: URL) -> Double? {
-        guard let text = try? String(contentsOf: url, encoding: .utf8),
-              let value = Double(text.trimmingCharacters(in: .whitespacesAndNewlines)),
-              value.isFinite else {
-            return nil
-        }
-        return value
+private func readSupervisorDouble(from url: URL) -> Double? {
+    guard let text = try? String(contentsOf: url, encoding: .utf8),
+          let value = Double(text.trimmingCharacters(in: .whitespacesAndNewlines)),
+          value.isFinite else {
+        return nil
     }
+    return value
+}
+
+public func liveSupervisorMatchesReadyFiles(journalRoot: URL) -> Bool {
+    liveSupervisorMatchesReadyFiles(journalRoot: journalRoot) { pid in
+        liveJournalProcessEvidence(for: pid)?.kernelStartTime
+    }
+}
+
+public func liveSupervisorMatchesReadyFiles(
+    journalRoot: URL,
+    kernelStartTime: (pid_t) -> Double?
+) -> Bool {
+    guard let marker = readSupervisorReadyMarker(
+        from: journalRoot.appendingPathComponent("health/supervisor.ready")
+    ),
+        let recordedPID = readSupervisorPositivePID(
+            from: journalRoot.appendingPathComponent("health/supervisor.pid")
+        ),
+        let recordedStartTime = readSupervisorDouble(
+            from: journalRoot.appendingPathComponent("health/supervisor.start_time")
+        ),
+        marker.pid == recordedPID,
+        let kernel = kernelStartTime(recordedPID),
+        kernel.isFinite else {
+        return false
+    }
+    return abs(recordedStartTime - kernel) <= journalSupervisorStartTimeToleranceSeconds
+        && abs(marker.startTime - kernel) <= journalSupervisorStartTimeToleranceSeconds
 }

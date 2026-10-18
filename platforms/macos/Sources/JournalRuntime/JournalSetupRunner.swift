@@ -62,6 +62,7 @@ public struct JournalSetupRunner: Sendable {
     public func run(
         journalRoot rawJournalRoot: URL,
         skipService: Bool = true,
+        skipModelInstall: Bool = false,
         progress: @escaping @Sendable (JournalSetupProgressEvent) async -> Void = { _ in }
     ) async throws -> JournalSetupResult {
         let journalRoot = rawJournalRoot.standardizedFileURL
@@ -162,7 +163,9 @@ public struct JournalSetupRunner: Sendable {
             throw JournalSetupRunnerError.missingCompletion
         }
 
-        try await installModels(runtime: runtime, journalRoot: journalRoot)
+        if !skipModelInstall {
+            try await installModels(runtime: runtime, journalRoot: journalRoot)
+        }
 
         return JournalSetupResult(
             runtime: runtime,
