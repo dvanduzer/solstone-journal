@@ -2974,7 +2974,7 @@ mod tests {
             .iter()
             .find(|notice| notice["id"] == hostname_id)
             .unwrap();
-        assert_eq!(hostname_notice["door"], "your hostname");
+        assert_eq!(hostname_notice["door"], "your own domain");
 
         for _ in 0..15 {
             replay_one(&relay, &client.id, &client.client_id, "relay", "192.0.2.1");
@@ -2984,9 +2984,9 @@ mod tests {
         assert_eq!(notices.len(), 16);
         assert!(!notices.iter().any(|notice| notice["id"] == oldest));
         assert!(
-            notices
-                .iter()
-                .any(|notice| { notice["id"] == hostname_id && notice["door"] == "your hostname" })
+            notices.iter().any(|notice| {
+                notice["id"] == hostname_id && notice["door"] == "your own domain"
+            })
         );
     }
 

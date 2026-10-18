@@ -304,7 +304,7 @@
     const host = b.hostname || '';
     const removed = byoRemovedMessage ? `<div class="notice"><p>${esc(byoRemovedMessage)}</p>${byoCommands?.remove ? `<p class="note">on your server, paste this as an admin to undo the setup:</p><pre class="cmd-block"><code>${esc(byoCommands.remove)}</code></pre><button class="btn sm" data-copy="${esc(byoCommands.remove)}">copy</button>` : ''}</div>` : '';
     if (!host && !byoSetupOpen) {
-      return `<div class="lane-body byo-setup">${removed}<p class="onlab">what you need</p><ol class="legs"><li><span class="step">1</span><span>a domain or subdomain whose DNS lets you add an A record and a CAA record</span></li><li><span class="step">2</span><span>a Linux server on the internet with a public IPv4 address, an SSH login with admin rights, and port 443 open. any provider works.</span></li><li><span class="step">3</span><span>this computer on and online when your agents connect</span></li></ol><div class="hand"><button class="btn primary" data-action="byo-setup">set it up</button></div></div>`;
+      return `<div class="lane-body byo-setup">${removed}<p class="onlab">what you need</p><ol class="legs"><li><span class="step">1</span><span>a domain or subdomain whose DNS lets you add an A record and a CAA record</span></li><li><span class="step">2</span><span>a Linux server on the internet with a public IPv4 address, an SSH login with admin rights, and port 443 open. any provider works.</span></li><li><span class="step">3</span><span>your journal's computer on and online when your agents connect</span></li></ol><div class="hand"><button class="btn primary" data-action="byo-setup">set it up</button></div></div>`;
     }
 
     const sshCommand = `ssh -N -R 443:${b.socket_path} you@your-server`;
@@ -332,7 +332,7 @@
 
     // 3 · two records at your DNS host
     let step3 = '';
-    if (b.relay && b.account_uri) {
+    if (b.account_uri) {
       const dns = byoDnsResult;
       const found = byoRecordsFound(b, dns);
       const verdict = dns?.verdict || b.dns_verdict || 'unchecked';
@@ -341,16 +341,16 @@
         : (() => {
             const addrs = dns?.addresses || b.dns_addresses || [];
             const diagLines = byoDiagnosticLines(b, dns);
-            const aOk = addrs.length > 0 && addrs.every(a => a === rAddr) && !diagLines.length;
+            const aOk = addrs.length > 0 && (!rAddr || addrs.every(a => a === rAddr)) && !diagLines.length;
             const verdictLine = BYO_CAA_MISMATCH.includes(verdict) ? byoCaaMismatchLine(host) : (BYO_DNS_COPY[verdict] || (verdict === 'admitted' ? '' : 'not checked yet'));
             return (aOk ? '<li><span class="step">✓</span><span>A record points at your server</span></li>' : '') + [...diagLines, verdictLine].filter(Boolean).map(line => `<li><span class="step">!</span><span>${esc(line)}</span></li>`).join('');
           })();
-      step3 = `<p class="onlab">two records at your DNS host</p><p>add these two records for <code>${esc(host)}</code>:</p><table class="records"><tr><th>type</th><th>value</th><th></th></tr><tr><td>A</td><td><code>${esc(rAddr)}</code></td><td><button class="btn sm" data-copy="${esc(rAddr)}">copy</button></td></tr><tr><td>CAA</td><td><code>${esc(b.caa_record || '')}</code></td><td><button class="btn sm" data-copy="${esc(b.caa_record || '')}">copy</button></td></tr></table><p class="note">if your DNS host's form has separate fields, use flags 0, tag issue, and the text between the quotes as the value. if it offers a proxy or CDN for this name, turn it off. the CAA record lets only your journal get a certificate for this exact name, though whoever can change your domain's DNS can still get one that covers it.</p><ul class="legs">${status}</ul><div class="button-row"><button class="btn sm" data-action="byo-dns-check">check</button></div>`;
+      step3 = `<p class="onlab">two records at your DNS host</p><p>add these two records for <code>${esc(host)}</code>:</p><table class="records"><tr><th>type</th><th>value</th><th></th></tr><tr><td>A</td><td>${rAddr ? `<code>${esc(rAddr)}</code>` : "your server's public IPv4 address"}</td><td>${rAddr ? `<button class="btn sm" data-copy="${esc(rAddr)}">copy</button>` : ''}</td></tr><tr><td>CAA</td><td><code>${esc(b.caa_record || '')}</code></td><td><button class="btn sm" data-copy="${esc(b.caa_record || '')}">copy</button></td></tr></table><p class="note">if your DNS host's form has separate fields, use flags 0, tag issue, and the text between the quotes as the value. if it offers a proxy or CDN for this name, turn it off. the CAA record lets only your journal get a certificate for this exact name, though whoever can change your domain's DNS can still get one that covers it.</p><ul class="legs">${status}</ul><div class="button-row"><button class="btn sm" data-action="byo-dns-check">check</button></div>`;
     }
 
     // 4 · turn it on
     let step4 = '';
-    if (b.relay && b.account_uri) {
+    if (b.account_uri) {
       if (!b.enabled) {
         step4 = `<p class="onlab">turn it on</p><div class="button-row"><button class="btn primary" data-action="byo-on">turn it on</button></div>`;
       } else {
@@ -358,10 +358,10 @@
         const outside = byoOutsideResult;
         const legs = [
           ['both records found', byoRecordsFound(b, byoDnsResult) || b.socket_listening],
-          ['connected to your server', b.relay?.state === 'connected'],
           ['getting the certificate. its key never leaves this computer.', Boolean(b.certificate_active)],
           ['checking your address from the outside', outside === 'outside_ok'],
         ];
+        if (b.relay) legs.splice(1, 0, ['connected to your server', b.relay.state === 'connected']);
         const legsHtml = `<ol class="legs">${legs.map(([title, done], i) => `<li class="${done ? 'done' : ''}"><span class="step">${done ? '✓' : i + 1}</span><span>${esc(title)}</span></li>`).join('')}</ol>`;
         const outsideLine = outside && BYO_OUTSIDE_COPY[outside] ? `<p class="${outside === 'outside_ok' ? 'note' : 'notice'}">${esc(BYO_OUTSIDE_COPY[outside])}</p>` : '';
         const trouble = byoRelayTrouble(b) ? `<div class="notice error"><p>${esc(BYO_RELAY_COPY[BYO_RELAY_STATE_CODE[b.relay.state]](b))}</p>${b.relay.state === 'host_key_changed' ? '<button class="btn sm" data-action="byo-relay-trust-again">trust it again</button>' : ''}</div>` : '';

@@ -292,6 +292,19 @@ async function test(name, body) {
     assert(calls.some(call => call.url === '/app/agents/api/byo' && call.method === 'PUT' && call.body.enabled === true));
   });
 
+  await test('an owner who forwards port 443 themselves still sees the CAA record and can turn the route on and off', async () => {
+    const {view, click, calls} = await boot(baseState({...door({listening: true}), ...byo()}));
+    await click({lane: 'byo'});
+    has(view, `accounturi=${BYO_URI}; validationmethods=tls-alpn-01`);
+    has(view, 'data-action="byo-on"');
+    await click({action: 'byo-on'});
+    assert(calls.some(call => call.url === '/app/agents/api/byo' && call.method === 'PUT' && call.body.enabled === true));
+    const {view: vOn, click: cOn} = await boot(baseState({...door({listening: true}), ...byo({enabled: true, dns_verdict: 'admitted', socket_listening: true, certificate_active: true, next_action: 'none'})}));
+    await cOn({lane: 'byo'});
+    has(vOn, 'data-action="byo-off"');
+    lacks(vOn, 'connected to your server');
+  });
+
   await test('a Windows hostname route names its loopback address and an OpenSSH command, not a socket', async () => {
     const {view, click} = await boot(baseState({...door({listening: true}), ...byo({ingress: 'loopback', socket_path: '127.0.0.1:7661'})}));
     await click({lane: 'byo'});
