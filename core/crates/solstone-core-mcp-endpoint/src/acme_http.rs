@@ -167,13 +167,50 @@ impl HttpClient for McpEndpointHttpClient {
         req: http::Request<BodyWrapper<bytes::Bytes>>,
     ) -> Pin<Box<dyn Future<Output = Result<BytesResponse, instant_acme::Error>> + Send>> {
         let client = self.client.clone();
-        Box::pin(async move {
+        with_request_deadline(async move {
             let res = client
                 .request(req)
                 .await
                 .map_err(|e| instant_acme::Error::Other(Box::new(e)))?;
             Ok(BytesResponse::from(res))
         })
+    }
+}
+
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Bound connection, response headers and body by one request deadline.
+pub(crate) fn with_request_deadline(
+    response: impl Future<Output = Result<BytesResponse, instant_acme::Error>> + Send + 'static,
+) -> Pin<Box<dyn Future<Output = Result<BytesResponse, instant_acme::Error>> + Send>> {
+    let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
+    Box::pin(async move {
+        let response = tokio::time::timeout_at(deadline, response)
+            .await
+            .map_err(|error| instant_acme::Error::Other(Box::new(error)))??;
+        Ok(BytesResponse {
+            parts: response.parts,
+            body: Box::new(DeadlineBody {
+                inner: response.body,
+                deadline,
+            }),
+        })
+    })
+}
+
+struct DeadlineBody {
+    inner: Box<dyn instant_acme::BytesBody>,
+    deadline: tokio::time::Instant,
+}
+
+#[async_trait::async_trait]
+impl instant_acme::BytesBody for DeadlineBody {
+    async fn into_bytes(
+        &mut self,
+    ) -> Result<bytes::Bytes, Box<dyn StdError + Send + Sync + 'static>> {
+        tokio::time::timeout_at(self.deadline, self.inner.into_bytes())
+            .await
+            .map_err(|error| -> Box<dyn StdError + Send + Sync> { Box::new(error) })?
     }
 }
 
@@ -306,6 +343,84 @@ pub fn parse_issuance_retry_after(header: Option<&str>, now_unix: i64) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct CancelProbe(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for CancelProbe {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    struct PendingBody(CancelProbe);
+
+    #[async_trait::async_trait]
+    impl instant_acme::BytesBody for PendingBody {
+        async fn into_bytes(
+            &mut self,
+        ) -> Result<bytes::Bytes, Box<dyn StdError + Send + Sync + 'static>> {
+            let _ = &self.0;
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_deadline_cancels_stalled_response_headers() {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = CancelProbe(Arc::clone(&cancelled));
+        let response = with_request_deadline(async move {
+            let _probe = probe;
+            std::future::pending().await
+        })
+        .await;
+        assert!(matches!(response, Err(instant_acme::Error::Other(error))
+            if error.is::<tokio::time::error::Elapsed>()));
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_deadline_covers_headers_and_body_with_one_budget() {
+        let start = tokio::time::Instant::now();
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = CancelProbe(Arc::clone(&cancelled));
+        let mut response = with_request_deadline(async move {
+            tokio::time::sleep(REQUEST_TIMEOUT - std::time::Duration::from_secs(1)).await;
+            let (parts, ()) = http::Response::builder()
+                .status(http::StatusCode::TOO_MANY_REQUESTS)
+                .header(http::header::RETRY_AFTER, "604800")
+                .body(())
+                .unwrap()
+                .into_parts();
+            Ok(BytesResponse {
+                parts,
+                body: Box::new(PendingBody(probe)),
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(response.parts.status, http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.parts.headers[http::header::RETRY_AFTER], "604800");
+        let error = response.body.into_bytes().await.unwrap_err();
+        assert!(error.is::<tokio::time::error::Elapsed>());
+        assert_eq!(start.elapsed(), REQUEST_TIMEOUT);
+        drop(response);
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_deadline_preserves_successful_response_bytes() {
+        let mut response = with_request_deadline(async move {
+            let response = http::Response::builder()
+                .status(http::StatusCode::OK)
+                .body(BodyWrapper::from(b"response body".to_vec()))
+                .unwrap();
+            Ok(BytesResponse::from(response))
+        })
+        .await
+        .unwrap();
+        assert_eq!(response.parts.status, http::StatusCode::OK);
+        assert_eq!(response.body.into_bytes().await.unwrap(), "response body");
+    }
 
     #[test]
     fn parse_retry_after_handles_all_prescribed_shapes() {

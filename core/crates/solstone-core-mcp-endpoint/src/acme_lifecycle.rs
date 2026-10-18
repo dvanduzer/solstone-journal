@@ -25,6 +25,20 @@ use crate::tls::{
 };
 use crate::unix::{self, TlsStateDirectory};
 
+#[cfg(all(test, feature = "full-tests"))]
+#[path = "acme_deadline_tests.rs"]
+mod acme_deadline_tests;
+
+#[cfg(all(test, feature = "full-tests"))]
+#[path = "acme_checkpoint_tests.rs"]
+mod acme_checkpoint_tests;
+
+#[cfg(all(test, feature = "full-tests"))]
+thread_local! {
+    static FAIL_ISSUANCE_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static FAIL_SCHEDULE_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Initial retry delay for failed issuance (30s).
 pub const INITIAL_ISSUE_BACKOFF_SECONDS: u64 = 30;
 
@@ -446,11 +460,18 @@ pub fn persist_issuance(
     directory: &TlsStateDirectory,
     record: &IssuanceRecord,
 ) -> Result<(), McpEndpointTlsError> {
+    #[cfg(all(test, feature = "full-tests"))]
+    if FAIL_ISSUANCE_WRITE.get() {
+        return Err(McpEndpointTlsError::State);
+    }
     let bytes = match serde_json::to_vec_pretty(record) {
         Ok(b) => b,
         Err(_) => return Err(McpEndpointTlsError::State),
     };
-    unix::persist_tls_issuance_bytes(directory, &bytes).map_err(|_| McpEndpointTlsError::State)?;
+    unix::persist_tls_issuance_bytes(directory, &bytes).map_err(|_| {
+        log::error!("failed to persist ACME issuance key checkpoint");
+        McpEndpointTlsError::State
+    })?;
     Ok(())
 }
 
@@ -661,6 +682,20 @@ pub fn decide_renewal_action(
         })
     };
 
+    // 3. Stored order URL resumes without creating a new order.
+    if let Some(order_url) = saved.and_then(|s| s.order_url.as_ref()) {
+        if let Some(blocked_until) = issue_blocked {
+            return RenewalAction::Wait {
+                until_epoch_seconds: blocked_until,
+                schedule: saved.cloned(),
+            };
+        }
+        return RenewalAction::ResumeOrder {
+            order_url: order_url.clone(),
+            schedule: saved.cloned(),
+        };
+    }
+
     // 2. Force staging renewal latch: issues once on start without waiting.
     if force_staging_renewal {
         let sched = fallback_schedule(now);
@@ -678,20 +713,6 @@ pub fn decide_renewal_action(
         return RenewalAction::IssueNow {
             replaces,
             schedule: Some(sched),
-        };
-    }
-
-    // 3. Stored order URL resumes without creating a new order.
-    if let Some(order_url) = saved.and_then(|s| s.order_url.as_ref()) {
-        if let Some(blocked_until) = issue_blocked {
-            return RenewalAction::Wait {
-                until_epoch_seconds: blocked_until,
-                schedule: saved.cloned(),
-            };
-        }
-        return RenewalAction::ResumeOrder {
-            order_url: order_url.clone(),
-            schedule: saved.cloned(),
         };
     }
 
@@ -877,10 +898,8 @@ pub fn decide_renewal_action(
                     Some(cert_id.clone())
                 };
 
-                // While ARI is unavailable (or retry not yet due): if now >= backstop, issue!
-                if (s.ari_unavailable_since.is_some() || s.ari_retry_at.is_some())
-                    && now >= backstop
-                {
+                // Only a confirmed ARI failure lets the lifetime backstop override a healthy window.
+                if s.ari_unavailable_since.is_some() && now >= backstop {
                     if let Some(blocked_until) = issue_blocked {
                         return RenewalAction::Wait {
                             until_epoch_seconds: blocked_until,
@@ -911,8 +930,13 @@ pub fn decide_renewal_action(
                 {
                     let wait_until = s
                         .window_start
-                        .map(|_| s.renew_at.min(ari_t).min(backstop))
-                        .unwrap_or(ari_t.min(backstop));
+                        .map(|_| s.renew_at.min(ari_t))
+                        .unwrap_or(ari_t);
+                    let wait_until = if s.ari_unavailable_since.is_some() {
+                        wait_until.min(backstop)
+                    } else {
+                        wait_until
+                    };
                     return RenewalAction::Wait {
                         until_epoch_seconds: wait_until,
                         schedule: Some(s.clone()),
@@ -1151,6 +1175,7 @@ pub async fn run_renewal_lifecycle(
         ) {
             Ok(l) => l,
             Err(_) => {
+                log::error!("failed to read ACME certificate state");
                 tokio::select! {
                     changed = params.shutdown.changed() => {
                         if changed.is_err() || *params.shutdown.borrow() {
@@ -1174,6 +1199,7 @@ pub async fn run_renewal_lifecycle(
         ) {
             Ok(s) => s,
             Err(_) => {
+                log::error!("failed to read ACME renewal schedule");
                 tokio::select! {
                     changed = params.shutdown.changed() => {
                         if changed.is_err() || *params.shutdown.borrow() {
@@ -1322,7 +1348,6 @@ pub async fn run_renewal_lifecycle(
                 }
             }
             RenewalAction::IssueNow { replaces, schedule } => {
-                force_staging = false;
                 let mut sched = if loop_order.is_none() {
                     schedule.unwrap_or_else(|| RenewalScheduleRecord {
                         environment: params.environment,
@@ -1471,7 +1496,7 @@ pub async fn run_renewal_lifecycle(
                                 params.directory,
                                 params.tls_service,
                                 &mut sched,
-                                now,
+                                current_epoch_seconds(),
                             );
                             schedule_dirty = persisted.is_err();
                             loop_schedule = Some(sched);
@@ -1487,31 +1512,38 @@ pub async fn run_renewal_lifecycle(
                             // still name the predecessor. A lost 201 is not this arm.
                             sched.replaces_submitted = None;
                             let captured = capturing_client.captured_retry_after();
-                            let deadline =
-                                match parse_issuance_retry_after(captured.as_deref(), now) {
-                                    Some(deadline) => {
-                                        sched.issue_retry_at = Some(deadline);
-                                        let persisted = persist_schedule(
-                                            params.directory,
-                                            params.tls_service,
-                                            &sched,
-                                        );
-                                        schedule_dirty = persisted.is_err();
-                                        deadline
-                                    }
-                                    None => {
-                                        let persisted = record_issuance_deadline_backoff(
-                                            params.directory,
-                                            params.tls_service,
-                                            &mut sched,
-                                            now,
-                                        );
-                                        schedule_dirty = persisted.is_err();
-                                        sched
-                                            .issue_retry_at
-                                            .unwrap_or(now + INITIAL_ISSUE_BACKOFF_SECONDS as i64)
-                                    }
-                                };
+                            let deadline = match parse_issuance_retry_after(
+                                captured.as_deref(),
+                                current_epoch_seconds(),
+                            ) {
+                                Some(deadline) => {
+                                    let deadline = deadline.max(
+                                        current_epoch_seconds()
+                                            + INITIAL_ISSUE_BACKOFF_SECONDS as i64,
+                                    );
+                                    sched.issue_retry_at = Some(deadline);
+                                    let persisted = persist_schedule(
+                                        params.directory,
+                                        params.tls_service,
+                                        &sched,
+                                    );
+                                    schedule_dirty = persisted.is_err();
+                                    deadline
+                                }
+                                None => {
+                                    let persisted = record_issuance_deadline_backoff(
+                                        params.directory,
+                                        params.tls_service,
+                                        &mut sched,
+                                        current_epoch_seconds(),
+                                    );
+                                    schedule_dirty = persisted.is_err();
+                                    sched.issue_retry_at.unwrap_or(
+                                        current_epoch_seconds()
+                                            + INITIAL_ISSUE_BACKOFF_SECONDS as i64,
+                                    )
+                                }
+                            };
                             if let Some(root) = params.journal_root {
                                 crate::owner_state::write_mcp_rate_limit_state(
                                     root,
@@ -1529,7 +1561,7 @@ pub async fn run_renewal_lifecycle(
                                 params.directory,
                                 params.tls_service,
                                 &mut sched,
-                                now,
+                                current_epoch_seconds(),
                             );
                             schedule_dirty = persisted.is_err();
                             loop_schedule = Some(sched);
@@ -1588,6 +1620,7 @@ pub async fn run_renewal_lifecycle(
                 .await
                 {
                     OrderCompletionOutcome::Installed => {
+                        force_staging = false;
                         clear_saved_order(&mut sched);
                         sched.issue_retry_at = None;
                         sched.issue_backoff_seconds = None;
@@ -1612,7 +1645,7 @@ pub async fn run_renewal_lifecycle(
                             params.directory,
                             params.tls_service,
                             &mut sched,
-                            now,
+                            current_epoch_seconds(),
                         );
                         schedule_dirty = persisted.is_err();
                         loop_schedule = Some(sched);
@@ -1628,7 +1661,7 @@ pub async fn run_renewal_lifecycle(
                             params.directory,
                             params.tls_service,
                             &mut sched,
-                            now,
+                            current_epoch_seconds(),
                         );
                         schedule_dirty = persisted.is_err();
                         if persisted.is_ok() {
@@ -1645,7 +1678,7 @@ pub async fn run_renewal_lifecycle(
                             params.tls_service,
                             &mut sched,
                             e,
-                            now,
+                            current_epoch_seconds(),
                         );
                         schedule_dirty = persisted.is_err();
                         loop_schedule = Some(sched);
@@ -1702,7 +1735,7 @@ pub async fn run_renewal_lifecycle(
                                     params.directory,
                                     params.tls_service,
                                     &mut sched,
-                                    now,
+                                    current_epoch_seconds(),
                                 );
                                 schedule_dirty = persisted.is_err();
                                 if persisted.is_ok() {
@@ -1732,6 +1765,7 @@ pub async fn run_renewal_lifecycle(
                             .await
                             {
                                 OrderCompletionOutcome::Installed => {
+                                    force_staging = false;
                                     if let Some(mut sched) = schedule {
                                         clear_saved_order(&mut sched);
                                         sched.issue_retry_at = None;
@@ -1762,7 +1796,7 @@ pub async fn run_renewal_lifecycle(
                                             params.directory,
                                             params.tls_service,
                                             &mut sched,
-                                            now,
+                                            current_epoch_seconds(),
                                         );
                                         schedule_dirty = persisted.is_err();
                                         loop_schedule = Some(sched);
@@ -1780,7 +1814,7 @@ pub async fn run_renewal_lifecycle(
                                             params.directory,
                                             params.tls_service,
                                             &mut sched,
-                                            now,
+                                            current_epoch_seconds(),
                                         );
                                         schedule_dirty = persisted.is_err();
                                         if persisted.is_ok() {
@@ -1799,7 +1833,7 @@ pub async fn run_renewal_lifecycle(
                                             params.tls_service,
                                             &mut sched,
                                             e,
-                                            now,
+                                            current_epoch_seconds(),
                                         );
                                         schedule_dirty = persisted.is_err();
                                         loop_schedule = Some(sched);
@@ -1830,7 +1864,7 @@ pub async fn run_renewal_lifecycle(
                                 params.directory,
                                 params.tls_service,
                                 &mut sched,
-                                now,
+                                current_epoch_seconds(),
                             );
                             schedule_dirty = persisted.is_err();
                             if persisted.is_ok() && is_definitive_not_found {
@@ -2245,6 +2279,10 @@ pub(crate) fn persist_schedule(
     _tls_service: &McpEndpointTlsService,
     schedule: &RenewalScheduleRecord,
 ) -> Result<(), McpEndpointTlsError> {
+    #[cfg(all(test, feature = "full-tests"))]
+    if FAIL_SCHEDULE_WRITE.get() {
+        return Err(McpEndpointTlsError::State);
+    }
     let bytes = match serde_json::to_vec(schedule) {
         Ok(b) => b,
         Err(_) => {
@@ -2294,6 +2332,36 @@ fn record_issuance_deadline_backoff(
     sched.issue_backoff_seconds = Some(next_backoff);
     sched.issue_retry_at = Some(now + next_backoff as i64);
     persist_schedule(directory, tls_service, sched)
+}
+
+#[cfg(test)]
+mod standard_certificate_vector {
+    use super::*;
+
+    #[test]
+    fn rfc9773_leaf_identifier_and_replacement_payload() {
+        let certificates =
+            pem::parse_many(include_bytes!("../tests/fixtures/ari-rfc9773.pem").as_slice())
+                .expect("standard certificate");
+        assert_eq!(certificates.len(), 1);
+        let leaf =
+            extract_leaf_cert_info(certificates[0].contents()).expect("extract standard leaf");
+        assert_eq!(leaf.raw_serial.as_slice(), &[0x00, 0x87, 0x65, 0x43, 0x21]);
+        assert_eq!(
+            leaf.aki.as_slice(),
+            &[
+                0x69, 0x88, 0x5b, 0x6b, 0x87, 0x46, 0x40, 0x41, 0xe1, 0xb3, 0x7b, 0x84, 0x7b, 0xa0,
+                0xae, 0x2c, 0xde, 0x01, 0xc8, 0xd4,
+            ]
+        );
+        let expected = "aYhba4dGQEHhs3uEe6CuLN4ByNQ.AIdlQyE";
+        let identifier = cert_id_from_leaf(&leaf);
+        assert_eq!(identifier.to_string(), expected);
+        let identifiers = [instant_acme::Identifier::Dns("acme.example.com".to_owned())];
+        let payload = serde_json::to_value(NewOrder::new(&identifiers).replaces(identifier))
+            .expect("replacement serialization");
+        assert_eq!(payload["replaces"], expected);
+    }
 }
 
 #[cfg(test)]

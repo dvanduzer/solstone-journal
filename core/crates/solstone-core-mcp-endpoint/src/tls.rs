@@ -52,6 +52,8 @@ pub struct McpEndpointTlsService {
     #[cfg(test)]
     pub(crate) last_publication_error: Arc<std::sync::Mutex<Option<McpEndpointTlsError>>>,
     #[cfg(test)]
+    test_install_shutdown: Arc<std::sync::Mutex<Option<tokio::sync::watch::Sender<bool>>>>,
+    #[cfg(test)]
     pub(crate) custom_http_client: Arc<std::sync::Mutex<Option<Arc<dyn instant_acme::HttpClient>>>>,
     #[cfg(test)]
     #[allow(clippy::type_complexity)]
@@ -280,6 +282,8 @@ impl McpEndpointTlsService {
             #[cfg(test)]
             last_publication_error: Arc::clone(&self.last_publication_error),
             #[cfg(test)]
+            test_install_shutdown: Arc::clone(&self.test_install_shutdown),
+            #[cfg(test)]
             custom_http_client: Arc::clone(&self.custom_http_client),
             #[cfg(test)]
             custom_picker: Arc::clone(&self.custom_picker),
@@ -335,23 +339,33 @@ impl McpEndpointTlsService {
         hostname: String,
         generation: u64,
     ) -> Result<Self, McpEndpointTlsError> {
+        Self::for_byo_cert_directory_in_environment(
+            cert_directory,
+            hostname,
+            generation,
+            McpEndpointCertificateEnvironment::Production,
+        )
+    }
+
+    fn for_byo_cert_directory_in_environment(
+        cert_directory: unix::TlsStateDirectory,
+        hostname: String,
+        generation: u64,
+        environment: McpEndpointCertificateEnvironment,
+    ) -> Result<Self, McpEndpointTlsError> {
         if !is_exact_authorized_hostname(&hostname, &hostname) {
             return Err(McpEndpointTlsError::State);
         }
         let store = Arc::new(CertificateStateStore {
             directory: cert_directory,
-            environment: McpEndpointCertificateEnvironment::Production,
+            environment,
             generation: Some(generation),
         });
         let service = Self::empty(hostname, Some(Arc::clone(&store)), false);
         if let Some(bytes) =
             unix::read_tls_state_bytes(&store.directory).map_err(|_| McpEndpointTlsError::State)?
         {
-            match classify_stored_state(
-                &bytes,
-                &service.resolver.hostname,
-                McpEndpointCertificateEnvironment::Production,
-            )? {
+            match classify_stored_state(&bytes, &service.resolver.hostname, environment)? {
                 StoredCertificateClassification::Same(decoded) => {
                     if certificate_is_current(&decoded)? {
                         let active = activate_decoded_stored_state(decoded)?;
@@ -387,6 +401,8 @@ impl McpEndpointTlsService {
             force_staging_renewal,
             #[cfg(test)]
             last_publication_error: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            test_install_shutdown: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             custom_http_client: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -431,6 +447,15 @@ impl McpEndpointTlsService {
             .ok_or(McpEndpointTlsError::State)?;
         let active = validate_stored_state(&reopened, &self.resolver.hostname, store.environment)?;
         self.resolver.ordinary.store(Some(Arc::new(active)));
+        #[cfg(test)]
+        if let Some(shutdown) = self
+            .test_install_shutdown
+            .lock()
+            .expect("test install hook")
+            .as_ref()
+        {
+            shutdown.send_replace(true);
+        }
         Ok(())
     }
 
@@ -667,6 +692,10 @@ impl McpEndpointTlsService {
             })));
     }
 }
+
+#[cfg(all(test, feature = "full-tests", unix))]
+#[path = "acme_process_tests.rs"]
+mod acme_test_driver;
 
 impl Drop for McpEndpointChallengeGuard {
     fn drop(&mut self) {
@@ -1082,7 +1111,7 @@ pub(crate) mod test_helpers {
     use base64::Engine;
     use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
     use rustls::pki_types::{CertificateDer, ServerName};
-    use rustls::{ClientConfig, ClientConnection, ServerConnection};
+    use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConnection};
     use time::OffsetDateTime;
 
     pub(crate) const HOSTNAME: &str = "ab12cd34.solstone.me";
@@ -1108,6 +1137,22 @@ pub(crate) mod test_helpers {
             "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
             base64::engine::general_purpose::STANDARD.encode(der)
         )
+    }
+
+    pub(crate) fn trusted_client_config(
+        certificate: CertificateDer<'static>,
+        alpn: Vec<Vec<u8>>,
+    ) -> Arc<ClientConfig> {
+        let mut roots = RootCertStore::empty();
+        roots.add(certificate).expect("fixture root");
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut config = ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("ring provider supports TLS 1.3")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        config.alpn_protocols = alpn;
+        Arc::new(config)
     }
 
     #[derive(Debug)]
@@ -1759,7 +1804,7 @@ mod tests {
 
     use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
-    use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConnection};
+    use rustls::{ClientConnection, ServerConnection};
     use solstone_core_journal_io::journal_root::JournalRoot;
     use tempfile::TempDir;
 
@@ -1821,22 +1866,6 @@ mod tests {
             not_before,
             not_after,
         )
-    }
-
-    fn trusted_client_config(
-        certificate: CertificateDer<'static>,
-        alpn: Vec<Vec<u8>>,
-    ) -> Arc<ClientConfig> {
-        let mut roots = RootCertStore::empty();
-        roots.add(certificate).expect("fixture root");
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut config = ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .expect("ring provider supports TLS 1.3")
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        config.alpn_protocols = alpn;
-        Arc::new(config)
     }
 
     #[test]
@@ -2583,8 +2612,26 @@ mod tests {
         // Restore permissions for clean tempdir drop
         fs::set_permissions(&tls_dir, fs::Permissions::from_mode(0o700)).unwrap();
     }
+}
 
-    #[tokio::test]
+#[cfg(all(test, feature = "full-tests"))]
+#[cfg(unix)]
+mod full_tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use tempfile::TempDir;
+
+    use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
+    use rustls::pki_types::ServerName;
+    use rustls::{ClientConnection, ServerConnection};
+    use solstone_core_journal_io::journal_root::JournalRoot;
+
+    use super::test_helpers::*;
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
     async fn hand_built_bytes_reload_and_preserve() {
         let _clock = lock_test_clock(None);
         let now = current_epoch_seconds();
@@ -2655,24 +2702,6 @@ mod tests {
         let read_uri = unix::read_byo_account_uri(&acc_dir).unwrap();
         assert_eq!(read_uri.as_deref(), Some(raw_uri));
     }
-}
-
-#[cfg(all(test, feature = "full-tests"))]
-#[cfg(unix)]
-mod full_tests {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
-    use tempfile::TempDir;
-
-    use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
-    use rustls::pki_types::ServerName;
-    use rustls::{ClientConnection, ServerConnection};
-    use solstone_core_journal_io::journal_root::JournalRoot;
-
-    use super::test_helpers::*;
-    use super::*;
 
     fn new_order_has_replaces(body: &[u8]) -> Option<bool> {
         let jws: serde_json::Value = serde_json::from_slice(body).ok()?;
@@ -3758,7 +3787,7 @@ mod full_tests {
             Arc::clone(&journal_root),
             HOSTNAME.to_owned(),
             McpEndpointCertificateEnvironment::Staging,
-            false,
+            true,
         )
         .expect("service2");
 
@@ -3944,18 +3973,16 @@ mod full_tests {
         let new_cert_pem = pem_from_der(&succ_der);
         service.set_custom_order_key(succ_key);
 
-        let tls_dir = root.path().join("mcp-endpoint/tls");
-
-        struct PermGuard(std::path::PathBuf);
-        impl Drop for PermGuard {
+        struct FaultGuard;
+        impl Drop for FaultGuard {
             fn drop(&mut self) {
-                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+                crate::acme_lifecycle::FAIL_SCHEDULE_WRITE.set(false);
             }
         }
-        let _guard = PermGuard(tls_dir.clone());
-
-        // First start: chmod 0o500 so persist_schedule fails on renewal.json
-        fs::set_permissions(&tls_dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let _guard = FaultGuard;
+        // Inject at renewal publication, after the account/storage admission
+        // boundary; changing directory permissions can refuse that boundary first.
+        crate::acme_lifecycle::FAIL_SCHEDULE_WRITE.set(true);
 
         let (mock_client1, requests1) = mock_acme_server(
             "https://acme.example/dir".to_string(),
@@ -3982,6 +4009,24 @@ mod full_tests {
         });
 
         tokio::time::advance(tokio::time::Duration::from_secs(1)).await;
+        for _ in 0..50 {
+            if requests1
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, uri, _)| uri.contains("/dir"))
+                || handle1.is_finished()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        if handle1.is_finished() {
+            panic!(
+                "renewal task exited before publication fault: {:?}",
+                handle1.await
+            );
+        }
 
         {
             let reqs = requests1.lock().unwrap();
@@ -3999,14 +4044,11 @@ mod full_tests {
         let res1 = handle1.await.expect("join 1");
         assert!(res1.is_ok());
 
-        // Restore mode to 0o700 for second start
-        fs::set_permissions(&tls_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::acme_lifecycle::FAIL_SCHEDULE_WRITE.set(false);
 
-        // Second start: before_new_order_response chmods 0o500 before the 201
-        let tls_dir_clone = tls_dir.clone();
         let gates2 = AcmeServerGates {
             before_new_order_response: Some(Arc::new(move || {
-                let _ = fs::set_permissions(&tls_dir_clone, fs::Permissions::from_mode(0o500));
+                crate::acme_lifecycle::FAIL_SCHEDULE_WRITE.set(true);
             })),
             ..Default::default()
         };
@@ -4047,7 +4089,7 @@ mod full_tests {
             .expect("active cert 2");
         assert_eq!(active2.key.cert[0], pred_cert);
 
-        fs::set_permissions(&tls_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::acme_lifecycle::FAIL_SCHEDULE_WRITE.set(false);
 
         shutdown2_tx.send(true).unwrap();
         let res2 = handle2.await.expect("join 2");
