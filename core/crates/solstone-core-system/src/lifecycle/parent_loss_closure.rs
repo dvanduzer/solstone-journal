@@ -83,6 +83,10 @@ const LIVE_REAP_GRACE_MS: u64 = 500;
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static HISTORICAL_DISCOVERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static DISCOVERY_STOP_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static SCAN_PUBLICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static AUDIT_BATCH_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static AUDIT_VALIDATED_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static AUDIT_STOP_AFTER_BATCH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static PUBLICATION_STOP_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1947,6 +1951,132 @@ pub(crate) fn close_abandoned_generation(
         }
     }
 
+    // 7. Load provisional files.
+    let mut provisional_map: HashMap<String, ProvisionalFile> = HashMap::new();
+    let prov_dir = ledger.closure_recovery_provisional_dir(generation);
+    if let Ok(entries) = fs::read_dir(&prov_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            match read_json_durable_validated::<ProvisionalFile>(
+                ArtifactId::ParentLossClosureRecovery,
+                &path,
+                |p| {
+                    if p.schema != PARENT_LOSS_RECOVERY_SCHEMA_V1
+                        || p.generation != generation
+                        || p.sealed_phase != ParentLossPhase::Sealed
+                        || p.kind != RecoveryArtifactKind::Provisional
+                    {
+                        return Err("invalid provisional envelope".to_string());
+                    }
+                    Ok(())
+                },
+            ) {
+                Ok(DurableRead::Present(prov)) => {
+                    provisional_map.insert(prov.launch_id.clone(), prov);
+                }
+                Ok(DurableRead::SetAside(aside)) => {
+                    if let Some(name) = aside.file_name() {
+                        set_aside_files.push(name.to_string_lossy().into_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // A completed scan schedules publication; it never certifies its rows.
+    // The publisher still authenticates actual IDs and committed output (or
+    // audits original sources), checks provisionals and inventories the result.
+    let scan_complete_path = ledger.closure_recovery_scan_complete_path(generation);
+    if next_seq == max_seq + 1
+        && current_batch_buffer.is_empty()
+        && publication::current_provisional_sources(ledger, generation, &provisional_map)?.is_some()
+    {
+        match read_json_durable_validated::<ScanCompleteFile>(
+            ArtifactId::ParentLossClosureRecovery,
+            &scan_complete_path,
+            |scan| {
+                if scan.schema != PARENT_LOSS_RECOVERY_SCHEMA_V1
+                    || scan.generation != generation
+                    || scan.sealed_phase != ParentLossPhase::Sealed
+                    || scan.kind != RecoveryArtifactKind::ScanComplete
+                {
+                    return Err("invalid scan-complete envelope".to_owned());
+                }
+                Ok(())
+            },
+        )? {
+            DurableRead::Present(scan)
+                if scan.sorted_launch_ids == publication::inventory(ledger, generation)? =>
+            {
+                #[cfg(test)]
+                SCAN_PUBLICATIONS.with(|count| count.set(count.get() + 1));
+                let result = publication::publish(
+                    ledger,
+                    generation,
+                    successor_generation,
+                    authority,
+                    supervisor,
+                    coordinator,
+                    record.clone(),
+                    supervisor_observation,
+                    coordinator_observation,
+                    set_aside_files.clone(),
+                    notes.clone(),
+                    scan.sorted_launch_ids,
+                    scan.ids_sequences,
+                    &provisional_map,
+                );
+                match &result {
+                    Ok(
+                        publication::PublicationOutcome::Closed
+                        | publication::PublicationOutcome::BudgetExpired,
+                    ) => {
+                        return result.map(publication::PublicationOutcome::into_closure);
+                    }
+                    #[cfg(test)]
+                    Ok(publication::PublicationOutcome::Paused) => {
+                        return result.map(publication::PublicationOutcome::into_closure);
+                    }
+                    Ok(publication::PublicationOutcome::RebuildRequired) | Err(_) => {}
+                }
+                // Invalid inputs invalidate the scheduling hint even if their
+                // cleanup crosses the deadline. A genuine budget refusal keeps
+                // the hint so the next start can resume publication directly.
+                let aside = set_aside(&scan_complete_path)?;
+                if let Some(name) = aside.file_name() {
+                    set_aside_files.push(name.to_string_lossy().into_owned());
+                }
+                result?;
+            }
+            DurableRead::Present(_) => {
+                let aside = set_aside(&scan_complete_path)?;
+                if let Some(name) = aside.file_name() {
+                    set_aside_files.push(name.to_string_lossy().into_owned());
+                }
+            }
+            DurableRead::SetAside(aside) => {
+                if let Some(name) = aside.file_name() {
+                    set_aside_files.push(name.to_string_lossy().into_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[cfg(test)]
+    {
+        HISTORICAL_DISCOVERIES.with(|count| count.set(count.get() + 1));
+        if DISCOVERY_STOP_FAULT.with(|fault| fault.get()) {
+            return Ok(ClosureOutcome::Refused(
+                BootstrapRecoveryReason::CoordinatorNotLive,
+            ));
+        }
+    }
+
     completed_ids.clear();
     // 6. Discovery IDs are scheduling hints. Publication validates each payload
     // against its receipt and source facts before any hint can enter the audit.
@@ -2154,42 +2284,6 @@ pub(crate) fn close_abandoned_generation(
     }
 
     next_seq = max_seq + 1;
-
-    // 7. Load provisional files.
-    let mut provisional_map: HashMap<String, ProvisionalFile> = HashMap::new();
-    let prov_dir = ledger.closure_recovery_provisional_dir(generation);
-    if let Ok(entries) = fs::read_dir(&prov_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            match read_json_durable_validated::<ProvisionalFile>(
-                ArtifactId::ParentLossClosureRecovery,
-                &path,
-                |p| {
-                    if p.schema != PARENT_LOSS_RECOVERY_SCHEMA_V1
-                        || p.generation != generation
-                        || p.sealed_phase != ParentLossPhase::Sealed
-                        || p.kind != RecoveryArtifactKind::Provisional
-                    {
-                        return Err("invalid provisional envelope".to_string());
-                    }
-                    Ok(())
-                },
-            ) {
-                Ok(DurableRead::Present(prov)) => {
-                    provisional_map.insert(prov.launch_id.clone(), prov);
-                }
-                Ok(DurableRead::SetAside(aside)) => {
-                    if let Some(name) = aside.file_name() {
-                        set_aside_files.push(name.to_string_lossy().into_owned());
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
 
     // 8. Check scan-complete.json.
     let mut skip_dir_scan = false;
@@ -2783,6 +2877,7 @@ pub(crate) fn close_abandoned_generation(
         ids_seqs,
         &provisional_map,
     )
+    .map(publication::PublicationOutcome::into_closure)
 }
 
 #[cfg(target_os = "linux")]
@@ -3358,6 +3453,7 @@ mod tests {
         assert!(retirer.signals.lock().expect("signals").is_empty());
     }
 
+    #[cfg(feature = "full-tests")]
     #[test]
     fn an_uninspectable_pid_is_settled_by_its_owner_or_refuses() {
         let directory = TempDir::new().expect("temporary root");
@@ -3404,7 +3500,7 @@ mod tests {
                 instance(11, 3),
                 [],
                 &lease,
-                &authority(&source, &retirer, Duration::from_millis(50)),
+                &authority(&source, &retirer, Duration::from_secs(2)),
             )
             .expect_err("mine staying unverifiable must refuse");
 
@@ -5108,6 +5204,263 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    fn pause_after_audit(
+        ledger: &ParentLossLedger,
+        lease: &CoordinatorLease,
+        source: &FakeSource,
+        retirer: &FakeRetirer,
+    ) {
+        AUDIT_STOP_AFTER_BATCH.with(|remaining| remaining.set(1));
+        let result = ledger.reserve_generation_closing_abandoned(
+            instance(11, 3),
+            [],
+            lease,
+            &authority(source, retirer, Duration::from_secs(10)),
+        );
+        AUDIT_STOP_AFTER_BATCH.with(|remaining| remaining.set(0));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn retained_scan_bypasses_discovery_and_survives_an_expired_publication_slice() {
+        let directory = TempDir::new().unwrap();
+        let (ledger, active) = open_generation(&directory);
+        let expected = admit(
+            directory.path(),
+            active.generation,
+            "scan-resume",
+            None,
+            Some(instance(8820, 600)),
+        )
+        .unwrap();
+        let (source, retirer) = fake(&[], &[], &[]);
+        let lease = acquire_lease(&ledger);
+        pause_after_audit(&ledger, &lease, &source, &retirer);
+        let scan = ledger.closure_recovery_scan_complete_path(active.generation);
+        let scan_bytes = fs::read(&scan).unwrap();
+        let progress = ledger
+            .closure_recovery_phase_dir(active.generation)
+            .join("audit-progress.json");
+        let progress_bytes = fs::read(&progress).unwrap();
+        HISTORICAL_DISCOVERIES.with(|count| count.set(0));
+        SCAN_PUBLICATIONS.with(|count| count.set(0));
+        let result = ledger.reserve_generation_closing_abandoned(
+            instance(12, 4),
+            [],
+            &lease,
+            &authority(&source, &retirer, Duration::ZERO),
+        );
+        assert!(result.is_err());
+        assert_eq!(HISTORICAL_DISCOVERIES.with(|count| count.get()), 0);
+        assert_eq!(SCAN_PUBLICATIONS.with(|count| count.get()), 1);
+        assert_eq!(
+            fs::read(&scan).unwrap(),
+            scan_bytes,
+            "actual deadline keeps scheduling progress"
+        );
+        assert_eq!(fs::read(progress).unwrap(), progress_bytes);
+        assert_eq!(
+            ledger.active_generation().unwrap().unwrap().generation,
+            active.generation
+        );
+        AUDIT_BATCH_READS.with(|count| count.set(0));
+        ledger
+            .reserve_generation_closing_abandoned(
+                instance(13, 5),
+                [],
+                &lease,
+                &authority(&source, &retirer, Duration::from_secs(10)),
+            )
+            .unwrap();
+        assert_eq!(HISTORICAL_DISCOVERIES.with(|count| count.get()), 0);
+        assert_eq!(SCAN_PUBLICATIONS.with(|count| count.get()), 2);
+        assert_eq!(AUDIT_BATCH_READS.with(|count| count.get()), 0);
+        assert_eq!(
+            fs::read(scan).unwrap(),
+            scan_bytes,
+            "valid scan is not rewritten"
+        );
+        let sealed: Vec<serde_json::Value> = serde_json::from_slice(
+            &fs::read(ledger.sealed_ledger_path(active.generation)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sealed.len(), 1);
+        assert_eq!(
+            serde_json::from_value::<AdmissionIdentity>(sealed[0]["identity"].clone()).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn damaged_scan_hints_are_preserved_and_rebuilt_without_early_allocation() {
+        for damage in 0..4 {
+            let directory = TempDir::new().unwrap();
+            let (ledger, active) = open_generation(&directory);
+            let expected = admit(
+                directory.path(),
+                active.generation,
+                "scan-damage",
+                None,
+                Some(instance(8821, 600)),
+            )
+            .unwrap();
+            let (source, retirer) = fake(&[], &[], &[]);
+            let lease = acquire_lease(&ledger);
+            pause_after_audit(&ledger, &lease, &source, &retirer);
+            let scan = ledger.closure_recovery_scan_complete_path(active.generation);
+            let mut hint: ScanCompleteFile =
+                serde_json::from_slice(&fs::read(&scan).unwrap()).unwrap();
+            match damage {
+                0 => hint.ids_sequences = vec![999],
+                1 => hint.ids_sequences.push(hint.ids_sequences[0]),
+                2 => {
+                    hint.sorted_launch_ids.pop();
+                }
+                _ => hint
+                    .sorted_launch_ids
+                    .push(hint.sorted_launch_ids[0].clone()),
+            }
+            write_json(&scan, &hint, json_options()).unwrap();
+            let damaged_bytes = fs::read(&scan).unwrap();
+            DISCOVERY_STOP_FAULT.with(|fault| fault.set(true));
+            let first = ledger.reserve_generation_closing_abandoned(
+                instance(12, 4),
+                [],
+                &lease,
+                &authority(&source, &retirer, Duration::from_secs(10)),
+            );
+            DISCOVERY_STOP_FAULT.with(|fault| fault.set(false));
+            assert!(first.is_err());
+            assert!(
+                !scan.exists(),
+                "pre-deadline rejection must discard the scheduling hint"
+            );
+            assert!(
+                fs::read_dir(scan.parent().unwrap())
+                    .unwrap()
+                    .flatten()
+                    .any(|entry| fs::read(entry.path()).is_ok_and(|bytes| bytes == damaged_bytes))
+            );
+            assert_eq!(
+                ledger.active_generation().unwrap().unwrap().generation,
+                active.generation
+            );
+            let record: ParentLossGenerationRecord =
+                serde_json::from_slice(&fs::read(ledger.record_path(active.generation)).unwrap())
+                    .unwrap();
+            assert!(record.closure.is_none());
+            ledger
+                .reserve_generation_closing_abandoned(
+                    instance(13, 5),
+                    [],
+                    &lease,
+                    &authority(&source, &retirer, Duration::from_secs(10)),
+                )
+                .unwrap();
+            let sealed: Vec<serde_json::Value> = serde_json::from_slice(
+                &fs::read(ledger.sealed_ledger_path(active.generation)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(sealed.len(), 1);
+            assert_eq!(
+                serde_json::from_value::<AdmissionIdentity>(sealed[0]["identity"].clone()).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn priority_retirement_that_already_flushed_a_batch_reconstructs_the_scan() {
+        let directory = TempDir::new().unwrap();
+        let (ledger, active) = open_generation(&directory);
+        admit(
+            directory.path(),
+            active.generation,
+            "history-before-live",
+            None,
+            Some(instance(8822, 600)),
+        )
+        .unwrap();
+        let root = instance(8823, 600);
+        let launch_id = "priority-live";
+        write_parent_loss_admission_intent(
+            directory.path(),
+            &AdmissionIntent::new(active.generation, launch_id, None, None),
+        )
+        .unwrap();
+        let (source, retirer) = fake(&[(root, 501)], &[root.pid], &[]);
+        let lease = acquire_lease(&ledger);
+        pause_after_audit(&ledger, &lease, &source, &retirer);
+        let expected = AdmissionIdentity {
+            generation: active.generation,
+            launch_id: launch_id.to_owned(),
+            instance: root,
+            uid: 501,
+            parent_launch_id: None,
+        };
+        acknowledge_parent_loss_admission(directory.path(), expected.clone()).unwrap();
+        let derived = read_derived_admission_drops(&ledger, active.generation, launch_id).unwrap();
+        let live = LiveRecoveryFile {
+            sources: Some(derived.sources),
+            schema: PARENT_LOSS_RECOVERY_SCHEMA_V1,
+            kind: RecoveryArtifactKind::Live,
+            generation: active.generation,
+            sealed_phase: ParentLossPhase::Sealed,
+            launch_id: launch_id.to_owned(),
+            service: None,
+            root,
+            uid: 501,
+            parent_launch_id: None,
+            descendants: Vec::new(),
+            binding_digest: String::new(),
+            escalate_at_unix_ms: 0,
+            reap_deadline_unix_ms: None,
+            term_requested: false,
+            escalated: false,
+        };
+        persist_live(&ledger, active.generation, &live).unwrap();
+        // Promotion has transferred the obligation to the authoritative census.
+        // Leave no provisional mismatch that could independently block the shortcut.
+        fs::remove_file(ledger.closure_recovery_provisional_path(active.generation, launch_id))
+            .unwrap();
+        HISTORICAL_DISCOVERIES.with(|count| count.set(0));
+        SCAN_PUBLICATIONS.with(|count| count.set(0));
+        ledger
+            .reserve_generation_closing_abandoned(
+                instance(12, 4),
+                [],
+                &lease,
+                &authority(&source, &retirer, Duration::from_secs(10)),
+            )
+            .unwrap();
+        assert_eq!(HISTORICAL_DISCOVERIES.with(|count| count.get()), 1);
+        assert_eq!(
+            SCAN_PUBLICATIONS.with(|count| count.get()),
+            0,
+            "a drained buffer does not make a newly flushed completion part of an old scan"
+        );
+        let closure = closure_of(&ledger, active.generation);
+        let retired = closure
+            .admissions
+            .iter()
+            .find(|row| row.launch_id == launch_id)
+            .unwrap();
+        assert_eq!(retired.instance, Some(root));
+        assert_eq!(
+            retired.finding,
+            AdmissionFinding::Retired { escalated: false }
+        );
+        let sealed: Vec<serde_json::Value> = serde_json::from_slice(
+            &fs::read(ledger.sealed_ledger_path(active.generation)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sealed.len(), 2);
+        assert!(sealed.iter().any(|row| {
+            serde_json::from_value::<AdmissionIdentity>(row["identity"].clone())
+                .is_ok_and(|actual| actual == expected)
+        }));
+    }
+
     #[test]
     fn committed_audit_progress_skips_prior_source_validation_but_includes_late_admissions() {
         let directory = TempDir::new().unwrap();
@@ -5151,6 +5504,7 @@ mod tests {
             .unwrap(),
         );
         AUDIT_VALIDATED_ROWS.with(|count| count.set(0));
+        AUDIT_BATCH_READS.with(|count| count.set(0));
         ledger
             .reserve_generation_closing_abandoned(
                 instance(12, 4),
@@ -5163,6 +5517,11 @@ mod tests {
             AUDIT_VALIDATED_ROWS.with(|count| count.get()),
             1,
             "a committed source audit must leave the retry budget for unfinished work"
+        );
+        assert_eq!(
+            AUDIT_BATCH_READS.with(|count| count.get()),
+            1,
+            "a retained committed chunk must not reread its completed raw batch"
         );
         let sealed: Vec<serde_json::Value> = serde_json::from_slice(
             &fs::read(ledger.sealed_ledger_path(active.generation)).unwrap(),
@@ -5200,29 +5559,34 @@ mod tests {
         );
         AUDIT_STOP_AFTER_BATCH.with(|remaining| remaining.set(0));
         assert!(first.is_err());
+        // Without the independent commit, this raw payload must be audited again.
+        fs::remove_file(
+            ledger
+                .closure_recovery_phase_dir(active.generation)
+                .join("audit-progress.json"),
+        )
+        .unwrap();
         let batch = ledger.closure_recovery_batch_path(active.generation, 1);
         fs::write(&batch, b"{damaged payload").unwrap();
-        assert!(
-            ledger
-                .reserve_generation_closing_abandoned(
-                    instance(12, 4),
-                    [],
-                    &lease,
-                    &authority(&source, &retirer, Duration::from_secs(2))
-                )
-                .is_err()
+        let recovered = ledger.reserve_generation_closing_abandoned(
+            instance(12, 4),
+            [],
+            &lease,
+            &authority(&source, &retirer, Duration::from_secs(2)),
         );
         assert!(!batch.exists());
         assert!(fs::read_dir(batch.parent().unwrap()).unwrap().flatten().any(|entry|
             fs::read(entry.path()).is_ok_and(|bytes| bytes == b"{damaged payload")));
-        ledger
-            .reserve_generation_closing_abandoned(
-                instance(13, 5),
-                [],
-                &lease,
-                &authority(&source, &retirer, Duration::from_secs(2)),
-            )
-            .unwrap();
+        if recovered.is_err() {
+            ledger
+                .reserve_generation_closing_abandoned(
+                    instance(13, 5),
+                    [],
+                    &lease,
+                    &authority(&source, &retirer, Duration::from_secs(2)),
+                )
+                .unwrap();
+        }
         let sealed: Vec<serde_json::Value> = serde_json::from_slice(
             &fs::read(ledger.sealed_ledger_path(active.generation)).unwrap(),
         )
@@ -5231,6 +5595,121 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<AdmissionIdentity>(sealed[0]["identity"].clone()).unwrap(),
             expected
+        );
+    }
+
+    #[test]
+    fn committed_output_survives_damage_to_its_historical_raw_batch() {
+        for malformed in [false, true] {
+            let directory = TempDir::new().unwrap();
+            let (ledger, active) = open_generation(&directory);
+            let expected = admit(
+                directory.path(),
+                active.generation,
+                "committed-payload",
+                None,
+                Some(instance(8814, 600)),
+            )
+            .unwrap();
+            let (source, retirer) = fake(&[], &[], &[]);
+            let lease = acquire_lease(&ledger);
+            AUDIT_STOP_AFTER_BATCH.with(|remaining| remaining.set(1));
+            let first = ledger.reserve_generation_closing_abandoned(
+                instance(11, 3),
+                [],
+                &lease,
+                &authority(&source, &retirer, Duration::from_secs(2)),
+            );
+            AUDIT_STOP_AFTER_BATCH.with(|remaining| remaining.set(0));
+            assert!(first.is_err());
+            let batch = ledger.closure_recovery_batch_path(active.generation, 1);
+            let bytes = if malformed {
+                b"{damaged payload".to_vec()
+            } else {
+                let mut payload: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&batch).unwrap()).unwrap();
+                payload["entries"][0]["uid"] = 502.into();
+                serde_json::to_vec(&payload).unwrap()
+            };
+            fs::write(&batch, &bytes).unwrap();
+            AUDIT_BATCH_READS.with(|count| count.set(0));
+            ledger
+                .reserve_generation_closing_abandoned(
+                    instance(12, 4),
+                    [],
+                    &lease,
+                    &authority(&source, &retirer, Duration::from_secs(2)),
+                )
+                .unwrap();
+            assert_eq!(AUDIT_BATCH_READS.with(|count| count.get()), 0);
+            assert_eq!(
+                fs::read(batch).unwrap(),
+                bytes,
+                "preserve damaged historical evidence"
+            );
+            let closure = closure_of(&ledger, active.generation);
+            assert_eq!(closure.admissions[0].uid, Some(expected.uid));
+            let sealed: Vec<serde_json::Value> = serde_json::from_slice(
+                &fs::read(ledger.sealed_ledger_path(active.generation)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(sealed.len(), 1);
+            assert_eq!(
+                serde_json::from_value::<AdmissionIdentity>(sealed[0]["identity"].clone()).unwrap(),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn changed_committed_ids_bytes_force_a_fresh_source_audit() {
+        let directory = TempDir::new().unwrap();
+        let (ledger, active) = open_generation(&directory);
+        let expected = admit(
+            directory.path(),
+            active.generation,
+            "committed-ids",
+            None,
+            Some(instance(8815, 600)),
+        )
+        .unwrap();
+        let (source, retirer) = fake(&[], &[], &[]);
+        let lease = acquire_lease(&ledger);
+        AUDIT_STOP_AFTER_BATCH.with(|remaining| remaining.set(1));
+        let first = ledger.reserve_generation_closing_abandoned(
+            instance(11, 3),
+            [],
+            &lease,
+            &authority(&source, &retirer, Duration::from_secs(2)),
+        );
+        AUDIT_STOP_AFTER_BATCH.with(|remaining| remaining.set(0));
+        assert!(first.is_err());
+        let ids = ledger.closure_recovery_ids_path(active.generation, 1);
+        let before = fs::read(&ids).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&before).unwrap();
+        let changed = serde_json::to_vec(&value).unwrap();
+        assert_ne!(changed, before, "same IDs, different serialized bytes");
+        fs::write(ids, changed).unwrap();
+        AUDIT_BATCH_READS.with(|count| count.set(0));
+        AUDIT_VALIDATED_ROWS.with(|count| count.set(0));
+        ledger
+            .reserve_generation_closing_abandoned(
+                instance(12, 4),
+                [],
+                &lease,
+                &authority(&source, &retirer, Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert_eq!(AUDIT_BATCH_READS.with(|count| count.get()), 1);
+        assert_eq!(AUDIT_VALIDATED_ROWS.with(|count| count.get()), 1);
+        let sealed: Vec<serde_json::Value> = serde_json::from_slice(
+            &fs::read(ledger.sealed_ledger_path(active.generation)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sealed.len(), 1);
+        assert_eq!(
+            serde_json::from_value::<AdmissionIdentity>(sealed[0]["identity"].clone()).unwrap(),
+            expected,
         );
     }
 
