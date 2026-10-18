@@ -11,6 +11,7 @@ publish = false
 
 [features]
 full-tests = []
+test-hooks = []
 
 [lints]
 workspace = true

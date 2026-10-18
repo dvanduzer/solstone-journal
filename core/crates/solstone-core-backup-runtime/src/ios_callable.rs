@@ -9,7 +9,7 @@ mod bundle;
 mod command;
 mod native;
 mod outcome;
-mod repository;
+pub mod repository;
 mod root;
 mod storage;
 
@@ -185,7 +185,8 @@ fn refused(reason: &'static str) -> RunnerError {
     RunnerError::Process(io::Error::new(io::ErrorKind::Unsupported, reason))
 }
 
-enum ExecuteError {
+#[derive(Debug)]
+pub enum ExecuteError {
     Admission(RunnerError),
     Entry(i32),
 }
@@ -732,4 +733,227 @@ pub(crate) fn add_key(
         return Err(RepoError::Callable(failure));
     }
     Ok(())
+}
+
+pub fn retire_s3_destination(
+    authority: &AdmittedIosBackupAuthority,
+    destination: &repository::Destination,
+) -> Result<(), &'static str> {
+    authority.revalidate().map_err(Refusal::code)?;
+    let state = authority
+        .installed
+        .storage
+        .create_state(&destination.namespace())
+        .map_err(Refusal::code)?;
+    state.revalidate().map_err(Refusal::code)?;
+    let status = unsafe { native::restic_bridge_s3_retire_v1(state.as_fd().as_raw_fd()) };
+    if status != 0 {
+        return Err("ios_backup_s3_retire_failed");
+    }
+    Ok(())
+}
+
+pub fn run_teardown_entry(
+    authority: &AdmittedIosBackupAuthority,
+    repository: repository::Repository<'_>,
+    password: &str,
+    admitted_ids: &[String],
+    timeout: Option<Duration>,
+    cancellation: Option<&ArchiveCancellation>,
+) -> Result<Vec<String>, ExecuteError> {
+    authority
+        .revalidate()
+        .map_err(|reason| refused(reason.code()))?;
+
+    if admitted_ids.len() > 4096 {
+        return Err(refused("ios_backup_teardown_admitted_ids_exceeded").into());
+    }
+    let mut contiguous_ids = Vec::with_capacity(admitted_ids.len() * 64);
+    for id in admitted_ids {
+        if id.len() != 64
+            || !id
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        {
+            return Err(refused("ios_backup_teardown_admitted_ids_invalid").into());
+        }
+        contiguous_ids.extend_from_slice(id.as_bytes());
+    }
+
+    let options = native::Options {
+        version: 1,
+        check_read_mode: 0,
+        retry_lock_ms: 0,
+        group: 0,
+        groups: 0,
+        reserved1: 0,
+        reserved2: 0,
+    };
+    let password_bytes = Zeroizing::new(password.as_bytes().to_vec());
+    let state;
+    let call = match repository {
+        repository::Repository::Local(repo_path) => {
+            let local_req = native::LocalRequest {
+                operation: 11, // OpTeardown
+                password: native::Bytes::new(&password_bytes)
+                    .map_err(|_| refused("ios_backup_password_too_long"))?,
+                recovery_password: native::Bytes::new(&[])
+                    .map_err(|_| refused("ios_backup_bytes_failed"))?,
+                repository: native::Bytes::new(repo_path.as_bytes())
+                    .map_err(|_| refused("ios_backup_repo_too_long"))?,
+                source: native::Bytes::new(&[]).map_err(|_| refused("ios_backup_bytes_failed"))?,
+                restore: native::Bytes::new(&[]).map_err(|_| refused("ios_backup_bytes_failed"))?,
+                snapshot: native::Bytes::new(&[])
+                    .map_err(|_| refused("ios_backup_bytes_failed"))?,
+            };
+            native::Call::teardown(
+                Some(&local_req),
+                None,
+                &options,
+                -1,
+                &contiguous_ids,
+                admitted_ids.len() as u32,
+            )
+        }
+        repository::Repository::S3 {
+            destination,
+            access,
+            secret,
+            token,
+            append_only,
+        } => {
+            if append_only {
+                return Err(refused("ios_backup_teardown_append_only_refused").into());
+            }
+            state = authority
+                .installed
+                .storage
+                .create_state(&destination.namespace())
+                .map_err(|reason| refused(reason.code()))?;
+            state
+                .revalidate()
+                .map_err(|reason| refused(reason.code()))?;
+            let remote_req = native::RemoteRequest {
+                version: 1,
+                operation: 11, // OpTeardown
+                endpoint: native::Bytes::new(destination.endpoint.as_bytes())
+                    .map_err(|_| refused("ios_backup_endpoint_too_long"))?,
+                region: native::Bytes::new(destination.region.as_bytes())
+                    .map_err(|_| refused("ios_backup_region_too_long"))?,
+                bucket: native::Bytes::new(destination.bucket.as_bytes())
+                    .map_err(|_| refused("ios_backup_bucket_too_long"))?,
+                prefix: native::Bytes::new(destination.prefix.as_bytes())
+                    .map_err(|_| refused("ios_backup_prefix_too_long"))?,
+                access: native::Bytes::new(access.as_bytes())
+                    .map_err(|_| refused("ios_backup_access_too_long"))?,
+                secret: native::Bytes::new(secret.as_bytes())
+                    .map_err(|_| refused("ios_backup_secret_too_long"))?,
+                token: native::Bytes::new(token.as_bytes())
+                    .map_err(|_| refused("ios_backup_token_too_long"))?,
+                password: native::Bytes::new(&password_bytes)
+                    .map_err(|_| refused("ios_backup_password_too_long"))?,
+                recovery_password: native::Bytes::new(&[])
+                    .map_err(|_| refused("ios_backup_bytes_failed"))?,
+                state: native::Bytes::new(state.path().as_bytes())
+                    .map_err(|_| refused("ios_backup_state_too_long"))?,
+                source: native::Bytes::new(&[]).map_err(|_| refused("ios_backup_bytes_failed"))?,
+                restore: native::Bytes::new(&[]).map_err(|_| refused("ios_backup_bytes_failed"))?,
+                snapshot: native::Bytes::new(&[])
+                    .map_err(|_| refused("ios_backup_bytes_failed"))?,
+                workspace: native::Bytes::new(&[])
+                    .map_err(|_| refused("ios_backup_bytes_failed"))?,
+            };
+            let state_fd = state.as_fd().as_raw_fd();
+            native::Call::teardown(
+                None,
+                Some(&remote_req),
+                &options,
+                state_fd,
+                &contiguous_ids,
+                admitted_ids.len() as u32,
+            )
+        }
+    }
+    .map_err(|status| {
+        log::warn!("ios backup teardown operation refused at entry: status {status}");
+        ExecuteError::Entry(status)
+    })?;
+
+    let cancelled = || cancellation.is_some_and(ArchiveCancellation::is_cancelled);
+    let completed = call.wait(timeout, Some(&cancelled), false);
+    log_failure(11, &completed);
+    if completed.fields.status != 0 {
+        return Err(ExecuteError::Entry(completed.fields.status));
+    }
+    if completed.monitor_failed {
+        return Err(ExecuteError::Entry(1));
+    }
+    let count = completed.fields.snapshot_count as usize;
+    if count > 4096 {
+        return Err(refused("ios_backup_teardown_snapshot_count_exceeded").into());
+    }
+    let mut remaining = Vec::with_capacity(count);
+    for slot in &completed.fields.snapshot_ids[..count] {
+        let end = slot.iter().position(|b| *b == 0).unwrap_or(slot.len());
+        let id_str = std::str::from_utf8(&slot[..end])
+            .map_err(|_| refused("ios_backup_teardown_snapshot_id_invalid"))?;
+        if id_str.len() != 64
+            || !id_str
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        {
+            return Err(refused("ios_backup_teardown_snapshot_id_invalid").into());
+        }
+        remaining.push(id_str.to_owned());
+    }
+    Ok(remaining)
+}
+
+pub fn list_snapshot_ids(
+    authority: &AdmittedIosBackupAuthority,
+    repository: &str,
+    password: &str,
+    env: Option<&BTreeMap<String, Option<String>>>,
+    timeout: Option<Duration>,
+    cancellation: Option<&ArchiveCancellation>,
+) -> Result<Vec<String>, RunnerError> {
+    let args = [String::from("snapshots")];
+    let result = run(
+        authority,
+        &args,
+        repository,
+        password,
+        env,
+        true,
+        None,
+        timeout,
+        &[],
+        None,
+        cancellation,
+        None,
+    )?;
+    if result.returncode != 0 {
+        return Err(refused("ios_backup_snapshots_failed"));
+    }
+    let value: serde_json::Value = serde_json::from_str(&result.stdout)
+        .map_err(|_| refused("ios_backup_snapshots_invalid"))?;
+    let rows = value
+        .as_array()
+        .ok_or_else(|| refused("ios_backup_snapshots_invalid"))?;
+    let mut ids = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id = row
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| refused("ios_backup_snapshots_invalid"))?;
+        if id.len() != 64
+            || !id
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        {
+            return Err(refused("ios_backup_snapshots_invalid"));
+        }
+        ids.push(id.to_owned());
+    }
+    Ok(ids)
 }

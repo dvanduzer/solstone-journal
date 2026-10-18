@@ -184,6 +184,7 @@ impl TeardownOperation {
         target_os = "linux",
         target_os = "macos",
         target_os = "android",
+        target_os = "ios",
         windows
     ))]
     pub(crate) fn date(&self) -> Result<String, TeardownRemoteRefusal> {
@@ -215,6 +216,101 @@ impl TeardownOperation {
         response.map_err(TeardownRemoteRefusal::Http)
     }
 
+    #[cfg(target_os = "ios")]
+    pub(crate) fn request(
+        &self,
+        mut request: crate::hosted_runtime::HttpRequest,
+    ) -> Result<crate::hosted_runtime::HttpResponse, TeardownRemoteRefusal> {
+        use std::collections::BTreeMap;
+        use std::ffi::CString;
+
+        request.timeout = request
+            .timeout
+            .min(self.remaining().map_err(TeardownRemoteRefusal::Operation)?);
+
+        let mut header_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (k, v) in &request.headers {
+            header_map.entry(k.clone()).or_default().push(v.clone());
+        }
+        let header_json = serde_json::to_vec(&header_map)
+            .map_err(|_| TeardownRemoteRefusal::Http(HttpError::Other))?;
+
+        let method_c = CString::new(request.method)
+            .map_err(|_| TeardownRemoteRefusal::Http(HttpError::Other))?;
+        let url_c =
+            CString::new(request.url).map_err(|_| TeardownRemoteRefusal::Http(HttpError::Other))?;
+
+        let mut out_status: i32 = 0;
+        let mut out_body_len: u32 = 0;
+        let mut out_body: Vec<u8> = vec![0u8; 1024 * 1024];
+
+        let finished = (std::sync::Mutex::new(false), std::sync::Condvar::new());
+        let cancelled_atomic =
+            std::sync::atomic::AtomicU32::new(if self.cancellation.is_cancelled() {
+                1
+            } else {
+                0
+            });
+
+        let status = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let (lock, wake) = &finished;
+                let mut done = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+                loop {
+                    if *done {
+                        break;
+                    }
+                    if self.cancellation.is_cancelled() {
+                        cancelled_atomic.store(1, std::sync::atomic::Ordering::Release);
+                        break;
+                    }
+                    done = wake
+                        .wait_timeout(done, std::time::Duration::from_millis(25))
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .0;
+                }
+            });
+            let status = unsafe {
+                crate::ios_callable::native::restic_bridge_http_exchange(
+                    method_c.as_ptr(),
+                    method_c.as_bytes().len() as u32,
+                    url_c.as_ptr(),
+                    url_c.as_bytes().len() as u32,
+                    header_json.as_ptr().cast(),
+                    header_json.len() as u32,
+                    request.body.as_ptr().cast(),
+                    request.body.len() as u32,
+                    cancelled_atomic.as_ptr(),
+                    &mut out_status,
+                    out_body.as_mut_ptr().cast(),
+                    out_body.len() as u32,
+                    &mut out_body_len,
+                )
+            };
+            let (lock, wake) = &finished;
+            let mut done = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+            *done = true;
+            wake.notify_all();
+            status
+        });
+
+        if status == 3 {
+            return Err(TeardownRemoteRefusal::Http(HttpError::Timeout));
+        }
+        if status != 0 {
+            return Err(TeardownRemoteRefusal::Http(HttpError::Other));
+        }
+
+        out_body.truncate(out_body_len as usize);
+        self.remaining().map_err(TeardownRemoteRefusal::Operation)?;
+
+        Ok(crate::hosted_runtime::HttpResponse {
+            status: out_status as u16,
+            headers: vec![],
+            body: out_body,
+        })
+    }
+
     /// Run once under the actual retained admission. The installed coordinator supplies
     /// the sole fresh Catalog/raw reader. No request transport or settlement callback
     /// can be injected here, and successful remote work grants no local finish.
@@ -228,6 +324,7 @@ impl TeardownOperation {
             target_os = "linux",
             target_os = "macos",
             target_os = "android",
+            target_os = "ios",
             windows
         ))]
         {
@@ -281,6 +378,7 @@ impl TeardownOperation {
             target_os = "linux",
             target_os = "macos",
             target_os = "android",
+            target_os = "ios",
             windows
         )))]
         {
@@ -293,6 +391,7 @@ impl TeardownOperation {
         target_os = "linux",
         target_os = "macos",
         target_os = "android",
+        target_os = "ios",
         windows
     ))]
     pub(crate) fn report_mut(&mut self) -> &mut RemoteTeardownReport {
@@ -302,6 +401,7 @@ impl TeardownOperation {
 
 mod own_storage;
 mod retention;
+pub use own_storage::snapshot_ids;
 pub use retention::{StorageKeeps, StorageRetention};
 
 #[cfg(test)]

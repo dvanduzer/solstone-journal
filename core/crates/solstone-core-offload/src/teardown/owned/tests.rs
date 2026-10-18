@@ -3,16 +3,22 @@
 
 use super::*;
 use std::fs;
+#[cfg(any(feature = "full-tests", target_os = "android"))]
 use std::io::{Read, Write};
+#[cfg(any(feature = "full-tests", target_os = "android"))]
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicI64, Ordering};
+#[cfg(any(feature = "full-tests", target_os = "android"))]
 use std::time::{Duration, Instant};
 
-use serde_json::json;
-use solstone_core_backup::{HostedBinding, save_hosted_binding};
+#[cfg(any(feature = "full-tests", target_os = "android"))]
+use solstone_core_backup::save_hosted_binding;
+#[cfg(any(feature = "full-tests", target_os = "android"))]
 use solstone_core_journal_io::activity::{ActivityAdmissionError, ActivityLease};
+#[cfg(any(feature = "full-tests", target_os = "android"))]
 use solstone_core_journal_io::activity_obligations::observe_obligations;
-use solstone_core_journal_io::media::{ActivityCarrierRetirementEffect, Confirmation, Durability};
+#[cfg(any(feature = "full-tests", target_os = "android"))]
+use solstone_core_journal_io::media::ActivityCarrierRetirementEffect;
 
 struct TestClock(AtomicI64);
 impl Clock for TestClock {
@@ -24,6 +30,7 @@ impl Clock for TestClock {
     }
 }
 
+#[cfg(feature = "full-tests")]
 fn request(peer: &mut TcpStream) -> (String, Vec<u8>) {
     // macOS hands an accepted socket the listener's non-blocking mode; Linux doesn't.
     peer.set_nonblocking(false).unwrap();
@@ -52,6 +59,7 @@ fn request(peer: &mut TcpStream) -> (String, Vec<u8>) {
     (head, body)
 }
 
+#[cfg(feature = "full-tests")]
 fn respond(peer: &mut TcpStream, body: &[u8]) {
     write!(
         peer,
@@ -62,6 +70,7 @@ fn respond(peer: &mut TcpStream, body: &[u8]) {
     peer.write_all(body).unwrap();
 }
 
+#[cfg(feature = "full-tests")]
 fn closed(peer: &mut TcpStream) {
     peer.set_nonblocking(false).unwrap();
     let mut extra = Vec::new();
@@ -107,6 +116,7 @@ fn production_reaches_root_admission_and_closed_custody_is_send() {
 }
 
 /// An operated journal whose hosted binding points at a local listener.
+#[cfg(feature = "full-tests")]
 struct OperatedJournal {
     temp: tempfile::TempDir,
     listener: Option<TcpListener>,
@@ -208,6 +218,7 @@ impl OperatedJournal {
 }
 
 #[test]
+#[cfg(feature = "full-tests")]
 fn backup_only_media_refuses_before_any_remote_or_config_effect() {
     use solstone_core_backup_runtime::TeardownReaderRefusal;
     use solstone_core_backup_runtime::teardown_admission::{
@@ -255,6 +266,7 @@ fn backup_only_media_refuses_before_any_remote_or_config_effect() {
 }
 
 #[test]
+#[cfg(feature = "full-tests")]
 fn fully_local_catalog_passes_coverage_to_the_remote_phase() {
     let mut journal = OperatedJournal::new();
     let local = journal.archive(true);
@@ -323,6 +335,7 @@ fn operated_destination_without_a_binding_is_not_called_unsupported() {
     );
 }
 
+#[cfg(any(feature = "full-tests", target_os = "android"))]
 const BOUNDARY_CASES: [&str; 11] = [
     "complete",
     "late_catalog",
@@ -590,6 +603,388 @@ fn owned_teardown_boundaries(case: &str) {
     std::thread::spawn(move || drop(result)).join().unwrap();
     drop(ActivityLease::try_acquire(root).unwrap());
     println!("owned_teardown_{case}_ok requests={expected}");
+}
+
+#[test]
+fn desktop_run_owned_teardown_refusal_does_not_create_recovery_file() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("config")).unwrap();
+    let config = br#"{"backup":{"enabled":true,"destination":{"repository":"s3:bucket/prefix","backend":"s3"}}}"#;
+    fs::write(temp.path().join("config/journal.json"), config).unwrap();
+    let result = run_owned_teardown(
+        temp.path(),
+        Arc::new(TestClock(AtomicI64::new(1_700_000_000))),
+        ArchiveCancellation::new(),
+        "fixture",
+    );
+    assert_eq!(result.phase(), TeardownRunPhase::Admission);
+    assert!(result.refused_before_effects());
+    let recovery_file = temp.path().join("backup/teardown-recovery.json");
+    assert!(!recovery_file.exists());
+    assert_eq!(
+        fs::read(temp.path().join("config/journal.json")).unwrap(),
+        config
+    );
+}
+
+#[test]
+fn run_owned_teardown_with_root_unsupported_destination_writes_no_recovery_and_preserves_config() {
+    for prefix in ["b2:my-bucket/path", "sftp:backup.host:/path"] {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("config")).unwrap();
+        let config = serde_json::json!({
+            "backup": {
+                "enabled": true,
+                "destination": {
+                    "repository": prefix,
+                    "backend": "s3",
+                },
+                "keys": {
+                    "daily_key": "k1",
+                    "recovery_key": "k2",
+                }
+            }
+        });
+        let config_bytes = serde_json::to_vec(&config).unwrap();
+        fs::write(temp.path().join("config/journal.json"), &config_bytes).unwrap();
+        let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+
+        let result = run_owned_teardown_with_root(
+            &root,
+            Arc::new(TestClock(AtomicI64::new(1_700_000_000))),
+            ArchiveCancellation::new(),
+            "fixture",
+        );
+        assert_eq!(result.phase(), TeardownRunPhase::Admission);
+        assert!(matches!(
+            result.refusal(),
+            Some(TeardownRunRefusal::UnsupportedDestination)
+        ));
+        let recovery_file = temp.path().join("backup/teardown-recovery.json");
+        assert!(!recovery_file.exists());
+        assert_eq!(
+            fs::read(temp.path().join("config/journal.json")).unwrap(),
+            config_bytes
+        );
+    }
+}
+
+#[test]
+fn empty_catalogue_with_admitted_obligation_does_not_report_wiped() {
+    use solstone_core_backup::teardown_recovery::{
+        PruneObligation, TeardownRecoveryRecord, stage_teardown_recovery_at_root,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("config")).unwrap();
+    let config = serde_json::json!({
+        "backup": {
+            "enabled": true,
+            "mode": "byo",
+            "daily_key": "daily-secret",
+            "recovery_key": "0".repeat(64),
+            "destination": {
+                "repository": "s3:my-bucket/prefix",
+                "backend": "s3",
+                "credentials": {},
+            },
+        }
+    });
+    fs::write(
+        temp.path().join("config/journal.json"),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+
+    let mut record = TeardownRecoveryRecord::new(
+        "test-sha".into(),
+        "byo".into(),
+        vec!["snap1".into()],
+        PruneObligation::Admitted,
+    );
+    record.repository_locator = Some("s3:my-bucket/prefix".into());
+    stage_teardown_recovery_at_root(&root, &record).unwrap();
+
+    test_seam::install(test_seam::TestSeamState {
+        list_ids: Some(Ok(vec![])),
+        teardown_result: Some(Ok(vec!["snap1".into()])),
+        ..Default::default()
+    });
+
+    let result = run_owned_teardown_with_root(
+        &root,
+        Arc::new(TestClock(AtomicI64::new(1_700_000_000))),
+        ArchiveCancellation::new(),
+        "fixture",
+    );
+    test_seam::clear();
+
+    assert_ne!(result.phase(), TeardownRunPhase::Finished);
+    assert_eq!(result.phase(), TeardownRunPhase::Remote);
+    assert!(matches!(
+        result.refusal(),
+        Some(TeardownRunRefusal::Remote(TeardownRemoteRefusal::Residual))
+    ));
+}
+
+#[test]
+fn empty_catalogue_with_no_prior_record_skips_forget_and_prune() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("config")).unwrap();
+    let config = serde_json::json!({
+        "backup": {
+            "enabled": true,
+            "mode": "byo",
+            "daily_key": "daily-secret",
+            "recovery_key": "0".repeat(64),
+            "destination": {
+                "repository": "s3:my-bucket/prefix",
+                "backend": "s3",
+                "credentials": {},
+            },
+        }
+    });
+    fs::write(
+        temp.path().join("config/journal.json"),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+
+    test_seam::install(test_seam::TestSeamState {
+        list_ids: Some(Ok(vec![])),
+        teardown_result: None,
+        retire_s3_result: Some(Ok(())),
+        ..Default::default()
+    });
+
+    let result = run_owned_teardown_with_root(
+        &root,
+        Arc::new(TestClock(AtomicI64::new(1_700_000_000))),
+        ArchiveCancellation::new(),
+        "fixture",
+    );
+
+    let teardown_called = test_seam::with_state(|s| s.teardown_called).unwrap_or(false);
+    let retire_s3_called = test_seam::with_state(|s| s.retire_s3_called).unwrap_or(false);
+    test_seam::clear();
+
+    assert!(
+        !teardown_called,
+        "teardown entry must not be called when first list is empty"
+    );
+    assert!(retire_s3_called, "retire_s3 must be called");
+    assert_eq!(result.phase(), TeardownRunPhase::Finished);
+}
+
+#[test]
+fn resume_after_confirmed_clear_uses_recovery_record_locator() {
+    use solstone_core_backup::teardown_recovery::{
+        PruneObligation, TeardownRecoveryRecord, stage_teardown_recovery_at_root,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("config")).unwrap();
+    let config = serde_json::json!({
+        "backup": {
+            "enabled": false,
+        }
+    });
+    fs::write(
+        temp.path().join("config/journal.json"),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+
+    let mut record = TeardownRecoveryRecord::new(
+        "test-sha".into(),
+        "byo".into(),
+        vec![],
+        PruneObligation::None,
+    );
+    record.clear_confirmed = true;
+    record.directory_flush = Some(solstone_core_journal_config_write::DirectoryFlush::Synced);
+    record.binding_released = true;
+    record.repository_locator = Some("s3:custom-vault/backup".into());
+    record.bucket = Some("custom-vault".into());
+    record.prefix = Some("backup".into());
+    stage_teardown_recovery_at_root(&root, &record).unwrap();
+
+    test_seam::install(test_seam::TestSeamState {
+        retire_s3_result: Some(Ok(())),
+        ..Default::default()
+    });
+
+    let result = run_owned_teardown_with_root(
+        &root,
+        Arc::new(TestClock(AtomicI64::new(1_700_000_000))),
+        ArchiveCancellation::new(),
+        "fixture",
+    );
+
+    let retire_s3_called = test_seam::with_state(|s| s.retire_s3_called).unwrap_or(false);
+    test_seam::clear();
+
+    assert!(
+        retire_s3_called,
+        "retire_s3 must be called from recovery record locator"
+    );
+    assert_eq!(result.phase(), TeardownRunPhase::Finished);
+    let recovery_file = temp.path().join("backup/teardown-recovery.json");
+    assert!(!recovery_file.exists(), "recovery file deleted on complete");
+}
+
+#[test]
+fn resume_with_retire_s3_failure_is_held_and_keeps_recovery_file() {
+    use solstone_core_backup::teardown_recovery::{
+        PruneObligation, TeardownRecoveryRecord, stage_teardown_recovery_at_root,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("config")).unwrap();
+    let config = serde_json::json!({
+        "backup": {
+            "enabled": false,
+        }
+    });
+    fs::write(
+        temp.path().join("config/journal.json"),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+
+    let mut record = TeardownRecoveryRecord::new(
+        "test-sha".into(),
+        "byo".into(),
+        vec![],
+        PruneObligation::None,
+    );
+    record.clear_confirmed = true;
+    record.directory_flush = Some(solstone_core_journal_config_write::DirectoryFlush::Synced);
+    record.binding_released = true;
+    record.carrier_retired = true;
+    record.repository_locator = Some("s3:custom-vault/backup".into());
+    record.bucket = Some("custom-vault".into());
+    record.prefix = Some("backup".into());
+    stage_teardown_recovery_at_root(&root, &record).unwrap();
+
+    test_seam::install(test_seam::TestSeamState {
+        retire_s3_result: Some(Err("mock s3 retirement failure".into())),
+        ..Default::default()
+    });
+
+    let result = run_owned_teardown_with_root(
+        &root,
+        Arc::new(TestClock(AtomicI64::new(1_700_000_000))),
+        ArchiveCancellation::new(),
+        "fixture",
+    );
+
+    let retire_s3_called = test_seam::with_state(|s| s.retire_s3_called).unwrap_or(false);
+    test_seam::clear();
+
+    assert!(retire_s3_called, "retire_s3 was attempted");
+    assert_eq!(result.phase(), TeardownRunPhase::Retirement);
+    assert!(matches!(
+        result.refusal(),
+        Some(TeardownRunRefusal::RetirementUncertain)
+    ));
+    let recovery_file = temp.path().join("backup/teardown-recovery.json");
+    assert!(
+        recovery_file.exists(),
+        "recovery file kept on retirement failure"
+    );
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn after_clear_hook_interrupts_and_resumes() {
+    use super::{
+        OwnedTeardownInterrupt, arm_owned_teardown_interrupt, owned_teardown_interrupt_observation,
+    };
+    use solstone_core_backup::teardown_recovery::load_teardown_recovery_at_root;
+
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("config")).unwrap();
+    let config = serde_json::json!({
+        "backup": {
+            "enabled": true,
+            "mode": "byo",
+            "daily_key": "daily-secret",
+            "recovery_key": "0".repeat(64),
+            "destination": {
+                "repository": "s3:my-bucket/prefix",
+                "backend": "s3",
+                "credentials": {},
+            },
+        }
+    });
+    fs::write(
+        temp.path().join("config/journal.json"),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+
+    let arm = arm_owned_teardown_interrupt(&root, OwnedTeardownInterrupt::AfterClear);
+    assert_eq!(arm.boundary(), OwnedTeardownInterrupt::AfterClear);
+    assert_eq!(arm.identity(), root.identity());
+    let obs_initial =
+        owned_teardown_interrupt_observation(&root, OwnedTeardownInterrupt::AfterClear);
+    assert!(obs_initial.armed());
+    assert!(!obs_initial.fired());
+
+    test_seam::install(test_seam::TestSeamState {
+        list_ids: Some(Ok(vec![])),
+        teardown_result: None,
+        retire_s3_result: Some(Ok(())),
+        ..Default::default()
+    });
+
+    let first_result = run_owned_teardown_with_root(
+        &root,
+        Arc::new(TestClock(AtomicI64::new(1_700_000_000))),
+        ArchiveCancellation::new(),
+        "fixture",
+    );
+
+    let obs_after_first =
+        owned_teardown_interrupt_observation(&root, OwnedTeardownInterrupt::AfterClear);
+    assert!(!obs_after_first.armed());
+    assert!(obs_after_first.fired());
+
+    assert_eq!(first_result.phase(), TeardownRunPhase::Binding);
+    assert!(matches!(
+        first_result.refusal(),
+        Some(TeardownRunRefusal::Binding)
+    ));
+
+    let rec = load_teardown_recovery_at_root(&root)
+        .unwrap()
+        .expect("recovery record must exist");
+    assert!(rec.clear_confirmed);
+    assert!(!rec.binding_released);
+    assert!(!rec.carrier_retired);
+    assert!(rec.directory_flush.is_some());
+
+    drop(first_result);
+
+    test_seam::install(test_seam::TestSeamState {
+        retire_s3_result: Some(Ok(())),
+        ..Default::default()
+    });
+
+    let second_result = run_owned_teardown_with_root(
+        &root,
+        Arc::new(TestClock(AtomicI64::new(1_700_000_000))),
+        ArchiveCancellation::new(),
+        "fixture",
+    );
+    test_seam::clear();
+
+    assert_eq!(second_result.phase(), TeardownRunPhase::Finished);
+    let recovery_file = temp.path().join("backup/teardown-recovery.json");
+    assert!(!recovery_file.exists(), "recovery file deleted on complete");
 }
 
 #[cfg(target_os = "android")]

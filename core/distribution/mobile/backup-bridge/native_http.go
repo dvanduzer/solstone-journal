@@ -3,6 +3,11 @@
 
 package main
 
+/*
+#include <stdint.h>
+*/
+import "C"
+
 import (
 	"bytes"
 	"context"
@@ -15,6 +20,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
+	"unsafe"
 )
 
 const (
@@ -161,7 +169,7 @@ func (transport *nativeHTTPTransport) prepareNativeHTTPRequest(request *http.Req
 		if request.ContentLength != 0 || request.Body != nil && request.Body != http.NoBody {
 			return wire, nil, errHTTPArgument
 		}
-	case http.MethodPut:
+	case http.MethodPut, http.MethodPost:
 	default:
 		return wire, nil, errHTTPArgument
 	}
@@ -337,4 +345,185 @@ func (body *nativeHTTPResponseBody) Close() error {
 	body.owned = nil
 	body.reader = nil
 	return nil
+}
+
+func exchangeNativeHTTP(ctx context.Context, request *http.Request) (nativeHTTPReply, error) {
+	if request == nil || request.URL == nil {
+		return nativeHTTPReply{}, errHTTPArgument
+	}
+	origin := "https://" + request.URL.Host
+	transport, err := newNativeHTTPTransport(ctx, origin)
+	if err != nil {
+		return nativeHTTPReply{}, err
+	}
+	wire, body, err := transport.prepareNativeHTTPRequest(request)
+	if err != nil {
+		return nativeHTTPReply{}, err
+	}
+	defer zeroBytes(body)
+	encoded, err := json.Marshal(wire)
+	if err != nil {
+		return nativeHTTPReply{}, errHTTPArgument
+	}
+	defer zeroBytes(encoded)
+	if len(encoded) > maxHTTPHeaderBytes {
+		return nativeHTTPReply{}, errHTTPLimit
+	}
+	limit := maxHTTPObjectBytes
+	if request.URL.Query().Get("list-type") == "2" {
+		limit = maxHTTPListBytes
+	}
+	reply, err := performNativeHTTP(ctx, encoded, body, limit)
+	if err != nil {
+		return nativeHTTPReply{}, err
+	}
+	if reply.Status < 100 || reply.Status > 599 || len(reply.Headers) > 256 || len(reply.Body) > limit {
+		zeroBytes(reply.Body)
+		return nativeHTTPReply{}, errHTTPProtocol
+	}
+	for name, values := range reply.Headers {
+		if !validHTTPHeader(name, values) {
+			zeroBytes(reply.Body)
+			return nativeHTTPReply{}, errHTTPProtocol
+		}
+	}
+	return reply, nil
+}
+
+func nativeHTTPStatusCode(err error) int32 {
+	if err == nil {
+		return 0
+	}
+	if errors.Is(err, errHTTPArgument) || errors.Is(err, errHTTPAuthority) || errors.Is(err, errHTTPBody) {
+		return 1
+	}
+	if errors.Is(err, errHTTPLimit) {
+		return 2
+	}
+	if errors.Is(err, context.Canceled) {
+		return 3
+	}
+	if errors.Is(err, errHTTPRedirect) {
+		return 4
+	}
+	if errors.Is(err, errHTTPAuth) {
+		return 5
+	}
+	if errors.Is(err, errHTTPUnsupported) {
+		return 6
+	}
+	if errors.Is(err, errHTTPProtocol) {
+		return 8
+	}
+	if errors.Is(err, errHTTPTLS) {
+		return 9
+	}
+	return 7
+}
+
+//export restic_bridge_http_exchange
+func restic_bridge_http_exchange(
+	method *C.char, methodLen C.uint32_t,
+	urlStr *C.char, urlLen C.uint32_t,
+	headerJSON *C.char, headerJSONLen C.uint32_t,
+	body *C.char, bodyLen C.uint32_t,
+	cancelled *C.uint32_t,
+	outHTTPStatus *C.int32_t,
+	outBody *C.char, outBodyCap C.uint32_t, outBodyLen *C.uint32_t,
+) C.int32_t {
+	if outHTTPStatus != nil {
+		*outHTTPStatus = 0
+	}
+	if outBodyLen != nil {
+		*outBodyLen = 0
+	}
+	if cancelled != nil && atomic.LoadUint32((*uint32)(unsafe.Pointer(cancelled))) != 0 {
+		return 3
+	}
+	m := readString(method, methodLen)
+	u := readString(urlStr, urlLen)
+	headersRaw := readBytes(headerJSON, headerJSONLen)
+	bodyBytes := readBytes(body, bodyLen)
+	defer zeroBytes(bodyBytes)
+
+	if len(m) == 0 || len(u) == 0 {
+		return 1
+	}
+	var headers map[string][]string
+	if len(headersRaw) != 0 {
+		if err := json.Unmarshal(headersRaw, &headers); err != nil {
+			return 1
+		}
+	}
+	parsedURL, err := url.Parse(u)
+	if err != nil {
+		return 1
+	}
+	req := &http.Request{
+		Method: m,
+		URL:    parsedURL,
+		Header: make(http.Header),
+	}
+	for k, vs := range headers {
+		for _, v := range vs {
+			req.Header.Add(k, v)
+		}
+	}
+	if len(bodyBytes) > 0 {
+		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		req.ContentLength = int64(len(bodyBytes))
+	} else {
+		req.ContentLength = 0
+		req.Body = http.NoBody
+	}
+	if clStr := req.Header.Get("Content-Length"); clStr != "" {
+		if cl, err := strconv.ParseInt(clStr, 10, 64); err == nil {
+			req.ContentLength = cl
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if cancelled != nil {
+		stopPolling := make(chan struct{})
+		defer close(stopPolling)
+		go func() {
+			ticker := time.NewTicker(10 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-stopPolling:
+					return
+				case <-ticker.C:
+					if atomic.LoadUint32((*uint32)(unsafe.Pointer(cancelled))) != 0 {
+						cancel()
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	reply, err := exchangeNativeHTTP(ctx, req)
+	if err != nil {
+		return C.int32_t(nativeHTTPStatusCode(err))
+	}
+	defer zeroBytes(reply.Body)
+
+	if outHTTPStatus != nil {
+		*outHTTPStatus = C.int32_t(reply.Status)
+	}
+	if outBodyLen != nil {
+		*outBodyLen = C.uint32_t(len(reply.Body))
+	}
+	if len(reply.Body) > int(outBodyCap) {
+		return 2
+	}
+	if outBody != nil && len(reply.Body) > 0 {
+		copy(unsafe.Slice((*byte)(unsafe.Pointer(outBody)), outBodyCap), reply.Body)
+	}
+	return 0
 }

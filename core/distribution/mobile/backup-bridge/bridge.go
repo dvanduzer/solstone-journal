@@ -390,6 +390,10 @@ func publishRestoreForHandle(h *callHandle, req *bridgeRequest) error {
 }
 
 func runWorker(h *callHandle, req bridgeRequest) {
+	if req.operation == OpTeardown {
+		runTeardownWorker(h, req)
+		return
+	}
 	if req.remote != nil {
 		runS3Worker(h, req)
 		return
