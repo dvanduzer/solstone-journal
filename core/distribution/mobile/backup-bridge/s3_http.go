@@ -424,3 +424,29 @@ func (be *s3Backend) Remove(ctx context.Context, handle backend.Handle) error {
 	}
 	return nil
 }
+
+func (be *s3Backend) removeExactKeyObject(ctx context.Context, keyID string) error {
+	if !validS3ID(keyID) {
+		return errS3Handle
+	}
+	owned, done, err := be.enter(ctx)
+	if err != nil {
+		return err
+	}
+	defer done()
+	handle := backend.Handle{Type: backend.KeyFile, Name: keyID}
+	key, err := be.filename(handle)
+	if err != nil {
+		return err
+	}
+	reply, body, err := be.request(owned, http.MethodDelete, key, nil, nil, "")
+	defer zeroBytes(body)
+	if err != nil {
+		return err
+	}
+	if reply.StatusCode != http.StatusNoContent || len(body) != 0 {
+		return errS3Protocol
+	}
+	return nil
+}
+

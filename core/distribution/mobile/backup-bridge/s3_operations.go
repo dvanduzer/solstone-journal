@@ -205,6 +205,10 @@ func executeS3Operation(h *callHandle, req *bridgeRequest, wrote *bool) (result 
 		}
 	case OpCheck:
 		result, _ = executeCheck(h.ctx, *req)
+	case OpListRecoveryKeys:
+		result, _ = executeListRecoveryKeys(h.ctx, *req)
+	case OpRemoveRecoveryKey:
+		result, _ = executeRemoveRecoveryKey(h.ctx, *req, markWrite)
 	default:
 		result = bridgeResult{status: StatusInvalidArgument, diagnostic: DiagInvalidArgument}
 	}

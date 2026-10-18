@@ -28,6 +28,24 @@ pub fn load_hosted_binding(journal: &Path) -> Option<HostedBinding> {
     decode_hosted_binding(&bytes)
 }
 
+/// Read hosted binding through an already-admitted journal root.
+pub fn load_hosted_binding_at_root(
+    root: &std::sync::Arc<solstone_core_journal_io::JournalRoot>,
+) -> Option<HostedBinding> {
+    let directory = solstone_core_journal_io::media::MediaDirectory::open(
+        root.clone(),
+        Path::new("backup/hosted"),
+    )
+    .ok()?;
+    let read = directory
+        .read_file_bounded(std::ffi::OsStr::new("binding.json"), 64 * 1024)
+        .ok()??;
+    if !read.complete {
+        return None;
+    }
+    decode_hosted_binding(&read.bytes)
+}
+
 pub(crate) fn decode_hosted_binding(bytes: &[u8]) -> Option<HostedBinding> {
     let raw = serde_json::from_slice::<Value>(bytes).ok()?;
     let raw = raw.as_object()?;
@@ -248,6 +266,22 @@ mod tests {
         let unlink_failure = temp();
         fs::create_dir_all(unlink_failure.path().join("backup/hosted/binding.json")).unwrap();
         assert!(delete_hosted_binding(unlink_failure.path()).is_err());
+    }
+
+    #[test]
+    fn load_hosted_binding_at_root_matches_path_content() {
+        use solstone_core_journal_io::JournalRoot;
+        let journal = temp();
+        let root = std::sync::Arc::new(JournalRoot::open(journal.path()).unwrap());
+        assert_eq!(load_hosted_binding_at_root(&root), None);
+
+        let value = binding();
+        save_hosted_binding(journal.path(), &value).unwrap();
+        assert_eq!(load_hosted_binding_at_root(&root), Some(value));
+
+        // Incomplete / malformed file returns None
+        fs::write(journal.path().join("backup/hosted/binding.json"), b"{").unwrap();
+        assert_eq!(load_hosted_binding_at_root(&root), None);
     }
 }
 

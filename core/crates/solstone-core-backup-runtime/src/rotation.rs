@@ -7,7 +7,6 @@ use std::fmt;
 use std::path::Path;
 
 use crate::engine::BackupServices;
-#[cfg(not(target_os = "ios"))]
 use crate::runner::reason_for_returncode;
 
 pub const ROTATION_TIMEOUT_SECONDS: u64 = 5 * 60;
@@ -45,10 +44,21 @@ fn error(reason: impl Into<String>) -> RotationResult {
         recovery_key_display: None,
     }
 }
-#[cfg(not(target_os = "ios"))]
+
 fn map_error(repo_error: crate::repo::RepoError) -> RotationResult {
     match repo_error {
         crate::repo::RepoError::Key(key) => error(reason_for_returncode(key.returncode)),
+        #[cfg(target_os = "ios")]
+        crate::repo::RepoError::Callable(failure) => {
+            let reason = match failure.diagnostic.as_str() {
+                "AUTH_FAILED" => "auth_failed",
+                "REPO_MISSING" => "repo_missing",
+                "REPO_LOCKED" => "locked",
+                "CANCELLED" if failure.deadline_requested => "timeout",
+                _ => "failed",
+            };
+            error(reason)
+        }
         _ => error("failed"),
     }
 }
@@ -78,16 +88,11 @@ pub fn pause_after_remote_removal() {
     }
 }
 
-#[cfg(not(target_os = "ios"))]
 mod transaction;
+#[cfg(all(unix, feature = "test-hooks"))]
+pub use transaction::{arm_rotation_parent_sync_fault, rotation_parent_sync_fault_observation};
 
 /// Publish and confirm replacement material before revoking the recorded original.
 pub fn rotate_recovery_key(journal: &Path, services: &BackupServices<'_>) -> RotationResult {
-    #[cfg(target_os = "ios")]
-    {
-        let _ = (journal, services);
-        error("restic_unavailable")
-    }
-    #[cfg(not(target_os = "ios"))]
     transaction::rotate_recovery_key(journal, services)
 }

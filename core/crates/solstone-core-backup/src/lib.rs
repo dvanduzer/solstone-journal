@@ -30,7 +30,9 @@ pub mod teardown_configuration;
 pub use archive_readback::SUPPORTED_RESTIC_VERSION;
 pub use defaults::backup_defaults;
 pub use destination::assemble_backend_env;
-pub use hosted::{delete_hosted_binding, load_hosted_binding, save_hosted_binding};
+pub use hosted::{
+    delete_hosted_binding, load_hosted_binding, load_hosted_binding_at_root, save_hosted_binding,
+};
 pub use keys::{
     CROCKFORD_ALPHABET, RECOVERY_KEY_LENGTH, confirm_recovery_key, format_recovery_key_display,
     generate_daily_key, generate_recovery_key, parse_recovery_key,

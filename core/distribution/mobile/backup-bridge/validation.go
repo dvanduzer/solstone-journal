@@ -14,7 +14,7 @@ type requestShape struct {
 
 // Validate before copying any foreign memory. A nonzero length never authorizes a NULL pointer.
 func validateShape(request requestShape) int32 {
-	if request.operation < OpInit || request.operation > OpCheck {
+	if request.operation < OpInit || request.operation > OpRemoveRecoveryKey {
 		return StatusInvalidArgument
 	}
 	caps := [6]uint32{maxPasswordLen, maxPasswordLen, maxPathLen, maxPathLen, maxPathLen, idHexLen}
@@ -30,6 +30,12 @@ func validateShape(request requestShape) int32 {
 		return StatusInvalidArgument
 	}
 	if request.operation == OpAddRecoveryKey && request.fields[1].length == 0 {
+		return StatusInvalidArgument
+	}
+	if (request.operation == OpListRecoveryKeys || request.operation == OpRemoveRecoveryKey) && request.fields[1].length != 0 {
+		return StatusInvalidArgument
+	}
+	if (request.operation == OpListRecoveryKeys || request.operation == OpRemoveRecoveryKey) && (request.fields[3].length != 0 || request.fields[4].length != 0 || request.fields[5].length != 0) {
 		return StatusInvalidArgument
 	}
 	if (request.operation == OpSnapshot || request.operation == OpRestore) && request.fields[3].length == 0 {

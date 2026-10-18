@@ -101,6 +101,8 @@ pub use resolve::{
 };
 pub use restore::{RestoreDraft, RestoreOutcome, publish_restore_outcome, restore_journal};
 pub use rotation::{RotationResult, rotate_recovery_key};
+#[cfg(all(unix, feature = "test-hooks"))]
+pub use rotation::{arm_rotation_parent_sync_fault, rotation_parent_sync_fault_observation};
 pub use runner::{
     PassedHandle, ResticInvocation, ResticResult, SystemToolRunner, ToolOutput, ToolRequest,
     ToolRunner, reason_for_returncode, run_restic, select_summary,

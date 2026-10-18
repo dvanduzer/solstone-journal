@@ -40,6 +40,11 @@ func (owner *s3Owner) closeOwned() error {
 	for _, password := range owner.record.Passwords {
 		zeroBytes(password)
 	}
+	for _, password := range owner.attemptPasses {
+		zeroBytes(password)
+	}
+	owner.attemptPasses = nil
+	owner.preservedAddIntent = nil
 	// No reverse path acquires owner.mu while holding s3OwnersMu; keep namespace
 	// registration until all teardown has actually completed.
 	s3OwnersMu.Lock()

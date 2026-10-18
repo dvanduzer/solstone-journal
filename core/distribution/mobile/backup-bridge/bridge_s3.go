@@ -53,7 +53,7 @@ func validateS3Shape(version uint32, operation int32, fields [14]requestField) i
 }
 
 func validateS3ShapeForRoot(version uint32, operation int32, fields [14]requestField, rooted bool) int32 {
-	if version != 1 || operation < OpInit || operation > OpS3Inspect {
+	if version != 1 || operation < OpInit || operation > OpRemoveRecoveryKey {
 		return StatusInvalidArgument
 	}
 	caps := [14]uint32{maxHTTPURLBytes, 64, 63, 512, 256, 1024, 16384, maxPasswordLen, maxPasswordLen, maxPathLen, maxPathLen, maxPathLen, idHexLen, maxPathLen}
@@ -421,3 +421,44 @@ func startS3OperationWithDirectories(request *C.restic_s3_request, options *C.re
 	}
 	return C.int32_t(status)
 }
+
+//export restic_bridge_s3_remove_recovery_key_v1_start
+func restic_bridge_s3_remove_recovery_key_v1_start(request *C.restic_s3_request, options *C.restic_operation_options_v1, keyID *C.char, keyIDLen C.uint32_t, outID *C.uint64_t) (returned C.int32_t) {
+	if outID == nil {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	*outID = 0
+	entry, status := reserveOwnedCall()
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	defer func() { returned = C.int32_t(entry.finishAdmission(int32(returned))) }()
+	if request == nil || request.operation != C.int32_t(OpRemoveRecoveryKey) || keyID == nil || keyIDLen != 64 {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	keyBytes := copyCBytes(keyID, keyIDLen)
+	keyStr := string(keyBytes)
+	zeroBytes(keyBytes)
+	if !validS3ID(keyStr) {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	ownedOptions, status := parseCRemoteOperationOptions(int32(request.operation), options)
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	req, status := validateS3RequestDirectoriesOwned(request, nil, entry, nil, nil)
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	req.executionOptions = ownedOptions
+	req.removeKeyID = keyStr
+	if ownedOptions.appendOnly {
+		req.remote.cfg.appendOnly = true
+	}
+	id, status := startBridgeCall(req)
+	if status == StatusOk {
+		*outID = C.uint64_t(id)
+	}
+	return C.int32_t(status)
+}
+

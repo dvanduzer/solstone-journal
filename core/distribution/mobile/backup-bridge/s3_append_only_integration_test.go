@@ -96,3 +96,24 @@ func TestOperationOptionsVersionTwoCarriesAppendOnlyOnlyWhenValid(t *testing.T) 
 		}
 	}
 }
+
+func TestS3AppendOnlyRemoveExactKeyAllowed(t *testing.T) {
+	cfg := s3TestConfig()
+	cfg.appendOnly = true
+	peer := &s3MemoryPeer{cfg: cfg, objects: make(map[string][]byte)}
+	transport := s3TestTransport(peer.RoundTrip)
+	be := s3TestBackend(t, cfg, transport)
+	keyHandle := backend.Handle{Type: backend.KeyFile, Name: s3TestID(44)}
+	if err := be.Save(be.ctx, keyHandle, backend.NewByteReader([]byte("key data"), nil)); err != nil {
+		t.Fatal("save key failed", err)
+	}
+	// Direct Remove refuses non-lock
+	if err := be.Remove(be.ctx, keyHandle); !errors.Is(err, errS3Denied) {
+		t.Fatal("expected Remove to deny key file", err)
+	}
+	// removeExactKeyObject deletes key file even under appendOnly
+	if err := be.removeExactKeyObject(be.ctx, s3TestID(44)); err != nil {
+		t.Fatal("removeExactKeyObject failed", err)
+	}
+}
+

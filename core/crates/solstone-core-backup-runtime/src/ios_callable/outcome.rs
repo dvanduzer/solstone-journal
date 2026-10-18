@@ -35,7 +35,7 @@ fn text(bytes: &[u8]) -> Result<&str, RunnerError> {
     std::str::from_utf8(&bytes[..end]).map_err(|_| invalid())
 }
 
-fn identifier(value: &str) -> bool {
+pub(super) fn identifier(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
@@ -150,6 +150,50 @@ struct RestoreState {
     AllBytesWritten: u64,
     AllBytesTotal: u64,
     AllBytesSkipped: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryKeyEnvelope {
+    schema: String,
+    kind: String,
+    keys: Vec<RecoveryKeyRow>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryKeyRow {
+    id: String,
+    current: bool,
+}
+
+pub(super) fn decode_recovery_keys(
+    completed: &Completed,
+) -> Result<Vec<(String, bool)>, RunnerError> {
+    let raw = metadata(completed)?;
+    let envelope: RecoveryKeyEnvelope = serde_json::from_slice(raw).map_err(|_| invalid())?;
+    if envelope.schema != "solstone.backup-metadata.v1"
+        || envelope.kind != "recovery-key-list"
+        || envelope.keys.len() > 16
+    {
+        return Err(invalid());
+    }
+    let mut seen = BTreeSet::new();
+    let mut current_count = 0;
+    let mut keys = Vec::with_capacity(envelope.keys.len());
+    for row in envelope.keys {
+        if !identifier(&row.id) || !seen.insert(row.id.clone()) {
+            return Err(invalid());
+        }
+        if row.current {
+            current_count += 1;
+        }
+        keys.push((row.id, row.current));
+    }
+    if current_count != 1 {
+        return Err(invalid());
+    }
+    Ok(keys)
 }
 
 fn metadata(completed: &Completed) -> Result<&[u8], RunnerError> {
@@ -327,6 +371,30 @@ pub(super) fn callable_failure(
         if key_id.is_none() {
             return Err(invalid());
         }
+        return Ok(None);
+    }
+    Ok(Some(crate::repo::IosCallableFailure {
+        native_status: status,
+        diagnostic: diagnostic.to_owned(),
+        key_id,
+        snapshot_id,
+        cancellation_requested: completed.cancellation_requested,
+        deadline_requested: completed.deadline_requested,
+        monitor_failed: completed.monitor_failed,
+    }))
+}
+
+pub(super) fn callable_remove_failure(
+    completed: &Completed,
+) -> Result<Option<crate::repo::IosCallableFailure>, RunnerError> {
+    let status = completed.fields.status;
+    if !(0..=11).contains(&status) {
+        return Err(invalid());
+    }
+    let diagnostic = diagnostic(&completed.fields)?;
+    let key_id = optional_id(&completed.fields.key_id)?.map(str::to_owned);
+    let snapshot_id = optional_id(&completed.fields.snapshot_id)?.map(str::to_owned);
+    if status == 0 && diagnostic.is_empty() && !completed.monitor_failed {
         return Ok(None);
     }
     Ok(Some(crate::repo::IosCallableFailure {

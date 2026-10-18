@@ -36,8 +36,10 @@ const (
 	OpAddRecoveryKey int32 = 3
 	OpSnapshot       int32 = 4
 	OpListSnapshots  int32 = 5
-	OpRestore        int32 = 6
-	OpCheck          int32 = 7
+	OpRestore            int32 = 6
+	OpCheck              int32 = 7
+	OpListRecoveryKeys   int32 = 9
+	OpRemoveRecoveryKey  int32 = 10
 )
 
 // Closed set of stable diagnostic tokens. Raw upstream strings containing passwords
@@ -74,6 +76,7 @@ type bridgeRequest struct {
 	sourceName        string
 	restorePath       string
 	snapshotID        string
+	removeKeyID       string
 	snapshotSelection *snapshotSelection
 	executionOptions  *operationOptions
 	// pathFiles pin caller-authorized directories for the complete asynchronous

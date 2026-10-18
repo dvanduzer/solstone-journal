@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -109,7 +110,7 @@ func TestS3OwnerPendingSurvivesReopenAndCleanupAcknowledgement(t *testing.T) {
 	}
 	s3OwnerTestClose(t, owner)
 	reopened := s3OwnerTestOpen(t, root, cfg)
-	if reopened.record.Active == nil || !reopened.record.Active.MayHaveWritten || len(reopened.record.Passwords) != 2 {
+	if reopened.record.Active == nil || !reopened.record.Active.MayHaveWritten || len(reopened.record.Passwords) != 1 {
 		t.Fatal("interruption custody missing")
 	}
 	before, err := os.ReadFile(filepath.Join(root, s3OwnerStateName))
@@ -383,3 +384,191 @@ func TestS3OwnerAtomicExchangePreservesUnexpectedEntries(t *testing.T) {
 		})
 	}
 }
+
+func TestS3OwnerInterruptedAddReconciles(t *testing.T) {
+	cfg, root := s3TestConfig(), s3OwnerTestDirectory(t)
+	owner := s3OwnerTestOpen(t, root, cfg)
+	if owner.begin(OpAddRecoveryKey, cfg, []byte("daily-1"), []byte("candidate-1")) != nil || owner.noteSave(s3TestID(2)) != nil {
+		t.Fatal("intent failed")
+	}
+	s3OwnerTestClose(t, owner)
+
+	// Consecutive OpAddRecoveryKey reconciles prior MayHaveWritten intent
+	reopened := s3OwnerTestOpen(t, root, cfg)
+	if err := reopened.begin(OpAddRecoveryKey, cfg, []byte("daily-1"), []byte("candidate-2")); err != nil {
+		t.Fatalf("interrupted add reconciliation failed: %v", err)
+	}
+	for _, p := range reopened.record.Passwords {
+		if bytes.Equal(p, []byte("candidate-2")) {
+			t.Fatal("candidate-2 should not be in record.Passwords before complete")
+		}
+	}
+	if len(reopened.record.Active.Locks) != 1 || reopened.record.Active.Locks[0] != s3TestID(2) {
+		t.Fatal("inherited locks missing")
+	}
+	reopened.lockRemoved(s3TestID(2), nil)
+	if reopened.drainPrimary() != nil {
+		t.Fatal("drain failed")
+	}
+	published, err := reopened.complete()
+	if !published || err != nil {
+		t.Fatalf("complete failed: %v", err)
+	}
+	if len(reopened.record.Passwords) != 2 || !bytes.Equal(reopened.record.Passwords[0], []byte("daily-1")) || !bytes.Equal(reopened.record.Passwords[1], []byte("candidate-2")) {
+		t.Fatal("passwords did not converge to attempt passwords")
+	}
+	s3OwnerTestClose(t, reopened)
+
+	// Now OpRemoveRecoveryKey unions daily onto retained passwords
+	reopened2 := s3OwnerTestOpen(t, root, cfg)
+	if err := reopened2.begin(OpRemoveRecoveryKey, cfg, []byte("daily-1")); err != nil {
+		t.Fatalf("begin remove failed: %v", err)
+	}
+	if reopened2.drainPrimary() != nil {
+		t.Fatal("drain failed")
+	}
+	published, err = reopened2.complete()
+	if !published || err != nil {
+		t.Fatalf("complete remove failed: %v", err)
+	}
+	if len(reopened2.record.Passwords) != 2 {
+		t.Fatalf("remove dropped retained password: %v", reopened2.record.Passwords)
+	}
+	s3OwnerTestClose(t, reopened2)
+}
+
+func TestS3OwnerInterruptedRemoveReconciles(t *testing.T) {
+	if adoptsUncertainty(OpListRecoveryKeys) || adoptsUncertainty(OpRemoveRecoveryKey) {
+		t.Fatal("adoptsUncertainty must be false for list and remove")
+	}
+
+	cfg := s3TestConfig()
+
+	// Interrupted OpAddRecoveryKey remains pending for snapshot, but list inherits and preserves add intent
+	addRoot := s3OwnerTestDirectory(t)
+	addOwner := s3OwnerTestOpen(t, addRoot, cfg)
+	if err := addOwner.begin(OpAddRecoveryKey, cfg, []byte("daily-1"), []byte("candidate-1")); err != nil {
+		t.Fatalf("begin add failed: %v", err)
+	}
+	if err := addOwner.noteSave(s3TestID(1)); err != nil {
+		t.Fatalf("noteSave add failed: %v", err)
+	}
+	s3OwnerTestClose(t, addOwner)
+
+	reopenedAdd := s3OwnerTestOpen(t, addRoot, cfg)
+	if !errors.Is(reopenedAdd.begin(OpSnapshot, cfg), errS3OwnerPending) {
+		t.Fatal("begin snapshot while add is MayHaveWritten must return errS3OwnerPending")
+	}
+	if reopenedAdd.record.Active == nil || reopenedAdd.record.Active.Operation != OpAddRecoveryKey {
+		t.Fatal("active operation must still be OpAddRecoveryKey")
+	}
+	if err := reopenedAdd.begin(OpListRecoveryKeys, cfg, []byte("daily-1")); err != nil {
+		t.Fatalf("begin list while add is MayHaveWritten failed: %v", err)
+	}
+	reopenedAdd.lockRemoved(s3TestID(1), nil)
+	if err := reopenedAdd.drainPrimary(); err != nil {
+		t.Fatalf("drainPrimary failed: %v", err)
+	}
+	published, err := reopenedAdd.complete()
+	if !published || err != nil {
+		t.Fatalf("complete failed: %v", err)
+	}
+	if reopenedAdd.record.Active == nil || reopenedAdd.record.Active.Operation != OpAddRecoveryKey {
+		t.Fatal("active operation must still be OpAddRecoveryKey after complete")
+	}
+	if !reopenedAdd.record.Active.MayHaveWritten {
+		t.Fatal("MayHaveWritten must still be true")
+	}
+	if reopenedAdd.record.Complete != nil {
+		t.Fatal("Complete must be nil")
+	}
+	s3OwnerTestClose(t, reopenedAdd)
+
+	reopenedAdd2 := s3OwnerTestOpen(t, addRoot, cfg)
+	if err := reopenedAdd2.begin(OpAddRecoveryKey, cfg, []byte("daily-1"), []byte("candidate-2")); err != nil {
+		t.Fatalf("begin OpAddRecoveryKey after list failed: %v", err)
+	}
+	s3OwnerTestClose(t, reopenedAdd2)
+
+	// noteSave an OpRemoveRecoveryKey, reopen, assert OpSnapshot returns errS3OwnerPending
+	// and active operation is still remove, then assert begin(OpListRecoveryKeys) returns nil
+	// and inherits the lock
+	root := s3OwnerTestDirectory(t)
+	owner := s3OwnerTestOpen(t, root, cfg)
+	if err := owner.begin(OpRemoveRecoveryKey, cfg, []byte("daily-1")); err != nil {
+		t.Fatalf("begin remove failed: %v", err)
+	}
+	if err := owner.noteSave(s3TestID(2)); err != nil {
+		t.Fatalf("noteSave remove failed: %v", err)
+	}
+	s3OwnerTestClose(t, owner)
+
+	reopened := s3OwnerTestOpen(t, root, cfg)
+	if !errors.Is(reopened.begin(OpSnapshot, cfg), errS3OwnerPending) {
+		t.Fatal("begin OpSnapshot while remove is MayHaveWritten must return errS3OwnerPending")
+	}
+	if reopened.record.Active == nil || reopened.record.Active.Operation != OpRemoveRecoveryKey {
+		t.Fatal("active operation must still be OpRemoveRecoveryKey")
+	}
+	if err := reopened.begin(OpListRecoveryKeys, cfg, []byte("daily-1")); err != nil {
+		t.Fatalf("begin list following remove failed: %v", err)
+	}
+	if len(reopened.record.Active.Locks) != 1 || reopened.record.Active.Locks[0] != s3TestID(2) {
+		t.Fatal("inherited lock missing")
+	}
+	s3OwnerTestClose(t, reopened)
+}
+
+func TestClassifyKeyOpen(t *testing.T) {
+	ctx := context.Background()
+
+	// password error: not current, not fatal
+	current, err := classifyKeyOpen(ctx, false, errors.New("wrong password"), nil)
+	if current || err != nil {
+		t.Fatalf("expected wrong password to be not current and not fatal, got current=%v err=%v", current, err)
+	}
+
+	// ciphertext error: not current, not fatal
+	current, err = classifyKeyOpen(ctx, false, errors.New("ciphertext verification failed"), nil)
+	if current || err != nil {
+		t.Fatalf("expected ciphertext error to be not current and not fatal, got current=%v err=%v", current, err)
+	}
+
+	// cancel: fatal
+	current, err = classifyKeyOpen(ctx, false, context.Canceled, nil)
+	if current || !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled to be fatal, got current=%v err=%v", current, err)
+	}
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	current, err = classifyKeyOpen(canceledCtx, false, errors.New("wrong password"), nil)
+	if current || !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected canceled context to be fatal, got current=%v err=%v", current, err)
+	}
+
+	// deadline: fatal
+	current, err = classifyKeyOpen(ctx, false, context.DeadlineExceeded, nil)
+	if current || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context.DeadlineExceeded to be fatal, got current=%v err=%v", current, err)
+	}
+
+	// panic: fatal
+	current, err = classifyKeyOpen(ctx, false, nil, "slice bounds out of range")
+	if current || err == nil || !strings.Contains(err.Error(), "panic: slice bounds out of range") {
+		t.Fatalf("expected panic to be fatal, got current=%v err=%v", current, err)
+	}
+
+	// plain I/O error: fatal
+	ioErr := errors.New("connection reset by peer")
+	current, err = classifyKeyOpen(ctx, false, ioErr, nil)
+	if current || !errors.Is(err, ioErr) {
+		t.Fatalf("expected plain I/O error to be fatal, got current=%v err=%v", current, err)
+	}
+
+	// nil error with key: current
+	current, err = classifyKeyOpen(ctx, true, nil, nil)
+	if !current || err != nil {
+		t.Fatalf("expected nil error with key to be current and not fatal, got current=%v err=%v", current, err)
+	}
+}
+

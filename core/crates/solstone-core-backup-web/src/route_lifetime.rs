@@ -333,4 +333,9 @@ impl<'a> ToolRunner for LifetimeRunner<'a> {
     fn cancellation(&self) -> Option<&ArchiveCancellation> {
         Some(&self.cancellation)
     }
+
+    #[cfg(target_os = "ios")]
+    fn ios_journal_root(&self) -> Option<&std::sync::Arc<solstone_core_journal_io::JournalRoot>> {
+        self.inner.ios_journal_root()
+    }
 }

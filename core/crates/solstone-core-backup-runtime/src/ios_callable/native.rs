@@ -18,6 +18,7 @@ const OK: i32 = 0;
 const INVALID_ARGUMENT: i32 = 1;
 const SNAPSHOT: i32 = 4;
 const RESTORE: i32 = 6;
+const REMOVE_KEY: i32 = 10;
 const CAP_EXCEEDED: i32 = 5;
 const MAX_METADATA: u32 = 4 * 1024 * 1024;
 static DRAIN_FAILED: AtomicBool = AtomicBool::new(false);
@@ -141,6 +142,20 @@ unsafe extern "C" {
         capacity: u32,
         required: *mut u32,
     ) -> i32;
+    fn restic_bridge_remove_recovery_key_v1_start(
+        request: *const LocalRequest,
+        options: *const Options,
+        key_id: *const c_char,
+        key_id_len: u32,
+        out: *mut u64,
+    ) -> i32;
+    fn restic_bridge_s3_remove_recovery_key_v1_start(
+        request: *const RemoteRequest,
+        options: *const Options,
+        key_id: *const c_char,
+        key_id_len: u32,
+        out: *mut u64,
+    ) -> i32;
     fn restic_bridge_free(id: u64) -> i32;
 }
 
@@ -213,6 +228,24 @@ mod unlinked {
         _: *mut c_char,
         _: u32,
         _: *mut u32,
+    ) -> i32 {
+        INVALID_ARGUMENT
+    }
+    pub(super) unsafe fn restic_bridge_remove_recovery_key_v1_start(
+        _: *const LocalRequest,
+        _: *const Options,
+        _: *const c_char,
+        _: u32,
+        _: *mut u64,
+    ) -> i32 {
+        INVALID_ARGUMENT
+    }
+    pub(super) unsafe fn restic_bridge_s3_remove_recovery_key_v1_start(
+        _: *const RemoteRequest,
+        _: *const Options,
+        _: *const c_char,
+        _: u32,
+        _: *mut u64,
     ) -> i32 {
         INVALID_ARGUMENT
     }
@@ -476,6 +509,75 @@ impl Call {
                 target.id,
                 selector.pointer,
                 selector.length,
+                &mut id,
+            )
+        };
+        Self::published(id, status, began)
+    }
+
+    pub(super) fn local_remove_key(
+        password: &[u8],
+        repo_path: &str,
+        key_id: &str,
+        options: &Options,
+    ) -> Result<Self, i32> {
+        let began = Instant::now();
+        let request = LocalRequest {
+            operation: REMOVE_KEY,
+            password: Bytes::new(password)?,
+            recovery_password: Bytes::new(&[])?,
+            repo: Bytes::new(repo_path.as_bytes())?,
+            source: Bytes::new(&[])?,
+            restore: Bytes::new(&[])?,
+            snapshot: Bytes::new(&[])?,
+        };
+        let key_id_bytes = Bytes::new(key_id.as_bytes())?;
+        let mut id = 0;
+        let status = unsafe {
+            restic_bridge_remove_recovery_key_v1_start(
+                &request,
+                options,
+                key_id_bytes.pointer,
+                key_id_bytes.length,
+                &mut id,
+            )
+        };
+        Self::published(id, status, began)
+    }
+
+    pub(super) fn remote_remove_key(
+        password: &[u8],
+        remote: &Remote<'_>,
+        key_id: &str,
+        options: &Options,
+    ) -> Result<Self, i32> {
+        let began = Instant::now();
+        let request = RemoteRequest {
+            version: 1,
+            operation: REMOVE_KEY,
+            endpoint: Bytes::new(remote.endpoint.as_bytes())?,
+            region: Bytes::new(remote.region.as_bytes())?,
+            bucket: Bytes::new(remote.bucket.as_bytes())?,
+            prefix: Bytes::new(remote.prefix.as_bytes())?,
+            access: Bytes::new(remote.access)?,
+            secret: Bytes::new(remote.secret)?,
+            token: Bytes::new(remote.token)?,
+            password: Bytes::new(password)?,
+            recovery_password: Bytes::new(&[])?,
+            state: Bytes::new(remote.state.path.as_bytes())?,
+            source: Bytes::new(&[])?,
+            restore: Bytes::new(&[])?,
+            snapshot: Bytes::new(&[])?,
+            workspace: Bytes::new(&[])?,
+        };
+        let key_id_bytes = Bytes::new(key_id.as_bytes())?;
+        let mut id = 0;
+        let status = unsafe {
+            restic_bridge_s3_remove_recovery_key_v1_start(
+                &request,
+                options,
+                key_id_bytes.pointer,
+                key_id_bytes.length,
                 &mut id,
             )
         };

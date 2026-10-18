@@ -96,6 +96,7 @@ type s3Owner struct {
 	baselinePasses  [][]byte
 	attemptFailed   bool
 	cleanupActive   bool
+	attemptPasses   [][]byte
 	knownKeyID      string
 	knownSnapshotID string
 	writeFailed     bool
@@ -103,7 +104,8 @@ type s3Owner struct {
 	lockAcks        map[string]bool
 	backends        []*s3OperationBackend
 	// Private deterministic fault/barrier injection; no public setter or ABI.
-	fault func(string) error
+	fault              func(string) error
+	preservedAddIntent *s3OwnerIntent
 }
 
 func s3DestinationFor(cfg s3Config) (s3Destination, error) {
@@ -385,6 +387,15 @@ func completeS3StateJSON(raw []byte) error {
 	return nil
 }
 
+func validOwnerOperation(operation int32) bool {
+	switch operation {
+	case OpInit, OpOpen, OpAddRecoveryKey, OpSnapshot, OpListSnapshots, OpRestore, OpCheck, OpListRecoveryKeys, OpRemoveRecoveryKey:
+		return true
+	default:
+		return false
+	}
+}
+
 func (record s3OwnerRecord) validate() error {
 	if record.Version != 1 || len(record.Credentials) == 0 || len(record.Credentials) > maxS3OwnerCredentials || len(record.Passwords) == 0 || len(record.Passwords) > maxS3OwnerPasswords || (record.Active == nil) == (record.Complete == nil) {
 		return errS3OwnerInvalid
@@ -412,7 +423,7 @@ func (record s3OwnerRecord) validate() error {
 		}
 	}
 	if active := record.Active; active != nil {
-		if !isMetadataNonce(active.ID) || active.Operation < OpInit || active.Operation > OpCheck || len(active.Locks) > maxS3OwnerLocks || len(active.Locks) != 0 && !active.MayHaveWritten {
+		if !isMetadataNonce(active.ID) || !validOwnerOperation(active.Operation) || len(active.Locks) > maxS3OwnerLocks || len(active.Locks) != 0 && !active.MayHaveWritten {
 			return errS3OwnerInvalid
 		}
 		seen := make(map[string]bool)
@@ -424,7 +435,7 @@ func (record s3OwnerRecord) validate() error {
 		}
 	}
 	if complete := record.Complete; complete != nil {
-		if !isMetadataNonce(complete.ID) || complete.Operation < OpInit || complete.Operation > OpCheck {
+		if !isMetadataNonce(complete.ID) || !validOwnerOperation(complete.Operation) {
 			return errS3OwnerInvalid
 		}
 	}
@@ -571,7 +582,7 @@ func (owner *s3Owner) persist(record s3OwnerRecord) (published bool, resultErr e
 func (owner *s3Owner) begin(operation int32, cfg s3Config, passwords ...[]byte) error {
 	owner.mu.Lock()
 	defer owner.mu.Unlock()
-	if owner.closed || owner.sealing || operation < OpInit || operation > OpCheck {
+	if owner.closed || owner.sealing || !validOwnerOperation(operation) {
 		return errS3OwnerInvalid
 	}
 	// A prior attempt that may have written stays in custody: this attempt
@@ -580,14 +591,26 @@ func (owner *s3Owner) begin(operation int32, cfg s3Config, passwords ...[]byte) 
 	// objects may be adopted; uncertain key or config writes stay pending.
 	inherited := []string{}
 	if prior := owner.record.Active; prior != nil && prior.MayHaveWritten {
-		if !adoptsUncertainty(prior.Operation) || !adoptsUncertainty(operation) {
+		if prior.Operation == OpAddRecoveryKey && (operation == OpAddRecoveryKey || operation == OpListRecoveryKeys) {
+			inherited = append(inherited, prior.Locks...)
+		} else if (prior.Operation == OpRemoveRecoveryKey || prior.Operation == OpListRecoveryKeys) &&
+			(operation == OpRemoveRecoveryKey || operation == OpListRecoveryKeys) {
+			inherited = append(inherited, prior.Locks...)
+		} else if adoptsUncertainty(prior.Operation) && adoptsUncertainty(operation) {
+			inherited = append(inherited, prior.Locks...)
+		} else {
 			return errS3OwnerPending
 		}
-		inherited = append(inherited, prior.Locks...)
 	}
 	destination, err := s3DestinationFor(cfg)
 	if err != nil || destination != owner.destination {
 		return errS3OwnerInvalid
+	}
+	if prior := owner.record.Active; prior != nil && prior.MayHaveWritten && prior.Operation == OpAddRecoveryKey && operation == OpListRecoveryKeys {
+		owner.begun = true
+		owner.liveID = prior.ID
+		owner.preservedAddIntent = prior
+		return nil
 	}
 	record := owner.record
 	record.Version, record.Destination = 1, owner.destination
@@ -605,14 +628,36 @@ func (owner *s3Owner) begin(operation int32, cfg s3Config, passwords ...[]byte) 
 	if !found {
 		record.Credentials = append(record.Credentials, credential)
 	}
+	var attemptPasses [][]byte
 	for _, password := range passwords {
 		if len(password) == 0 {
+			continue
+		}
+		found = false
+		for _, seen := range attemptPasses {
+			if bytes.Equal(seen, password) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			attemptPasses = append(attemptPasses, append([]byte(nil), password...))
+		}
+	}
+	owner.attemptPasses = attemptPasses
+
+	for i, password := range passwords {
+		if len(password) == 0 {
+			continue
+		}
+		if operation == OpAddRecoveryKey && i > 0 {
 			continue
 		}
 		found = false
 		for _, retained := range record.Passwords {
 			if bytes.Equal(retained, password) {
 				found = true
+				break
 			}
 		}
 		if !found {
@@ -741,6 +786,32 @@ func (owner *s3Owner) complete() (published bool, err error) {
 	if owner.record.Active == nil || owner.closed || !owner.primaryDrained || owner.cleanupActive || owner.liveID == "" || owner.liveID != owner.record.Active.ID {
 		return false, errS3OwnerInvalid
 	}
+	if owner.preservedAddIntent != nil {
+		if owner.writeFailed || owner.stateFailed {
+			return false, errS3OwnerPending
+		}
+		var remainingLocks []string
+		hasUnacked := false
+		for _, id := range owner.record.Active.Locks {
+			if !owner.lockAcks[id] {
+				hasUnacked = true
+				remainingLocks = append(remainingLocks, id)
+			}
+		}
+		if hasUnacked {
+			return false, errS3OwnerPending
+		}
+		record := owner.record
+		addIntent := *owner.preservedAddIntent
+		addIntent.Locks = remainingLocks
+		record.Active = &addIntent
+		record.Complete = nil
+		published, err := owner.persist(record)
+		if err == nil {
+			owner.preservedAddIntent = nil
+		}
+		return published, err
+	}
 	if owner.writeFailed || owner.stateFailed {
 		return false, errS3OwnerPending
 	}
@@ -761,6 +832,34 @@ func (owner *s3Owner) complete() (published bool, err error) {
 		record.Passwords = owner.baselinePasses
 	} else if !owner.attemptFailed {
 		record.Credentials = []s3RetainedCredential{owner.liveCredential}
+		if record.Complete != nil {
+			switch record.Complete.Operation {
+			case OpAddRecoveryKey:
+				newPasses := make([][]byte, 0, len(owner.attemptPasses))
+				for _, p := range owner.attemptPasses {
+					if len(p) > 0 {
+						newPasses = append(newPasses, append([]byte(nil), p...))
+					}
+				}
+				record.Passwords = newPasses
+			case OpRemoveRecoveryKey:
+				for _, p := range owner.attemptPasses {
+					if len(p) == 0 {
+						continue
+					}
+					found := false
+					for _, retained := range record.Passwords {
+						if bytes.Equal(retained, p) {
+							found = true
+							break
+						}
+					}
+					if !found {
+						record.Passwords = append(record.Passwords, append([]byte(nil), p...))
+					}
+				}
+			}
+		}
 	}
 	previous := owner.record.Passwords
 	published, err = owner.persist(record)
@@ -808,6 +907,11 @@ func (owner *s3Owner) Close() error {
 	for _, password := range owner.record.Passwords {
 		zeroBytes(password)
 	}
+	for _, password := range owner.attemptPasses {
+		zeroBytes(password)
+	}
+	owner.attemptPasses = nil
+	owner.preservedAddIntent = nil
 	owner.mu.Unlock()
 	s3OwnersMu.Lock()
 	if s3Owners[owner.destination] == owner {
