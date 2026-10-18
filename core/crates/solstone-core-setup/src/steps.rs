@@ -3359,9 +3359,7 @@ mod tests {
         assert_eq!(
             cmd_on,
             vec![
-                setup_on
-                    .install_bin_dir
-                    .join("solstone")
+                solstone_executable(&setup_on.install_bin_dir)
                     .to_string_lossy()
                     .into_owned(),
                 "journal".to_owned(),
@@ -3518,9 +3516,7 @@ mod tests {
         assert_eq!(
             cmd_omitted,
             vec![
-                setup_omitted
-                    .install_bin_dir
-                    .join("solstone")
+                solstone_executable(&setup_omitted.install_bin_dir)
                     .to_string_lossy()
                     .into_owned(),
                 "journal".to_owned(),

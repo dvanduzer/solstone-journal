@@ -390,7 +390,7 @@ fn install_task(
         .map_err(task_error)?
     };
     let installed = validate_task(ctx, &after)?;
-    if installed.action != action || installed.starts_at_sign_in != starts_at_sign_in {
+    if installed.action != action || installed.starts_at_sign_in != profile.starts_at_sign_in {
         return Err(task_error(
             "installed task action did not match its readback",
         ));
