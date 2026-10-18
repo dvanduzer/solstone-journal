@@ -71,7 +71,7 @@ fn read_publication(
     }
 }
 
-fn inventory(
+pub(super) fn inventory(
     ledger: &ParentLossLedger,
     generation: ParentLossGeneration,
 ) -> Result<Vec<String>, ParentLossLedgerError> {
@@ -194,10 +194,24 @@ pub(super) fn supersede_overtaken_publication(
     Ok(Some(aside))
 }
 
-fn finish(
-    ledger: &ParentLossLedger,
-    proof: &Publication,
-) -> Result<ClosureOutcome, ParentLossLedgerError> {
+pub(super) enum PublicationOutcome {
+    Closed,
+    BudgetExpired,
+    RebuildRequired,
+    #[cfg(test)]
+    Paused,
+}
+
+impl PublicationOutcome {
+    pub(super) fn into_closure(self) -> ClosureOutcome {
+        match self {
+            Self::Closed => ClosureOutcome::Closed,
+            _ => ClosureOutcome::Refused(BootstrapRecoveryReason::CoordinatorNotLive),
+        }
+    }
+}
+
+fn finish(ledger: &ParentLossLedger, proof: &Publication) -> Result<(), ParentLossLedgerError> {
     let dir = phase(ledger, proof.generation);
     let final_ledger = ledger.sealed_ledger_path(proof.generation);
     if !matches_digest(&final_ledger, &proof.ledger_digest) {
@@ -229,7 +243,7 @@ fn finish(
         )?;
     }
     seam("after-record");
-    Ok(ClosureOutcome::Closed)
+    Ok(())
 }
 
 fn seam(_name: &str) {
@@ -239,6 +253,29 @@ fn seam(_name: &str) {
             thread::sleep(Duration::from_millis(100));
         }
     }
+}
+
+pub(super) fn current_provisional_sources(
+    ledger: &ParentLossLedger,
+    generation: ParentLossGeneration,
+    provisional: &HashMap<String, ProvisionalFile>,
+) -> Result<Option<HashMap<String, AdmissionSourceSnapshot>>, ParentLossLedgerError> {
+    let mut provisional_sources = HashMap::new();
+    for (id, prov) in provisional {
+        let derived = read_derived_admission_drops(ledger, generation, id)?;
+        if derived.instance.is_some()
+            || derived.finding != prov.finding
+            || derived.service != prov.service
+            || derived.digests.intent != prov.intent_digest
+            || derived.digests.result != prov.result_digest
+            || derived.digests.ack != prov.ack_digest
+            || derived.digests.spawn_identity != prov.spawn_identity_digest
+        {
+            return Ok(None);
+        }
+        provisional_sources.insert(id.clone(), derived.sources);
+    }
+    Ok(Some(provisional_sources))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -257,7 +294,7 @@ pub(super) fn publish(
     all_ids: Vec<String>,
     seqs: Vec<u64>,
     provisional: &HashMap<String, ProvisionalFile>,
-) -> Result<ClosureOutcome, ParentLossLedgerError> {
+) -> Result<PublicationOutcome, ParentLossLedgerError> {
     let dir = phase(ledger, generation);
     if let Some(proof) = read_publication(ledger, generation)?
         && proof.schema == 1
@@ -283,25 +320,12 @@ pub(super) fn publish(
         {
             return Err(unverifiable_admission());
         }
-        return finish(ledger, &proof);
+        return finish(ledger, &proof).map(|()| PublicationOutcome::Closed);
     }
-    let mut provisional_sources = HashMap::new();
-    for (id, prov) in provisional {
-        let derived = read_derived_admission_drops(ledger, generation, id)?;
-        if derived.instance.is_some()
-            || derived.finding != prov.finding
-            || derived.service != prov.service
-            || derived.digests.intent != prov.intent_digest
-            || derived.digests.result != prov.result_digest
-            || derived.digests.ack != prov.ack_digest
-            || derived.digests.spawn_identity != prov.spawn_identity_digest
-        {
-            return Ok(ClosureOutcome::Refused(
-                BootstrapRecoveryReason::CoordinatorNotLive,
-            ));
-        }
-        provisional_sources.insert(id.clone(), derived.sources);
-    }
+    let Some(provisional_sources) = current_provisional_sources(ledger, generation, provisional)?
+    else {
+        return Ok(PublicationOutcome::RebuildRequired);
+    };
     let progress_path = dir.join("audit-progress.json");
     let mut progress = match read_json_durable_validated::<AuditProgress>(
         ArtifactId::ParentLossClosureRecovery,
@@ -328,14 +352,12 @@ pub(super) fn publish(
     let mut inputs = Vec::new();
     for seq in seqs {
         if Instant::now() >= authority.deadline {
-            return Ok(ClosureOutcome::Refused(
-                BootstrapRecoveryReason::CoordinatorNotLive,
-            ));
+            return Ok(PublicationOutcome::BudgetExpired);
         }
         let batch_path = ledger.closure_recovery_batch_path(generation, seq);
         let ids_path = ledger.closure_recovery_ids_path(generation, seq);
         let receipt_path = ledger.closure_recovery_receipt_path(generation, seq);
-        let preserve_invalid = || -> Result<ClosureOutcome, ParentLossLedgerError> {
+        let preserve_invalid = || -> Result<PublicationOutcome, ParentLossLedgerError> {
             // No derived payload can make a scheduling hint authoritative. Drop
             // the hint with the damaged payload so the next scan reads originals.
             for path in [&batch_path, &ids_path, &receipt_path] {
@@ -343,9 +365,7 @@ pub(super) fn publish(
                     set_aside(path)?;
                 }
             }
-            Ok(ClosureOutcome::Refused(
-                BootstrapRecoveryReason::CoordinatorNotLive,
-            ))
+            Ok(PublicationOutcome::RebuildRequired)
         };
         let Ok(ids_bytes) = fs::read(&ids_path) else {
             return preserve_invalid();
@@ -485,9 +505,7 @@ pub(super) fn publish(
                 remaining.set(value - 1);
                 value == 1
             }) {
-                return Ok(ClosureOutcome::Refused(
-                    BootstrapRecoveryReason::CoordinatorNotLive,
-                ));
+                return Ok(PublicationOutcome::Paused);
             }
             (batch_digest, chunk)
         };
@@ -525,9 +543,7 @@ pub(super) fn publish(
         return Err(unverifiable_admission());
     }
     if Instant::now() >= authority.deadline {
-        return Ok(ClosureOutcome::Refused(
-            BootstrapRecoveryReason::CoordinatorNotLive,
-        ));
+        return Ok(PublicationOutcome::BudgetExpired);
     }
     let mut closures = Vec::new();
     let mut sealed = Vec::new();
@@ -640,15 +656,11 @@ pub(super) fn publish(
     write_json(dir.join("publication.json"), &proof, json_options())?;
     #[cfg(test)]
     if PUBLICATION_STOP_FAULT.with(|fault| fault.get()) {
-        return Ok(ClosureOutcome::Refused(
-            BootstrapRecoveryReason::CoordinatorNotLive,
-        ));
+        return Ok(PublicationOutcome::Paused);
     }
     seam("before-publication");
     if Instant::now() >= authority.deadline {
-        return Ok(ClosureOutcome::Refused(
-            BootstrapRecoveryReason::CoordinatorNotLive,
-        ));
+        return Ok(PublicationOutcome::BudgetExpired);
     }
-    finish(ledger, &proof)
+    finish(ledger, &proof).map(|()| PublicationOutcome::Closed)
 }
