@@ -25,10 +25,7 @@ fn cross_boundary_loopback_400_to_capped_daily_unit_with_detail() {
         let (mut stream, _) = listener.accept().expect("accept");
         let mut request_buf = Vec::new();
         let mut buffer = [0_u8; 4096];
-        loop {
-            let Ok(read) = stream.read(&mut buffer) else {
-                break;
-            };
+        while let Ok(read) = stream.read(&mut buffer) {
             if read == 0 {
                 break;
             }

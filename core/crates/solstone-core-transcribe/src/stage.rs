@@ -111,6 +111,7 @@ fn commit_input<'a>(
 #[cfg(all(test, feature = "full-tests"))]
 thread_local! {
     static BEFORE_PROCESSING_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static PROCESSING_TEST_VAD: std::cell::RefCell<Option<solstone_core_observe_audio::VadResult>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Run the currently implemented native transcription path for one segment audio file.
@@ -174,6 +175,17 @@ fn finish_context_output(
     Ok(())
 }
 
+// Read only while holding this transcript's output claim. Ordinary retries
+// have no explicit retry context, but own replacement of their failed output.
+fn automatic_retry_replaces_output(output: &Path) -> bool {
+    use solstone_core_processing_record::{should_reenter_analysis_output, vocab};
+    read_processing_record_header(output).is_some_and(|record| {
+        record["schema"] == vocab::SCHEMA
+            && record["handler"] == vocab::HANDLER_TRANSCRIBE
+            && should_reenter_analysis_output(Some(&record), output, vocab::HANDLER_TRANSCRIBE)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn process_one_with(
     audio_path: &Path,
@@ -208,7 +220,7 @@ pub(crate) fn process_one_with(
     // Allow an ordinary Sense transcription's 45-minute execution budget to finish.
     let output = audio_path.with_extension("jsonl");
     let claim = OutputClaims::acquire(
-        [output],
+        [output.clone()],
         LockOptions {
             timeout: {
                 #[cfg(all(feature = "embedded", unix))]
@@ -232,6 +244,7 @@ pub(crate) fn process_one_with(
     if should_skip_process_one_processed(audio_path, redo, Some(journal_path), retry) {
         return Ok(ProcessOutcome::Skipped);
     }
+    let automatic_retry = automatic_retry_replaces_output(&output);
     let observation = InputObservation::capture(&claim, audio_path).map_err(|error| {
         TranscribeError::ProcessingClaim {
             path: audio_path.to_path_buf(),
@@ -268,9 +281,9 @@ pub(crate) fn process_one_with(
     } else {
         (false, None)
     };
-    // The existing failed artifact was validated under the output claim. Keep
-    // that narrow replacement authority through successful/empty publication.
-    let redo = redo || admitted_retry;
+    // Keep both ordinary and explicitly admitted retry authority through
+    // successful, empty and failed publication under this output claim.
+    let redo = redo || admitted_retry || automatic_retry;
     let facts = InputFacts {
         path: audio_path.to_path_buf(),
         input_size: observation.input_size(),
@@ -354,24 +367,29 @@ pub(crate) fn process_one_with(
         runtime.checkpoint()?;
     }
     let vad_at = Instant::now();
-    #[cfg(all(feature = "embedded", unix))]
-    let vad = if let Some(runtime) = embedded {
-        crate::audio::run_vad_embedded(
+    let compute_vad = || {
+        #[cfg(all(feature = "embedded", unix))]
+        if let Some(runtime) = embedded {
+            return crate::audio::run_vad_embedded(
+                &full_audio,
+                min_speech_seconds(config),
+                runtime.models,
+                runtime.scratch,
+            );
+        }
+        run_vad(
             &full_audio,
             min_speech_seconds(config),
-            runtime.models,
-            runtime.scratch,
+            #[cfg(windows)]
+            generation,
         )
-    } else {
-        run_vad(&full_audio, min_speech_seconds(config))
-    }?;
-    #[cfg(not(all(feature = "embedded", unix)))]
-    let vad = run_vad(
-        &full_audio,
-        min_speech_seconds(config),
-        #[cfg(windows)]
-        generation,
-    )?;
+    };
+    #[cfg(all(test, feature = "full-tests"))]
+    let vad = PROCESSING_TEST_VAD
+        .with(|result| result.borrow_mut().take())
+        .map_or_else(compute_vad, Ok)?;
+    #[cfg(not(all(test, feature = "full-tests")))]
+    let vad = compute_vad()?;
     timings.add_ms("vad", elapsed_ms(vad_at));
     #[cfg(all(feature = "embedded", unix))]
     if let Some(runtime) = embedded {
@@ -2102,6 +2120,154 @@ mod tests {
         assert_eq!(record["state"], vocab::STATE_FAILED);
         assert_eq!(record["reason_code"], vocab::REASON_CORRUPT_INPUT);
         assert!(is_failure_exhausted(&record));
+    }
+
+    #[cfg(all(unix, feature = "full-tests"))]
+    #[test]
+    fn automatic_transient_retry_publishes_empty_without_replacing_terminal_outputs() {
+        for (state, attempts, retry) in [
+            ("failed", 1, true),
+            ("failed", 3, false),
+            ("analyzed", 1, false),
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let facts = input(temporary.path());
+            let audio = vec![0.0; 16_000];
+            fs::write(
+                &facts.path,
+                solstone_core_observe_audio::audio_to_wav_bytes(&audio, 16_000).unwrap(),
+            )
+            .unwrap();
+            let original = fs::read(&facts.path).unwrap();
+            let output = facts.path.with_extension("jsonl");
+            let header = json!({
+                "raw": facts.path.file_name().unwrap().to_str().unwrap(),
+                "_solstone_processing": {
+                    "schema": vocab::SCHEMA, "handler": vocab::HANDLER_TRANSCRIBE,
+                    "state": state, "reason_code": "hosted_transcribe_unreachable",
+                    "attempts": attempts, "input_size": original.len()
+                }
+            });
+            let before = format!("{header}\n");
+            fs::write(&output, &before).unwrap();
+            if retry {
+                super::PROCESSING_TEST_VAD.with(|result| {
+                    *result.borrow_mut() = Some(VadResult {
+                        duration_s: 1.0,
+                        speech_duration_s: 0.0,
+                        speech_segments: Vec::new(),
+                        has_speech: false,
+                        noisy_rms: None,
+                        noisy_s: 0.0,
+                        loud_windows: 0,
+                        speech_loud_windows: 0,
+                    });
+                });
+            }
+            let outcome = super::process_one_with(
+                &facts.path,
+                temporary.path(),
+                false,
+                None,
+                &solstone_core_journal_config::JournalConfigRead {
+                    present: false,
+                    sha256: None,
+                    config: None,
+                },
+                &solstone_core_spp_ratls::AttestationStateStore::new(),
+                #[cfg(all(feature = "embedded", unix))]
+                None,
+                None,
+            )
+            .unwrap();
+            if retry {
+                assert_eq!(outcome, super::ProcessOutcome::Preserved);
+                let record = read_header(&output)["_solstone_processing"].clone();
+                assert_eq!(record["state"], vocab::STATE_EMPTY);
+            } else {
+                assert_eq!(outcome, super::ProcessOutcome::Skipped);
+                assert_eq!(fs::read_to_string(&output).unwrap(), before);
+            }
+            assert!(super::PROCESSING_TEST_VAD.with(|result| result.borrow().is_none()));
+            assert_eq!(fs::read(&facts.path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn automatic_retry_authority_reaches_full_and_empty_transcript_writers() {
+        use solstone_core_segment::output_attempt::{InputObservation, OutputClaims};
+        for empty in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let facts = input(temporary.path());
+            let original = fs::read(&facts.path).unwrap();
+            let (jsonl, npz) = transcript_paths(&facts.path);
+            let header = json!({
+                "raw": "clip.wav", "_solstone_processing": {
+                    "schema": vocab::SCHEMA, "handler": vocab::HANDLER_TRANSCRIBE,
+                    "state": "failed", "reason_code": "hosted_transcribe_unreachable",
+                    "attempts": 1, "input_size": original.len()
+                }
+            });
+            fs::write(&jsonl, format!("{header}\n")).unwrap();
+            let claims = OutputClaims::acquire([jsonl.clone()], Default::default()).unwrap();
+            let observed = InputObservation::capture(&claims, &facts.path).unwrap();
+            let replaces = super::automatic_retry_replaces_output(&jsonl);
+            assert!(replaces);
+            let _commit = observed.commit(&claims).unwrap();
+            if empty {
+                stt_zero_statements(&facts, replaces, None, None, None).unwrap();
+            } else {
+                let speaker = crate::speakers::SpeakerAnalyzeResult {
+                    statements: vec![
+                        json!({"id":1,"start":0.0,"end":1.0,"text":"retained recovered speech"})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ],
+                    embedding_payload: None,
+                    speaker_evidence: "none".into(),
+                    speaker_evidence_multi_fraction: 0.0,
+                    overlap_fraction: 0.0,
+                    statement_labels: None,
+                };
+                super::write_full_transcript(super::FullTranscriptWrite {
+                    raw_path: &facts.path,
+                    jsonl_path: &jsonl,
+                    npz_path: &npz,
+                    base_time_us_of_day: 0,
+                    source: None,
+                    speaker_result: &speaker,
+                    backend: Some("confidential"),
+                    model: Some("fixture"),
+                    device: Some("remote"),
+                    compute_type: None,
+                    observer: None,
+                    vad_result: None,
+                    segment_meta: None,
+                    overlap_detector: None,
+                    speaker_evidence_version: "windowed-slots-v1",
+                    processing: &crate::processing::analyzed_record(facts.input_size),
+                    sound_tags: None,
+                    sound_tag_status: None,
+                    speaker_analysis_producer: None,
+                    redo: replaces,
+                })
+                .unwrap();
+            }
+            assert_eq!(
+                read_header(&jsonl)["_solstone_processing"]["state"],
+                if empty { "empty" } else { "analyzed" }
+            );
+            if !empty {
+                assert!(
+                    fs::read_to_string(&jsonl)
+                        .unwrap()
+                        .contains("retained recovered speech")
+                );
+            }
+            assert!(!super::automatic_retry_replaces_output(&jsonl));
+            assert_eq!(fs::read(&facts.path).unwrap(), original);
+        }
     }
 
     #[cfg(all(feature = "full-tests", feature = "embedded", unix))]

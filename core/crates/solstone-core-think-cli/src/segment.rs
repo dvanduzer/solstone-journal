@@ -26,10 +26,10 @@ use solstone_core_system::activity_state::{
     ActivityStateMachine, SHARED_ACTIVITY_STATE, activity_state_path,
 };
 use solstone_core_system_health::{
-    DataState, FilesystemHealthLogSource, SEGMENT_FLOOR_TALENTS, SEGMENT_NONGATING_TALENTS,
+    FilesystemHealthLogSource, SEGMENT_FLOOR_TALENTS, SEGMENT_NONGATING_TALENTS,
     detect_segment_change, find_segment_dir, is_floor_talent_capped, lookup_segment_progress,
     newest_segment_input_ms, read_segment_data_state, read_segment_progress, resolve_predecessor,
-    segment_thinking_is_current,
+    segment_fully_sensed, segment_thinking_is_current,
 };
 use solstone_core_talent_config::{
     TalentConfig, TalentFilter, get_output_path, load_talent_configs,
@@ -239,11 +239,8 @@ fn think(
     let _turn = segment_turn(context, &segment_dir);
     let state =
         read_segment_data_state(&context.journal, &context.day, segment, stream, Utc::now());
-    let in_flight = state.0.values().any(|value| {
-        value == DataState::Pending.as_str() || value == DataState::Analyzing.as_str()
-    });
-    if in_flight {
-        // Source-derived, not measured: thinking.py:1485-1499 records this raw-media gate.
+    if !segment_fully_sensed(&state) {
+        // A retryable failure is still owed media analysis, not empty input.
         log_skip(log, context, "sense", segment, "raw_media_pending", stream);
         return Ok(ModeResult::default());
     }

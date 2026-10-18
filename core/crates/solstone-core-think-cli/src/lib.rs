@@ -52,6 +52,7 @@ pub mod test_support {
         crate::dispatch::runtime()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn reserve_daily_attempt(
         journal: &Path,
         identity: &solstone_core_journal_io::DailyUnitIdentity,
@@ -3506,6 +3507,51 @@ mod tests {
                 .iter()
                 .any(|record| record["reason"] == "raw_media_pending")
         );
+    }
+
+    #[test]
+    fn retryable_failed_audio_waits_for_recovered_speech_before_sense() {
+        let journal = tempdir().unwrap();
+        let roots = tempdir().unwrap();
+        let (context, recorder) = segment_context(
+            journal.path(),
+            roots.path(),
+            "{\n\"type\": \"generate\", \"max_output_tokens\": 1024, \"schedule\": \"segment\", \"priority\": 1, \"output\": \"json\", \"load\": {\"transcripts\": true}\n}\n",
+        );
+        let segment = "090000_300";
+        let path = segment_dir(journal.path(), "20260813", segment);
+        let raw = b"retained synthetic speech";
+        fs::write(path.join("audio.wav"), raw).unwrap();
+        let failure = serde_json::json!({
+            "raw":"audio.wav", "_solstone_processing": {
+                "schema":"solstone.processing.v1", "handler":"transcribe", "state":"failed",
+                "reason_code":"hosted_transcribe_unreachable", "attempts":1, "input_size":raw.len()
+            }
+        });
+        fs::write(path.join("audio.jsonl"), format!("{failure}\n")).unwrap();
+        assert_eq!(
+            run_segment(&context, journal.path(), segment, false, false),
+            dispatch::ModeResult::default()
+        );
+        assert!(recorder.requests.lock().unwrap().is_empty());
+        for name in ["sense.json", "activity.md", "publication.json"] {
+            assert!(!path.join("talents").join(name).exists());
+        }
+        assert_eq!(fs::read(path.join("audio.wav")).unwrap(), raw);
+
+        // Simulate the upstream writer's recovered transcript, then use the
+        // same ordinary segment execution; no refresh or diagnostic rescue.
+        fs::write(path.join("audio.jsonl"), "{\"raw\":\"audio.wav\"}\n{\"start\":\"09:00:00\",\"text\":\"Maya checked the pump; an unidentified speaker requested supplies.\"}\n").unwrap();
+        run_segment(&context, journal.path(), segment, false, false);
+        assert!(
+            recorder
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.name == "sense")
+        );
+        assert_eq!(fs::read(path.join("audio.wav")).unwrap(), raw);
     }
 
     #[test]
