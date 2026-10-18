@@ -64,7 +64,7 @@ fn owner_non_utf8_expected_fingerprint_resolves_stale_instead_of_usage() {
     assert!(output.stderr.is_empty());
     assert_eq!(
         output.stdout,
-        b"Brain unknown: stale expected fingerprint\n"
+        b"Thinking unknown: the last check is out of date\n"
     );
     assert!(!solstone_core_brain::brain_state_path(journal.path()).exists());
 }

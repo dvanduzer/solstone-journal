@@ -137,7 +137,7 @@ fn brain_failures_are_nonfatal_and_later_success_recovers_only_brain() {
         Err("\x1b[31mhostile".to_owned()),
         Err("completion failure".to_owned()),
         Err("periodic failure".to_owned()),
-        Ok(json!({"lines":["Brain Health — OK"]})),
+        Ok(json!({"lines":["Thinking Health — OK"]})),
     ]));
     run_top_with(
         &mut state,
