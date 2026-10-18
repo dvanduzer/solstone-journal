@@ -83,6 +83,7 @@ const LIVE_REAP_GRACE_MS: u64 = 500;
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static AUDIT_BATCH_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static AUDIT_VALIDATED_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static AUDIT_STOP_AFTER_BATCH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static PUBLICATION_STOP_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -5151,6 +5152,7 @@ mod tests {
             .unwrap(),
         );
         AUDIT_VALIDATED_ROWS.with(|count| count.set(0));
+        AUDIT_BATCH_READS.with(|count| count.set(0));
         ledger
             .reserve_generation_closing_abandoned(
                 instance(12, 4),
@@ -5163,6 +5165,11 @@ mod tests {
             AUDIT_VALIDATED_ROWS.with(|count| count.get()),
             1,
             "a committed source audit must leave the retry budget for unfinished work"
+        );
+        assert_eq!(
+            AUDIT_BATCH_READS.with(|count| count.get()),
+            1,
+            "a retained committed chunk must not reread its completed raw batch"
         );
         let sealed: Vec<serde_json::Value> = serde_json::from_slice(
             &fs::read(ledger.sealed_ledger_path(active.generation)).unwrap(),
@@ -5200,6 +5207,13 @@ mod tests {
         );
         AUDIT_STOP_AFTER_BATCH.with(|remaining| remaining.set(0));
         assert!(first.is_err());
+        // Without the independent commit, this raw payload must be audited again.
+        fs::remove_file(
+            ledger
+                .closure_recovery_phase_dir(active.generation)
+                .join("audit-progress.json"),
+        )
+        .unwrap();
         let batch = ledger.closure_recovery_batch_path(active.generation, 1);
         fs::write(&batch, b"{damaged payload").unwrap();
         assert!(
@@ -5231,6 +5245,121 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<AdmissionIdentity>(sealed[0]["identity"].clone()).unwrap(),
             expected
+        );
+    }
+
+    #[test]
+    fn committed_output_survives_damage_to_its_historical_raw_batch() {
+        for malformed in [false, true] {
+            let directory = TempDir::new().unwrap();
+            let (ledger, active) = open_generation(&directory);
+            let expected = admit(
+                directory.path(),
+                active.generation,
+                "committed-payload",
+                None,
+                Some(instance(8814, 600)),
+            )
+            .unwrap();
+            let (source, retirer) = fake(&[], &[], &[]);
+            let lease = acquire_lease(&ledger);
+            AUDIT_STOP_AFTER_BATCH.with(|remaining| remaining.set(1));
+            let first = ledger.reserve_generation_closing_abandoned(
+                instance(11, 3),
+                [],
+                &lease,
+                &authority(&source, &retirer, Duration::from_secs(2)),
+            );
+            AUDIT_STOP_AFTER_BATCH.with(|remaining| remaining.set(0));
+            assert!(first.is_err());
+            let batch = ledger.closure_recovery_batch_path(active.generation, 1);
+            let bytes = if malformed {
+                b"{damaged payload".to_vec()
+            } else {
+                let mut payload: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&batch).unwrap()).unwrap();
+                payload["entries"][0]["uid"] = 502.into();
+                serde_json::to_vec(&payload).unwrap()
+            };
+            fs::write(&batch, &bytes).unwrap();
+            AUDIT_BATCH_READS.with(|count| count.set(0));
+            ledger
+                .reserve_generation_closing_abandoned(
+                    instance(12, 4),
+                    [],
+                    &lease,
+                    &authority(&source, &retirer, Duration::from_secs(2)),
+                )
+                .unwrap();
+            assert_eq!(AUDIT_BATCH_READS.with(|count| count.get()), 0);
+            assert_eq!(
+                fs::read(batch).unwrap(),
+                bytes,
+                "preserve damaged historical evidence"
+            );
+            let closure = closure_of(&ledger, active.generation);
+            assert_eq!(closure.admissions[0].uid, Some(expected.uid));
+            let sealed: Vec<serde_json::Value> = serde_json::from_slice(
+                &fs::read(ledger.sealed_ledger_path(active.generation)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(sealed.len(), 1);
+            assert_eq!(
+                serde_json::from_value::<AdmissionIdentity>(sealed[0]["identity"].clone()).unwrap(),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn changed_committed_ids_bytes_force_a_fresh_source_audit() {
+        let directory = TempDir::new().unwrap();
+        let (ledger, active) = open_generation(&directory);
+        let expected = admit(
+            directory.path(),
+            active.generation,
+            "committed-ids",
+            None,
+            Some(instance(8815, 600)),
+        )
+        .unwrap();
+        let (source, retirer) = fake(&[], &[], &[]);
+        let lease = acquire_lease(&ledger);
+        AUDIT_STOP_AFTER_BATCH.with(|remaining| remaining.set(1));
+        let first = ledger.reserve_generation_closing_abandoned(
+            instance(11, 3),
+            [],
+            &lease,
+            &authority(&source, &retirer, Duration::from_secs(2)),
+        );
+        AUDIT_STOP_AFTER_BATCH.with(|remaining| remaining.set(0));
+        assert!(first.is_err());
+        let ids = ledger.closure_recovery_ids_path(active.generation, 1);
+        let before = fs::read(&ids).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&before).unwrap();
+        let changed = serde_json::to_vec(&value).unwrap();
+        assert_ne!(changed, before, "same IDs, different serialized bytes");
+        fs::write(ids, changed).unwrap();
+        AUDIT_BATCH_READS.with(|count| count.set(0));
+        AUDIT_VALIDATED_ROWS.with(|count| count.set(0));
+        ledger
+            .reserve_generation_closing_abandoned(
+                instance(12, 4),
+                [],
+                &lease,
+                &authority(&source, &retirer, Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert_eq!(AUDIT_BATCH_READS.with(|count| count.get()), 1);
+        assert_eq!(AUDIT_VALIDATED_ROWS.with(|count| count.get()), 1);
+        let sealed: Vec<serde_json::Value> = serde_json::from_slice(
+            &fs::read(ledger.sealed_ledger_path(active.generation)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sealed.len(), 1);
+        assert_eq!(
+            serde_json::from_value::<AdmissionIdentity>(sealed[0]["identity"].clone()).unwrap(),
+            expected,
         );
     }
 

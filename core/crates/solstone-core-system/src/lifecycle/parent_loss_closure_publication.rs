@@ -347,15 +347,14 @@ pub(super) fn publish(
                 BootstrapRecoveryReason::CoordinatorNotLive,
             ))
         };
-        let (Ok(batch_bytes), Ok(ids_bytes)) = (fs::read(&batch_path), fs::read(&ids_path)) else {
+        let Ok(ids_bytes) = fs::read(&ids_path) else {
             return preserve_invalid();
         };
-        let batch_digest = digest_bytes(&batch_bytes);
         let ids_digest = digest_bytes(&ids_bytes);
         let prepared_path = dir.join(format!("audited-{seq:06}.json"));
         let stamp_path = dir.join(format!("audited-{seq:06}.sha256"));
         let retained = progress.inputs.get(&seq).and_then(|committed| {
-            if committed.batch_digest != batch_digest || committed.ids_digest != ids_digest {
+            if committed.ids_digest != ids_digest {
                 return None;
             }
             let bytes = fs::read(&prepared_path).ok()?;
@@ -366,13 +365,22 @@ pub(super) fn publish(
             (chunk.schema == 1
                 && chunk.generation == generation
                 && chunk.seq == seq
-                && chunk.batch_digest == batch_digest
+                && chunk.batch_digest == committed.batch_digest
                 && chunk.ids_digest == ids_digest)
                 .then_some(chunk)
         });
-        let chunk = if let Some(chunk) = retained {
-            chunk
+        let (batch_digest, chunk) = if let Some(chunk) = retained {
+            // This writer's independent commit authorizes the exact canonical
+            // output. The raw batch is historical provenance after that commit;
+            // rereading it would spend every retry on the completed prefix.
+            (chunk.batch_digest.clone(), chunk)
         } else {
+            #[cfg(test)]
+            AUDIT_BATCH_READS.with(|count| count.set(count.get() + 1));
+            let Ok(batch_bytes) = fs::read(&batch_path) else {
+                return preserve_invalid();
+            };
+            let batch_digest = digest_bytes(&batch_bytes);
             let parsed = (|| {
                 let batch: RecoveryBatchFile = serde_json::from_slice(&batch_bytes).ok()?;
                 let index: RecoveryIdsFile = serde_json::from_slice(&ids_bytes).ok()?;
@@ -481,7 +489,7 @@ pub(super) fn publish(
                     BootstrapRecoveryReason::CoordinatorNotLive,
                 ));
             }
-            chunk
+            (batch_digest, chunk)
         };
         inputs.push((seq, batch_digest, ids_digest));
         for row in chunk.rows {
