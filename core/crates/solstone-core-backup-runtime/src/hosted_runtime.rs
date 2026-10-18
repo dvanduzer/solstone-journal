@@ -328,7 +328,18 @@ pub fn operated_destination(
     binding: &HostedBinding,
     credentials: &HostedCredentials,
 ) -> Destination {
-    Destination { repository:operated_repository(binding, credentials), backend:"s3".into(), credentials:serde_json::from_value(json!({"access_key_id":credentials.access_key_id,"secret_access_key":credentials.secret_access_key,"session_token":credentials.session_token})).expect("object") }
+    #[cfg(not(target_os = "ios"))]
+    let fields = json!({"access_key_id":credentials.access_key_id,"secret_access_key":credentials.secret_access_key,"session_token":credentials.session_token});
+    // iOS reaches operated storage through its linked transport, which signs
+    // for R2's own region and keeps every non-lock write create-only, the
+    // counterpart of desktop's append-only rclone transport.
+    #[cfg(target_os = "ios")]
+    let fields = json!({"access_key_id":credentials.access_key_id,"secret_access_key":credentials.secret_access_key,"session_token":credentials.session_token,"region":"auto","append_only":"1"});
+    Destination {
+        repository: operated_repository(binding, credentials),
+        backend: "s3".into(),
+        credentials: serde_json::from_value(fields).expect("object"),
+    }
 }
 #[derive(Clone)]
 pub struct HostedResticSession {

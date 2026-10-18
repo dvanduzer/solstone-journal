@@ -659,6 +659,24 @@ pub fn produce_raw_percept_chunks(
     produce_raw_percept_chunks_by_shape(family, Some(rel), &records)
 }
 
+/// The records a raw percept renders from, parsed exactly as
+/// [`produce_raw_percept_chunks`] parses them, and how many non-empty lines
+/// were not JSON objects and so render nothing.
+pub fn parse_raw_percept_records(text: &str) -> (Vec<JsonObject>, usize) {
+    let mut unparsed = 0;
+    let records = text
+        .lines()
+        .filter_map(|line| {
+            let record = parse_jsonl_line(line)?;
+            if record.is_none() {
+                unparsed += 1;
+            }
+            record
+        })
+        .collect();
+    (records, unparsed)
+}
+
 /// Render raw screen records for the Screen talent's private input projection.
 ///
 /// The ordinary raw-screen renderer remains the owner/index/display contract.
@@ -685,17 +703,21 @@ pub(super) fn recorded_chunk(
 
 fn parse_jsonl_objects(text: &str) -> Vec<JsonObject> {
     text.lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                return None;
-            }
-            match serde_json::from_str::<Value>(trimmed) {
-                Ok(Value::Object(record)) => Some(record),
-                Ok(_) | Err(_) => None,
-            }
-        })
+        .filter_map(parse_jsonl_line)
+        .flatten()
         .collect()
+}
+
+/// `None` for a blank line, `Some(None)` for a line that is not a JSON object.
+fn parse_jsonl_line(line: &str) -> Option<Option<JsonObject>> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(match serde_json::from_str::<Value>(trimmed) {
+        Ok(Value::Object(record)) => Some(record),
+        Ok(_) | Err(_) => None,
+    })
 }
 
 // Whole-file JSON talent outputs are intentionally infallible. Python writes

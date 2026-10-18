@@ -3812,6 +3812,7 @@ dependencies = [
  "solstone-core-journal-stats-cli",
  "solstone-core-segment",
  "solstone-core-sol-link",
+ "solstone-core-speaker-id",
  "solstone-core-speaker-resolve",
  "solstone-core-system",
  "solstone-core-system-health",

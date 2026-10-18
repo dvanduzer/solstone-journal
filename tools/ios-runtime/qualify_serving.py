@@ -87,7 +87,7 @@ class Phone:
 
     @contextmanager
     def device_file(self, name):
-        assert name in ('evidence.jsonl', 'owner-reply.json')
+        assert name in ('evidence.jsonl', 'owner-reply.json', 'owner-command.json')
         with tempfile.TemporaryDirectory(prefix='receipt-', dir=self.args.output) as temporary:
             downloaded = Path(temporary) / name
             subprocess.run(['xcrun', 'devicectl', 'device', 'copy', 'from', '--device', self.args.device,
@@ -122,6 +122,10 @@ class Phone:
             # the device. The host consumes each ID once, so resending the same
             # command until it is consumed never replays it.
             for _attempt in range(8):
+                if _attempt:
+                    # A resend of the identical file is again not delivered, so
+                    # vary its size; the host identifies a command by ID alone.
+                    command.write_text(data + ' ' * _attempt)
                 subprocess.run(['xcrun', 'devicectl', 'device', 'copy', 'to', '--device', self.args.device,
                                 '--domain-type', 'appDataContainer', '--domain-identifier', BUNDLE,
                                 '--source', str(command), '--destination', 'Documents/owner-command.json'],
@@ -130,6 +134,16 @@ class Phone:
                     reply = self.wait(matches, seconds=20)['value']
                     break
                 except queue.Empty:
+                    # Record what the device actually holds, to tell a lost copy
+                    # from a host that read the command and never answered.
+                    with self.device_file('owner-command.json') as held:
+                        try:
+                            held_id = json.loads(held.read_bytes()).get('id')
+                        except ValueError:
+                            held_id = 'unreadable'
+                    self.log.write(json.dumps({'qualification_resend': identifier, 'attempt': _attempt,
+                                               'device_command_is_current': held_id == identifier}) + '\n')
+                    self.log.flush()
                     continue
         finally:
             command.unlink(missing_ok=True)

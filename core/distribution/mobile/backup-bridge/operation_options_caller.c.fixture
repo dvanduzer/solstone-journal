@@ -51,7 +51,7 @@ int main(int argc, char **argv) {
     restic_s3_request remote = {0}; remote.version = 1; remote.operation = 7;
     restic_operation_options_v1 options = {0}; options.version = 1; options.check_read_mode = 2;
     if (local_refuses(&request, NULL, 1) || remote_refuses(&remote, NULL, 1)) return 2;
-    options.version = 2;
+    options.version = 3;
     if (local_refuses(&request, &options, 1) || remote_refuses(&remote, &options, 1)) return 3;
     options.version = 1; options.reserved1 = 1;
     if (local_refuses(&request, &options, 1) || remote_refuses(&remote, &options, 1)) return 4;
@@ -111,7 +111,7 @@ int main(int argc, char **argv) {
         options = (restic_operation_options_v1){.version = 1, .check_read_mode = 2};
         int expected = 1;
         switch (variant) {
-            case 0: options.version = 2; break;
+            case 0: options.version = 3; break;
             case 1: options.reserved1 = 1; break;
             case 2: options.reserved2 = 1; break;
             case 3: options.check_read_mode = 0; break;
@@ -124,6 +124,13 @@ int main(int argc, char **argv) {
         }
         if (local_refuses(&request, &options, expected) || remote_refuses(&remote, &options, expected)) return 25;
     }
+    /* Version 2 carries only the append-only bit, which local storage refuses. */
+    options = (restic_operation_options_v1){.version = 2, .check_read_mode = 2, .reserved1 = 2};
+    if (local_refuses(&request, &options, 1) || remote_refuses(&remote, &options, 1)) return 29;
+    options.reserved1 = 1;
+    if (local_refuses(&request, &options, 1)) return 30;
+    options.reserved1 = 0;
+    if (local_refuses(&request, &options, 1)) return 31;
     /* A valid remote shape really publishes a handle. Cancel and join it; the
        reserved .invalid fixture has no provider or usable credentials. */
     options = (restic_operation_options_v1){.version = 1, .check_read_mode = 1};

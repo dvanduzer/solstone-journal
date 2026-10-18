@@ -36,6 +36,8 @@ mod screen_batch;
 pub mod source_passages;
 pub mod speaker_attribution;
 pub mod story;
+#[cfg(test)]
+mod story_source_conformance;
 mod transcript;
 pub mod weekly_reflection;
 
@@ -880,6 +882,7 @@ fn generate_response(
     writer: &mut impl Write,
 ) -> Result<GeneratedTalentResponse, RuntimeOutcome> {
     let _ = prepared.config.remove(INPUT_BUDGET_KEY);
+    let _ = prepared.config.remove(story::INPUT_WHOLE_KEY);
     match screen_batch::generate_if_needed(prepared, context, generate, Some(writer)) {
         Some(Ok(response)) => Ok((response, None, None)),
         Some(Err(outcome)) => Err(outcome),
@@ -925,6 +928,14 @@ fn generate_response(
                         prepared
                             .config
                             .insert(INPUT_BUDGET_KEY.to_owned(), budget.clone());
+                    }
+                    // Only the fitter drops input, and it reports every drop.
+                    if response.input_budget.as_ref().is_none_or(|budget| {
+                        budget.get("clipped").and_then(Value::as_bool) == Some(false)
+                    }) {
+                        prepared
+                            .config
+                            .insert(story::INPUT_WHOLE_KEY.to_owned(), Value::Bool(true));
                     }
                     Ok((response.text.clone(), usage, None))
                 }

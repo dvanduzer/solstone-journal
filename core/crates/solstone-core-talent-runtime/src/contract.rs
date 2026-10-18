@@ -191,7 +191,7 @@ pub static STORY: StageSpec = StageSpec {
     unavailable_commit: None,
     unavailable_before_generate: None,
     writes_as_intent: Some(crate::writers::apply_prepared),
-    output_override: None,
+    output_override: Some(crate::story::output),
 };
 pub static PULSE: StageSpec = StageSpec {
     stage: StageId::Pulse,
