@@ -184,7 +184,9 @@ def external_population_sha256(external: list[dict[str, Any]]) -> str:
     (non-workspace) `[[package]]` row, identified the same way the committed
     index identifies its own rows (`name@version (source)`), sorted and
     hashed. Must match `windows_cli.rs`'s `external_population_sha256`
-    exactly -- same identity string, same sort, same join.
+    exactly -- same identity string, same sort, same join. Path-patched
+    Velopack is absent from this digest on purpose; the no-source check
+    accounts for it.
     """
     identities = sorted(f"{p['name']}@{p['version']} ({p['source']})" for p in external)
     return sha256_bytes("\n".join(identities).encode())
@@ -275,6 +277,10 @@ def classify_external_delta(
     upgrade (which reads as a removal plus an add) or an added git dependency
     still refuses. Empty results mean the population is identical and the
     cheap member-preserving path applies unchanged.
+
+    This script still refuses a zip 2.4.2/8.6.0 → 9.0.3 upgrade and Velopack
+    leaving the registry source. That regeneration is caller work. No rewrite
+    mode.
     """
     old_by_id = {(p["name"], p["version"]): p for p in old_external}
     new_by_id = {(p["name"], p["version"]): p for p in new_external}
@@ -595,17 +601,18 @@ def _workspace_existing_deps_only(
 
 
 def declared_workspace_crates(repo: Path) -> frozenset[str]:
-    """Every crate `core/Cargo.toml`'s `[workspace]` table declares, as a
-    member or an exclude, by its own `[package].name`.
+    """Workspace members and explicitly owned excluded evidence code.
 
-    The same checkable definition of sol pbc's own crates the Windows producer
-    uses for the no-`source` rows of the lock: a lock row without a source
-    that is not declared here could be a patched third-party crate, so it is
-    never admitted as a new workspace crate.
+    An arbitrary workspace exclusion does not establish first-party ownership.
+    Keep this classification consistent with the Windows producer and the
+    target-notice selector; unknown no-source packages remain unqualified.
     """
     workspace = tomllib.loads((repo / "core/Cargo.toml").read_text())["workspace"]
     names = set()
-    for path in [*workspace.get("members", []), *workspace.get("exclude", [])]:
+    for path in [*workspace.get("members", []), *[
+        item for item in workspace.get("exclude", [])
+        if item == "crates/solstone-core-service-legacy-evidence"
+    ]]:
         manifest = repo / "core" / path / "Cargo.toml"
         names.add(tomllib.loads(manifest.read_text())["package"]["name"])
     return frozenset(names)
@@ -665,7 +672,7 @@ def workspace_version_or_existing_dependency_edge_delta(
         raise RefreshError(
             f"the workspace package set changed (a crate was added: {undeclared}) "
             "and core/Cargo.toml does not declare it as a workspace member or "
-            "exclude; scope this as engineering work instead"
+            "an explicitly owned exclusion; scope this as engineering work instead"
         )
     for name in added_workspace:
         if not _added_workspace_crate_edges_resolve(

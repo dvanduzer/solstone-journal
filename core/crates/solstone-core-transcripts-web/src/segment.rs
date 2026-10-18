@@ -48,6 +48,7 @@ struct SegmentContext<'a> {
     root: &'a Path,
     /// The journal's owner zone, which the page shows every time in.
     zone: Tz,
+    now: DateTime<Utc>,
 }
 
 pub(crate) async fn segment_content(
@@ -103,6 +104,7 @@ fn prepare_segment(
         dir: &dir,
         root,
         zone,
+        now,
     };
     let unclaimed_images = solstone_core_system_health::unclaimed_image_state(&dir, stream, now)
         .map_err(|error| {
@@ -193,7 +195,7 @@ fn prepare_segment(
                     audio_chunks(
                         &mut chunks,
                         &mut media,
-                        &speakers,
+                        &mut speakers,
                         &context,
                         name,
                         &entries,
@@ -236,6 +238,7 @@ fn prepare_segment(
             }
         }
     }
+    warnings.extend(std::mem::take(&mut speakers.warnings));
     for raw_path in &unclaimed_images.raw_paths {
         let Some(raw_name) = raw_path.file_name().and_then(|n| n.to_str()) else {
             continue;
@@ -445,14 +448,25 @@ fn extract_modality_reason_codes(
 fn audio_chunks(
     chunks: &mut Vec<Value>,
     media: &mut SegmentMedia,
-    speakers: &crate::segment_speakers::SpeakerJoin,
+    speakers: &mut crate::segment_speakers::SpeakerJoin,
     context: &SegmentContext<'_>,
     name: &str,
     entries: &[Map<String, Value>],
     placement: Option<&AudioArchivePlacement>,
 ) {
     let source = name.trim_end_matches(".jsonl");
-    let ids = embedding_ids(context.dir, source);
+    let ids = match embedding_ids(context.dir, source) {
+        Ok(ids) => Some(ids),
+        Err(error) => {
+            speakers.warnings.push(warning(
+                "speaker_labels",
+                &context.dir.join(format!("{source}.npz")),
+                error.to_string(),
+                context.now,
+            ));
+            None
+        }
+    };
     let voices = speakers.voices(
         context.root,
         context.day,
@@ -529,7 +543,10 @@ fn audio_chunks(
         if row.get("turn_boundary_suspect").and_then(Value::as_bool) == Some(true) {
             markdown = format!("{markdown} [{POSSIBLE_SPEAKER_CHANGE_WITHIN_SENTENCE}]");
         }
-        let mut chunk = json!({"type":"audio","time":start,"timestamp":produced.chunks.iter().find(|chunk| chunk.source.as_ref() == Some(row)).and_then(|chunk| chunk.occurrence_time_ms).map_or(0, |value| local_wall_instant(context.zone, value.0)),"markdown":markdown,"sentence_id":sid,"speaker_source":source,"has_embedding":sid.is_some_and(|id| ids.contains(&id)),"speaker_actionable":speakers.state.present && speakers.state.loaded && speakers.state.source.as_deref() == Some(source) && sid.is_some_and(|id| ids.contains(&id)),"source_ref":{"start":start,"source":row.get("source"),"speaker":row.get("speaker")}});
+        let has_embedding = ids
+            .as_ref()
+            .is_some_and(|ids| sid.is_some_and(|id| ids.contains(&id)));
+        let mut chunk = json!({"type":"audio","time":start,"timestamp":produced.chunks.iter().find(|chunk| chunk.source.as_ref() == Some(row)).and_then(|chunk| chunk.occurrence_time_ms).map_or(0, |value| local_wall_instant(context.zone, value.0)),"markdown":markdown,"sentence_id":sid,"speaker_source":source,"has_embedding":has_embedding,"speaker_actionable":speakers.state.present && speakers.state.loaded && speakers.state.source.as_deref() == Some(source) && has_embedding,"source_ref":{"start":start,"source":row.get("source"),"speaker":row.get("speaker")}});
         if let Some((ref audio_url, origin_ms)) = placement_media
             && let Some(obj) = chunk.as_object_mut()
         {

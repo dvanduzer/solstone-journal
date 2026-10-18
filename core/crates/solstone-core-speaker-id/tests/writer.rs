@@ -625,7 +625,14 @@ fn ac19_npz_has_exactly_four_expected_members() {
         ZipArchive::new(fs::File::open(directory.path().join("segment.npz")).expect("open"))
             .expect("archive");
     let mut names = (0..archive.len())
-        .map(|index| archive.by_index(index).expect("member").name().to_owned())
+        .map(|index| {
+            archive
+                .by_index(index)
+                .expect("member")
+                .name()
+                .expect("zip member name")
+                .into_owned()
+        })
         .collect::<Vec<_>>();
     names.sort_unstable();
     assert_eq!(

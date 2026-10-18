@@ -356,15 +356,16 @@ fn plan_zip_archive(archive_path: &Path) -> Result<ArchivePlan, ImportSourcesErr
             detail: error.to_string(),
         },
     })?;
-    let mut archive =
-        ZipArchive::new(file).map_err(|error| ImportSourcesError::ArchiveInvalid {
-            path: archive_path.to_path_buf(),
-            detail: error.to_string(),
-        })?;
+    let archive = ZipArchive::new(file).map_err(|error| ImportSourcesError::ArchiveInvalid {
+        path: archive_path.to_path_buf(),
+        detail: error.to_string(),
+    })?;
+    let (mut archive, proved_names) = crate::zip_names::prove_open_zip(archive)
+        .map_err(|failure| crate::zip_names::archive_invalid(archive_path, failure))?;
     let mut names = Vec::with_capacity(archive.len());
     let mut directories = Vec::with_capacity(archive.len());
     let mut root_candidates = BTreeSet::new();
-    for index in 0..archive.len() {
+    for (index, proved_name) in proved_names.iter().enumerate() {
         let entry =
             archive
                 .by_index(index)
@@ -372,7 +373,7 @@ fn plan_zip_archive(archive_path: &Path) -> Result<ArchivePlan, ImportSourcesErr
                     path: archive_path.to_path_buf(),
                     detail: error.to_string(),
                 })?;
-        let name = entry.name().replace('\\', "/");
+        let name = proved_name.replace('\\', "/");
         let is_dir = entry.is_dir() || name.ends_with('/');
         if let Some(first) = member_components(&name).first().copied()
             && first != "__MACOSX"
@@ -733,14 +734,15 @@ fn validate_zip_archive(
         path: path.to_path_buf(),
         detail: error.to_string(),
     })?;
-    let mut archive =
-        ZipArchive::new(file).map_err(|error| ImportSourcesError::ArchiveInvalid {
-            path: path.to_path_buf(),
-            detail: error.to_string(),
-        })?;
+    let archive = ZipArchive::new(file).map_err(|error| ImportSourcesError::ArchiveInvalid {
+        path: path.to_path_buf(),
+        detail: error.to_string(),
+    })?;
+    let (mut archive, proved_names) = crate::zip_names::prove_open_zip(archive)
+        .map_err(|failure| crate::zip_names::archive_invalid(path, failure))?;
     let mut root_candidates = BTreeSet::new();
     let mut expanded_size = 0_u64;
-    for index in 0..archive.len() {
+    for (index, name) in proved_names.iter().enumerate() {
         let entry =
             archive
                 .by_index(index)
@@ -749,12 +751,12 @@ fn validate_zip_archive(
                     detail: error.to_string(),
                 })?;
         validate_entry(
-            entry.name(),
+            name,
             entry.unix_mode(),
             entry.encrypted(),
             ArchiveSafetyPhase::Validation,
         )?;
-        let normalized = Path::new(entry.name());
+        let normalized = Path::new(name.as_str());
         if let Some(Component::Normal(first)) = normalized.components().next()
             && first != "__MACOSX"
             && first != ".DS_Store"
@@ -899,38 +901,71 @@ fn extract_zip_archive(
             },
         );
     }
-    let file = File::open(path).map_err(|error| ImportSourcesError::ExtractionFailed {
-        archive: path.to_path_buf(),
-        extraction_dir: run_dir.to_path_buf(),
-        detail: error.to_string(),
-    })?;
-    let mut archive =
-        ZipArchive::new(file).map_err(|error| ImportSourcesError::ExtractionFailed {
-            archive: path.to_path_buf(),
-            extraction_dir: run_dir.to_path_buf(),
-            detail: error.to_string(),
-        })?;
-    let mut copied = 0_u64;
-    for index in 0..archive.len() {
-        let mut entry =
-            archive
-                .by_index(index)
-                .map_err(|error| ImportSourcesError::ExtractionFailed {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            return cleanup_extraction(
+                path,
+                run_dir,
+                ImportSourcesError::ExtractionFailed {
                     archive: path.to_path_buf(),
                     extraction_dir: run_dir.to_path_buf(),
                     detail: error.to_string(),
-                })?;
+                },
+            );
+        }
+    };
+    let archive = match ZipArchive::new(file) {
+        Ok(archive) => archive,
+        Err(error) => {
+            return cleanup_extraction(
+                path,
+                run_dir,
+                ImportSourcesError::ExtractionFailed {
+                    archive: path.to_path_buf(),
+                    extraction_dir: run_dir.to_path_buf(),
+                    detail: error.to_string(),
+                },
+            );
+        }
+    };
+    let (mut archive, proved_names) = match crate::zip_names::prove_open_zip(archive) {
+        Ok(opened) => opened,
+        Err(failure) => {
+            return cleanup_extraction(
+                path,
+                run_dir,
+                crate::zip_names::archive_invalid(path, failure),
+            );
+        }
+    };
+    let mut copied = 0_u64;
+    for (index, name) in proved_names.iter().enumerate() {
+        let mut entry = match archive.by_index(index) {
+            Ok(entry) => entry,
+            Err(error) => {
+                return cleanup_extraction(
+                    path,
+                    run_dir,
+                    ImportSourcesError::ExtractionFailed {
+                        archive: path.to_path_buf(),
+                        extraction_dir: run_dir.to_path_buf(),
+                        detail: error.to_string(),
+                    },
+                );
+            }
+        };
         // With stable archive bytes this duplicates validation; it detects entries that change
         // between validation's read and this extraction read.
         if let Err(error) = validate_entry(
-            entry.name(),
+            name,
             entry.unix_mode(),
             entry.encrypted(),
             ArchiveSafetyPhase::Extraction,
         ) {
             return cleanup_extraction(path, run_dir, error);
         }
-        let output = run_dir.join(entry.name());
+        let output = run_dir.join(name);
         if entry.is_dir() {
             if let Err(error) = fs::create_dir_all(&output) {
                 return cleanup_extraction(
@@ -5112,5 +5147,205 @@ mod tests {
         let error =
             merge_journal_archive(&archive, &target, &merge_options(&tree), None).unwrap_err();
         assert_eq!(error.mutation_state(), MergeMutationState::MayHaveMutated);
+    }
+
+    fn write_bytes_zip(tree: &Path, bytes: &[u8]) -> PathBuf {
+        let archive = tree.join(format!("hand-{}.zip", NEXT.fetch_add(1, Ordering::Relaxed)));
+        fs::write(&archive, bytes).unwrap();
+        archive
+    }
+
+    fn extract_named(bytes: &[u8]) -> Result<(PlanTree, PathBuf), ImportSourcesError> {
+        let tree = PlanTree::new();
+        let archive = write_bytes_zip(&tree.path, bytes);
+        let run_dir = tree.path.join("run");
+        let options = ArchiveMergeOptions {
+            working_root: tree.path.join("work"),
+            ..ArchiveMergeOptions::default()
+        };
+        extract_zip_archive(&archive, Path::new(""), 64, &run_dir, &options)?;
+        Ok((tree, run_dir))
+    }
+
+    fn extract_error(bytes: &[u8]) -> (ImportSourcesError, PathBuf) {
+        let tree = PlanTree::new();
+        let archive = write_bytes_zip(&tree.path, bytes);
+        let run_dir = tree.path.join("run");
+        let options = ArchiveMergeOptions {
+            working_root: tree.path.join("work"),
+            ..ArchiveMergeOptions::default()
+        };
+        let error = extract_zip_archive(&archive, Path::new(""), 64, &run_dir, &options)
+            .expect_err("extract must fail");
+        let run_exists = run_dir.exists();
+        drop(tree);
+        (
+            error,
+            PathBuf::from(if run_exists { "exists" } else { "gone" }),
+        )
+    }
+
+    #[test]
+    fn zip2_name_extract_matrix_keeps_zip2_identities() {
+        use crate::zip_names::fixtures::{Member, UTF8_FLAG, ascii, build_zip, extra_7075};
+
+        let flagged = build_zip(&[ascii("café.txt", b"utf8")]);
+        let (_tree, run) = extract_named(&flagged).expect("flagged utf8");
+        assert_eq!(fs::read(run.join("café.txt")).unwrap(), b"utf8");
+
+        let mut cp437 = b"Cura".to_vec();
+        cp437.push(0x87);
+        cp437.extend_from_slice(b"ao.txt");
+        let unflagged = build_zip(&[Member {
+            name: cp437,
+            flags: 0,
+            extra: Vec::new(),
+            data: b"island".to_vec(),
+        }]);
+        let (_tree, run) = extract_named(&unflagged).expect("unflagged cp437");
+        assert_eq!(fs::read(run.join("Curaçao.txt")).unwrap(), b"island");
+
+        let box_drawings = build_zip(&[Member {
+            name: vec![0xC3, 0xA9],
+            flags: 0,
+            extra: Vec::new(),
+            data: b"cp".to_vec(),
+        }]);
+        let (_tree, run) = extract_named(&box_drawings).expect("unflagged c3 a9");
+        assert_eq!(fs::read(run.join("├⌐")).unwrap(), b"cp");
+
+        let zip9_pair = build_zip(&[
+            Member {
+                name: vec![0xC3, 0xA9],
+                flags: 0,
+                extra: Vec::new(),
+                data: b"a".to_vec(),
+            },
+            Member {
+                name: "é".as_bytes().to_vec(),
+                flags: UTF8_FLAG,
+                extra: Vec::new(),
+                data: b"b".to_vec(),
+            },
+        ]);
+        // These raw names differ under ZIP2, but ZIP9 collapses their raw keys.
+        // Refuse before extraction rather than silently publishing one member.
+        let (error, run_state) = extract_error(&zip9_pair);
+        assert!(matches!(error, ImportSourcesError::ArchiveInvalid { .. }));
+        assert_eq!(run_state, PathBuf::from("gone"));
+
+        let collision = build_zip(&[
+            Member {
+                name: vec![0x82],
+                flags: 0,
+                extra: Vec::new(),
+                data: b"a".to_vec(),
+            },
+            Member {
+                name: "é".as_bytes().to_vec(),
+                flags: UTF8_FLAG,
+                extra: Vec::new(),
+                data: b"b".to_vec(),
+            },
+        ]);
+        let (error, leftover) = extract_error(&collision);
+        assert!(
+            matches!(error, ImportSourcesError::ArchiveInvalid { .. }),
+            "{error:?}"
+        );
+        assert_eq!(leftover, PathBuf::from("gone"));
+
+        let unicode_path = build_zip(&[Member {
+            name: b"raw".to_vec(),
+            flags: 0,
+            extra: extra_7075(b"raw", b"unicode.txt", None),
+            data: b"u".to_vec(),
+        }]);
+        let (_tree, run) = extract_named(&unicode_path).expect("valid 0x7075");
+        assert_eq!(fs::read(run.join("unicode.txt")).unwrap(), b"u");
+
+        let bad_crc = build_zip(&[Member {
+            name: b"raw".to_vec(),
+            flags: 0,
+            extra: extra_7075(b"raw", b"unicode.txt", Some(0)),
+            data: b"u".to_vec(),
+        }]);
+        assert!(matches!(
+            extract_error(&bad_crc).0,
+            ImportSourcesError::ArchiveInvalid { .. }
+        ));
+
+        let bad_utf8 = build_zip(&[Member {
+            name: b"raw".to_vec(),
+            flags: 0,
+            extra: extra_7075(b"raw", &[0xFF], None),
+            data: b"u".to_vec(),
+        }]);
+        assert!(matches!(
+            extract_error(&bad_utf8).0,
+            ImportSourcesError::ArchiveInvalid { .. }
+        ));
+
+        let tree = PlanTree::new();
+        let good_bytes = build_zip(&[ascii("ok.txt", b"payload")]);
+        let good = write_bytes_zip(&tree.path, &good_bytes);
+        let mut truncated_bytes = good_bytes.clone();
+        truncated_bytes.truncate(truncated_bytes.len() / 2);
+        let truncated = write_bytes_zip(&tree.path, &truncated_bytes);
+        let options = ArchiveMergeOptions {
+            working_root: tree.path.join("work"),
+            ..ArchiveMergeOptions::default()
+        };
+        let trunc_run = tree.path.join("trunc-run");
+        let trunc_err =
+            extract_zip_archive(&truncated, Path::new(""), 64, &trunc_run, &options).unwrap_err();
+        assert!(
+            matches!(
+                trunc_err,
+                ImportSourcesError::ExtractionFailed { .. }
+                    | ImportSourcesError::ArchiveInvalid { .. }
+            ),
+            "{trunc_err:?}"
+        );
+        assert!(!trunc_run.exists(), "truncated extract must clean up");
+        let twin_run = tree.path.join("twin-run");
+        extract_zip_archive(&good, Path::new(""), 64, &twin_run, &options).unwrap();
+        assert_eq!(fs::read(twin_run.join("ok.txt")).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn zip2_name_plan_and_validate_refuse_unproved_and_collision() {
+        use crate::zip_names::fixtures::{Member, UTF8_FLAG, ascii, build_zip};
+
+        let tree = PlanTree::new();
+        let flagged = write_bytes_zip(&tree.path, &build_zip(&[ascii("chronicle/x", b"ok")]));
+        plan_zip_archive(&flagged).expect("flagged utf8 plans");
+        validate_zip_archive(&flagged, &ArchiveMergeOptions::default()).expect("flagged validates");
+
+        let collision = write_bytes_zip(
+            &tree.path,
+            &build_zip(&[
+                Member {
+                    name: vec![0x82],
+                    flags: 0,
+                    extra: Vec::new(),
+                    data: b"a".to_vec(),
+                },
+                Member {
+                    name: "é".as_bytes().to_vec(),
+                    flags: UTF8_FLAG,
+                    extra: Vec::new(),
+                    data: b"b".to_vec(),
+                },
+            ]),
+        );
+        assert!(matches!(
+            plan_zip_archive(&collision),
+            Err(ImportSourcesError::ArchiveInvalid { .. })
+        ));
+        assert!(matches!(
+            validate_zip_archive(&collision, &ArchiveMergeOptions::default()),
+            Err(ImportSourcesError::ArchiveInvalid { .. })
+        ));
     }
 }

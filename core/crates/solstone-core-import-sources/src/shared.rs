@@ -461,21 +461,25 @@ pub(crate) fn read_zip_member(
     member: &'static str,
 ) -> Result<Option<Vec<u8>>, SourceError> {
     let file = File::open(path).map_err(|error| source_io(path, "open source", error))?;
-    let mut archive = ZipArchive::new(file).map_err(|error| SourceError::ArchiveOpen {
+    let archive = ZipArchive::new(file).map_err(|error| SourceError::ArchiveOpen {
         path: path.to_owned(),
         message: error.to_string(),
     })?;
-    let mut entry = match archive.by_name(member) {
-        Ok(entry) => entry,
-        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
-        Err(error) => {
-            return Err(SourceError::ArchiveMemberRead {
-                path: path.to_owned(),
-                member,
-                message: error.to_string(),
-            });
-        }
+    let (mut archive, names) =
+        crate::zip_names::prove_open_zip(archive).map_err(|failure| SourceError::ArchiveOpen {
+            path: path.to_owned(),
+            message: failure.to_string(),
+        })?;
+    let Some(index) = names.iter().position(|name| name == member) else {
+        return Ok(None);
     };
+    let mut entry = archive
+        .by_index(index)
+        .map_err(|error| SourceError::ArchiveMemberRead {
+            path: path.to_owned(),
+            member,
+            message: error.to_string(),
+        })?;
     let mut bytes = Vec::new();
     entry
         .read_to_end(&mut bytes)
@@ -531,5 +535,34 @@ mod windows_set_times_tests {
             .unwrap();
         assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
         assert_eq!(fs::read(&path).unwrap(), b"%PDF-1.4");
+    }
+}
+
+#[cfg(test)]
+mod zip2_name_tests {
+    use super::*;
+    use crate::zip_names::fixtures::{ascii, colliding};
+
+    #[test]
+    fn read_zip_member_refuses_collision_and_returns_none_only_for_proved_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = dir.path().join("ok.zip");
+        std::fs::write(
+            &ok,
+            crate::zip_names::fixtures::build_zip(&[ascii("conversations.json", b"[]")]),
+        )
+        .unwrap();
+        assert_eq!(
+            read_zip_member(&ok, "conversations.json").unwrap(),
+            Some(b"[]".to_vec())
+        );
+        assert_eq!(read_zip_member(&ok, "missing.json").unwrap(), None);
+
+        let bad = dir.path().join("bad.zip");
+        std::fs::write(&bad, colliding("conversations.json", b"[]")).unwrap();
+        assert!(matches!(
+            read_zip_member(&bad, "conversations.json"),
+            Err(SourceError::ArchiveOpen { .. })
+        ));
     }
 }

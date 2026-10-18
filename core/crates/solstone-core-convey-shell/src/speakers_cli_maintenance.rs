@@ -523,9 +523,13 @@ pub async fn backfill_last_seen(
             skipped_ineligible.push(entity_id.clone());
             continue;
         }
-        let Some(rows) = solstone_core_entity::load_entity_voiceprints_file(&root.0, entity_id)
-        else {
-            continue;
+        let rows = match crate::speakers_npz::entity_voiceprints_for_read(&root.0, entity_id) {
+            Ok(Some(rows)) => rows,
+            Ok(None) => continue,
+            Err(error) => {
+                errors.push(format!("{entity_id}: {error}"));
+                continue;
+            }
         };
         rows_scanned += rows.metadata.len();
         let count = rows
@@ -853,4 +857,50 @@ fn write_error(detail: String, _labels: bool) -> Response {
 }
 fn err(code: &str, message: &str, detail: &str, status: StatusCode) -> Response {
     error_envelope(code, message, detail, status).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+
+    #[tokio::test]
+    async fn last_seen_backfill_reports_unproved_names_without_writing_in_both_modes() {
+        for commit in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let entity = root.path().join("entities/person");
+            fs::create_dir_all(&entity).unwrap();
+            fs::write(
+                entity.join("entity.json"),
+                br#"{"id":"person","type":"Person"}"#,
+            )
+            .unwrap();
+            let segment = root.path().join("chronicle/20260808/main/120000_1/talents");
+            fs::create_dir_all(&segment).unwrap();
+            fs::write(
+                segment.join("speaker_labels.json"),
+                br#"{"labels":[{"speaker":"person"}]}"#,
+            )
+            .unwrap();
+            let bytes = crate::speakers_npz::tests::colliding("embeddings.npy", b"x");
+            let archive = entity.join("voiceprints.npz");
+            fs::write(&archive, &bytes).unwrap();
+            let request = Request::new(Body::from(json!({"commit":commit}).to_string()));
+            let response = backfill_last_seen(
+                Extension(Arc::new(JournalRoot(root.path().to_owned()))),
+                request,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                value["entities_seen"], 1,
+                "the fixture must reach the rejected entity"
+            );
+            assert_eq!(value["errors"].as_array().unwrap().len(), 1);
+            assert_eq!(value["rows_written"], 0);
+            assert_eq!(fs::read(&archive).unwrap(), bytes);
+        }
+    }
 }

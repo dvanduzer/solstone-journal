@@ -278,14 +278,16 @@ int wmain(int argc, wchar_t **argv) {{
             let build = self.directory.path().join(case);
             let current = build.join("Solstone/current");
             fs::create_dir_all(&current).unwrap();
-            let image = current.join("receiver.exe");
+            let filename = if probe {
+                "receiver.dll"
+            } else {
+                "receiver.exe"
+            };
+            let image = current.join(filename);
             let mut link = Command::new("link.exe");
             link.current_dir(&build)
-                .args([
-                    "/NOLOGO",
-                    "/SUBSYSTEM:CONSOLE",
-                    "/OUT:Solstone/current/receiver.exe",
-                ])
+                .args(["/NOLOGO", "/SUBSYSTEM:CONSOLE"])
+                .arg(format!("/OUT:Solstone/current/{filename}"))
                 .arg(
                     self.directory
                         .path()

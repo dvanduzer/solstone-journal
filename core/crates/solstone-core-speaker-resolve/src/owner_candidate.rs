@@ -70,20 +70,28 @@ pub fn load_owner_candidate(
     }
     let file =
         File::open(&path).map_err(|error| OwnerCandidateError::Archive(error.to_string()))?;
-    let mut archive =
+    let archive =
         ZipArchive::new(file).map_err(|error| OwnerCandidateError::Archive(error.to_string()))?;
-    let centroid = f32_vector(&member(&mut archive, "centroid.npy")?, "centroid.npy")?;
+    let (mut archive, names) = crate::zip_names::prove_open_zip(archive)
+        .map_err(|failure| OwnerCandidateError::Archive(failure.to_string()))?;
+    let centroid = f32_vector(
+        &member(&mut archive, &names, "centroid.npy")?,
+        "centroid.npy",
+    )?;
     let centroid = normalize_embedding(&centroid).ok_or_else(|| {
         OwnerCandidateError::Invalid("candidate centroid has zero norm".to_owned())
     })?;
     let cluster_size = i32_scalar(
-        &member(&mut archive, "cluster_size.npy")?,
+        &member(&mut archive, &names, "cluster_size.npy")?,
         "cluster_size.npy",
     )?;
-    let threshold = f32_scalar(&member(&mut archive, "threshold.npy")?, "threshold.npy")?;
-    let version = unicode_scalar(&member(&mut archive, "version.npy")?, "version.npy")?;
+    let threshold = f32_scalar(
+        &member(&mut archive, &names, "threshold.npy")?,
+        "threshold.npy",
+    )?;
+    let version = unicode_scalar(&member(&mut archive, &names, "version.npy")?, "version.npy")?;
     let evidence_tier = unicode_scalar(
-        &member(&mut archive, "evidence_tier.npy")?,
+        &member(&mut archive, &names, "evidence_tier.npy")?,
         "evidence_tier.npy",
     )?;
     Ok(Some(OwnerCandidate {
@@ -166,10 +174,19 @@ fn convert_write_error(error: OwnerCentroidWriteError) -> OwnerCandidateError {
     OwnerCandidateError::Archive(error.to_string())
 }
 
-fn member(archive: &mut ZipArchive<File>, name: &str) -> Result<Vec<u8>, OwnerCandidateError> {
-    let mut member = archive.by_name(name).map_err(|_| {
-        OwnerCandidateError::Invalid(format!("owner candidate is missing required member {name}"))
-    })?;
+fn member(
+    archive: &mut ZipArchive<File>,
+    names: &[String],
+    name: &str,
+) -> Result<Vec<u8>, OwnerCandidateError> {
+    let Some(index) = names.iter().position(|proved| proved == name) else {
+        return Err(OwnerCandidateError::Invalid(format!(
+            "owner candidate is missing required member {name}"
+        )));
+    };
+    let mut member = archive
+        .by_index(index)
+        .map_err(|error| OwnerCandidateError::Archive(error.to_string()))?;
     let mut bytes = Vec::new();
     member
         .read_to_end(&mut bytes)
@@ -272,5 +289,27 @@ mod tests {
         assert_eq!(cleared, None);
 
         drop(lock);
+    }
+
+    #[test]
+    fn load_owner_candidate_refuses_collision_instead_of_missing_member() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("awareness")).unwrap();
+        std::fs::write(
+            root.join("awareness/owner_candidate.npz"),
+            crate::zip_names::fixtures::colliding("centroid.npy", b"x"),
+        )
+        .unwrap();
+        let error = load_owner_candidate(root).expect_err("collision");
+        match error {
+            OwnerCandidateError::Archive(detail) => {
+                assert!(!detail.contains("missing required member"), "{detail}");
+            }
+            OwnerCandidateError::Invalid(detail) => {
+                panic!("collision must not look like absence: {detail}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

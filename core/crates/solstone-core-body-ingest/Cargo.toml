@@ -26,7 +26,7 @@ solstone-core-journal-io.workspace = true
 solstone-core-journal-config.workspace = true
 solstone-core-journal-config-write.workspace = true
 ureq = { workspace = true, features = ["rustls"] }
-zip = { version = "=2.4.2", default-features = false, features = ["deflate"] }
+zip = { version = "=9.0.3", default-features = false, features = ["deflate"] }
 
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true

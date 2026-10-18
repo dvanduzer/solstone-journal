@@ -4,10 +4,11 @@
 //! Small typed reads for the NPZ records shared by the speakers read surface.
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::path::Path;
 
 use serde_json::Value;
+use solstone_core_journal_io::zip2_name::{Zip2NameFailure, prove_zip2_directory};
 use solstone_core_npy::parse_npy;
 use zip::ZipArchive;
 
@@ -26,63 +27,112 @@ pub(crate) struct SegmentEmbeddings {
 ///
 /// This intentionally treats any unreadable or incomplete archive as absent,
 /// matching Python's broad failure handling around segment NPZ reads.
-pub(crate) fn load_segment_embeddings(path: &Path) -> Option<SegmentEmbeddings> {
-    let mut archive = open_archive(path)?;
-    f32_matrix(&member(&mut archive, "embeddings.npy")?, 256)?;
-    let statement_ids = i32_vector(&member(&mut archive, "statement_ids.npy")?)?;
-    let durations_s = match optional_member(&mut archive, "durations_s.npy") {
-        Some(bytes) => Some(f32_vector(&bytes)?),
+pub(crate) fn load_segment_embeddings(
+    path: &Path,
+) -> Result<Option<SegmentEmbeddings>, Zip2NameFailure> {
+    let Some((mut archive, names)) = open_archive(path)? else {
+        return Ok(None);
+    };
+    let Some(embeddings) = member(&mut archive, &names, "embeddings.npy")? else {
+        return Ok(None);
+    };
+    let Some(_) = f32_matrix(&embeddings, 256) else {
+        return Ok(None);
+    };
+    let Some(statement_bytes) = member(&mut archive, &names, "statement_ids.npy")? else {
+        return Ok(None);
+    };
+    let Some(statement_ids) = i32_vector(&statement_bytes) else {
+        return Ok(None);
+    };
+    let durations_s = match member(&mut archive, &names, "durations_s.npy")? {
+        Some(bytes) => Some(match f32_vector(&bytes) {
+            Some(values) => values,
+            None => return Ok(None),
+        }),
         None => None,
     };
-    Some(SegmentEmbeddings {
+    Ok(Some(SegmentEmbeddings {
         statement_ids,
         durations_s,
-    })
+    }))
 }
 
-pub(crate) fn load_voiceprints(path: &Path) -> Option<Voiceprints> {
-    let mut archive = open_archive(path)?;
-    let embeddings = f32_matrix(&member(&mut archive, "embeddings.npy")?, 256)?;
-    let metadata = unicode_array(&member(&mut archive, "metadata.npy")?)?
-        .into_iter()
-        .map(|row| serde_json::from_str(&row).ok())
-        .collect::<Option<Vec<_>>>()?;
-    (embeddings.len() == metadata.len()).then_some(Voiceprints {
+pub(crate) fn load_voiceprints(path: &Path) -> Result<Option<Voiceprints>, Zip2NameFailure> {
+    let Some((mut archive, names)) = open_archive(path)? else {
+        return Ok(None);
+    };
+    let Some(embedding_bytes) = member(&mut archive, &names, "embeddings.npy")? else {
+        return Ok(None);
+    };
+    let Some(embeddings) = f32_matrix(&embedding_bytes, 256) else {
+        return Ok(None);
+    };
+    let Some(metadata_bytes) = member(&mut archive, &names, "metadata.npy")? else {
+        return Ok(None);
+    };
+    let Some(metadata) = unicode_array(&metadata_bytes).and_then(|rows| {
+        rows.into_iter()
+            .map(|row| serde_json::from_str(&row).ok())
+            .collect::<Option<Vec<_>>>()
+    }) else {
+        return Ok(None);
+    };
+    Ok((embeddings.len() == metadata.len()).then_some(Voiceprints {
         embeddings,
         metadata,
-    })
+    }))
 }
 
-pub(crate) fn owner_centroid_summary(path: &Path) -> Option<OwnerCentroidSummary> {
-    let mut archive = open_archive(path)?;
-    let centroid = f32_vector(&member(&mut archive, "centroid.npy")?)?;
+pub(crate) fn owner_centroid_summary(
+    path: &Path,
+) -> Result<Option<OwnerCentroidSummary>, Zip2NameFailure> {
+    let Some((mut archive, names)) = open_archive(path)? else {
+        return Ok(None);
+    };
+    let Some(centroid_bytes) = member(&mut archive, &names, "centroid.npy")? else {
+        return Ok(None);
+    };
+    let Some(centroid) = f32_vector(&centroid_bytes) else {
+        return Ok(None);
+    };
     let norm = centroid
         .iter()
         .map(|value| value * value)
         .sum::<f32>()
         .sqrt();
     if norm == 0.0 {
-        return None;
+        return Ok(None);
     }
-    let threshold = f32_scalar(&member(&mut archive, "threshold.npy")?)?;
-    let cluster_size = i32_scalar(&member(&mut archive, "cluster_size.npy")?)?;
-    let margin = optional_member(&mut archive, "margin.npy").and_then(|bytes| f32_scalar(&bytes));
-    let last_refreshed_at = optional_member(&mut archive, "last_refreshed_at.npy")
+    let Some(threshold_bytes) = member(&mut archive, &names, "threshold.npy")? else {
+        return Ok(None);
+    };
+    let Some(threshold) = f32_scalar(&threshold_bytes) else {
+        return Ok(None);
+    };
+    let Some(cluster_size_bytes) = member(&mut archive, &names, "cluster_size.npy")? else {
+        return Ok(None);
+    };
+    let Some(cluster_size) = i32_scalar(&cluster_size_bytes) else {
+        return Ok(None);
+    };
+    let margin = member(&mut archive, &names, "margin.npy")?.and_then(|bytes| f32_scalar(&bytes));
+    let last_refreshed_at = member(&mut archive, &names, "last_refreshed_at.npy")?
         .and_then(|bytes| unicode_scalar(&bytes))
         .unwrap_or_default();
-    let created_at = optional_member(&mut archive, "created_at.npy")
+    let created_at = member(&mut archive, &names, "created_at.npy")?
         .and_then(|bytes| unicode_scalar(&bytes))
         .filter(|value| !value.is_empty());
-    let evidence_tier = optional_member(&mut archive, "evidence_tier.npy")
+    let evidence_tier = member(&mut archive, &names, "evidence_tier.npy")?
         .and_then(|bytes| unicode_scalar(&bytes))
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "standard".to_owned());
-    let evidence_hash = optional_member(&mut archive, "evidence_hash.npy")
+    let evidence_hash = member(&mut archive, &names, "evidence_hash.npy")?
         .and_then(|bytes| unicode_scalar(&bytes))
         .filter(|value| !value.is_empty());
-    let evidence_intra_cosine_p25 = optional_member(&mut archive, "evidence_intra_cosine_p25.npy")
+    let evidence_intra_cosine_p25 = member(&mut archive, &names, "evidence_intra_cosine_p25.npy")?
         .and_then(|bytes| f32_scalar(&bytes));
-    Some(OwnerCentroidSummary {
+    Ok(Some(OwnerCentroidSummary {
         cluster_size,
         threshold,
         margin,
@@ -91,7 +141,7 @@ pub(crate) fn owner_centroid_summary(path: &Path) -> Option<OwnerCentroidSummary
         evidence_tier,
         evidence_hash,
         evidence_intra_cosine_p25,
-    })
+    }))
 }
 
 pub(crate) struct OwnerCentroidSummary {
@@ -105,26 +155,85 @@ pub(crate) struct OwnerCentroidSummary {
     pub(crate) evidence_intra_cosine_p25: Option<f32>,
 }
 
-pub(crate) fn npz_row_count(path: &Path, name: &str) -> Option<usize> {
-    let mut archive = open_archive(path)?;
-    let member = member(&mut archive, &format!("{name}.npy"))?;
-    let blob = parse_npy(&member).ok()?;
-    (!blob.shape.is_empty()).then_some(blob.shape[0])
+pub(crate) fn npz_row_count(path: &Path, name: &str) -> Result<Option<usize>, Zip2NameFailure> {
+    let Some((mut archive, names)) = open_archive(path)? else {
+        return Ok(None);
+    };
+    let Some(member) = member(&mut archive, &names, &format!("{name}.npy"))? else {
+        return Ok(None);
+    };
+    let blob = parse_npy(&member).ok();
+    Ok(blob.and_then(|blob| (!blob.shape.is_empty()).then_some(blob.shape[0])))
 }
 
-fn open_archive(path: &Path) -> Option<ZipArchive<File>> {
-    ZipArchive::new(File::open(path).ok()?).ok()
+type ProvedArchive = (ZipArchive<File>, Vec<String>);
+
+/// Preserve legacy optional entity reads while refusing unproved member names.
+pub(crate) fn entity_voiceprints_for_read(
+    root: &Path,
+    entity_id: &str,
+) -> Result<Option<solstone_core_entity::VoiceprintArchive>, Zip2NameFailure> {
+    match solstone_core_entity::try_load_entity_voiceprints_file(root, entity_id) {
+        Ok(archive) => Ok(archive),
+        Err(solstone_core_entity::VoiceprintOperationError::Npz(
+            solstone_core_entity::VoiceprintNpzError::NameProof(failure),
+        )) => Err(failure),
+        Err(_) => Ok(None),
+    }
 }
 
-fn member(archive: &mut ZipArchive<File>, name: &str) -> Option<Vec<u8>> {
-    let mut member = archive.by_name(name).ok()?;
+fn open_archive(path: &Path) -> Result<Option<ProvedArchive>, Zip2NameFailure> {
+    let Ok(file) = File::open(path) else {
+        return Ok(None);
+    };
+    let archive = match ZipArchive::new(file) {
+        Ok(archive) => archive,
+        Err(_) => return Ok(None),
+    };
+    Ok(Some(prove_open_zip(archive)?))
+}
+
+fn prove_open_zip<R: Read + Seek>(
+    mut archive: ZipArchive<R>,
+) -> Result<(ZipArchive<R>, Vec<String>), Zip2NameFailure> {
+    let mut coords = Vec::with_capacity(archive.len());
+    for index in 0..archive.len() {
+        let entry = archive
+            .by_index(index)
+            .map_err(|error| Zip2NameFailure::Unreadable {
+                detail: error.to_string(),
+            })?;
+        coords.push((entry.header_start(), entry.central_header_start()));
+    }
+    let central_start = archive.central_directory_start();
+    let mut reader = archive.into_inner();
+    let names = prove_zip2_directory(&mut reader, central_start, &coords)?;
+    let archive = ZipArchive::new(reader).map_err(|error| Zip2NameFailure::Unreadable {
+        detail: error.to_string(),
+    })?;
+    Ok((archive, names))
+}
+
+fn member(
+    archive: &mut ZipArchive<File>,
+    names: &[String],
+    name: &str,
+) -> Result<Option<Vec<u8>>, Zip2NameFailure> {
+    let Some(index) = names.iter().position(|proved| proved == name) else {
+        return Ok(None);
+    };
+    let mut member = archive
+        .by_index(index)
+        .map_err(|error| Zip2NameFailure::Unreadable {
+            detail: error.to_string(),
+        })?;
     let mut bytes = Vec::new();
-    member.read_to_end(&mut bytes).ok()?;
-    Some(bytes)
-}
-
-fn optional_member(archive: &mut ZipArchive<File>, name: &str) -> Option<Vec<u8>> {
-    member(archive, name)
+    member
+        .read_to_end(&mut bytes)
+        .map_err(|error| Zip2NameFailure::Unreadable {
+            detail: error.to_string(),
+        })?;
+    Ok(Some(bytes))
 }
 
 fn f32_matrix(bytes: &[u8], columns: usize) -> Option<Vec<Vec<f32>>> {
@@ -218,4 +327,86 @@ fn unicode_from_utf32(bytes: &[u8]) -> Option<String> {
         }
     }
     Some(value)
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use solstone_core_journal_io::zip2_name::crc32_ieee;
+
+    pub(crate) fn colliding(name: &str, data: &[u8]) -> Vec<u8> {
+        const UTF8_FLAG: u16 = 1 << 11;
+        let flagged = "é".as_bytes();
+        stored_zip(&[
+            (name.as_bytes(), UTF8_FLAG, &[], data),
+            (&[0x82], 0, &[], b"a"),
+            (flagged, UTF8_FLAG, &[], b"b"),
+        ])
+    }
+
+    fn stored_zip(members: &[(&[u8], u16, &[u8], &[u8])]) -> Vec<u8> {
+        let mut local = Vec::new();
+        let mut offsets = Vec::new();
+        for (name, flags, _extra, data) in members {
+            offsets.push(local.len() as u32);
+            let crc = crc32_ieee(data);
+            let size = data.len() as u32;
+            local.extend_from_slice(b"PK\x03\x04");
+            local.extend_from_slice(&20_u16.to_le_bytes());
+            local.extend_from_slice(&flags.to_le_bytes());
+            local.extend_from_slice(&[0; 6]);
+            local.extend_from_slice(&crc.to_le_bytes());
+            local.extend_from_slice(&size.to_le_bytes());
+            local.extend_from_slice(&size.to_le_bytes());
+            local.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            local.extend_from_slice(&0_u16.to_le_bytes());
+            local.extend_from_slice(name);
+            local.extend_from_slice(data);
+        }
+        let cd_start = local.len() as u32;
+        let mut central = Vec::new();
+        for (index, (name, flags, extra, data)) in members.iter().enumerate() {
+            let crc = crc32_ieee(data);
+            let size = data.len() as u32;
+            central.extend_from_slice(b"PK\x01\x02");
+            central.extend_from_slice(&20_u16.to_le_bytes());
+            central.extend_from_slice(&20_u16.to_le_bytes());
+            central.extend_from_slice(&flags.to_le_bytes());
+            central.extend_from_slice(&[0; 6]);
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&size.to_le_bytes());
+            central.extend_from_slice(&size.to_le_bytes());
+            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            central.extend_from_slice(&(extra.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0_u16.to_le_bytes());
+            central.extend_from_slice(&0_u16.to_le_bytes());
+            central.extend_from_slice(&0_u16.to_le_bytes());
+            central.extend_from_slice(&0_u32.to_le_bytes());
+            central.extend_from_slice(&offsets[index].to_le_bytes());
+            central.extend_from_slice(name);
+            central.extend_from_slice(extra);
+        }
+        let mut bytes = local;
+        bytes.extend_from_slice(&central);
+        let count = members.len() as u16;
+        bytes.extend_from_slice(b"PK\x05\x06");
+        bytes.extend_from_slice(&[0; 4]);
+        bytes.extend_from_slice(&count.to_le_bytes());
+        bytes.extend_from_slice(&count.to_le_bytes());
+        bytes.extend_from_slice(&(central.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&cd_start.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn load_segment_embeddings_refuses_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.npz");
+        assert!(load_segment_embeddings(&missing).unwrap().is_none());
+
+        let collision = dir.path().join("collision.npz");
+        std::fs::write(&collision, colliding("embeddings.npy", b"x")).unwrap();
+        assert!(load_segment_embeddings(&collision).is_err());
+    }
 }

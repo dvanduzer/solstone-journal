@@ -4,10 +4,12 @@
 
 """Dependency-edge admission regressions for the mechanical notice refresh."""
 import copy
-import unittest
+import sys
 import tempfile
+import unittest
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import refresh_windows_rust_notices as refresh
 
 SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
@@ -262,6 +264,16 @@ class RegistryAdditionOutsideClosure(unittest.TestCase):
         before = [package("digest", source=SOURCE), package("old", source=SOURCE)]
         with self.assertRaisesRegex(refresh.RefreshError, "removed or upgraded"):
             refresh.classify_external_delta(before, [before[0], self.added()])
+
+    def test_zip_upgrade_and_velopack_source_loss_still_refuses(self):
+        before = [
+            package("zip", version="2.4.2", source=SOURCE),
+            package("zip", version="8.6.0", source=SOURCE),
+            package("velopack", version="1.2.0", source=SOURCE),
+        ]
+        after = [package("zip", version="9.0.3", source=SOURCE)]
+        with self.assertRaisesRegex(refresh.RefreshError, "removed or upgraded"):
+            refresh.classify_external_delta(before, after)
 
     def test_git_addition_refuses(self):
         before = [package("digest", source=SOURCE)]

@@ -3,13 +3,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
 use solstone_core_entity::{is_admissible_person, load_all_journal_entities};
+use solstone_core_journal_io::zip2_name::{Zip2NameFailure, prove_zip2_directory};
 use solstone_core_npy::parse_npy;
 use zip::ZipArchive;
 
@@ -225,11 +226,11 @@ pub(crate) fn load(
     }
 }
 
-pub(crate) fn embedding_ids(dir: &Path, source: &str) -> BTreeSet<i64> {
-    read_statement_ids(&dir.join(format!("{source}.npz")))
-        .unwrap_or_default()
-        .into_iter()
-        .collect()
+pub(crate) fn embedding_ids(dir: &Path, source: &str) -> Result<BTreeSet<i64>, Zip2NameFailure> {
+    match read_statement_ids(&dir.join(format!("{source}.npz")))? {
+        Some(ids) => Ok(ids.into_iter().collect()),
+        None => Ok(BTreeSet::new()),
+    }
 }
 pub(crate) fn statement_ordinals(text: &str) -> Vec<Option<i64>> {
     let mut ordinal = 0;
@@ -249,16 +250,35 @@ fn warning(path: &Path, message: &str, now: DateTime<Utc>) -> crate::segment::Wa
 fn fs_read_json(path: &Path) -> Option<Value> {
     serde_json::from_reader(File::open(path).ok()?).ok()
 }
-fn read_statement_ids(path: &Path) -> Option<Vec<i64>> {
-    let mut archive = ZipArchive::new(File::open(path).ok()?).ok()?;
-    let mut member = archive.by_name("statement_ids.npy").ok()?;
+fn read_statement_ids(path: &Path) -> Result<Option<Vec<i64>>, Zip2NameFailure> {
+    let Ok(file) = File::open(path) else {
+        return Ok(None);
+    };
+    let archive = ZipArchive::new(file).map_err(|error| Zip2NameFailure::Unreadable {
+        detail: error.to_string(),
+    })?;
+    let (mut archive, names) = prove_open_zip(archive)?;
+    let Some(index) = names.iter().position(|name| name == "statement_ids.npy") else {
+        return Ok(None);
+    };
+    let mut member = archive
+        .by_index(index)
+        .map_err(|error| Zip2NameFailure::Unreadable {
+            detail: error.to_string(),
+        })?;
     let mut bytes = Vec::new();
-    member.read_to_end(&mut bytes).ok()?;
-    let blob = parse_npy(&bytes).ok()?;
+    member
+        .read_to_end(&mut bytes)
+        .map_err(|error| Zip2NameFailure::Unreadable {
+            detail: error.to_string(),
+        })?;
+    let Some(blob) = parse_npy(&bytes).ok() else {
+        return Ok(None);
+    };
     if blob.fortran_order || blob.shape.len() != 1 {
-        return None;
+        return Ok(None);
     }
-    match blob.descr.as_str() {
+    Ok(match blob.descr.as_str() {
         "<i4" => blob
             .payload
             .chunks_exact(4)
@@ -270,7 +290,28 @@ fn read_statement_ids(path: &Path) -> Option<Vec<i64>> {
             .map(|b| Some(i64::from_le_bytes(b.try_into().ok()?)))
             .collect(),
         _ => None,
+    })
+}
+
+fn prove_open_zip<R: Read + Seek>(
+    mut archive: ZipArchive<R>,
+) -> Result<(ZipArchive<R>, Vec<String>), Zip2NameFailure> {
+    let mut coords = Vec::with_capacity(archive.len());
+    for index in 0..archive.len() {
+        let entry = archive
+            .by_index(index)
+            .map_err(|error| Zip2NameFailure::Unreadable {
+                detail: error.to_string(),
+            })?;
+        coords.push((entry.header_start(), entry.central_header_start()));
     }
+    let central_start = archive.central_directory_start();
+    let mut reader = archive.into_inner();
+    let names = prove_zip2_directory(&mut reader, central_start, &coords)?;
+    let archive = ZipArchive::new(reader).map_err(|error| Zip2NameFailure::Unreadable {
+        detail: error.to_string(),
+    })?;
+    Ok((archive, names))
 }
 
 #[cfg(test)]
@@ -378,5 +419,72 @@ mod tests {
         assert_eq!(join.warnings[0].kind, "speaker_labels");
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn embedding_ids_refuses_collision() {
+        use solstone_core_journal_io::zip2_name::crc32_ieee;
+
+        let dir = tempfile::tempdir().unwrap();
+        const UTF8_FLAG: u16 = 1 << 11;
+        let flagged = "é".as_bytes();
+        let mut local = Vec::new();
+        let mut offsets = Vec::new();
+        let members: [(&[u8], u16, &[u8], &[u8]); 3] = [
+            (b"statement_ids.npy", UTF8_FLAG, &[], b"x"),
+            (&[0x82], 0, &[], b"a"),
+            (flagged, UTF8_FLAG, &[], b"b"),
+        ];
+        for (name, flags, _extra, data) in members {
+            offsets.push(local.len() as u32);
+            let crc = crc32_ieee(data);
+            let size = data.len() as u32;
+            local.extend_from_slice(b"PK\x03\x04");
+            local.extend_from_slice(&20_u16.to_le_bytes());
+            local.extend_from_slice(&flags.to_le_bytes());
+            local.extend_from_slice(&[0; 6]);
+            local.extend_from_slice(&crc.to_le_bytes());
+            local.extend_from_slice(&size.to_le_bytes());
+            local.extend_from_slice(&size.to_le_bytes());
+            local.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            local.extend_from_slice(&0_u16.to_le_bytes());
+            local.extend_from_slice(name);
+            local.extend_from_slice(data);
+        }
+        let cd_start = local.len() as u32;
+        let mut central = Vec::new();
+        for (index, (name, flags, extra, data)) in members.iter().enumerate() {
+            let crc = crc32_ieee(data);
+            let size = data.len() as u32;
+            central.extend_from_slice(b"PK\x01\x02");
+            central.extend_from_slice(&20_u16.to_le_bytes());
+            central.extend_from_slice(&20_u16.to_le_bytes());
+            central.extend_from_slice(&flags.to_le_bytes());
+            central.extend_from_slice(&[0; 6]);
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&size.to_le_bytes());
+            central.extend_from_slice(&size.to_le_bytes());
+            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            central.extend_from_slice(&(extra.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0_u16.to_le_bytes());
+            central.extend_from_slice(&0_u16.to_le_bytes());
+            central.extend_from_slice(&0_u16.to_le_bytes());
+            central.extend_from_slice(&0_u32.to_le_bytes());
+            central.extend_from_slice(&offsets[index].to_le_bytes());
+            central.extend_from_slice(name);
+            central.extend_from_slice(extra);
+        }
+        let mut bytes = local;
+        bytes.extend_from_slice(&central);
+        let count = members.len() as u16;
+        bytes.extend_from_slice(b"PK\x05\x06");
+        bytes.extend_from_slice(&[0; 4]);
+        bytes.extend_from_slice(&count.to_le_bytes());
+        bytes.extend_from_slice(&count.to_le_bytes());
+        bytes.extend_from_slice(&(central.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&cd_start.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        fs::write(dir.path().join("audio.npz"), bytes).unwrap();
+        assert!(super::embedding_ids(dir.path(), "audio").is_err());
     }
 }

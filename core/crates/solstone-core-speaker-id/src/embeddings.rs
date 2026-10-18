@@ -48,12 +48,15 @@ pub fn load_embeddings_file(path: &Path) -> Result<Option<EmbeddingsFile>, Embed
         path: path.to_path_buf(),
         detail: error.to_string(),
     })?;
-    let mut archive =
+    let archive =
         ZipArchive::new(file).map_err(|error| EmbeddingsError::Archive(error.to_string()))?;
-    let Some(embedding_bytes) = optional_member(&mut archive, "embeddings.npy")? else {
+    let (mut archive, names) = crate::zip_names::prove_open_zip(archive)
+        .map_err(|failure| EmbeddingsError::Archive(failure.to_string()))?;
+    let Some(embedding_bytes) = optional_member(&mut archive, &names, "embeddings.npy")? else {
         return Ok(None);
     };
-    let Some(statement_id_bytes) = optional_member(&mut archive, "statement_ids.npy")? else {
+    let Some(statement_id_bytes) = optional_member(&mut archive, &names, "statement_ids.npy")?
+    else {
         return Ok(None);
     };
     let embeddings =
@@ -69,7 +72,7 @@ pub fn load_embeddings_file(path: &Path) -> Result<Option<EmbeddingsFile>, Embed
     }
     let statement_count = rows.len();
     let durations_s =
-        if let Some(duration_bytes) = optional_member(&mut archive, "durations_s.npy")? {
+        if let Some(duration_bytes) = optional_member(&mut archive, &names, "durations_s.npy")? {
             if let Ok(blob) = parse_npy(&duration_bytes) {
                 if blob.descr == "<f4" && !blob.fortran_order && blob.shape.len() == 1 {
                     let parsed = blob
@@ -105,19 +108,20 @@ pub fn load_embeddings_file(path: &Path) -> Result<Option<EmbeddingsFile>, Embed
 
 fn optional_member(
     archive: &mut ZipArchive<File>,
+    names: &[String],
     name: &str,
 ) -> Result<Option<Vec<u8>>, EmbeddingsError> {
-    match archive.by_name(name) {
-        Ok(mut member) => {
-            let mut bytes = Vec::new();
-            member
-                .read_to_end(&mut bytes)
-                .map_err(|error| EmbeddingsError::Archive(error.to_string()))?;
-            Ok(Some(bytes))
-        }
-        Err(zip::result::ZipError::FileNotFound) => Ok(None),
-        Err(error) => Err(EmbeddingsError::Archive(error.to_string())),
-    }
+    let Some(index) = names.iter().position(|proved| proved == name) else {
+        return Ok(None);
+    };
+    let mut member = archive
+        .by_index(index)
+        .map_err(|error| EmbeddingsError::Archive(error.to_string()))?;
+    let mut bytes = Vec::new();
+    member
+        .read_to_end(&mut bytes)
+        .map_err(|error| EmbeddingsError::Archive(error.to_string()))?;
+    Ok(Some(bytes))
 }
 
 fn f32_rows(blob: &NpyBlob<'_>) -> Result<Vec<Vec<f32>>, EmbeddingsError> {
@@ -247,10 +251,10 @@ mod tests {
         let mut members = Vec::new();
         for i in 0..archive.len() {
             let mut member = archive.by_index(i).unwrap();
-            if member.name() != "durations_s.npy" {
+            if member.name().unwrap() != "durations_s.npy" {
                 let mut data = Vec::new();
                 member.read_to_end(&mut data).unwrap();
-                members.push((member.name().to_owned(), data));
+                members.push((member.name().unwrap().into_owned(), data));
             }
         }
         let stripped_path = dir.path().join("stripped.npz");
@@ -280,7 +284,7 @@ mod tests {
         let mut members = Vec::new();
         for i in 0..archive.len() {
             let mut member = archive.by_index(i).unwrap();
-            let name = member.name().to_owned();
+            let name = member.name().unwrap().into_owned();
             let mut data = Vec::new();
             member.read_to_end(&mut data).unwrap();
             if name == "durations_s.npy" {
@@ -316,7 +320,7 @@ mod tests {
         let mut members = Vec::new();
         for i in 0..archive.len() {
             let mut member = archive.by_index(i).unwrap();
-            let name = member.name().to_owned();
+            let name = member.name().unwrap().into_owned();
             let mut data = Vec::new();
             member.read_to_end(&mut data).unwrap();
             if name == "durations_s.npy" {
@@ -340,5 +344,23 @@ mod tests {
         let file = load_embeddings_file(&custom_path).unwrap().expect("loaded");
         assert_eq!(file.statements.len(), 2);
         assert_eq!(file.durations_s, vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn load_embeddings_file_refuses_collision_and_unproved() {
+        let dir = TempTestDir::new();
+        let ok = write_test_npz(&dir, None);
+        load_embeddings_file(&ok).unwrap().expect("literal success");
+
+        let collision = dir.path().join("collision.npz");
+        fs::write(
+            &collision,
+            crate::zip_names::fixtures::colliding("embeddings.npy", b"x"),
+        )
+        .unwrap();
+        assert!(matches!(
+            load_embeddings_file(&collision),
+            Err(EmbeddingsError::Archive(_))
+        ));
     }
 }

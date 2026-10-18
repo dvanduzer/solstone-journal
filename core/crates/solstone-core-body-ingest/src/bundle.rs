@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Seek};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -656,12 +656,10 @@ fn populate(
             } => {
                 let file = open_regular_file(archive)
                     .map_err(|_| error(BodyIngestErrorKind::Source, "raw_archive"))?;
-                let mut archive = zip::ZipArchive::new(file)
+                let archive = zip::ZipArchive::new(file)
                     .map_err(|_| error(BodyIngestErrorKind::Source, "raw_archive"))?;
-                let mut reader = archive
-                    .by_name(member)
-                    .map_err(|_| error(BodyIngestErrorKind::Source, "raw_member"))?;
-                write_raw(staging, relative, &mut reader, options)?
+                let bytes = zip_member_bytes(archive, member)?;
+                write_raw(staging, relative, &mut bytes.as_slice(), options)?
             }
             RawAsset::Bytes { bytes, relative } => {
                 write_raw(staging, relative, &mut bytes.as_slice(), options)?
@@ -796,12 +794,10 @@ fn hash_raw_asset(asset: &RawAsset) -> Result<(u64, String), BodyIngestError> {
         } => {
             let file = open_regular_file(archive)
                 .map_err(|_| error(BodyIngestErrorKind::Source, "raw_archive"))?;
-            let mut archive = zip::ZipArchive::new(file)
+            let archive = zip::ZipArchive::new(file)
                 .map_err(|_| error(BodyIngestErrorKind::Source, "raw_archive"))?;
-            let mut reader = archive
-                .by_name(member)
-                .map_err(|_| error(BodyIngestErrorKind::Source, "raw_member"))?;
-            hash_reader(&mut reader, MAX_RAW_ASSET_BYTES)
+            let bytes = zip_member_bytes(archive, member)?;
+            hash_reader(&mut bytes.as_slice(), MAX_RAW_ASSET_BYTES)
         }
         RawAsset::Bytes { bytes, .. } => {
             let size = u64::try_from(bytes.len())
@@ -812,6 +808,25 @@ fn hash_raw_asset(asset: &RawAsset) -> Result<(u64, String), BodyIngestError> {
             Ok((size, format!("sha256:{:x}", Sha256::digest(bytes))))
         }
     }
+}
+
+fn zip_member_bytes<R: Read + Seek>(
+    archive: zip::ZipArchive<R>,
+    member: &str,
+) -> Result<Vec<u8>, BodyIngestError> {
+    let (mut archive, names) = crate::zip_names::prove_open_zip(archive)
+        .map_err(|_| error(BodyIngestErrorKind::Source, "raw_archive"))?;
+    let Some(index) = names.iter().position(|name| name == member) else {
+        return Err(error(BodyIngestErrorKind::Source, "raw_member"));
+    };
+    let mut reader = archive
+        .by_index(index)
+        .map_err(|_| error(BodyIngestErrorKind::Source, "raw_archive"))?;
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|_| error(BodyIngestErrorKind::Source, "raw_archive"))?;
+    Ok(bytes)
 }
 
 fn hash_file(path: &Path, limit: u64) -> Result<(u64, String), BodyIngestError> {
@@ -1036,6 +1051,38 @@ mod tests {
         )
         .unwrap();
         find_existing(imports, family, &hash, BodyRawRetention::Discard, None).unwrap_err()
+    }
+
+    #[test]
+    fn zip_member_bytes_refuses_collision_and_proved_absence() {
+        use std::io::Cursor;
+
+        use crate::zip_names::fixtures::{Member, UTF8_FLAG, build_zip, colliding};
+
+        let ok = build_zip(&[Member {
+            name: b"export.xml".to_vec(),
+            flags: UTF8_FLAG,
+            extra: Vec::new(),
+            data: b"<ok/>".to_vec(),
+        }]);
+        let archive = zip::ZipArchive::new(Cursor::new(ok)).unwrap();
+        assert_eq!(zip_member_bytes(archive, "export.xml").unwrap(), b"<ok/>");
+
+        let missing = build_zip(&[Member {
+            name: b"other.xml".to_vec(),
+            flags: UTF8_FLAG,
+            extra: Vec::new(),
+            data: b"<x/>".to_vec(),
+        }]);
+        let archive = zip::ZipArchive::new(Cursor::new(missing)).unwrap();
+        let error = zip_member_bytes(archive, "export.xml").unwrap_err();
+        assert_eq!(error.stage(), "raw_member");
+
+        let colliding = colliding("export.xml", b"<ok/>");
+        let archive = zip::ZipArchive::new(Cursor::new(colliding)).unwrap();
+        let error = zip_member_bytes(archive, "export.xml").unwrap_err();
+        assert_eq!(error.stage(), "raw_archive");
+        assert_ne!(error.stage(), "raw_member");
     }
 
     #[cfg(unix)]

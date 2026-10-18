@@ -96,7 +96,7 @@ fn rewrite_member(archive: &[u8], name: &str, replacement: Option<&[u8]>) -> Vec
     let mut found = false;
     for index in 0..source.len() {
         let mut member = source.by_index(index).unwrap();
-        let member_name = member.name().to_owned();
+        let member_name = member.name().unwrap().into_owned();
         let mut bytes = Vec::new();
         member.read_to_end(&mut bytes).unwrap();
         if member_name == name {

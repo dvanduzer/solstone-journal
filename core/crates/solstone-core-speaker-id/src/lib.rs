@@ -22,3 +22,4 @@ pub mod writer;
 
 mod ascii_json;
 mod npz;
+mod zip_names;

@@ -217,17 +217,20 @@ pub fn load_owner_centroid(
         path: path.clone(),
         detail: error.to_string(),
     })?;
-    let mut archive =
+    let archive =
         ZipArchive::new(file).map_err(|error| OwnerCentroidError::Archive(error.to_string()))?;
-    let centroid_bytes = read_member_bytes(&mut archive, "centroid.npy")?;
-    let threshold_bytes = read_member_bytes(&mut archive, "threshold.npy")?;
-    let cluster_size_bytes = read_member_bytes(&mut archive, "cluster_size.npy")?;
-    let margin = optional_member(&mut archive, "margin.npy")?;
-    let last_refreshed_at = optional_member(&mut archive, "last_refreshed_at.npy")?;
-    let created_at = optional_member(&mut archive, "created_at.npy")?;
-    let evidence_tier = optional_member(&mut archive, "evidence_tier.npy")?;
-    let evidence_hash = optional_member(&mut archive, "evidence_hash.npy")?;
-    let evidence_intra_cosine_p25 = optional_member(&mut archive, "evidence_intra_cosine_p25.npy")?;
+    let (mut archive, names) = crate::zip_names::prove_open_zip(archive)
+        .map_err(|failure| OwnerCentroidError::Archive(failure.to_string()))?;
+    let centroid_bytes = read_member_bytes(&mut archive, &names, "centroid.npy")?;
+    let threshold_bytes = read_member_bytes(&mut archive, &names, "threshold.npy")?;
+    let cluster_size_bytes = read_member_bytes(&mut archive, &names, "cluster_size.npy")?;
+    let margin = optional_member(&mut archive, &names, "margin.npy")?;
+    let last_refreshed_at = optional_member(&mut archive, &names, "last_refreshed_at.npy")?;
+    let created_at = optional_member(&mut archive, &names, "created_at.npy")?;
+    let evidence_tier = optional_member(&mut archive, &names, "evidence_tier.npy")?;
+    let evidence_hash = optional_member(&mut archive, &names, "evidence_hash.npy")?;
+    let evidence_intra_cosine_p25 =
+        optional_member(&mut archive, &names, "evidence_intra_cosine_p25.npy")?;
 
     let centroid_blob = parse_blob(&centroid_bytes)?;
     let threshold_blob = parse_blob(&threshold_bytes)?;
@@ -467,6 +470,35 @@ fn owner_centroid_at(
     Ok(entity_memory_path(journal_root, principal_entity_id, create)?.join("owner_centroid.npz"))
 }
 
+#[cfg(test)]
+mod zip2_name_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn load_owner_centroid_refuses_collision_instead_of_missing_member() {
+        let root = tempfile::tempdir().unwrap();
+        let entity = root.path().join("entities/owner");
+        std::fs::create_dir_all(&entity).unwrap();
+        std::fs::write(
+            entity.join("entity.json"),
+            json!({"id":"owner","name":"Owner","type":"Person","is_principal":true}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            entity.join("owner_centroid.npz"),
+            crate::zip_names::fixtures::colliding("centroid.npy", b"x"),
+        )
+        .unwrap();
+        let error = load_owner_centroid(root.path(), "owner").expect_err("collision");
+        assert!(matches!(error, OwnerCentroidError::Archive(_)), "{error:?}");
+        assert!(!matches!(
+            error,
+            OwnerCentroidError::MissingRequiredMember(_)
+        ));
+    }
+}
+
 fn base_members(
     centroid: &[f32],
     cluster_size: i32,
@@ -583,26 +615,28 @@ fn parse_blob(bytes: &[u8]) -> Result<NpyBlob<'_>, OwnerCentroidError> {
 
 fn optional_member(
     archive: &mut ZipArchive<File>,
+    names: &[String],
     name: &str,
 ) -> Result<Option<Vec<u8>>, OwnerCentroidError> {
-    match archive.by_name(name) {
-        Ok(mut member) => {
-            let mut bytes = Vec::new();
-            member
-                .read_to_end(&mut bytes)
-                .map_err(|error| OwnerCentroidError::Archive(error.to_string()))?;
-            Ok(Some(bytes))
-        }
-        Err(zip::result::ZipError::FileNotFound) => Ok(None),
-        Err(error) => Err(OwnerCentroidError::Archive(error.to_string())),
-    }
+    let Some(index) = names.iter().position(|proved| proved == name) else {
+        return Ok(None);
+    };
+    let mut member = archive
+        .by_index(index)
+        .map_err(|error| OwnerCentroidError::Archive(error.to_string()))?;
+    let mut bytes = Vec::new();
+    member
+        .read_to_end(&mut bytes)
+        .map_err(|error| OwnerCentroidError::Archive(error.to_string()))?;
+    Ok(Some(bytes))
 }
 
 fn read_member_bytes(
     archive: &mut ZipArchive<File>,
+    names: &[String],
     name: &str,
 ) -> Result<Vec<u8>, OwnerCentroidError> {
-    optional_member(archive, name)?.ok_or_else(|| {
+    optional_member(archive, names, name)?.ok_or_else(|| {
         OwnerCentroidError::MissingRequiredMember(format!(
             "owner centroid is missing required member {name}"
         ))

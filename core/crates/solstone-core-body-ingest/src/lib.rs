@@ -10,6 +10,7 @@ mod bundle;
 mod oura;
 mod oura_connect;
 mod oura_sync;
+mod zip_names;
 
 pub use apple::{
     AppleImportOptions, detect_apple_source, hold_apple_ingest_lock, preview_apple, save_apple,

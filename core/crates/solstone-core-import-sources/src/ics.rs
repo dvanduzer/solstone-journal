@@ -90,8 +90,11 @@ pub fn detect(path: &Path) -> bool {
     let Ok(archive) = ZipArchive::new(file) else {
         return false;
     };
-    archive
-        .file_names()
+    let Ok((_archive, names)) = crate::zip_names::prove_open_zip(archive) else {
+        return false;
+    };
+    names
+        .iter()
         .any(|name| name.to_ascii_lowercase().ends_with(".ics"))
 }
 
@@ -403,21 +406,26 @@ fn extract_ics_data(path: &Path) -> Result<Vec<Vec<u8>>, IcsError> {
         path: path.to_path_buf(),
         source,
     })?;
-    let mut archive = ZipArchive::new(file).map_err(|source| IcsError::Archive {
+    let archive = ZipArchive::new(file).map_err(|source| IcsError::Archive {
         path: path.to_path_buf(),
         source,
     })?;
+    let (mut archive, names) =
+        crate::zip_names::prove_open_zip(archive).map_err(|failure| IcsError::Archive {
+            path: path.to_path_buf(),
+            source: crate::zip_names::zip2_failure_to_zip_error(failure),
+        })?;
     let mut data = Vec::new();
-    for index in 0..archive.len() {
+    for (index, name) in names.iter().enumerate() {
+        if !name.to_ascii_lowercase().ends_with(".ics") {
+            continue;
+        }
         let mut entry = archive
             .by_index(index)
             .map_err(|source| IcsError::Archive {
                 path: path.to_path_buf(),
                 source,
             })?;
-        if !entry.name().to_ascii_lowercase().ends_with(".ics") {
-            continue;
-        }
         let mut bytes = Vec::new();
         entry
             .read_to_end(&mut bytes)
@@ -682,4 +690,31 @@ fn has_extension(path: &Path, expected: &str) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
+}
+
+#[cfg(test)]
+mod zip2_name_tests {
+    use super::*;
+    use crate::zip_names::fixtures::{ascii, colliding};
+
+    #[test]
+    fn extract_ics_zip_selects_literal_ics_and_refuses_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let ics = b"BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:1\nDTSTART:20260101T120000Z\nSUMMARY:Test\nEND:VEVENT\nEND:VCALENDAR\n";
+        let ok = dir.path().join("ok.zip");
+        std::fs::write(
+            &ok,
+            crate::zip_names::fixtures::build_zip(&[ascii("meet.ics", ics)]),
+        )
+        .unwrap();
+        let extracted = extract_ics_data(&ok).expect("literal .ics");
+        assert_eq!(extracted, vec![ics.to_vec()]);
+
+        let bad = dir.path().join("bad.zip");
+        std::fs::write(&bad, colliding("meet.ics", ics)).unwrap();
+        assert!(matches!(
+            extract_ics_data(&bad),
+            Err(IcsError::Archive { .. })
+        ));
+    }
 }

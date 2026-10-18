@@ -65,15 +65,13 @@ impl NpzMembers {
 
     pub(crate) fn verify_at(&self, path: &Path) -> Result<(), String> {
         let file = File::open(path).map_err(|error| error.to_string())?;
-        let mut archive = ZipArchive::new(file).map_err(|error| error.to_string())?;
-        if archive.len() != MEMBER_NAMES.len() {
+        let archive = ZipArchive::new(file).map_err(|error| error.to_string())?;
+        let (mut archive, names) =
+            crate::zip_names::prove_open_zip(archive).map_err(|error| error.to_string())?;
+        if names.len() != MEMBER_NAMES.len() {
             return Err("NPZ has an unexpected member count".to_owned());
         }
-        let mut actual_names = Vec::with_capacity(archive.len());
-        for index in 0..archive.len() {
-            let file = archive.by_index(index).map_err(|error| error.to_string())?;
-            actual_names.push(file.name().to_owned());
-        }
+        let mut actual_names = names.clone();
         actual_names.sort_unstable();
         let mut expected_names = MEMBER_NAMES.map(str::to_owned).to_vec();
         expected_names.sort_unstable();
@@ -81,7 +79,11 @@ impl NpzMembers {
             return Err("NPZ members do not match the transcript sidecar contract".to_owned());
         }
         for (name, expected) in self.iter() {
-            let mut member = archive.by_name(name).map_err(|error| error.to_string())?;
+            let index = names
+                .iter()
+                .position(|proved| proved == name)
+                .ok_or_else(|| format!("NPZ member {name} is missing"))?;
+            let mut member = archive.by_index(index).map_err(|error| error.to_string())?;
             let mut actual = Vec::new();
             member
                 .read_to_end(&mut actual)
@@ -125,4 +127,37 @@ fn unicode_scalar_bytes(value: &str) -> Vec<u8> {
         bytes.extend_from_slice(&(character as u32).to_le_bytes());
     }
     bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::zip_names::fixtures::{Member, build_zip, colliding, extra_7075};
+
+    #[test]
+    fn verify_at_literal_success_and_collision_is_archive_error() {
+        let members = NpzMembers::build(&[0.0; 256], 1, &[1], &[1.0], "enc");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ok.npz");
+        std::fs::write(&path, members.archive().unwrap()).unwrap();
+        members.verify_at(&path).expect("literal success");
+
+        let bad = dir.path().join("bad.npz");
+        std::fs::write(&bad, colliding("embeddings.npy", &members.embeddings)).unwrap();
+        let error = members.verify_at(&bad).expect_err("collision");
+        assert!(error.contains("collision") || error.contains("unproved") || !error.is_empty());
+
+        let unflagged = dir.path().join("unflagged.npz");
+        std::fs::write(
+            &unflagged,
+            build_zip(&[Member {
+                name: b"embeddings.npy".to_vec(),
+                flags: 0,
+                extra: extra_7075(b"embeddings.npy", b"embeddings.npy", Some(0)),
+                data: members.embeddings.clone(),
+            }]),
+        )
+        .unwrap();
+        assert!(members.verify_at(&unflagged).is_err());
+    }
 }

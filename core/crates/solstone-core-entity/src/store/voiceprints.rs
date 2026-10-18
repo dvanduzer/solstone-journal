@@ -20,6 +20,7 @@ use solstone_core_journal_io::hold_lock;
 use solstone_core_journal_io::path_lexists;
 use solstone_core_journal_io::read_bytes;
 use solstone_core_journal_io::remove_file;
+use solstone_core_journal_io::zip2_name::{Zip2NameFailure, prove_zip2_directory};
 use solstone_core_npy::{NpyBlob, parse_npy, write_npy};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
@@ -81,6 +82,7 @@ impl VoiceprintArchive {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VoiceprintNpzError {
     Archive(String),
+    NameProof(Zip2NameFailure),
     Invalid(String),
     EmbeddingWidth { found: usize },
 }
@@ -89,6 +91,7 @@ impl fmt::Display for VoiceprintNpzError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Archive(message) | Self::Invalid(message) => formatter.write_str(message),
+            Self::NameProof(failure) => write!(formatter, "invalid voiceprint archive: {failure}"),
             Self::EmbeddingWidth { found } => write!(
                 formatter,
                 "embeddings.npy width {found} does not match {EMBEDDING_WIDTH}"
@@ -730,19 +733,12 @@ fn mark_all_missing(report: &mut VoiceprintRemovalReport, count: usize) {
 }
 
 pub(crate) fn read_voiceprints_npz(bytes: &[u8]) -> Result<VoiceprintArchive, VoiceprintNpzError> {
-    let mut archive = ZipArchive::new(Cursor::new(bytes)).map_err(|error| {
+    let archive = ZipArchive::new(Cursor::new(bytes)).map_err(|error| {
         VoiceprintNpzError::Archive(format!("invalid voiceprint archive: {error}"))
     })?;
-    let mut names = (0..archive.len())
-        .map(|index| {
-            archive
-                .by_index(index)
-                .map(|file| file.name().to_owned())
-                .map_err(|error| {
-                    VoiceprintNpzError::Archive(format!("invalid voiceprint archive: {error}"))
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let (mut archive, mut names) =
+        prove_open_zip(archive).map_err(VoiceprintNpzError::NameProof)?;
+    let original_names = names.clone();
     names.sort();
     if names
         .iter()
@@ -760,8 +756,8 @@ pub(crate) fn read_voiceprints_npz(bytes: &[u8]) -> Result<VoiceprintArchive, Vo
                 .to_owned(),
         ));
     }
-    let embeddings = read_member(&mut archive, EMBEDDINGS_MEMBER)?;
-    let metadata = read_member(&mut archive, METADATA_MEMBER)?;
+    let embeddings = read_member(&mut archive, &original_names, EMBEDDINGS_MEMBER)?;
+    let metadata = read_member(&mut archive, &original_names, METADATA_MEMBER)?;
     let (embedding_rows, values) = parse_embeddings(&embeddings)?;
     let (metadata_rows, metadata) = parse_metadata(&metadata)?;
     if embedding_rows != metadata_rows {
@@ -769,12 +765,12 @@ pub(crate) fn read_voiceprints_npz(bytes: &[u8]) -> Result<VoiceprintArchive, Vo
             "voiceprint embedding and metadata row counts differ".to_owned(),
         ));
     }
-    let envelope_count = names
+    let envelope_count = original_names
         .iter()
         .filter(|name| name.as_str() == ENVELOPE_MEMBER)
         .count();
     let envelope = if envelope_count == 1 {
-        read_member(&mut archive, ENVELOPE_MEMBER)
+        read_member(&mut archive, &original_names, ENVELOPE_MEMBER)
             .ok()
             .map_or_else(VoiceprintEnvelope::default, |bytes| parse_envelope(&bytes))
     } else {
@@ -836,11 +832,37 @@ pub(crate) fn write_voiceprints_npz(
         .map(|cursor| cursor.into_inner())
 }
 
+fn prove_open_zip<R: Read + std::io::Seek>(
+    mut archive: ZipArchive<R>,
+) -> Result<(ZipArchive<R>, Vec<String>), Zip2NameFailure> {
+    let mut coords = Vec::with_capacity(archive.len());
+    for index in 0..archive.len() {
+        let entry = archive
+            .by_index(index)
+            .map_err(|error| Zip2NameFailure::Unreadable {
+                detail: error.to_string(),
+            })?;
+        coords.push((entry.header_start(), entry.central_header_start()));
+    }
+    let central_start = archive.central_directory_start();
+    let mut reader = archive.into_inner();
+    let names = prove_zip2_directory(&mut reader, central_start, &coords)?;
+    let archive = ZipArchive::new(reader).map_err(|error| Zip2NameFailure::Unreadable {
+        detail: error.to_string(),
+    })?;
+    Ok((archive, names))
+}
+
 fn read_member(
     archive: &mut ZipArchive<Cursor<&[u8]>>,
+    names: &[String],
     name: &str,
 ) -> Result<Vec<u8>, VoiceprintNpzError> {
-    let mut member = archive.by_name(name).map_err(zip_error)?;
+    let index = names
+        .iter()
+        .position(|proved| proved == name)
+        .ok_or_else(|| zip_error(zip::result::ZipError::FileNotFound))?;
+    let mut member = archive.by_index(index).map_err(zip_error)?;
     let mut bytes = Vec::new();
     member.read_to_end(&mut bytes).map_err(io_error)?;
     Ok(bytes)
@@ -1156,5 +1178,84 @@ mod tests {
                 unrecognized_members: Vec::new(),
             }
         );
+    }
+
+    fn colliding_member(name: &str, data: &[u8]) -> Vec<u8> {
+        const UTF8_FLAG: u16 = 1 << 11;
+        let flagged = "é".as_bytes();
+        stored_zip(&[
+            (name.as_bytes(), UTF8_FLAG, &[], data),
+            (&[0x82], 0, &[], b"a"),
+            (flagged, UTF8_FLAG, &[], b"b"),
+        ])
+    }
+
+    fn stored_zip(members: &[(&[u8], u16, &[u8], &[u8])]) -> Vec<u8> {
+        use solstone_core_journal_io::zip2_name::crc32_ieee;
+        let mut local = Vec::new();
+        let mut offsets = Vec::new();
+        for (name, flags, _extra, data) in members {
+            offsets.push(local.len() as u32);
+            let crc = crc32_ieee(data);
+            let size = data.len() as u32;
+            local.extend_from_slice(b"PK\x03\x04");
+            local.extend_from_slice(&20_u16.to_le_bytes());
+            local.extend_from_slice(&flags.to_le_bytes());
+            local.extend_from_slice(&[0; 6]);
+            local.extend_from_slice(&crc.to_le_bytes());
+            local.extend_from_slice(&size.to_le_bytes());
+            local.extend_from_slice(&size.to_le_bytes());
+            local.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            local.extend_from_slice(&0_u16.to_le_bytes());
+            local.extend_from_slice(name);
+            local.extend_from_slice(data);
+        }
+        let cd_start = local.len() as u32;
+        let mut central = Vec::new();
+        for (index, (name, flags, extra, data)) in members.iter().enumerate() {
+            let crc = crc32_ieee(data);
+            let size = data.len() as u32;
+            central.extend_from_slice(b"PK\x01\x02");
+            central.extend_from_slice(&20_u16.to_le_bytes());
+            central.extend_from_slice(&20_u16.to_le_bytes());
+            central.extend_from_slice(&flags.to_le_bytes());
+            central.extend_from_slice(&[0; 6]);
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&size.to_le_bytes());
+            central.extend_from_slice(&size.to_le_bytes());
+            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            central.extend_from_slice(&(extra.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0_u16.to_le_bytes());
+            central.extend_from_slice(&0_u16.to_le_bytes());
+            central.extend_from_slice(&0_u16.to_le_bytes());
+            central.extend_from_slice(&0_u32.to_le_bytes());
+            central.extend_from_slice(&offsets[index].to_le_bytes());
+            central.extend_from_slice(name);
+            central.extend_from_slice(extra);
+        }
+        let mut bytes = local;
+        bytes.extend_from_slice(&central);
+        let count = members.len() as u16;
+        bytes.extend_from_slice(b"PK\x05\x06");
+        bytes.extend_from_slice(&[0; 4]);
+        bytes.extend_from_slice(&count.to_le_bytes());
+        bytes.extend_from_slice(&count.to_le_bytes());
+        bytes.extend_from_slice(&(central.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&cd_start.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn read_voiceprints_npz_refuses_colliding_member_names() {
+        let good = write_voiceprints_npz(&[], &[], &VoiceprintEnvelope::default(), &test_encoder())
+            .unwrap();
+        read_voiceprints_npz(&good).expect("literal success");
+
+        let colliding = colliding_member("embeddings.npy", b"not-npy");
+        assert!(matches!(
+            read_voiceprints_npz(&colliding),
+            Err(VoiceprintNpzError::NameProof(_))
+        ));
     }
 }

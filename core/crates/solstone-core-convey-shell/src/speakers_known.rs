@@ -53,7 +53,18 @@ pub async fn known(
     solstone_core_convey_http::owner_read::spawn_blocking_response(
         solstone_core_convey_http::owner_read::OwnerReadRole::SpeakersKnown,
         move || {
-            let mut speakers = known_speakers(&root.0);
+            let mut speakers = match known_speakers(&root.0) {
+                Ok(speakers) => speakers,
+                Err(error) => {
+                    return error_envelope(
+                        "speaker_command_failed",
+                        "that speaker command didn't finish.",
+                        error.to_string(),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    )
+                    .into_response();
+                }
+            };
             sort_speakers(&mut speakers, &sort);
             Json(json!({"speakers": speakers, "total": speakers.len(), "sort": sort}))
                 .into_response()
@@ -73,7 +84,9 @@ struct Speaker {
     intra_cosine_p25: Option<f64>,
 }
 
-fn known_speakers(root: &Path) -> Vec<Speaker> {
+fn known_speakers(
+    root: &Path,
+) -> Result<Vec<Speaker>, solstone_core_journal_io::zip2_name::Zip2NameFailure> {
     live_entities(root)
         .into_iter()
         .filter_map(|(dir, entity)| {
@@ -82,8 +95,13 @@ fn known_speakers(root: &Path) -> Vec<Speaker> {
             if !is_admissible_speaker_entity(&entity) {
                 return None;
             }
-            let voiceprints =
-                load_voiceprints(&solstone_core_entity::entity_voiceprints_path(root, &dir).ok()?)?;
+            let voiceprints = match load_voiceprints(
+                &solstone_core_entity::entity_voiceprints_path(root, &dir).ok()?,
+            ) {
+                Ok(Some(voiceprints)) => voiceprints,
+                Ok(None) => return None,
+                Err(error) => return Some(Err(error)),
+            };
             let mut streams = BTreeSet::new();
             let mut segments = BTreeSet::new();
             let mut last_seen = None;
@@ -110,7 +128,7 @@ fn known_speakers(root: &Path) -> Vec<Speaker> {
                 }
             }
             let name = entity_name(&entity, &entity_id);
-            Some(Speaker {
+            Some(Ok(Speaker {
                 entity_id,
                 name,
                 embedding_count: voiceprints.embeddings.len(),
@@ -118,7 +136,7 @@ fn known_speakers(root: &Path) -> Vec<Speaker> {
                 streams: streams.into_iter().collect(),
                 last_seen_ts: last_seen,
                 intra_cosine_p25: intra_cosine_p25(&voiceprints.embeddings),
-            })
+            }))
         })
         .collect()
 }
@@ -176,6 +194,25 @@ mod tests {
     use super::known_speakers;
 
     #[test]
+    fn known_speakers_reports_unproved_names_instead_of_omitting_the_person() {
+        let root = tempfile::tempdir().unwrap();
+        let entity = root.path().join("entities/person");
+        fs::create_dir_all(&entity).unwrap();
+        fs::write(
+            entity.join("entity.json"),
+            br#"{"id":"person","type":"Person"}"#,
+        )
+        .unwrap();
+        assert!(known_speakers(root.path()).unwrap().is_empty());
+        fs::write(
+            entity.join("voiceprints.npz"),
+            crate::speakers_npz::tests::colliding("embeddings.npy", b"x"),
+        )
+        .unwrap();
+        assert!(known_speakers(root.path()).is_err());
+    }
+
+    #[test]
     fn known_speakers_excludes_non_person_and_blocked_voiceprints() {
         let root = std::env::temp_dir().join(format!(
             "solstone-known-speaker-admission-{}",
@@ -216,6 +253,7 @@ mod tests {
         }
 
         let ids = known_speakers(&root)
+            .expect("speaker archive names are proved")
             .into_iter()
             .map(|speaker| speaker.entity_id)
             .collect::<Vec<_>>();
@@ -272,6 +310,7 @@ mod tests {
         .expect("loser voice");
 
         let speakers = known_speakers(&root)
+            .expect("speaker archive names are proved")
             .into_iter()
             .map(|speaker| (speaker.entity_id, speaker.name))
             .collect::<Vec<_>>();
@@ -324,7 +363,7 @@ mod tests {
         }
 
         // 1. Initial read: both present
-        let initial = known_speakers(root);
+        let initial = known_speakers(root).expect("speaker archive names are proved");
         assert_eq!(initial.len(), 2);
         let alice_p25 = initial
             .iter()
@@ -341,7 +380,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        let after_rename = known_speakers(root);
+        let after_rename = known_speakers(root).expect("speaker archive names are proved");
         let alice_after = after_rename
             .iter()
             .find(|s| s.entity_id == "alice")
@@ -359,7 +398,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let after_block = known_speakers(root);
+        let after_block = known_speakers(root).expect("speaker archive names are proved");
         assert_eq!(after_block.len(), 1);
         assert_eq!(after_block[0].entity_id, "alice");
 
@@ -369,7 +408,12 @@ mod tests {
             serde_json::to_vec(&json!({"id": "bob", "name": "Bob", "type": "Person"})).unwrap(),
         )
         .unwrap();
-        assert_eq!(known_speakers(root).len(), 2);
+        assert_eq!(
+            known_speakers(root)
+                .expect("speaker archive names are proved")
+                .len(),
+            2
+        );
 
         // 4. Change bob to non-person
         fs::write(
@@ -377,7 +421,7 @@ mod tests {
             serde_json::to_vec(&json!({"id": "bob", "name": "Bob", "type": "Tool"})).unwrap(),
         )
         .unwrap();
-        let after_type = known_speakers(root);
+        let after_type = known_speakers(root).expect("speaker archive names are proved");
         assert_eq!(after_type.len(), 1);
         assert_eq!(after_type[0].entity_id, "alice");
 
@@ -387,17 +431,22 @@ mod tests {
             serde_json::to_vec(&json!({"id": "bob", "name": "Bob", "type": "Person"})).unwrap(),
         )
         .unwrap();
-        assert_eq!(known_speakers(root).len(), 2);
+        assert_eq!(
+            known_speakers(root)
+                .expect("speaker archive names are proved")
+                .len(),
+            2
+        );
 
         // 5. Corrupt bob's voiceprint file
         fs::write(bob_dir.join("voiceprints.npz"), b"not an npz file").unwrap();
-        let after_corrupt = known_speakers(root);
+        let after_corrupt = known_speakers(root).expect("speaker archive names are proved");
         assert_eq!(after_corrupt.len(), 1);
         assert_eq!(after_corrupt[0].entity_id, "alice");
 
         // 6. Delete bob entity directory entirely
         let _ = fs::remove_dir_all(&bob_dir);
-        let after_delete = known_speakers(root);
+        let after_delete = known_speakers(root).expect("speaker archive names are proved");
         assert_eq!(after_delete.len(), 1);
         assert_eq!(after_delete[0].entity_id, "alice");
     }
