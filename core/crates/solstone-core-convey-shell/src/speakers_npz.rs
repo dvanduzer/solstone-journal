@@ -344,7 +344,9 @@ pub(crate) mod tests {
         ])
     }
 
-    fn stored_zip(members: &[(&[u8], u16, &[u8], &[u8])]) -> Vec<u8> {
+    type ZipMember<'a> = (&'a [u8], u16, &'a [u8], &'a [u8]);
+
+    fn stored_zip(members: &[ZipMember<'_>]) -> Vec<u8> {
         let mut local = Vec::new();
         let mut offsets = Vec::new();
         for (name, flags, _extra, data) in members {

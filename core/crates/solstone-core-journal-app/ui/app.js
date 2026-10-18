@@ -607,7 +607,7 @@ function stepSequence(view) {
     if (view.step === number) item.setAttribute('aria-current', 'step');
     return item;
   });
-  const home = el('li', {}, document.createTextNode('5'));
+  const home = el('li', {}, document.createTextNode(COPY.panes.home));
   if (view.step === 5) home.setAttribute('aria-current', 'step');
   items.push(home);
   return el('ol', { class: 'setup-steps' }, ...items);
