@@ -18,8 +18,8 @@ from qualify_serving import Phone, RECORDS, body_for, native, provenance, reconc
 
 
 def init_journal(phone, name):
-    owner(phone, 'GET', '/init/mark')
-    owner(phone, 'POST', '/init/mark/lock', {})
+    mark = owner(phone, 'GET', '/init/mark')
+    owner(phone, 'POST', '/init/mark/lock', {'proposal_id': mark['proposal_id']})
     owner(phone, 'POST', '/init/finalize', {'name': name, 'timezone': 'America/Denver'})
 
 
