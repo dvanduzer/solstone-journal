@@ -1207,7 +1207,9 @@ mod tests {
         ])
     }
 
-    fn stored_zip(members: &[(&[u8], u16, &[u8], &[u8])]) -> Vec<u8> {
+    type ZipMember<'a> = (&'a [u8], u16, &'a [u8], &'a [u8]);
+
+    fn stored_zip(members: &[ZipMember<'_>]) -> Vec<u8> {
         use solstone_core_journal_io::zip2_name::crc32_ieee;
         let mut local = Vec::new();
         let mut offsets = Vec::new();

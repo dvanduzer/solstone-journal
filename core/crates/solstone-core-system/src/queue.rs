@@ -9360,55 +9360,89 @@ mod tests {
     }
 
     #[cfg(feature = "full-tests")]
-    #[test]
-    fn callable_reference_reuse_retains_both_threads_through_tls_retirement() {
-        struct ExitWait {
-            entered: mpsc::Sender<()>,
-            gate: Arc<(Mutex<bool>, Condvar)>,
+    #[derive(Clone, Default)]
+    struct CallableRetirementGate(Arc<(Mutex<bool>, Condvar)>);
+
+    #[cfg(feature = "full-tests")]
+    impl CallableRetirementGate {
+        fn wait(&self) {
+            let (lock, ready) = &*self.0;
+            let mut released = lock.lock().unwrap_or_else(|p| p.into_inner());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !*released {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return;
+                }
+                released = ready
+                    .wait_timeout(released, remaining)
+                    .unwrap_or_else(|p| p.into_inner())
+                    .0;
+            }
         }
-        impl Drop for ExitWait {
-            fn drop(&mut self) {
-                self.entered.send(()).unwrap();
-                let (lock, ready) = &*self.gate;
-                let mut released = lock.lock().unwrap();
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while !*released {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        return;
+
+        fn release(&self) {
+            *self.0.0.lock().unwrap_or_else(|p| p.into_inner()) = true;
+            self.0.1.notify_all();
+        }
+    }
+
+    #[cfg(feature = "full-tests")]
+    struct ReleaseCallableRetirement(CallableRetirementGate);
+
+    #[cfg(feature = "full-tests")]
+    impl Drop for ReleaseCallableRetirement {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn callable_reference_reuse_retains_both_handles_until_observers_join() {
+        struct Completed(mpsc::Sender<()>);
+        impl TaskQueueEventSink for Completed {
+            fn emit(&self, event: TaskQueueEvent) {
+                if matches!(
+                    event,
+                    TaskQueueEvent::QueueChanged {
+                        running_reference: None,
+                        ..
                     }
-                    released = ready.wait_timeout(released, remaining).unwrap().0;
+                ) {
+                    let _ = self.0.send(());
                 }
             }
         }
-        thread_local! { static EXIT_WAIT: std::cell::RefCell<Option<ExitWait>> = const { std::cell::RefCell::new(None) }; }
-        struct Release(Arc<(Mutex<bool>, Condvar)>);
-        impl Drop for Release {
-            fn drop(&mut self) {
-                *self.0.0.lock().unwrap() = true;
-                self.0.1.notify_all();
-            }
-        }
-        let gate = Arc::new((Mutex::new(false), Condvar::new()));
-        let release = Release(Arc::clone(&gate));
+        let (completed_send, completed) = mpsc::channel();
+        let queue = callable_control_queue(
+            Arc::new(|_, _| 0),
+            Duration::from_secs(30),
+            Some(Arc::new(Completed(completed_send))),
+        );
+        let gate = CallableRetirementGate::default();
+        let release = ReleaseCallableRetirement(gate.clone());
         let (entered_send, entered) = mpsc::channel();
-        let worker: CallableQueueWorker = Arc::new(move |_, _| {
-            EXIT_WAIT.with(|slot| {
-                *slot.borrow_mut() = Some(ExitWait {
-                    entered: entered_send.clone(),
-                    gate: Arc::clone(&gate),
-                })
-            });
-            0
-        });
-        let queue = callable_control_queue(worker, Duration::from_secs(30), None);
+        // Gate observers outside TLS: Windows holds the loader lock in TLS
+        // destructors, so a blocked destructor cannot await a new thread.
+        queue.set_worker_thread_spawner(Arc::new(move |join| {
+            let gate = gate.clone();
+            let entered_send = entered_send.clone();
+            thread::Builder::new().spawn(move || {
+                let _ = entered_send.send(());
+                gate.wait();
+                join();
+            })
+        }));
         queue.submit(request("reused-reference"));
+        completed.recv_timeout(Duration::from_secs(5)).unwrap();
         entered.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(
             !queue.contains_reference("reused-reference"),
-            "logical completion precedes TLS exit"
+            "logical completion precedes native join"
         );
         queue.submit(request("reused-reference"));
+        completed.recv_timeout(Duration::from_secs(5)).unwrap();
         entered.recv_timeout(Duration::from_secs(5)).unwrap();
         let retained = {
             let workers = queue.inner.callable_workers.lock().unwrap();
@@ -9424,13 +9458,84 @@ mod tests {
         queue.join_callable_workers().unwrap();
         assert!(
             elapsed < Duration::from_millis(500),
-            "TLS teardown must not block bounded shutdown: {elapsed:?}"
+            "pending native joins must not block bounded shutdown: {elapsed:?}"
         );
         assert_eq!(
             retained, 2,
             "a reused reference must not replace the first live handle"
         );
+        assert!(report.forced, "unjoined workers are real pending work");
+        assert!(queue.inner.callable_workers.lock().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn callable_tls_retirement_retains_native_join_and_bounds_shutdown() {
+        struct ExitWait {
+            entered: mpsc::Sender<()>,
+            gate: CallableRetirementGate,
+        }
+        impl Drop for ExitWait {
+            fn drop(&mut self) {
+                if self.entered.send(()).is_ok() {
+                    self.gate.wait();
+                }
+            }
+        }
+        thread_local! { static EXIT_WAIT: std::cell::RefCell<Option<ExitWait>> = const { std::cell::RefCell::new(None) }; }
+        let gate = CallableRetirementGate::default();
+        let body_gate = CallableRetirementGate::default();
+        let (entered_send, entered) = mpsc::channel();
+        let release = ReleaseCallableRetirement(gate.clone());
+        let body_release = ReleaseCallableRetirement(body_gate.clone());
+        let queue = callable_control_queue(
+            Arc::new(move |_, _| {
+                EXIT_WAIT.with(|slot| {
+                    *slot.borrow_mut() = Some(ExitWait {
+                        entered: entered_send.clone(),
+                        gate: gate.clone(),
+                    })
+                });
+                body_gate.wait();
+                0
+            }),
+            Duration::from_secs(30),
+            None,
+        );
+        let (observer_send, observer_started) = mpsc::channel();
+        queue.set_worker_thread_spawner(Arc::new(move |join| {
+            let observer_send = observer_send.clone();
+            thread::Builder::new().spawn(move || {
+                let _ = observer_send.send(());
+                join();
+            })
+        }));
+        queue.submit(request("tls-retirement"));
+        // Start the actual native-join owner before entering the Windows TLS
+        // loader lock. No second worker or observer is spawned while it is held.
+        observer_started
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        drop(body_release);
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!queue.contains_reference("tls-retirement"));
+        {
+            let workers = queue.inner.callable_workers.lock().unwrap();
+            assert_eq!(workers.len(), 1);
+            assert!(workers[0].observer.is_some());
+            assert!(!workers[0].joined.load(std::sync::atomic::Ordering::Acquire));
+        }
+        let began = Instant::now();
+        let report = queue.shutdown_until(Instant::now() + Duration::from_millis(20));
+        let elapsed = began.elapsed();
+        drop(release);
+        queue.join_callable_workers().unwrap();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "TLS teardown must not block bounded shutdown: {elapsed:?}"
+        );
         assert!(report.forced, "TLS retirement is real pending work");
+        assert!(queue.inner.callable_workers.lock().unwrap().is_empty());
     }
 
     #[cfg(feature = "full-tests")]
