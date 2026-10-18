@@ -684,7 +684,7 @@ while IFS= read -r line || [ -n "$line" ]; do
 done < "{sshd_config}"
 
 if [ "$has_include" -ne 1 ]; then
-  echo "this server's SSH settings don't read {conf_dir}, so the relay login can't be limited. nothing was changed."
+  echo "this server's SSH settings don't read {conf_dir}, so your journal's login can't be limited. nothing was changed."
   exit 1
 fi
 
@@ -783,31 +783,31 @@ EOF
 
 if [ "$val_allowtcpforwarding" != "remote" ]; then
   rm -f "{dropin_file}"
-  echo "this server still blocks the relay: allowtcpforwarding is $val_allowtcpforwarding"
+  echo "this server still blocks your journal's forward: allowtcpforwarding is $val_allowtcpforwarding"
   exit 1
 fi
 
 if [ "$val_gatewayports" != "clientspecified" ]; then
   rm -f "{dropin_file}"
-  echo "this server still blocks the relay: gatewayports is $val_gatewayports"
+  echo "this server still blocks your journal's forward: gatewayports is $val_gatewayports"
   exit 1
 fi
 
 if [ "$val_disableforwarding" != "no" ]; then
   rm -f "{dropin_file}"
-  echo "this server still blocks the relay: disableforwarding is $val_disableforwarding"
+  echo "this server still blocks your journal's forward: disableforwarding is $val_disableforwarding"
   exit 1
 fi
 
 if [ "$val_pubkeyauthentication" != "yes" ]; then
   rm -f "{dropin_file}"
-  echo "this server still blocks the relay: pubkeyauthentication is $val_pubkeyauthentication"
+  echo "this server still blocks your journal's forward: pubkeyauthentication is $val_pubkeyauthentication"
   exit 1
 fi
 
 if [ -z "$val_clientaliveinterval" ] || [ "$val_clientaliveinterval" = "0" ]; then
   rm -f "{dropin_file}"
-  echo "this server still blocks the relay: clientaliveinterval is $val_clientaliveinterval"
+  echo "this server still blocks your journal's forward: clientaliveinterval is $val_clientaliveinterval"
   exit 1
 fi
 
@@ -820,20 +820,20 @@ for tok in $val_authorizedkeysfile; do
 done
 if [ "$has_auth_key" -ne 1 ]; then
   rm -f "{dropin_file}"
-  echo "this server still blocks the relay: authorizedkeysfile is $val_authorizedkeysfile"
+  echo "this server still blocks your journal's forward: authorizedkeysfile is $val_authorizedkeysfile"
   exit 1
 fi
 
 if [ "$val_authenticationmethods" != "any" ] && [ "$val_authenticationmethods" != "publickey" ]; then
   rm -f "{dropin_file}"
-  echo "this server still blocks the relay: authenticationmethods is $val_authenticationmethods"
+  echo "this server still blocks your journal's forward: authenticationmethods is $val_authenticationmethods"
   exit 1
 fi
 
 for u in $val_denyusers; do
   if [ "$u" = "solstone-relay" ]; then
     rm -f "{dropin_file}"
-    echo "this server still blocks the relay: denyusers is $val_denyusers"
+    echo "this server still blocks your journal's forward: denyusers is $val_denyusers"
     exit 1
   fi
 done
@@ -841,7 +841,7 @@ done
 for g in $val_denygroups; do
   if [ "$g" = "solstone-relay" ]; then
     rm -f "{dropin_file}"
-    echo "this server still blocks the relay: denygroups is $val_denygroups"
+    echo "this server still blocks your journal's forward: denygroups is $val_denygroups"
     exit 1
   fi
 done
@@ -861,13 +861,13 @@ else
 fi
 if [ "$has_permitlisten" -ne 1 ]; then
   rm -f "{dropin_file}"
-  echo "this server still blocks the relay: permitlisten is $val_permitlisten"
+  echo "this server still blocks your journal's forward: permitlisten is $val_permitlisten"
   exit 1
 fi
 
 if [ -n "$val_allowgroups" ]; then
   rm -f "{dropin_file}"
-  echo "this server still blocks the relay: allowgroups is $val_allowgroups"
+  echo "this server still blocks your journal's forward: allowgroups is $val_allowgroups"
   exit 1
 fi
 
@@ -881,7 +881,7 @@ if [ -n "$val_allowusers" ]; then
   done
   if [ "$has_user" -ne 1 ]; then
     rm -f "{dropin_file}"
-    echo "this server still blocks the relay: allowusers is $val_allowusers"
+    echo "this server still blocks your journal's forward: allowusers is $val_allowusers"
     exit 1
   fi
 fi

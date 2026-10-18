@@ -29,7 +29,7 @@
   .agents .check small{display:block}
   .agents .outcome.empty{padding:4px 8px;text-align:left}.agents .activity-row .outcome{flex:none;align-self:flex-start}
   .agents .door-lan{margin-top:16px;border-top:1px solid var(--hairline)}.agents .fp{font-size:.8rem;line-height:1.55;word-spacing:.12em;overflow-wrap:anywhere}.agents .addr-preview code{color:var(--muted)}
-  .agents .seg3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.agents .ways{display:grid;grid-template-columns:1fr;gap:10px}.agents .byo-setup{overflow-wrap:anywhere}.agents .byo-setup .onlab{margin-top:14px}.agents .cmd-block{max-height:16rem;overflow:auto;white-space:pre;font-size:.74rem;line-height:1.35;padding:10px;border:1px solid var(--border, #e5dccb);border-radius:8px;margin:8px 0}.agents .records{width:100%;border-collapse:collapse;margin:8px 0}.agents .records td,.agents .records th{text-align:left;padding:6px 8px;border-bottom:1px solid var(--border, #e5dccb);vertical-align:top;font-size:.85rem}
+  .agents .seg3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.agents .ways{display:grid;grid-template-columns:1fr;gap:10px}.agents .byo-setup{overflow-wrap:anywhere}.agents .byo-setup .onlab{margin-top:14px}.agents .cmd-block{max-height:16rem;overflow:auto;white-space:pre;font-size:.74rem;line-height:1.35;padding:10px;border:1px solid var(--border, #e5dccb);border-radius:8px;margin:8px 0}.agents .records{width:100%;border-collapse:collapse;margin:8px 0}.agents .cmd-block code{background:none;padding:0;border:0}.agents .records td:first-child,.agents .records th:first-child{white-space:nowrap;width:3.5em}.agents .records td:last-child{white-space:nowrap;width:1%}.agents .records td,.agents .records th{text-align:left;padding:6px 8px;border-bottom:1px solid var(--border, #e5dccb);vertical-align:top;font-size:.85rem}
   .agents .picks{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 4px}.agents .pick{appearance:none;border:1.5px solid var(--hairline-2);border-radius:999px;background:var(--cream-bright);color:var(--ink);font:inherit;font-size:.86rem;font-weight:600;padding:5px 12px;cursor:pointer}.agents .pick.is{border-color:var(--orange);background:var(--paper)}.agents .pick:focus-visible{outline:2px solid var(--focus);outline-offset:2px}.agents .hint{margin:8px 0 0}.agents .hint .cmd{white-space:nowrap}
   .agents .watch{display:flex;align-items:center;gap:.55em;margin:10px 0 0;font-size:.86rem}.agents .sdot.pulse{animation:agents-pulse 1.6s ease-in-out infinite}@keyframes agents-pulse{50%{opacity:.35}}@media(prefers-reduced-motion:reduce){.agents .sdot.pulse{animation:none}}
   .agents .first{margin-top:14px}.agents .first .ag-row{cursor:default}.agents .first .ag-row:hover{background:none}.agents .first time{font-size:.8rem;color:var(--muted);white-space:nowrap}.agents .first .none{padding:16px}.agents .first .none p{margin:0;font-size:.88rem;color:var(--muted)}
@@ -254,7 +254,7 @@
     relay_unreachable: (b) => `your journal can't reach your server at ${b.relay?.address || 'that address'}. check the address, and that your server accepts SSH.`,
     relay_auth_refused: () => "your server didn't accept your journal's login. paste the command on it again.",
     relay_forward_refused: () => "your server didn't let your journal use port 443. something else on it may be using that port, or the command didn't finish.",
-    relay_host_key_changed: () => "your server's identity changed since your journal last connected. if you rebuilt it, choose trust it again. if you didn't, don't.",
+    relay_host_key_changed: () => "your server's identity changed since your journal last connected. if you rebuilt it, choose \"trust it again\". if you didn't, check that the address is still your server's.",
     relay_not_configured: () => "save your server's address first.",
   };
   const BYO_RELAY_STATE_CODE = {connected:'relay_ok', connecting:'relay_connecting', unreachable:'relay_unreachable', auth_refused:'relay_auth_refused', forward_refused:'relay_forward_refused', host_key_changed:'relay_host_key_changed'};
@@ -266,16 +266,28 @@
   };
   const BYO_DNS_COPY = {
     unchecked:'not checked yet', cname:'this name is a CNAME. replace it with an A record for your server.', no_address:'no A record found yet. DNS changes can take a few minutes.',
-    caa_missing:'CAA record not found yet. DNS changes can take a few minutes.', issuewild:'remove the issuewild CAA record for this name.', extra_issue:'remove the other CAA issue records for this name, so only this one is left.',
-    other_ca:'the CAA record names another certificate authority. use the one shown here.', account_uri:"the CAA record names a different registration than this journal's. use the one shown here.",
-    validation_method:'the CAA record must end with validationmethods=tls-alpn-01, as shown here.', lookup_error:"your journal couldn't check DNS just now. it tries again.", lookup_timeout:'the DNS check took too long. it tries again.',
+    caa_missing:'CAA record not found yet. DNS changes can take a few minutes.', lookup_error:"your journal couldn't check DNS just now. it tries again.", lookup_timeout:'the DNS check took too long. it tries again.',
   };
+  // These verdicts can come from a CAA record on a parent name, so the fix named is always the record at this exact name.
+  const BYO_CAA_MISMATCH = ['issuewild', 'extra_issue', 'other_ca', 'account_uri', 'validation_method'];
+  function byoCaaMismatchLine(host) { return `the CAA record that applies to ${host} doesn't match the one shown here. add the record shown here at ${host} itself, not at the domain above it, and remove any other CAA record at ${host}. if it's already there, copy it again.`; }
+  function byoNonPublic(addr) {
+    const a = String(addr).toLowerCase();
+    if (a.includes(':')) return a === '::1' || a.startsWith('fc') || a.startsWith('fd') || a.startsWith('fe8') || a.startsWith('fe9') || a.startsWith('fea') || a.startsWith('feb');
+    const [o1, o2] = a.split('.').map(Number);
+    return o1 === 10 || o1 === 127 || (o1 === 172 && o2 >= 16 && o2 <= 31) || (o1 === 192 && o2 === 168) || (o1 === 169 && o2 === 254) || (o1 === 100 && o2 >= 64 && o2 <= 127);
+  }
   function byoDiagnosticLines(b, dns) {
     const lines = [];
     const addrs = (dns?.addresses || b.dns_addresses || []).join(', ');
     const diags = dns?.diagnostics || b.diagnostics || [];
     if (diags.includes('address_mismatch')) lines.push(`this name points at ${addrs || 'no address yet'}. it should have one A record, for your server at ${b.relay?.address || 'your server'}, and no other A or AAAA records. if your DNS host offers a proxy or CDN for this name, turn it off.`);
-    if (diags.includes('non_public_address')) lines.push(`this name also points at an address that isn't on the internet (${addrs}). remove that record. Claude won't connect to a name that has one.`);
+    if (diags.includes('non_public_address')) {
+      const all = dns?.addresses || b.dns_addresses || [];
+      const bad = all.filter(byoNonPublic);
+      const lead = bad.length < all.length ? 'this name also points at' : 'this name points at';
+      lines.push(`${lead} ${bad.join(', ') || 'an address'}, which isn't on the internet. remove that record. Claude won't connect to a name that has one.`);
+    }
     return lines;
   }
   function byoRecordsFound(b, dns) {
@@ -326,7 +338,13 @@
       const verdict = dns?.verdict || b.dns_verdict || 'unchecked';
       const status = found
         ? '<li><span class="step">✓</span><span>both records found</span></li>'
-        : [...byoDiagnosticLines(b, dns), BYO_DNS_COPY[verdict] || (verdict === 'admitted' ? '' : 'not checked yet')].filter(Boolean).map(line => `<li><span class="step">!</span><span>${esc(line)}</span></li>`).join('');
+        : (() => {
+            const addrs = dns?.addresses || b.dns_addresses || [];
+            const diagLines = byoDiagnosticLines(b, dns);
+            const aOk = addrs.length > 0 && addrs.every(a => a === rAddr) && !diagLines.length;
+            const verdictLine = BYO_CAA_MISMATCH.includes(verdict) ? byoCaaMismatchLine(host) : (BYO_DNS_COPY[verdict] || (verdict === 'admitted' ? '' : 'not checked yet'));
+            return (aOk ? '<li><span class="step">✓</span><span>A record points at your server</span></li>' : '') + [...diagLines, verdictLine].filter(Boolean).map(line => `<li><span class="step">!</span><span>${esc(line)}</span></li>`).join('');
+          })();
       step3 = `<p class="onlab">two records at your DNS host</p><p>add these two records for <code>${esc(host)}</code>:</p><table class="records"><tr><th>type</th><th>value</th><th></th></tr><tr><td>A</td><td><code>${esc(rAddr)}</code></td><td><button class="btn sm" data-copy="${esc(rAddr)}">copy</button></td></tr><tr><td>CAA</td><td><code>${esc(b.caa_record || '')}</code></td><td><button class="btn sm" data-copy="${esc(b.caa_record || '')}">copy</button></td></tr></table><p class="note">if your DNS host's form has separate fields, use flags 0, tag issue, and the text between the quotes as the value. if it offers a proxy or CDN for this name, turn it off. the CAA record lets only your journal get a certificate for this exact name, though whoever can change your domain's DNS can still get one that covers it.</p><ul class="legs">${status}</ul><div class="button-row"><button class="btn sm" data-action="byo-dns-check">check</button></div>`;
     }
 
@@ -354,6 +372,8 @@
       }
     }
 
+    // Once ready, the result leads and the setup steps fold away for reference.
+    if (byoReady() && !byoRelayTrouble(b)) return `<div class="lane-body byo-setup">${keyLost}${socketBlocked}${step4}${step1}<details><summary>your server and DNS records</summary>${step2}${step3}</details>${manual}</div>`;
     return `<div class="lane-body byo-setup">${keyLost}${socketBlocked}${step1}${step2}${step3}${step4}${manual}</div>`;
   }
 
@@ -595,7 +615,7 @@
     const where = `<details><summary>certificate fingerprint</summary><p>your journal's certificate for these addresses has this SHA-256 fingerprint:</p><p><code class="fp">${esc(fingerprint())}</code></p><p>your browser shows it in the certificate's details.</p></details>`;
     const step3 = connectWay === 'lan'
       ? `<div class="mstep"><span class="n">3</span><div><p>the browser on that computer opens your journal's page. it may warn about the certificate unless you have trusted your journal's LAN CA there. choose what the agent may see, enter the code on that page and connect.</p>${fingerprint() ? where : ''}</div></div>`
-      : `<div class="mstep"><span class="n">3</span><div><p>your browser opens your journal's page.${connectWay === 'byo' ? ' check the address is your own domain.' : connectWay === 'relay' ? ` check the address starts with <code>https://${esc(meAddress())}/</code>.` : ''} choose what the agent may see, enter the code on that page and connect.</p></div></div>`;
+      : `<div class="mstep"><span class="n">3</span><div><p>your browser opens your journal's page.${connectWay === 'byo' ? ` check the address starts with <code>https://${esc(state?.byo?.hostname || '')}/</code>.` : connectWay === 'relay' ? ` check the address starts with <code>https://${esc(meAddress())}/</code>.` : ''} choose what the agent may see, enter the code on that page and connect.</p></div></div>`;
     return `<div class="modal" data-close-modal><article class="modal-card" role="dialog" aria-modal="true" aria-label="connect an agent" data-open-pairing="${openPairingKind}">${close}${choice}${step1}${step2}${step3}<p class="meta">didn't expect that page? close it. nothing connects until you enter the code.</p></article></div>`;
   }
   function confirmDialog(kind) {
@@ -852,7 +872,7 @@
     if (target.dataset.lane) { lane = target.dataset.lane; render(); return; }
     if (target.dataset.way) { connectWay = target.dataset.way; pairingCode = null; stopWatch(); render(); return; }
     if (target.dataset.agent) { agentChoice = target.dataset.agent; render(); return; }
-    if (target.dataset.moveByo) { stopWatch(); dialog = 'connect'; connectWay = 'byo'; agentChoice = target.dataset.moveByo; pairingCode = null; render(); return; }
+    if (target.dataset.moveByo) { const moving = (state.connections || []).find(c => String(c.id) === target.dataset.moveByo); const kind = Object.keys(AGENT_NAMES).find(k => AGENT_NAMES[k].toLowerCase() === String(moving?.name || '').toLowerCase()); stopWatch(); dialog = 'connect'; connectWay = 'byo'; agentChoice = kind || null; pairingCode = null; render(); return; }
     if (target.dataset.route) { event.preventDefault(); if (target.dataset.route === 'activity') await loadActivity(); else { route = {name: target.dataset.route}; render(); } return; }
     if (target.dataset.activityConnection) { await loadActivity(target.dataset.activityConnection); return; }
     if (target.dataset.connection) { const [kind,id] = target.dataset.connection.split(':'); route = {name:'connection', connection: state.connections.find(item => item.kind === kind && item.id === id)}; render(); return; }
@@ -882,7 +902,7 @@
       else if (action === 'byo-dns-check') { byoDnsResult = await api('/app/agents/api/byo/dns-check', ownerOptions('POST')); render(); }
       else if (action === 'byo-outside-check') { const res = await api('/app/agents/api/byo/outside-check', ownerOptions('POST')); byoOutsideResult = res?.code || null; render(); }
       else if (action === 'byo-on' || action === 'byo-off') { await api('/app/agents/api/byo', jsonOptions('PUT', {enabled:action === 'byo-on'})); await reload(true); }
-      else if (action === 'byo-remove') { if (!confirm('remove this hostname? agents paired through it lose access, even if you add the same hostname again.')) return; await api('/app/agents/api/byo', ownerOptions('DELETE')); byoRemovedMessage = "delete the A record at your DNS host first, then the CAA record, or both together. don't leave the A record pointing at a server you no longer have."; byoRelayCheck = null; byoDnsResult = null; byoOutsideResult = null; byoSetupOpen = false; await reload(true); }
+      else if (action === 'byo-remove') { if (!confirm("remove your journal's address? agents paired through it lose access, even if you add the same address again.")) return; await api('/app/agents/api/byo', ownerOptions('DELETE')); byoRemovedMessage = "delete the A record at your DNS host first, then the CAA record, or both together. don't leave the A record pointing at a server you no longer have."; byoRelayCheck = null; byoDnsResult = null; byoOutsideResult = null; byoSetupOpen = false; await reload(true); }
       else if (action === 'byo-replace') { if (!confirm("replace this journal's certificate registration? the public route will turn off and you must publish a new CAA record before turning it on again.")) return; await api('/app/agents/api/byo/account/replace', ownerOptions('POST')); await reload(true); }
       else if (action === 'turn-on') await turnOn();
       else if (action === 'turn-off') { await api('/app/agents/api/capability', jsonOptions('PUT', {enabled:false})); dialog = null; await reload(true); }
