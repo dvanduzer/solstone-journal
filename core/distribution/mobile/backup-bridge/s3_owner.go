@@ -412,7 +412,7 @@ func (record s3OwnerRecord) validate() error {
 		}
 	}
 	if active := record.Active; active != nil {
-		if !isMetadataNonce(active.ID) || active.Operation < OpInit || active.Operation > OpCheck || len(active.Locks) > maxS3OwnerLocks || len(active.Locks) != 0 && !active.MayHaveWritten {
+		if !isMetadataNonce(active.ID) || (active.Operation < OpInit || (active.Operation > OpCheck && active.Operation != OpTeardown)) || len(active.Locks) > maxS3OwnerLocks || len(active.Locks) != 0 && !active.MayHaveWritten {
 			return errS3OwnerInvalid
 		}
 		seen := make(map[string]bool)
@@ -424,7 +424,7 @@ func (record s3OwnerRecord) validate() error {
 		}
 	}
 	if complete := record.Complete; complete != nil {
-		if !isMetadataNonce(complete.ID) || complete.Operation < OpInit || complete.Operation > OpCheck {
+		if !isMetadataNonce(complete.ID) || (complete.Operation < OpInit || (complete.Operation > OpCheck && complete.Operation != OpTeardown)) {
 			return errS3OwnerInvalid
 		}
 	}
@@ -640,6 +640,70 @@ func (owner *s3Owner) begin(operation int32, cfg s3Config, passwords ...[]byte) 
 	return err
 }
 
+func (owner *s3Owner) beginTeardown(cfg s3Config, passwords ...[]byte) error {
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+	if owner.closed || owner.sealing {
+		return errS3OwnerInvalid
+	}
+	if prior := owner.record.Active; prior != nil && prior.MayHaveWritten {
+		return errS3OwnerPending
+	}
+	destination, err := s3DestinationFor(cfg)
+	if err != nil || destination != owner.destination {
+		return errS3OwnerInvalid
+	}
+	record := owner.record
+	record.Version, record.Destination = 1, owner.destination
+	baselineCreds := append([]s3RetainedCredential(nil), record.Credentials...)
+	baselinePasses := append([][]byte(nil), record.Passwords...)
+	record.Credentials = append([]s3RetainedCredential(nil), record.Credentials...)
+	record.Passwords = append([][]byte(nil), record.Passwords...)
+	credential := s3RetainedCredential{cfg.access, cfg.secret, cfg.token}
+	found := false
+	for _, retained := range record.Credentials {
+		if retained == credential {
+			found = true
+		}
+	}
+	if !found {
+		record.Credentials = append(record.Credentials, credential)
+	}
+	for _, password := range passwords {
+		if len(password) == 0 {
+			continue
+		}
+		found = false
+		for _, retained := range record.Passwords {
+			if bytes.Equal(retained, password) {
+				found = true
+			}
+		}
+		if !found {
+			record.Passwords = append(record.Passwords, append([]byte(nil), password...))
+		}
+	}
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return errS3OwnerIO
+	}
+	record.Active = &s3OwnerIntent{ID: hex.EncodeToString(nonce[:]), Operation: OpTeardown, MayHaveWritten: owner.record.Active != nil && owner.record.Active.MayHaveWritten, Locks: nil}
+	record.Complete = nil
+	if len(record.Credentials) > maxS3OwnerCredentials || len(record.Passwords) > maxS3OwnerPasswords {
+		return errResourceLimit
+	}
+	_, err = owner.persist(record)
+	owner.begun = true
+	if err != nil {
+		owner.stateFailed = true
+	} else {
+		owner.liveID = record.Active.ID
+		owner.baselineCreds, owner.baselinePasses, owner.attemptFailed = baselineCreds, baselinePasses, false
+		owner.liveCredential = credential
+	}
+	return err
+}
+
 // noteAttemptFailed marks the live attempt as not having succeeded, so its
 // completion retains no credential or password that attempt introduced.
 func (owner *s3Owner) noteAttemptFailed() {
@@ -710,6 +774,12 @@ func (owner *s3Owner) saveReturned(err error) {
 		owner.writeFailed = true
 		owner.mu.Unlock()
 	}
+}
+
+func (owner *s3Owner) hasWriteFailed() bool {
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+	return owner.writeFailed
 }
 
 func (owner *s3Owner) ownsLock(id string) bool {
@@ -815,4 +885,50 @@ func (owner *s3Owner) Close() error {
 	}
 	s3OwnersMu.Unlock()
 	return closeErr
+}
+
+// Retire unlinks state.json and zeroes liveCredential and all passwords and credentials.
+func (owner *s3Owner) Retire() error {
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+	if owner.closed {
+		return nil
+	}
+	var unlinkErr error
+	if owner.directory != nil {
+		unlinkErr = unix.Unlinkat(int(owner.directory.Fd()), s3OwnerStateName, 0)
+		if errors.Is(unlinkErr, unix.ENOENT) {
+			unlinkErr = nil
+		}
+	}
+	if owner.stateFile != nil {
+		_ = owner.stateFile.Close()
+		owner.stateFile = nil
+	}
+	owner.exists = false
+	zeroBytes(owner.liveCredential.SecretKey)
+	owner.liveCredential = s3RetainedCredential{}
+	for _, password := range owner.record.Passwords {
+		zeroBytes(password)
+	}
+	owner.record.Passwords = nil
+	for _, password := range owner.baselinePasses {
+		zeroBytes(password)
+	}
+	owner.baselinePasses = nil
+	for _, cred := range owner.record.Credentials {
+		zeroBytes(cred.SecretKey)
+	}
+	owner.record.Credentials = nil
+	for _, cred := range owner.baselineCreds {
+		zeroBytes(cred.SecretKey)
+	}
+	owner.baselineCreds = nil
+	return unlinkErr
+}
+
+func (owner *s3Owner) isUnsealed() bool {
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+	return !owner.closed && !owner.sealing
 }

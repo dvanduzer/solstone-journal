@@ -22,6 +22,13 @@ use crate::restore::owned::discover;
 use crate::status::{CatalogLocalPresence, CatalogMediaObservation, observe_catalog_media};
 
 mod owned;
+#[cfg(any(target_os = "ios", test))]
+pub use owned::run_owned_teardown_with_root;
+#[cfg(feature = "test-hooks")]
+pub use owned::{
+    OwnedTeardownInterrupt, OwnedTeardownInterruptArm, OwnedTeardownInterruptObservation,
+    arm_owned_teardown_interrupt, owned_teardown_interrupt_observation,
+};
 pub use owned::{
     OwnedTeardownOutcome, SettledTeardownReport, TeardownAttemptJournal, TeardownRunPhase,
     TeardownRunRefusal, run_owned_teardown,

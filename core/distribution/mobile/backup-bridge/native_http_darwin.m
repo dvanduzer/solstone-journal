@@ -48,7 +48,7 @@ static const NSUInteger SBErrorLimit = 64 * 1024;
     NSDictionary *headers = metadata[@"headers"];
     if (![urlText isKindOfClass:[NSString class]] || ![method isKindOfClass:[NSString class]] ||
         ![headers isKindOfClass:[NSDictionary class]] || headers.count > 256 ||
-        ![@[@"GET", @"HEAD", @"PUT", @"DELETE"] containsObject:method]) {
+        ![@[@"GET", @"HEAD", @"PUT", @"POST", @"DELETE"] containsObject:method]) {
         [self release];
         return nil;
     }
@@ -59,7 +59,7 @@ static const NSUInteger SBErrorLimit = 64 * 1024;
         return nil;
     }
     _head = [method isEqualToString:@"HEAD"];
-    if (![method isEqualToString:@"PUT"] && body.length != 0) {
+    if (![method isEqualToString:@"PUT"] && ![method isEqualToString:@"POST"] && body.length != 0) {
         [self release];
         return nil;
     }

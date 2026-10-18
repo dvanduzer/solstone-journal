@@ -12,7 +12,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub(super) struct Destination {
+pub struct Destination {
     pub endpoint: String,
     pub region: String,
     pub bucket: String,
@@ -27,7 +27,7 @@ impl Destination {
     }
 }
 
-pub(super) enum Repository<'a> {
+pub enum Repository<'a> {
     Local(&'a str),
     S3 {
         destination: Destination,
@@ -39,7 +39,7 @@ pub(super) enum Repository<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct RepositoryRefusal;
+pub struct RepositoryRefusal;
 
 fn printable(value: &str, cap: usize, optional: bool) -> bool {
     value.len() <= cap
@@ -175,7 +175,7 @@ fn destination(repository: &str, region: &str) -> Result<Destination, Repository
     })
 }
 
-pub(super) fn parse<'a>(
+pub fn parse<'a>(
     repository: &'a str,
     env: Option<&'a BTreeMap<String, Option<String>>>,
 ) -> Result<Repository<'a>, RepositoryRefusal> {

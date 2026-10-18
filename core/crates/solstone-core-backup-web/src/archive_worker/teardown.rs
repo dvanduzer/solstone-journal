@@ -12,9 +12,12 @@ use std::{
 use axum::response::Response;
 use serde_json::Value;
 use solstone_core_backup::archive_admission::{ArchiveCancellation, Clock};
+use solstone_core_backup_runtime::ToolRunner;
 use solstone_core_backup_runtime::teardown_admission::{
     TeardownAdmissionRefusal, TeardownCarrierRefusal, TeardownReaderRefusal,
 };
+#[cfg(target_os = "ios")]
+use solstone_core_offload::teardown::run_owned_teardown_with_root;
 use solstone_core_offload::teardown::{
     OwnedTeardownOutcome, TeardownRunRefusal, run_owned_teardown,
 };
@@ -35,6 +38,8 @@ struct Reservation {
     clock: Arc<dyn Clock + Send + Sync>,
     cancellation: ArchiveCancellation,
     version: &'static str,
+    #[allow(dead_code)]
+    runner: Arc<dyn ToolRunner + Send + Sync>,
 }
 
 // Private allocation identity; neither a response nor a generation can mint it.
@@ -124,6 +129,7 @@ fn begin(deps: &BackupWebDeps) -> Result<Ticket, Response> {
         clock: Arc::clone(&deps.clock),
         cancellation,
         version: deps.version,
+        runner: Arc::clone(&deps.runner),
     }));
     state.archive.teardown.reservation = Some(Arc::clone(&ticket.0));
     state.archive.teardown.input = Some(Input {
@@ -282,12 +288,33 @@ fn execute(
         }
         invoked = true;
         let original = &input.ticket.0;
-        outcome = Some(run_owned_teardown(
-            &original.journal,
-            Arc::clone(&original.clock),
-            original.cancellation.clone(),
-            original.version,
-        ));
+        #[cfg(target_os = "ios")]
+        {
+            if let Some(root) = original.runner.ios_journal_root() {
+                outcome = Some(run_owned_teardown_with_root(
+                    root,
+                    Arc::clone(&original.clock),
+                    original.cancellation.clone(),
+                    original.version,
+                ));
+            } else {
+                outcome = Some(run_owned_teardown(
+                    &original.journal,
+                    Arc::clone(&original.clock),
+                    original.cancellation.clone(),
+                    original.version,
+                ));
+            }
+        }
+        #[cfg(not(target_os = "ios"))]
+        {
+            outcome = Some(run_owned_teardown(
+                &original.journal,
+                Arc::clone(&original.clock),
+                original.cancellation.clone(),
+                original.version,
+            ));
+        }
         report = Some(project(outcome.as_ref().expect("actual returned outcome")));
     }));
     let ticket = input.ticket.clone();
@@ -1157,5 +1184,41 @@ mod tests {
             fs::read(root.path().join("original.txt")).unwrap(),
             b"retained original"
         );
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    #[test]
+    fn runner_whose_ios_journal_root_panics_does_not_panic_on_linux() {
+        struct PanickingRunner;
+        impl ToolRunner for PanickingRunner {
+            fn run(
+                &self,
+                _: &solstone_core_backup_runtime::runner::ToolRequest<'_>,
+            ) -> std::io::Result<solstone_core_backup_runtime::runner::ToolOutput> {
+                Err(std::io::Error::other("unused"))
+            }
+            #[cfg(any(target_os = "ios", test))]
+            fn ios_journal_root(&self) -> Option<&Arc<solstone_core_journal_io::JournalRoot>> {
+                panic!("ios_journal_root must not be called on Linux");
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut deps = BackupWebDeps::production(
+            dir.path().to_path_buf(),
+            crate::measurement::with_geometry(crate::measurement::DeviceGeometry {
+                free_bytes: None,
+                total_bytes: None,
+            }),
+        );
+        deps.runner = Arc::new(PanickingRunner);
+        let ticket = begin(&deps).unwrap();
+        let input = take_input(&mut deps.operations.lock().unwrap(), &ticket).unwrap();
+        let returned = execute(input, || {}, crate::teardown_report::outcome);
+        assert!(returned.projected);
     }
 }

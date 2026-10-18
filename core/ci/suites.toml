@@ -1149,7 +1149,7 @@ platforms = ["linux", "macos"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
 default_full = true
-features = ["full-tests"]
+features = ["full-tests", "test-hooks"]
 runtime = "none"
 
 [[package_suites]]

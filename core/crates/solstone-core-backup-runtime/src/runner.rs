@@ -128,7 +128,6 @@ pub trait ToolRunner {
         None
     }
 
-    #[cfg(target_os = "ios")]
     fn ios_journal_root(&self) -> Option<&std::sync::Arc<solstone_core_journal_io::JournalRoot>> {
         None
     }
