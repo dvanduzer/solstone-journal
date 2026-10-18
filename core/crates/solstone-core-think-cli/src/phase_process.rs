@@ -197,6 +197,7 @@ mod hosted_tests {
             assert!(matches!(outcome, PhaseProcessOutcome::Exited(1)));
         }
         assert!(!journal.path().join("indexer").exists());
+        assert!(!journal.path().join("stats.json").exists());
         assert!(
             !journal
                 .path()
@@ -218,6 +219,21 @@ mod hosted_tests {
             Duration::from_secs(1),
         );
         assert!(matches!(outcome, PhaseProcessOutcome::Exited(0)));
+        assert!(solstone_core_indexer_store::db::db_path(journal.path()).is_file());
+    }
+
+    #[test]
+    fn open_hosted_journal_stats_writes_stats_json() {
+        let journal = tempfile::tempdir().expect("journal");
+        let outcome = runner(false).run(
+            "journal_stats",
+            Vec::new(),
+            journal.path(),
+            "20261018",
+            Duration::from_secs(1),
+        );
+        assert!(matches!(outcome, PhaseProcessOutcome::Exited(0)));
+        assert!(journal.path().join("stats.json").is_file());
     }
 
     #[test]

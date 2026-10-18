@@ -2625,15 +2625,12 @@ mod processing_proofs {
         enable_only(temp.path(), "rebuild-edges");
         let now = Utc.with_ymd_and_hms(2026, 10, 17, 12, 0, 0).unwrap();
         let host = open_host(temp.path(), &payload, now);
-        wait_until(|| scheduler_field(temp.path(), "rebuild-edges", "last_status").is_some());
-        let status = scheduler_field(temp.path(), "rebuild-edges", "last_status");
+        wait_until(|| {
+            scheduler_field(temp.path(), "rebuild-edges", "last_status") == Some("success".into())
+        });
         let reference = scheduler_field(temp.path(), "rebuild-edges", "last_ref").unwrap();
         assert!(reference.starts_with("sched:rebuild-edges:"));
-        if status.as_deref() == Some("success") {
-            assert!(solstone_core_indexer_store::db::db_path(temp.path()).is_file());
-        } else {
-            assert_ne!(status.as_deref(), Some("success"));
-        }
+        assert!(solstone_core_indexer_store::db::db_path(temp.path()).is_file());
         drop(host);
     }
 
