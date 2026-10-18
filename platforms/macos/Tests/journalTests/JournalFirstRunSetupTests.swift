@@ -152,6 +152,7 @@ extension JournalFirstRunModelTests {
         #expect(world.client.actions == [.saveThinking(choice: "later"),
                                         .finalize(timezone: TimeZone.autoupdatingCurrent.identifier)])
         #expect(world.peer.launched.count == 1)
+        #expect(world.fixture.stepAsides.count == 1)
     }
 
     @Test func mismatchedChoiceSaveNeverFinalizesTheOlderChoice() async throws {
@@ -165,6 +166,7 @@ extension JournalFirstRunModelTests {
         #expect(world.client.actions == [.saveThinking(choice: "later")])
         #expect(world.fixture.model.thinkingFailure?.isEmpty == false)
         #expect(world.peer.launched.isEmpty)
+        #expect(world.fixture.stepAsides.count == 0)
     }
 
     @Test func activationWaitsAcrossChoiceSaveCompletionProbeAndOutboundVerification() async throws {

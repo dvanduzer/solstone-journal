@@ -478,10 +478,17 @@ struct FirstRunModelFixture {
     let routeLog: RouteLog
     let mailbox: SetupMailboxStore
     let continuation: JournalSetupContinuationStore
+    let stepAsides: StepAsideLog
     var openJournalCalls = 0
     var backupOpens = 0
 
     @MainActor var routes: [JournalFirstRunRoute] { routeLog.routes }
+}
+
+@MainActor
+final class StepAsideLog {
+    private(set) var count = 0
+    func record() { count += 1 }
 }
 
 @MainActor
@@ -574,6 +581,7 @@ func makeModel(
     let continuation = injectedContinuation ?? JournalSetupContinuationStore(
         directory: makeIsolatedDirectory("continuation")
     )
+    let stepAsides = StepAsideLog()
     let model = JournalFirstRunModel(
         config: config,
         setupRunner: setupRunner,
@@ -592,6 +600,7 @@ func makeModel(
         loadSetupCopy: loadSetupCopy,
         localSetupCapability: localSetupCapability,
         peer: peer,
+        stepAsideAfterHandoff: { stepAsides.record() },
         setupClient: setupClient,
         identity: identity,
         mailbox: mailbox,
@@ -609,7 +618,8 @@ func makeModel(
         browser: browser,
         routeLog: routeLog,
         mailbox: mailbox,
-        continuation: continuation
+        continuation: continuation,
+        stepAsides: stepAsides
     )
 }
 
