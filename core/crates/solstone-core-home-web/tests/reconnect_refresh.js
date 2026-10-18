@@ -83,11 +83,11 @@ async function main() {
   notify({ connected: true, state: 'connected' });
   assert.deepStrictEqual(
     requests.slice().sort(),
-    ['/app/home/api/briefing', '/app/home/api/first-minutes', '/app/home/api/pulse', '/init/api/state'],
-    'open window reconnect re-reads briefing, pulse, first-minutes, and setup',
+    ['/app/home/api/briefing', '/app/home/api/first-minutes', '/app/home/api/pulse'],
+    'open window reconnect re-reads briefing, pulse, and first-minutes (which carries setup)',
   );
   notify({ connected: true, state: 'connected' });
-  assert.strictEqual(requests.length, 4, 'a repeated connected state does not reconcile again');
+  assert.strictEqual(requests.length, 3, 'a repeated connected state does not reconcile again');
 
   // Let first reconnect settle
   await new Promise((resolve) => setImmediate(resolve));
@@ -99,7 +99,7 @@ async function main() {
   notify({ connected: true, state: 'connected' });
   assert.deepStrictEqual(
     requests.slice().sort(),
-    ['/app/home/api/briefing', '/app/home/api/first-minutes', '/app/home/api/pulse', '/init/api/state'],
+    ['/app/home/api/briefing', '/app/home/api/first-minutes', '/app/home/api/pulse'],
   );
   // Allow promise to resolve and latch firstMinutesClosed
   await new Promise((resolve) => setImmediate(resolve));

@@ -507,6 +507,11 @@ const SCANNED_MODULE_SOURCES: &[(&str, &str, &str)] = &[
     ),
     (
         "convey",
+        "setup_host",
+        include_str!("../../../solstone-core-convey-shell/src/setup_host.rs"),
+    ),
+    (
+        "convey",
         "sse",
         include_str!("../../../solstone-core-convey-shell/src/sse.rs"),
     ),

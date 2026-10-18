@@ -6998,11 +6998,17 @@ mod tests {
     fn clean_worker_exit_releases_partition_and_dispatches_follower() {
         let cleanups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observer = Arc::new(FakeTreeObserver::default());
+        let arrived = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
         let queue = queue_with_sink_and_observer(
             true,
             10,
             VecDeque::from([
-                SpawnPlan::Process(FakeProcess::complete(1, Arc::clone(&cleanups))),
+                gated_plan(
+                    Arc::clone(&arrived),
+                    Arc::clone(&release),
+                    Arc::clone(&cleanups),
+                ),
                 SpawnPlan::Process(FakeProcess::complete(2, Arc::clone(&cleanups))),
             ]),
             None,
@@ -7010,7 +7016,10 @@ mod tests {
         );
 
         assert_eq!(queue.submit(request("sentinel")), SubmitOutcome::Dispatched);
-        assert_eq!(queue.submit(request("follower")), SubmitOutcome::Queued);
+        arrived.wait();
+        let follower = queue.submit(request("follower"));
+        release.wait();
+        assert_eq!(follower, SubmitOutcome::Queued);
 
         queue
             .join_test_workers(2, TEST_TRANSITION_TIMEOUT)

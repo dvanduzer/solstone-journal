@@ -6,6 +6,10 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- your journal can start again after an unexpected stop, even if it had been running for days. recovery keeps its progress between startup attempts instead of starting over each time.
+
 ## [2.0.50] - 2026-10-18
 
 ### Added

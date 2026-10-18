@@ -331,6 +331,94 @@ impl ParentLossLedger {
         self.generation_path(generation).join("ledger.json")
     }
 
+    pub fn closure_recovery_dir(&self, generation: ParentLossGeneration) -> PathBuf {
+        self.generation_path(generation).join("closure-recovery")
+    }
+
+    pub fn closure_recovery_batches_dir(&self, generation: ParentLossGeneration) -> PathBuf {
+        self.closure_recovery_dir(generation).join("batches")
+    }
+
+    pub fn closure_recovery_ids_dir(&self, generation: ParentLossGeneration) -> PathBuf {
+        self.closure_recovery_dir(generation).join("ids")
+    }
+
+    pub fn closure_recovery_live_dir(&self, generation: ParentLossGeneration) -> PathBuf {
+        self.closure_recovery_dir(generation).join("live")
+    }
+
+    pub fn closure_recovery_provisional_dir(&self, generation: ParentLossGeneration) -> PathBuf {
+        self.closure_recovery_dir(generation).join("provisional")
+    }
+
+    pub fn closure_recovery_phase_dir(&self, generation: ParentLossGeneration) -> PathBuf {
+        self.closure_recovery_dir(generation).join("phase")
+    }
+
+    pub fn closure_recovery_batch_path(
+        &self,
+        generation: ParentLossGeneration,
+        seq: u64,
+    ) -> PathBuf {
+        self.closure_recovery_batches_dir(generation)
+            .join(format!("{seq:06}.json"))
+    }
+
+    pub fn closure_recovery_ids_path(&self, generation: ParentLossGeneration, seq: u64) -> PathBuf {
+        self.closure_recovery_ids_dir(generation)
+            .join(format!("{seq:06}.json"))
+    }
+
+    pub fn closure_recovery_live_path(
+        &self,
+        generation: ParentLossGeneration,
+        launch_id: &str,
+    ) -> PathBuf {
+        self.closure_recovery_live_dir(generation)
+            .join(format!("{launch_id}.json"))
+    }
+
+    pub fn closure_recovery_provisional_path(
+        &self,
+        generation: ParentLossGeneration,
+        launch_id: &str,
+    ) -> PathBuf {
+        self.closure_recovery_provisional_dir(generation)
+            .join(format!("{launch_id}.json"))
+    }
+
+    pub fn closure_recovery_scan_complete_path(&self, generation: ParentLossGeneration) -> PathBuf {
+        self.closure_recovery_phase_dir(generation)
+            .join("scan-complete.json")
+    }
+
+    pub fn closure_recovery_legacy_path(&self, generation: ParentLossGeneration) -> PathBuf {
+        self.generation_path(generation)
+            .join("closure-recovery.json")
+    }
+
+    pub fn census_obligation_path(&self, generation: ParentLossGeneration) -> PathBuf {
+        self.generation_path(generation)
+            .join("census-obligation.json")
+    }
+
+    pub fn census_refusal_path(&self, generation: ParentLossGeneration) -> PathBuf {
+        self.generation_path(generation).join("census-refusal.json")
+    }
+
+    pub fn closure_recovery_receipts_dir(&self, generation: ParentLossGeneration) -> PathBuf {
+        self.closure_recovery_dir(generation).join("receipts")
+    }
+
+    pub fn closure_recovery_receipt_path(
+        &self,
+        generation: ParentLossGeneration,
+        seq: u64,
+    ) -> PathBuf {
+        self.closure_recovery_receipts_dir(generation)
+            .join(format!("{seq:06}.json"))
+    }
+
     pub fn active_generation(&self) -> Result<Option<ActiveGeneration>, ParentLossLedgerError> {
         read_json_optional(&self.active_path())
     }
@@ -459,17 +547,53 @@ impl ParentLossLedger {
                 // Computed before the match so the guard below reads one fact
                 // rather than re-deriving it per arm.
                 let coordinator_gone = coordinator_is_provably_gone(&active);
-                let outcome = match self.outcome_for_active(&active) {
-                    Ok(outcome) => outcome,
-                    // A record we cannot parse is bookkeeping; with closing
-                    // authority the admissions directory is the evidence and
-                    // the record is set aside by the closer.
-                    Err(ParentLossLedgerError::Json(_)) if closing.is_some() => {
-                        ParentLossReaderOutcome::MalformedState {
-                            artifact: "record.json".to_owned(),
+                let reused = match closing {
+                    Some((_, authority)) => super::parent_loss_closure::completed_recovery(
+                        self,
+                        active.generation,
+                        authority,
+                    )?,
+                    None => false,
+                };
+                if reused {
+                    let (_, authority) = closing.expect("recovery reuse requires the lease");
+                    for (instance, reason) in [
+                        (
+                            Some(active.supervisor),
+                            BootstrapRecoveryReason::SupervisorLive,
+                        ),
+                        (
+                            active.coordinator,
+                            BootstrapRecoveryReason::ActiveCoordinator,
+                        ),
+                    ] {
+                        if instance.is_some_and(|i| {
+                            matches!(
+                                authority.source.observe(&i),
+                                InstanceVerdict::SameLive { .. }
+                            )
+                        }) {
+                            return Err(ParentLossLedgerError::RecoveryRequired(reason));
                         }
                     }
-                    Err(error) => return Err(error),
+                }
+                let outcome = if reused {
+                    ParentLossReaderOutcome::RetiredExpected {
+                        generation: active.generation,
+                    }
+                } else {
+                    match self.outcome_for_active(&active) {
+                        Ok(outcome) => outcome,
+                        // A record we cannot parse is bookkeeping; with closing
+                        // authority the admissions directory is the evidence and
+                        // the record is set aside by the closer.
+                        Err(ParentLossLedgerError::Json(_)) if closing.is_some() => {
+                            ParentLossReaderOutcome::MalformedState {
+                                artifact: "record.json".to_owned(),
+                            }
+                        }
+                        Err(error) => return Err(error),
+                    }
                 };
                 match outcome {
                     ParentLossReaderOutcome::Completed { generation, .. }
@@ -643,6 +767,9 @@ impl ParentLossLedger {
         successor_generation: ParentLossGeneration,
         authority: &ClosingAuthority<'_>,
     ) -> Result<(), ParentLossLedgerError> {
+        if super::parent_loss_closure::completed_recovery(self, generation, authority)? {
+            return Ok(());
+        }
         let (record, set_aside) = load_record_for_closure(self, generation)?;
         if let Some(record) = record.as_ref()
             && matches!(
@@ -1128,7 +1255,7 @@ pub(crate) fn read_json_optional<T: for<'de> Deserialize<'de>>(
     }
 }
 
-fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>, ParentLossLedgerError> {
+pub(crate) fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>, ParentLossLedgerError> {
     let mut value = serde_json::to_value(value)?;
     sort_json_value(&mut value);
     let mut bytes = serde_json::to_vec_pretty(&value)?;

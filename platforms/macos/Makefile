@@ -469,7 +469,9 @@ release-preflight: signing-check
 		git status --short; \
 		exit 1; \
 	fi
-	@STALE="$$(ps aux | grep -E 'tmux-run|notarytool|sign-and|wheel-macos|codesign' | grep -v grep | grep -v 'release-preflight' || true)"; \
+	@# Match each process's program and first argument (a script run by its interpreter), not its
+	@# whole argument text: an unrelated process whose arguments merely mention these names is not one.
+	@STALE="$$(ps -Ao pid=,args= | awk '{a=$$2; b=$$3; sub(/.*\//,"",a); sub(/.*\//,"",b); if (a ~ /^(tmux-run|notarytool|codesign|wheel-macos)$$/ || a ~ /sign-and/ || b ~ /^(tmux-run|notarytool|codesign|wheel-macos)$$/ || b ~ /sign-and/) print}' || true)"; \
 		[ -z "$$STALE" ] || { \
 			echo "error: stale signing/build processes — one may be holding a keychain prompt:"; \
 			echo "$$STALE"; \
