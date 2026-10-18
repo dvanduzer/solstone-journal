@@ -324,6 +324,9 @@ fn archive_query_cleanup_releases_original_page_owner() {
         retry_bounded_helper_admission_until(Instant::now() + WAIT),
         HelperAdmissionStatus::Ready
     ));
+    // Helper admission turns Ready before the retained return is applied, so
+    // wait (bounded) for the terminal phase instead of reading it at once.
+    wait_for_phase(&deps, "error");
     let current = operation::observed_current(&deps.operations)
         .unwrap()
         .unwrap();

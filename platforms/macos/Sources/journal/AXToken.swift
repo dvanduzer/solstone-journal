@@ -20,7 +20,11 @@ enum JournalDevicesCopiedState: CaseIterable {
 
 enum JournalFirstRunRouteState: CaseIterable {
     case deciding
+    case welcome
+    case folder
     case nameLocation
+    case mark
+    case thinking
     case setupProgress
     case finishInBrowser
     case adopting
@@ -32,6 +36,24 @@ enum JournalAdoptState: CaseIterable {
     case opening
     case landed
     case blocked
+    case failed
+}
+
+enum JournalRitualOperationToken: CaseIterable {
+    case none
+    case setup
+    case mark
+    case thinkingSave
+    case thinkingFinalize
+    case thinkingDownload
+    case speechDownload
+    case outbound
+}
+
+enum JournalOutboundToken: CaseIterable {
+    case none
+    case delivering
+    case delivered
     case failed
 }
 
@@ -108,16 +130,56 @@ extension JournalDevicesCopiedState {
 }
 
 extension JournalFirstRunRouteState {
-    static let axTokens = ["deciding", "name_location", "setup_progress", "finish_in_browser", "adopting", "home"]
+    static let axTokens = [
+        "deciding", "welcome", "folder", "name_location", "mark", "thinking",
+        "setup_progress", "finish_in_browser", "adopting", "home"
+    ]
 
     var axToken: String {
         switch self {
         case .deciding: return "deciding"
+        case .welcome: return "welcome"
+        case .folder: return "folder"
         case .nameLocation: return "name_location"
+        case .mark: return "mark"
+        case .thinking: return "thinking"
         case .setupProgress: return "setup_progress"
         case .finishInBrowser: return "finish_in_browser"
         case .adopting: return "adopting"
         case .home: return "home"
+        }
+    }
+}
+
+extension JournalRitualOperationToken {
+    static let axTokens = [
+        "none", "setup", "mark", "thinking_save", "thinking_finalize",
+        "thinking_download", "speech_download", "outbound",
+    ]
+
+    var axToken: String {
+        switch self {
+        case .none: return "none"
+        case .setup: return "setup"
+        case .mark: return "mark"
+        case .thinkingSave: return "thinking_save"
+        case .thinkingFinalize: return "thinking_finalize"
+        case .thinkingDownload: return "thinking_download"
+        case .speechDownload: return "speech_download"
+        case .outbound: return "outbound"
+        }
+    }
+}
+
+extension JournalOutboundToken {
+    static let axTokens = ["none", "delivering", "delivered", "failed"]
+
+    var axToken: String {
+        switch self {
+        case .none: return "none"
+        case .delivering: return "delivering"
+        case .delivered: return "delivered"
+        case .failed: return "failed"
         }
     }
 }
@@ -141,8 +203,16 @@ extension JournalFirstRunRoute {
         switch self {
         case .deciding:
             return JournalFirstRunRouteState.deciding.axToken
+        case .ritual(.welcome):
+            return JournalFirstRunRouteState.welcome.axToken
+        case .ritual(.folder):
+            return JournalFirstRunRouteState.folder.axToken
         case .ritual(.nameLocation):
             return JournalFirstRunRouteState.nameLocation.axToken
+        case .ritual(.mark):
+            return JournalFirstRunRouteState.mark.axToken
+        case .ritual(.thinking):
+            return JournalFirstRunRouteState.thinking.axToken
         case .ritual(.setupProgress):
             return JournalFirstRunRouteState.setupProgress.axToken
         case .ritual(.finishInBrowser):

@@ -213,9 +213,8 @@ pub fn read_parent_loss_admission_spawn_identity(
     generation: ParentLossGeneration,
     launch_id: &str,
 ) -> Result<Option<AdmissionSpawnIdentity>, ParentLossAdmissionError> {
-    validate_launch_id(launch_id)?;
     let ledger = ParentLossLedger::open(journal)?;
-    read_json_optional(&spawn_identity_path(&ledger, generation, launch_id))
+    read_parent_loss_admission_spawn_identity_in(&ledger, generation, launch_id)
 }
 
 /// Host-service entry points call this before listener binding or readiness.
@@ -349,15 +348,6 @@ pub(crate) fn read_parent_loss_admission_result(
 ) -> Result<Option<AdmissionResult>, ParentLossAdmissionError> {
     validate_launch_id(launch_id)?;
     read_json_optional(&result_path(ledger, generation, launch_id))
-}
-
-pub(crate) fn read_parent_loss_admission_acknowledgement_in(
-    ledger: &ParentLossLedger,
-    generation: ParentLossGeneration,
-    launch_id: &str,
-) -> Result<Option<AdmissionAcknowledgement>, ParentLossAdmissionError> {
-    validate_launch_id(launch_id)?;
-    read_json_optional(&ack_path(ledger, generation, launch_id))
 }
 
 pub(crate) fn read_parent_loss_admission_spawn_identity_in(

@@ -99,6 +99,11 @@ name = "never_admitted_generation_children"
 path = "tests/never_admitted_generation_children.rs"
 required-features = ["test-hooks"]
 
+[[test]]
+name = "parent_loss_closure_resume"
+path = "tests/parent_loss_closure_resume.rs"
+required-features = ["full-tests", "test-hooks"]
+
 # The file is cfg(windows) and cannot share a target with the unix harnesses,
 # and solstone-core-generate must not depend on solstone-core-system.
 [[test]]
