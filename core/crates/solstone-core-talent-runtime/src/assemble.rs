@@ -48,7 +48,11 @@ pub fn assemble_prompt_preview(
             }
         }
         let state = match stage.build {
-            Some(build) => match build(&mut prepared, context) {
+            Some(build) => match build(
+                &mut prepared,
+                context,
+                &solstone_core_generate::Cancellation::never(),
+            ) {
                 Ok(state) => state,
                 Err(RuntimeOutcome::Skipped { reason, .. }) => {
                     return would_not_run(request, &reason);

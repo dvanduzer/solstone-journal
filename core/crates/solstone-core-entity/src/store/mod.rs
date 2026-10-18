@@ -100,7 +100,7 @@ pub use review_candidates::{
     EntityReviewCandidateError, PreparedMergeProposals, accept_merge_candidate,
     dismiss_merge_candidate, find_active_recorded_merge, load_merge_candidates,
     prepare_merge_proposals, publish_merge_proposals, record_merge_candidate,
-    standing_merge_for_suggestion,
+    record_merge_candidate_checked, standing_merge_for_suggestion,
 };
 pub use review_policy::{
     AmbiguityGroupResolveRequest, ENTITY_REVIEW_POLICY_VERSION, PREFIX_CUTOFF,
@@ -115,15 +115,15 @@ pub use voiceprints::{
     VoiceprintRemovalReport, VoiceprintSkipReasons, entity_voiceprints_path,
     load_entity_voiceprints_file, load_existing_voiceprint_keys, normalize_embedding,
     remove_voiceprints_by_key, rewrite_voiceprint_metadata, save_voiceprints_batch,
-    try_load_entity_voiceprints_file, try_load_entity_voiceprints_in_dir,
-    voiceprint_key_from_metadata,
+    save_voiceprints_batch_checked, try_load_entity_voiceprints_file,
+    try_load_entity_voiceprints_in_dir, voiceprint_key_from_metadata,
 };
 pub use write::{
     AmbiguityChoiceEntity, AmbiguityChoiceRequest, AmbiguityObservation, EntityOperationContext,
     EntityOperationKind, EntitySaveResult, EntityWriteError, IdentityMapCacheLoad,
     PreparedIdentityChange, dismiss_ambiguity, prepare_identity_changes, publish_identity_change,
-    record_ambiguity_choice, record_ambiguity_observation, refresh_identity_map_cache,
-    rewrite_identity_map_cache, save_entity_identity,
+    record_ambiguity_choice, record_ambiguity_observation, record_ambiguity_observation_checked,
+    refresh_identity_map_cache, rewrite_identity_map_cache, save_entity_identity,
 };
 
 #[cfg(test)]

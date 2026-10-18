@@ -16,7 +16,8 @@ pub use ambiguity::ambiguity_id;
 pub use archive_dedupe::{archive_dedupe_akas, archive_dedupe_emails, archive_dedupe_observations};
 pub use resolution::{
     EntityResolution, EntityResolutionEntity, EntityResolutionError, EntityResolutionOutcome,
-    ResolutionCandidate, record_entity_resolution, record_entity_resolution_from_name_evidence,
+    ResolutionCandidate, record_entity_resolution, record_entity_resolution_checked,
+    record_entity_resolution_from_name_evidence,
 };
 pub use review_owner::{ReviewOwnerConflictKind, ReviewOwnerError};
 pub use solstone_core_journal_io::FileLock;
@@ -70,14 +71,16 @@ pub use store::{
     read_identity_group_map, read_identity_map, read_journal_principal, read_live_observations,
     read_merge_log, read_prepared_history, read_retired_entities, read_visible_history,
     record_ambiguity_choice, record_ambiguity_group_choice, record_ambiguity_observation,
-    record_deleted_entity, record_merge_candidate, record_observation_ops_strict,
-    record_seeded_deletion, recover_interrupted_entity_merge, refresh_identity_map_cache,
+    record_ambiguity_observation_checked, record_deleted_entity, record_merge_candidate,
+    record_merge_candidate_checked, record_observation_ops_strict, record_seeded_deletion,
+    recover_interrupted_entity_merge, refresh_identity_map_cache,
     remove_entity_ambiguity_references, remove_voiceprints_by_key, repair_entity_identities,
     rescope_facet_ambiguities, resolve_observation_entity_dir, restore_journal_entity_version,
     restore_review, retired_record_damage, retired_record_hold, retired_state, retry_add_for_test,
     retry_record_for_test, rewrite_identity_map_cache, rewrite_voiceprint_metadata,
-    save_entity_identity, save_voiceprints_batch, scan_identity_census, serialize_observation_rows,
-    standing_merge_for_suggestion, sweep_entity_review_policy, try_load_entity_voiceprints_file,
+    save_entity_identity, save_voiceprints_batch, save_voiceprints_batch_checked,
+    scan_identity_census, serialize_observation_rows, standing_merge_for_suggestion,
+    sweep_entity_review_policy, try_load_entity_voiceprints_file,
     try_load_entity_voiceprints_in_dir, unblock_journal_entity, unrecognized_entity_files,
     validate_review_object, voiceprint_key_from_metadata,
 };

@@ -6,8 +6,8 @@
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use solstone_core_transcribe::{
-    TranscribeOutcome, discover_audio_files,
-    embedded_already_processed, embedded_retry_context, process_embedded,
+    TranscribeOutcome, discover_audio_files, embedded_already_processed, embedded_retry_context,
+    embedded_retryable_failure, process_embedded,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -56,6 +56,7 @@ struct State {
     stop: AtomicBool,
     cancel: AtomicBool,
     generation: AtomicU64,
+    external_cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
     status: Mutex<Value>,
     recent_failures: Mutex<VecDeque<Value>>,
     wake: Condvar,
@@ -86,7 +87,9 @@ impl State {
     }
 
     fn cancelled(&self, generation: u64) -> bool {
-        self.cancel.load(Ordering::Acquire) || self.generation.load(Ordering::Acquire) != generation
+        (self.external_cancelled)()
+            || self.cancel.load(Ordering::Acquire)
+            || self.generation.load(Ordering::Acquire) != generation
     }
 }
 
@@ -96,16 +99,30 @@ pub(super) struct AudioWorker {
 }
 
 impl AudioWorker {
+    #[cfg(test)]
     pub fn start(
         root: PathBuf,
         models: PathBuf,
         model: PathBuf,
         scratch: PathBuf,
     ) -> Result<Self, String> {
+        Self::start_with_cancellation(root, models, model, scratch, Arc::new(|| false))
+    }
+
+    pub fn start_with_cancellation(
+        root: PathBuf,
+        models: PathBuf,
+        model: PathBuf,
+        scratch: PathBuf,
+        external_cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<Self, String> {
+        let authority =
+            solstone_core_journal_io::JournalRoot::open(&root).map_err(|e| e.to_string())?;
         let state = Arc::new(State {
             stop: AtomicBool::new(false),
             cancel: AtomicBool::new(false),
             generation: AtomicU64::new(0),
+            external_cancelled,
             status: Mutex::new(json!({"state":"starting"})),
             recent_failures: Mutex::new(VecDeque::new()),
             wake: Condvar::new(),
@@ -114,17 +131,18 @@ impl AudioWorker {
         let thread = thread::Builder::new()
             .name("journal-audio".into())
             .spawn(move || {
-                while !shared.stop.load(Ordering::Acquire) {
-                    if let Err(error) = run(&shared, &root, &models, &model, &scratch) {
-                        shared.cancel.store(true, Ordering::Release);
+                while !shared.stop.load(Ordering::Acquire) && !(shared.external_cancelled)() {
+                    if let Err(error) = run(&shared, &authority, &models, &model, &scratch) {
                         *shared.status.lock().unwrap() = json!({"state":"failed","error":error});
-                        let mut status = shared.status.lock().unwrap();
-                        while shared.cancel.load(Ordering::Acquire)
-                            && !shared.stop.load(Ordering::Acquire)
-                        {
-                            status = shared.wake.wait(status).unwrap();
-                        }
+                        let status = shared.status.lock().unwrap();
+                        let _ = shared
+                            .wake
+                            .wait_timeout(status, Duration::from_secs(2))
+                            .unwrap();
                     }
+                }
+                if (shared.external_cancelled)() {
+                    shared.status.lock().unwrap()["state"] = json!("cancelled");
                 }
             })
             .map_err(|e| e.to_string())?;
@@ -169,18 +187,14 @@ pub(crate) enum InputDecision {
     Process(Option<solstone_core_transcribe::RetryContext>),
 }
 
-pub(crate) fn decide_input(
-    root: &Path,
-    input: &Path,
-    held: &HashSet<PathBuf>,
-) -> InputDecision {
-    if held.contains(input) {
-        return InputDecision::Skip;
-    }
+pub(crate) fn decide_input(root: &Path, input: &Path, held: &HashSet<PathBuf>) -> InputDecision {
     let retry = match embedded_retry_context(root, input) {
         Ok(context) => context,
         Err(error) => return InputDecision::Hold(error),
     };
+    if held.contains(input) && retry.is_none() {
+        return InputDecision::Skip;
+    }
     if embedded_already_processed(root, input, retry.as_ref()) {
         return InputDecision::Skip;
     }
@@ -193,12 +207,18 @@ pub(crate) fn decide_input(
 
 fn run(
     state: &State,
-    root: &Path,
+    authority: &solstone_core_journal_io::JournalRoot,
     models: &Path,
     model: &Path,
     scratch: &Path,
 ) -> Result<(), String> {
-    let authority = solstone_core_journal_io::JournalRoot::open(root).map_err(|e| e.to_string())?;
+    authority
+        .revalidate_canonical_binding()
+        .map_err(|e| e.to_string())?;
+    if (state.external_cancelled)() {
+        return Ok(());
+    }
+    let root = authority.canonical_path();
     let started = Instant::now();
     let asr = LocalAsr {
         model,
@@ -210,7 +230,7 @@ fn run(
     *state.status.lock().unwrap() = json!({"state":"ready","worker_start_ms":worker_start_ms,"model_load_ms":asr.load_ms.get()});
     let mut held = HashSet::new();
     let mut retry_generation = state.generation.load(Ordering::Acquire);
-    while !state.stop.load(Ordering::Acquire) {
+    while !state.stop.load(Ordering::Acquire) && !(state.external_cancelled)() {
         authority
             .revalidate_canonical_binding()
             .map_err(|e| e.to_string())?;
@@ -237,6 +257,14 @@ fn run(
                 status["error"] = json!(err_str.clone());
                 Some(err_str)
             } else {
+                let mut status = state.status.lock().unwrap();
+                if let Some(previous) = status
+                    .as_object_mut()
+                    .and_then(|row| row.remove("day_error"))
+                    && status.get("error") == Some(&previous)
+                {
+                    status.as_object_mut().unwrap().remove("error");
+                }
                 None
             };
             let set_status = |mut obj: serde_json::Value| {
@@ -246,7 +274,9 @@ fn run(
                 *state.status.lock().unwrap() = obj;
             };
             for input in inputs {
-                if state.stop.load(Ordering::Acquire) || state.cancel.load(Ordering::Acquire) {
+                if state.stop.load(Ordering::Acquire)
+                    || state.cancelled(state.generation.load(Ordering::Acquire))
+                {
                     break;
                 }
                 match decide_input(root, &input, &held) {
@@ -265,6 +295,9 @@ fn run(
                     }
                     InputDecision::Process(retry) => {
                         let generation = state.generation.load(Ordering::Acquire);
+                        if state.cancelled(generation) {
+                            break;
+                        }
                         let start = Instant::now();
                         let prior = state.status.lock().unwrap().clone();
                         set_status(json!({
@@ -279,7 +312,10 @@ fn run(
                             models,
                             scratch,
                             &asr,
-                            &|| state.cancelled(generation),
+                            &|| {
+                                state.cancelled(generation)
+                                    || authority.revalidate_canonical_binding().is_err()
+                            },
                             retry.as_ref(),
                         );
                         if state.cancelled(generation) {
@@ -305,7 +341,11 @@ fn run(
                                 }));
                             }
                             Err(error) => {
-                                held.insert(input.clone());
+                                if !matches!(error, solstone_core_transcribe::TranscribeError::ConfidentialDeferred { .. })
+                                    || !embedded_retryable_failure(&input)
+                                {
+                                    held.insert(input.clone());
+                                }
                                 state.input_failed(generation, &input, &error.to_string());
                                 set_status(json!({
                                     "state": "failed",
@@ -407,7 +447,11 @@ mod tests {
         filename: &str,
         content: &[u8],
     ) -> PathBuf {
-        let segment = root.join("chronicle").join(day).join(stream).join(segment_name);
+        let segment = root
+            .join("chronicle")
+            .join(day)
+            .join(stream)
+            .join(segment_name);
         std::fs::create_dir_all(&segment).unwrap();
         let audio_path = segment.join(filename);
         std::fs::write(&audio_path, content).unwrap();
@@ -463,6 +507,154 @@ mod tests {
         let decision = decide_input(temp.path(), &audio_path, &held);
         assert!(matches!(decision, InputDecision::Process(_)));
         assert!(!held.contains(&audio_path));
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn fresh_accepted_audio_enters_without_an_existing_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let audio = setup_fixture_audio(
+            temp.path(),
+            "20261012",
+            "device_audio",
+            "120000_1",
+            "audio.wav",
+            b"speech",
+        );
+        assert_eq!(
+            decide_input(temp.path(), &audio, &HashSet::new()),
+            InputDecision::Process(None)
+        );
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn ordinary_retry_permission_reenters_a_process_held_input_once() {
+        use solstone_core_system::work_retry::{self, raw};
+        let temp = tempfile::tempdir().unwrap();
+        let audio = setup_fixture_audio(
+            temp.path(),
+            "20261012",
+            "device_audio",
+            "120000_1",
+            "audio.wav",
+            b"speech",
+        );
+        let output = audio.with_extension("jsonl");
+        let header = json!({"raw":"audio.wav","_solstone_processing":{
+            "schema":"solstone.processing.v1","state":"failed","handler":"transcribe",
+            "reason_code":"local_endpoint_unreachable","attempts":3
+        }});
+        std::fs::write(&output, format!("{header}\n")).unwrap();
+        let held = HashSet::from([audio.clone()]);
+        assert_eq!(
+            decide_input(temp.path(), &audio, &held),
+            InputDecision::Skip
+        );
+        let evidence = raw::inspect_output(temp.path(), &output).unwrap().unwrap();
+        raw::observe(temp.path(), &evidence).unwrap();
+        work_retry::request(temp.path(), &evidence.unit).unwrap();
+        let InputDecision::Process(Some(context)) = decide_input(temp.path(), &audio, &held) else {
+            panic!("ordinary owner permission did not reenter held input");
+        };
+        raw::consume_context(temp.path(), &output, "transcribe", &context)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decide_input(temp.path(), &audio, &held),
+            InputDecision::Skip
+        );
+    }
+
+    #[cfg(all(feature = "full-tests", unix))]
+    #[test]
+    fn actual_worker_recovers_day_discovery_error_with_its_valid_binding() {
+        use std::os::unix::fs::PermissionsExt;
+        fn wait(worker: &AudioWorker, predicate: impl Fn(&Value) -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                let status = worker.status();
+                if predicate(&status) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "worker did not recover discovery: {status}"
+                );
+                std::thread::park_timeout(Duration::from_millis(20));
+            }
+        }
+        struct RestoreMode(PathBuf);
+        impl Drop for RestoreMode {
+            fn drop(&mut self) {
+                std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let day = temp.path().join("chronicle/20261012");
+        std::fs::create_dir_all(&day).unwrap();
+        let binding = solstone_core_journal_io::JournalRoot::open(temp.path()).unwrap();
+        let _restore = RestoreMode(day.clone());
+        std::fs::set_permissions(&day, std::fs::Permissions::from_mode(0o0)).unwrap();
+        let worker = AudioWorker::start(
+            temp.path().to_owned(),
+            temp.path().join("models"),
+            temp.path().join("model"),
+            temp.path().join("scratch"),
+        )
+        .unwrap();
+        wait(&worker, |status| status["day_error"].is_string());
+        binding.revalidate_canonical_binding().unwrap();
+        std::fs::set_permissions(&day, std::fs::Permissions::from_mode(0o700)).unwrap();
+        wait(&worker, |status| {
+            status["day_error"].is_null() && status["state"] == "ready"
+        });
+        binding.revalidate_canonical_binding().unwrap();
+        assert_eq!(worker.status()["generation"], 0);
+        drop(worker);
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn actual_outer_worker_retains_its_binding_and_recovers_without_resume() {
+        fn wait(worker: &AudioWorker, predicate: impl Fn(&Value) -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                let status = worker.status();
+                if predicate(&status) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "worker did not reach expected state: {status}"
+                );
+                std::thread::park_timeout(Duration::from_millis(20));
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("journal");
+        std::fs::create_dir(&root).unwrap();
+        let worker = AudioWorker::start(
+            root.clone(),
+            temp.path().join("models"),
+            temp.path().join("model"),
+            temp.path().join("scratch"),
+        )
+        .unwrap();
+        wait(&worker, |status| status["state"] == "ready");
+        std::fs::rename(&root, temp.path().join("original")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let replacement = solstone_core_journal_io::JournalRoot::open(&root).unwrap();
+        wait(&worker, |status| status["state"] == "failed");
+        std::thread::park_timeout(Duration::from_millis(2200));
+        assert_eq!(worker.status()["state"], "failed");
+        assert!(!worker.state.cancel.load(Ordering::Acquire));
+        drop(replacement);
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::rename(temp.path().join("original"), &root).unwrap();
+        wait(&worker, |status| status["state"] == "ready");
+        assert_eq!(worker.status()["generation"], 0);
+        drop(worker);
     }
 
     #[test]
@@ -584,16 +776,33 @@ mod tests {
             stop: AtomicBool::new(false),
             cancel: AtomicBool::new(false),
             generation: AtomicU64::new(0),
+            external_cancelled: Arc::new(|| false),
             status: Mutex::new(json!({"state":"ready"})),
             recent_failures: Mutex::new(VecDeque::new()),
             wake: Condvar::new(),
         };
         let mut held = HashSet::new();
 
-        // Pre-record custody / oversize error
+        // Missing custody stays pending. The oversize control must actually
+        // carry an accepted receipt, or it only exercises that earlier gate.
+        assert_eq!(
+            decide_input(temp.path(), &audio_path, &held),
+            InputDecision::Skip
+        );
+        setup_fixture_audio(
+            temp.path(),
+            "20261012",
+            "device_audio",
+            "120000_1",
+            "audio.wav",
+            &vec![0; 16 * 1024 * 1024 + 1],
+        );
         let decision = decide_input(temp.path(), &audio_path, &held);
         let error_msg = match decision {
-            InputDecision::Hold(msg) => msg,
+            InputDecision::Hold(msg) => {
+                assert!(msg.contains("16 MiB"), "unexpected hold: {msg}");
+                msg
+            }
             other => panic!("expected Hold, got {other:?}"),
         };
         state.input_failed(0, &audio_path, &error_msg);
@@ -624,7 +833,10 @@ mod tests {
         held.insert(audio_path2.clone());
         state.input_failed(0, &audio_path2, &budget_err.to_string());
         assert!(held.contains(&audio_path2));
-        assert_eq!(decide_input(temp.path(), &audio_path2, &held), InputDecision::Skip);
+        assert_eq!(
+            decide_input(temp.path(), &audio_path2, &held),
+            InputDecision::Skip
+        );
     }
 
     #[test]
@@ -665,6 +877,7 @@ mod tests {
             stop: AtomicBool::new(false),
             cancel: AtomicBool::new(false),
             generation: AtomicU64::new(0),
+            external_cancelled: Arc::new(|| false),
             status: Mutex::new(json!({"state":"ready"})),
             recent_failures: Mutex::new(VecDeque::new()),
             wake: Condvar::new(),
@@ -682,22 +895,30 @@ mod tests {
 
     #[test]
     fn foreground_scan_binding_failure_aborts_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("journal");
+        std::fs::create_dir(&root).unwrap();
+        let authority = solstone_core_journal_io::JournalRoot::open(&root).unwrap();
+        std::fs::rename(&root, temp.path().join("away")).unwrap();
         let state = State {
             stop: AtomicBool::new(false),
             cancel: AtomicBool::new(false),
             generation: AtomicU64::new(0),
+            external_cancelled: Arc::new(|| false),
             status: Mutex::new(json!({"state":"ready"})),
             recent_failures: Mutex::new(VecDeque::new()),
             wake: Condvar::new(),
         };
-        assert!(run(
-            &state,
-            Path::new("/nonexistent/journal/path"),
-            Path::new("unused"),
-            Path::new("unused"),
-            Path::new("unused"),
-        )
-        .is_err());
+        assert!(
+            run(
+                &state,
+                &authority,
+                Path::new("unused"),
+                Path::new("unused"),
+                Path::new("unused"),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -706,6 +927,7 @@ mod tests {
             stop: AtomicBool::new(false),
             cancel: AtomicBool::new(false),
             generation: AtomicU64::new(0),
+            external_cancelled: Arc::new(|| false),
             status: Mutex::new(json!({})),
             recent_failures: Mutex::new(VecDeque::new()),
             wake: Condvar::new(),
@@ -736,6 +958,7 @@ mod tests {
                 stop: AtomicBool::new(false),
                 cancel: AtomicBool::new(false),
                 generation: AtomicU64::new(7),
+                external_cancelled: Arc::new(|| false),
                 status: Mutex::new(json!({"state":"processing"})),
                 recent_failures: Mutex::new(VecDeque::new()),
                 wake: Condvar::new(),

@@ -5,11 +5,30 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Map;
+import java.util.HashMap;
 
 // Standalone host lifecycle check; no Android or provider stand-in is involved.
 public final class ThinkingAdmissionTest {
     static void require(boolean value) { if (!value) throw new AssertionError(); }
+    static Map<String, Object> object(Object... pairs) {
+        Map<String, Object> value = new HashMap<>();
+        for (int i = 0; i < pairs.length; i += 2) value.put((String)pairs[i], pairs[i+1]);
+        return value;
+    }
+    static ServingConnection.Retirement retirement(Object response) {
+        return ServingConnection.retirement(response, (row, key) ->
+            row instanceof Map ? ((Map<?, ?>)row).get(key) : null);
+    }
     public static void main(String[] args) throws Exception {
+        require(retirement(object("native", object("ok", true, "value", object("stopping", true, "failed", false)))) == ServingConnection.Retirement.PENDING);
+        require(retirement(object("native", object("ok", true, "value", object("stopping", false, "failed", false)))) == ServingConnection.Retirement.STOPPED);
+        require(retirement(object("native", object("ok", true, "value", object("stopping", true, "failed", true)))) == ServingConnection.Retirement.FAILED);
+        require(retirement(object("native", object("ok", false, "error", "server stopped"))) == ServingConnection.Retirement.STOPPED);
+        require(retirement(object("native", object("ok", false, "error", "retirement unreadable"))) == ServingConnection.Retirement.FAILED);
+        require(retirement(object("native", object("ok", true))) == ServingConnection.Retirement.FAILED);
+        require(retirement(object("native", object("ok", true, "value", 5))) == ServingConnection.Retirement.FAILED);
+        require(retirement(object("native", object("ok", true, "value", object("root_current", true)))) == ServingConnection.Retirement.STOPPED);
         ThinkingAdmission admission = new ThinkingAdmission();
         require(admission.admit() == null);
         long first = admission.generation(); admission.opened(first);

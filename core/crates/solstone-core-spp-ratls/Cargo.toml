@@ -20,6 +20,7 @@ x509-parser = "=0.16.0"
 nix = { workspace = true, features = ["fs"] }
 
 [features]
+full-tests = []
 test-hooks = []
 nvattest-directory = ["test-hooks", "solstone-core-spp-attest/test-hooks"]
 

@@ -311,6 +311,7 @@ pub(crate) fn execute_with_paths(
         }
         match crate::generate_response(&mut prepared, context, generate, writer) {
             Ok((response, usage, degraded)) => (response, usage, degraded),
+            Err(_) if cancellation.is_cancelled() => return RuntimeOutcome::Cancelled,
             Err(outcome) => return outcome,
         }
     };
@@ -346,6 +347,9 @@ pub(crate) fn execute_with_paths(
         None
     };
     let result = with_daily_unit_authority(&context.journal, &identity, |authority| {
+        if cancellation.is_cancelled() {
+            return Ok(Ok(RuntimeOutcome::Cancelled));
+        }
         authority.require_token(token)?;
         let stored_packet = authority
             .record()
@@ -412,10 +416,14 @@ pub(crate) fn execute_with_paths(
             skip,
             writer,
             admission.take(),
+            cancellation,
         );
         Ok(match outcome {
             Ok(outcome) => Ok(outcome),
             Err(mut error) => {
+                if cancellation.is_cancelled() {
+                    return Ok(Ok(RuntimeOutcome::Cancelled));
+                }
                 let record = authority.record_mut().as_mut().expect("authority");
                 // Rejected model output has no actions to recover. Keep valid
                 // results for owner preparation/I/O recovery, but allow the
@@ -511,7 +519,11 @@ fn publish(
     skip: bool,
     writer: &mut (impl Write + ?Sized),
     mut admission: Option<solstone_core_journal_io::FileLock>,
+    cancellation: &solstone_core_generate::Cancellation,
 ) -> Result<RuntimeOutcome, StageError> {
+    if cancellation.is_cancelled() {
+        return Ok(RuntimeOutcome::Cancelled);
+    }
     let name = &prepared.name;
     let record = authority.record().expect("checked publication authority");
     if record.status.is_terminal_success()
@@ -558,13 +570,14 @@ fn publish(
         publication
     };
     let mut changed_paths = Vec::new();
-    let publication_result = crate::writers::publish_daily_publication(
+    let publication_result = crate::writers::publish_daily_publication_cancellable(
         authority,
         token,
         &publication,
         context,
         &mut changed_paths,
         admission.take(),
+        cancellation,
     );
     // This branch is the configured writer, as in preparation above. Derive
     // ownership from the stage contract rather than adding it to retained plans.
@@ -585,6 +598,9 @@ fn publish(
     } else {
         None
     };
+    if cancellation.is_cancelled() {
+        return Ok(RuntimeOutcome::Cancelled);
+    }
     let disposition = publication_result?;
     let output = if let Some((spec, state)) = stage {
         if let Some(override_output) = spec.output_override {
@@ -595,6 +611,9 @@ fn publish(
     } else {
         response.clone()
     };
+    if cancellation.is_cancelled() {
+        return Ok(RuntimeOutcome::Cancelled);
+    }
     let record = authority.record_mut().as_mut().expect("authority");
     let status = if publication.no_output {
         DailyUnitStatus::CommittedNoOutput
@@ -711,6 +730,7 @@ mod tests {
                     false,
                     &mut events,
                     None,
+                    &solstone_core_generate::Cancellation::never(),
                 );
                 let error = result.unwrap_err();
                 if mode != "later_action" {

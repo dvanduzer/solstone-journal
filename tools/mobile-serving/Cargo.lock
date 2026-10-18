@@ -1805,6 +1805,7 @@ dependencies = [
  "solstone-core-maintenance",
  "solstone-core-mcp-endpoint",
  "solstone-core-spl",
+ "solstone-core-system",
  "solstone-core-transcribe",
  "tempfile",
  "tokio",

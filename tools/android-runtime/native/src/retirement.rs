@@ -143,10 +143,7 @@ fn inspect_record(record: &Record) -> Outcome {
             Err(TryLockError::WouldBlock) => return Outcome::Pending,
             Err(TryLockError::Poisoned(_)) => return Outcome::Failed,
         };
-        if worker.is_some()
-            || !panics.is_empty()
-            || record.failed.load(Ordering::Acquire)
-        {
+        if worker.is_some() || !panics.is_empty() || record.failed.load(Ordering::Acquire) {
             return Outcome::Failed;
         }
         if !record.owner_retired.load(Ordering::Acquire) {
@@ -785,4 +782,3 @@ mod inspect_tests {
         let _ = tx.send(());
     }
 }
-

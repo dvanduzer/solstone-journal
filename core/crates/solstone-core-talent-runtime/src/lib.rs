@@ -470,6 +470,9 @@ pub fn execute_request(
     writer: &mut impl Write,
     cancellation: &solstone_core_generate::Cancellation,
 ) -> RuntimeOutcome {
+    if cancellation.is_cancelled() {
+        return RuntimeOutcome::Cancelled;
+    }
     if request.contains_key("lock_token") {
         return daily_execution::execute_with_paths(
             request,
@@ -564,6 +567,9 @@ pub fn execute_request(
         }
     }
     let outcome = execute_unclaimed(request, paths, context, generate, writer, cancellation);
+    if cancellation.is_cancelled() || matches!(outcome, RuntimeOutcome::Cancelled) {
+        return RuntimeOutcome::Cancelled;
+    }
     let failure = match &outcome {
         RuntimeOutcome::Finished { .. } => None,
         RuntimeOutcome::StageFailed(error) | RuntimeOutcome::GenerateRefused { error, .. } => {
@@ -573,23 +579,36 @@ pub fn execute_request(
         _ => Some("talent_unfinished"),
     };
     if let Some(attempt) = attempt {
-        if let Err(error) = work_retry::finish(&context.journal, &unit, &attempt, failure) {
-            return refused(error);
+        if let Err(error) =
+            work_retry::finish_checked(&context.journal, &unit, &attempt, failure, &|| {
+                crate::writers::check_cancellation(cancellation)
+            })
+        {
+            return if cancellation.is_cancelled() {
+                RuntimeOutcome::Cancelled
+            } else {
+                refused(error)
+            };
         }
     } else if matches!(unit, Unit::Segment { .. })
         && !failure.is_some_and(|reason| {
             reason == "confidential_access_ended"
                 || solstone_core_generate::is_attestation_family_reason(reason)
         })
-        && let Err(error) = work_retry::record_floor_outcome(
+        && let Err(error) = work_retry::record_floor_outcome_checked(
             &context.journal,
             &unit,
             &input,
             failure,
             chrono::Utc::now().timestamp_millis(),
+            &|| crate::writers::check_cancellation(cancellation),
         )
     {
-        return refused(error);
+        return if cancellation.is_cancelled() {
+            RuntimeOutcome::Cancelled
+        } else {
+            refused(error)
+        };
     }
     outcome
 }
@@ -605,8 +624,12 @@ fn execute_unclaimed(
     let mut prepared =
         match prepare::prepare(request, paths, context, prepare::PrepareMode::Execute) {
             Ok(prepared) => prepared,
+            Err(_) if cancellation.is_cancelled() => return RuntimeOutcome::Cancelled,
             Err(error) => return RuntimeOutcome::PrepareFailed(error),
         };
+    if cancellation.is_cancelled() {
+        return RuntimeOutcome::Cancelled;
+    }
     emit_start(writer, &prepared);
     if let Some(reason) = prepared.config.get("skip_reason").and_then(Value::as_str) {
         return RuntimeOutcome::PrepareSkipped {
@@ -656,12 +679,16 @@ fn execute_unclaimed(
         }
     }
     let state = match stage.build {
-        Some(build) => match build(&mut prepared, context) {
+        Some(build) => match build(&mut prepared, context, cancellation) {
             Ok(state) => state,
+            Err(_) if cancellation.is_cancelled() => return RuntimeOutcome::Cancelled,
             Err(outcome) => return outcome,
         },
         None => PrePostState::None,
     };
+    if cancellation.is_cancelled() {
+        return RuntimeOutcome::Cancelled;
+    }
     if let Some(check) = stage.unavailable_before_generate
         && let Some(reason) = check(&state)
     {
@@ -673,6 +700,7 @@ fn execute_unclaimed(
             writer,
             None,
             None,
+            cancellation,
         );
     }
     if let Some(override_prompt) = stage.prompt_override
@@ -836,6 +864,7 @@ type GeneratedTalentResponse = (String, Option<Box<Value>>, Option<Box<Value>>);
 /// Runtime-owned config key carrying a clipped request's input budget.
 pub(crate) const INPUT_BUDGET_KEY: &str = "input_budget";
 
+#[allow(clippy::too_many_arguments)]
 fn finish_unavailable(
     reason: &str,
     prepared: &mut PreparedTalent,
@@ -844,7 +873,11 @@ fn finish_unavailable(
     writer: &mut impl Write,
     usage: Option<Box<Value>>,
     degraded: Option<Box<Value>>,
+    cancellation: &solstone_core_generate::Cancellation,
 ) -> RuntimeOutcome {
+    if cancellation.is_cancelled() {
+        return RuntimeOutcome::Cancelled;
+    }
     let (stage, state) = stage_state;
     let Some(callback) = stage.unavailable_commit else {
         return RuntimeOutcome::StageFailed(stage_error(
@@ -858,9 +891,13 @@ fn finish_unavailable(
         Ok(plan) => plan,
         Err(error) => return RuntimeOutcome::StageFailed(error),
     };
+    if cancellation.is_cancelled() {
+        return RuntimeOutcome::Cancelled;
+    }
     let disposition = match stage.writes_as_intent {
-        Some(apply) => match apply(plan, context, prepared) {
+        Some(apply) => match apply(plan, context, prepared, cancellation) {
             Ok(disposition) => disposition,
+            Err(_) if cancellation.is_cancelled() => return RuntimeOutcome::Cancelled,
             Err(error) => return RuntimeOutcome::StageFailed(error),
         },
         None => {
@@ -872,6 +909,9 @@ fn finish_unavailable(
             ));
         }
     };
+    if cancellation.is_cancelled() {
+        return RuntimeOutcome::Cancelled;
+    }
     if reason != "zero_slots" {
         emit(
             writer,
@@ -1010,6 +1050,7 @@ pub(crate) fn generate_and_write(
                         writer,
                         u,
                         d,
+                        cancellation,
                     );
                 }
             }
@@ -1036,6 +1077,7 @@ pub(crate) fn generate_and_write(
                 writer,
                 usage,
                 degraded,
+                cancellation,
             );
         }
         let disposition;
@@ -1093,9 +1135,13 @@ pub(crate) fn generate_and_write(
                     return RuntimeOutcome::StageFailed(error);
                 }
             };
+            if cancellation.is_cancelled() {
+                return RuntimeOutcome::Cancelled;
+            }
             disposition = match stage.writes_as_intent {
-                Some(apply) => match apply(plan, context, prepared) {
+                Some(apply) => match apply(plan, context, prepared, cancellation) {
                     Ok(value) => value,
+                    Err(_) if cancellation.is_cancelled() => return RuntimeOutcome::Cancelled,
                     Err(mut error) => {
                         if error.usage.is_none() {
                             error.usage = usage;
@@ -1109,7 +1155,12 @@ pub(crate) fn generate_and_write(
                 None => CommitDisposition::CommittedNoOutput,
             };
         } else {
-            disposition = match writers::write_output_if_configured(prepared, context, &response) {
+            disposition = match writers::write_output_if_configured_cancellable(
+                prepared,
+                context,
+                &response,
+                cancellation,
+            ) {
                 Ok(changed) => {
                     output_changed = Some(changed);
                     if changed
@@ -1134,6 +1185,7 @@ pub(crate) fn generate_and_write(
                     }
                     CommitDisposition::Written
                 }
+                Err(_) if cancellation.is_cancelled() => return RuntimeOutcome::Cancelled,
                 Err(error) => {
                     let mut err = stage_error("write", "runtime", prepared, error);
                     err.usage = usage;
@@ -1157,6 +1209,9 @@ pub(crate) fn generate_and_write(
             },
             None => response,
         };
+        if cancellation.is_cancelled() {
+            return RuntimeOutcome::Cancelled;
+        }
         return RuntimeOutcome::Finished {
             output,
             disposition,
@@ -1165,7 +1220,12 @@ pub(crate) fn generate_and_write(
             output_changed,
         };
     }
-    match writers::write_output_if_configured(prepared, context, &response) {
+    match writers::write_output_if_configured_cancellable(
+        prepared,
+        context,
+        &response,
+        cancellation,
+    ) {
         Ok(changed) => {
             if changed
                 && let Some(path) = prepared.config.get("output_path").and_then(Value::as_str)
@@ -1186,6 +1246,9 @@ pub(crate) fn generate_and_write(
                 );
                 emit_index_attempt(writer, &attempt);
             }
+            if cancellation.is_cancelled() {
+                return RuntimeOutcome::Cancelled;
+            }
             RuntimeOutcome::Finished {
                 output: response,
                 disposition: CommitDisposition::Written,
@@ -1194,6 +1257,7 @@ pub(crate) fn generate_and_write(
                 output_changed: Some(changed),
             }
         }
+        Err(_) if cancellation.is_cancelled() => RuntimeOutcome::Cancelled,
         Err(error) => {
             let mut err = stage_error("write", "runtime", prepared, error);
             err.usage = usage;
@@ -1511,6 +1575,109 @@ mod tests {
     use std::fs;
     use std::io::Cursor;
 
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn cancelled_segment_talent_does_not_publish_output_or_retry_failure() {
+        use solstone_core_system::work_retry::{self, Unit};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for granted in [false, true] {
+            for mode in ["positive", "late_generated", "provider_cancelled"] {
+                let (_root, paths, context) = fixture(
+                    "documents",
+                    r#"{
+"type":"generate","max_output_tokens":1024,"schedule":"segment","output":"md"
+}"#,
+                );
+                let unit = Unit::Segment {
+                    day: "20260101".into(),
+                    stream: "desktop".into(),
+                    segment: "120000_300".into(),
+                    talent: "documents".into(),
+                    direct: false,
+                };
+                let directory = unit.segment_directory(&context.journal).unwrap();
+                fs::create_dir_all(directory.join("talents")).unwrap();
+                fs::write(
+                    directory.join("talents/sense.json"),
+                    br#"{"density":"active","content_type":"work"}"#,
+                )
+                .unwrap();
+                let output = directory.join("talents/documents.md");
+                let input = work_retry::input::current(&context.journal, &unit).unwrap();
+                let mut request = json!({"name":"documents","day":"20260101","segment":"120000_300","stream":"desktop","output_path":output,"_work_unit":unit});
+                if granted {
+                    work_retry::observe_held(&context.journal, &unit, "analysis_failed", &input)
+                        .unwrap();
+                    work_retry::request(&context.journal, &unit).unwrap();
+                    let permission = work_retry::read(&context.journal, &unit.id().unwrap())
+                        .unwrap()
+                        .unwrap()
+                        .permission(&input, work_retry::DECLARED_FIXES)
+                        .unwrap();
+                    request["_work_retry"] = serde_json::to_value(permission).unwrap();
+                }
+                let cancelled = AtomicBool::new(false);
+                let executor = |_request: &solstone_core_generate::GenerateRequest| {
+                    if mode == "provider_cancelled" {
+                        return Ok(GenerateResponse::Cancelled);
+                    }
+                    if mode == "late_generated" {
+                        cancelled.store(true, Ordering::SeqCst);
+                    }
+                    Ok(GenerateResponse::Generated(Box::new(GeneratedResponse {
+                        id: None,
+                        text: "Published text".into(),
+                        model: "test-model".into(),
+                        finish_reason: "stop".into(),
+                        usage: json!({}),
+                        thinking: None,
+                        schema_validation: None,
+                        input_budget: None,
+                        request_budget: None,
+                        inference: None,
+                        hints_applied: vec![],
+                    })))
+                };
+                let check = || cancelled.load(Ordering::SeqCst);
+                let outcome = execute_request(
+                    request.as_object().unwrap().clone(),
+                    &paths,
+                    &context,
+                    &executor,
+                    &mut Vec::new(),
+                    &solstone_core_generate::Cancellation::from_fn(&check),
+                );
+                let record = work_retry::read(&context.journal, &unit.id().unwrap()).unwrap();
+                if mode == "positive" {
+                    assert!(
+                        matches!(outcome, RuntimeOutcome::Finished { .. }),
+                        "{outcome:?}"
+                    );
+                    assert!(output.is_file());
+                    assert_eq!(
+                        serde_json::to_value(record.as_ref().unwrap()).unwrap()["failure_count"],
+                        0
+                    );
+                    assert!(record.unwrap().attempt.is_none());
+                } else {
+                    assert!(matches!(outcome, RuntimeOutcome::Cancelled), "{outcome:?}");
+                    assert!(!output.exists());
+                    assert!(!output.with_file_name("documents.md.sources.json").exists());
+                    if granted {
+                        let record = record.unwrap();
+                        assert_eq!(serde_json::to_value(&record).unwrap()["failure_count"], 0);
+                        assert_eq!(record.reason, "analysis_failed");
+                        assert!(
+                            record.attempt.is_some(),
+                            "cancellation must not certify an attempt's terminal outcome"
+                        );
+                    } else {
+                        assert!(record.is_none());
+                    }
+                }
+            }
+        }
+    }
     fn reason_code_value(code: &str) -> ReasonCodeValue {
         match ReasonCode::new(code) {
             Ok(code) => ReasonCodeValue::Known(code),
@@ -1763,7 +1930,12 @@ mod tests {
             &paths, &context, prepare::PrepareMode::Execute,
         ).unwrap();
         let stage = resolve_hook("pulse").unwrap();
-        let state = stage.build.unwrap()(&mut prepared, &context).unwrap();
+        let state = stage.build.unwrap()(
+            &mut prepared,
+            &context,
+            &solstone_core_generate::Cancellation::never(),
+        )
+        .unwrap();
         stage.prompt_override.unwrap()(&mut prepared, &state).unwrap();
         let text = generate_contents(&prepared)
             .into_iter()
@@ -3775,6 +3947,7 @@ mod tests {
             &OneShotClient::at_path(&stub),
             &mut events,
             None,
+            &solstone_core_generate::Cancellation::never(),
         );
         assert!(matches!(outcome, RuntimeOutcome::GenerateRefused { .. }));
         assert_eq!(stub_invocations(&stub), 2);
@@ -4349,7 +4522,14 @@ mod tests {
             serde_json::to_value(&[original]).unwrap(),
         );
         let mut output2 = Vec::new();
-        let outcome = generate_and_write(&mut prepared, &context, &client, &mut output2, None);
+        let outcome = generate_and_write(
+            &mut prepared,
+            &context,
+            &client,
+            &mut output2,
+            None,
+            &solstone_core_generate::Cancellation::never(),
+        );
         emit_outcome(&mut output2, outcome);
         let evts2 = events(&output2);
         let finish2 = evts2.iter().find(|e| e["event"] == "finish").unwrap();

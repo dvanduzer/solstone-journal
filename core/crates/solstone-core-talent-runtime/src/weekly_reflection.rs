@@ -1149,7 +1149,14 @@ pub fn write_page(
     markdown: &str,
     document: &str,
 ) -> Result<(), StageError> {
-    write_page_with_sources(journal, start, markdown, document, &[])
+    write_page_with_sources(
+        journal,
+        start,
+        markdown,
+        document,
+        &[],
+        &solstone_core_generate::Cancellation::never(),
+    )
 }
 
 pub(crate) fn write_page_with_sources(
@@ -1158,7 +1165,11 @@ pub(crate) fn write_page_with_sources(
     markdown: &str,
     document: &str,
     sources: &[solstone_core_format::content::ConsumedOriginal],
+    cancellation: &solstone_core_generate::Cancellation,
 ) -> Result<(), StageError> {
+    crate::writers::check_cancellation(cancellation).map_err(|detail| {
+        StageError::new("cancel", "weekly_reflection", "weekly_reflection", detail)
+    })?;
     let target_dir = journal.join("reflections/weekly");
     fs::create_dir_all(&target_dir).map_err(|e| {
         StageError::new(
@@ -1172,32 +1183,40 @@ pub(crate) fn write_page_with_sources(
     let md_path = target_dir.join(format!("{start}.md"));
     let json_path = target_dir.join(format!("{start}.json"));
 
-    crate::writers::write_output_with_sources(md_path.clone(), markdown, sources).map_err(
-        |error| {
-            StageError::new(
-                "write",
-                "weekly_reflection",
-                "weekly_reflection",
-                format!(
-                    "failed to write markdown sources {}: {error}",
-                    md_path.display()
-                ),
-            )
-        },
-    )?;
-    crate::writers::write_output_with_sources(json_path.clone(), document, sources).map_err(
-        |error| {
-            StageError::new(
-                "write",
-                "weekly_reflection",
-                "weekly_reflection",
-                format!(
-                    "failed to write document sources {}: {error}",
-                    json_path.display()
-                ),
-            )
-        },
-    )?;
+    crate::writers::write_output_with_sources_cancellable(
+        md_path.clone(),
+        markdown,
+        sources,
+        cancellation,
+    )
+    .map_err(|error| {
+        StageError::new(
+            "write",
+            "weekly_reflection",
+            "weekly_reflection",
+            format!(
+                "failed to write markdown sources {}: {error}",
+                md_path.display()
+            ),
+        )
+    })?;
+    crate::writers::write_output_with_sources_cancellable(
+        json_path.clone(),
+        document,
+        sources,
+        cancellation,
+    )
+    .map_err(|error| {
+        StageError::new(
+            "write",
+            "weekly_reflection",
+            "weekly_reflection",
+            format!(
+                "failed to write document sources {}: {error}",
+                json_path.display()
+            ),
+        )
+    })?;
 
     match rescan_file(journal, &md_path) {
         Ok(RescanFileStatus::Indexed { warnings }) => {
@@ -2459,7 +2478,6 @@ Weekly prompt
         use serde_json::json;
         use std::fs;
         use std::path::{Path, PathBuf};
-        use tempfile::tempdir;
 
         fn parse_events(output: &[u8]) -> Vec<Value> {
             String::from_utf8_lossy(output)
@@ -2473,6 +2491,47 @@ Weekly prompt
             fs::read_to_string(count_file)
                 .map(|s| s.trim().parse::<usize>().unwrap_or(0))
                 .unwrap_or(0)
+        }
+
+        #[test]
+        fn cancelled_zero_slots_preserves_absence_and_uncancelled_twin_publishes() {
+            let _guard = pin_stage_now("2026-03-15T18:00:00Z");
+            for cancel in [true, false] {
+                let (_root, paths, context) = test_fixture("20260308", &[], false);
+                let generate = |_: &solstone_core_generate::GenerateRequest| -> Result<
+                    solstone_core_generate::GenerateResponse,
+                    solstone_core_generate::ClientError,
+                > {
+                    panic!("zero slots must not call Generate");
+                };
+                let cancelled = || cancel;
+                let outcome = execute_request(
+                    json!({"name":"weekly_reflection","day":"20260308","today":"20260316"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                    &paths,
+                    &context,
+                    &generate,
+                    &mut Vec::new(),
+                    &solstone_core_generate::Cancellation::from_fn(&cancelled),
+                );
+                let markdown = context.journal.join("reflections/weekly/20260308.md");
+                let document = context.journal.join("reflections/weekly/20260308.json");
+                if cancel {
+                    assert!(matches!(outcome, RuntimeOutcome::Cancelled), "{outcome:?}");
+                    assert!(!markdown.exists() && !document.exists());
+                } else {
+                    assert!(
+                        matches!(outcome, RuntimeOutcome::Finished { .. }),
+                        "{outcome:?}"
+                    );
+                    assert!(markdown.is_file() && document.is_file());
+                    let value: Value =
+                        serde_json::from_slice(&fs::read(document).unwrap()).unwrap();
+                    assert_eq!(value["selection"]["status"], "none");
+                }
+            }
         }
 
         #[test]

@@ -14,7 +14,7 @@ use solstone_core_speaker_resolve::admission::{
 };
 use solstone_core_speaker_resolve::resolve::{ResolveMetadata, ResolveOutcome, ResolveOutput};
 use solstone_core_speaker_resolve::voiceprint_accumulation::{
-    AccumulationEmbedding, AccumulationLabel, AccumulationRequest, accumulate_voiceprints,
+    AccumulationEmbedding, AccumulationLabel, AccumulationRequest,
 };
 
 use crate::contract::{CommitPlan, ParsedOutput, PrePostState};
@@ -187,6 +187,7 @@ fn try_accumulate(
     segment: &str,
     stream: &str,
     output: &ResolveOutput,
+    cancellation: &solstone_core_generate::Cancellation,
 ) {
     let Some(source) = output.source.as_deref() else {
         return;
@@ -200,7 +201,7 @@ fn try_accumulate(
         else {
             return Ok(());
         };
-        accumulate_with_embeddings(
+        accumulate_with_embeddings_cancellable(
             journal,
             day,
             layout,
@@ -215,6 +216,7 @@ fn try_accumulate(
                     values,
                 })
                 .collect(),
+            cancellation,
         )
     })();
     // Preserve solstone/talent/speaker_attribution.py:73-79,204-210: flywheel failures warn only.
@@ -223,6 +225,7 @@ fn try_accumulate(
     }
 }
 
+#[cfg(test)]
 fn accumulate_with_embeddings(
     journal: &Path,
     day: &str,
@@ -231,6 +234,29 @@ fn accumulate_with_embeddings(
     stream: &str,
     output: &ResolveOutput,
     embeddings: Vec<AccumulationEmbedding>,
+) -> Result<(), String> {
+    accumulate_with_embeddings_cancellable(
+        journal,
+        day,
+        layout,
+        segment,
+        stream,
+        output,
+        embeddings,
+        &solstone_core_generate::Cancellation::never(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accumulate_with_embeddings_cancellable(
+    journal: &Path,
+    day: &str,
+    layout: SegmentLayout,
+    segment: &str,
+    stream: &str,
+    output: &ResolveOutput,
+    embeddings: Vec<AccumulationEmbedding>,
+    cancellation: &solstone_core_generate::Cancellation,
 ) -> Result<(), String> {
     let Some(source) = output.source.as_deref() else {
         return Ok(());
@@ -268,9 +294,12 @@ fn accumulate_with_embeddings(
         embeddings,
         entity_ids,
     };
-    accumulate_voiceprints(&request)
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+    solstone_core_speaker_resolve::voiceprint_accumulation::accumulate_voiceprints_checked(
+        &request,
+        &|| crate::writers::check_cancellation(cancellation),
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 fn is_dry_run(prepared: &PreparedTalent) -> bool {
@@ -285,6 +314,21 @@ pub fn build(
     prepared: &mut PreparedTalent,
     context: &ExecutionContext,
 ) -> Result<PrePostState, RuntimeOutcome> {
+    build_cancellable(
+        prepared,
+        context,
+        &solstone_core_generate::Cancellation::never(),
+    )
+}
+
+pub(crate) fn build_cancellable(
+    prepared: &mut PreparedTalent,
+    context: &ExecutionContext,
+    cancellation: &solstone_core_generate::Cancellation,
+) -> Result<PrePostState, RuntimeOutcome> {
+    if cancellation.is_cancelled() {
+        return Err(RuntimeOutcome::Cancelled);
+    }
     let Some((day, layout, segment, stream)) = fields(prepared) else {
         return Err(skipped(prepared, "no_segment_context"));
     };
@@ -306,8 +350,12 @@ pub fn build(
         Err(error) => {
             let reason = error.to_string();
             if !dry_run && has_embeddings(&segment_dir) {
-                solstone_core_speaker_id::labels::write_stub_labels(&segment_dir, &reason)
-                    .map_err(|error| skipped(prepared, error.to_string()))?;
+                solstone_core_speaker_id::labels::write_stub_labels_checked(
+                    &segment_dir,
+                    &reason,
+                    &|| crate::writers::check_cancellation(cancellation),
+                )
+                .map_err(|error| skipped(prepared, error.to_string()))?;
             }
             return Err(skipped(prepared, reason));
         }
@@ -327,8 +375,12 @@ pub fn build(
                 ResolveOutcome::Resolved(_) => unreachable!("matched above"),
             };
             if !dry_run && has_embeddings(&segment_dir) {
-                solstone_core_speaker_id::labels::write_stub_labels(&segment_dir, reason)
-                    .map_err(|error| skipped(prepared, error.to_string()))?;
+                solstone_core_speaker_id::labels::write_stub_labels_checked(
+                    &segment_dir,
+                    reason,
+                    &|| crate::writers::check_cancellation(cancellation),
+                )
+                .map_err(|error| skipped(prepared, error.to_string()))?;
             }
             return Err(skipped(prepared, reason));
         }
@@ -336,18 +388,23 @@ pub fn build(
     if resolved.labels.is_empty() {
         let reason = "no_embeddings";
         if !dry_run && has_embeddings(&segment_dir) {
-            solstone_core_speaker_id::labels::write_stub_labels(&segment_dir, reason)
-                .map_err(|error| skipped(prepared, error.to_string()))?;
+            solstone_core_speaker_id::labels::write_stub_labels_checked(
+                &segment_dir,
+                reason,
+                &|| crate::writers::check_cancellation(cancellation),
+            )
+            .map_err(|error| skipped(prepared, error.to_string()))?;
         }
         return Err(skipped(prepared, reason));
     }
     let state = SpeakerAttributionState { resolved };
     if state.resolved.unmatched.is_empty() {
         if !dry_run {
-            solstone_core_speaker_id::labels::write_full_labels(
+            solstone_core_speaker_id::labels::write_full_labels_checked(
                 &segment_dir,
                 label_values(&state.resolved),
                 &metadata_values(&state.resolved.metadata),
+                &|| crate::writers::check_cancellation(cancellation),
             )
             .map_err(|error| skipped(prepared, error.to_string()))?;
             try_accumulate(
@@ -357,6 +414,7 @@ pub fn build(
                 segment,
                 stream,
                 &state.resolved,
+                cancellation,
             );
         }
         // Preserve solstone/talent/speaker_attribution.py:73-81: this writes from build because
@@ -458,6 +516,30 @@ pub fn apply_result(
     layout: SegmentLayout,
     state: &SpeakerAttributionState,
 ) -> Result<(), String> {
+    apply_result_cancellable(
+        journal,
+        output,
+        day,
+        segment,
+        stream,
+        layout,
+        state,
+        &solstone_core_generate::Cancellation::never(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_result_cancellable(
+    journal: &Path,
+    output: &str,
+    day: &str,
+    segment: &str,
+    stream: &str,
+    layout: SegmentLayout,
+    state: &SpeakerAttributionState,
+    cancellation: &solstone_core_generate::Cancellation,
+) -> Result<(), String> {
+    crate::writers::check_cancellation(cancellation)?;
     let mut layer4 = HashMap::new();
     if !output.is_empty() {
         let parsed = serde_json::from_str::<Value>(output)
@@ -492,7 +574,7 @@ pub fn apply_result(
                     {
                         continue;
                     }
-                    let resolution = solstone_core_entity::record_entity_resolution(
+                    let resolution = solstone_core_entity::record_entity_resolution_checked(
                         journal,
                         speaker,
                         &resolution_entities,
@@ -500,6 +582,7 @@ pub fn apply_result(
                         json!({"lane":"talent.speaker_attribution","day":day,"segment_id":segment,"field":"layer4.speaker"}),
                         90.0,
                         false,
+                        &|| crate::writers::check_cancellation(cancellation),
                     )
                     .map_err(|error| error.to_string())?;
                     if resolution.outcome == solstone_core_entity::EntityResolutionOutcome::Resolved
@@ -524,14 +607,24 @@ pub fn apply_result(
         }
     }
     // Preserve solstone/talent/speaker_attribution.py:200: post processing creates the segment path.
+    crate::writers::check_cancellation(cancellation)?;
     let segment_dir = segment_dir(journal, day, stream, segment, layout, true)?;
-    solstone_core_speaker_id::labels::write_full_labels(
+    solstone_core_speaker_id::labels::write_full_labels_checked(
         &segment_dir,
         label_values(&resolved),
         &metadata_values(&resolved.metadata),
+        &|| crate::writers::check_cancellation(cancellation),
     )
     .map_err(|error| error.to_string())?;
-    try_accumulate(journal, day, layout, segment, stream, &resolved);
+    try_accumulate(
+        journal,
+        day,
+        layout,
+        segment,
+        stream,
+        &resolved,
+        cancellation,
+    );
     Ok(())
 }
 

@@ -6,7 +6,9 @@ pub use daily::{
     PreparedDailyAction, PreparedDailyPublication, prepare_daily_output, prepare_daily_publication,
     publish_daily_publication, required_artifact_receipts,
 };
-pub(crate) use daily::{bind_output_action, prepare_frozen_output_action};
+pub(crate) use daily::{
+    bind_output_action, prepare_frozen_output_action, publish_daily_publication_cancellable,
+};
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -102,6 +104,31 @@ pub fn write_output_if_configured(
     context: &ExecutionContext,
     output: &str,
 ) -> Result<bool, String> {
+    write_output_if_configured_cancellable(
+        prepared,
+        context,
+        output,
+        &solstone_core_generate::Cancellation::never(),
+    )
+}
+
+pub(crate) fn check_cancellation(
+    cancellation: &solstone_core_generate::Cancellation,
+) -> Result<(), String> {
+    if cancellation.is_cancelled() {
+        Err("cancelled".into())
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn write_output_if_configured_cancellable(
+    prepared: &PreparedTalent,
+    context: &ExecutionContext,
+    output: &str,
+    cancellation: &solstone_core_generate::Cancellation,
+) -> Result<bool, String> {
+    check_cancellation(cancellation)?;
     let Some(path_str) = prepared.config.get("output_path").and_then(Value::as_str) else {
         return Ok(false);
     };
@@ -124,6 +151,7 @@ pub fn write_output_if_configured(
         let _guard =
             solstone_core_facets::hold_activity_enrichment(&context.journal, facet, expected)
                 .map_err(|error| error.to_string())?;
+        check_cancellation(cancellation)?;
         let directory = solstone_core_journal_io::contained_path(
             &context.journal,
             &format!("facets/{facet}/activities"),
@@ -134,10 +162,15 @@ pub fn write_output_if_configured(
         if !contained.starts_with(&directory) {
             return Err("activity output is outside its destination facet".to_owned());
         }
-        return write_output_with_sources(contained, output, &trusted_sources(prepared))
-            .map_err(|error| error.to_string());
+        return write_output_with_sources_cancellable(
+            contained,
+            output,
+            &trusted_sources(prepared),
+            cancellation,
+        )
+        .map_err(|error| error.to_string());
     }
-    write_output_with_sources(path, output, &trusted_sources(prepared))
+    write_output_with_sources_cancellable(path, output, &trusted_sources(prepared), cancellation)
         .map_err(|error| error.to_string())
 }
 
@@ -150,22 +183,49 @@ fn trusted_sources(prepared: &PreparedTalent) -> Vec<ConsumedOriginal> {
 }
 
 pub fn write_output(path: PathBuf, output: &str) -> Result<bool, std::io::Error> {
+    write_output_cancellable(path, output, &solstone_core_generate::Cancellation::never())
+}
+
+fn write_output_cancellable(
+    path: PathBuf,
+    output: &str,
+    cancellation: &solstone_core_generate::Cancellation,
+) -> Result<bool, std::io::Error> {
+    check_cancellation(cancellation).map_err(std::io::Error::other)?;
     let bytes = output.as_bytes();
     if path.exists() && fs::read(&path)? == bytes {
         return Ok(false);
     }
     if let Some(parent) = path.parent() {
+        check_cancellation(cancellation).map_err(std::io::Error::other)?;
         fs::create_dir_all(parent)?;
     }
+    check_cancellation(cancellation).map_err(std::io::Error::other)?;
     replace_output_bytes(&path, bytes)?;
     Ok(true)
 }
 
+#[cfg(test)]
 pub(crate) fn write_output_with_sources(
     path: PathBuf,
     output: &str,
     sources: &[ConsumedOriginal],
 ) -> Result<bool, std::io::Error> {
+    write_output_with_sources_cancellable(
+        path,
+        output,
+        sources,
+        &solstone_core_generate::Cancellation::never(),
+    )
+}
+
+pub(crate) fn write_output_with_sources_cancellable(
+    path: PathBuf,
+    output: &str,
+    sources: &[ConsumedOriginal],
+    cancellation: &solstone_core_generate::Cancellation,
+) -> Result<bool, std::io::Error> {
+    check_cancellation(cancellation).map_err(std::io::Error::other)?;
     let mut sidecar_name = path
         .file_name()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing filename"))?
@@ -186,10 +246,11 @@ pub(crate) fn write_output_with_sources(
         Some(serde_json::to_vec(sources).map_err(std::io::Error::other)?)
     };
     let sidecar_changed = previous_sidecar != next_sidecar;
+    check_cancellation(cancellation).map_err(std::io::Error::other)?;
     if sidecar_changed {
         publish_sidecar(&sidecar, next_sidecar.as_deref())?;
     }
-    match write_output(path, output) {
+    match write_output_cancellable(path, output, cancellation) {
         Ok(changed) => Ok(changed || sidecar_changed),
         Err(body_error) => {
             if sidecar_changed {
@@ -223,22 +284,31 @@ pub fn apply(
     plan: CommitPlan,
     context: &ExecutionContext,
 ) -> Result<CommitDisposition, StageError> {
-    apply_with_sources(plan, context, &[])
+    apply_with_sources(
+        plan,
+        context,
+        &[],
+        &solstone_core_generate::Cancellation::never(),
+    )
 }
 
 pub(crate) fn apply_prepared(
     plan: CommitPlan,
     context: &ExecutionContext,
     prepared: &PreparedTalent,
+    cancellation: &solstone_core_generate::Cancellation,
 ) -> Result<CommitDisposition, StageError> {
-    apply_with_sources(plan, context, &trusted_sources(prepared))
+    apply_with_sources(plan, context, &trusted_sources(prepared), cancellation)
 }
 
 fn apply_with_sources(
     plan: CommitPlan,
     context: &ExecutionContext,
     sources: &[ConsumedOriginal],
+    cancellation: &solstone_core_generate::Cancellation,
 ) -> Result<CommitDisposition, StageError> {
+    check_cancellation(cancellation)
+        .map_err(|detail| StageError::new("cancel", "runtime", "publication", detail))?;
     match plan {
         CommitPlan::NoOutput => Ok(CommitDisposition::CommittedNoOutput),
         CommitPlan::Write(WriteIntent::DayAccumulator {
@@ -246,7 +316,14 @@ fn apply_with_sources(
             agent,
             mut record,
         }) => {
-            append_day_record_with_sources(&context.journal, &day, &agent, &mut record, sources)?;
+            append_day_record_with_sources(
+                &context.journal,
+                &day,
+                &agent,
+                &mut record,
+                sources,
+                cancellation,
+            )?;
             Ok(CommitDisposition::Written)
         }
         CommitPlan::Write(WriteIntent::Story {
@@ -257,7 +334,7 @@ fn apply_with_sources(
             record_id,
             value,
         }) => {
-            crate::story::apply_story(
+            crate::story::apply_story_cancellable(
                 &context.journal,
                 &talent,
                 &facet,
@@ -265,6 +342,7 @@ fn apply_with_sources(
                 &day,
                 &record_id,
                 &value,
+                cancellation,
             )
             .map_err(|detail| StageError::new("commit", "story", talent, detail))?;
             Ok(CommitDisposition::CommittedNoOutput)
@@ -273,22 +351,31 @@ fn apply_with_sources(
             output,
             output_path,
         }) => {
-            crate::daily_schedule::apply_result(&context.journal, &output).map_err(|detail| {
+            crate::daily_schedule::apply_result_cancellable(
+                &context.journal,
+                &output,
+                cancellation,
+            )
+            .map_err(|detail| {
                 StageError::new("write-intent", "daily_schedule", "daily_schedule", detail)
             })?;
             let Some(output_path) = output_path else {
                 return Ok(CommitDisposition::CommittedNoOutput);
             };
-            write_output_with_sources(PathBuf::from(output_path), &output, sources).map_err(
-                |error| {
-                    StageError::new(
-                        "write-intent",
-                        "daily_schedule",
-                        "daily_schedule",
-                        error.to_string(),
-                    )
-                },
-            )?;
+            write_output_with_sources_cancellable(
+                PathBuf::from(output_path),
+                &output,
+                sources,
+                cancellation,
+            )
+            .map_err(|error| {
+                StageError::new(
+                    "write-intent",
+                    "daily_schedule",
+                    "daily_schedule",
+                    error.to_string(),
+                )
+            })?;
             Ok(CommitDisposition::Written)
         }
         CommitPlan::Write(WriteIntent::Participation {
@@ -298,13 +385,14 @@ fn apply_with_sources(
             day,
             activity,
         }) => {
-            crate::participation::apply_result(
+            crate::participation::apply_result_cancellable(
                 &context.journal,
                 &output,
                 &facet,
                 &destination_id,
                 &day,
                 &activity,
+                cancellation,
             )
             .map_err(|detail| {
                 StageError::new("write-intent", "participation", "participation", detail)
@@ -312,21 +400,31 @@ fn apply_with_sources(
             Ok(CommitDisposition::CommittedNoOutput)
         }
         CommitPlan::Write(WriteIntent::Schedule { output, day }) => {
-            crate::schedule::apply_result(&context.journal, &output, &day).map_err(|detail| {
-                StageError::new("write-intent", "schedule", "schedule", detail)
-            })?;
+            crate::schedule::apply_result_cancellable(
+                &context.journal,
+                &output,
+                &day,
+                cancellation,
+            )
+            .map_err(|detail| StageError::new("write-intent", "schedule", "schedule", detail))?;
             Ok(CommitDisposition::CommittedNoOutput)
         }
         CommitPlan::Write(WriteIntent::FacetNewsletter { output, facet, day }) => {
-            crate::facet_newsletter::apply_result(&context.journal, &output, &facet, &day)
-                .map_err(|detail| {
-                    StageError::new(
-                        "write-intent",
-                        "facet_newsletter",
-                        "facet_newsletter",
-                        detail,
-                    )
-                })?;
+            crate::facet_newsletter::apply_result_cancellable(
+                &context.journal,
+                &output,
+                &facet,
+                &day,
+                cancellation,
+            )
+            .map_err(|detail| {
+                StageError::new(
+                    "write-intent",
+                    "facet_newsletter",
+                    "facet_newsletter",
+                    detail,
+                )
+            })?;
             Ok(CommitDisposition::CommittedNoOutput)
         }
         CommitPlan::Write(WriteIntent::EntityDetection {
@@ -335,12 +433,13 @@ fn apply_with_sources(
             segment,
             stream,
         }) => {
-            crate::entities::detection::apply_result(
+            crate::entities::detection::apply_result_cancellable(
                 &context.journal,
                 &output,
                 &day,
                 &segment,
                 stream.as_deref(),
+                cancellation,
             )
             .map_err(|detail| {
                 StageError::new(
@@ -353,15 +452,21 @@ fn apply_with_sources(
             Ok(CommitDisposition::CommittedNoOutput)
         }
         CommitPlan::Write(WriteIntent::EntitiesReview { output, facet, day }) => {
-            crate::entities::review::apply_result(&context.journal, &output, &facet, &day)
-                .map_err(|detail| {
-                    StageError::new(
-                        "write-intent",
-                        "entities:entities_review",
-                        "entities:entities_review",
-                        detail,
-                    )
-                })?;
+            crate::entities::review::apply_result_cancellable(
+                &context.journal,
+                &output,
+                &facet,
+                &day,
+                cancellation,
+            )
+            .map_err(|detail| {
+                StageError::new(
+                    "write-intent",
+                    "entities:entities_review",
+                    "entities:entities_review",
+                    detail,
+                )
+            })?;
             Ok(CommitDisposition::CommittedNoOutput)
         }
         CommitPlan::Write(WriteIntent::EntitySuggest { output, facet, day }) => {
@@ -371,7 +476,13 @@ fn apply_with_sources(
                 .join(&facet)
                 .join("entities")
                 .join(format!("{day}_observer_suggestions.json"));
-            write_output_with_sources(path, &format!("{output}\n"), sources).map_err(|e| {
+            write_output_with_sources_cancellable(
+                path,
+                &format!("{output}\n"),
+                sources,
+                cancellation,
+            )
+            .map_err(|e| {
                 StageError::new(
                     "write-intent",
                     "entities:entity_suggest",
@@ -388,13 +499,14 @@ fn apply_with_sources(
             served_ids,
             shown_observation_ids,
         }) => {
-            crate::entities::observer::apply_result(
+            crate::entities::observer::apply_result_cancellable(
                 &context.journal,
                 &output,
                 &facet,
                 &day,
                 &served_ids,
                 &shown_observation_ids,
+                cancellation,
             )
             .map_err(|detail| {
                 StageError::new(
@@ -414,7 +526,7 @@ fn apply_with_sources(
             stream,
             state,
         }) => {
-            crate::speaker_attribution::apply_result(
+            crate::speaker_attribution::apply_result_cancellable(
                 &context.journal,
                 &output,
                 &day,
@@ -422,6 +534,7 @@ fn apply_with_sources(
                 &stream,
                 stream_layout,
                 &state,
+                cancellation,
             )
             .map_err(|detail| {
                 StageError::new(
@@ -444,6 +557,7 @@ fn apply_with_sources(
                 &markdown,
                 &document,
                 sources,
+                cancellation,
             )?;
             Ok(CommitDisposition::Written)
         }
@@ -456,7 +570,14 @@ pub fn append_day_record(
     agent: &str,
     record: &mut Map<String, Value>,
 ) -> Result<(), StageError> {
-    append_day_record_with_sources(journal, day, agent, record, &[])
+    append_day_record_with_sources(
+        journal,
+        day,
+        agent,
+        record,
+        &[],
+        &solstone_core_generate::Cancellation::never(),
+    )
 }
 
 fn append_day_record_with_sources(
@@ -465,7 +586,9 @@ fn append_day_record_with_sources(
     agent: &str,
     record: &mut Map<String, Value>,
     sources: &[ConsumedOriginal],
+    cancellation: &solstone_core_generate::Cancellation,
 ) -> Result<(), StageError> {
+    check_cancellation(cancellation).map_err(|detail| stage_error(agent, detail))?;
     record.insert(
         "sources".to_owned(),
         serde_json::to_value(sources).map_err(|error| stage_error(agent, error.to_string()))?,
@@ -489,6 +612,7 @@ fn append_day_record_with_sources(
         .map_err(|error| stage_error(agent, error.to_string()))?
         .records;
     records.push(Value::Object(record.clone()));
+    check_cancellation(cancellation).map_err(|detail| stage_error(agent, detail))?;
     write_jsonl(&path, records, AtomicWriteOptions { mode: Some(0o600) })
         .map_err(|error| stage_error(agent, error.to_string()))?;
     match rescan_file(journal, &path) {

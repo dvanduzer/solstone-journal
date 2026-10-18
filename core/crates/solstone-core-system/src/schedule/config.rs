@@ -237,13 +237,25 @@ pub fn publish_daily_time(
     allow_before: bool,
     receipt: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
+    publish_daily_time_checked(path, batch, allow_before, || Ok(()), receipt)
+}
+
+pub fn publish_daily_time_checked(
+    path: &Path,
+    batch: &PreparedDailyTime,
+    allow_before: bool,
+    checkpoint: impl Fn() -> Result<(), String>,
+    receipt: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
     let _lock = hold_lock(path, Default::default()).map_err(|e| e.to_string())?;
+    checkpoint()?;
     let mut raw = read_strict_raw(path).map_err(|e| e.to_string())?;
     if raw.get("daily_time") != Some(&batch.after) {
         if !allow_before || raw.get("daily_time") != batch.before.as_ref() {
             return Err("conflict: daily time changed after preparation".into());
         }
         raw.insert("daily_time".into(), batch.after.clone());
+        checkpoint()?;
         write_raw(path, raw).map_err(|e| e.to_string())?;
     }
     receipt()
@@ -499,6 +511,78 @@ mod tests {
         let value: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(value["daily_time"], "09:30");
         assert_eq!(value["job"]["enabled"], true);
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn cancelled_daily_time_publication_waits_for_the_owner_lock_without_writing() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        use std::time::Duration;
+        for cancel in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("schedules.json");
+            let before = br#"{"daily_time":"08:00","weekly_day":"sunday","cadence":{"enabled":false,"interval_minutes":5}}"#;
+            std::fs::write(&path, before).unwrap();
+            let batch = prepare_daily_time(&path, "09:30").unwrap();
+            let held = hold_lock(&path, Default::default()).unwrap();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let receipted = Arc::new(AtomicBool::new(false));
+            let worker_path = path.clone();
+            let worker_cancelled = cancelled.clone();
+            let worker_receipted = receipted.clone();
+            let (entered, observed) = mpsc::channel();
+            let (release, gate) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let gated = AtomicBool::new(false);
+                publish_daily_time_checked(
+                    &worker_path,
+                    &batch,
+                    true,
+                    || {
+                        if !gated.swap(true, Ordering::SeqCst) {
+                            entered.send(()).unwrap();
+                            gate.recv_timeout(Duration::from_secs(5)).unwrap();
+                        }
+                        if worker_cancelled.load(Ordering::SeqCst) {
+                            Err("cancelled".into())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    || {
+                        worker_receipted.store(true, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+            });
+            assert!(matches!(
+                observed.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            cancelled.store(cancel, Ordering::SeqCst);
+            drop(held);
+            observed.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            release.send(()).unwrap();
+            let result = worker.join().unwrap();
+            if cancel {
+                assert_eq!(result.unwrap_err(), "cancelled");
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+                assert!(!receipted.load(Ordering::SeqCst));
+            } else {
+                result.unwrap();
+                assert!(receipted.load(Ordering::SeqCst));
+                let value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                assert_eq!(value["daily_time"], "09:30");
+                assert_eq!(value["weekly_day"], "sunday");
+                assert_eq!(value["cadence"]["enabled"], false);
+                assert_eq!(value["cadence"]["interval_minutes"], 5);
+            }
+        }
     }
 
     #[test]

@@ -128,6 +128,18 @@ pub fn embedded_already_processed(
     crate::args::should_skip_process_one_processed(audio, false, Some(journal), retry)
 }
 
+pub fn embedded_retryable_failure(audio: &Path) -> bool {
+    use solstone_core_processing_record::{
+        is_failure_exhausted, read_processing_record_header, vocab,
+    };
+    read_processing_record_header(&audio.with_extension("jsonl")).is_some_and(|record| {
+        record["schema"] == vocab::SCHEMA
+            && record["handler"] == vocab::HANDLER_TRANSCRIBE
+            && record["state"] == vocab::STATE_FAILED
+            && !is_failure_exhausted(&record)
+    })
+}
+
 /// Run the normal claimed decode/VAD/ASR/speaker/publication pipeline in process.
 ///
 /// The caller opts in explicitly and supplies app-private pinned model and scratch

@@ -1085,6 +1085,13 @@ mod tests {
     }
 
     impl AttestedIo for FailingWriteStream {
+        fn set_io_deadline(
+            &mut self,
+            _deadline: Option<std::time::Instant>,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
         fn set_io_timeout(&mut self, _timeout: Option<Duration>) -> std::io::Result<()> {
             Ok(())
         }
@@ -1215,6 +1222,13 @@ mod tests {
     }
 
     impl AttestedIo for MockAttestedStream {
+        fn set_io_deadline(
+            &mut self,
+            _deadline: Option<std::time::Instant>,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
         fn set_io_timeout(&mut self, _timeout: Option<Duration>) -> std::io::Result<()> {
             Ok(())
         }

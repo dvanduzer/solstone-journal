@@ -73,16 +73,8 @@ public class ServingActivity extends Activity {
                     }
                     public ServingConnection.Retirement retirement() throws Exception {
                         JSONObject res = call(target, MainActivity.obj("op", "status"));
-                        JSONObject nat = res.optJSONObject("native");
-                        if (nat != null) {
-                            if (nat.optBoolean("failed", false)) {
-                                return ServingConnection.Retirement.FAILED;
-                            }
-                            if (nat.optBoolean("stopping", false)) {
-                                return ServingConnection.Retirement.PENDING;
-                            }
-                        }
-                        return ServingConnection.Retirement.STOPPED;
+                        return ServingConnection.retirement(res, (row, key) ->
+                            row instanceof JSONObject ? ((JSONObject)row).opt(key) : null);
                     }
                     public boolean start() throws Exception {
                         JSONObject res = call(target, MainActivity.obj("op", "start",

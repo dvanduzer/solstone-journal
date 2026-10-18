@@ -19,7 +19,7 @@ use solstone_core_entity_matching::{
 
 use crate::{
     AmbiguityObservation, EntityStoreError, EntityTrustLockError, EntityWriteError,
-    hold_entity_trust_lock, load_resolved_ambiguity_choice, record_ambiguity_observation,
+    hold_entity_trust_lock, load_resolved_ambiguity_choice,
 };
 
 /// One caller-supplied entity available for resolution.
@@ -281,6 +281,29 @@ pub fn record_entity_resolution(
     fuzzy_threshold: f64,
     read_only: bool,
 ) -> Result<EntityResolution, EntityResolutionError> {
+    record_entity_resolution_checked(
+        journal_root,
+        query,
+        entities,
+        scope,
+        origin,
+        fuzzy_threshold,
+        read_only,
+        &|| Ok(()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn record_entity_resolution_checked(
+    journal_root: &Path,
+    query: &str,
+    entities: &[EntityResolutionEntity],
+    scope: Value,
+    origin: Value,
+    fuzzy_threshold: f64,
+    read_only: bool,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<EntityResolution, EntityResolutionError> {
     record_entity_resolution_impl(
         journal_root,
         query,
@@ -290,6 +313,7 @@ pub fn record_entity_resolution(
         fuzzy_threshold,
         read_only,
         false,
+        checkpoint,
     )
 }
 
@@ -316,6 +340,7 @@ pub fn record_entity_resolution_from_name_evidence(
         fuzzy_threshold,
         read_only,
         true,
+        &|| Ok(()),
     )
 }
 
@@ -335,6 +360,7 @@ fn record_entity_resolution_impl(
     fuzzy_threshold: f64,
     read_only: bool,
     name_evidence_only: bool,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<EntityResolution, EntityResolutionError> {
     if query.trim().is_empty() {
         return Ok(no_match());
@@ -343,6 +369,9 @@ fn record_entity_resolution_impl(
     let _trust = (!read_only)
         .then(|| hold_entity_trust_lock(journal_root))
         .transpose()?;
+    checkpoint().map_err(|detail| {
+        EntityResolutionError::Write(EntityWriteError::PublicationRefused(detail))
+    })?;
     let normalized_query = normalize_resolution_query(query);
     let match_query = matchable_resolution_query(query);
     let is_placeholder = matches!(
@@ -458,6 +487,7 @@ fn record_entity_resolution_impl(
                 scope,
                 origin,
                 read_only,
+                checkpoint,
             },
             tier,
             candidates,
@@ -474,6 +504,7 @@ struct AmbiguityRecordContext<'a> {
     scope: Value,
     origin: Value,
     read_only: bool,
+    checkpoint: &'a dyn Fn() -> Result<(), String>,
 }
 
 fn record_resolution_ambiguity(
@@ -495,11 +526,15 @@ fn record_resolution_ambiguity(
                 .collect(),
             origin: context.origin,
         };
-        record_ambiguity_observation(context.journal_root, &observation)?
-            .get("ambiguity_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned()
+        crate::record_ambiguity_observation_checked(
+            context.journal_root,
+            &observation,
+            context.checkpoint,
+        )?
+        .get("ambiguity_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
     };
     Ok(EntityResolution {
         outcome: EntityResolutionOutcome::Ambiguous,

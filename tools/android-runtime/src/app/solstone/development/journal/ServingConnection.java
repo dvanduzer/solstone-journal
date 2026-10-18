@@ -2,6 +2,8 @@
 // Copyright (c) 2026 sol pbc
 package app.solstone.development.journal;
 
+import java.util.function.BiFunction;
+
 public final class ServingConnection {
     public enum Action {
         DROP,
@@ -23,6 +25,26 @@ public final class ServingConnection {
         boolean start() throws Exception;
         boolean enableAudio() throws Exception;
         void onReady(long generation);
+    }
+
+    // The accessor keeps this boundary decoder executable in host lifecycle
+    // tests while the activity supplies the real JSONObject accessor.
+    public static Retirement retirement(Object response, BiFunction<Object, String, Object> get) {
+        Object nativeResult = get.apply(response, "native");
+        if (!Boolean.TRUE.equals(get.apply(nativeResult, "ok"))) {
+            return "server stopped".equals(get.apply(nativeResult, "error"))
+                ? Retirement.STOPPED : Retirement.FAILED;
+        }
+        Object value = get.apply(nativeResult, "value");
+        if (value == null) return Retirement.FAILED;
+        Object failed = get.apply(value, "failed"), stopping = get.apply(value, "stopping");
+        if ((failed != null && !(failed instanceof Boolean))
+            || (stopping != null && !(stopping instanceof Boolean))) return Retirement.FAILED;
+        if (failed == null && stopping == null
+            && !(get.apply(value, "root_current") instanceof Boolean)) return Retirement.FAILED;
+        if (Boolean.TRUE.equals(failed)) return Retirement.FAILED;
+        if (Boolean.TRUE.equals(stopping)) return Retirement.PENDING;
+        return Retirement.STOPPED;
     }
 
     public static Action decide(

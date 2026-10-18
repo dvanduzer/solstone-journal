@@ -45,6 +45,20 @@ public class JournalService extends Service {
                 final boolean isThinking = operation.equals("generate") || operation.equals("talent");
                 final boolean isToolStatus = operation.equals("service-tools");
                 final boolean isStop = operation.equals("stop"), isStart = operation.equals("start");
+                String admitted = op;
+                if (isThinking || isStart || operation.equals("audio-enable")) {
+                    try {
+                        JSONObject nativeGeneration = new JSONObject(Native.run("", "thinking-generation", 1));
+                        if (!nativeGeneration.optBoolean("ok")) throw new JSONException("native admission unavailable");
+                        JSONObject command = new JSONObject(op.substring(6));
+                        command.put("admission_generation", nativeGeneration.getJSONObject("value").getLong("generation"));
+                        admitted = "serve:" + command;
+                    } catch (JSONException e) {
+                        respond(reply,id,"{\"ok\":false,\"error\":\"native admission unavailable\"}",0);
+                        return;
+                    }
+                }
+                final String admittedOp = admitted;
                 final long generation = thinkingAdmission.generation();
                 if (isStop) execution.beginStop(() -> Native.run("", "cancel", 1));
                 final ThinkingAdmission.Ticket ticket = isThinking ? thinkingAdmission.admit() : null;
@@ -61,7 +75,7 @@ public class JournalService extends Service {
                             if (ticket != null && !ticket.current()) {
                                 result="{\"ok\":false,\"error\":\"server stopped\"}";
                             } else {
-                                result=Native.run(root,op,count);
+                                result=Native.run(root,admittedOp,count);
                             }
                             if (isToolStatus) {
                                 JSONObject diagnostic = new JSONObject(result);

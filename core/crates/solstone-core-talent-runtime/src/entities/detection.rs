@@ -360,11 +360,32 @@ pub fn apply_result(
     segment_name: &str,
     stream: Option<&str>,
 ) -> Result<(), String> {
+    apply_result_cancellable(
+        journal,
+        output,
+        day,
+        segment_name,
+        stream,
+        &solstone_core_generate::Cancellation::never(),
+    )
+}
+
+pub(crate) fn apply_result_cancellable(
+    journal: &std::path::Path,
+    output: &str,
+    day: &str,
+    segment_name: &str,
+    stream: Option<&str>,
+    cancellation: &solstone_core_generate::Cancellation,
+) -> Result<(), String> {
+    let _trust = solstone_core_facets::hold_facet_trust_lock(journal).map_err(|e| e.to_string())?;
+    crate::writers::check_cancellation(cancellation)?;
+
     let Some(path) = find_segment_dir(journal, day, segment_name, stream) else {
         return Ok(());
     };
     let outcome = path.join("talents/detection_outcome.json");
-    let (counts, error) = apply_detections(journal, output, day, &path);
+    let (counts, error) = apply_detections(journal, output, day, &path, cancellation);
     let payload = serde_json::json!({
         "wrote": counts.wrote,
         "skipped": counts.skipped,
@@ -373,6 +394,7 @@ pub fn apply_result(
         "error": error,
         "ts": chrono::Utc::now().timestamp_millis(),
     });
+    crate::writers::check_cancellation(cancellation)?;
     let _ = fs::write(outcome, format!("{payload}\n"));
     Ok(())
 }
@@ -390,6 +412,7 @@ fn apply_detections(
     output: &str,
     day: &str,
     path: &std::path::Path,
+    cancellation: &solstone_core_generate::Cancellation,
 ) -> (DetectionCounts, Option<String>) {
     let mut counts = DetectionCounts::default();
     let mut error = None;
@@ -464,6 +487,9 @@ fn apply_detections(
         );
     }
     for (facet, detections) in kept_by_facet {
+        if let Err(detail) = crate::writers::check_cancellation(cancellation) {
+            return (counts, Some(detail));
+        }
         match solstone_core_facets::upsert_detection_segment(
             journal,
             &facet,

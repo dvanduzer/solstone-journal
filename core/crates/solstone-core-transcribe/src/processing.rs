@@ -62,6 +62,10 @@ fn record(state: &str, reason_code: &str, input_size: u64) -> Value {
     })
 }
 
+pub(crate) fn backend_failure_record(input_size: u64, reason: &str) -> Value {
+    record(vocab::STATE_FAILED, reason, input_size)
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::DateTime;

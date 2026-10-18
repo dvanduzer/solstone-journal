@@ -6,7 +6,7 @@
 use std::{
     collections::BTreeSet,
     io::{self, Read, Write},
-    net::{Ipv4Addr, SocketAddrV4, TcpListener},
+    net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream},
     path::Path,
     sync::{Arc, mpsc},
     thread,
@@ -388,6 +388,19 @@ fn read_http_request(reader: &mut impl Read) -> io::Result<Vec<u8>> {
 }
 
 fn start_gateway(config: ServerConfig, plan: GatewayPlan) -> Gateway {
+    start_gateway_with_writer(config, plan, |stream, response| stream.write_all(response))
+}
+
+fn start_gateway_with_writer(
+    config: ServerConfig,
+    plan: GatewayPlan,
+    mut write_application: impl FnMut(
+        &mut StreamOwned<ServerConnection, TcpStream>,
+        &[u8],
+    ) -> io::Result<()>
+    + Send
+    + 'static,
+) -> Gateway {
     let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
     let port = listener.local_addr().expect("listener address").port();
     listener.set_nonblocking(true).expect("nonblocking accept");
@@ -479,7 +492,7 @@ fn start_gateway(config: ServerConfig, plan: GatewayPlan) -> Gateway {
         for response in plan.application_responses {
             let request = read_http_request(&mut stream).expect("bounded application request");
             observation.application_requests.push(request);
-            stream.write_all(&response).expect("application response");
+            write_application(&mut stream, &response).expect("application response");
         }
         if plan.capture_unanswered_application {
             observation
@@ -842,6 +855,86 @@ fn exact_spprat1_preface_nonce_and_exporter_request_establish_channel() {
     let observation = gateway.finish();
     assert_preface(&observation);
     assert_eq!(observation.exporter_request, exact_exporter_request());
+}
+
+#[cfg(feature = "full-tests")]
+fn probe_with_encrypted_record(complete: bool) {
+    let (config, evidence) = certificate_with_evidence(&[7; 32], true, false);
+    let (release_sender, release_receiver) = mpsc::channel();
+    let gateway = start_gateway_with_writer(
+        config,
+        GatewayPlan {
+            proof: GatewayResponse::ValidProof(Box::new(evidence)),
+            application_responses: vec![static_response(200, b"")],
+            capture_unanswered_application: false,
+        },
+        move |stream, response| {
+            stream.sock.set_nodelay(true)?;
+            stream.conn.writer().write_all(response)?;
+            let mut encrypted = Vec::new();
+            while stream.conn.wants_write() {
+                stream.conn.write_tls(&mut encrypted)?;
+            }
+            assert_eq!(encrypted[0], 23, "application-data TLS record");
+            let record_length = 5 + usize::from(u16::from_be_bytes([encrypted[3], encrypted[4]]));
+            assert_eq!(encrypted.len(), record_length, "one encrypted record");
+            if complete {
+                stream.sock.write_all(&encrypted)?;
+            } else {
+                let prefix_end = 32.min(record_length - 1);
+                assert!(prefix_end > 25 && prefix_end < record_length);
+                stream.sock.write_all(&encrypted[..5])?;
+                for byte in &encrypted[5..prefix_end] {
+                    thread::sleep(Duration::from_millis(40));
+                    stream.sock.write_all(std::slice::from_ref(byte))?;
+                }
+            }
+            let _ = release_receiver.recv_timeout(THREAD_TIMEOUT);
+            Ok(())
+        },
+    );
+    let mut channel =
+        establish(gateway.port, &AcceptingCompositeVerifier).expect("attested channel");
+    let started = std::time::Instant::now();
+    let result = solstone_core_spp_ratls::send_admission_probe(
+        &mut channel,
+        "spp-engine",
+        None,
+        Duration::from_millis(200),
+    );
+    let elapsed = started.elapsed();
+    eprintln!("complete={complete} result={result:?} elapsed={elapsed:?}");
+    if complete {
+        assert_eq!(result, Ok(()));
+    } else {
+        assert_eq!(result, Err("local_endpoint_unreachable"));
+        assert!(
+            elapsed < Duration::from_millis(600),
+            "total deadline overrun: {elapsed:?}"
+        );
+    }
+    release_sender
+        .send(())
+        .expect("release peer after measuring caller");
+    let observation = gateway.finish();
+    assert_preface(&observation);
+    assert_eq!(observation.exporter_request, exact_exporter_request());
+    assert_eq!(
+        observation.application_requests,
+        vec![b"GET /solstone-admission HTTP/1.1\r\nHost: spp-engine\r\n\r\n".to_vec()]
+    );
+}
+
+#[cfg(feature = "full-tests")]
+#[test]
+fn admission_probe_incomplete_encrypted_record_obeys_total_deadline() {
+    probe_with_encrypted_record(false);
+}
+
+#[cfg(feature = "full-tests")]
+#[test]
+fn admission_probe_complete_encrypted_record_is_admitted() {
+    probe_with_encrypted_record(true);
 }
 
 #[test]

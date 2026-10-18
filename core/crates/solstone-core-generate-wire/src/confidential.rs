@@ -1016,6 +1016,13 @@ mod tests {
     }
 
     impl AttestedIo for RecordingChannel {
+        fn set_io_deadline(
+            &mut self,
+            _deadline: Option<std::time::Instant>,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
         fn set_io_timeout(&mut self, _timeout: Option<Duration>) -> io::Result<()> {
             Ok(())
         }

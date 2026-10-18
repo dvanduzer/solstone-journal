@@ -89,6 +89,7 @@ fn commit_input<'a>(
     input: &InputObservation,
     claims: &'a OutputClaims,
     raw: &Path,
+    checkpoint: &dyn Fn() -> Result<(), TranscribeError>,
 ) -> Result<solstone_core_segment::output_attempt::SegmentCommit<'a>, TranscribeError> {
     #[cfg(all(test, feature = "full-tests"))]
     BEFORE_PROCESSING_COMMIT.with(|hook| {
@@ -96,12 +97,15 @@ fn commit_input<'a>(
             hook();
         }
     });
-    input
+    let commit = input
         .commit(claims)
         .map_err(|error| TranscribeError::ProcessingClaim {
             path: raw.to_path_buf(),
             detail: error.to_string(),
-        })
+        })?;
+    // Segment exclusion can wait after the caller's previous checkpoint.
+    checkpoint()?;
+    Ok(commit)
 }
 
 #[cfg(all(test, feature = "full-tests"))]
@@ -139,7 +143,9 @@ fn finish_context_output(
     output: &Path,
     attempt: Option<&solstone_core_system::work_retry::Attempt>,
     audio_path: &Path,
+    checkpoint: &dyn Fn() -> Result<(), TranscribeError>,
 ) -> Result<(), TranscribeError> {
+    checkpoint()?;
     if let Some(attempt) = attempt {
         let unit = solstone_core_system::work_retry::raw::unit_for_output(
             journal_path,
@@ -150,11 +156,20 @@ fn finish_context_output(
             path: audio_path.to_path_buf(),
             detail,
         })?;
-        solstone_core_system::work_retry::raw::finish_output(journal_path, &unit, attempt)
-            .map_err(|detail| TranscribeError::ProcessingClaim {
-                path: audio_path.to_path_buf(),
-                detail,
-            })?;
+        solstone_core_system::work_retry::raw::finish_output_checked(
+            journal_path,
+            &unit,
+            attempt,
+            &|| checkpoint().map_err(|error| error.to_string()),
+        )
+        .map_err(|detail| {
+            checkpoint()
+                .err()
+                .unwrap_or_else(|| TranscribeError::ProcessingClaim {
+                    path: audio_path.to_path_buf(),
+                    detail,
+                })
+        })?;
     }
     Ok(())
 }
@@ -171,6 +186,14 @@ pub(crate) fn process_one_with(
     #[cfg(all(feature = "embedded", unix))] embedded: Option<&crate::embedded::EmbeddedContext<'_>>,
     retry: Option<&solstone_core_system::work_retry::RetryContext>,
 ) -> Result<ProcessOutcome, TranscribeError> {
+    let checkpoint = || {
+        #[cfg(all(feature = "embedded", unix))]
+        if let Some(runtime) = embedded {
+            runtime.checkpoint()?;
+        }
+        Ok(())
+    };
+
     #[cfg(all(feature = "embedded", unix))]
     if let Some(runtime) = embedded {
         runtime.checkpoint()?;
@@ -290,7 +313,7 @@ pub(crate) fn process_one_with(
             if let Some(runtime) = embedded {
                 runtime.checkpoint()?;
             }
-            let commit = commit_input(&observation, &claim, audio_path)?;
+            let commit = commit_input(&observation, &claim, audio_path, &checkpoint)?;
             let terminal = decode_failure(&facts, redo, &error, context_attempt.as_ref())?;
             drop(commit);
             finish_context_output(
@@ -298,6 +321,7 @@ pub(crate) fn process_one_with(
                 &facts.path.with_extension("jsonl"),
                 context_attempt.as_ref(),
                 audio_path,
+                &checkpoint,
             )?;
             timings.add_ms("write", elapsed_ms(write_at));
             emit_event(
@@ -360,7 +384,7 @@ pub(crate) fn process_one_with(
         if let Some(runtime) = embedded {
             runtime.checkpoint()?;
         }
-        let commit = commit_input(&observation, &claim, audio_path)?;
+        let commit = commit_input(&observation, &claim, audio_path, &checkpoint)?;
         let terminal = vad_no_speech(
             &facts,
             redo,
@@ -374,6 +398,7 @@ pub(crate) fn process_one_with(
             &facts.path.with_extension("jsonl"),
             context_attempt.as_ref(),
             audio_path,
+            &checkpoint,
         )?;
         timings.add_ms("write", elapsed_ms(write_at));
         let outcome = match terminal {
@@ -532,6 +557,23 @@ pub(crate) fn process_one_with(
     let (transcription, model_info) = match dispatched {
         Ok(result) => result,
         Err(error) => {
+            #[cfg(all(feature = "embedded", unix))]
+            if let Some(runtime) = embedded {
+                runtime.checkpoint()?;
+            }
+            if matches!(error, TranscribeError::Cancelled) {
+                return Err(error);
+            }
+            let commit = commit_input(&observation, &claim, audio_path, &checkpoint)?;
+            backend_failure(&facts, redo, &error, context_attempt.as_ref())?;
+            drop(commit);
+            finish_context_output(
+                journal_path,
+                &facts.path.with_extension("jsonl"),
+                context_attempt.as_ref(),
+                audio_path,
+                &checkpoint,
+            )?;
             emit_backend_error(
                 BackendErrorContext {
                     audio_path,
@@ -554,7 +596,7 @@ pub(crate) fn process_one_with(
         if let Some(runtime) = embedded {
             runtime.checkpoint()?;
         }
-        let commit = commit_input(&observation, &claim, audio_path)?;
+        let commit = commit_input(&observation, &claim, audio_path, &checkpoint)?;
         let terminal = stt_zero_statements(
             &facts,
             redo,
@@ -568,6 +610,7 @@ pub(crate) fn process_one_with(
             &facts.path.with_extension("jsonl"),
             context_attempt.as_ref(),
             audio_path,
+            &checkpoint,
         )?;
         timings.add_ms("write", elapsed_ms(write_at));
         let outcome = match terminal {
@@ -685,7 +728,7 @@ pub(crate) fn process_one_with(
     if let Some(runtime) = embedded {
         runtime.checkpoint()?;
     }
-    let commit = commit_input(&observation, &claim, audio_path)?;
+    let commit = commit_input(&observation, &claim, audio_path, &checkpoint)?;
     write_full_transcript(FullTranscriptWrite {
         raw_path: audio_path,
         jsonl_path: &jsonl_path,
@@ -715,6 +758,7 @@ pub(crate) fn process_one_with(
         &jsonl_path,
         context_attempt.as_ref(),
         audio_path,
+        &checkpoint,
     )?;
     timings.add_ms("write", elapsed_ms(write_at));
     emit_event(
@@ -1100,8 +1144,6 @@ pub(crate) fn decode_failure(
     error: &AudioError,
     attempt: Option<&solstone_core_system::work_retry::Attempt>,
 ) -> Result<TerminalOutcome, TranscribeError> {
-    let (jsonl_path, npz_path) = transcript_paths(&facts.path);
-    let prior_header = read_processing_record_header(&jsonl_path);
     let mut processing = match error {
         AudioError::NoAudioStream { .. } => no_audio_stream_record(facts.input_size),
         _ if error.is_transient_decode() => decode_transient_record(facts.input_size),
@@ -1110,6 +1152,29 @@ pub(crate) fn decode_failure(
     if let Some(errno) = error.ffmpeg_errno() {
         processing["errno"] = json!(errno);
     }
+    write_failed_record(facts, redo, processing, attempt)
+}
+
+fn backend_failure(
+    facts: &InputFacts,
+    redo: bool,
+    error: &TranscribeError,
+    attempt: Option<&solstone_core_system::work_retry::Attempt>,
+) -> Result<TerminalOutcome, TranscribeError> {
+    let mut processing =
+        crate::processing::backend_failure_record(facts.input_size, backend_error_reason(error));
+    processing["error"] = json!(error.to_string());
+    write_failed_record(facts, redo, processing, attempt)
+}
+
+fn write_failed_record(
+    facts: &InputFacts,
+    redo: bool,
+    mut processing: Value,
+    attempt: Option<&solstone_core_system::work_retry::Attempt>,
+) -> Result<TerminalOutcome, TranscribeError> {
+    let (jsonl_path, npz_path) = transcript_paths(&facts.path);
+    let prior_header = read_processing_record_header(&jsonl_path);
     let prior_attempts = prior_header.as_ref().map(record_attempts).unwrap_or(0);
     let base = std::cmp::max(0, prior_attempts);
     processing["attempts"] = json!(base + 1);
@@ -1462,6 +1527,139 @@ mod tests {
 
     #[cfg(feature = "full-tests")]
     #[test]
+    fn cancelled_transcription_after_segment_commit_lock_wait_and_positive_twins() {
+        use solstone_core_journal_io::{LockOptions, hold_lock};
+        use solstone_core_segment::output_attempt::{InputObservation, OutputClaims};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+        for kind in ["vad", "stt", "decode", "backend", "analyzed"] {
+            for cancel in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let segment = root.path().join("segment");
+                fs::create_dir(&segment).unwrap();
+                let facts = input(&segment);
+                let original = fs::read(&facts.path).unwrap();
+                let (jsonl, npz) = transcript_paths(&facts.path);
+                let held = hold_lock(&segment, LockOptions::default()).unwrap();
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let flag = cancelled.clone();
+                let (started, ready) = mpsc::channel();
+                let (checkpoint, reached) = mpsc::channel();
+                let worker = std::thread::spawn(move || {
+                    let claims =
+                        OutputClaims::acquire([jsonl.clone()], Default::default()).unwrap();
+                    let observed = InputObservation::capture(&claims, &facts.path).unwrap();
+                    started.send(()).unwrap();
+                    let _commit = super::commit_input(&observed, &claims, &facts.path, &|| {
+                        checkpoint.send(()).unwrap();
+                        if flag.load(Ordering::SeqCst) {
+                            Err(TranscribeError::Cancelled)
+                        } else {
+                            Ok(())
+                        }
+                    })?;
+                    match kind {
+                        "vad" => {
+                            vad_no_speech(&facts, false, None, None, None)?;
+                        }
+                        "stt" => {
+                            stt_zero_statements(&facts, false, None, None, None)?;
+                        }
+                        "decode" => {
+                            decode_failure(
+                                &facts,
+                                false,
+                                &AudioError::CorruptInput {
+                                    path: facts.path.clone(),
+                                    detail: "synthetic corrupt input".into(),
+                                    errno: None,
+                                },
+                                None,
+                            )?;
+                        }
+                        "backend" => {
+                            super::backend_failure(
+                                &facts,
+                                false,
+                                &TranscribeError::ConfidentialDeferred {
+                                    reason: "local_endpoint_unreachable".into(),
+                                    detail: "synthetic transport".into(),
+                                },
+                                None,
+                            )?;
+                        }
+                        _ => {
+                            let result = crate::speakers::SpeakerAnalyzeResult {
+                                statements: vec![
+                                    json!({"id":1,"start":0.0,"end":1.0,"text":"synthetic words"})
+                                        .as_object()
+                                        .unwrap()
+                                        .clone(),
+                                ],
+                                embedding_payload: None,
+                                speaker_evidence: "none".into(),
+                                speaker_evidence_multi_fraction: 0.0,
+                                overlap_fraction: 0.0,
+                                statement_labels: None,
+                            };
+                            let processing = crate::processing::analyzed_record(facts.input_size);
+                            super::write_full_transcript(super::FullTranscriptWrite {
+                                raw_path: &facts.path,
+                                jsonl_path: &jsonl,
+                                npz_path: &npz,
+                                base_time_us_of_day: 0,
+                                source: None,
+                                speaker_result: &result,
+                                backend: Some("parakeet-cpp"),
+                                model: Some("parakeet"),
+                                device: Some("cpu"),
+                                compute_type: None,
+                                observer: None,
+                                vad_result: None,
+                                segment_meta: None,
+                                overlap_detector: None,
+                                speaker_evidence_version: "windowed-slots-v1",
+                                processing: &processing,
+                                sound_tags: None,
+                                sound_tag_status: None,
+                                speaker_analysis_producer: None,
+                                redo: false,
+                            })?;
+                        }
+                    }
+                    Ok::<(), TranscribeError>(())
+                });
+                ready.recv_timeout(Duration::from_secs(2)).unwrap();
+                assert!(
+                    reached.recv_timeout(Duration::from_millis(100)).is_err(),
+                    "checkpoint must follow actual segment exclusion"
+                );
+                cancelled.store(cancel, Ordering::SeqCst);
+                drop(held);
+                let result = worker.join().unwrap();
+                let output = segment.join("clip.jsonl");
+                if cancel {
+                    assert!(matches!(result, Err(TranscribeError::Cancelled)));
+                    assert!(!output.exists());
+                } else {
+                    result.unwrap();
+                    let record =
+                        solstone_core_processing_record::read_processing_record_header(&output)
+                            .unwrap();
+                    let state = match kind {
+                        "vad" | "stt" => "empty",
+                        "analyzed" => "analyzed",
+                        _ => "failed",
+                    };
+                    assert_eq!(record["state"], state);
+                }
+                assert_eq!(fs::read(segment.join("clip.wav")).unwrap(), original);
+            }
+        }
+    }
+    #[cfg(feature = "full-tests")]
+    #[test]
     fn writer_commit_guards_success_empty_and_failure_publications() {
         use solstone_core_segment::output_attempt::{InputObservation, OutputClaims};
         for state in ["analyzed", "empty", "failed"] {
@@ -1481,7 +1679,7 @@ mod tests {
                     }
                     _ => (),
                 }
-                let commit = super::commit_input(&observed, &claims, &facts.path);
+                let commit = super::commit_input(&observed, &claims, &facts.path, &|| Ok(()));
                 if mutation != "unchanged" {
                     assert!(commit.is_err(), "{state}/{mutation}");
                     assert!(!jsonl.exists());
@@ -1902,6 +2100,55 @@ mod tests {
         assert_eq!(record["state"], vocab::STATE_FAILED);
         assert_eq!(record["reason_code"], vocab::REASON_CORRUPT_INPUT);
         assert!(is_failure_exhausted(&record));
+    }
+
+    #[cfg(all(feature = "full-tests", feature = "embedded", unix))]
+    #[test]
+    fn deferred_provider_outcomes_keep_reason_and_existing_attempt_bound() {
+        let temporary = tempfile::tempdir().unwrap();
+        let facts = input(temporary.path());
+        let original = fs::read(&facts.path).unwrap();
+        let error = crate::TranscribeError::ConfidentialDeferred {
+            reason: "local_endpoint_unreachable".into(),
+            detail: "fixture connection interrupted".into(),
+        };
+        for attempt in 1..=3 {
+            assert_eq!(
+                super::backend_failure(&facts, false, &error, None).unwrap(),
+                TerminalOutcome::Failed
+            );
+            let record =
+                read_header(&facts.path.with_extension("jsonl"))["_solstone_processing"].clone();
+            assert_eq!(record["attempts"], attempt);
+            assert_eq!(record["reason_code"], "local_endpoint_unreachable");
+            assert_eq!(record["error"], error.to_string());
+            assert_eq!(
+                crate::embedded::embedded_retryable_failure(&facts.path),
+                attempt < 3
+            );
+        }
+        assert_eq!(fs::read(&facts.path).unwrap(), original);
+    }
+
+    #[cfg(all(feature = "full-tests", feature = "embedded", unix))]
+    #[test]
+    fn corrected_provider_terminal_stays_skipped_after_retryable_failure() {
+        let temporary = tempfile::tempdir().unwrap();
+        let facts = input(temporary.path());
+        let error = crate::TranscribeError::ConfidentialDeferred {
+            reason: "local_endpoint_unreachable".into(),
+            detail: "fixture connection interrupted".into(),
+        };
+        super::backend_failure(&facts, false, &error, None).unwrap();
+        assert!(crate::embedded::embedded_retryable_failure(&facts.path));
+        stt_zero_statements(&facts, true, None, None, None).unwrap();
+        assert!(!crate::embedded::embedded_retryable_failure(&facts.path));
+        assert!(crate::args::should_skip_process_one_processed(
+            &facts.path,
+            false,
+            None,
+            None
+        ));
     }
 
     #[test]

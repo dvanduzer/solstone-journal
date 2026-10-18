@@ -91,6 +91,23 @@ pub fn commit(
 }
 
 pub fn apply_result(journal: &std::path::Path, output: &str, day: &str) -> Result<(), String> {
+    apply_result_cancellable(
+        journal,
+        output,
+        day,
+        &solstone_core_generate::Cancellation::never(),
+    )
+}
+
+pub(crate) fn apply_result_cancellable(
+    journal: &std::path::Path,
+    output: &str,
+    day: &str,
+    cancellation: &solstone_core_generate::Cancellation,
+) -> Result<(), String> {
+    let _guard =
+        solstone_core_facets::hold_facet_trust_lock(journal).map_err(|error| error.to_string())?;
+    crate::writers::check_cancellation(cancellation)?;
     // Preserve solstone/talent/schedule.py:45-71: malformed output is ignored.
     let Ok(mut events) = serde_json::from_str::<Value>(output.trim()) else {
         return Ok(());
@@ -113,6 +130,7 @@ pub fn apply_result(journal: &std::path::Path, output: &str, day: &str) -> Resul
         .collect::<BTreeSet<_>>();
     let mut entity_cache = BTreeMap::new();
     for raw in events {
+        crate::writers::check_cancellation(cancellation)?;
         let Some(raw) = raw.as_object() else { continue };
         let _ = apply_event(
             journal,
@@ -121,6 +139,7 @@ pub fn apply_result(journal: &std::path::Path, output: &str, day: &str) -> Resul
             current_day,
             &known_facets,
             &mut entity_cache,
+            cancellation,
         );
         // Python skips one invalid event and continues with the following event.
     }
@@ -137,6 +156,7 @@ fn apply_event(
         (String, String),
         Vec<solstone_core_entity::EntityResolutionEntity>,
     >,
+    cancellation: &solstone_core_generate::Cancellation,
 ) -> Result<(), String> {
     let (facet, target_day_key, record) = prepare_event(
         journal,
@@ -161,11 +181,12 @@ fn apply_event(
         AnticipationAction::Skip => return Ok(()),
         AnticipationAction::Create => {
             if !matches!(
-                solstone_core_facets::append_activity_record(
+                solstone_core_facets::append_activity_record_checked(
                     journal,
                     &facet,
                     &target_day_key,
-                    record
+                    record,
+                    || crate::writers::check_cancellation(cancellation),
                 )
                 .map_err(|error| error.to_string())?,
                 solstone_core_facets::AppendOutcome::Written(_)
@@ -174,7 +195,7 @@ fn apply_event(
             }
         }
         AnticipationAction::Update(patch) => {
-            solstone_core_facets::update_activity_record(
+            solstone_core_facets::update_activity_record_checked(
                 journal,
                 &facet,
                 &target_day_key,
@@ -187,12 +208,13 @@ fn apply_event(
                     "updated by schedule"
                 },
                 &timestamp,
+                || crate::writers::check_cancellation(cancellation),
             )
             .map_err(|error| error.to_string())?;
         }
     }
     for superseded_id in superseded {
-        solstone_core_facets::set_activity_hidden(
+        solstone_core_facets::set_activity_hidden_checked(
             journal,
             &facet,
             &target_day_key,
@@ -201,6 +223,7 @@ fn apply_event(
             "schedule",
             Some(&format!("superseded by {new_id}")),
             &timestamp,
+            || crate::writers::check_cancellation(cancellation),
         )
         .map_err(|error| error.to_string())?;
     }

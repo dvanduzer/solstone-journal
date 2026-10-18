@@ -5337,7 +5337,7 @@ platforms = ["linux", "macos"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
 default_full = true
-required_features = []
+required_features = ["full-tests"]
 runtime = "none"
 
 [[suites]]

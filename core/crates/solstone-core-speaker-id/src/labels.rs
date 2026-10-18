@@ -31,6 +31,7 @@ pub enum LabelsError {
     Corrections(CorrectionsError),
     SentenceIdNotFound(i64),
     InvalidCorrectionSentenceId,
+    PublicationRefused(String),
     InvalidLabelRestoration,
     MalformedCurrentLabels(String),
     MalformedCorrections(String),
@@ -73,6 +74,7 @@ impl fmt::Display for LabelsError {
                     "speaker label for sentence ID {sentence_id} was not found"
                 )
             }
+            Self::PublicationRefused(detail) => f.write_str(detail),
             Self::InvalidCorrectionSentenceId => {
                 write!(f, "speaker correction has an invalid sentence ID")
             }
@@ -116,7 +118,8 @@ impl Error for LabelsError {
             Self::Serialize(error) => Some(error),
             Self::Corrections(error) => Some(error),
             Self::Io(error) => Some(error),
-            Self::SentenceIdNotFound(_)
+            Self::PublicationRefused(_)
+            | Self::SentenceIdNotFound(_)
             | Self::InvalidCorrectionSentenceId
             | Self::InvalidLabelRestoration
             | Self::MalformedCurrentLabels(_)
@@ -131,13 +134,23 @@ impl Error for LabelsError {
 /// Write fresh labels while preserving current user-authored labels and applying corrections.
 pub fn write_full_labels(
     segment_dir: &Path,
+    fresh_labels: Vec<Value>,
+    metadata: &Map<String, Value>,
+) -> Result<(), LabelsError> {
+    write_full_labels_checked(segment_dir, fresh_labels, metadata, &|| Ok(()))
+}
+
+pub fn write_full_labels_checked(
+    segment_dir: &Path,
     mut fresh_labels: Vec<Value>,
     metadata: &Map<String, Value>,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<(), LabelsError> {
     let corrected =
         corrections_by_sentence(read_corrections(segment_dir).map_err(LabelsError::Corrections)?)?;
     let path = labels_path(segment_dir);
     let _lock = hold_lock(&path, LockOptions::default()).map_err(LabelsError::Lock)?;
+    checkpoint().map_err(LabelsError::PublicationRefused)?;
 
     let current = read_current_labels(&path);
     let mut result = current.clone().unwrap_or_default();
@@ -226,14 +239,24 @@ pub fn write_full_labels(
         result.remove("candidate_evidence_gaps");
     }
 
+    checkpoint().map_err(LabelsError::PublicationRefused)?;
     write_labels(&path, Value::Object(result))
 }
 
 /// Write a skipped-labels payload, replacing every label the speaker step wrote.
 /// Labels the owner set by hand stay.
 pub fn write_stub_labels(segment_dir: &Path, reason: &str) -> Result<(), LabelsError> {
+    write_stub_labels_checked(segment_dir, reason, &|| Ok(()))
+}
+
+pub fn write_stub_labels_checked(
+    segment_dir: &Path,
+    reason: &str,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), LabelsError> {
     let path = labels_path(segment_dir);
     let _lock = hold_lock(&path, LockOptions::default()).map_err(LabelsError::Lock)?;
+    checkpoint().map_err(LabelsError::PublicationRefused)?;
 
     let user_labels = read_current_labels(&path)
         .and_then(|current| current.get("labels").and_then(Value::as_array).cloned())
@@ -245,6 +268,7 @@ pub fn write_stub_labels(segment_dir: &Path, reason: &str) -> Result<(), LabelsE
     result.insert("labels".to_owned(), Value::Array(user_labels));
     result.insert("skipped".to_owned(), Value::Bool(true));
     result.insert("reason".to_owned(), Value::String(reason.to_owned()));
+    checkpoint().map_err(LabelsError::PublicationRefused)?;
     write_labels(&path, Value::Object(result))
 }
 
