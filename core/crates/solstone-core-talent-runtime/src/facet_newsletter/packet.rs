@@ -99,8 +99,7 @@ pub(super) fn gather(journal: &Path, facet: &str, day: &str) -> Result<Packet, S
     items.extend(load_prior_newsletter(journal, facet, day, &mut gaps));
     let (included, dropped) = gather_budgeted_items(items.clone());
     gaps.extend(dropped);
-    let mut counts = gather_source_counts(&included);
-    add_available_source_counts(&mut counts, &items);
+    let mut counts = source_counts(&included, &items);
     let substantive_items = included
         .iter()
         .filter(|item| matches!(item.tier, 1 | 2))
@@ -492,7 +491,10 @@ fn gather_source_counts(items: &[Item]) -> BTreeMap<String, usize> {
     }
     counts
 }
-fn add_available_source_counts(counts: &mut BTreeMap<String, usize>, items: &[Item]) {
+/// Counts of the packet's included items beside every gathered item, so a
+/// class the budget dropped in part or whole reads as such.
+fn source_counts(included: &[Item], items: &[Item]) -> BTreeMap<String, usize> {
+    let mut counts = gather_source_counts(included);
     let available = gather_source_counts(items);
     for key in ["total", "tier1", "tier2", "tier3"] {
         counts.insert(
@@ -505,8 +507,10 @@ fn add_available_source_counts(counts: &mut BTreeMap<String, usize>, items: &[It
             continue;
         }
         counts.insert(format!("{key}_available"), value);
-        counts.entry(format!("{key}_included")).or_insert(0);
+        let included = *counts.entry(key.clone()).or_insert(0);
+        counts.insert(format!("{key}_included"), included);
     }
+    counts
 }
 fn render_activity_order(record: &Map<String, Value>) -> (i64, String, String) {
     (
@@ -891,6 +895,72 @@ mod tests {
             None,
         );
         assert!(gather_budgeted_items(vec![item]).0.is_empty());
+    }
+
+    #[test]
+    fn included_counts_say_what_the_budget_kept() {
+        let item = |class: &str, label: Option<&str>, tier: u8, order: &str, chars: usize| {
+            gather_item!(
+                class,
+                label.map(str::to_owned),
+                None,
+                format!("{class}-{order}"),
+                tier,
+                "z".repeat(chars),
+                false,
+                vec![order.to_owned()],
+                None,
+                None,
+            )
+        };
+        let half = MAX_PACKET_CHARS / 2;
+        let items = vec![
+            item("activity_record", None, 1, "0", 100),
+            item("activity_record", None, 1, "1", 100),
+            item("activity_narrative", None, 1, "2", half),
+            item("activity_narrative", None, 1, "3", half),
+            item("facet_metadata", None, 2, "4", 100),
+            item(
+                "facet_entities",
+                Some("facet_entities:attached"),
+                3,
+                "5",
+                half,
+            ),
+        ];
+        let (included, dropped) = gather_budgeted_items(items.clone());
+        assert_eq!(dropped.len(), 2, "{dropped:?}");
+        let counts = source_counts(&included, &items);
+        // Partly dropped, wholly dropped, whole, and absent classes.
+        for (class, kept, gathered) in [
+            ("activity_record", 2, 2),
+            ("activity_narrative", 1, 2),
+            ("facet_metadata", 1, 1),
+            ("facet_entities:attached", 0, 1),
+            ("facet_entities:detected", 0, 0),
+            ("prior_newsletter", 0, 0),
+        ] {
+            let in_packet = included
+                .iter()
+                .filter(|item| render_source_label(item) == class)
+                .count();
+            assert_eq!(in_packet, kept, "{class}: kept by the budget");
+            assert_eq!(counts[class], kept, "{class}");
+            assert_eq!(counts[&format!("{class}_included")], kept, "{class}");
+            assert_eq!(counts[&format!("{class}_available")], gathered, "{class}");
+        }
+        for (key, value) in [
+            ("total_included", 4),
+            ("total_available", 6),
+            ("tier1_included", 3),
+            ("tier1_available", 4),
+            ("tier2_included", 1),
+            ("tier2_available", 1),
+            ("tier3_included", 0),
+            ("tier3_available", 1),
+        ] {
+            assert_eq!(counts[key], value, "{key}");
+        }
     }
 
     #[test]

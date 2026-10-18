@@ -34,8 +34,8 @@ pub(crate) const MAX_STORY_BODY_CHARS: usize = 1_800;
 
 /// A Story body that quotes every word of a short activity source, framed by
 /// who the producer says wrote or said it: one imported conversation, or one
-/// utterance by an unidentified speaker. `None` for any other talent or
-/// source, which keeps the model's own body.
+/// utterance by an unidentified speaker. `None` for any other talent, source
+/// or request, which keeps the model's own body.
 pub(crate) fn source_body(
     name: &str,
     config: &Map<String, Value>,
@@ -49,6 +49,13 @@ pub(crate) fn source_body(
         return None;
     }
     let transcript = config.get("transcript")?.as_str()?;
+    // The model read only the measured task: this transcript and the talent's
+    // own instruction. Words a request adds can ask for a body that the
+    // source's words are not.
+    let instruction = config.get("user_instruction")?.as_str()?;
+    if crate::model_text_parts(config) != [transcript, instruction] {
+        return None;
+    }
     let [Some(source)] = sources else {
         return None;
     };

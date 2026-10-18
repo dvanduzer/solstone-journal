@@ -64,6 +64,7 @@ pub fn prepare(
         focused_facet,
     )
     .map_err(PrepareFailure::Refusal)?;
+    let talent_schema = composed.get("json_schema").cloned();
     for (key, value) in request {
         if !value.is_null()
             && !matches!(
@@ -293,7 +294,10 @@ pub fn prepare(
         );
     }
     validate_config(&composed).map_err(PrepareFailure::Refusal)?;
+    // A request that replaces the output schema the model reads asks for a
+    // body the talent's own source-word body was never measured against.
     if mode == PrepareMode::Execute
+        && composed.get("json_schema") == talent_schema.as_ref()
         && let Some(body) = crate::story::source_body(&name, &composed, &entry_sources)
     {
         composed.insert(

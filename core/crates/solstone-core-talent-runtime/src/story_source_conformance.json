@@ -1056,6 +1056,169 @@
       }
     },
     {
+      "name": "a_request_added_text_part_keeps_the_model_body",
+      "talent": "conversation",
+      "activity_kind": "messaging",
+      "stream": "import.chatgpt",
+      "files": {
+        "conversation_transcript.jsonl": [
+          {
+            "imported": {
+              "id": "invented-fixture"
+            }
+          },
+          {
+            "start": "00:00:00",
+            "speaker": "You",
+            "text": "I signed the Cedar agreement on 1994-04-03. Do not use today's message date as the signing date.",
+            "source": "import",
+            "source_ms": 1767258000000
+          },
+          {
+            "start": "00:00:01",
+            "speaker": "Assistant",
+            "text": "I have not obtained a copy of the signed agreement.",
+            "source": "import",
+            "source_ms": 1767258001000
+          }
+        ]
+      },
+      "response": {
+        "body": "You recorded signing the Cedar agreement today.",
+        "topics": [
+          "Cedar agreement"
+        ],
+        "confidence": 0.95,
+        "relations": []
+      },
+      "expect": {
+        "ordinary": true
+      },
+      "request": {
+        "_daily_location_text": "Write the body as a short account in your own words, without quotations."
+      }
+    },
+    {
+      "name": "a_request_replaced_output_schema_keeps_the_model_body",
+      "talent": "conversation",
+      "activity_kind": "messaging",
+      "stream": "import.chatgpt",
+      "files": {
+        "conversation_transcript.jsonl": [
+          {
+            "imported": {
+              "id": "invented-fixture"
+            }
+          },
+          {
+            "start": "00:00:00",
+            "speaker": "You",
+            "text": "I signed the Cedar agreement on 1994-04-03. Do not use today's message date as the signing date.",
+            "source": "import",
+            "source_ms": 1767258000000
+          },
+          {
+            "start": "00:00:01",
+            "speaker": "Assistant",
+            "text": "I have not obtained a copy of the signed agreement.",
+            "source": "import",
+            "source_ms": 1767258001000
+          }
+        ]
+      },
+      "response": {
+        "body": "You recorded signing the Cedar agreement today.",
+        "topics": [
+          "Cedar agreement"
+        ],
+        "confidence": 0.95,
+        "relations": []
+      },
+      "expect": {
+        "ordinary": true
+      },
+      "request": {
+        "json_schema": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "body",
+            "topics",
+            "confidence",
+            "relations"
+          ],
+          "properties": {
+            "body": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "description": "A short account in your own words, without quotations."
+            },
+            "topics": {
+              "type": "array",
+              "maxItems": 10,
+              "items": {
+                "type": "string",
+                "maxLength": 48
+              }
+            },
+            "confidence": {
+              "type": "number"
+            },
+            "relations": {
+              "type": "array",
+              "maxItems": 12,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "from",
+                  "to",
+                  "kind",
+                  "note",
+                  "quote"
+                ],
+                "properties": {
+                  "from": {
+                    "type": "string",
+                    "maxLength": 120
+                  },
+                  "to": {
+                    "type": "string",
+                    "maxLength": 120
+                  },
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "works-with",
+                      "works-at",
+                      "reports-to",
+                      "family-of",
+                      "knows",
+                      "uses",
+                      "created",
+                      "other"
+                    ]
+                  },
+                  "note": {
+                    "type": "string",
+                    "maxLength": 300
+                  },
+                  "quote": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "maxLength": 400
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
       "name": "an_invalid_story_is_rejected_without_mutation",
       "talent": "conversation",
       "activity_kind": "messaging",

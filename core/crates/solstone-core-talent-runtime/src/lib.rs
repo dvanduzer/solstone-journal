@@ -1319,26 +1319,28 @@ pub(crate) fn ordinary_text_parts(config: &Map<String, Value>) -> Vec<String> {
         .collect()
 }
 
+/// Every text part a talent's model request carries, in order.
+pub(crate) fn model_text_parts(config: &Map<String, Value>) -> Vec<String> {
+    let mut parts = ordinary_text_parts(config);
+    if !parts.is_empty()
+        && let Some(text) = config.get("_daily_location_text").and_then(Value::as_str)
+    {
+        parts.push(text.to_owned());
+    }
+    parts
+}
+
 pub(crate) fn generate_contents(prepared: &PreparedTalent) -> Vec<ContentPart> {
-    let mut contents: Vec<ContentPart> = ordinary_text_parts(&prepared.config)
-        .into_iter()
-        .map(|text| ContentPart::Text { text })
-        .collect();
-    if contents.is_empty() {
+    let parts = model_text_parts(&prepared.config);
+    if parts.is_empty() {
         return vec![ContentPart::Text {
             text: "No input provided.".to_owned(),
         }];
     }
-    if let Some(text) = prepared
-        .config
-        .get("_daily_location_text")
-        .and_then(Value::as_str)
-    {
-        contents.push(ContentPart::Text {
-            text: text.to_owned(),
-        });
-    }
-    contents
+    parts
+        .into_iter()
+        .map(|text| ContentPart::Text { text })
+        .collect()
 }
 
 // Persist the assembled talent input alongside this run. The generate worker may

@@ -266,6 +266,65 @@ fn every_story_source_case_stores_and_returns_one_story() {
     }
 }
 
+fn request_texts(request: &GenerateRequest) -> Vec<&str> {
+    request
+        .contents
+        .iter()
+        .filter_map(|part| match part {
+            solstone_core_generate::ContentPart::Text { text } => Some(text.as_str()),
+            solstone_core_generate::ContentPart::Image { .. } => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_request_added_instruction_reaches_the_model_and_keeps_its_body() {
+    let instruction = "Write the body as a short account in your own words, without quotations.";
+    for name in [
+        "imported_messages_keep_their_authors_and_message_dates",
+        "an_unidentified_utterance_keeps_negation_and_latest_status",
+    ] {
+        let mut case = cases()
+            .into_iter()
+            .find(|case| case["name"] == name)
+            .unwrap();
+        // The empty prompt every scheduled Story request carries.
+        case["request"] = json!({"prompt": ""});
+        let stock = run(&case);
+        assert!(matches!(stock.outcome, RuntimeOutcome::Finished { .. }));
+        assert_eq!(request_texts(&stock.requests[0]).len(), 2, "{name}");
+        assert_eq!(
+            stock.record["story"]["body"], case["expect"]["body"],
+            "{name}: the stock request keeps its source words"
+        );
+
+        case["request"] = json!({"prompt": instruction});
+        let added = run(&case);
+        let RuntimeOutcome::Finished {
+            output,
+            disposition,
+            ..
+        } = added.outcome
+        else {
+            panic!("{name}: the story run did not finish: {:?}", added.outcome);
+        };
+        assert_eq!(added.requests.len(), 1, "{name}");
+        let texts = request_texts(&added.requests[0]);
+        assert_eq!(texts.len(), 3, "{name}");
+        assert_eq!(texts[2], instruction, "{name}: the model read the request");
+        assert_eq!(disposition, CommitDisposition::CommittedNoOutput, "{name}");
+        assert_eq!(
+            added.record["story"]["body"],
+            case["response"]["body"].as_str().unwrap().trim(),
+            "{name}: the stored body answers the request"
+        );
+        assert_eq!(
+            output, added.response,
+            "{name}: the response is returned as is"
+        );
+    }
+}
+
 /// Multi-message Unicode source with a correction at its end. Every message
 /// fits the individual quote limit; only the assembled reader budget varies.
 fn source_at_reader_boundary(chars: usize) -> (Value, String) {
