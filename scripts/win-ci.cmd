@@ -147,11 +147,11 @@ call :run_exact_library "solstone-core-spp-attest" "nvgpu::windows::tests::child
 call :run_exact_integration "solstone-core-spp-attest" "windows_verifier" "signed_layout_refuses_missing_or_changed_executable_ca_and_runtime" "test-hooks" || exit /b 1
 call :run_exact_integration "solstone-core-spp-attest" "windows_verifier" "production_spawn_clears_hostile_environment_and_uses_the_verified_directory" "test-hooks" || exit /b 1
 echo JOURNAL_WIN_CI_WINDOWS_VERIFIER=executed/pass
-call :run_exact_integration "solstone-core-spp-ratls" "attested_channels" "fixture_seam_refuses_every_non_loopback_endpoint_before_resolution" "test-hooks" || exit /b 1
-call :run_exact_integration "solstone-core-spp-ratls" "attested_channels" "certificate_evidence_nonce_spki_criticality_and_presence_are_enforced" "test-hooks" || exit /b 1
-call :run_exact_integration "solstone-core-spp-ratls" "attested_channels" "exporter_mismatch_rejects_after_a_verified_certificate" "test-hooks" || exit /b 1
-call :run_exact_integration "solstone-core-spp-ratls" "attested_channels" "exact_spprat1_preface_nonce_and_exporter_request_establish_channel" "test-hooks" || exit /b 1
-call :run_exact_integration "solstone-core-spp-ratls" "attested_channels" "certificate_rejection_writes_no_exporter_http_payload_and_closes" "test-hooks" || exit /b 1
+call :run_exact_integration "solstone-core-spp-ratls" "attested_channels" "fixture_seam_refuses_every_non_loopback_endpoint_before_resolution" "full-tests,test-hooks" || exit /b 1
+call :run_exact_integration "solstone-core-spp-ratls" "attested_channels" "certificate_evidence_nonce_spki_criticality_and_presence_are_enforced" "full-tests,test-hooks" || exit /b 1
+call :run_exact_integration "solstone-core-spp-ratls" "attested_channels" "exporter_mismatch_rejects_after_a_verified_certificate" "full-tests,test-hooks" || exit /b 1
+call :run_exact_integration "solstone-core-spp-ratls" "attested_channels" "exact_spprat1_preface_nonce_and_exporter_request_establish_channel" "full-tests,test-hooks" || exit /b 1
+call :run_exact_integration "solstone-core-spp-ratls" "attested_channels" "certificate_rejection_writes_no_exporter_http_payload_and_closes" "full-tests,test-hooks" || exit /b 1
 call :run_exact_library "solstone-core-brain" "presentation::tests::a_platform_with_no_hardware_check_says_so_on_every_brain_surface" || exit /b 1
 call :run_exact_library "solstone-core-thinking" "brain::tests::this_platform_offers_confidential_processing" || exit /b 1
 call :run_exact_library "solstone-core-thinking" "brain::tests::with_no_hardware_check_confidential_processing_reads_not_on_platform" || exit /b 1

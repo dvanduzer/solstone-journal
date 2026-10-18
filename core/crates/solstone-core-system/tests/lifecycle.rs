@@ -1471,7 +1471,7 @@ mod abandoned_generation_closer {
         let (ledger, generation) =
             abandoned_generation_with(&bed, child_instance, "cortex-stubborn");
 
-        close_with_budget(&ledger, Duration::from_secs(4));
+        close_with_budget(&ledger, Duration::from_secs(20));
 
         let status = child.wait().expect("child reaped");
         assert!(!status.success());

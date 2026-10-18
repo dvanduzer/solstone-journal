@@ -15,6 +15,7 @@ const TARGETS: &[&str] = &[
     "rebuild_stream_state",
     "backfill_stream_records",
     "advance_unbound_stream",
+    "advance_unbound_stream_checked",
     "inspect_stream",
     "rebuild_streams",
     "relocate_segment",
@@ -312,6 +313,10 @@ fn expected_consumers() -> BTreeSet<(String, String)> {
         (
             "solstone-core-segment/src/stream_record.rs",
             "advance_unbound_stream",
+        ),
+        (
+            "solstone-core-segment/src/stream_record.rs",
+            "advance_unbound_stream_checked",
         ),
         (
             "solstone-core-segment/src/stream_record.rs",

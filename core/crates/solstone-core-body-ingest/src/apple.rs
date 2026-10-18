@@ -1584,7 +1584,7 @@ mod tests {
             }]),
         )
         .unwrap();
-        assert_eq!(detect_apple_source(&ok_path).unwrap(), true);
+        assert!(detect_apple_source(&ok_path).unwrap());
         with_export(&ok_path, "export.xml", |_reader| Ok(())).expect("literal export");
 
         let missing = dir.0.join("missing.zip");
@@ -1598,7 +1598,7 @@ mod tests {
             }]),
         )
         .unwrap();
-        assert_eq!(detect_apple_source(&missing).unwrap(), false);
+        assert!(!detect_apple_source(&missing).unwrap());
         assert_eq!(find_export(&missing).unwrap_err().stage(), "export_xml");
 
         let collision = dir.0.join("collision.zip");
