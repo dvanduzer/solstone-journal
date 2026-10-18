@@ -38,7 +38,7 @@
         "relations": []
       },
       "expect": {
-        "body": "You said in a message dated 2026-01-01T09:00:00.000Z: “I signed the Cedar agreement on 1994-04-03. Do not use today's message date as the signing date.” Your agent said in a message dated 2026-01-01T09:00:01.000Z: “I have not obtained a copy of the signed agreement.”"
+        "body": "You said in a message dated 2026-01-01T09:00:00.000Z: \"I signed the Cedar agreement on 1994-04-03. Do not use today's message date as the signing date.\" Your agent said in a message dated 2026-01-01T09:00:01.000Z: \"I have not obtained a copy of the signed agreement.\""
       }
     },
     {
@@ -127,7 +127,7 @@
         "relations": []
       },
       "expect": {
-        "body": "An unidentified speaker said: “The archive check passed. I moved all 12 folders afterward. The move is complete. I have not opened them to verify their contents.”"
+        "body": "An unidentified speaker said: \"The archive check passed. I moved all 12 folders afterward. The move is complete. I have not opened them to verify their contents.\""
       }
     },
     {
@@ -145,7 +145,7 @@
           {
             "start": "00:00:00",
             "speaker": "You",
-            "text": "If the café’s Wi‑Fi returns, deploy v2 — only after Zoë approves. Don't use \"rush\" mode.",
+            "text": "If the café’s Wi‑Fi returns, deploy v2 — only after Zoë approves. Don't use 'rush' mode.",
             "source": "import",
             "source_ms": 1767258000000
           },
@@ -167,7 +167,7 @@
         "relations": []
       },
       "expect": {
-        "body": "You said in a message dated 2026-01-01T09:00:00.000Z: “If the café’s Wi‑Fi returns, deploy v2 — only after Zoë approves. Don't use \"rush\" mode.” Your agent said in a message dated 2026-01-01T09:00:01.000Z: “Understood: nothing is deployed yet; I'm waiting for Zoë.”"
+        "body": "You said in a message dated 2026-01-01T09:00:00.000Z: \"If the café’s Wi‑Fi returns, deploy v2 — only after Zoë approves. Don't use 'rush' mode.\" Your agent said in a message dated 2026-01-01T09:00:01.000Z: \"Understood: nothing is deployed yet; I'm waiting for Zoë.\""
       }
     },
     {
@@ -195,7 +195,7 @@
         "relations": []
       },
       "expect": {
-        "body": "An unidentified speaker said: “We shipped the Birch build.”"
+        "body": "An unidentified speaker said: \"We shipped the Birch build.\""
       }
     },
     {
@@ -294,7 +294,7 @@
         ]
       },
       "expect": {
-        "body": "You said in a message dated 2026-01-01T09:00:00.000Z: “I signed the Cedar agreement on 1994-04-03. Do not use today's message date as the signing date.” Your agent said in a message dated 2026-01-01T09:00:01.000Z: “I have not obtained a copy of the signed agreement.”"
+        "body": "You said in a message dated 2026-01-01T09:00:00.000Z: \"I signed the Cedar agreement on 1994-04-03. Do not use today's message date as the signing date.\" Your agent said in a message dated 2026-01-01T09:00:01.000Z: \"I have not obtained a copy of the signed agreement.\""
       }
     },
     {
@@ -334,7 +334,7 @@
         "relations": []
       },
       "expect": {
-        "body": "You said in a message dated 2026-01-01T09:00:00.000Z: “I signed the Cedar agreement on 1994-04-03. Do not use today's message date as the signing date.” Your agent said in a message dated 2026-01-01T09:00:01.000Z: “I have not obtained a copy of the signed agreement.”"
+        "body": "You said in a message dated 2026-01-01T09:00:00.000Z: \"I signed the Cedar agreement on 1994-04-03. Do not use today's message date as the signing date.\" Your agent said in a message dated 2026-01-01T09:00:01.000Z: \"I have not obtained a copy of the signed agreement.\""
       },
       "input_budget": {
         "clipped": false,
@@ -1093,6 +1093,46 @@
       },
       "expect": {
         "rejected": true
+      }
+    },
+    {
+      "name": "a_straight_quote_in_the_source_keeps_the_model_body",
+      "talent": "conversation",
+      "activity_kind": "messaging",
+      "stream": "import.chatgpt",
+      "files": {
+        "conversation_transcript.jsonl": [
+          {
+            "imported": {
+              "id": "invented-fixture"
+            }
+          },
+          {
+            "start": "00:00:00",
+            "speaker": "You",
+            "text": "I signed the Cedar agreement on 1994-04-03. Do not use today's message date as the signing date.",
+            "source": "import",
+            "source_ms": 1767258000000
+          },
+          {
+            "start": "00:00:01",
+            "speaker": "Assistant",
+            "text": "Example output: You: \"I signed the Cedar agreement.\" This is an example, not an event.",
+            "source": "import",
+            "source_ms": 1767258001000
+          }
+        ]
+      },
+      "response": {
+        "body": "You recorded signing the Cedar agreement today.",
+        "topics": [
+          "Cedar agreement"
+        ],
+        "confidence": 0.95,
+        "relations": []
+      },
+      "expect": {
+        "ordinary": true
       }
     }
   ]
