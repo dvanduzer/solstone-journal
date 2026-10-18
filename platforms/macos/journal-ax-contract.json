@@ -94,8 +94,25 @@
       "journal.journal.diskUsage.state",
       "journal.journal.location.path.state",
       "journal.ritual.browser.reopen",
+      "journal.ritual.download.speech.cancel",
+      "journal.ritual.download.speech.retry",
+      "journal.ritual.download.speech.state",
+      "journal.ritual.download.thinking.cancel",
+      "journal.ritual.download.thinking.retry",
+      "journal.ritual.download.thinking.state",
+      "journal.ritual.folder.choose",
+      "journal.ritual.folder.continue",
+      "journal.ritual.folder.field",
+      "journal.ritual.handoff.error.state",
+      "journal.ritual.handoff.retry",
       "journal.ritual.location.choose",
       "journal.ritual.location.field",
+      "journal.ritual.login.failure.state",
+      "journal.ritual.login.toggle",
+      "journal.ritual.mark.continue",
+      "journal.ritual.mark.error.state",
+      "journal.ritual.mark.proposal.state",
+      "journal.ritual.mark.regenerate",
       "journal.ritual.nameLocation.continue",
       "journal.ritual.nameLocation.error.state",
       "journal.ritual.root",
@@ -105,6 +122,12 @@
       "journal.ritual.setup.progress",
       "journal.ritual.setup.retry",
       "journal.ritual.setup.step.state",
+      "journal.ritual.thinking.change",
+      "journal.ritual.thinking.choice.state",
+      "journal.ritual.thinking.continue",
+      "journal.ritual.thinking.error.state",
+      "journal.ritual.thinking.later",
+      "journal.ritual.welcome.continue",
       "journal.runState.about.copy",
       "journal.runState.about.copyFeedback.state",
       "journal.runState.about.state",
@@ -202,6 +225,24 @@
     "journal.journal.location.path.state" : {
       "kind" : "freeform"
     },
+    "journal.ritual.download.speech.state" : {
+      "kind" : "freeform"
+    },
+    "journal.ritual.download.thinking.state" : {
+      "kind" : "freeform"
+    },
+    "journal.ritual.handoff.error.state" : {
+      "kind" : "freeform"
+    },
+    "journal.ritual.login.failure.state" : {
+      "kind" : "freeform"
+    },
+    "journal.ritual.mark.error.state" : {
+      "kind" : "freeform"
+    },
+    "journal.ritual.mark.proposal.state" : {
+      "kind" : "freeform"
+    },
     "journal.ritual.nameLocation.error.state" : {
       "kind" : "freeform"
     },
@@ -216,6 +257,12 @@
       "kind" : "freeform"
     },
     "journal.ritual.setup.step.state" : {
+      "kind" : "freeform"
+    },
+    "journal.ritual.thinking.choice.state" : {
+      "kind" : "freeform"
+    },
+    "journal.ritual.thinking.error.state" : {
       "kind" : "freeform"
     },
     "journal.runState.about.copyFeedback.state" : {
@@ -319,7 +366,11 @@
     ],
     "JournalFirstRunRouteState" : [
       "deciding",
+      "welcome",
+      "folder",
       "name_location",
+      "mark",
+      "thinking",
       "setup_progress",
       "finish_in_browser",
       "adopting",

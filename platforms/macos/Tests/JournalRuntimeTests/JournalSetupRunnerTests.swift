@@ -338,6 +338,26 @@ struct JournalSetupRunnerTests {
         #expect(sawInstallModels)
     }
 
+    @Test func skipModelInstallDoesNotRecordInstallModels() async throws {
+        let runtime = try makeRuntime()
+        defer { try? FileManager.default.removeItem(at: runtime.layout.rootURL) }
+        let subprocess = FakeSubprocessRunner()
+        subprocess.enqueue("setup", .success(stdout: Data(Self.okSetupJSONL.utf8)))
+        let runner = JournalSetupRunner(
+            subprocessRunner: subprocess,
+            gate: MockSingleSupervisorGate(),
+            materializer: MockRuntimeMaterializer(result: .success(runtime))
+        )
+
+        _ = try await runner.run(
+            journalRoot: try makeTemporaryDirectory(),
+            skipModelInstall: true
+        )
+
+        #expect(subprocess.invocations.contains { $0.arguments.first == "journal" && $0.arguments.dropFirst().first == "setup" })
+        #expect(!subprocess.invocations.contains { $0.arguments == ["journal", "install-models"] })
+    }
+
     private static let okSetupJSONL = """
     {"event":"setup.completed","status":"ok","duration_ms":10}
 

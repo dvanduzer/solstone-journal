@@ -9,27 +9,27 @@ enum DevicesCopy {
     static let peerJournalsHeader = "peer journals"
     static let loading = "loading devices..."
     static let emptyTitle = "no devices yet"
-    static let emptyBody = "add a device and it joins your journal."
+    static let emptyBody = "pair a device and it joins your journal."
     static let notRunningTitle = "journal is not running"
     static let notRunningBody = "start the journal, then try again."
     static let notReadyTitle = "devices are not ready"
     static let notReadyBody = "finish setting up your journal, then try again."
     static let tryAgain = "try again"
-    static let addDevice = "add a device"
+    static let addDevice = "pair a device"
     static let unnamedDevice = "unnamed device"
     static let unnamedJournal = "unnamed journal"
     static let remove = "remove"
     static let revokeFailed = "couldn't remove this device"
     static let cancel = "cancel"
-    static let pairingTitle = "add a device"
+    static let pairingTitle = "pair a device"
     static let pairingOpening = "opening pairing..."
-    static let pairingInstructions = "scan this code or open the link on the device you want to add."
+    static let pairingInstructions = "scan this code or open the link on the device you want to pair."
     static let pairingLinkLabel = "pairing link"
     static let copyLink = "copy link"
     static let copied = "copied ✓"
     static let pairingCode = "pairing code"
     static let linkExpiredTitle = "link expired"
-    static let linkExpiredBody = "open a fresh link to add a device."
+    static let linkExpiredBody = "open a fresh link to pair a device."
     static let openFreshLink = "open a fresh link"
     static let pairingFailedTitle = "couldn't open pairing"
     static let close = "close"
@@ -39,7 +39,7 @@ enum DevicesCopy {
     }
 
     static func revokeBody(_ name: String, detail: String) -> String {
-        "\(name) loses access to your journal. you can add it again later.\n\(detail)"
+        "\(name) loses access to your journal. you can pair it again later.\n\(detail)"
     }
 
     static func countdown(seconds: Int) -> String {

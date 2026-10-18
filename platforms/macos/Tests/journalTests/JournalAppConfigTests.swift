@@ -59,6 +59,38 @@ struct JournalAppConfigTests {
         #expect(loginItems.unregisterCalls == 1)
     }
 
+    @Test func reportingFailureDoesNotStoreWhenRegisterThrows() {
+        let fixture = makeDefaults()
+        defer { fixture.clear() }
+        let loginItems = ThrowingLoginItemManager()
+        let config = JournalAppConfig(defaults: fixture.defaults, loginItemManager: loginItems)
+
+        #expect(throws: (any Error).self) {
+            try config.setLaunchAtLoginEnabledReportingFailure(true)
+        }
+
+        #expect(fixture.defaults.object(forKey: "launchAtLoginEnabled") == nil)
+        #expect(config.launchAtLoginEnabled)
+        #expect(loginItems.registerCalls == 1)
+    }
+
+    @Test func ineligibleEnablePersistsWithoutRegister() throws {
+        let fixture = makeDefaults()
+        defer { fixture.clear() }
+        let loginItems = FakeLoginItemManager()
+        let config = JournalAppConfig(
+            defaults: fixture.defaults,
+            loginItemManager: loginItems,
+            loginItemEligibility: { false }
+        )
+
+        try config.setLaunchAtLoginEnabledReportingFailure(true)
+
+        #expect(config.launchAtLoginEnabled)
+        #expect(loginItems.registerCalls == 0)
+        #expect(fixture.defaults.object(forKey: "launchAtLoginEnabled") as? Bool == true)
+    }
+
     @Test func cachedIconMarkJSONRoundTripsValidatedMark() throws {
         let fixture = makeDefaults()
         defer { fixture.clear() }
@@ -127,4 +159,16 @@ private final class FakeLoginItemManager: LoginItemManaging {
     func unregister() throws {
         unregisterCalls += 1
     }
+}
+
+@MainActor
+private final class ThrowingLoginItemManager: LoginItemManaging {
+    private(set) var registerCalls = 0
+
+    func register() throws {
+        registerCalls += 1
+        throw CocoaError(.fileWriteUnknown)
+    }
+
+    func unregister() throws {}
 }
