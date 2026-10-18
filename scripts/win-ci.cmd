@@ -123,6 +123,8 @@ cargo build --manifest-path core\Cargo.toml --locked -p solstone-core-journal -p
 cargo build --manifest-path core\Cargo.toml --locked -p solstone-core-repository-contracts --bin solstone-ci || exit /b 1
 echo === cargo test --locked (the Windows journal app) ===
 cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-journal-app || exit /b 1
+call :run_exact_binary "solstone-core-journal-app" "journal-app" "setup_receiver::native_tests::prepared_receiver_reads_real_resources_and_guards_launch" "full-tests" || exit /b 1
+call :run_exact_binary "solstone-core-journal-app" "journal-app" "setup_receiver::native_tests::prepared_receiver_refuses_real_directory_junctions" "full-tests" || exit /b 1
 echo === cargo test --locked (Windows local thinking runtime) ===
 cargo build --manifest-path core\Cargo.toml --locked -p solstone-core-vulkan-probe --bin solstone-core-vulkan-probe || exit /b 1
 cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-vulkan-probe --bin solstone-core-vulkan-probe || exit /b 1

@@ -1032,10 +1032,10 @@ mod tests {
             self.authority_current
         }
         fn get(&self, _path: &str) -> Result<Value, String> {
-            if self.pair_start_called.get() {
-                if let Some(identity) = &self.identity_after_mint {
-                    return Ok(identity.clone());
-                }
+            if self.pair_start_called.get()
+                && let Some(identity) = &self.identity_after_mint
+            {
+                return Ok(identity.clone());
             }
             self.identity.clone()
         }
@@ -1469,7 +1469,7 @@ mod tests {
 
         // Missing receipt leaves pending
         let mut clk = VirtualClock::default();
-        assert_eq!(observe_receipt(&paths, &mut clk).unwrap(), true);
+        assert!(observe_receipt(&paths, &mut clk).unwrap());
         assert!(state_dir.join("setup-continuation.json").exists());
 
         // Receipt ID mismatch (receipt ID A leaves pending B)
@@ -1480,13 +1480,13 @@ mod tests {
             "accepted": true,
         });
         fs::write(&rc_path, serde_json::to_vec(&rc_mismatch).unwrap()).unwrap();
-        assert_eq!(observe_receipt(&paths, &mut clk).unwrap(), true);
+        assert!(observe_receipt(&paths, &mut clk).unwrap());
         assert!(state_dir.join("setup-continuation.json").exists());
 
         // Oversized receipt leaves pending
         let large_rc = vec![b' '; 5000];
         fs::write(&rc_path, &large_rc).unwrap();
-        assert_eq!(observe_receipt(&paths, &mut clk).unwrap(), true);
+        assert!(observe_receipt(&paths, &mut clk).unwrap());
         assert!(state_dir.join("setup-continuation.json").exists());
 
         // Extra field in receipt leaves pending
@@ -1497,7 +1497,7 @@ mod tests {
             "extra": "bad",
         });
         fs::write(&rc_path, serde_json::to_vec(&rc_extra).unwrap()).unwrap();
-        assert_eq!(observe_receipt(&paths, &mut clk).unwrap(), true);
+        assert!(observe_receipt(&paths, &mut clk).unwrap());
         assert!(state_dir.join("setup-continuation.json").exists());
 
         // accepted: false leaves pending
@@ -1507,7 +1507,7 @@ mod tests {
             "accepted": false,
         });
         fs::write(&rc_path, serde_json::to_vec(&rc_declined).unwrap()).unwrap();
-        assert_eq!(observe_receipt(&paths, &mut clk).unwrap(), true);
+        assert!(observe_receipt(&paths, &mut clk).unwrap());
         assert!(state_dir.join("setup-continuation.json").exists());
 
         // Matching receipt deletes ONLY pending; receipt and mailbox remain intact
@@ -1517,7 +1517,7 @@ mod tests {
             "accepted": true,
         });
         fs::write(&rc_path, serde_json::to_vec(&rc_matching).unwrap()).unwrap();
-        assert_eq!(observe_receipt(&paths, &mut clk).unwrap(), false);
+        assert!(!observe_receipt(&paths, &mut clk).unwrap());
         assert!(!state_dir.join("setup-continuation.json").exists());
         assert!(rc_path.exists());
     }
