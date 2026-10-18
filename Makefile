@@ -1468,11 +1468,25 @@ ci-under-poison:
 	  node --check --input-type=module < core/crates/solstone-core-journal-app/ui/app.js && \
 	  node --check --input-type=module < core/crates/solstone-core-journal-app/ui/mark.js; \
 	fi
+	@$(MAKE) check-mobile-lockfiles
 	@$(MAKE) check-rust-fmt
 	@$(MAKE) check-rust-ci-topology
 	@$(MAKE) check-rust-clippy
 	@$(MAKE) check-rust-unit
 	@$(MAKE) --no-print-directory RUST_CODE_EVIDENCE_CONTEXT=ci report-rust-code-evidence
+
+# Resolve the standalone mobile graphs too: workspace-only CI cannot see their
+# local dependency edges drift. Locked metadata checks without building a target.
+.PHONY: check-mobile-lockfiles
+check-mobile-lockfiles:
+	@set -eu; for manifest in \
+		tools/mobile-serving/Cargo.toml \
+		tools/ios-runtime/native/Cargo.toml \
+		tools/ios-runtime/appraisal-helper/Cargo.toml \
+		tools/mobile-serving/client/Cargo.toml; do \
+		printf 'Checking locked mobile graph: %s\n' "$$manifest"; \
+		cargo metadata --manifest-path "$$manifest" --locked --offline --format-version 1 >/dev/null; \
+	done
 
 # HOPPER_LID is set by the external build orchestrator that runs isolated
 # automated build tasks. The name is that tool's contract and cannot be
