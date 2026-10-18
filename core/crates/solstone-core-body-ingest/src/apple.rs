@@ -158,7 +158,9 @@ pub fn detect_apple_source(source: &Path) -> Result<bool, BodyIngestError> {
     let mut file = open_nofollow(source).map_err(|_| source_error("archive"))?;
     preflight_zip(&mut file)?;
     let archive = zip::ZipArchive::new(file).map_err(|_| source_error("archive"))?;
-    Ok(archive.file_names().any(is_export_member))
+    let (_archive, names) =
+        crate::zip_names::prove_open_zip(archive).map_err(|_| source_error("archive"))?;
+    Ok(names.iter().any(|name| is_export_member(name)))
 }
 
 pub fn save_apple(
@@ -703,15 +705,17 @@ fn find_export(source: &Path) -> Result<String, BodyIngestError> {
         let mut file = open_nofollow(source).map_err(|_| source_error("archive"))?;
         preflight_zip(&mut file)?;
         let archive = zip::ZipArchive::new(file).map_err(|_| source_error("archive"))?;
+        let (_archive, names) =
+            crate::zip_names::prove_open_zip(archive).map_err(|_| source_error("archive"))?;
         for candidate in ["export.xml", "apple_health_export/export.xml"] {
-            if archive
-                .file_names()
+            if names
+                .iter()
                 .any(|name| name.trim_end_matches('/') == candidate)
             {
                 return Ok(candidate.to_owned());
             }
         }
-        if let Some(name) = archive.file_names().find(|name| {
+        if let Some(name) = names.iter().find(|name| {
             let clean = name.trim_end_matches('/');
             clean.ends_with("/export.xml") && clean.contains("apple_health_export/")
         }) {
@@ -742,10 +746,16 @@ fn with_export<T>(
     }
     let mut file = open_nofollow(source).map_err(|_| source_error("archive"))?;
     preflight_zip(&mut file)?;
-    let mut archive = zip::ZipArchive::new(file).map_err(|_| source_error("archive"))?;
+    let archive = zip::ZipArchive::new(file).map_err(|_| source_error("archive"))?;
+    let (mut archive, names) =
+        crate::zip_names::prove_open_zip(archive).map_err(|_| source_error("archive"))?;
+    let index = names
+        .iter()
+        .position(|name| name == export)
+        .ok_or_else(|| source_error("export_xml"))?;
     let entry = archive
-        .by_name(export)
-        .map_err(|_| source_error("export_xml"))?;
+        .by_index(index)
+        .map_err(|_| source_error("archive"))?;
     if entry.size() > MAX_APPLE_EXPORT_BYTES {
         return Err(source_error("export_size_limit"));
     }
@@ -1556,5 +1566,51 @@ mod tests {
             published["metadata"]["totalEnergyBurned"],
             Value::String("620".into())
         );
+    }
+
+    #[test]
+    fn zip2_name_detect_and_export_refuse_collision() {
+        use crate::zip_names::fixtures::{Member, UTF8_FLAG, build_zip, colliding};
+
+        let dir = TestDir::new();
+        let ok_path = dir.0.join("ok.zip");
+        fs::write(
+            &ok_path,
+            build_zip(&[Member {
+                name: b"export.xml".to_vec(),
+                flags: UTF8_FLAG,
+                extra: Vec::new(),
+                data: b"<HealthData></HealthData>".to_vec(),
+            }]),
+        )
+        .unwrap();
+        assert_eq!(detect_apple_source(&ok_path).unwrap(), true);
+        with_export(&ok_path, "export.xml", |_reader| Ok(())).expect("literal export");
+
+        let missing = dir.0.join("missing.zip");
+        fs::write(
+            &missing,
+            build_zip(&[Member {
+                name: b"other.xml".to_vec(),
+                flags: UTF8_FLAG,
+                extra: Vec::new(),
+                data: b"<x/>".to_vec(),
+            }]),
+        )
+        .unwrap();
+        assert_eq!(detect_apple_source(&missing).unwrap(), false);
+        assert_eq!(find_export(&missing).unwrap_err().stage(), "export_xml");
+
+        let collision = dir.0.join("collision.zip");
+        fs::write(
+            &collision,
+            colliding("export.xml", b"<HealthData></HealthData>"),
+        )
+        .unwrap();
+        let detect = detect_apple_source(&collision).unwrap_err();
+        assert_eq!(detect.stage(), "archive");
+        let export = with_export(&collision, "export.xml", |_reader| Ok(())).unwrap_err();
+        assert_eq!(export.stage(), "archive");
+        assert_ne!(export.stage(), "export_xml");
     }
 }

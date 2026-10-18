@@ -184,7 +184,9 @@ def external_population_sha256(external: list[dict[str, Any]]) -> str:
     (non-workspace) `[[package]]` row, identified the same way the committed
     index identifies its own rows (`name@version (source)`), sorted and
     hashed. Must match `windows_cli.rs`'s `external_population_sha256`
-    exactly -- same identity string, same sort, same join.
+    exactly -- same identity string, same sort, same join. Path-patched
+    Velopack is absent from this digest on purpose; the no-source check
+    accounts for it.
     """
     identities = sorted(f"{p['name']}@{p['version']} ({p['source']})" for p in external)
     return sha256_bytes("\n".join(identities).encode())
@@ -275,6 +277,10 @@ def classify_external_delta(
     upgrade (which reads as a removal plus an add) or an added git dependency
     still refuses. Empty results mean the population is identical and the
     cheap member-preserving path applies unchanged.
+
+    This script still refuses a zip 2.4.2/8.6.0 → 9.0.3 upgrade and Velopack
+    leaving the registry source. That regeneration is caller work. No rewrite
+    mode.
     """
     old_by_id = {(p["name"], p["version"]): p for p in old_external}
     new_by_id = {(p["name"], p["version"]): p for p in new_external}

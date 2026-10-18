@@ -134,7 +134,18 @@ pub async fn review(
             Err(response) => return response,
         };
         let time_key = parsed_time_key(&segment_key).unwrap_or_else(|| segment_key.clone());
-        let (sentences, embeddings) = load_sentences(&segment_dir, &time_key, &source);
+        let (sentences, embeddings) = match load_sentences(&segment_dir, &time_key, &source) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                return error_envelope(
+                    "speaker_review_unavailable",
+                    "that speaker review couldn't be loaded.",
+                    error.to_string(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                )
+                .into_response();
+            }
+        };
         if sentences.is_empty() {
             return error_envelope(
                 "speaker_review_unavailable",
@@ -317,13 +328,16 @@ fn load_sentences(
     segment_dir: &Path,
     segment_key: &str,
     source: &str,
-) -> (Vec<Value>, Option<SegmentEmbeddings>) {
+) -> Result<
+    (Vec<Value>, Option<SegmentEmbeddings>),
+    solstone_core_journal_io::zip2_name::Zip2NameFailure,
+> {
     let Ok(contents) = fs::read_to_string(segment_dir.join(format!("{source}.jsonl"))) else {
-        return (Vec::new(), None);
+        return Ok((Vec::new(), None));
     };
     let lines = contents.lines().collect::<Vec<_>>();
     if lines.is_empty() {
-        return (Vec::new(), None);
+        return Ok((Vec::new(), None));
     }
     let segment_start = segment_start_seconds(segment_key).unwrap_or(0);
     let mut sentences = Vec::new();
@@ -345,7 +359,7 @@ fn load_sentences(
             "text": text,
         }));
     }
-    let embeddings = load_segment_embeddings(&segment_dir.join(format!("{source}.npz")));
+    let embeddings = load_segment_embeddings(&segment_dir.join(format!("{source}.npz")))?;
     if let Some(embeddings) = &embeddings {
         let statement_ids = embeddings
             .statement_ids
@@ -363,7 +377,7 @@ fn load_sentences(
                 );
         }
     }
-    (sentences, embeddings)
+    Ok((sentences, embeddings))
 }
 
 fn sentence_map<'a>(payload: Option<&'a Value>, key: &str) -> BTreeMap<i32, &'a Value> {

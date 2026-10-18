@@ -355,7 +355,8 @@ mod tests {
                     .by_index(index)
                     .expect("zip member")
                     .name()
-                    .to_owned()
+                    .expect("zip member name")
+                    .into_owned()
             })
             .collect()
     }

@@ -38,7 +38,8 @@ fn assert_archive_shape(path: &std::path::Path, expected_names: &[&str], expecte
                 .by_index(index)
                 .expect("archive member")
                 .name()
-                .to_owned()
+                .expect("zip member name")
+                .into_owned()
         })
         .collect();
     assert_eq!(
@@ -429,7 +430,14 @@ fn portable_zip_keeps_owner_bytes_and_credentials() {
     expected_sequence.push("_export.json".to_owned());
 
     let actual_names: Vec<String> = (0..archive.len())
-        .map(|i| archive.by_index(i).expect("zip member").name().to_owned())
+        .map(|i| {
+            archive
+                .by_index(i)
+                .expect("zip member")
+                .name()
+                .expect("zip member name")
+                .into_owned()
+        })
         .collect();
 
     for (name, expected_bytes) in &kept_sentinels {
@@ -534,7 +542,14 @@ fn date_window_keeps_matching_chronicle_and_drops_every_other_root() {
     encode_archive(&request, &mut file).expect("encode sliced");
     let mut archive = ZipArchive::new(File::open(&path).expect("open archive")).expect("parse");
     let names: Vec<String> = (0..archive.len())
-        .map(|index| archive.by_index(index).expect("member").name().to_owned())
+        .map(|index| {
+            archive
+                .by_index(index)
+                .expect("member")
+                .name()
+                .expect("zip member name")
+                .into_owned()
+        })
         .collect();
     assert_eq!(
         names,
@@ -579,7 +594,12 @@ fn date_window_keeps_matching_chronicle_and_drops_every_other_root() {
         ZipArchive::new(File::open(&empty_path).expect("open empty-window")).expect("parse");
     assert_eq!(empty_archive.len(), 1);
     assert_eq!(
-        empty_archive.by_index(0).expect("only member").name(),
+        empty_archive
+            .by_index(0)
+            .expect("only member")
+            .name()
+            .expect("zip member name")
+            .as_ref(),
         "_export.json"
     );
 }
@@ -740,7 +760,7 @@ fn portable_zip_preserves_legacy_peer_credentials() {
     let mut members = Vec::new();
     for index in 0..archive.len() {
         let mut member = archive.by_index(index).expect("member");
-        let name = member.name().to_owned();
+        let name = member.name().expect("zip member name").into_owned();
         let mut body = Vec::new();
         member.read_to_end(&mut body).expect("read member body");
         members.push((name, body));

@@ -166,15 +166,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
-name = "arbitrary"
-version = "1.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
-dependencies = [
- "derive_arbitrary",
-]
-
-[[package]]
 name = "arc-swap"
 version = "1.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -827,12 +818,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crossbeam-utils"
-version = "0.8.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
-
-[[package]]
 name = "crossterm"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1097,17 +1082,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
-]
-
-[[package]]
-name = "derive_arbitrary"
-version = "1.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -4515,7 +4489,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-tungstenite",
  "windows-sys 0.61.2",
- "zip 2.4.2",
+ "zip",
 ]
 
 [[package]]
@@ -4691,7 +4665,7 @@ dependencies = [
  "solstone-core-journal-config-write",
  "solstone-core-journal-io",
  "ureq",
- "zip 2.4.2",
+ "zip",
 ]
 
 [[package]]
@@ -4985,7 +4959,7 @@ dependencies = [
  "tower",
  "ureq",
  "x509-parser 0.16.0",
- "zip 2.4.2",
+ "zip",
 ]
 
 [[package]]
@@ -5114,7 +5088,7 @@ dependencies = [
  "tempfile",
  "toml_edit",
  "windows-sys 0.61.2",
- "zip 2.4.2",
+ "zip",
 ]
 
 [[package]]
@@ -5194,7 +5168,7 @@ dependencies = [
  "solstone-core-journal-io",
  "solstone-core-npy",
  "unicode-normalization",
- "zip 2.4.2",
+ "zip",
 ]
 
 [[package]]
@@ -5517,7 +5491,7 @@ dependencies = [
  "solstone-core-segment",
  "solstone-core-system",
  "tempfile",
- "zip 2.4.2",
+ "zip",
 ]
 
 [[package]]
@@ -5549,7 +5523,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tower",
- "zip 2.4.2",
+ "zip",
 ]
 
 [[package]]
@@ -5706,7 +5680,7 @@ dependencies = [
  "nix 0.30.1",
  "serde_json",
  "solstone-core-journal-io",
- "zip 2.4.2",
+ "zip",
 ]
 
 [[package]]
@@ -5727,7 +5701,7 @@ dependencies = [
  "solstone-core-sol",
  "solstone-core-system",
  "tempfile",
- "zip 2.4.2",
+ "zip",
 ]
 
 [[package]]
@@ -6519,7 +6493,7 @@ dependencies = [
  "solstone-core-npy",
  "solstone-core-speakers",
  "tempfile",
- "zip 2.4.2",
+ "zip",
 ]
 
 [[package]]
@@ -6551,7 +6525,7 @@ dependencies = [
  "solstone-core-system",
  "tempfile",
  "thiserror 2.0.20",
- "zip 2.4.2",
+ "zip",
 ]
 
 [[package]]
@@ -6820,7 +6794,7 @@ dependencies = [
  "solstone-core-talent-config",
  "solstone-core-transcripts",
  "tempfile",
- "zip 2.4.2",
+ "zip",
 ]
 
 [[package]]
@@ -7038,7 +7012,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tower",
- "zip 2.4.2",
+ "zip",
 ]
 
 [[package]]
@@ -7900,8 +7874,6 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 [[package]]
 name = "velopack"
 version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd3fd8e7b771e0d0fc4ca67249273ad4eacfabe2562617b3ca42065a5972a58c"
 dependencies = [
  "anyhow",
  "bitflags 2.13.1",
@@ -7926,7 +7898,7 @@ dependencies = [
  "waitpid-any",
  "windows 0.62.2",
  "xml",
- "zip 8.6.0",
+ "zip",
 ]
 
 [[package]]
@@ -8676,31 +8648,15 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "2.4.2"
+version = "9.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fabe6324e908f85a1c52063ce7aa26b68dcb7eb6dbc83a2d148403c9bc3eba50"
-dependencies = [
- "arbitrary",
- "crc32fast",
- "crossbeam-utils",
- "displaydoc",
- "flate2",
- "indexmap",
- "memchr",
- "thiserror 2.0.20",
- "zopfli",
-]
-
-[[package]]
-name = "zip"
-version = "8.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
+checksum = "c2d98561b612a84ae525331a7a094429ef8a5772514ed507ff6db5f54badc971"
 dependencies = [
  "crc32fast",
  "flate2",
  "indexmap",
  "memchr",
+ "nix 0.31.3",
  "typed-path",
  "zopfli",
 ]

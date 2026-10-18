@@ -22,6 +22,7 @@ pub mod registry;
 pub mod save;
 pub mod shared;
 pub mod strava;
+mod zip_names;
 
 pub use producer::{
     NativeProducerError, NativeProducerOutcome, NativeProducerRequest, NullDocumentModelClient,

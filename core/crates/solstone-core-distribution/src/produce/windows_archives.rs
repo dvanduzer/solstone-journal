@@ -138,20 +138,30 @@ fn require_pin(bytes: &[u8], size: u64, digest: &str) -> Result<(), String> {
 
 fn admit_zip(path: &Path, pin: &ArchivePin) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let bytes = pinned_file(path, pin.bytes, pin.sha256)?;
-    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| e.to_string())?;
+    let archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| e.to_string())?;
     if archive.len() > 512 {
         return Err("pinned upstream archive exceeds member limit".into());
     }
-    let mut names = BTreeSet::new();
-    for index in 0..archive.len() {
-        let entry = archive.by_index(index).map_err(|e| e.to_string())?;
-        if !names.insert(entry.name().to_owned()) {
+    let (mut archive, names) =
+        crate::zip_names::prove_open_zip(archive).map_err(|failure| match failure {
+            solstone_core_journal_io::zip2_name::Zip2NameFailure::Collision { .. } => {
+                "duplicate upstream archive member".to_owned()
+            }
+            other => other.to_string(),
+        })?;
+    let mut unique = BTreeSet::new();
+    for name in &names {
+        if !unique.insert(name.clone()) {
             return Err("duplicate upstream archive member".into());
         }
     }
     let mut members = BTreeMap::new();
     for expected in pin.members {
-        let mut entry = archive.by_name(expected.path).map_err(|e| e.to_string())?;
+        let index = names
+            .iter()
+            .position(|name| name == expected.path)
+            .ok_or_else(|| format!("missing upstream member {}", expected.path))?;
+        let mut entry = archive.by_index(index).map_err(|e| e.to_string())?;
         if entry.is_dir()
             || entry.size() != expected.bytes
             || entry
@@ -310,5 +320,24 @@ mod tests {
                 .contains("pinned size or SHA-256")
         );
         assert_eq!(admitted["engine.dll"], original);
+    }
+
+    #[test]
+    fn admit_zip_refuses_duplicate_proved_names() {
+        let bytes = crate::zip_names::fixtures::colliding("engine.dll", b"x");
+        let pin = ArchivePin {
+            version: "fixture",
+            url: "fixture",
+            bytes: bytes.len() as u64,
+            sha256: Box::leak(sha256_hex(&bytes).into_boxed_str()),
+            members: &[],
+        };
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("dup.zip");
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            admit_zip(&path, &pin).unwrap_err(),
+            "duplicate upstream archive member"
+        );
     }
 }

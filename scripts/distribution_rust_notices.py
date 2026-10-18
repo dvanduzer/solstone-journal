@@ -41,6 +41,108 @@ def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+VELOPACK_IDENTITY = "velopack@1.2.0 (path+core/vendor/velopack)"
+VELOPACK_PUBLISHED_CRATE_SHA256 = "bd3fd8e7b771e0d0fc4ca67249273ad4eacfabe2562617b3ca42065a5972a58c"
+VELOPACK_DONOR_CRATE_SHA256 = "cbfbd9ee9818d1155813c4a1024a459763c3782405d5c1ad8f116bd8adaf0b88"
+VELOPACK_DONOR_VERSION = "1.3.39-g8d2844f"
+VELOPACK_LICENSE_URL = (
+    "https://raw.githubusercontent.com/velopack/velopack/"
+    "f2edcbcafb81da5b3c884aaea330e225ad91d8b6/LICENSE"
+)
+VELOPACK_LICENSE_COMMIT = "f2edcbcafb81da5b3c884aaea330e225ad91d8b6"
+VELOPACK_LICENSE_SHA256 = "91845db83551c877ebbb1118e0fb92e4e527290d23b995c55dcd438b3293943f"
+VELOPACK_LICENSE_LENGTH = 1091
+VELOPACK_NOT_THE_PUBLISHED_CRATE = (
+    "This tree is not the published crates.io crate velopack-1.2.0."
+)
+
+
+def patched_velopack_tree_sha256(vendor: Path) -> str:
+    files: list[tuple[str, bytes]] = []
+
+    def visit(current: Path) -> None:
+        for path in sorted(current.iterdir(), key=lambda item: item.name):
+            if path.is_dir():
+                visit(path)
+                continue
+            if not path.is_file():
+                continue
+            relative = path.relative_to(vendor).as_posix()
+            if relative == "ORIGIN.toml":
+                continue
+            files.append((relative, path.read_bytes()))
+
+    visit(vendor)
+    files.sort(key=lambda item: item[0])
+    hasher = hashlib.sha256()
+    for relative, data in files:
+        hasher.update(relative.encode())
+        hasher.update(b"\x00")
+        hasher.update(len(data).to_bytes(8, "little"))
+        hasher.update(data)
+    return hasher.hexdigest()
+
+
+def prove_velopack_provenance() -> bytes:
+    vendor = ROOT / "core/vendor/velopack"
+    manifest = tomllib.loads((vendor / "Cargo.toml").read_text())
+    package = manifest.get("package") or {}
+    if package.get("name") != "velopack" or package.get("version") != "1.2.0":
+        raise RuntimeError(
+            "vendored velopack Cargo.toml must be name velopack version 1.2.0"
+        )
+    origin = tomllib.loads((vendor / "ORIGIN.toml").read_text())
+    expected_tree = patched_velopack_tree_sha256(vendor)
+    expected = {
+        "published_crate_sha256": VELOPACK_PUBLISHED_CRATE_SHA256,
+        "donor_crate_sha256": VELOPACK_DONOR_CRATE_SHA256,
+        "donor_version": VELOPACK_DONOR_VERSION,
+        "license_url": VELOPACK_LICENSE_URL,
+        "license_commit": VELOPACK_LICENSE_COMMIT,
+        "license_sha256": VELOPACK_LICENSE_SHA256,
+        "license_length": VELOPACK_LICENSE_LENGTH,
+        "patched_tree_sha256": expected_tree,
+        "not_the_published_crate": VELOPACK_NOT_THE_PUBLISHED_CRATE,
+    }
+    for key, value in expected.items():
+        if origin.get(key) != value:
+            raise RuntimeError(f"velopack ORIGIN.toml {key} mismatch: {origin.get(key)!r}")
+    vendor_license = (vendor / "LICENSE").read_bytes()
+    if (
+        len(vendor_license) != VELOPACK_LICENSE_LENGTH
+        or digest(vendor_license) != VELOPACK_LICENSE_SHA256
+    ):
+        raise RuntimeError("vendored velopack LICENSE digest or length mismatch")
+    shipped = (DIST / "licenses/velopack/LICENSE").read_bytes()
+    if shipped != vendor_license:
+        raise RuntimeError(
+            "core/distribution/licenses/velopack/LICENSE is not byte-identical "
+            "to the vendor LICENSE"
+        )
+    return shipped
+
+
+def velopack_notice_row(license_bytes: bytes) -> dict:
+    return {
+        "identity": VELOPACK_IDENTITY,
+        "name": "velopack",
+        "version": "1.2.0",
+        "source": "path+core/vendor/velopack",
+        "license_expression": "MIT",
+        "notice_references": [
+            {
+                "sha256": digest(license_bytes),
+                "bytes": len(license_bytes),
+                "source": {
+                    "kind": "shipped-license",
+                    "member": "LICENSE",
+                    "path": "core/distribution/licenses/velopack/LICENSE",
+                },
+            }
+        ],
+    }
+
+
 def closure(target: str, triple: str) -> tuple[list[str], dict[str, dict]]:
     inventory = tomllib.loads((DIST / "inventory.toml").read_text())
     roots = {
@@ -74,11 +176,20 @@ def closure(target: str, triple: str) -> tuple[list[str], dict[str, dict]]:
         for dep in nodes[key]["deps"]:
             if any(kind["kind"] != "dev" for kind in dep["dep_kinds"]):
                 pending.append(dep["pkg"])
-    external = {
-        f"{packages[key]['name']}@{packages[key]['version']} ({packages[key]['source']})": packages[key]
-        for key in seen
-        if packages[key]["source"]
-    }
+    external = {}
+    for key in seen:
+        package = packages[key]
+        if package["source"]:
+            identity = f"{package['name']}@{package['version']} ({package['source']})"
+            external[identity] = package
+            continue
+        if package["name"] == "velopack":
+            if package["version"] != "1.2.0":
+                raise RuntimeError(
+                    f"path-patched velopack must be 1.2.0, got {package['version']}"
+                )
+            prove_velopack_provenance()
+            external[VELOPACK_IDENTITY] = package
     return sorted(external), external
 
 
@@ -158,7 +269,12 @@ def new_registry_row(identity: str, package: dict) -> dict:
 
 def source_text(reference: dict, package: dict) -> bytes:
     source = reference["source"]
-    if source["kind"] == "cargo-registry-archive":
+    if source["kind"] == "shipped-license":
+        path = ROOT / source["path"]
+        if path != DIST / "licenses/velopack/LICENSE":
+            raise RuntimeError(f"invalid shipped licence path for {package['name']}: {path}")
+        data = path.read_bytes()
+    elif source["kind"] == "cargo-registry-archive":
         member = source["member"]
         if Path(member).name != member:
             raise RuntimeError(f"invalid crate notice member for {package['name']}: {member}")
@@ -188,7 +304,10 @@ def write(target: str, triple: str, old_index: dict, known_texts: dict[str, byte
     texts = {}
     for identity in identities:
         package = metadata[identity]
-        row = source_rows.get(identity) or new_registry_row(identity, package)
+        if identity == VELOPACK_IDENTITY:
+            row = source_rows.get(identity) or velopack_notice_row(prove_velopack_provenance())
+        else:
+            row = source_rows.get(identity) or new_registry_row(identity, package)
         if row.get("notice_status") not in (None, "texts-acquired"):
             raise RuntimeError(f"licence text needs review for {identity}")
         references = row["notice_references"]

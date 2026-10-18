@@ -82,8 +82,12 @@ fn known_speakers(root: &Path) -> Vec<Speaker> {
             if !is_admissible_speaker_entity(&entity) {
                 return None;
             }
-            let voiceprints =
-                load_voiceprints(&solstone_core_entity::entity_voiceprints_path(root, &dir).ok()?)?;
+            let voiceprints = match load_voiceprints(
+                &solstone_core_entity::entity_voiceprints_path(root, &dir).ok()?,
+            ) {
+                Ok(Some(voiceprints)) => voiceprints,
+                Ok(None) | Err(_) => return None,
+            };
             let mut streams = BTreeSet::new();
             let mut segments = BTreeSet::new();
             let mut last_seen = None;

@@ -236,7 +236,17 @@ pub async fn status(Extension(root): Extension<Arc<JournalRoot>>) -> Response {
                 );
             }
         };
-        let owner = owner_section(&root.0, &voiceprint, &owner_id);
+        let owner = match owner_section(&root.0, &voiceprint, &owner_id) {
+            Ok(owner) => owner,
+            Err(detail) => {
+                return err(
+                    "speaker_command_failed",
+                    "that speaker command didn't finish.",
+                    &detail,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                );
+            }
+        };
         Json(json!({
             "embeddings": embeddings_section(&segments),
             "owner": owner,
@@ -344,9 +354,10 @@ fn active_speaker_label<'a>(
 fn embedded_sentence_ids(path: &Path) -> BTreeSet<i64> {
     // A malformed or absent NPZ means no sentence is embedded; this mirrors the
     // browser reader's conservative presentation behavior.
-    crate::speakers_npz::load_segment_embeddings(path)
-        .map(|data| data.statement_ids.into_iter().map(i64::from).collect())
-        .unwrap_or_default()
+    match crate::speakers_npz::load_segment_embeddings(path) {
+        Ok(Some(data)) => data.statement_ids.into_iter().map(i64::from).collect(),
+        Ok(None) | Err(_) => BTreeSet::new(),
+    }
 }
 
 fn read_json(path: &Path) -> Option<Value> {
@@ -396,7 +407,11 @@ fn embeddings_section(segments: &[CatalogedSegment]) -> Value {
     json!({"segments":total,"streams":streams,"days":days.len(),"date_range":range})
 }
 
-fn owner_section(root: &Path, voiceprint: &BTreeMap<String, Value>, owner_id: &str) -> Value {
+fn owner_section(
+    root: &Path,
+    voiceprint: &BTreeMap<String, Value>,
+    owner_id: &str,
+) -> Result<Value, String> {
     let status = voiceprint
         .get("status")
         .cloned()
@@ -448,16 +463,18 @@ fn owner_section(root: &Path, voiceprint: &BTreeMap<String, Value>, owner_id: &s
         }
     }
     let centroid =
-        solstone_core_speaker_resolve::owner_centroid::owner_centroid_file(root, owner_id)
-            .ok()
-            .and_then(|path| crate::speakers_npz::owner_centroid_summary(&path));
+        match solstone_core_speaker_resolve::owner_centroid::owner_centroid_file(root, owner_id) {
+            Ok(path) => crate::speakers_npz::owner_centroid_summary(&path)
+                .map_err(|error| error.to_string())?,
+            Err(_) => None,
+        };
     result.insert("centroid_saved".to_owned(), Value::Bool(centroid.is_some()));
     if status_text == "confirmed"
         && let Some(centroid) = centroid
     {
         result.insert("centroid_metadata".to_owned(), json!({"cluster_size":centroid.cluster_size,"streams":Value::Null,"created_at":centroid.created_at,"last_refreshed_at":centroid.last_refreshed_at,"threshold":centroid.threshold,"margin":centroid.margin,"intra_cosine_p25":Value::Null,"evidence_hash":centroid.evidence_hash,"evidence_intra_cosine_p25":centroid.evidence_intra_cosine_p25,"evidence_tier":centroid.evidence_tier}));
     }
-    Value::Object(result)
+    Ok(Value::Object(result))
 }
 
 fn speakers_section(

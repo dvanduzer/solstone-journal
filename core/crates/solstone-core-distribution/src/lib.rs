@@ -74,6 +74,7 @@ pub use solstone_core_installed_payload::windows_payload;
 pub mod windows_pe_closure;
 pub mod windows_publish;
 pub mod zip;
+mod zip_names;
 
 use std::fs;
 use std::io;

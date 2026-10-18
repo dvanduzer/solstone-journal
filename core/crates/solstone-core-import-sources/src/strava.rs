@@ -85,7 +85,10 @@ pub fn claims_path(path: &Path) -> bool {
         return false;
     };
     if let Ok(archive) = zip::ZipArchive::new(file) {
-        return archive.file_names().any(|name| name == "activities.csv");
+        let Ok((_archive, names)) = crate::zip_names::prove_open_zip(archive) else {
+            return false;
+        };
+        return names.iter().any(|name| name == "activities.csv");
     }
     file_passes_csv_rule(path)
 }
@@ -126,7 +129,10 @@ pub fn looks_like_strava_download(path: &Path, name_hint: Option<&str>) -> bool 
                 Ok(a) => a,
                 Err(_) => return false,
             };
-            for entry_name in archive.file_names() {
+            let Ok((_archive, names)) = crate::zip_names::prove_open_zip(archive) else {
+                return false;
+            };
+            for entry_name in &names {
                 let parts: Vec<&str> = entry_name
                     .split(['/', '\\'])
                     .filter(|s| !s.is_empty())
@@ -640,22 +646,12 @@ pub fn read_workouts(path: &Path, max_bytes: usize) -> Result<ReadWorkouts, Stra
 
         if is_zip {
             let file = File::open(path).map_err(|e| StravaError::ZipUnreadable(e.to_string()))?;
-            let mut archive = zip::ZipArchive::new(file)
+            let archive = zip::ZipArchive::new(file)
                 .map_err(|e| StravaError::ZipUnreadable(e.to_string()))?;
+            let (mut archive, names) = crate::zip_names::prove_open_zip(archive)
+                .map_err(|failure| StravaError::ZipUnreadable(failure.to_string()))?;
 
-            let mut exact_index = None;
-            for i in 0..archive.len() {
-                let name = match archive.by_index_raw(i) {
-                    Ok(entry) => entry.name().to_owned(),
-                    Err(e) => return Err(StravaError::ZipUnreadable(e.to_string())),
-                };
-                if name == ACTIVITIES_CSV {
-                    exact_index = Some(i);
-                    break;
-                }
-            }
-
-            let Some(index) = exact_index else {
+            let Some(index) = names.iter().position(|name| name == ACTIVITIES_CSV) else {
                 return Err(StravaError::ListMissing);
             };
 
@@ -3664,6 +3660,66 @@ mod tests {
         assert!(matches!(
             read_workouts(&unsupported_csv, DEFAULT_LIST_CAP),
             Err(StravaError::LanguageUnsupported)
+        ));
+    }
+
+    #[test]
+    fn zip2_name_read_workouts_refuses_collision_and_unproved() {
+        use crate::zip_names::fixtures::{ascii, colliding, unproved};
+
+        let temp = TempDir::new().unwrap();
+        let csv = build_csv(
+            HEADER_ENGLISH_103,
+            &[&[
+                ("Activity ID", 1, "123"),
+                ("Activity Date", 1, "\"Sep 20, 2026, 2:12:12 PM\""),
+                ("Activity Name", 1, "Afternoon Run"),
+                ("Activity Type", 1, "Run"),
+                ("Elapsed Time", 2, "300"),
+                ("Moving Time", 1, "300"),
+                ("Distance", 2, "5000"),
+                ("Elevation Gain", 1, "100"),
+                ("Average Heart Rate", 1, "140"),
+                ("Max Heart Rate", 2, "160"),
+                ("Average Watts", 1, "200"),
+                ("Weighted Average Power", 1, "210"),
+                ("Calories", 1, "350"),
+                ("Commute", 2, "true"),
+                ("Filename", 1, "activities/123.gpx"),
+            ]],
+        );
+        let ok = temp.path().join("ok.zip");
+        fs::write(
+            &ok,
+            crate::zip_names::fixtures::build_zip(&[ascii("activities.csv", csv.as_bytes())]),
+        )
+        .unwrap();
+        let workouts = read_workouts(&ok, DEFAULT_LIST_CAP).expect("literal activities.csv");
+        assert_eq!(workouts.workouts.len(), 1);
+
+        let collision = temp.path().join("collision.zip");
+        fs::write(&collision, colliding("activities.csv", csv.as_bytes())).unwrap();
+        assert!(matches!(
+            read_workouts(&collision, DEFAULT_LIST_CAP),
+            Err(StravaError::ZipUnreadable(_))
+        ));
+
+        let unproved_path = temp.path().join("unproved.zip");
+        fs::write(&unproved_path, unproved("activities.csv", csv.as_bytes())).unwrap();
+        assert!(matches!(
+            read_workouts(&unproved_path, DEFAULT_LIST_CAP),
+            Err(StravaError::ZipUnreadable(_))
+        ));
+
+        let missing = temp.path().join("missing.zip");
+        fs::write(
+            &missing,
+            crate::zip_names::fixtures::build_zip(&[ascii("other.csv", b"x")]),
+        )
+        .unwrap();
+        assert!(matches!(
+            read_workouts(&missing, DEFAULT_LIST_CAP),
+            Err(StravaError::ListMissing)
         ));
     }
 

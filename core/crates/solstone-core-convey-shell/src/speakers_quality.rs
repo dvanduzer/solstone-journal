@@ -329,21 +329,25 @@ fn owner_voice_state(root: &Path, principal_id: &str) -> OwnerVoice {
         .map(str::to_owned)
         .unwrap_or_else(|| "none".to_owned());
     let manual_stats = manual_owner_tag_stats(root, principal_id);
-    if let Some(centroid) =
+    if let Ok(path) =
         solstone_core_speaker_resolve::owner_centroid::owner_centroid_file(root, principal_id)
-            .ok()
-            .and_then(|path| owner_centroid_summary(&path))
     {
-        return OwnerVoice {
-            bootstrap_state: "bootstrapped",
-            status,
-            centroid_saved: true,
-            evidence_tier: Some(centroid.evidence_tier),
-            evidence_count: centroid.cluster_size,
-            manual_tag_lookup_error_count: manual_stats.lookup_error_count,
-            built_at: centroid.created_at,
-            refreshed_at: Some(centroid.last_refreshed_at),
-        };
+        match owner_centroid_summary(&path) {
+            Ok(Some(centroid)) => {
+                return OwnerVoice {
+                    bootstrap_state: "bootstrapped",
+                    status,
+                    centroid_saved: true,
+                    evidence_tier: Some(centroid.evidence_tier),
+                    evidence_count: centroid.cluster_size,
+                    manual_tag_lookup_error_count: manual_stats.lookup_error_count,
+                    built_at: centroid.created_at,
+                    refreshed_at: Some(centroid.last_refreshed_at),
+                };
+            }
+            Ok(None) => {}
+            Err(_) => {}
+        }
     }
     OwnerVoice {
         bootstrap_state: "pre_bootstrap",
@@ -372,11 +376,17 @@ pub(crate) fn count_manual_owner_tags(root: &Path, principal_id: &str) -> usize 
 }
 
 pub(crate) fn manual_owner_tag_stats(root: &Path, principal_id: &str) -> ManualOwnerTagStats {
-    let Some(voiceprints) =
+    let Some(path) =
         solstone_core_entity::entity_voiceprints_path(root, &principal_folder(root, principal_id))
             .ok()
-            .and_then(|path| load_voiceprints(&path))
     else {
+        return ManualOwnerTagStats {
+            manual_tags_count: 0,
+            streams_represented: 0,
+            lookup_error_count: 0,
+        };
+    };
+    let Ok(Some(voiceprints)) = load_voiceprints(&path) else {
         return ManualOwnerTagStats {
             manual_tags_count: 0,
             streams_represented: 0,
@@ -587,7 +597,11 @@ mod tests {
 
     #[test]
     fn missing_centroid_is_not_loaded() {
-        assert!(owner_centroid_summary(Path::new("missing-owner-centroid.npz")).is_none());
+        assert!(
+            owner_centroid_summary(Path::new("missing-owner-centroid.npz"))
+                .expect("missing file is a proved absence")
+                .is_none()
+        );
     }
 
     #[test]

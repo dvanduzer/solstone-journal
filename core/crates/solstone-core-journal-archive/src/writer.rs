@@ -397,7 +397,8 @@ mod tests {
                     .by_index(index)
                     .expect("archive member")
                     .name()
-                    .to_owned()
+                    .expect("member name")
+                    .into_owned()
             })
             .collect();
         assert_eq!(names, expected);
@@ -438,7 +439,7 @@ mod tests {
                 ),
                 (2026, 8, 7, 21, 22, 22)
             );
-            let name = member.name().to_owned();
+            let name = member.name().expect("member name").into_owned();
             let mut contents = Vec::new();
             member.read_to_end(&mut contents).expect("read file member");
             let expected = match name.as_str() {
@@ -468,7 +469,10 @@ mod tests {
 
         assert_eq!(archive.len(), 1);
         let mut manifest = archive.by_index(0).expect("empty manifest");
-        assert_eq!(manifest.name(), EXPORT_MANIFEST);
+        assert_eq!(
+            manifest.name().expect("manifest name").as_ref(),
+            EXPORT_MANIFEST
+        );
         let mut contents = Vec::new();
         manifest
             .read_to_end(&mut contents)
@@ -498,7 +502,7 @@ mod tests {
                 ),
                 (2040, 1, 2, 3, 4, 58),
                 "wrong timestamp for {}",
-                member.name()
+                member.name().expect("member name")
             );
         }
 

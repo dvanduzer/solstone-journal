@@ -100,21 +100,21 @@ fn owner_setup_status(root: &Path) -> Result<Value, OwnerStatusError> {
         None
     };
     let centroid = if status == "confirmed" {
-        solstone_core_speaker_resolve::owner_centroid::owner_centroid_file(root, &principal_id)
-            .ok()
-            .and_then(|path| owner_centroid_summary(&path))
+        match solstone_core_speaker_resolve::owner_centroid::owner_centroid_file(
+            root,
+            &principal_id,
+        ) {
+            Ok(path) => owner_centroid_summary(&path)
+                .map_err(|error| OwnerStatusError::Failed(error.to_string()))?,
+            Err(_) => None,
+        }
     } else {
         None
     };
     drop(lock);
     let manual_stats = manual_owner_tag_stats(root, &principal_id);
     if status == "confirmed" {
-        return Ok(confirmed_status(
-            root,
-            &principal_id,
-            &manual_stats,
-            centroid,
-        ));
+        return confirmed_status(root, &principal_id, &manual_stats, centroid);
     }
     let diagnostics = diagnostics(root, &manual_stats).map_err(OwnerStatusError::Catalog)?;
 
@@ -239,29 +239,32 @@ fn confirmed_status(
     principal_id: &str,
     manual_stats: &ManualOwnerTagStats,
     centroid: Option<OwnerCentroidSummary>,
-) -> Value {
+) -> Result<Value, OwnerStatusError> {
     let folder = principal_folder(root, principal_id);
     let (streams, intra_cosine_p25) = if centroid.is_some() {
-        solstone_core_entity::entity_voiceprints_path(root, &folder)
-            .ok()
-            .and_then(|path| load_voiceprints(&path))
-            .map(|voiceprints| {
-                let mut streams = voiceprints
-                    .metadata
-                    .iter()
-                    .filter_map(|row| row.get("stream").and_then(Value::as_str))
-                    .filter(|stream| !stream.is_empty())
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>();
-                streams.sort();
-                streams.dedup();
-                (streams, intra_cosine_p25(&voiceprints.embeddings))
-            })
-            .unwrap_or_default()
+        match solstone_core_entity::entity_voiceprints_path(root, &folder) {
+            Ok(path) => match load_voiceprints(&path) {
+                Ok(Some(voiceprints)) => {
+                    let mut streams = voiceprints
+                        .metadata
+                        .iter()
+                        .filter_map(|row| row.get("stream").and_then(Value::as_str))
+                        .filter(|stream| !stream.is_empty())
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>();
+                    streams.sort();
+                    streams.dedup();
+                    (streams, intra_cosine_p25(&voiceprints.embeddings))
+                }
+                Ok(None) => (Vec::new(), None),
+                Err(error) => return Err(OwnerStatusError::Failed(error.to_string())),
+            },
+            Err(_) => (Vec::new(), None),
+        }
     } else {
         (Vec::new(), None)
     };
-    json!({
+    Ok(json!({
         "status": "confirmed",
         "centroid_metadata": {
             "cluster_size": centroid.as_ref().map_or(0, |centroid| centroid.cluster_size),
@@ -280,7 +283,7 @@ fn confirmed_status(
             "evidence_tier": centroid.as_ref().map(|centroid| centroid.evidence_tier.clone()),
         },
         "manual_tags_count": manual_stats.manual_tags_count,
-    })
+    }))
 }
 
 struct Diagnostics {
@@ -360,8 +363,10 @@ fn owner_embedding_inventory(root: &Path) -> Result<(usize, usize), CatalogBuild
                 continue;
             }
             embeddings_available +=
-                npz_row_count(&segment.path.join(format!("{source}.npz")), "embeddings")
-                    .unwrap_or_default();
+                match npz_row_count(&segment.path.join(format!("{source}.npz")), "embeddings") {
+                    Ok(count) => count.unwrap_or_default(),
+                    Err(_) => 0,
+                };
         }
     }
     Ok((segments_available, embeddings_available))

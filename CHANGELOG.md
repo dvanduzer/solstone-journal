@@ -6,6 +6,10 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- direct ZIP readers and the Windows Velopack 1.2.0 updater use zip 9.0.3.
+
 ## [2.0.50] - 2026-10-18
 
 ### Added

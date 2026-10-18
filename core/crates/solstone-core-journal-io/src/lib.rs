@@ -69,6 +69,7 @@ pub mod windows_inventory;
 mod windows_lock;
 #[cfg(windows)]
 mod windows_ntcreate;
+pub mod zip2_name;
 // Parser is host-neutral (AC1); Windows prepare/revalidate are cfg'd inside.
 mod windows_publication_path;
 #[cfg(windows)]
