@@ -23,6 +23,8 @@ public class ServingActivity extends Activity {
     FileObserver commands;
     int sequence;
     boolean bound;
+    WorkerConnection connection;
+    volatile boolean ownerStopped;
     volatile long readyConnection;
     final AtomicLong connectionGeneration = new AtomicLong();
     volatile boolean destroyed;
@@ -42,34 +44,66 @@ public class ServingActivity extends Activity {
             }
         }
     });
-    final ServiceConnection connection = new ServiceConnection() {
+    final class WorkerConnection implements ServiceConnection {
         public void onServiceConnected(ComponentName name, IBinder binder) {
-            if (destroyed) return;
+            if (destroyed || connection != this) return;
             final long generation = connectionGeneration.incrementAndGet();
             final Messenger target = new Messenger(binder);
             worker = target;
             readyConnection = 0;
-            connectService(generation, target, false);
+            if (ownerStopped) {
+                control.execute(() -> {
+                    if (currentConnection(generation, target)) {
+                        readyConnection = generation;
+                        consumeCommand();
+                    }
+                });
+            } else {
+                connectService(generation, target, false);
+            }
         }
         public void onServiceDisconnected(ComponentName name) {
-            connectionGeneration.incrementAndGet();
-            readyConnection = 0;
-            worker = null;
-            for (CompletableFuture<JSONObject> future: pending.values()) future.completeExceptionally(new EOFException("worker lost"));
-            pending.clear();
-            show(MainActivity.obj("error", "worker disconnected"));
+            connectionLost(this);
         }
-    };
+        public void onBindingDied(ComponentName name) {
+            connectionLost(this);
+        }
+    }
+    void bindWorker() {
+        if (destroyed || ownerStopped) return;
+        connection = new WorkerConnection();
+        bound = bindService(new Intent(this, JournalService.class), connection, Context.BIND_AUTO_CREATE);
+        if (!bound) show(MainActivity.obj("error", "worker binding refused"));
+    }
+    void connectionLost(WorkerConnection lost) {
+        if (destroyed || connection != lost) return;
+        final long generation = connectionGeneration.incrementAndGet();
+        readyConnection = 0;
+        worker = null;
+        for (CompletableFuture<JSONObject> future: pending.values()) future.completeExceptionally(new EOFException("worker lost"));
+        pending.clear();
+        show(MainActivity.obj("error", "worker disconnected"));
+        // A retained auto-create binding need not promptly restart its worker.
+        // Replace only this lost binding; a newer callback or Stop wins.
+        ui.post(() -> {
+            if (generation != connectionGeneration.get() || destroyed || ownerStopped
+                    || connection != lost || worker != null) return;
+            if (bound) unbindService(lost);
+            bound = false;
+            connection = null;
+            bindWorker();
+        });
+    }
     boolean currentConnection(long generation, Messenger target) {
         return !destroyed && connectionGeneration.get() == generation && worker == target;
     }
     void connectService(final long generation, final Messenger target, final boolean startAlreadySucceeded) {
         control.execute(() -> {
-            if (!currentConnection(generation, target)) return;
+            if (!currentConnection(generation, target) || ownerStopped) return;
             try {
                 ServingConnection.Action action = ServingConnection.drive(generation, startAlreadySucceeded, new ServingConnection.Environment() {
                     public long currentGeneration() {
-                        return connectionGeneration.get();
+                        return ownerStopped ? -1 : connectionGeneration.get();
                     }
                     public ServingConnection.Retirement retirement() throws Exception {
                         JSONObject res = call(target, MainActivity.obj("op", "status"));
@@ -159,6 +193,7 @@ public class ServingActivity extends Activity {
             JSONObject input = new JSONObject(new String(Files.readAllBytes(command.toPath()), StandardCharsets.UTF_8));
             id = input.getString("id");
             if (readyConnection != generation || !currentConnection(generation, target)) return;
+            if ("stop".equals(input.optString("op"))) ownerStopped = true;
             if (!command.delete()) throw new IOException("command retirement failed");
             row = call(target, input);
         } catch(Exception e) { row = MainActivity.obj("error", e.toString()); }
@@ -181,12 +216,19 @@ public class ServingActivity extends Activity {
         for(String op: new String[]{"status", "index", "stop"}) {
             Button button = new Button(this); button.setText(op);
             button.setOnClickListener(v->{
+                if ("stop".equals(op)) ownerStopped = true;
                 final long gen = connectionGeneration.get();
                 final Messenger target = worker;
                 control.execute(()->{
                     if (ServingConnection.decide(gen, connectionGeneration.get(), true, true, true, ServingConnection.Retirement.STOPPED) == ServingConnection.Action.DROP) return;
                     if (!currentConnection(gen, target)) return;
-                    try { show(call(target, MainActivity.obj("op", op))); }
+                    try {
+                        show(call(target, MainActivity.obj("op", op)));
+                        if ("stop".equals(op) && currentConnection(gen, target)) {
+                            readyConnection = gen;
+                            consumeCommand();
+                        }
+                    }
                     catch(Exception e) { show(MainActivity.obj("error", e.toString())); }
                 });
             });
@@ -201,7 +243,7 @@ public class ServingActivity extends Activity {
         commands.startWatching();
         try {
             unpackPayload("journal-payload", new File(getFilesDir(), "journal-payload"));
-            bound = bindService(new Intent(this, JournalService.class), connection, Context.BIND_AUTO_CREATE);
+            bindWorker();
         } catch(IOException e) { show(MainActivity.obj("error", e.toString())); }
     }
     protected void onDestroy() {
