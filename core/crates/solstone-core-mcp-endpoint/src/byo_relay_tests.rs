@@ -1345,7 +1345,7 @@ async fn test_lifetime() {
         .await
         .unwrap();
     let val_unreach: Value = serde_json::from_slice(&body_unreach).unwrap();
-    assert_eq!(val_unreach["code"], "unreachable");
+    assert_eq!(val_unreach["code"], "relay_unreachable");
     assert_eq!(
         accepts1.load(Ordering::SeqCst),
         base_accepts,

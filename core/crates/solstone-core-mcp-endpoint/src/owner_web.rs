@@ -1212,8 +1212,16 @@ async fn byo_relay_commands(Extension(journal): Extension<Arc<PathBuf>>) -> Resp
     match crate::byo_relay::ensure_or_read_client_key(&journal) {
         Ok((_, pub_key)) => {
             let root = std::path::Path::new("/");
-            let setup = crate::byo_relay::generate_setup_script(root, &pub_key);
-            let remove = crate::byo_relay::generate_remove_script(root);
+            // Paste-ready: run as a script under sudo, so a refusal ends the script
+            // rather than the admin's interactive shell.
+            let setup = format!(
+                "sudo sh -s <<'SETUP'\n{}SETUP\n",
+                crate::byo_relay::generate_setup_script(root, &pub_key)
+            );
+            let remove = format!(
+                "sudo sh -s <<'REMOVE'\n{}REMOVE\n",
+                crate::byo_relay::generate_remove_script(root)
+            );
             Json(json!({
                 "setup": setup,
                 "remove": remove,
@@ -1264,10 +1272,10 @@ pub(crate) async fn byo_relay_check(Extension(journal): Extension<Arc<PathBuf>>)
         match state.relay_state.as_str() {
             "connecting" => return Json(json!({"code": "relay_connecting"})).into_response(),
             "connected" => return Json(json!({"code": "relay_ok"})).into_response(),
-            "unreachable" => return Json(json!({"code": "unreachable"})).into_response(),
-            "auth_refused" => return Json(json!({"code": "auth_refused"})).into_response(),
+            "unreachable" => return Json(json!({"code": "relay_unreachable"})).into_response(),
+            "auth_refused" => return Json(json!({"code": "relay_auth_refused"})).into_response(),
             "forward_refused" => {
-                return Json(json!({"code": "forward_refused"})).into_response();
+                return Json(json!({"code": "relay_forward_refused"})).into_response();
             }
             "host_key_changed" => {
                 return Json(json!({"code": "relay_host_key_changed"})).into_response();
@@ -1280,6 +1288,9 @@ pub(crate) async fn byo_relay_check(Extension(journal): Extension<Arc<PathBuf>>)
         match crate::byo_relay::execute_byo_relay_check(&journal, relay_addr, relay_port).await {
             Ok(()) => "relay_ok",
             Err("host_key_changed") => "relay_host_key_changed",
+            Err("unreachable") => "relay_unreachable",
+            Err("auth_refused") => "relay_auth_refused",
+            Err("forward_refused") => "relay_forward_refused",
             Err(e) => e,
         };
     Json(json!({"code": code})).into_response()
@@ -4237,21 +4248,21 @@ mod tests {
         let resp = byo_relay_check(Extension(journal.clone())).await;
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
         let val: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(val["code"], "unreachable");
+        assert_eq!(val["code"], "relay_unreachable");
 
         state.relay_state = "auth_refused".to_string();
         crate::byo_door::write_byo_door_state(root, &state);
         let resp = byo_relay_check(Extension(journal.clone())).await;
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
         let val: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(val["code"], "auth_refused");
+        assert_eq!(val["code"], "relay_auth_refused");
 
         state.relay_state = "forward_refused".to_string();
         crate::byo_door::write_byo_door_state(root, &state);
         let resp = byo_relay_check(Extension(journal.clone())).await;
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
         let val: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(val["code"], "forward_refused");
+        assert_eq!(val["code"], "relay_forward_refused");
 
         state.relay_state = "host_key_changed".to_string();
         crate::byo_door::write_byo_door_state(root, &state);

@@ -664,10 +664,12 @@ pub fn generate_setup_script(root: &Path, public_key_openssh: &str) -> String {
 set -eu
 
 if [ "$(id -u)" -ne 0 ]; then
+  echo "run this as an admin (with sudo). nothing was changed."
   exit 1
 fi
 
 if [ ! -f "{sshd_config}" ]; then
+  echo "this server has no OpenSSH server settings at {sshd_config}. nothing was changed."
   exit 1
 fi
 
@@ -682,6 +684,7 @@ while IFS= read -r line || [ -n "$line" ]; do
 done < "{sshd_config}"
 
 if [ "$has_include" -ne 1 ]; then
+  echo "this server's SSH settings don't read {conf_dir}, so the relay login can't be limited. nothing was changed."
   exit 1
 fi
 
