@@ -397,6 +397,28 @@ impl ParentLossLedger {
             .join("closure-recovery.json")
     }
 
+    pub fn census_obligation_path(&self, generation: ParentLossGeneration) -> PathBuf {
+        self.generation_path(generation)
+            .join("census-obligation.json")
+    }
+
+    pub fn census_refusal_path(&self, generation: ParentLossGeneration) -> PathBuf {
+        self.generation_path(generation).join("census-refusal.json")
+    }
+
+    pub fn closure_recovery_receipts_dir(&self, generation: ParentLossGeneration) -> PathBuf {
+        self.closure_recovery_dir(generation).join("receipts")
+    }
+
+    pub fn closure_recovery_receipt_path(
+        &self,
+        generation: ParentLossGeneration,
+        seq: u64,
+    ) -> PathBuf {
+        self.closure_recovery_receipts_dir(generation)
+            .join(format!("{seq:06}.json"))
+    }
+
     pub fn active_generation(&self) -> Result<Option<ActiveGeneration>, ParentLossLedgerError> {
         read_json_optional(&self.active_path())
     }
