@@ -91,6 +91,10 @@ pub(super) struct ResultFields {
     pub diagnostic: [u8; 256],
 }
 
+// Only the app's static library links the Go archive, and only it enables
+// `ios-linked-bridge`. The workspace's standalone iOS executables do not link
+// the archive: there every entry refuses before any native state exists.
+#[cfg(feature = "ios-linked-bridge")]
 unsafe extern "C" {
     fn restic_bridge_operation_directories_v1_start(
         request: *const LocalRequest,
@@ -138,6 +142,83 @@ unsafe extern "C" {
         required: *mut u32,
     ) -> i32;
     fn restic_bridge_free(id: u64) -> i32;
+}
+
+#[cfg(not(feature = "ios-linked-bridge"))]
+use unlinked::*;
+
+#[cfg(not(feature = "ios-linked-bridge"))]
+#[allow(clippy::too_many_arguments)]
+mod unlinked {
+    use super::{INVALID_ARGUMENT, LocalRequest, Options, RemoteRequest, ResultFields};
+    use std::ffi::c_char;
+
+    pub(super) unsafe fn restic_bridge_operation_directories_v1_start(
+        _: *const LocalRequest,
+        _: *const Options,
+        _: i32,
+        _: i32,
+        _: *const c_char,
+        _: u32,
+        _: *const c_char,
+        _: u32,
+        _: *mut u64,
+    ) -> i32 {
+        INVALID_ARGUMENT
+    }
+    pub(super) unsafe fn restic_bridge_s3_operation_directories_v1_start(
+        _: *const RemoteRequest,
+        _: *const Options,
+        _: i32,
+        _: i32,
+        _: i32,
+        _: *const c_char,
+        _: u32,
+        _: *mut u64,
+    ) -> i32 {
+        INVALID_ARGUMENT
+    }
+    pub(super) unsafe fn restic_bridge_target_admit_v1(
+        _: u32,
+        _: i32,
+        _: *const c_char,
+        _: u32,
+        _: *mut u64,
+    ) -> i32 {
+        INVALID_ARGUMENT
+    }
+    pub(super) unsafe fn restic_bridge_target_revalidate_v1(_: u32, _: u64) -> i32 {
+        INVALID_ARGUMENT
+    }
+    pub(super) unsafe fn restic_bridge_target_release_v1(_: u32, _: u64) -> i32 {
+        INVALID_ARGUMENT
+    }
+    pub(super) unsafe fn restic_bridge_s3_restore_admitted_v1_start(
+        _: *const RemoteRequest,
+        _: u64,
+        _: *const c_char,
+        _: u32,
+        _: *mut u64,
+    ) -> i32 {
+        INVALID_ARGUMENT
+    }
+    pub(super) unsafe fn restic_bridge_cancel(_: u64) -> i32 {
+        INVALID_ARGUMENT
+    }
+    pub(super) unsafe fn restic_bridge_wait(_: u64, _: *mut ResultFields) -> i32 {
+        INVALID_ARGUMENT
+    }
+    pub(super) unsafe fn restic_bridge_result_metadata(
+        _: u64,
+        _: *mut c_char,
+        _: u32,
+        _: *mut u32,
+    ) -> i32 {
+        INVALID_ARGUMENT
+    }
+    pub(super) unsafe fn restic_bridge_free(_: u64) -> i32 {
+        INVALID_ARGUMENT
+    }
 }
 
 pub(super) struct Remote<'a> {

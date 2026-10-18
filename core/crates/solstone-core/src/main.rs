@@ -5081,7 +5081,7 @@ fn run_mcp_pairing_at(journal_root: &Path, command: McpPairingCommand) -> ExitCo
                             println!("It works only through solstone.me.");
                         }
                         Some("hostname") => {
-                            println!("It works only at your hostname.");
+                            println!("It works only at your own domain.");
                         }
                         Some(_) => {
                             println!("It works only for an agent on this computer.");

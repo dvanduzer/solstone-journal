@@ -240,8 +240,15 @@ fn validate_record(
 
 #[allow(unsafe_code)] // One read-only, bounded export from the linked Go archive.
 fn actual_linked_identity() -> Result<[u8; 32], BuildIdentityRefusal> {
+    // Only the app links the Go archive (`ios-linked-bridge`); without it no
+    // linked build exists to admit.
+    #[cfg(feature = "ios-linked-bridge")]
     unsafe extern "C" {
         fn restic_bridge_build_identity_v1(output: *mut u8, capacity: u32) -> i32;
+    }
+    #[cfg(not(feature = "ios-linked-bridge"))]
+    unsafe fn restic_bridge_build_identity_v1(_: *mut u8, _: u32) -> i32 {
+        1
     }
     let mut actual = [0u8; 32];
     // SAFETY: output is a live exactly32-byte array for the synchronous copy.
