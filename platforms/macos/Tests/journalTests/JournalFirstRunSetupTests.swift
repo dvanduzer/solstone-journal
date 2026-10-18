@@ -205,7 +205,7 @@ extension JournalFirstRunModelTests {
         defer { fresh.refresh.release() }
         let freshID = try writeStep1(fresh.fixture.mailbox)
         await fresh.fixture.model.reconcileActivation()
-        #expect(fresh.fixture.model.route == .ritual(.folder))
+        #expect(fresh.fixture.model.route == .ritual(.welcome))
         #expect(fresh.fixture.config.journalRoot == nil)
         guard case .ready(let rootless) = fresh.fixture.continuation.loadContinuation() else {
             Issue.record("expected a rootless continuation")
@@ -363,8 +363,16 @@ extension JournalFirstRunModelTests {
         defer { missingPending.refresh.release() }
         try seedContinuation(missingPending.fixture.continuation, root: missingPending.root)
         await missingPending.fixture.model.reconcileActivation()
-        #expect(missingPending.fixture.mailbox.loadStep5() == .missing)
-        #expect(missingPending.peer.launched.isEmpty)
+        guard case .ready(let minted) = missingPending.fixture.mailbox.loadStep5() else {
+            Issue.record("a committed continuation mints and writes step 5")
+            return
+        }
+        #expect(missingPending.peer.launched.count == 1)
+        guard case .ready(let record) = missingPending.fixture.continuation.loadContinuation() else {
+            Issue.record("expected the continuation to keep the minted id")
+            return
+        }
+        #expect(record.pendingStep5HandoffID == minted.handoffID)
 
         let uncommitted = try makeSetupWorld(configureRoot: true, probes: [.complete])
         defer { uncommitted.refresh.release() }
@@ -395,6 +403,92 @@ extension JournalFirstRunModelTests {
         await badFingerprint.fixture.model.reconcileActivation()
         #expect(badFingerprint.fixture.mailbox.loadStep5() == .missing)
         #expect(badFingerprint.peer.launched.isEmpty)
+    }
+
+    @Test func freshModelMintsThePendingLeftByARefusedPeer() async throws {
+        let peer = ScriptedPeer()
+        peer.queue = [setupPeerURL]
+        peer.verifyQueue = [true, false]
+        let world = try makeSetupWorld(configureRoot: true, probes: [.complete], peer: peer)
+        defer { world.refresh.release() }
+        let step1 = try writeStep1(world.fixture.mailbox)
+
+        await world.fixture.model.reconcileActivation()
+
+        #expect(try world.fixture.mailbox.readStep1Receipt()?.handoffID == step1)
+        #expect(world.fixture.mailbox.loadStep1() == .missing)
+        guard case .ready(let stored) = world.fixture.continuation.loadContinuation() else {
+            Issue.record("expected the accepted continuation")
+            return
+        }
+        #expect(stored.step1HandoffID == step1)
+        #expect(stored.pendingStep5HandoffID == nil)
+        #expect(world.fixture.mailbox.loadStep5() == .missing)
+        #expect(world.peer.launched.isEmpty)
+
+        let recoveryPeer = ScriptedPeer()
+        recoveryPeer.queue = [setupPeerURL]
+        let client = ScriptedSetupClient()
+        client.setNetwork(JournalNetworkStatus(caFingerprint: setupFingerprint, instanceID: setupInstanceID))
+        let identity = ScriptedIdentity()
+        identity.resolution = .mark(.uiTestSample, instanceID: setupInstanceID)
+        let copy = try loadSetupFixtureCopy()
+        let recoveryRefresh = RefreshGate()
+        defer { recoveryRefresh.release() }
+        let recovery = makeModel(
+            config: world.fixture.config,
+            startResults: [],
+            probeResults: [.complete],
+            localSetupCapability: { true },
+            loadSetupCopy: { copy },
+            peer: recoveryPeer,
+            setupClient: client,
+            identity: identity,
+            mailbox: world.fixture.mailbox,
+            continuation: world.fixture.continuation,
+            supervisorIsLive: { _ in true },
+            refreshSleep: { await recoveryRefresh.sleep() }
+        )
+        await recovery.model.reconcileActivation()
+
+        guard case .ready(let minted) = world.fixture.continuation.loadContinuation() else {
+            Issue.record("expected the recovered continuation")
+            return
+        }
+        let pending = try #require(minted.pendingStep5HandoffID)
+        guard case .ready(let handoff) = world.fixture.mailbox.loadStep5() else {
+            Issue.record("expected one step 5")
+            return
+        }
+        #expect(handoff.handoffID == pending)
+        #expect(recoveryPeer.launched.count == 1)
+
+        await recovery.model.reconcileActivation()
+        guard case .ready(let retried) = world.fixture.mailbox.loadStep5() else {
+            Issue.record("expected the same step 5")
+            return
+        }
+        #expect(retried.handoffID == pending)
+        guard case .ready(let reused) = world.fixture.continuation.loadContinuation() else {
+            Issue.record("retry keeps the continuation")
+            return
+        }
+        #expect(reused.pendingStep5HandoffID == pending)
+
+        try writeAcceptedReceipt(world.fixture.mailbox, id: pending, step: 5)
+        await recovery.model.reconcileActivation()
+        #expect(world.fixture.continuation.loadContinuation() == .missing)
+        #expect(world.fixture.continuation.acceptance(of: step1) == .accepted)
+        let launched = recoveryPeer.launched.count
+
+        try writeStep1(world.fixture.mailbox, id: step1)
+        await recovery.model.reconcileActivation()
+        #expect(world.fixture.continuation.loadContinuation() == .missing)
+        #expect(try world.fixture.mailbox.readStep1Receipt()?.handoffID == step1)
+        #expect(recoveryPeer.launched.count == launched)
+        #expect(recovery.browser.opened.isEmpty)
+        await recovery.model.prepareForTermination()
+        expectQuietLaunch(world)
     }
 
     @Test func savedIntentWithIncompleteSetupDoesNotLaunch() async throws {
@@ -634,9 +728,52 @@ extension JournalFirstRunModelTests {
         await world.fixture.model.finalizeThinking()
 
         #expect(world.client.actions == [.finalize(timezone: TimeZone.autoupdatingCurrent.identifier)])
-        #expect(world.peer.launched.isEmpty)
-        #expect(world.fixture.mailbox.loadStep5() == .missing)
         #expect(world.fixture.setupRunner.skipModelInstallFlags == [true])
+        #expect(world.fixture.model.setupState?.downloads.speech.state == .idle)
+        #expect(world.fixture.model.setupState?.downloads.thinking.state == .idle)
+        guard case .ready(let local) = world.fixture.continuation.loadLocal() else {
+            Issue.record("expected a local continuation")
+            return
+        }
+        #expect(local.journalRootPath == world.root.standardizedFileURL.path)
+        guard case .ready(let handoff) = world.fixture.mailbox.loadStep5() else {
+            Issue.record("expected one step 5")
+            return
+        }
+        #expect(handoff.handoffID == local.pendingStep5HandoffID)
+        #expect(world.peer.launched.count == 1)
+        #expect(world.fixture.continuation.loadContinuation() == .missing)
+        #expect(world.fixture.continuation.loadLedger() == .missing)
+        expectQuietLaunch(world)
+    }
+
+    @Test func localReplaceRefusalSkipsFinalize() async throws {
+        let gate = FailWrites()
+        let world = try makeSetupWorld(
+            configureRoot: true,
+            markState: "locked",
+            saved: true,
+            choice: "later",
+            probes: [.incomplete, .incomplete],
+            continuationReplace: { data, url in
+                if gate.fail { throw CocoaError(.fileWriteUnknown) }
+                try data.write(to: url, options: .atomic)
+            }
+        )
+        defer { world.refresh.release() }
+        await world.fixture.model.reconcileActivation()
+        await world.fixture.model.continueFromFolder()
+        gate.fail = true
+
+        await world.fixture.model.finalizeThinking()
+
+        #expect(world.client.actions.isEmpty)
+        #expect(world.fixture.mailbox.loadStep5() == .missing)
+        #expect(world.peer.launched.isEmpty)
+        #expect(world.fixture.model.thinkingFailure?.isEmpty == false)
+        let localURL = world.fixture.continuation.directory
+            .appendingPathComponent(JournalSetupContinuationStore.localFileName)
+        #expect(!FileManager.default.fileExists(atPath: localURL.path))
         expectQuietLaunch(world)
     }
 
@@ -756,13 +893,15 @@ extension JournalFirstRunModelTests {
         defer { world.refresh.release() }
         let id = try writeStep1(world.fixture.mailbox)
         await world.fixture.model.reconcileActivation()
-        #expect(world.fixture.model.route == .ritual(.folder))
+        #expect(world.fixture.model.route == .ritual(.welcome))
         guard case .ready(let before) = world.fixture.continuation.loadContinuation() else {
             Issue.record("expected a rootless continuation")
             return
         }
         #expect(before.journalRootPath == nil)
         #expect(before.step1HandoffID == id)
+        world.fixture.model.continueFromWelcome()
+        #expect(world.fixture.model.route == .ritual(.folder))
 
         world.fixture.model.journalRoot = world.root
         await world.fixture.model.continueFromFolder()
@@ -852,6 +991,80 @@ extension JournalFirstRunModelTests {
         stateGate.release()
 
         #expect(world.fixture.model.displayedProposalID == "proposal-2")
+        expectQuietLaunch(world)
+    }
+
+    @Test func refreshStartedDuringAnActionDoesNotApplyUntilTheActionFinishes() async throws {
+        let world = try makeSetupWorld(configureRoot: true, supervisorLive: true, probes: [.incomplete])
+        defer { world.refresh.release() }
+        try seedContinuation(world.fixture.continuation, root: world.root)
+        await world.fixture.model.reconcileActivation()
+        #expect(world.fixture.model.displayedProposalID == "proposal-1")
+
+        let performGate = PerformGate()
+        let stateGate = PerformGate()
+        world.client.gate = performGate
+        world.client.setHold(true)
+        world.client.setStateGate(stateGate)
+        world.client.setHoldState(true)
+        world.client.setGets([setupState(root: world.root, proposalID: "proposal-3")])
+        world.client.setPerforms([setupState(root: world.root, proposalID: "proposal-2")])
+        let refresh = world.refresh
+        world.client.setHook { _ in
+            refresh.release()
+        }
+        let seen = world.client.stateCalls
+        let task = Task { await world.fixture.model.commitDisplayedMark() }
+        await performGate.waitUntilEntered()
+        await stateGate.waitUntilEntered()
+        stateGate.release()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while world.client.stateCalls == seen, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        #expect(world.client.stateCalls > seen)
+        #expect(world.fixture.model.displayedProposalID == "proposal-1")
+        performGate.release()
+        await task.value
+        #expect(world.fixture.model.displayedProposalID == "proposal-2")
+        expectQuietLaunch(world)
+    }
+
+    @Test func thinkingSaveTransportFailureLeavesTheProposal() async throws {
+        let world = try makeSetupWorld(configureRoot: true, probes: [.incomplete])
+        defer { world.refresh.release() }
+        try seedContinuation(world.fixture.continuation, root: world.root)
+        await world.fixture.model.reconcileActivation()
+        #expect(world.fixture.model.displayedProposalID == "proposal-1")
+        world.client.setError(.transport("unavailable"))
+
+        await world.fixture.model.saveThinking("local")
+
+        #expect(world.fixture.model.thinkingFailure?.isEmpty == false)
+        #expect(world.fixture.model.markFailure == nil)
+        #expect(world.fixture.model.displayedProposalID == "proposal-1")
+        expectQuietLaunch(world)
+    }
+
+    @Test func speechRetryTransportFailureIsVisibleWithoutANewSentence() async throws {
+        let world = try makeSetupWorld(configureRoot: true, speech: "error")
+        defer { world.refresh.release() }
+        try seedContinuation(world.fixture.continuation, root: world.root)
+        await world.fixture.model.reconcileActivation()
+        #expect(world.fixture.model.showsSpeechRetry)
+        world.client.setError(.transport("unavailable"))
+
+        await world.fixture.model.retrySpeechDownload()
+
+        let failure = try #require(world.fixture.model.speechFailure)
+        #expect(!failure.isEmpty)
+        if let shared = world.fixture.model.setupCopy?.downloads.error, !shared.isEmpty {
+            #expect(failure == shared)
+        }
+        #expect(!JournalFirstRunCopy.all.contains(failure))
+        #expect(world.fixture.model.markFailure == nil)
+        #expect(world.fixture.model.thinkingFailure == nil)
         expectQuietLaunch(world)
     }
 

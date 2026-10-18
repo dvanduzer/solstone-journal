@@ -10,70 +10,119 @@ import Testing
 @MainActor
 @Suite("JournalSetupPeer")
 struct JournalSetupPeerTests {
-    @Test func nonzeroSignalAndThrowRefuseWithoutASecondCommand() async {
+    private let requirement =
+        "=anchor apple generic and identifier \"app.solstone.observer\" and certificate leaf[subject.OU] = \"7QCG8V4M6H\""
+
+    private let described = Data("""
+    Identifier=app.solstone.observer
+    TeamIdentifier=7QCG8V4M6H
+    designated => identifier "app.solstone.observer" and certificate leaf[subject.OU] = "7QCG8V4M6H"
+    """.utf8)
+
+    @Test func oneCodesignEvaluationTrustsOnlyTheExitStatus() async {
+        let url = URL(fileURLWithPath: "/Applications/Observer.app", isDirectory: true)
+        let runner = FakeSubprocessRunner()
+        runner.enqueue("codesign", .success(stdout: described, exitCode: 0))
+        let seen = CapabilitySeen()
+        let accepted = resolver(runner: runner) { candidate in
+            seen.url = candidate
+            seen.count += 1
+            return ["setup-sequence-v1"]
+        }
+
+        #expect(await accepted.verify(url))
+        #expect(seen.url == url)
+        #expect(seen.count == 1)
+        #expect(runner.invocations.count == 1)
+        let invocation = runner.invocations[0]
+        #expect(invocation.executable == URL(fileURLWithPath: "/usr/bin/codesign"))
+        #expect(invocation.arguments == [
+            "--verify", "--strict", "--deep", "--verbose=2",
+            "-R", requirement, url.path,
+        ])
+    }
+
+    @Test func exitSignalThrowAndTimeoutRefuseBeforeCapability() async {
         let url = URL(fileURLWithPath: "/Applications/Observer.app")
-        let nonzero = FakeSubprocessRunner()
-        nonzero.enqueue("codesign", .success(exitCode: 1))
-        let nonzeroResolver = resolver(runner: nonzero)
-        #expect(await nonzeroResolver.verify(url) == false)
-        #expect(nonzero.invocations.count == 1)
+
+        let exit3 = FakeSubprocessRunner()
+        exit3.enqueue("codesign", .success(stdout: described, exitCode: 3))
+        let exitCalls = CapabilitySeen()
+        let exitResolver = resolver(runner: exit3) { _ in
+            exitCalls.count += 1
+            return ["setup-sequence-v1"]
+        }
+        #expect(await exitResolver.verify(url) == false)
+        #expect(exitCalls.count == 0)
+        #expect(exit3.invocations.count == 1)
 
         let signal = FakeSubprocessRunner()
-        signal.enqueue("codesign", .success(delay: .milliseconds(5)))
-        let signalResolver = resolver(runner: signal, timeout: .milliseconds(5))
+        signal.enqueue("codesign", .success(stdout: described, delay: .milliseconds(5)))
+        let signalCalls = CapabilitySeen()
+        let signalResolver = resolver(runner: signal, timeout: .milliseconds(5)) { _ in
+            signalCalls.count += 1
+            return ["setup-sequence-v1"]
+        }
         #expect(await signalResolver.verify(url) == false)
+        #expect(signalCalls.count == 0)
         #expect(signal.invocations.count == 1)
 
         let thrown = FakeSubprocessRunner()
         thrown.enqueue("codesign", .failure("codesign failed"))
-        let thrownResolver = resolver(runner: thrown)
+        let thrownCalls = CapabilitySeen()
+        let thrownResolver = resolver(runner: thrown) { _ in
+            thrownCalls.count += 1
+            return ["setup-sequence-v1"]
+        }
         #expect(await thrownResolver.verify(url) == false)
+        #expect(thrownCalls.count == 0)
         #expect(thrown.invocations.count == 1)
+
+        let timedOut = FakeSubprocessRunner()
+        timedOut.enqueue("codesign", .success(delay: .milliseconds(20)))
+        let timeoutCalls = CapabilitySeen()
+        let timeoutResolver = resolver(runner: timedOut, timeout: .milliseconds(20)) { _ in
+            timeoutCalls.count += 1
+            return ["setup-sequence-v1"]
+        }
+        #expect(await timeoutResolver.verify(url) == false)
+        #expect(timeoutCalls.count == 0)
+        #expect(timedOut.invocations.count == 1)
     }
 
-    @Test func designatedRequirementTokensPassAndSubstringsDoNot() async {
+    @Test func exitZeroWithTheWrongCapabilityRefusesAfterOneCommand() async {
         let url = URL(fileURLWithPath: "/Applications/Observer.app", isDirectory: true)
+        let runner = FakeSubprocessRunner()
+        runner.enqueue("codesign", .success(stdout: described, exitCode: 0))
         let seen = CapabilitySeen()
-        let passing = FakeSubprocessRunner()
-        passing.enqueue("codesign", .success(stdout: Data("verified\n".utf8)))
-        passing.enqueue("codesign", .success(stdout: Data(passingRequirement.utf8)))
-        let accepted = resolver(runner: passing) { candidate in
+        let rejected = resolver(runner: runner) { candidate in
             seen.url = candidate
-            return ["setup-sequence-v1"]
+            seen.count += 1
+            return ["other"]
         }
-        #expect(await accepted.verify(url))
-        #expect(seen.url == url)
-        #expect(passing.invocations.count == 2)
 
-        let otherCapability = FakeSubprocessRunner()
-        otherCapability.enqueue("codesign", .success())
-        otherCapability.enqueue("codesign", .success(stdout: Data(passingRequirement.utf8)))
-        let rejectedCapability = resolver(runner: otherCapability) { _ in ["other"] }
-        #expect(await rejectedCapability.verify(url) == false)
-
-        let substrings = FakeSubprocessRunner()
-        substrings.enqueue("codesign", .success())
-        substrings.enqueue("codesign", .success(stdout: Data("""
-        Identifier=app.solstone.observer
-        TeamIdentifier=7QCG8V4M6H
-        designated => identifier "app.solstone.other" and certificate leaf[subject.OU] = "FFFFFFFFFF"
-        """.utf8)))
-        let calls = CapabilitySeen()
-        let rejected = resolver(runner: substrings) { _ in
-            calls.count += 1
-            return ["setup-sequence-v1"]
-        }
         #expect(await rejected.verify(url) == false)
-        #expect(calls.count == 0)
-        #expect(substrings.invocations.count == 2)
+        #expect(seen.url == url)
+        #expect(seen.count == 1)
+        #expect(runner.invocations.count == 1)
+        #expect(runner.invocations[0].arguments == [
+            "--verify", "--strict", "--deep", "--verbose=2",
+            "-R", requirement, url.path,
+        ])
     }
 
     @Test func truncatedOutputRefuses() async {
         let url = URL(fileURLWithPath: "/Applications/Observer.app")
         let runner = FakeSubprocessRunner()
         runner.enqueue("codesign", .success(stdout: Data(count: JournalSetupPeerResolver.outputCap + 1)))
-        let resolver = resolver(runner: runner)
+        let seen = CapabilitySeen()
+        let resolver = resolver(runner: runner) { _ in
+            seen.count += 1
+            return ["setup-sequence-v1"]
+        }
+
         #expect(await resolver.verify(url) == false)
+        #expect(seen.count == 0)
         #expect(runner.invocations.count == 1)
     }
 
@@ -94,13 +143,5 @@ struct JournalSetupPeerTests {
     private final class CapabilitySeen: @unchecked Sendable {
         var url: URL?
         var count = 0
-    }
-
-    private var passingRequirement: String {
-        """
-        Identifier=app.solstone.other
-        TeamIdentifier=FFFFFFFFFF
-        designated => identifier "app.solstone.observer" and certificate leaf[subject.OU] = "7QCG8V4M6H"
-        """
     }
 }

@@ -7,8 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-- this prepares native setup. current setup still finishes in the browser.
+### Fixed
+- if start at login can't be changed, the journal app keeps the previous setting and shows an error.
 
 ## [2.0.49 (build 91)] - 2026-10-17
 

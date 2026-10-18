@@ -14,6 +14,12 @@ struct JournalSetupCopyLoaderTests {
         #expect(document["schema"] as? String == "solstone.setup-copy.v1")
         #expect(document["heading"] is String)
         #expect(document["footer"] is String)
+        let welcome = try #require(document["welcome"] as? [String: Any])
+        #expect(welcome["title"] is String)
+        #expect(welcome["body"] is String)
+        let howItFits = try #require(welcome["how_it_fits"] as? [Any])
+        #expect(!howItFits.isEmpty)
+        #expect(howItFits.allSatisfy { $0 is String })
 
         let fits = try #require(document["fits"] as? [String: Any])
         for key in ["title", "journal_term", "journal", "app_term", "app", "thinking_term", "thinking"] {

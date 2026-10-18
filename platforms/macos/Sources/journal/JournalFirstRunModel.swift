@@ -87,6 +87,7 @@ final class JournalFirstRunModel {
     var loginFailure: String?
     var markFailure: String?
     var thinkingFailure: String?
+    var speechFailure: String?
     var nativeFolderSetup = false
     var choosingThinking = false
     private(set) var reopenCount = 0
@@ -691,7 +692,7 @@ final class JournalFirstRunModel {
         switch continuation.loadContinuation() {
         case .failed:
             if failUserAction(captured, operation: .setup) {
-                handoffError = JournalFirstRunCopy.setupProgressNotSaved
+                errorMessage = JournalFirstRunCopy.setupProgressNotSaved
             }
             return
         case .ready(let record) where record.journalRootPath == nil:
@@ -699,7 +700,7 @@ final class JournalFirstRunModel {
                 try continuation.bindRoot(step1: record.step1HandoffID, root: root)
             } catch {
                 if failUserAction(captured, operation: .setup) {
-                    handoffError = JournalFirstRunCopy.setupProgressNotSaved
+                    errorMessage = JournalFirstRunCopy.setupProgressNotSaved
                 }
                 return
             }
@@ -731,6 +732,15 @@ final class JournalFirstRunModel {
            let path = record.journalRootPath {
             let root = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
             await deliverStep5(root: root, step1: record.step1HandoffID, captured: captured, mintIfNeeded: false)
+            if actionInFlight {
+                _ = endUserAction(captured)
+            }
+            return
+        }
+        if case .ready(let local) = continuation.loadLocal(),
+           local.pendingStep5HandoffID != nil {
+            let root = URL(fileURLWithPath: local.journalRootPath, isDirectory: true).standardizedFileURL
+            await deliverStep5(root: root, step1: local.localHandoffID, captured: captured, mintIfNeeded: false)
             if actionInFlight {
                 _ = endUserAction(captured)
             }
@@ -783,19 +793,23 @@ final class JournalFirstRunModel {
         guard beginUserAction(.thinkingFinalize) else { return }
         let captured = epoch
         let root = journalRoot.standardizedFileURL
-        var step1: UUID?
-        if case .ready(let record) = continuation.loadContinuation(),
-           let path = record.journalRootPath,
-           samePath(path, root) {
-            do {
+        let handoffID: UUID
+        do {
+            if case .ready(let record) = continuation.loadContinuation(),
+               let path = record.journalRootPath,
+               samePath(path, root) {
                 _ = try continuation.mintPending(step1: record.step1HandoffID)
-                step1 = record.step1HandoffID
-            } catch {
-                if failUserAction(captured, operation: .thinkingFinalize) {
-                    thinkingFailure = JournalFirstRunCopy.setupProgressNotSaved
-                }
-                return
+                handoffID = record.step1HandoffID
+            } else {
+                let localID = try continuation.storeLocal(root: root)
+                _ = try continuation.mintPending(step1: localID)
+                handoffID = localID
             }
+        } catch {
+            if failUserAction(captured, operation: .thinkingFinalize) {
+                thinkingFailure = JournalFirstRunCopy.setupProgressNotSaved
+            }
+            return
         }
         do {
             let state = try await setupClient.perform(
@@ -806,7 +820,6 @@ final class JournalFirstRunModel {
                 setupState = state
                 displayedProposalID = state.mark.proposalID
             }
-            guard let step1 else { return }
             let next = epoch
             let probe: JournalInitSetupProbe
             do {
@@ -815,7 +828,7 @@ final class JournalFirstRunModel {
                 return
             }
             guard stillCurrent(next), probe == .complete else { return }
-            await deliverStep5(root: root, step1: step1, captured: next, mintIfNeeded: false)
+            await deliverStep5(root: root, step1: handoffID, captured: next, mintIfNeeded: false)
         } catch {
             await handleActionError(error, captured: captured, operation: .thinkingFinalize, conflictStaysOnMark: false)
         }
@@ -892,7 +905,11 @@ final class JournalFirstRunModel {
             break
         }
         guard stillCurrent(captured) else { return }
-        if await resumeContinuation(allowDelivery: true, allowMint: false, captured: captured) {
+        if await resumeContinuation(allowDelivery: true, allowMint: true, captured: captured) {
+            return
+        }
+        guard stillCurrent(captured) else { return }
+        if await resumeLocal(allowDelivery: true, allowMint: true, captured: captured) {
             return
         }
         guard stillCurrent(captured) else { return }
@@ -1014,51 +1031,89 @@ final class JournalFirstRunModel {
             return true
         case .ready(let record):
             guard let path = record.journalRootPath else {
-                showFolder()
+                showWelcome()
                 return true
             }
-            let root = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
-            assignRoot(root)
-            if config.journalRoot?.standardizedFileURL.path != root.path {
-                config.journalRoot = root
-            }
-            let live = supervisorIsLive(root) || externalSupervisorIsLive(root)
-            if !live {
-                guard await startSupervisor(root) else {
-                    errorMessage = supervisorFailureMessage()
-                    handoffError = nil
-                    failedOperationToken(.setup)
-                    route = .ritual(.setupProgress)
-                    return true
-                }
-            }
-            guard stillCurrent(captured) else { return true }
-            let probe: JournalInitSetupProbe
-            do {
-                probe = try await initClient.probeSetupComplete()
-            } catch {
-                errorMessage = readableMessage(for: error)
-                failedOperationToken(.setup)
-                return true
-            }
-            guard stillCurrent(captured) else { return true }
-            if probe == .complete {
-                let hasPending = record.pendingStep5HandoffID != nil
-                if allowDelivery && (hasPending || allowMint) {
-                    await deliverStep5(
-                        root: root,
-                        step1: record.step1HandoffID,
-                        captured: captured,
-                        mintIfNeeded: record.pendingStep5HandoffID == nil
-                    )
-                    return true
-                }
-                await landHomeIfCurrent(captured)
-                return true
-            }
-            await presentServerStep(root: root, captured: captured)
+            await resumeOwned(
+                handoffID: record.step1HandoffID,
+                rootPath: path,
+                pending: record.pendingStep5HandoffID,
+                allowDelivery: allowDelivery,
+                allowMint: allowMint,
+                captured: captured
+            )
             return true
         }
+    }
+
+    /// Returns true when a local continuation was present, including a failed one.
+    private func resumeLocal(allowDelivery: Bool, allowMint: Bool, captured: UInt64) async -> Bool {
+        switch continuation.loadLocal() {
+        case .missing:
+            return false
+        case .failed:
+            presentPersistenceFailure()
+            return true
+        case .ready(let record):
+            await resumeOwned(
+                handoffID: record.localHandoffID,
+                rootPath: record.journalRootPath,
+                pending: record.pendingStep5HandoffID,
+                allowDelivery: allowDelivery,
+                allowMint: allowMint,
+                captured: captured
+            )
+            return true
+        }
+    }
+
+    private func resumeOwned(
+        handoffID: UUID,
+        rootPath: String,
+        pending: UUID?,
+        allowDelivery: Bool,
+        allowMint: Bool,
+        captured: UInt64
+    ) async {
+        let root = URL(fileURLWithPath: rootPath, isDirectory: true).standardizedFileURL
+        assignRoot(root)
+        if config.journalRoot?.standardizedFileURL.path != root.path {
+            config.journalRoot = root
+        }
+        let live = supervisorIsLive(root) || externalSupervisorIsLive(root)
+        if !live {
+            guard await startSupervisor(root) else {
+                errorMessage = supervisorFailureMessage()
+                handoffError = nil
+                failedOperationToken(.setup)
+                route = .ritual(.setupProgress)
+                return
+            }
+        }
+        guard stillCurrent(captured) else { return }
+        let probe: JournalInitSetupProbe
+        do {
+            probe = try await initClient.probeSetupComplete()
+        } catch {
+            errorMessage = readableMessage(for: error)
+            failedOperationToken(.setup)
+            return
+        }
+        guard stillCurrent(captured) else { return }
+        if probe == .complete {
+            if allowDelivery && (pending != nil || allowMint) {
+                await deliverStep5(
+                    root: root,
+                    step1: handoffID,
+                    captured: captured,
+                    mintIfNeeded: pending == nil
+                )
+                return
+            }
+            await landHomeIfCurrent(captured)
+            return
+        }
+        await presentServerStep(root: root, captured: captured)
     }
 
     private func presentServerStep(root: URL, captured: UInt64) async {
@@ -1307,15 +1362,12 @@ final class JournalFirstRunModel {
                 presentPersistenceFailure()
                 return
             }
-        } else {
-            guard case .ready(let record) = continuation.loadContinuation(),
-                  record.step1HandoffID == step1,
-                  let existing = record.pendingStep5HandoffID else {
-                outbound = .none
-                if pendingOperation == .outbound { pendingOperation = .none }
-                return
-            }
+        } else if let existing = continuation.pendingStep5(ownedBy: step1) {
             pending = existing
+        } else {
+            outbound = .none
+            if pendingOperation == .outbound { pendingOperation = .none }
+            return
         }
         guard stillCurrent(captured) else { return }
         guard let again = peer.resolve() else {
@@ -1418,7 +1470,7 @@ final class JournalFirstRunModel {
         guard let clientError = error as? JournalSetupClientError,
               case .server(let envelope) = clientError else {
             if failUserAction(captured, operation: operation) {
-                applyGenericFailure(operation)
+                applyGenericFailure(operation, error: error)
             }
             return
         }
@@ -1461,17 +1513,28 @@ final class JournalFirstRunModel {
         syncRefresh()
     }
 
-    private func applyGenericFailure(_ operation: JournalRitualOperationToken) {
+    private func applyGenericFailure(_ operation: JournalRitualOperationToken, error: Error) {
         switch operation {
         case .setup:
             if errorMessage == nil { errorMessage = supervisorFailureMessage() }
         case .mark:
             markFailure = setupCopy?.mark.error ?? ""
-        case .thinkingSave, .thinkingFinalize, .thinkingDownload:
-            break
-        case .speechDownload, .outbound, .none:
+        case .thinkingSave, .thinkingFinalize:
+            thinkingFailure = readableMessage(for: error)
+        case .thinkingDownload:
+            thinkingFailure = downloadFailureText(for: error)
+        case .speechDownload:
+            speechFailure = downloadFailureText(for: error)
+        case .outbound, .none:
             break
         }
+    }
+
+    private func downloadFailureText(for error: Error) -> String {
+        if let message = setupCopy?.downloads.error, !message.isEmpty {
+            return message
+        }
+        return readableMessage(for: error)
     }
 
     private func applyEnvelopeFailure(
@@ -1571,9 +1634,11 @@ final class JournalFirstRunModel {
             markFailure = nil
         case .thinkingSave, .thinkingFinalize, .thinkingDownload:
             thinkingFailure = nil
+        case .speechDownload:
+            speechFailure = nil
         case .outbound:
             handoffError = nil
-        case .speechDownload, .none:
+        case .none:
             break
         }
         return true
@@ -1646,6 +1711,7 @@ final class JournalFirstRunModel {
         do {
             let state = try await setupClient.state()
             guard stillCurrent(captured) else { return }
+            guard !actionInFlight else { return }
             guard journalRoot.standardizedFileURL.path == root.path else { return }
             guard stateIsConsistent(state, root: root) else { return }
             applyRefreshedState(state)

@@ -6,12 +6,19 @@ import Foundation
 public struct JournalSetupCopy: Equatable, Sendable {
     public var heading: String
     public var footer: String
+    public var welcome: Welcome
     public var fits: Fits
     public var login: Login
     public var folder: Folder
     public var mark: Mark
     public var thinking: Thinking
     public var downloads: Downloads
+
+    public struct Welcome: Equatable, Sendable {
+        public var title: String
+        public var body: String
+        public var howItFits: [String]
+    }
 
     public struct Fits: Equatable, Sendable {
         public var title: String
@@ -89,12 +96,19 @@ public struct JournalSetupCopy: Equatable, Sendable {
     var isQualified: Bool {
         !heading.isEmpty
             && !footer.isEmpty
+            && welcome.isQualified
             && fits.isQualified
             && login.isQualified
             && folder.isQualified
             && mark.isQualified
             && thinking.isQualified
             && downloads.isQualified
+    }
+}
+
+extension JournalSetupCopy.Welcome {
+    var isQualified: Bool {
+        !title.isEmpty && !body.isEmpty && !howItFits.isEmpty && howItFits.allSatisfy { !$0.isEmpty }
     }
 }
 
@@ -253,7 +267,7 @@ private struct Document: Decodable {
     var copy: JournalSetupCopy
 
     private enum CodingKeys: String, CodingKey {
-        case schema, heading, footer, fits, login, folder, mark, thinking, downloads
+        case schema, heading, footer, welcome, fits, login, folder, mark, thinking, downloads
     }
 
     init(from decoder: Decoder) throws {
@@ -262,12 +276,31 @@ private struct Document: Decodable {
         copy = JournalSetupCopy(
             heading: try container.decode(String.self, forKey: .heading),
             footer: try container.decode(String.self, forKey: .footer),
+            welcome: try container.decode(WelcomeDocument.self, forKey: .welcome).value,
             fits: try container.decode(FitsDocument.self, forKey: .fits).value,
             login: try container.decode(LoginDocument.self, forKey: .login).value,
             folder: try container.decode(FolderDocument.self, forKey: .folder).value,
             mark: try container.decode(MarkDocument.self, forKey: .mark).value,
             thinking: try container.decode(ThinkingDocument.self, forKey: .thinking).value,
             downloads: try container.decode(DownloadsDocument.self, forKey: .downloads).value
+        )
+    }
+}
+
+private struct WelcomeDocument: Decodable {
+    var value: JournalSetupCopy.Welcome
+
+    private enum CodingKeys: String, CodingKey {
+        case title, body
+        case howItFits = "how_it_fits"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        value = JournalSetupCopy.Welcome(
+            title: try container.decode(String.self, forKey: .title),
+            body: try container.decode(String.self, forKey: .body),
+            howItFits: try container.decode([String].self, forKey: .howItFits)
         )
     }
 }

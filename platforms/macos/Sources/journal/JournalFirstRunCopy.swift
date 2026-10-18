@@ -20,7 +20,7 @@ enum JournalFirstRunCopy {
     static let setupProgressNotSaved = "setup progress couldn't be saved."
     static let loginItemChangeFailed = "start at login couldn't be changed."
     static let loginItemUnavailable = "start at login isn't available from this app location."
-    static let handoffNotDelivered = "the handoff couldn't be delivered."
+    static let handoffNotDelivered = "couldn't continue setup in the solstone app."
 
     static let all = [
         nameLocationTitle,

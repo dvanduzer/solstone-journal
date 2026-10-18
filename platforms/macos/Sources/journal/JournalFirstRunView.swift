@@ -49,6 +49,12 @@ struct JournalFirstRunView: View {
                 value: model.outbound.axToken
             )
         }
+        .overlay(alignment: .top) {
+            if model.pendingOperation != .none {
+                ProgressView()
+                    .padding(.top, 12)
+            }
+        }
     }
 
     private var decidingView: some View {
@@ -251,6 +257,19 @@ struct JournalFirstRunView: View {
                     .monospacedDigit()
                 Text(copy.heading)
                     .font(.title2.weight(.semibold))
+                Text(copy.welcome.title)
+                    .font(.title3.weight(.semibold))
+                Text(copy.welcome.body)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                let welcomeLines = copy.welcome.howItFits.filter { line in
+                    line != copy.welcome.title && line != copy.welcome.body
+                }
+                ForEach(Array(welcomeLines.enumerated()), id: \.offset) { _, line in
+                    Text(line)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 Text(copy.fits.title)
                     .font(.headline)
                 copyRow(term: copy.fits.journalTerm, body: copy.fits.journal)
@@ -304,12 +323,19 @@ struct JournalFirstRunView: View {
                     )
                     .textFieldStyle(.roundedBorder)
                     .accessibilityIdentifier(AXID.Journal.Ritual.folderField)
+                    .disabled(model.pendingOperation != .none)
                     Button {
                         chooseJournalLocation()
                     } label: {
                         Label(copy.folder.change, systemImage: "folder")
                     }
                     .accessibilityIdentifier(AXID.Journal.Ritual.folderChoose)
+                    .disabled(model.pendingOperation != .none)
+                }
+                if let error = model.errorMessage, !error.isEmpty {
+                    Text(error)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 Button {
                     Task { await model.continueFromFolder() }
@@ -318,6 +344,7 @@ struct JournalFirstRunView: View {
                 }
                 .keyboardShortcut(.defaultAction)
                 .accessibilityIdentifier(AXID.Journal.Ritual.folderContinue)
+                .disabled(model.pendingOperation != .none)
             }
         }
     }
@@ -335,8 +362,13 @@ struct JournalFirstRunView: View {
                     .fixedSize(horizontal: false, vertical: true)
                 if let mark = model.validatedMark {
                     JournalMarkView(mark: mark, isConfirmed: model.setupState?.mark.state == .locked)
-                } else {
-                    Text(model.markFailure ?? copy.mark.error)
+                }
+                if let failure = model.markFailure, !failure.isEmpty {
+                    Text(failure)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else if model.validatedMark == nil {
+                    Text(copy.mark.error)
                         .foregroundStyle(.red)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -360,6 +392,7 @@ struct JournalFirstRunView: View {
                         Label(copy.mark.tryAnother, systemImage: "arrow.triangle.2.circlepath")
                     }
                     .accessibilityIdentifier(AXID.Journal.Ritual.markRegenerate)
+                    .disabled(model.pendingOperation != .none)
                 }
                 Button {
                     Task { await model.commitDisplayedMark() }
@@ -368,6 +401,7 @@ struct JournalFirstRunView: View {
                 }
                 .keyboardShortcut(.defaultAction)
                 .accessibilityIdentifier(AXID.Journal.Ritual.markContinue)
+                .disabled(model.pendingOperation != .none)
                 downloadFooter(copy)
             }
         }
@@ -394,6 +428,7 @@ struct JournalFirstRunView: View {
                     }
                     .keyboardShortcut(.defaultAction)
                     .accessibilityIdentifier(AXID.Journal.Ritual.thinkingContinue)
+                    .disabled(model.pendingOperation != .none)
                 } else {
                     Text(copy.thinking.chooseLater)
                         .foregroundStyle(.secondary)
@@ -405,6 +440,7 @@ struct JournalFirstRunView: View {
                     Label(copy.thinking.change, systemImage: "list.bullet")
                 }
                 .accessibilityIdentifier(AXID.Journal.Ritual.thinkingChange)
+                .disabled(model.pendingOperation != .none)
                 if model.choosingThinking {
                     ForEach(copy.thinking.choices, id: \.id) { choice in
                         Button {
@@ -416,7 +452,10 @@ struct JournalFirstRunView: View {
                                     .foregroundStyle(.secondary)
                             }
                         }
-                        .disabled(choice.id == "local" && model.setupState?.thinking.capability != .ok)
+                        .disabled(
+                            model.pendingOperation != .none
+                                || (choice.id == "local" && model.setupState?.thinking.capability != .ok)
+                        )
                         .modifier(ThinkingChoiceIdentifier(choiceID: choice.id))
                     }
                     Button {
@@ -425,6 +464,7 @@ struct JournalFirstRunView: View {
                         Text(copy.thinking.later)
                     }
                     .accessibilityIdentifier(AXID.Journal.Ritual.thinkingLater)
+                    .disabled(model.pendingOperation != .none)
                 }
                 AXStateCompanion(
                     id: AXID.Journal.Ritual.thinkingChoiceState,
@@ -446,6 +486,7 @@ struct JournalFirstRunView: View {
                     }
                     .keyboardShortcut(.defaultAction)
                     .accessibilityIdentifier(AXID.Journal.Ritual.thinkingContinue)
+                    .disabled(model.pendingOperation != .none)
                 }
                 downloadFooter(copy)
             }
@@ -507,6 +548,7 @@ struct JournalFirstRunView: View {
                 retryID: AXID.Journal.Ritual.downloadSpeechRetry,
                 cancelID: nil,
                 stateID: AXID.Journal.Ritual.downloadSpeechState,
+                failure: model.speechFailure,
                 retry: { await model.retrySpeechDownload() },
                 cancel: {}
             )
@@ -518,6 +560,7 @@ struct JournalFirstRunView: View {
                 retryID: AXID.Journal.Ritual.downloadThinkingRetry,
                 cancelID: AXID.Journal.Ritual.downloadThinkingCancel,
                 stateID: AXID.Journal.Ritual.downloadThinkingState,
+                failure: nil,
                 retry: { await model.retryThinkingDownload() },
                 cancel: { await model.cancelThinkingDownload() }
             )
@@ -532,12 +575,14 @@ struct JournalFirstRunView: View {
         retryID: String,
         cancelID: String?,
         stateID: String,
+        failure: String?,
         retry: @escaping () async -> Void,
         cancel: @escaping () async -> Void
     ) -> some View {
         let wire = job?.state.rawValue ?? ""
         let retryLabel = model.setupCopy?.downloads.retry ?? ""
         let cancelLabel = model.setupCopy?.downloads.cancel ?? ""
+        let locked = model.pendingOperation != .none
         return VStack(alignment: .leading, spacing: 4) {
             Text(title)
             if let job {
@@ -549,6 +594,11 @@ struct JournalFirstRunView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+            if let failure, !failure.isEmpty {
+                Text(failure)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             AXStateCompanion(id: stateID, value: wire)
             if canCancel, let cancelID {
                 Button {
@@ -558,6 +608,7 @@ struct JournalFirstRunView: View {
                 }
                 .accessibilityIdentifier(cancelID)
                 .accessibilityLabel("\(title) \(cancelLabel)")
+                .disabled(locked)
             }
             if canRetry {
                 Button {
@@ -567,6 +618,7 @@ struct JournalFirstRunView: View {
                 }
                 .accessibilityIdentifier(retryID)
                 .accessibilityLabel("\(title) \(retryLabel)")
+                .disabled(locked)
             }
         }
     }

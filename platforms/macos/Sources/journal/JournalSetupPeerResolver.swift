@@ -19,6 +19,9 @@ final class JournalSetupPeerResolver: JournalSetupPeerResolving {
     static let requiredIdentifier = "app.solstone.observer"
     static let requiredTeam = "7QCG8V4M6H"
     static let outputCap = 64 * 1024
+    static let signingRequirement =
+        "=anchor apple generic and identifier \"\(requiredIdentifier)\" "
+            + "and certificate leaf[subject.OU] = \"\(requiredTeam)\""
 
     private let runner: any SubprocessRunning
     private let lookup: (String) -> URL?
@@ -51,13 +54,12 @@ final class JournalSetupPeerResolver: JournalSetupPeerResolving {
     }
 
     func verify(_ url: URL) async -> Bool {
-        guard await codesignSucceeds(["--verify", "--strict", "--deep", "--verbose=2", url.path]) != nil else {
+        guard await codesignSucceeds([
+            "--verify", "--strict", "--deep", "--verbose=2",
+            "-R", Self.signingRequirement, url.path,
+        ]) != nil else {
             return false
         }
-        guard let described = await codesignSucceeds(["-dvvv", "-r-", url.path]) else {
-            return false
-        }
-        guard Self.designatedRequirementAccepts(described) else { return false }
         return journalSupportsSetupSequence(capabilities(url))
     }
 
@@ -84,49 +86,6 @@ final class JournalSetupPeerResolver: JournalSetupPeerResolving {
             return nil
         }
         return box.text
-    }
-
-    static func designatedRequirementAccepts(_ output: String) -> Bool {
-        guard let marker = output.range(of: "designated =>") else { return false }
-        let requirement = String(output[marker.upperBound...])
-        let identifiers = quotedValues(in: requirement, label: "identifier")
-        let teams = quotedValues(in: requirement, label: "subject.OU")
-        return identifiers == [requiredIdentifier] && teams == [requiredTeam]
-    }
-
-    private static func quotedValues(in text: String, label: String) -> [String] {
-        var values: [String] = []
-        var search = text.startIndex
-        while let range = text.range(of: label, range: search..<text.endIndex) {
-            if !isTokenStart(text, range.lowerBound) {
-                search = range.upperBound
-                continue
-            }
-            var index = range.upperBound
-            while index < text.endIndex {
-                let character = text[index]
-                if character == "]" || character == " " || character == "\t" || character == "=" {
-                    index = text.index(after: index)
-                    continue
-                }
-                break
-            }
-            guard index < text.endIndex, text[index] == "\"" else {
-                search = range.upperBound
-                continue
-            }
-            let valueStart = text.index(after: index)
-            guard let end = text[valueStart...].firstIndex(of: "\"") else { break }
-            values.append(String(text[valueStart..<end]))
-            search = text.index(after: end)
-        }
-        return values
-    }
-
-    private static func isTokenStart(_ text: String, _ index: String.Index) -> Bool {
-        guard index > text.startIndex else { return true }
-        let previous = text[text.index(before: index)]
-        return !previous.isLetter && !previous.isNumber && previous != "_" && previous != "."
     }
 }
 
