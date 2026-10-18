@@ -424,7 +424,7 @@ impl Fixture {
         fixture
     }
     fn new(name: &str) -> Self {
-        let root = PathBuf::from("/var/tmp").join(format!(
+        let root = std::env::temp_dir().join(format!(
             "solstone-records-web-{name}-{}-{}",
             std::process::id(),
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
