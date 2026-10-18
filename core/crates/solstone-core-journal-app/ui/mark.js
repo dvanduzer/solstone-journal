@@ -16,10 +16,18 @@ const PLATE_PATH = 'M 527.36 0 c 103.834 0 155.751 0 195.41 20.207 a 185.4 185.4
 
 function validMark(mark) {
   if (!mark || !Array.isArray(mark.words) || mark.words.length !== 2) return false;
+  if (!mark.words.every(word => typeof word === 'string' && word.trim())) return false;
   return [mark.icon1, mark.icon2].every(icon =>
     icon && typeof icon.svg === 'string' && icon.svg.trim() &&
-    icon.color && /^#[0-9a-fA-F]{6}$/.test(icon.color.hex) &&
+    icon.color && typeof icon.color.name === 'string' && icon.color.name.trim() &&
+    /^#[0-9a-fA-F]{6}$/.test(icon.color.hex) &&
     (icon.rot === 0 || icon.rot === 45));
+}
+
+export function displayableMark(mark) {
+  return validMark(mark) &&
+    glyphShapes(mark.icon1.svg).length > 0 &&
+    glyphShapes(mark.icon2.svg).length > 0;
 }
 
 // The glyph markup the journal serves, read as shapes rather than inserted

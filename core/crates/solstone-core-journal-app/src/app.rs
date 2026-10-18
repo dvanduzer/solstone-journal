@@ -207,7 +207,9 @@ fn dispatch_effect(context: &Context, effect: &crate::setup_flow::Effect, port: 
             });
         }
         crate::setup_flow::Effect::SetSignInLaunch(on) => {
-            let _ = shell::set_sign_in_launch(*on);
+            if let Err(message) = shell::set_sign_in_launch(*on) {
+                context.push(json!({"type": "sign-in-launch", "error": message}));
+            }
         }
         crate::setup_flow::Effect::CheckModels { generation } => {
             let proxy = context.proxy.clone();
@@ -254,12 +256,9 @@ fn run_turn(context: &Context, step: crate::setup_flow::Step, reply: impl FnOnce
     let rendered = crate::setup_flow::view(&step.session);
     *context.session.borrow_mut() = step.session;
     let port = bound.ok();
-    for item in crate::setup_flow::execution_order(&step.effects) {
-        match item {
-            crate::setup_flow::TurnItem::Reply => reply(rendered.clone()),
-            crate::setup_flow::TurnItem::Effect(effect) => dispatch_effect(context, &effect, port),
-        }
-    }
+    crate::setup_flow::execute_turn(rendered, &step.effects, reply, |effect| {
+        dispatch_effect(context, effect, port);
+    });
 }
 
 impl Context {
@@ -398,27 +397,18 @@ fn handle(context: &Context, window: &Window, message: &str) {
             context.reply(&id, shell::set_sign_in_launch(on).map(|()| Value::Null));
         }
         "installModels" => {
+            let session = context.session.borrow().clone();
             let step = crate::setup_flow::reduce(
-                &context.session.borrow(),
+                &session,
                 &crate::setup_flow::Event::RetryModelsInstallClicked,
             );
             run_turn(context, step, |view| context.reply(&id, Ok(view)));
         }
         "modelsReady" => {
-            let mut session = context.session.borrow_mut();
-            session.models_generation += 1;
-            let current_gen = session.models_generation;
-            let proxy = context.proxy.clone();
-            std::thread::spawn(move || {
-                let result = journal::models_ready();
-                proxy.send_event(UserEvent::Flow(
-                    crate::setup_flow::Event::ModelsCheckFinished {
-                        generation: current_gen,
-                        result,
-                    },
-                ));
-            });
-            context.reply(&id, Ok(Value::Null));
+            let session = context.session.borrow().clone();
+            let step =
+                crate::setup_flow::reduce(&session, &crate::setup_flow::Event::RequestModelsCheck);
+            run_turn(context, step, |_view| context.reply(&id, Ok(Value::Null)));
         }
         "pickFolder" => {
             let start = text("start").map(PathBuf::from);
@@ -439,22 +429,34 @@ fn handle(context: &Context, window: &Window, message: &str) {
         "convey" => {
             let method = text("method").unwrap_or_else(|| "GET".to_owned());
             let path = text("path").unwrap_or_default();
-            let port = args
+            let renderer_port = args
                 .get("port")
                 .and_then(Value::as_u64)
                 .and_then(|port| u16::try_from(port).ok());
-            if !convey_route_allowed(&method, &path) {
-                context.reply(
-                    &id,
-                    Err(format!(
-                        "{method} {path} isn't a journal route the app uses"
-                    )),
-                );
-                return;
-            }
+            let target_port = match crate::setup_flow::convey_dispatch(
+                &method,
+                &path,
+                renderer_port,
+                journal_port(),
+            ) {
+                crate::setup_flow::ConveyDispatch::Rejected => {
+                    context.reply(
+                        &id,
+                        Err(format!(
+                            "{method} {path} isn't a journal route the app uses"
+                        )),
+                    );
+                    return;
+                }
+                crate::setup_flow::ConveyDispatch::Unanswered => {
+                    context.reply(&id, Err("the journal isn't answering".to_owned()));
+                    return;
+                }
+                crate::setup_flow::ConveyDispatch::Use(port) => port,
+            };
             let body = args.get("body").cloned();
             context.spawn_convey(id, move || {
-                let convey = Convey::new(port);
+                let convey = Convey::new(target_port);
                 match method.as_str() {
                     "GET" => convey.get(&path),
                     "PUT" => convey.put(&path, body.as_ref().unwrap_or(&Value::Null)),
@@ -486,8 +488,9 @@ fn handle(context: &Context, window: &Window, message: &str) {
                     Err("that folder isn't there".to_owned())
                 }
             } else if target == "journal" {
+                let session = context.session.borrow().clone();
                 let mut step = crate::setup_flow::reduce(
-                    &context.session.borrow(),
+                    &session,
                     &crate::setup_flow::Event::OpenJournalClicked,
                 );
                 let wanted = step.browser_effect();
@@ -538,7 +541,8 @@ fn handle(context: &Context, window: &Window, message: &str) {
                     return;
                 }
             };
-            let step = crate::setup_flow::reduce(&context.session.borrow(), &event);
+            let session = context.session.borrow().clone();
+            let step = crate::setup_flow::reduce(&session, &event);
             run_turn(context, step, |view| context.reply(&id, Ok(view)));
         }
         "adminTerminal" => {
@@ -719,7 +723,8 @@ pub fn run(launch: Launch, update_feed: Option<String>) {
         WindowEvent::User(UserEvent::Ipc(message)) => handle(&context, &looped, &message),
         WindowEvent::User(UserEvent::Script(script)) => page.run_script(&script),
         WindowEvent::User(UserEvent::Flow(flow_event)) => {
-            let step = crate::setup_flow::reduce(&context.session.borrow(), &flow_event);
+            let session = context.session.borrow().clone();
+            let step = crate::setup_flow::reduce(&session, &flow_event);
             run_turn(&context, step, |view| {
                 let message = json!({"type": "flow", "view": view});
                 page.run_script(&format!("window.journalApp.receive({message});"));
@@ -732,19 +737,16 @@ pub fn run(launch: Launch, update_feed: Option<String>) {
         WindowEvent::Activated => {
             page.focus();
             page.run_script("window.journalApp.receive({type:'shown'});");
-            if context.session.borrow().phase == crate::setup_flow::Phase::Home {
-                let mut session = context.session.borrow_mut();
-                session.models_generation += 1;
-                let current_gen = session.models_generation;
-                let proxy = context.proxy.clone();
-                std::thread::spawn(move || {
-                    let result = journal::models_ready();
-                    proxy.send_event(UserEvent::Flow(
-                        crate::setup_flow::Event::ModelsCheckFinished {
-                            generation: current_gen,
-                            result,
-                        },
-                    ));
+            let is_home = context.session.borrow().phase == crate::setup_flow::Phase::Home;
+            if is_home {
+                let session = context.session.borrow().clone();
+                let step = crate::setup_flow::reduce(
+                    &session,
+                    &crate::setup_flow::Event::RequestModelsCheck,
+                );
+                run_turn(&context, step, |view| {
+                    let message = json!({"type": "flow", "view": view});
+                    page.run_script(&format!("window.journalApp.receive({message});"));
                 });
             }
         }

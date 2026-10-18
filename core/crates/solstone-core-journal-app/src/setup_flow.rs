@@ -123,6 +123,7 @@ pub enum Event {
         result: Result<(), String>,
     },
     RetryModelsInstallClicked,
+    RequestModelsCheck,
     RetryState,
     Refresh,
     DismissError,
@@ -146,6 +147,7 @@ pub struct Session {
     pub resting: bool,
     pub setup_failed: bool,
     pub setup_running: bool,
+    pub authoritative: bool,
     pub error: Option<String>,
 }
 
@@ -168,6 +170,7 @@ impl Default for Session {
             resting: false,
             setup_failed: false,
             setup_running: false,
+            authoritative: false,
             error: None,
         }
     }
@@ -274,6 +277,24 @@ pub fn execution_order(effects: &[Effect]) -> Vec<TurnItem> {
     items
 }
 
+pub fn execute_turn<R, D>(rendered: Value, effects: &[Effect], reply: R, mut dispatch: D)
+where
+    R: FnOnce(Value),
+    D: FnMut(&Effect),
+{
+    let mut reply = Some(reply);
+    for item in execution_order(effects) {
+        match item {
+            TurnItem::Reply => {
+                if let Some(reply) = reply.take() {
+                    reply(rendered.clone());
+                }
+            }
+            TurnItem::Effect(effect) => dispatch(&effect),
+        }
+    }
+}
+
 fn arg_string(args: &Value, key: &str) -> String {
     args.get(key)
         .and_then(Value::as_str)
@@ -348,6 +369,58 @@ pub fn convey_route_allowed(method: &str, path: &str) -> bool {
             | ("GET", "/init/api/state")
             | ("POST", "/init/api/action")
     )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConveyDispatch {
+    Rejected,
+    Unanswered,
+    Use(Option<u16>),
+}
+
+pub fn convey_dispatch(
+    method: &str,
+    path: &str,
+    renderer_port: Option<u16>,
+    status_port: Option<u16>,
+) -> ConveyDispatch {
+    if !convey_route_allowed(method, path) {
+        return ConveyDispatch::Rejected;
+    }
+    match (method, path) {
+        ("GET", "/init/api/state") | ("POST", "/init/api/action") => match status_port {
+            Some(p) => ConveyDispatch::Use(Some(p)),
+            None => ConveyDispatch::Unanswered,
+        },
+        _ => ConveyDispatch::Use(renderer_port),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelsJob {
+    Check,
+    Install,
+}
+
+pub fn admit_models_job(session: &mut Session, effects: &mut Vec<Effect>, job: ModelsJob) -> bool {
+    if session.models_pending {
+        return false;
+    }
+    session.models_generation += 1;
+    session.models_pending = true;
+    match job {
+        ModelsJob::Check => {
+            effects.push(Effect::CheckModels {
+                generation: session.models_generation,
+            });
+        }
+        ModelsJob::Install => {
+            effects.push(Effect::InstallModels {
+                generation: session.models_generation,
+            });
+        }
+    }
+    true
 }
 
 pub fn setup_argv(journal: &Path, task_installed: bool, start_at_sign_in: bool) -> Vec<String> {
@@ -479,6 +552,12 @@ pub fn view(session: &Session) -> Value {
         .and_then(Value::as_str)
         == Some("ok");
 
+    let thinking_capability = session
+        .snapshot
+        .as_ref()
+        .and_then(|s| s.pointer("/thinking/capability"))
+        .and_then(Value::as_str);
+
     let default_line = match (
         session
             .copy
@@ -596,6 +675,8 @@ pub fn view(session: &Session) -> Value {
         "can_finalize": can_finalize,
         "watch_downloads": watch_downloads,
         "destination_rejected": destination_rejected,
+        "authoritative": session.authoritative,
+        "thinking_capability": thinking_capability,
     })
 }
 
@@ -711,17 +792,10 @@ pub fn reduce(session: &Session, event: &Event) -> Step {
             match result {
                 Ok(models_err) => {
                     next.setup_failed = false;
-                    if !next.task_installed {
-                        effects.push(Effect::SetSignInLaunch(next.start_at_sign_in));
-                    }
                     if let Some(text) = models_err {
                         next.models_notice = Some(text.clone());
                     }
-                    next.models_generation += 1;
-                    next.models_pending = true;
-                    effects.push(Effect::CheckModels {
-                        generation: next.models_generation,
-                    });
+                    admit_models_job(&mut next, &mut effects, ModelsJob::Check);
                     next.generation += 1;
                     next.inflight = Some(next.generation);
                     next.busy = true;
@@ -767,7 +841,10 @@ pub fn reduce(session: &Session, event: &Event) -> Step {
                     apply_snapshot(&mut next, &mut effects, state);
                 }
                 Err(err) => {
-                    next.error = Some(err.clone());
+                    next.authoritative = false;
+                    if next.error.is_none() {
+                        next.error = Some(err.clone());
+                    }
                 }
             }
         }
@@ -794,7 +871,7 @@ pub fn reduce(session: &Session, event: &Event) -> Step {
             }
         }
         Event::RegenerateMarkClicked => {
-            if next.inflight.is_some() || next.phase != Phase::Mark {
+            if !next.authoritative || next.inflight.is_some() || next.phase != Phase::Mark {
                 return Step {
                     session: next,
                     effects,
@@ -819,7 +896,7 @@ pub fn reduce(session: &Session, event: &Event) -> Step {
             effects.push(Effect::PostAction(SetupAction::RegenerateMark));
         }
         Event::CommitMarkClicked { proposal_id } => {
-            if next.inflight.is_some() || next.phase != Phase::Mark {
+            if !next.authoritative || next.inflight.is_some() || next.phase != Phase::Mark {
                 return Step {
                     session: next,
                     effects,
@@ -827,6 +904,17 @@ pub fn reduce(session: &Session, event: &Event) -> Step {
             }
             if proposal_id.trim().is_empty() {
                 next.error = Some("that mark isn't the one on screen".to_owned());
+                return Step {
+                    session: next,
+                    effects,
+                };
+            }
+            let render_ok = next
+                .snapshot
+                .as_ref()
+                .and_then(|s| s.pointer("/mark/render"))
+                .is_some_and(|r| admit_mark_render(r).is_ok());
+            if !render_ok {
                 return Step {
                     session: next,
                     effects,
@@ -841,7 +929,7 @@ pub fn reduce(session: &Session, event: &Event) -> Step {
             }));
         }
         Event::ChooseThinking(choice) => {
-            if next.inflight.is_some() || next.phase != Phase::Thinking {
+            if !next.authoritative || next.inflight.is_some() || next.phase != Phase::Thinking {
                 return Step {
                     session: next,
                     effects,
@@ -877,7 +965,10 @@ pub fn reduce(session: &Session, event: &Event) -> Step {
             }));
         }
         Event::StartThinkingDownloadClicked => {
-            if next.inflight.is_some() || !thinking_retry(next.snapshot.as_ref()) {
+            if !next.authoritative
+                || next.inflight.is_some()
+                || !thinking_retry(next.snapshot.as_ref())
+            {
                 return Step {
                     session: next,
                     effects,
@@ -890,7 +981,7 @@ pub fn reduce(session: &Session, event: &Event) -> Step {
             effects.push(Effect::PostAction(SetupAction::StartThinkingDownload));
         }
         Event::CancelThinkingDownloadClicked { attempt_id } => {
-            if next.inflight.is_some() {
+            if !next.authoritative || next.inflight.is_some() {
                 return Step {
                     session: next,
                     effects,
@@ -912,7 +1003,10 @@ pub fn reduce(session: &Session, event: &Event) -> Step {
             }));
         }
         Event::RetrySpeechDownloadClicked => {
-            if next.inflight.is_some() || !speech_retry(next.snapshot.as_ref()) {
+            if !next.authoritative
+                || next.inflight.is_some()
+                || !speech_retry(next.snapshot.as_ref())
+            {
                 return Step {
                     session: next,
                     effects,
@@ -925,7 +1019,7 @@ pub fn reduce(session: &Session, event: &Event) -> Step {
             effects.push(Effect::PostAction(SetupAction::RetrySpeechDownload));
         }
         Event::FinalizeClicked { timezone } => {
-            if next.inflight.is_some() || next.phase != Phase::Thinking {
+            if !next.authoritative || next.inflight.is_some() || next.phase != Phase::Thinking {
                 return Step {
                     session: next,
                     effects,
@@ -999,11 +1093,7 @@ pub fn reduce(session: &Session, event: &Event) -> Step {
             next.models_pending = false;
             match result {
                 Ok(()) => {
-                    next.models_generation += 1;
-                    next.models_pending = true;
-                    effects.push(Effect::CheckModels {
-                        generation: next.models_generation,
-                    });
+                    admit_models_job(&mut next, &mut effects, ModelsJob::Check);
                 }
                 Err(text) => {
                     next.models_notice = Some(text.clone());
@@ -1011,17 +1101,10 @@ pub fn reduce(session: &Session, event: &Event) -> Step {
             }
         }
         Event::RetryModelsInstallClicked => {
-            if next.models_pending {
-                return Step {
-                    session: next,
-                    effects,
-                };
-            }
-            next.models_generation += 1;
-            next.models_pending = true;
-            effects.push(Effect::InstallModels {
-                generation: next.models_generation,
-            });
+            admit_models_job(&mut next, &mut effects, ModelsJob::Install);
+        }
+        Event::RequestModelsCheck => {
+            admit_models_job(&mut next, &mut effects, ModelsJob::Check);
         }
         Event::RetryState => {
             if next.inflight.is_some()
@@ -1087,6 +1170,44 @@ fn nonblank(text: Option<&str>) -> bool {
     text.is_some_and(|text| !text.trim().is_empty())
 }
 
+fn admit_mark_render(render: &Value) -> Result<(), ()> {
+    let obj = render.as_object().ok_or(())?;
+    let icon1 = obj.get("icon1").and_then(Value::as_object).ok_or(())?;
+    let icon2 = obj.get("icon2").and_then(Value::as_object).ok_or(())?;
+    let words = obj.get("words").and_then(Value::as_array).ok_or(())?;
+    if words.len() != 2 {
+        return Err(());
+    }
+    for w in words {
+        if w.as_str().unwrap_or("").is_empty() {
+            return Err(());
+        }
+    }
+    for icon in [icon1, icon2] {
+        let svg = icon.get("svg").and_then(Value::as_str).unwrap_or("");
+        if svg.is_empty() {
+            return Err(());
+        }
+        let rot = icon.get("rot").and_then(Value::as_i64).ok_or(())?;
+        if rot != 0 && rot != 45 {
+            return Err(());
+        }
+        let color = icon.get("color").and_then(Value::as_object).ok_or(())?;
+        let color_name = color.get("name").and_then(Value::as_str).unwrap_or("");
+        if color_name.is_empty() {
+            return Err(());
+        }
+        let hex = color.get("hex").and_then(Value::as_str).unwrap_or("");
+        if hex.len() != 7 || !hex.starts_with('#') {
+            return Err(());
+        }
+        if !hex[1..].chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
 fn admit_download(value: &Value) -> Result<(), ()> {
     let Some(download) = value.as_object() else {
         return Err(());
@@ -1101,15 +1222,12 @@ fn admit_download(value: &Value) -> Result<(), ()> {
     if string_or_null(download.get("attempt_id")).is_none() {
         return Err(());
     }
-    if download
-        .get("bytes_done")
-        .and_then(Value::as_number)
-        .is_none()
-    {
+    if download.get("bytes_done").and_then(Value::as_u64).is_none() {
         return Err(());
     }
     match download.get("bytes_total") {
-        Some(Value::Null) | Some(Value::Number(_)) => {}
+        Some(Value::Null) => {}
+        Some(val) if val.as_u64().is_some() => {}
         _ => return Err(()),
     }
     match download.get("error") {
@@ -1168,7 +1286,8 @@ fn admit_setup_state(state: &Value) -> Result<(), ()> {
         return Err(());
     }
     match thinking.get("download_bytes") {
-        Some(Value::Null) | Some(Value::Number(_)) => {}
+        Some(Value::Null) => {}
+        Some(val) if val.as_u64().is_some() => {}
         _ => return Err(()),
     }
     let Some(downloads) = body.get("downloads").and_then(Value::as_object) else {
@@ -1213,8 +1332,12 @@ fn admit_setup_state(state: &Value) -> Result<(), ()> {
     } else if choice.is_some() {
         return Err(());
     }
-    if mark_state == Some("proposed") && !nonblank(proposal_id) {
-        return Err(());
+    if mark_state == Some("proposed") {
+        if !nonblank(proposal_id) {
+            return Err(());
+        }
+        let render = mark.get("render").ok_or(())?;
+        admit_mark_render(render)?;
     }
     if mark_state == Some("unavailable") && nonblank(proposal_id) {
         return Err(());
@@ -1224,11 +1347,13 @@ fn admit_setup_state(state: &Value) -> Result<(), ()> {
 
 fn apply_snapshot(session: &mut Session, effects: &mut Vec<Effect>, state: &Value) {
     if admit_setup_state(state).is_err() {
+        session.authoritative = false;
         if session.error.is_none() {
             session.error = Some("the journal's setup state could not be read".to_owned());
         }
         return;
     }
+    session.authoritative = true;
     session.resting = false;
     session.snapshot = Some(state.clone());
     if let Some(copy) = state.get("copy").filter(|copy| !copy.is_null()) {
@@ -1246,11 +1371,7 @@ fn apply_snapshot(session: &mut Session, effects: &mut Vec<Effect>, state: &Valu
         let already_home = session.phase == Phase::Home;
         session.phase = Phase::Home;
         if !already_home {
-            session.models_generation += 1;
-            session.models_pending = true;
-            effects.push(Effect::CheckModels {
-                generation: session.models_generation,
-            });
+            admit_models_job(session, effects, ModelsJob::Check);
         }
         return;
     }
@@ -1276,6 +1397,28 @@ mod tests {
             "bytes_done": 0,
             "bytes_total": null,
             "error": null
+        })
+    }
+
+    fn sample_render() -> Value {
+        json!({
+            "icon1": {
+                "svg": "<path d=\"M0 0h10v10H0z\"/>",
+                "rot": 0,
+                "color": {
+                    "name": "blue",
+                    "hex": "#0000ff"
+                }
+            },
+            "icon2": {
+                "svg": "<circle cx=\"5\" cy=\"5\" r=\"5\"/>",
+                "rot": 45,
+                "color": {
+                    "name": "red",
+                    "hex": "#ff0000"
+                }
+            },
+            "words": ["north", "stone"]
         })
     }
 
@@ -1386,11 +1529,7 @@ mod tests {
         session = step.session;
         assert_eq!(
             step.effects,
-            vec![
-                Effect::SetSignInLaunch(false),
-                Effect::CheckModels { generation: 1 },
-                Effect::FetchState,
-            ]
+            vec![Effect::CheckModels { generation: 1 }, Effect::FetchState,]
         );
 
         // A fresh unavailable mark waits. The owner asks for the first proposal.
@@ -1417,6 +1556,7 @@ mod tests {
         let mut state_with_prop = setup_state();
         state_with_prop["mark"]["state"] = json!("proposed");
         state_with_prop["mark"]["proposal_id"] = json!("prop-42");
+        state_with_prop["mark"]["render"] = sample_render();
         let step = reduce(
             &session,
             &Event::ActionCompleted {
@@ -1534,7 +1674,7 @@ mod tests {
             },
         );
         assert_eq!(step.browser_effect(), BrowserEffect::None);
-        assert_eq!(step.effects, vec![Effect::CheckModels { generation: 2 }]);
+        assert!(step.effects.is_empty());
         session = step.session;
         assert_eq!(session.phase, Phase::Home);
     }
@@ -1601,8 +1741,9 @@ mod tests {
             generation: 10,
             inflight: Some(10),
             phase: Phase::Mark,
+            authoritative: true,
             snapshot: Some(json!({
-                "mark": { "state": "proposed", "proposal_id": "click-id" },
+                "mark": { "state": "proposed", "proposal_id": "click-id", "render": sample_render() },
                 "downloads": { "thinking": { "state": "downloading", "attempt_id": "att-99" } }
             })),
             ..Default::default()
@@ -1682,6 +1823,7 @@ mod tests {
     fn saved_local_survives_failures_retry_and_finalize_with_downloads() {
         let mut session = Session {
             phase: Phase::Thinking,
+            authoritative: true,
             snapshot: Some(json!({
                 "done": false,
                 "redirect": "/app/home",
@@ -1930,8 +2072,9 @@ mod tests {
     fn speech_diagnostics_isolation_and_package_repair() {
         let session = Session {
             phase: Phase::Mark,
+            authoritative: true,
             snapshot: Some(json!({
-                "mark": { "state": "proposed", "proposal_id": "p-1" },
+                "mark": { "state": "proposed", "proposal_id": "p-1", "render": sample_render() },
                 "downloads": {
                     "speech": {
                         "state": "error",
@@ -1965,8 +2108,9 @@ mod tests {
         // Speech complete click emits nothing
         let complete_session = Session {
             phase: Phase::Mark,
+            authoritative: true,
             snapshot: Some(json!({
-                "mark": { "state": "proposed", "proposal_id": "p-1" },
+                "mark": { "state": "proposed", "proposal_id": "p-1", "render": sample_render() },
                 "downloads": { "speech": { "state": "complete" } }
             })),
             ..Default::default()
@@ -1978,8 +2122,9 @@ mod tests {
         // Another speech error enables retry
         let session_other_err = Session {
             phase: Phase::Mark,
+            authoritative: true,
             snapshot: Some(json!({
-                "mark": { "state": "proposed", "proposal_id": "p-1" },
+                "mark": { "state": "proposed", "proposal_id": "p-1", "render": sample_render() },
                 "downloads": {
                     "speech": {
                         "state": "error",
@@ -2023,8 +2168,6 @@ mod tests {
         // Speech complete state load whose generation matches inflight leaves notice in place
         session.inflight = Some(10);
         let mut speech_complete = setup_state();
-        speech_complete["mark"]["state"] = json!("proposed");
-        speech_complete["mark"]["proposal_id"] = json!("p1");
         speech_complete["downloads"]["speech"]["state"] = json!("complete");
         let step = reduce(
             &session,
@@ -2210,6 +2353,7 @@ mod tests {
     fn choose_thinking_local_capability_gate() {
         let blocked_session = Session {
             phase: Phase::Thinking,
+            authoritative: true,
             snapshot: Some(json!({
                 "thinking": { "capability": "blocked" }
             })),
@@ -2221,6 +2365,7 @@ mod tests {
 
         let ok_session = Session {
             phase: Phase::Thinking,
+            authoritative: true,
             snapshot: Some(json!({
                 "thinking": { "capability": "ok" }
             })),
@@ -2236,6 +2381,7 @@ mod tests {
 
         let unknown_session = Session {
             phase: Phase::Thinking,
+            authoritative: true,
             snapshot: Some(json!({
                 "thinking": { "capability": "unknown" }
             })),
@@ -2303,10 +2449,12 @@ mod tests {
         let mut snapshot = setup_state();
         snapshot["mark"]["state"] = json!("proposed");
         snapshot["mark"]["proposal_id"] = json!("Y");
+        snapshot["mark"]["render"] = sample_render();
         snapshot["downloads"]["thinking"]["state"] = json!("downloading");
         snapshot["downloads"]["thinking"]["attempt_id"] = json!("B");
         let session = Session {
             phase: Phase::Mark,
+            authoritative: true,
             snapshot: Some(snapshot),
             ..Default::default()
         };
@@ -2400,6 +2548,7 @@ mod tests {
         extra["lanes"] = json!(["confidential"]);
         extra["mark"]["state"] = json!("proposed");
         extra["mark"]["proposal_id"] = json!("kept-id");
+        extra["mark"]["render"] = sample_render();
         let step = load(
             &Session {
                 inflight: Some(1),
@@ -2438,6 +2587,7 @@ mod tests {
         let mut proposed = setup_state();
         proposed["mark"]["state"] = json!("proposed");
         proposed["mark"]["proposal_id"] = json!("p-1");
+        proposed["mark"]["render"] = sample_render();
         let step = load(
             &Session {
                 inflight: Some(1),
@@ -2476,6 +2626,7 @@ mod tests {
 
         let session = Session {
             phase: Phase::Mark,
+            authoritative: true,
             snapshot: Some(proposed),
             ..Default::default()
         };
@@ -2550,6 +2701,7 @@ mod tests {
         let mut body = setup_state();
         body["mark"]["state"] = json!("proposed");
         body["mark"]["proposal_id"] = json!("Y");
+        body["mark"]["render"] = sample_render();
         let session = Session {
             phase: Phase::Thinking,
             inflight: Some(3),
@@ -2677,5 +2829,454 @@ mod tests {
             };
             assert_eq!(view(&session)["step"], json!(step));
         }
+    }
+
+    #[test]
+    fn reply_is_issued_before_effects_run() {
+        use std::cell::RefCell;
+        let log = RefCell::new(Vec::new());
+        let rendered = json!({ "phase": "home" });
+        let effects = vec![Effect::FetchState];
+        execute_turn(
+            rendered,
+            &effects,
+            |_val| log.borrow_mut().push("reply"),
+            |_eff| log.borrow_mut().push("effect"),
+        );
+        assert_eq!(*log.borrow(), vec!["reply", "effect"]);
+    }
+
+    #[test]
+    fn convey_dispatch_matrix_and_port_rules() {
+        // setup GET /init/api/state and POST /init/api/action with status None and renderer Some(5015), Some(80), Some(0), and None are Unanswered.
+        for method in ["GET", "POST"] {
+            let path = if method == "GET" {
+                "/init/api/state"
+            } else {
+                "/init/api/action"
+            };
+            for renderer in [Some(5015), Some(80), Some(0), None] {
+                assert_eq!(
+                    convey_dispatch(method, path, renderer, None),
+                    ConveyDispatch::Unanswered
+                );
+            }
+        }
+        // Status Some(5016) with renderer Some(5015) is Use(Some(5016)).
+        assert_eq!(
+            convey_dispatch("GET", "/init/api/state", Some(5015), Some(5016)),
+            ConveyDispatch::Use(Some(5016))
+        );
+        assert_eq!(
+            convey_dispatch("POST", "/init/api/action", Some(5015), Some(5016)),
+            ConveyDispatch::Use(Some(5016))
+        );
+        // Settings GET and devices routes with renderer None are Use(None).
+        assert_eq!(
+            convey_dispatch("GET", "/app/settings/api/config", None, None),
+            ConveyDispatch::Use(None)
+        );
+        assert_eq!(
+            convey_dispatch("GET", "/app/network/api/devices", None, None),
+            ConveyDispatch::Use(None)
+        );
+        // Renderer Some(5016) on those routes is Use(Some(5016)).
+        assert_eq!(
+            convey_dispatch("GET", "/app/settings/api/config", Some(5016), None),
+            ConveyDispatch::Use(Some(5016))
+        );
+        assert_eq!(
+            convey_dispatch("GET", "/app/network/api/devices", Some(5016), None),
+            ConveyDispatch::Use(Some(5016))
+        );
+        // A path with ? or .. is Rejected.
+        assert_eq!(
+            convey_dispatch("GET", "/init/api/state?q=1", Some(5015), Some(5016)),
+            ConveyDispatch::Rejected
+        );
+        assert_eq!(
+            convey_dispatch(
+                "GET",
+                "/app/settings/api/config/../evil",
+                Some(5015),
+                Some(5016)
+            ),
+            ConveyDispatch::Rejected
+        );
+    }
+
+    #[test]
+    fn authority_bit_blocks_mutations_and_recovers_on_admitted_refresh() {
+        // Include a negative bytes_done and a fractional download_bytes as malformed.
+        let mut bad_bytes_done = setup_state();
+        bad_bytes_done["downloads"]["speech"]["bytes_done"] = json!(-1);
+        assert!(admit_setup_state(&bad_bytes_done).is_err());
+
+        let mut bad_download_bytes = setup_state();
+        bad_download_bytes["thinking"]["download_bytes"] = json!(12.5);
+        assert!(admit_setup_state(&bad_download_bytes).is_err());
+
+        // valid state sets authority true
+        let mut valid_state = setup_state();
+        valid_state["mark"]["state"] = json!("proposed");
+        valid_state["mark"]["proposal_id"] = json!("prop-1");
+        valid_state["mark"]["render"] = sample_render();
+
+        let session = Session {
+            inflight: Some(1),
+            phase: Phase::Mark,
+            ..Default::default()
+        };
+        let step = reduce(
+            &session,
+            &Event::StateLoaded {
+                generation: 1,
+                result: Ok(valid_state.clone()),
+            },
+        );
+        let mut session = step.session;
+        assert!(session.authoritative);
+
+        // transport error or malformed state clears authority
+        session.inflight = Some(2);
+        let step = reduce(
+            &session,
+            &Event::StateLoaded {
+                generation: 2,
+                result: Err("transport failure".into()),
+            },
+        );
+        session = step.session;
+        assert!(!session.authoritative);
+
+        // each of the seven mutations has no effects
+        let m1 = reduce(&session, &Event::RegenerateMarkClicked);
+        assert!(m1.effects.is_empty());
+
+        let m2 = reduce(
+            &session,
+            &Event::CommitMarkClicked {
+                proposal_id: "prop-1".into(),
+            },
+        );
+        assert!(m2.effects.is_empty());
+
+        let mut thinking_session = session.clone();
+        thinking_session.phase = Phase::Thinking;
+        let m3 = reduce(&thinking_session, &Event::ChooseThinking("local".into()));
+        assert!(m3.effects.is_empty());
+
+        let m4 = reduce(&thinking_session, &Event::StartThinkingDownloadClicked);
+        assert!(m4.effects.is_empty());
+
+        let m5 = reduce(
+            &thinking_session,
+            &Event::CancelThinkingDownloadClicked {
+                attempt_id: "att-1".into(),
+            },
+        );
+        assert!(m5.effects.is_empty());
+
+        let m6 = reduce(&session, &Event::RetrySpeechDownloadClicked);
+        assert!(m6.effects.is_empty());
+
+        let m7 = reduce(
+            &thinking_session,
+            &Event::FinalizeClicked { timezone: None },
+        );
+        assert!(m7.effects.is_empty());
+
+        // RetryState emits FetchState
+        let step = reduce(&session, &Event::RetryState);
+        assert_eq!(step.effects, vec![Effect::FetchState]);
+        let load_gen = step.session.inflight.unwrap();
+
+        // valid state restores authority and does not emit save/commit/finalize
+        let step = reduce(
+            &step.session,
+            &Event::StateLoaded {
+                generation: load_gen,
+                result: Ok(valid_state.clone()),
+            },
+        );
+        session = step.session;
+        assert!(session.authoritative);
+        assert!(
+            !step
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::PostAction(_)))
+        );
+
+        // one new click emits its effect (empty effect list on recovered click fails test)
+        let click_step = reduce(&session, &Event::RegenerateMarkClicked);
+        assert_eq!(
+            click_step.effects,
+            vec![Effect::PostAction(SetupAction::RegenerateMark)]
+        );
+
+        // Action-error text remains after a successful follow-up load and after a failed follow-up load
+        session.inflight = Some(10);
+        let action_err_step = reduce(
+            &session,
+            &Event::ActionCompleted {
+                generation: 10,
+                result: Err(ActionErrorPayload {
+                    reason_code: Some("err_code".into()),
+                    message: "action failed detail".into(),
+                    is_transport: false,
+                }),
+            },
+        );
+        session = action_err_step.session;
+        assert_eq!(session.error.as_deref(), Some("action failed detail"));
+        assert_eq!(action_err_step.effects, vec![Effect::FetchState]);
+
+        let success_load = reduce(
+            &session,
+            &Event::StateLoaded {
+                generation: session.inflight.unwrap(),
+                result: Ok(valid_state),
+            },
+        );
+        assert_eq!(
+            success_load.session.error.as_deref(),
+            Some("action failed detail")
+        );
+
+        let failed_load = reduce(
+            &session,
+            &Event::StateLoaded {
+                generation: session.inflight.unwrap(),
+                result: Err("failed load".into()),
+            },
+        );
+        assert_eq!(
+            failed_load.session.error.as_deref(),
+            Some("action failed detail")
+        );
+
+        // Include legacy done: true, unsaved thinking, choice null, render null: phase Home, no PostAction, no Browser
+        let mut legacy = setup_state();
+        legacy["done"] = json!(true);
+        legacy["remaining_required_steps"] = json!([]);
+        legacy["thinking"]["saved"] = json!(false);
+        legacy["thinking"]["choice"] = Value::Null;
+        // render is null in setup_state()
+        let leg_session = Session {
+            inflight: Some(20),
+            ..Default::default()
+        };
+        let leg_step = reduce(
+            &leg_session,
+            &Event::StateLoaded {
+                generation: 20,
+                result: Ok(legacy),
+            },
+        );
+        assert_eq!(leg_step.session.phase, Phase::Home);
+        assert!(
+            !leg_step
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::PostAction(_) | Effect::Browser(_)))
+        );
+    }
+
+    #[test]
+    fn models_admission_serializes_checks_and_installs_through_reduce() {
+        // install in flight, then RequestModelsCheck twice and a not-yet-home done load:
+        // generation unchanged, no extra effect, notice unchanged.
+        let mut session = Session {
+            phase: Phase::Opening,
+            models_generation: 1,
+            models_pending: true,
+            models_notice: Some("current notice".into()),
+            ..Default::default()
+        };
+
+        let step1 = reduce(&session, &Event::RequestModelsCheck);
+        assert!(step1.effects.is_empty());
+        assert_eq!(step1.session.models_generation, 1);
+        assert_eq!(
+            step1.session.models_notice.as_deref(),
+            Some("current notice")
+        );
+
+        let step2 = reduce(&step1.session, &Event::RequestModelsCheck);
+        assert!(step2.effects.is_empty());
+        assert_eq!(step2.session.models_generation, 1);
+
+        session = step2.session;
+        session.inflight = Some(5);
+
+        let mut done_state = setup_state();
+        done_state["done"] = json!(true);
+        done_state["remaining_required_steps"] = json!([]);
+        let step_done = reduce(
+            &session,
+            &Event::StateLoaded {
+                generation: 5,
+                result: Ok(done_state),
+            },
+        );
+        assert_eq!(step_done.session.phase, Phase::Home);
+        assert!(step_done.effects.is_empty());
+        assert_eq!(step_done.session.models_generation, 1);
+        assert_eq!(
+            step_done.session.models_notice.as_deref(),
+            Some("current notice")
+        );
+        session = step_done.session;
+
+        // Stale completion does not emit check
+        let stale = reduce(
+            &session,
+            &Event::ModelsInstallFinished {
+                generation: 0,
+                result: Ok(()),
+            },
+        );
+        assert!(stale.effects.is_empty());
+        assert_eq!(stale.session.models_generation, 1);
+        assert!(stale.session.models_pending);
+
+        // Install completion for that generation emits one check
+        let install_done = reduce(
+            &session,
+            &Event::ModelsInstallFinished {
+                generation: 1,
+                result: Ok(()),
+            },
+        );
+        assert_eq!(
+            install_done.effects,
+            vec![Effect::CheckModels { generation: 2 }]
+        );
+        assert_eq!(install_done.session.models_generation, 2);
+        assert!(install_done.session.models_pending);
+        assert_eq!(
+            install_done.session.models_notice.as_deref(),
+            Some("current notice")
+        );
+        session = install_done.session;
+
+        // Check in flight ignores repeated RequestModelsCheck
+        let repeat_check = reduce(&session, &Event::RequestModelsCheck);
+        assert!(repeat_check.effects.is_empty());
+        assert_eq!(repeat_check.session.models_generation, 2);
+
+        // Check Err keeps the text
+        let check_err = reduce(
+            &session,
+            &Event::ModelsCheckFinished {
+                generation: 2,
+                result: Err("model check failure msg".into()),
+            },
+        );
+        assert_eq!(
+            check_err.session.models_notice.as_deref(),
+            Some("model check failure msg")
+        );
+        assert!(!check_err.session.models_pending);
+        session = check_err.session;
+
+        // RetryModelsInstallClicked then admits one install
+        let retry_install = reduce(&session, &Event::RetryModelsInstallClicked);
+        assert_eq!(
+            retry_install.effects,
+            vec![Effect::InstallModels { generation: 3 }]
+        );
+        assert_eq!(retry_install.session.models_generation, 3);
+        assert!(retry_install.session.models_pending);
+
+        // Finish install and check Ok clears notice
+        let install_finish = reduce(
+            &retry_install.session,
+            &Event::ModelsInstallFinished {
+                generation: 3,
+                result: Ok(()),
+            },
+        );
+        assert_eq!(
+            install_finish.effects,
+            vec![Effect::CheckModels { generation: 4 }]
+        );
+
+        let check_ok = reduce(
+            &install_finish.session,
+            &Event::ModelsCheckFinished {
+                generation: 4,
+                result: Ok(()),
+            },
+        );
+        assert_eq!(check_ok.session.models_notice, None);
+        assert!(!check_ok.session.models_pending);
+    }
+
+    #[test]
+    fn stopped_opening_reconciles_without_a_setup_write() {
+        // Opening session, RetryState emits only FetchState
+        let session = Session {
+            phase: Phase::Opening,
+            ..Default::default()
+        };
+        let step = reduce(&session, &Event::RetryState);
+        assert_eq!(step.effects, vec![Effect::FetchState]);
+        let load_gen = step.session.inflight.unwrap();
+
+        // Admitted not-done state lands on Mark or Thinking
+        let not_done_mark = setup_state();
+        let step_mark = reduce(
+            &step.session,
+            &Event::StateLoaded {
+                generation: load_gen,
+                result: Ok(not_done_mark),
+            },
+        );
+        assert_eq!(step_mark.session.phase, Phase::Mark);
+        assert!(
+            !step_mark
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::PostAction(_) | Effect::Browser(_)))
+        );
+
+        let mut not_done_thinking = setup_state();
+        not_done_thinking["mark"]["state"] = json!("locked");
+        not_done_thinking["remaining_required_steps"] = json!(["thinking"]);
+        let step_thinking = reduce(
+            &step.session,
+            &Event::StateLoaded {
+                generation: load_gen,
+                result: Ok(not_done_thinking),
+            },
+        );
+        assert_eq!(step_thinking.session.phase, Phase::Thinking);
+        assert!(
+            !step_thinking
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::PostAction(_) | Effect::Browser(_)))
+        );
+
+        // Admitted done lands on Home. Neither emits PostAction or Browser.
+        let mut done_state = setup_state();
+        done_state["done"] = json!(true);
+        done_state["remaining_required_steps"] = json!([]);
+        let step_home = reduce(
+            &step.session,
+            &Event::StateLoaded {
+                generation: load_gen,
+                result: Ok(done_state),
+            },
+        );
+        assert_eq!(step_home.session.phase, Phase::Home);
+        assert!(
+            !step_home
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::PostAction(_) | Effect::Browser(_)))
+        );
     }
 }

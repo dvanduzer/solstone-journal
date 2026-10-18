@@ -4,7 +4,7 @@
 // The journal app's window. Every word the owner reads is in COPY; the Mac
 // journal app's words are kept wherever they say the same thing here.
 
-import { renderMarkCard, markIconImages, sameMark, validMark } from './mark.js';
+import { renderMarkCard, markIconImages, sameMark, validMark, displayableMark } from './mark.js';
 
 const COPY = {
   panes: {
@@ -48,7 +48,7 @@ const COPY = {
   yourDevices: 'your devices',
   devicesLoading: 'loading devices…',
   devicesEmptyTitle: 'no devices yet',
-  devicesEmptyBody: 'add a device and it joins your journal.',
+  devicesEmptyBody: 'pair a device and it joins your journal.',
   devicesNotRunningTitle: "your journal isn't running",
   devicesNotRunningBody: 'start the journal, then try again.',
   devicesLoadFailed: "couldn't load your devices",
@@ -62,7 +62,7 @@ const COPY = {
   paired: date => `paired ${date}`,
   remove: 'remove',
   removeTitle: name => `remove ${name}?`,
-  removeBody: name => `${name} loses access to your journal. you can add it again later.`,
+  removeBody: name => `${name} loses access to your journal. you can pair it again later.`,
   removeFailed: "couldn't remove this device",
   cancel: 'cancel',
   close: 'close',
@@ -76,7 +76,7 @@ const COPY = {
   copied: 'copied ✓',
   countdown: seconds => `expires in ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`,
   linkExpiredTitle: 'pairing link expired',
-  linkExpiredBody: 'open a fresh pairing link to add a device.',
+  linkExpiredBody: 'open a fresh pairing link to pair a device.',
   openFreshLink: 'open a fresh pairing link',
   pairingFailedTitle: "couldn't open pairing",
   pairingClosed: "your journal is closed to devices on your network, so another device can't reach it directly yet. open your journal to devices on your network, or turn on your private network to pair from anywhere. the solstone app on this PC can still pair.",
@@ -168,7 +168,12 @@ function call(cmd, args = {}) {
   });
 }
 
-const listeners = { setup: [], update: [], shown: [], flow: [] };
+const listeners = { setup: [], update: [], shown: [], flow: [], 'sign-in-launch': [] };
+
+listeners['sign-in-launch'].push(data => {
+  state.message = data.error || data.message || 'sign-in launch failed';
+  render();
+});
 
 window.journalApp = {
   receive(message) {
@@ -268,14 +273,45 @@ function show(section) {
 
 // --- status --------------------------------------------------------------
 
-async function refreshStatus() {
+async function refreshStatus(throwOnError = false) {
   try {
     state.status = await call('status');
   } catch (error) {
     state.message = error.message;
+    render();
+    if (throwOnError) throw error;
+    return null;
   }
   render();
   return state.status;
+}
+
+let syncRetryNeeded = false;
+async function syncAppRunEntry(on) {
+  try {
+    await call('syncSignInLaunch', { on });
+    syncRetryNeeded = false;
+    state.message = null;
+  } catch (error) {
+    state.message = error.message;
+    syncRetryNeeded = true;
+  }
+  render();
+}
+
+async function retrySyncSignIn() {
+  try {
+    const status = await call('status');
+    state.status = status;
+    const on = status?.service?.starts_at_sign_in ?? true;
+    await call('syncSignInLaunch', { on });
+    syncRetryNeeded = false;
+    state.message = null;
+  } catch (error) {
+    state.message = error.message;
+    syncRetryNeeded = true;
+  }
+  render();
 }
 
 async function serviceAction(action) {
@@ -286,10 +322,16 @@ async function serviceAction(action) {
     state.status = await call(action);
   } catch (error) {
     state.message = error.message;
-    await refreshStatus();
+    state.pending = null;
+    render();
+    return;
   }
   state.pending = null;
   render();
+  if (action === 'start' || action === 'restart') {
+    call('flow', { intent: 'retry-state' }).catch(() => {});
+    return;
+  }
   if (display() !== 'running') return;
   await loadJournalFacts();
 }
@@ -297,28 +339,17 @@ async function serviceAction(action) {
 async function loadJournalFacts() {
   try {
     const identity = await call('convey', { method: 'GET', path: '/app/link/api/identity', port: port() });
-    if (identity?.availability === 'ready' && validMark(identity.mark)) {
+    if (identity?.committed === true && displayableMark(identity.mark)) {
       state.mark = identity.mark;
       state.markUnavailable = false;
       await applyIcon(state.mark);
-    } else if (validMark(state.init?.mark) && (identity?.availability === 'unavailable' || (identity?.committed && !validMark(identity?.mark)))) {
-      state.mark = state.init.mark;
-      state.markUnavailable = false;
-    } else if (identity?.availability === 'unavailable' || (identity?.committed && !validMark(identity?.mark))) {
-      state.mark = null;
-      state.markUnavailable = true;
     } else {
       state.mark = null;
       state.markUnavailable = false;
     }
   } catch {
-    if (validMark(state.init?.mark)) {
-      state.mark = state.init.mark;
-      state.markUnavailable = false;
-    } else {
-      state.mark = null;
-      state.markUnavailable = true;
-    }
+    state.mark = null;
+    state.markUnavailable = false;
   }
   render();
 }
@@ -416,7 +447,8 @@ function thinkingChoiceNodes(view) {
   const thinkingCopy = view.copy?.thinking || {};
   const choices = Array.isArray(thinkingCopy.choices) ? thinkingCopy.choices : [];
   const savedId = view.thinking_choice;
-  const saved = view.thinking_saved && ['local', 'spp', 'byo', 'later'].includes(savedId);
+  const saved = Boolean(view.thinking_saved) && ['local', 'spp', 'byo', 'later'].includes(savedId);
+
   if (saved && !thinkingChoicesOpen) {
     const label = savedId === 'later'
       ? (thinkingCopy.later || '')
@@ -430,42 +462,183 @@ function thinkingChoiceNodes(view) {
       }, document.createTextNode(thinkingCopy.change)) : null,
     ];
   }
+
   const nodes = [];
-  for (const choice of choices) {
-    if (choice.id === 'local' && !view.local_offered) {
+
+  const isBlockedOrUnknown = view.thinking_capability === 'blocked' || view.thinking_capability === 'unknown';
+  if (!saved && isBlockedOrUnknown) {
+    if (thinkingCopy.choose_later) {
+      nodes.push(el('p', {}, document.createTextNode(thinkingCopy.choose_later)));
+    }
+    for (const choice of choices) {
+      if (choice.id === 'local') continue;
+      const line = choice.sub;
+      const desc = choice.description;
       nodes.push(el('div', { class: 'field' },
-        el('p', {}, document.createTextNode(choice.label || '')),
-        choice.sub ? el('p', { class: 'muted' }, document.createTextNode(choice.sub)) : null));
-      continue;
+        el('button', {
+          type: 'button',
+          disabled: Boolean(view.busy) || view.authoritative === false,
+          on: { click: () => {
+            if (view.authoritative === false) return;
+            call('flow', { intent: 'choose-thinking', choice: choice.id });
+          } },
+        }, document.createTextNode(choice.label || choice.id)),
+        line ? el('p', { class: 'muted' }, document.createTextNode(line)) : null,
+        desc ? el('p', { class: 'faint' }, document.createTextNode(desc)) : null
+      ));
     }
-    let line = choice.sub;
-    if (choice.id === 'local' && view.local_offered && typeof view.default_line === 'string' && view.default_line) {
-      line = view.default_line;
+    if (typeof thinkingCopy.later === 'string' && thinkingCopy.later) {
+      nodes.push(el('button', {
+        type: 'button',
+        disabled: Boolean(view.busy) || view.authoritative === false,
+        on: { click: () => {
+          if (view.authoritative === false) return;
+          call('flow', { intent: 'choose-thinking', choice: 'later' });
+        } },
+      }, document.createTextNode(thinkingCopy.later)));
     }
+    return nodes;
+  }
+
+  if (saved || thinkingChoicesOpen) {
+    for (const choice of choices) {
+      const line = choice.sub;
+      const desc = choice.description;
+      nodes.push(el('div', { class: 'field' },
+        el('button', {
+          type: 'button',
+          disabled: Boolean(view.busy) || view.authoritative === false,
+          on: { click: () => {
+            if (view.authoritative === false) return;
+            call('flow', { intent: 'choose-thinking', choice: choice.id });
+          } },
+        }, document.createTextNode(choice.label || choice.id)),
+        line ? el('p', { class: 'muted' }, document.createTextNode(line)) : null,
+        desc ? el('p', { class: 'faint' }, document.createTextNode(desc)) : null
+      ));
+    }
+    if (typeof thinkingCopy.later === 'string' && thinkingCopy.later) {
+      nodes.push(el('button', {
+        type: 'button',
+        disabled: Boolean(view.busy) || view.authoritative === false,
+        on: { click: () => {
+          if (view.authoritative === false) return;
+          call('flow', { intent: 'choose-thinking', choice: 'later' });
+        } },
+      }, document.createTextNode(thinkingCopy.later)));
+    }
+    return nodes;
+  }
+
+  const isCapable = view.thinking_capability === 'ok' || view.local_offered === true;
+  if (isCapable) {
+    if (view.default_line) {
+      nodes.push(el('p', {}, document.createTextNode(view.default_line)));
+    }
+    if (thinkingCopy.change) {
+      nodes.push(el('button', {
+        type: 'button',
+        disabled: Boolean(view.busy),
+        on: { click: () => { thinkingChoicesOpen = true; renderFlow(state.flow); } },
+      }, document.createTextNode(thinkingCopy.change)));
+    }
+    if (thinkingCopy.later) {
+      nodes.push(el('button', {
+        type: 'button',
+        disabled: Boolean(view.busy) || view.authoritative === false,
+        on: { click: () => {
+          if (view.authoritative === false) return;
+          call('flow', { intent: 'choose-thinking', choice: 'later' });
+        } },
+      }, document.createTextNode(thinkingCopy.later)));
+    }
+    nodes.push(el('button', {
+      type: 'button',
+      class: 'primary',
+      disabled: Boolean(view.busy) || view.authoritative === false,
+      on: { click: () => {
+        if (view.authoritative === false) return;
+        call('flow', { intent: 'choose-thinking', choice: 'local' });
+      } },
+    }, document.createTextNode(thinkingCopy.continue || COPY.continueButton)));
+    return nodes;
+  }
+
+  if (thinkingCopy.choose_later) {
+    nodes.push(el('p', {}, document.createTextNode(thinkingCopy.choose_later)));
+  }
+  for (const choice of choices) {
+    if (choice.id === 'local') continue;
+    const line = choice.sub;
+    const desc = choice.description;
     nodes.push(el('div', { class: 'field' },
       el('button', {
         type: 'button',
-        disabled: Boolean(view.busy),
-        on: { click: () => call('flow', { intent: 'choose-thinking', choice: choice.id }) },
+        disabled: Boolean(view.busy) || view.authoritative === false,
+        on: { click: () => {
+          if (view.authoritative === false) return;
+          call('flow', { intent: 'choose-thinking', choice: choice.id });
+        } },
       }, document.createTextNode(choice.label || choice.id)),
-      line ? el('p', { class: 'muted' }, document.createTextNode(line)) : null));
+      line ? el('p', { class: 'muted' }, document.createTextNode(line)) : null,
+      desc ? el('p', { class: 'faint' }, document.createTextNode(desc)) : null
+    ));
   }
   if (typeof thinkingCopy.later === 'string' && thinkingCopy.later) {
     nodes.push(el('button', {
       type: 'button',
-      disabled: Boolean(view.busy),
-      on: { click: () => call('flow', { intent: 'choose-thinking', choice: 'later' }) },
+      disabled: Boolean(view.busy) || view.authoritative === false,
+      on: { click: () => {
+        if (view.authoritative === false) return;
+        call('flow', { intent: 'choose-thinking', choice: 'later' });
+      } },
     }, document.createTextNode(thinkingCopy.later)));
   }
   return nodes;
 }
 
+let setupRunningArmed = false;
+
+async function finishSetupToHome(view) {
+  let status = null;
+  try {
+    status = await refreshStatus(true);
+  } catch (error) {
+    const root = $('firstrun');
+    root.replaceChildren(
+      el('p', { class: 'error' }, document.createTextNode(error.message || String(error))),
+      el('div', { class: 'actions centered' },
+        el('button', {
+          type: 'button',
+          on: { click: () => finishSetupToHome(view) },
+        }, document.createTextNode(COPY.tryAgain))
+      )
+    );
+    return;
+  }
+  setupRunningArmed = false;
+  landHome(view);
+  if (status?.service?.installed === true && typeof status.service.starts_at_sign_in === 'boolean') {
+    await syncAppRunEntry(status.service.starts_at_sign_in);
+  }
+}
+
 function renderFlow(view) {
   if (!view) return;
   const previousPhase = state.flow?.phase ?? null;
+  const previousChoice = state.flow?.thinking_choice ?? null;
+  const previousSaved = state.flow?.thinking_saved ?? null;
   state.flow = view;
   syncDownloadWatch(view.watch_downloads);
-  if (view.phase !== previousPhase) thinkingChoicesOpen = false;
+  if ((view.phase ?? null) !== previousPhase ||
+      (view.thinking_choice ?? null) !== previousChoice ||
+      (view.thinking_saved ?? null) !== previousSaved) {
+    thinkingChoicesOpen = false;
+  }
+
+  if (view.phase === 'setup' && view.setup_running === true) {
+    setupRunningArmed = true;
+  }
 
   if (view.resting) {
     show('main');
@@ -473,6 +646,10 @@ function renderFlow(view) {
     return;
   }
   if (view.phase === 'home') {
+    if (setupRunningArmed) {
+      finishSetupToHome(view);
+      return;
+    }
     landHome(view);
     return;
   }
@@ -481,6 +658,13 @@ function renderFlow(view) {
   const focused = document.activeElement;
   if (view.phase === previousPhase && focused && focused.tagName === 'INPUT' && root.contains(focused)) {
     return;
+  }
+
+  let savedTag = null;
+  let savedText = null;
+  if (view.phase === previousPhase && focused && root.contains(focused)) {
+    savedTag = focused.tagName;
+    savedText = focused.textContent.trim();
   }
 
   root.replaceChildren();
@@ -493,6 +677,14 @@ function renderFlow(view) {
   }
 
   if (view.phase === 'opening') {
+    const installed = state.status?.service?.installed === true;
+    const hasPort = state.status?.service?.port != null;
+    const disp = display();
+    if (installed && hasPort && (disp === 'stopped' || disp === 'not-running')) {
+      show('main');
+      render();
+      return;
+    }
     put(card,
       view.error ? failure(COPY.setupStopped, view.error) : null,
       view.error ? el('div', { class: 'actions centered' },
@@ -638,6 +830,35 @@ function renderFlow(view) {
     const markBox = el('div');
     const markMissing = view.mark?.render == null;
     if (!markMissing) renderMarkCard(markBox, view.mark.render);
+    const canCommit = view.authoritative !== false && displayableMark(view.mark?.render);
+    const actions = [];
+    if (view.authoritative === false) {
+      actions.push(el('button', {
+        type: 'button',
+        disabled: Boolean(view.busy),
+        on: { click: () => call('flow', { intent: 'retry-state' }) },
+      }, document.createTextNode(COPY.tryAgain)));
+    }
+    if (markCopy.try_another) {
+      actions.push(el('button', {
+        type: 'button',
+        disabled: Boolean(view.busy) || view.authoritative === false,
+        on: { click: () => {
+          if (view.authoritative === false) return;
+          call('flow', { intent: 'regenerate-mark' });
+        } },
+      }, document.createTextNode(markCopy.try_another)));
+    }
+    actions.push(el('button', {
+      type: 'button',
+      class: 'primary',
+      disabled: Boolean(view.busy) || !canCommit,
+      on: { click: () => {
+        if (!canCommit) return;
+        call('flow', { intent: 'commit-mark', proposal_id: proposalId });
+      } },
+    }, document.createTextNode(markCopy.continue || COPY.continueButton)));
+
     put(card,
       markCopy.title ? el('h1', {}, document.createTextNode(markCopy.title)) : el('h1', {}, document.createTextNode('')),
       markCopy.help ? el('p', { class: 'muted' }, document.createTextNode(markCopy.help)) : null,
@@ -646,32 +867,30 @@ function renderFlow(view) {
         : markBox,
       markCopy.permanence ? el('p', { class: 'faint' }, document.createTextNode(markCopy.permanence)) : null,
       view.error ? el('p', { class: 'error' }, document.createTextNode(view.error)) : null,
-      el('div', { class: 'actions' },
-        markCopy.try_another ? el('button', {
-          type: 'button',
-          disabled: Boolean(view.busy),
-          on: { click: () => call('flow', { intent: 'regenerate-mark' }) },
-        }, document.createTextNode(markCopy.try_another)) : null,
-        el('button', {
-          type: 'button',
-          class: 'primary',
-          disabled: Boolean(view.busy),
-          on: { click: () => call('flow', { intent: 'commit-mark', proposal_id: proposalId }) },
-        }, document.createTextNode(markCopy.continue || COPY.continueButton))
-      )
+      el('div', { class: 'actions' }, ...actions)
     );
   } else if (view.phase === 'thinking') {
     const thinkingCopy = view.copy?.thinking || {};
     const finalizeButton = view.can_finalize ? el('button', {
       type: 'button',
       class: 'primary',
-      disabled: Boolean(view.busy),
+      disabled: Boolean(view.busy) || view.authoritative === false,
       on: { click: () => {
+        if (view.authoritative === false) return;
         let tz = null;
         try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch { /* the journal can place the day */ }
         call('flow', { intent: 'finalize', timezone: tz });
       } },
     }, document.createTextNode(thinkingCopy.continue || COPY.continueButton)) : null;
+    const actions = [];
+    if (view.authoritative === false) {
+      actions.push(el('button', {
+        type: 'button',
+        disabled: Boolean(view.busy),
+        on: { click: () => call('flow', { intent: 'retry-state' }) },
+      }, document.createTextNode(COPY.tryAgain)));
+    }
+    if (finalizeButton) actions.push(finalizeButton);
     put(card,
       thinkingCopy.title ? el('h1', {}, document.createTextNode(thinkingCopy.title)) : el('h1', {}, document.createTextNode('')),
       ...thinkingChoiceNodes(view),
@@ -679,7 +898,7 @@ function renderFlow(view) {
       thinkingBlock(),
       modelsBlock(),
       view.error ? el('p', { class: 'error' }, document.createTextNode(view.error)) : null,
-      el('div', { class: 'actions' }, finalizeButton)
+      actions.length ? el('div', { class: 'actions' }, ...actions) : null
     );
   }
 
@@ -689,6 +908,13 @@ function renderFlow(view) {
     if (heading) {
       heading.tabIndex = -1;
       heading.focus();
+    }
+  } else if (savedTag) {
+    const candidate = [...card.querySelectorAll(savedTag.toLowerCase())].find(
+      el => el.textContent.trim() === savedText && !el.disabled
+    );
+    if (candidate) {
+      candidate.focus();
     }
   }
 }
@@ -709,7 +935,8 @@ function landHome(view) {
     if (display() === 'running') loadJournalFacts();
     return;
   }
-  if (!$('main').hidden && state.pane === 'home') render(false);
+  show('main');
+  if (state.pane === 'home') render(false);
 }
 
 listeners.flow.push(({ view }) => {
@@ -767,6 +994,15 @@ function statusLine() {
 }
 
 function message() {
+  if (syncRetryNeeded) {
+    return el('div', { class: 'field' },
+      state.message ? el('p', { class: 'error' }, state.message) : null,
+      el('button', {
+        type: 'button',
+        on: { click: () => retrySyncSignIn() }
+      }, COPY.tryAgain)
+    );
+  }
   return state.message ? el('p', { class: 'muted' }, state.message) : null;
 }
 
@@ -819,8 +1055,11 @@ function speechBlock() {
   if (speech.state === 'error' && flow.speech_retry) {
     parts.push(el('button', {
       type: 'button',
-      disabled: Boolean(flow.busy),
-      on: { click: () => call('flow', { intent: 'retry-speech-download' }) },
+      disabled: Boolean(flow.busy) || flow.authoritative === false,
+      on: { click: () => {
+        if (flow.authoritative === false) return;
+        call('flow', { intent: 'retry-speech-download' });
+      } },
     }, document.createTextNode(retryWord(copy))));
   }
   if (!parts.length) return null;
@@ -844,16 +1083,22 @@ function thinkingBlock() {
   if (flow.thinking_retry && ['error', 'cancelled', 'idle'].includes(thinking.state)) {
     parts.push(el('button', {
       type: 'button',
-      disabled: Boolean(flow.busy),
-      on: { click: () => call('flow', { intent: 'start-thinking-download' }) },
+      disabled: Boolean(flow.busy) || flow.authoritative === false,
+      on: { click: () => {
+        if (flow.authoritative === false) return;
+        call('flow', { intent: 'start-thinking-download' });
+      } },
     }, document.createTextNode(retryWord(copy))));
   }
   const paintedAttempt = typeof thinking.attempt_id === 'string' ? thinking.attempt_id : '';
   if (flow.thinking_cancel && paintedAttempt.trim()) {
     parts.push(el('button', {
       type: 'button',
-      disabled: Boolean(flow.busy),
-      on: { click: () => call('flow', { intent: 'cancel-thinking-download', attempt_id: paintedAttempt }) },
+      disabled: Boolean(flow.busy) || flow.authoritative === false,
+      on: { click: () => {
+        if (flow.authoritative === false) return;
+        call('flow', { intent: 'cancel-thinking-download', attempt_id: paintedAttempt });
+      } },
     }, document.createTextNode(copy.cancel || COPY.cancel)));
   }
   if (!parts.length) return null;
@@ -891,11 +1136,19 @@ const panes = {
     } else {
       offer = el('button', { type: 'button', on: { click: () => openPane('run') } }, COPY.runStateLink);
     }
+    const authRetry = state.flow?.authoritative === false ? el('div', { class: 'actions centered' },
+      el('button', {
+        type: 'button',
+        disabled: Boolean(state.flow?.busy),
+        on: { click: () => call('flow', { intent: 'retry-state' }) },
+      }, COPY.tryAgain)
+    ) : null;
     return [
       el('h1', {}, COPY.homeTitle),
       markBox,
       statusLine(),
       message(),
+      authRetry,
       flowError(),
       speechBlock(),
       thinkingBlock(),
@@ -1479,7 +1732,19 @@ function render(force = false) {
   const focused = document.activeElement;
   const keepFocus = focused && pane.contains(focused) && focused.tagName === 'INPUT';
   if (keepFocus) return; // don't pull a field out from under the owner's typing
+  let savedTag = null;
+  let savedText = null;
+  if (focused && pane.contains(focused)) {
+    savedTag = focused.tagName;
+    savedText = focused.textContent.trim();
+  }
   pane.replaceChildren(...[panes[state.pane]()].flat().filter(Boolean));
+  if (savedTag) {
+    const candidate = [...pane.querySelectorAll(savedTag.toLowerCase())].find(
+      el => el.textContent.trim() === savedText && !el.disabled
+    );
+    if (candidate) candidate.focus();
+  }
   // The pairing panel replaces the list in place, so the button the owner
   // pressed is gone: start them at the panel's heading.
   if (pairing.phase && state.pane === 'devices' && !pane.contains(document.activeElement)) {
@@ -1488,6 +1753,55 @@ function render(force = false) {
 }
 
 // --- launch ---------------------------------------------------------------
+
+let booted = false;
+
+async function continueStartup() {
+  try {
+    await refreshStatus(true);
+  } catch (error) {
+    $('loading').replaceChildren(
+      el('p', { class: 'error' }, document.createTextNode(error.message || "couldn't read journal status")),
+      el('button', {
+        type: 'button',
+        on: { click: () => continueStartup() },
+      }, document.createTextNode(COPY.tryAgain))
+    );
+    return;
+  }
+
+  if (typeof state.status?.service?.installed !== 'boolean') {
+    $('loading').replaceChildren(
+      el('p', { class: 'error' }, document.createTextNode(state.message || "couldn't read journal status")),
+      el('button', {
+        type: 'button',
+        on: { click: () => continueStartup() },
+      }, document.createTextNode(COPY.tryAgain))
+    );
+    return;
+  }
+
+  // Opening the app starts the journal, as opening the Mac app does. A
+  // sign-in start leaves that to the journal's own task, and an update puts
+  // it back only if the owner had it running.
+  if (state.init.launch === 'plain' && !['running', 'starting'].includes(display()) && state.status?.set_up) {
+    await serviceAction('start');
+  }
+
+  if (!booted) {
+    booted = true;
+    await call('flow', { intent: 'boot', task_installed: state.status.service.installed });
+  }
+
+  startPolling();
+
+  if (state.status?.service?.installed === true && typeof state.status?.service?.starts_at_sign_in === 'boolean') {
+    await syncAppRunEntry(state.status.service.starts_at_sign_in);
+  }
+  if (display() === 'running') {
+    await loadJournalFacts();
+  }
+}
 
 async function main() {
   $('admin-terminal').addEventListener('click', () => call('adminTerminal').catch(error => {
@@ -1504,31 +1818,8 @@ async function main() {
 
   state.init = await call('init');
   // The locked mark the app last drew, until the running journal says.
-  if (validMark(state.init.mark)) state.mark = state.init.mark;
-  await refreshStatus();
-
-  if (typeof state.status?.service?.installed !== 'boolean') {
-    $('loading').replaceChildren(el('p', { class: 'error' }, document.createTextNode(state.message || "couldn't read journal status")));
-    return;
-  }
-
-  // Opening the app starts the journal, as opening the Mac app does. A
-  // sign-in start leaves that to the journal's own task, and an update puts
-  // it back only if the owner had it running.
-  if (state.init.launch === 'plain' && !['running', 'starting'].includes(display()) && state.status?.set_up) {
-    await serviceAction('start');
-  }
-
-  await call('flow', { intent: 'boot', task_installed: state.status.service.installed });
-
-  startPolling();
-
-  if (state.status?.service?.installed === true && typeof state.status?.service?.starts_at_sign_in === 'boolean') {
-    await call('syncSignInLaunch', { on: state.status.service.starts_at_sign_in }).catch(() => {});
-  }
-  if (display() === 'running') {
-    await loadJournalFacts();
-  }
+  if (validMark(state.init?.mark)) state.mark = state.init.mark;
+  await continueStartup();
 }
 
 main().catch(error => {
