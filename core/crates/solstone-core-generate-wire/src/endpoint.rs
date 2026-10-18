@@ -173,6 +173,7 @@ pub(crate) fn endpoint_generate_with_context(
     config: &Map<String, Value>,
     runtime: &EndpointRuntime,
     context: &crate::GenerateCallContext<'_>,
+    gate: Option<&crate::credential_binding::ContentGate<'_>>,
 ) -> EndpointResult {
     endpoint_generate_internal_with_context(
         request,
@@ -184,6 +185,7 @@ pub(crate) fn endpoint_generate_with_context(
         Instant::now(),
         Instant::now(),
         context,
+        gate,
     )
 }
 
@@ -236,6 +238,7 @@ pub(crate) fn endpoint_generate_internal<T: EndpointTransport>(
             priority,
             cancellation: &solstone_core_generate::Cancellation::never(),
         },
+        None,
     )
 }
 
@@ -250,6 +253,7 @@ pub(crate) fn endpoint_generate_internal_with_context<T: EndpointTransport>(
     now: Instant,
     started: Instant,
     context: &crate::GenerateCallContext<'_>,
+    gate: Option<&crate::credential_binding::ContentGate<'_>>,
 ) -> EndpointResult {
     if context.cancellation.is_cancelled() {
         return failure("request_cancelled");
@@ -263,6 +267,24 @@ pub(crate) fn endpoint_generate_internal_with_context<T: EndpointTransport>(
         Ok(prepared) => prepared,
         Err(reason_code) => return failure(reason_code),
     };
+    if let Some(gate) = gate {
+        let credential = endpoint.credential.as_deref().unwrap_or("");
+        let binding = crate::credential_binding::classify_endpoint_binding(
+            journal_path,
+            config,
+            &endpoint.base_url,
+            credential,
+        );
+        if crate::credential_binding::endpoint_admission_refuses(
+            request,
+            gate.admit_content,
+            binding,
+        ) {
+            return failure("provider_key_invalid");
+        }
+    }
+    let witness =
+        gate.and_then(|gate| crate::credential_binding::capture_root_witness(gate.journal));
     let timeout = request_timeout(request.timeout_s, thinking_headroom(endpoint, config));
     let Some(admission_timeout) = remaining_timeout(started, timeout) else {
         return failure("local_capacity_exhausted");
@@ -341,6 +363,17 @@ pub(crate) fn endpoint_generate_internal_with_context<T: EndpointTransport>(
     };
     let secret = endpoint.credential.as_deref().unwrap_or("");
     if !(200..300).contains(&response.status) {
+        if let (Some(gate), Some(credential)) = (gate, endpoint.credential.as_deref()) {
+            crate::credential_binding::retain_endpoint_rejection(
+                gate,
+                witness.as_ref(),
+                request,
+                &endpoint.base_url,
+                credential,
+                response.status,
+                &response.body,
+            );
+        }
         let detail = capture_provider_detail(&response.body, secret);
         return EndpointResult::Failed(EndpointFailure {
             reason_code: Some(non_success_reason(endpoint, response.status).to_owned()),

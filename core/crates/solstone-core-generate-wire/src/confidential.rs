@@ -613,6 +613,7 @@ where
         Instant::now(),
         started,
         context,
+        None,
     );
 
     if let EndpointResult::Generated(_) = &result

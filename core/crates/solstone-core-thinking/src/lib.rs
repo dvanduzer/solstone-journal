@@ -30,6 +30,8 @@ pub enum MutationError {
     Read(ConfigLoadError),
     /// The configuration committed, but its audit record could not be appended.
     ActionLog(String),
+    /// A probed key no longer matches the credential or rejection stored under the lock.
+    StaleProbe,
 }
 
 impl MutationError {

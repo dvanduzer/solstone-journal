@@ -639,6 +639,126 @@ fn sha256_text(value: &str) -> String {
     hex_digest(Sha256::digest(value.as_bytes()))
 }
 
+/// Version stored beside a credential-binding HMAC. Integer `1` only.
+pub const CREDENTIAL_BINDING_VERSION: i64 = 1;
+
+/// HMAC over the managed provider id and the credential that was sent.
+pub fn managed_credential_binding_hmac(key: &[u8; 32], provider: &str, credential: &str) -> String {
+    let mut material = String::from("solstone-credential-binding/v1\0");
+    material.push_str(provider);
+    material.push('\0');
+    material.push_str(credential);
+    hmac_sha256(key, &material)
+}
+
+/// HMAC over a custom endpoint base URL and its credential, or an empty credential.
+pub fn endpoint_credential_binding_hmac(
+    key: &[u8; 32],
+    base_url: &str,
+    credential_or_empty: &str,
+) -> String {
+    let mut material = String::from("solstone-endpoint-binding/v1\0");
+    material.push_str(base_url);
+    material.push('\0');
+    material.push_str(credential_or_empty);
+    hmac_sha256(key, &material)
+}
+
+/// How a stored `key_validation` entry relates to the credential now configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoredCredentialBinding {
+    /// No binding fields. Legacy validation objects are unbound.
+    Unbound,
+    /// `provider_key_invalid` bound to this credential under version 1.
+    Matches,
+    /// A readable result that does not reject this credential.
+    DoesNotReject,
+    /// A `provider_key_invalid` claim whose binding cannot be checked.
+    Corrupt,
+}
+
+/// Classify one stored validation entry against the credential HMAC it should carry.
+pub fn classify_stored_binding(
+    entry: Option<&Value>,
+    key: Option<&[u8; 32]>,
+    expected_hmac: Option<&str>,
+) -> StoredCredentialBinding {
+    let Some(object) = entry.and_then(Value::as_object) else {
+        return StoredCredentialBinding::Unbound;
+    };
+    let version = object.get("binding_version");
+    let hmac = object.get("credential_hmac");
+    if version.is_none() && hmac.is_none() {
+        return StoredCredentialBinding::Unbound;
+    }
+    if object.get("reason_code").and_then(Value::as_str) != Some("provider_key_invalid") {
+        return StoredCredentialBinding::DoesNotReject;
+    }
+    if key.is_none() {
+        return StoredCredentialBinding::Corrupt;
+    }
+    let Some(version) = version.and_then(Value::as_i64) else {
+        return StoredCredentialBinding::Corrupt;
+    };
+    if version != CREDENTIAL_BINDING_VERSION {
+        return StoredCredentialBinding::Corrupt;
+    }
+    let Some(stored) = hmac
+        .and_then(Value::as_str)
+        .filter(|value| is_binding_hmac(value))
+    else {
+        return StoredCredentialBinding::Corrupt;
+    };
+    match expected_hmac {
+        Some(expected) if stored == expected => StoredCredentialBinding::Matches,
+        _ => StoredCredentialBinding::DoesNotReject,
+    }
+}
+
+/// Record version 1 and the credential HMAC on one validation object.
+pub fn attach_credential_binding(entry: &mut Map<String, Value>, hmac_hex: &str) {
+    entry.insert(
+        "binding_version".to_owned(),
+        Value::Number(serde_json::Number::from(CREDENTIAL_BINDING_VERSION)),
+    );
+    entry.insert(
+        "credential_hmac".to_owned(),
+        Value::String(hmac_hex.to_owned()),
+    );
+}
+
+/// Remove binding fields from one validation object, or from each provider object in a map.
+pub fn strip_credential_binding(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    object.remove("binding_version");
+    object.remove("credential_hmac");
+    for child in object.values_mut() {
+        if let Some(child) = child.as_object_mut() {
+            child.remove("binding_version");
+            child.remove("credential_hmac");
+        }
+    }
+}
+
+/// Base URL and credential used to bind a custom endpoint, from the local reader.
+///
+/// The credential is empty when the config omits it. Callers must not treat that
+/// empty value as a configured secret.
+pub(crate) fn endpoint_binding_parts(config: &Map<String, Value>) -> (String, String) {
+    let endpoint = local_endpoint(config);
+    let credential = endpoint.credential.filter(|value| !value.is_empty());
+    (endpoint.base_url, credential.unwrap_or_default())
+}
+
+fn is_binding_hmac(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

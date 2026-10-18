@@ -1332,6 +1332,29 @@ async fn save_key(Extension(journal): Extension<Arc<JournalRoot>>, body: Bytes) 
         Ok(validator) => validator,
         Err(response) => return *response,
     };
+    let (pre_probe_key, pre_probe_entry) = match solstone_core_thinking::read_config(&journal.0) {
+        Ok(config) => {
+            let key = config
+                .get("env")
+                .and_then(Value::as_object)
+                .and_then(|env| env.get(env_var))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+            let entry = config
+                .get("providers")
+                .and_then(Value::as_object)
+                .and_then(|providers| providers.get("key_validation"))
+                .and_then(Value::as_object)
+                .and_then(|entries| entries.get(provider))
+                .cloned();
+            (key, entry)
+        }
+        Err(error) => {
+            return mutation_error(solstone_core_thinking::MutationError::Read(error));
+        }
+    };
     let validation = (!value.is_empty()).then(|| {
         let result = validator.validate(provider, value).unwrap_or_else(
             |error| json!({"valid":false,"reason_code":"validation_unavailable","error":error}),
@@ -1344,7 +1367,13 @@ async fn save_key(Extension(journal): Extension<Arc<JournalRoot>>, body: Bytes) 
         Value::Object(result)
     });
     match solstone_core_thinking::providers::save_key(
-        &journal.0, env_var, provider, value, validation,
+        &journal.0,
+        env_var,
+        provider,
+        value,
+        validation,
+        &pre_probe_key,
+        pre_probe_entry.as_ref(),
     ) {
         Ok(value) => json_response(value),
         Err(error) => mutation_error(error),
@@ -1966,6 +1995,7 @@ fn mutation_error(error: solstone_core_thinking::MutationError) -> Response {
         solstone_core_thinking::MutationError::ConfigWrite(_error) => thinking_failure(),
         solstone_core_thinking::MutationError::Read(_error) => thinking_failure(),
         solstone_core_thinking::MutationError::ActionLog(_error) => saved_unlogged(),
+        solstone_core_thinking::MutationError::StaleProbe => thinking_failure(),
     }
 }
 
@@ -3904,6 +3934,81 @@ mod tests {
         assert_eq!(body["image_check"]["status"], "read");
         assert_eq!(counter.load(Ordering::SeqCst), before + 1);
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[tokio::test]
+    async fn overlapping_save_fails_closed() {
+        use axum::body::Bytes;
+        use axum::extract::Extension;
+
+        let response = super::mutation_error(solstone_core_thinking::MutationError::StaleProbe);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(!body.contains("\"success\":true"));
+        assert!(!body.contains("\"success\": true"));
+
+        let root = PathBuf::from("/var/tmp").join(format!(
+            "solstone-thinking-overlap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("config")).unwrap();
+        fs::write(root.join("config/journal.json"), b"{}").unwrap();
+        let rejection = json!({"valid":false,"reason_code":"provider_key_invalid"});
+        let committed = solstone_core_thinking::providers::save_key(
+            &root,
+            "OPENAI_API_KEY",
+            "openai",
+            "key-b",
+            Some(rejection),
+            "",
+            None,
+        )
+        .expect("save B commits");
+        assert_eq!(committed["success"], true);
+        let stored = solstone_core_thinking::read_config(&root).expect("config");
+        let entry = stored["providers"]["key_validation"]["openai"].clone();
+        let before = fs::read(root.join("config/journal.json")).unwrap();
+        let stale = solstone_core_thinking::providers::save_key(
+            &root,
+            "OPENAI_API_KEY",
+            "openai",
+            "key-a",
+            Some(json!({"valid":true})),
+            "",
+            None,
+        )
+        .expect_err("save A is stale");
+        assert!(matches!(
+            stale,
+            solstone_core_thinking::MutationError::StaleProbe
+        ));
+        assert_eq!(fs::read(root.join("config/journal.json")).unwrap(), before);
+        assert_eq!(
+            solstone_core_thinking::read_config(&root).expect("config")["env"]["OPENAI_API_KEY"],
+            "key-b"
+        );
+        assert_eq!(
+            solstone_core_thinking::read_config(&root).expect("config")["providers"]["key_validation"]
+                ["openai"]["credential_hmac"],
+            entry["credential_hmac"]
+        );
+
+        let rejected = super::save_key(
+            Extension(Arc::new(crate::JournalRoot(root.clone()))),
+            Bytes::from(r#"{"env_var":"NOT_A_KEY","value":"key-a"}"#),
+        )
+        .await;
+        assert_ne!(rejected.status(), StatusCode::OK);
+        let rejected_body = to_bytes(rejected.into_body(), usize::MAX).await.unwrap();
+        let rejected_body = String::from_utf8(rejected_body.to_vec()).unwrap();
+        assert!(!rejected_body.contains("\"success\":true"));
         let _ = fs::remove_dir_all(root);
     }
 }

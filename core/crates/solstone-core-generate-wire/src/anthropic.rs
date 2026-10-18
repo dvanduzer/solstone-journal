@@ -96,11 +96,29 @@ pub fn anthropic_generate(
     anthropic_generate_with(request, config, &mut transport)
 }
 
-pub(crate) fn anthropic_generate_from_config(
+pub(crate) fn anthropic_generate_admitted(
     request: &GenerateRequest,
     config: &Map<String, Value>,
+    process_overrides: bool,
+    gate: &crate::credential_binding::ContentGate<'_>,
 ) -> AnthropicResult {
-    anthropic_generate_with_lookup(request, config, &mut UreqAnthropicTransport, |_| None)
+    if process_overrides {
+        anthropic_generate_with_lookup(
+            request,
+            config,
+            &mut UreqAnthropicTransport,
+            crate::overrides::non_blank_process_env,
+            Some(gate),
+        )
+    } else {
+        anthropic_generate_with_lookup(
+            request,
+            config,
+            &mut UreqAnthropicTransport,
+            |_| None,
+            Some(gate),
+        )
+    }
 }
 
 fn anthropic_generate_with<T: AnthropicTransport>(
@@ -113,6 +131,7 @@ fn anthropic_generate_with<T: AnthropicTransport>(
         config,
         transport,
         crate::overrides::non_blank_process_env,
+        None,
     )
 }
 
@@ -121,6 +140,7 @@ fn anthropic_generate_with_lookup<T: AnthropicTransport>(
     config: &Map<String, Value>,
     transport: &mut T,
     env: impl Fn(&str) -> Option<String>,
+    gate: Option<&crate::credential_binding::ContentGate<'_>>,
 ) -> AnthropicResult {
     let env = &env;
     let Some(api_key) =
@@ -128,10 +148,29 @@ fn anthropic_generate_with_lookup<T: AnthropicTransport>(
     else {
         return failure("provider_key_missing");
     };
+    if let Some(gate) = gate {
+        let binding = crate::credential_binding::classify_managed_binding(
+            gate.journal,
+            config,
+            "anthropic",
+            &api_key,
+        );
+        if crate::credential_binding::managed_admission(
+            Some(&api_key),
+            request,
+            gate.admit_content,
+            binding,
+        ) == crate::credential_binding::ManagedAdmission::Rejected
+        {
+            return failure("provider_key_invalid");
+        }
+    }
     let Some(model) = crate::overrides::configured_model_with(config, env) else {
         return failure("model_missing");
     };
     let base_url = crate::overrides::configured_base_url_with(config, ANTHROPIC_BASE_URL, env);
+    let witness =
+        gate.and_then(|gate| crate::credential_binding::capture_root_witness(gate.journal));
     let thinking = byo_thinking(config);
     let candidates = anthropic_candidates(thinking);
     let mut step = 0;
@@ -166,6 +205,18 @@ fn anthropic_generate_with_lookup<T: AnthropicTransport>(
         break response;
     };
     if !(200..300).contains(&response.status) {
+        if let Some(gate) = gate {
+            crate::credential_binding::retain_managed_rejection(
+                gate,
+                witness.as_ref(),
+                request,
+                "anthropic",
+                ANTHROPIC_API_KEY_ENV,
+                &api_key,
+                response.status,
+                &response.body,
+            );
+        }
         let reason_code = classify_http_failure(response.status, &response.body);
         let detail = capture_provider_detail(&response.body, &api_key);
         return AnthropicResult::Failed(AnthropicFailure {
@@ -438,6 +489,7 @@ mod tests {
             &config(None, None),
             &mut transport,
             crate::overrides::lookup_leaks_conventional_keys,
+            None,
         );
         assert_eq!(
             result,
@@ -475,6 +527,7 @@ mod tests {
             &config(None, None),
             &mut transport,
             crate::overrides::lookup_api_key_override,
+            None,
         ));
         assert_eq!(transport.api_keys, ["override-secret"]);
         assert!(

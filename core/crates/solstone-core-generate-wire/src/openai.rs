@@ -100,11 +100,29 @@ pub fn openai_generate(request: &GenerateRequest, config: &Map<String, Value>) -
     openai_generate_with(request, config, &mut transport)
 }
 
-pub(crate) fn openai_generate_from_config(
+pub(crate) fn openai_generate_admitted(
     request: &GenerateRequest,
     config: &Map<String, Value>,
+    process_overrides: bool,
+    gate: &crate::credential_binding::ContentGate<'_>,
 ) -> OpenAiResult {
-    openai_generate_with_lookup(request, config, &mut UreqOpenAiTransport, |_| None)
+    if process_overrides {
+        openai_generate_with_lookup(
+            request,
+            config,
+            &mut UreqOpenAiTransport,
+            crate::overrides::non_blank_process_env,
+            Some(gate),
+        )
+    } else {
+        openai_generate_with_lookup(
+            request,
+            config,
+            &mut UreqOpenAiTransport,
+            |_| None,
+            Some(gate),
+        )
+    }
 }
 
 fn openai_generate_with<T: OpenAiTransport>(
@@ -117,6 +135,7 @@ fn openai_generate_with<T: OpenAiTransport>(
         config,
         transport,
         crate::overrides::non_blank_process_env,
+        None,
     )
 }
 
@@ -125,16 +144,36 @@ fn openai_generate_with_lookup<T: OpenAiTransport>(
     config: &Map<String, Value>,
     transport: &mut T,
     env: impl Fn(&str) -> Option<String>,
+    gate: Option<&crate::credential_binding::ContentGate<'_>>,
 ) -> OpenAiResult {
     let env = &env;
     let Some(api_key) = crate::overrides::configured_api_key_with(config, OPENAI_API_KEY_ENV, env)
     else {
         return failure("provider_key_missing");
     };
+    if let Some(gate) = gate {
+        let binding = crate::credential_binding::classify_managed_binding(
+            gate.journal,
+            config,
+            "openai",
+            &api_key,
+        );
+        if crate::credential_binding::managed_admission(
+            Some(&api_key),
+            request,
+            gate.admit_content,
+            binding,
+        ) == crate::credential_binding::ManagedAdmission::Rejected
+        {
+            return failure("provider_key_invalid");
+        }
+    }
     let Some(model) = crate::overrides::configured_model_with(config, env) else {
         return failure("model_missing");
     };
     let base_url = crate::overrides::configured_base_url_with(config, OPENAI_BASE_URL, env);
+    let witness =
+        gate.and_then(|gate| crate::credential_binding::capture_root_witness(gate.journal));
     let thinking = byo_thinking(config);
     let efforts = openai_efforts(thinking);
     let mut step = 0;
@@ -172,6 +211,18 @@ fn openai_generate_with_lookup<T: OpenAiTransport>(
         break response;
     };
     if !(200..300).contains(&response.status) {
+        if let Some(gate) = gate {
+            crate::credential_binding::retain_managed_rejection(
+                gate,
+                witness.as_ref(),
+                request,
+                "openai",
+                OPENAI_API_KEY_ENV,
+                &api_key,
+                response.status,
+                &response.body,
+            );
+        }
         let reason_code = classify_http_failure(response.status, &response.body);
         let detail = capture_provider_detail(&response.body, &api_key);
         return OpenAiResult::Failed(OpenAiFailure {
@@ -1081,6 +1132,7 @@ mod tests {
             &config(None, None),
             &mut transport,
             crate::overrides::lookup_leaks_conventional_keys,
+            None,
         );
         assert_eq!(
             result,

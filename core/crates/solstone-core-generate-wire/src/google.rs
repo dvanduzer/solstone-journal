@@ -92,11 +92,29 @@ pub fn google_generate(request: &GenerateRequest, config: &Map<String, Value>) -
     google_generate_with(request, config, &mut transport)
 }
 
-pub(crate) fn google_generate_from_config(
+pub(crate) fn google_generate_admitted(
     request: &GenerateRequest,
     config: &Map<String, Value>,
+    process_overrides: bool,
+    gate: &crate::credential_binding::ContentGate<'_>,
 ) -> GoogleResult {
-    google_generate_with_lookup(request, config, &mut UreqGoogleTransport, |_| None)
+    if process_overrides {
+        google_generate_with_lookup(
+            request,
+            config,
+            &mut UreqGoogleTransport,
+            crate::overrides::non_blank_process_env,
+            Some(gate),
+        )
+    } else {
+        google_generate_with_lookup(
+            request,
+            config,
+            &mut UreqGoogleTransport,
+            |_| None,
+            Some(gate),
+        )
+    }
 }
 
 fn google_generate_with<T: GoogleTransport>(
@@ -109,6 +127,7 @@ fn google_generate_with<T: GoogleTransport>(
         config,
         transport,
         crate::overrides::non_blank_process_env,
+        None,
     )
 }
 
@@ -117,16 +136,36 @@ fn google_generate_with_lookup<T: GoogleTransport>(
     config: &Map<String, Value>,
     transport: &mut T,
     env: impl Fn(&str) -> Option<String>,
+    gate: Option<&crate::credential_binding::ContentGate<'_>>,
 ) -> GoogleResult {
     let env = &env;
     let Some(api_key) = crate::overrides::configured_api_key_with(config, GOOGLE_API_KEY_ENV, env)
     else {
         return failure("provider_key_missing");
     };
+    if let Some(gate) = gate {
+        let binding = crate::credential_binding::classify_managed_binding(
+            gate.journal,
+            config,
+            "google",
+            &api_key,
+        );
+        if crate::credential_binding::managed_admission(
+            Some(&api_key),
+            request,
+            gate.admit_content,
+            binding,
+        ) == crate::credential_binding::ManagedAdmission::Rejected
+        {
+            return failure("provider_key_invalid");
+        }
+    }
     let Some(model) = crate::overrides::configured_model_with(config, env) else {
         return failure("model_missing");
     };
     let base_url = crate::overrides::configured_base_url_with(config, GOOGLE_BASE_URL, env);
+    let witness =
+        gate.and_then(|gate| crate::credential_binding::capture_root_witness(gate.journal));
     let path = format!("/v1beta/models/{model}:generateContent");
     let thinking = byo_thinking(config);
     let levels = google_levels(thinking);
@@ -203,6 +242,18 @@ fn google_generate_with_lookup<T: GoogleTransport>(
         }
     };
     if !(200..300).contains(&response.status) {
+        if let Some(gate) = gate {
+            crate::credential_binding::retain_managed_rejection(
+                gate,
+                witness.as_ref(),
+                request,
+                "google",
+                GOOGLE_API_KEY_ENV,
+                &api_key,
+                response.status,
+                &response.body,
+            );
+        }
         let reason_code = classify_http_failure(response.status, &response.body);
         let detail = capture_provider_detail(&response.body, &api_key);
         return GoogleResult::Failed(GoogleFailure {
@@ -394,7 +445,7 @@ fn normalize_finish_reason(candidate: &Value) -> String {
     }
 }
 
-fn classify_http_failure(status: u16, body: &str) -> &'static str {
+pub(crate) fn classify_http_failure(status: u16, body: &str) -> &'static str {
     match status {
         401 | 403 => "provider_key_invalid",
         400 if body.contains("API_KEY_INVALID") => "provider_key_invalid",
@@ -1070,6 +1121,7 @@ mod tests {
             &config(None, None),
             &mut transport,
             crate::overrides::lookup_leaks_conventional_keys,
+            None,
         );
         assert_eq!(
             result,

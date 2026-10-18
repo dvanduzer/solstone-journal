@@ -16,11 +16,13 @@ mod writer;
 mod corpus_tests;
 
 pub use fingerprint::{
-    BundledRuntimeDesired, CanonicalInput, FingerprintError, LaneResolution,
+    BundledRuntimeDesired, CREDENTIAL_BINDING_VERSION, CanonicalInput, FingerprintError,
+    LaneResolution, StoredCredentialBinding, attach_credential_binding,
     build_active_brain_fingerprint, bundled_runtime_desired_fingerprint, canonical_fingerprint,
     canonical_fingerprint_preserving_array_order, canonical_json,
-    canonical_json_preserving_array_order, derive_active_brain_lane, fingerprint_sha256,
-    is_cloud_byo_provider,
+    canonical_json_preserving_array_order, classify_stored_binding, derive_active_brain_lane,
+    endpoint_credential_binding_hmac, fingerprint_sha256, is_cloud_byo_provider,
+    managed_credential_binding_hmac, strip_credential_binding,
 };
 pub use inspect::{
     BrainInspection, BrainProjection, BundledRuntimePrerequisiteAssessment, InspectionStatus,

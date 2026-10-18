@@ -196,13 +196,27 @@ pub fn confidential_disable(ctx: CommandContext<'_>) -> CommandOutput {
     }
 }
 
+fn strip_credential_binding_fields(mut value: Value) -> Value {
+    if let Some(object) = value.as_object_mut() {
+        object.remove("binding_version");
+        object.remove("credential_hmac");
+        for child in object.values_mut() {
+            if let Some(child) = child.as_object_mut() {
+                child.remove("binding_version");
+                child.remove("credential_hmac");
+            }
+        }
+    }
+    value
+}
+
 #[must_use]
 pub fn keys_show(ctx: CommandContext<'_>) -> CommandOutput {
     match get_keys(ctx) {
         Ok(response) => stdout_json_value(&json!({
             "api_keys": response.get("api_keys").cloned().unwrap_or_else(|| json!({})),
             "env": response.get("env").cloned().unwrap_or_else(|| json!({})),
-            "key_validation": response.get("key_validation").cloned().unwrap_or_else(|| json!({})),
+            "key_validation": strip_credential_binding_fields(response.get("key_validation").cloned().unwrap_or_else(|| json!({}))),
         })),
         Err(error) => thinking_error(error),
     }
@@ -235,7 +249,7 @@ pub fn keys_set(ctx: CommandContext<'_>) -> CommandOutput {
             stdout_json_value(&json!({
                 "env_var": env_var,
                 "set": true,
-                "validation": response.get("key_validation").and_then(|item| item.get(provider)).cloned().unwrap_or(Value::Null),
+                "validation": strip_credential_binding_fields(response.get("key_validation").and_then(|item| item.get(provider)).cloned().unwrap_or(Value::Null)),
             }))
         }
         Err(error) => invalid_config_detail_error(error),
@@ -279,7 +293,7 @@ pub fn keys_validate(ctx: CommandContext<'_>) -> CommandOutput {
     };
     match request_json(ctx, method, "/app/thinking/api/validate-keys", vec![], None) {
         Ok(response) => stdout_json_value(&json!({
-            "key_validation": response.get("key_validation").cloned().unwrap_or_else(|| json!({})),
+            "key_validation": strip_credential_binding_fields(response.get("key_validation").cloned().unwrap_or_else(|| json!({}))),
         })),
         Err(error) => thinking_error(error),
     }
@@ -305,7 +319,7 @@ pub fn providers_show(ctx: CommandContext<'_>) -> CommandOutput {
         "active": response.get("active").cloned().unwrap_or_else(|| json!({})),
         "local_override": response.get("local_override").cloned().unwrap_or_else(|| json!({})),
         "api_keys": response.get("api_keys").cloned().unwrap_or_else(|| json!({})),
-        "key_validation": response.get("key_validation").cloned().unwrap_or_else(|| json!({})),
+        "key_validation": strip_credential_binding_fields(response.get("key_validation").cloned().unwrap_or_else(|| json!({}))),
     }))
 }
 
