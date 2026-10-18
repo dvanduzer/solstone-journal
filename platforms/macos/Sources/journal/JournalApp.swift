@@ -18,6 +18,7 @@ final class JournalAppModel {
     let windowModel: JournalWindowModel
     let firstRunModel: JournalFirstRunModel
     private var startupTask: Task<Void, Never>?
+    private var activationTasks: [Task<Void, Never>] = []
     private(set) var terminationPrepared = false
     private(set) var appKitTerminationBegan = false
 
@@ -41,7 +42,11 @@ final class JournalAppModel {
             startSupervisor: { [supervisor] root in
                 await supervisor.start(journalRoot: root)
             },
-            windowModel: windowModel
+            windowModel: windowModel,
+            supervisorIsLive: { [supervisor] root in
+                supervisor.state == .running
+                    && supervisor.activeJournalRoot?.standardizedFileURL.path == root.standardizedFileURL.path
+            }
         )
     }
 
@@ -51,11 +56,22 @@ final class JournalAppModel {
         }
         JournalMarkFont.register()
         iconManager.start()
-        config.applyLaunchAtLoginPreference()
+        _ = config.applyLaunchAtLoginPreference()
+        windowModel.noteLaunchAtLoginApplied()
         windowModel.prepareForWindowOpen()
-        startupTask = Task { @MainActor [firstRunModel] in
-            await firstRunModel.decideLaunchRoute()
+        startActivation()
+    }
+
+    func reconcileForReopen() {
+        startActivation()
+    }
+
+    private func startActivation() {
+        let task = Task { @MainActor [firstRunModel] in
+            await firstRunModel.reconcileActivation()
         }
+        activationTasks.append(task)
+        startupTask = task
     }
 
     func prepareWindowOpen(load: Bool = true) {
@@ -72,6 +88,7 @@ final class JournalAppModel {
         guard !terminationPrepared else { return }
         terminationPrepared = true
         startupTask?.cancel()
+        activationTasks.forEach { $0.cancel() }
         await firstRunModel.prepareForTermination()
         await supervisor.terminate(reason: "ordinary-quit")
     }
@@ -164,6 +181,7 @@ final class JournalAppDelegate: NSObject, NSApplicationDelegate {
             NotificationCenter.default.post(name: .openJournalWindow, object: nil)
             NSApp.activate(ignoringOtherApps: true)
         }
+        model.reconcileForReopen()
         return true
     }
 

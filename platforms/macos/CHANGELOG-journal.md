@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- if start at login can't be changed, the journal app keeps the previous setting and shows an error.
+
 ## [2.0.50 (build 93)] - 2026-10-18
 
 ### Changed

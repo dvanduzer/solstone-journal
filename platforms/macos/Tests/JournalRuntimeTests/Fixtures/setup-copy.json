@@ -1,0 +1,81 @@
+{
+  "schema": "solstone.setup-copy.v1",
+  "heading": "your journal",
+  "welcome": {
+    "title": "welcome to solstone.",
+    "body": "the solstone app takes in what you share with it, and all of it goes into your journal.",
+    "how_it_fits": [
+      "welcome to solstone.",
+      "the solstone app takes in what you share with it, and all of it goes into your journal.",
+      "your journal is always private, only yours."
+    ]
+  },
+  "fits": {
+    "title": "how it fits together",
+    "journal_term": "your journal",
+    "journal": "lives on your journal's computer and keeps everything that goes into it.",
+    "app_term": "the solstone app",
+    "app": "runs on each device you choose and takes in what you share with it. all of it goes into your journal.",
+    "thinking_term": "thinking",
+    "thinking": "helps your journal make sense of what it keeps. choose where it happens below, or later."
+  },
+  "login": {
+    "label": "start your journal when you sign in",
+    "help": "start automatically after you sign in to your journal's computer."
+  },
+  "folder": {
+    "title": "journal folder",
+    "help": "where your journal is kept on your journal's computer.",
+    "change": "change folder",
+    "continue": "continue"
+  },
+  "mark": {
+    "title": "your journal mark",
+    "help": "a unique visual mark created for your journal.",
+    "error": "your journal mark could not be loaded. try again.",
+    "permanence": "continue makes this your journal's mark for good.",
+    "try_another": "try another",
+    "continue": "continue"
+  },
+  "thinking": {
+    "title": "thinking",
+    "choices": [
+      {
+        "id": "local",
+        "label": "local",
+        "sub": "on your journal's computer",
+        "description": "model requests stay on your journal's computer."
+      },
+      {
+        "id": "spp",
+        "label": "confidential processing",
+        "sub": "paid · sign-in required",
+        "description": "sol pbc runs the model on confidential GPUs."
+      },
+      {
+        "id": "byo",
+        "label": "your own model",
+        "sub": "your key, or your own endpoint",
+        "description": "your journal sends model requests to the provider or endpoint you choose. provider keys stay in your journal."
+      }
+    ],
+    "default_line": "on your journal's computer · {size}",
+    "size_unknown": "download size unavailable",
+    "choose_later": "choose thinking when you're ready",
+    "change": "change",
+    "later": "decide later",
+    "continue": "continue"
+  },
+  "downloads": {
+    "speech": "speech recognition",
+    "thinking": "local thinking",
+    "progress": "downloading…",
+    "cancel": "cancel",
+    "retry": "try again",
+    "error": "download failed. try again.",
+    "idle": "not started",
+    "complete": "ready",
+    "cancelled": "cancelled"
+  },
+  "footer": "your journal is kept on your journal's computer. thinking uses the option you choose."
+}

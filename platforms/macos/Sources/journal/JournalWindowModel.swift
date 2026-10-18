@@ -244,6 +244,12 @@ final class JournalWindowModel {
         config.launchAtLoginEnabled
     }
 
+    private(set) var launchAtLoginFailure: String?
+
+    func noteLaunchAtLoginApplied() {
+        launchAtLoginFailure = config.launchAtLoginFailureSentence
+    }
+
     var runDisplay: JournalRunDisplay {
         JournalRunDisplay.derive(state: supervisor.state, runtimeStatus: supervisor.runtimeStatus)
     }
@@ -380,7 +386,8 @@ final class JournalWindowModel {
     }
 
     func setLaunchAtLoginEnabled(_ enabled: Bool) {
-        config.setLaunchAtLoginEnabled(enabled)
+        _ = config.setLaunchAtLoginEnabled(enabled)
+        launchAtLoginFailure = config.launchAtLoginFailureSentence
     }
 
     func startJournal() {
