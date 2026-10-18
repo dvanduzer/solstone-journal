@@ -31,6 +31,15 @@ rowid INTEGER PRIMARY KEY,
 is_activity INTEGER NOT NULL CHECK (is_activity IN (0, 1))
 )";
 
+// `chunks` is FTS5 with `path` unindexed, so a path predicate on it reads the
+// whole index. These run once or twice per file on every scan; they reach a
+// file's rows through the indexed `chunk_sources` mapping instead.
+const MEMBERSHIP_MISSING_FOR_PATH: &str = "SELECT EXISTS(SELECT 1 FROM chunk_sources AS s JOIN chunks ON chunks.rowid=s.rowid LEFT JOIN activity_membership AS m ON m.rowid=s.rowid WHERE s.path=? AND chunks.agent='activity' AND m.rowid IS NULL)";
+const CHUNK_COUNT_FOR_PATH: &str = "SELECT count(*) FROM chunk_sources WHERE path = ?";
+const DIGESTS_FOR_PATH: &str = "\
+SELECT CASE WHEN typeof(p.digest)='blob' AND length(p.digest)=32 THEN p.digest ELSE NULL END \
+FROM chunk_sources AS s JOIN activity_provenance AS p ON p.rowid = s.rowid WHERE s.path = ?";
+
 pub(crate) fn record_activity_membership(
     conn: &Connection,
     rowid: i64,
@@ -57,7 +66,9 @@ pub(crate) fn activity_membership_current(
     conn: &Connection,
     rel: &str,
 ) -> Result<bool, StoreError> {
-    Ok(!conn.query_row("SELECT EXISTS(SELECT 1 FROM chunks LEFT JOIN activity_membership AS m ON m.rowid=chunks.rowid WHERE chunks.path=? AND chunks.agent='activity' AND m.rowid IS NULL)", [rel], |row| row.get::<_, bool>(0))?)
+    Ok(!conn.query_row(MEMBERSHIP_MISSING_FOR_PATH, [rel], |row| {
+        row.get::<_, bool>(0)
+    })?)
 }
 
 pub(crate) fn digest_bytes(bytes: &[u8]) -> [u8; 32] {
@@ -123,19 +134,11 @@ pub(crate) fn activity_source_current(
         return Ok(false);
     }
     let digest = digest_bytes(text.as_bytes());
-    let chunk_count: i64 =
-        conn.query_row("SELECT count(*) FROM chunks WHERE path = ?", [rel], |row| {
-            row.get(0)
-        })?;
+    let chunk_count: i64 = conn.query_row(CHUNK_COUNT_FOR_PATH, [rel], |row| row.get(0))?;
     if chunk_count == 0 {
         return Ok(!activity_file_has_chunk(rel, &text));
     }
-    let mut statement = conn.prepare(
-        "SELECT CASE WHEN typeof(activity_provenance.digest)='blob' AND length(activity_provenance.digest)=32 THEN activity_provenance.digest ELSE NULL END \
-         FROM chunks \
-         JOIN activity_provenance ON activity_provenance.rowid = chunks.rowid \
-         WHERE chunks.path = ?",
-    )?;
+    let mut statement = conn.prepare(DIGESTS_FOR_PATH)?;
     let digests = statement
         .query_map([rel], |row| row.get::<_, Option<Vec<u8>>>(0))?
         .collect::<Result<Vec<_>, _>>()?;
@@ -152,6 +155,63 @@ fn activity_file_has_chunk(rel: &str, text: &str) -> bool {
         .chunks
         .iter()
         .any(|chunk| !chunk.content.trim().is_empty())
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use rusqlite::Connection;
+
+    use super::{
+        CHUNK_COUNT_FOR_PATH, CREATE_ACTIVITY_MEMBERSHIP, CREATE_ACTIVITY_PROVENANCE,
+        DIGESTS_FOR_PATH, MEMBERSHIP_MISSING_FOR_PATH,
+    };
+    use crate::chunk_sources::{CREATE_CHUNK_SOURCES, CREATE_CHUNK_SOURCES_PATH_INDEX};
+
+    #[test]
+    fn per_file_activity_checks_never_scan_the_chunk_index() {
+        let conn = Connection::open_in_memory().expect("open");
+        conn.execute(
+            "CREATE VIRTUAL TABLE chunks USING fts5(content, path UNINDEXED, day UNINDEXED, \
+             facet UNINDEXED, agent UNINDEXED, stream UNINDEXED, idx UNINDEXED, time_bucket UNINDEXED)",
+            [],
+        )
+        .expect("chunks");
+        for create in [
+            CREATE_CHUNK_SOURCES,
+            CREATE_CHUNK_SOURCES_PATH_INDEX,
+            CREATE_ACTIVITY_PROVENANCE,
+            CREATE_ACTIVITY_MEMBERSHIP,
+        ] {
+            conn.execute(create, []).expect("schema");
+        }
+        for sql in [
+            MEMBERSHIP_MISSING_FOR_PATH,
+            CHUNK_COUNT_FOR_PATH,
+            DIGESTS_FOR_PATH,
+        ] {
+            let mut statement = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("explain");
+            let plan = statement
+                .query_map(["facets/work/activities/20240101.jsonl"], |row| {
+                    row.get::<_, String>(3)
+                })
+                .expect("plan")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("plan rows");
+            assert!(
+                plan.iter().any(|step| step.contains("chunk_sources_path")),
+                "{sql}: {plan:?}"
+            );
+            // A full FTS scan has an empty index constraint; a rowid probe is `0:=`.
+            assert!(
+                !plan
+                    .iter()
+                    .any(|step| step.ends_with("VIRTUAL TABLE INDEX 0:")),
+                "{sql}: {plan:?}"
+            );
+        }
+    }
 }
 
 #[cfg(all(test, feature = "full-tests"))]

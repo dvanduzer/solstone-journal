@@ -8,6 +8,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- on a journal with a long history, the nightly search update could run for an hour without finishing, and while it ran, new things in your journal couldn't be added to search. it finishes again, and the first run after you update adds anything it left out.
 - your journal can start again after an unexpected stop, even if it had been running for days. recovery keeps its progress between startup attempts instead of starting over each time.
 
 ## [2.0.50] - 2026-10-18
