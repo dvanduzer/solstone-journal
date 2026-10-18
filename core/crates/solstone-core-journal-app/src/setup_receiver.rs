@@ -302,7 +302,7 @@ int wmain(int argc, wchar_t **argv) {{
                 fs::write(
                     build.join("fixture.rc"),
                     format!(
-                        "\"{}\" {resource_type} \"capability.json\"\r\n",
+                        "{} {resource_type} \"capability.json\"\r\n",
                         self.contract.resource.name
                     ),
                 )
@@ -356,7 +356,7 @@ int wmain(int argc, wchar_t **argv) {{
             ("missing", None, CapabilityResult::NoResource),
             (
                 "wrong-type",
-                Some(("\"RT_RCDATA\"", valid.as_slice())),
+                Some(("RT_RCDATA", valid.as_slice())),
                 CapabilityResult::NoResource,
             ),
             (
@@ -378,7 +378,8 @@ int wmain(int argc, wchar_t **argv) {{
             let image = fixture.image(case, resource, false);
             assert_eq!(
                 PreparedReceiver::open(&image, contract).err(),
-                Some(expected)
+                Some(expected),
+                "resource fixture {case}"
             );
             assert!(
                 !evidence_path(&image, ".executed").exists(),
