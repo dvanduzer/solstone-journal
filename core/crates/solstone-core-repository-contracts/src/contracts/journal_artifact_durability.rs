@@ -23,7 +23,7 @@ const NO_SEMANTIC_VARIANTS: [ArtifactId; 12] = [
 ];
 
 #[test]
-fn artifact_paths_are_unique_and_journal_config_is_sole_must_be_valid() {
+fn artifact_paths_are_unique_and_strict_artifacts_preserve_irreplaceable_evidence() {
     let mut seen_paths = BTreeSet::new();
     let mut must_be_valid_paths = Vec::new();
 
@@ -40,8 +40,13 @@ fn artifact_paths_are_unique_and_journal_config_is_sole_must_be_valid() {
 
     assert_eq!(
         must_be_valid_paths,
-        vec!["config/journal.json"],
-        "exactly one MustBeValid artifact is allowed (config/journal.json); found: {:?}",
+        vec![
+            "config/journal.json",
+            "health/parent-loss/generations/*/census-obligation.json",
+            "health/parent-loss/generations/*/census-started.json",
+            "health/parent-loss/generations/*/census-refusal.json",
+        ],
+        "MustBeValid artifacts must match the reviewed configuration and retirement evidence; found: {:?}",
         must_be_valid_paths
     );
 }
@@ -182,6 +187,13 @@ fn every_artifact_has_owning_production_mention_outside_durability() {
         let has_variant = combined_source.contains(&pattern);
         let has_special_reader = match entry.id {
             ArtifactId::JournalConfig => combined_source.contains("read_journal_config"),
+            ArtifactId::ParentLossCensusStarted => {
+                combined_source.contains(".join(\"census-started.json\")")
+            }
+            ArtifactId::ParentLossCensusRefusal => {
+                combined_source.contains("fn census_refusal(")
+                    && combined_source.contains("fn has_census_refusal_or_wedged(")
+            }
             ArtifactId::CallosumSock => combined_source.contains("callosum.sock"),
             ArtifactId::SyncHeartbeat => {
                 combined_source.contains("fn classify_heartbeat")

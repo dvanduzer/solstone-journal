@@ -450,7 +450,8 @@ fn controlled_failures_never_reach_zip_drop_stderr() {
     let uncontrolled = run_named_child("stderr_oracle_child", &[(STDERR_CHILD, "uncontrolled")]);
     assert!(uncontrolled.status.success());
     assert!(
-        String::from_utf8_lossy(&uncontrolled.stderr).contains("ZipWriter drop failed"),
+        String::from_utf8_lossy(&uncontrolled.stderr)
+            .contains("ZipWriter::drop: failed to finalize archive:"),
         "negative control did not observe zip Drop stderr: {uncontrolled:?}"
     );
 

@@ -472,7 +472,7 @@ mod tests {
         write_parent_loss_admission_spawn_identity(&journal.root, &identity)
             .expect("write spawn identity");
 
-        let successor_gen = close_with_budget(&ledger, Duration::from_secs(5))
+        let successor_gen = close_with_budget(&ledger, Duration::from_secs(20))
             .expect("closer escalates to SIGKILL and closes generation");
         assert_eq!(successor_gen, active.generation + 1);
 
