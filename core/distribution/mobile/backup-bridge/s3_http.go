@@ -159,6 +159,12 @@ func (be *s3Backend) send(ctx context.Context, method, key string, query url.Val
 		return nil, nil, ctx.Err()
 	}
 	endpoint, _ := url.Parse(be.cfg.endpoint) // configuration was validated before admission
+	// The signer signs the URL's host, while Foundation sends Host without a
+	// default port. Providers that verify the received Host (R2) refuse the
+	// mismatch, so a default port is never spelled in the signed host.
+	if endpoint.Port() == "443" {
+		endpoint.Host = strings.TrimSuffix(endpoint.Host, ":443")
+	}
 	endpoint.Path = "/" + be.cfg.bucket
 	if key != "" {
 		endpoint.Path += "/" + key
