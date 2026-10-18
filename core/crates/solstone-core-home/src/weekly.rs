@@ -3,12 +3,15 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 
 use chrono::{Datelike, Duration, NaiveDate};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use solstone_core_journal_io::observation::FlatDirectoryEntry;
+use solstone_core_journal_io::read_relative_file_bounded;
+use solstone_core_journal_io::{FlatDirectoryError, JournalEntryKind, JournalRoot};
 
 use crate::context::HomeContext;
 
@@ -16,6 +19,7 @@ use crate::context::HomeContext;
 pub enum WeekJudgment {
     Page(TrustedWeek),
     CantShow,
+    Untrusted,
     CouldntCheck,
     Absent,
 }
@@ -94,31 +98,170 @@ pub fn week_day(segment: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(segment, "%Y%m%d").ok()
 }
 
-pub fn judge(journal: &Path, day: &str) -> WeekJudgment {
-    let Some(start_date) = week_day(day) else {
-        return WeekJudgment::CouldntCheck;
+const MAX_WEEK_ENTRIES: usize = 10_000;
+const MAX_WEEK_FILE_BYTES: usize = 1_048_576; // 1 MiB
+
+#[derive(Debug)]
+pub(crate) enum WeeklyDirResult {
+    Absent,
+    Unreadable,
+    Entries(Vec<FlatDirectoryEntry>),
+}
+
+pub(crate) fn weekly_dir_entries(journal: &Path) -> WeeklyDirResult {
+    let Ok(root) = JournalRoot::open(journal) else {
+        return if !journal.exists() {
+            WeeklyDirResult::Absent
+        } else {
+            WeeklyDirResult::Unreadable
+        };
     };
 
-    let json_path = journal.join(format!("reflections/weekly/{day}.json"));
-    let content = match fs::read_to_string(&json_path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            let md_path = journal.join(format!("reflections/weekly/{day}.md"));
-            return match fs::metadata(&md_path) {
-                Ok(meta) if meta.is_file() => WeekJudgment::CantShow,
-                Ok(_) => WeekJudgment::Absent,
-                Err(e) if e.kind() == ErrorKind::NotFound => WeekJudgment::Absent,
-                Err(_) => WeekJudgment::CouldntCheck,
-            };
+    #[cfg(unix)]
+    {
+        use solstone_core_journal_io::FlatDirectory;
+        use solstone_core_journal_io::list_flat_directory;
+
+        let flat = match FlatDirectory::open(&root, Path::new("reflections/weekly")) {
+            Ok(dir) => dir,
+            Err(FlatDirectoryError::Io { source, .. })
+                if source.kind() == io::ErrorKind::NotFound =>
+            {
+                return WeeklyDirResult::Absent;
+            }
+            Err(_) => return WeeklyDirResult::Unreadable,
+        };
+        match list_flat_directory(&flat, MAX_WEEK_ENTRIES) {
+            Ok(Some(entries)) => WeeklyDirResult::Entries(entries),
+            _ => WeeklyDirResult::Unreadable,
         }
-        Err(_) => return WeekJudgment::CouldntCheck,
+    }
+
+    #[cfg(windows)]
+    {
+        use solstone_core_journal_io::list_windows_flat_directory;
+        use solstone_core_journal_io::open_windows_flat_directory_bound;
+        use std::ffi::OsStr;
+
+        let reflections = match open_windows_flat_directory_bound(
+            &root,
+            OsStr::new("reflections"),
+            root.canonical_path(),
+        ) {
+            Ok(Some(dir)) => dir,
+            Ok(None) => return WeeklyDirResult::Absent,
+            Err(_) => return WeeklyDirResult::Unreadable,
+        };
+        let reflections_diagnostic = root.canonical_path().join("reflections");
+        let weekly = match open_windows_flat_directory_bound(
+            &reflections,
+            OsStr::new("weekly"),
+            &reflections_diagnostic,
+        ) {
+            Ok(Some(dir)) => dir,
+            Ok(None) => return WeeklyDirResult::Absent,
+            Err(_) => return WeeklyDirResult::Unreadable,
+        };
+        match list_windows_flat_directory(&weekly, MAX_WEEK_ENTRIES) {
+            Ok(Some(entries)) => WeeklyDirResult::Entries(entries),
+            _ => WeeklyDirResult::Unreadable,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WeeklyDirectoryCandidate {
+    Absent,
+    Unreadable,
+    Empty,
+    Candidate {
+        stem: String,
+        kind: JournalEntryKind,
+    },
+}
+
+pub fn newest_week_candidate(journal: &Path) -> WeeklyDirectoryCandidate {
+    let entries = match weekly_dir_entries(journal) {
+        WeeklyDirResult::Absent => return WeeklyDirectoryCandidate::Absent,
+        WeeklyDirResult::Unreadable => return WeeklyDirectoryCandidate::Unreadable,
+        WeeklyDirResult::Entries(entries) => entries,
+    };
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let Some(name_str) = entry.name.to_str() else {
+            continue;
+        };
+        let Some(stem) = name_str.strip_suffix(".json") else {
+            continue;
+        };
+        if week_day(stem).is_some() {
+            candidates.push((stem.to_string(), entry.kind));
+        }
+    }
+    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    match candidates.pop() {
+        Some((stem, kind)) => WeeklyDirectoryCandidate::Candidate { stem, kind },
+        None => WeeklyDirectoryCandidate::Empty,
+    }
+}
+
+pub fn judge(journal: &Path, day: &str) -> WeekJudgment {
+    read_and_judge(journal, day, false).unwrap_or(WeekJudgment::CouldntCheck)
+}
+
+fn read_and_judge(journal: &Path, day: &str, listed_json: bool) -> Result<WeekJudgment, ()> {
+    let Some(start_date) = week_day(day) else {
+        return Ok(WeekJudgment::CouldntCheck);
     };
 
+    let entries = match weekly_dir_entries(journal) {
+        WeeklyDirResult::Absent => return Ok(WeekJudgment::Absent),
+        WeeklyDirResult::Unreadable => return Err(()),
+        WeeklyDirResult::Entries(entries) => entries,
+    };
+
+    let json_filename = format!("{day}.json");
+    let md_filename = format!("{day}.md");
+
+    let json_entry = entries.iter().find(|e| e.name == json_filename.as_str());
+    let md_entry = entries.iter().find(|e| e.name == md_filename.as_str());
+
+    let content_bytes = match json_entry {
+        Some(entry) => {
+            if entry.kind != JournalEntryKind::RegularFile {
+                return Err(());
+            }
+            let Ok(root) = JournalRoot::open(journal) else {
+                return Err(());
+            };
+            let rel = Path::new("reflections").join("weekly").join(&json_filename);
+            match read_relative_file_bounded(&root, &rel, MAX_WEEK_FILE_BYTES) {
+                Ok(Some(obs)) => obs.bytes,
+                _ => return Err(()),
+            }
+        }
+        None if listed_json => return Err(()),
+        None => {
+            return Ok(match md_entry {
+                Some(entry) if entry.kind == JournalEntryKind::RegularFile => {
+                    WeekJudgment::CantShow
+                }
+                Some(entry) if entry.kind == JournalEntryKind::Directory => WeekJudgment::Absent,
+                Some(_) => WeekJudgment::CouldntCheck,
+                None => WeekJudgment::Absent,
+            });
+        }
+    };
+
+    Ok(judge_contents(day, start_date, &content_bytes))
+}
+
+fn judge_contents(day: &str, start_date: NaiveDate, content_bytes: &[u8]) -> WeekJudgment {
     if start_date.weekday() != chrono::Weekday::Sun {
         return WeekJudgment::CouldntCheck;
     }
 
-    let value: Value = match serde_json::from_str(&content) {
+    let value: Value = match serde_json::from_slice(content_bytes) {
         Ok(Value::Object(map)) => Value::Object(map),
         _ => return WeekJudgment::CouldntCheck,
     };
@@ -128,7 +271,7 @@ pub fn judge(journal: &Path, day: &str) -> WeekJudgment {
     };
 
     if version_val.as_i64() != Some(1) {
-        return WeekJudgment::CantShow;
+        return WeekJudgment::Untrusted;
     }
 
     let mut trusted_memories = Vec::new();
@@ -166,7 +309,7 @@ pub fn judge(journal: &Path, day: &str) -> WeekJudgment {
             };
 
             if kind != "briefing" {
-                return WeekJudgment::CantShow;
+                return WeekJudgment::Untrusted;
             }
 
             if !memory_ids.insert(id.to_string()) {
@@ -395,15 +538,124 @@ pub fn has_page(journal: &Path, day: &str) -> bool {
 }
 
 pub fn read_left_out(journal: &Path) -> LeftOut {
-    let path = left_out_path(journal);
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == ErrorKind::NotFound => return LeftOut::None,
-        Err(_) => return LeftOut::Unreadable,
+    let Ok(root) = JournalRoot::open(journal) else {
+        return if !journal.exists() {
+            LeftOut::None
+        } else {
+            LeftOut::Unreadable
+        };
     };
-    match serde_json::from_str::<RawLeftOut>(&content) {
-        Ok(raw) => LeftOut::Keys(raw.keys.into_iter().collect()),
+    match read_relative_file_bounded(
+        &root,
+        Path::new("health/week-left-out.json"),
+        MAX_WEEK_FILE_BYTES,
+    ) {
+        Ok(Some(obs)) => match serde_json::from_slice::<RawLeftOut>(&obs.bytes) {
+            Ok(raw) => LeftOut::Keys(raw.keys.into_iter().collect()),
+            Err(_) => LeftOut::Unreadable,
+        },
+        Ok(None) => LeftOut::None,
         Err(_) => LeftOut::Unreadable,
+    }
+}
+
+pub fn format_week_intro(shown_memories: usize, shown_quotes: usize) -> Option<String> {
+    if shown_memories == 0 && shown_quotes == 0 {
+        Some("nothing from this week is on this page.".to_string())
+    } else if shown_memories == 0 {
+        None
+    } else if shown_memories == 1 {
+        Some("your week, a memory from one day.".to_string())
+    } else {
+        Some(format!(
+            "your week, a memory from each of {shown_memories} days."
+        ))
+    }
+}
+
+pub fn resolve_day_cell_state<'a>(
+    stored_state: &'a str,
+    memory_key: Option<&str>,
+    left_out_keys: &BTreeSet<String>,
+) -> &'a str {
+    if stored_state == "memory" {
+        if let Some(key) = memory_key
+            && left_out_keys.contains(key)
+        {
+            return "not_on_page";
+        }
+        "memory"
+    } else {
+        stored_state
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeekNavigation {
+    pub previous: Option<String>,
+    pub next: Option<String>,
+    pub failed: bool,
+}
+
+pub fn trusted_neighbors(journal: &Path, day: &str) -> WeekNavigation {
+    neighbors(journal, day, false)
+}
+
+/// Neighbor projection for a caller that must distinguish absence from failed reads.
+pub fn checked_neighbors(journal: &Path, day: &str) -> WeekNavigation {
+    neighbors(journal, day, true)
+}
+
+fn neighbors(journal: &Path, day: &str, require_readable_candidates: bool) -> WeekNavigation {
+    let entries = match weekly_dir_entries(journal) {
+        WeeklyDirResult::Absent | WeeklyDirResult::Unreadable => {
+            return WeekNavigation {
+                previous: None,
+                next: None,
+                failed: true,
+            };
+        }
+        WeeklyDirResult::Entries(entries) => entries,
+    };
+
+    let mut valid_stems = Vec::new();
+    for entry in entries {
+        let Some(name_str) = entry.name.to_str() else {
+            continue;
+        };
+        let Some(stem) = name_str.strip_suffix(".json") else {
+            continue;
+        };
+        let Some(date) = week_day(stem) else {
+            continue;
+        };
+        if date.weekday() != chrono::Weekday::Sun {
+            continue;
+        }
+        match read_and_judge(journal, stem, true) {
+            Ok(WeekJudgment::Page(_)) => valid_stems.push(stem.to_string()),
+            Err(()) | Ok(WeekJudgment::Absent | WeekJudgment::CantShow)
+                if require_readable_candidates =>
+            {
+                return WeekNavigation {
+                    previous: None,
+                    next: None,
+                    failed: true,
+                };
+            }
+            _ => {}
+        }
+    }
+    valid_stems.sort();
+    valid_stems.dedup();
+
+    let previous = valid_stems.iter().rfind(|s| s.as_str() < day).cloned();
+    let next = valid_stems.iter().find(|s| s.as_str() > day).cloned();
+
+    WeekNavigation {
+        previous,
+        next,
+        failed: false,
     }
 }
 
@@ -661,17 +913,9 @@ pub fn page_model(
     }
 
     let shown_quotes = shown_quote_count(&trusted.said, left_out_keys);
-    let intro = if shown_count == 0 && shown_quotes == 0 {
-        Value::String("nothing from this week is on this page.".to_string())
-    } else if shown_count == 0 {
-        Value::Null
-    } else if shown_count == 1 {
-        Value::String("your week, a memory from one day.".to_string())
-    } else {
-        Value::String(format!(
-            "your week, a memory from each of {shown_count} days."
-        ))
-    };
+    let intro = format_week_intro(shown_count, shown_quotes)
+        .map(Value::String)
+        .unwrap_or(Value::Null);
     let said_model = said_model(&trusted.said, left_out_keys, start_date);
 
     let mut present_states = BTreeSet::new();
@@ -685,16 +929,12 @@ pub fn page_model(
         let weekday = weekday_name(date);
         let day_num = date.day();
 
-        let cell_state = if d.state == "memory" {
-            let is_left_out = d
-                .memory_id
-                .as_deref()
-                .and_then(|id| memory_by_id.get(id))
-                .is_some_and(|m| left_out_keys.contains(&m.key));
-            if is_left_out { "not_on_page" } else { "memory" }
-        } else {
-            d.state.as_str()
-        };
+        let memory_key = d
+            .memory_id
+            .as_deref()
+            .and_then(|id| memory_by_id.get(id))
+            .map(|m| m.key.as_str());
+        let cell_state = resolve_day_cell_state(d.state.as_str(), memory_key, left_out_keys);
 
         present_states.insert(cell_state);
 
@@ -772,47 +1012,29 @@ pub fn page_model(
         Value::String(from_parts.join(" "))
     };
 
-    // Nav scan
-    let mut prev_label = Value::Null;
-    let mut prev_href = Value::Null;
-    let mut next_label = Value::Null;
-    let mut next_href = Value::Null;
-
-    let weekly_dir = journal.join("reflections/weekly");
-    if let Ok(entries) = fs::read_dir(weekly_dir) {
-        let mut valid_stems = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(stem) = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .filter(|stem| week_day(stem).is_some() && has_page(journal, stem))
-            {
-                valid_stems.push(stem.to_string());
-            }
-        }
-        valid_stems.sort();
-        valid_stems.dedup();
-
-        if let Some(idx) = valid_stems.iter().position(|s| s == day) {
-            if idx > 0 {
-                let p_stem = &valid_stems[idx - 1];
-                if let Some(p_date) = week_day(p_stem) {
-                    prev_label =
-                        Value::String(format!("← {}", format_week_title(p_date, current_year)));
-                    prev_href = Value::String(format!("/app/home/week/{p_stem}"));
-                }
-            }
-            if idx + 1 < valid_stems.len() {
-                let n_stem = &valid_stems[idx + 1];
-                if let Some(n_date) = week_day(n_stem) {
-                    next_label =
-                        Value::String(format!("{} →", format_week_title(n_date, current_year)));
-                    next_href = Value::String(format!("/app/home/week/{n_stem}"));
-                }
-            }
-        }
-    }
+    let nav = trusted_neighbors(journal, day);
+    let (prev_label, prev_href) = if !nav.failed
+        && let Some(p_stem) = nav.previous.as_deref()
+        && let Some(p_date) = week_day(p_stem)
+    {
+        (
+            Value::String(format!("← {}", format_week_title(p_date, current_year))),
+            Value::String(format!("/app/home/week/{p_stem}")),
+        )
+    } else {
+        (Value::Null, Value::Null)
+    };
+    let (next_label, next_href) = if !nav.failed
+        && let Some(n_stem) = nav.next.as_deref()
+        && let Some(n_date) = week_day(n_stem)
+    {
+        (
+            Value::String(format!("{} →", format_week_title(n_date, current_year))),
+            Value::String(format!("/app/home/week/{n_stem}")),
+        )
+    } else {
+        (Value::Null, Value::Null)
+    };
 
     Ok(json!({
         "title": title,
@@ -934,7 +1156,7 @@ pub fn card(context: &HomeContext) -> Value {
                     "line": Value::Null,
                 })
             }
-            WeekJudgment::CantShow | WeekJudgment::CouldntCheck => {
+            WeekJudgment::CantShow | WeekJudgment::Untrusted | WeekJudgment::CouldntCheck => {
                 let line = format_unreadable_line(stem_date, current_year);
                 json!({
                     "state": "unreadable",
@@ -1627,23 +1849,23 @@ mod tests {
         );
         assert_eq!(judge(root.path(), sun), WeekJudgment::CouldntCheck);
 
-        // Version string "1" -> CantShow
+        // Version string "1" -> Untrusted
         write(
             root.path(),
             "reflections/weekly/20260308.json",
             r#"{"version":"1","days":[]}"#,
         );
-        assert_eq!(judge(root.path(), sun), WeekJudgment::CantShow);
+        assert_eq!(judge(root.path(), sun), WeekJudgment::Untrusted);
 
-        // Version integer 2 -> CantShow
+        // Version integer 2 -> Untrusted
         write(
             root.path(),
             "reflections/weekly/20260308.json",
             r#"{"version":2,"days":[]}"#,
         );
-        assert_eq!(judge(root.path(), sun), WeekJudgment::CantShow);
+        assert_eq!(judge(root.path(), sun), WeekJudgment::Untrusted);
 
-        // Non-briefing source kind -> CantShow
+        // Non-briefing source kind -> Untrusted
         let non_briefing_json = r#"{
             "version": 1,
             "days": [
@@ -1670,7 +1892,7 @@ mod tests {
             "reflections/weekly/20260308.json",
             non_briefing_json,
         );
-        assert_eq!(judge(root.path(), sun), WeekJudgment::CantShow);
+        assert_eq!(judge(root.path(), sun), WeekJudgment::Untrusted);
 
         // 6 days -> CouldntCheck
         let six_days_json = r#"{
@@ -2185,5 +2407,154 @@ mod tests {
         let card_unreadable = card(&ctx);
         assert!(card_unreadable["memory"].is_null());
         assert!(card_unreadable["empty"].is_null());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unix_symlink_escapes_refused() {
+        let outside = TempDir::new().unwrap();
+        let sentinel_file = outside.path().join("sentinel.json");
+        let sentinel = "SENTINEL_WEEK_CONTENT_12345";
+        fs::write(&sentinel_file, format!(r#"{{"sentinel":"{sentinel}"}}"#)).unwrap();
+
+        let root = TempDir::new().unwrap();
+        let weekly_dir = root.path().join("reflections/weekly");
+        fs::create_dir_all(&weekly_dir).unwrap();
+
+        // 1. A YYYYMMDD.json symlink to an outside file: CouldntCheck, and judgment does not contain outside sentinel
+        let target_symlink = weekly_dir.join("20260308.json");
+        symlink(&sentinel_file, &target_symlink).unwrap();
+        let res = judge(root.path(), "20260308");
+        assert_eq!(res, WeekJudgment::CouldntCheck);
+        fs::remove_file(&target_symlink).unwrap();
+
+        // 2. Leave-out path symlinked outside: LeftOut::Unreadable, sentinel not observed as keys
+        let health_dir = root.path().join("health");
+        fs::create_dir_all(&health_dir).unwrap();
+        let outside_left_out = outside.path().join("outside_left_out.json");
+        fs::write(
+            &outside_left_out,
+            r#"{"keys":["SENTINEL_LEFT_OUT_KEY_98765"]}"#,
+        )
+        .unwrap();
+        symlink(&outside_left_out, health_dir.join("week-left-out.json")).unwrap();
+        let left_out = read_left_out(root.path());
+        assert_eq!(left_out, LeftOut::Unreadable);
+
+        // 3. reflections or reflections/weekly symlinked outside: directory helper is Unreadable, not a list of outside week names
+        let root_outside_reflections = TempDir::new().unwrap();
+        let outside_reflections = outside.path().join("reflections_dir");
+        fs::create_dir_all(outside_reflections.join("weekly")).unwrap();
+        write(
+            outside_reflections.as_path(),
+            "weekly/20260308.json",
+            &valid_week_json("20260308"),
+        );
+        symlink(
+            &outside_reflections,
+            root_outside_reflections.path().join("reflections"),
+        )
+        .unwrap();
+        match weekly_dir_entries(root_outside_reflections.path()) {
+            WeeklyDirResult::Unreadable => {}
+            other => panic!("expected Unreadable for symlinked reflections, got {other:?}"),
+        }
+
+        let root_outside_weekly = TempDir::new().unwrap();
+        fs::create_dir_all(root_outside_weekly.path().join("reflections")).unwrap();
+        symlink(
+            outside_reflections.join("weekly"),
+            root_outside_weekly.path().join("reflections/weekly"),
+        )
+        .unwrap();
+        match weekly_dir_entries(root_outside_weekly.path()) {
+            WeeklyDirResult::Unreadable => {}
+            other => panic!("expected Unreadable for symlinked weekly, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn navigation_skips_malformed_and_untrusted_and_handles_failures() {
+        let root = TempDir::new().unwrap();
+        let sun1 = "20260308";
+        let sun2 = "20260315";
+        let sun3 = "20260322";
+
+        write(
+            root.path(),
+            &format!("reflections/weekly/{sun1}.json"),
+            &valid_week_json(sun1),
+        );
+        write(
+            root.path(),
+            &format!("reflections/weekly/{sun2}.json"),
+            &valid_week_json(sun2),
+        );
+        write(
+            root.path(),
+            &format!("reflections/weekly/{sun3}.json"),
+            &valid_week_json(sun3),
+        );
+
+        // Malformed name (not 8 digits, not date)
+        write(root.path(), "reflections/weekly/notadate.json", "{}");
+        write(root.path(), "reflections/weekly/20260399.json", "{}");
+        // Non-Sunday date
+        write(
+            root.path(),
+            "reflections/weekly/20260310.json",
+            &valid_week_json("20260310"),
+        );
+        // Untrusted week (version 2)
+        write(
+            root.path(),
+            "reflections/weekly/20260329.json",
+            r#"{"version":2,"days":[]}"#,
+        );
+
+        let nav = trusted_neighbors(root.path(), sun2);
+        assert!(!nav.failed);
+        assert_eq!(nav.previous.as_deref(), Some(sun1));
+        assert_eq!(nav.next.as_deref(), Some(sun3));
+
+        // Missing weekly dir -> failed: true, neighbors None
+        let empty_root = TempDir::new().unwrap();
+        let nav_missing = trusted_neighbors(empty_root.path(), sun2);
+        assert!(nav_missing.failed);
+        assert_eq!(nav_missing.previous, None);
+        assert_eq!(nav_missing.next, None);
+
+        // page_model on sun1 has null prev_href and sun2 as next_href
+        let model = page_model(root.path(), sun1, 2026, &|_| false).unwrap();
+        assert!(model["prev_href"].is_null());
+        assert_eq!(model["next_href"], format!("/app/home/week/{sun2}"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn page_model_navigation_failure_leaves_links_null() {
+        let sun = "20260308";
+        let outside = TempDir::new().unwrap();
+        let outside_reflections = outside.path().join("reflections");
+        fs::create_dir_all(outside_reflections.join("weekly")).unwrap();
+        write(
+            outside.path(),
+            &format!("reflections/weekly/{sun}.json"),
+            &valid_week_json(sun),
+        );
+
+        let sym_root = TempDir::new().unwrap();
+        symlink(&outside_reflections, sym_root.path().join("reflections")).unwrap();
+        let nav_err = trusted_neighbors(sym_root.path(), sun);
+        assert!(nav_err.failed);
+        assert_eq!(nav_err.previous, None);
+        assert_eq!(nav_err.next, None);
+        assert!(
+            matches!(
+                page_model(sym_root.path(), sun, 2026, &|_| false),
+                Err(WeekJudgment::CouldntCheck)
+            ),
+            "an outside weekly directory is not a page"
+        );
     }
 }

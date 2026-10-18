@@ -523,7 +523,10 @@ pub fn read_first_minutes(context: &HomeContext) -> Value {
                                         )
                                     {
                                         if let Some(zone) =
-                                            solstone_core_callosum::read_reported_zone(&segment_dir)
+                                            solstone_core_callosum::read_reported_zone(
+                                                context.journal_root(),
+                                                &segment_dir,
+                                            )
                                         {
                                             (zone.tz, zone.utc_offset_seconds)
                                         } else {

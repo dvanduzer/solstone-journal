@@ -1109,17 +1109,19 @@ pub(crate) mod test_helpers {
     use std::sync::Arc;
 
     use base64::Engine;
-    use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
     use rustls::pki_types::{CertificateDer, ServerName};
     use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConnection};
-    use time::OffsetDateTime;
 
     pub(crate) const HOSTNAME: &str = "ab12cd34.solstone.me";
 
+    #[cfg(feature = "full-tests")]
     pub(crate) fn mint_test_leaf(
         not_before: i64,
         not_after: i64,
     ) -> (Vec<u8>, Vec<u8>, CertificateDer<'static>) {
+        use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
+        use time::OffsetDateTime;
+
         let keypair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("leaf key");
         let mut params = CertificateParams::new(vec![HOSTNAME.to_owned()]).expect("params");
         params.use_authority_key_identifier_extension = true;

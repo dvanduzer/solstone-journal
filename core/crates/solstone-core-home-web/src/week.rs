@@ -51,7 +51,7 @@ pub async fn week_shell(AxumPath(week): AxumPath<String>, journal_root: PathBuf)
             WeekJudgment::Absent => {
                 cant_open_response(StatusCode::NOT_FOUND, "it isn't in your journal.")
             }
-            WeekJudgment::CantShow => cant_open_response(
+            WeekJudgment::CantShow | WeekJudgment::Untrusted => cant_open_response(
                 StatusCode::NOT_FOUND,
                 "your journal can't show this kind of source.",
             ),
@@ -85,7 +85,7 @@ pub async fn week_api(
             Err(WeekJudgment::Absent) => {
                 cant_open_response(StatusCode::NOT_FOUND, "it isn't in your journal.")
             }
-            Err(WeekJudgment::CantShow) => cant_open_response(
+            Err(WeekJudgment::CantShow) | Err(WeekJudgment::Untrusted) => cant_open_response(
                 StatusCode::NOT_FOUND,
                 "your journal can't show this kind of source.",
             ),

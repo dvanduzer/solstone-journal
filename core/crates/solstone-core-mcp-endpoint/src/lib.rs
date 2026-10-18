@@ -22,6 +22,7 @@ mod account_wire;
 pub(crate) mod acme_http;
 pub(crate) mod acme_lifecycle;
 mod activity;
+mod activity_admit;
 mod audit;
 #[cfg(all(test, feature = "full-tests"))]
 mod boundary_tests;

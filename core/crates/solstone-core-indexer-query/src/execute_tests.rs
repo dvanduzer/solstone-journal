@@ -16,10 +16,11 @@ use crate::execute::{
 };
 use crate::test_support::reserve_temp_path;
 use crate::{
-    CompileOutcome, ConnectionBoundary, ConnectionCorpusRefusal, ConnectionScope,
-    ConnectionSearchRequest, CoverageState, IndexAccessError, IndexBuildCounts, IndexDegraded,
-    Order, OwnerBoundary, QueryBoundary, SearchRequest, compile_query, coverage as owner_coverage,
-    hit_at as owner_hit_at, indexed_entity_ids as owner_indexed_entity_ids, open_owner_index,
+    ActivityObservation, ActivityObservationRead, CompileOutcome, ConnectionBoundary,
+    ConnectionCorpusRefusal, ConnectionScope, ConnectionSearchRequest, CoverageState,
+    IndexAccessError, IndexBuildCounts, IndexDegraded, Order, OwnerBoundary, QueryBoundary,
+    SearchRequest, compile_query, coverage as owner_coverage, hit_at as owner_hit_at,
+    indexed_entity_ids as owner_indexed_entity_ids, open_owner_index, read_activity_observation,
     search as owner_search, search_counts as owner_search_counts,
 };
 
@@ -3097,4 +3098,206 @@ fn protected_video_notes_are_indexed_and_searchable_by_owner_but_excluded_from_c
     );
 
     fs::remove_dir_all(root).expect("cleanup protected video index");
+}
+
+#[test]
+fn activity_observation_returns_the_stored_proof_or_nothing() {
+    const A: &str = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+    const B: &str = "b1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+    let (root, connection) = seeded_root("activity-observation");
+    let path = "facets/work/activities/20260107.jsonl";
+    let stored = "stored activity prose";
+    insert(
+        &connection,
+        stored,
+        path,
+        "20260107",
+        "work",
+        "activity",
+        "",
+        0,
+    );
+    let row_id = connection.last_insert_rowid();
+    let digest = [0x11_u8; 32];
+    connection
+        .execute(
+            "INSERT INTO activity_provenance(rowid, digest, hidden) VALUES (?1, ?2, 1)",
+            params![row_id, digest.as_slice()],
+        )
+        .expect("seed proof");
+    insert(
+        &connection,
+        "visible activity prose",
+        path,
+        "20260107",
+        "work",
+        "activity",
+        "",
+        1,
+    );
+    let visible_id = connection.last_insert_rowid();
+    connection
+        .execute(
+            "INSERT INTO activity_provenance(rowid, digest, hidden) VALUES (?1, ?2, 0)",
+            params![visible_id, digest.as_slice()],
+        )
+        .expect("seed visible proof");
+    insert(
+        &connection,
+        "no proof prose",
+        path,
+        "20260107",
+        "work",
+        "activity",
+        "",
+        2,
+    );
+    let bare_id = connection.last_insert_rowid();
+    insert(
+        &connection,
+        "bad proof prose",
+        path,
+        "20260107",
+        "work",
+        "activity",
+        "",
+        3,
+    );
+    let bad_id = connection.last_insert_rowid();
+    connection
+        .execute(
+            "INSERT INTO activity_provenance(rowid, digest, hidden) VALUES (?1, ?2, 0)",
+            params![bad_id, vec![1_u8, 2, 3]],
+        )
+        .expect("seed short proof");
+    insert(
+        &connection,
+        "text proof prose",
+        path,
+        "20260107",
+        "work",
+        "activity",
+        "",
+        4,
+    );
+    let text_id = connection.last_insert_rowid();
+    connection
+        .execute(
+            "INSERT INTO activity_provenance(rowid, digest, hidden) VALUES (?1, ?2, 0)",
+            params![text_id, "not-a-thirty-two-byte-digest"],
+        )
+        .expect("seed text proof");
+    insert(
+        &connection,
+        "wide proof prose",
+        path,
+        "20260107",
+        "work",
+        "activity",
+        "",
+        5,
+    );
+    let wide_id = connection.last_insert_rowid();
+    connection
+        .execute(
+            "INSERT INTO activity_provenance(rowid, digest, hidden) VALUES (?1, ?2, 0)",
+            params![wide_id, vec![0xab_u8; 64]],
+        )
+        .expect("seed oversized proof");
+    seed_classification(&connection, path, "facets", "facet_owned", &[A]);
+    finish_classification(&connection);
+    drop(connection);
+    assert!(!root.join(path).exists());
+
+    let read = |idx, row, max_bytes| {
+        read_activity_observation(&root, QueryBoundary::Owner, path, idx, row, max_bytes)
+            .expect("owner observation")
+    };
+    assert_eq!(
+        read(0, row_id, 64 * 1024),
+        ActivityObservationRead::Ready(ActivityObservation {
+            content: stored.to_string(),
+            digest,
+            hidden: true,
+        })
+    );
+    assert_eq!(
+        read(1, visible_id, 64 * 1024),
+        ActivityObservationRead::Ready(ActivityObservation {
+            content: "visible activity prose".to_string(),
+            digest,
+            hidden: false,
+        })
+    );
+    assert_eq!(
+        read(2, bare_id, 64 * 1024),
+        ActivityObservationRead::Unproven
+    );
+    assert_eq!(
+        read(3, bad_id, 64 * 1024),
+        ActivityObservationRead::Unavailable
+    );
+    let text_digest =
+        read_activity_observation(&root, QueryBoundary::Owner, path, 4, text_id, 64 * 1024);
+    assert!(
+        matches!(text_digest, Ok(ActivityObservationRead::Unavailable)),
+        "a text digest is unavailable, not an index error: {text_digest:?}"
+    );
+    assert_eq!(
+        read(5, wide_id, 64 * 1024),
+        ActivityObservationRead::Unavailable
+    );
+    assert_eq!(read(0, row_id, 4), ActivityObservationRead::Unavailable);
+    assert_eq!(read(9, row_id, 64 * 1024), ActivityObservationRead::Absent);
+
+    let inside = connection_boundary(
+        &["Facets"],
+        ConnectionScope::ChosenFacets {
+            ids: [A.to_string()].into_iter().collect(),
+        },
+    );
+    let outside = connection_boundary(
+        &["Facets"],
+        ConnectionScope::ChosenFacets {
+            ids: [B.to_string()].into_iter().collect(),
+        },
+    );
+    assert_eq!(
+        read_activity_observation(
+            &root,
+            QueryBoundary::Connection(inside),
+            path,
+            0,
+            row_id,
+            64 * 1024
+        )
+        .expect("inside observation"),
+        ActivityObservationRead::Ready(ActivityObservation {
+            content: stored.to_string(),
+            digest,
+            hidden: true,
+        })
+    );
+    assert_eq!(
+        read_activity_observation(
+            &root,
+            QueryBoundary::Connection(outside),
+            path,
+            0,
+            row_id,
+            64 * 1024
+        )
+        .expect("outside observation"),
+        ActivityObservationRead::Absent
+    );
+
+    let conn = Connection::open(db_path(&root)).unwrap();
+    conn.execute("DROP TABLE activity_provenance", []).unwrap();
+    drop(conn);
+    assert_eq!(
+        read(0, row_id, 64 * 1024),
+        ActivityObservationRead::Unproven
+    );
+    assert!(!root.join(path).exists());
+    fs::remove_dir_all(root).expect("cleanup activity observation");
 }

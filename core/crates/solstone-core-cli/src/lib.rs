@@ -9613,6 +9613,18 @@ mod tests {
             })))
         );
         assert_eq!(
+            evaluate_args(&args(&["mcp", "activity", "--tool", "get_week"])),
+            Ok(Command::Mcp(McpCommand::Activity(McpActivityCommand {
+                target: None,
+                tool: Some("get_week".to_owned()),
+                outcome: None,
+                day_from: None,
+                day_to: None,
+                limit: DEFAULT_ACTIVITY_LIMIT,
+                json: false,
+            })))
+        );
+        assert_eq!(
             evaluate_args(&args(&["mcp", "pairing"])),
             Ok(Command::McpUsage(McpUsageError(
                 "the following arguments are required: generate, revoke".to_owned()
