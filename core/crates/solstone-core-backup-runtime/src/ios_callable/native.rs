@@ -700,8 +700,19 @@ impl Call {
                 undrained();
             }
         });
+        let diagnostic_str = std::str::from_utf8(
+            &fields.diagnostic[..fields.diagnostic.iter().position(|b| *b == 0).unwrap_or(0)],
+        )
+        .unwrap_or("");
+        let is_remote_pending = fields.status == 11 && diagnostic_str == "REMOTE_PENDING";
+
         let metadata = if metadata && fields.status == OK {
             self.metadata().map(Some)
+        } else if is_remote_pending {
+            match self.metadata() {
+                Ok(bytes) if !bytes.is_empty() => Ok(Some(bytes)),
+                _ => Ok(None),
+            }
         } else {
             Ok(None)
         };

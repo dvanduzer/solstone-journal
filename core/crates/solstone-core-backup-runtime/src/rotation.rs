@@ -88,6 +88,7 @@ pub fn pause_after_remote_removal() {
     }
 }
 
+pub mod resume;
 mod transaction;
 #[cfg(all(unix, feature = "test-hooks"))]
 pub use transaction::{arm_rotation_parent_sync_fault, rotation_parent_sync_fault_observation};

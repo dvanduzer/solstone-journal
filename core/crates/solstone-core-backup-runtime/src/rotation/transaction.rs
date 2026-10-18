@@ -470,6 +470,7 @@ fn execute_rotate_recovery_key(journal: &Path, services: &BackupServices<'_>) ->
             return error("failed");
         }
 
+        #[cfg(not(target_os = "ios"))]
         if let Err(err) = add_recovery_key(
             &runner,
             &destination,
@@ -480,6 +481,53 @@ fn execute_rotate_recovery_key(journal: &Path, services: &BackupServices<'_>) ->
         ) {
             return map_error(err);
         }
+
+        #[cfg(target_os = "ios")]
+        let candidate = {
+            let authority = match restic {
+                crate::runner::ResticInvocation::Callable(a) => a,
+                _ => return error("failed"),
+            };
+            let env = match crate::repo::backend(&destination) {
+                Ok(e) => e,
+                Err(_) => return error("failed"),
+            };
+            let outcome = match crate::ios_callable::add_recovery_key_rotation(
+                authority,
+                &destination,
+                daily_key,
+                &candidate,
+                &env,
+                timeout,
+                runner.cancellation(),
+            ) {
+                Ok(o) => o,
+                Err(err) => return map_error(err),
+            };
+
+            match outcome {
+                crate::ios_callable::AddOutcome::Added => candidate,
+                crate::ios_callable::AddOutcome::Resumed(resumed) => {
+                    let second_outcome = match crate::ios_callable::add_recovery_key_rotation(
+                        authority,
+                        &destination,
+                        daily_key,
+                        &resumed,
+                        &env,
+                        timeout,
+                        runner.cancellation(),
+                    ) {
+                        Ok(o) => o,
+                        Err(err) => return map_error(err),
+                    };
+
+                    match second_outcome {
+                        crate::ios_callable::AddOutcome::Added => resumed,
+                        crate::ios_callable::AddOutcome::Resumed(_) => return error("failed"),
+                    }
+                }
+            }
+        };
 
         #[cfg(target_os = "ios")]
         if !admits_journal_root(&root, journal) {

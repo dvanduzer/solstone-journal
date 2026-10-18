@@ -53,7 +53,7 @@ fn optional_id(bytes: &[u8]) -> Result<Option<&str>, RunnerError> {
     }
 }
 
-fn diagnostic(fields: &ResultFields) -> Result<&str, RunnerError> {
+pub(super) fn diagnostic(fields: &ResultFields) -> Result<&str, RunnerError> {
     let value = text(&fields.diagnostic)?;
     if matches!(
         value,

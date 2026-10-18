@@ -57,7 +57,9 @@ impl From<BackupError> for RepoError {
     }
 }
 
-fn backend(destination: &Destination) -> Result<BTreeMap<String, Option<String>>, BackupError> {
+pub(crate) fn backend(
+    destination: &Destination,
+) -> Result<BTreeMap<String, Option<String>>, BackupError> {
     Ok(assemble_backend_env(destination)?
         .into_iter()
         .map(|(key, value)| {

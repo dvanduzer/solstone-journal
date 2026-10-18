@@ -43,11 +43,29 @@ func (owner *s3Owner) closeOwned() error {
 	for _, password := range owner.attemptPasses {
 		zeroBytes(password)
 	}
-	if owner.record.Active != nil && len(owner.record.Active.RecoveryPassword) > 0 {
-		zeroBytes(owner.record.Active.RecoveryPassword)
+	if owner.record.Active != nil {
+		if len(owner.record.Active.RecoveryPassword) > 0 {
+			zeroBytes(owner.record.Active.RecoveryPassword)
+		}
+		if len(owner.record.Active.Ciphertext) > 0 {
+			zeroBytes(owner.record.Active.Ciphertext)
+		}
 	}
-	if owner.preservedAddIntent != nil && len(owner.preservedAddIntent.RecoveryPassword) > 0 {
-		zeroBytes(owner.preservedAddIntent.RecoveryPassword)
+	if owner.preservedAddIntent != nil {
+		if len(owner.preservedAddIntent.RecoveryPassword) > 0 {
+			zeroBytes(owner.preservedAddIntent.RecoveryPassword)
+		}
+		if len(owner.preservedAddIntent.Ciphertext) > 0 {
+			zeroBytes(owner.preservedAddIntent.Ciphertext)
+		}
+	}
+	if owner.record.RecoveryHold != nil {
+		if len(owner.record.RecoveryHold.RecoveryPassword) > 0 {
+			zeroBytes(owner.record.RecoveryHold.RecoveryPassword)
+		}
+		if len(owner.record.RecoveryHold.Ciphertext) > 0 {
+			zeroBytes(owner.record.RecoveryHold.Ciphertext)
+		}
 	}
 	owner.attemptPasses = nil
 	owner.preservedAddIntent = nil

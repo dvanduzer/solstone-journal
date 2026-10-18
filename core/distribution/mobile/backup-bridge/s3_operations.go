@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"time"
@@ -339,10 +340,43 @@ func runS3Worker(h *callHandle, req bridgeRequest) {
 			pending = true
 		}
 	} else if err := beginS3Owner(owner, req.operation, req.remote.cfg, req.password, req.recoveryPassword); err != nil {
-		result = bridgeResult{status: StatusFailed, diagnostic: DiagIoFailed}
-		pending = errors.Is(err, errS3OwnerPending)
-		if errors.Is(err, errResourceLimit) {
-			result.status, result.diagnostic = StatusCapExceeded, DiagCapExceeded
+		if errors.Is(err, errS3RecoveryHold) {
+			pending = true
+			keyID, holdPw := owner.recoveryHoldInfo()
+			if len(holdPw) > 0 {
+				defer zeroBytes(holdPw)
+			}
+			resume := struct {
+				Schema           string `json:"schema"`
+				Kind             string `json:"kind"`
+				RecoveryPassword string `json:"recovery_password"`
+				KeyID            string `json:"key_id,omitempty"`
+			}{
+				Schema:           metadataSchema,
+				Kind:             "recovery-add-recorded",
+				RecoveryPassword: string(holdPw),
+			}
+			if lowerHexID(keyID) {
+				resume.KeyID = keyID
+			}
+			encoded, marshalErr := json.Marshal(resume)
+			if marshalErr != nil {
+				pending = false
+				result = bridgeResult{status: StatusFailed, diagnostic: DiagInternal}
+			} else {
+				result = bridgeResult{
+					status:         StatusRemotePending,
+					diagnostic:     DiagRemotePending,
+					metadata:       encoded,
+					metadataStatus: StatusOk,
+				}
+			}
+		} else {
+			result = bridgeResult{status: StatusFailed, diagnostic: DiagIoFailed}
+			pending = errors.Is(err, errS3OwnerPending)
+			if errors.Is(err, errResourceLimit) {
+				result.status, result.diagnostic = StatusCapExceeded, DiagCapExceeded
+			}
 		}
 	} else if err := removeInheritedS3Locks(req.remote); err != nil {
 		// The adopted locks stay in custody; no repository work runs over them.

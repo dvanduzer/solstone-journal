@@ -734,6 +734,82 @@ pub(crate) fn add_key(
     Ok(())
 }
 
+#[derive(PartialEq, Eq)]
+pub(crate) enum AddOutcome {
+    Added,
+    Resumed(String),
+}
+
+impl std::fmt::Debug for AddOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Added => write!(f, "Added"),
+            Self::Resumed(_) => write!(f, "Resumed([redacted])"),
+        }
+    }
+}
+
+pub(crate) fn add_recovery_key_rotation(
+    authority: &AdmittedIosBackupAuthority,
+    destination: &Destination,
+    daily_key: &str,
+    candidate: &str,
+    env: &BTreeMap<String, Option<String>>,
+    timeout: Option<Duration>,
+    cancellation: Option<&ArchiveCancellation>,
+) -> Result<AddOutcome, RepoError> {
+    let repository = validate_call(
+        authority,
+        &[],
+        &destination.repository,
+        daily_key,
+        Some(candidate),
+        Some(env),
+        cancellation,
+    )
+    .map_err(|_| RepoError::Failed)?;
+    let options = native::Options {
+        version: 1,
+        check_read_mode: 0,
+        retry_lock_ms: 0,
+        group: 0,
+        groups: 0,
+        reserved1: 0,
+        reserved2: 0,
+    };
+    let completed = execute(
+        authority,
+        3,
+        false,
+        repository,
+        daily_key,
+        candidate,
+        &[],
+        &options,
+        timeout,
+        cancellation,
+        false,
+    )
+    .map_err(ExecuteError::into_repo)?;
+
+    let is_remote_pending = completed.fields.status == 11
+        && outcome::diagnostic(&completed.fields).is_ok_and(|d| d == "REMOTE_PENDING");
+
+    if is_remote_pending {
+        if let Ok(Some(bytes)) = completed.metadata {
+            if let Ok(resumed_pw) = crate::rotation::resume::decode_recovery_add_resume(&bytes) {
+                return Ok(AddOutcome::Resumed(resumed_pw));
+            }
+        }
+        return Err(RepoError::Failed);
+    }
+
+    if let Some(failure) = outcome::callable_failure(&completed).map_err(|_| RepoError::Failed)? {
+        return Err(RepoError::Callable(failure));
+    }
+    Ok(AddOutcome::Added)
+}
+
 pub(crate) fn list_keys(
     authority: &AdmittedIosBackupAuthority,
     destination: &Destination,

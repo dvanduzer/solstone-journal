@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -36,6 +37,7 @@ var (
 	errS3OwnerPending = errors.New("S3_REMOTE_PENDING")
 	errS3OwnerBusy    = errors.New("S3_DESTINATION_BUSY")
 	errS3OwnerPolicy  = errors.New("S3_OWNER_FILE_POLICY_REFUSED")
+	errS3RecoveryHold = errors.New("S3_RECOVERY_HOLD")
 	s3OwnersMu        sync.Mutex
 	s3Owners          = make(map[s3Destination]*s3Owner)
 )
@@ -60,6 +62,13 @@ type s3OwnerIntent struct {
 	Locks            []string `json:"locks"`
 	RecoveryPassword []byte   `json:"recovery_password,omitempty"`
 	KeyID            string   `json:"key_id,omitempty"`
+	Ciphertext       []byte   `json:"ciphertext,omitempty"`
+}
+
+type s3RecoveryHold struct {
+	KeyID            string `json:"key_id"`
+	RecoveryPassword []byte `json:"recovery_password"`
+	Ciphertext       []byte `json:"ciphertext"`
 }
 
 // A completed record is prepared only after observed write/lock outcomes and
@@ -70,12 +79,13 @@ type s3OwnerCompletion struct {
 }
 
 type s3OwnerRecord struct {
-	Version     int                    `json:"version"`
-	Destination s3Destination          `json:"destination"`
-	Credentials []s3RetainedCredential `json:"credentials"`
-	Passwords   [][]byte               `json:"passwords"`
-	Active      *s3OwnerIntent         `json:"active"`
-	Complete    *s3OwnerCompletion     `json:"complete"`
+	Version      int                    `json:"version"`
+	Destination  s3Destination          `json:"destination"`
+	Credentials  []s3RetainedCredential `json:"credentials"`
+	Passwords    [][]byte               `json:"passwords"`
+	Active       *s3OwnerIntent         `json:"active"`
+	Complete     *s3OwnerCompletion     `json:"complete"`
+	RecoveryHold *s3RecoveryHold        `json:"recovery_hold"`
 }
 
 type s3Owner struct {
@@ -360,7 +370,7 @@ func completeS3StateJSON(raw []byte) error {
 		}
 		return fields, nil
 	}
-	fields, err := object(raw, []string{"version", "destination", "credentials", "passwords", "active", "complete"}, map[string]bool{"active": true, "complete": true})
+	fields, err := object(raw, []string{"version", "destination", "credentials", "passwords", "active", "complete", "recovery_hold"}, map[string]bool{"active": true, "complete": true, "recovery_hold": true})
 	if err != nil {
 		return err
 	}
@@ -389,7 +399,7 @@ func completeS3StateJSON(raw []byte) error {
 				}
 			case "locks":
 				// nullable
-			case "recovery_password", "key_id":
+			case "recovery_password", "key_id", "ciphertext":
 				if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
 					return errS3OwnerInvalid
 				}
@@ -405,6 +415,11 @@ func completeS3StateJSON(raw []byte) error {
 	}
 	if !bytes.Equal(bytes.TrimSpace(fields["complete"]), []byte("null")) {
 		if _, err := object(fields["complete"], []string{"id", "operation"}, nil); err != nil {
+			return err
+		}
+	}
+	if !bytes.Equal(bytes.TrimSpace(fields["recovery_hold"]), []byte("null")) {
+		if _, err := object(fields["recovery_hold"], []string{"key_id", "recovery_password", "ciphertext"}, nil); err != nil {
 			return err
 		}
 	}
@@ -459,6 +474,9 @@ func (record s3OwnerRecord) validate() error {
 		if len(active.RecoveryPassword) > maxPasswordLen || (active.Operation != OpAddRecoveryKey && len(active.RecoveryPassword) != 0) {
 			return errS3OwnerInvalid
 		}
+		if len(active.Ciphertext) > 0 && (active.Operation != OpAddRecoveryKey || len(active.Ciphertext) > maxS3OwnerBytes) {
+			return errS3OwnerInvalid
+		}
 		seen := make(map[string]bool)
 		for _, id := range active.Locks {
 			if !validS3ID(id) || seen[id] {
@@ -469,6 +487,17 @@ func (record s3OwnerRecord) validate() error {
 	}
 	if complete := record.Complete; complete != nil {
 		if !isMetadataNonce(complete.ID) || !validOwnerOperation(complete.Operation) {
+			return errS3OwnerInvalid
+		}
+	}
+	if hold := record.RecoveryHold; hold != nil {
+		if !lowerHexID(hold.KeyID) || len(hold.KeyID) != 64 {
+			return errS3OwnerInvalid
+		}
+		if len(hold.RecoveryPassword) == 0 || len(hold.RecoveryPassword) > maxPasswordLen {
+			return errS3OwnerInvalid
+		}
+		if len(hold.Ciphertext) == 0 || len(hold.Ciphertext) > maxS3OwnerBytes {
 			return errS3OwnerInvalid
 		}
 	}
@@ -618,6 +647,17 @@ func (owner *s3Owner) begin(operation int32, cfg s3Config, passwords ...[]byte) 
 	if owner.closed || owner.sealing || !validOwnerOperation(operation) {
 		return errS3OwnerInvalid
 	}
+	if operation == OpAddRecoveryKey && owner.record.RecoveryHold != nil {
+		hold := owner.record.RecoveryHold
+		var callerRecPw []byte
+		if len(passwords) > 1 {
+			callerRecPw = passwords[1]
+		}
+		if len(callerRecPw) == 0 || len(callerRecPw) != len(hold.RecoveryPassword) ||
+			subtle.ConstantTimeCompare(callerRecPw, hold.RecoveryPassword) != 1 {
+			return errS3RecoveryHold
+		}
+	}
 	// A prior attempt that may have written stays in custody: this attempt
 	// adopts its recorded lock IDs and cannot complete until each is removed.
 	// Only attempts whose other remote effects are content-addressed restic
@@ -733,6 +773,14 @@ func (owner *s3Owner) begin(operation int32, cfg s3Config, passwords ...[]byte) 
 	}
 	record.Active = &s3OwnerIntent{ID: hex.EncodeToString(nonce[:]), Operation: operation, MayHaveWritten: owner.record.Active != nil && owner.record.Active.MayHaveWritten, Locks: inherited}
 	record.Complete = nil
+	if operation == OpAddRecoveryKey && owner.record.RecoveryHold != nil {
+		hold := owner.record.RecoveryHold
+		record.Active.KeyID = hold.KeyID
+		record.Active.RecoveryPassword = append([]byte(nil), hold.RecoveryPassword...)
+		record.Active.Ciphertext = append([]byte(nil), hold.Ciphertext...)
+		record.Active.MayHaveWritten = true
+		owner.knownKeyID = hold.KeyID
+	}
 	if len(record.Credentials) > maxS3OwnerCredentials || len(record.Passwords) > maxS3OwnerPasswords {
 		return errResourceLimit
 	}
@@ -870,7 +918,69 @@ func (owner *s3Owner) recordKeyID(keyID string) error {
 	return nil
 }
 
-func (owner *s3Owner) activeAddRecoveryInfo() (string, []byte) {
+func (owner *s3Owner) recordKeyPayload(keyID string, ciphertext []byte) error {
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+	if owner.closed || owner.sealing || owner.stateFailed || owner.record.Active == nil || owner.liveID == "" || owner.liveID != owner.record.Active.ID {
+		return errS3OwnerInvalid
+	}
+	if owner.recheckCustody("") != nil {
+		owner.stateFailed = true
+		return errS3OwnerInvalid
+	}
+	active := *owner.record.Active
+	if active.Operation != OpAddRecoveryKey {
+		owner.knownKeyID = keyID
+		return nil
+	}
+	if !lowerHexID(keyID) || len(keyID) != 64 || len(ciphertext) == 0 {
+		return errS3OwnerInvalid
+	}
+	if active.KeyID != "" && active.KeyID != keyID {
+		return errS3OwnerInvalid
+	}
+	if len(active.Ciphertext) > 0 {
+		if !bytes.Equal(active.Ciphertext, ciphertext) {
+			return errS3OwnerInvalid
+		}
+		owner.knownKeyID = keyID
+		return nil
+	}
+	active.KeyID = keyID
+	active.Ciphertext = append([]byte(nil), ciphertext...)
+	active.MayHaveWritten = true
+	if len(active.RecoveryPassword) == 0 {
+		for i, p := range owner.attemptPasses {
+			if i > 0 && len(p) > 0 {
+				active.RecoveryPassword = append([]byte(nil), p...)
+				break
+			}
+		}
+	}
+	record := owner.record
+	if len(active.RecoveryPassword) > 0 {
+		found := false
+		for _, retained := range record.Passwords {
+			if bytes.Equal(retained, active.RecoveryPassword) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			record.Passwords = append(record.Passwords, append([]byte(nil), active.RecoveryPassword...))
+		}
+	}
+	record.Active = &active
+	_, err := owner.persist(record)
+	if err != nil {
+		owner.stateFailed = true
+		return err
+	}
+	owner.knownKeyID = keyID
+	return nil
+}
+
+func (owner *s3Owner) activeAddRecoveryInfo() (string, []byte, []byte) {
 	owner.mu.Lock()
 	defer owner.mu.Unlock()
 	if owner.record.Active != nil && owner.record.Active.Operation == OpAddRecoveryKey {
@@ -878,7 +988,24 @@ func (owner *s3Owner) activeAddRecoveryInfo() (string, []byte) {
 		if len(owner.record.Active.RecoveryPassword) > 0 {
 			pw = append([]byte(nil), owner.record.Active.RecoveryPassword...)
 		}
-		return owner.record.Active.KeyID, pw
+		var ct []byte
+		if len(owner.record.Active.Ciphertext) > 0 {
+			ct = append([]byte(nil), owner.record.Active.Ciphertext...)
+		}
+		return owner.record.Active.KeyID, pw, ct
+	}
+	return "", nil, nil
+}
+
+func (owner *s3Owner) recoveryHoldInfo() (string, []byte) {
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+	if owner.record.RecoveryHold != nil {
+		var pw []byte
+		if len(owner.record.RecoveryHold.RecoveryPassword) > 0 {
+			pw = append([]byte(nil), owner.record.RecoveryHold.RecoveryPassword...)
+		}
+		return owner.record.RecoveryHold.KeyID, pw
 	}
 	return "", nil
 }
@@ -954,7 +1081,33 @@ func (owner *s3Owner) complete() (published bool, err error) {
 			return false, errS3OwnerPending
 		}
 	}
+	if owner.attemptFailed && owner.record.Active != nil && owner.record.Active.Operation == OpAddRecoveryKey && owner.record.Active.MayHaveWritten {
+		return false, errS3OwnerPending
+	}
 	record := owner.record
+	if !owner.attemptFailed && owner.record.Active != nil && owner.record.Active.Operation == OpAddRecoveryKey {
+		keyID := owner.record.Active.KeyID
+		if keyID == "" {
+			keyID = owner.knownKeyID
+		}
+		var recPw []byte
+		if len(owner.record.Active.RecoveryPassword) > 0 {
+			recPw = owner.record.Active.RecoveryPassword
+		} else if len(owner.attemptPasses) > 1 {
+			recPw = owner.attemptPasses[1]
+		}
+		ciphertext := owner.record.Active.Ciphertext
+		if keyID == "" || !lowerHexID(keyID) || len(keyID) != 64 || len(recPw) == 0 || len(ciphertext) == 0 {
+			return false, errS3OwnerPending
+		}
+		record.RecoveryHold = &s3RecoveryHold{
+			KeyID:            keyID,
+			RecoveryPassword: append([]byte(nil), recPw...),
+			Ciphertext:       append([]byte(nil), ciphertext...),
+		}
+	} else if !owner.attemptFailed && owner.record.Active != nil && owner.record.Active.Operation == OpRemoveRecoveryKey {
+		record.RecoveryHold = nil
+	}
 	record.Complete = &s3OwnerCompletion{ID: record.Active.ID, Operation: record.Active.Operation}
 	record.Active = nil
 	// A failed attempt that wrote nothing (a mistyped recovery key, a refused
@@ -969,14 +1122,22 @@ func (owner *s3Owner) complete() (published bool, err error) {
 		if record.Complete != nil {
 			switch record.Complete.Operation {
 			case OpAddRecoveryKey:
-				newPasses := make([][]byte, 0, len(owner.attemptPasses))
-				for _, p := range owner.attemptPasses {
-					if len(p) > 0 {
-						newPasses = append(newPasses, append([]byte(nil), p...))
-					}
+				var candidate []byte
+				if record.RecoveryHold != nil && len(record.RecoveryHold.RecoveryPassword) > 0 {
+					candidate = record.RecoveryHold.RecoveryPassword
+				} else if len(owner.attemptPasses) > 1 {
+					candidate = owner.attemptPasses[1]
+				}
+				var newPasses [][]byte
+				if len(owner.attemptPasses) > 0 && len(owner.attemptPasses[0]) > 0 {
+					newPasses = append(newPasses, append([]byte(nil), owner.attemptPasses[0]...))
+				}
+				if len(candidate) > 0 {
+					newPasses = append(newPasses, append([]byte(nil), candidate...))
 				}
 				record.Passwords = newPasses
 			case OpRemoveRecoveryKey:
+				record.RecoveryHold = nil
 				for _, p := range owner.attemptPasses {
 					if len(p) == 0 {
 						continue
@@ -1044,11 +1205,29 @@ func (owner *s3Owner) Close() error {
 	for _, password := range owner.attemptPasses {
 		zeroBytes(password)
 	}
-	if owner.record.Active != nil && len(owner.record.Active.RecoveryPassword) > 0 {
-		zeroBytes(owner.record.Active.RecoveryPassword)
+	if owner.record.Active != nil {
+		if len(owner.record.Active.RecoveryPassword) > 0 {
+			zeroBytes(owner.record.Active.RecoveryPassword)
+		}
+		if len(owner.record.Active.Ciphertext) > 0 {
+			zeroBytes(owner.record.Active.Ciphertext)
+		}
 	}
-	if owner.preservedAddIntent != nil && len(owner.preservedAddIntent.RecoveryPassword) > 0 {
-		zeroBytes(owner.preservedAddIntent.RecoveryPassword)
+	if owner.preservedAddIntent != nil {
+		if len(owner.preservedAddIntent.RecoveryPassword) > 0 {
+			zeroBytes(owner.preservedAddIntent.RecoveryPassword)
+		}
+		if len(owner.preservedAddIntent.Ciphertext) > 0 {
+			zeroBytes(owner.preservedAddIntent.Ciphertext)
+		}
+	}
+	if owner.record.RecoveryHold != nil {
+		if len(owner.record.RecoveryHold.RecoveryPassword) > 0 {
+			zeroBytes(owner.record.RecoveryHold.RecoveryPassword)
+		}
+		if len(owner.record.RecoveryHold.Ciphertext) > 0 {
+			zeroBytes(owner.record.RecoveryHold.Ciphertext)
+		}
 	}
 	owner.attemptPasses = nil
 	owner.preservedAddIntent = nil

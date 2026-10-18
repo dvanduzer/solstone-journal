@@ -62,31 +62,24 @@ func TestSaveReportsPostRenameDirectoryOpenFailure(t *testing.T) {
 
 func TestLocalKeyListRefusesMalformedNames(t *testing.T) {
 	dir := t.TempDir()
+	password := []byte("valid-test-daily-password")
+	ctx := context.Background()
+
+	initRes, err := executeInit(ctx, bridgeRequest{operation: OpInit, password: password, repoPath: dir}, func() {})
+	if err != nil || initRes.status != StatusOk {
+		t.Fatalf("executeInit failed: status=%d err=%v", initRes.status, err)
+	}
+
 	keysDir := filepath.Join(dir, "keys")
-	if err := os.Mkdir(keysDir, 0700); err != nil {
-		t.Fatal(err)
-	}
-	validKeyName := strings.Repeat("a", 64)
-	if err := os.WriteFile(filepath.Join(keysDir, validKeyName), []byte("valid-key-data"), 0600); err != nil {
-		t.Fatal(err)
-	}
 	malformedPath := filepath.Join(keysDir, "truncated-name")
 	if err := os.WriteFile(malformedPath, []byte("malformed-key-data"), 0600); err != nil {
 		t.Fatal(err)
 	}
 
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer root.Close()
-
-	ctx := context.Background()
 	req := bridgeRequest{
-		operation:   OpListRecoveryKeys,
-		pathsPinned: true,
-		repoRoot:    root,
-		password:    []byte("dummy-password"),
+		operation: OpListRecoveryKeys,
+		repoPath:  dir,
+		password:  password,
 	}
 
 	res, _ := executeListRecoveryKeys(ctx, req)
@@ -104,6 +97,22 @@ func TestLocalKeyListRefusesMalformedNames(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	res2, err := executeListRecoveryKeys(ctx, req)
+	if err != nil || res2.status != StatusOk {
+		t.Fatalf("executeListRecoveryKeys failed after removal: status=%d err=%v", res2.status, err)
+	}
+	if res2.keyID == "" {
+		t.Fatal("expected real key id, got empty")
+	}
+	if len(res2.metadata) == 0 {
+		t.Fatal("expected metadata containing real key")
+	}
+
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
 	be, err := newRootBackend(root)
 	if err != nil {
 		t.Fatal(err)

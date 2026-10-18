@@ -111,7 +111,20 @@ func TestS3OwnerPendingSurvivesReopenAndCleanupAcknowledgement(t *testing.T) {
 	}
 	s3OwnerTestClose(t, owner)
 	reopened := s3OwnerTestOpen(t, root, cfg)
-	if reopened.record.Active == nil || !reopened.record.Active.MayHaveWritten || len(reopened.record.Passwords) != 1 {
+	if reopened.record.Active == nil || !reopened.record.Active.MayHaveWritten {
+		t.Fatal("interruption custody missing")
+	}
+	var foundOldDaily, foundNewRecovery bool
+	for _, p := range reopened.record.Passwords {
+		if bytes.Equal(p, []byte("old-daily")) {
+			foundOldDaily = true
+		} else if bytes.Equal(p, []byte("new-recovery")) {
+			foundNewRecovery = true
+		} else {
+			t.Fatalf("unexpected password in record: %s", string(p))
+		}
+	}
+	if len(reopened.record.Passwords) != 2 || !foundOldDaily || !foundNewRecovery {
 		t.Fatal("interruption custody missing")
 	}
 	before, err := os.ReadFile(filepath.Join(root, s3OwnerStateName))
@@ -414,6 +427,8 @@ func TestS3OwnerInterruptedAddReconciles(t *testing.T) {
 	if !published || err != nil {
 		t.Fatalf("complete list failed: %v", err)
 	}
+	s3OwnerTestClose(t, reopened)
+	reopened = s3OwnerTestOpen(t, root, cfg)
 
 	// Then begin(OpAddRecoveryKey) with candidate-2
 	if err := reopened.begin(OpAddRecoveryKey, cfg, []byte("daily-1"), []byte("candidate-2")); err != nil {
@@ -531,6 +546,8 @@ func TestS3OwnerInterruptedRemoveReconciles(t *testing.T) {
 	if reopenedAdd.record.Complete != nil {
 		t.Fatal("Complete must be nil")
 	}
+	s3OwnerTestClose(t, reopenedAdd)
+	reopenedAdd = s3OwnerTestOpen(t, root, cfg)
 	if err := reopenedAdd.begin(OpAddRecoveryKey, cfg, []byte("daily-1"), []byte("candidate-2")); err != nil {
 		t.Fatalf("begin OpAddRecoveryKey after list failed: %v", err)
 	}
