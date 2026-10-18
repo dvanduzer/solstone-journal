@@ -262,7 +262,7 @@ pub struct CoremlInstallError {
 }
 
 impl CoremlInstallError {
-    fn new(reason_code: impl Into<String>, message: impl Into<String>, exit_code: u8) -> Self {
+    pub fn new(reason_code: impl Into<String>, message: impl Into<String>, exit_code: u8) -> Self {
         Self {
             reason_code: reason_code.into(),
             message: message.into(),
@@ -355,11 +355,19 @@ pub fn install_parakeet_coreml_model(
 ) -> Result<PathBuf, CoremlInstallError> {
     let (os_name, arch) = canonical_host_pair(std::env::consts::OS, std::env::consts::ARCH);
     let rows = rows()?;
-    install_with_rows(home_dir, config, force, (os_name, arch), &rows)
+    install_with_rows(
+        home_dir,
+        config,
+        force,
+        (os_name, arch),
+        &rows,
+        &mut |_, _| {},
+    )
 }
 
 /// Refresh an installed CoreML model tree if on darwin/arm64 and catalog pins moved.
 pub fn refresh_installed_parakeet_coreml(
+    journal: &Path,
     home_dir: &Path,
     config: &JournalConfigRead,
 ) -> Result<PathBuf, CoremlInstallError> {
@@ -370,10 +378,67 @@ pub fn refresh_installed_parakeet_coreml(
         )));
     }
     let rows = rows()?;
+    let total_bytes: u64 = rows.iter().map(|r| r.size_bytes).sum();
+    let mut completed_bytes: u64 = 0;
+    let mut progress_at = std::time::Instant::now();
+    let mut progress_error: Option<String> = None;
+
     let mut fetch = |query: &RuntimeFetchQuery<'_>, destination: &Path| {
-        fetch_runtime_member(query, destination)
+        if let Some(ref err) = progress_error {
+            return Err(CoremlInstallError::new(
+                "status_write_failed",
+                err.clone(),
+                74,
+            ));
+        }
+        let fetch_res = fetch_runtime_member(query, destination, &mut |received, _| {
+            if progress_error.is_some() {
+                return;
+            }
+            let cumulative = completed_bytes.saturating_add(received);
+            let state = match super::status::read_status(journal, "parakeet") {
+                Ok(s) => s,
+                Err(e) => {
+                    progress_error = Some(e.to_string());
+                    return;
+                }
+            };
+            match super::status::bump_progress(
+                state,
+                Some(cumulative),
+                Some(total_bytes),
+                &mut progress_at,
+            )
+            .and_then(|next| {
+                next.map(|next| super::status::write_status(journal, next))
+                    .transpose()
+            }) {
+                Ok(Some(_)) => {}
+                Ok(None) => {}
+                Err(err) => progress_error = Some(err.to_string()),
+            }
+        });
+        fetch_res?;
+        if let Some(ref err) = progress_error {
+            return Err(CoremlInstallError::new(
+                "status_write_failed",
+                err.clone(),
+                74,
+            ));
+        }
+        if let Some(row) = rows.iter().find(|r| Some(r.origin_key) == query.origin_key) {
+            completed_bytes = completed_bytes.saturating_add(row.size_bytes);
+        }
+        Ok(())
     };
-    refresh_with_rows(home_dir, config, (os_name, arch), &rows, &mut fetch)
+    refresh_with_rows(
+        journal,
+        home_dir,
+        config,
+        (os_name, arch),
+        &rows,
+        &mut fetch,
+    )
 }
 
 /// Verify the model tree and install sentinel without fetching.
@@ -449,7 +514,7 @@ pub fn heal_missing_parakeet_coreml(
         installed,
         catalog_version,
         chrono::Utc::now(),
-        || install_parakeet_coreml_model(home_dir, config, false),
+        || download_publish_coreml(journal, home_dir, config, false),
     )
 }
 
@@ -462,16 +527,13 @@ fn heal_with(
 ) -> Result<CoremlHeal, String> {
     use super::{lease, status};
 
-    let record = status::read_status(journal, "parakeet").map_err(|error| error.to_string())?;
+    if lease::is_held(journal, "parakeet").map_err(|error| error.to_string())? {
+        return Ok(CoremlHeal::InstallRunning);
+    }
     if installed {
-        // A model installed some other way (setup, or by hand) clears a failure.
-        if record.install_state == "failed" {
-            status::transition(record, "idle", None, None)
-                .and_then(|next| status::write_status(journal, next))
-                .map_err(|error| error.to_string())?;
-        }
         return Ok(CoremlHeal::AlreadyInstalled);
     }
+    let record = status::read_status(journal, "parakeet").map_err(|error| error.to_string())?;
     if record.install_state == "failed" {
         if record.error_code.as_deref() == Some("install_cancelled") {
             return Ok(CoremlHeal::OwnerCancelled);
@@ -486,7 +548,7 @@ fn heal_with(
             return Ok(CoremlHeal::CoolingDown);
         }
     }
-    let Some(_lease) = lease::acquire(journal, "parakeet").map_err(|error| error.to_string())?
+    let Some(lease) = lease::acquire(journal, "parakeet").map_err(|error| error.to_string())?
     else {
         return Ok(CoremlHeal::InstallRunning);
     };
@@ -497,17 +559,18 @@ fn heal_with(
     })
     .to_string();
     let fingerprint_sha256 = format!("{:x}", Sha256::digest(fingerprint_json.as_bytes()));
-    let state = status::begin_or_replace(
+    let state = super::admit_parakeet_attempt(
         journal,
-        "parakeet",
+        &lease,
         fingerprint_json,
         fingerprint_sha256,
-        None,
         "downloading",
-        None,
+        |_| {},
     )
     .map_err(|error| error.to_string())?;
-    let (next, outcome) = match install() {
+    let result = install();
+    let state = current_attempt_status(journal, &state).map_err(|error| error.to_string())?;
+    let (next, outcome) = match result {
         Ok(_) => (
             status::transition(state, "installed", None, None),
             CoremlHeal::Installed,
@@ -527,9 +590,135 @@ fn heal_with(
     Ok(outcome)
 }
 
+fn write_attempt_phase(journal: &Path, phase: &str) -> Result<(), CoremlInstallError> {
+    let mut current = super::status::read_status(journal, "parakeet")
+        .map_err(|error| CoremlInstallError::new("status_unreadable", error.to_string(), 74))?;
+    if phase == "verifying" {
+        current.progress_bytes_received = current.progress_bytes_total;
+    }
+    super::status::transition(current, phase, None, None)
+        .and_then(|next| super::status::write_status(journal, next))
+        .map_err(|error| CoremlInstallError::new("status_write_failed", error.to_string(), 74))?;
+    Ok(())
+}
+
+fn current_attempt_status(
+    journal: &Path,
+    admitted: &super::status::InstallStatus,
+) -> Result<super::status::InstallStatus, CoremlInstallError> {
+    let current = super::status::read_status(journal, "parakeet")
+        .map_err(|error| CoremlInstallError::new("status_unreadable", error.to_string(), 74))?;
+    if current.attempt_id != admitted.attempt_id {
+        return Err(CoremlInstallError::new(
+            "status_write_failed",
+            "the speech install attempt changed.",
+            74,
+        ));
+    }
+    Ok(current)
+}
+
+pub fn run_coreml_parakeet_attempt(
+    journal: &Path,
+    lease: &super::lease::InstallLease,
+    home_dir: &Path,
+    config: &JournalConfigRead,
+    force: bool,
+    on_admitted: impl FnOnce(&super::status::InstallStatus),
+) -> Result<PathBuf, CoremlInstallError> {
+    use super::status;
+
+    let rows = rows()?;
+    let catalog_version = shared_catalog_version(&rows)?;
+    let fingerprint_json = serde_json::json!({
+        "catalog_version": catalog_version,
+        "provider": "parakeet",
+        "variant": "coreml",
+    })
+    .to_string();
+    let fingerprint_sha256 = format!("{:x}", Sha256::digest(fingerprint_json.as_bytes()));
+    let state = super::admit_parakeet_attempt(
+        journal,
+        lease,
+        fingerprint_json,
+        fingerprint_sha256,
+        "downloading",
+        on_admitted,
+    )
+    .map_err(|e| CoremlInstallError::new("status_write_failed", e.to_string(), 74))?;
+
+    match download_publish_coreml(journal, home_dir, config, force) {
+        Ok(target) => {
+            let record = current_attempt_status(journal, &state)?;
+            let next = status::transition(record, "installed", None, None)
+                .map_err(|e| CoremlInstallError::new("status_write_failed", e.to_string(), 74))?;
+            status::write_status(journal, next)
+                .map_err(|e| CoremlInstallError::new("status_write_failed", e.to_string(), 74))?;
+            Ok(target)
+        }
+        Err(error) => {
+            let record = current_attempt_status(journal, &state)?;
+            let write_res = status::transition(
+                record,
+                "failed",
+                Some(error.to_string()),
+                Some(error.reason_code.clone()),
+            )
+            .and_then(|failed| status::write_status(journal, failed));
+            if let Err(term_err) = write_res {
+                return Err(CoremlInstallError::new(
+                    "status_write_failed",
+                    term_err.to_string(),
+                    74,
+                ));
+            }
+            Err(error)
+        }
+    }
+}
+
+fn download_publish_coreml(
+    journal: &Path,
+    home_dir: &Path,
+    config: &JournalConfigRead,
+    force: bool,
+) -> Result<PathBuf, CoremlInstallError> {
+    let platform = canonical_host_pair(std::env::consts::OS, std::env::consts::ARCH);
+    let rows = rows()?;
+    let mut publish = |staging: &Path, target: &Path| fs::rename(staging, target);
+    let mut write = write_sentinel;
+    let mut progress_at = std::time::Instant::now();
+    install_observed_with_rows(
+        home_dir,
+        config,
+        force,
+        platform,
+        &rows,
+        CoremlAdmission::Mint,
+        &mut publish,
+        &mut write,
+        Some(journal),
+        &mut |received, total| {
+            let state = super::status::read_status(journal, "parakeet").map_err(|error| {
+                CoremlInstallError::new("status_unreadable", error.to_string(), 74)
+            })?;
+            super::status::bump_progress(state, Some(received), total, &mut progress_at)
+                .and_then(|next| {
+                    next.map(|next| super::status::write_status(journal, next))
+                        .transpose()
+                })
+                .map_err(|error| {
+                    CoremlInstallError::new("status_write_failed", error.to_string(), 74)
+                })?;
+            Ok(())
+        },
+    )
+}
+
 fn fetch_runtime_member(
     query: &solstone_core_assets::RuntimeFetchQuery<'_>,
     destination: &Path,
+    on_chunk: &mut impl FnMut(u64, Option<u64>),
 ) -> Result<(), CoremlInstallError> {
     let handle = solstone_core_assets::mint_runtime_fetch(query).map_err(|err| {
         CoremlInstallError::new(
@@ -538,7 +727,7 @@ fn fetch_runtime_member(
             65,
         )
     })?;
-    solstone_core_artifact_download::download_runtime_fetch(&handle, destination, |_, _| {})
+    solstone_core_artifact_download::download_runtime_fetch(&handle, destination, on_chunk)
         .map_err(archive_error)?;
     Ok(())
 }
@@ -556,6 +745,7 @@ fn install_with_rows(
     force: bool,
     platform: (&str, &str),
     rows: &[&Artifact],
+    progress: &mut impl FnMut(u64, Option<u64>),
 ) -> Result<PathBuf, CoremlInstallError> {
     let mut publish = |staging: &Path, target: &Path| fs::rename(staging, target);
     let mut write = write_sentinel;
@@ -568,6 +758,7 @@ fn install_with_rows(
         CoremlAdmission::Mint,
         &mut publish,
         &mut write,
+        progress,
     )
 }
 
@@ -582,6 +773,37 @@ pub(crate) fn install_with_rows_and_seams(
     admission: CoremlAdmission,
     publish: &mut impl FnMut(&Path, &Path) -> std::io::Result<()>,
     write: &mut impl FnMut(&Path, &ParakeetCoremlSentinel) -> std::io::Result<()>,
+    progress: &mut impl FnMut(u64, Option<u64>),
+) -> Result<PathBuf, CoremlInstallError> {
+    install_observed_with_rows(
+        home_dir,
+        config,
+        force,
+        platform,
+        rows,
+        admission,
+        publish,
+        write,
+        None,
+        &mut |received, total| {
+            progress(received, total);
+            Ok(())
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_observed_with_rows(
+    home_dir: &Path,
+    config: &JournalConfigRead,
+    force: bool,
+    platform: (&str, &str),
+    rows: &[&Artifact],
+    admission: CoremlAdmission,
+    publish: &mut impl FnMut(&Path, &Path) -> std::io::Result<()>,
+    write: &mut impl FnMut(&Path, &ParakeetCoremlSentinel) -> std::io::Result<()>,
+    journal: Option<&Path>,
+    progress: &mut impl FnMut(u64, Option<u64>) -> Result<(), CoremlInstallError>,
 ) -> Result<PathBuf, CoremlInstallError> {
     let (os_name, arch) = platform;
     require_coreml_host(os_name, arch)?;
@@ -628,6 +850,9 @@ pub(crate) fn install_with_rows_and_seams(
         .collect::<Vec<_>>();
 
     if !force && files_match_rows(&target, rows) {
+        if let Some(journal) = journal {
+            write_attempt_phase(journal, "installing")?;
+        }
         publish_coreml(
             home_dir,
             os_name,
@@ -643,32 +868,48 @@ pub(crate) fn install_with_rows_and_seams(
         return Ok(target);
     }
 
-    let mut fetch = |query: &RuntimeFetchQuery<'_>, destination: &Path| match admission {
-        CoremlAdmission::Mint => fetch_runtime_member(query, destination),
-        #[cfg(feature = "test-hooks")]
-        CoremlAdmission::Fixture => {
-            let row = rows
-                .iter()
-                .find(|r| Some(r.origin_key) == query.origin_key)
-                .expect("row exists in fixture rows");
-            let handle = solstone_core_assets::runtime_fetch_handle_fixture(
-                row.unit,
-                row.origin_key,
-                row.sha256,
-                row.size_bytes,
-            );
-            solstone_core_artifact_download::download_runtime_fetch(
-                &handle,
-                destination,
-                |_, _| {},
-            )
-            .map_err(archive_error)?;
-            Ok(())
+    let total = rows.iter().map(|row| row.size_bytes).sum();
+    let mut completed = 0_u64;
+    let mut fetch = |query: &RuntimeFetchQuery<'_>, destination: &Path| {
+        let row = rows
+            .iter()
+            .find(|row| Some(row.origin_key) == query.origin_key)
+            .expect("fetch query belongs to the selected rows");
+        let mut progress_error = None;
+        let mut on_chunk = |received, _| {
+            if progress_error.is_none() {
+                progress_error = progress(completed.saturating_add(received), Some(total)).err();
+            }
+        };
+        let result = match admission {
+            CoremlAdmission::Mint => fetch_runtime_member(query, destination, &mut on_chunk),
+            #[cfg(feature = "test-hooks")]
+            CoremlAdmission::Fixture => {
+                let handle = solstone_core_assets::runtime_fetch_handle_fixture(
+                    row.unit,
+                    row.origin_key,
+                    row.sha256,
+                    row.size_bytes,
+                );
+                solstone_core_artifact_download::download_runtime_fetch(
+                    &handle,
+                    destination,
+                    &mut on_chunk,
+                )
+                .map(|_| ())
+                .map_err(archive_error)
+            }
+        };
+        if let Some(error) = progress_error {
+            return Err(error);
         }
+        result?;
+        completed = completed.saturating_add(row.size_bytes);
+        Ok(())
     };
 
-    download_and_commit_coreml(
-        home_dir, config, platform, rows, false, &mut fetch, publish, write,
+    download_and_commit_coreml_observed(
+        home_dir, config, platform, rows, false, &mut fetch, publish, write, journal,
     )
 }
 
@@ -680,6 +921,136 @@ fn check_parakeet_coreml_install_with_platform(
 ) -> Result<(), CoremlInstallError> {
     let rows = rows()?;
     check_with_rows(home_dir, config, os_name, arch, &rows)
+}
+
+// Setup polls must neither recover publication nor hash an unchanged model tree
+// on every request. This memo stores one integrity proof, never job state.
+#[cfg(unix)]
+#[derive(Clone, PartialEq, Eq)]
+struct CoremlTreeStamp {
+    entries: Vec<CoremlFileStamp>,
+    rows: Vec<(String, String, u64)>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, PartialEq, Eq)]
+struct CoremlFileStamp {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    len: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+#[cfg(unix)]
+fn coreml_tree_stamp(
+    home: &Path,
+    config: &JournalConfigRead,
+    rows: &[&Artifact],
+) -> Option<CoremlTreeStamp> {
+    use std::os::unix::fs::MetadataExt;
+    let configured_cache = parakeet_coreml_cache_dir(config, home);
+    let root = parakeet_coreml_model_root(&configured_cache);
+    let mut paths = vec![
+        parakeet_coreml_sentinel_path(home),
+        configured_cache,
+        root.clone(),
+    ];
+    paths.extend(rows.iter().map(|row| root.join(row.filename)));
+    let entries = paths
+        .into_iter()
+        .map(|path| {
+            let meta = fs::metadata(&path).ok()?;
+            Some(CoremlFileStamp {
+                path,
+                device: meta.dev(),
+                inode: meta.ino(),
+                len: meta.len(),
+                modified: (meta.mtime(), meta.mtime_nsec()),
+                changed: (meta.ctime(), meta.ctime_nsec()),
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(CoremlTreeStamp {
+        entries,
+        rows: rows
+            .iter()
+            .map(|row| (row.filename.into(), row.sha256.into(), row.size_bytes))
+            .collect(),
+    })
+}
+
+/// Read-only integrity verification for setup progress. Reuse a digest proof
+/// only while the complete tree, receipt and offered catalog identities match.
+#[cfg(unix)]
+pub fn parakeet_coreml_current_verified(home: &Path, config: &JournalConfigRead) -> bool {
+    static PROOF: std::sync::Mutex<Option<(CoremlTreeStamp, bool)>> = std::sync::Mutex::new(None);
+    let Ok(rows) = rows() else {
+        return false;
+    };
+    current_verified_with_rows(home, config, &rows, &PROOF, || {
+        check_with_rows(home, config, "darwin", "arm64", &rows).is_ok()
+    })
+}
+
+#[cfg(unix)]
+fn current_verified_with_rows(
+    home: &Path,
+    config: &JournalConfigRead,
+    rows: &[&Artifact],
+    proof: &std::sync::Mutex<Option<(CoremlTreeStamp, bool)>>,
+    verify: impl FnOnce() -> bool,
+) -> bool {
+    let cache = default_parakeet_coreml_cache_dir(home);
+    let lock_path = cache.join(".admission.lock");
+    let Ok(guard) = solstone_core_journal_io::hold_existing_lock(
+        &lock_path,
+        LockOptions {
+            timeout: Duration::ZERO,
+            ..LockOptions::default()
+        },
+    ) else {
+        return false;
+    };
+    let marker = cache.join(".publication.json");
+    if marker.exists()
+        && !fs::read(&marker)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<PublicationMarker>(&bytes).ok())
+            .is_some_and(|marker| publication_was_committed(home, &marker))
+    {
+        return false;
+    }
+    let Some(before) = coreml_tree_stamp(home, config, rows) else {
+        return false;
+    };
+    let Ok(mut cached) = proof.lock() else {
+        return false;
+    };
+    let verified = match cached.as_ref() {
+        Some((stamp, verified)) if stamp == &before => *verified,
+        _ => verify(),
+    };
+    // Legacy installations can predate the admission lock. Refuse a snapshot
+    // if a writer established its authority while the unlocked read ran.
+    if guard.is_none()
+        && solstone_core_journal_io::hold_existing_lock(
+            &lock_path,
+            LockOptions {
+                timeout: Duration::ZERO,
+                ..LockOptions::default()
+            },
+        )
+        .map_or(true, |guard| guard.is_some())
+    {
+        return false;
+    }
+    if coreml_tree_stamp(home, config, rows).as_ref() != Some(&before) {
+        return false;
+    }
+    *cached = Some((before, verified));
+    verified
 }
 
 fn check_with_rows(
@@ -1056,6 +1427,7 @@ fn publish_coreml(
 }
 
 fn refresh_with_rows(
+    journal: &Path,
     home_dir: &Path,
     config: &JournalConfigRead,
     platform: (&str, &str),
@@ -1075,7 +1447,7 @@ fn refresh_with_rows(
     }
 
     let lock_path = default_cache.join(".publish.lock");
-    let _lock = match hold_lock(
+    let _publish_lock = match hold_lock(
         &lock_path,
         LockOptions {
             timeout: Duration::ZERO,
@@ -1136,7 +1508,36 @@ fn refresh_with_rows(
         return Ok(target);
     }
 
-    download_and_commit_coreml(
+    let lease = match super::lease::acquire(journal, "parakeet") {
+        Ok(Some(lease)) => lease,
+        Ok(None) => {
+            log::warn!("parakeet CoreML refresh skipped: install lease held");
+            return Ok(target);
+        }
+        Err(err) => {
+            log::warn!("parakeet CoreML refresh skipped: lease acquire error: {err}");
+            return Ok(target);
+        }
+    };
+
+    let fingerprint_json = serde_json::json!({
+        "catalog_version": catalog_version,
+        "provider": "parakeet",
+        "variant": "coreml",
+    })
+    .to_string();
+    let fingerprint_sha256 = format!("{:x}", Sha256::digest(fingerprint_json.as_bytes()));
+    let state = super::admit_parakeet_attempt(
+        journal,
+        &lease,
+        fingerprint_json,
+        fingerprint_sha256,
+        "downloading",
+        |_| {},
+    )
+    .map_err(|e| CoremlInstallError::new("status_write_failed", e.to_string(), 74))?;
+
+    let outcome = download_and_commit_coreml_observed(
         home_dir,
         config,
         platform,
@@ -1145,9 +1546,39 @@ fn refresh_with_rows(
         fetch,
         &mut publish,
         &mut write,
-    )
+        Some(journal),
+    );
+    match outcome {
+        Ok(target) => {
+            let record = current_attempt_status(journal, &state)?;
+            let next = super::status::transition(record, "installed", None, None)
+                .map_err(|e| CoremlInstallError::new("status_write_failed", e.to_string(), 74))?;
+            super::status::write_status(journal, next)
+                .map_err(|e| CoremlInstallError::new("status_write_failed", e.to_string(), 74))?;
+            Ok(target)
+        }
+        Err(error) => {
+            let record = current_attempt_status(journal, &state)?;
+            let write_res = super::status::transition(
+                record,
+                "failed",
+                Some(error.to_string()),
+                Some(error.reason_code.clone()),
+            )
+            .and_then(|failed| super::status::write_status(journal, failed));
+            if let Err(term_err) = write_res {
+                return Err(CoremlInstallError::new(
+                    "status_write_failed",
+                    term_err.to_string(),
+                    74,
+                ));
+            }
+            Err(error)
+        }
+    }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn download_and_commit_coreml(
     home_dir: &Path,
@@ -1158,6 +1589,23 @@ fn download_and_commit_coreml(
     fetch: &mut impl FnMut(&RuntimeFetchQuery<'_>, &Path) -> Result<(), CoremlInstallError>,
     publish: &mut impl FnMut(&Path, &Path) -> std::io::Result<()>,
     write: &mut impl FnMut(&Path, &ParakeetCoremlSentinel) -> std::io::Result<()>,
+) -> Result<PathBuf, CoremlInstallError> {
+    download_and_commit_coreml_observed(
+        home_dir, config, platform, rows, is_refresh, fetch, publish, write, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn download_and_commit_coreml_observed(
+    home_dir: &Path,
+    config: &JournalConfigRead,
+    platform: (&str, &str),
+    rows: &[&Artifact],
+    is_refresh: bool,
+    fetch: &mut impl FnMut(&RuntimeFetchQuery<'_>, &Path) -> Result<(), CoremlInstallError>,
+    publish: &mut impl FnMut(&Path, &Path) -> std::io::Result<()>,
+    write: &mut impl FnMut(&Path, &ParakeetCoremlSentinel) -> std::io::Result<()>,
+    journal: Option<&Path>,
 ) -> Result<PathBuf, CoremlInstallError> {
     let (os_name, arch) = platform;
     let cache_dir = parakeet_coreml_cache_dir(config, home_dir);
@@ -1207,6 +1655,34 @@ fn download_and_commit_coreml(
         ));
     }
 
+    let preparation = (|| {
+        if let Some(journal) = journal {
+            write_attempt_phase(journal, "verifying")?;
+        }
+        // Fetch handles prove digests; validate the complete staged tree too.
+        for row in rows {
+            let path = staging.join(row.filename);
+            let metadata = fs::metadata(&path).map_err(|error| {
+                CoremlInstallError::new("model_incomplete", error.to_string(), 65)
+            })?;
+            if !metadata.is_file() || metadata.len() != row.size_bytes {
+                return Err(CoremlInstallError::new(
+                    "model_incomplete",
+                    "speech model asset is incomplete",
+                    65,
+                ));
+            }
+        }
+        if let Some(journal) = journal {
+            write_attempt_phase(journal, "installing")?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = preparation {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+
     let files = rows
         .iter()
         .map(|r| ParakeetCoremlFile {
@@ -1250,6 +1726,7 @@ pub(crate) fn install_with_rows_for_test(
         CoremlAdmission::Fixture,
         &mut publish,
         &mut write,
+        &mut |_, _| {},
     )
 }
 
@@ -1271,6 +1748,7 @@ pub(crate) fn install_minted_rows_for_test(
         CoremlAdmission::Mint,
         &mut publish,
         &mut write,
+        &mut |_, _| {},
     )
 }
 
@@ -1553,8 +2031,270 @@ mod tests {
         .unwrap();
         assert_eq!(outcome, CoremlHeal::AlreadyInstalled);
         let record = parakeet_status(journal.path());
-        assert_eq!(record.install_state, "idle");
-        assert_eq!(record.error_code, None);
+        assert_eq!(record.install_state, "failed");
+        assert_eq!(record.error_code.as_deref(), Some("download_failed"));
+    }
+
+    #[test]
+    fn heal_with_lease_held_and_installed_true_returns_install_running() {
+        let journal = tempfile::tempdir().unwrap();
+        heal_with(journal.path(), false, "v1", chrono::Utc::now(), || {
+            Err(CoremlInstallError::new(
+                "download_failed",
+                "network down",
+                65,
+            ))
+        })
+        .unwrap();
+        let _lease = super::super::lease::acquire(journal.path(), "parakeet")
+            .unwrap()
+            .unwrap();
+        let outcome = heal_with(journal.path(), true, "v1", chrono::Utc::now(), || {
+            panic!("lease is held")
+        })
+        .unwrap();
+        assert_eq!(outcome, CoremlHeal::InstallRunning);
+        let record = parakeet_status(journal.path());
+        assert_eq!(record.install_state, "failed");
+        assert_eq!(record.error_code.as_deref(), Some("download_failed"));
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[cfg(all(feature = "test-hooks", feature = "runtime-fetch-test"))]
+    #[test]
+    fn observed_coreml_fetch_persists_real_cumulative_bytes_and_terminal_revision() {
+        use super::super::{
+            status,
+            test_hooks::{RuntimeFetchLoopback, with_runtime_fetch_loopback},
+        };
+        use std::io::{Read, Write};
+        let root = tempfile::tempdir().unwrap();
+        let journal = root.path().join("journal");
+        let home = root.path().join("home");
+        let cfg = config(&root.path().join("cache"));
+        let one = row("one", b"first");
+        let two = row("two", b"second");
+        let rows = [&one, &two];
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for bytes in [b"first".as_slice(), b"second".as_slice()] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut request = [0; 1024];
+                assert!(stream.read(&mut request).unwrap() > 0);
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    bytes.len()
+                )
+                .unwrap();
+                stream.write_all(bytes).unwrap();
+            }
+        });
+        let mut observed = Vec::new();
+        let outcome = heal_with(&journal, false, "test", chrono::Utc::now(), || {
+            with_runtime_fetch_loopback(
+                RuntimeFetchLoopback {
+                    base_url,
+                    allowed_hosts: vec!["127.0.0.1".into()],
+                    allow_http: true,
+                },
+                || {
+                    install_observed_with_rows(
+                        &home,
+                        &cfg,
+                        false,
+                        ("darwin", "arm64"),
+                        &rows,
+                        CoremlAdmission::Fixture,
+                        &mut |staging, target| {
+                            assert_eq!(parakeet_status(&journal).install_state, "installing");
+                            fs::rename(staging, target)
+                        },
+                        &mut write_sentinel,
+                        Some(&journal),
+                        &mut |received, total| {
+                            observed.push((received, total));
+                            let mut current = status::read_status(&journal, "parakeet").unwrap();
+                            current.progress_bytes_received = Some(received);
+                            current.progress_bytes_total = total;
+                            status::write_status(&journal, current).map_err(|error| {
+                                CoremlInstallError::new(
+                                    "status_write_failed",
+                                    error.to_string(),
+                                    74,
+                                )
+                            })?;
+                            Ok(())
+                        },
+                    )
+                },
+            )
+        })
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(outcome, CoremlHeal::Installed);
+        assert!(observed.iter().any(|(n, _)| *n == 5));
+        assert_eq!(observed.last(), Some(&(11, Some(11))));
+        assert!(observed.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+        assert_eq!(parakeet_status(&journal).install_state, "installed");
+        check_with_rows(&home, &cfg, "darwin", "arm64", &rows).unwrap();
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[cfg(all(feature = "test-hooks", feature = "runtime-fetch-test"))]
+    #[test]
+    fn progress_callback_failure_prevents_coreml_publication_and_is_durable() {
+        use super::super::test_hooks::{RuntimeFetchLoopback, with_runtime_fetch_loopback};
+        use std::io::{Read, Write};
+        let root = tempfile::tempdir().unwrap();
+        let journal = root.path().join("journal");
+        let home = root.path().join("home");
+        let cache = root.path().join("cache");
+        let cfg = config(&cache);
+        let artifact = row("model.bin", b"valid");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nvalid",
+                )
+                .unwrap();
+        });
+        let mut called = false;
+        let result = heal_with(&journal, false, "test", chrono::Utc::now(), || {
+            with_runtime_fetch_loopback(
+                RuntimeFetchLoopback {
+                    base_url,
+                    allowed_hosts: vec!["127.0.0.1".into()],
+                    allow_http: true,
+                },
+                || {
+                    install_observed_with_rows(
+                        &home,
+                        &cfg,
+                        false,
+                        ("darwin", "arm64"),
+                        &[&artifact],
+                        CoremlAdmission::Fixture,
+                        &mut |_, _| panic!("failed progress must prevent publication"),
+                        &mut write_sentinel,
+                        Some(&journal),
+                        &mut |received, _| {
+                            assert!(received > 0);
+                            called = true;
+                            Err(CoremlInstallError::new(
+                                "status_write_failed",
+                                "injected progress write failure",
+                                74,
+                            ))
+                        },
+                    )
+                },
+            )
+        })
+        .unwrap();
+        server.join().unwrap();
+        assert!(called);
+        assert!(matches!(result, CoremlHeal::Failed(_)));
+        assert_eq!(
+            parakeet_status(&journal).error_code.as_deref(),
+            Some("status_write_failed")
+        );
+        assert!(!parakeet_coreml_model_root(&cache).exists());
+        assert!(!parakeet_coreml_sentinel_path(&home).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_integrity_proof_reuses_only_unchanged_tree_and_never_creates_locks() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let cache = root.path().join("cache");
+        let cfg = config(&cache);
+        let artifact = row("model.bin", b"valid");
+        let rows = [&artifact];
+        let proof = std::sync::Mutex::new(None);
+        let check = || check_with_rows(&home, &cfg, "darwin", "arm64", &rows).is_ok();
+        assert!(!current_verified_with_rows(
+            &home, &cfg, &rows, &proof, check
+        ));
+        assert!(!home.exists());
+        stage_installed(&home, &cache, b"valid");
+        let mut count = 0;
+        assert!(current_verified_with_rows(
+            &home,
+            &cfg,
+            &rows,
+            &proof,
+            || {
+                count += 1;
+                check()
+            }
+        ));
+        assert!(current_verified_with_rows(
+            &home,
+            &cfg,
+            &rows,
+            &proof,
+            || {
+                count += 1;
+                check()
+            }
+        ));
+        assert_eq!(count, 1, "unchanged tree reuses its digest proof");
+        assert!(
+            !default_parakeet_coreml_cache_dir(&home)
+                .join(".admission.lock")
+                .exists()
+        );
+        fs::write(
+            parakeet_coreml_model_root(&cache).join("model.bin"),
+            b"other",
+        )
+        .unwrap();
+        assert!(
+            !current_verified_with_rows(&home, &cfg, &rows, &proof, check),
+            "same-size corruption invalidates proof"
+        );
+        fs::write(
+            parakeet_coreml_model_root(&cache).join("model.bin"),
+            b"valid",
+        )
+        .unwrap();
+        assert!(
+            current_verified_with_rows(&home, &cfg, &rows, &proof, check),
+            "repair invalidates the negative proof"
+        );
+        let sibling_cache = root.path().join("other-cache");
+        fs::create_dir(&sibling_cache).unwrap();
+        let other_cfg = config(&sibling_cache);
+        assert!(
+            !current_verified_with_rows(&home, &other_cfg, &rows, &proof, || {
+                check_with_rows(&home, &other_cfg, "darwin", "arm64", &rows).is_ok()
+            }),
+            "a config change with the same model root invalidates the proof"
+        );
+        assert!(current_verified_with_rows(
+            &home, &cfg, &rows, &proof, check
+        ));
+        let lock = hold_coreml_admission(&home).unwrap();
+        assert!(
+            !current_verified_with_rows(&home, &cfg, &rows, &proof, check),
+            "publication excludes observation"
+        );
+        drop(lock);
+        fs::remove_file(parakeet_coreml_model_root(&cache).join("model.bin")).unwrap();
+        assert!(!current_verified_with_rows(
+            &home, &cfg, &rows, &proof, check
+        ));
     }
 
     #[test]
@@ -1587,8 +2327,15 @@ mod tests {
         let config = config(&temporary.path().join("cache"));
         let artifact = row("model.mil", b"model");
         let rows = [&artifact];
-        let error =
-            install_with_rows(&home, &config, false, ("darwin", "arm64"), &rows).unwrap_err();
+        let error = install_with_rows(
+            &home,
+            &config,
+            false,
+            ("darwin", "arm64"),
+            &rows,
+            &mut |_, _| {},
+        )
+        .unwrap_err();
         assert_eq!(error.reason_code, "component_packaged");
         assert!(!parakeet_coreml_model_root(&parakeet_coreml_cache_dir(&config, &home)).exists());
         assert!(!parakeet_coreml_sentinel_path(&home).exists());
@@ -1695,7 +2442,15 @@ mod tests {
             Ok(())
         };
 
-        refresh_with_rows(&home, &cfg, ("darwin", "arm64"), &rows, &mut fetch).unwrap();
+        refresh_with_rows(
+            temporary.path(),
+            &home,
+            &cfg,
+            ("darwin", "arm64"),
+            &rows,
+            &mut fetch,
+        )
+        .unwrap();
         assert_eq!(fetch_count, 0);
 
         let reloaded = read_valid_parakeet_coreml_sentinel(&home, "darwin", "arm64").unwrap();
@@ -1733,7 +2488,15 @@ mod tests {
             Ok(())
         };
 
-        refresh_with_rows(&home, &cfg, ("darwin", "arm64"), &rows, &mut fetch).unwrap();
+        refresh_with_rows(
+            temporary.path(),
+            &home,
+            &cfg,
+            ("darwin", "arm64"),
+            &rows,
+            &mut fetch,
+        )
+        .unwrap();
         assert_eq!(fetch_count, 0);
 
         let reloaded = read_valid_parakeet_coreml_sentinel(&home, "darwin", "arm64").unwrap();
@@ -1771,7 +2534,15 @@ mod tests {
             Ok(())
         };
 
-        refresh_with_rows(&home, &cfg, ("darwin", "arm64"), &rows, &mut fetch).unwrap();
+        refresh_with_rows(
+            temporary.path(),
+            &home,
+            &cfg,
+            ("darwin", "arm64"),
+            &rows,
+            &mut fetch,
+        )
+        .unwrap();
         assert_eq!(fetch_count, 0);
     }
 
@@ -1868,8 +2639,15 @@ mod tests {
             }
         };
 
-        let error =
-            refresh_with_rows(&home, &cfg, ("darwin", "arm64"), &rows, &mut fetch).unwrap_err();
+        let error = refresh_with_rows(
+            temporary.path(),
+            &home,
+            &cfg,
+            ("darwin", "arm64"),
+            &rows,
+            &mut fetch,
+        )
+        .unwrap_err();
         assert_eq!(error.reason_code, "download_failed");
         assert_eq!(fs::read(target.join("old.bin")).unwrap(), b"old-content");
         assert!(!target.join("file1.bin").exists());
@@ -1909,7 +2687,15 @@ mod tests {
                 .map_err(|e| CoremlInstallError::new("io", e.to_string(), 74))
         };
 
-        refresh_with_rows(&home, &cfg, ("darwin", "arm64"), &rows, &mut fetch).unwrap();
+        refresh_with_rows(
+            temporary.path(),
+            &home,
+            &cfg,
+            ("darwin", "arm64"),
+            &rows,
+            &mut fetch,
+        )
+        .unwrap();
         assert_eq!(fetch_count, 1);
         check_with_rows(&home, &cfg, "darwin", "arm64", &rows).unwrap();
 
@@ -1918,7 +2704,15 @@ mod tests {
             second_fetch_count += 1;
             Ok(())
         };
-        refresh_with_rows(&home, &cfg, ("darwin", "arm64"), &rows, &mut second_fetch).unwrap();
+        refresh_with_rows(
+            temporary.path(),
+            &home,
+            &cfg,
+            ("darwin", "arm64"),
+            &rows,
+            &mut second_fetch,
+        )
+        .unwrap();
         assert_eq!(second_fetch_count, 0);
     }
 
@@ -1961,7 +2755,14 @@ mod tests {
             ))
         };
 
-        let result = refresh_with_rows(&home, &cfg, ("darwin", "arm64"), &rows, &mut fetch);
+        let result = refresh_with_rows(
+            temporary.path(),
+            &home,
+            &cfg,
+            ("darwin", "arm64"),
+            &rows,
+            &mut fetch,
+        );
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().reason_code, "download_failed");
 
@@ -2069,7 +2870,15 @@ mod tests {
             |_query: &RuntimeFetchQuery<'_>, _dest: &Path| -> Result<(), CoremlInstallError> {
                 panic!("fetch closure must not be called when bytes match");
             };
-        refresh_with_rows(&home, &cfg, ("darwin", "arm64"), &rows, &mut fetch).unwrap();
+        refresh_with_rows(
+            temporary.path(),
+            &home,
+            &cfg,
+            ("darwin", "arm64"),
+            &rows,
+            &mut fetch,
+        )
+        .unwrap();
 
         recover_parakeet_coreml_publication(&home).unwrap();
     }
@@ -2204,7 +3013,7 @@ mod tests {
     }
 
     #[test]
-    fn contention_refresh_returns_zero_fetches_and_doctor_stays_ok() {
+    fn contention_across_journals_holds_publication_lock_through_fetch() {
         use std::sync::mpsc;
         use std::thread;
 
@@ -2241,6 +3050,7 @@ mod tests {
 
         let home_clone = home.clone();
         let cfg_clone = cfg.clone();
+        let journal_clone = temporary.path().to_path_buf();
         let worker = thread::spawn(move || {
             let mut fetch = |_query: &RuntimeFetchQuery<'_>, dest: &Path| {
                 entered_tx.send(()).unwrap();
@@ -2249,6 +3059,7 @@ mod tests {
                     .map_err(|e| CoremlInstallError::new("io", e.to_string(), 74))
             };
             refresh_with_rows(
+                &journal_clone,
                 &home_clone,
                 &cfg_clone,
                 ("darwin", "arm64"),
@@ -2265,8 +3076,15 @@ mod tests {
             second_fetch_count += 1;
             Ok(())
         };
-        let second_result =
-            refresh_with_rows(&home, &cfg, ("darwin", "arm64"), rows, &mut second_fetch);
+        let other_journal = temporary.path().join("other-journal");
+        let second_result = refresh_with_rows(
+            &other_journal,
+            &home,
+            &cfg,
+            ("darwin", "arm64"),
+            rows,
+            &mut second_fetch,
+        );
         assert!(second_result.is_ok());
         assert_eq!(second_fetch_count, 0);
 
@@ -2280,8 +3098,14 @@ mod tests {
             following_fetch_count += 1;
             Ok(())
         };
-        let following_result =
-            refresh_with_rows(&home, &cfg, ("darwin", "arm64"), rows, &mut following_fetch);
+        let following_result = refresh_with_rows(
+            temporary.path(),
+            &home,
+            &cfg,
+            ("darwin", "arm64"),
+            rows,
+            &mut following_fetch,
+        );
         assert!(following_result.is_ok());
         assert_eq!(following_fetch_count, 0);
     }
@@ -2324,6 +3148,7 @@ mod tests {
 
         let home_clone = home.clone();
         let cfg_clone = cfg.clone();
+        let journal_clone = temporary.path().to_path_buf();
         let worker = thread::spawn(move || {
             let mut fetch = |_query: &RuntimeFetchQuery<'_>, dest: &Path| {
                 entered_tx.send(()).unwrap();
@@ -2332,6 +3157,7 @@ mod tests {
                     .map_err(|e| CoremlInstallError::new("io", e.to_string(), 74))
             };
             refresh_with_rows(
+                &journal_clone,
                 &home_clone,
                 &cfg_clone,
                 ("darwin", "arm64"),
@@ -2478,9 +3304,14 @@ mod tests {
             );
             drop(permissions);
             // The next real installer entry recovers before eligibility/fetch.
-            refresh_with_rows(&home, &cfg, ("darwin", "arm64"), &[&old], &mut |_, _| {
-                panic!("recovered matching bytes must not fetch")
-            })
+            refresh_with_rows(
+                temporary.path(),
+                &home,
+                &cfg,
+                ("darwin", "arm64"),
+                &[&old],
+                &mut |_, _| panic!("recovered matching bytes must not fetch"),
+            )
             .unwrap();
             assert!(!marker.exists());
             assert_eq!(fs::read(target.join(old.filename)).unwrap(), b"incumbent");
@@ -2606,6 +3437,7 @@ mod tests {
         let offered = row("model.bin", b"new-bytes");
         let mut calls = 0;
         refresh_with_rows(
+            temporary.path(),
             &home,
             &cfg,
             ("darwin", "arm64"),
@@ -2620,5 +3452,114 @@ mod tests {
         assert_eq!(calls, 1);
         assert_eq!(fs::read(target.join("model.bin")).unwrap(), b"new-bytes");
         assert!(check_with_rows(&home, &cfg, "darwin", "arm64", &[&offered]).is_ok());
+    }
+
+    #[test]
+    #[cfg(feature = "full-tests")]
+    fn coreml_heal_refresh_and_install_models_share_the_parakeet_lease() {
+        use super::super::status;
+
+        let root = tempfile::tempdir().unwrap();
+        let journal = root.path();
+        let initial = status::begin_or_replace(
+            journal,
+            "parakeet",
+            r#"{"catalog_version":"v1"}"#.to_string(),
+            "test-sha".to_string(),
+            None,
+            "downloading",
+            None,
+        )
+        .unwrap();
+        let failed = status::transition(
+            initial,
+            "failed",
+            Some("install_cancelled".to_string()),
+            Some("install_cancelled".to_string()),
+        )
+        .unwrap();
+        status::write_status(journal, failed).unwrap();
+
+        let r = heal_with(journal, false, "v1", chrono::Utc::now(), || {
+            panic!("cancelled")
+        });
+        assert_eq!(r, Ok(CoremlHeal::OwnerCancelled));
+        assert!(!super::super::lease::lease_path(journal, "parakeet").exists());
+
+        let root2 = tempfile::tempdir().unwrap();
+        let journal2 = root2.path();
+        let r1 = heal_with(journal2, false, "v1", chrono::Utc::now(), || {
+            Err(CoremlInstallError::new(
+                "download_failed",
+                "network down",
+                65,
+            ))
+        });
+        assert!(matches!(r1, Ok(CoremlHeal::Failed(_))));
+        let r2 = heal_with(journal2, false, "v1", chrono::Utc::now(), || {
+            panic!("cooling down")
+        });
+        assert_eq!(r2, Ok(CoremlHeal::CoolingDown));
+        assert!(!super::super::lease::is_held(journal2, "parakeet").unwrap());
+
+        let root3 = tempfile::tempdir().unwrap();
+        let journal3 = root3.path();
+        let home3 = root3.path().join("home");
+        fs::create_dir_all(&home3).unwrap();
+        let cfg3 = config(journal3);
+        let offered = row("m.bin", b"bytes");
+        let r_refresh = refresh_with_rows(
+            journal3,
+            &home3,
+            &cfg3,
+            ("darwin", "arm64"),
+            &[&offered],
+            &mut |_, _| panic!("fetch"),
+        );
+        assert!(r_refresh.is_ok());
+        assert!(!status::status_path(journal3, "parakeet").exists());
+
+        let root4 = tempfile::tempdir().unwrap();
+        let journal4 = root4.path();
+        let home4 = root4.path().join("home");
+        fs::create_dir_all(&home4).unwrap();
+        let default_cache = default_parakeet_coreml_cache_dir(&home4);
+        fs::create_dir_all(&default_cache).unwrap();
+        fs::write(default_cache.join(".publication.json"), b"").unwrap();
+        let lock_guard = hold_lock(
+            default_cache.join(".publish.lock"),
+            LockOptions {
+                timeout: std::time::Duration::ZERO,
+                poll_interval: DEFAULT_LOCK_POLL_INTERVAL,
+                mode: None,
+            },
+        )
+        .unwrap();
+        let cfg4 = config(journal4);
+        let r_refresh2 = refresh_with_rows(
+            journal4,
+            &home4,
+            &cfg4,
+            ("darwin", "arm64"),
+            &[&offered],
+            &mut |_, _| panic!("fetch"),
+        );
+        assert!(r_refresh2.is_ok());
+        assert!(!status::status_path(journal4, "parakeet").exists());
+        drop(lock_guard);
+
+        let root5 = tempfile::tempdir().unwrap();
+        let journal5 = root5.path();
+        let home5 = root5.path().join("home");
+        fs::create_dir_all(&home5).unwrap();
+        let cfg5 = config(journal5);
+        let r_heal = heal_missing_parakeet_coreml(journal5, &home5, &cfg5);
+        assert!(r_heal.is_err() || matches!(r_heal, Ok(CoremlHeal::Failed(_))));
+        assert!(
+            super::super::lease::acquire(journal5, "parakeet")
+                .unwrap()
+                .is_some()
+        );
+        assert!(status::status_path(journal5, "parakeet").exists());
     }
 }

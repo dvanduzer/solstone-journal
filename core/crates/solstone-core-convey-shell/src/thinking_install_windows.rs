@@ -162,6 +162,8 @@ pub(super) fn admit(
     model: &str,
     timeout: Duration,
     admitted: &std::sync::mpsc::SyncSender<Result<Value, String>>,
+    observed_attempt_id: Option<&str>,
+    observed_revision: u64,
 ) {
     let owner = match register(child, journal) {
         Ok(owner) => owner,
@@ -202,7 +204,15 @@ pub(super) fn admit(
         }
         result => {
             let result = match retire(&owner) {
-                Ok(()) => result.map(|(value, _)| value),
+                Ok(()) => result.map(|(value, _)| value).map_err(|error| {
+                    super::persist_local_refusal(
+                        journal,
+                        observed_attempt_id,
+                        observed_revision,
+                        "installer_admission_failed",
+                        error,
+                    )
+                }),
                 Err(error) => Err(error),
             };
             let _ = admitted.send(result);
@@ -289,7 +299,7 @@ fn admission(
             return Err(format!("installer exited before admission ({code})"));
         }
         if Instant::now() >= deadline {
-            return Err("installer admission timed out".into());
+            return Err("installer admission timed out".to_owned());
         }
         std::thread::sleep(Duration::from_millis(50));
     }

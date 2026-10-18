@@ -201,78 +201,7 @@ pub(crate) fn inspect_parakeet_manifests(
     journal: &Path,
     artifact_key: &str,
 ) -> (Value, Value, Value) {
-    let paths = pins::parakeet_paths(journal, artifact_key);
-
-    let cpu_proof = inspect_server_manifest(&paths, "binary_path_cpu", artifact_key, "cpu");
-    let vulkan_proof =
-        inspect_server_manifest(&paths, "binary_path_vulkan", artifact_key, "vulkan");
-    let model_proof = inspect_model_manifest(&paths);
-
-    (cpu_proof, vulkan_proof, model_proof)
-}
-
-pub(crate) fn inspect_server_manifest(
-    paths: &Value,
-    binary_path_key: &str,
-    artifact_key: &str,
-    backend: &str,
-) -> Value {
-    let Some(binary_path_str) = paths.get(binary_path_key).and_then(Value::as_str) else {
-        return serde_json::json!({
-            "status": "missing-or-mismatched",
-            "reason_code": "manifest_missing",
-            "cache_hit": false
-        });
-    };
-    let binary_path = Path::new(binary_path_str);
-    let Some(manifest_dir) = binary_path.parent() else {
-        return serde_json::json!({
-            "status": "missing-or-mismatched",
-            "reason_code": "manifest_missing",
-            "cache_hit": false
-        });
-    };
-    let Some(identity) = pins::parakeet_backend_identity(artifact_key, backend) else {
-        return serde_json::json!({
-            "status": "missing-or-mismatched",
-            "reason_code": "manifest_missing",
-            "cache_hit": false
-        });
-    };
-    let Some((_, _, _, binary_name)) = pins::parakeet_backend_pin(artifact_key, backend) else {
-        return serde_json::json!({
-            "status": "missing-or-mismatched",
-            "reason_code": "manifest_missing",
-            "cache_hit": false
-        });
-    };
-    let manifest_path = manifest::artifact_manifest_path(manifest_dir);
-    manifest::inspect_manifest_required(&manifest_path, &identity, &[binary_name])
-}
-
-pub(crate) fn inspect_model_manifest(paths: &Value) -> Value {
-    let Some(model_path_str) = paths.get("model_path").and_then(Value::as_str) else {
-        return serde_json::json!({
-            "status": "missing-or-mismatched",
-            "reason_code": "manifest_missing",
-            "cache_hit": false
-        });
-    };
-    let model_path = Path::new(model_path_str);
-    let Some(manifest_dir) = model_path.parent() else {
-        return serde_json::json!({
-            "status": "missing-or-mismatched",
-            "reason_code": "manifest_missing",
-            "cache_hit": false
-        });
-    };
-    let identity = pins::parakeet_model_identity();
-    let filename = identity
-        .get("filename")
-        .and_then(Value::as_str)
-        .unwrap_or(pins::PARAKEET_MODEL.1);
-    let manifest_path = manifest::artifact_manifest_path(manifest_dir);
-    manifest::inspect_manifest_required(&manifest_path, &identity, &[filename])
+    solstone_core_local::install::inspect_parakeet_manifests(journal, artifact_key)
 }
 
 #[cfg(test)]

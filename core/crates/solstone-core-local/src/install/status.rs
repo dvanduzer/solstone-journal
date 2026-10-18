@@ -576,6 +576,25 @@ pub fn record_terminal_refusal(
     record_terminal_refusal_with_lease(journal, provider, reason_code, message, &lease)
 }
 
+pub fn record_terminal_refusal_if_unchanged(
+    journal: &Path,
+    provider: &str,
+    observed_attempt_id: Option<&str>,
+    observed_revision: u64,
+    reason_code: &str,
+    message: &str,
+) -> Result<InstallStatus, StatusError> {
+    let Some(lease) = super::lease::acquire(journal, provider)? else {
+        return read_status(journal, provider);
+    };
+    let current = read_status(journal, provider)?;
+    if current.revision != observed_revision || current.attempt_id.as_deref() != observed_attempt_id
+    {
+        return Ok(current);
+    }
+    record_terminal_refusal_with_lease(journal, provider, reason_code, message, &lease)
+}
+
 pub(crate) fn record_terminal_refusal_with_lease(
     journal: &Path,
     provider: &str,
@@ -608,4 +627,191 @@ pub(crate) fn record_terminal_refusal_with_lease(
         Some(reason_code.to_owned()),
     )?;
     write_status(journal, failed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::install::lease;
+
+    #[test]
+    fn record_terminal_refusal_if_unchanged_cases() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = root.path();
+
+        // 1. Writes when matching and not in-flight
+        let initial = read_status(journal, "local").unwrap();
+        let written = record_terminal_refusal_if_unchanged(
+            journal,
+            "local",
+            initial.attempt_id.as_deref(),
+            initial.revision,
+            "installer_missing",
+            "sibling missing",
+        )
+        .unwrap();
+        assert_eq!(written.install_state, "failed");
+        assert_eq!(written.error_code.as_deref(), Some("installer_missing"));
+        assert_eq!(written.install_error.as_deref(), Some("sibling missing"));
+        assert_eq!(written.revision, initial.revision + 1);
+
+        // 2. Writes nothing on revision mismatch
+        let current = read_status(journal, "local").unwrap();
+        let unchanged = record_terminal_refusal_if_unchanged(
+            journal,
+            "local",
+            current.attempt_id.as_deref(),
+            current.revision + 99,
+            "installer_missing",
+            "sibling missing",
+        )
+        .unwrap();
+        assert_eq!(unchanged.revision, current.revision);
+        assert_eq!(unchanged.attempt_id, current.attempt_id);
+
+        // 3. Writes nothing on attempt-id mismatch
+        let unchanged = record_terminal_refusal_if_unchanged(
+            journal,
+            "local",
+            Some("wrong-attempt-id"),
+            current.revision,
+            "installer_missing",
+            "sibling missing",
+        )
+        .unwrap();
+        assert_eq!(unchanged.revision, current.revision);
+        assert_eq!(unchanged.attempt_id, current.attempt_id);
+
+        // 4. A live installer retains authority over its in-flight record
+        let in_flight = transition(current.clone(), "downloading", None, None).unwrap();
+        let in_flight = write_status(journal, in_flight).unwrap();
+        let live_lease = lease::acquire(journal, "local").unwrap().unwrap();
+        let unchanged = record_terminal_refusal_if_unchanged(
+            journal,
+            "local",
+            in_flight.attempt_id.as_deref(),
+            in_flight.revision,
+            "installer_missing",
+            "sibling missing",
+        )
+        .unwrap();
+        assert_eq!(unchanged.install_state, "downloading");
+        assert_eq!(unchanged.revision, in_flight.revision);
+        drop(live_lease);
+
+        // Transition back to failed/not in-flight for lease test
+        let current = write_status(
+            journal,
+            transition(in_flight, "failed", None, None).unwrap(),
+        )
+        .unwrap();
+
+        // 5. Writes nothing when lease already held
+        let _lease = lease::acquire(journal, "local").unwrap().unwrap();
+        let unchanged = record_terminal_refusal_if_unchanged(
+            journal,
+            "local",
+            current.attempt_id.as_deref(),
+            current.revision,
+            "installer_missing",
+            "sibling missing",
+        )
+        .unwrap();
+        assert_eq!(unchanged.revision, current.revision);
+        assert_eq!(unchanged.attempt_id, current.attempt_id);
+        drop(_lease);
+
+        // 6. Garbage JSON returns Malformed and bytes stay
+        let path = status_path(journal, "local");
+        std::fs::write(&path, b"not json").unwrap();
+        let err = record_terminal_refusal_if_unchanged(
+            journal,
+            "local",
+            None,
+            1,
+            "installer_missing",
+            "sibling missing",
+        )
+        .unwrap_err();
+        assert!(matches!(err, StatusError::Malformed(_)));
+        assert_eq!(std::fs::read(&path).unwrap(), b"not json");
+    }
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+mod full_tests {
+    use super::*;
+
+    #[test]
+    fn delayed_local_refusal_loses_to_a_newer_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = temp.path();
+
+        let old_attempt = "old-attempt";
+        let old_rev = 0;
+
+        let newer = begin_or_replace(
+            journal,
+            "local",
+            "{}".to_string(),
+            "fp".to_string(),
+            None,
+            "downloading",
+            None,
+        )
+        .unwrap();
+        let minted_id = newer.attempt_id.clone().unwrap();
+
+        let res = record_terminal_refusal_if_unchanged(
+            journal,
+            "local",
+            Some(old_attempt),
+            old_rev,
+            "installer_missing",
+            "sibling missing",
+        )
+        .unwrap();
+
+        assert_eq!(res.attempt_id.as_deref(), Some(minted_id.as_str()));
+        assert_eq!(res.install_state, "downloading");
+        let on_disk = read_status(journal, "local").unwrap();
+        assert_eq!(on_disk.attempt_id.as_deref(), Some(minted_id.as_str()));
+        assert_eq!(on_disk.install_state, "downloading");
+
+        let _installed = write_status(
+            journal,
+            transition(on_disk, "installed", None, None).unwrap(),
+        )
+        .unwrap();
+
+        let res2 = record_terminal_refusal_if_unchanged(
+            journal,
+            "local",
+            Some(old_attempt),
+            old_rev,
+            "installer_missing",
+            "sibling missing",
+        )
+        .unwrap();
+        assert_eq!(res2.attempt_id.as_deref(), Some(minted_id.as_str()));
+        assert_eq!(res2.install_state, "installed");
+
+        let on_disk2 = read_observed_status(journal, "local").unwrap();
+        assert_eq!(on_disk2.attempt_id.as_deref(), Some(minted_id.as_str()));
+        assert_eq!(on_disk2.install_state, "installed");
+
+        let path = status_path(journal, "local");
+        std::fs::write(&path, b"corrupt bytes").unwrap();
+        let err = record_terminal_refusal_if_unchanged(
+            journal,
+            "local",
+            Some(old_attempt),
+            old_rev,
+            "installer_missing",
+            "sibling missing",
+        )
+        .unwrap_err();
+        assert!(matches!(err, StatusError::Malformed(_)));
+        assert_eq!(std::fs::read(&path).unwrap(), b"corrupt bytes");
+    }
 }
