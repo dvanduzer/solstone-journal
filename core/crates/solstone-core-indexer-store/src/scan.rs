@@ -41,7 +41,7 @@ use crate::chunk_sources::{
     record_chunk_source, require_chunk_path_lookup,
 };
 use crate::classification::{FacetDeclarationSet, classify_source};
-use crate::classification_batch::{Counts, ResumeCount, classify_one_batch};
+use crate::classification_batch::{Counts, ResumeCount, classify_one_batch_checked};
 use crate::db::{
     EDGES_SCHEMA_PATH, EDGES_SCHEMA_VERSION, IndexBuildLifecycle, delete_chunk_classification,
     mark_index_build_complete, open_index_admitted, prune_authored_chat_paths_admitted,
@@ -399,25 +399,49 @@ fn memory_original_exists(conn: &Connection, path: &str) -> Result<bool, StoreEr
 }
 
 pub fn scan_journal(journal: &Path, full: bool) -> Result<ScanReport, StoreError> {
-    let admission = IndexAdmission::acquire(journal, "scan")?;
-    scan_journal_admitted(journal, full, &admission)
+    scan_journal_with_checkpoint(journal, full, &|| Ok(()))
+}
+
+pub fn scan_journal_with_checkpoint(
+    journal: &Path,
+    full: bool,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<ScanReport, StoreError> {
+    let admission = IndexAdmission::acquire_checked(journal, "scan", checkpoint)?;
+    scan_journal_admitted(journal, full, &admission, checkpoint)
 }
 
 pub(crate) fn scan_journal_admitted(
     journal: &Path,
     full: bool,
     admission: &IndexAdmission,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<ScanReport, StoreError> {
-    let result = scan_journal_pass(journal, full, admission);
-    if let Err(error) = &result {
+    let result = scan_journal_pass(journal, full, admission, checkpoint);
+    if let Err(error) = &result
+        && !matches!(
+            error,
+            StoreError::WriterAdmission {
+                operation: "scan-journal",
+                ..
+            }
+        )
+    {
         // A scan that stops leaves an observation too, so a pass that fails
         // every night is visible rather than an old receipt aging quietly.
-        record_failed_scan(journal, full, error);
+        // A checkpoint refusal is not that observation: it publishes nothing,
+        // including under a root the admission no longer names.
+        record_failed_scan(journal, full, error, checkpoint);
     }
     result
 }
 
-fn record_failed_scan(journal: &Path, full: bool, error: &StoreError) {
+fn record_failed_scan(
+    journal: &Path,
+    full: bool,
+    error: &StoreError,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) {
     let path = crate::db::db_path(journal);
     if !crate::generation::has_sqlite_header(&path) {
         return;
@@ -448,6 +472,13 @@ fn record_failed_scan(journal: &Path, full: bool, error: &StoreError) {
             conn.execute_batch("PRAGMA busy_timeout=5000;")?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             record_scan(&tx, &receipt)?;
+            if let Err(cause) = checkpoint() {
+                drop(tx);
+                return Err(StoreError::WriterAdmission {
+                    operation: "scan-journal",
+                    cause,
+                });
+            }
             tx.commit()?;
             Ok(())
         });
@@ -467,13 +498,29 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
+fn commit_scanned(
+    tx: rusqlite::Transaction<'_>,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), StoreError> {
+    if let Err(cause) = checkpoint() {
+        drop(tx);
+        return Err(StoreError::WriterAdmission {
+            operation: "scan-journal",
+            cause,
+        });
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn scan_journal_pass(
     journal: &Path,
     full: bool,
     admission: &IndexAdmission,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<ScanReport, StoreError> {
-    prune_authored_chat_paths_admitted(journal, admission)?;
-    let mut conn = open_index_admitted(journal, admission)?;
+    prune_authored_chat_paths_admitted(journal, admission, checkpoint)?;
+    let mut conn = open_index_admitted(journal, admission, checkpoint)?;
     if !chunk_path_lookup_ready(&conn)? {
         return Err(StoreError::PathLookupRequired { cause: None });
     }
@@ -570,7 +617,7 @@ fn scan_journal_pass(
                     delete_file_chunks(&tx, rel, Some(&chunk_rows))?;
                     invalid_memory_removed +=
                         tx.execute("DELETE FROM files WHERE path=?", [rel])?;
-                    tx.commit()?;
+                    commit_scanned(tx, checkpoint)?;
                     report.skipped += 1;
                     if matches!(result, OriginalRead::Corrupt) {
                         report.fail(Some(rel), Some(*mtime));
@@ -628,7 +675,7 @@ fn scan_journal_pass(
             }
             Err(error) => return Err(error),
         };
-        tx.commit()?;
+        commit_scanned(tx, checkpoint)?;
         report.warnings.extend(warnings);
         report.indexed += 1;
     }
@@ -648,24 +695,24 @@ fn scan_journal_pass(
         let chunk_rows = pending_chunks.take(&tx, rel)?;
         delete_file_chunks(&tx, rel, Some(&chunk_rows))?;
         tx.execute("DELETE FROM files WHERE path=?", [rel])?;
-        tx.commit()?;
+        commit_scanned(tx, checkpoint)?;
         removed_count += 1;
     }
     report.removed = removed_count + invalid_memory_removed;
     report
         .warnings
-        .extend(migrate_segment_aggregates(&mut conn, journal)?);
+        .extend(migrate_segment_aggregates(&mut conn, journal, checkpoint)?);
 
     let search_build = build_entity_search(journal)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     index_entity_search_build(&tx, journal, &search_build, full)?;
-    tx.commit()?;
+    commit_scanned(tx, checkpoint)?;
 
-    report
-        .warnings
-        .extend(migrate_chunk_classifications(&mut conn, journal)?);
+    report.warnings.extend(migrate_chunk_classifications(
+        &mut conn, journal, checkpoint,
+    )?);
 
-    let edge_report = reconcile_edges(&mut conn, journal, full)?;
+    let edge_report = reconcile_edges(&mut conn, journal, full, checkpoint)?;
     report.edges_indexed = edge_report.indexed;
     report.edges_removed = edge_report.removed;
     report.edge_rows_inserted = edge_report.rows_inserted;
@@ -686,16 +733,25 @@ fn scan_journal_pass(
             let chunks_count = tx.query_row("SELECT count(*) FROM chunks", [], |row| row.get(0))?;
             mark_index_build_complete(&tx, files_count, chunks_count)?;
         }
-        tx.commit()?;
+        commit_scanned(tx, checkpoint)?;
     }
-    let (merge_steps_spent, merge_warning) = run_bounded_merge(&mut conn);
+    let (merge_steps_spent, merge_warning) = run_bounded_merge(&mut conn, checkpoint)?;
     report.merge_steps_spent = merge_steps_spent;
     if let Some(warning) = merge_warning {
         report.warnings.push(warning);
     }
     // The receipt is an observation for status and health; failing to record it
     // never fails the scan.
-    if let Err(error) = record_scan_receipt(&mut conn, &report, full) {
+    if let Err(error) = record_scan_receipt(&mut conn, &report, full, checkpoint) {
+        if matches!(
+            error,
+            StoreError::WriterAdmission {
+                operation: "scan-journal",
+                ..
+            }
+        ) {
+            return Err(error);
+        }
         log::warn!(target: "solstone::indexer", "scan receipt not recorded: {error}");
     }
     Ok(report)
@@ -705,6 +761,7 @@ fn record_scan_receipt(
     conn: &mut Connection,
     report: &ScanReport,
     full: bool,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<(), StoreError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     record_scan(
@@ -722,6 +779,13 @@ fn record_scan_receipt(
             writer_version: WRITER_VERSION.to_owned(),
         },
     )?;
+    if let Err(cause) = checkpoint() {
+        drop(tx);
+        return Err(StoreError::WriterAdmission {
+            operation: "scan-journal",
+            cause,
+        });
+    }
     tx.commit()?;
     Ok(())
 }
@@ -732,12 +796,19 @@ fn record_scan_receipt(
 fn migrate_chunk_classifications(
     conn: &mut Connection,
     journal: &Path,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<Vec<String>, StoreError> {
     let existing = read_chunk_classification_backfill(conn)?;
     if let Some(ref state) = existing
         && state.completed
     {
-        let status = classify_one_batch(conn, journal, ResumeCount::Preserve, Counts::Terminal)?;
+        let status = classify_one_batch_checked(
+            conn,
+            journal,
+            ResumeCount::Preserve,
+            Counts::Terminal,
+            checkpoint,
+        )?;
         if status.coverage_mismatch {
             return Ok(vec![format!(
                 "chunk classification coverage mismatch: {} missing rows",
@@ -754,7 +825,13 @@ fn migrate_chunk_classifications(
 
     let mut current_resume = resume_target;
     for _ in 0..CHUNK_CLASSIFICATION_BACKFILL_BUDGET {
-        let status = classify_one_batch(conn, journal, current_resume, Counts::Terminal)?;
+        let status = classify_one_batch_checked(
+            conn,
+            journal,
+            current_resume,
+            Counts::Terminal,
+            checkpoint,
+        )?;
         if status.stalled {
             let err = status
                 .stalled_error
@@ -777,16 +854,19 @@ fn migrate_chunk_classifications(
     Ok(Vec::new())
 }
 
-fn run_bounded_merge(conn: &mut Connection) -> (usize, Option<String>) {
+fn run_bounded_merge(
+    conn: &mut Connection,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(usize, Option<String>), StoreError> {
     let tx = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
         Ok(tx) => tx,
         Err(error) => {
-            return (
+            return Ok((
                 0,
                 Some(format!(
                     "index is correct and merely uncompacted: could not start FTS5 merge transaction: {error}"
                 )),
-            );
+            ));
         }
     };
     let mut steps_spent = 0;
@@ -796,26 +876,33 @@ fn run_bounded_merge(conn: &mut Connection) -> (usize, Option<String>) {
             "INSERT INTO chunks(chunks, rank) VALUES('merge', ?)",
             [MERGE_STEP],
         ) {
-            return (
+            return Ok((
                 steps_spent,
                 Some(format!(
                     "index is correct and merely uncompacted: FTS5 merge failed: {error}"
                 )),
-            );
+            ));
         }
         steps_spent += 1;
         if tx.total_changes() - before < 2 {
             break;
         }
     }
+    if let Err(cause) = checkpoint() {
+        drop(tx);
+        return Err(StoreError::WriterAdmission {
+            operation: "scan-journal",
+            cause,
+        });
+    }
     match tx.commit() {
-        Ok(()) => (steps_spent, None),
-        Err(error) => (
+        Ok(()) => Ok((steps_spent, None)),
+        Err(error) => Ok((
             steps_spent,
             Some(format!(
                 "index is correct and merely uncompacted: could not commit FTS5 merge: {error}"
             )),
-        ),
+        )),
     }
 }
 
@@ -851,7 +938,7 @@ pub(crate) fn rescan_file_admitted(
         None
     };
     check_test_seam("after-memory-read");
-    let mut conn = open_index_admitted(journal, admission)?;
+    let mut conn = open_index_admitted(journal, admission, &|| Ok(()))?;
     require_chunk_path_lookup(&conn)?;
     let memory_original = match memory_original_res {
         Some(Ok(original)) => Some(original),
@@ -907,19 +994,20 @@ pub(crate) fn rescan_file_admitted(
         replace_edge_file_mtime(&tx, &rel, mtime)?;
     }
     tx.commit()?;
-    warnings.extend(migrate_segment_aggregates(&mut conn, journal)?);
+    warnings.extend(migrate_segment_aggregates(&mut conn, journal, &|| Ok(()))?);
     Ok(RescanFileStatus::Indexed { warnings })
 }
 
 pub(crate) fn rebuild_edges_guarded<F>(
     journal: &Path,
     admission: &IndexAdmission,
+    checkpoint: &dyn Fn() -> Result<(), String>,
     before_commit: F,
 ) -> Result<Option<EdgeRebuildReport>, StoreError>
 where
     F: FnOnce() -> Result<bool, StoreError>,
 {
-    let mut conn = open_index_admitted(journal, admission)?;
+    let mut conn = open_index_admitted(journal, admission, checkpoint)?;
     let mut resolver = EdgeResolver::new(journal);
     let mut report = EdgeRebuildReport::default();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -938,6 +1026,7 @@ where
 
     let files = discover_edge_files(journal)?;
     for (rel, path) in files {
+        crate::db::admit_scan_journal(checkpoint)?;
         let mtime = match file_mtime_secs(&path) {
             Ok(mtime) => mtime,
             Err(error) => {
@@ -967,14 +1056,37 @@ where
         tx.rollback()?;
         return Ok(None);
     }
+    crate::db::admit_scan_journal(checkpoint)?;
     tx.commit()?;
     Ok(Some(report))
 }
 
 pub fn rebuild_edges(journal: &Path) -> Result<EdgeRebuildReport, StoreError> {
     let admission = IndexAdmission::acquire(journal, "rebuild-edges")?;
-    rebuild_edges_guarded(journal, &admission, || Ok(true))
+    rebuild_edges_guarded(journal, &admission, &|| Ok(()), || Ok(true))
         .map(|opt| opt.expect("closure returned true"))
+}
+
+pub fn rebuild_edges_with_checkpoint(
+    journal: &Path,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<EdgeRebuildReport, StoreError> {
+    let admission = IndexAdmission::acquire_checked(journal, "rebuild-edges", checkpoint)?;
+    let mut refusal = None;
+    let report = rebuild_edges_guarded(journal, &admission, checkpoint, || match checkpoint() {
+        Ok(()) => Ok(true),
+        Err(message) => {
+            refusal = Some(message);
+            Ok(false)
+        }
+    })?;
+    match report {
+        Some(report) => Ok(report),
+        None => Err(StoreError::WriterAdmission {
+            operation: "rebuild-edges",
+            cause: refusal.unwrap_or_else(|| "cancelled".to_owned()),
+        }),
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -990,6 +1102,7 @@ fn reconcile_edges(
     conn: &mut Connection,
     journal: &Path,
     full: bool,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<EdgeScanReport, StoreError> {
     let files = discover_edge_files(journal)?;
 
@@ -1058,6 +1171,7 @@ fn reconcile_edges(
             report.warnings.extend(result.warnings);
             continue;
         }
+        crate::db::admit_scan_journal(checkpoint)?;
         tx.commit()?;
         report.rows_inserted += result.rows_inserted;
         report.warnings.extend(result.warnings);
@@ -1065,6 +1179,7 @@ fn reconcile_edges(
     for rel in &removed {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         delete_edges_for_path(&tx, rel)?;
+        crate::db::admit_scan_journal(checkpoint)?;
         tx.commit()?;
     }
     report.removed = removed.len();
@@ -1240,6 +1355,7 @@ enum SegmentMigrationOutcome {
 fn migrate_segment_aggregates(
     conn: &mut Connection,
     journal: &Path,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<Vec<String>, StoreError> {
     let mut state = read_segment_aggregate_migration(conn)?.unwrap_or_else(|| {
         crate::db::SegmentAggregateMigration {
@@ -1261,15 +1377,21 @@ fn migrate_segment_aggregates(
         let paths = legacy_segment_aggregate_paths(conn, &state.cursor)?;
         if paths.is_empty() {
             if !has_legacy_segment_aggregates(conn)? {
-                write_segment_aggregate_migration(conn, "", true)?;
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                crate::db::admit_scan_journal(checkpoint)?;
+                write_segment_aggregate_migration(&tx, "", true)?;
+                tx.commit()?;
                 break;
             }
             state.cursor.clear();
-            write_segment_aggregate_migration(conn, "", false)?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            crate::db::admit_scan_journal(checkpoint)?;
+            write_segment_aggregate_migration(&tx, "", false)?;
+            tx.commit()?;
             continue;
         }
         for rel_segment in paths {
-            match migrate_segment_aggregate(conn, journal, &rel_segment) {
+            match migrate_segment_aggregate(conn, journal, &rel_segment, checkpoint) {
                 Ok(SegmentMigrationOutcome::Complete(mut segment_warnings)) => {
                     warnings.append(&mut segment_warnings);
                     state.cursor = rel_segment;
@@ -1314,6 +1436,7 @@ fn migrate_segment_aggregate(
     conn: &mut Connection,
     journal: &Path,
     rel_segment: &str,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<SegmentMigrationOutcome, StoreError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let talent_files = match discover_segment_talent_markdown_files(journal, rel_segment) {
@@ -1389,6 +1512,7 @@ fn migrate_segment_aggregate(
         "DELETE FROM chunks WHERE path=? AND agent='segment'",
         [rel_segment],
     )?;
+    crate::db::admit_scan_journal(checkpoint)?;
     write_segment_aggregate_migration(&tx, rel_segment, false)?;
     tx.commit()?;
     Ok(SegmentMigrationOutcome::Complete(warnings))
@@ -1963,7 +2087,7 @@ mod tests {
         // AC20: two step-sized pages make bounded progress and leave an
         // assertable running cursor; the resumed invocation alone increments.
         assert!(
-            migrate_chunk_classifications(&mut conn, &root)
+            migrate_chunk_classifications(&mut conn, &root, &|| Ok(()))
                 .expect("first migration")
                 .is_empty()
         );
@@ -1978,7 +2102,7 @@ mod tests {
             2 * step as i64
         );
 
-        migrate_chunk_classifications(&mut conn, &root).expect("resume migration");
+        migrate_chunk_classifications(&mut conn, &root, &|| Ok(())).expect("resume migration");
         let complete = read_chunk_classification_backfill(&conn)
             .expect("read complete state")
             .expect("complete state");
@@ -1989,7 +2113,7 @@ mod tests {
             count(&conn, "SELECT count(*) FROM chunk_classification"),
             seeded as i64
         );
-        migrate_chunk_classifications(&mut conn, &root).expect("idempotent migration");
+        migrate_chunk_classifications(&mut conn, &root, &|| Ok(())).expect("idempotent migration");
         assert_eq!(
             read_chunk_classification_backfill(&conn).expect("read idempotent state"),
             Some(complete)
@@ -2007,7 +2131,7 @@ mod tests {
         crate::chunk_sources::apply_path_lookup(&stalled_root).expect("apply path lookup");
         fs::write(stalled_root.join("facets"), "not a directory").expect("block facets scan");
         assert!(
-            !migrate_chunk_classifications(&mut stalled_conn, &stalled_root)
+            !migrate_chunk_classifications(&mut stalled_conn, &stalled_root, &|| Ok(()))
                 .expect("stalled migration is a warning")
                 .is_empty()
         );
@@ -7053,5 +7177,490 @@ not json
             .query_map([], |row| row.get::<_, String>(0))
             .expect("query chunk contents")
             .any(|row| row.expect("chunk content row").contains(needle))
+    }
+
+    #[test]
+    fn index_receipt_fence_refusal_skips_failure_receipt() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let root = temp_root("index-receipt-fence-refusal");
+        open_index(&root).unwrap();
+        let calls = AtomicUsize::new(0);
+        let error = scan_journal_with_checkpoint(&root, false, &|| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err("stopped".into())
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::WriterAdmission {
+                operation: "scan-journal",
+                ..
+            }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let conn = open_index(&root).unwrap();
+        assert!(crate::generation::read_last_scan(&conn).unwrap().is_none());
+    }
+
+    #[test]
+    fn index_receipt_fence_failed_scan_skips_replacement() {
+        let root = temp_root("index-receipt-fence-replacement");
+        open_index(&root).unwrap();
+        let parked = root.with_extension("original");
+        fs::rename(&root, &parked).unwrap();
+        fs::create_dir_all(&root).unwrap();
+        open_index(&root).unwrap();
+        record_failed_scan(
+            &root,
+            false,
+            &StoreError::Io(std::io::Error::other("later real error")),
+            &|| Err("stopped".into()),
+        );
+        let replacement = open_index(&root).unwrap();
+        assert!(
+            crate::generation::read_last_scan(&replacement)
+                .unwrap()
+                .is_none()
+        );
+        let original = Connection::open(db_path(&parked)).unwrap();
+        assert!(
+            crate::generation::read_last_scan(&original)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn index_receipt_fence_cancelled_while_blocked() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, mpsc};
+        use std::thread;
+
+        let root = temp_root("index-receipt-fence-blocked");
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let proceed = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let allowed = Arc::new(AtomicBool::new(false));
+        let proceed_flag = Arc::clone(&proceed);
+        let started_flag = Arc::clone(&started);
+        let cancel_flag = Arc::clone(&cancel);
+        let allowed_flag = Arc::clone(&allowed);
+        let journal = root.clone();
+        let worker = thread::spawn(move || {
+            let mut conn = open_index(&journal).unwrap();
+            opened_tx.send(()).unwrap();
+            while !proceed_flag.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            started_flag.store(true, Ordering::Release);
+            record_scan_receipt(&mut conn, &ScanReport::default(), false, &|| {
+                if cancel_flag.load(Ordering::Acquire) {
+                    Err("stopped".into())
+                } else {
+                    allowed_flag.store(true, Ordering::Release);
+                    Ok(())
+                }
+            })
+        });
+        opened_rx.recv().unwrap();
+        let mut holder = Connection::open(db_path(&root)).unwrap();
+        let tx = holder
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        proceed.store(true, Ordering::Release);
+        while !started.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        for _ in 0..1_000 {
+            assert!(
+                !allowed.load(Ordering::Acquire),
+                "receipt checkpoint ran before its transaction"
+            );
+            thread::yield_now();
+        }
+        assert!(!cancel.load(Ordering::Acquire));
+        cancel.store(true, Ordering::Release);
+        drop(tx);
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::WriterAdmission {
+                operation: "scan-journal",
+                ..
+            }
+        ));
+        assert!(!allowed.load(Ordering::Acquire));
+        let conn = open_index(&root).unwrap();
+        assert!(crate::generation::read_last_scan(&conn).unwrap().is_none());
+    }
+
+    const GHOST_EDGE: &str = "ghost/not-on-disk.jsonl";
+
+    fn write_owner_zone(root: &Path) {
+        fs::create_dir_all(root.join("config")).unwrap();
+        fs::write(
+            root.join("config/journal.json"),
+            r#"{"identity":{"timezone":"UTC"}}"#,
+        )
+        .unwrap();
+    }
+
+    fn seed_ghost_edge(conn: &Connection) {
+        conn.execute(
+            "INSERT INTO edges(src, dst, kind, directed, source, path, weight) VALUES ('a', 'b', 'seen', 0, 'screen', ?1, 1)",
+            [GHOST_EDGE],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO edge_files(path, mtime) VALUES (?1, 1)",
+            [GHOST_EDGE],
+        )
+        .unwrap();
+    }
+
+    fn ghost_edge_count(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM edges WHERE path=?1",
+            [GHOST_EDGE],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn assert_scan_journal_refusal(error: &StoreError) {
+        assert!(matches!(
+            error,
+            StoreError::WriterAdmission {
+                operation: "scan-journal",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn edge_owner_removes_a_file_that_is_gone() {
+        let root = temp_root("edge-owner-removes");
+        write_owner_zone(&root);
+        let mut conn = open_index(&root).unwrap();
+        seed_ghost_edge(&conn);
+        let report = reconcile_edges(&mut conn, &root, true, &|| Ok(())).unwrap();
+        assert!(report.removed >= 1);
+        assert_eq!(ghost_edge_count(&conn), 0);
+    }
+
+    #[test]
+    fn aggregate_owner_marks_migration_complete() {
+        let root = temp_root("aggregate-owner-complete");
+        let mut conn = open_index(&root).unwrap();
+        assert!(read_segment_aggregate_migration(&conn).unwrap().is_none());
+        migrate_segment_aggregates(&mut conn, &root, &|| Ok(())).unwrap();
+        let state = read_segment_aggregate_migration(&conn).unwrap().unwrap();
+        assert!(state.completed);
+        assert!(state.cursor.is_empty());
+    }
+
+    #[test]
+    fn path_lookup_owner_seeds_readiness() {
+        let root = temp_root("path-lookup-owner");
+        let mut conn = open_index(&root).unwrap();
+        conn.execute("DELETE FROM chunk_source_readiness", [])
+            .unwrap();
+        assert!(!chunk_path_lookup_ready(&conn).unwrap());
+        crate::chunk_sources::seed_path_lookup(&mut conn, &|| Ok(())).unwrap();
+        assert!(chunk_path_lookup_ready(&conn).unwrap());
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn edge_removal_refusal_while_the_commit_is_blocked_leaves_the_row() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, mpsc};
+        use std::thread;
+
+        let root = temp_root("edge-removal-blocked");
+        write_owner_zone(&root);
+        {
+            let conn = open_index(&root).unwrap();
+            seed_ghost_edge(&conn);
+        }
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let proceed = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let allowed = Arc::new(AtomicBool::new(false));
+        let proceed_flag = Arc::clone(&proceed);
+        let cancel_flag = Arc::clone(&cancel);
+        let allowed_flag = Arc::clone(&allowed);
+        let journal = root.clone();
+        let worker = thread::spawn(move || {
+            let mut conn = open_index(&journal).unwrap();
+            opened_tx.send(()).unwrap();
+            while !proceed_flag.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            reconcile_edges(&mut conn, &journal, true, &|| {
+                if cancel_flag.load(Ordering::Acquire) {
+                    Err("stopped".into())
+                } else {
+                    allowed_flag.store(true, Ordering::Release);
+                    Ok(())
+                }
+            })
+        });
+        opened_rx.recv().unwrap();
+        let mut holder = Connection::open(db_path(&root)).unwrap();
+        let tx = holder
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        proceed.store(true, Ordering::Release);
+        for _ in 0..20_000 {
+            assert!(
+                !allowed.load(Ordering::Acquire),
+                "edge checkpoint ran before its transaction"
+            );
+            thread::yield_now();
+        }
+        cancel.store(true, Ordering::Release);
+        drop(tx);
+        let error = worker.join().unwrap().unwrap_err();
+        assert_scan_journal_refusal(&error);
+        let conn = open_index(&root).unwrap();
+        assert_eq!(ghost_edge_count(&conn), 1);
+        assert!(crate::generation::read_last_scan(&conn).unwrap().is_none());
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn aggregate_cursor_refusal_while_blocked_leaves_the_cursor() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, mpsc};
+        use std::thread;
+
+        let root = temp_root("aggregate-cursor-blocked");
+        {
+            let conn = open_index(&root).unwrap();
+            conn.execute(
+                "INSERT INTO chunks(content, path, day, facet, agent, stream, idx, time_bucket) VALUES ('legacy segment', 'chronicle/20260808/main/120000_300', '20260808', '', 'segment', 'main', 0, '')",
+                [],
+            )
+            .unwrap();
+            write_segment_aggregate_migration(&conn, "zzz", false).unwrap();
+        }
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let proceed = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let allowed = Arc::new(AtomicBool::new(false));
+        let proceed_flag = Arc::clone(&proceed);
+        let cancel_flag = Arc::clone(&cancel);
+        let allowed_flag = Arc::clone(&allowed);
+        let journal = root.clone();
+        let worker = thread::spawn(move || {
+            let mut conn = open_index(&journal).unwrap();
+            opened_tx.send(()).unwrap();
+            while !proceed_flag.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            migrate_segment_aggregates(&mut conn, &journal, &|| {
+                if cancel_flag.load(Ordering::Acquire) {
+                    Err("stopped".into())
+                } else {
+                    allowed_flag.store(true, Ordering::Release);
+                    Ok(())
+                }
+            })
+        });
+        opened_rx.recv().unwrap();
+        let mut holder = Connection::open(db_path(&root)).unwrap();
+        let tx = holder
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        proceed.store(true, Ordering::Release);
+        for _ in 0..20_000 {
+            assert!(!allowed.load(Ordering::Acquire));
+            thread::yield_now();
+        }
+        cancel.store(true, Ordering::Release);
+        drop(tx);
+        let error = worker.join().unwrap().unwrap_err();
+        assert_scan_journal_refusal(&error);
+        let conn = open_index(&root).unwrap();
+        let state = read_segment_aggregate_migration(&conn).unwrap().unwrap();
+        assert_eq!(state.cursor, "zzz");
+        assert!(!state.completed);
+        assert!(crate::generation::read_last_scan(&conn).unwrap().is_none());
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn path_lookup_seed_refusal_while_blocked_leaves_readiness_unset() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, mpsc};
+        use std::thread;
+
+        let root = temp_root("path-seed-blocked");
+        open_index(&root).unwrap();
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let proceed = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let allowed = Arc::new(AtomicBool::new(false));
+        let proceed_flag = Arc::clone(&proceed);
+        let cancel_flag = Arc::clone(&cancel);
+        let allowed_flag = Arc::clone(&allowed);
+        let journal = root.clone();
+        let worker = thread::spawn(move || {
+            let mut conn = open_index(&journal).unwrap();
+            opened_tx.send(()).unwrap();
+            while !proceed_flag.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            crate::chunk_sources::seed_path_lookup(&mut conn, &|| {
+                if cancel_flag.load(Ordering::Acquire) {
+                    Err("stopped".into())
+                } else {
+                    allowed_flag.store(true, Ordering::Release);
+                    Ok(())
+                }
+            })
+        });
+        opened_rx.recv().unwrap();
+        {
+            let conn = Connection::open(db_path(&root)).unwrap();
+            conn.execute("DELETE FROM chunk_source_readiness", [])
+                .unwrap();
+        }
+        let mut holder = Connection::open(db_path(&root)).unwrap();
+        let tx = holder
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        proceed.store(true, Ordering::Release);
+        for _ in 0..20_000 {
+            assert!(!allowed.load(Ordering::Acquire));
+            thread::yield_now();
+        }
+        cancel.store(true, Ordering::Release);
+        drop(tx);
+        let error = worker.join().unwrap().unwrap_err();
+        assert_scan_journal_refusal(&error);
+        let conn = open_index(&root).unwrap();
+        assert!(!chunk_path_lookup_ready(&conn).unwrap());
+        assert!(crate::generation::read_last_scan(&conn).unwrap().is_none());
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn edge_removal_refusal_after_root_replacement_writes_neither_root() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, mpsc};
+        use std::thread;
+
+        let parent = temp_root("edge-root-replacement");
+        fs::create_dir_all(&parent).unwrap();
+        let journal = parent.join("journal");
+        fs::create_dir_all(&journal).unwrap();
+        write_owner_zone(&journal);
+        {
+            let conn = open_index(&journal).unwrap();
+            seed_ghost_edge(&conn);
+        }
+        let bound = solstone_core_journal_io::JournalRoot::open(&journal).unwrap();
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let proceed = Arc::new(AtomicBool::new(false));
+        let called = Arc::new(AtomicBool::new(false));
+        let proceed_flag = Arc::clone(&proceed);
+        let called_flag = Arc::clone(&called);
+        let journal_for_worker = journal.clone();
+        let worker = thread::spawn(move || {
+            let mut conn = open_index(&journal_for_worker).unwrap();
+            opened_tx.send(()).unwrap();
+            while !proceed_flag.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            reconcile_edges(&mut conn, &journal_for_worker, true, &|| {
+                called_flag.store(true, Ordering::Release);
+                bound
+                    .revalidate_canonical_binding()
+                    .map_err(|error| error.to_string())
+            })
+        });
+        opened_rx.recv().unwrap();
+        let mut holder = Connection::open(db_path(&journal)).unwrap();
+        let tx = holder
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        proceed.store(true, Ordering::Release);
+        for _ in 0..20_000 {
+            assert!(!called.load(Ordering::Acquire));
+            thread::yield_now();
+        }
+        let parked = parent.join("parked");
+        fs::rename(&journal, &parked).unwrap();
+        fs::create_dir(&journal).unwrap();
+        drop(tx);
+        let error = worker.join().unwrap().unwrap_err();
+        assert_scan_journal_refusal(&error);
+        let parked_conn = Connection::open(db_path(&parked)).unwrap();
+        assert_eq!(ghost_edge_count(&parked_conn), 1);
+        assert!(
+            crate::generation::read_last_scan(&parked_conn)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!db_path(&journal).exists());
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn edge_removal_deadline_while_the_commit_is_blocked_leaves_the_row() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, mpsc};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let root = temp_root("edge-removal-deadline");
+        write_owner_zone(&root);
+        {
+            let conn = open_index(&root).unwrap();
+            seed_ghost_edge(&conn);
+        }
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let proceed = Arc::new(AtomicBool::new(false));
+        let allowed = Arc::new(AtomicBool::new(false));
+        let proceed_flag = Arc::clone(&proceed);
+        let allowed_flag = Arc::clone(&allowed);
+        let deadline = Instant::now() + Duration::from_millis(80);
+        let journal = root.clone();
+        let worker = thread::spawn(move || {
+            let mut conn = open_index(&journal).unwrap();
+            opened_tx.send(()).unwrap();
+            while !proceed_flag.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            reconcile_edges(&mut conn, &journal, true, &|| {
+                if Instant::now() >= deadline {
+                    Err("deadline".into())
+                } else {
+                    allowed_flag.store(true, Ordering::Release);
+                    Ok(())
+                }
+            })
+        });
+        opened_rx.recv().unwrap();
+        let mut holder = Connection::open(db_path(&root)).unwrap();
+        let tx = holder
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        proceed.store(true, Ordering::Release);
+        while Instant::now() < deadline {
+            assert!(!allowed.load(Ordering::Acquire));
+            thread::yield_now();
+        }
+        drop(tx);
+        let error = worker.join().unwrap().unwrap_err();
+        assert_scan_journal_refusal(&error);
+        let conn = open_index(&root).unwrap();
+        assert_eq!(ghost_edge_count(&conn), 1);
+        assert!(crate::generation::read_last_scan(&conn).unwrap().is_none());
     }
 }

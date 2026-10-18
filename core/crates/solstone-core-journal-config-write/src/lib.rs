@@ -37,6 +37,7 @@ pub use bound_commit::{
 };
 pub use commit::{
     CommitConfigError, ConfigConflict, ConfigExpectation, ConfigFingerprint, commit_journal_config,
+    commit_journal_config_checked,
 };
 pub use config::{
     CasConfigMutationError, ConfigMutationError, InsertDailyInputSinceError, JournalConfigMutation,

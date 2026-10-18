@@ -184,15 +184,22 @@ pub(crate) fn stamp_if_needed(conn: &Connection) -> Result<(), StoreError> {
 /// write. The two repairs that replace the file outright (reset, legacy
 /// removal) proceed past a damaged stamp, so a broken index can still be
 /// rebuilt; reset then writes a fresh stamp.
-pub(crate) fn admit_writer(db_path: &Path, operation: &str) -> Result<(), StoreError> {
+pub(crate) fn admit_writer(
+    db_path: &Path,
+    operation: &str,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), StoreError> {
+    crate::db::admit_scan_journal(checkpoint)?;
     // A file that is not a SQLite database has nothing to stamp, and opening
     // one, even read-only, can create sidecars beside it.
     if !has_sqlite_header(db_path) {
         return Ok(());
     }
-    match stamp_existing(db_path) {
+    match stamp_existing(db_path, checkpoint) {
         Ok(()) => Ok(()),
-        Err(error @ StoreError::IndexGenerationNewer { .. }) => Err(error),
+        Err(
+            error @ (StoreError::IndexGenerationNewer { .. } | StoreError::WriterAdmission { .. }),
+        ) => Err(error),
         Err(error)
             if matches!(
                 operation,
@@ -218,7 +225,10 @@ pub fn has_sqlite_header(db_path: &Path) -> bool {
         .is_ok_and(|()| &header == b"SQLite format 3\0")
 }
 
-fn stamp_existing(db_path: &Path) -> Result<(), StoreError> {
+fn stamp_existing(
+    db_path: &Path,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), StoreError> {
     // Read first through a read-only connection, so an index whose stamp is
     // already current, or newer, is never opened for writing here.
     let stamp = {
@@ -235,10 +245,13 @@ fn stamp_existing(db_path: &Path) -> Result<(), StoreError> {
     if stamp.current() {
         return Ok(());
     }
+    crate::db::admit_scan_journal(checkpoint)?;
     let mut conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     conn.execute_batch("PRAGMA busy_timeout=5000;")?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    crate::db::admit_scan_journal(checkpoint)?;
     stamp_if_needed(&tx)?;
+    crate::db::admit_scan_journal(checkpoint)?;
     tx.commit()?;
     Ok(())
 }
@@ -363,6 +376,95 @@ mod tests {
     impl Drop for Journal {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_admission_cancellation_and_root_loss_do_not_stamp_legacy_index() {
+        for replace_root in [false, true] {
+            let journal = Journal::with_one_note("checked-legacy-stamp");
+            scan_journal(&journal.0, true).unwrap();
+            let database = db_path(&journal.0);
+            // Match the existing legacy-index control: retain a complete real
+            // index and remove only the generation marks.
+            let seed = Connection::open(&database).unwrap();
+            seed.execute_batch(
+                "DROP TABLE index_meta; PRAGMA user_version=0; PRAGMA application_id=0;",
+            )
+            .unwrap();
+            drop(seed);
+            let before = fs::read(&database).unwrap();
+            let bound = solstone_core_journal_io::JournalRoot::open(&journal.0).unwrap();
+            let parked = Journal(journal.0.with_extension("parked"));
+            let locked_checks = std::cell::Cell::new(0);
+            let checkpoint = || {
+                let observer = Connection::open(&database).unwrap();
+                observer.busy_timeout(std::time::Duration::ZERO).unwrap();
+                match observer.execute_batch("BEGIN IMMEDIATE") {
+                    Ok(()) => observer.execute_batch("ROLLBACK").unwrap(),
+                    Err(rusqlite::Error::SqliteFailure(error, _))
+                        if error.code == rusqlite::ErrorCode::DatabaseBusy =>
+                    {
+                        locked_checks.set(locked_checks.get() + 1);
+                        // The second locked check is after stamp_if_needed,
+                        // immediately before its actual transaction commit.
+                        if locked_checks.get() == 2 {
+                            drop(observer);
+                            if replace_root {
+                                fs::rename(&journal.0, &parked.0).unwrap();
+                                fs::create_dir_all(journal.0.join("indexer")).unwrap();
+                                fs::write(&database, &before).unwrap();
+                                return bound
+                                    .revalidate_canonical_binding()
+                                    .map_err(|error| error.to_string());
+                            }
+                            return Err("declared cancellation before legacy stamp commit".into());
+                        }
+                    }
+                    other => panic!("unexpected lock observation: {other:?}"),
+                }
+                Ok(())
+            };
+            let result = crate::writer_admission::IndexAdmission::acquire_checked(
+                &journal.0,
+                "scan",
+                &checkpoint,
+            );
+            assert!(matches!(result, Err(StoreError::WriterAdmission { .. })));
+            assert_eq!(
+                locked_checks.get(),
+                2,
+                "must reach the real generation commit boundary"
+            );
+            let original = if replace_root {
+                db_path(&parked.0)
+            } else {
+                database.clone()
+            };
+            assert!(
+                !read_stamp(&Connection::open(&original).unwrap())
+                    .unwrap()
+                    .is_stamped()
+            );
+            assert!(
+                !read_stamp(&Connection::open(&database).unwrap())
+                    .unwrap()
+                    .is_stamped()
+            );
+            let admitted = crate::writer_admission::IndexAdmission::acquire_checked(
+                &journal.0,
+                "scan",
+                &|| Ok(()),
+            )
+            .unwrap();
+            assert!(
+                read_stamp(&Connection::open(&database).unwrap())
+                    .unwrap()
+                    .current()
+            );
+            drop(admitted);
+            scan_journal(&journal.0, false).unwrap();
         }
     }
 

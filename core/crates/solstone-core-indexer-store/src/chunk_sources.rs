@@ -132,13 +132,16 @@ pub fn apply_path_lookup(journal: &Path) -> Result<PathLookupStatus, StoreError>
     conn.execute_batch(
         "PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
     )?;
-    seed_path_lookup(&mut conn)?;
+    seed_path_lookup(&mut conn, &|| Ok(()))?;
     Ok(PathLookupStatus { ready: true })
 }
 
 /// Rebuild the path lookup from `chunks` and mark it ready. The caller must
 /// hold the index writer admission.
-pub(crate) fn seed_path_lookup(conn: &mut Connection) -> Result<(), StoreError> {
+pub(crate) fn seed_path_lookup(
+    conn: &mut Connection,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), StoreError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
     if !sqlite_table_exists(&tx, "chunks")? {
@@ -175,6 +178,7 @@ pub(crate) fn seed_path_lookup(conn: &mut Connection) -> Result<(), StoreError> 
         "REPLACE INTO chunk_source_readiness(id, ready) VALUES (1, 1)",
         [],
     )?;
+    crate::db::admit_scan_journal(checkpoint)?;
     tx.commit()?;
     Ok(())
 }
@@ -630,7 +634,7 @@ mod tests {
         conn.execute("DROP TRIGGER corrupt_seed", []).unwrap();
         drop(conn);
         let admission = IndexAdmission::acquire(&root, "retry-probe").unwrap();
-        let reopened = crate::db::open_index_admitted(&root, &admission).unwrap();
+        let reopened = crate::db::open_index_admitted(&root, &admission, &|| Ok(())).unwrap();
         assert!(chunk_path_lookup_ready(&reopened).unwrap());
         drop(reopened);
         drop(admission);

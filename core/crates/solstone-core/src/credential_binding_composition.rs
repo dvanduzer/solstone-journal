@@ -231,6 +231,7 @@ fn owner_correction_keeps_the_unprocessed_segment() {
                 },
                 &RespondWithConfigProbe { runtime },
                 &ProductionSppPrerequisite,
+                &|| false,
             );
             let owner = match outcome {
                 OwnerRefreshOutcome::PersistedReady { .. } => "ready",

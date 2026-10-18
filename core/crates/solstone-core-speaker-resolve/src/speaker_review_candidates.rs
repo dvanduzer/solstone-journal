@@ -31,6 +31,8 @@ pub enum SpeakerReviewCandidateError {
     InvalidRow(&'static str),
     #[error("speaker keep-separate read failed: {0}")]
     KeepSeparate(#[from] crate::keep_separate::KeepSeparateError),
+    #[error("{0}")]
+    Cancelled(String),
 }
 
 /// Load name-variant review candidates, skipping malformed JSONL rows.
@@ -54,6 +56,14 @@ pub fn load_candidates(journal_root: &Path) -> Result<Vec<Value>, SpeakerReviewC
 pub fn record_name_variant_candidate(
     journal_root: &Path,
     candidate: &crate::name_variant_scan::NameVariantCandidate,
+) -> Result<(Value, bool, bool), SpeakerReviewCandidateError> {
+    record_name_variant_candidate_checked(journal_root, candidate, &|| Ok(()))
+}
+
+pub fn record_name_variant_candidate_checked(
+    journal_root: &Path,
+    candidate: &crate::name_variant_scan::NameVariantCandidate,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<(Value, bool, bool), SpeakerReviewCandidateError> {
     let path = review_candidates_path(journal_root);
     create_parent(&path)?;
@@ -137,6 +147,7 @@ pub fn record_name_variant_candidate(
     } else {
         rows.push(row.clone());
     }
+    checkpoint().map_err(SpeakerReviewCandidateError::Cancelled)?;
     write_jsonl(&path, rows, AtomicWriteOptions::default())?;
     Ok((row, created, suppressed))
 }

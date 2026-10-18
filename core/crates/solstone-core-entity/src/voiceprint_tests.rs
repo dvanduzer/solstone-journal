@@ -968,10 +968,10 @@ fn cancelled_voiceprint_publication_after_archive_lock_wait_and_positive_twin() 
         let flag = cancelled.clone();
         let journal = root.path().to_path_buf();
         let (started, ready) = mpsc::channel();
-        let (checkpoint, reached) = mpsc::channel();
+        let (finished, completion) = mpsc::channel();
         let worker = std::thread::spawn(move || {
             started.send(()).unwrap();
-            crate::save_voiceprints_batch_checked(
+            let result = crate::save_voiceprints_batch_checked(
                 &journal,
                 fixture_entity_id(),
                 &[VoiceprintItem {
@@ -980,20 +980,28 @@ fn cancelled_voiceprint_publication_after_archive_lock_wait_and_positive_twin() 
                 }],
                 &test_encoder(),
                 &|| {
-                    checkpoint.send(()).unwrap();
                     if flag.load(Ordering::SeqCst) {
                         Err("cancelled".into())
                     } else {
                         Ok(())
                     }
                 },
-            )
+            );
+            finished.send(()).unwrap();
+            result
         });
-        ready.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(reached.recv_timeout(Duration::from_millis(100)).is_err());
+        let started_in_time = ready.recv_timeout(Duration::from_secs(2)).is_ok();
+        let blocked_on_archive = completion.recv_timeout(Duration::from_millis(100)).is_err();
+        let unchanged_while_locked = fs::read(&path).unwrap() == before;
         cancelled.store(cancel, Ordering::SeqCst);
         drop(held);
         let result = worker.join().unwrap();
+        assert!(started_in_time);
+        assert!(
+            blocked_on_archive,
+            "the public operation must await the held archive lock"
+        );
+        assert!(unchanged_while_locked);
         if cancel {
             assert!(matches!(
                 result,

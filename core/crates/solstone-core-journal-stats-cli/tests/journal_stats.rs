@@ -24,6 +24,152 @@ const FIXTURE: &str = include_str!("../../../fixtures/journal-storage-ops-refere
 const DAY: &str = "20260105";
 const OTHER_DAY: &str = "20260104";
 
+#[cfg(unix)]
+fn seed_checked_stats(root: &Path, family: usize) -> PathBuf {
+    let day = root.join("chronicle").join(DAY);
+    let source = day.join("phone/120000_60");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(
+        source.join("audio.jsonl"),
+        "{\"header\":true}\n{\"start\":\"12:00:00\",\"text\":\"retained speech\"}\n",
+    )
+    .unwrap();
+    if family == 1 {
+        daily_talent(&root.join("system-talents"));
+        damage_via_truncated_source(root, DAY);
+    }
+    let tokens = root.join("tokens");
+    fs::create_dir_all(&tokens).unwrap();
+    fs::write(
+        tokens.join(format!("{DAY}.jsonl")),
+        "{\"timestamp\":1,\"model\":\"model\",\"usage\":{\"input\":3}}\n",
+    )
+    .unwrap();
+    match family {
+        0 | 1 => day.join("stats.json"),
+        2 => tokens.join(format!("{DAY}.tokens_cache.json")),
+        3 => root.join("stats.json"),
+        _ => unreachable!(),
+    }
+}
+
+#[cfg(unix)]
+fn checked_stats_native_stage_control(replace_parent: bool) {
+    use solstone_core_journal_io::JournalRoot;
+    for family in 0..4 {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("journal");
+        let destination = seed_checked_stats(&root, family);
+        let parent = destination.parent().unwrap().to_path_buf();
+        let parked = temporary.path().join("parked");
+        let before = b"{\"sentinel\":\"existing\"}\n";
+        fs::write(&destination, before).unwrap();
+        let root_witness = JournalRoot::open(&root).unwrap();
+        let staged = Cell::new(false);
+        let stopped = Cell::new(false);
+        let checkpoint = || {
+            if stopped.get() {
+                return Err("declared Stop after statistics staging".to_owned());
+            }
+            root_witness
+                .revalidate_canonical_binding()
+                .map_err(|error| error.to_string())?;
+            if !staged.get()
+                && fs::read_dir(&parent).unwrap().any(|entry| {
+                    solstone_core_journal_io::is_publication_candidate_name(
+                        &entry.unwrap().file_name(),
+                    )
+                })
+            {
+                staged.set(true);
+                if replace_parent {
+                    fs::rename(&parent, &parked).unwrap();
+                    fs::create_dir(&parent).unwrap();
+                    fs::write(&destination, before).unwrap();
+                } else {
+                    stopped.set(true);
+                    return Err("declared Stop after statistics staging".to_owned());
+                }
+            }
+            Ok(())
+        };
+        let run = crate::run_cli_with_cache_checked(
+            &[],
+            &root,
+            now(),
+            &root.join("system-talents"),
+            &root.join("apps"),
+            &EmptyBacklog,
+            &crate::FilesystemDocumentWriter,
+            &crate::FilesystemDayCacheWriter,
+            &checkpoint,
+        );
+        assert!(
+            staged.get(),
+            "family {family} must reach its actual native stage"
+        );
+        assert_eq!(fs::read(&destination).unwrap(), before, "family {family}");
+        if replace_parent {
+            assert_eq!(
+                fs::read(parked.join(destination.file_name().unwrap())).unwrap(),
+                before,
+                "family {family}: original child must remain unchanged"
+            );
+            if family == 3 {
+                assert_ne!(
+                    run.exit_code, 0,
+                    "journal root loss must fail the stats phase"
+                );
+            }
+        } else {
+            assert_ne!(
+                run.exit_code, 0,
+                "Stop cannot become a successful stats phase"
+            );
+        }
+
+        // A new admitted invocation uses the current real inputs and publishes
+        // through the same production route; a refused cache is never success evidence.
+        seed_checked_stats(&root, family);
+        let run = crate::run_cli_with_cache_checked(
+            &[],
+            &root,
+            now(),
+            &root.join("system-talents"),
+            &root.join("apps"),
+            &EmptyBacklog,
+            &crate::FilesystemDocumentWriter,
+            &crate::FilesystemDayCacheWriter,
+            &|| Ok(()),
+        );
+        assert_eq!(run.exit_code, 0, "family {family}: {}", run.stderr);
+        let saved: Value = serde_json::from_slice(&fs::read(&destination).unwrap()).unwrap();
+        match family {
+            0 => assert_eq!(saved["stats"]["transcript_sessions"], 1),
+            1 => assert!(
+                saved["unreadable"]["cause"]
+                    .as_str()
+                    .is_some_and(|cause| !cause.is_empty())
+            ),
+            2 => assert_eq!(saved["model"]["input"], 3),
+            3 => assert_eq!(saved["tokens"]["by_day"][DAY]["model"]["input"], 3),
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn checked_stats_cancel_at_native_stage() {
+    checked_stats_native_stage_control(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn checked_stats_parent_replacement_at_native_stage() {
+    checked_stats_native_stage_control(true);
+}
+
 fn now() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 1, 6, 12, 0, 0).unwrap()
 }

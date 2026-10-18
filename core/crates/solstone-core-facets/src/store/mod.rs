@@ -134,6 +134,7 @@ pub use retired::{
 pub use review_candidates::{
     FacetReviewCandidateError, accept_candidate, dismiss_candidate, facet_slug,
     humanize_facet_title, load_candidates, record_facet_candidates,
+    record_facet_candidates_checked,
 };
 pub use seeding::{
     SeedEntitiesError, SeedEntityBaseOutcome, SeedEntityInput, SeedEntityItemResult,

@@ -114,6 +114,18 @@ pub fn commit_journal_config(
     replacement: &Map<String, Value>,
     options: LockOptions,
 ) -> Result<(), CommitConfigError> {
+    commit_journal_config_checked(journal_path, expected, replacement, options, &|| Ok(()))
+}
+
+/// Replace journal config when its fingerprint matches, refusing the write when
+/// `checkpoint` fails after the lock is held.
+pub fn commit_journal_config_checked(
+    journal_path: &Path,
+    expected: ConfigExpectation,
+    replacement: &Map<String, Value>,
+    options: LockOptions,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), CommitConfigError> {
     let config_path = get_journal_config_path(journal_path);
     #[cfg(any(unix, windows))]
     let budget = crate::credential_interlock::PublicationBudget::new(options);
@@ -125,6 +137,7 @@ pub fn commit_journal_config(
         })
     })?;
     let entry_checkpoint = || {
+        checkpoint()?;
         #[cfg(any(unix, windows))]
         if let Some(root) = &admitted {
             root.revalidate_canonical_binding()
@@ -166,6 +179,7 @@ pub fn commit_journal_config(
         replacement,
         &budget,
         &|| {
+            checkpoint()?;
             admitted
                 .revalidate_canonical_binding()
                 .map_err(|error| error.to_string())
@@ -178,6 +192,7 @@ pub fn commit_journal_config(
         })
     })?;
     let checkpoint = || {
+        checkpoint()?;
         #[cfg(any(unix, windows))]
         admitted
             .revalidate_canonical_binding()
@@ -217,7 +232,9 @@ mod tests {
 
     use serde_json::{Map, Value, json};
     use solstone_core_journal_config::{get_journal_config_path, read_journal_config};
-    use solstone_core_journal_io::{LockError, LockOptions, hold_lock, write_json};
+    use solstone_core_journal_io::{
+        JsonWriteOptions, LockError, LockOptions, hold_lock, write_json,
+    };
 
     use super::*;
     use crate::test_support::TempDir;

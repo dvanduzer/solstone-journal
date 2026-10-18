@@ -380,6 +380,7 @@ impl SenseDispatcher {
         describe_workers: usize,
         child_environment: solstone_core_system::process::ChildLaunchContext,
         executor: Arc<dyn SenseExecutor>,
+        marker_policy: BatchMarkerPolicy,
     ) -> Self {
         Self::new_inner(
             journal,
@@ -391,7 +392,7 @@ impl SenseDispatcher {
             BatchContext {
                 describe_workers: Some(describe_workers),
                 child_environment,
-                marker_policy: BatchMarkerPolicy::AdvanceStream,
+                marker_policy,
             },
             None,
             Some(executor),

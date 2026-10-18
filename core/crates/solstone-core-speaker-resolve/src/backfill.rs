@@ -10,7 +10,7 @@ use serde_json::{Map, Value};
 use solstone_core_entity::{
     hold_entity_trust_lock, is_admissible_person, load_all_journal_entities,
 };
-use solstone_core_speaker_id::labels::{write_full_labels, write_stub_labels};
+use solstone_core_speaker_id::labels::{write_full_labels_checked, write_stub_labels_checked};
 use thiserror::Error;
 
 use crate::backfill_operations::{BackfillCheckpointOutcome, BackfillSegmentKey};
@@ -20,8 +20,12 @@ use crate::owner_centroid::owner_centroid_file;
 use crate::resolve::{ResolveError, ResolveOutcome, resolve};
 use crate::voiceprint_accumulation::{
     AccumulationEmbedding, AccumulationLabel, AccumulationOutcome, AccumulationRequest,
-    accumulate_voiceprints,
+    accumulate_voiceprints_checked,
 };
+
+fn backfill_checkpoint() -> Result<(), String> {
+    crate::backfill_operations::admit_backfill_task().map_err(|error| error.to_string())
+}
 
 fn encoder() -> solstone_core_entity::EncoderIdentity {
     solstone_core_entity::EncoderIdentity {
@@ -257,8 +261,16 @@ pub fn execute_backfill_member(
     match resolved {
         ResolveOutcome::Resolved(output) => {
             if commit {
+                if let Err(error) = crate::backfill_operations::admit_backfill_task() {
+                    return (BackfillCheckpointOutcome::Error, Some(error.to_string()));
+                }
                 if let Err(err) = write_resolved_backfill_labels(segment_path, &output) {
                     return (BackfillCheckpointOutcome::Error, Some(err.to_string()));
+                }
+                if accumulation
+                    && let Err(error) = crate::backfill_operations::admit_backfill_task()
+                {
+                    return (BackfillCheckpointOutcome::Error, Some(error.to_string()));
                 }
                 if accumulation
                     && let Err(err) = accumulate_voiceprints_for_segment(
@@ -283,7 +295,11 @@ pub fn execute_backfill_member(
         // keeping labels the owner set by hand. A centroid that is present but
         // unreadable is not "no voice", and those labels are left alone.
         ResolveOutcome::NoOwnerCentroid if commit && owner_voice_absent(journal_root) => {
-            match write_stub_labels(segment_path, "no_owner_centroid") {
+            if let Err(error) = crate::backfill_operations::admit_backfill_task() {
+                return (BackfillCheckpointOutcome::Error, Some(error.to_string()));
+            }
+            match write_stub_labels_checked(segment_path, "no_owner_centroid", &backfill_checkpoint)
+            {
                 Ok(()) => (BackfillCheckpointOutcome::Processed, None),
                 Err(err) => (BackfillCheckpointOutcome::Error, Some(err.to_string())),
             }
@@ -316,7 +332,12 @@ pub fn write_resolved_backfill_labels(
     output: &crate::resolve::ResolveOutput,
 ) -> Result<(), solstone_core_speaker_id::labels::LabelsError> {
     let labels = output.labels.iter().map(label_json).collect::<Vec<_>>();
-    write_full_labels(segment, labels, &metadata_json(&output.metadata))
+    write_full_labels_checked(
+        segment,
+        labels,
+        &metadata_json(&output.metadata),
+        &backfill_checkpoint,
+    )
 }
 
 fn accumulate_voiceprints_for_segment(
@@ -389,7 +410,7 @@ fn accumulate_voiceprints_for_segment(
         entity_ids,
     };
 
-    match accumulate_voiceprints(&request) {
+    match accumulate_voiceprints_checked(&request, &backfill_checkpoint) {
         Ok(
             AccumulationOutcome::Completed { .. }
             | AccumulationOutcome::NothingEligible { .. }
@@ -990,5 +1011,448 @@ mod tests {
             }
         }
         map
+    }
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+mod publication_fence {
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    use serde_json::{Value, json};
+    use solstone_core_entity::{EncoderIdentity, load_entity_voiceprints_file};
+    use solstone_core_journal_io::{JournalRoot, LockOptions, SegmentLayout, hold_lock};
+    use solstone_core_speaker_id::labels::LabelsError;
+    use solstone_core_system::queue::CallableTaskContext;
+
+    use super::write_resolved_backfill_labels;
+    use crate::backfill_operations::with_backfill_task_checkpoint;
+    use crate::layer1::Label;
+    use crate::owner_centroid::{OwnerCentroidWriteInput, write_owner_centroid};
+    use crate::resolve::{ResolveMetadata, ResolveOutput};
+    use crate::voiceprint_accumulation::{
+        AccumulationEmbedding, AccumulationLabel, AccumulationOutcome, AccumulationRequest,
+        EntityWriteStatus, accumulate_voiceprints_checked,
+    };
+
+    fn wait_until(mut ready: impl FnMut() -> bool) {
+        for _ in 0..1_000_000 {
+            if ready() {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        assert!(ready());
+    }
+
+    fn output() -> ResolveOutput {
+        ResolveOutput {
+            labels: vec![Label {
+                sentence_id: 1,
+                speaker: Some("alice".to_owned()),
+                confidence: Some("high".to_owned()),
+                method: Some("acoustic".to_owned()),
+                owner_margin_declined: None,
+                acoustic_margin_declined: None,
+            }],
+            unmatched: Vec::new(),
+            unmatched_texts: HashMap::new(),
+            source: Some("transcript".to_owned()),
+            candidates: Vec::new(),
+            metadata: ResolveMetadata {
+                owner_centroid_last_refreshed_at: None,
+                voiceprint_versions: HashMap::new(),
+                candidate_evidence: Vec::new(),
+                candidate_evidence_gaps: None,
+                voiceprint_gaps: None,
+            },
+        }
+    }
+
+    fn segment() -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let segment = root.path().join("chronicle/20260808/main/120000_300");
+        fs::create_dir_all(&segment).unwrap();
+        (root, segment)
+    }
+
+    fn labels_file(segment: &Path) -> PathBuf {
+        segment.join("talents/speaker_labels.json")
+    }
+
+    #[test]
+    fn backfill_owner_publishes_resolved_labels() {
+        let (_root, segment) = segment();
+        let task: Arc<dyn Fn() -> Result<(), String> + Send + Sync> = Arc::new(|| Ok(()));
+        with_backfill_task_checkpoint(task, || {
+            write_resolved_backfill_labels(&segment, &output()).unwrap();
+        });
+        let saved: Value =
+            serde_json::from_slice(&fs::read(labels_file(&segment)).unwrap()).unwrap();
+        assert_eq!(saved["labels"][0]["sentence_id"].as_i64(), Some(1));
+        assert_eq!(saved["labels"][0]["speaker"].as_str(), Some("alice"));
+    }
+
+    #[test]
+    fn label_refusal_while_the_labels_lock_is_held_writes_nothing() {
+        let (_root, segment) = segment();
+        let path = labels_file(&segment);
+        let held = hold_lock(&path, LockOptions::default()).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fail = Arc::new(AtomicBool::new(false));
+        let calls_flag = Arc::clone(&calls);
+        let fail_flag = Arc::clone(&fail);
+        let task: Arc<dyn Fn() -> Result<(), String> + Send + Sync> = Arc::new(move || {
+            calls_flag.fetch_add(1, Ordering::AcqRel);
+            if fail_flag.load(Ordering::Acquire) {
+                Err("cancelled".to_owned())
+            } else {
+                Ok(())
+            }
+        });
+        let segment_for_worker = segment.clone();
+        let worker = std::thread::spawn(move || {
+            with_backfill_task_checkpoint(task, || {
+                write_resolved_backfill_labels(&segment_for_worker, &output())
+            })
+        });
+        let mut entered = false;
+        let mut finished_while_locked = false;
+        for _ in 0..100_000 {
+            entered |= calls.load(Ordering::Acquire) > 0;
+            finished_while_locked |= worker.is_finished();
+            std::thread::yield_now();
+        }
+        fail.store(true, Ordering::Release);
+        drop(held);
+        let result = worker.join().unwrap();
+        assert!(
+            entered,
+            "the task must enter before the sidecar is released"
+        );
+        assert!(
+            !finished_while_locked,
+            "the operation must await the actual labels lock"
+        );
+        let error = result.unwrap_err();
+        assert!(matches!(error, LabelsError::PublicationRefused(_)));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn label_refusal_after_root_replacement_writes_neither_root() {
+        let parent = tempfile::tempdir().unwrap();
+        let journal = parent.path().join("journal");
+        let segment = journal.join("chronicle/20260808/main/120000_300");
+        fs::create_dir_all(&segment).unwrap();
+        let bound = JournalRoot::open(&journal).unwrap();
+        let release = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(AtomicBool::new(false));
+        let release_flag = Arc::clone(&release);
+        let entered_flag = Arc::clone(&entered);
+        let task: Arc<dyn Fn() -> Result<(), String> + Send + Sync> = Arc::new(move || {
+            entered_flag.store(true, Ordering::Release);
+            while !release_flag.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            bound
+                .revalidate_canonical_binding()
+                .map_err(|error| error.to_string())
+        });
+        let segment_for_worker = segment.clone();
+        let worker = std::thread::spawn(move || {
+            with_backfill_task_checkpoint(task, || {
+                write_resolved_backfill_labels(&segment_for_worker, &output())
+            })
+        });
+        wait_until(|| entered.load(Ordering::Acquire));
+        let parked = parent.path().join("parked");
+        fs::rename(&journal, &parked).unwrap();
+        fs::create_dir(&journal).unwrap();
+        release.store(true, Ordering::Release);
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(matches!(error, LabelsError::PublicationRefused(_)));
+        assert!(
+            !parked
+                .join("chronicle/20260808/main/120000_300/talents/speaker_labels.json")
+                .exists()
+        );
+        assert!(
+            !journal
+                .join("chronicle/20260808/main/120000_300/talents/speaker_labels.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn label_deadline_while_the_labels_lock_is_held_writes_nothing() {
+        let (_root, segment) = segment();
+        let path = labels_file(&segment);
+        let held = hold_lock(&path, LockOptions::default()).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(40);
+        let control = CallableTaskContext {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            priority: Default::default(),
+            deadline,
+        };
+        let task: Arc<dyn Fn() -> Result<(), String> + Send + Sync> = Arc::new(move || {
+            if control.is_cancelled() {
+                Err("deadline".to_owned())
+            } else {
+                Ok(())
+            }
+        });
+        let segment_for_worker = segment.clone();
+        let worker = std::thread::spawn(move || {
+            with_backfill_task_checkpoint(task, || {
+                write_resolved_backfill_labels(&segment_for_worker, &output())
+            })
+        });
+        while Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        drop(held);
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(matches!(error, LabelsError::PublicationRefused(_)));
+        assert!(!path.exists());
+    }
+
+    fn vector(x: f32, y: f32) -> Vec<f32> {
+        let mut values = vec![0.0; 256];
+        values[0] = x;
+        values[1] = y;
+        values
+    }
+
+    fn person(root: &Path, id: &str, principal: bool) {
+        let dir = root.join("entities").join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("entity.json"),
+            json!({"id": id, "name": id, "type": "Person", "is_principal": principal}).to_string(),
+        )
+        .unwrap();
+    }
+
+    fn accumulation(root: &Path) -> AccumulationRequest {
+        let dir = root.join("chronicle/20260808/main/120000_300");
+        fs::create_dir_all(&dir).unwrap();
+        person(root, "owner", true);
+        person(root, "alice", false);
+        write_owner_centroid(
+            root,
+            "owner",
+            &OwnerCentroidWriteInput {
+                centroid: vector(1.0, 0.0),
+                cluster_size: 10,
+                timestamp: "2026-08-08T12:00:00Z".to_owned(),
+                evidence_tier: "high".to_owned(),
+            },
+        )
+        .unwrap();
+        AccumulationRequest {
+            journal_root: root.to_path_buf(),
+            day: "20260808".to_owned(),
+            stream_layout: SegmentLayout::Named,
+            stream: "main".to_owned(),
+            segment_key: "120000_300".to_owned(),
+            source: "transcript".to_owned(),
+            now_ms: 1234,
+            encoder: EncoderIdentity {
+                id: "test-encoder".to_owned(),
+                sha256: "a".repeat(64),
+                width: 256,
+            },
+            labels: vec![AccumulationLabel {
+                sentence_id: 4,
+                speaker: Some("alice".to_owned()),
+                confidence: Some("high".to_owned()),
+                method: Some("acoustic".to_owned()),
+            }],
+            embeddings: vec![AccumulationEmbedding {
+                sentence_id: 4,
+                values: vector(0.0, 1.0),
+            }],
+            entity_ids: vec!["alice".to_owned()],
+        }
+    }
+
+    fn admit_task(
+        task: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+        request: AccumulationRequest,
+    ) -> Result<AccumulationOutcome, crate::voiceprint_accumulation::AccumulationError> {
+        with_backfill_task_checkpoint(task, || {
+            accumulate_voiceprints_checked(&request, &|| {
+                crate::backfill_operations::admit_backfill_task().map_err(|error| error.to_string())
+            })
+        })
+    }
+
+    #[test]
+    fn admitted_checkpoint_publishes_a_voiceprint() {
+        let root = tempfile::tempdir().unwrap();
+        let request = accumulation(root.path());
+        let task: Arc<dyn Fn() -> Result<(), String> + Send + Sync> = Arc::new(|| Ok(()));
+        let outcome = admit_task(task, request).unwrap();
+        assert!(matches!(
+            outcome,
+            AccumulationOutcome::Completed {
+                written_rows: 1,
+                ..
+            }
+        ));
+        let archive = load_entity_voiceprints_file(root.path(), "alice").unwrap();
+        assert_eq!(archive.rows, 1);
+    }
+
+    #[test]
+    fn voiceprint_refusal_while_its_lock_is_held_writes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let request = accumulation(root.path());
+        let path = root.path().join("entities/alice/voiceprints.npz");
+        let held = hold_lock(&path, LockOptions::default()).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fail = Arc::new(AtomicBool::new(false));
+        let calls_flag = Arc::clone(&calls);
+        let fail_flag = Arc::clone(&fail);
+        let task: Arc<dyn Fn() -> Result<(), String> + Send + Sync> = Arc::new(move || {
+            calls_flag.fetch_add(1, Ordering::AcqRel);
+            if fail_flag.load(Ordering::Acquire) {
+                Err("cancelled".to_owned())
+            } else {
+                Ok(())
+            }
+        });
+        let worker = std::thread::spawn(move || admit_task(task, request));
+        for _ in 0..1_000_000 {
+            if calls.load(Ordering::Acquire) >= 2 {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        let entered = calls.load(Ordering::Acquire) >= 2;
+        let mut finished_while_locked = false;
+        for _ in 0..10_000 {
+            finished_while_locked |= worker.is_finished();
+            std::thread::yield_now();
+        }
+        fail.store(true, Ordering::Release);
+        drop(held);
+        let result = worker.join().unwrap();
+        assert!(
+            entered,
+            "the task must enter before the sidecar is released"
+        );
+        assert!(
+            !finished_while_locked,
+            "the operation must await the actual voiceprint lock"
+        );
+        let outcome = result.unwrap();
+        match outcome {
+            AccumulationOutcome::NothingEligible { entity_reports, .. } => {
+                assert!(matches!(
+                    entity_reports.get("alice").unwrap().write_status,
+                    EntityWriteStatus::Failed { .. }
+                ));
+            }
+            other => panic!("voiceprint publication was not refused: {other:?}"),
+        }
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn voiceprint_refusal_after_root_replacement_writes_neither_root() {
+        let parent = tempfile::tempdir().unwrap();
+        let journal = parent.path().join("journal");
+        fs::create_dir(&journal).unwrap();
+        let request = accumulation(&journal);
+        let bound = JournalRoot::open(&journal).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let calls_flag = Arc::clone(&calls);
+        let release_flag = Arc::clone(&release);
+        let task: Arc<dyn Fn() -> Result<(), String> + Send + Sync> = Arc::new(move || {
+            let seen = calls_flag.fetch_add(1, Ordering::AcqRel) + 1;
+            if seen >= 3 {
+                while !release_flag.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+            }
+            bound
+                .revalidate_canonical_binding()
+                .map_err(|error| error.to_string())
+        });
+        let worker = std::thread::spawn(move || admit_task(task, request));
+        wait_until(|| calls.load(Ordering::Acquire) >= 3);
+        let parked = parent.path().join("parked");
+        fs::rename(&journal, &parked).unwrap();
+        fs::create_dir(&journal).unwrap();
+        release.store(true, Ordering::Release);
+        let outcome = worker.join().unwrap().unwrap();
+        match outcome {
+            AccumulationOutcome::NothingEligible { entity_reports, .. } => {
+                assert!(matches!(
+                    entity_reports.get("alice").unwrap().write_status,
+                    EntityWriteStatus::Failed { .. }
+                ));
+            }
+            other => panic!("voiceprint publication was not refused: {other:?}"),
+        }
+        assert!(!parked.join("entities/alice/voiceprints.npz").exists());
+        assert!(!journal.join("entities/alice/voiceprints.npz").exists());
+    }
+
+    #[test]
+    fn voiceprint_deadline_while_its_lock_is_held_writes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let request = accumulation(root.path());
+        let path = root.path().join("entities/alice/voiceprints.npz");
+        let held = hold_lock(&path, LockOptions::default()).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_flag = Arc::clone(&calls);
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        let control = CallableTaskContext {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            priority: Default::default(),
+            deadline,
+        };
+        let task: Arc<dyn Fn() -> Result<(), String> + Send + Sync> = Arc::new(move || {
+            calls_flag.fetch_add(1, Ordering::AcqRel);
+            if control.is_cancelled() {
+                Err("deadline".to_owned())
+            } else {
+                Ok(())
+            }
+        });
+        let worker = std::thread::spawn(move || admit_task(task, request));
+        let mut entered = false;
+        let mut finished_while_locked = false;
+        while Instant::now() < deadline {
+            entered |= calls.load(Ordering::Acquire) >= 2;
+            finished_while_locked |= worker.is_finished();
+            std::thread::yield_now();
+        }
+        drop(held);
+        let result = worker.join().unwrap();
+        assert!(entered, "the task must enter before its original deadline");
+        assert!(
+            !finished_while_locked,
+            "the operation must await the actual voiceprint lock"
+        );
+        let outcome = result.unwrap();
+        match outcome {
+            AccumulationOutcome::NothingEligible { entity_reports, .. } => {
+                assert!(matches!(
+                    entity_reports.get("alice").unwrap().write_status,
+                    EntityWriteStatus::Failed { .. }
+                ));
+            }
+            other => panic!("voiceprint publication was not refused: {other:?}"),
+        }
+        assert!(!path.exists());
     }
 }

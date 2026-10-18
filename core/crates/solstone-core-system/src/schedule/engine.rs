@@ -10,7 +10,7 @@ use serde_json::{Map, Value};
 
 use crate::request::{ScheduledArgv, ScheduledRequest};
 
-use super::completion::{load_runtime_state, record_completion};
+use super::completion::{load_runtime_state, record_completion, record_completion_checked};
 use super::config::{ConfigDiagnostic, load_runtime, minute_interval, register_default_entries};
 use super::due::{compute_next_run, current_marks, effective_every, is_due, state_entry};
 use super::status::ScheduleStatus;
@@ -252,6 +252,27 @@ impl ScheduleEngine {
             ended_at,
             exit_status,
             reference,
+        )
+    }
+
+    /// Same publication as [`Self::record_completion`], after the completion lock
+    /// is held and immediately before the state file is replaced.
+    pub fn record_completion_checked(
+        &self,
+        name: &str,
+        ended_at: f64,
+        exit_status: &str,
+        reference: &str,
+        checkpoint: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), ScheduleError> {
+        record_completion_checked(
+            &self.completion_lock,
+            &self.state_path,
+            name,
+            ended_at,
+            exit_status,
+            reference,
+            checkpoint,
         )
     }
 }

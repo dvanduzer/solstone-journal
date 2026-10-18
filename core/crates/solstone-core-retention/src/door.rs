@@ -524,10 +524,24 @@ pub fn notify_index(
 /// One [`TargetOutcome`] per class, in table order. A failed entry is a row on its
 /// class and never halts the run: one unreadable log must not stop the rest.
 pub fn remove_logs(journal: &Path, targets: &[crate::logs::LogTarget]) -> Outcome {
+    remove_logs_checked(journal, targets, &|| Ok(()))
+}
+
+pub fn remove_logs_checked(
+    journal: &Path,
+    targets: &[crate::logs::LogTarget],
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Outcome {
     use crate::logs::EntryKind;
 
     let mut by_class: Vec<TargetOutcome> = Vec::new();
     for target in targets {
+        if let Err(reason) = checkpoint() {
+            return Outcome {
+                targets: by_class,
+                halted: Some(RunHalt { reason }),
+            };
+        }
         let class = target.class();
         if !by_class.iter().any(|done| done.target.dir == class) {
             by_class.push(TargetOutcome {
@@ -580,6 +594,14 @@ pub fn remove_planned_oplogs(
     journal: &Path,
     targets: &[crate::oplog_retention::OplogRetentionTarget],
 ) -> Outcome {
+    remove_planned_oplogs_checked(journal, targets, &|| Ok(()))
+}
+
+pub fn remove_planned_oplogs_checked(
+    journal: &Path,
+    targets: &[crate::oplog_retention::OplogRetentionTarget],
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Outcome {
     if targets.is_empty() {
         return Outcome {
             targets: Vec::new(),
@@ -599,6 +621,12 @@ pub fn remove_planned_oplogs(
     };
 
     for planned in targets {
+        if let Err(reason) = checkpoint() {
+            return Outcome {
+                targets: vec![row],
+                halted: Some(RunHalt { reason }),
+            };
+        }
         let rel = planned.rel();
         let root = match JournalRoot::open(journal) {
             Ok(root) => root,
@@ -644,16 +672,24 @@ pub fn remove_planned_oplogs(
             continue;
         }
         match probe_retained_oplog_lease(&file, entry.identity()) {
-            LeaseProbe::Released => match remove_file(journal, &rel) {
-                Ok(Removed::Unlinked | Removed::AlreadyAbsent) => {
-                    row.removed.push(RemovedPath::confirmed(rel));
+            LeaseProbe::Released => {
+                if let Err(reason) = checkpoint() {
+                    return Outcome {
+                        targets: vec![row],
+                        halted: Some(RunHalt { reason }),
+                    };
                 }
-                Err(error) => row.not_removed.push(NotRemoved {
-                    entry: rel,
-                    reason: format!("the oplog could not be removed: {error}"),
-                    staged: None,
-                }),
-            },
+                match remove_file(journal, &rel) {
+                    Ok(Removed::Unlinked | Removed::AlreadyAbsent) => {
+                        row.removed.push(RemovedPath::confirmed(rel));
+                    }
+                    Err(error) => row.not_removed.push(NotRemoved {
+                        entry: rel,
+                        reason: format!("the oplog could not be removed: {error}"),
+                        staged: None,
+                    }),
+                }
+            }
             LeaseProbe::Active | LeaseProbe::Indeterminate => row.not_removed.push(NotRemoved {
                 entry: rel,
                 reason: "the oplog changed before removal because its lease is no longer released"
@@ -692,6 +728,14 @@ fn existing_mode(_path: &Path) -> Option<u32> {
 /// The mode is read from the file being replaced rather than defaulted: a log the
 /// operator tightened must not be widened by being pruned.
 pub fn compact_log(journal: &Path, planned: &crate::logs::Compaction) -> Outcome {
+    compact_log_checked(journal, planned, &|| Ok(()))
+}
+
+pub fn compact_log_checked(
+    journal: &Path,
+    planned: &crate::logs::Compaction,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Outcome {
     let target = Target {
         day: String::new(),
         stream: String::new(),
@@ -711,6 +755,12 @@ pub fn compact_log(journal: &Path, planned: &crate::logs::Compaction) -> Outcome
         }
     };
     let mode = existing_mode(&path);
+    if let Err(reason) = checkpoint() {
+        return Outcome {
+            targets: Vec::new(),
+            halted: Some(RunHalt { reason }),
+        };
+    }
     match atomic_replace(&path, planned.contents(), AtomicWriteOptions { mode }) {
         Ok(()) => Outcome {
             targets: vec![TargetOutcome {

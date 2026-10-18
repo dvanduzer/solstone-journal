@@ -44,6 +44,7 @@ pub(crate) fn decode_hosted_binding(bytes: &[u8]) -> Option<HostedBinding> {
 pub fn save_hosted_binding(journal: &Path, binding: &HostedBinding) -> Result<(), BackupError> {
     let path = hosted_binding_path(journal).map_err(|_| BackupError::HostedWrite)?;
     let _guard = hold_lock(&path, binding_lock_options()).map_err(|_| BackupError::HostedWrite)?;
+    crate::state::admit_backup_task().map_err(|_| BackupError::HostedWrite)?;
     let value = Map::from_iter([
         (
             "broker_endpoint".to_owned(),
@@ -78,6 +79,7 @@ pub fn save_hosted_binding(journal: &Path, binding: &HostedBinding) -> Result<()
 pub fn delete_hosted_binding(journal: &Path) -> Result<(), BackupError> {
     let path = hosted_binding_path(journal).map_err(|_| BackupError::HostedDelete)?;
     let _guard = hold_lock(&path, binding_lock_options()).map_err(|_| BackupError::HostedDelete)?;
+    crate::state::admit_backup_task().map_err(|_| BackupError::HostedDelete)?;
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),

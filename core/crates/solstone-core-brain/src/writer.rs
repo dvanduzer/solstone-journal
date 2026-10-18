@@ -514,6 +514,7 @@ pub enum WriterError {
     Conflict(String),
     Fingerprint(String),
     Random,
+    Cancelled(String),
 }
 
 impl fmt::Display for WriterError {
@@ -526,6 +527,7 @@ impl fmt::Display for WriterError {
             | Self::Fingerprint(message) => formatter.write_str(message),
             Self::Validation(error) => error.fmt(formatter),
             Self::Random => formatter.write_str("could not generate secure random bytes"),
+            Self::Cancelled(message) => formatter.write_str(message),
         }
     }
 }
@@ -539,7 +541,8 @@ impl Error for WriterError {
             | Self::Config(_)
             | Self::Conflict(_)
             | Self::Fingerprint(_)
-            | Self::Random => None,
+            | Self::Random
+            | Self::Cancelled(_) => None,
         }
     }
 }
@@ -2059,43 +2062,77 @@ pub fn begin_refresh(
     expect_active_fingerprint_absent: bool,
     bundled_runtime_fingerprint_sha256: Option<String>,
 ) -> Result<Option<BrainRefreshPermit>, BeginRefreshError> {
-    validate_expected(
-        expected_active_fingerprint_sha256,
-        expect_active_fingerprint_absent,
-    )?;
-    let expected_contract =
-        expected_active_fingerprint_sha256.is_some() || expect_active_fingerprint_absent;
-    let root = BrainWriteRoot::open(journal_path).map_err(BeginRefreshError::Writer)?;
-    let checkpoint = || root.checkpoint(journal_path);
-    checkpoint().map_err(|error| BeginRefreshError::Writer(WriterError::Io(error)))?;
-    let config = match config(&root) {
-        Ok(config) => config,
-        Err(_) => return Ok(None),
-    };
-    let initial = derive_active_brain_lane(&config);
-    if initial.lane.is_none() && !expected_contract {
-        return Ok(None);
-    }
-    if initial.lane.as_deref() == Some("none") && !expected_contract {
-        begin_none_lane(&root, now, &initial, &checkpoint).map_err(BeginRefreshError::Writer)?;
-        return Ok(None);
-    }
-
-    let Some(lease) = root
-        .acquire_lease(&checkpoint)
-        .map_err(BeginRefreshError::Writer)?
-    else {
-        return Ok(None);
-    };
-    begin_refresh_under_lease(
+    begin_refresh_checked(
+        journal_path,
         now,
         run_id,
         expected_active_fingerprint_sha256,
         expect_active_fingerprint_absent,
         bundled_runtime_fingerprint_sha256,
-        lease,
-        root,
+        &|| Ok(()),
     )
+}
+
+pub fn begin_refresh_checked(
+    journal_path: &Path,
+    now: DateTime<Utc>,
+    run_id: Option<String>,
+    expected_active_fingerprint_sha256: Option<&str>,
+    expect_active_fingerprint_absent: bool,
+    bundled_runtime_fingerprint_sha256: Option<String>,
+    publication_checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Option<BrainRefreshPermit>, BeginRefreshError> {
+    publication_checkpoint()
+        .map_err(|error| BeginRefreshError::Writer(WriterError::Cancelled(error)))?;
+    let result = (|| {
+        validate_expected(
+            expected_active_fingerprint_sha256,
+            expect_active_fingerprint_absent,
+        )?;
+        let expected_contract =
+            expected_active_fingerprint_sha256.is_some() || expect_active_fingerprint_absent;
+        let root = BrainWriteRoot::open(journal_path).map_err(BeginRefreshError::Writer)?;
+        let checkpoint = || {
+            publication_checkpoint()?;
+            root.checkpoint(journal_path)
+        };
+        checkpoint().map_err(|error| BeginRefreshError::Writer(WriterError::Io(error)))?;
+        let config = match config(&root) {
+            Ok(config) => config,
+            Err(_) => return Ok(None),
+        };
+        let initial = derive_active_brain_lane(&config);
+        if initial.lane.is_none() && !expected_contract {
+            return Ok(None);
+        }
+        if initial.lane.as_deref() == Some("none") && !expected_contract {
+            begin_none_lane(&root, now, &initial, &checkpoint)
+                .map_err(BeginRefreshError::Writer)?;
+            return Ok(None);
+        }
+
+        let Some(lease) = root
+            .acquire_lease(&checkpoint)
+            .map_err(BeginRefreshError::Writer)?
+        else {
+            return Ok(None);
+        };
+        begin_refresh_under_lease(
+            now,
+            run_id,
+            expected_active_fingerprint_sha256,
+            expect_active_fingerprint_absent,
+            bundled_runtime_fingerprint_sha256,
+            lease,
+            root,
+            publication_checkpoint,
+        )
+    })();
+    if result.is_err() {
+        publication_checkpoint()
+            .map_err(|error| BeginRefreshError::Writer(WriterError::Cancelled(error)))?;
+    }
+    result
 }
 
 /// Begin the narrow SPP prerequisite-renewal lane.
@@ -2106,184 +2143,245 @@ pub fn begin_prerequisite_renewal(
     expected_fingerprint_sha256: Option<&str>,
     bundled_runtime_fingerprint_sha256: Option<String>,
 ) -> BeginPrerequisiteRenewal {
-    if expected_fingerprint_sha256.is_some_and(|value| !is_sha256(value)) {
-        return BeginPrerequisiteRenewal::Unsafe {
-            reason: "fingerprint_mismatch".to_owned(),
-        };
-    }
-    let root = match BrainWriteRoot::open(journal_path) {
-        Ok(root) => root,
-        Err(error) => {
+    begin_prerequisite_renewal_checked(
+        journal_path,
+        now,
+        run_id,
+        expected_fingerprint_sha256,
+        bundled_runtime_fingerprint_sha256,
+        &|| Ok(()),
+    )
+    .unwrap_or_else(|error| BeginPrerequisiteRenewal::Unsafe {
+        reason: error.to_string(),
+    })
+}
+
+pub fn begin_prerequisite_renewal_checked(
+    journal_path: &Path,
+    now: DateTime<Utc>,
+    run_id: Option<String>,
+    expected_fingerprint_sha256: Option<&str>,
+    bundled_runtime_fingerprint_sha256: Option<String>,
+    publication_checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<BeginPrerequisiteRenewal, WriterError> {
+    publication_checkpoint().map_err(WriterError::Cancelled)?;
+    let result = (|| {
+        if expected_fingerprint_sha256.is_some_and(|value| !is_sha256(value)) {
             return BeginPrerequisiteRenewal::Unsafe {
-                reason: error.to_string(),
+                reason: "fingerprint_mismatch".to_owned(),
             };
         }
-    };
-    let checkpoint = || root.checkpoint(journal_path);
-    let lease = match root.acquire_lease(&checkpoint) {
-        Ok(Some(lease)) => lease,
-        Ok(None) => {
-            return BeginPrerequisiteRenewal::Busy {
-                reason: "lease_held".to_owned(),
-            };
-        }
-        Err(error) => {
-            return BeginPrerequisiteRenewal::Unsafe {
-                reason: error.to_string(),
-            };
-        }
-    };
-    let loaded = match fingerprint_for_write(&root, bundled_runtime_fingerprint_sha256.clone()) {
-        Ok(Some(loaded)) => loaded,
-        Ok(None) => {
-            return BeginPrerequisiteRenewal::Unsafe {
-                reason: "fingerprint_not_available".to_owned(),
-            };
-        }
-        Err(error) => {
-            return BeginPrerequisiteRenewal::Unsafe {
-                reason: error.to_string(),
-            };
-        }
-    };
-    if loaded.resolution.lane.as_deref() != Some("spp") {
-        return BeginPrerequisiteRenewal::Unsafe {
-            reason: "non_spp_lane".to_owned(),
-        };
-    }
-    if expected_fingerprint_sha256.is_some_and(|expected| expected != loaded.sha256) {
-        return BeginPrerequisiteRenewal::Unsafe {
-            reason: "fingerprint_mismatch".to_owned(),
-        };
-    }
-    let run_id = match run_id {
-        Some(run_id) => run_id,
-        None => match random_id() {
-            Ok(run_id) => run_id,
+        let root = match BrainWriteRoot::open(journal_path) {
+            Ok(root) => root,
             Err(error) => {
                 return BeginPrerequisiteRenewal::Unsafe {
                     reason: error.to_string(),
                 };
             }
-        },
-    };
-    let expires_at = now + checking_ttl();
-    let result: Result<BeginPrerequisiteRenewal, WriterError> = (|| {
+        };
         let checkpoint = || {
-            root.checkpoint(journal_path)?;
-            lease
-                .revalidate_bound(root.health.get().expect("leased health"), lease_name())
-                .map_err(|error| error.to_string())
+            publication_checkpoint()?;
+            root.checkpoint(journal_path)
         };
-        let lock = root.lock(record_name(), &checkpoint)?;
-        let Some((raw, current)) = read_current(&root, now)? else {
-            return Ok(BeginPrerequisiteRenewal::Unsafe {
-                reason: "brain_record_missing".to_owned(),
-            });
+        let lease = match root.acquire_lease(&checkpoint) {
+            Ok(Some(lease)) => lease,
+            Ok(None) => {
+                return BeginPrerequisiteRenewal::Busy {
+                    reason: "lease_held".to_owned(),
+                };
+            }
+            Err(error) => {
+                return BeginPrerequisiteRenewal::Unsafe {
+                    reason: error.to_string(),
+                };
+            }
         };
-        if current.fingerprint_sha256.as_deref() != Some(&loaded.sha256) {
-            return Ok(BeginPrerequisiteRenewal::Unsafe {
-                reason: "brain_record_missing".to_owned(),
-            });
+        let loaded = match fingerprint_for_write(&root, bundled_runtime_fingerprint_sha256.clone())
+        {
+            Ok(Some(loaded)) => loaded,
+            Ok(None) => {
+                return BeginPrerequisiteRenewal::Unsafe {
+                    reason: "fingerprint_not_available".to_owned(),
+                };
+            }
+            Err(error) => {
+                return BeginPrerequisiteRenewal::Unsafe {
+                    reason: error.to_string(),
+                };
+            }
+        };
+        if loaded.resolution.lane.as_deref() != Some("spp") {
+            return BeginPrerequisiteRenewal::Unsafe {
+                reason: "non_spp_lane".to_owned(),
+            };
         }
-        let Some(evidence) = safe_prerequisite_evidence(&raw, &current, now) else {
-            return Ok(BeginPrerequisiteRenewal::Unsafe {
-                reason: "unsafe_evidence".to_owned(),
+        if expected_fingerprint_sha256.is_some_and(|expected| expected != loaded.sha256) {
+            return BeginPrerequisiteRenewal::Unsafe {
+                reason: "fingerprint_mismatch".to_owned(),
+            };
+        }
+        let run_id = match run_id {
+            Some(run_id) => run_id,
+            None => match random_id() {
+                Ok(run_id) => run_id,
+                Err(error) => {
+                    return BeginPrerequisiteRenewal::Unsafe {
+                        reason: error.to_string(),
+                    };
+                }
+            },
+        };
+        let expires_at = now + checking_ttl();
+        let result: Result<BeginPrerequisiteRenewal, WriterError> = (|| {
+            let checkpoint = || {
+                publication_checkpoint()?;
+                root.checkpoint(journal_path)?;
+                lease
+                    .revalidate_bound(root.health.get().expect("leased health"), lease_name())
+                    .map_err(|error| error.to_string())
+            };
+            let lock = root.lock(record_name(), &checkpoint)?;
+            let Some((raw, current)) = read_current(&root, now)? else {
+                return Ok(BeginPrerequisiteRenewal::Unsafe {
+                    reason: "brain_record_missing".to_owned(),
+                });
+            };
+            if current.fingerprint_sha256.as_deref() != Some(&loaded.sha256) {
+                return Ok(BeginPrerequisiteRenewal::Unsafe {
+                    reason: "brain_record_missing".to_owned(),
+                });
+            }
+            let Some(evidence) = safe_prerequisite_evidence(&raw, &current, now) else {
+                return Ok(BeginPrerequisiteRenewal::Unsafe {
+                    reason: "unsafe_evidence".to_owned(),
+                });
+            };
+            let revision = next_revision(Some(&current));
+            let marker_seen = marker_id(Some(&raw));
+            let record = compose_checking_record(CheckingRecord {
+                revision,
+                now,
+                expires_at,
+                run_id: &run_id,
+                loaded: &loaded,
+                evidence,
+                marker: raw
+                    .get("runtime_failure_marker")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                marker_seen: marker_seen.clone(),
             });
-        };
-        let revision = next_revision(Some(&current));
-        let marker_seen = marker_id(Some(&raw));
-        let record = compose_checking_record(CheckingRecord {
-            revision,
-            now,
-            expires_at,
-            run_id: &run_id,
-            loaded: &loaded,
-            evidence,
-            marker: raw
-                .get("runtime_failure_marker")
-                .cloned()
-                .unwrap_or(Value::Null),
-            marker_seen: marker_seen.clone(),
-        });
-        let publish_checkpoint = || {
-            checkpoint()?;
-            fingerprint_checkpoint(
-                &root,
-                &loaded.sha256,
-                bundled_runtime_fingerprint_sha256.clone(),
-            )
-        };
-        let written = write_record(&root, &lock, &record, now, &publish_checkpoint)?;
-        let credential_holds_seen =
-            crate::record::parse_credential_holds(written.get("credential_holds"))?;
-        Ok(BeginPrerequisiteRenewal::Started(BrainRefreshPermit {
-            run_id,
-            started_at: now,
-            expires_at,
-            fingerprint_sha256: loaded.sha256.clone(),
-            checking_revision: revision,
-            runtime_failure_marker_seen: marker_seen,
-            credential_holds_seen,
-            credential_generation: None,
-            credential_authority_seen: None,
-            credential_publication_deadline: None,
-            bundled_runtime_fingerprint_sha256,
-            root: Box::new(root),
-            _lease: lease,
-        }))
+            let publish_checkpoint = || {
+                checkpoint()?;
+                fingerprint_checkpoint(
+                    &root,
+                    &loaded.sha256,
+                    bundled_runtime_fingerprint_sha256.clone(),
+                )
+            };
+            let written = write_record(&root, &lock, &record, now, &publish_checkpoint)?;
+            let credential_holds_seen =
+                crate::record::parse_credential_holds(written.get("credential_holds"))?;
+            Ok(BeginPrerequisiteRenewal::Started(BrainRefreshPermit {
+                run_id,
+                started_at: now,
+                expires_at,
+                fingerprint_sha256: loaded.sha256.clone(),
+                checking_revision: revision,
+                runtime_failure_marker_seen: marker_seen,
+                credential_holds_seen,
+                credential_generation: None,
+                credential_authority_seen: None,
+                credential_publication_deadline: None,
+                bundled_runtime_fingerprint_sha256,
+                root: Box::new(root),
+                _lease: lease,
+            }))
+        })();
+        result.unwrap_or_else(|error| BeginPrerequisiteRenewal::Unsafe {
+            reason: error.to_string(),
+        })
     })();
-    result.unwrap_or_else(|error| BeginPrerequisiteRenewal::Unsafe {
-        reason: error.to_string(),
-    })
+    publication_checkpoint().map_err(WriterError::Cancelled)?;
+    Ok(result)
 }
 
 /// Finish a definitive rejected probe using its exact acknowledged registration.
 /// This renews only negative evidence; the receipt cannot authorize success.
 pub fn finish_refresh_rejected(
     journal_path: &Path,
-    mut permit: BrainRefreshPermit,
+    permit: BrainRefreshPermit,
     outcome: Value,
     now: DateTime<Utc>,
     bundled_runtime_fingerprint_sha256: Option<String>,
     receipt: CredentialRejectionReceipt,
 ) -> Result<Value, WriterError> {
-    let reason = outcome
-        .get("generate")
-        .and_then(|generate| generate.get("reason_code"))
-        .and_then(Value::as_str);
-    if !(reason == Some("provider_key_invalid")
-        || (reason == Some("provider_key_missing") && receipt.keyless_endpoint))
-        || receipt.root_identity != permit.root.root.identity()
-        || derive_active_brain_lane(&config(&permit.root)?).provider != receipt.provider
-        || permit
-            .credential_generation
-            .as_ref()
-            .is_none_or(|generation| !generation.same_target(&receipt.generation))
-    {
-        return Err(WriterError::Conflict(
-            "rejected refresh receipt does not match its probe".to_owned(),
-        ));
-    }
-    receipt
-        .generation
-        .ensure_current()
-        .map_err(|error| WriterError::Conflict(error.to_string()))?;
-    receipt.authority.checkpoint(&permit.root)?;
-    permit.credential_generation = Some(Box::new(receipt.generation.provider_generation()));
-    permit.credential_authority_seen = Some(Box::new(receipt.authority));
-    if receipt.carrier == CredentialRejectionCarrier::Brain {
-        permit
-            .credential_holds_seen
-            .insert(receipt.provider.to_owned(), receipt.hold);
-    }
-    finish_refresh(
+    finish_refresh_rejected_checked(
         journal_path,
         permit,
         outcome,
         now,
         bundled_runtime_fingerprint_sha256,
+        receipt,
+        &|| Ok(()),
     )
+}
+
+pub fn finish_refresh_rejected_checked(
+    journal_path: &Path,
+    permit: BrainRefreshPermit,
+    outcome: Value,
+    now: DateTime<Utc>,
+    bundled_runtime_fingerprint_sha256: Option<String>,
+    receipt: CredentialRejectionReceipt,
+    publication_checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Value, WriterError> {
+    publication_checkpoint().map_err(WriterError::Cancelled)?;
+    let result = (|| {
+        let mut permit = permit;
+
+        let reason = outcome
+            .get("generate")
+            .and_then(|generate| generate.get("reason_code"))
+            .and_then(Value::as_str);
+        if !(reason == Some("provider_key_invalid")
+            || (reason == Some("provider_key_missing") && receipt.keyless_endpoint))
+            || receipt.root_identity != permit.root.root.identity()
+            || derive_active_brain_lane(&config(&permit.root)?).provider != receipt.provider
+            || permit
+                .credential_generation
+                .as_ref()
+                .is_none_or(|generation| !generation.same_target(&receipt.generation))
+        {
+            return Err(WriterError::Conflict(
+                "rejected refresh receipt does not match its probe".to_owned(),
+            ));
+        }
+        receipt
+            .generation
+            .ensure_current()
+            .map_err(|error| WriterError::Conflict(error.to_string()))?;
+        receipt.authority.checkpoint(&permit.root)?;
+        permit.credential_generation = Some(Box::new(receipt.generation.provider_generation()));
+        permit.credential_authority_seen = Some(Box::new(receipt.authority));
+        if receipt.carrier == CredentialRejectionCarrier::Brain {
+            permit
+                .credential_holds_seen
+                .insert(receipt.provider.to_owned(), receipt.hold);
+        }
+        finish_refresh_checked(
+            journal_path,
+            permit,
+            outcome,
+            now,
+            bundled_runtime_fingerprint_sha256,
+            publication_checkpoint,
+        )
+    })();
+    if result.is_err() {
+        publication_checkpoint().map_err(WriterError::Cancelled)?;
+    }
+    result
 }
 
 /// Finish a refresh from the caller's probe outcome.
@@ -2294,33 +2392,63 @@ pub fn finish_refresh(
     now: DateTime<Utc>,
     bundled_runtime_fingerprint_sha256: Option<String>,
 ) -> Result<Value, WriterError> {
-    let checkpoint = || permit.checkpoint(journal_path);
-    checkpoint().map_err(WriterError::Io)?;
-    parse_evidence(Some(&outcome), now)?;
-    let loaded = fingerprint_for_write(&permit.root, bundled_runtime_fingerprint_sha256)?
-        .ok_or_else(|| WriterError::Conflict("brain fingerprint key is unavailable".to_owned()))?;
-    let lock = permit.root.lock(record_name(), &checkpoint)?;
-    let Some((_, current)) = read_current(&permit.root, now)? else {
-        return Err(WriterError::Conflict(
-            "brain refresh checking marker is absent".to_owned(),
-        ));
-    };
-    assert_finish_allowed(&permit, &current, now)?;
-    if loaded.sha256 != permit.fingerprint_sha256 {
-        return Err(WriterError::Conflict(
-            "brain fingerprint changed".to_owned(),
-        ));
-    }
-    let record = compose_record_from_evidence(
+    finish_refresh_checked(
+        journal_path,
+        permit,
         outcome,
-        &loaded,
-        next_revision(Some(&current)),
         now,
-        Value::Null,
-        Value::Null,
-        Value::Object(Map::new()),
-    )?;
-    write_record(&permit.root, &lock, &record, now, &checkpoint)
+        bundled_runtime_fingerprint_sha256,
+        &|| Ok(()),
+    )
+}
+
+pub fn finish_refresh_checked(
+    journal_path: &Path,
+    permit: BrainRefreshPermit,
+    outcome: Value,
+    now: DateTime<Utc>,
+    bundled_runtime_fingerprint_sha256: Option<String>,
+    publication_checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Value, WriterError> {
+    publication_checkpoint().map_err(WriterError::Cancelled)?;
+    let result = (|| {
+        let checkpoint = || {
+            publication_checkpoint()?;
+            permit.checkpoint(journal_path)
+        };
+        checkpoint().map_err(WriterError::Io)?;
+        parse_evidence(Some(&outcome), now)?;
+        let loaded = fingerprint_for_write(&permit.root, bundled_runtime_fingerprint_sha256)?
+            .ok_or_else(|| {
+                WriterError::Conflict("brain fingerprint key is unavailable".to_owned())
+            })?;
+        let lock = permit.root.lock(record_name(), &checkpoint)?;
+        let Some((_, current)) = read_current(&permit.root, now)? else {
+            return Err(WriterError::Conflict(
+                "brain refresh checking marker is absent".to_owned(),
+            ));
+        };
+        assert_finish_allowed(&permit, &current, now)?;
+        if loaded.sha256 != permit.fingerprint_sha256 {
+            return Err(WriterError::Conflict(
+                "brain fingerprint changed".to_owned(),
+            ));
+        }
+        let record = compose_record_from_evidence(
+            outcome,
+            &loaded,
+            next_revision(Some(&current)),
+            now,
+            Value::Null,
+            Value::Null,
+            Value::Object(Map::new()),
+        )?;
+        write_record(&permit.root, &lock, &record, now, &checkpoint)
+    })();
+    if result.is_err() {
+        publication_checkpoint().map_err(WriterError::Cancelled)?;
+    }
+    result
 }
 
 /// Abandon a refresh with one evidence-recordable reason.
@@ -2331,41 +2459,64 @@ pub fn abandon_refresh(
     diagnostic: Map<String, Value>,
     now: DateTime<Utc>,
 ) -> Result<Value, WriterError> {
-    let checkpoint = || permit.checkpoint(journal_path);
-    checkpoint().map_err(WriterError::Io)?;
-    let component = target_component(reason_code).ok_or_else(|| {
-        WriterError::Conflict("brain abandon reason is not recordable evidence".to_owned())
-    })?;
-    let lock = permit.root.lock(record_name(), &checkpoint)?;
-    let Some((raw, current)) = read_current(&permit.root, now)? else {
-        return Err(WriterError::Conflict(
-            "brain refresh checking marker is absent".to_owned(),
-        ));
-    };
-    assert_finish_allowed(&permit, &current, now)?;
-    let mut evidence = object_field(&raw, "evidence")?.clone();
-    evidence.insert(
-        component.to_owned(),
-        component_for_reason(reason_code, diagnostic.clone(), now)?,
-    );
-    let revision = next_revision(Some(&current));
-    let record = compose_direct_record(DirectRecord {
-        revision,
-        reason_code: reason_code.to_owned(),
-        active_lane: current.active_lane.clone(),
-        active_provider: current.active_provider.clone(),
-        active_model: current.active_model.clone(),
-        fingerprint_sha256: current.fingerprint_sha256.clone(),
-        evidence: Value::Object(evidence),
-        checking: Value::Null,
-        marker: raw
-            .get("runtime_failure_marker")
-            .cloned()
-            .unwrap_or(Value::Null),
-        diagnostic: Value::Object(diagnostic),
-        now,
-    });
-    write_record(&permit.root, &lock, &record, now, &checkpoint)
+    abandon_refresh_checked(journal_path, permit, reason_code, diagnostic, now, &|| {
+        Ok(())
+    })
+}
+
+pub fn abandon_refresh_checked(
+    journal_path: &Path,
+    permit: BrainRefreshPermit,
+    reason_code: &str,
+    diagnostic: Map<String, Value>,
+    now: DateTime<Utc>,
+    publication_checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Value, WriterError> {
+    publication_checkpoint().map_err(WriterError::Cancelled)?;
+    let result = (|| {
+        let checkpoint = || {
+            publication_checkpoint()?;
+            permit.checkpoint(journal_path)
+        };
+        checkpoint().map_err(WriterError::Io)?;
+        let component = target_component(reason_code).ok_or_else(|| {
+            WriterError::Conflict("brain abandon reason is not recordable evidence".to_owned())
+        })?;
+        let lock = permit.root.lock(record_name(), &checkpoint)?;
+        let Some((raw, current)) = read_current(&permit.root, now)? else {
+            return Err(WriterError::Conflict(
+                "brain refresh checking marker is absent".to_owned(),
+            ));
+        };
+        assert_finish_allowed(&permit, &current, now)?;
+        let mut evidence = object_field(&raw, "evidence")?.clone();
+        evidence.insert(
+            component.to_owned(),
+            component_for_reason(reason_code, diagnostic.clone(), now)?,
+        );
+        let revision = next_revision(Some(&current));
+        let record = compose_direct_record(DirectRecord {
+            revision,
+            reason_code: reason_code.to_owned(),
+            active_lane: current.active_lane.clone(),
+            active_provider: current.active_provider.clone(),
+            active_model: current.active_model.clone(),
+            fingerprint_sha256: current.fingerprint_sha256.clone(),
+            evidence: Value::Object(evidence),
+            checking: Value::Null,
+            marker: raw
+                .get("runtime_failure_marker")
+                .cloned()
+                .unwrap_or(Value::Null),
+            diagnostic: Value::Object(diagnostic),
+            now,
+        });
+        write_record(&permit.root, &lock, &record, now, &checkpoint)
+    })();
+    if result.is_err() {
+        publication_checkpoint().map_err(WriterError::Cancelled)?;
+    }
+    result
 }
 
 /// Finish an SPP prerequisite renewal.
@@ -2376,48 +2527,78 @@ pub fn finish_prerequisite_renewal(
     now: DateTime<Utc>,
     bundled_runtime_fingerprint_sha256: Option<String>,
 ) -> Result<Value, WriterError> {
-    let checkpoint = || permit.checkpoint(journal_path);
-    checkpoint().map_err(WriterError::Io)?;
-    let component = parse_component("lane_prerequisites", &lane_prerequisites, now)?;
-    if component.status == "not_attempted" {
-        return Err(WriterError::Validation(ValidationError {
-            path: "lane_prerequisites.status".to_owned(),
-            reason: "prerequisite renewal requires ok or declared failure".to_owned(),
-        }));
-    }
-    let loaded = fingerprint_for_write(&permit.root, bundled_runtime_fingerprint_sha256)?
-        .ok_or_else(|| WriterError::Conflict("brain fingerprint key is unavailable".to_owned()))?;
-    let lock = permit.root.lock(record_name(), &checkpoint)?;
-    let Some((raw, current)) = read_current(&permit.root, now)? else {
-        return Err(WriterError::Conflict(
-            "brain refresh checking marker is absent".to_owned(),
-        ));
-    };
-    assert_finish_allowed(&permit, &current, now)?;
-    if loaded.sha256 != permit.fingerprint_sha256 {
-        return Err(WriterError::Conflict(
-            "brain fingerprint changed".to_owned(),
-        ));
-    }
-    if loaded.resolution.lane.as_deref() != Some("spp") {
-        return Err(WriterError::Conflict("brain lane changed".to_owned()));
-    }
-    let Some(mut evidence) = safe_prerequisite_evidence(&raw, &current, now) else {
-        return Err(WriterError::Conflict(
-            "brain prerequisite evidence is unsafe".to_owned(),
-        ));
-    };
-    evidence.insert("lane_prerequisites".to_owned(), lane_prerequisites);
-    let record = compose_record_from_evidence(
-        Value::Object(evidence),
-        &loaded,
-        next_revision(Some(&current)),
+    finish_prerequisite_renewal_checked(
+        journal_path,
+        permit,
+        lane_prerequisites,
         now,
-        Value::Null,
-        Value::Null,
-        Value::Object(Map::new()),
-    )?;
-    write_record(&permit.root, &lock, &record, now, &checkpoint)
+        bundled_runtime_fingerprint_sha256,
+        &|| Ok(()),
+    )
+}
+
+pub fn finish_prerequisite_renewal_checked(
+    journal_path: &Path,
+    permit: BrainRefreshPermit,
+    lane_prerequisites: Value,
+    now: DateTime<Utc>,
+    bundled_runtime_fingerprint_sha256: Option<String>,
+    publication_checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Value, WriterError> {
+    publication_checkpoint().map_err(WriterError::Cancelled)?;
+    let result = (|| {
+        let checkpoint = || {
+            publication_checkpoint()?;
+            permit.checkpoint(journal_path)
+        };
+        checkpoint().map_err(WriterError::Io)?;
+        let component = parse_component("lane_prerequisites", &lane_prerequisites, now)?;
+        if component.status == "not_attempted" {
+            return Err(WriterError::Validation(ValidationError {
+                path: "lane_prerequisites.status".to_owned(),
+                reason: "prerequisite renewal requires ok or declared failure".to_owned(),
+            }));
+        }
+        let loaded = fingerprint_for_write(&permit.root, bundled_runtime_fingerprint_sha256)?
+            .ok_or_else(|| {
+                WriterError::Conflict("brain fingerprint key is unavailable".to_owned())
+            })?;
+        let lock = permit.root.lock(record_name(), &checkpoint)?;
+        let Some((raw, current)) = read_current(&permit.root, now)? else {
+            return Err(WriterError::Conflict(
+                "brain refresh checking marker is absent".to_owned(),
+            ));
+        };
+        assert_finish_allowed(&permit, &current, now)?;
+        if loaded.sha256 != permit.fingerprint_sha256 {
+            return Err(WriterError::Conflict(
+                "brain fingerprint changed".to_owned(),
+            ));
+        }
+        if loaded.resolution.lane.as_deref() != Some("spp") {
+            return Err(WriterError::Conflict("brain lane changed".to_owned()));
+        }
+        let Some(mut evidence) = safe_prerequisite_evidence(&raw, &current, now) else {
+            return Err(WriterError::Conflict(
+                "brain prerequisite evidence is unsafe".to_owned(),
+            ));
+        };
+        evidence.insert("lane_prerequisites".to_owned(), lane_prerequisites);
+        let record = compose_record_from_evidence(
+            Value::Object(evidence),
+            &loaded,
+            next_revision(Some(&current)),
+            now,
+            Value::Null,
+            Value::Null,
+            Value::Object(Map::new()),
+        )?;
+        write_record(&permit.root, &lock, &record, now, &checkpoint)
+    })();
+    if result.is_err() {
+        publication_checkpoint().map_err(WriterError::Cancelled)?;
+    }
+    result
 }
 
 /// Abandon an SPP prerequisite renewal by delegating to its finish path.
@@ -2429,13 +2610,41 @@ pub fn abandon_prerequisite_renewal(
     now: DateTime<Utc>,
     bundled_runtime_fingerprint_sha256: Option<String>,
 ) -> Result<Value, WriterError> {
-    finish_prerequisite_renewal(
+    abandon_prerequisite_renewal_checked(
         journal_path,
         permit,
-        component_for_reason(reason_code, diagnostic, now)?,
+        reason_code,
+        diagnostic,
         now,
         bundled_runtime_fingerprint_sha256,
+        &|| Ok(()),
     )
+}
+
+pub fn abandon_prerequisite_renewal_checked(
+    journal_path: &Path,
+    permit: BrainRefreshPermit,
+    reason_code: &str,
+    diagnostic: Map<String, Value>,
+    now: DateTime<Utc>,
+    bundled_runtime_fingerprint_sha256: Option<String>,
+    publication_checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Value, WriterError> {
+    publication_checkpoint().map_err(WriterError::Cancelled)?;
+    let result = (|| {
+        finish_prerequisite_renewal_checked(
+            journal_path,
+            permit,
+            component_for_reason(reason_code, diagnostic, now)?,
+            now,
+            bundled_runtime_fingerprint_sha256,
+            publication_checkpoint,
+        )
+    })();
+    if result.is_err() {
+        publication_checkpoint().map_err(WriterError::Cancelled)?;
+    }
+    result
 }
 
 /// Record an independent runtime failure without acquiring the refresh lease.
@@ -2740,6 +2949,7 @@ impl From<WriterError> for RuntimeFailureInternal {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Each independent refresh fence and publication admission is retained.
 fn begin_refresh_under_lease(
     now: DateTime<Utc>,
     run_id: Option<String>,
@@ -2748,9 +2958,11 @@ fn begin_refresh_under_lease(
     bundled_runtime: Option<String>,
     lease: FileLease,
     root: BrainWriteRoot,
+    publication_checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<Option<BrainRefreshPermit>, BeginRefreshError> {
     let journal_path = root.admitted_path.as_path();
     let checkpoint = || {
+        publication_checkpoint()?;
         root.check()?;
         lease
             .revalidate_bound(root.health.get().expect("leased health"), lease_name())
@@ -3621,6 +3833,120 @@ mod tests {
 
     fn record_bytes(journal: &TestJournal) -> Vec<u8> {
         fs::read(brain_state_path(journal.path())).unwrap()
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn checked_finish_observes_the_held_record_lock() {
+        let journal = TestJournal::new();
+        let permit = begin_cloud(&journal);
+        let before = record_bytes(&journal);
+        let stopped = std::cell::Cell::new(false);
+        let error = finish_refresh_checked(
+            journal.path(),
+            permit,
+            ready_outcome(),
+            fixture_now(),
+            None,
+            &|| {
+                if solstone_core_journal_io::lock_is_held(brain_state_path(journal.path())).unwrap()
+                {
+                    stopped.set(true);
+                }
+                if stopped.get() {
+                    Err("stopped".into())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, WriterError::Cancelled(message) if message == "stopped"));
+        assert_eq!(record_bytes(&journal), before);
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn checked_finish_cancelled_while_blocked_does_not_publish() {
+        use std::sync::{Arc, atomic::AtomicBool};
+        use std::thread;
+
+        let journal = TestJournal::new();
+        let permit = begin_cloud(&journal);
+        let before = record_bytes(&journal);
+        let path = brain_state_path(journal.path());
+        let holder = hold_record_lock(&path).unwrap();
+        let started = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let started_flag = Arc::clone(&started);
+        let cancel_flag = Arc::clone(&cancel);
+        let journal_path = journal.path().to_path_buf();
+        let outcome = ready_outcome();
+        let now = fixture_now();
+        let worker = thread::spawn(move || {
+            started_flag.store(true, Ordering::Release);
+            finish_refresh_checked(&journal_path, permit, outcome, now, None, &|| {
+                if cancel_flag.load(Ordering::Acquire) {
+                    Err("stopped".into())
+                } else {
+                    Ok(())
+                }
+            })
+        });
+        while !started.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        assert!(!cancel.load(Ordering::Acquire));
+        cancel.store(true, Ordering::Release);
+        drop(holder);
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(matches!(error, WriterError::Cancelled(_)));
+        assert_eq!(record_bytes(&journal), before);
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn begin_refresh_cancelled_after_key_staging_does_not_publish() {
+        let journal = TestJournal::new();
+        journal.write_config("lane_byo_cloud");
+        let key_path = brain_fingerprint_key_path(journal.path());
+        let cancelled = std::cell::Cell::new(false);
+        let checkpoint = || {
+            if fs::read_dir(key_path.parent().unwrap()).is_ok_and(|mut entries| {
+                entries.any(|entry| {
+                    entry.is_ok_and(|entry| {
+                        solstone_core_journal_io::is_publication_candidate_name(&entry.file_name())
+                    })
+                })
+            }) {
+                cancelled.set(true);
+            }
+            if cancelled.get() {
+                Err("stopped at key stage".to_owned())
+            } else {
+                Ok(())
+            }
+        };
+        let error = begin_refresh_checked(
+            journal.path(),
+            fixture_now(),
+            None,
+            None,
+            false,
+            None,
+            &checkpoint,
+        )
+        .unwrap_err();
+        assert!(
+            cancelled.get(),
+            "the original key owner must reach its actual stage"
+        );
+        assert!(matches!(
+            error,
+            BeginRefreshError::Writer(WriterError::Cancelled(_))
+        ));
+        assert!(!key_path.exists());
+        assert!(!brain_state_path(journal.path()).exists());
     }
 
     #[test]

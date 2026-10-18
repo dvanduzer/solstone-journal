@@ -116,6 +116,14 @@ pub fn write_owner_candidate_in_lock(
     journal_root: &Path,
     candidate: &OwnerCandidate,
 ) -> Result<(), OwnerCandidateError> {
+    write_owner_candidate_in_lock_checked(journal_root, candidate, &|| Ok(()))
+}
+
+pub fn write_owner_candidate_in_lock_checked(
+    journal_root: &Path,
+    candidate: &OwnerCandidate,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), OwnerCandidateError> {
     let centroid = normalize_embedding(&candidate.centroid).ok_or_else(|| {
         OwnerCandidateError::Invalid("candidate centroid has zero norm".to_owned())
     })?;
@@ -131,6 +139,7 @@ pub fn write_owner_candidate_in_lock(
         ),
     ];
     let bytes = write_archive(&members).map_err(convert_write_error)?;
+    checkpoint().map_err(OwnerCandidateError::Invalid)?;
     atomic_replace(&path, &bytes, AtomicWriteOptions::default())
         .map_err(OwnerCandidateError::Write)?;
     load_owner_candidate(journal_root)?.ok_or_else(|| {
@@ -143,9 +152,17 @@ pub fn write_owner_candidate_in_lock(
 ///
 /// An absent snapshot is a successful no-op, matching the Python clear paths.
 pub fn clear_owner_candidate_in_lock(journal_root: &Path) -> Result<Removed, OwnerCandidateError> {
+    clear_owner_candidate_in_lock_checked(journal_root, &|| Ok(()))
+}
+
+pub fn clear_owner_candidate_in_lock_checked(
+    journal_root: &Path,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Removed, OwnerCandidateError> {
     if !journal_root.join("awareness").is_dir() {
         return Ok(Removed::AlreadyAbsent);
     }
+    checkpoint().map_err(OwnerCandidateError::Invalid)?;
     remove_file(journal_root, "awareness/owner_candidate.npz").map_err(OwnerCandidateError::Path)
 }
 

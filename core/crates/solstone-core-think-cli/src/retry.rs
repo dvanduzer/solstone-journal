@@ -58,8 +58,14 @@ pub(crate) fn run(
             Ok(ModeResult::default())
         }
         Unit::Daily { .. } => {
-            let input = work_retry::daily::observe(&context.journal, &record.unit)?
-                .ok_or("daily unit is no longer held")?;
+            let input = work_retry::daily::observe_with_roots_checked(
+                &context.journal,
+                &record.unit,
+                &context.talent_root,
+                &context.apps_root,
+                &|| context.checkpoint(),
+            )?
+            .ok_or("daily unit is no longer held")?;
             let attempt = work_retry::read(&context.journal, id)?
                 .ok_or("missing daily permission")?
                 .permission(&input, work_retry::DECLARED_FIXES)
@@ -84,7 +90,13 @@ pub(crate) fn run(
             }
             let remaining = (!daily.status.is_terminal_success())
                 .then(|| daily.reason_code.as_deref().unwrap_or("daily_failed"));
-            work_retry::finish(&context.journal, &record.unit, &attempt, remaining)?;
+            work_retry::finish_checked(
+                &context.journal,
+                &record.unit,
+                &attempt,
+                remaining,
+                &|| context.checkpoint(),
+            )?;
             Ok(result)
         }
         Unit::Activity {

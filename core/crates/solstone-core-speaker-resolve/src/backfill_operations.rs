@@ -6,9 +6,11 @@
 //! This module intentionally exposes only strict read/fold and append operations.
 //! It contains no rewrite, compaction, or deletion primitive.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -496,6 +498,8 @@ pub enum BackfillOperationError {
     InvalidCheckpointOutcome { outcome: String },
     #[error("invalid failure stage: {stage}")]
     InvalidFailureStage { stage: String },
+    #[error("backfill operation stopped: {0}")]
+    Stopped(String),
     #[error("prepared total_count does not match segments")]
     PreparedTotalCountMismatch,
     #[error("prepared segment is not an object")]
@@ -793,6 +797,38 @@ pub fn truncate_torn_tail_if_present(path: &Path) -> Result<(), BackfillOperatio
     Ok(())
 }
 
+type BackfillTaskCheckpoint = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
+/// Install `checkpoint` for backfill ledger and member writes on this thread.
+///
+/// The blocking relabel path installs the admitted checkpoint. Desktop start
+/// and resume leave the slot empty, and an empty slot admits the write.
+pub(crate) fn with_backfill_task_checkpoint<R>(
+    checkpoint: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+    body: impl FnOnce() -> R,
+) -> R {
+    struct Guard(Option<BackfillTaskCheckpoint>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            BACKFILL_TASK_CHECKPOINT.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let previous = BACKFILL_TASK_CHECKPOINT.with(|slot| slot.borrow_mut().replace(checkpoint));
+    let _guard = Guard(previous);
+    body()
+}
+
+thread_local! {
+    static BACKFILL_TASK_CHECKPOINT: RefCell<Option<BackfillTaskCheckpoint>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn admit_backfill_task() -> Result<(), BackfillOperationError> {
+    BACKFILL_TASK_CHECKPOINT.with(|slot| match slot.borrow().as_ref() {
+        Some(checkpoint) => checkpoint().map_err(BackfillOperationError::Stopped),
+        None => Ok(()),
+    })
+}
+
 /// Append one validated row assuming the ledger lock is already held.
 pub fn append_backfill_event_locked(
     path: &Path,
@@ -800,13 +836,16 @@ pub fn append_backfill_event_locked(
 ) -> Result<(), BackfillOperationError> {
     let value = event.to_json();
     validate_backfill_row(&value)?;
+    admit_backfill_task()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| BackfillOperationError::CreateDirectory {
             path: parent.to_path_buf(),
             source,
         })?;
     }
+    admit_backfill_task()?;
     truncate_torn_tail_if_present(path)?;
+    admit_backfill_task()?;
     append_jsonl(path, &value)?;
     Ok(())
 }
@@ -817,6 +856,7 @@ pub fn append_backfill_event(
     event: &BackfillOperationEvent,
 ) -> Result<(), BackfillOperationError> {
     let _lock = hold_lock(path, LockOptions::default())?;
+    admit_backfill_task()?;
     append_backfill_event_locked(path, event)
 }
 

@@ -32,7 +32,7 @@ pub fn fold_entity_edges_for_recorded_merge(
     target_id: &str,
 ) -> Result<EntityEdgeFoldReport, StoreError> {
     let admission = IndexAdmission::acquire(journal, "fold-entity-edges")?;
-    let mut conn = open_index_admitted(journal, &admission)?;
+    let mut conn = open_index_admitted(journal, &admission, &|| Ok(()))?;
     let fallback_rebuild = edge_rows_all_from_sources(&conn, journal)?;
     let transaction = conn.transaction()?;
     let rows_folded = transaction.query_row(
@@ -64,7 +64,7 @@ pub fn fold_entity_edges_for_recorded_merge(
     drop(conn);
 
     if fallback_rebuild {
-        let rebuild = rebuild_edges_guarded(journal, &admission, || Ok(true))?
+        let rebuild = rebuild_edges_guarded(journal, &admission, &|| Ok(()), || Ok(true))?
             .expect("closure returned true");
         if rebuild.failed > 0 {
             return Err(StoreError::EdgeRebuildFailed(rebuild));
@@ -79,8 +79,8 @@ pub fn fold_entity_edges_for_recorded_merge(
 
 pub fn rebuild_edges_for_recorded_merge_undo(journal: &Path) -> Result<String, StoreError> {
     let admission = IndexAdmission::acquire(journal, "rebuild-edges-fingerprint")?;
-    let rebuild =
-        rebuild_edges_guarded(journal, &admission, || Ok(true))?.expect("closure returned true");
+    let rebuild = rebuild_edges_guarded(journal, &admission, &|| Ok(()), || Ok(true))?
+        .expect("closure returned true");
     if rebuild.failed > 0 {
         return Err(StoreError::EdgeRebuildFailed(rebuild));
     }

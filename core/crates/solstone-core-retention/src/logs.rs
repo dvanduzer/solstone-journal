@@ -819,3 +819,68 @@ pub fn plan_compactions(
     }
     planned
 }
+
+#[cfg(all(test, feature = "full-tests"))]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+
+    use chrono::NaiveDate;
+
+    use super::{LogPolicy, plan};
+
+    #[test]
+    fn log_deletion_cancelled_while_blocked_leaves_the_file() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = root.path();
+        let rel = "config/actions/20200101.jsonl";
+        let path = journal.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"row\n").unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
+        let planned = plan(
+            journal,
+            &LogPolicy {
+                days: 1,
+                enabled: true,
+            },
+            today,
+        );
+        assert!(
+            planned.prunable.iter().any(|target| target.rel() == rel),
+            "planner did not admit the dated action log"
+        );
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let entered_flag = Arc::clone(&entered);
+        let release_flag = Arc::clone(&release);
+        let journal_path = journal.to_path_buf();
+        let targets = planned.prunable;
+        let worker = thread::spawn(move || {
+            crate::door::remove_logs_checked(&journal_path, &targets, &|| {
+                entered_flag.store(true, Ordering::Release);
+                while !release_flag.load(Ordering::Acquire) {
+                    thread::yield_now();
+                }
+                Err("stopped".into())
+            })
+        });
+        for _ in 0..1_000_000 {
+            if entered.load(Ordering::Acquire) {
+                break;
+            }
+            thread::yield_now();
+        }
+        assert!(
+            entered.load(Ordering::Acquire),
+            "deletion checkpoint never started"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"row\n");
+        release.store(true, Ordering::Release);
+        let outcome = worker.join().unwrap();
+        assert!(outcome.halted.is_some());
+        assert_eq!(std::fs::read(&path).unwrap(), b"row\n");
+    }
+}

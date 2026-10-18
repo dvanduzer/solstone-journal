@@ -26,6 +26,7 @@ pub enum OplogCreateReason {
     },
     Lock(OplogCreateLockClass),
     Publish(OplogPublishReason),
+    Stopped,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,6 +101,7 @@ impl OplogCreateReason {
             }
             Self::Lock(class) => format!("oplog_create_lock_{}", class.token()),
             Self::Publish(reason) => format!("oplog_create_{}", reason.token()),
+            Self::Stopped => "oplog_create_stopped".to_owned(),
         }
     }
 }

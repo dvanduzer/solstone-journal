@@ -16,13 +16,14 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{Map, Value, json};
 use solstone_core_journal_io::{JsonWriteOptions, LockOptions, hold_lock, write_json};
 
 use crate::backfill_coordinator::{
-    StartBackfillRequest, backfill_status, run_backfill_blocking, start_backfill,
+    StartBackfillRequest, backfill_status, run_backfill_blocking_checked, start_backfill,
 };
 use crate::backfill_operations::BackfillStatusKind;
 use crate::owner_admission::{OwnerAdmission, admitted_owner_id};
@@ -30,7 +31,9 @@ use crate::owner_candidate::{
     clear_owner_candidate_in_lock, hold_owner_candidate_lock, load_owner_candidate,
 };
 use crate::owner_centroid::{load_owner_centroid, owner_centroid_file, remove_owner_centroid};
+#[cfg(test)]
 use crate::owner_detection::detect_owner_candidate;
+use crate::owner_detection::detect_owner_candidate_checked;
 
 /// Days a rejected voice waits before the journal looks for another.
 pub const COOLDOWN_DAYS: i64 = 14;
@@ -54,6 +57,14 @@ pub fn voiceprint_state(root: &Path) -> BTreeMap<String, Value> {
 
 /// Merge `update` into the recorded setup state. A null value removes its key.
 pub fn update_voiceprint_state(root: &Path, update: Value) -> Result<(), String> {
+    update_voiceprint_state_checked(root, update, &|| Ok(()))
+}
+
+pub fn update_voiceprint_state_checked(
+    root: &Path,
+    update: Value,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
     let path = root.join("awareness/current.json");
     let _lock = hold_lock(&path, LockOptions::default()).map_err(|error| error.to_string())?;
     let mut state = fs::read(&path)
@@ -74,6 +85,7 @@ pub fn update_voiceprint_state(root: &Path, update: Value) -> Result<(), String>
             object.insert(key, value);
         }
     }
+    checkpoint()?;
     write_json(path, &Value::Object(state), JsonWriteOptions::default())
         .map_err(|error| error.to_string())
 }
@@ -309,7 +321,10 @@ pub fn relabel_progress(root: &Path) -> Option<Value> {
 }
 
 /// Finish a past-label update that stopped or never started, on this thread.
-fn finish_pending_relabel(root: &Path) -> Result<Value, String> {
+fn finish_pending_relabel_checked(
+    root: &Path,
+    checkpoint: &Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+) -> Result<Value, String> {
     let state = voiceprint_state(root);
     let Some(relabel) = state.get("relabel").and_then(Value::as_object) else {
         return Ok(Value::Null);
@@ -329,12 +344,13 @@ fn finish_pending_relabel(root: &Path) -> Result<Value, String> {
     {
         return Ok(Value::Null);
     }
-    let status = run_backfill_blocking(root, &relabel_request(operation_id.clone()))
-        .map_err(|error| error.to_string())?;
+    let status =
+        run_backfill_blocking_checked(root, &relabel_request(operation_id.clone()), checkpoint)
+            .map_err(|error| error.to_string())?;
     if operation_id.is_none() {
         let mut recorded = relabel.clone();
         recorded.insert("operation_id".to_owned(), json!(status.operation_id));
-        update_voiceprint_state(root, json!({"relabel":recorded}))?;
+        update_voiceprint_state_checked(root, json!({"relabel": recorded}), checkpoint.as_ref())?;
     }
     Ok(json!({"operation_id":status.operation_id,"done":status.done}))
 }
@@ -347,20 +363,28 @@ fn finish_pending_relabel(root: &Path) -> Result<Value, String> {
 /// candidate the same way the Speakers page does, including after an earlier
 /// look found none.
 pub fn refresh_owner_voice(root: &Path) -> Result<Value, String> {
+    let admit: Arc<dyn Fn() -> Result<(), String> + Send + Sync> = Arc::new(|| Ok(()));
+    refresh_owner_voice_checked(root, &admit)
+}
+
+pub fn refresh_owner_voice_checked(
+    root: &Path,
+    checkpoint: &Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+) -> Result<Value, String> {
     let principal = match admitted_owner_id(root) {
         OwnerAdmission::Admitted(id) => id,
         OwnerAdmission::Invalid => {
             return Ok(json!({"status":"skipped","reason":"identity_invalid"}));
         }
     };
-    let relabel = finish_pending_relabel(root)?;
+    let relabel = finish_pending_relabel_checked(root, checkpoint)?;
     let voice_saved = owner_centroid_file(root, &principal)
         .map_err(|error| error.to_string())?
         .exists();
     if voice_saved {
         return Ok(json!({"status":"skipped","reason":"voice_saved","relabel":relabel}));
     }
-    let detected = detect_owner_candidate(root, false)?;
+    let detected = detect_owner_candidate_checked(root, false, checkpoint.as_ref())?;
     Ok(json!({
         "status": "looked",
         "owner_voice": detected.get("status").cloned().unwrap_or(Value::Null),

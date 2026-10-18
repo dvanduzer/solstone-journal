@@ -3,7 +3,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use serde_json::{Map, Value, json};
@@ -21,6 +21,24 @@ use tokio::{
 };
 
 static NEXT_START: AtomicU64 = AtomicU64::new(1);
+static REFRESH_LEASE: AtomicBool = AtomicBool::new(false);
+
+struct RefreshLease;
+
+impl RefreshLease {
+    fn try_acquire() -> Option<Self> {
+        REFRESH_LEASE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for RefreshLease {
+    fn drop(&mut self) {
+        REFRESH_LEASE.store(false, Ordering::Release);
+    }
+}
 
 #[derive(Debug, PartialEq)]
 enum Action {
@@ -70,8 +88,12 @@ fn action(envelope: &CallosumEnvelope) -> Option<Action> {
     Some(Action::Refresh(options))
 }
 
-fn execute(root: &JournalRoot, action: Action) -> i32 {
-    if root.revalidate_canonical_binding().is_err() {
+fn execute(
+    root: &JournalRoot,
+    action: Action,
+    cancelled: &(dyn Fn() -> bool + Send + Sync),
+) -> i32 {
+    if cancelled() || root.revalidate_canonical_binding().is_err() {
         return 2;
     }
     let probe = RespondWithConfigProbe {
@@ -83,19 +105,21 @@ fn execute(root: &JournalRoot, action: Action) -> i32 {
             &options,
             &probe,
             &ProductionSppPrerequisite,
+            cancelled,
         ),
         Action::Renew(fingerprint) => solstone_core_brain_owner::renew_prerequisites(
             root.canonical_path(),
             Some(&fingerprint),
             &probe,
             &ProductionSppPrerequisite,
+            cancelled,
         ),
     };
-    if root.revalidate_canonical_binding().is_err() {
+    if cancelled() || root.revalidate_canonical_binding().is_err() {
         return 2;
     }
     match outcome {
-        OwnerRefreshOutcome::OperationalFailure { .. } => 2,
+        OwnerRefreshOutcome::OperationalFailure { .. } | OwnerRefreshOutcome::Cancelled => 2,
         OwnerRefreshOutcome::PersistedReady { view }
         | OwnerRefreshOutcome::PersistedNonReady { view, .. }
         | OwnerRefreshOutcome::Busy { view }
@@ -118,15 +142,42 @@ fn event(
     connection.emit("supervisor", name, fields);
 }
 
+/// One refresh shared with the socket loop. A busy lease is a non-success
+/// and does not start a second refresh. The returned code is the worker's.
+pub(super) fn run_scheduled(
+    root: &JournalRoot,
+    cancelled: &(dyn Fn() -> bool + Send + Sync),
+) -> i32 {
+    let Some(_lease) = RefreshLease::try_acquire() else {
+        return 3;
+    };
+    execute(
+        root,
+        Action::Refresh(OwnerRefreshOptions {
+            expected_fingerprint: None,
+            expected_active_fingerprint: false,
+            expect_active_fingerprint_absent: false,
+        }),
+        cancelled,
+    )
+}
+
 pub(super) async fn run(
     root: Arc<JournalRoot>,
     stop: watch::Receiver<bool>,
     ready: oneshot::Sender<()>,
 ) {
-    run_with_executor(root, stop, ready, Arc::new(execute)).await;
+    run_with_executor(
+        root,
+        stop,
+        ready,
+        Arc::new(|root, action, cancelled| execute(root, action, cancelled)),
+    )
+    .await;
 }
 
-type Executor = Arc<dyn Fn(&JournalRoot, Action) -> i32 + Send + Sync>;
+type Executor =
+    Arc<dyn Fn(&JournalRoot, Action, &(dyn Fn() -> bool + Send + Sync)) -> i32 + Send + Sync>;
 
 async fn run_with_executor(
     root: Arc<JournalRoot>,
@@ -211,13 +262,28 @@ async fn run_with_executor(
                     ]));
                     continue;
                 }
+                let Some(lease) = RefreshLease::try_acquire() else {
+                    event(&connection, "skipped", &reference, Map::from_iter([
+                        ("active_ref".into(), json!(active_ref)), ("reason".into(), json!("busy")),
+                    ]));
+                    continue;
+                };
                 active_ref = reference;
                 event(&connection, "started", &active_ref, Map::new());
                 let root = Arc::clone(&root);
                 let executor = Arc::clone(&executor);
-                // The real worker retains the root and fenced refresh until it
-                // returns. Dropping a reply observer cannot release that lease.
-                worker = Some(tokio::task::spawn_blocking(move || executor(&root, action)));
+                let stop_for_worker = stop.clone();
+                // The real worker retains the root, the lease, and the fenced
+                // refresh until it returns. Dropping a reply observer cannot
+                // release that lease.
+                worker = Some(tokio::task::spawn_blocking(move || {
+                    let _lease = lease;
+                    let cancelled = || {
+                        *stop_for_worker.borrow()
+                            || root.revalidate_canonical_binding().is_err()
+                    };
+                    executor(&root, action, &cancelled)
+                }));
             },
         }
     }
@@ -380,7 +446,7 @@ mod tests {
         let released = Mutex::new(released);
         let calls = Arc::new(AtomicUsize::new(0));
         let worker_calls = Arc::clone(&calls);
-        let executor: Executor = Arc::new(move |root, action| {
+        let executor: Executor = Arc::new(move |root, action, _cancelled| {
             root.revalidate_canonical_binding().unwrap();
             worker_calls.fetch_add(1, Ordering::SeqCst);
             entered.send(action).unwrap();

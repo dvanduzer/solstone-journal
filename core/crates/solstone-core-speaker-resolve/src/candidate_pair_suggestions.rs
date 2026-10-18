@@ -14,12 +14,19 @@ use crate::candidate_tracker::{
     CandidateProfile, CandidateTracker, eligible_for_pair_suggestion, source_segment_anchor,
 };
 use crate::speaker_candidate_pair_review_candidates::{
-    CandidatePairSuggestion, record_candidate_pair,
+    CandidatePairSuggestion, record_candidate_pair_checked,
 };
 
 /// Refresh review suggestions without merging candidates or changing identities.
 pub fn refresh_candidate_pair_suggestions(
     journal: &Path,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    refresh_candidate_pair_suggestions_checked(journal, &|| Ok(()))
+}
+
+pub fn refresh_candidate_pair_suggestions_checked(
+    journal: &Path,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     let candidates = CandidateTracker::new(journal).snapshot_candidates_locked()?;
     let mut suggestions = Vec::new();
@@ -49,7 +56,8 @@ pub fn refresh_candidate_pair_suggestions(
     }
     let (mut created, mut updated, mut suppressed) = (0, 0, 0);
     for suggestion in &suggestions {
-        let (row, was_created, was_suppressed) = record_candidate_pair(journal, suggestion)?;
+        let (row, was_created, was_suppressed) =
+            record_candidate_pair_checked(journal, suggestion, checkpoint)?;
         if was_suppressed {
             suppressed += 1;
         } else if row.is_some() && was_created {

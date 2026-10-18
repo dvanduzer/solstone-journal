@@ -654,8 +654,8 @@ mod tests {
     }
 
     fn journal(name: &str) -> std::path::PathBuf {
-        let path = std::path::PathBuf::from(format!(
-            "/var/tmp/solstone-binding-{name}-{}-{}",
+        let path = std::env::temp_dir().join(format!(
+            "solstone-binding-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

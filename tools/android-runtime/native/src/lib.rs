@@ -349,10 +349,12 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
             let processing_stop = std::sync::Arc::new(AtomicBool::new(false));
             *PROCESSING_STOP.lock().unwrap_or_else(|p| p.into_inner()) =
                 Some(std::sync::Arc::clone(&processing_stop));
+            let backup = handle.backup_dependencies();
             let mut host = match journal_mobile_serving::foreground::ForegroundProcessingHost::open_with_cancellation(
                 std::sync::Arc::clone(&binding), &payload_dir,
                 std::sync::Arc::new(move || THINKING_GENERATION.load(Ordering::SeqCst) & !1 != generation & !1),
                 processing_stop,
+                backup,
             ) {
                 Ok(host) => host,
                 Err(error) => {
