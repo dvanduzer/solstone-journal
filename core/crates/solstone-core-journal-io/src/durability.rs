@@ -57,7 +57,6 @@ pub enum ArtifactId {
     ConveyConfig,
     ParentLossActive,
     ParentLossRecord,
-    ParentLossClosureRecovery,
     Entity,
     FacetDeclaration,
     SchedulerState,
@@ -153,13 +152,6 @@ pub const JOURNAL_ARTIFACTS: &[DurableArtifact] = &[
         class: DurabilityClass::Healable,
         parser: ParserKind::WholeJson,
         rationale: "set aside; the generation is closed from its admissions directory",
-    },
-    DurableArtifact {
-        id: ArtifactId::ParentLossClosureRecovery,
-        path: "health/parent-loss/generations/*/closure-recovery.json",
-        class: DurabilityClass::Healable,
-        parser: ParserKind::WholeJson,
-        rationale: "checkpoint for abandoned generation closure; set aside on corruption and rebuilt from surviving admission drops",
     },
     DurableArtifact {
         id: ArtifactId::Entity,
