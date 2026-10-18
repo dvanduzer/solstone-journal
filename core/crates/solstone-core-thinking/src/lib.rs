@@ -30,9 +30,20 @@ pub enum MutationError {
     Read(ConfigLoadError),
     /// The configuration committed, but its audit record could not be appended.
     ActionLog(String),
+    /// A probed key no longer matches the credential or rejection stored under the lock.
+    StaleProbe,
 }
 
 impl MutationError {
+    pub fn bound_config(error: solstone_core_journal_config_write::BoundConfigRefusal) -> Self {
+        use solstone_core_journal_config_write::BoundConfigRefusal;
+        match error {
+            BoundConfigRefusal::Lock(error) => Self::ConfigLock(error.to_string()),
+            BoundConfigRefusal::Load(error) => Self::ConfigLoad(error.to_string()),
+            other => Self::ConfigWrite(other.to_string()),
+        }
+    }
+
     pub fn config(error: ConfigMutationError) -> Self {
         match error {
             ConfigMutationError::Lock(error) => Self::ConfigLock(error.to_string()),

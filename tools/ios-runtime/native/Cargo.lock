@@ -4412,6 +4412,7 @@ dependencies = [
  "solstone-core-chatgpt-auth",
  "solstone-core-installed-payload",
  "solstone-core-journal-config",
+ "solstone-core-journal-config-write",
  "solstone-core-journal-io",
 ]
 
@@ -4425,6 +4426,9 @@ dependencies = [
  "solstone-core-chatgpt-auth",
  "solstone-core-generate",
  "solstone-core-generate-wire",
+ "solstone-core-journal-config",
+ "solstone-core-journal-config-write",
+ "solstone-core-journal-io",
  "solstone-core-local",
  "solstone-core-spp-ratls",
 ]
@@ -4799,6 +4803,8 @@ dependencies = [
  "solstone-core-generate",
  "solstone-core-installed-payload",
  "solstone-core-journal-config",
+ "solstone-core-journal-config-write",
+ "solstone-core-journal-io",
  "solstone-core-local",
  "solstone-core-spp-ratls",
  "ureq",
@@ -5914,6 +5920,7 @@ dependencies = [
  "chrono",
  "getrandom 0.3.4",
  "image",
+ "log",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -5926,6 +5933,7 @@ dependencies = [
  "solstone-core-journal",
  "solstone-core-journal-config",
  "solstone-core-journal-config-write",
+ "solstone-core-journal-io",
  "solstone-core-local",
  "solstone-core-sense",
  "solstone-core-spp-ratls",

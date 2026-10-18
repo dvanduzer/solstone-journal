@@ -173,8 +173,10 @@ pub(crate) fn endpoint_generate_with_context(
     config: &Map<String, Value>,
     runtime: &EndpointRuntime,
     context: &crate::GenerateCallContext<'_>,
-) -> EndpointResult {
-    endpoint_generate_internal_with_context(
+    gate: Option<&crate::credential_binding::ContentGate<'_>>,
+) -> Result<EndpointResult, String> {
+    let mut unpublished = None;
+    let result = endpoint_generate_internal_with_context(
         request,
         journal_path,
         endpoint,
@@ -184,7 +186,13 @@ pub(crate) fn endpoint_generate_with_context(
         Instant::now(),
         Instant::now(),
         context,
-    )
+        gate,
+        &mut unpublished,
+    );
+    match unpublished {
+        Some(error) => Err(error),
+        None => Ok(result),
+    }
 }
 
 pub fn endpoint_generate_with<T: EndpointTransport>(
@@ -223,7 +231,8 @@ pub(crate) fn endpoint_generate_internal<T: EndpointTransport>(
         Ok(priority) => priority,
         Err(_) => return failure("provider_response_invalid"),
     };
-    endpoint_generate_internal_with_context(
+    let mut unpublished = None;
+    let result = endpoint_generate_internal_with_context(
         request,
         journal_path,
         endpoint,
@@ -236,7 +245,11 @@ pub(crate) fn endpoint_generate_internal<T: EndpointTransport>(
             priority,
             cancellation: &solstone_core_generate::Cancellation::never(),
         },
-    )
+        None,
+        &mut unpublished,
+    );
+    debug_assert!(unpublished.is_none(), "an ungated call does not retain");
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -250,6 +263,8 @@ pub(crate) fn endpoint_generate_internal_with_context<T: EndpointTransport>(
     now: Instant,
     started: Instant,
     context: &crate::GenerateCallContext<'_>,
+    gate: Option<&crate::credential_binding::ContentGate<'_>>,
+    unpublished: &mut Option<String>,
 ) -> EndpointResult {
     if context.cancellation.is_cancelled() {
         return failure("request_cancelled");
@@ -263,6 +278,42 @@ pub(crate) fn endpoint_generate_internal_with_context<T: EndpointTransport>(
         Ok(prepared) => prepared,
         Err(reason_code) => return failure(reason_code),
     };
+    let witness =
+        gate.and_then(|gate| crate::credential_binding::capture_root_witness(gate.journal));
+    if let Some(gate) = gate
+        && gate.admit_content
+        && !crate::credential_binding::canned_probe(request)
+        && !endpoint.is_confidential
+        && !endpoint.is_bundled
+    {
+        let credential = endpoint.credential.as_deref().unwrap_or("");
+        let binding = match crate::credential_binding::admission_binding(
+            gate,
+            witness.as_ref(),
+            config,
+            solstone_core_brain::CredentialHoldTarget::Endpoint {
+                base_url: &endpoint.base_url,
+                credential,
+            },
+        ) {
+            Ok(binding) => binding,
+            Err(error) => {
+                log::warn!("credential admission refused: {error}");
+                return failure(if gate.cancellation.is_cancelled() {
+                    "request_cancelled"
+                } else {
+                    "provider_unavailable"
+                });
+            }
+        };
+        if crate::credential_binding::endpoint_admission_refuses(
+            request,
+            gate.admit_content,
+            binding,
+        ) {
+            return failure("provider_key_invalid");
+        }
+    }
     let timeout = request_timeout(request.timeout_s, thinking_headroom(endpoint, config));
     let Some(admission_timeout) = remaining_timeout(started, timeout) else {
         return failure("local_capacity_exhausted");
@@ -341,6 +392,20 @@ pub(crate) fn endpoint_generate_internal_with_context<T: EndpointTransport>(
     };
     let secret = endpoint.credential.as_deref().unwrap_or("");
     if !(200..300).contains(&response.status) {
+        if let Some(gate) = gate {
+            crate::credential_binding::note_unpublished_retain(
+                crate::credential_binding::retain_endpoint_rejection(
+                    gate,
+                    witness.as_ref(),
+                    request,
+                    &endpoint.base_url,
+                    endpoint.credential.as_deref().unwrap_or(""),
+                    response.status,
+                    &response.body,
+                ),
+                unpublished,
+            );
+        }
         let detail = capture_provider_detail(&response.body, secret);
         return EndpointResult::Failed(EndpointFailure {
             reason_code: Some(non_success_reason(endpoint, response.status).to_owned()),

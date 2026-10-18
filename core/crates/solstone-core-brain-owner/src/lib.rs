@@ -74,6 +74,9 @@ pub enum OwnerRefreshOutcome {
 }
 
 pub trait OwnerProbe {
+    fn process_overrides(&self) -> bool {
+        true
+    }
     fn bundled_runtime_fingerprint(
         &self,
         journal: &Path,
@@ -121,6 +124,9 @@ pub struct RespondWithConfigProbe {
 }
 
 impl OwnerProbe for RespondWithConfigProbe {
+    fn process_overrides(&self) -> bool {
+        false
+    }
     fn bundled_runtime_fingerprint(
         &self,
         journal: &Path,
@@ -201,7 +207,28 @@ pub fn refresh(
     {
         return OwnerRefreshOutcome::PersistedReady { view: before };
     }
-    let permit = match begin_refresh(
+    // Reconcile a genuine correction from another process before the refresh
+    // captures its generation. A refusal remains eligible for this owner's
+    // ordinary correction probe; unreadable authority remains a real failure.
+    if let Some(target) = RefreshCredential::from_config(&config) {
+        let admission = solstone_core_journal_io::JournalRoot::open(journal)
+            .map_err(|error| error.to_string())
+            .and_then(|root| {
+                solstone_core_brain::classify_credential_admission_bound(
+                    std::sync::Arc::new(root),
+                    journal,
+                    target.target(),
+                    validation_entry(&config, target.provider()),
+                )
+                .map_err(|error| error.to_string())
+            });
+        if let Err(error) = admission {
+            return OwnerRefreshOutcome::OperationalFailure {
+                message: format!("thinking check failed: {error}"),
+            };
+        }
+    }
+    let mut permit = match begin_refresh(
         journal,
         now,
         None,
@@ -270,6 +297,58 @@ pub fn refresh(
         return abandon_probe_failure(journal, &checking_config, permit, now);
     };
 
+    let credential_target = RefreshCredential::from_config(&checking_config);
+    let credential_witness = match credential_target.as_ref() {
+        Some(target) => {
+            if !target.matches(&checking_config, probe.process_overrides()) {
+                return OwnerRefreshOutcome::LostFence {
+                    view: transient_view("lost_fence", &empty_view()),
+                };
+            }
+            match solstone_core_brain::capture_credential_validation_bound(
+                permit.admitted_root(),
+                journal,
+                target.target(),
+            ) {
+                Ok(witness) => Some(witness),
+                Err(error) => {
+                    return OwnerRefreshOutcome::OperationalFailure {
+                        message: format!("thinking check failed: {error}"),
+                    };
+                }
+            }
+        }
+        None => None,
+    };
+    // A correction racing the preliminary read must invalidate this permit,
+    // before the actual probe. Never rebind the permit to the witness's epoch.
+    if permit.checkpoint(journal).is_err() {
+        return OwnerRefreshOutcome::LostFence {
+            view: transient_view("lost_fence", &empty_view()),
+        };
+    }
+    let prior_validation = credential_target
+        .as_ref()
+        .and_then(|target| validation_entry(&checking_config, target.provider()).cloned());
+    let needs_credential_retirement = match (
+        credential_target.as_ref(),
+        credential_witness.as_ref(),
+        key.as_ref(),
+    ) {
+        (Some(target), Some(witness), Some(key)) => {
+            witness.has_matching_rejection()
+                || matches!(
+                    solstone_core_brain::classify_stored_binding(
+                        prior_validation.as_ref(),
+                        Some(key),
+                        Some(&target.hmac(key))
+                    ),
+                    solstone_core_brain::StoredCredentialBinding::Matches
+                        | solstone_core_brain::StoredCredentialBinding::Corrupt
+                )
+        }
+        _ => false,
+    };
     let outcome = probe_outcome(
         journal,
         &checking_config,
@@ -279,23 +358,133 @@ pub fn refresh(
         probe,
         spp,
     );
+    if let Some(witness) = credential_witness.as_ref() {
+        permit.share_credential_publication_budget(witness);
+    }
     let finish_bundled_runtime_fingerprint = (lane == "bundled")
         .then(|| probe.bundled_runtime_fingerprint(journal, &checking_config))
         .flatten();
-    if finish_refresh(
-        journal,
-        permit,
-        outcome,
-        Utc::now(),
-        finish_bundled_runtime_fingerprint,
-    )
-    .is_err()
+    let refresh_root = permit.admitted_root();
+    let rejection_reason = outcome
+        .evidence
+        .get("generate")
+        .and_then(|generate| generate.get("reason_code"))
+        .and_then(Value::as_str);
+    let rejected = rejection_reason == Some("provider_key_invalid")
+        || (rejection_reason == Some("provider_key_missing")
+            && matches!(credential_target.as_ref(), Some(RefreshCredential::Endpoint { credential, .. }) if credential.is_empty()));
+    let rejection_receipt = if rejected
+        && let (Some(target), Some(witness)) =
+            (credential_target.as_ref(), credential_witness.as_ref())
+    {
+        let checkpoint = || {
+            refresh_root
+                .revalidate_canonical_binding()
+                .map_err(|error| error.to_string())?;
+            if solstone_core_journal_io::JournalRoot::open(journal)
+                .map_err(|error| error.to_string())?
+                .identity()
+                != refresh_root.identity()
+            {
+                return Err("admitted journal path changed".to_owned());
+            }
+            Ok(())
+        };
+        match solstone_core_brain::retain_current_credential_rejection_bound(
+            journal,
+            target.target(),
+            witness,
+            &checkpoint,
+            &|config| target.matches(config, probe.process_overrides()),
+            None,
+        ) {
+            Ok(Some(receipt)) => Some(receipt),
+            Ok(None) | Err(solstone_core_brain::CredentialRejectionFailure::Refused(_)) => {
+                return OwnerRefreshOutcome::LostFence {
+                    view: transient_view("lost_fence", &empty_view()),
+                };
+            }
+            Err(solstone_core_brain::CredentialRejectionFailure::Unpublished) => {
+                let missing = matches!(target,
+                    RefreshCredential::Endpoint { credential, .. } if credential.is_empty());
+                return OwnerRefreshOutcome::OperationalFailure {
+                    message: if missing {
+                        "the provider needs a key, and your journal couldn't confirm the result was saved."
+                    } else {
+                        "the provider rejected this key, and your journal couldn't confirm the result was saved."
+                    }.to_owned(),
+                };
+            }
+        }
+    } else {
+        if let (Some(witness), Some(key)) = (credential_witness.as_ref(), key.as_ref())
+            && witness.checkpoint_with_binding_key(key).is_err()
+        {
+            return OwnerRefreshOutcome::LostFence {
+                view: transient_view("lost_fence", &empty_view()),
+            };
+        }
+        None
+    };
+    let finished = if let Some(receipt) = rejection_receipt {
+        solstone_core_brain::finish_refresh_rejected(
+            journal,
+            permit,
+            outcome.evidence,
+            Utc::now(),
+            finish_bundled_runtime_fingerprint,
+            receipt,
+        )
+    } else {
+        finish_refresh(
+            journal,
+            permit,
+            outcome.evidence,
+            Utc::now(),
+            finish_bundled_runtime_fingerprint,
+        )
+    };
+    if finished.is_err() {
+        return OwnerRefreshOutcome::LostFence {
+            view: transient_view("lost_fence", &empty_view()),
+        };
+    }
+    if outcome.credential_valid
+        && let (Some(target), Some(witness), Some(key)) =
+            (credential_target.as_ref(), credential_witness, key.as_ref())
+        && let Err(error) = settle_refresh_credential(
+            journal,
+            target,
+            witness,
+            key,
+            prior_validation.as_ref(),
+            outcome.probe_reason,
+            probe.process_overrides(),
+            needs_credential_retirement,
+        )
+    {
+        return OwnerRefreshOutcome::OperationalFailure {
+            message: format!("thinking check failed: {error}"),
+        };
+    }
+    let committed_config =
+        match solstone_core_journal_config::read_journal_config_bound(&refresh_root) {
+            Ok(read) => read.config.unwrap_or_default(),
+            Err(error) => {
+                return OwnerRefreshOutcome::OperationalFailure {
+                    message: format!("thinking check failed: {error}"),
+                };
+            }
+        };
+    let committed = owner_view(journal, &committed_config, Utc::now());
+    if refresh_root.revalidate_canonical_binding().is_err()
+        || !solstone_core_journal_io::JournalRoot::open(journal)
+            .is_ok_and(|root| root.identity() == refresh_root.identity())
     {
         return OwnerRefreshOutcome::LostFence {
             view: transient_view("lost_fence", &empty_view()),
         };
     }
-    let committed = owner_view(journal, &checking_config, Utc::now());
     persisted(committed)
 }
 
@@ -409,6 +598,291 @@ fn persisted(view: OwnerView) -> OwnerRefreshOutcome {
     }
 }
 
+enum RefreshCredential {
+    Managed {
+        provider: &'static str,
+        env_var: &'static str,
+        credential: String,
+    },
+    Endpoint {
+        base_url: String,
+        credential: String,
+    },
+}
+
+impl RefreshCredential {
+    fn from_config(config: &Map<String, Value>) -> Option<Self> {
+        let provider = derive_active_brain_lane(config).provider;
+        let (provider, env_var) = match provider.as_str() {
+            "openai" => ("openai", "OPENAI_API_KEY"),
+            "anthropic" => ("anthropic", "ANTHROPIC_API_KEY"),
+            "google" => ("google", "GOOGLE_API_KEY"),
+            "local" => {
+                return match solstone_core_local::resolve_local_endpoint(config) {
+                    solstone_core_local::LocalEndpointResolution::Byo(endpoint)
+                        if !endpoint.is_confidential && !endpoint.is_bundled =>
+                    {
+                        Some(Self::Endpoint {
+                            base_url: endpoint.base_url,
+                            credential: endpoint.credential.unwrap_or_default(),
+                        })
+                    }
+                    _ => None,
+                };
+            }
+            _ => return None,
+        };
+        let credential = config
+            .get("env")
+            .and_then(Value::as_object)
+            .and_then(|env| env.get(env_var))
+            .and_then(Value::as_str)?
+            .trim();
+        (!credential.is_empty()).then(|| Self::Managed {
+            provider,
+            env_var,
+            credential: credential.to_owned(),
+        })
+    }
+
+    fn provider(&self) -> &'static str {
+        match self {
+            Self::Managed { provider, .. } => provider,
+            Self::Endpoint { .. } => "local",
+        }
+    }
+
+    fn target(&self) -> solstone_core_brain::CredentialHoldTarget<'_> {
+        match self {
+            Self::Managed {
+                provider,
+                credential,
+                ..
+            } => solstone_core_brain::CredentialHoldTarget::Managed {
+                provider,
+                credential,
+            },
+            Self::Endpoint {
+                base_url,
+                credential,
+            } => solstone_core_brain::CredentialHoldTarget::Endpoint {
+                base_url,
+                credential,
+            },
+        }
+    }
+
+    fn hmac(&self, key: &[u8; 32]) -> String {
+        match self {
+            Self::Managed {
+                provider,
+                credential,
+                ..
+            } => solstone_core_brain::managed_credential_binding_hmac(key, provider, credential),
+            Self::Endpoint {
+                base_url,
+                credential,
+            } => solstone_core_brain::endpoint_credential_binding_hmac(key, base_url, credential),
+        }
+    }
+
+    fn matches(&self, config: &Map<String, Value>, process_overrides: bool) -> bool {
+        if derive_active_brain_lane(config).provider != self.provider()
+            || (process_overrides
+                && solstone_core_generate_wire::overrides::configured_provider(config)
+                    != self.provider())
+        {
+            return false;
+        }
+        match self {
+            Self::Managed {
+                env_var,
+                credential,
+                ..
+            } => {
+                config
+                    .get("env")
+                    .and_then(Value::as_object)
+                    .and_then(|env| env.get(*env_var))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    == Some(credential.as_str())
+                    && (!process_overrides
+                        || solstone_core_generate_wire::overrides::configured_api_key(
+                            config, env_var,
+                        )
+                        .as_deref()
+                            == Some(credential.as_str()))
+            }
+            Self::Endpoint {
+                base_url,
+                credential,
+            } => matches!(solstone_core_local::resolve_local_endpoint(config),
+                solstone_core_local::LocalEndpointResolution::Byo(endpoint)
+                    if !endpoint.is_confidential && !endpoint.is_bundled
+                        && endpoint.base_url == *base_url && endpoint.credential.as_deref().unwrap_or("") == credential),
+        }
+    }
+}
+
+fn validation_entry<'a>(config: &'a Map<String, Value>, provider: &str) -> Option<&'a Value> {
+    config
+        .get("providers")
+        .and_then(Value::as_object)
+        .and_then(|providers| providers.get("key_validation"))
+        .and_then(Value::as_object)
+        .and_then(|entries| entries.get(provider))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn settle_refresh_credential(
+    journal: &Path,
+    target: &RefreshCredential,
+    witness: solstone_core_brain::CredentialValidationWitness,
+    key: &[u8; 32],
+    prior_validation: Option<&Value>,
+    probe_reason: Option<&str>,
+    process_overrides: bool,
+    needs_credential_retirement: bool,
+) -> Result<(), String> {
+    let root = witness.admitted_root();
+    let provider = target.provider();
+    let mut entry = json!({"valid":true,"timestamp":Utc::now().to_rfc3339()});
+    solstone_core_brain::attach_credential_binding(
+        entry.as_object_mut().unwrap(),
+        &target.hmac(key),
+    );
+    if let Some(reason) = probe_reason {
+        entry["probe_reason_code"] = json!(reason);
+    }
+    let root_checkpoint = || {
+        root.revalidate_canonical_binding()
+            .map_err(|error| error.to_string())?;
+        if solstone_core_journal_io::JournalRoot::open(journal)
+            .map_err(|error| error.to_string())?
+            .identity()
+            != root.identity()
+        {
+            return Err("admitted journal path changed".to_owned());
+        }
+        Ok(())
+    };
+    if !needs_credential_retirement {
+        let owner_checkpoint = || {
+            root_checkpoint()?;
+            let current = solstone_core_journal_config::read_journal_config_bound(&root)
+                .map_err(|error| error.to_string())?
+                .config
+                .unwrap_or_default();
+            if !target.matches(&current, process_overrides)
+                || validation_entry(&current, provider) != prior_validation
+            {
+                return Err("credential validation changed after refresh".to_owned());
+            }
+            Ok(())
+        };
+        witness
+            .retire_after_validation(key, &owner_checkpoint)
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    witness
+        .prepare_successful_validation(&mut entry)
+        .map_err(|error| error.to_string())?;
+    let checkpoint = || {
+        root_checkpoint()?;
+        witness
+            .checkpoint_with_binding_key(key)
+            .map_err(|error| error.to_string())?;
+        let current = solstone_core_journal_config::read_journal_config_bound(&root)
+            .map_err(|error| error.to_string())?
+            .config
+            .unwrap_or_default();
+        if !target.matches(&current, process_overrides) {
+            return Err("credential selection changed during refresh".to_owned());
+        }
+        Ok(())
+    };
+    let transaction =
+        solstone_core_journal_config_write::mutate_journal_config_at_root_interlocked(
+            &root,
+            Default::default(),
+            &checkpoint,
+            &|| {
+                witness
+                    .begin_positive_config_publication(key)
+                    .map_err(|error| error.to_string())
+            },
+            |config| {
+                if !target.matches(config, process_overrides)
+                    || validation_entry(config, provider) != prior_validation
+                {
+                    return solstone_core_journal_config_write::JournalConfigMutation {
+                        changed: false,
+                        value: false,
+                    };
+                }
+                let changed = validation_entry(config, provider) != Some(&entry);
+                let providers = config
+                    .entry("providers")
+                    .or_insert_with(|| json!({}))
+                    .as_object_mut()
+                    .unwrap();
+                let validations = providers
+                    .entry("key_validation")
+                    .or_insert_with(|| json!({}));
+                let Some(validations) = validations.as_object_mut() else {
+                    return solstone_core_journal_config_write::JournalConfigMutation {
+                        changed: false,
+                        value: false,
+                    };
+                };
+                validations.insert(provider.to_owned(), entry.clone());
+                solstone_core_journal_config_write::JournalConfigMutation {
+                    changed,
+                    value: true,
+                }
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    if !transaction.value
+        || matches!(&transaction.outcome,
+        solstone_core_journal_config_write::BoundConfigOutcome::Published(facts)
+            if facts.durability_uncertainty.is_some() || facts.observation_uncertainty.is_some() || facts.confirmation_refusal.is_some())
+    {
+        return Err("credential validation publication was not confirmed".to_owned());
+    }
+    let owner_checkpoint = || {
+        root_checkpoint()?;
+        let current = solstone_core_journal_config::read_journal_config_bound(&root)
+            .map_err(|error| error.to_string())?
+            .config
+            .unwrap_or_default();
+        if !target.matches(&current, process_overrides)
+            || validation_entry(&current, provider) != Some(&entry)
+        {
+            return Err("credential validation changed after publication".to_owned());
+        }
+        if solstone_core_brain::read_fingerprint_key_material_bound(root.clone(), journal)
+            .map_err(|error| error.to_string())?
+            != solstone_core_brain::FingerprintKeyMaterial::Ready(*key)
+        {
+            return Err("protected fingerprint key changed after validation".to_owned());
+        }
+        Ok(())
+    };
+    witness
+        .retire_after_validation(key, &owner_checkpoint)
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+struct RefreshProbeOutcome {
+    evidence: Value,
+    credential_valid: bool,
+    probe_reason: Option<&'static str>,
+}
+
 fn probe_outcome(
     journal: &Path,
     config: &Map<String, Value>,
@@ -417,7 +891,7 @@ fn probe_outcome(
     now: DateTime<Utc>,
     probe: &impl OwnerProbe,
     spp: &impl OwnerSppPrerequisite,
-) -> Value {
+) -> RefreshProbeOutcome {
     let lane_prerequisites = lane_prerequisite(
         journal,
         config,
@@ -431,17 +905,27 @@ fn probe_outcome(
         .get("reason_code")
         .and_then(Value::as_str)
     {
-        return json!({
+        return RefreshProbeOutcome {
+            evidence: json!({
+                "configuration": component_ok(now),
+                "lane_prerequisites": lane_prerequisites,
+                "generate": component_not_attempted(reason, now),
+            }),
+            credential_valid: false,
+            probe_reason: None,
+        };
+    }
+    let (generate, credential_valid, probe_reason) =
+        generate_component(journal, config, now, probe);
+    RefreshProbeOutcome {
+        evidence: json!({
             "configuration": component_ok(now),
             "lane_prerequisites": lane_prerequisites,
-            "generate": component_not_attempted(reason, now),
-        });
+            "generate": generate,
+        }),
+        credential_valid,
+        probe_reason,
     }
-    json!({
-        "configuration": component_ok(now),
-        "lane_prerequisites": lane_prerequisites,
-        "generate": generate_component(journal, config, now, probe),
-    })
 }
 
 fn lane_prerequisite(
@@ -589,7 +1073,7 @@ fn generate_component(
     config: &Map<String, Value>,
     now: DateTime<Utc>,
     probe: &impl OwnerProbe,
-) -> Value {
+) -> (Value, bool, Option<&'static str>) {
     let request = GenerateRequest {
         id: None,
         context: HEALTH_BRAIN_GENERATE_CONTEXT.to_owned(),
@@ -607,21 +1091,59 @@ fn generate_component(
         transport_retries: Some(0),
     };
     let result = probe.execute_generate(&request, journal, config);
+    let credential_valid = match &result {
+        Ok(GenerateResponse::Generated(_)) => true,
+        Ok(GenerateResponse::Refused(response)) => {
+            response.reason_code.as_ref().is_some_and(|code| {
+                matches!(
+                    code.as_wire(),
+                    "model_not_found" | "provider_quota_exceeded"
+                )
+            })
+        }
+        _ => false,
+    };
+    let probe_reason = match &result {
+        Ok(GenerateResponse::Refused(response)) => {
+            match response.reason_code.as_ref().map(|code| code.as_wire()) {
+                Some("model_not_found") => Some("model_not_found"),
+                Some("provider_quota_exceeded") => Some("provider_quota_exceeded"),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
     let reason = match result {
         Ok(GenerateResponse::Generated(response)) => {
             let Some(reason) = classify_canned_generate(&response) else {
-                return component_ok(now);
+                return (component_ok(now), true, None);
             };
             reason.to_owned()
         }
-        Ok(GenerateResponse::Refused(response)) => map_provider_reason(
-            "generate",
-            response.reason_code.as_ref().map(|value| value.as_wire()),
-        ),
+        Ok(GenerateResponse::Refused(response)) => {
+            let reason = response.reason_code.as_ref().map(|value| value.as_wire());
+            // The endpoint transport names a real keyless auth rejection
+            // provider_key_missing. Brain's Generate evidence uses the existing
+            // provider_key_invalid vocabulary. Managed missing-key refusal and
+            // nonempty/custom credentials keep their ordinary classification.
+            let reason = if reason == Some("provider_key_missing")
+                && matches!(RefreshCredential::from_config(config),
+                    Some(RefreshCredential::Endpoint { credential, .. }) if credential.is_empty())
+            {
+                Some("provider_key_invalid")
+            } else {
+                reason
+            };
+            map_provider_reason("generate", reason)
+        }
         Ok(GenerateResponse::Cancelled) => "probe_internal_error".to_owned(),
         Err(error) => generate_client_failure_reason(&error),
     };
-    component_for_reason("generate", &reason, Map::new(), now)
+    (
+        component_for_reason("generate", &reason, Map::new(), now),
+        credential_valid,
+        probe_reason,
+    )
 }
 
 fn generate_client_failure_reason(error: &ClientError) -> String {
@@ -1344,6 +1866,417 @@ mod tests {
                 .expect("serialize runtime"),
             )
             .expect("write runtime");
+        }
+
+        fn cloud_journal() -> tempfile::TempDir {
+            let temporary = setup_temp_journal();
+            std::fs::write(
+                temporary.path().join("config/journal.json"),
+                serde_json::to_vec(&json!({
+                    "env":{"OPENAI_API_KEY":"owner-test-key"},
+                    "providers":{"active":{"provider":"openai","model":"gpt-binding"}}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            solstone_core_brain::generate_fingerprint_key(temporary.path()).unwrap();
+            temporary
+        }
+
+        fn refused_probe(reason: &str) -> GenerateResponse {
+            GenerateResponse::Refused(solstone_core_generate::RefusedResponse {
+                id: None,
+                reason: solstone_core_generate::RefusalReason::Unknown,
+                reason_code: Some(solstone_core_generate::ReasonCodeValue::Known(
+                    solstone_core_generate::ReasonCode::new(reason).unwrap(),
+                )),
+                retryable: false,
+                blocking: true,
+                reset_at_ms: None,
+                provider: Some("openai".to_owned()),
+                detail: "unit probe refusal".to_owned(),
+            })
+        }
+
+        fn default_refresh_options() -> OwnerRefreshOptions {
+            OwnerRefreshOptions {
+                expected_fingerprint: None,
+                expected_active_fingerprint: false,
+                expect_active_fingerprint_absent: false,
+            }
+        }
+
+        #[test]
+        fn a_rejected_owner_probe_persists_terminal_evidence_and_fresh_credential_valid_results_retire_it()
+         {
+            for reason in [
+                None,
+                Some("model_not_found"),
+                Some("provider_quota_exceeded"),
+            ] {
+                let temporary = cloud_journal();
+                let root = std::sync::Arc::new(
+                    solstone_core_journal_io::JournalRoot::open(temporary.path()).unwrap(),
+                );
+                let target = solstone_core_brain::CredentialHoldTarget::Managed {
+                    provider: "openai",
+                    credential: "owner-test-key",
+                };
+                let session =
+                    solstone_core_brain::CredentialHoldSession::open_bound(root.clone(), target)
+                        .unwrap();
+                let rejected = TestProbe::new(String::new(), |_, _, _| {
+                    Ok(refused_probe("provider_key_invalid"))
+                });
+                let first = refresh(
+                    temporary.path(),
+                    &default_refresh_options(),
+                    &rejected,
+                    &PanicSpp,
+                );
+                assert!(
+                    matches!(first,OwnerRefreshOutcome::PersistedNonReady { ref reason_code, .. } if reason_code == "provider_key_invalid")
+                );
+                assert!(session.is_held().unwrap());
+                let record: Value = serde_json::from_slice(
+                    &std::fs::read(temporary.path().join("health/brain.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(record["checking"], Value::Null);
+                assert_eq!(record["reason_code"], "provider_key_invalid");
+                let valid = TestProbe::new(String::new(), |_, _, _| {
+                    Ok(match reason {
+                        Some(reason) => refused_probe(reason),
+                        None => GenerateResponse::Generated(Box::new(generated_response(
+                            "OK",
+                            "stop",
+                            json!({}),
+                            None,
+                        ))),
+                    })
+                });
+                let settled = refresh(
+                    temporary.path(),
+                    &default_refresh_options(),
+                    &valid,
+                    &PanicSpp,
+                );
+                if reason.is_none() {
+                    assert!(matches!(
+                        settled,
+                        OwnerRefreshOutcome::PersistedReady { .. }
+                    ));
+                } else {
+                    assert!(matches!(
+                        settled,
+                        OwnerRefreshOutcome::PersistedNonReady { .. }
+                    ));
+                }
+                assert!(!session.is_held().unwrap());
+                assert_eq!(
+                    solstone_core_brain::classify_credential_admission_bound(
+                        root,
+                        temporary.path(),
+                        target,
+                        None
+                    )
+                    .unwrap(),
+                    solstone_core_brain::StoredCredentialBinding::DoesNotReject
+                );
+            }
+        }
+
+        #[test]
+        fn a_new_memory_only_rejection_during_the_probe_blocks_old_success_publication() {
+            let temporary = cloud_journal();
+            let root = std::sync::Arc::new(
+                solstone_core_journal_io::JournalRoot::open(temporary.path()).unwrap(),
+            );
+            let target = solstone_core_brain::CredentialHoldTarget::Managed {
+                provider: "openai",
+                credential: "owner-test-key",
+            };
+            let session =
+                solstone_core_brain::CredentialHoldSession::open_bound(root, target).unwrap();
+            let before = Mutex::new(None);
+            let probe = TestProbe::new(String::new(), |_, journal: &Path, _| {
+                *before.lock().unwrap() =
+                    Some(std::fs::read(journal.join("health/brain.json")).unwrap());
+                session.record_rejection().unwrap();
+                Ok(GenerateResponse::Generated(Box::new(generated_response(
+                    "OK",
+                    "stop",
+                    json!({}),
+                    None,
+                ))))
+            });
+            let outcome = refresh(
+                temporary.path(),
+                &default_refresh_options(),
+                &probe,
+                &PanicSpp,
+            );
+            assert!(matches!(outcome, OwnerRefreshOutcome::LostFence { .. }));
+            assert!(session.is_held().unwrap());
+            assert_eq!(
+                std::fs::read(temporary.path().join("health/brain.json")).unwrap(),
+                before.lock().unwrap().clone().unwrap()
+            );
+        }
+
+        #[test]
+        fn successful_unheld_refresh_invalidates_an_older_rejection_witness() {
+            let temporary = cloud_journal();
+            let root = std::sync::Arc::new(
+                solstone_core_journal_io::JournalRoot::open(temporary.path()).unwrap(),
+            );
+            let target = solstone_core_brain::CredentialHoldTarget::Managed {
+                provider: "openai",
+                credential: "owner-test-key",
+            };
+            let older = solstone_core_brain::capture_credential_validation_bound(
+                root.clone(),
+                temporary.path(),
+                target,
+            )
+            .unwrap();
+            let config_before =
+                std::fs::read(temporary.path().join("config/journal.json")).unwrap();
+            let probe = TestProbe::new(String::new(), |_, _, _| {
+                Ok(GenerateResponse::Generated(Box::new(generated_response(
+                    "OK",
+                    "stop",
+                    json!({}),
+                    None,
+                ))))
+            });
+            assert!(matches!(
+                refresh(
+                    temporary.path(),
+                    &default_refresh_options(),
+                    &probe,
+                    &PanicSpp
+                ),
+                OwnerRefreshOutcome::PersistedReady { .. }
+            ));
+            let brain_before = std::fs::read(temporary.path().join("health/brain.json")).unwrap();
+            let rejected = solstone_core_brain::retain_current_credential_rejection_bound(
+                temporary.path(),
+                target,
+                &older,
+                &|| Ok(()),
+                &|_| true,
+                None,
+            );
+            assert!(matches!(
+                rejected,
+                Err(solstone_core_brain::CredentialRejectionFailure::Refused(_))
+            ));
+            assert!(
+                !solstone_core_brain::CredentialHoldSession::open_bound(root, target)
+                    .unwrap()
+                    .is_held()
+                    .unwrap()
+            );
+            assert_eq!(
+                std::fs::read(temporary.path().join("config/journal.json")).unwrap(),
+                config_before
+            );
+            assert_eq!(
+                std::fs::read(temporary.path().join("health/brain.json")).unwrap(),
+                brain_before
+            );
+        }
+
+        #[test]
+        fn keyless_custom_auth_refusal_retains_the_actual_empty_credential() {
+            let temporary = tempfile::tempdir().unwrap();
+            std::fs::create_dir(temporary.path().join("config")).unwrap();
+            let endpoint = "http://127.0.0.1:9";
+            std::fs::write(
+                temporary.path().join("config/journal.json"),
+                json!({"providers": {
+                    "active": {"provider": "local", "model": "served-model"},
+                    "local": {"endpoint_url": endpoint, "served_model_id": "served-model"}
+                }})
+                .to_string(),
+            )
+            .unwrap();
+            // Provider-boundary control: the actual endpoint transport maps a
+            // keyless 401 to this refusal; a keyless 200 remains allowed.
+            let probe = TestProbe::new(String::new(), |_, _, _| {
+                Ok(refused_probe("provider_key_missing"))
+            });
+            assert!(matches!(
+                refresh(
+                    temporary.path(),
+                    &default_refresh_options(),
+                    &probe,
+                    &PanicSpp
+                ),
+                OwnerRefreshOutcome::PersistedNonReady { .. }
+            ));
+            assert_eq!(probe.captured_requests.lock().unwrap().len(), 1);
+            let root = std::sync::Arc::new(
+                solstone_core_journal_io::JournalRoot::open(temporary.path()).unwrap(),
+            );
+            assert_eq!(
+                solstone_core_brain::classify_credential_admission_bound(
+                    root,
+                    temporary.path(),
+                    solstone_core_brain::CredentialHoldTarget::Endpoint {
+                        base_url: endpoint,
+                        credential: ""
+                    },
+                    None
+                )
+                .unwrap(),
+                solstone_core_brain::StoredCredentialBinding::Matches
+            );
+            let brain: Value = serde_json::from_slice(
+                &std::fs::read(temporary.path().join("health/brain.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(brain["checking"], Value::Null);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn rejected_refresh_keeps_the_process_fact_when_post_probe_storage_is_unreadable() {
+            for unavailable in ["config/journal.json", "health/brain-fingerprint.key"] {
+                let temporary = cloud_journal();
+                let root = std::sync::Arc::new(
+                    solstone_core_journal_io::JournalRoot::open(temporary.path()).unwrap(),
+                );
+                let target = solstone_core_brain::CredentialHoldTarget::Managed {
+                    provider: "openai",
+                    credential: "owner-test-key",
+                };
+                let session =
+                    solstone_core_brain::CredentialHoldSession::open_bound(root.clone(), target)
+                        .unwrap();
+                let config_before =
+                    std::fs::read(temporary.path().join("config/journal.json")).unwrap();
+                let key_before =
+                    std::fs::read(temporary.path().join("health/brain-fingerprint.key")).unwrap();
+                let path = temporary.path().join(unavailable);
+                let retained = path.with_extension("held-original");
+                let rejected = TestProbe::new(String::new(), |_, _, _| {
+                    std::fs::rename(&path, &retained).unwrap();
+                    std::fs::create_dir(&path).unwrap();
+                    Ok(refused_probe("provider_key_invalid"))
+                });
+                let outcome = refresh(
+                    temporary.path(),
+                    &default_refresh_options(),
+                    &rejected,
+                    &PanicSpp,
+                );
+                let held_while_unreadable = session.is_held().unwrap();
+                std::fs::remove_dir(&path).unwrap();
+                std::fs::rename(&retained, &path).unwrap();
+                assert!(
+                    !matches!(
+                        outcome,
+                        OwnerRefreshOutcome::PersistedReady { .. }
+                            | OwnerRefreshOutcome::PersistedNonReady { .. }
+                    ),
+                    "{outcome:?}"
+                );
+                assert_eq!(
+                    std::fs::read(temporary.path().join("config/journal.json")).unwrap(),
+                    config_before
+                );
+                assert_eq!(
+                    std::fs::read(temporary.path().join("health/brain-fingerprint.key")).unwrap(),
+                    key_before
+                );
+                assert_eq!(
+                    (
+                        held_while_unreadable,
+                        session.is_held().unwrap(),
+                        solstone_core_brain::classify_credential_admission_bound(
+                            root.clone(),
+                            temporary.path(),
+                            target,
+                            None,
+                        )
+                        .unwrap()
+                    ),
+                    (
+                        true,
+                        true,
+                        solstone_core_brain::StoredCredentialBinding::Matches
+                    ),
+                    "unavailable={unavailable}: restoring exact old bytes is not a correction",
+                );
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn rejected_refresh_uses_brain_when_config_fails_and_normal_refresh_can_recover() {
+            use std::os::unix::fs::PermissionsExt;
+            let temporary = cloud_journal();
+            let config_dir = temporary.path().join("config");
+            let original_permissions = std::fs::metadata(&config_dir).unwrap().permissions();
+            struct Restore(std::path::PathBuf, std::fs::Permissions);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    let _ = std::fs::set_permissions(&self.0, self.1.clone());
+                }
+            }
+            let restore = Restore(config_dir.clone(), original_permissions);
+            let before = std::fs::read(config_dir.join("journal.json")).unwrap();
+            std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let rejected = TestProbe::new(String::new(), |_, _, _| {
+                Ok(refused_probe("provider_key_invalid"))
+            });
+            let first = refresh(
+                temporary.path(),
+                &default_refresh_options(),
+                &rejected,
+                &PanicSpp,
+            );
+            assert!(
+                matches!(first,OwnerRefreshOutcome::PersistedNonReady { ref reason_code,.. } if reason_code == "provider_key_invalid")
+            );
+            assert_eq!(
+                std::fs::read(config_dir.join("journal.json")).unwrap(),
+                before
+            );
+            let record: Value = serde_json::from_slice(
+                &std::fs::read(temporary.path().join("health/brain.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(record["checking"], Value::Null);
+            assert_eq!(
+                record["credential_holds"]["openai"]["reason_code"],
+                "provider_key_invalid"
+            );
+            drop(restore);
+            let valid = TestProbe::new(String::new(), |_, _, _| {
+                Ok(GenerateResponse::Generated(Box::new(generated_response(
+                    "OK",
+                    "stop",
+                    json!({}),
+                    None,
+                ))))
+            });
+            assert!(matches!(
+                refresh(
+                    temporary.path(),
+                    &default_refresh_options(),
+                    &valid,
+                    &PanicSpp
+                ),
+                OwnerRefreshOutcome::PersistedReady { .. }
+            ));
+            let record: Value = serde_json::from_slice(
+                &std::fs::read(temporary.path().join("health/brain.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(record["credential_holds"], json!({}));
         }
 
         #[test]

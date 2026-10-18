@@ -1525,10 +1525,7 @@ async fn post_validate_model_missing_key_has_exact_top_level_keys() {
     .await;
     assert_eq!(response.0, StatusCode::OK);
     let body: Value = serde_json::from_slice(&response.3).expect("response is JSON");
-    assert_top_level_keys(
-        &body,
-        vec!["message", "model", "provider", "reason_code", "valid"],
-    );
+    assert_top_level_keys(&body, vec!["model", "provider", "reason_code", "valid"]);
 
     let response = request_with_body(
         router(journal.0.clone()),

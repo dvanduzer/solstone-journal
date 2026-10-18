@@ -84,17 +84,26 @@ pub use append::append_jsonl;
 pub use append::append_jsonl_no_follow;
 #[cfg(any(unix, windows))]
 pub use append::append_text;
-#[cfg(windows)]
-pub use atomic::atomic_replace_detailed_bound;
+#[cfg(any(test, feature = "test-hooks"))]
+pub use append::run_with_bound_append_open_barrier;
+#[cfg(any(unix, windows))]
+pub use append::{append_text_bound_checked, append_text_checked};
 #[cfg(any(unix, windows))]
 pub use atomic::install_file;
 pub use atomic::is_publication_candidate_name;
+pub use atomic::serialize_json_bytes;
 #[cfg(unix)]
 pub use atomic::write_bytes_exclusive_bound_detailed;
 #[cfg(any(unix, windows))]
-pub use atomic::{AtomicWriteOptions, JsonWriteOptions, atomic_replace, write_json};
+pub use atomic::{
+    AtomicWriteOptions, JsonWriteOptions, atomic_replace, atomic_replace_checked, write_json,
+    write_json_checked,
+};
 #[cfg(unix)]
-pub use atomic::{BoundAtomicOutcome, atomic_replace_bound, write_bytes_exclusive_bound};
+pub use atomic::{
+    BoundAtomicOutcome, atomic_replace_bound, atomic_replace_bound_checked,
+    write_bytes_exclusive_bound,
+};
 #[cfg(all(unix, feature = "test-hooks"))]
 pub use atomic::{
     BoundPublicationPrimitive, run_with_bound_publication_barrier,
@@ -117,6 +126,8 @@ pub use atomic::{
     WindowsInstallPrimitive, WindowsInstallTrace, run_with_windows_install_barrier,
     run_with_windows_install_faults, run_with_windows_install_faults_and_barrier,
 };
+#[cfg(windows)]
+pub use atomic::{atomic_replace_detailed_bound, atomic_replace_detailed_bound_checked};
 #[cfg(all(unix, feature = "test-hooks"))]
 pub use atomic::{
     run_with_bound_publication_faults, run_with_bound_publication_faults_and_barrier,
@@ -185,7 +196,7 @@ pub use lease::probe_exclusive_flock_no_release;
 #[cfg(any(unix, windows))]
 pub use lease::{
     DEFAULT_LEASE_ATTEMPTS, DEFAULT_LEASE_MODE, DEFAULT_LEASE_RETRY_MAX, FileLease, LeaseOptions,
-    acquire_file_lease,
+    acquire_file_lease, acquire_file_lease_bound_checked, acquire_file_lease_checked,
 };
 pub use legacy_log_alias::{
     LegacyAliasCleanupError, LegacyAliasCleanupReport, LegacyAliasDisposition,
@@ -199,12 +210,14 @@ pub use locking::hold_shared_lock;
 pub use locking::lock_is_held;
 #[cfg(any(unix, windows))]
 pub use locking::{
-    BoundParentLock, acquire_existing_parent_lock_bound, open_existing_parent_lock_bound,
+    BoundParentLock, acquire_existing_parent_lock_bound,
+    acquire_existing_parent_lock_bound_checked, open_existing_parent_lock_bound,
 };
 #[cfg(any(unix, windows))]
 pub use locking::{
     DEFAULT_LOCK_POLL_INTERVAL, DEFAULT_LOCK_TIMEOUT, ExistingParentLock, FileLock, LockOptions,
     acquire_existing_parent_lock, hold_daily_location_admission, hold_existing_lock, hold_lock,
+    hold_lock_checked,
 };
 pub use name_admission::{
     ClaimName, ConflictEntry, ConflictKind, NameAdmissionError, NameAdmissionReason,

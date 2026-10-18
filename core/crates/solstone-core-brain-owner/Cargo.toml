@@ -21,6 +21,9 @@ solstone-core-brain.workspace = true
 solstone-core-chatgpt-auth.workspace = true
 solstone-core-generate.workspace = true
 solstone-core-generate-wire.workspace = true
+solstone-core-journal-config.workspace = true
+solstone-core-journal-config-write.workspace = true
+solstone-core-journal-io.workspace = true
 solstone-core-local.workspace = true
 solstone-core-spp-ratls.workspace = true
 

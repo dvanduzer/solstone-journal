@@ -954,6 +954,16 @@ mod tests {
         assert!(status["admission_warning"].as_str().is_some());
 
         drop(lease);
+        // The interrupted-state projection requires the native lease to be
+        // free. Observe that boundary under parallel full-test execution.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while solstone_core_local::install::lease::is_held(&journal, "local").unwrap() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "install lease did not release"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         let status = super::bootstrap_status(&journal, default_model());
         assert_eq!(status["install_state"], "failed");
         assert_eq!(status["install_error"], "install_interrupted");

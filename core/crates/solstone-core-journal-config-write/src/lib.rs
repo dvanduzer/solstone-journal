@@ -17,6 +17,8 @@
 mod bound_commit;
 mod commit;
 mod config;
+#[cfg(any(unix, windows))]
+mod credential_interlock;
 mod direct_port;
 mod pairing_migration;
 mod thinking_migration;
@@ -27,7 +29,11 @@ mod test_support;
 pub use bound_commit::conditional_update_journal_config_in_directory;
 pub use bound_commit::{
     BoundConfigConfirmationRefusal, BoundConfigOutcome, BoundConfigPublication, BoundConfigRefusal,
-    DirectoryFlush, MAX_BOUND_CONFIG_BYTES, conditional_update_journal_config_at_root,
+    BoundConfigTransaction, DirectoryFlush, MAX_BOUND_CONFIG_BYTES,
+    conditional_update_journal_config_at_root, conditional_update_journal_config_at_root_checked,
+    conditional_update_journal_config_at_root_interlocked,
+    conditional_update_journal_config_in_directory_checked, mutate_journal_config_at_root_checked,
+    mutate_journal_config_at_root_interlocked,
 };
 pub use commit::{
     CommitConfigError, ConfigConflict, ConfigExpectation, ConfigFingerprint, commit_journal_config,

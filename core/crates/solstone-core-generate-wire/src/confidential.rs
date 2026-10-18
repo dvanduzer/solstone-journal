@@ -603,6 +603,7 @@ where
         admission,
     };
 
+    let mut unpublished = None;
     let result = endpoint_generate_internal_with_context(
         request,
         journal_path,
@@ -613,7 +614,10 @@ where
         Instant::now(),
         started,
         context,
+        None,
+        &mut unpublished,
     );
+    debug_assert!(unpublished.is_none(), "an ungated call does not retain");
 
     if let EndpointResult::Generated(_) = &result
         && !is_health_probe

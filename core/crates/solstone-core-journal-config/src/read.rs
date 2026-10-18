@@ -13,9 +13,15 @@ use chrono::NaiveDate;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 #[cfg(any(unix, windows))]
+use solstone_core_journal_io::JournalRoot;
+#[cfg(any(unix, windows))]
 use solstone_core_journal_io::media::{MediaDirectory, MediaEntry};
 #[cfg(unix)]
-use solstone_core_journal_io::{JournalRoot, open_flat_directory_bound, read_bytes_bound};
+use solstone_core_journal_io::{open_flat_directory_bound, read_bytes_bound};
+#[cfg(windows)]
+use solstone_core_journal_io::{
+    open_windows_flat_directory_bound, read_windows_observed_file_bounded,
+};
 
 use crate::{get_journal_config_path, materialized_defaults};
 
@@ -92,19 +98,33 @@ pub fn read_journal_config(journal_path: &Path) -> Result<JournalConfigRead, Con
 ///
 /// The retained root descriptor is the source authority. Its canonical path is
 /// used only to preserve diagnostic paths in [`ConfigLoadError`].
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn read_journal_config_bound(root: &JournalRoot) -> Result<JournalConfigRead, ConfigLoadError> {
     let config_path = root.canonical_path().join("config/journal.json");
     root.revalidate()
         .map_err(|source| corrupt(&config_path, source))?;
-    let Some(config_directory) =
+    #[cfg(unix)]
+    let config_directory =
         open_flat_directory_bound(root, OsStr::new("config"), root.canonical_path())
-            .map_err(|source| corrupt(&config_path, source))?
-    else {
+            .map_err(|source| corrupt(&config_path, source))?;
+    #[cfg(windows)]
+    let config_directory =
+        open_windows_flat_directory_bound(root, OsStr::new("config"), root.canonical_path())
+            .map_err(|source| corrupt(&config_path, source))?;
+    let Some(config_directory) = config_directory else {
         return parse_config_bytes(&config_path, None);
     };
+    #[cfg(unix)]
     let bytes = read_bytes_bound(&config_directory, OsStr::new("journal.json"))
         .map_err(|source| corrupt(&config_path, source))?;
+    #[cfg(windows)]
+    let bytes = read_windows_observed_file_bounded(
+        &config_directory,
+        OsStr::new("journal.json"),
+        usize::MAX,
+    )
+    .map_err(|source| corrupt(&config_path, source))?
+    .map(|observation| observation.bytes);
     parse_config_bytes(&config_path, bytes)
 }
 

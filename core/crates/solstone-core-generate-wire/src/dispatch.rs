@@ -19,7 +19,8 @@ pub struct GenerateCallContext<'a> {
 ///
 /// # Errors
 /// Returns configuration, response encoding or local-runtime errors. Provider
-/// and attestation refusals remain typed Generate responses.
+/// and attestation refusals remain typed Generate responses. A definitive
+/// rejection whose journal record could not be published is returned as Err.
 pub fn respond(
     request: &solstone_core_generate::GenerateRequest,
     endpoint_runtime: &crate::EndpointRuntime,
@@ -38,6 +39,7 @@ pub fn respond(
         &config,
         acquire_local_inference_authority,
         true,
+        true,
         &GenerateCallContext {
             priority: solstone_core_journal_config::work_priority::WorkPriority::from_environment(
             )?,
@@ -47,11 +49,13 @@ pub fn respond(
 }
 
 /// Run the same dispatch against an explicit owner-selected configuration.
-/// Candidate credential/model probes use this without mutating journal or
-/// process configuration. The caller owns admission of the configuration.
+/// Process overrides are ignored. Arbitrary content is admitted and retained
+/// for the caller-supplied configuration. The existing exact canned probe is
+/// the only exemption.
 ///
 /// # Errors
 /// Returns response encoding or local-runtime errors; provider refusals stay typed.
+/// A definitive rejection whose journal record could not be published is returned as Err.
 pub fn respond_with_config(
     request: &solstone_core_generate::GenerateRequest,
     endpoint_runtime: &crate::EndpointRuntime,
@@ -67,6 +71,7 @@ pub fn respond_with_config(
         config,
         acquire_local_inference_authority,
         false,
+        true,
         &GenerateCallContext {
             priority: solstone_core_journal_config::work_priority::WorkPriority::from_environment(
             )?,
@@ -97,10 +102,12 @@ pub fn respond_with_context(
         &config,
         acquire_local_inference_authority,
         false,
+        true,
         context,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn respond_config(
     request: &solstone_core_generate::GenerateRequest,
     endpoint_runtime: &crate::EndpointRuntime,
@@ -108,12 +115,19 @@ fn respond_config(
     config: &serde_json::Map<String, Value>,
     acquire_local_inference_authority: impl FnOnce(&Path) -> Option<LocalInferenceAuthority>,
     process_overrides: bool,
+    admit_content: bool,
     context: &GenerateCallContext<'_>,
 ) -> Result<solstone_core_generate::GenerateResponse, String> {
     let cancellation = context.cancellation;
     if cancellation.is_cancelled() {
         return Ok(solstone_core_generate::GenerateResponse::Cancelled);
     }
+    let gate = crate::credential_binding::ContentGate {
+        journal,
+        admit_content,
+        process_overrides,
+        cancellation,
+    };
     let request_id = request.id.clone();
     let (provider, outcome) = if process_overrides {
         crate::resolve_lane(config)
@@ -187,7 +201,8 @@ fn respond_config(
                 config,
                 endpoint_runtime,
                 context,
-            ),
+                Some(&gate),
+            )?,
             request,
             journal,
             &provider,
@@ -235,11 +250,12 @@ fn respond_config(
                 }
             }
         }
-        crate::LaneOutcome::Anthropic => match if process_overrides {
-            crate::anthropic_generate(request, config)
-        } else {
-            crate::anthropic::anthropic_generate_from_config(request, config)
-        } {
+        crate::LaneOutcome::Anthropic => match crate::anthropic::anthropic_generate_admitted(
+            request,
+            config,
+            process_overrides,
+            &gate,
+        )? {
             crate::AnthropicResult::Generated(mut success) => {
                 if cancellation.is_cancelled() {
                     return Ok(solstone_core_generate::GenerateResponse::Cancelled);
@@ -280,94 +296,106 @@ fn respond_config(
                 ))
             }
         },
-        crate::LaneOutcome::OpenAi => match if process_overrides {
-            crate::openai_generate(request, config)
-        } else {
-            crate::openai::openai_generate_from_config(request, config)
-        } {
-            crate::OpenAiResult::Generated(mut success) => {
-                if cancellation.is_cancelled() {
-                    return Ok(solstone_core_generate::GenerateResponse::Cancelled);
+        crate::LaneOutcome::OpenAi => {
+            match crate::openai::openai_generate_admitted(
+                request,
+                config,
+                process_overrides,
+                &gate,
+            )? {
+                crate::OpenAiResult::Generated(mut success) => {
+                    if cancellation.is_cancelled() {
+                        return Ok(solstone_core_generate::GenerateResponse::Cancelled);
+                    }
+                    let assessment = crate::assess_provider_result(crate::ProviderResultView {
+                        journal_path: journal,
+                        context: &request.context,
+                        model: &success.model,
+                        text: &success.text,
+                        finish_reason: &success.finish_reason,
+                        usage: &success.usage,
+                        json_output: request.json_output,
+                        raw_response_snippet: success.raw_response_snippet.as_deref(),
+                        thinking_seen: false,
+                    });
+                    if let Some(error) = assessment.token_log_error {
+                        eprintln!("generate token usage log failed: {error}");
+                    }
+                    if let Some(failure) = assessment.failure {
+                        solstone_core_generate::GenerateResponse::Refused(crate::refusal_for(
+                            &crate::LaneOutcome::ValidationFailure(failure),
+                            &provider,
+                            request_id.clone(),
+                        ))
+                    } else {
+                        let schema_validation = apply_schema_validation(
+                            &mut success.text,
+                            request.json_schema.as_ref(),
+                        );
+                        let response =
+                            openai_generated_response(request, success, schema_validation)?;
+                        solstone_core_generate::GenerateResponse::Generated(Box::new(response))
+                    }
                 }
-                let assessment = crate::assess_provider_result(crate::ProviderResultView {
-                    journal_path: journal,
-                    context: &request.context,
-                    model: &success.model,
-                    text: &success.text,
-                    finish_reason: &success.finish_reason,
-                    usage: &success.usage,
-                    json_output: request.json_output,
-                    raw_response_snippet: success.raw_response_snippet.as_deref(),
-                    thinking_seen: false,
-                });
-                if let Some(error) = assessment.token_log_error {
-                    eprintln!("generate token usage log failed: {error}");
-                }
-                if let Some(failure) = assessment.failure {
+                crate::OpenAiResult::Failed(failure) => {
                     solstone_core_generate::GenerateResponse::Refused(crate::refusal_for(
-                        &crate::LaneOutcome::ValidationFailure(failure),
+                        &crate::LaneOutcome::OpenAiFailure(failure),
                         &provider,
                         request_id.clone(),
                     ))
-                } else {
-                    let schema_validation =
-                        apply_schema_validation(&mut success.text, request.json_schema.as_ref());
-                    let response = openai_generated_response(request, success, schema_validation)?;
-                    solstone_core_generate::GenerateResponse::Generated(Box::new(response))
                 }
             }
-            crate::OpenAiResult::Failed(failure) => {
-                solstone_core_generate::GenerateResponse::Refused(crate::refusal_for(
-                    &crate::LaneOutcome::OpenAiFailure(failure),
-                    &provider,
-                    request_id.clone(),
-                ))
-            }
-        },
-        crate::LaneOutcome::Google => match if process_overrides {
-            crate::google_generate(request, config)
-        } else {
-            crate::google::google_generate_from_config(request, config)
-        } {
-            crate::GoogleResult::Generated(mut success) => {
-                if cancellation.is_cancelled() {
-                    return Ok(solstone_core_generate::GenerateResponse::Cancelled);
+        }
+        crate::LaneOutcome::Google => {
+            match crate::google::google_generate_admitted(
+                request,
+                config,
+                process_overrides,
+                &gate,
+            )? {
+                crate::GoogleResult::Generated(mut success) => {
+                    if cancellation.is_cancelled() {
+                        return Ok(solstone_core_generate::GenerateResponse::Cancelled);
+                    }
+                    let assessment = crate::assess_provider_result(crate::ProviderResultView {
+                        journal_path: journal,
+                        context: &request.context,
+                        model: &success.model,
+                        text: &success.text,
+                        finish_reason: &success.finish_reason,
+                        usage: &success.usage,
+                        json_output: request.json_output,
+                        raw_response_snippet: success.raw_response_snippet.as_deref(),
+                        thinking_seen: false,
+                    });
+                    if let Some(error) = assessment.token_log_error {
+                        eprintln!("generate token usage log failed: {error}");
+                    }
+                    if let Some(failure) = assessment.failure {
+                        solstone_core_generate::GenerateResponse::Refused(crate::refusal_for(
+                            &crate::LaneOutcome::ValidationFailure(failure),
+                            &provider,
+                            request_id.clone(),
+                        ))
+                    } else {
+                        let schema_validation = apply_schema_validation(
+                            &mut success.text,
+                            request.json_schema.as_ref(),
+                        );
+                        let response =
+                            google_generated_response(request, success, schema_validation)?;
+                        solstone_core_generate::GenerateResponse::Generated(Box::new(response))
+                    }
                 }
-                let assessment = crate::assess_provider_result(crate::ProviderResultView {
-                    journal_path: journal,
-                    context: &request.context,
-                    model: &success.model,
-                    text: &success.text,
-                    finish_reason: &success.finish_reason,
-                    usage: &success.usage,
-                    json_output: request.json_output,
-                    raw_response_snippet: success.raw_response_snippet.as_deref(),
-                    thinking_seen: false,
-                });
-                if let Some(error) = assessment.token_log_error {
-                    eprintln!("generate token usage log failed: {error}");
-                }
-                if let Some(failure) = assessment.failure {
+                crate::GoogleResult::Failed(failure) => {
                     solstone_core_generate::GenerateResponse::Refused(crate::refusal_for(
-                        &crate::LaneOutcome::ValidationFailure(failure),
+                        &crate::LaneOutcome::GoogleFailure(failure),
                         &provider,
                         request_id.clone(),
                     ))
-                } else {
-                    let schema_validation =
-                        apply_schema_validation(&mut success.text, request.json_schema.as_ref());
-                    let response = google_generated_response(request, success, schema_validation)?;
-                    solstone_core_generate::GenerateResponse::Generated(Box::new(response))
                 }
             }
-            crate::GoogleResult::Failed(failure) => {
-                solstone_core_generate::GenerateResponse::Refused(crate::refusal_for(
-                    &crate::LaneOutcome::GoogleFailure(failure),
-                    &provider,
-                    request_id.clone(),
-                ))
-            }
-        },
+        }
         crate::LaneOutcome::ChatGpt => match if process_overrides {
             crate::chatgpt_generate(request, config, journal)
         } else {
@@ -759,6 +787,7 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
         let addr = listener.local_addr().expect("local addr");
+        listener.set_nonblocking(true).unwrap();
 
         struct SyncBarrier {
             entered: Mutex<bool>,
@@ -775,9 +804,28 @@ mod tests {
         let sync_barrier_clone = Arc::clone(&sync_barrier);
 
         let server_thread = thread::spawn(move || {
+            fn accept_request(listener: &TcpListener) -> std::net::TcpStream {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => return stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "provider request did not arrive"
+                            );
+                            thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("provider accept failed: {error}"),
+                    }
+                }
+            }
             fn read_request(stream: &mut std::net::TcpStream) {
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(std::time::Duration::from_secs(10)))
                     .unwrap();
                 let mut header = Vec::new();
                 while !header.ends_with(b"\r\n\r\n") {
@@ -802,7 +850,7 @@ mod tests {
                 serde_json::from_slice::<serde_json::Value>(&body).unwrap();
             }
             // First run: provider blocks until released
-            let (mut stream, _) = listener.accept().expect("accept 1");
+            let mut stream = accept_request(&listener);
             read_request(&mut stream);
             {
                 let mut entered = sync_barrier_clone.entered.lock().unwrap();
@@ -810,10 +858,14 @@ mod tests {
                 sync_barrier_clone.entered_cvar.notify_all();
             }
             {
-                let mut released = sync_barrier_clone.released.lock().unwrap();
-                while !*released {
-                    released = sync_barrier_clone.released_cvar.wait(released).unwrap();
-                }
+                let released = sync_barrier_clone.released.lock().unwrap();
+                let (released, _) = sync_barrier_clone
+                    .released_cvar
+                    .wait_timeout_while(released, std::time::Duration::from_secs(10), |released| {
+                        !*released
+                    })
+                    .unwrap();
+                assert!(*released, "provider release did not arrive");
             }
             let body = json!({
                 "choices": [{"message": {"content": "provider output"}, "finish_reason": "stop"}],
@@ -830,7 +882,7 @@ mod tests {
             drop(stream);
 
             // Second run: provider returns success directly
-            let (mut stream2, _) = listener.accept().expect("accept 2");
+            let mut stream2 = accept_request(&listener);
             read_request(&mut stream2);
             let _ = stream2.write_all(header.as_bytes());
             let _ = stream2.write_all(body.as_bytes());
@@ -862,6 +914,12 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
+        std::fs::create_dir_all(temp_journal.join("config")).unwrap();
+        std::fs::write(
+            temp_journal.join("config/journal.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
 
         let request = solstone_core_generate::GenerateRequest {
             id: Some("req-1".into()),
@@ -902,10 +960,17 @@ mod tests {
 
         // Wait until provider blocks
         {
-            let mut entered = sync_barrier.entered.lock().unwrap();
-            while !*entered {
-                entered = sync_barrier.entered_cvar.wait(entered).unwrap();
-            }
+            let entered = sync_barrier.entered.lock().unwrap();
+            let (entered, _) = sync_barrier
+                .entered_cvar
+                .wait_timeout_while(entered, std::time::Duration::from_secs(10), |entered| {
+                    !*entered
+                })
+                .unwrap();
+            assert!(
+                *entered,
+                "provider did not receive the cancellation control request"
+            );
         }
 
         // Test cancels

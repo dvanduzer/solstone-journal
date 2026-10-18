@@ -19,6 +19,861 @@ use solstone_core_generate_wire::{LaneOutcome, refusal_for, resolve_lane};
 
 static NEXT_ROOT: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(all(unix, feature = "full-tests"))]
+mod applicable_credential_targets {
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+    use std::path::Path;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use serde_json::{Value, json};
+    use solstone_core_brain::{CredentialHoldSession, CredentialHoldTarget};
+    use solstone_core_generate::{Cancellation, ContentPart, GenerateRequest, GenerateResponse};
+    use solstone_core_generate_wire::overrides::{API_KEY_OVERRIDE_ENV, BASE_URL_OVERRIDE_ENV};
+    use solstone_core_thinking::providers::{ManagedKeyValidator, OneShotKeyValidator, save_key};
+
+    const CHILD: &str = "SOLSTONE_APPLICABLE_TARGET_CHILD";
+    const A: &str = "sk-applicable-override-a";
+    const B: &str = "sk-applicable-configured-b";
+    const CANARY: &str = "retained-applicable-target-input";
+    const PREFIX: &str = "applicable_credential_targets::";
+
+    struct OwnedChild(Option<Child>);
+
+    impl OwnedChild {
+        fn finish(&mut self, status: std::process::ExitStatus) -> Result<(), &'static str> {
+            if !status.success() {
+                return Err("actual caller leader failed");
+            }
+            let child = self.0.as_ref().unwrap();
+            let group = nix::unistd::Pid::from_raw(child.id().try_into().unwrap());
+            if nix::sys::signal::killpg(group, None) != Err(nix::errno::Errno::ESRCH) {
+                return Err("caller process group is still occupied");
+            }
+            self.0.take();
+            Ok(())
+        }
+    }
+
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            // Include the real OneShot probe child on every parent unwind.
+            if let Some(child) = self.0.as_mut() {
+                let pid = nix::unistd::Pid::from_raw(child.id().try_into().expect("child pid"));
+                let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
+                let _ = child.wait();
+            }
+        }
+    }
+
+    fn request() -> GenerateRequest {
+        GenerateRequest {
+            id: None,
+            context: "segment.thought".into(),
+            contents: vec![ContentPart::Text {
+                text: CANARY.into(),
+            }],
+            system_instruction: None,
+            temperature: 0.2,
+            max_output_tokens: 32,
+            timeout_s: Some(30.0),
+            json_output: false,
+            json_schema: None,
+            attempt_index: 0,
+            exclusive_admission: false,
+            transport_retries: Some(0),
+        }
+    }
+
+    fn assert_a_refused(journal: &Path) {
+        let result = solstone_core_generate_wire::respond(
+            &request(),
+            &solstone_core_generate_wire::EndpointRuntime::default(),
+            journal,
+            |_| None,
+            &Cancellation::never(),
+        )
+        .expect("actual A dispatch");
+        let GenerateResponse::Refused(refusal) = result else {
+            panic!("rejected A must refuse content");
+        };
+        assert_eq!(
+            refusal.reason_code.unwrap().as_wire(),
+            "provider_key_invalid"
+        );
+    }
+
+    fn hold(journal: &Path, key: &str) -> CredentialHoldSession {
+        CredentialHoldSession::open(
+            journal,
+            CredentialHoldTarget::Managed {
+                provider: "openai",
+                credential: key,
+            },
+        )
+        .unwrap()
+    }
+
+    fn capture(journal: &Path, key: &str) -> solstone_core_brain::CredentialValidationWitness {
+        solstone_core_brain::capture_credential_validation_bound(
+            Arc::new(solstone_core_journal_io::JournalRoot::open(journal).unwrap()),
+            journal,
+            CredentialHoldTarget::Managed {
+                provider: "openai",
+                credential: key,
+            },
+        )
+        .expect("ordinary pre-probe witness")
+    }
+
+    fn settings_probe(journal: &Path, validator: &OneShotKeyValidator, key: &str, valid: bool) {
+        let before = solstone_core_thinking::read_config(journal).unwrap();
+        let prior_key = before["env"]["OPENAI_API_KEY"].as_str().unwrap();
+        let prior_entry = before["providers"]["key_validation"]["openai"]
+            .as_object()
+            .map(|_| before["providers"]["key_validation"]["openai"].clone());
+        let witness = capture(journal, key);
+        let validation = validator
+            .validate("openai", key)
+            .expect("actual native canned probe");
+        assert_eq!(validation["valid"], valid);
+        if !valid {
+            assert_eq!(validation["reason_code"], "provider_key_invalid");
+        }
+        let root = solstone_core_journal_io::JournalRoot::open(journal).unwrap();
+        save_key(
+            journal,
+            &root,
+            &Cancellation::never(),
+            "OPENAI_API_KEY",
+            "openai",
+            key,
+            Some(validation),
+            prior_key,
+            prior_entry.as_ref(),
+            Some(witness),
+        )
+        .expect("ordinary Settings publication/settlement");
+    }
+
+    struct JoinedThread<T> {
+        thread: Option<std::thread::JoinHandle<T>>,
+        release: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl<T> JoinedThread<T> {
+        fn finish(mut self) -> T {
+            self.thread
+                .take()
+                .unwrap()
+                .join()
+                .expect("owned overlapping caller")
+        }
+    }
+
+    impl<T> Drop for JoinedThread<T> {
+        fn drop(&mut self) {
+            self.release
+                .store(false, std::sync::atomic::Ordering::Release);
+            if let Some(thread) = self.thread.take() {
+                // Publication locks unwind before this outer guard is dropped.
+                // Actual provider and retainer calls keep their existing bounds.
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn run_overlapping_child(journal: &Path) {
+        use solstone_core_journal_io::{
+            BoundPublicationPrimitive, run_with_two_bound_publication_barriers,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Release(Arc<AtomicBool>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let held_a = Arc::new(hold(journal, A));
+        let held_b = Arc::new(hold(journal, B));
+        let blocked = Arc::new(AtomicBool::new(true));
+        let path_a = journal.to_path_buf();
+        let a_held = held_a.clone();
+        let a_blocked = blocked.clone();
+        let a_thread = JoinedThread {
+            release: blocked.clone(),
+            thread: Some(std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                // Pause only after the actual retainer has learned P_A. This keeps
+                // its deferred carrier attempt from racing the positive's settle,
+                // while P_A must protect the actual caller throughout publication.
+                let check = || {
+                    if a_held.is_held().unwrap() {
+                        while a_blocked.load(Ordering::Acquire) {
+                            assert!(
+                                Instant::now() < deadline,
+                                "P_A continuation exceeded fixture bound"
+                            );
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                    false
+                };
+                solstone_core_generate_wire::respond(
+                    &request(),
+                    &solstone_core_generate_wire::EndpointRuntime::default(),
+                    &path_a,
+                    |_| None,
+                    &Cancellation::from_fn(&check),
+                )
+            })),
+        };
+        let path_b = journal.to_path_buf();
+        let b_thread = JoinedThread {
+            release: blocked.clone(),
+            thread: Some(std::thread::spawn(move || {
+                let before = solstone_core_thinking::read_config(&path_b).unwrap();
+                let witness = capture(&path_b, B);
+                let validation = OneShotKeyValidator::at_path(path_b.join("generate-wrapper"))
+                    .validate("openai", B)
+                    .unwrap();
+                assert_eq!(validation["reason_code"], "provider_key_invalid");
+                let root = solstone_core_journal_io::JournalRoot::open(&path_b).unwrap();
+                save_key(
+                    &path_b,
+                    &root,
+                    &Cancellation::never(),
+                    "OPENAI_API_KEY",
+                    "openai",
+                    B,
+                    Some(validation),
+                    B,
+                    before["providers"]["key_validation"]["openai"]
+                        .as_object()
+                        .map(|_| &before["providers"]["key_validation"]["openai"]),
+                    Some(witness),
+                )
+            })),
+        };
+        // Declared after both threads: release their barrier before outer thread
+        // custody joins on any unwind, after the publisher's C/B locks unwind.
+        let release = Release(blocked);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !journal.join("actual-requests-pending").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "two actual requests were not pending"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let validator = OneShotKeyValidator::at_path(journal.join("generate-wrapper"));
+        let before = solstone_core_thinking::read_config(journal).unwrap();
+        let witness = capture(journal, B);
+        let validation = validator.validate("openai", B).unwrap();
+        assert_eq!(validation["valid"], true);
+        let authorized = journal.join("positive-native-authorized");
+        let both_a = held_a.clone();
+        let both_b = held_b.clone();
+        let native_path = journal.to_path_buf();
+        let native_seen = Arc::new(std::sync::Mutex::new(None));
+        let observed = native_seen.clone();
+        let root = solstone_core_journal_io::JournalRoot::open(journal).unwrap();
+        let (saved, barriers) = run_with_two_bound_publication_barriers(
+            BoundPublicationPrimitive::AuthorizedRename,
+            1,
+            move || {
+                fs::write(authorized, b"release the declared original HTTP responses").unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !both_a.is_held().unwrap() || !both_b.is_held().unwrap() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "both actual retainer facts must precede native rename"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            },
+            BoundPublicationPrimitive::ParentSync,
+            1,
+            move || {
+                let published = solstone_core_thinking::read_config(&native_path).unwrap();
+                let entry = &published["providers"]["key_validation"]["openai"];
+                assert_eq!(entry["valid"], true);
+                *observed.lock().unwrap() = Some(
+                    entry["credential_observation_id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                );
+            },
+            || {
+                save_key(
+                    journal,
+                    &root,
+                    &Cancellation::never(),
+                    "OPENAI_API_KEY",
+                    "openai",
+                    B,
+                    Some(validation),
+                    B,
+                    before["providers"]["key_validation"]["openai"]
+                        .as_object()
+                        .map(|_| &before["providers"]["key_validation"]["openai"]),
+                    Some(witness),
+                )
+            },
+        );
+        assert_eq!(
+            barriers, 2,
+            "both actual native publication stages executed"
+        );
+        saved.expect("newer B Settings success must settle");
+        assert!(held_a.is_held().unwrap());
+        assert!(!held_b.is_held().unwrap());
+        drop(release);
+        let old_b = b_thread.finish();
+        assert!(matches!(
+            old_b,
+            Err(solstone_core_thinking::MutationError::StaleProbe)
+        ));
+        let old_a = a_thread.finish();
+        // A's deferred publication may truthfully refuse after B changed the
+        // durable carrier; its already learned process fact must still survive.
+        assert!(matches!(old_a, Err(_) | Ok(GenerateResponse::Refused(_))));
+        assert!(held_a.is_held().unwrap());
+        assert!(!held_b.is_held().unwrap());
+        assert_a_refused(journal);
+        let corrected =
+            solstone_core_generate::OneShotClient::at_path(journal.join("generate-wrapper"))
+                .with_env(API_KEY_OVERRIDE_ENV, B)
+                .execute(&request())
+                .unwrap();
+        assert!(matches!(corrected, GenerateResponse::Generated(_)));
+        println!(
+            "overlapping-native-config-observation {}",
+            native_seen.lock().unwrap().as_ref().unwrap()
+        );
+    }
+
+    fn run_child(journal: &Path, case: &str) {
+        if case == "overlapping_rejections_survive_configured_b_native_publication" {
+            run_overlapping_child(journal);
+            assert_eq!(
+                fs::read(journal.join("retained-input.txt")).unwrap(),
+                CANARY.as_bytes()
+            );
+            return;
+        }
+        let validator = OneShotKeyValidator::at_path(journal.join("generate-wrapper"));
+        // A is the existing dedicated process override, while Settings selects B.
+        // The first call sends real content; later calls must never resend it.
+        assert_a_refused(journal);
+        assert!(hold(journal, A).is_held().unwrap());
+        if case == "sequential_corrections_retire_only_unselectable_targets" {
+            for index in 0..24 {
+                let key = format!("sk-applicable-sequential-{index}");
+                settings_probe(journal, &validator, &key, true);
+                settings_probe(journal, &validator, &key, false);
+                assert!(hold(journal, &key).is_held().unwrap());
+                assert_a_refused(journal);
+            }
+        } else {
+            settings_probe(journal, &validator, B, false);
+            assert!(hold(journal, A).is_held().unwrap());
+            assert!(hold(journal, B).is_held().unwrap());
+            let mut pending = Vec::new();
+            if case == "capacity_refusal_preserves_live_callers_and_existing_key_recovery" {
+                for index in 0..6 {
+                    let key = format!("sk-applicable-pending-{index}");
+                    let witness = capture(journal, &key);
+                    let validation = validator.validate("openai", &key).unwrap();
+                    assert_eq!(validation["reason_code"], "provider_key_invalid");
+                    // Keep real pre-work authority/results alive: their caller
+                    // can still return. No config switch can retire these cells.
+                    pending.push((witness, validation));
+                }
+                let before = fs::read(journal.join("config/journal.json")).unwrap();
+                let root = Arc::new(solstone_core_journal_io::JournalRoot::open(journal).unwrap());
+                let refusal = solstone_core_brain::capture_credential_validation_bound(
+                    root,
+                    journal,
+                    CredentialHoldTarget::Managed {
+                        provider: "openai",
+                        credential: "sk-applicable-ninth",
+                    },
+                )
+                .unwrap_err();
+                assert!(
+                    matches!(&refusal, solstone_core_brain::WriterError::Conflict(detail)
+                    if detail == &solstone_core_brain::CredentialHoldError::Capacity.to_string())
+                );
+                println!("actual-caller-capacity-refusal {refusal}");
+                assert_eq!(
+                    fs::read(journal.join("config/journal.json")).unwrap(),
+                    before
+                );
+                assert!(hold(journal, A).is_held().unwrap());
+                assert!(hold(journal, B).is_held().unwrap());
+            }
+            settings_probe(journal, &validator, B, true);
+            assert!(!hold(journal, B).is_held().unwrap());
+            assert!(hold(journal, A).is_held().unwrap());
+            assert_a_refused(journal);
+            let response =
+                solstone_core_generate::OneShotClient::at_path(journal.join("generate-wrapper"))
+                    .with_env(API_KEY_OVERRIDE_ENV, B)
+                    .execute(&request())
+                    .expect("actual corrected B content");
+            assert!(matches!(response, GenerateResponse::Generated(_)));
+            drop(pending);
+            drop(capture(journal, "sk-applicable-after-pending"));
+        }
+        assert_eq!(
+            fs::read(journal.join("retained-input.txt")).unwrap(),
+            CANARY.as_bytes()
+        );
+        let config = solstone_core_thinking::read_config(journal).unwrap();
+        assert_eq!(config["providers"]["active"]["provider"], "openai");
+        assert_eq!(config["providers"]["active"]["model"], "gpt-applicable");
+        println!("applicable-target-control-complete {case}");
+    }
+
+    struct WireRequest {
+        key: String,
+        text: String,
+    }
+
+    fn decode_request(bytes: &[u8]) -> Result<Option<WireRequest>, &'static str> {
+        if bytes.len() > 65_536 {
+            return Err("oversized frame");
+        }
+        let Some(split) = bytes.windows(4).position(|value| value == b"\r\n\r\n") else {
+            return Ok(None);
+        };
+        let mut lines = std::str::from_utf8(&bytes[..split])
+            .map_err(|_| "invalid headers")?
+            .split("\r\n");
+        if lines.next() != Some("POST /v1/responses HTTP/1.1") {
+            return Err("unexpected request line");
+        }
+        let mut headers = Vec::new();
+        for line in lines {
+            let (name, value) = line.split_once(':').ok_or("invalid header")?;
+            if name.is_empty()
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                || value.contains(['\r', '\n'])
+            {
+                return Err("invalid header syntax");
+            }
+            headers.push((name, value.trim()));
+        }
+        if headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding"))
+        {
+            return Err("transfer encoding is not an exact frame");
+        }
+        let lengths = headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .map(|(_, value)| *value)
+            .collect::<Vec<_>>();
+        if lengths.len() != 1 || !lengths[0].bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("missing or ambiguous length");
+        }
+        let length = lengths[0].parse::<usize>().map_err(|_| "invalid length")?;
+        if length > 65_536 - (split + 4) {
+            return Err("oversized body");
+        }
+        let end = split + 4 + length;
+        if bytes.len() < end {
+            return Ok(None);
+        }
+        if bytes.len() != end {
+            return Err("extra frame bytes");
+        }
+        let auth = headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| *value)
+            .collect::<Vec<_>>();
+        if auth.len() != 1 {
+            return Err("missing or ambiguous authorization");
+        }
+        let key = auth[0]
+            .strip_prefix("Bearer ")
+            .filter(|key| !key.is_empty())
+            .ok_or("invalid authorization")?;
+        let body =
+            std::str::from_utf8(&bytes[split + 4..end]).map_err(|_| "invalid body encoding")?;
+        let value: Value = serde_json::from_str(body).map_err(|_| "invalid JSON body")?;
+        let text = value["input"][0]["content"][0]["text"]
+            .as_str()
+            .ok_or("missing input text")?;
+        if ![CANARY, "Reply with the single word OK."].contains(&text)
+            || value["input"]
+                != json!([{"role":"user","content":[{"type":"input_text","text":text}]}])
+            || value["store"] != false
+            || value["model"]
+                != if text == CANARY {
+                    "gpt-applicable"
+                } else {
+                    "solstone-key-check"
+                }
+            || body.contains(key)
+        {
+            return Err("unexpected actual provider input");
+        }
+        Ok(Some(WireRequest {
+            key: key.into(),
+            text: text.into(),
+        }))
+    }
+
+    fn read_request(stream: &mut TcpStream) -> WireRequest {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut bytes = Vec::new();
+        let mut chunk = [0; 4096];
+        loop {
+            let count = stream.read(&mut chunk).unwrap();
+            assert!(count > 0 && bytes.len() + count <= 65_536);
+            bytes.extend_from_slice(&chunk[..count]);
+            if let Some(request) = decode_request(&bytes).expect("strict actual HTTP frame") {
+                return request;
+            }
+        }
+    }
+
+    fn run(case: &str) {
+        if std::env::var(CHILD).ok().as_deref() == Some(case) {
+            run_child(Path::new(&std::env::var("SOLSTONE_JOURNAL").unwrap()), case);
+            return;
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let journal = temporary.path();
+        super::write_config(
+            journal,
+            json!({
+                "env": {"OPENAI_API_KEY": B},
+                "providers": {"active": {"provider": "openai", "model": "gpt-applicable"}}
+            }),
+        );
+        solstone_core_brain::generate_fingerprint_key(journal).unwrap();
+        fs::write(journal.join("retained-input.txt"), CANARY).unwrap();
+        let wrapper = journal.join("generate-wrapper");
+        let binary = env!("CARGO_BIN_EXE_solstone-core").replace('\'', "'\\''");
+        fs::write(
+            &wrapper,
+            format!("#!/bin/sh\nexec '{binary}' generate \"$@\"\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stdout = journal.join("child.stdout");
+        let stderr = journal.join("child.stderr");
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg(format!("{PREFIX}{case}"))
+            .arg("--nocapture")
+            .env_clear()
+            .env("PATH", "")
+            .env(CHILD, case)
+            .env("SOLSTONE_JOURNAL", journal)
+            .env(API_KEY_OVERRIDE_ENV, A)
+            .env(
+                BASE_URL_OVERRIDE_ENV,
+                format!("http://{}", listener.local_addr().unwrap()),
+            )
+            .stdin(Stdio::null())
+            .stdout(fs::File::create(&stdout).unwrap())
+            .stderr(fs::File::create(&stderr).unwrap())
+            .process_group(0);
+        let mut child = OwnedChild(Some(command.spawn().unwrap()));
+        let deadline = Instant::now() + Duration::from_secs(180);
+        let mut posts = BTreeMap::<String, usize>::new();
+        let mut content = BTreeMap::<String, usize>::new();
+        let overlap = case == "overlapping_rejections_survive_configured_b_native_publication";
+        let mut pending = Vec::<TcpStream>::new();
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "bounded actual caller control timed out"
+            );
+            if pending.len() == 2 && journal.join("positive-native-authorized").exists() {
+                for mut stream in pending.drain(..) {
+                    stream
+                        .write_all(super::http_response(401, "{}").as_bytes())
+                        .unwrap();
+                }
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let request = read_request(&mut stream);
+                    let key = request.key.as_str();
+                    let count = posts.entry(key.into()).or_default();
+                    *count += 1;
+                    let is_content = request.text == CANARY;
+                    if overlap
+                        && ((is_content && key == A) || (!is_content && key == B && *count == 1))
+                    {
+                        if is_content {
+                            *content.entry(key.into()).or_default() += 1;
+                        }
+                        pending.push(stream);
+                        if pending.len() == 2 {
+                            fs::write(
+                                journal.join("actual-requests-pending"),
+                                b"both original real requests are pending",
+                            )
+                            .unwrap();
+                        }
+                        continue;
+                    }
+                    let status = if is_content {
+                        *content.entry(key.into()).or_default() += 1;
+                        if key == A {
+                            401
+                        } else {
+                            assert_eq!(key, B);
+                            200
+                        }
+                    } else {
+                        assert_eq!(request.text, "Reply with the single word OK.");
+                        if key.starts_with("sk-applicable-sequential-") {
+                            if *count == 1 {
+                                200
+                            } else {
+                                assert_eq!(*count, 2);
+                                401
+                            }
+                        } else if key.starts_with("sk-applicable-pending-") {
+                            assert_eq!(*count, 1);
+                            401
+                        } else {
+                            assert_eq!(key, B);
+                            if *count == 1 {
+                                401
+                            } else {
+                                assert_eq!(*count, 2);
+                                200
+                            }
+                        }
+                    };
+                    let response = if status == 200 {
+                        r#"{"model":"gpt-applicable","status":"completed","output":[{"content":[{"type":"output_text","text":"OK"}]}]}"#
+                    } else {
+                        "{}"
+                    };
+                    stream
+                        .write_all(super::http_response(status, response).as_bytes())
+                        .unwrap();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("actual caller HTTP accept: {error}"),
+            }
+            if let Some(status) = child.0.as_mut().unwrap().try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "actual child failed:\n{}\n{}",
+                    fs::read_to_string(&stdout).unwrap(),
+                    fs::read_to_string(&stderr).unwrap()
+                );
+                child
+                    .finish(status)
+                    .expect("successful leader must leave no child group");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            content.get(A),
+            Some(&1),
+            "no repeated A content after definitive rejection"
+        );
+        assert!(
+            pending.is_empty(),
+            "original response streams must be released"
+        );
+        if case == "sequential_corrections_retire_only_unselectable_targets" {
+            assert_eq!(posts.len(), 25);
+            assert_eq!(content.len(), 1);
+            for index in 0..24 {
+                assert_eq!(posts[&format!("sk-applicable-sequential-{index}")], 2);
+            }
+        } else {
+            assert_eq!(content.get(B), Some(&1));
+            assert_eq!(posts.get(B), Some(&3));
+            assert!(!posts.contains_key("sk-applicable-ninth"));
+            assert_eq!(
+                posts.len(),
+                if case == "capacity_refusal_preserves_live_callers_and_existing_key_recovery" {
+                    8
+                } else {
+                    2
+                }
+            );
+            if case == "capacity_refusal_preserves_live_callers_and_existing_key_recovery" {
+                for index in 0..6 {
+                    assert_eq!(posts[&format!("sk-applicable-pending-{index}")], 1);
+                }
+                assert!(
+                    fs::read_to_string(&stdout)
+                        .unwrap()
+                        .contains("actual-caller-capacity-refusal")
+                );
+            }
+        }
+        assert_eq!(
+            fs::read(journal.join("retained-input.txt")).unwrap(),
+            CANARY.as_bytes()
+        );
+        println!(
+            "actual-native-caller-receipt {}",
+            json!({"case":case,"posts_by_fixture_credential":posts,"content_posts_by_fixture_credential":content,"child_stdout":fs::read_to_string(&stdout).unwrap()})
+        );
+    }
+
+    #[test]
+    fn overlapping_rejections_survive_configured_b_native_publication() {
+        run("overlapping_rejections_survive_configured_b_native_publication");
+    }
+
+    #[test]
+    fn configured_b_success_keeps_rejected_override_a() {
+        run("configured_b_success_keeps_rejected_override_a");
+    }
+
+    #[test]
+    fn capacity_refusal_preserves_live_callers_and_existing_key_recovery() {
+        run("capacity_refusal_preserves_live_callers_and_existing_key_recovery");
+    }
+
+    #[test]
+    fn sequential_corrections_retire_only_unselectable_targets() {
+        run("sequential_corrections_retire_only_unselectable_targets");
+    }
+
+    #[test]
+    fn actual_caller_frame_instrument_rejects_ambiguous_or_mutated_evidence() {
+        let body = json!({"model":"gpt-applicable", "store":false,
+            "input":[{"role":"user","content":[{"type":"input_text","text":CANARY}]}]});
+        let frame = |auth: &str, extra: &str, body: &str| {
+            format!(
+                "POST /v1/responses HTTP/1.1\r\n{auth}Content-Length: {}\r\n{extra}\r\n{body}",
+                body.len()
+            )
+        };
+        let auth = format!("Authorization: Bearer {A}\r\n");
+        let body = body.to_string();
+        let positive = frame(&auth, "", &body);
+        let accepts_a = |bytes: &[u8]| {
+            decode_request(bytes)
+                .ok()
+                .flatten()
+                .is_some_and(|request| request.key == A && request.text == CANARY)
+        };
+        assert!(accepts_a(positive.as_bytes()));
+        let mut wrong_input: Value = serde_json::from_str(&body).unwrap();
+        wrong_input["input"][0]["content"][0]["text"] = json!("invented-input");
+        let mut extra_input: Value = serde_json::from_str(&body).unwrap();
+        extra_input["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":[]}));
+        let mut exposed_key: Value = serde_json::from_str(&body).unwrap();
+        exposed_key["unexpected_key"] = json!(A);
+        for (name, mutated) in [
+            ("missing auth", frame("", "", &body)),
+            (
+                "wrong auth",
+                frame(&format!("Authorization: Bearer {B}\r\n"), "", &body),
+            ),
+            (
+                "duplicate auth",
+                frame(&auth, &format!("aUtHoRiZaTiOn: Bearer {B}\r\n"), &body),
+            ),
+            (
+                "duplicate length",
+                frame(&auth, &format!("cOnTeNt-LeNgTh: {}\r\n", body.len()), &body),
+            ),
+            (
+                "transfer encoding",
+                frame(&auth, "Transfer-Encoding: chunked\r\n", &body),
+            ),
+            ("truncated", positive[..positive.len() - 1].into()),
+            ("extra bytes", format!("{positive}x")),
+            ("invalid JSON", frame(&auth, "", "{")),
+            ("wrong input", frame(&auth, "", &wrong_input.to_string())),
+            ("extra input", frame(&auth, "", &extra_input.to_string())),
+            ("key in body", frame(&auth, "", &exposed_key.to_string())),
+        ] {
+            assert!(!accepts_a(mutated.as_bytes()), "instrument accepted {name}");
+        }
+    }
+
+    #[test]
+    fn failed_leader_keeps_process_group_custody() {
+        // Both group members are direct children so this adverse guard control
+        // can reap them itself; no orphan or detached fixture is needed.
+        struct Peer(Option<Child>);
+        impl Drop for Peer {
+            fn drop(&mut self) {
+                if let Some(child) = self.0.as_mut() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+        let mut leader = OwnedChild(Some(
+            Command::new("/bin/sleep")
+                .arg("60")
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        ));
+        let group = leader.0.as_ref().unwrap().id();
+        let mut peer = Peer(Some(
+            Command::new("/bin/sleep")
+                .arg("60")
+                .process_group(group.try_into().unwrap())
+                .spawn()
+                .unwrap(),
+        ));
+        leader.0.as_mut().unwrap().kill().unwrap();
+        let status = leader.0.as_mut().unwrap().wait().unwrap();
+        assert_eq!(leader.finish(status), Err("actual caller leader failed"));
+        drop(leader);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(status) = peer.0.as_mut().unwrap().try_wait().unwrap() {
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(status.signal(), Some(nix::libc::SIGKILL));
+                peer.0.take();
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "failed leader lost its live group member"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
 fn root(name: &str) -> PathBuf {
     let suffix = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
     let stamp = SystemTime::now()

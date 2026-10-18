@@ -46,6 +46,17 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use crate::errors::{ExistingParentLockError, LockError, LockTimeout};
+
+fn authorize_bound_lock(
+    path: &Path,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), ExistingParentLockError> {
+    checkpoint().map_err(|detail| ExistingParentLockError::Io {
+        operation: "authorize persistent lock",
+        path: path.to_path_buf(),
+        source: io::Error::new(io::ErrorKind::Interrupted, detail),
+    })
+}
 #[cfg(windows)]
 use crate::windows_identity::{WindowsFileIdentity, file_identity};
 #[cfg(windows)]
@@ -832,6 +843,19 @@ pub fn acquire_existing_parent_lock_bound(
     timeout: Duration,
     poll_interval: Duration,
 ) -> Result<BoundParentLock, ExistingParentLockError> {
+    acquire_existing_parent_lock_bound_checked(parent, name, timeout, poll_interval, &|| Ok(()))
+}
+
+/// Acquire a retained-parent persistent lock with caller checkpoints throughout
+/// contention and after acquisition. Keeps the existing lock entry and budgets.
+#[cfg(unix)]
+pub fn acquire_existing_parent_lock_bound_checked(
+    parent: &impl AsFd,
+    name: &OsStr,
+    timeout: Duration,
+    poll_interval: Duration,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<BoundParentLock, ExistingParentLockError> {
     let name =
         NormalLockName::parse(name).ok_or_else(|| ExistingParentLockError::InvalidLockPath {
             name: name.to_os_string(),
@@ -845,11 +869,22 @@ pub fn acquire_existing_parent_lock_bound(
             kind: file_kind(&status),
         });
     }
-    let guard = acquire_lock_in_parent(parent, &name, &path, timeout, poll_interval, true)?;
-    Ok(BoundParentLock {
+    let guard = acquire_lock_in_parent_retained(
+        parent,
+        &name,
+        &path,
+        timeout,
+        poll_interval,
+        true,
+        checkpoint,
+    )
+    .map_err(|failure| failure.error)?;
+    let lock = BoundParentLock {
         _guard: guard,
         require_private_mode: true,
-    })
+    };
+    lock.revalidate_bound(parent, name.as_os_str())?;
+    Ok(lock)
 }
 
 /// Hold an existing persistent entry without creating it or its parent.
@@ -906,15 +941,22 @@ pub(crate) fn open_existing_parent_lock_retained(
     if inspect_lock_entry(parent, &name, &path, false)?.is_none() {
         return Ok(None);
     }
-    let guard =
-        acquire_lock_in_parent_retained(parent, &name, &path, timeout, poll_interval, false)
-            .map_err(|failure| BoundLockAcquisitionFailure {
-                guard: failure.guard.map(|guard| BoundParentLock {
-                    _guard: guard,
-                    require_private_mode: false,
-                }),
-                error: failure.error,
-            })?;
+    let guard = acquire_lock_in_parent_retained(
+        parent,
+        &name,
+        &path,
+        timeout,
+        poll_interval,
+        false,
+        &|| Ok(()),
+    )
+    .map_err(|failure| BoundLockAcquisitionFailure {
+        guard: failure.guard.map(|guard| BoundParentLock {
+            _guard: guard,
+            require_private_mode: false,
+        }),
+        error: failure.error,
+    })?;
     Ok(Some(BoundParentLock {
         _guard: guard,
         require_private_mode: false,
@@ -930,8 +972,16 @@ fn acquire_lock_in_parent(
     poll_interval: Duration,
     allow_create: bool,
 ) -> Result<Flock<File>, ExistingParentLockError> {
-    acquire_lock_in_parent_retained(parent_fd, name, path, timeout, poll_interval, allow_create)
-        .map_err(|failure| failure.error)
+    acquire_lock_in_parent_retained(
+        parent_fd,
+        name,
+        path,
+        timeout,
+        poll_interval,
+        allow_create,
+        &|| Ok(()),
+    )
+    .map_err(|failure| failure.error)
 }
 
 #[cfg(unix)]
@@ -955,9 +1005,11 @@ fn acquire_lock_in_parent_retained(
     timeout: Duration,
     poll_interval: Duration,
     allow_create: bool,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<Flock<File>, LockAcquisitionFailure> {
     let deadline = Instant::now() + timeout;
     loop {
+        authorize_bound_lock(path, checkpoint)?;
         let existing = inspect_lock_entry(parent_fd, name, path, allow_create)?;
         let file = match existing {
             Some(_) => match openat(parent_fd, name.as_os_str(), ENTRY_OPEN_FLAGS, Mode::empty()) {
@@ -986,6 +1038,7 @@ fn acquire_lock_in_parent_retained(
             ) {
                 Ok(fd) => File::from(fd),
                 Err(Errno::EEXIST) => {
+                    authorize_bound_lock(path, checkpoint)?;
                     wait_or_expire(deadline, poll_interval, path, timeout)?;
                     continue;
                 }
@@ -1006,6 +1059,12 @@ fn acquire_lock_in_parent_retained(
                         error,
                     });
                 }
+                if let Err(error) = authorize_bound_lock(path, checkpoint) {
+                    return Err(LockAcquisitionFailure {
+                        guard: Some(guard),
+                        error,
+                    });
+                }
                 if timeout.is_zero() {
                     return Ok(guard);
                 }
@@ -1019,6 +1078,7 @@ fn acquire_lock_in_parent_retained(
             }
             Err((file, error)) if is_contention(error) => {
                 drop(file);
+                authorize_bound_lock(path, checkpoint)?;
                 wait_or_expire(deadline, poll_interval, path, timeout)?;
             }
             Err((file, source)) => {
@@ -1035,7 +1095,22 @@ fn acquire_lock_in_parent_retained(
 /// because the RAII guard owns the locked file descriptor.
 #[cfg(unix)]
 pub fn hold_lock(path: impl AsRef<Path>, options: LockOptions) -> Result<FileLock, LockError> {
-    hold_sidecar_lock(path.as_ref(), options, FlockArg::LockExclusiveNonblock)
+    hold_lock_checked(path, options, &|| Ok(()))
+}
+
+/// Acquire [`hold_lock`]'s sidecar after `checkpoint` accepts the parent and sidecar creation.
+#[cfg(unix)]
+pub fn hold_lock_checked(
+    path: impl AsRef<Path>,
+    options: LockOptions,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<FileLock, LockError> {
+    hold_sidecar_lock(
+        path.as_ref(),
+        options,
+        FlockArg::LockExclusiveNonblock,
+        checkpoint,
+    )
 }
 
 /// Hold the same sidecar as `hold_lock`, allowing concurrent Unix readers while
@@ -1045,7 +1120,12 @@ pub fn hold_shared_lock(
     path: impl AsRef<Path>,
     options: LockOptions,
 ) -> Result<FileLock, LockError> {
-    hold_sidecar_lock(path.as_ref(), options, FlockArg::LockSharedNonblock)
+    hold_sidecar_lock(
+        path.as_ref(),
+        options,
+        FlockArg::LockSharedNonblock,
+        &|| Ok(()),
+    )
 }
 
 #[cfg(unix)]
@@ -1053,8 +1133,14 @@ fn hold_sidecar_lock(
     path: &Path,
     options: LockOptions,
     operation: FlockArg,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<FileLock, LockError> {
     let parent = parent_dir(path);
+    let check = || {
+        checkpoint()
+            .map_err(|detail| io_error(path, io::Error::new(io::ErrorKind::Interrupted, detail)))
+    };
+    check()?;
     fs::create_dir_all(parent).map_err(|source| io_error(path, source))?;
     let file_name = path.file_name().ok_or_else(|| {
         io_error(
@@ -1071,11 +1157,13 @@ fn hold_sidecar_lock(
         .custom_flags(nix::libc::O_NOFOLLOW);
     let deadline = Instant::now() + options.timeout;
     loop {
+        check()?;
         let file = open_options
             .open(&sidecar)
             .map_err(|source| io_error(path, source))?;
         match Flock::lock(file, operation) {
             Ok(guard) => {
+                check()?;
                 return Ok(FileLock {
                     _guard: guard,
                     path: path.to_path_buf(),
@@ -1083,6 +1171,7 @@ fn hold_sidecar_lock(
             }
             Err((file, Errno::EACCES | Errno::EAGAIN)) => {
                 drop(file);
+                check()?;
                 if Instant::now() >= deadline {
                     return Err(LockError::Timeout(LockTimeout {
                         path: path.to_path_buf(),
@@ -1500,6 +1589,19 @@ pub fn acquire_existing_parent_lock_bound(
     timeout: Duration,
     poll_interval: Duration,
 ) -> Result<BoundParentLock, ExistingParentLockError> {
+    acquire_existing_parent_lock_bound_checked(parent, name, timeout, poll_interval, &|| Ok(()))
+}
+
+/// Acquire a retained-parent persistent lock with caller checkpoints throughout
+/// contention and after acquisition. Keeps the existing lock entry and budgets.
+#[cfg(windows)]
+pub fn acquire_existing_parent_lock_bound_checked(
+    parent: &impl AsHandle,
+    name: &OsStr,
+    timeout: Duration,
+    poll_interval: Duration,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<BoundParentLock, ExistingParentLockError> {
     let name =
         NormalLockName::parse(name).ok_or_else(|| ExistingParentLockError::InvalidLockPath {
             name: name.to_os_string(),
@@ -1508,11 +1610,21 @@ pub fn acquire_existing_parent_lock_bound(
     validate_parent_handle_windows(parent, &path)?;
     let parent_identity = file_identity(parent.as_handle().as_raw_handle())
         .map_err(|source| existing_io("stat bound persistent lock parent", &path, source))?;
-    let guard = acquire_lock_in_parent_windows(parent, &name, &path, timeout, poll_interval, true)?;
-    Ok(BoundParentLock {
+    let guard = acquire_lock_in_parent_windows_checked(
+        parent,
+        &name,
+        &path,
+        timeout,
+        poll_interval,
+        true,
+        checkpoint,
+    )?;
+    let lock = BoundParentLock {
         _guard: guard,
         parent_identity,
-    })
+    };
+    lock.revalidate_bound(parent, name.as_os_str())?;
+    Ok(lock)
 }
 
 /// Hold an existing persistent entry without creating it or its parent.
@@ -1552,8 +1664,30 @@ fn acquire_lock_in_parent_windows(
     poll_interval: Duration,
     allow_create: bool,
 ) -> Result<WindowsLockGuard, ExistingParentLockError> {
+    acquire_lock_in_parent_windows_checked(
+        parent,
+        name,
+        path,
+        timeout,
+        poll_interval,
+        allow_create,
+        &|| Ok(()),
+    )
+}
+
+#[cfg(windows)]
+fn acquire_lock_in_parent_windows_checked(
+    parent: &impl AsHandle,
+    name: &NormalLockName,
+    path: &Path,
+    timeout: Duration,
+    poll_interval: Duration,
+    allow_create: bool,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<WindowsLockGuard, ExistingParentLockError> {
     let deadline = Instant::now() + timeout;
     loop {
+        authorize_bound_lock(path, checkpoint)?;
         let observed = observe_lock_entry_windows(parent, name, path)?;
         if observed.is_none() && !allow_create {
             return Err(ExistingParentLockError::NamespaceChanged {
@@ -1640,6 +1774,7 @@ fn acquire_lock_in_parent_windows(
             Ok(guard) => {
                 run_windows_entry_replacement_hook();
                 verify_final_lock_entry_windows(parent, name, guard.file(), path)?;
+                authorize_bound_lock(path, checkpoint)?;
                 if timeout.is_zero() {
                     return Ok(guard);
                 }
@@ -1651,6 +1786,7 @@ fn acquire_lock_in_parent_windows(
             }
             Err((file, error)) if windows_contention(&error) => {
                 drop(file);
+                authorize_bound_lock(path, checkpoint)?;
                 wait_or_expire(deadline, poll_interval, path, timeout)?;
             }
             Err((file, source)) => {
@@ -1913,7 +2049,22 @@ pub(crate) fn open_windows_path(
 
 #[cfg(windows)]
 pub fn hold_lock(path: impl AsRef<Path>, options: LockOptions) -> Result<FileLock, LockError> {
+    hold_lock_checked(path, options, &|| Ok(()))
+}
+
+/// Acquire [`hold_lock`]'s sidecar after `checkpoint` accepts the parent and sidecar creation.
+#[cfg(windows)]
+pub fn hold_lock_checked(
+    path: impl AsRef<Path>,
+    options: LockOptions,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<FileLock, LockError> {
     let path = path.as_ref();
+    let check = || {
+        checkpoint()
+            .map_err(|detail| io_error(path, io::Error::new(io::ErrorKind::Interrupted, detail)))
+    };
+    check()?;
     let parent = parent_dir(path);
     fs::create_dir_all(parent).map_err(|source| io_error(path, source))?;
     let file_name = path.file_name().ok_or_else(|| {
@@ -1925,6 +2076,7 @@ pub fn hold_lock(path: impl AsRef<Path>, options: LockOptions) -> Result<FileLoc
     let sidecar = derive_sidecar_path(parent, file_name);
     let deadline = Instant::now() + options.timeout;
     loop {
+        check()?;
         let file = open_windows_path(
             &sidecar,
             GENERIC_READ | GENERIC_WRITE,
@@ -1944,6 +2096,7 @@ pub fn hold_lock(path: impl AsRef<Path>, options: LockOptions) -> Result<FileLoc
         }
         match try_lock_exclusive(file) {
             Ok(guard) => {
+                check()?;
                 return Ok(FileLock {
                     _guard: guard,
                     path: path.to_path_buf(),
@@ -1951,6 +2104,7 @@ pub fn hold_lock(path: impl AsRef<Path>, options: LockOptions) -> Result<FileLoc
             }
             Err((file, error)) if windows_contention(&error) => {
                 drop(file);
+                check()?;
                 if Instant::now() >= deadline {
                     return Err(LockError::Timeout(LockTimeout {
                         path: path.to_path_buf(),
@@ -2904,5 +3058,75 @@ mod existing_read_lock_tests {
         ));
         drop(reader);
         assert!(hold_lock(&protected, immediate).is_ok());
+    }
+}
+
+#[cfg(all(test, unix, feature = "full-tests"))]
+mod checked_lock_tests {
+    use super::*;
+    use crate::test_support::TempDir;
+
+    #[test]
+    fn checked_lock_rechecks_authority_after_acquisition_and_releases_on_refusal() {
+        let temporary = TempDir::new();
+        let path = temporary.path().join("authority");
+        let result = hold_lock_checked(&path, LockOptions::default(), &|| {
+            if lock_is_held(&path).map_err(|error| error.to_string())? {
+                Err("authority revoked after acquisition".to_owned())
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(result, Err(LockError::Io { source, .. })
+            if source.kind() == io::ErrorKind::Interrupted));
+        assert!(!lock_is_held(&path).unwrap());
+        let guard = hold_lock_checked(&path, LockOptions::default(), &|| Ok(())).unwrap();
+        assert!(lock_is_held(&path).unwrap());
+        drop(guard);
+        assert!(!lock_is_held(&path).unwrap());
+    }
+
+    #[test]
+    fn checked_bound_lock_root_replacement_receives_no_sidecar_and_guard_is_released() {
+        let temporary = TempDir::new();
+        let journal = temporary.path().join("journal");
+        let displaced = temporary.path().join("displaced");
+        fs::create_dir(&journal).unwrap();
+        let root = crate::JournalRoot::open(&journal).unwrap();
+        let parent = File::open(&journal).unwrap();
+        let protected = journal.join("brain.json");
+        let replaced = std::cell::Cell::new(false);
+        let result = acquire_existing_parent_lock_bound_checked(
+            &parent,
+            OsStr::new("brain.json.lock"),
+            Duration::ZERO,
+            Duration::ZERO,
+            &|| {
+                if !replaced.get() && lock_is_held(&protected).map_err(|error| error.to_string())? {
+                    fs::rename(&journal, &displaced).unwrap();
+                    fs::create_dir(&journal).unwrap();
+                    replaced.set(true);
+                }
+                root.revalidate_canonical_binding()
+                    .map_err(|error| error.to_string())
+            },
+        );
+        assert!(replaced.get());
+        assert!(
+            matches!(result, Err(ExistingParentLockError::Io { source, .. })
+            if source.kind() == io::ErrorKind::Interrupted)
+        );
+        assert!(fs::read_dir(&journal).unwrap().next().is_none());
+        assert!(displaced.join("brain.json.lock").is_file());
+        let guard = acquire_existing_parent_lock_bound(
+            &parent,
+            OsStr::new("brain.json.lock"),
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+        guard
+            .revalidate_bound(&parent, OsStr::new("brain.json.lock"))
+            .unwrap();
     }
 }

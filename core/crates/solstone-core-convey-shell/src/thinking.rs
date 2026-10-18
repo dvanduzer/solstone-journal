@@ -1328,6 +1328,67 @@ async fn save_key(Extension(journal): Extension<Arc<JournalRoot>>, body: Bytes) 
     };
     let value = value.trim();
     let provider = key_provider(env_var).expect("checked provider");
+    let admitted = match solstone_core_journal_io::JournalRoot::open(&journal.0) {
+        Ok(root) => Arc::new(root),
+        Err(error) => {
+            log::warn!("thinking key save refused the journal root: {error}");
+            return mutation_error(solstone_core_thinking::MutationError::StaleProbe);
+        }
+    };
+    if let Err(error) = admitted.revalidate_canonical_binding() {
+        log::warn!("thinking key save refused the journal root: {error}");
+        return mutation_error(solstone_core_thinking::MutationError::StaleProbe);
+    }
+    let identity = admitted.identity();
+    let (pre_probe_key, pre_probe_entry) = match solstone_core_thinking::read_config(&journal.0) {
+        Ok(config) => {
+            let key = config
+                .get("env")
+                .and_then(Value::as_object)
+                .and_then(|env| env.get(env_var))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+            let entry = config
+                .get("providers")
+                .and_then(Value::as_object)
+                .and_then(|providers| providers.get("key_validation"))
+                .and_then(Value::as_object)
+                .and_then(|entries| entries.get(provider))
+                .cloned();
+            (key, entry)
+        }
+        Err(error) => {
+            return mutation_error(solstone_core_thinking::MutationError::Read(error));
+        }
+    };
+    if let Err(error) = admitted.revalidate_canonical_binding() {
+        log::warn!("thinking key save refused the journal root: {error}");
+        return mutation_error(solstone_core_thinking::MutationError::StaleProbe);
+    }
+    if admitted.identity() != identity {
+        log::warn!("thinking key save refused a replaced journal root");
+        return mutation_error(solstone_core_thinking::MutationError::StaleProbe);
+    }
+    let validation_witness = if value.is_empty() {
+        None
+    } else {
+        match solstone_core_brain::capture_credential_validation_bound(
+            admitted.clone(),
+            &journal.0,
+            solstone_core_brain::CredentialHoldTarget::Managed {
+                provider,
+                credential: value,
+            },
+        ) {
+            Ok(witness) => Some(witness),
+            Err(error) => {
+                log::warn!("thinking key validation lost its local authority: {error}");
+                return mutation_error(solstone_core_thinking::MutationError::StaleProbe);
+            }
+        }
+    };
     let validator = match one_shot_validator(&journal.0) {
         Ok(validator) => validator,
         Err(response) => return *response,
@@ -1344,7 +1405,16 @@ async fn save_key(Extension(journal): Extension<Arc<JournalRoot>>, body: Bytes) 
         Value::Object(result)
     });
     match solstone_core_thinking::providers::save_key(
-        &journal.0, env_var, provider, value, validation,
+        &journal.0,
+        &admitted,
+        &solstone_core_thinking::providers::Cancellation::never(),
+        env_var,
+        provider,
+        value,
+        validation,
+        &pre_probe_key,
+        pre_probe_entry.as_ref(),
+        validation_witness,
     ) {
         Ok(value) => json_response(value),
         Err(error) => mutation_error(error),
@@ -1820,14 +1890,8 @@ fn browser_validation(result: Value, identity: Value) -> Response {
             "reason_code".to_owned(),
             result.get("reason_code").cloned().unwrap_or(Value::Null),
         );
-        response.insert(
-            "message".to_owned(),
-            result
-                .get("error")
-                .cloned()
-                .unwrap_or_else(|| Value::String(String::new())),
-        );
-    } else if let Some(reason) = result.get("probe_reason_code") {
+    }
+    if let Some(reason) = result.get("probe_reason_code") {
         response.insert("probe_reason_code".to_owned(), reason.clone());
     }
     json_response(Value::Object(response))
@@ -1929,12 +1993,12 @@ fn confidential_enable_failed() -> Response {
         StatusCode::INTERNAL_SERVER_ERROR,
     )
 }
-/// The change committed but its audit record could not be appended. The save
-/// landed, so the refusal must not say it didn't.
+/// The change committed but its audit append was not confirmed. The complete
+/// row may already be present, so report uncertainty without claiming absence.
 fn saved_unlogged() -> Response {
     envelope(
         "settings_saved_unlogged",
-        "your change was saved, but your journal couldn't add it to its log. check the health dashboard.",
+        "your change was saved, but your journal couldn't confirm its log entry. check the health dashboard.",
         GENERIC_THINKING_ERROR,
         StatusCode::INTERNAL_SERVER_ERROR,
     )
@@ -1966,6 +2030,7 @@ fn mutation_error(error: solstone_core_thinking::MutationError) -> Response {
         solstone_core_thinking::MutationError::ConfigWrite(_error) => thinking_failure(),
         solstone_core_thinking::MutationError::Read(_error) => thinking_failure(),
         solstone_core_thinking::MutationError::ActionLog(_error) => saved_unlogged(),
+        solstone_core_thinking::MutationError::StaleProbe => thinking_failure(),
     }
 }
 
@@ -3904,6 +3969,453 @@ mod tests {
         assert_eq!(body["image_check"]["status"], "read");
         assert_eq!(counter.load(Ordering::SeqCst), before + 1);
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[tokio::test]
+    async fn overlapping_save_fails_closed() {
+        use axum::body::Bytes;
+        use axum::extract::Extension;
+
+        let response = super::mutation_error(solstone_core_thinking::MutationError::StaleProbe);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(!body.contains("\"success\":true"));
+        assert!(!body.contains("\"success\": true"));
+
+        let root = PathBuf::from("/var/tmp").join(format!(
+            "solstone-thinking-overlap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("config")).unwrap();
+        fs::write(root.join("config/journal.json"), b"{}").unwrap();
+        let admitted = solstone_core_journal_io::JournalRoot::open(&root).expect("journal root");
+        let cancellation = solstone_core_thinking::providers::Cancellation::never();
+        let validation_root = Arc::new(solstone_core_journal_io::JournalRoot::open(&root).unwrap());
+        let witness_b = solstone_core_brain::capture_credential_validation_bound(
+            validation_root.clone(),
+            &root,
+            solstone_core_brain::CredentialHoldTarget::Managed {
+                provider: "openai",
+                credential: "key-b",
+            },
+        )
+        .unwrap();
+        let witness_a = solstone_core_brain::capture_credential_validation_bound(
+            validation_root,
+            &root,
+            solstone_core_brain::CredentialHoldTarget::Managed {
+                provider: "openai",
+                credential: "key-a",
+            },
+        )
+        .unwrap();
+        let rejection = json!({"valid":false,"reason_code":"provider_key_invalid"});
+        let committed = solstone_core_thinking::providers::save_key(
+            &root,
+            &admitted,
+            &cancellation,
+            "OPENAI_API_KEY",
+            "openai",
+            "key-b",
+            Some(rejection),
+            "",
+            None,
+            Some(witness_b),
+        )
+        .expect("save B commits");
+        assert_eq!(committed["success"], true);
+        let stored = solstone_core_thinking::read_config(&root).expect("config");
+        let entry = stored["providers"]["key_validation"]["openai"].clone();
+        let before = fs::read(root.join("config/journal.json")).unwrap();
+        let stale = solstone_core_thinking::providers::save_key(
+            &root,
+            &admitted,
+            &cancellation,
+            "OPENAI_API_KEY",
+            "openai",
+            "key-a",
+            Some(json!({"valid":true})),
+            "",
+            None,
+            Some(witness_a),
+        )
+        .expect_err("save A is stale");
+        assert!(matches!(
+            stale,
+            solstone_core_thinking::MutationError::StaleProbe
+        ));
+        assert_eq!(fs::read(root.join("config/journal.json")).unwrap(), before);
+        assert_eq!(
+            solstone_core_thinking::read_config(&root).expect("config")["env"]["OPENAI_API_KEY"],
+            "key-b"
+        );
+        assert_eq!(
+            solstone_core_thinking::read_config(&root).expect("config")["providers"]["key_validation"]
+                ["openai"]["credential_hmac"],
+            entry["credential_hmac"]
+        );
+
+        let rejected = super::save_key(
+            Extension(Arc::new(crate::JournalRoot(root.clone()))),
+            Bytes::from(r#"{"env_var":"NOT_A_KEY","value":"key-a"}"#),
+        )
+        .await;
+        assert_ne!(rejected.status(), StatusCode::OK);
+        let rejected_body = to_bytes(rejected.into_body(), usize::MAX).await.unwrap();
+        let rejected_body = String::from_utf8(rejected_body.to_vec()).unwrap();
+        assert!(!rejected_body.contains("\"success\":true"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[test]
+    fn http_save_keeps_the_key_that_won_the_probe() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::os::unix::fs::PermissionsExt;
+        use std::thread;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        use axum::body::Bytes;
+        use axum::extract::Extension;
+
+        const SECRET_A: &str = "alpha-save-secret";
+        const SECRET_B: &str = "beta-save-secret";
+        const BODY_CANARY: &str = "PROVIDER-BODY-CANARY";
+        const MARKER: &str = "SOLSTONE_HTTP_SAVE_REEXEC";
+
+        if std::env::var(MARKER).ok().as_deref() != Some("1") {
+            let current = std::env::current_exe().expect("test executable");
+            let original_sibling = current
+                .parent()
+                .expect("deps")
+                .join(format!("solstone-core{}", std::env::consts::EXE_SUFFIX));
+            let before = fs::metadata(&original_sibling).ok().map(|meta| meta.len());
+            let private_dir = PathBuf::from("/var/tmp").join(format!(
+                "solstone-http-save-reexec-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&private_dir).expect("private directory");
+            let child_exe = private_dir.join(current.file_name().expect("executable name"));
+            fs::copy(&current, &child_exe).expect("private test executable");
+            let output = std::process::Command::new(&child_exe)
+                .arg("--exact")
+                .arg("thinking::tests::http_save_keeps_the_key_that_won_the_probe")
+                .arg("--nocapture")
+                .env(MARKER, "1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+                .expect("re-exec");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "private save harness failed: {stdout}{stderr}"
+            );
+            assert!(stdout.contains("http_save_keeps_the_key_that_won_the_probe"));
+            assert!(stdout.contains("... ok"));
+            assert_eq!(
+                fs::metadata(&original_sibling).ok().map(|meta| meta.len()),
+                before
+            );
+            let _ = fs::remove_dir_all(private_dir);
+            return;
+        }
+
+        struct SiblingGuard {
+            path: PathBuf,
+            previous: Option<Vec<u8>>,
+        }
+        impl Drop for SiblingGuard {
+            fn drop(&mut self) {
+                match &self.previous {
+                    Some(bytes) => {
+                        let _ = fs::write(&self.path, bytes);
+                    }
+                    None => {
+                        let _ = fs::remove_file(&self.path);
+                    }
+                }
+            }
+        }
+
+        let root = PathBuf::from("/var/tmp").join(format!(
+            "solstone-thinking-http-save-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("config")).expect("config");
+        fs::write(root.join("config/journal.json"), b"{}").expect("config");
+        let receipt = root.with_file_name(format!(
+            "{}-receipt",
+            root.file_name().expect("journal name").to_string_lossy()
+        ));
+        let receipt_text = receipt.display().to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback");
+        let port = listener.local_addr().expect("port").port();
+        let sibling = std::env::current_exe()
+            .expect("test executable")
+            .parent()
+            .expect("private directory")
+            .join(format!("solstone-core{}", std::env::consts::EXE_SUFFIX));
+        let previous = fs::read(&sibling).ok();
+        let script = format!(
+            r#"#!/usr/bin/env python3
+import json, os, socket, sys
+receipt = r"{receipt_text}"
+override = os.environ.get("SOLSTONE_GENERATE_API_KEY_OVERRIDE", "")
+with open(receipt, "a", encoding="utf-8") as handle:
+    handle.write(override + "\n")
+stdin = sys.stdin.read()
+sentence = "Reply with the single word OK."
+payload = sentence.encode() if sentence in stdin else b"STDIN-LACKS-CANNED-SENTENCE"
+request = (
+    b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: %d\r\nConnection: close\r\n\r\n"
+    % len(payload)
+) + payload
+sock = socket.create_connection(("127.0.0.1", {port}), 30)
+sock.sendall(request)
+data = b""
+while True:
+    chunk = sock.recv(4096)
+    if not chunk:
+        break
+    data += chunk
+head, _, body = data.partition(b"\r\n\r\n")
+status = int(head.split()[1])
+text = body.decode()
+if status == 200:
+    out = {{
+        "schema": "solstone-generate-response-v2",
+        "outcome": "generated",
+        "text": "OK",
+        "model": "solstone-key-check",
+        "usage": {{}},
+        "finish_reason": "stop",
+    }}
+else:
+    out = {{
+        "schema": "solstone-generate-response-v2",
+        "outcome": "refused",
+        "reason": "provider-response-invalid",
+        "reason_code": "provider_key_invalid",
+        "retryable": False,
+        "blocking": True,
+        "detail": text,
+    }}
+with open(receipt + "-outcomes", "a", encoding="utf-8") as handle:
+    handle.write(json.dumps({{"credential": override, "outcome": out["outcome"],
+                            "reason_code": out.get("reason_code")}}) + "\n")
+sys.stdout.write(json.dumps(out))
+"#
+        );
+        fs::write(&sibling, script).expect("stub");
+        fs::set_permissions(&sibling, fs::Permissions::from_mode(0o755)).expect("stub mode");
+        let _guard = SiblingGuard {
+            path: sibling,
+            previous,
+        };
+
+        fn invoke(root: PathBuf, body: String) -> (StatusCode, String) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async {
+                let response = super::save_key(
+                    Extension(Arc::new(crate::JournalRoot(root))),
+                    Bytes::from(body),
+                )
+                .await;
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("body");
+                (status, String::from_utf8(bytes.to_vec()).expect("utf8"))
+            })
+        }
+        fn read_http(stream: &mut std::net::TcpStream) -> String {
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+                .expect("timeout");
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 2048];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        buffer.extend_from_slice(&chunk[..count]);
+                        if let Some(split) =
+                            buffer.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            let headers = String::from_utf8_lossy(&buffer[..split]);
+                            let length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().ok())?
+                                })
+                                .unwrap_or(0);
+                            if buffer.len() >= split + 4 + length {
+                                break;
+                            }
+                        }
+                    }
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            || error.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+            String::from_utf8_lossy(&buffer).into_owned()
+        }
+        fn write_http(stream: &mut std::net::TcpStream, status: u16, body: &str) {
+            let message = format!(
+                "HTTP/1.1 {status} Save\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(message.as_bytes()).expect("response");
+        }
+
+        let root_a = root.clone();
+        let save_a = thread::spawn(move || {
+            invoke(
+                root_a,
+                format!(r#"{{"env_var":"OPENAI_API_KEY","value":"{SECRET_A}"}}"#),
+            )
+        });
+        fn accept_bounded(listener: &TcpListener) -> std::net::TcpStream {
+            use std::time::{Duration, Instant};
+            listener.set_nonblocking(true).expect("nonblocking");
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false).expect("blocking");
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(30)))
+                            .expect("read timeout");
+                        return stream;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            panic!("accept timed out");
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                }
+            }
+        }
+        let (mut stream_a, request_a) = {
+            let mut stream = accept_bounded(&listener);
+            let request = read_http(&mut stream);
+            (stream, request)
+        };
+        assert!(request_a.contains("Reply with the single word OK."));
+        let root_b = root.clone();
+        let save_b = thread::spawn(move || {
+            invoke(
+                root_b,
+                format!(r#"{{"env_var":"OPENAI_API_KEY","value":"{SECRET_B}"}}"#),
+            )
+        });
+        let (mut stream_b, request_b) = {
+            let mut stream = accept_bounded(&listener);
+            let request = read_http(&mut stream);
+            (stream, request)
+        };
+        assert!(request_b.contains("Reply with the single word OK."));
+        let recorded = fs::read_to_string(&receipt).expect("probe receipt");
+        assert_eq!(recorded.lines().collect::<Vec<_>>(), [SECRET_A, SECRET_B]);
+        assert!(!root.join("probe-receipt").exists());
+        write_http(&mut stream_b, 200, "OK");
+        drop(stream_b);
+        let (status_b, body_b) = save_b.join().expect("save B");
+        assert_eq!(status_b, StatusCode::OK, "{body_b}");
+        let saved_b: Value = serde_json::from_str(&body_b).expect("save B response");
+        assert_eq!(saved_b["success"], true);
+        assert_eq!(saved_b["validation"]["valid"], true);
+        assert!(
+            !save_a.is_finished(),
+            "A stays pending until its actual refusal is released"
+        );
+        write_http(&mut stream_a, 401, BODY_CANARY);
+        drop(stream_a);
+        let (_status_a, body_a) = save_a.join().expect("save A");
+        assert!(!body_a.contains("\"success\":true"));
+        assert!(!body_a.contains(SECRET_A));
+        assert!(!body_a.contains(BODY_CANARY));
+
+        let config = solstone_core_thinking::read_config(&root).expect("config");
+        assert_eq!(config["env"]["OPENAI_API_KEY"], SECRET_B);
+        assert_eq!(
+            config["providers"]["key_validation"]["openai"]["valid"],
+            true
+        );
+        assert!(
+            config["providers"]["key_validation"]["openai"]["credential_observation_id"]
+                .as_str()
+                .is_some_and(|id| id.len() == 64)
+        );
+        assert!(
+            config["providers"]["key_validation"]["openai"]["credential_hmac"]
+                .as_str()
+                .is_some()
+        );
+        assert_ne!(config["env"]["OPENAI_API_KEY"], SECRET_A);
+        fn walk(path: &std::path::Path, secret: &str, canary: &str) {
+            if path.is_dir() {
+                for entry in fs::read_dir(path).expect("dir") {
+                    walk(&entry.expect("entry").path(), secret, canary);
+                }
+                return;
+            }
+            if path.file_name().and_then(|name| name.to_str()) == Some("brain-fingerprint.key") {
+                return;
+            }
+            let bytes = fs::read(path).expect("file");
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(!text.contains(secret), "{}", path.display());
+            assert!(!text.contains(canary), "{}", path.display());
+        }
+        walk(&root, SECRET_A, BODY_CANARY);
+        assert!(!receipt.starts_with(&root));
+        let outcomes_path = PathBuf::from(format!("{receipt_text}-outcomes"));
+        let outcomes = fs::read_to_string(&outcomes_path)
+            .expect("actual probe outcomes")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("probe outcome"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes,
+            [
+                json!({"credential":SECRET_B,"outcome":"generated","reason_code":null}),
+                json!({"credential":SECRET_A,"outcome":"refused","reason_code":"provider_key_invalid"}),
+            ]
+        );
+        let _ = fs::remove_file(outcomes_path);
+        let _ = fs::remove_file(&receipt);
         let _ = fs::remove_dir_all(root);
     }
 }

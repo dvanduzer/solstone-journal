@@ -37,7 +37,136 @@ pub struct BrainStateRecord {
     pub evidence: BTreeMap<String, Option<EvidenceComponent>>,
     pub checking: Option<Checking>,
     pub runtime_failure_marker: Option<RuntimeFailureMarker>,
+    pub credential_holds: BTreeMap<String, CredentialRejectionHold>,
+    pub credential_observations: BTreeMap<String, CredentialObservation>,
     pub diagnostic: BTreeMap<String, String>,
+}
+
+/// Model-independent authority carried through every Brain record rewrite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialRejectionHold {
+    pub credential_hmac: String,
+    pub marker_id: String,
+}
+
+/// Latest successfully settled credential-valid observation for one provider.
+/// This is model-independent authority, not general Brain evidence or history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialObservation {
+    pub credential_hmac: String,
+    pub observation_id: String,
+}
+
+pub(crate) fn parse_credential_observations(
+    value: Option<&Value>,
+) -> Result<BTreeMap<String, CredentialObservation>, ValidationError> {
+    let Some(value) = value else {
+        return Ok(BTreeMap::new());
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| failure("credential_observations", "must be an object"))?;
+    let providers = ["openai", "anthropic", "google", "local"].map(str::to_owned);
+    closed(object, &providers, "credential_observations.")?;
+    let fields = ["binding_version", "credential_hmac", "observation_id"].map(str::to_owned);
+    object
+        .iter()
+        .map(|(provider, value)| {
+            let path = format!("credential_observations.{provider}");
+            let entry = value
+                .as_object()
+                .ok_or_else(|| failure(&path, "must be an object"))?;
+            closed(entry, &fields, &format!("{path}."))?;
+            if entry.get("binding_version").and_then(Value::as_u64)
+                != Some(crate::CREDENTIAL_BINDING_VERSION as u64)
+            {
+                return Err(failure(
+                    &format!("{path}.binding_version"),
+                    "unsupported binding version",
+                ));
+            }
+            let digest = |name| {
+                entry
+                    .get(name)
+                    .and_then(Value::as_str)
+                    .filter(|value| is_sha256(value))
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        failure(&format!("{path}.{name}"), "must be a SHA-256 hex digest")
+                    })
+            };
+            Ok((
+                provider.clone(),
+                CredentialObservation {
+                    credential_hmac: digest("credential_hmac")?,
+                    observation_id: digest("observation_id")?,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Parse authoritative holds independently of derived evidence. Repairing an
+/// invalid evidence/checking record must not discard valid hold authority.
+pub(crate) fn parse_credential_holds(
+    value: Option<&Value>,
+) -> Result<BTreeMap<String, CredentialRejectionHold>, ValidationError> {
+    let Some(value) = value else {
+        return Ok(BTreeMap::new());
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| failure("credential_holds", "must be an object"))?;
+    let providers = ["openai", "anthropic", "google", "local"].map(str::to_owned);
+    closed(object, &providers, "credential_holds.")?;
+    let fields = [
+        "binding_version",
+        "credential_hmac",
+        "marker_id",
+        "reason_code",
+    ]
+    .map(str::to_owned);
+    object
+        .iter()
+        .map(|(provider, value)| {
+            let path = format!("credential_holds.{provider}");
+            let entry = value
+                .as_object()
+                .ok_or_else(|| failure(&path, "must be an object"))?;
+            closed(entry, &fields, &format!("{path}."))?;
+            if entry.get("binding_version").and_then(Value::as_u64)
+                != Some(crate::CREDENTIAL_BINDING_VERSION as u64)
+            {
+                return Err(failure(
+                    &format!("{path}.binding_version"),
+                    "unsupported binding version",
+                ));
+            }
+            if entry.get("reason_code").and_then(Value::as_str) != Some("provider_key_invalid") {
+                return Err(failure(
+                    &format!("{path}.reason_code"),
+                    "must be provider_key_invalid",
+                ));
+            }
+            let digest = |name| {
+                entry
+                    .get(name)
+                    .and_then(Value::as_str)
+                    .filter(|value| is_sha256(value))
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        failure(&format!("{path}.{name}"), "must be a SHA-256 hex digest")
+                    })
+            };
+            Ok((
+                provider.clone(),
+                CredentialRejectionHold {
+                    credential_hmac: digest("credential_hmac")?,
+                    marker_id: digest("marker_id")?,
+                },
+            ))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -122,6 +251,9 @@ pub fn validate_brain_state_record(
         None | Some(Value::Null) => None,
         Some(value) => Some(parse_runtime_failure_marker(value, now)?),
     };
+    let credential_holds = parse_credential_holds(object.get("credential_holds"))?;
+    let credential_observations =
+        parse_credential_observations(object.get("credential_observations"))?;
 
     if aggregate_state == "ready" && reason_code.is_some() {
         return Err(failure(
@@ -171,6 +303,8 @@ pub fn validate_brain_state_record(
         evidence,
         checking,
         runtime_failure_marker,
+        credential_holds,
+        credential_observations,
         diagnostic,
     };
     validate_reduction(&record)?;
@@ -795,7 +929,7 @@ fn parse_time(
     Ok(parsed)
 }
 
-fn is_sha256(value: &str) -> bool {
+pub(crate) fn is_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
@@ -846,6 +980,8 @@ mod tests {
             ]),
             checking: None,
             runtime_failure_marker: None,
+            credential_holds: BTreeMap::new(),
+            credential_observations: BTreeMap::new(),
             diagnostic: BTreeMap::new(),
         };
 

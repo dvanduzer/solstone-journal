@@ -13,7 +13,8 @@ mod store;
 mod trust_lock;
 
 pub use action_log::{
-    ActionLogScan, append_action_log, append_action_log_for_day, read_journal_action_rows,
+    ActionLogScan, append_action_log, append_action_log_checked, append_action_log_for_day,
+    append_journal_action_log_at_root_checked, read_journal_action_rows,
 };
 pub use activity_placement::{
     ActivityCourse, PlacedRecord, ResolvedSegment, place_activity_records,

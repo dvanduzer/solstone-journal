@@ -100,11 +100,36 @@ pub fn openai_generate(request: &GenerateRequest, config: &Map<String, Value>) -
     openai_generate_with(request, config, &mut transport)
 }
 
-pub(crate) fn openai_generate_from_config(
+pub(crate) fn openai_generate_admitted(
     request: &GenerateRequest,
     config: &Map<String, Value>,
-) -> OpenAiResult {
-    openai_generate_with_lookup(request, config, &mut UreqOpenAiTransport, |_| None)
+    process_overrides: bool,
+    gate: &crate::credential_binding::ContentGate<'_>,
+) -> Result<OpenAiResult, String> {
+    let mut unpublished = None;
+    let result = if process_overrides {
+        openai_generate_with_lookup(
+            request,
+            config,
+            &mut UreqOpenAiTransport,
+            crate::overrides::non_blank_process_env,
+            Some(gate),
+            &mut unpublished,
+        )
+    } else {
+        openai_generate_with_lookup(
+            request,
+            config,
+            &mut UreqOpenAiTransport,
+            |_| None,
+            Some(gate),
+            &mut unpublished,
+        )
+    };
+    match unpublished {
+        Some(error) => Err(error),
+        None => Ok(result),
+    }
 }
 
 fn openai_generate_with<T: OpenAiTransport>(
@@ -112,12 +137,17 @@ fn openai_generate_with<T: OpenAiTransport>(
     config: &Map<String, Value>,
     transport: &mut T,
 ) -> OpenAiResult {
-    openai_generate_with_lookup(
+    let mut unpublished = None;
+    let result = openai_generate_with_lookup(
         request,
         config,
         transport,
         crate::overrides::non_blank_process_env,
-    )
+        None,
+        &mut unpublished,
+    );
+    debug_assert!(unpublished.is_none(), "an ungated call does not retain");
+    result
 }
 
 fn openai_generate_with_lookup<T: OpenAiTransport>(
@@ -125,12 +155,49 @@ fn openai_generate_with_lookup<T: OpenAiTransport>(
     config: &Map<String, Value>,
     transport: &mut T,
     env: impl Fn(&str) -> Option<String>,
+    gate: Option<&crate::credential_binding::ContentGate<'_>>,
+    unpublished: &mut Option<String>,
 ) -> OpenAiResult {
     let env = &env;
     let Some(api_key) = crate::overrides::configured_api_key_with(config, OPENAI_API_KEY_ENV, env)
     else {
         return failure("provider_key_missing");
     };
+    let witness =
+        gate.and_then(|gate| crate::credential_binding::capture_root_witness(gate.journal));
+    if let Some(gate) = gate
+        && gate.admit_content
+        && !crate::credential_binding::canned_probe(request)
+    {
+        let binding = match crate::credential_binding::admission_binding(
+            gate,
+            witness.as_ref(),
+            config,
+            solstone_core_brain::CredentialHoldTarget::Managed {
+                provider: "openai",
+                credential: &api_key,
+            },
+        ) {
+            Ok(binding) => binding,
+            Err(error) => {
+                log::warn!("credential admission refused: {error}");
+                return failure(if gate.cancellation.is_cancelled() {
+                    "request_cancelled"
+                } else {
+                    "provider_unavailable"
+                });
+            }
+        };
+        if crate::credential_binding::managed_admission(
+            Some(&api_key),
+            request,
+            gate.admit_content,
+            binding,
+        ) == crate::credential_binding::ManagedAdmission::Rejected
+        {
+            return failure("provider_key_invalid");
+        }
+    }
     let Some(model) = crate::overrides::configured_model_with(config, env) else {
         return failure("model_missing");
     };
@@ -172,6 +239,21 @@ fn openai_generate_with_lookup<T: OpenAiTransport>(
         break response;
     };
     if !(200..300).contains(&response.status) {
+        if let Some(gate) = gate {
+            crate::credential_binding::note_unpublished_retain(
+                crate::credential_binding::retain_managed_rejection(
+                    gate,
+                    witness.as_ref(),
+                    request,
+                    "openai",
+                    OPENAI_API_KEY_ENV,
+                    &api_key,
+                    response.status,
+                    &response.body,
+                ),
+                unpublished,
+            );
+        }
         let reason_code = classify_http_failure(response.status, &response.body);
         let detail = capture_provider_detail(&response.body, &api_key);
         return OpenAiResult::Failed(OpenAiFailure {
@@ -1076,12 +1158,16 @@ mod tests {
     #[test]
     fn process_environment_key_is_ignored_when_config_key_is_absent() {
         let mut transport = StubTransport::default();
+        let mut unpublished = None;
         let result = openai_generate_with_lookup(
             &request(),
             &config(None, None),
             &mut transport,
             crate::overrides::lookup_leaks_conventional_keys,
+            None,
+            &mut unpublished,
         );
+        assert!(unpublished.is_none());
         assert_eq!(
             result,
             OpenAiResult::Failed(OpenAiFailure {

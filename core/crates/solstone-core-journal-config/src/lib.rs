@@ -3,6 +3,10 @@
 
 //! Strict journal configuration reads and default materialization.
 
+/// Existing child-only credential selector, shared with credential lifetime
+/// accounting. Conventional ambient provider keys are never selectors.
+pub const GENERATE_API_KEY_OVERRIDE_ENV: &str = "SOLSTONE_GENERATE_API_KEY_OVERRIDE";
+
 mod capture_zone;
 mod defaults;
 mod direct_port;
@@ -43,7 +47,7 @@ pub use notification_labels::{
     SYSTEM_NOTIFICATIONS, SYSTEM_NOTIFICATIONS_LINUX, SYSTEM_NOTIFICATIONS_MACOS,
 };
 pub use path::get_journal_config_path;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use read::read_journal_config_bound;
 pub use read::{
     ConfigLoadError, DailyInputSinceError, JournalConfigMutationBase, JournalConfigRead,
