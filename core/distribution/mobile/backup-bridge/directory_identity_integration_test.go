@@ -222,7 +222,7 @@ func TestDirectoryIdentityPublicCRefusalAndABA(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					if owner.begin(OpSnapshot, *f.input.remote, f.input.password) != nil || owner.noteSave("") != nil {
+					if owner.begin(OpSnapshot, false, *f.input.remote, f.input.password) != nil || owner.noteSave("") != nil {
 						t.Fatal("real pending record was not established")
 					}
 					s3OwnerTestClose(t, owner)
@@ -332,7 +332,7 @@ func TestDirectoryIdentityPublicCRefusalAndABA(t *testing.T) {
 						t.Fatal(err)
 					}
 					// Init cannot adopt an uncertain attempt, so it must still refuse.
-					pending := owner.begin(OpInit, *f.input.remote, f.input.password)
+					pending := owner.begin(OpInit, false, *f.input.remote, f.input.password)
 					s3OwnerTestClose(t, owner)
 					if !errors.Is(pending, errS3OwnerPending) {
 						t.Fatal("matching A reopen bypassed pending", pending)

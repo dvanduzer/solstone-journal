@@ -401,6 +401,18 @@ fn execute_rotate_recovery_key(journal: &Path, services: &BackupServices<'_>) ->
             return error("failed");
         }
 
+        #[cfg(target_os = "ios")]
+        {
+            let candidate_id =
+                match capture_rotation_key_id(&runner, &destination, &candidate, restic, timeout) {
+                    Ok(id) => id,
+                    Err(_) => return error("failed"),
+                };
+            if candidate_id == parsed.original_key_id {
+                return error("failed");
+            }
+        }
+
         match strict_key_list_absence(
             &runner,
             &destination,
@@ -541,6 +553,18 @@ fn execute_rotate_recovery_key(journal: &Path, services: &BackupServices<'_>) ->
             };
         if !(verified.repo_exists && verified.reason_code == "repo_exists") {
             return error(verified.reason_code);
+        }
+
+        #[cfg(target_os = "ios")]
+        {
+            let candidate_id =
+                match capture_rotation_key_id(&runner, &destination, &candidate, restic, timeout) {
+                    Ok(id) => id,
+                    Err(_) => return error("failed"),
+                };
+            if candidate_id == old_id {
+                return error("failed");
+            }
         }
 
         let candidate_binding = match candidate_binding(daily_key, &candidate) {

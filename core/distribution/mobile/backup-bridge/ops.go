@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -1260,6 +1261,9 @@ func executeRemoveRecoveryKey(ctx context.Context, req bridgeRequest, setWrote f
 	setWrote()
 	if req.remote != nil && req.remote.owner != nil {
 		if err := req.remote.owner.noteSave(""); err != nil {
+			return bridgeResult{status: StatusFailed, diagnostic: DiagIoFailed}, err
+		}
+		if err := req.remote.owner.recordRemoveKeyID(keyID); err != nil {
 			return bridgeResult{status: StatusFailed, diagnostic: DiagIoFailed}, err
 		}
 	}

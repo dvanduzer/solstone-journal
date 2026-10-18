@@ -504,7 +504,7 @@ func TestS3GenericEntriesRejectOp10BeforeOwnerAdmission(t *testing.T) {
 			cfg := s3TestConfig()
 			root := s3OwnerTestDirectory(t)
 			owner := s3OwnerTestOpen(t, root, cfg)
-			if err := owner.begin(OpRemoveRecoveryKey, cfg, []byte("daily-1")); err != nil {
+			if err := owner.begin(OpRemoveRecoveryKey, false, cfg, []byte("daily-1")); err != nil {
 				t.Fatalf("begin failed: %v", err)
 			}
 			if err := tc.setup(owner); err != nil {

@@ -67,6 +67,9 @@ func s3TestWaitOperation(t *testing.T, id uint64, handle *callHandle) bridgeResu
 	}
 	handle.mu.Lock()
 	result := handle.result
+	if len(result.metadata) > 0 {
+		result.metadata = append([]byte(nil), result.metadata...)
+	}
 	handle.mu.Unlock()
 	if freeCall(id) != StatusOk {
 		t.Fatal("completed operation did not release handle")

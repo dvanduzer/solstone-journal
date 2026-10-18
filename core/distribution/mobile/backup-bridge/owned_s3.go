@@ -59,6 +59,14 @@ func (owner *s3Owner) closeOwned() error {
 			zeroBytes(owner.preservedAddIntent.Ciphertext)
 		}
 	}
+	if owner.preservedRemoveIntent != nil {
+		if len(owner.preservedRemoveIntent.RecoveryPassword) > 0 {
+			zeroBytes(owner.preservedRemoveIntent.RecoveryPassword)
+		}
+		if len(owner.preservedRemoveIntent.Ciphertext) > 0 {
+			zeroBytes(owner.preservedRemoveIntent.Ciphertext)
+		}
+	}
 	if owner.record.RecoveryHold != nil {
 		if len(owner.record.RecoveryHold.RecoveryPassword) > 0 {
 			zeroBytes(owner.record.RecoveryHold.RecoveryPassword)
@@ -69,6 +77,7 @@ func (owner *s3Owner) closeOwned() error {
 	}
 	owner.attemptPasses = nil
 	owner.preservedAddIntent = nil
+	owner.preservedRemoveIntent = nil
 	// No reverse path acquires owner.mu while holding s3OwnersMu; keep namespace
 	// registration until all teardown has actually completed.
 	s3OwnersMu.Lock()

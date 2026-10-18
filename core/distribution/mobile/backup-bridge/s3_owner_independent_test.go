@@ -17,7 +17,7 @@ import (
 func TestS3OwnerIndependentStateReplacementBeforeRenameIsPreserved(t *testing.T) {
 	cfg, root := s3TestConfig(), s3OwnerTestDirectory(t)
 	owner := s3OwnerTestOpen(t, root, cfg)
-	if err := owner.begin(OpSnapshot, cfg, []byte("fixture-password")); err != nil {
+	if err := owner.begin(OpSnapshot, false, cfg, []byte("fixture-password")); err != nil {
 		t.Fatal(err)
 	}
 	path := filepath.Join(root, s3OwnerStateName)
@@ -44,7 +44,7 @@ func TestS3OwnerIndependentStateReplacementBeforeRenameIsPreserved(t *testing.T)
 func TestS3OwnerIndependentSubsequentSaveDetectsStateReplacement(t *testing.T) {
 	cfg, root := s3TestConfig(), s3OwnerTestDirectory(t)
 	owner := s3OwnerTestOpen(t, root, cfg)
-	if owner.begin(OpSnapshot, cfg, []byte("fixture-password")) != nil || owner.noteSave("") != nil {
+	if owner.begin(OpSnapshot, false, cfg, []byte("fixture-password")) != nil || owner.noteSave("") != nil {
 		t.Fatal("setup failed")
 	}
 	path := filepath.Join(root, s3OwnerStateName)
@@ -62,12 +62,12 @@ func TestS3OwnerIndependentSubsequentSaveDetectsStateReplacement(t *testing.T) {
 func TestS3OwnerIndependentRecoveredPendingCannotBecomeCompleted(t *testing.T) {
 	cfg, root := s3TestConfig(), s3OwnerTestDirectory(t)
 	first := s3OwnerTestOpen(t, root, cfg)
-	if first.begin(OpInit, cfg, []byte("fixture-password")) != nil || first.noteSave("") != nil {
+	if first.begin(OpInit, false, cfg, []byte("fixture-password")) != nil || first.noteSave("") != nil {
 		t.Fatal("setup failed")
 	}
 	s3OwnerTestClose(t, first)
 	recovered := s3OwnerTestOpen(t, root, cfg)
-	if recovered.begin(OpInit, cfg, []byte("fixture-password")) == nil {
+	if recovered.begin(OpInit, false, cfg, []byte("fixture-password")) == nil {
 		t.Fatal("pending admission succeeded")
 	}
 	if err := recovered.drainPrimary(); err != nil {
@@ -81,7 +81,7 @@ func TestS3OwnerIndependentRecoveredPendingCannotBecomeCompleted(t *testing.T) {
 func TestS3OwnerIndependentAdmittedSavePanicCannotBecomeCompleted(t *testing.T) {
 	cfg, root := s3TestConfig(), s3OwnerTestDirectory(t)
 	owner := s3OwnerTestOpen(t, root, cfg)
-	if owner.begin(OpInit, cfg, []byte("fixture-password")) != nil {
+	if owner.begin(OpInit, false, cfg, []byte("fixture-password")) != nil {
 		t.Fatal("setup failed")
 	}
 	entered := false

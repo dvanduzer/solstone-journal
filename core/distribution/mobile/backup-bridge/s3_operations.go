@@ -146,7 +146,7 @@ func removeInheritedS3Locks(request *s3RemoteRequest) (err error) {
 	return result
 }
 
-func beginS3Owner(owner *s3Owner, operation int32, cfg s3Config, passwords ...[]byte) (err error) {
+func beginS3Owner(owner *s3Owner, operation int32, rotationCustody bool, cfg s3Config, passwords ...[]byte) (err error) {
 	defer func() {
 		if recover() != nil {
 			owner.mu.Lock()
@@ -155,7 +155,7 @@ func beginS3Owner(owner *s3Owner, operation int32, cfg s3Config, passwords ...[]
 			err = errS3OwnerIO
 		}
 	}()
-	return owner.begin(operation, cfg, passwords...)
+	return owner.begin(operation, rotationCustody, cfg, passwords...)
 }
 
 func safelyCleanupS3Locks(request *s3RemoteRequest) (err error) {
@@ -339,7 +339,7 @@ func runS3Worker(h *callHandle, req bridgeRequest) {
 		if owner.record.Active != nil && owner.record.Active.MayHaveWritten {
 			pending = true
 		}
-	} else if err := beginS3Owner(owner, req.operation, req.remote.cfg, req.password, req.recoveryPassword); err != nil {
+	} else if err := beginS3Owner(owner, req.operation, req.rotationCustody, req.remote.cfg, req.password, req.recoveryPassword); err != nil {
 		if errors.Is(err, errS3RecoveryHold) {
 			pending = true
 			keyID, holdPw := owner.recoveryHoldInfo()

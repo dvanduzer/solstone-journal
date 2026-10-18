@@ -7,11 +7,11 @@ package main
 import (
 	"context"
 	"errors"
-	"github.com/restic/restic/internal/backend"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
+
+	"github.com/restic/restic/internal/backend"
 )
 
 type permissionChangingReader struct {

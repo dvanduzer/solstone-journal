@@ -48,10 +48,12 @@ pub fn decode_recovery_add_resume(bytes: &[u8]) -> Result<String, ResumeDecodeEr
     if payload.recovery_password.len() > 256 {
         return Err(ResumeDecodeError::PasswordTooLong);
     }
-    if let Some(ref key_id) = payload.key_id {
-        if !valid_key_id(key_id) {
-            return Err(ResumeDecodeError::BadKeyId);
-        }
+    if payload
+        .key_id
+        .as_deref()
+        .is_some_and(|key_id| !valid_key_id(key_id))
+    {
+        return Err(ResumeDecodeError::BadKeyId);
     }
 
     Ok(payload.recovery_password)

@@ -159,6 +159,13 @@ unsafe extern "C" {
         maintenance: u32,
         out: *mut u64,
     ) -> i32;
+    fn restic_bridge_s3_add_recovery_key_v1_start(
+        request: *const RemoteRequest,
+        options: *const Options,
+        state_fd: i32,
+        custody: u32,
+        out: *mut u64,
+    ) -> i32;
     fn restic_bridge_free(id: u64) -> i32;
 }
 
@@ -250,6 +257,15 @@ mod unlinked {
         _: i32,
         _: *const c_char,
         _: u32,
+        _: u32,
+        _: *mut u64,
+    ) -> i32 {
+        INVALID_ARGUMENT
+    }
+    pub(super) unsafe fn restic_bridge_s3_add_recovery_key_v1_start(
+        _: *const RemoteRequest,
+        _: *const Options,
+        _: i32,
         _: u32,
         _: *mut u64,
     ) -> i32 {
@@ -589,6 +605,45 @@ impl Call {
                 key_id_bytes.pointer,
                 key_id_bytes.length,
                 maintenance,
+                &mut id,
+            )
+        };
+        Self::published(id, status, began)
+    }
+
+    pub(super) fn remote_add_recovery_key_rotation(
+        password: &[u8],
+        recovery_password: &[u8],
+        remote: &Remote<'_>,
+        options: &Options,
+        custody: u32,
+    ) -> Result<Self, i32> {
+        let began = Instant::now();
+        let request = RemoteRequest {
+            version: 1,
+            operation: ADD_RECOVERY_KEY,
+            endpoint: Bytes::new(remote.endpoint.as_bytes())?,
+            region: Bytes::new(remote.region.as_bytes())?,
+            bucket: Bytes::new(remote.bucket.as_bytes())?,
+            prefix: Bytes::new(remote.prefix.as_bytes())?,
+            access: Bytes::new(remote.access)?,
+            secret: Bytes::new(remote.secret)?,
+            token: Bytes::new(remote.token)?,
+            password: Bytes::new(password)?,
+            recovery_password: Bytes::new(recovery_password)?,
+            state: Bytes::new(remote.state.path.as_bytes())?,
+            source: Bytes::new(&[])?,
+            restore: Bytes::new(&[])?,
+            snapshot: Bytes::new(&[])?,
+            workspace: Bytes::new(&[])?,
+        };
+        let mut id = 0;
+        let status = unsafe {
+            restic_bridge_s3_add_recovery_key_v1_start(
+                &request,
+                options,
+                remote.state.descriptor.as_raw_fd(),
+                custody,
                 &mut id,
             )
         };

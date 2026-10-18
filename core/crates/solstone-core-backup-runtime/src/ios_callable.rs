@@ -768,29 +768,69 @@ pub(crate) fn add_recovery_key_rotation(
         cancellation,
     )
     .map_err(|_| RepoError::Failed)?;
+    let repository::Repository::S3 {
+        destination: s3_dest,
+        access,
+        secret,
+        token,
+        append_only,
+    } = repository
+    else {
+        return Err(RepoError::Failed);
+    };
+
+    authority
+        .revalidate()
+        .map_err(|reason| refused(reason.code()))
+        .map_err(|_| RepoError::Failed)?;
+    let daily_password = Zeroizing::new(daily_key.as_bytes().to_vec());
+    let candidate_password = Zeroizing::new(candidate.as_bytes().to_vec());
+    let state = authority
+        .installed
+        .storage
+        .create_state(&s3_dest.namespace())
+        .map_err(|reason| refused(reason.code()))
+        .map_err(|_| RepoError::Failed)?;
+    state
+        .revalidate()
+        .map_err(|reason| refused(reason.code()))
+        .map_err(|_| RepoError::Failed)?;
+    let remote = native::Remote {
+        endpoint: &s3_dest.endpoint,
+        region: &s3_dest.region,
+        bucket: &s3_dest.bucket,
+        prefix: &s3_dest.prefix,
+        access: access.as_bytes(),
+        secret: secret.as_bytes(),
+        token: token.as_bytes(),
+        state: native::PrivateDirectory {
+            path: state.path(),
+            descriptor: state.as_fd(),
+        },
+    };
     let options = native::Options {
-        version: 1,
+        version: if append_only { 2 } else { 1 },
         check_read_mode: 0,
         retry_lock_ms: 0,
         group: 0,
         groups: 0,
-        reserved1: 0,
+        reserved1: u32::from(append_only),
         reserved2: 0,
     };
-    let completed = execute(
-        authority,
-        3,
-        false,
-        repository,
-        daily_key,
-        candidate,
-        &[],
+    let call = native::Call::remote_add_recovery_key_rotation(
+        &daily_password,
+        &candidate_password,
+        &remote,
         &options,
-        timeout,
-        cancellation,
-        false,
+        1,
     )
-    .map_err(ExecuteError::into_repo)?;
+    .map_err(|status| {
+        log::warn!("ios backup add recovery key rotation refused at entry: status {status}");
+        RepoError::Failed
+    })?;
+    let cancelled = || cancellation.is_some_and(ArchiveCancellation::is_cancelled);
+    let completed = call.wait(timeout, Some(&cancelled), true);
+    log_failure(3, &completed);
 
     let is_remote_pending = completed.fields.status == 11
         && outcome::diagnostic(&completed.fields).is_ok_and(|d| d == "REMOTE_PENDING");

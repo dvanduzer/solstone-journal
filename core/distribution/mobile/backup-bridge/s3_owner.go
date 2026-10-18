@@ -63,6 +63,7 @@ type s3OwnerIntent struct {
 	RecoveryPassword []byte   `json:"recovery_password,omitempty"`
 	KeyID            string   `json:"key_id,omitempty"`
 	Ciphertext       []byte   `json:"ciphertext,omitempty"`
+	RotationCustody  bool     `json:"rotation_custody,omitempty"`
 }
 
 type s3RecoveryHold struct {
@@ -116,8 +117,9 @@ type s3Owner struct {
 	lockAcks        map[string]bool
 	backends        []*s3OperationBackend
 	// Private deterministic fault/barrier injection; no public setter or ABI.
-	fault              func(string) error
-	preservedAddIntent *s3OwnerIntent
+	fault                 func(string) error
+	preservedAddIntent    *s3OwnerIntent
+	preservedRemoveIntent *s3OwnerIntent
 }
 
 func s3DestinationFor(cfg s3Config) (s3Destination, error) {
@@ -364,15 +366,32 @@ func completeS3StateJSON(raw []byte) error {
 		}
 		for _, name := range names {
 			value, present := fields[name]
-			if !present || bytes.Equal(bytes.TrimSpace(value), []byte("null")) && !nullable[name] {
+			if !present || (bytes.Equal(bytes.TrimSpace(value), []byte("null")) && !nullable[name]) {
 				return nil, errS3OwnerInvalid
 			}
 		}
 		return fields, nil
 	}
-	fields, err := object(raw, []string{"version", "destination", "credentials", "passwords", "active", "complete", "recovery_hold"}, map[string]bool{"active": true, "complete": true, "recovery_hold": true})
-	if err != nil {
-		return err
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil {
+		return errS3OwnerInvalid
+	}
+	if len(fields) != 6 && len(fields) != 7 {
+		return errS3OwnerInvalid
+	}
+	required6 := []string{"version", "destination", "credentials", "passwords", "active", "complete"}
+	nullable := map[string]bool{"active": true, "complete": true, "recovery_hold": true}
+	for _, name := range required6 {
+		value, present := fields[name]
+		if !present || (bytes.Equal(bytes.TrimSpace(value), []byte("null")) && !nullable[name]) {
+			return errS3OwnerInvalid
+		}
+	}
+	if len(fields) == 7 {
+		value, present := fields["recovery_hold"]
+		if !present || (bytes.Equal(bytes.TrimSpace(value), []byte("null")) && !nullable["recovery_hold"]) {
+			return errS3OwnerInvalid
+		}
 	}
 	if _, err := object(fields["destination"], []string{"endpoint", "region", "bucket", "prefix"}, nil); err != nil {
 		return err
@@ -403,6 +422,14 @@ func completeS3StateJSON(raw []byte) error {
 				if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
 					return errS3OwnerInvalid
 				}
+			case "rotation_custody":
+				if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+					return errS3OwnerInvalid
+				}
+				var b bool
+				if json.Unmarshal(value, &b) != nil {
+					return errS3OwnerInvalid
+				}
 			default:
 				return errS3OwnerInvalid
 			}
@@ -418,8 +445,8 @@ func completeS3StateJSON(raw []byte) error {
 			return err
 		}
 	}
-	if !bytes.Equal(bytes.TrimSpace(fields["recovery_hold"]), []byte("null")) {
-		if _, err := object(fields["recovery_hold"], []string{"key_id", "recovery_password", "ciphertext"}, nil); err != nil {
+	if holdRaw, present := fields["recovery_hold"]; present && !bytes.Equal(bytes.TrimSpace(holdRaw), []byte("null")) {
+		if _, err := object(holdRaw, []string{"key_id", "recovery_password", "ciphertext"}, nil); err != nil {
 			return err
 		}
 	}
@@ -641,7 +668,7 @@ func (owner *s3Owner) persist(record s3OwnerRecord) (published bool, resultErr e
 	return true, nil
 }
 
-func (owner *s3Owner) begin(operation int32, cfg s3Config, passwords ...[]byte) error {
+func (owner *s3Owner) begin(operation int32, rotationCustody bool, cfg s3Config, passwords ...[]byte) error {
 	owner.mu.Lock()
 	defer owner.mu.Unlock()
 	if owner.closed || owner.sealing || !validOwnerOperation(operation) {
@@ -666,8 +693,9 @@ func (owner *s3Owner) begin(operation int32, cfg s3Config, passwords ...[]byte) 
 	if prior := owner.record.Active; prior != nil && prior.MayHaveWritten {
 		if prior.Operation == OpAddRecoveryKey && (operation == OpAddRecoveryKey || operation == OpListRecoveryKeys) {
 			inherited = append(inherited, prior.Locks...)
-		} else if (prior.Operation == OpRemoveRecoveryKey || prior.Operation == OpListRecoveryKeys) &&
-			(operation == OpRemoveRecoveryKey || operation == OpListRecoveryKeys) {
+		} else if prior.Operation == OpRemoveRecoveryKey && (operation == OpRemoveRecoveryKey || operation == OpListRecoveryKeys || operation == OpOpen) {
+			inherited = append(inherited, prior.Locks...)
+		} else if prior.Operation == OpListRecoveryKeys && (operation == OpRemoveRecoveryKey || operation == OpListRecoveryKeys) {
 			inherited = append(inherited, prior.Locks...)
 		} else if adoptsUncertainty(prior.Operation) && adoptsUncertainty(operation) {
 			inherited = append(inherited, prior.Locks...)
@@ -712,6 +740,14 @@ func (owner *s3Owner) begin(operation int32, cfg s3Config, passwords ...[]byte) 
 			if prior.KeyID != "" {
 				owner.knownKeyID = prior.KeyID
 			}
+			return nil
+		}
+	}
+	if prior := owner.record.Active; prior != nil && prior.MayHaveWritten && prior.Operation == OpRemoveRecoveryKey {
+		if operation == OpOpen || operation == OpListRecoveryKeys {
+			owner.begun = true
+			owner.liveID = prior.ID
+			owner.preservedRemoveIntent = prior
 			return nil
 		}
 	}
@@ -771,7 +807,16 @@ func (owner *s3Owner) begin(operation int32, cfg s3Config, passwords ...[]byte) 
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return errS3OwnerIO
 	}
-	record.Active = &s3OwnerIntent{ID: hex.EncodeToString(nonce[:]), Operation: operation, MayHaveWritten: owner.record.Active != nil && owner.record.Active.MayHaveWritten, Locks: inherited}
+	record.Active = &s3OwnerIntent{
+		ID:              hex.EncodeToString(nonce[:]),
+		Operation:       operation,
+		MayHaveWritten:  owner.record.Active != nil && owner.record.Active.MayHaveWritten,
+		Locks:           inherited,
+		RotationCustody: operation == OpAddRecoveryKey && rotationCustody,
+	}
+	if prior := owner.record.Active; prior != nil && prior.Operation == OpRemoveRecoveryKey && prior.KeyID != "" {
+		record.Active.KeyID = prior.KeyID
+	}
 	record.Complete = nil
 	if operation == OpAddRecoveryKey && owner.record.RecoveryHold != nil {
 		hold := owner.record.RecoveryHold
@@ -779,6 +824,7 @@ func (owner *s3Owner) begin(operation int32, cfg s3Config, passwords ...[]byte) 
 		record.Active.RecoveryPassword = append([]byte(nil), hold.RecoveryPassword...)
 		record.Active.Ciphertext = append([]byte(nil), hold.Ciphertext...)
 		record.Active.MayHaveWritten = true
+		record.Active.RotationCustody = true
 		owner.knownKeyID = hold.KeyID
 	}
 	if len(record.Credentials) > maxS3OwnerCredentials || len(record.Passwords) > maxS3OwnerPasswords {
@@ -898,6 +944,42 @@ func (owner *s3Owner) recordKeyID(keyID string) error {
 	if active.Operation != OpAddRecoveryKey {
 		owner.knownKeyID = keyID
 		return nil
+	}
+	if active.KeyID != "" && active.KeyID != keyID {
+		return errS3OwnerInvalid
+	}
+	if active.KeyID == keyID {
+		owner.knownKeyID = keyID
+		return nil
+	}
+	active.KeyID = keyID
+	record := owner.record
+	record.Active = &active
+	_, err := owner.persist(record)
+	if err != nil {
+		owner.stateFailed = true
+		return err
+	}
+	owner.knownKeyID = keyID
+	return nil
+}
+
+func (owner *s3Owner) recordRemoveKeyID(keyID string) error {
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+	if owner.closed || owner.sealing || owner.stateFailed || owner.record.Active == nil || owner.liveID == "" || owner.liveID != owner.record.Active.ID {
+		return errS3OwnerInvalid
+	}
+	if owner.recheckCustody("") != nil {
+		owner.stateFailed = true
+		return errS3OwnerInvalid
+	}
+	active := *owner.record.Active
+	if active.Operation != OpRemoveRecoveryKey {
+		return errS3OwnerInvalid
+	}
+	if !lowerHexID(keyID) || len(keyID) != 64 {
+		return errS3OwnerInvalid
 	}
 	if active.KeyID != "" && active.KeyID != keyID {
 		return errS3OwnerInvalid
@@ -1073,6 +1155,32 @@ func (owner *s3Owner) complete() (published bool, err error) {
 		}
 		return published, err
 	}
+	if owner.preservedRemoveIntent != nil {
+		if owner.writeFailed || owner.stateFailed {
+			return false, errS3OwnerPending
+		}
+		var remainingLocks []string
+		hasUnacked := false
+		for _, id := range owner.record.Active.Locks {
+			if !owner.lockAcks[id] {
+				hasUnacked = true
+				remainingLocks = append(remainingLocks, id)
+			}
+		}
+		if hasUnacked {
+			return false, errS3OwnerPending
+		}
+		record := owner.record
+		removeIntent := *owner.preservedRemoveIntent
+		removeIntent.Locks = remainingLocks
+		record.Active = &removeIntent
+		record.Complete = nil
+		published, err := owner.persist(record)
+		if err == nil {
+			owner.preservedRemoveIntent = nil
+		}
+		return published, err
+	}
 	if owner.writeFailed || owner.stateFailed {
 		return false, errS3OwnerPending
 	}
@@ -1100,10 +1208,14 @@ func (owner *s3Owner) complete() (published bool, err error) {
 		if keyID == "" || !lowerHexID(keyID) || len(keyID) != 64 || len(recPw) == 0 || len(ciphertext) == 0 {
 			return false, errS3OwnerPending
 		}
-		record.RecoveryHold = &s3RecoveryHold{
-			KeyID:            keyID,
-			RecoveryPassword: append([]byte(nil), recPw...),
-			Ciphertext:       append([]byte(nil), ciphertext...),
+		if owner.record.Active.RotationCustody {
+			record.RecoveryHold = &s3RecoveryHold{
+				KeyID:            keyID,
+				RecoveryPassword: append([]byte(nil), recPw...),
+				Ciphertext:       append([]byte(nil), ciphertext...),
+			}
+		} else {
+			record.RecoveryHold = nil
 		}
 	} else if !owner.attemptFailed && owner.record.Active != nil && owner.record.Active.Operation == OpRemoveRecoveryKey {
 		record.RecoveryHold = nil
@@ -1125,6 +1237,8 @@ func (owner *s3Owner) complete() (published bool, err error) {
 				var candidate []byte
 				if record.RecoveryHold != nil && len(record.RecoveryHold.RecoveryPassword) > 0 {
 					candidate = record.RecoveryHold.RecoveryPassword
+				} else if len(owner.record.Active.RecoveryPassword) > 0 {
+					candidate = owner.record.Active.RecoveryPassword
 				} else if len(owner.attemptPasses) > 1 {
 					candidate = owner.attemptPasses[1]
 				}
@@ -1221,6 +1335,14 @@ func (owner *s3Owner) Close() error {
 			zeroBytes(owner.preservedAddIntent.Ciphertext)
 		}
 	}
+	if owner.preservedRemoveIntent != nil {
+		if len(owner.preservedRemoveIntent.RecoveryPassword) > 0 {
+			zeroBytes(owner.preservedRemoveIntent.RecoveryPassword)
+		}
+		if len(owner.preservedRemoveIntent.Ciphertext) > 0 {
+			zeroBytes(owner.preservedRemoveIntent.Ciphertext)
+		}
+	}
 	if owner.record.RecoveryHold != nil {
 		if len(owner.record.RecoveryHold.RecoveryPassword) > 0 {
 			zeroBytes(owner.record.RecoveryHold.RecoveryPassword)
@@ -1231,6 +1353,7 @@ func (owner *s3Owner) Close() error {
 	}
 	owner.attemptPasses = nil
 	owner.preservedAddIntent = nil
+	owner.preservedRemoveIntent = nil
 	owner.mu.Unlock()
 	s3OwnersMu.Lock()
 	if s3Owners[owner.destination] == owner {

@@ -78,6 +78,7 @@ type bridgeRequest struct {
 	snapshotID          string
 	removeKeyID         string
 	maintenanceRotation bool
+	rotationCustody     bool
 	snapshotSelection   *snapshotSelection
 	executionOptions    *operationOptions
 	// pathFiles pin caller-authorized directories for the complete asynchronous
