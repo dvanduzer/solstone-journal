@@ -3617,3 +3617,97 @@ fn entity_listings_give_one_entity_per_id_the_one_the_identity_map_resolves() {
         assert_eq!(map.resolved[&entity.id], dir);
     }
 }
+
+#[cfg(feature = "full-tests")]
+#[test]
+fn cancelled_entity_publication_after_file_lock_wait_and_positive_twins() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, mpsc};
+    for ambiguity in [false, true] {
+        for cancel in [false, true] {
+            let root = TempDir::new();
+            if ambiguity {
+                record_ambiguity_observation(root.path(), &valid_observation()).unwrap();
+            } else {
+                crate::record_merge_candidate(
+                    root.path(),
+                    "work",
+                    "20260805",
+                    "Ada",
+                    "ada",
+                    "Ada Lovelace",
+                    "ada_lovelace",
+                    "before",
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            }
+            let path = if ambiguity {
+                root.path().join("entities/ambiguities.jsonl")
+            } else {
+                root.path().join(
+                    solstone_core_journal_io::durability::artifact(
+                        solstone_core_journal_io::durability::ArtifactId::EntityReviewCandidates,
+                    )
+                    .path,
+                )
+            };
+            let before = fs::read(&path).unwrap();
+            let held = hold_lock(&path, LockOptions::default()).unwrap();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let flag = cancelled.clone();
+            let journal = root.path().to_path_buf();
+            let (started, ready) = mpsc::channel();
+            let (checkpoint, reached) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                started.send(()).unwrap();
+                let check = || {
+                    checkpoint.send(()).unwrap();
+                    if flag.load(Ordering::SeqCst) {
+                        Err("cancelled".into())
+                    } else {
+                        Ok(())
+                    }
+                };
+                if ambiguity {
+                    let mut observation = valid_observation();
+                    observation.query.push_str(" later");
+                    crate::record_ambiguity_observation_checked(&journal, &observation, &check)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                } else {
+                    crate::record_merge_candidate_checked(
+                        &journal,
+                        "work",
+                        "20260806",
+                        "Ada",
+                        "ada",
+                        "Ada Lovelace",
+                        "ada_lovelace",
+                        "after",
+                        None,
+                        None,
+                        None,
+                        &check,
+                    )
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+                }
+            });
+            ready.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(reached.recv_timeout(Duration::from_millis(100)).is_err());
+            cancelled.store(cancel, Ordering::SeqCst);
+            drop(held);
+            let result = worker.join().unwrap();
+            if cancel {
+                assert_eq!(result.unwrap_err(), "cancelled");
+                assert_eq!(fs::read(&path).unwrap(), before);
+            } else {
+                result.unwrap();
+                assert_ne!(fs::read(&path).unwrap(), before);
+            }
+        }
+    }
+}

@@ -699,7 +699,22 @@ impl ArchiveStore {
         parts: &[(String, PartOutcome)],
         phase: u32,
     ) -> Result<(), AudioArchiveError> {
-        let tx = self.conn.transaction()?;
+        self.set_tile_outcomes_checked(day, segment, parts, phase, &|| Ok(()))
+    }
+
+    pub(crate) fn set_tile_outcomes_checked(
+        &mut self,
+        day: &str,
+        segment: &str,
+        parts: &[(String, PartOutcome)],
+        phase: u32,
+        checkpoint: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), AudioArchiveError> {
+        checkpoint().map_err(AudioArchiveError::Other)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        checkpoint().map_err(AudioArchiveError::Other)?;
         {
             let mut update=tx.prepare("UPDATE parts SET outcome=?,processing=CASE WHEN ?='saved_but_unavailable' AND processing=0 THEN 2 ELSE processing END WHERE day=? AND segment_key=? AND stored_name=? AND (outcome!=? OR (outcome='saved_but_unavailable' AND processing=0))")?;
             for (name, outcome) in parts {
@@ -731,6 +746,7 @@ impl ArchiveStore {
             "UPDATE tiles SET phase=? WHERE day=? AND segment_key=? AND phase!=?",
             params![phase, day, segment, phase],
         )?;
+        checkpoint().map_err(AudioArchiveError::Other)?;
         tx.commit()?;
         Ok(())
     }
@@ -749,8 +765,26 @@ impl ArchiveStore {
         name: &str,
         unavailable: bool,
     ) -> Result<(), AudioArchiveError> {
-        self.conn.execute("UPDATE parts SET processing=?,outcome=CASE WHEN ? THEN 'saved_but_unavailable' ELSE outcome END WHERE day=? AND segment_key=? AND stored_name=? AND processing=0 AND (outcome='saved' OR (? AND outcome='saved_but_unavailable'))",
+        self.finish_processing_checked(day, segment, name, unavailable, &|| Ok(()))
+    }
+
+    pub(crate) fn finish_processing_checked(
+        &mut self,
+        day: &str,
+        segment: &str,
+        name: &str,
+        unavailable: bool,
+        checkpoint: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), AudioArchiveError> {
+        checkpoint().map_err(AudioArchiveError::Other)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        checkpoint().map_err(AudioArchiveError::Other)?;
+        tx.execute("UPDATE parts SET processing=?,outcome=CASE WHEN ? THEN 'saved_but_unavailable' ELSE outcome END WHERE day=? AND segment_key=? AND stored_name=? AND processing=0 AND (outcome='saved' OR (? AND outcome='saved_but_unavailable'))",
             params![if unavailable {2} else {1},unavailable,day,segment,name,unavailable])?;
+        checkpoint().map_err(AudioArchiveError::Other)?;
+        tx.commit()?;
         Ok(())
     }
 

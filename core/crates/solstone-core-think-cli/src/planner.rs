@@ -153,9 +153,66 @@ fn rest(
     }
 }
 
-pub(crate) struct WorkDiscovery {
+/// Packaged talent resources admitted by an embedded host independently of its executable.
+#[derive(Clone)]
+pub struct DiscoveryTalentRoots {
+    pub talent: PathBuf,
+    pub apps: PathBuf,
+}
+
+impl DiscoveryTalentRoots {
+    fn revalidate(&self) -> Result<(), String> {
+        for directory in [&self.talent, &self.apps] {
+            if !directory.is_dir() {
+                return Err(format!(
+                    "packaged talent directory is unavailable: {}",
+                    directory.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn read_coverage(
+    journal: &Path,
+    day: &str,
+    roots: Option<&DiscoveryTalentRoots>,
+) -> Result<daily_coverage::DailyCoverage, String> {
+    match roots {
+        Some(roots) => {
+            roots.revalidate()?;
+            daily_coverage::read_daily_coverage_with_roots(journal, day, &roots.talent, &roots.apps)
+        }
+        None => daily_coverage::read_daily_coverage(journal, day),
+    }
+}
+
+fn observe_daily_retry(
+    journal: &Path,
+    unit: &Unit,
+    roots: Option<&DiscoveryTalentRoots>,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Option<String>, String> {
+    match roots {
+        Some(roots) => {
+            roots.revalidate()?;
+            work_retry::daily::observe_with_roots_checked(
+                journal,
+                unit,
+                &roots.talent,
+                &roots.apps,
+                checkpoint,
+            )
+        }
+        None => work_retry::daily::observe_checked(journal, unit, checkpoint),
+    }
+}
+
+pub struct WorkDiscovery {
     stopped: Arc<AtomicBool>,
     wake: mpsc::SyncSender<()>,
+    handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl WorkDiscovery {
@@ -169,11 +226,82 @@ impl WorkDiscovery {
         journal: PathBuf,
         queue: TaskQueue,
         automatic: bool,
+        reconcile_pass: impl FnMut(&Path, &TaskQueue, &AtomicBool) -> Result<Backlog, String>
+        + Send
+        + 'static,
+    ) -> Self {
+        Self::with_reconciler_and_stop(
+            journal,
+            queue,
+            automatic,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(|| Ok(())),
+            reconcile_pass,
+        )
+    }
+
+    pub fn new_with_checkpoint(
+        journal: PathBuf,
+        queue: TaskQueue,
+        automatic: bool,
+        checkpoint: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+    ) -> Self {
+        let reconcile_checkpoint = Arc::clone(&checkpoint);
+        Self::with_reconciler_and_stop(
+            journal,
+            queue,
+            automatic,
+            Arc::new(AtomicBool::new(false)),
+            checkpoint,
+            move |journal, queue, stopped| {
+                reconcile_pass_checked(
+                    journal,
+                    queue,
+                    stopped,
+                    automatic,
+                    reconcile_checkpoint.as_ref(),
+                )
+            },
+        )
+    }
+
+    pub fn new_with_talent_roots_and_checkpoint(
+        journal: PathBuf,
+        queue: TaskQueue,
+        automatic: bool,
+        roots: DiscoveryTalentRoots,
+        checkpoint: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+    ) -> Self {
+        let reconcile_checkpoint = Arc::clone(&checkpoint);
+        Self::with_reconciler_and_stop(
+            journal,
+            queue,
+            automatic,
+            Arc::new(AtomicBool::new(false)),
+            checkpoint,
+            move |journal, queue, stopped| {
+                reconcile_pass_with_roots(
+                    journal,
+                    queue,
+                    stopped,
+                    automatic,
+                    Some(&roots),
+                    reconcile_checkpoint.as_ref(),
+                )
+            },
+        )
+    }
+
+    fn with_reconciler_and_stop(
+        journal: PathBuf,
+        queue: TaskQueue,
+        automatic: bool,
+        stopped: Arc<AtomicBool>,
+        checkpoint: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
         mut reconcile_pass: impl FnMut(&Path, &TaskQueue, &AtomicBool) -> Result<Backlog, String>
         + Send
         + 'static,
     ) -> Self {
-        let stopped = Arc::new(AtomicBool::new(false));
         let (wake, receiver) = mpsc::sync_channel(1);
         let worker_stop = Arc::clone(&stopped);
         let spawned = std::thread::Builder::new()
@@ -184,15 +312,16 @@ impl WorkDiscovery {
                 }
                 let mut initial = true;
                 loop {
-                    if worker_stop.load(Ordering::Acquire) {
+                    if worker_stop.load(Ordering::Acquire) || checkpoint().is_err() {
                         return;
                     }
                     let started = Instant::now();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         if initial {
-                            solstone_core_system::catchup::reconcile_stale_catchup_attempts(
+                            solstone_core_system::catchup::reconcile_stale_catchup_attempts_checked(
                                 &journal,
                                 SystemTime::now(),
+                                checkpoint.as_ref(),
                             )
                             .map_err(|error| error.to_string())?;
                             initial = false;
@@ -210,13 +339,13 @@ impl WorkDiscovery {
                     };
                     if let Some(error) = error {
                         log::warn!("work discovery: {error}");
-                        if !worker_stop.load(Ordering::Acquire) {
+                        if !worker_stop.load(Ordering::Acquire) && checkpoint().is_ok() {
                             let mut report = WorkInventory::default();
                             report.unreadable.push(error);
-                            let _ = report.publish(&journal);
+                            let _ = report.publish_checked(&journal, checkpoint.as_ref());
                         }
                     }
-                    if worker_stop.load(Ordering::Acquire) {
+                    if worker_stop.load(Ordering::Acquire) || checkpoint().is_err() {
                         return;
                     }
                     let pass = started.elapsed();
@@ -237,10 +366,11 @@ impl WorkDiscovery {
                         });
                     let mut promise = |due: Instant| {
                         if let Some(report) = published.as_mut() {
-                            repromise(&journal, report, due);
+                            repromise(&journal, report, due, checkpoint.as_ref());
                         }
                     };
-                    let mut top_up = || backlog.top_up(&journal, &queue, &worker_stop);
+                    let mut top_up =
+                        || backlog.top_up(&journal, &queue, &worker_stop, checkpoint.as_ref());
                     if !rest(
                         &receiver,
                         automatic.then(|| ended + rest_after(pass)),
@@ -253,11 +383,19 @@ impl WorkDiscovery {
                     }
                 }
             });
-        if let Err(error) = spawned {
-            stopped.store(true, Ordering::Release);
-            log::warn!("could not start work discovery: {error}");
+        let handle = match spawned {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                stopped.store(true, Ordering::Release);
+                log::warn!("could not start work discovery: {error}");
+                None
+            }
+        };
+        Self {
+            stopped,
+            wake,
+            handle,
         }
-        Self { stopped, wake }
     }
 
     pub fn request(&self) {
@@ -267,22 +405,39 @@ impl WorkDiscovery {
         self.stopped.store(true, Ordering::Release);
         self.request();
     }
+    pub fn shutdown_checked(&mut self) -> Result<(), String> {
+        self.stop();
+        if let Some(handle) = self.handle.take() {
+            handle
+                .join()
+                .map_err(|_| "work discovery failed to join".to_owned())?;
+        }
+        Ok(())
+    }
+    pub fn shutdown(&mut self) {
+        let _ = self.shutdown_checked();
+    }
 }
 
 impl Drop for WorkDiscovery {
     fn drop(&mut self) {
-        self.stop();
+        self.shutdown();
     }
 }
 
 /// Republish a resting pass's snapshot with a later next pass. It is still the
 /// snapshot as of its pass; only the promise moves.
-fn repromise(journal: &Path, report: &mut WorkInventory, due: Instant) {
+fn repromise(
+    journal: &Path,
+    report: &mut WorkInventory,
+    due: Instant,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) {
     report.next_pass_ms = Some(
         chrono::Utc::now().timestamp_millis()
             + due.saturating_duration_since(Instant::now()).as_millis() as i64,
     );
-    if let Err(error) = report.publish(journal) {
+    if let Err(error) = report.publish_checked(journal, checkpoint) {
         log::warn!("work discovery: {error}");
     }
 }
@@ -294,13 +449,23 @@ struct Backlog {
     admitted: Vec<DiscoveredTask>,
     ranked: VecDeque<DiscoveredTask>,
     published: Option<WorkInventory>,
+    roots: Option<DiscoveryTalentRoots>,
 }
 
 impl Backlog {
     /// Once admitted work has left the queue, admit the next ranked work that
     /// is still owed in its place, without another pass. Returns whether any
     /// ranked work remains.
-    fn top_up(&mut self, journal: &Path, queue: &TaskQueue, stopped: &AtomicBool) -> bool {
+    fn top_up(
+        &mut self,
+        journal: &Path,
+        queue: &TaskQueue,
+        stopped: &AtomicBool,
+        checkpoint: &dyn Fn() -> Result<(), String>,
+    ) -> bool {
+        if checkpoint().is_err() || stopped.load(Ordering::Acquire) {
+            return false;
+        }
         if self.ranked.is_empty() {
             return false;
         }
@@ -321,6 +486,8 @@ impl Backlog {
             present,
             &mut self.ranked,
             &mut report,
+            self.roots.as_ref(),
+            checkpoint,
         ) {
             Ok(admitted) => self.admitted = admitted,
             Err(error) => {
@@ -489,6 +656,7 @@ fn raw_retries(
     capped: &BTreeSet<solstone_core_system_health::TerminalUnit>,
     permanently_held: &mut bool,
     report: &mut WorkInventory,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<Vec<DiscoveredTask>, String> {
     let directory = match segment.stream_layout {
         solstone_core_journal_io::SegmentLayout::Direct => {
@@ -528,7 +696,13 @@ fn raw_retries(
             activity: None,
         }) {
             match work_retry::input::current(journal, &unit) {
-                Ok(input) => work_retry::observe_held(journal, &unit, "floor_failed", &input)?,
+                Ok(input) => work_retry::observe_held_checked(
+                    journal,
+                    &unit,
+                    "floor_failed",
+                    &input,
+                    checkpoint,
+                )?,
                 Err(error) => report.unreadable.push(error),
             }
         }
@@ -548,11 +722,11 @@ fn raw_retries(
                 continue;
             }
         };
-        work_retry::raw::observe(journal, &evidence)?;
+        work_retry::raw::observe_checked(journal, &evidence, checkpoint)?;
         let id = evidence.unit.id()?;
         // A durable day ask is expanded idempotently, never renewed by ticks.
         if let Some(intent) = intent {
-            work_retry::request_with_id(journal, &evidence.unit, &intent.id)?;
+            work_retry::request_with_id_checked(journal, &evidence.unit, &intent.id, checkpoint)?;
         }
         let record = work_retry::read(journal, &id)?.ok_or("missing native hold")?;
         let grant = record.permission(&evidence.input, work_retry::DECLARED_FIXES);
@@ -609,12 +783,14 @@ fn daily_retries(
     journal: &Path,
     day: &str,
     coverage: &daily_coverage::DailyCoverage,
+    roots: Option<&DiscoveryTalentRoots>,
     intent: Option<&OwnerIntent>,
     imports: &[ImportThinking],
     policy: WorkPolicy,
     ready: bool,
     permanently_held: &mut BTreeSet<String>,
     report: &mut WorkInventory,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<Vec<DiscoveredTask>, String> {
     let today = chrono::Utc::now()
         .with_timezone(&solstone_core_journal_config::owner_zone(journal))
@@ -630,12 +806,12 @@ fn daily_retries(
             talent: covered.identity.name.clone(),
             facet: covered.identity.facet.clone(),
         };
-        let Some(input) = work_retry::daily::observe(journal, &unit)? else {
+        let Some(input) = observe_daily_retry(journal, &unit, roots, checkpoint)? else {
             continue;
         };
         let id = unit.id()?;
         if let Some(intent) = intent {
-            work_retry::request_with_id(journal, &unit, &intent.id)?;
+            work_retry::request_with_id_checked(journal, &unit, &intent.id, checkpoint)?;
         }
         let record = work_retry::read(journal, &id)?.ok_or("daily permission missing")?;
         let grant = record.permission(&input, work_retry::DECLARED_FIXES);
@@ -694,6 +870,10 @@ fn daily_retries(
     Ok(candidates)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The discovery inputs and bound publication checkpoint remain explicit."
+)]
 fn talent_retries(
     journal: &Path,
     day: &str,
@@ -702,6 +882,7 @@ fn talent_retries(
     policy: WorkPolicy,
     permanently_held_activities: &mut u64,
     report: &mut WorkInventory,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<Vec<DiscoveredTask>, String> {
     let (records, errors) = work_retry::list(journal);
     report.unreadable.extend(errors);
@@ -714,9 +895,7 @@ fn talent_retries(
     }) {
         let id = record.unit.id()?;
         let current = match &record.unit {
-            Unit::Activity { .. } => {
-                solstone_core_think_cli::activity_held_input(journal, &record.unit)
-            }
+            Unit::Activity { .. } => crate::activity_held_input(journal, &record.unit),
             _ => work_retry::input::current(journal, &record.unit).map(Some),
         };
         let input = match current {
@@ -728,7 +907,7 @@ fn talent_retries(
             }
         };
         if let Some(intent) = intent {
-            work_retry::request_with_id(journal, &record.unit, &intent.id)?;
+            work_retry::request_with_id_checked(journal, &record.unit, &intent.id, checkpoint)?;
         }
         let record = work_retry::read(journal, &id)?.ok_or("missing talent retry")?;
         let grant = input
@@ -796,8 +975,13 @@ fn talent_retries(
 struct DaySources<'a> {
     imports: &'a [ImportThinking],
     archive_coordinates: &'a BTreeSet<Coordinate>,
+    roots: Option<&'a DiscoveryTalentRoots>,
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The discovery inputs and bound publication checkpoint remain explicit."
+)]
 fn inspect_day(
     journal: &Path,
     day: &str,
@@ -806,6 +990,7 @@ fn inspect_day(
     sources: DaySources<'_>,
     policy: WorkPolicy,
     report: &mut WorkInventory,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<DayWork, String> {
     let now = chrono::Utc::now();
     let today = now
@@ -882,7 +1067,7 @@ fn inspect_day(
     let mut segments_thought = true;
     let mut owed_segments = Vec::new();
     for segment in &segments {
-        if super::tick::is_mcp_audit_segment(Some(&segment.stream)) {
+        if is_mcp_audit_segment(Some(&segment.stream)) {
             continue;
         }
         // Archive ASR belongs to the shared Sense workers. A segment repair
@@ -906,6 +1091,7 @@ fn inspect_day(
             &failures.value.capped,
             &mut permanently_held,
             report,
+            checkpoint,
         )?);
         let coordinate = Coordinate {
             day: day.into(),
@@ -936,6 +1122,7 @@ fn inspect_day(
                 segment,
                 &progress.value,
                 &failures.value.repeated,
+                checkpoint,
             )?
         } else {
             None
@@ -966,8 +1153,7 @@ fn inspect_day(
         held(report, day, None, WorkBand::Import, "segment_prerequisites");
         false
     } else {
-        let closing = super::tick::day_still_closing(journal, queue, SystemTime::now()).as_deref()
-            == Some(day);
+        let closing = day_still_closing(journal, queue, SystemTime::now()).as_deref() == Some(day);
         let imported = sources
             .imports
             .iter()
@@ -975,19 +1161,21 @@ fn inspect_day(
         let explicit = intent
             .map(|_| WorkBand::Waiting)
             .or_else(|| imported.then_some(WorkBand::Import));
-        let coverage = daily_coverage::read_daily_coverage(journal, day)?;
+        let coverage = read_coverage(journal, day, sources.roots)?;
         let p = daily_priority(priority(day, None, today, explicit), &coverage);
         let mut permanently_held_daily = BTreeSet::new();
         work.candidates.extend(daily_retries(
             journal,
             day,
             &coverage,
+            sources.roots,
             intent,
             sources.imports,
             policy,
             prerequisites_ready && !closing,
             &mut permanently_held_daily,
             report,
+            checkpoint,
         )?);
         // A daily output waiting solely on set-aside recordings, or on their
         // set-aside thinking, is also set aside for the range. Ordinary
@@ -1029,6 +1217,10 @@ fn inspect_day(
                 &mut work,
                 report,
             )?
+            && work
+                .candidates
+                .last()
+                .is_some_and(|candidate| queue.admits_command(candidate.request.cmd.as_wire()))
     };
     for (segment, p, readiness) in owed_segments {
         report.band(p.band).segments_owed += 1;
@@ -1163,7 +1355,12 @@ impl solstone_core_system_health::SegmentSource for ExactSegmentSource<'_> {
     }
 }
 
-fn still_owed(journal: &Path, candidate: &DiscoveredTask) -> Result<bool, String> {
+fn still_owed(
+    journal: &Path,
+    candidate: &DiscoveredTask,
+    roots: Option<&DiscoveryTalentRoots>,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<bool, String> {
     #[cfg(test)]
     STILL_OWED_CHECKS.with(|checks| checks.set(checks.get() + 1));
     let day = candidate.request.day.as_deref().ok_or("work has no day")?;
@@ -1192,7 +1389,8 @@ fn still_owed(journal: &Path, candidate: &DiscoveredTask) -> Result<bool, String
                 {
                     return Ok(false);
                 }
-                let Some(input) = work_retry::daily::observe(journal, &record.unit)? else {
+                let Some(input) = observe_daily_retry(journal, &record.unit, roots, checkpoint)?
+                else {
                     return Ok(false);
                 };
                 (input, record.reason.clone())
@@ -1202,9 +1400,7 @@ fn still_owed(journal: &Path, candidate: &DiscoveredTask) -> Result<bool, String
                 record.reason.clone(),
             ),
             Unit::Activity { .. } => {
-                let Some(input) =
-                    solstone_core_think_cli::activity_held_input(journal, &record.unit)?
-                else {
+                let Some(input) = crate::activity_held_input(journal, &record.unit)? else {
                     return Ok(false);
                 };
                 (input, record.reason.clone())
@@ -1217,9 +1413,9 @@ fn still_owed(journal: &Path, candidate: &DiscoveredTask) -> Result<bool, String
             }));
     }
     if let Some(activity) = argument("--activity") {
-        return solstone_core_think_cli::activity_retry_due(
+        return crate::activity_retry_due(
             journal,
-            &solstone_core_think_cli::ActivityRetry {
+            &crate::ActivityRetry {
                 day: day.into(),
                 facet: argument("--facet").ok_or("activity has no facet")?.into(),
                 activity: activity.into(),
@@ -1271,15 +1467,17 @@ fn still_owed(journal: &Path, candidate: &DiscoveredTask) -> Result<bool, String
     {
         return Ok(false);
     }
-    Ok(daily_coverage::read_daily_coverage(journal, day)?
-        .state
-        .is_owed()
+    Ok(read_coverage(journal, day, roots)?.state.is_owed()
         && solstone_core_system_health::day_unpublished_segments(journal, day)?.is_some())
 }
 
 /// Hand the queue `current` and then the best of `ranked` still owed, up to
 /// its admission bound, replacing the discovered work it has not started.
 /// Returns what was handed over; `ranked` keeps what was not examined.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Admission retains the pass resources and publication checkpoint."
+)]
 fn admit(
     journal: &Path,
     queue: &TaskQueue,
@@ -1287,6 +1485,8 @@ fn admit(
     mut current: Vec<DiscoveredTask>,
     ranked: &mut VecDeque<DiscoveredTask>,
     report: &mut WorkInventory,
+    roots: Option<&DiscoveryTalentRoots>,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<Vec<DiscoveredTask>, String> {
     if stopped.load(Ordering::Acquire) {
         return Ok(Vec::new());
@@ -1297,7 +1497,7 @@ fn admit(
         if stopped.load(Ordering::Acquire) {
             return Ok(Vec::new());
         }
-        match still_owed(journal, &candidate) {
+        match still_owed(journal, &candidate, roots, checkpoint) {
             Ok(true) => {
                 current.push(candidate);
             }
@@ -1311,6 +1511,7 @@ fn admit(
     if stopped.load(Ordering::Acquire) {
         return Ok(Vec::new());
     }
+    checkpoint()?;
     queue.replace_discovered(current.clone());
     Ok(current)
 }
@@ -1342,6 +1543,7 @@ fn held_thinking(
         solstone_core_system_health::TerminalUnit,
         solstone_core_system_health::RepeatedFailure,
     >,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<Option<HeldThinking>, String> {
     if !solstone_core_system_health::segment_fully_sensed(&segment.data_state) {
         return Ok(None);
@@ -1420,7 +1622,13 @@ fn held_thinking(
             failing.filter(|failure| newest.is_none_or(|newest| failure.latest_ts > newest))
             && !is_held
         {
-            work_retry::observe_held(journal, &unit, &failure.reason_code, &input)?;
+            work_retry::observe_held_checked(
+                journal,
+                &unit,
+                &failure.reason_code,
+                &input,
+                checkpoint,
+            )?;
         }
         match work_retry::read(journal, &id)?.filter(|record| record.held) {
             None => return Ok(None),
@@ -1556,6 +1764,45 @@ fn reconcile_pass(
     stopped: &AtomicBool,
     automatic: bool,
 ) -> Result<Backlog, String> {
+    reconcile_pass_checked(journal, queue, stopped, automatic, &|| {
+        if stopped.load(Ordering::Acquire) {
+            Err("work discovery stopped".into())
+        } else {
+            Ok(())
+        }
+    })
+}
+
+fn reconcile_pass_checked(
+    journal: &Path,
+    queue: &TaskQueue,
+    stopped: &AtomicBool,
+    automatic: bool,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Backlog, String> {
+    reconcile_pass_with_roots(journal, queue, stopped, automatic, None, checkpoint)
+}
+
+fn reconcile_pass_with_roots(
+    journal: &Path,
+    queue: &TaskQueue,
+    stopped: &AtomicBool,
+    automatic: bool,
+    roots: Option<&DiscoveryTalentRoots>,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Backlog, String> {
+    if let Some(roots) = roots {
+        roots.revalidate()?;
+    }
+    let external_checkpoint = checkpoint;
+    let checkpoint = &|| {
+        if stopped.load(Ordering::Acquire) {
+            Err("work discovery stopped".into())
+        } else {
+            external_checkpoint()
+        }
+    };
+    checkpoint()?;
     let pass_started = Instant::now();
     // One small reporting snapshot, before this pass publishes its progress.
     // No day or segment is read again to obtain the rate baseline.
@@ -1580,7 +1827,9 @@ fn reconcile_pass(
         .collect::<BTreeMap<_, _>>();
     let imports = solstone_core_import::thinking::read(journal)?;
     let pending_archives =
-        match solstone_core_import::audio_archive::update_pending_archive_tiles(journal, 64) {
+        match solstone_core_import::audio_archive::update_pending_archive_tiles_checked(
+            journal, 64, checkpoint,
+        ) {
             Ok(batch) => {
                 for tile in &batch.tiles {
                     days.entry(tile.day.clone())
@@ -1596,16 +1845,14 @@ fn reconcile_pass(
                 }
             }
         };
-    let (activities, activity_errors) = solstone_core_think_cli::discover_activity_retries(
-        journal,
-        chrono::Utc::now().timestamp_millis(),
-    );
-    let (held_activities, held_errors) = solstone_core_think_cli::discover_held_activities(journal);
+    let (activities, activity_errors) =
+        crate::discover_activity_retries(journal, chrono::Utc::now().timestamp_millis());
+    let (held_activities, held_errors) = crate::discover_held_activities(journal);
     let (held_records, retry_errors) = work_retry::list(journal);
     let now = chrono::Utc::now();
     let today = daily_coverage::local_day(journal, now);
     let pass_day = today.clone();
-    solstone_core_system::daily_coverage::activate_daily_inputs(journal, now)?;
+    solstone_core_system::daily_coverage::activate_daily_inputs_checked(journal, now, checkpoint)?;
     let maintenance =
         solstone_core_journal_io::DailyUnitIdentity::new(&today, "daily_schedule", None);
     if solstone_core_journal_io::load_daily_unit_record(journal, &maintenance)
@@ -1654,7 +1901,7 @@ fn reconcile_pass(
     if last_current && report.unreadable.is_empty() {
         report.history = last_history.clone();
     }
-    report.publish(journal)?;
+    report.publish_checked(journal, checkpoint)?;
     let mut last_publish = Instant::now();
     let mut candidates = Vec::new();
     let mut day_reports = BTreeMap::<String, WorkInventory>::new();
@@ -1673,7 +1920,7 @@ fn reconcile_pass(
     // reads run only here, never on the supervisor's event loop.
     let mut ordered = days.keys().rev().cloned().collect::<VecDeque<_>>();
     loop {
-        if stopped.load(Ordering::Acquire) {
+        if stopped.load(Ordering::Acquire) || checkpoint().is_err() {
             return Ok(Backlog::default());
         }
         let intents = work_intent::read(journal)?;
@@ -1706,10 +1953,11 @@ fn reconcile_pass(
         days.entry(day.clone())
             .or_insert_with(|| journal.join("chronicle").join(&day));
         let mut day_report = WorkInventory::default();
-        if let Err(error) = solstone_core_think_cli::seed_activity_retries(
+        if let Err(error) = crate::activity_work::seed_activity_retries_checked(
             journal,
             &day,
             chrono::Utc::now().timestamp_millis(),
+            checkpoint,
         ) {
             day_report.unreadable.push(format!("{day}: {error}"));
         }
@@ -1722,9 +1970,11 @@ fn reconcile_pass(
             DaySources {
                 imports: &imports.imports,
                 archive_coordinates: &archive_coordinates,
+                roots,
             },
             policy,
             &mut day_report,
+            checkpoint,
         ) {
             Ok(work) => {
                 history_day = work.history;
@@ -1750,13 +2000,14 @@ fn reconcile_pass(
                             &directory.join(&part.stored_name),
                         ) == solstone_core_sense::archive::ArchiveTranscription::Complete
                             && let Err(error) =
-                                solstone_core_import::audio_archive::finish_archive_part(
+                                solstone_core_import::audio_archive::finish_archive_part_checked(
                                     journal,
                                     &tile.import_id,
                                     &tile.day,
                                     &tile.segment_key,
                                     &part.stored_name,
                                     false,
+                                    checkpoint,
                                 )
                         {
                             day_report
@@ -1783,6 +2034,7 @@ fn reconcile_pass(
                 policy,
                 &mut permanent_activities,
                 &mut day_report,
+                checkpoint,
             ) {
                 Ok(work) => retain_best(&mut candidates, work),
                 Err(error) => day_report.unreadable.push(format!("{day}: {error}")),
@@ -1799,7 +2051,7 @@ fn reconcile_pass(
             && !activities.iter().any(|a| a.day == day)
             && let Some(intent) = intents.get(&day).filter(|intent| !intent.from_scratch)
         {
-            work_intent::retire_current(journal, &day, &intent.id)?;
+            work_intent::retire_current_checked(journal, &day, &intent.id, checkpoint)?;
         }
         for activity in activities.iter().filter(|a| {
             a.day == day && !intents.get(&day).is_some_and(|intent| intent.from_scratch)
@@ -1866,7 +2118,7 @@ fn reconcile_pass(
         );
         inspected.insert(day.clone());
         day_reports.insert(day, day_report);
-        if stopped.load(Ordering::Acquire) {
+        if stopped.load(Ordering::Acquire) || checkpoint().is_err() {
             return Ok(Backlog::default());
         }
         // Progress, not a rewrite of the whole inventory after every day.
@@ -1878,7 +2130,7 @@ fn reconcile_pass(
                 &days,
                 inspected.len(),
             );
-            report.publish(journal)?;
+            report.publish_checked(journal, checkpoint)?;
             last_publish = Instant::now();
         }
         // Reconstruct an independent copy; TaskQueue owns submissions.
@@ -1909,11 +2161,19 @@ fn reconcile_pass(
                 // Track only what the queue actually took: work it skipped
                 // because the same command is already queued or running under
                 // another reference never "leaves", and must not re-trigger.
-                early_admitted =
-                    admit(journal, queue, stopped, Vec::new(), &mut early, &mut report)?
-                        .into_iter()
-                        .filter(|task| queue.contains_reference(&task.request.reference))
-                        .collect();
+                early_admitted = admit(
+                    journal,
+                    queue,
+                    stopped,
+                    Vec::new(),
+                    &mut early,
+                    &mut report,
+                    roots,
+                    checkpoint,
+                )?
+                .into_iter()
+                .filter(|task| queue.contains_reference(&task.request.reference))
+                .collect();
                 early_considered = Some(considered);
             }
         }
@@ -1937,7 +2197,9 @@ fn reconcile_pass(
             .cloned()
             .collect::<BTreeSet<_>>();
         if !segments.is_empty() || !days.is_empty() {
-            solstone_core_import::thinking::fulfill(journal, &import, segments, days)?;
+            solstone_core_import::thinking::fulfill_checked(
+                journal, &import, segments, days, checkpoint,
+            )?;
         }
     }
     report.complete = report.unreadable.is_empty() && report.days_inspected == report.days_total;
@@ -1949,6 +2211,8 @@ fn reconcile_pass(
         Vec::new(),
         &mut ranked,
         &mut report,
+        roots,
+        checkpoint,
     )?;
     if stopped.load(Ordering::Acquire) {
         return Ok(Backlog::default());
@@ -1970,12 +2234,225 @@ fn reconcile_pass(
                 .and_then(|history| history.sample.as_ref()),
         ));
     }
-    report.publish(journal)?;
+    report.publish_checked(journal, checkpoint)?;
     Ok(Backlog {
         admitted,
         ranked,
         published: Some(report),
+        roots: roots.cloned(),
     })
+}
+
+/// The idle flush still owed to each stream, keyed by stream.
+#[derive(Default)]
+pub struct FlushState {
+    pub pending: BTreeMap<Option<String>, PendingFlush>,
+}
+
+/// The last segment a stream delivered, not yet flushed.
+pub struct PendingFlush {
+    pub last_segment_ts: Instant,
+    pub day: String,
+    pub segment: String,
+}
+
+pub const FLUSH_TIMEOUT: Duration = Duration::from_secs(3600);
+pub const SETTLE_SCAN_INTERVAL: Duration = Duration::from_secs(30);
+pub const DAY_CLOSE_GRACE: Duration = Duration::from_secs(10 * 60);
+pub const DAY_CLOSE_LIMIT: Duration = Duration::from_secs(60 * 60);
+
+pub fn flush_think_argv(day: &str, segment: &str, stream: Option<&str>) -> Vec<String> {
+    let mut tail = vec![
+        "think".to_owned(),
+        "-v".to_owned(),
+        "--day".to_owned(),
+        day.to_owned(),
+        "--segment".to_owned(),
+        segment.to_owned(),
+        "--flush".to_owned(),
+    ];
+    if let Some(stream) = stream {
+        tail.extend(["--stream".to_owned(), stream.to_owned()]);
+    }
+    canonical_journal_command(tail)
+}
+
+pub fn settle_think_argv(stream: &str) -> Vec<String> {
+    canonical_journal_command(["think", "-v", "--settle", "--stream", stream])
+}
+
+pub fn submit_think(
+    queue: &TaskQueue,
+    argv: Vec<String>,
+    day: &str,
+    reference: String,
+) -> solstone_core_system::queue::SubmitOutcome {
+    submit_task(queue, argv, reference, Some(day), None)
+}
+
+pub fn submit_task(
+    queue: &TaskQueue,
+    argv: Vec<String>,
+    reference: String,
+    day: Option<&str>,
+    daily_catchup_provenance: Option<DailyCatchupProvenance>,
+) -> solstone_core_system::queue::SubmitOutcome {
+    let cmd = TaskArgv::from_wire(argv).expect("supervisor constructs a non-empty argv");
+    queue.submit(solstone_core_system::queue::ExecutionRequest::Bus(
+        BusTaskRequest {
+            cmd,
+            reference,
+            day: day.map(str::to_owned),
+            scheduler_name: None,
+            queue_if_active_cmd_differs: false,
+            priority: None,
+            daily_catchup_provenance,
+        },
+    ))
+}
+
+pub fn check_segment_flush(
+    journal: &Path,
+    queue: &TaskQueue,
+    flush: &mut FlushState,
+    force_day: Option<&str>,
+    now: Instant,
+) {
+    if flush.pending.is_empty()
+        || !solstone_core_system::processing::processing_allowed(journal)
+        || solstone_core_journal_config::no_thinking_engine_chosen(journal)
+    {
+        return;
+    }
+    flush.pending.retain(|stream, pending| {
+        let due = force_day == Some(pending.day.as_str())
+            || now.saturating_duration_since(pending.last_segment_ts) >= FLUSH_TIMEOUT;
+        if due {
+            let _ = submit_think(
+                queue,
+                flush_think_argv(&pending.day, &pending.segment, stream.as_deref()),
+                &pending.day,
+                format!("supervisor-flush-{}-{}", pending.day, pending.segment),
+            );
+        }
+        !due
+    });
+}
+
+pub fn check_activity_settle(
+    journal: &Path,
+    queue: &TaskQueue,
+    last_scan: &mut Instant,
+    tick: Instant,
+    now_ms: i64,
+    today: &str,
+) {
+    if tick.saturating_duration_since(*last_scan) < SETTLE_SCAN_INTERVAL
+        || !solstone_core_system::processing::processing_allowed(journal)
+        || solstone_core_journal_config::no_thinking_engine_chosen(journal)
+    {
+        return;
+    }
+    *last_scan = tick;
+    for stream in crate::activity_settle_due(journal, now_ms) {
+        let reference = format!("supervisor-settle-{stream}");
+        if queue.contains_reference(&reference) {
+            continue;
+        }
+        let _ = submit_think(queue, settle_think_argv(&stream), today, reference);
+    }
+}
+
+pub fn is_mcp_audit_segment(stream: Option<&str>) -> bool {
+    stream == Some("mcp.agent")
+}
+
+pub fn day_still_closing(journal: &Path, queue: &TaskQueue, now: SystemTime) -> Option<String> {
+    let local_day = |at: SystemTime| {
+        solstone_core_system::daily_coverage::local_day(journal, chrono::DateTime::from(at))
+    };
+    let day = local_day(now.checked_sub(DAY_CLOSE_LIMIT)?);
+    if day == local_day(now) {
+        return None;
+    }
+    let within_grace = now
+        .checked_sub(DAY_CLOSE_GRACE)
+        .is_some_and(|at| local_day(at) == day);
+    let flush = format!("supervisor-flush-{day}-");
+    let observed = format!("supervisor-observed-{day}-");
+    let activity = format!("\"day\":\"{day}\"");
+    let busy = || {
+        queue.any_reference(|reference| {
+            reference.starts_with(&flush)
+                || reference.starts_with(&observed)
+                || reference.starts_with("supervisor-settle-")
+                || reference.starts_with(&format!("supervisor-retry-raw-{day}-"))
+                || reference.starts_with(&format!("supervisor-retry-talent-{day}-"))
+                || reference.starts_with(&format!("supervisor-activity-{day}-"))
+                || (reference.starts_with("supervisor-activity-") && reference.contains(&activity))
+        })
+    };
+    (within_grace || busy() || crate::activity_settle_holds_day(journal, &day)).then_some(day)
+}
+
+pub fn plan_observed_segment(
+    journal: &Path,
+    queue: &TaskQueue,
+    flush: &mut FlushState,
+    day: &str,
+    segment: &str,
+    stream: Option<&str>,
+    batch: bool,
+) -> bool {
+    if batch {
+        log::debug!("planner: batch observed segment held for daily catchup: {day}/{segment}");
+        return false;
+    }
+    if solstone_core_system::processing::is_deferred(journal).unwrap_or(true)
+        || solstone_core_journal_config::no_thinking_engine_chosen(journal)
+    {
+        log::debug!("planner: observed segment held by processing configuration: {day}/{segment}");
+        return false;
+    }
+    if is_mcp_audit_segment(stream) {
+        log::debug!("planner: MCP audit segment is not enriched: {day}/{segment}");
+        return false;
+    }
+    let stream_key = stream.map(str::to_owned);
+    if flush
+        .pending
+        .get(&stream_key)
+        .is_none_or(|pending| (day, segment) >= (pending.day.as_str(), pending.segment.as_str()))
+    {
+        flush.pending.insert(
+            stream_key,
+            PendingFlush {
+                last_segment_ts: Instant::now(),
+                day: day.to_owned(),
+                segment: segment.to_owned(),
+            },
+        );
+    }
+    let mut tail = vec![
+        "think".to_owned(),
+        "-v".to_owned(),
+        "--day".to_owned(),
+        day.to_owned(),
+        "--segment".to_owned(),
+        segment.to_owned(),
+    ];
+    if let Some(stream) = stream {
+        tail.extend(["--stream".to_owned(), stream.to_owned()]);
+    }
+    tail.push("--live".to_owned());
+    let argv = canonical_journal_command(tail);
+    let _ = submit_think(
+        queue,
+        argv,
+        day,
+        format!("supervisor-observed-{day}-{segment}"),
+    );
+    true
 }
 
 #[cfg(test)]
@@ -2020,6 +2497,194 @@ mod tests {
             "{\"text\":\"A meeting about a garden.\"}\n",
         )
         .unwrap();
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[cfg(unix)]
+    #[test]
+    fn embedded_resources_survive_discovery_and_refill_outside_a_checkout() {
+        const CHILD: &str = "SOLSTONE_DISCOVERY_RESOURCE_TEST";
+        if let Some(payload) = std::env::var_os(CHILD) {
+            // The executable has no checkout or installed-share ancestor. This
+            // reproduces an app process even though the host supplied its assets.
+            assert!(daily_coverage::package_roots().is_err());
+            let resources = DiscoveryTalentRoots {
+                talent: PathBuf::from(&payload).join("solstone/talent"),
+                apps: PathBuf::from(&payload).join("solstone/apps"),
+            };
+            let root = fixture("local");
+            for second in 0..DISCOVERED_ADMISSION + 2 {
+                segment(root.path(), "19990101", &format!("1200{second:02}_60"));
+            }
+            let queue = queue(root.path());
+            let stopped = AtomicBool::new(false);
+            let negative = reconcile_pass(root.path(), &queue, &stopped, false).unwrap();
+            assert!(
+                negative
+                    .published
+                    .unwrap()
+                    .unreadable
+                    .iter()
+                    .any(|error| { error.contains("could not locate packaged talent roots") })
+            );
+            let mut backlog = reconcile_pass_with_roots(
+                root.path(),
+                &queue,
+                &stopped,
+                false,
+                Some(&resources),
+                &|| Ok(()),
+            )
+            .unwrap();
+            let inventory = backlog.published.as_ref().unwrap();
+            assert!(inventory.complete, "{:?}", inventory.unreadable);
+            assert!(inventory.unreadable.is_empty());
+            assert_eq!(backlog.admitted.len(), DISCOVERED_ADMISSION);
+            let next = backlog
+                .ranked
+                .front()
+                .expect("ranked work beyond admission")
+                .request
+                .reference
+                .clone();
+            queue.replace_discovered(Vec::new());
+            backlog.top_up(root.path(), &queue, &stopped, &|| Ok(()));
+            assert!(queue.contains_reference(&next));
+
+            // The daily refill/retry reads must use those same resources, rather
+            // than falling back to current_exe after the first pass succeeds.
+            let today = daily_coverage::local_day(root.path(), chrono::Utc::now());
+            let unit = Unit::Daily {
+                day: today.clone(),
+                talent: "daily_schedule".into(),
+                facet: None,
+            };
+            let evidence = work_retry::daily::evidence_with_roots(
+                root.path(),
+                &unit,
+                &resources.talent,
+                &resources.apps,
+            )
+            .unwrap();
+            let mut record = solstone_core_journal_io::DailyUnitRecord::new(
+                work_retry::daily::identity(&unit).unwrap(),
+                &evidence.revision,
+                &evidence.contract,
+            );
+            record.status = solstone_core_journal_io::DailyUnitStatus::Capped;
+            record.reason_code = Some("schema_invalid".into());
+            solstone_core_journal_io::save_daily_unit_record(root.path(), &record).unwrap();
+            assert!(observe_daily_retry(root.path(), &unit, None, &|| Ok(())).is_err());
+            let input = observe_daily_retry(root.path(), &unit, backlog.roots.as_ref(), &|| Ok(()))
+                .unwrap()
+                .unwrap();
+            assert!(
+                work_retry::read(root.path(), &unit.id().unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .permission(&input, work_retry::DECLARED_FIXES)
+                    .is_none()
+            );
+            work_retry::request(root.path(), &unit).unwrap();
+            let granted = work_retry::read(root.path(), &unit.id().unwrap())
+                .unwrap()
+                .unwrap()
+                .permission(&input, work_retry::DECLARED_FIXES)
+                .unwrap();
+            let retry = DiscoveredTask {
+                request: BusTaskRequest {
+                    cmd: TaskArgv::from_wire(canonical_journal_command([
+                        "think",
+                        "--day",
+                        &today,
+                        "--retry-unit",
+                        &unit.id().unwrap(),
+                        "--retry-cause",
+                        &granted.cause,
+                    ]))
+                    .unwrap(),
+                    reference: "resource-retry".into(),
+                    day: Some(today),
+                    scheduler_name: None,
+                    queue_if_active_cmd_differs: false,
+                    priority: None,
+                    daily_catchup_provenance: None,
+                },
+            };
+            assert!(still_owed(root.path(), &retry, backlog.roots.as_ref(), &|| Ok(())).unwrap());
+            assert!(still_owed(root.path(), &retry, None, &|| Ok(())).is_err());
+            reconcile_pass_with_roots(
+                root.path(),
+                &queue,
+                &stopped,
+                false,
+                Some(&resources),
+                &|| Ok(()),
+            )
+            .unwrap();
+            assert!(queue.contains_reference(&format!(
+                "supervisor-retry-daily-{}-{}",
+                unit.day(),
+                unit.id().unwrap()
+            )));
+            queue.replace_discovered(Vec::new());
+            backlog.ranked = VecDeque::from([retry.clone()]);
+            backlog.top_up(root.path(), &queue, &stopped, &|| Ok(()));
+            assert!(queue.contains_reference(&retry.request.reference));
+            queue.replace_discovered(Vec::new());
+            backlog.ranked = VecDeque::from([retry.clone()]);
+            stopped.store(true, Ordering::Release);
+            assert!(!backlog.top_up(root.path(), &queue, &stopped, &|| Ok(())));
+            assert!(!queue.contains_reference(&retry.request.reference));
+            let missing = DiscoveryTalentRoots {
+                talent: root.path().join("missing-payload"),
+                apps: resources.apps.clone(),
+            };
+            assert!(read_coverage(root.path(), unit.day(), Some(&missing)).is_err());
+            assert!(
+                reconcile_pass_with_roots(
+                    root.path(),
+                    &queue,
+                    &AtomicBool::new(false),
+                    false,
+                    Some(&missing),
+                    &|| Ok(())
+                )
+                .is_err()
+            );
+            queue.shutdown();
+            return;
+        }
+        fn copy_tree(from: &Path, to: &Path) {
+            std::fs::create_dir_all(to).unwrap();
+            for entry in std::fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let target = to.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_tree(&entry.path(), &target);
+                } else {
+                    std::fs::copy(entry.path(), target).unwrap();
+                }
+            }
+        }
+        let isolated = tempfile::tempdir().unwrap();
+        let executable = isolated.path().join("discovery-test");
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        let payload = isolated.path().join("payload");
+        copy_tree(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../payload"),
+            &payload,
+        );
+        let output = std::process::Command::new(executable)
+            .args(["--exact", "planner::tests::embedded_resources_survive_discovery_and_refill_outside_a_checkout", "--nocapture"])
+            .env(CHILD, payload)
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -2294,9 +2959,11 @@ mod tests {
             DaySources {
                 imports: &[],
                 archive_coordinates: &BTreeSet::new(),
+                roots: None,
             },
             policy,
             &mut report,
+            &|| Ok(()),
         )
         .unwrap();
         assert_eq!(work.history.owed, 0);
@@ -2327,9 +2994,11 @@ mod tests {
             DaySources {
                 imports: &[],
                 archive_coordinates: &BTreeSet::new(),
+                roots: None,
             },
             policy,
             &mut report,
+            &|| Ok(()),
         )
         .unwrap();
         assert!(work.history.owed > 1);
@@ -2346,9 +3015,11 @@ mod tests {
             DaySources {
                 imports: &[],
                 archive_coordinates: &BTreeSet::new(),
+                roots: None,
             },
             policy,
             &mut report,
+            &|| Ok(()),
         )
         .unwrap();
         assert_eq!(work.history.segments_set_aside, 0);
@@ -2414,6 +3085,7 @@ mod tests {
                 &BTreeSet::new(),
                 &mut false,
                 &mut report,
+                &|| Ok(()),
             )
             .unwrap();
             assert_eq!(tasks.len(), 1);
@@ -2431,7 +3103,8 @@ mod tests {
                         own_keys,
                         &BTreeSet::new(),
                         &mut false,
-                        &mut report
+                        &mut report,
+                        &|| Ok(())
                     )
                     .unwrap()
                     .is_empty()
@@ -2448,6 +3121,7 @@ mod tests {
                     &BTreeSet::new(),
                     &mut false,
                     &mut report,
+                    &|| Ok(()),
                 )
                 .unwrap();
                 assert_eq!(tasks.len(), 1);
@@ -2464,6 +3138,7 @@ mod tests {
                     &BTreeSet::new(),
                     &mut false,
                     &mut WorkInventory::default(),
+                    &|| Ok(()),
                 )
                 .unwrap();
                 assert_eq!(tasks.len(), 1);
@@ -2556,7 +3231,7 @@ mod tests {
         for day in [
             "19990101", "20000101", "20010101", "20020101", "20030101", "20040101",
         ] {
-            let identity = solstone_core_think_cli::ActivityRetry {
+            let identity = crate::ActivityRetry {
                 day: day.into(),
                 facet: "work".into(),
                 activity: "reading_090000".into(),
@@ -2658,7 +3333,10 @@ mod tests {
             0
         );
         work_intent::register(root.path(), "19990101", true).unwrap();
-        reconcile(root.path(), &queue, &AtomicBool::new(true)).unwrap();
+        assert_eq!(
+            reconcile(root.path(), &queue, &AtomicBool::new(true)).unwrap_err(),
+            "work discovery stopped"
+        );
         assert_eq!(
             queue
                 .collect_queue_counts()
@@ -2743,6 +3421,43 @@ mod tests {
             let row = serde_json::json!({"event":"sense.complete","ts":sensed,"mode":"segment","stream":"notes","segment":key,"density":"idle"});
             writeln!(log, "{row}").unwrap();
         }
+    }
+
+    #[test]
+    fn refused_daily_execution_does_not_suppress_existing_segment_publication_recovery() {
+        let root = fixture("local");
+        let day = "19990101";
+        thought_without_receipt(root.path(), day, &["120000_60"]);
+        let queue = TaskQueue::with_callable_worker_and_admission(
+            TaskQueueOptions {
+                #[cfg(windows)]
+                read_file_grants: Vec::new(),
+                journal_root: root.path().to_path_buf(),
+                cap_resolver: Arc::new(solstone_core_system::cap::DefaultCapResolver::default()),
+                process_state_probe: Arc::new(NoProcesses),
+                queue_sink: None,
+                process_sink: None,
+                ready: false,
+                before_deadline_commit: None,
+                child_environment: BTreeMap::new(),
+                task_binary: None,
+            },
+            Arc::new(|_, _| panic!("unready planning control cannot execute")),
+            Arc::new(|args| !args.iter().any(|arg| arg == "--daily-only")),
+        );
+        reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
+        assert!(!queue.contains_reference("supervisor-work-19990101-daily"));
+        assert!(
+            queue.contains_reference("supervisor-work-19990101-notes-120000_60"),
+            "held daily work must leave segment publication independently recoverable"
+        );
+        let report = solstone_core_system::work_inventory::read(root.path())
+            .unwrap()
+            .unwrap();
+        assert!(
+            report.bands.iter().any(|band| band.daily_units_owed > 0),
+            "daily remains owed"
+        );
     }
 
     /// Segments thought before their publication was recorded must not hold
@@ -3362,9 +4077,11 @@ mod tests {
             DaySources {
                 imports: &[],
                 archive_coordinates: &BTreeSet::new(),
+                roots: None,
             },
             policy,
             &mut report,
+            &|| Ok(()),
         )
         .unwrap();
         assert_eq!(work.history.owed, 0);
@@ -3503,30 +4220,42 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(inventory.bands[5].daily_units_owed > 0);
-        let history = inventory.history.unwrap();
+        let history = inventory.history.clone().unwrap();
         assert_eq!(history.caught_up_since.as_deref(), Some("19990102"));
         assert_eq!(history.segments_owed, 1);
         assert!(history.daily_units_owed > inventory.bands[4].daily_units_owed);
-        // A stopped pass publishes only its first progress, which keeps the line.
-        reconcile(journal, &queue, &AtomicBool::new(true)).unwrap();
+        // Stop leaves the last durable snapshot intact; freshness is a read.
+        assert_eq!(
+            reconcile(journal, &queue, &AtomicBool::new(true)).unwrap_err(),
+            "work discovery stopped"
+        );
         let progress = solstone_core_system::work_inventory::read(journal)
             .unwrap()
             .unwrap();
-        assert_eq!(progress.days_inspected, 0);
+        assert_eq!(
+            serde_json::to_value(&progress).unwrap(),
+            serde_json::to_value(&inventory).unwrap()
+        );
         assert_eq!(
             serde_json::to_value(&progress.history).unwrap(),
             serde_json::to_value(Some(history)).unwrap()
         );
-        // A line from before a long stop is not shown as current.
         let mut old = progress;
         old.as_of_ms = 1;
         old.next_pass_ms = None;
         old.publish(journal).unwrap();
-        reconcile(journal, &queue, &AtomicBool::new(true)).unwrap();
+        assert_eq!(
+            reconcile(journal, &queue, &AtomicBool::new(true)).unwrap_err(),
+            "work discovery stopped"
+        );
         let progress = solstone_core_system::work_inventory::read(journal)
             .unwrap()
             .unwrap();
-        assert!(progress.history.is_none());
+        assert_eq!(
+            serde_json::to_value(&progress).unwrap(),
+            serde_json::to_value(&old).unwrap()
+        );
+        assert!(!progress.current_at(chrono::Utc::now().timestamp_millis()));
         // A daily output never made on that newer day still holds the range.
         let unmade = coverage
             .units
@@ -3608,6 +4337,7 @@ mod tests {
             root.path(),
             &mut report,
             Instant::now() + Duration::from_secs(600),
+            &|| Ok(()),
         );
         let after = chrono::Utc::now().timestamp_millis();
         let read = solstone_core_system::work_inventory::read(root.path())
@@ -3670,9 +4400,11 @@ mod tests {
             DaySources {
                 imports: &[],
                 archive_coordinates: &archive_coords_today,
+                roots: None,
             },
             policy,
             &mut report_today,
+            &|| Ok(()),
         )
         .unwrap();
 
@@ -3715,9 +4447,11 @@ mod tests {
             DaySources {
                 imports: &[],
                 archive_coordinates: &BTreeSet::new(),
+                roots: None,
             },
             policy,
             &mut report_past_empty,
+            &|| Ok(()),
         )
         .unwrap();
         assert!(
@@ -3742,9 +4476,11 @@ mod tests {
             DaySources {
                 imports: &[],
                 archive_coordinates: &past_archive_coords,
+                roots: None,
             },
             policy,
             &mut report_past_set,
+            &|| Ok(()),
         )
         .unwrap();
 
@@ -3834,9 +4570,11 @@ mod tests {
             DaySources {
                 imports: &[],
                 archive_coordinates: &coords,
+                roots: None,
             },
             policy,
             &mut report,
+            &|| Ok(()),
         )
         .unwrap();
         assert!(!work.daily_current);
@@ -3870,7 +4608,7 @@ mod tests {
             priority(day, None, chrono::Utc::now().date_naive(), None),
             None,
         );
-        assert!(!still_owed(root.path(), &daily).unwrap());
+        assert!(!still_owed(root.path(), &daily, None, &|| Ok(())).unwrap());
         let unit = Unit::Daily {
             day: day.into(),
             talent: "schedule".into(),
@@ -3881,7 +4619,7 @@ mod tests {
         let mut wire = retry.request.cmd.as_wire().to_vec();
         wire.extend(["--retry-unit".into(), unit.id().unwrap()]);
         retry.request.cmd = TaskArgv::from_wire(wire).unwrap();
-        assert!(!still_owed(root.path(), &retry).unwrap());
+        assert!(!still_owed(root.path(), &retry, None, &|| Ok(())).unwrap());
         // Even a selected Ready tile cannot release the day's other pending
         // archive prerequisite or complete its outstanding owner intent.
         thought_without_receipt(root.path(), day, &["120000_60"]);
@@ -3929,9 +4667,11 @@ mod tests {
             DaySources {
                 imports: &[],
                 archive_coordinates: &coords,
+                roots: None,
             },
             policy,
             &mut report,
+            &|| Ok(()),
         )
         .unwrap();
         assert!(work.completed_segments.contains(&Coordinate {
@@ -3986,14 +4726,16 @@ mod tests {
                 None,
                 DaySources {
                     imports: &[],
-                    archive_coordinates: &coords
+                    archive_coordinates: &coords,
+                    roots: None,
                 },
                 policy,
-                &mut WorkInventory::default()
+                &mut WorkInventory::default(),
+                &|| Ok(())
             )
             .is_err()
         );
-        assert!(still_owed(root.path(), &daily).is_err());
+        assert!(still_owed(root.path(), &daily, None, &|| Ok(())).is_err());
         std::fs::remove_file(poison).unwrap();
         let work = inspect_day(
             root.path(),
@@ -4003,9 +4745,11 @@ mod tests {
             DaySources {
                 imports: &[],
                 archive_coordinates: &coords,
+                roots: None,
             },
             policy,
             &mut WorkInventory::default(),
+            &|| Ok(()),
         )
         .unwrap();
         assert!(!work.history.archive_pending);
@@ -4020,7 +4764,7 @@ mod tests {
                 .iter()
                 .any(|arg| arg == "--daily-only")
         }));
-        assert!(!still_owed(root.path(), &daily).unwrap());
+        assert!(!still_owed(root.path(), &daily, None, &|| Ok(())).unwrap());
         let coverage = daily_coverage::read_daily_coverage(root.path(), day).unwrap();
         let covered = coverage
             .units
@@ -4052,7 +4796,7 @@ mod tests {
         ]);
         valid_retry.request.cmd = TaskArgv::from_wire(wire).unwrap();
         assert!(
-            !still_owed(root.path(), &valid_retry).unwrap(),
+            !still_owed(root.path(), &valid_retry, None, &|| Ok(())).unwrap(),
             "ordinary prerequisite also holds a genuinely granted daily retry"
         );
         std::fs::remove_dir_all(
@@ -4070,9 +4814,11 @@ mod tests {
             DaySources {
                 imports: &[],
                 archive_coordinates: &coords,
+                roots: None,
             },
             policy,
             &mut WorkInventory::default(),
+            &|| Ok(()),
         )
         .unwrap();
         assert!(
@@ -4084,18 +4830,18 @@ mod tests {
                 .any(|arg| arg == "--daily-only")),
             "last archive prerequisite released and real daily work is admitted"
         );
-        assert!(still_owed(root.path(), &daily).unwrap());
+        assert!(still_owed(root.path(), &daily, None, &|| Ok(())).unwrap());
         assert!(
-            still_owed(root.path(), &valid_retry).unwrap(),
+            still_owed(root.path(), &valid_retry, None, &|| Ok(())).unwrap(),
             "granted daily retry resumes once prerequisites are Ready"
         );
         register_pending_tile(root.path(), "19990101_010101", day, "130000_300").unwrap();
         assert!(
-            !still_owed(root.path(), &valid_retry).unwrap(),
+            !still_owed(root.path(), &valid_retry, None, &|| Ok(())).unwrap(),
             "pending archive also holds a valid retry grant"
         );
         retire_pending_tile(root.path(), "19990101_010101", day, "130000_300").unwrap();
-        assert!(still_owed(root.path(), &valid_retry).unwrap());
+        assert!(still_owed(root.path(), &valid_retry, None, &|| Ok(())).unwrap());
     }
 
     #[cfg(all(unix, feature = "full-tests"))]
@@ -4148,8 +4894,8 @@ mod tests {
             ),
             None,
         );
-        let ordinary_result = still_owed(root.path(), &ordinary);
-        let archive_result = still_owed(root.path(), &archive);
+        let ordinary_result = still_owed(root.path(), &ordinary, None, &|| Ok(()));
+        let archive_result = still_owed(root.path(), &archive, None, &|| Ok(()));
         std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
             whole.is_err(),
@@ -4159,7 +4905,7 @@ mod tests {
         assert!(archive_result.unwrap());
         thought_without_receipt(root.path(), day, &["120000_60"]);
         assert!(
-            still_owed(root.path(), &ordinary).unwrap(),
+            still_owed(root.path(), &ordinary, None, &|| Ok(())).unwrap(),
             "thought output still owes publication"
         );
         let target = root
@@ -4177,15 +4923,15 @@ mod tests {
         })
         .unwrap();
         assert!(
-            !still_owed(root.path(), &ordinary).unwrap(),
+            !still_owed(root.path(), &ordinary, None, &|| Ok(())).unwrap(),
             "Ready target is not requeued"
         );
         assert!(
-            still_owed(root.path(), &archive).unwrap(),
+            still_owed(root.path(), &archive, None, &|| Ok(())).unwrap(),
             "same-key archive remains independently owed"
         );
         std::fs::remove_dir_all(&target).unwrap();
-        assert!(!still_owed(root.path(), &ordinary).unwrap());
+        assert!(!still_owed(root.path(), &ordinary, None, &|| Ok(())).unwrap());
         thought_without_receipt(root.path(), day, &["120000_60"]);
         std::fs::remove_dir_all(&same_key).unwrap();
         std::fs::rename(&target, &same_key).unwrap();
@@ -4201,7 +4947,7 @@ mod tests {
             }
         }
         assert!(
-            still_owed(root.path(), &archive).unwrap(),
+            still_owed(root.path(), &archive, None, &|| Ok(())).unwrap(),
             "archive thinking alone still owes publication"
         );
         let input = solstone_core_system_health::newest_segment_input_ms(&same_key).unwrap();
@@ -4219,16 +4965,16 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !still_owed(root.path(), &archive).unwrap(),
+            !still_owed(root.path(), &archive, None, &|| Ok(())).unwrap(),
             "Ready archive target is not requeued"
         );
         assert!(
-            !still_owed(root.path(), &ordinary).unwrap(),
+            !still_owed(root.path(), &ordinary, None, &|| Ok(())).unwrap(),
             "other stream does not borrow archive readiness"
         );
         std::fs::remove_dir_all(same_key).unwrap();
-        assert!(!still_owed(root.path(), &archive).unwrap());
-        assert!(!still_owed(root.path(), &ordinary).unwrap());
+        assert!(!still_owed(root.path(), &archive, None, &|| Ok(())).unwrap());
+        assert!(!still_owed(root.path(), &ordinary, None, &|| Ok(())).unwrap());
     }
 
     #[cfg(feature = "full-tests")]
@@ -4248,7 +4994,7 @@ mod tests {
             priority(day, None, chrono::Utc::now().date_naive(), None),
             None,
         );
-        assert!(still_owed(root.path(), &candidate).is_err());
+        assert!(still_owed(root.path(), &candidate, None, &|| Ok(())).is_err());
         assert!(
             inspect_day(
                 root.path(),
@@ -4257,10 +5003,12 @@ mod tests {
                 None,
                 DaySources {
                     imports: &[],
-                    archive_coordinates: &BTreeSet::new()
+                    archive_coordinates: &BTreeSet::new(),
+                    roots: None,
                 },
                 WorkPolicy::read(root.path()).unwrap(),
-                &mut WorkInventory::default()
+                &mut WorkInventory::default(),
+                &|| Ok(())
             )
             .is_err()
         );

@@ -345,8 +345,52 @@ pub struct EmbeddedConveyHandle {
     backup_deps: solstone_core_backup_web::BackupWebDeps,
 }
 
+/// Clone-only stop signal; task and runtime ownership remains in the serving handle.
+#[cfg(feature = "host")]
+#[derive(Clone)]
+pub struct EmbeddedConveyStop {
+    door: Arc<door::DoorLifecycle>,
+    local_network: Option<tokio::task::AbortHandle>,
+    link_health: Option<tokio::task::AbortHandle>,
+    renewal: tokio::sync::watch::Sender<bool>,
+}
+
+/// Publish cancellation before exposing the embedded listener. The callback
+/// receives signals only; the constructor retains the actual serving owner.
+#[cfg(feature = "host")]
+pub struct EmbeddedStartup {
+    pub cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+    pub stop_ready: Arc<
+        dyn Fn(EmbeddedConveyStop, solstone_core_backup_web::BackupRouteLifetime) + Send + Sync,
+    >,
+}
+
+#[cfg(feature = "host")]
+impl EmbeddedConveyStop {
+    /// Close ingress and request support-task cancellation without joining.
+    pub fn request_stop(&self) {
+        if let Some(task) = &self.local_network {
+            task.abort();
+        }
+        if let Some(task) = &self.link_health {
+            task.abort();
+        }
+        self.renewal.send_replace(true);
+        self.door.shutdown();
+    }
+}
+
 #[cfg(feature = "host")]
 impl EmbeddedConveyHandle {
+    pub fn stop_handle(&self) -> EmbeddedConveyStop {
+        EmbeddedConveyStop {
+            door: Arc::clone(&self.door),
+            local_network: Some(self.local_network_task.abort_handle()),
+            link_health: Some(self.link_health_task.abort_handle()),
+            renewal: self.renewal_shutdown.clone(),
+        }
+    }
+
     /// Share the exact operation ownership used by the embedded Home and backup routes.
     pub fn backup_dependencies(&self) -> solstone_core_backup_web::BackupWebDeps {
         self.backup_deps.clone()
@@ -369,10 +413,7 @@ impl EmbeddedConveyHandle {
     }
 
     pub fn shutdown(&self) {
-        self.local_network_task.abort();
-        self.link_health_task.abort();
-        self.renewal_shutdown.send_replace(true);
-        self.door.shutdown();
+        self.stop_handle().request_stop();
     }
 
     /// Stop app-owned services and join any active token renewal before the
@@ -409,7 +450,7 @@ pub async fn bind_embedded_device_door(
     journal_root: PathBuf,
     address: std::net::SocketAddrV4,
 ) -> Result<EmbeddedConveyHandle, ConveyServeError> {
-    bind_embedded_with_dependencies(journal_root, address, None, None).await
+    bind_embedded_with_dependencies(journal_root, address, None, None, None).await
 }
 
 #[cfg(feature = "host")]
@@ -418,7 +459,7 @@ pub async fn bind_embedded_device_door_with_payload(
     address: std::net::SocketAddrV4,
     payload_root: PathBuf,
 ) -> Result<EmbeddedConveyHandle, ConveyServeError> {
-    bind_embedded_with_dependencies(journal_root, address, Some(payload_root), None).await
+    bind_embedded_with_dependencies(journal_root, address, Some(payload_root), None, None).await
 }
 
 /// Compose app-owned routes using the same optional agent owner surface as the
@@ -430,7 +471,32 @@ pub async fn bind_embedded_device_door_with_routes(
     payload_root: Option<PathBuf>,
     agents_routes: Router,
 ) -> Result<EmbeddedConveyHandle, ConveyServeError> {
-    bind_embedded_with_dependencies(journal_root, address, payload_root, Some(agents_routes)).await
+    bind_embedded_with_dependencies(
+        journal_root,
+        address,
+        payload_root,
+        Some(agents_routes),
+        None,
+    )
+    .await
+}
+
+#[cfg(feature = "host")]
+pub async fn bind_embedded_device_door_with_routes_and_startup(
+    journal_root: PathBuf,
+    address: std::net::SocketAddrV4,
+    payload_root: Option<PathBuf>,
+    agents_routes: Router,
+    startup: EmbeddedStartup,
+) -> Result<EmbeddedConveyHandle, ConveyServeError> {
+    bind_embedded_with_dependencies(
+        journal_root,
+        address,
+        payload_root,
+        Some(agents_routes),
+        Some(startup),
+    )
+    .await
 }
 
 /// Compose iOS backup routes and the door using the app's actual retained root.
@@ -459,7 +525,7 @@ pub async fn bind_embedded_device_door_with_root(
     );
     root.revalidate_canonical_binding()
         .map_err(ConveyServeError::EmbeddedRoot)?;
-    bind_embedded_router(journal_root, address, app, backup_deps, Some(root)).await
+    bind_embedded_router(journal_root, address, app, backup_deps, Some(root), None).await
 }
 
 #[cfg(feature = "host")]
@@ -468,6 +534,7 @@ async fn bind_embedded_with_dependencies(
     address: std::net::SocketAddrV4,
     payload_root: Option<PathBuf>,
     agents_routes: Option<Router>,
+    startup: Option<EmbeddedStartup>,
 ) -> Result<EmbeddedConveyHandle, ConveyServeError> {
     let roots = payload_root
         .map(|payload| thinking_sol_reads::TalentRoots::from_payload_root(&payload))
@@ -481,7 +548,7 @@ async fn bind_embedded_with_dependencies(
         roots,
         Some(backup_deps.clone()),
     );
-    bind_embedded_router(journal_root, address, app, backup_deps, None).await
+    bind_embedded_router(journal_root, address, app, backup_deps, None, startup).await
 }
 
 #[cfg(feature = "host")]
@@ -491,6 +558,7 @@ async fn bind_embedded_router(
     app: Router,
     backup_deps: solstone_core_backup_web::BackupWebDeps,
     _retained_root: Option<Arc<solstone_core_journal_io::JournalRoot>>,
+    startup: Option<EmbeddedStartup>,
 ) -> Result<EmbeddedConveyHandle, ConveyServeError> {
     use solstone_core_sol_link::ledger::AuthorizedClientsRead;
     use tokio::sync::watch;
@@ -524,7 +592,21 @@ async fn bind_embedded_router(
         ),
     };
     let cache: link_health_cache::RelayHealthCacheStore = Arc::new(std::sync::Mutex::new(None));
-    let router = app.layer(Extension(cache.clone()));
+    let (renewal_shutdown, renewal_stop) = tokio::sync::watch::channel(false);
+    let cancelled = startup
+        .as_ref()
+        .map(|startup| Arc::clone(&startup.cancelled))
+        .unwrap_or_else(|| Arc::new(|| false));
+    let admission = EmbeddedAdmission {
+        stopped: renewal_stop.clone(),
+        cancelled,
+    };
+    let router = app
+        .layer(Extension(cache.clone()))
+        .layer(axum::middleware::from_fn_with_state(
+            admission.clone(),
+            embedded_admission_gate,
+        ));
     let door_router = authorization_gate::authorized_router_with_router(
         router.clone(),
         journal_root.clone(),
@@ -557,13 +639,27 @@ async fn bind_embedded_router(
         .layer(axum::middleware::from_fn_with_state(
             binding,
             embedded_root_gate,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            admission,
+            embedded_admission_gate,
         ));
+    if let Some(startup) = &startup {
+        (startup.stop_ready)(
+            EmbeddedConveyStop {
+                door: Arc::clone(&door),
+                local_network: None,
+                link_health: None,
+                renewal: renewal_shutdown.clone(),
+            },
+            backup_deps.lifetime(),
+        );
+    }
     let _ = door.ensure_started().await;
     let local_network_task = tokio::spawn(local_network::watch(door.clone()));
-    let (renewal_shutdown, renewal_stop) = tokio::sync::watch::channel(false);
     let (link_health_task, service_token_renewal_task) =
         start_relay_health_tasks(service_root, cache, Some(renewal_stop));
-    Ok(EmbeddedConveyHandle {
+    let handle = EmbeddedConveyHandle {
         owner_router,
         door,
         local_network_task,
@@ -571,7 +667,41 @@ async fn bind_embedded_router(
         service_token_renewal_task: tokio::sync::Mutex::new(Some(service_token_renewal_task)),
         renewal_shutdown,
         backup_deps,
-    })
+    };
+    if *handle.renewal_shutdown.borrow()
+        || startup
+            .as_ref()
+            .is_some_and(|startup| (startup.cancelled)())
+    {
+        handle.shutdown();
+    }
+    if let Some(startup) = startup {
+        (startup.stop_ready)(handle.stop_handle(), handle.backup_deps.lifetime());
+    }
+    Ok(handle)
+}
+
+#[cfg(feature = "host")]
+#[derive(Clone)]
+struct EmbeddedAdmission {
+    stopped: tokio::sync::watch::Receiver<bool>,
+    cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+#[cfg(feature = "host")]
+async fn embedded_admission_gate(
+    axum::extract::State(admission): axum::extract::State<EmbeddedAdmission>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if *admission.stopped.borrow() || (admission.cancelled)() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":"server_stopping"})),
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 #[cfg(feature = "host")]

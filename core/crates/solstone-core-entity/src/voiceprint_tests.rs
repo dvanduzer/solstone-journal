@@ -950,3 +950,61 @@ fn embedding(value: f32) -> Vec<f32> {
     embedding[0] = value;
     embedding
 }
+
+#[cfg(feature = "full-tests")]
+#[test]
+fn cancelled_voiceprint_publication_after_archive_lock_wait_and_positive_twin() {
+    use solstone_core_journal_io::{LockOptions, hold_lock};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+    for cancel in [false, true] {
+        let root = fixture_journal();
+        let path = voiceprint_path(root.path());
+        assert!(path.is_file(), "fixture must witness the actual archive");
+        let before = fs::read(&path).unwrap();
+        let held = hold_lock(&path, LockOptions::default()).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let journal = root.path().to_path_buf();
+        let (started, ready) = mpsc::channel();
+        let (checkpoint, reached) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            crate::save_voiceprints_batch_checked(
+                &journal,
+                fixture_entity_id(),
+                &[VoiceprintItem {
+                    embedding: embedding(8.0),
+                    metadata: json!({"day":"20260805","segment_key":"cancel-control","source":"mic_audio","sentence_id":8}),
+                }],
+                &test_encoder(),
+                &|| {
+                    checkpoint.send(()).unwrap();
+                    if flag.load(Ordering::SeqCst) {
+                        Err("cancelled".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+        });
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(reached.recv_timeout(Duration::from_millis(100)).is_err());
+        cancelled.store(cancel, Ordering::SeqCst);
+        drop(held);
+        let result = worker.join().unwrap();
+        if cancel {
+            assert!(matches!(
+                result,
+                Err(VoiceprintOperationError::PublicationRefused(_))
+            ));
+            assert_eq!(fs::read(&path).unwrap(), before);
+        } else {
+            assert_eq!(result.unwrap(), 1);
+            let archive = load_entity_voiceprints_file(root.path(), fixture_entity_id()).unwrap();
+            assert_eq!(archive.rows, 8);
+            assert_eq!(archive.embeddings[7 * 256], 8.0);
+        }
+    }
+}

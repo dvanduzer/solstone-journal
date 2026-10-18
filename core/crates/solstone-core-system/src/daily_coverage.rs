@@ -102,14 +102,24 @@ pub fn daily_input_since_day(
 /// Initialize registered input cutoffs before automatic or explicit coverage.
 /// Reads remain pure; this coordinator delegates persistence to the config owner.
 pub fn activate_daily_inputs(journal: &Path, now: DateTime<Utc>) -> Result<(), String> {
+    activate_daily_inputs_checked(journal, now, &|| Ok(()))
+}
+
+pub fn activate_daily_inputs_checked(
+    journal: &Path,
+    now: DateTime<Utc>,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    checkpoint()?;
     let zone = solstone_core_journal_config::owner_zone(journal);
     for input in solstone_core_indexer::daily_evidence::DAILY_INPUTS {
         let day = daily_input_since_day(now, &zone, input.lookback_closed_days);
-        solstone_core_journal_config_write::insert_daily_input_since(
+        solstone_core_journal_config_write::insert_daily_input_since_checked(
             journal,
             input.id,
             input.version,
             &day,
+            checkpoint,
         )
         .map_err(|error| error.to_string())?;
     }

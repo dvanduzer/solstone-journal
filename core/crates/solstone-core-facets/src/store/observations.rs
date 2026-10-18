@@ -139,7 +139,19 @@ pub fn publish_observation_batch(
     allow_before: bool,
     receipt: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
+    publish_observation_batch_checked(root, batch, allow_before, || Ok(()), receipt)
+}
+
+/// Publish prepared observations after rechecking the caller at the owner lock.
+pub fn publish_observation_batch_checked(
+    root: &Path,
+    batch: &PreparedObservationBatch,
+    allow_before: bool,
+    checkpoint: impl Fn() -> Result<(), String>,
+    receipt: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
     let _trust = hold_facet_trust_lock(root).map_err(|e| e.to_string())?;
+    checkpoint()?;
     super::declaration::require_facet_write_identity(root, &batch.facet, &batch.facet_id)?;
     let scoped =
         list_scoped_facet_entities(root, &batch.facet, true, true).map_err(|e| e.to_string())?;
@@ -160,6 +172,7 @@ pub fn publish_observation_batch(
         }
         let parsed = parse_observation_file(&batch.after, ObservationParseSource::CapturedSnapshot)
             .map_err(|e| e.to_string())?;
+        checkpoint()?;
         apply_observation_change(
             root,
             &batch.facet,

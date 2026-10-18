@@ -298,8 +298,32 @@ pub fn apply_story(
     record_id: &str,
     value: &Value,
 ) -> Result<(), String> {
+    apply_story_cancellable(
+        root,
+        talent,
+        facet,
+        destination_id,
+        day,
+        record_id,
+        value,
+        &solstone_core_generate::Cancellation::never(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_story_cancellable(
+    root: &std::path::Path,
+    talent: &str,
+    facet: &str,
+    destination_id: &str,
+    day: &str,
+    record_id: &str,
+    value: &Value,
+    cancellation: &solstone_core_generate::Cancellation,
+) -> Result<(), String> {
     let _guard = solstone_core_facets::hold_activity_enrichment(root, facet, destination_id)
         .map_err(|error| error.to_string())?;
+    crate::writers::check_cancellation(cancellation)?;
     let Some(record) = solstone_core_facets::get_activity_record(root, facet, day, record_id)
         .map_err(|error| error.to_string())?
     else {
@@ -413,7 +437,7 @@ pub fn apply_story(
     }
     patch.insert("story".into(), story);
     patch.insert("relations".into(), Value::Array(relations));
-    solstone_core_facets::update_activity_record(
+    solstone_core_facets::update_activity_record_checked(
         root,
         facet,
         day,
@@ -422,6 +446,7 @@ pub fn apply_story(
         "story",
         "",
         &chrono::Utc::now().to_rfc3339(),
+        || crate::writers::check_cancellation(cancellation),
     )
     .map_err(|error| error.to_string())?
     .ok_or("activity no longer exists")?;
@@ -932,6 +957,7 @@ mod tests {
             &client,
             &mut sink,
             Some((&STORY, PrePostState::None)),
+            &solstone_core_generate::Cancellation::never(),
         );
         let crate::RuntimeOutcome::Finished {
             disposition: CommitDisposition::RejectedNoMutation,
@@ -999,6 +1025,7 @@ mod tests {
                 &client,
                 &mut Vec::new(),
                 Some((&STORY, PrePostState::None)),
+                &solstone_core_generate::Cancellation::never(),
             );
             assert!(matches!(
                 outcome,
@@ -1074,6 +1101,7 @@ mod tests {
             &client,
             &mut Vec::new(),
             Some((&STORY, PrePostState::None)),
+            &solstone_core_generate::Cancellation::never(),
         );
         assert!(matches!(
             outcome,

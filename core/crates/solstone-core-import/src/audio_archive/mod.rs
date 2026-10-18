@@ -22,7 +22,8 @@ pub use claims::{
 };
 pub use frontier::{
     AudioArchiveFrontier, FrontierPart, FrontierTile, FrontierUnavailablePart, PendingArchiveBatch,
-    finish_archive_part, update_archive_frontier, update_pending_archive_tiles,
+    finish_archive_part, finish_archive_part_checked, update_archive_frontier,
+    update_pending_archive_tiles, update_pending_archive_tiles_checked,
 };
 pub use identity::{MemberIdentity, MemberStartEvidence, MemberTimeAuthority, ResolvedOccurrence};
 pub use plan::{

@@ -192,7 +192,7 @@ pub(crate) struct SupervisorState {
     pub server: Arc<CallosumSocketServer>,
     pub connection: CallosumSocketConnection,
     pub queue: TaskQueue,
-    pub discovery: super::work_discovery::WorkDiscovery,
+    pub discovery: super::WorkDiscovery,
     pub last_sync_snapshot: Option<SyncSnapshot>,
     pub stale_heartbeats: Vec<SyncPeerObservation>,
     pub shutdown_started: AtomicBool,
@@ -334,17 +334,9 @@ impl ParentLossCoordinatorSession {
 /// Each stream's activity state is its own, so each stream goes idle on its
 /// own: a phone that keeps sending location segments must not hold back the
 /// flush that ends a desktop's activity after its screen locks.
-#[derive(Default)]
-pub(crate) struct FlushState {
-    pub pending: BTreeMap<Option<String>, PendingFlush>,
-}
-
-/// The last segment a stream delivered, not yet flushed.
-pub(crate) struct PendingFlush {
-    pub last_segment_ts: Instant,
-    pub day: String,
-    pub segment: String,
-}
+pub(crate) use solstone_core_think_cli::planner::FlushState;
+#[cfg(test)]
+pub(crate) use solstone_core_think_cli::planner::PendingFlush;
 
 pub(crate) struct DailyState {
     pub last_day: Option<chrono::NaiveDate>,
@@ -2084,11 +2076,7 @@ pub(crate) async fn boot_and_tick(
         );
     }
     let mut state = SupervisorState {
-        discovery: super::work_discovery::WorkDiscovery::new(
-            journal.clone(),
-            queue.clone(),
-            !options.no_daily,
-        ),
+        discovery: super::WorkDiscovery::new(journal.clone(), queue.clone(), !options.no_daily),
         journal,
         #[cfg(windows)]
         service_guard,

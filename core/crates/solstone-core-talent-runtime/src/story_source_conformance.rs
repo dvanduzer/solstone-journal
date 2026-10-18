@@ -161,6 +161,7 @@ fn run(case: &Value) -> Run {
         &context,
         &executor,
         &mut Vec::new(),
+        &solstone_core_generate::Cancellation::never(),
     );
     let record = solstone_core_facets::get_activity_record(&context.journal, FACET, DAY, ACTIVITY)
         .unwrap()

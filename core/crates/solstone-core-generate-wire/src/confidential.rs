@@ -25,7 +25,8 @@ use solstone_core_spp_ratls::{check_nvattest_readiness, resolve_nvattest_dir};
 
 use crate::endpoint::{
     EndpointFailure, EndpointGenerated, EndpointResult, EndpointRuntime, EndpointTransport,
-    EndpointTransportError, endpoint_generate_with,
+    EndpointTransportError, endpoint_generate_internal_with_context, endpoint_generate_with,
+    remaining_timeout, thinking_headroom,
 };
 use crate::pool::{PoolAcquisition, PoolKey, RedactedCredential};
 
@@ -49,7 +50,38 @@ pub fn confidential_generate(
     config: &Map<String, Value>,
     runtime: &EndpointRuntime,
 ) -> ConfidentialResult {
-    confidential_generate_with(
+    let priority =
+        match solstone_core_journal_config::work_priority::WorkPriority::from_environment() {
+            Ok(priority) => priority,
+            Err(error) => {
+                return ConfidentialResult::Failed(EndpointFailure {
+                    reason_code: Some("provider_request_rejected".into()),
+                    detail: Some(error),
+                });
+            }
+        };
+    confidential_generate_with_context(
+        request,
+        journal_path,
+        endpoint,
+        config,
+        runtime,
+        &crate::GenerateCallContext {
+            priority,
+            cancellation: &solstone_core_generate::Cancellation::never(),
+        },
+    )
+}
+
+pub(crate) fn confidential_generate_with_context(
+    request: &GenerateRequest,
+    journal_path: &Path,
+    endpoint: &ByoEndpoint,
+    config: &Map<String, Value>,
+    runtime: &EndpointRuntime,
+    context: &crate::GenerateCallContext<'_>,
+) -> ConfidentialResult {
+    confidential_generate_with_control(
         ConfidentialCall {
             request,
             journal_path,
@@ -58,6 +90,7 @@ pub fn confidential_generate(
             runtime,
             now: SystemTime::now(),
         },
+        context,
         #[cfg(not(windows))]
         |_| {
             resolve_nvattest_from_current_exe()
@@ -203,52 +236,20 @@ where
                 });
             }
         };
-    let timeout = crate::transport::request_timeout(
-        call.request.timeout_s,
-        crate::endpoint::thinking_headroom(call.endpoint, call.config),
-    );
-    paced(call.journal_path, priority, timeout, |remaining| {
-        if !priority.band.is_background() {
-            return confidential_generate_unpaced_with(call, readiness, establish);
-        }
-        let mut bounded = call.request.clone();
-        bounded.timeout_s = Some(remaining.as_secs_f64());
-        confidential_generate_unpaced_with(
-            ConfidentialCall {
-                request: &bounded,
-                ..call
-            },
-            readiness,
-            establish,
-        )
-    })
-}
-
-/// Older calls share the journal's one background slot and pause older work
-/// after a failure; a local admission failure reads as exhausted capacity.
-fn paced(
-    journal: &Path,
-    priority: solstone_core_journal_config::work_priority::WorkPriority,
-    timeout: Duration,
-    generate: impl FnOnce(Duration) -> ConfidentialResult,
-) -> ConfidentialResult {
-    solstone_core_local::admission::run_confidential_call(
-        journal,
-        priority,
-        timeout,
-        generate,
-        |result| !matches!(result, ConfidentialResult::Generated(_)),
+    confidential_generate_with_control(
+        call,
+        &crate::GenerateCallContext {
+            priority,
+            cancellation: &solstone_core_generate::Cancellation::never(),
+        },
+        readiness,
+        establish,
     )
-    .unwrap_or_else(|detail| {
-        ConfidentialResult::Failed(EndpointFailure {
-            reason_code: Some("local_capacity_exhausted".into()),
-            detail: Some(detail),
-        })
-    })
 }
 
-fn confidential_generate_unpaced_with<R, O, E>(
+fn confidential_generate_with_control<R, O, E>(
     call: ConfidentialCall<'_>,
+    context: &crate::GenerateCallContext<'_>,
     readiness: R,
     establish: E,
 ) -> ConfidentialResult
@@ -262,6 +263,104 @@ where
         &dyn solstone_core_spp_ratls::AdmissionClock,
     ) -> Result<EstablishedChannel, &'static str>,
 {
+    let priority = context.priority;
+    if context.cancellation.is_cancelled() {
+        return ConfidentialResult::Failed(EndpointFailure {
+            reason_code: Some("request_cancelled".into()),
+            detail: None,
+        });
+    }
+    let timeout = crate::transport::request_timeout(
+        call.request.timeout_s,
+        crate::endpoint::thinking_headroom(call.endpoint, call.config),
+    );
+    paced_checked(
+        call.journal_path,
+        priority,
+        timeout,
+        &|| {
+            if context.cancellation.is_cancelled() {
+                Err("request cancelled".into())
+            } else {
+                Ok(())
+            }
+        },
+        |remaining| {
+            if !priority.band.is_background() {
+                return confidential_generate_unpaced_with(call, context, readiness, establish);
+            }
+            let mut bounded = call.request.clone();
+            bounded.timeout_s = Some(remaining.as_secs_f64());
+            confidential_generate_unpaced_with(
+                ConfidentialCall {
+                    request: &bounded,
+                    ..call
+                },
+                context,
+                readiness,
+                establish,
+            )
+        },
+    )
+}
+
+/// Older calls share the journal's one background slot and pause older work
+/// after a failure; a local admission failure reads as exhausted capacity.
+#[cfg(feature = "test-hooks")]
+fn paced(
+    journal: &Path,
+    priority: solstone_core_journal_config::work_priority::WorkPriority,
+    timeout: Duration,
+    generate: impl FnOnce(Duration) -> ConfidentialResult,
+) -> ConfidentialResult {
+    paced_checked(journal, priority, timeout, &|| Ok(()), generate)
+}
+
+fn paced_checked(
+    journal: &Path,
+    priority: solstone_core_journal_config::work_priority::WorkPriority,
+    timeout: Duration,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+    generate: impl FnOnce(Duration) -> ConfidentialResult,
+) -> ConfidentialResult {
+    solstone_core_local::admission::run_confidential_call_checked(
+        journal,
+        priority,
+        timeout,
+        checkpoint,
+        generate,
+        |result| !matches!(result, ConfidentialResult::Generated(_)),
+    )
+    .unwrap_or_else(|detail| {
+        ConfidentialResult::Failed(EndpointFailure {
+            reason_code: Some("local_capacity_exhausted".into()),
+            detail: Some(detail),
+        })
+    })
+}
+
+fn confidential_generate_unpaced_with<R, O, E>(
+    call: ConfidentialCall<'_>,
+    context: &crate::GenerateCallContext<'_>,
+    readiness: R,
+    establish: E,
+) -> ConfidentialResult
+where
+    R: FnOnce(&Path) -> O,
+    O: IntoReadinessOutcome,
+    E: FnOnce(
+        &RatlsEndpoint,
+        &Path,
+        u64,
+        &dyn solstone_core_spp_ratls::AdmissionClock,
+    ) -> Result<EstablishedChannel, &'static str>,
+{
+    if context.cancellation.is_cancelled() {
+        return ConfidentialResult::Failed(EndpointFailure {
+            reason_code: Some("request_cancelled".into()),
+            detail: None,
+        });
+    }
     let ConfidentialCall {
         request,
         journal_path,
@@ -270,7 +369,14 @@ where
         runtime,
         now,
     } = call;
-    let nvattest_dir = match readiness(journal_path).into_readiness_outcome() {
+    let readiness = readiness(journal_path).into_readiness_outcome();
+    if context.cancellation.is_cancelled() {
+        return ConfidentialResult::Failed(EndpointFailure {
+            reason_code: Some("request_cancelled".into()),
+            detail: None,
+        });
+    }
+    let nvattest_dir = match readiness {
         Ok(dir) => dir,
         Err(failure) => {
             if !attestation_refusal_is_health_probe(request) {
@@ -366,8 +472,14 @@ where
 
     if need_establish {
         let admission_clock = PoolAdmissionClock(runtime.confidential_channel_pool().clock());
-        let established = match establish(&target_endpoint, &nvattest_dir, epoch, &admission_clock)
-        {
+        let established = establish(&target_endpoint, &nvattest_dir, epoch, &admission_clock);
+        if context.cancellation.is_cancelled() {
+            return ConfidentialResult::Failed(EndpointFailure {
+                reason_code: Some("request_cancelled".into()),
+                detail: None,
+            });
+        }
+        let established = match established {
             Ok(channel) => channel,
             Err(reason_code) => {
                 drop(guard);
@@ -447,11 +559,29 @@ where
         (&mut **injected_stream.as_mut().unwrap(), None)
     };
 
-    if need_establish {
+    let started = if need_establish {
+        let started = Instant::now();
+        let budget = crate::transport::request_timeout(
+            request.timeout_s,
+            thinking_headroom(endpoint, config),
+        );
+        let Some(probe_deadline) = remaining_timeout(started, budget) else {
+            return ConfidentialResult::Failed(EndpointFailure {
+                reason_code: Some("local_capacity_exhausted".to_owned()),
+                detail: None,
+            });
+        };
+        if probe_deadline.is_zero() {
+            return ConfidentialResult::Failed(EndpointFailure {
+                reason_code: Some("local_capacity_exhausted".to_owned()),
+                detail: None,
+            });
+        }
         match solstone_core_spp_ratls::send_admission_probe(
             stream_ref,
             &target_host,
             endpoint.credential.as_deref(),
+            probe_deadline,
         ) {
             Ok(()) => {}
             Err(code) => {
@@ -461,7 +591,10 @@ where
                 });
             }
         }
-    }
+        started
+    } else {
+        Instant::now()
+    };
 
     let mut transport = AttestedEndpointTransport {
         stream: stream_ref,
@@ -470,7 +603,7 @@ where
         admission,
     };
 
-    let result = endpoint_generate_with(
+    let result = endpoint_generate_internal_with_context(
         request,
         journal_path,
         endpoint,
@@ -478,6 +611,8 @@ where
         runtime,
         &mut transport,
         Instant::now(),
+        started,
+        context,
     );
 
     if let EndpointResult::Generated(_) = &result
@@ -772,6 +907,51 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn explicit_background_priority_reaches_confidential_admission_without_environment_changes() {
+        use solstone_core_journal_config::work_priority::{WorkBand, WorkPriority};
+        for band in [WorkBand::Now, WorkBand::Import] {
+            let journal = journal(&format!("explicit-priority-{}", band as u8));
+            let request = request();
+            let endpoint = endpoint(1);
+            let runtime = EndpointRuntime::default();
+            let config = Map::new();
+            let context = crate::GenerateCallContext {
+                priority: WorkPriority {
+                    band,
+                    source_time: 20200101120000,
+                },
+                cancellation: &solstone_core_generate::Cancellation::never(),
+            };
+            let result = confidential_generate_with_control(
+                ConfidentialCall {
+                    request: &request,
+                    journal_path: &journal,
+                    endpoint: &endpoint,
+                    config: &config,
+                    runtime: &runtime,
+                    now: UNIX_EPOCH,
+                },
+                &context,
+                |_| NvattestEnsureStatus::AlreadyInstalled,
+                |_, _, _, _| Err("tls_handshake_failed"),
+            );
+            assert!(matches!(result, ConfidentialResult::AttestationFailed(_)));
+            assert_eq!(
+                journal.join("health/confidential-background").exists(),
+                band.is_background()
+            );
+            if band.is_background() {
+                assert!(
+                    !solstone_core_local::admission::confidential_background_open(&journal),
+                    "a failed admitted history call must preserve the ordinary background pause"
+                );
+            }
+            std::fs::remove_dir_all(journal).unwrap();
+        }
+    }
+
     pub(crate) fn endpoint(port: u16) -> ByoEndpoint {
         ByoEndpoint {
             base_url: format!("http://127.0.0.1:{port}"),
@@ -993,6 +1173,13 @@ mod tests {
     }
 
     impl AttestedIo for RecordingChannel {
+        fn set_io_deadline(
+            &mut self,
+            _deadline: Option<std::time::Instant>,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
         fn set_io_timeout(&mut self, _timeout: Option<Duration>) -> io::Result<()> {
             Ok(())
         }
@@ -2211,6 +2398,127 @@ mod tests {
                     .as_deref(),
                 Some("spp")
             );
+        }
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn probe_timeout_prevents_chat_completion_post() {
+        let runtime = EndpointRuntime::default();
+        let path = journal("probe-timeout-prevents-chat");
+        let config_map = active_spp_config();
+        setup_journal(&path, &config_map);
+        let endpoint = endpoint(9099);
+        let chat_body = r#"{"choices":[{"message":{"content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}"#;
+
+        // 1. Probe failure (TimedOut on IO) writes no chat body and fails with local_endpoint_unreachable
+        {
+            let written = Rc::new(RefCell::new(Vec::new()));
+            let written_clone = written.clone();
+            let req = request();
+            let result = confidential_generate_with(
+                ConfidentialCall {
+                    request: &req,
+                    journal_path: &path,
+                    endpoint: &endpoint,
+                    config: &config_map,
+                    runtime: &runtime,
+                    now: UNIX_EPOCH,
+                },
+                |_| NvattestEnsureStatus::AlreadyInstalled,
+                |_, _, _, _| {
+                    Ok(EstablishedChannel::Injected {
+                        verdict: Box::new(verdict()),
+                        stream: Box::new(RecordingChannel::with_initial_read_error(
+                            written_clone,
+                            io::ErrorKind::TimedOut,
+                        )),
+                    })
+                },
+            );
+            assert!(matches!(
+                result,
+                ConfidentialResult::Failed(EndpointFailure {
+                    reason_code: Some(ref code),
+                    ..
+                }) if code == "local_endpoint_unreachable"
+            ));
+            let written_str = String::from_utf8(written.borrow().clone()).unwrap();
+            assert!(written_str.contains("GET /solstone-admission"));
+            assert!(!written_str.contains("POST /v1/chat/completions"));
+            assert!(!written_str.contains("hello"));
+        }
+
+        // 2. A 200 probe proceeds to chat content
+        {
+            let written = Rc::new(RefCell::new(Vec::new()));
+            let written_clone = written.clone();
+            let req = request();
+            let result = confidential_generate_with(
+                ConfidentialCall {
+                    request: &req,
+                    journal_path: &path,
+                    endpoint: &endpoint,
+                    config: &config_map,
+                    runtime: &runtime,
+                    now: UNIX_EPOCH,
+                },
+                |_| NvattestEnsureStatus::AlreadyInstalled,
+                |_, _, _, _| {
+                    Ok(EstablishedChannel::Injected {
+                        verdict: Box::new(verdict()),
+                        stream: Box::new(RecordingChannel::with_probe_and_status(
+                            written_clone,
+                            200,
+                            "OK",
+                            200,
+                            "OK",
+                            chat_body,
+                        )),
+                    })
+                },
+            );
+            assert!(matches!(result, ConfidentialResult::Generated(_)));
+            let written_str = String::from_utf8(written.borrow().clone()).unwrap();
+            assert!(written_str.contains("GET /solstone-admission"));
+            assert!(written_str.contains("POST /v1/chat/completions"));
+        }
+
+        // 3. No-time-left before the probe stays local_capacity_exhausted
+        {
+            let written = Rc::new(RefCell::new(Vec::new()));
+            let mut req = request();
+            req.timeout_s = Some(0.000000001);
+            let result = confidential_generate_with(
+                ConfidentialCall {
+                    request: &req,
+                    journal_path: &path,
+                    endpoint: &endpoint,
+                    config: &config_map,
+                    runtime: &runtime,
+                    now: UNIX_EPOCH,
+                },
+                |_| NvattestEnsureStatus::AlreadyInstalled,
+                |_, _, _, _| {
+                    Ok(EstablishedChannel::Injected {
+                        verdict: Box::new(verdict()),
+                        stream: Box::new(RecordingChannel::with_probe_failure(
+                            written.clone(),
+                            200,
+                            "OK",
+                        )),
+                    })
+                },
+            );
+            assert!(matches!(
+                result,
+                ConfidentialResult::Failed(EndpointFailure {
+                    reason_code: Some(ref code),
+                    ..
+                }) if code == "local_capacity_exhausted"
+            ));
+            assert!(written.borrow().is_empty());
         }
 
         let _ = std::fs::remove_dir_all(path);

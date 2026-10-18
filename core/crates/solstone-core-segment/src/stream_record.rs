@@ -945,6 +945,26 @@ pub fn advance_unbound_stream(
     segment: &str,
     hints: StreamHints,
 ) -> Result<StreamAdvance, UnboundStreamAdvanceError> {
+    advance_unbound_stream_checked(journal, stream, day, segment, hints, &|| Ok(()))
+}
+
+pub fn advance_unbound_stream_checked(
+    journal: &Path,
+    stream: &str,
+    day: &str,
+    segment: &str,
+    hints: StreamHints,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<StreamAdvance, UnboundStreamAdvanceError> {
+    let check = || {
+        checkpoint().map_err(|detail| {
+            UnboundStreamAdvanceError::Advance(SegmentError::Io {
+                path: journal.to_path_buf(),
+                source: std::io::Error::new(std::io::ErrorKind::Interrupted, detail),
+            })
+        })
+    };
+    check()?;
     if stream.is_empty() || stream.contains('/') || stream.contains('\\') {
         return Err(UnboundStreamAdvanceError::Advance(
             SegmentError::StreamInput("stream name must be a plain path component"),
@@ -955,6 +975,7 @@ pub fn advance_unbound_stream(
     let state_path = stream_record_path(journal, stream);
     let _lock = hold_lock(&state_path, LockOptions::default())
         .map_err(|error| UnboundStreamAdvanceError::Advance(error.into()))?;
+    check()?;
     let record =
         read_typed_stream_record(&state_path).map_err(UnboundStreamAdvanceError::Advance)?;
     match owner_deleted(&segment_dir.path) {
@@ -974,6 +995,7 @@ pub fn advance_unbound_stream(
             .map_err(UnboundStreamAdvanceError::Advance)?
     {
         if marker_missing {
+            check()?;
             write_stream_marker(&marker_path, stream, &advance)?;
         }
         return Ok(advance);
@@ -997,12 +1019,15 @@ pub fn advance_unbound_stream(
         ));
     }
     if let Some(record) = record.as_ref() {
+        check()?;
         ensure_unbound_head_marker(journal, stream, record)?;
     }
     let (mut record, advance) = update_unbound_record(record, stream, day, segment, hints)
         .map_err(UnboundStreamAdvanceError::Advance)?;
     record.last_marker = Some(advance.clone());
+    check()?;
     write_stream_record(&state_path, &record).map_err(UnboundStreamAdvanceError::Advance)?;
+    check()?;
     write_stream_marker(&marker_path, stream, &advance)?;
     Ok(advance)
 }

@@ -8,6 +8,67 @@ use std::sync::atomic::AtomicBool;
 const DAY: &str = "20260813";
 const NOW: i64 = 1_786_615_200_000;
 
+#[cfg(feature = "full-tests")]
+#[test]
+fn cancellation_after_activity_state_turn_preserves_state_and_a_new_owner_can_finish() {
+    let _serial = INTERLEAVING.lock().unwrap_or_else(|p| p.into_inner());
+    let (_journal, _roots, mut context, recorder) = journal();
+    write_sense(
+        &context.journal,
+        "default",
+        "090000_300",
+        &work_and_home("work"),
+    );
+    live(&context, "default", "090000_300").unwrap();
+    let state = solstone_core_system::activity_state::activity_state_path(
+        &context.journal,
+        Some("default"),
+    );
+    let before = fs::read(&state).unwrap();
+    write_sense(&context.journal, "default", "090500_300", &idle());
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let check = Arc::clone(&cancelled);
+    context.cancel_checkpoint = Arc::new(move || check.load(Ordering::Acquire));
+    let target = context.journal.clone();
+    segment::state_probe::install(Some(Arc::new(move |journal: &Path, point: &str| {
+        if journal == target && point == "hydrated" {
+            cancelled.store(true, Ordering::Release);
+        }
+    })));
+    let stopped = live(&context, "default", "090500_300");
+    segment::state_probe::install(None);
+    assert!(stopped.is_err());
+    assert_eq!(fs::read(&state).unwrap(), before);
+    assert!(
+        segment::activity_context(&context, DAY)
+            .unwrap()
+            .checkpoint()
+            .is_err(),
+        "day-specific activity work must retain the original lifetime"
+    );
+    for facet in ["home", "work"] {
+        assert!(
+            solstone_core_facets::load_activity_records(&context.journal, facet, DAY, true)
+                .unwrap()
+                .is_empty()
+        );
+    }
+    let resumed =
+        context::ThinkContext::new(&context.journal, DAY.into(), context.day_dir.clone(), NOW)
+            .unwrap()
+            .with_boundary(recorder)
+            .with_talent_roots(context.talent_root.clone(), context.apps_root.clone());
+    live(&resumed, "default", "090500_300").unwrap();
+    for facet in ["home", "work"] {
+        assert_eq!(
+            solstone_core_facets::load_activity_records(&resumed.journal, facet, DAY, true)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}
+
 fn work_and_home(active: &str) -> Value {
     serde_json::json!({"density":"active","content_type":"work","activity_summary":active,
         "facets":[{"facet":"home","level":"high","activity":active},

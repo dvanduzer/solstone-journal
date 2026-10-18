@@ -20,7 +20,7 @@ use solstone_core_format::audio_archive::{
 };
 use solstone_core_journal_io::{AtomicWriteOptions, LockOptions, atomic_replace};
 use solstone_core_segment::output_attempt::SegmentMutation;
-use solstone_core_segment::{ImportSource, Kind, StreamHints, advance_unbound_stream};
+use solstone_core_segment::{ImportSource, Kind, StreamHints, advance_unbound_stream_checked};
 
 use super::claims::{
     DEFAULT_WRITE_BUSY_TIMEOUT, find_held_members, insert_tile_claims, record_archive_run,
@@ -655,10 +655,22 @@ pub fn recover_published_tile(
     day: &str,
     key: &str,
 ) -> Result<bool, AudioArchiveError> {
+    recover_published_tile_checked(journal, id, store, day, key, &|| Ok(()))
+}
+
+pub(crate) fn recover_published_tile_checked(
+    journal: &Path,
+    id: &str,
+    store: &mut ArchiveStore,
+    day: &str,
+    key: &str,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<bool, AudioArchiveError> {
+    checkpoint().map_err(AudioArchiveError::Other)?;
     super::record::validate_coordinates(day, key)?;
     if store.tile_phase(day, key)? == 2 {
         let stream = store.settings()?.stream;
-        refresh_saved_availability(journal, id, store, day, key, &stream)?;
+        refresh_saved_availability_checked(journal, id, store, day, key, &stream, checkpoint)?;
         return Ok(true);
     }
     let stage = stage_path(journal, id, day, key);
@@ -675,7 +687,7 @@ pub fn recover_published_tile(
     if !intent_path(journal, id, day, key).try_exists()? {
         return Ok(false);
     }
-    recover_or_publish_tile(journal, id, store, day, key, false, &None)?;
+    recover_or_publish_tile_checked(journal, id, store, day, key, false, &None, checkpoint)?;
     Ok(true)
 }
 
@@ -688,6 +700,23 @@ fn recover_or_publish_tile(
     allow_publish: bool,
     seams: &Option<AudioArchivePublishSeams>,
 ) -> Result<(), AudioArchiveError> {
+    recover_or_publish_tile_checked(journal, id, store, day, key, allow_publish, seams, &|| {
+        Ok(())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recover_or_publish_tile_checked(
+    journal: &Path,
+    id: &str,
+    store: &mut ArchiveStore,
+    day: &str,
+    key: &str,
+    allow_publish: bool,
+    seams: &Option<AudioArchivePublishSeams>,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), AudioArchiveError> {
+    checkpoint().map_err(AudioArchiveError::Other)?;
     let parts = store.publishable_tile_parts(day, key)?;
     let stream = store.settings()?.stream;
     let intent: TileIntent =
@@ -737,6 +766,7 @@ fn recover_or_publish_tile(
         solstone_core_journal_io::ensure_directory(target.parent().expect("segment parent"))
             .map_err(|error| AudioArchiveError::Other(error.to_string()))?;
         let _exclusion = SegmentMutation::acquire(&target, LockOptions::default())?;
+        checkpoint().map_err(AudioArchiveError::Other)?;
         match fs::symlink_metadata(&target) {
             Ok(_) => {
                 return Err(AudioArchiveError::ChronicleSegmentRefused(format!(
@@ -746,6 +776,7 @@ fn recover_or_publish_tile(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
+        checkpoint().map_err(AudioArchiveError::Other)?;
         fs::rename(&stage, &target)?;
         sync_directory(journal, &format!("imports/{id}/staged/{day}"))?;
         for directory in [
@@ -758,11 +789,12 @@ fn recover_or_publish_tile(
         #[cfg(unix)]
         solstone_core_journal_io::sync_root(journal)
             .map_err(|error| AudioArchiveError::Other(error.to_string()))?;
-        advance_stream(journal, &stream, day, key)?;
+        advance_stream(journal, &stream, day, key, checkpoint)?;
         check_fault(seams, ArchiveFault::AfterPublishBeforeSavedMark)?;
     } else if target.try_exists()? {
         // Synchronize with a writer that just consumed its stage before recording Saved.
         let _exclusion = SegmentMutation::acquire(&target, LockOptions::default())?;
+        checkpoint().map_err(AudioArchiveError::Other)?;
         let placement: AudioArchivePlacement =
             serde_json::from_slice(&fs::read(target.join(AUDIO_ARCHIVE_PLACEMENT_FILENAME))?)?;
         if placement != intent.placement {
@@ -772,9 +804,9 @@ fn recover_or_publish_tile(
         }
         sync_directory(journal, &format!("imports/{id}/staged/{day}"))?;
         sync_directory(journal, &format!("chronicle/{day}/{stream}"))?;
-        advance_stream(journal, &stream, day, key)?;
+        advance_stream(journal, &stream, day, key, checkpoint)?;
     }
-    refresh_saved_availability(journal, id, store, day, key, &stream)
+    refresh_saved_availability_checked(journal, id, store, day, key, &stream, checkpoint)
 }
 
 fn advance_stream(
@@ -782,9 +814,10 @@ fn advance_stream(
     stream: &str,
     day: &str,
     key: &str,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<(), AudioArchiveError> {
     let qualifier = stream.strip_prefix("import.").unwrap_or(stream).to_owned();
-    advance_unbound_stream(
+    advance_unbound_stream_checked(
         journal,
         stream,
         day,
@@ -794,6 +827,7 @@ fn advance_stream(
             host: None,
             platform: None,
         },
+        checkpoint,
     )
     .map_err(|error| AudioArchiveError::Other(error.to_string()))?;
     Ok(())
@@ -806,6 +840,19 @@ fn refresh_saved_availability(
     key: &str,
     stream: &str,
 ) -> Result<(), AudioArchiveError> {
+    refresh_saved_availability_checked(journal, _id, store, day, key, stream, &|| Ok(()))
+}
+
+fn refresh_saved_availability_checked(
+    journal: &Path,
+    _id: &str,
+    store: &mut ArchiveStore,
+    day: &str,
+    key: &str,
+    stream: &str,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), AudioArchiveError> {
+    checkpoint().map_err(AudioArchiveError::Other)?;
     let planned = store.publishable_tile_parts(day, key)?;
     let placement_path = journal
         .join("chronicle")
@@ -852,10 +899,10 @@ fn refresh_saved_availability(
             },
         ));
     }
-    store.set_tile_outcomes(day, key, &outcomes, 2)?;
+    store.set_tile_outcomes_checked(day, key, &outcomes, 2, checkpoint)?;
     for (name, outcome) in outcomes {
         if outcome == PartOutcome::SavedButUnavailable {
-            store.finish_processing(day, key, &name, true)?;
+            store.finish_processing_checked(day, key, &name, true, checkpoint)?;
         }
     }
     Ok(())

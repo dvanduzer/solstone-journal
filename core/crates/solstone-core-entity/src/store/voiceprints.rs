@@ -160,6 +160,7 @@ pub enum VoiceprintOperationError {
     Path(PathError),
     Npz(VoiceprintNpzError),
     MetadataJson(String),
+    PublicationRefused(String),
     MetadataNotObject,
     InvalidRemovalKey,
     UnsupportedKeyField {
@@ -188,6 +189,7 @@ impl fmt::Display for VoiceprintOperationError {
             Self::Write(error) => error.fmt(formatter),
             Self::Path(error) => error.fmt(formatter),
             Self::Npz(error) => error.fmt(formatter),
+            Self::PublicationRefused(detail) => formatter.write_str(detail),
             Self::MetadataJson(error) => {
                 write!(formatter, "invalid voiceprint metadata JSON: {error}")
             }
@@ -234,7 +236,8 @@ impl Error for VoiceprintOperationError {
             Self::Write(error) => Some(error),
             Self::Path(error) => Some(error),
             Self::Npz(error) => Some(error),
-            Self::MetadataJson(_)
+            Self::PublicationRefused(_)
+            | Self::MetadataJson(_)
             | Self::MetadataNotObject
             | Self::InvalidRemovalKey
             | Self::UnsupportedKeyField { .. }
@@ -380,6 +383,18 @@ pub fn save_voiceprints_batch(
     new_items: &[VoiceprintItem],
     running_encoder: &EncoderIdentity,
 ) -> Result<usize, VoiceprintOperationError> {
+    save_voiceprints_batch_checked(journal_root, entity_id, new_items, running_encoder, &|| {
+        Ok(())
+    })
+}
+
+pub fn save_voiceprints_batch_checked(
+    journal_root: &Path,
+    entity_id: &str,
+    new_items: &[VoiceprintItem],
+    running_encoder: &EncoderIdentity,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<usize, VoiceprintOperationError> {
     if new_items.is_empty() {
         return Ok(0);
     }
@@ -387,6 +402,7 @@ pub fn save_voiceprints_batch(
         crate::hold_entity_trust_lock(journal_root).map_err(EntityLifecycleError::TrustLock)?;
     let (_directory, path) = resolve_voiceprint_path(journal_root, entity_id, true)?;
     let _lock = hold_lock(&path, LockOptions::default())?;
+    checkpoint().map_err(VoiceprintOperationError::PublicationRefused)?;
     let mut archive = load_voiceprints(&path)?.unwrap_or_else(empty_archive);
     ensure_mutation_allowed(&archive, running_encoder)?;
     for item in new_items {
@@ -394,6 +410,7 @@ pub fn save_voiceprints_batch(
         archive.metadata.push(serialize_metadata(&item.metadata)?);
     }
     archive.rows = archive.metadata.len();
+    checkpoint().map_err(VoiceprintOperationError::PublicationRefused)?;
     write_and_verify_voiceprints(&path, &archive, running_encoder)?;
     Ok(new_items.len())
 }

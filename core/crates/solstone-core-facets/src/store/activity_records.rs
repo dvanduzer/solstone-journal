@@ -78,6 +78,9 @@ pub enum ActivityRecordStoreError {
     DestinationMuted {
         facet: String,
     },
+    PublicationRefused {
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for ActivityRecordStoreError {
@@ -106,6 +109,7 @@ impl std::fmt::Display for ActivityRecordStoreError {
             Self::DestinationMuted { facet } => {
                 write!(formatter, "destination facet is muted: {facet}")
             }
+            Self::PublicationRefused { detail } => write!(formatter, "{detail}"),
         }
     }
 }
@@ -505,9 +509,20 @@ pub fn publish_anticipation_batch(
     allow_before: bool,
     receipt: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
+    publish_anticipation_batch_checked(root, batch, allow_before, || Ok(()), receipt)
+}
+
+pub fn publish_anticipation_batch_checked(
+    root: &Path,
+    batch: &PreparedAnticipationBatch,
+    allow_before: bool,
+    checkpoint: impl Fn() -> Result<(), String>,
+    receipt: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
     // A receipt that fails leaves the batch written, and its retry then writes
     // nothing, so search takes the file whenever it holds the batch.
-    let (path, receipted) = write_anticipation_batch(root, batch, allow_before, receipt)?;
+    let (path, receipted) =
+        write_anticipation_batch(root, batch, allow_before, checkpoint, receipt)?;
     super::publication::publish_saved(root, &path);
     receipted
 }
@@ -518,6 +533,7 @@ fn write_anticipation_batch(
     root: &Path,
     batch: &PreparedAnticipationBatch,
     allow_before: bool,
+    checkpoint: impl Fn() -> Result<(), String>,
     receipt: impl FnOnce() -> Result<(), String>,
 ) -> Result<(PathBuf, Result<(), String>), String> {
     let _facet = crate::hold_facet_trust_lock(root).map_err(|e| e.to_string())?;
@@ -525,6 +541,7 @@ fn write_anticipation_batch(
     let path = day_path(root, &batch.facet, &batch.day).map_err(|e| e.to_string())?;
     let _entity = solstone_core_entity::hold_entity_trust_lock(root).map_err(|e| e.to_string())?;
     let _lock = hold_lock(&path, LockOptions::default()).map_err(|e| e.to_string())?;
+    checkpoint()?;
     let current = optional_activity_bytes(&path)?;
     if current.as_deref() != Some(batch.after.as_str()) {
         let bytes = match rebase_anticipation_batch(batch, current.as_deref())? {
@@ -535,6 +552,7 @@ fn write_anticipation_batch(
             }
         };
         if let Some(bytes) = bytes {
+            checkpoint()?;
             atomic_replace(
                 &path,
                 bytes.as_bytes(),
@@ -794,7 +812,33 @@ pub fn append_activity_record(
     root: &Path,
     facet: &str,
     day: &str,
+    record: ActivityRecord,
+) -> Result<AppendOutcome, ActivityRecordStoreError> {
+    append_activity_record_with_check(root, facet, day, record, || Ok(()))
+}
+
+pub fn append_activity_record_checked(
+    root: &Path,
+    facet: &str,
+    day: &str,
+    record: ActivityRecord,
+    checkpoint: impl Fn() -> Result<(), String>,
+) -> Result<AppendOutcome, ActivityRecordStoreError> {
+    let _guard = crate::hold_facet_trust_lock(root).map_err(|error| {
+        ActivityRecordStoreError::Identity(super::declaration::FacetIdentityError::Failed(
+            error.to_string(),
+        ))
+    })?;
+    checkpoint().map_err(|detail| ActivityRecordStoreError::PublicationRefused { detail })?;
+    append_activity_record_with_check(root, facet, day, record, checkpoint)
+}
+
+fn append_activity_record_with_check(
+    root: &Path,
+    facet: &str,
+    day: &str,
     mut record: ActivityRecord,
+    checkpoint: impl Fn() -> Result<(), String>,
 ) -> Result<AppendOutcome, ActivityRecordStoreError> {
     let facet_id = admit_activity_destination(root, facet)?;
     record.insert(
@@ -802,6 +846,7 @@ pub fn append_activity_record(
         Value::String(facet_id.clone()),
     );
     locked_modify_day_records(root, facet, day, true, &facet_id, |rows| {
+        checkpoint().map_err(|detail| ActivityRecordStoreError::PublicationRefused { detail })?;
         let record_id = id(&record).to_owned();
         if !record_id.is_empty() && rows.iter().any(|row| id(row) == record_id) {
             return Ok((rows, AppendOutcome::AlreadyExists));
@@ -809,6 +854,7 @@ pub fn append_activity_record(
         let written = normalize(record);
         let mut updated = rows;
         updated.push(written.clone());
+        checkpoint().map_err(|detail| ActivityRecordStoreError::PublicationRefused { detail })?;
         Ok((updated, AppendOutcome::Written(written)))
     })
 }
@@ -851,9 +897,66 @@ pub fn update_activity_record_with(
     note: &str,
     timestamp: &str,
 ) -> Result<Option<ActivityRecord>, ActivityRecordStoreError> {
+    update_activity_record_with_check(
+        root,
+        facet,
+        day,
+        record_id,
+        derive,
+        actor,
+        note,
+        timestamp,
+        || Ok(()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn update_activity_record_checked(
+    root: &Path,
+    facet: &str,
+    day: &str,
+    record_id: &str,
+    patch: &Map<String, Value>,
+    actor: &str,
+    note: &str,
+    timestamp: &str,
+    checkpoint: impl Fn() -> Result<(), String>,
+) -> Result<Option<ActivityRecord>, ActivityRecordStoreError> {
+    let _guard = crate::hold_facet_trust_lock(root).map_err(|error| {
+        ActivityRecordStoreError::Identity(super::declaration::FacetIdentityError::Failed(
+            error.to_string(),
+        ))
+    })?;
+    checkpoint().map_err(|detail| ActivityRecordStoreError::PublicationRefused { detail })?;
+    update_activity_record_with_check(
+        root,
+        facet,
+        day,
+        record_id,
+        |_| Some(patch.clone()),
+        actor,
+        note,
+        timestamp,
+        checkpoint,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_activity_record_with_check(
+    root: &Path,
+    facet: &str,
+    day: &str,
+    record_id: &str,
+    derive: impl FnOnce(&ActivityRecord) -> Option<Map<String, Value>>,
+    actor: &str,
+    note: &str,
+    timestamp: &str,
+    checkpoint: impl Fn() -> Result<(), String>,
+) -> Result<Option<ActivityRecord>, ActivityRecordStoreError> {
     let current_id = admit_activity_destination(root, facet)?;
     let mut derive = Some(derive);
     locked_modify_day_records(root, facet, day, false, &current_id, |rows| {
+        checkpoint().map_err(|detail| ActivityRecordStoreError::PublicationRefused { detail })?;
         let rows = adopt_moved_rows(root, &current_id, rows);
         let mut result = None;
         for row in &rows {
@@ -891,6 +994,7 @@ pub fn update_activity_record_with(
                 edited
             })
             .collect();
+        checkpoint().map_err(|detail| ActivityRecordStoreError::PublicationRefused { detail })?;
         Ok((updated, result))
     })
 }
@@ -906,8 +1010,65 @@ pub fn set_activity_hidden(
     reason: Option<&str>,
     timestamp: &str,
 ) -> Result<Option<ActivityRecord>, ActivityRecordStoreError> {
+    set_activity_hidden_with_check(
+        root,
+        facet,
+        day,
+        record_id,
+        hidden_value,
+        actor,
+        reason,
+        timestamp,
+        || Ok(()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn set_activity_hidden_checked(
+    root: &Path,
+    facet: &str,
+    day: &str,
+    record_id: &str,
+    hidden_value: bool,
+    actor: &str,
+    reason: Option<&str>,
+    timestamp: &str,
+    checkpoint: impl Fn() -> Result<(), String>,
+) -> Result<Option<ActivityRecord>, ActivityRecordStoreError> {
+    let _guard = crate::hold_facet_trust_lock(root).map_err(|error| {
+        ActivityRecordStoreError::Identity(super::declaration::FacetIdentityError::Failed(
+            error.to_string(),
+        ))
+    })?;
+    checkpoint().map_err(|detail| ActivityRecordStoreError::PublicationRefused { detail })?;
+    set_activity_hidden_with_check(
+        root,
+        facet,
+        day,
+        record_id,
+        hidden_value,
+        actor,
+        reason,
+        timestamp,
+        checkpoint,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn set_activity_hidden_with_check(
+    root: &Path,
+    facet: &str,
+    day: &str,
+    record_id: &str,
+    hidden_value: bool,
+    actor: &str,
+    reason: Option<&str>,
+    timestamp: &str,
+    checkpoint: impl Fn() -> Result<(), String>,
+) -> Result<Option<ActivityRecord>, ActivityRecordStoreError> {
     let current_id = admit_activity_destination(root, facet)?;
     locked_modify_day_records(root, facet, day, false, &current_id, |rows| {
+        checkpoint().map_err(|detail| ActivityRecordStoreError::PublicationRefused { detail })?;
         let rows = adopt_moved_rows(root, &current_id, rows);
         let mut result = None;
         for row in &rows {
@@ -945,8 +1106,111 @@ pub fn set_activity_hidden(
                 }
             })
             .collect();
+        checkpoint().map_err(|detail| ActivityRecordStoreError::PublicationRefused { detail })?;
         Ok((updated, result))
     })
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+mod publication_cancellation_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn cancellation_after_anticipation_lock_wait_preserves_bytes_and_positive_twin() {
+        for cancel in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            crate::create_facet(root.path(), "work", "Work", "", "", "", None).unwrap();
+            assert!(matches!(
+                append_activity_record(
+                    root.path(),
+                    "work",
+                    "20261012",
+                    json!({"id":"old","activity":"meeting","title":"Before quiet rain"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                )
+                .unwrap(),
+                AppendOutcome::Written(_)
+            ));
+            let batch = prepare_anticipation_batch(root.path(), "work", "20261012", &[(json!({"id":"new","source":"anticipated","title":"After quiet rain","hidden":false}).as_object().unwrap().clone(), vec![])], "2026-10-12T12:00:00Z").unwrap();
+            let path = day_path(root.path(), "work", "20261012").unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let held = hold_lock(&path, LockOptions::default()).unwrap();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let receipt = Arc::new(AtomicBool::new(false));
+            let (entered, observed) = mpsc::channel();
+            let (release, gate) = mpsc::channel();
+            let worker_root = root.path().to_owned();
+            let worker_cancelled = cancelled.clone();
+            let worker_receipt = receipt.clone();
+            let worker = std::thread::spawn(move || {
+                let gated = AtomicBool::new(false);
+                publish_anticipation_batch_checked(
+                    &worker_root,
+                    &batch,
+                    true,
+                    || {
+                        if !gated.swap(true, Ordering::SeqCst) {
+                            entered.send(()).unwrap();
+                            gate.recv_timeout(Duration::from_secs(5)).unwrap();
+                        }
+                        if worker_cancelled.load(Ordering::SeqCst) {
+                            Err("cancelled".into())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    || {
+                        worker_receipt.store(true, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+            });
+            assert!(matches!(
+                observed.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            cancelled.store(cancel, Ordering::SeqCst);
+            drop(held);
+            observed.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            release.send(()).unwrap();
+            let result = worker.join().unwrap();
+            if cancel {
+                assert_eq!(result.unwrap_err(), "cancelled");
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+                assert!(!receipt.load(Ordering::SeqCst));
+            } else {
+                result.unwrap();
+                assert!(receipt.load(Ordering::SeqCst));
+                assert!(
+                    get_activity_record(root.path(), "work", "20261012", "new")
+                        .unwrap()
+                        .is_some()
+                );
+                let index = solstone_core_indexer_store::db::open_index(root.path()).unwrap();
+                let searchable: bool = index
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM chunks WHERE path=?1 AND content LIKE ?2)",
+                        [
+                            "facets/work/activities/20261012.jsonl",
+                            "%After quiet rain%",
+                        ],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(searchable);
+            }
+        }
+    }
 }
 
 /// Append an activity edit using the store's canonical edit shape.

@@ -21,7 +21,7 @@ mod windows;
 
 pub use admission::{
     CortexAdmissionError, CortexAdmittedUse, CortexUseFileIdentity, admit_active_use,
-    complete_active_use, recover_active_use,
+    admit_active_use_checked, complete_active_use, complete_active_use_checked, recover_active_use,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]

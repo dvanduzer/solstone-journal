@@ -1143,6 +1143,7 @@ fn tile_context(
             }
             None
         }
+        Ok(GenerateResponse::Cancelled) => None,
         Err(_) => {
             *model_available = false;
             None

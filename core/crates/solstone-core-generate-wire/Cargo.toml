@@ -29,6 +29,7 @@ solstone-core-spp-ratls.workspace = true
 ureq = { workspace = true, features = ["rustls"] }
 
 [features]
+full-tests = []
 test-hooks = []
 
 [[test]]

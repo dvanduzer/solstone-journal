@@ -3150,6 +3150,7 @@ fn generate_response_for_request(
         endpoint_runtime,
         journal,
         acquire_local_inference_authority,
+        &solstone_core_generate::Cancellation::never(),
     )
 }
 

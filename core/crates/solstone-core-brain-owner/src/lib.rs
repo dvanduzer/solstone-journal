@@ -149,6 +149,7 @@ impl OwnerProbe for RespondWithConfigProbe {
             journal,
             config,
             |_| None,
+            &solstone_core_generate::Cancellation::never(),
         )
         .map_err(ClientError::Decode)
     }
@@ -617,6 +618,7 @@ fn generate_component(
             "generate",
             response.reason_code.as_ref().map(|value| value.as_wire()),
         ),
+        Ok(GenerateResponse::Cancelled) => "probe_internal_error".to_owned(),
         Err(error) => generate_client_failure_reason(&error),
     };
     component_for_reason("generate", &reason, Map::new(), now)

@@ -170,11 +170,29 @@ pub fn update_pending_tiles(
     update_pending_tiles_for_run(journal, limit, None)
 }
 
+pub(crate) fn update_pending_tiles_checked(
+    journal: &Path,
+    limit: u32,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Vec<(String, String, String)>, AudioArchiveError> {
+    update_pending_tiles_for_run_checked(journal, limit, None, checkpoint)
+}
+
 pub(crate) fn update_pending_tiles_for_run(
     journal: &Path,
     limit: u32,
     import_id: Option<&str>,
 ) -> Result<Vec<(String, String, String)>, AudioArchiveError> {
+    update_pending_tiles_for_run_checked(journal, limit, import_id, &|| Ok(()))
+}
+
+fn update_pending_tiles_for_run_checked(
+    journal: &Path,
+    limit: u32,
+    import_id: Option<&str>,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Vec<(String, String, String)>, AudioArchiveError> {
+    checkpoint().map_err(AudioArchiveError::Other)?;
     let path = claim_db_path(journal);
     if !path.try_exists()? {
         return Ok(Vec::new());
@@ -195,6 +213,7 @@ pub(crate) fn update_pending_tiles_for_run(
     // Rotate every selected batch, including damaged or not-yet-published tiles.
     // Discovery fairness is separate from the worker's newest-first band-4 order.
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    checkpoint().map_err(AudioArchiveError::Other)?;
     let selected: Vec<(String, String, String)> = {
         let sql = if import_id.is_some() {
             "SELECT import_id,day,segment_key FROM audio_archive_pending_tile WHERE import_id=?1 ORDER BY discovery_order,day DESC,segment_key DESC,import_id LIMIT ?2"
@@ -216,6 +235,7 @@ pub(crate) fn update_pending_tiles_for_run(
     for (id, day, key) in &selected {
         tx.execute("UPDATE audio_archive_pending_tile SET discovery_order=? WHERE import_id=? AND day=? AND segment_key=?",params![next,id,day,key])?;
     }
+    checkpoint().map_err(AudioArchiveError::Other)?;
     tx.commit()?;
     Ok(selected)
 }
@@ -226,13 +246,28 @@ pub fn retire_pending_tile(
     day: &str,
     segment: &str,
 ) -> Result<(), AudioArchiveError> {
-    let conn =
+    retire_pending_tile_checked(journal, import_id, day, segment, &|| Ok(()))
+}
+
+pub(crate) fn retire_pending_tile_checked(
+    journal: &Path,
+    import_id: &str,
+    day: &str,
+    segment: &str,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), AudioArchiveError> {
+    checkpoint().map_err(AudioArchiveError::Other)?;
+    let mut conn =
         Connection::open_with_flags(claim_db_path(journal), OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     conn.busy_timeout(DEFAULT_WRITE_BUSY_TIMEOUT)?;
-    conn.execute(
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    checkpoint().map_err(AudioArchiveError::Other)?;
+    tx.execute(
         "DELETE FROM audio_archive_pending_tile WHERE import_id=? AND day=? AND segment_key=?",
         params![import_id, day, segment],
     )?;
+    checkpoint().map_err(AudioArchiveError::Other)?;
+    tx.commit()?;
     Ok(())
 }
 

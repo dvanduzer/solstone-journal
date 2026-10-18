@@ -91,13 +91,28 @@ pub fn publish(
     journal: &Path,
     segment: &Path,
     source_mtime_ms: Option<i64>,
-    mut rescan: impl FnMut(
+    rescan: impl FnMut(
         &Path,
         &Path,
     ) -> Result<solstone_core_indexer_store::scan::RescanFileStatus, String>,
 ) -> Result<(), String> {
+    publish_checked(journal, segment, source_mtime_ms, rescan, &|| Ok(()))
+}
+
+pub fn publish_checked(
+    journal: &Path,
+    segment: &Path,
+    source_mtime_ms: Option<i64>,
+    mut rescan: impl FnMut(
+        &Path,
+        &Path,
+    ) -> Result<solstone_core_indexer_store::scan::RescanFileStatus, String>,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    checkpoint()?;
     let before = snapshot(journal, segment, source_mtime_ms)?;
     for relative in before.files.keys() {
+        checkpoint()?;
         let attempt =
             attempt_saved_publication(journal, &journal.join(relative), |journal, path| {
                 rescan(journal, path)
@@ -116,6 +131,7 @@ pub fn publish(
     if before != snapshot(journal, segment, source_mtime_ms)? {
         return Err("saved outputs changed during publication".into());
     }
+    checkpoint()?;
     solstone_core_journal_io::write_json(
         receipt_path(segment),
         &before,
@@ -164,5 +180,46 @@ mod tests {
         })
         .unwrap();
         assert_eq!(std::fs::read_to_string(output).unwrap(), "the owner's edit");
+    }
+
+    #[test]
+    fn cancellation_during_the_final_rescan_leaves_the_receipt_owed() {
+        use std::cell::Cell;
+        for cancel in [false, true] {
+            let journal = tempfile::tempdir().unwrap();
+            let segment = journal.path().join("chronicle/20260101/desktop/120000_300");
+            std::fs::create_dir_all(segment.join("talents")).unwrap();
+            let output = segment.join("talents/activity.md");
+            std::fs::write(&output, "saved summary").unwrap();
+            let cancelled = Cell::new(false);
+            let result = publish_checked(
+                journal.path(),
+                &segment,
+                Some(1),
+                |_, _| {
+                    cancelled.set(cancel);
+                    Ok(RescanFileStatus::Indexed {
+                        warnings: Vec::new(),
+                    })
+                },
+                &|| {
+                    if cancelled.get() {
+                        Err("cancelled".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            if cancel {
+                assert_eq!(result.unwrap_err(), "cancelled");
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(
+                is_current(journal.path(), &segment, Some(1)).unwrap(),
+                !cancel
+            );
+            assert_eq!(std::fs::read_to_string(output).unwrap(), "saved summary");
+        }
     }
 }

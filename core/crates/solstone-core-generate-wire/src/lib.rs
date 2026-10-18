@@ -38,7 +38,7 @@ pub use confidential::confidential_generate_in_package;
 #[doc(hidden)]
 pub use confidential::test_support;
 pub use confidential::{ConfidentialResult, confidential_generate};
-pub use dispatch::{respond, respond_with_config};
+pub use dispatch::{GenerateCallContext, respond, respond_with_config, respond_with_context};
 pub use endpoint::{
     ENDPOINT_SERVED_WINDOW_CACHE_TTL, EndpointFailure, EndpointGenerated, EndpointResult,
     EndpointRuntime, EndpointTransport, EndpointTransportError, OverflowDecision,

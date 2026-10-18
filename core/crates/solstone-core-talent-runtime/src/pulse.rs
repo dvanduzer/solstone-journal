@@ -5,6 +5,8 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
+use std::path::Path;
 
 use chrono::{SecondsFormat, Utc};
 use serde_json::{Map, Value, json};
@@ -26,6 +28,7 @@ const TITLE_MAX: usize = 80;
 const SENTENCE_MAX: usize = 240;
 const DETAILS_MAX: usize = 1800;
 const NEED_MAX: usize = 240;
+const SENSE_BYTES_MAX: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PulseSummary {
@@ -338,9 +341,80 @@ fn read_segment_activity(
             return None;
         }
     };
+    let evidence = read_sense_evidence(&segment_dir, &segment, gaps);
     Some(
-        json!({"day": day, "segment": segment, "stream": stream, "ts": unit.get("ts").cloned().unwrap_or(Value::Null), "activity": activity}),
+        json!({"day": day, "segment": segment, "stream": stream, "ts": unit.get("ts").cloned().unwrap_or(Value::Null), "activity": activity, "supporting_evidence": evidence}),
     )
+}
+
+fn read_sense_evidence(segment_dir: &Path, segment: &str, gaps: &mut Vec<String>) -> Value {
+    let read = || -> Result<Value, String> {
+        let file = fs::File::open(segment_dir.join("talents/sense.json"))
+            .map_err(|error| error.to_string())?;
+        let mut bytes = Vec::new();
+        file.take((SENSE_BYTES_MAX + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        if bytes.len() > SENSE_BYTES_MAX {
+            return Err("sense assessment exceeds the context limit".to_owned());
+        }
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+    };
+    let sense = match read() {
+        Ok(Value::Object(sense)) => sense,
+        Ok(_) => {
+            gaps.push(format!("invalid sense evidence for segment {segment}"));
+            return Value::Null;
+        }
+        Err(error) => {
+            gaps.push(format!(
+                "could not read sense evidence for segment {segment}: {error}"
+            ));
+            return Value::Null;
+        }
+    };
+    let quotes: Vec<_> = sense
+        .get("quotes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|quote| {
+            let text = bounded_evidence_text(quote.get("text")?, 240)?;
+            Some(json!({"text": text, "speaker": quote.get("speaker").and_then(|value| bounded_evidence_text(value, 80))}))
+        })
+        .take(4)
+        .collect();
+    let entities: Vec<_> = sense
+        .get("entities")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entity| {
+            let name = bounded_evidence_text(entity.get("name")?, 160)?;
+            let context = bounded_evidence_text(entity.get("context")?, 320)?;
+            let mut value = Map::from_iter([
+                ("name".to_owned(), json!(name)),
+                ("context".to_owned(), json!(context)),
+            ]);
+            for field in ["type", "source", "role"] {
+                if let Some(text) = entity
+                    .get(field)
+                    .and_then(|value| bounded_evidence_text(value, 40))
+                {
+                    value.insert(field.to_owned(), json!(text));
+                }
+            }
+            Some(Value::Object(value))
+        })
+        .take(6)
+        .collect();
+    json!({"quotes": quotes, "entities": entities})
+}
+
+fn bounded_evidence_text(value: &Value, limit: usize) -> Option<&str> {
+    value
+        .as_str()
+        .filter(|text| !text.trim().is_empty() && text.chars().count() <= limit)
 }
 
 fn read_activity(
@@ -583,6 +657,78 @@ mod tests {
         assert_eq!(window.activities, 0);
         assert_eq!(packet["segments"].as_array().unwrap().len(), 7);
         assert!(!window.gaps.is_empty());
+    }
+
+    #[test]
+    fn completed_segment_keeps_named_attribution_beside_subjectless_summary() {
+        let root = tempfile::tempdir().unwrap();
+        let talents = root
+            .path()
+            .join("chronicle/20261017/device_audio/231713_12/talents");
+        fs::create_dir_all(&talents).unwrap();
+        fs::write(talents.join("activity.md"), "Checked the irrigation pump.").unwrap();
+        let quote = "Maya checked the orchard irrigation pump this morning.";
+        fs::write(
+            talents.join("sense.json"),
+            json!({
+                "entities": [{"name":"Maya", "type":"Person", "source":"voice", "role":"mentioned", "context":"checked the orchard irrigation pump this morning"}],
+                "quotes": [{"text":quote, "speaker":"unknown"}],
+                "unrelated_field":"not part of the bounded evidence packet"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let context = ExecutionContext {
+            journal: root.path().to_owned(),
+        };
+        let config = json!({"cadence_window":{"segments":[{"day":"20261017", "stream":"device_audio", "segment":"231713_12", "ts":1}]}});
+        let mut gaps = Vec::new();
+        let (packet, window) = completed_since(config.as_object().unwrap(), &context, &mut gaps);
+        let segment = &packet["segments"][0];
+        assert_eq!(segment["activity"], "Checked the irrigation pump.");
+        assert_eq!(segment["segment"], "231713_12");
+        assert_eq!(segment["stream"], "device_audio");
+        let evidence = &segment["supporting_evidence"];
+        assert_eq!(evidence["quotes"][0]["text"], quote);
+        assert_eq!(evidence["quotes"][0]["speaker"], "unknown");
+        assert_eq!(evidence["entities"][0]["name"], "Maya");
+        assert_eq!(evidence["entities"][0]["role"], "mentioned");
+        assert!(!evidence.to_string().contains("unrelated_field"));
+        assert_eq!(window.segments, 1);
+        assert!(gaps.is_empty());
+    }
+
+    #[test]
+    fn supporting_evidence_is_bounded_without_cutting_quotes_or_inventing_speakers() {
+        let root = tempfile::tempdir().unwrap();
+        let talents = root.path().join("talents");
+        fs::create_dir(&talents).unwrap();
+        let mut quotes = vec![json!({"text":"x".repeat(241), "speaker":"Maya"})];
+        quotes.extend((0..10).map(|i| json!({"text":format!("Exact quote {i}."), "speaker":null})));
+        let entities: Vec<_> = (0..10)
+            .map(|i| json!({"name":format!("Person {i}"), "context":"reported a need", "role":"mentioned", "extra":"omit"}))
+            .collect();
+        fs::write(
+            talents.join("sense.json"),
+            json!({"quotes":quotes, "entities":entities}).to_string(),
+        )
+        .unwrap();
+        let mut gaps = Vec::new();
+        let evidence = read_sense_evidence(root.path(), "segment", &mut gaps);
+        assert_eq!(evidence["quotes"].as_array().unwrap().len(), 4);
+        assert_eq!(evidence["quotes"][0]["text"], "Exact quote 0.");
+        assert!(evidence["quotes"][0]["speaker"].is_null());
+        assert_eq!(evidence["entities"].as_array().unwrap().len(), 6);
+        assert!(evidence["entities"][0].get("extra").is_none());
+        assert!(gaps.is_empty());
+
+        fs::write(talents.join("sense.json"), vec![b' '; SENSE_BYTES_MAX + 1]).unwrap();
+        assert!(read_sense_evidence(root.path(), "segment", &mut gaps).is_null());
+        assert!(gaps.last().unwrap().contains("exceeds the context limit"));
+        fs::write(talents.join("sense.json"), b"{").unwrap();
+        assert!(read_sense_evidence(root.path(), "segment", &mut gaps).is_null());
+        fs::remove_file(talents.join("sense.json")).unwrap();
+        assert!(read_sense_evidence(root.path(), "segment", &mut gaps).is_null());
     }
 
     #[test]

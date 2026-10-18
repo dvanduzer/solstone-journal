@@ -8,6 +8,12 @@ use solstone_core_journal_config::read_journal_config;
 use solstone_core_local::LocalInferenceAuthority;
 use std::path::Path;
 
+/// Admission and cancellation belonging to one hosted call, never process globals.
+pub struct GenerateCallContext<'a> {
+    pub priority: solstone_core_journal_config::work_priority::WorkPriority,
+    pub cancellation: &'a solstone_core_generate::Cancellation<'a>,
+}
+
 /// Resolve the journal's configured lane and run the production Generate policy.
 /// The local authority factory is called only for bundled local inference.
 ///
@@ -19,6 +25,7 @@ pub fn respond(
     endpoint_runtime: &crate::EndpointRuntime,
     journal: &Path,
     acquire_local_inference_authority: impl FnOnce(&Path) -> Option<LocalInferenceAuthority>,
+    cancellation: &solstone_core_generate::Cancellation,
 ) -> Result<solstone_core_generate::GenerateResponse, String> {
     let config = match read_journal_config(journal) {
         Ok(read) => read.config.unwrap_or_default(),
@@ -31,6 +38,11 @@ pub fn respond(
         &config,
         acquire_local_inference_authority,
         true,
+        &GenerateCallContext {
+            priority: solstone_core_journal_config::work_priority::WorkPriority::from_environment(
+            )?,
+            cancellation,
+        },
     )
 }
 
@@ -46,6 +58,7 @@ pub fn respond_with_config(
     journal: &Path,
     config: &serde_json::Map<String, Value>,
     acquire_local_inference_authority: impl FnOnce(&Path) -> Option<LocalInferenceAuthority>,
+    cancellation: &solstone_core_generate::Cancellation,
 ) -> Result<solstone_core_generate::GenerateResponse, String> {
     respond_config(
         request,
@@ -54,6 +67,37 @@ pub fn respond_with_config(
         config,
         acquire_local_inference_authority,
         false,
+        &GenerateCallContext {
+            priority: solstone_core_journal_config::work_priority::WorkPriority::from_environment(
+            )?,
+            cancellation,
+        },
+    )
+}
+
+/// Dispatch an app-owned call with its admitted task priority and owner configuration.
+///
+/// # Errors
+/// Returns configuration, response encoding or local-runtime errors.
+pub fn respond_with_context(
+    request: &solstone_core_generate::GenerateRequest,
+    endpoint_runtime: &crate::EndpointRuntime,
+    journal: &Path,
+    acquire_local_inference_authority: impl FnOnce(&Path) -> Option<LocalInferenceAuthority>,
+    context: &GenerateCallContext<'_>,
+) -> Result<solstone_core_generate::GenerateResponse, String> {
+    let config = read_journal_config(journal)
+        .map_err(|error| format!("could not read journal config: {error}"))?
+        .config
+        .unwrap_or_default();
+    respond_config(
+        request,
+        endpoint_runtime,
+        journal,
+        &config,
+        acquire_local_inference_authority,
+        false,
+        context,
     )
 }
 
@@ -64,7 +108,12 @@ fn respond_config(
     config: &serde_json::Map<String, Value>,
     acquire_local_inference_authority: impl FnOnce(&Path) -> Option<LocalInferenceAuthority>,
     process_overrides: bool,
+    context: &GenerateCallContext<'_>,
 ) -> Result<solstone_core_generate::GenerateResponse, String> {
+    let cancellation = context.cancellation;
+    if cancellation.is_cancelled() {
+        return Ok(solstone_core_generate::GenerateResponse::Cancelled);
+    }
     let request_id = request.id.clone();
     let (provider, outcome) = if process_overrides {
         crate::resolve_lane(config)
@@ -79,6 +128,9 @@ fn respond_config(
             let mut authority = acquire_local_inference_authority(journal);
             match crate::bundled_generate_with_authority(request, journal, authority.as_mut()) {
                 Ok(solstone_core_local::GenerateResult::Success(mut success)) => {
+                    if cancellation.is_cancelled() {
+                        return Ok(solstone_core_generate::GenerateResponse::Cancelled);
+                    }
                     let usage = success
                         .usage
                         .as_ref()
@@ -128,19 +180,28 @@ fn respond_config(
             }
         }
         crate::LaneOutcome::ByoEndpoint(endpoint) => endpoint_result_response(
-            crate::endpoint_generate(request, journal, &endpoint, config, endpoint_runtime),
-            request,
-            journal,
-            &provider,
-            request_id.clone(),
-        )?,
-        crate::LaneOutcome::ConfidentialEndpoint(endpoint) => {
-            match crate::confidential_generate(
+            crate::endpoint::endpoint_generate_with_context(
                 request,
                 journal,
                 &endpoint,
                 config,
                 endpoint_runtime,
+                context,
+            ),
+            request,
+            journal,
+            &provider,
+            request_id.clone(),
+            cancellation,
+        )?,
+        crate::LaneOutcome::ConfidentialEndpoint(endpoint) => {
+            match crate::confidential::confidential_generate_with_context(
+                request,
+                journal,
+                &endpoint,
+                config,
+                endpoint_runtime,
+                context,
             ) {
                 crate::ConfidentialResult::Generated(success) => endpoint_result_response(
                     crate::EndpointResult::Generated(success),
@@ -148,6 +209,7 @@ fn respond_config(
                     journal,
                     &provider,
                     request_id.clone(),
+                    cancellation,
                 )?,
                 crate::ConfidentialResult::Failed(failure) => endpoint_result_response(
                     crate::EndpointResult::Failed(failure),
@@ -155,6 +217,7 @@ fn respond_config(
                     journal,
                     &provider,
                     request_id.clone(),
+                    cancellation,
                 )?,
                 crate::ConfidentialResult::AttestationNotVerified(detail) => {
                     solstone_core_generate::GenerateResponse::Refused(crate::refusal_for(
@@ -178,6 +241,9 @@ fn respond_config(
             crate::anthropic::anthropic_generate_from_config(request, config)
         } {
             crate::AnthropicResult::Generated(mut success) => {
+                if cancellation.is_cancelled() {
+                    return Ok(solstone_core_generate::GenerateResponse::Cancelled);
+                }
                 let assessment = crate::assess_provider_result(crate::ProviderResultView {
                     journal_path: journal,
                     context: &request.context,
@@ -220,6 +286,9 @@ fn respond_config(
             crate::openai::openai_generate_from_config(request, config)
         } {
             crate::OpenAiResult::Generated(mut success) => {
+                if cancellation.is_cancelled() {
+                    return Ok(solstone_core_generate::GenerateResponse::Cancelled);
+                }
                 let assessment = crate::assess_provider_result(crate::ProviderResultView {
                     journal_path: journal,
                     context: &request.context,
@@ -261,6 +330,9 @@ fn respond_config(
             crate::google::google_generate_from_config(request, config)
         } {
             crate::GoogleResult::Generated(mut success) => {
+                if cancellation.is_cancelled() {
+                    return Ok(solstone_core_generate::GenerateResponse::Cancelled);
+                }
                 let assessment = crate::assess_provider_result(crate::ProviderResultView {
                     journal_path: journal,
                     context: &request.context,
@@ -302,6 +374,9 @@ fn respond_config(
             crate::chatgpt::chatgpt_generate_from_config(request, config, journal)
         } {
             crate::ChatGptResult::Generated(mut success) => {
+                if cancellation.is_cancelled() {
+                    return Ok(solstone_core_generate::GenerateResponse::Cancelled);
+                }
                 let assessment = crate::assess_provider_result(crate::ProviderResultView {
                     journal_path: journal,
                     context: &request.context,
@@ -358,6 +433,13 @@ fn respond_config(
             unreachable!("lane resolution cannot return an arm failure")
         }
     };
+    if matches!(
+        response,
+        solstone_core_generate::GenerateResponse::Generated(_)
+    ) && cancellation.is_cancelled()
+    {
+        return Ok(solstone_core_generate::GenerateResponse::Cancelled);
+    }
     Ok(response)
 }
 
@@ -367,7 +449,11 @@ fn endpoint_result_response(
     journal: &std::path::Path,
     provider: &str,
     request_id: Option<String>,
+    cancellation: &solstone_core_generate::Cancellation,
 ) -> Result<solstone_core_generate::GenerateResponse, String> {
+    if cancellation.is_cancelled() {
+        return Ok(solstone_core_generate::GenerateResponse::Cancelled);
+    }
     match result {
         crate::EndpointResult::Generated(mut success) => {
             let usage = success
@@ -660,5 +746,202 @@ mod tests {
             response.thinking,
             Some(json!({"type": "thinking", "thinking": "work"}))
         );
+    }
+
+    #[test]
+    #[cfg(all(test, feature = "full-tests"))]
+    fn direct_generate_cancellation_discards_provider_success() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        struct SyncBarrier {
+            entered: Mutex<bool>,
+            entered_cvar: Condvar,
+            released: Mutex<bool>,
+            released_cvar: Condvar,
+        }
+        let sync_barrier = Arc::new(SyncBarrier {
+            entered: Mutex::new(false),
+            entered_cvar: Condvar::new(),
+            released: Mutex::new(false),
+            released_cvar: Condvar::new(),
+        });
+        let sync_barrier_clone = Arc::clone(&sync_barrier);
+
+        let server_thread = thread::spawn(move || {
+            fn read_request(stream: &mut std::net::TcpStream) {
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    assert!(header.len() < 8192, "bounded fixture request headers");
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    header.push(byte[0]);
+                }
+                let header = std::str::from_utf8(&header).unwrap();
+                assert!(header.starts_with("POST "));
+                let length: usize = header
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .expect("fixture request content length");
+                assert!(length < 16384, "bounded fixture request body");
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).unwrap();
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+            }
+            // First run: provider blocks until released
+            let (mut stream, _) = listener.accept().expect("accept 1");
+            read_request(&mut stream);
+            {
+                let mut entered = sync_barrier_clone.entered.lock().unwrap();
+                *entered = true;
+                sync_barrier_clone.entered_cvar.notify_all();
+            }
+            {
+                let mut released = sync_barrier_clone.released.lock().unwrap();
+                while !*released {
+                    released = sync_barrier_clone.released_cvar.wait(released).unwrap();
+                }
+            }
+            let body = json!({
+                "choices": [{"message": {"content": "provider output"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
+            })
+            .to_string();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.flush();
+            drop(stream);
+
+            // Second run: provider returns success directly
+            let (mut stream2, _) = listener.accept().expect("accept 2");
+            read_request(&mut stream2);
+            let _ = stream2.write_all(header.as_bytes());
+            let _ = stream2.write_all(body.as_bytes());
+            let _ = stream2.flush();
+            drop(stream2);
+        });
+
+        let temp_journal = std::path::PathBuf::from(format!(
+            "/var/tmp/solstone-generate-wire-dispatch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_journal);
+        std::fs::create_dir_all(&temp_journal).unwrap();
+        let journal_path = temp_journal.as_path();
+        let config = json!({
+            "providers": {
+                "active": {"provider": "local"},
+                "local": {
+                    "endpoint_url": format!("http://{addr}"),
+                    "served_model_id": "served",
+                    "served_context_window": 4096
+                }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let request = solstone_core_generate::GenerateRequest {
+            id: Some("req-1".into()),
+            context: "test".into(),
+            contents: vec![solstone_core_generate::ContentPart::Text {
+                text: "hello".into(),
+            }],
+            system_instruction: None,
+            temperature: 0.0,
+            max_output_tokens: 16,
+            timeout_s: Some(10.0),
+            json_output: false,
+            json_schema: None,
+            attempt_index: 0,
+            exclusive_admission: false,
+            transport_retries: None,
+        };
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_clone = Arc::clone(&cancelled);
+
+        let req_clone = request.clone();
+        let config_clone = config.clone();
+        let runtime = crate::EndpointRuntime::default();
+        let jpath = journal_path.to_path_buf();
+        let client_thread = thread::spawn(move || {
+            let check_fn = move || cancelled_clone.load(Ordering::SeqCst);
+            let cancellation = solstone_core_generate::Cancellation::from_fn(&check_fn);
+            respond_with_config(
+                &req_clone,
+                &runtime,
+                &jpath,
+                &config_clone,
+                |_| None,
+                &cancellation,
+            )
+        });
+
+        // Wait until provider blocks
+        {
+            let mut entered = sync_barrier.entered.lock().unwrap();
+            while !*entered {
+                entered = sync_barrier.entered_cvar.wait(entered).unwrap();
+            }
+        }
+
+        // Test cancels
+        cancelled.store(true, Ordering::SeqCst);
+
+        // Test releases
+        {
+            let mut released = sync_barrier.released.lock().unwrap();
+            *released = true;
+            sync_barrier.released_cvar.notify_all();
+        }
+
+        let result = client_thread
+            .join()
+            .unwrap()
+            .expect("respond_with_config ok");
+        assert_eq!(result, solstone_core_generate::GenerateResponse::Cancelled);
+
+        // The same fixture without cancel returns the provider success
+        let runtime2 = crate::EndpointRuntime::default();
+        let success_result = respond_with_config(
+            &request,
+            &runtime2,
+            journal_path,
+            &config,
+            |_| None,
+            &solstone_core_generate::Cancellation::never(),
+        )
+        .expect("respond_with_config ok");
+
+        let solstone_core_generate::GenerateResponse::Generated(generated) = success_result else {
+            panic!("expected Generated response, got {success_result:?}");
+        };
+        assert_eq!(generated.text, "provider output");
+
+        server_thread.join().unwrap();
+        let _ = std::fs::remove_dir_all(&temp_journal);
     }
 }

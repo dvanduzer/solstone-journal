@@ -14,7 +14,7 @@ use serde_json::Value;
 use solstone_core_entity::{
     EncoderIdentity, VoiceprintItem, VoiceprintKey, is_admissible_person,
     load_all_journal_entities, load_entity_voiceprints_file, normalize_embedding,
-    save_voiceprints_batch,
+    save_voiceprints_batch_checked,
 };
 use solstone_core_journal_io::SegmentLayout;
 use solstone_core_speaker_id::calibration::{
@@ -150,6 +150,14 @@ impl Error for AccumulationError {}
 pub fn accumulate_voiceprints(
     request: &AccumulationRequest,
 ) -> Result<AccumulationOutcome, AccumulationError> {
+    accumulate_voiceprints_checked(request, &|| Ok(()))
+}
+
+pub fn accumulate_voiceprints_checked(
+    request: &AccumulationRequest,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<AccumulationOutcome, AccumulationError> {
+    checkpoint().map_err(AccumulationError::Invalid)?;
     validate_request(request)?;
     let owner_id = match admitted_owner_id(&request.journal_root) {
         OwnerAdmission::Admitted(id) => id,
@@ -332,7 +340,14 @@ pub fn accumulate_voiceprints(
             skip_entity(report, &mut skipped, AccumulationSkipReason::UnknownEntity);
             continue;
         }
-        match save_voiceprints_batch(&request.journal_root, &entity_id, &items, &request.encoder) {
+        checkpoint().map_err(AccumulationError::Invalid)?;
+        match save_voiceprints_batch_checked(
+            &request.journal_root,
+            &entity_id,
+            &items,
+            &request.encoder,
+            checkpoint,
+        ) {
             Ok(count) => {
                 report.written_rows = count;
                 report.write_status = EntityWriteStatus::Written;

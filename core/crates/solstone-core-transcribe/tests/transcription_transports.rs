@@ -265,6 +265,10 @@ impl Write for InterruptWriteStream {
 }
 
 impl AttestedIo for InterruptWriteStream {
+    fn set_io_deadline(&mut self, _deadline: Option<std::time::Instant>) -> std::io::Result<()> {
+        Ok(())
+    }
+
     fn set_io_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
         if self.interrupt_timeout {
             self.interrupt_timeout = false;
@@ -314,6 +318,10 @@ impl Write for InterruptReadStream {
 }
 
 impl AttestedIo for InterruptReadStream {
+    fn set_io_deadline(&mut self, _deadline: Option<std::time::Instant>) -> std::io::Result<()> {
+        Ok(())
+    }
+
     fn set_io_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
         self.stream.set_read_timeout(timeout)?;
         self.stream.set_write_timeout(timeout)

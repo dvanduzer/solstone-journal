@@ -752,8 +752,9 @@ areas = ["cognition"]
 platforms = ["linux", "macos"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
-default_full = false
+default_full = true
 runtime = "none"
+features = ["full-tests"]
 
 [[package_suites]]
 id = "package::solstone-core-grab"
@@ -1524,8 +1525,9 @@ areas = ["trust"]
 platforms = ["linux", "macos", "windows"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
-default_full = false
+default_full = true
 runtime = "none"
+features = ["full-tests"]
 
 [[package_suites]]
 id = "package::solstone-core-stats-web"
@@ -5376,7 +5378,7 @@ platforms = ["linux", "macos"]
 prerequisites = ["cargo-cache"]
 timeout = "standard"
 default_full = true
-required_features = []
+required_features = ["full-tests"]
 runtime = "none"
 
 [[suites]]

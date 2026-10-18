@@ -10,7 +10,20 @@ publish = false
 [features]
 full-tests = ["solstone-core-backup-web/full-tests"]
 audio-native = ["audio", "journal-mobile-audio/native"]
-audio = ["dep:journal-mobile-audio", "dep:solstone-core-transcribe", "dep:sha2"]
+audio = ["dep:journal-mobile-audio", "dep:sha2", "dep:solstone-core-transcribe"]
+processing = [
+    "dep:sha2",
+    "dep:solstone-core-sense",
+    "dep:solstone-core-think-cli",
+    "dep:solstone-core-depict",
+    "dep:solstone-core-system",
+    "dep:solstone-core-transcribe",
+    "dep:solstone-core-journal-config",
+    "dep:solstone-core-cortex-client",
+    "dep:solstone-core-generate",
+    "dep:chrono",
+    "dep:chrono-tz",
+]
 
 [dependencies]
 axum = { version = "0.8.9", default-features = false }
@@ -34,9 +47,20 @@ solstone-core-brain-owner = { path = "../../core/crates/solstone-core-brain-owne
 solstone-core-cortex = { path = "../../core/crates/solstone-core-cortex" }
 solstone-core-generate-wire = { path = "../../core/crates/solstone-core-generate-wire" }
 sha2 = { version = "0.10", optional = true }
+solstone-core-sense = { path = "../../core/crates/solstone-core-sense", optional = true }
+solstone-core-think-cli = { path = "../../core/crates/solstone-core-think-cli", optional = true }
+solstone-core-depict = { path = "../../core/crates/solstone-core-depict", optional = true }
+solstone-core-system = { path = "../../core/crates/solstone-core-system", optional = true }
+solstone-core-journal-config = { path = "../../core/crates/solstone-core-journal-config", optional = true }
+solstone-core-cortex-client = { path = "../../core/crates/solstone-core-cortex-client", optional = true }
+solstone-core-generate = { path = "../../core/crates/solstone-core-generate", optional = true }
+chrono = { version = "0.4", optional = true }
+chrono-tz = { version = "0.10", optional = true }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["api-24", "load-dynamic", "std"] }
 
 [dev-dependencies]
 tempfile = "3"
+solstone-core-system = { path = "../../core/crates/solstone-core-system" }
 
 [patch.crates-io]
 ffmpeg-sys-next = { path = "../../core/vendor/ffmpeg-sys-next" }

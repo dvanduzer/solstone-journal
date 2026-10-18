@@ -5,7 +5,7 @@ use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use solstone_core_journal_io::{AppendError, append_jsonl_no_follow};
+use solstone_core_journal_io::{AppendError, append::append_jsonl_no_follow_checked};
 
 use crate::DurableEvent;
 
@@ -50,6 +50,14 @@ pub fn append_durable_event(
     segment_path: &Path,
     event: &DurableEvent,
 ) -> Result<(), CallosumWriteError> {
+    append_durable_event_checked(segment_path, event, &|| Ok(()))
+}
+
+pub fn append_durable_event_checked(
+    segment_path: &Path,
+    event: &DurableEvent,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), CallosumWriteError> {
     if !segment_path.is_dir() {
         return Err(CallosumWriteError::SegmentDirectoryMissing(
             segment_path.to_path_buf(),
@@ -57,8 +65,10 @@ pub fn append_durable_event(
     }
     let path = segment_path.join(EVENTS_FILE);
     match event {
-        DurableEvent::Callosum(event) => append_jsonl_no_follow(path, event),
-        DurableEvent::DeviceIngest(event) => append_jsonl_no_follow(path, event),
+        DurableEvent::Callosum(event) => append_jsonl_no_follow_checked(path, event, checkpoint),
+        DurableEvent::DeviceIngest(event) => {
+            append_jsonl_no_follow_checked(path, event, checkpoint)
+        }
     }
     .map_err(CallosumWriteError::Append)
 }

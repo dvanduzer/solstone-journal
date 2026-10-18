@@ -32,6 +32,7 @@ solstone-core-callosum.workspace = true
 solstone-core-cortex-client.workspace = true
 solstone-core-facets.workspace = true
 solstone-core-format.workspace = true
+solstone-core-import.workspace = true
 solstone-core-indexer-store.workspace = true
 solstone-core-indexer.workspace = true
 solstone-core-journal.workspace = true
@@ -49,6 +50,7 @@ solstone-core-talent-runtime.workspace = true
 tokio = { workspace = true, features = ["net", "rt", "time"] }
 
 [dev-dependencies]
+chrono-tz.workspace = true
 solstone-core-indexer-store = { workspace = true, features = ["test-fixtures"] }
 solstone-core-entity.workspace = true
 solstone-core-entity-matching.workspace = true

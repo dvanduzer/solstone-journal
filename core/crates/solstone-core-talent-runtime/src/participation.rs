@@ -74,8 +74,29 @@ pub fn apply_result(
     day: &str,
     activity: &Map<String, Value>,
 ) -> Result<(), String> {
+    apply_result_cancellable(
+        journal,
+        output,
+        facet,
+        destination_id,
+        day,
+        activity,
+        &solstone_core_generate::Cancellation::never(),
+    )
+}
+
+pub(crate) fn apply_result_cancellable(
+    journal: &std::path::Path,
+    output: &str,
+    facet: &str,
+    destination_id: &str,
+    day: &str,
+    activity: &Map<String, Value>,
+    cancellation: &solstone_core_generate::Cancellation,
+) -> Result<(), String> {
     let _guard = solstone_core_facets::hold_activity_enrichment(journal, facet, destination_id)
         .map_err(|error| error.to_string())?;
+    crate::writers::check_cancellation(cancellation)?;
     // Preserve solstone/talent/participation.py:76-105: malformed model output is ignored.
     let Ok(Value::Object(data)) = serde_json::from_str(output.trim()) else {
         return Ok(());
@@ -210,7 +231,7 @@ pub fn apply_result(
         patch.insert("participation_confidence".to_owned(), confidence.clone());
     }
     let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true);
-    solstone_core_facets::update_activity_record(
+    solstone_core_facets::update_activity_record_checked(
         journal,
         facet,
         day,
@@ -219,6 +240,7 @@ pub fn apply_result(
         "participation",
         "updated participation",
         &timestamp,
+        || crate::writers::check_cancellation(cancellation),
     )
     .map_err(|error| error.to_string())?
     .ok_or("activity no longer exists")?;

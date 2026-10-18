@@ -327,9 +327,14 @@ fn embedded_config_is_not_replaced_by_inherited_probe_overrides() {
     ] {
         let config = config.as_object().unwrap();
         let before = config.clone();
-        let response = wire::respond_with_config(&request, &runtime, &journal, config, |_| {
-            panic!("candidate probe must not enter local inference")
-        })
+        let response = wire::respond_with_config(
+            &request,
+            &runtime,
+            &journal,
+            config,
+            |_| panic!("candidate probe must not enter local inference"),
+            &solstone_core_generate::Cancellation::never(),
+        )
         .unwrap();
         let solstone_core_generate::GenerateResponse::Refused(response) = response else {
             panic!("incomplete candidate must refuse before egress");

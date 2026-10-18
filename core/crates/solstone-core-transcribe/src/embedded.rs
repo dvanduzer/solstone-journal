@@ -9,6 +9,12 @@ use serde_json::Value;
 
 use crate::{TranscribeError, TranscribeFile, backend::parakeet_cpp};
 
+/// The caller's cancellation lifetime and content-free service-I/O observation.
+pub struct EmbeddedControl<'a> {
+    pub cancelled: &'a dyn Fn() -> bool,
+    pub service_io: &'a dyn Fn(crate::ConfidentialIoPhase),
+}
+
 /// Provenance of the model actually used by the embedded caller.
 pub struct EmbeddedModelInfo {
     /// Registered backend identifier.
@@ -35,6 +41,7 @@ pub(crate) struct EmbeddedContext<'a> {
     pub(crate) scratch: &'a Path,
     pub(crate) asr: &'a dyn EmbeddedAsr,
     pub(crate) cancel: &'a dyn Fn() -> bool,
+    pub(crate) service_io: &'a dyn Fn(crate::ConfidentialIoPhase),
 }
 
 pub(crate) fn select_backend(
@@ -107,6 +114,39 @@ impl EmbeddedContext<'_> {
     }
 }
 
+pub use solstone_core_system::work_retry::raw::RetryContext;
+
+pub fn embedded_retry_context(
+    journal: &Path,
+    audio: &Path,
+) -> Result<Option<RetryContext>, String> {
+    solstone_core_system::work_retry::raw::context_for_output(
+        journal,
+        &audio.with_extension("jsonl"),
+        solstone_core_processing_record::vocab::HANDLER_TRANSCRIBE,
+    )
+}
+
+pub fn embedded_already_processed(
+    journal: &Path,
+    audio: &Path,
+    retry: Option<&RetryContext>,
+) -> bool {
+    crate::args::should_skip_process_one_processed(audio, false, Some(journal), retry)
+}
+
+pub fn embedded_retryable_failure(audio: &Path) -> bool {
+    use solstone_core_processing_record::{
+        is_failure_exhausted, read_processing_record_header, vocab,
+    };
+    read_processing_record_header(&audio.with_extension("jsonl")).is_some_and(|record| {
+        record["schema"] == vocab::SCHEMA
+            && record["handler"] == vocab::HANDLER_TRANSCRIBE
+            && record["state"] == vocab::STATE_FAILED
+            && !is_failure_exhausted(&record)
+    })
+}
+
 /// Run the normal claimed decode/VAD/ASR/speaker/publication pipeline in process.
 ///
 /// The caller opts in explicitly and supplies app-private pinned model and scratch
@@ -119,13 +159,15 @@ pub fn process_embedded(
     models: &Path,
     scratch: &Path,
     asr: &dyn EmbeddedAsr,
-    cancel: &dyn Fn() -> bool,
+    control: EmbeddedControl<'_>,
+    retry: Option<&RetryContext>,
 ) -> Result<TranscribeFile, TranscribeError> {
     let context = EmbeddedContext {
         models,
         scratch,
         asr,
-        cancel,
+        cancel: control.cancelled,
+        service_io: control.service_io,
     };
     context.checkpoint()?;
     std::fs::create_dir_all(scratch).map_err(|error| TranscribeError::VadTemporary {
@@ -151,6 +193,7 @@ pub fn process_embedded(
         &config,
         &solstone_core_spp_ratls::AttestationStateStore::new(),
         Some(&context),
+        retry,
     )?;
     Ok(crate::record_transcribe_file(outcome, audio))
 }
@@ -238,6 +281,7 @@ mod tests {
                     scratch: Path::new("unused"),
                     asr: &LocalRecognizer,
                     cancel: &|| false,
+                    service_io: &|_| {},
                 };
                 assert_eq!(
                     select_backend(resolve(), Some(&context), requested, &config).unwrap(),
@@ -265,6 +309,7 @@ mod tests {
             scratch: Path::new("unused"),
             asr: &LocalRecognizer,
             cancel: &|| false,
+            service_io: &|_| {},
         };
         let selected = select_backend(
             Err(TranscribeError::SttSurface {
@@ -329,6 +374,7 @@ mod tests {
                 scratch: Path::new("unused"),
                 asr: &LocalRecognizer,
                 cancel: &|| false,
+                service_io: &|_| {},
             };
             assert_eq!(
                 select_backend(
@@ -367,7 +413,11 @@ mod tests {
             Path::new("unused-models"),
             &journal.path().join("scratch"),
             &LocalRecognizer,
-            &|| false,
+            EmbeddedControl {
+                cancelled: &|| false,
+                service_io: &|_| {},
+            },
+            None,
         );
         assert!(
             matches!(result, Err(TranscribeError::ProcessingClaim { detail, .. })
@@ -391,6 +441,7 @@ mod tests {
             scratch: Path::new("unused"),
             asr: &LocalMustNotRun,
             cancel: &|| false,
+            service_io: &|_| {},
         };
         let config = solstone_core_journal_config::JournalConfigRead {
             present: false,
@@ -429,6 +480,7 @@ mod tests {
             scratch: Path::new("unused"),
             asr: &asr,
             cancel: &cancel,
+            service_io: &|_| {},
         };
         assert!(matches!(
             context.transcribe(&[0.0; 16000]),
@@ -441,7 +493,11 @@ mod tests {
                 Path::new("unused"),
                 Path::new("unused"),
                 &asr,
-                &cancel
+                EmbeddedControl {
+                    cancelled: &cancel,
+                    service_io: &|_| {}
+                },
+                None,
             ),
             Err(TranscribeError::Cancelled)
         ));
@@ -463,7 +519,11 @@ mod tests {
             Path::new("missing-models"),
             &root.path().join("scratch"),
             &asr,
-            &|| false,
+            EmbeddedControl {
+                cancelled: &|| false,
+                service_io: &|_| {},
+            },
+            None,
         );
         assert!(
             matches!(result, Err(TranscribeError::ParakeetCppDeferred { reason, .. }) if reason == "embedded-duration-budget")

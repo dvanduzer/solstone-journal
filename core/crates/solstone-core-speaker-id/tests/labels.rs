@@ -10,7 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Map, Value};
 use solstone_core_journal_io::{LockError, LockOptions, hold_lock};
 use solstone_core_speaker_id::labels::{
-    LabelsError, patch_labels, write_full_labels, write_stub_labels,
+    LabelsError, patch_labels, write_full_labels, write_full_labels_checked, write_stub_labels,
+    write_stub_labels_checked,
 };
 
 const FULL: &[u8] = b"{\n  \"unknown_top\": {\n    \"preserve\": \"yes\"\n  },\n  \"labels\": [\n    {\n      \"sentence_id\": 1,\n      \"speaker\": \"Jos\\u00e9 \\ud83d\\ude3a\",\n      \"confidence\": \"medium\",\n      \"method\": \"acoustic\",\n      \"owner_margin_declined\": true,\n      \"unknown_row\": \"kept\"\n    },\n    {\n      \"sentence_id\": 2,\n      \"speaker\": null,\n      \"confidence\": \"low\",\n      \"method\": \"context\",\n      \"unknown_row\": \"also_kept\"\n    }\n  ],\n  \"owner_centroid_last_refreshed_at\": \"2026-08-08T00:00:00Z\",\n  \"voiceprint_versions\": {\n    \"jos\\u00e9\": 2\n  },\n  \"candidate_evidence\": [\n    {\n      \"name\": \"Jos\\u00e9 \\ud83d\\ude3a\"\n    }\n  ],\n  \"candidate_evidence_gaps\": [\n    {\n      \"source\": \"screen\",\n      \"reason\": \"Caf\\u00e9 \\ud83e\\uddea\"\n    }\n  ]\n}\n";
@@ -534,4 +535,74 @@ fn ac15_full_rewrite_preserves_margin_flags_without_normalizing_absence() {
     assert_eq!(result["candidate_evidence"][0]["source"], "audio");
     assert_eq!(result["candidate_evidence_gaps"][0]["reason"], "gap");
     fs::remove_dir_all(segment).expect("temporary segment is removed");
+}
+
+#[test]
+fn cancelled_label_publication_after_file_lock_wait_and_positive_twins() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+    for stub in [false, true] {
+        for cancel in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let segment = root.path().join("segment");
+            fs::create_dir_all(&segment).unwrap();
+            write_full_labels(
+                &segment,
+                vec![serde_json::json!({"sentence_id":1,"speaker":"original"})],
+                &Map::new(),
+            )
+            .unwrap();
+            let path = labels_path(&segment);
+            let before = fs::read(&path).unwrap();
+            let held = hold_lock(&path, LockOptions::default()).unwrap();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let flag = cancelled.clone();
+            let (started, ready) = mpsc::channel();
+            let (checkpoint, reached) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                started.send(()).unwrap();
+                let check = || {
+                    checkpoint.send(()).unwrap();
+                    if flag.load(Ordering::SeqCst) {
+                        Err("cancelled".into())
+                    } else {
+                        Ok(())
+                    }
+                };
+                if stub {
+                    write_stub_labels_checked(&segment, "no_owner_centroid", &check)
+                } else {
+                    write_full_labels_checked(
+                        &segment,
+                        vec![serde_json::json!({"sentence_id":2,"speaker":"new"})],
+                        &Map::new(),
+                        &check,
+                    )
+                }
+            });
+            ready.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(
+                reached.recv_timeout(Duration::from_millis(100)).is_err(),
+                "checkpoint must follow the real label lock"
+            );
+            cancelled.store(cancel, Ordering::SeqCst);
+            drop(held);
+            let result = worker.join().unwrap();
+            if cancel {
+                assert!(matches!(result, Err(LabelsError::PublicationRefused(_))));
+                assert_eq!(fs::read(&path).unwrap(), before);
+            } else {
+                result.unwrap();
+                let after = fs::read(&path).unwrap();
+                assert_ne!(after, before);
+                let value: Value = serde_json::from_slice(&after).unwrap();
+                if stub {
+                    assert_eq!(value["skipped"], true);
+                } else {
+                    assert_eq!(value["labels"][0]["speaker"], "new");
+                }
+            }
+        }
+    }
 }

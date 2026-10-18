@@ -356,6 +356,44 @@ impl CortexRequestClient {
     ) -> Result<WaitForUsesReport, CortexClientError> {
         wait_for_uses_with(&self.journal, use_ids, deadline, OUTCOME_POLL_INTERVAL).await
     }
+
+    /// Wait for all requested uses, reading status directly from disk without
+    /// connecting to the Callosum socket.
+    pub fn wait_for_uses_from_disk(
+        &self,
+        use_ids: &[String],
+    ) -> Result<WaitForUsesReport, CortexClientError> {
+        let mut pending = use_ids.iter().cloned().collect::<HashSet<_>>();
+        let mut report = WaitForUsesReport::default();
+        let completed_ids = use_ids
+            .iter()
+            .filter_map(|id| {
+                matches!(
+                    use_file_status(&self.journal.join("talents"), id),
+                    Ok(UseFileStatus::Completed)
+                )
+                .then_some(id.clone())
+            })
+            .collect::<HashSet<_>>();
+        let mut completed_pending = completed_ids;
+        recover_completed_from_disk(&self.journal, &mut completed_pending, &mut report.completed)?;
+        pending.retain(|id| !report.completed.contains_key(id));
+        for use_id in pending {
+            let timed_out = match use_file_status(&self.journal.join("talents"), &use_id)
+                .map_err(CortexClientError::ReadUseLog)?
+            {
+                UseFileStatus::NotFound => TimedOutUse::LostAtDeadline { use_id },
+                UseFileStatus::Completed | UseFileStatus::Running => {
+                    TimedOutUse::GenuineTimeout { use_id }
+                }
+            };
+            report.timed_out.push(timed_out);
+        }
+        report
+            .timed_out
+            .sort_by(|left, right| left.use_id().cmp(right.use_id()));
+        Ok(report)
+    }
 }
 
 /// Poll for a durable Cortex use file after one broadcast.
@@ -1154,5 +1192,32 @@ mod tests {
         let path = journal.path().join("noid.jsonl");
         fs::write(&path, r#"{"event":"request"}"#).unwrap();
         assert!(!candidate_matches(&path, "noid").unwrap());
+    }
+
+    #[test]
+    fn disk_wait_completes_finished_and_reports_missing_as_lost_at_deadline() {
+        let journal = tempfile::tempdir().unwrap();
+        let client = CortexRequestClient::new(journal.path(), CortexRequestPolicy::think());
+        let talents = journal.path().join("talents/test");
+        fs::create_dir_all(&talents).unwrap();
+        fs::write(
+            talents.join("finished.jsonl"),
+            "{\"use_id\":\"finished\"}\n{\"event\":\"finish\"}\n",
+        )
+        .unwrap();
+
+        let report = client
+            .wait_for_uses_from_disk(&["finished".to_owned(), "missing".to_owned()])
+            .unwrap();
+
+        assert_eq!(report.completed.len(), 1);
+        assert_eq!(report.completed["finished"].end_state, UseEndState::Finish);
+        assert_eq!(report.timed_out.len(), 1);
+        assert_eq!(
+            report.timed_out[0],
+            TimedOutUse::LostAtDeadline {
+                use_id: "missing".to_owned()
+            }
+        );
     }
 }

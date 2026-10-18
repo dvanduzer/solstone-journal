@@ -3,12 +3,15 @@
 
 //! Typed codecs and one-shot client for the generate contract.
 
+mod cancellation;
 mod client;
 mod codec;
 mod fixture;
 mod session;
 mod session_adapter;
 mod types;
+
+pub use cancellation::Cancellation;
 
 pub use client::{
     CapturedStream, ChildStatus, ClientError, InvalidResponseFailure, OneShotClient,

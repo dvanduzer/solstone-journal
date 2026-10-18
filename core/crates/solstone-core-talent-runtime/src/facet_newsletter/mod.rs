@@ -158,11 +158,31 @@ pub fn apply_result(
     facet: &str,
     day: &str,
 ) -> Result<(), String> {
+    apply_result_cancellable(
+        journal,
+        output,
+        facet,
+        day,
+        &solstone_core_generate::Cancellation::never(),
+    )
+}
+
+pub(crate) fn apply_result_cancellable(
+    journal: &std::path::Path,
+    output: &str,
+    facet: &str,
+    day: &str,
+    cancellation: &solstone_core_generate::Cancellation,
+) -> Result<(), String> {
+    let _trust = solstone_core_facets::hold_facet_trust_lock(journal).map_err(|e| e.to_string())?;
+    crate::writers::check_cancellation(cancellation)?;
+
     // Preserve solstone/talent/facet_newsletter.py:880-912: blank and sentinel results do not write.
     let content = output.trim();
     if facet.is_empty() || day.is_empty() || content.is_empty() || content == "No activity" {
         return Ok(());
     }
+    crate::writers::check_cancellation(cancellation)?;
     solstone_core_facets::write_news_file(journal, facet, &format!("{day}.md"), content)
         .map_err(|error| error.to_string())
 }

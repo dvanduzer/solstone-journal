@@ -16,6 +16,12 @@ pub const UNIT_ENV: &str = "SOLSTONE_RETRY_UNIT";
 pub const CAUSE_ENV: &str = "SOLSTONE_RETRY_CAUSE";
 pub const ATTEMPT_ENV: &str = "SOLSTONE_RETRY_ATTEMPT";
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct RetryContext {
+    pub unit_id: String,
+    pub attempt: Attempt,
+}
+
 pub struct Evidence {
     pub unit: Unit,
     pub reason: String,
@@ -59,8 +65,8 @@ pub fn unit_for_output(journal: &Path, output: &Path, handler: &str) -> Result<U
     Ok(unit)
 }
 
-/// The header stays bounded and read errors remain errors, never an absent
-/// processing record that could manufacture a fresh attempt.
+/// The header stays bounded and existing-file read errors remain errors,
+/// never an absent processing record that could manufacture a fresh attempt.
 fn header(output: &Path) -> Result<Value, String> {
     bounded_header(output)?.ok_or_else(|| "native processing header is incomplete".into())
 }
@@ -69,7 +75,11 @@ fn header(output: &Path) -> Result<Value, String> {
 /// readable record. A shorter row without its newline is still an error.
 fn bounded_header(output: &Path) -> Result<Option<Value>, String> {
     let bound = solstone_core_processing_record::vocab::MAX_FIRST_ROW_BYTES;
-    let file = std::fs::File::open(output).map_err(|e| e.to_string())?;
+    let file = match std::fs::File::open(output) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
     let mut reader = std::io::BufReader::new(file.take(bound as u64));
     let mut row = Vec::new();
     reader
@@ -150,11 +160,20 @@ pub fn inspect_output(journal: &Path, output: &Path) -> Result<Option<Evidence>,
 }
 
 pub fn observe(journal: &Path, evidence: &Evidence) -> Result<(), String> {
-    super::observe_held(
+    observe_checked(journal, evidence, &|| Ok(()))
+}
+
+pub fn observe_checked(
+    journal: &Path,
+    evidence: &Evidence,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    super::observe_held_checked(
         journal,
         &evidence.unit,
         &evidence.reason,
         &evidence.baseline,
+        checkpoint,
     )
 }
 
@@ -192,12 +211,101 @@ fn selected(
     Ok(Some((unit, attempt)))
 }
 
+/// Read-only eligibility for an output. None when not an exhausted held failure or permission() is None.
+pub fn context_for_output(
+    journal: &Path,
+    output: &Path,
+    handler: &str,
+) -> Result<Option<RetryContext>, String> {
+    let unit = unit_for_output(journal, output, handler)?;
+    let evidence = match inspect_output(journal, output)? {
+        Some(e) => e,
+        None => return Ok(None),
+    };
+    if evidence.unit != unit {
+        return Ok(None);
+    }
+    let record = match super::read(journal, &unit.id()?)? {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    let attempt = match record
+        .permission(&evidence.input, DECLARED_FIXES)
+        .filter(|attempt| attempt.reason == evidence.reason)
+    {
+        Some(a) => a,
+        None => return Ok(None),
+    };
+    Ok(Some(RetryContext {
+        unit_id: unit.id()?,
+        attempt,
+    }))
+}
+
+/// Preflight with explicit context. True only when unit id matches and permission is still current.
+pub fn waiting_context(
+    journal: &Path,
+    output: &Path,
+    handler: &str,
+    context: &RetryContext,
+) -> bool {
+    let Ok(unit) = unit_for_output(journal, output, handler) else {
+        return false;
+    };
+    let Ok(id) = unit.id() else {
+        return false;
+    };
+    if id != context.unit_id {
+        return false;
+    }
+    context_for_output(journal, output, handler)
+        .is_ok_and(|c| c.as_ref().map(|c| &c.attempt) == Some(&context.attempt))
+}
+
 /// Preflight only. The native writer repeats this under OutputClaims.
 pub fn waiting_from_environment(output: &Path, handler: &str) -> bool {
     let Some(journal) = std::env::var_os(JOURNAL_ENV) else {
         return false;
     };
     selected(Path::new(&journal), output, handler).is_ok_and(|grant| grant.is_some())
+}
+
+/// Never call before acquiring the native output execution claim.
+pub fn consume_context(
+    journal: &Path,
+    output: &Path,
+    handler: &str,
+    context: &RetryContext,
+) -> Result<Option<Attempt>, String> {
+    consume_context_checked(journal, output, handler, context, &|| Ok(()))
+}
+
+pub fn consume_context_checked(
+    journal: &Path,
+    output: &Path,
+    handler: &str,
+    context: &RetryContext,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Option<Attempt>, String> {
+    checkpoint()?;
+    let unit = unit_for_output(journal, output, handler)?;
+    if unit.id()? != context.unit_id {
+        return Ok(None);
+    }
+    let evidence = inspect_output(journal, output)?.ok_or("native output is no longer held")?;
+    if evidence.unit != unit {
+        return Err("native failure handler changed".into());
+    }
+    super::consume_checked(
+        journal,
+        &unit,
+        &context.attempt,
+        &evidence.reason,
+        &evidence.input,
+        DECLARED_FIXES,
+        checkpoint,
+    )?;
+    Ok(Some(context.attempt.clone()))
 }
 
 /// Never call before acquiring the native output execution claim.
@@ -227,10 +335,36 @@ pub fn consume_for_output(output: &Path, handler: &str) -> Result<bool, String> 
     consume_from_environment(Path::new(&journal), output, handler)
 }
 
+pub fn retry_attempt_from_environment() -> Result<Option<Attempt>, String> {
+    match std::env::var(ATTEMPT_ENV) {
+        Ok(value) => serde_json::from_str(&value)
+            .map(Some)
+            .map_err(|e| e.to_string()),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 /// Called by the owning native publication writer before saving its failed
 /// processing record, while its existing input observation still protects it.
 pub fn stamp_failed_input(record: &mut Value, input: &Path) -> Result<(), String> {
     stamp_attempt(record)?;
+    if record.get("state").and_then(Value::as_str) == Some("failed") {
+        let hash = super::file_fingerprint(input)?;
+        record
+            .as_object_mut()
+            .ok_or("processing record is not an object")?
+            .insert("input_sha256".into(), Value::String(hash));
+    }
+    Ok(())
+}
+
+pub fn stamp_failed_input_from(
+    record: &mut Value,
+    input: &Path,
+    attempt: &Attempt,
+) -> Result<(), String> {
+    stamp_attempt_from(record, attempt)?;
     if record.get("state").and_then(Value::as_str) == Some("failed") {
         let hash = super::file_fingerprint(input)?;
         record
@@ -250,9 +384,25 @@ pub fn stamp_attempt(record: &mut Value) -> Result<(), String> {
     Ok(())
 }
 
+pub fn stamp_attempt_from(record: &mut Value, attempt: &Attempt) -> Result<(), String> {
+    record["retry_attempt"] = serde_json::to_value(attempt).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// A child exiting successfully is not a terminal receipt. Require a consumed
 /// matching attempt and a recognized processing disposition from the writer.
 pub fn finish_output(journal: &Path, unit: &Unit, attempt: &Attempt) -> Result<(), String> {
+    finish_output_checked(journal, unit, attempt, &|| Ok(()))
+}
+
+/// Reconcile an actual terminal receipt only while the caller still admits publication.
+pub fn finish_output_checked(
+    journal: &Path,
+    unit: &Unit,
+    attempt: &Attempt,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    checkpoint()?;
     let Unit::Raw {
         output, handler, ..
     } = unit
@@ -289,5 +439,150 @@ pub fn finish_output(journal: &Path, unit: &Unit, attempt: &Attempt) -> Result<(
         Some("analyzed" | "empty") => None,
         _ => return Err("native terminal receipt is unreadable".into()),
     };
-    super::finish(journal, unit, attempt, remaining)
+    super::finish_checked(journal, unit, attempt, remaining, checkpoint)
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn output(root: &Path) -> PathBuf {
+        let segment = root.join("chronicle/20260101/audio/120000_300");
+        std::fs::create_dir_all(&segment).unwrap();
+        std::fs::write(segment.join("speech.wav"), b"accepted audio bytes").unwrap();
+        segment.join("speech.jsonl")
+    }
+
+    fn failed(output: &Path, reason: &str) {
+        let header = json!({"raw":"speech.wav", "_solstone_processing": {
+            "schema": solstone_core_processing_record::vocab::SCHEMA,
+            "state":"failed", "handler":"transcribe", "reason_code":reason,
+            "attempts": 5, "first_failure_at":"2026-01-01T00:00:00Z",
+            "last_failure_at":"2026-01-01T03:00:00Z"
+        }});
+        std::fs::write(output, format!("{header}\n")).unwrap();
+    }
+
+    #[test]
+    fn cancelled_raw_completion_after_retry_record_lock_wait_and_positive_twin() {
+        use solstone_core_journal_io::{LockOptions, hold_lock};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+        for cancel in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let output = output(root.path());
+            failed(&output, "service_unavailable");
+            let evidence = inspect_output(root.path(), &output).unwrap().unwrap();
+            observe(root.path(), &evidence).unwrap();
+            super::super::request(root.path(), &evidence.unit).unwrap();
+            let context = context_for_output(root.path(), &output, "transcribe")
+                .unwrap()
+                .unwrap();
+            consume_context(root.path(), &output, "transcribe", &context)
+                .unwrap()
+                .unwrap();
+            let receipt = serde_json::json!({"raw":"audio.wav","_solstone_processing":{
+                "schema":"solstone.processing.v1","handler":"transcribe","state":"analyzed","retry_attempt":context.attempt
+            }});
+            std::fs::write(&output, format!("{receipt}\n")).unwrap();
+            let path = super::super::path(root.path(), &context.unit_id).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let held = hold_lock(&path, LockOptions::default()).unwrap();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let flag = cancelled.clone();
+            let journal = root.path().to_path_buf();
+            let (started, ready) = mpsc::channel();
+            let (checkpoint, reached) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let calls = AtomicUsize::new(0);
+                finish_output_checked(&journal, &evidence.unit, &context.attempt, &|| {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        started.send(()).unwrap();
+                    } else {
+                        checkpoint.send(()).unwrap();
+                    }
+                    if flag.load(Ordering::SeqCst) {
+                        Err("cancelled".into())
+                    } else {
+                        Ok(())
+                    }
+                })
+            });
+            ready.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(reached.recv_timeout(Duration::from_millis(100)).is_err());
+            cancelled.store(cancel, Ordering::SeqCst);
+            drop(held);
+            let result = worker.join().unwrap();
+            if cancel {
+                assert_eq!(result.unwrap_err(), "cancelled");
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+            } else {
+                result.unwrap();
+                let record =
+                    super::super::read(root.path(), &path.file_stem().unwrap().to_string_lossy())
+                        .unwrap()
+                        .unwrap();
+                assert!(record.attempt.is_none());
+                assert!(!record.held);
+            }
+        }
+    }
+    #[test]
+    fn fresh_admitted_audio_has_no_retry_context_without_a_sidecar() {
+        let root = tempfile::tempdir().unwrap();
+        let output = output(root.path());
+        assert_eq!(
+            context_for_output(root.path(), &output, "transcribe").unwrap(),
+            None
+        );
+        std::fs::write(&output, b"{broken\n").unwrap();
+        assert!(context_for_output(root.path(), &output, "transcribe").is_err());
+        std::fs::remove_file(&output).unwrap();
+        std::fs::create_dir(&output).unwrap();
+        assert!(context_for_output(root.path(), &output, "transcribe").is_err());
+    }
+
+    #[test]
+    fn changed_failure_reason_refuses_stale_context_without_consuming_permission() {
+        let root = tempfile::tempdir().unwrap();
+        let output = output(root.path());
+        failed(&output, "service_unavailable");
+        let evidence = inspect_output(root.path(), &output)
+            .unwrap()
+            .expect("exhausted failure");
+        observe(root.path(), &evidence).unwrap();
+        super::super::request(root.path(), &evidence.unit).unwrap();
+        let context = context_for_output(root.path(), &output, "transcribe")
+            .unwrap()
+            .unwrap();
+        let before = super::super::read(root.path(), &context.unit_id)
+            .unwrap()
+            .unwrap();
+        failed(&output, "corrupt_input");
+        assert_eq!(
+            context_for_output(root.path(), &output, "transcribe").unwrap(),
+            None
+        );
+        assert!(consume_context(root.path(), &output, "transcribe", &context).is_err());
+        let after = super::super::read(root.path(), &context.unit_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.consumed, before.consumed);
+        assert_eq!(after.attempt, before.attempt);
+        failed(&output, "service_unavailable");
+        assert_eq!(
+            context_for_output(root.path(), &output, "transcribe").unwrap(),
+            Some(context.clone())
+        );
+        assert_eq!(
+            consume_context(root.path(), &output, "transcribe", &context).unwrap(),
+            Some(context.attempt)
+        );
+        assert_eq!(
+            context_for_output(root.path(), &output, "transcribe").unwrap(),
+            None
+        );
+    }
 }

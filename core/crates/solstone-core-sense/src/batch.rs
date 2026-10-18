@@ -23,7 +23,9 @@ use solstone_core_processing_record::{
 use thiserror::Error;
 
 use crate::config::{read_config, resolve_concurrency};
-use crate::dispatch::{BatchMarkerPolicy, Outbound, SenseDispatcher};
+use crate::dispatch::{
+    BatchMarkerPolicy, Outbound, SenseDispatcher, SenseExecutor, SenseJobResult,
+};
 use crate::log;
 
 /// Existing output classes that can be deleted before a batch reprocess.
@@ -94,6 +96,8 @@ pub enum BatchError {
     Runtime,
     #[error("sense batch timed out after {timeout:?}")]
     TimedOut { timeout: Duration },
+    #[error("Sense worker did not stop cleanly")]
+    WorkerJoin,
     #[error("sense batch lease error: {0}")]
     Lease(#[from] solstone_core_journal_io::LeaseError),
     #[error("sense batch lease for day {day} is held by another process")]
@@ -705,6 +709,47 @@ where
     Ok(())
 }
 
+/// Run the maintained finite Sense lifecycle using an in-process handler owner.
+pub fn run_batch_with_executor(
+    journal: &Path,
+    request: &BatchRequest,
+    child_environment: &solstone_core_system::process::ChildLaunchContext,
+    timeout: Option<Duration>,
+    executor: Arc<dyn SenseExecutor>,
+) -> Result<(), BatchError> {
+    if request.reprocess.is_some() || request.dry_run {
+        return Err(BatchError::Unrepresentable {
+            reason: "hosted Sense requires ordinary processing".into(),
+        });
+    }
+    if executor.cancelled() {
+        return Ok(());
+    }
+    let _lease =
+        crate::lease::acquire_sense_day_lease(journal, &request.day)?.ok_or_else(|| {
+            BatchError::LeaseContended {
+                day: request.day.clone(),
+            }
+        })?;
+    process_day_with_dispatcher(
+        journal,
+        request,
+        None,
+        |outbound, describe_workers| {
+            SenseDispatcher::new_batch_with_executor(
+                journal.to_path_buf(),
+                request.verbose,
+                request.debug,
+                outbound,
+                describe_workers,
+                child_environment.clone(),
+                executor,
+            )
+        },
+        timeout.map(BatchDeadline::new),
+    )
+}
+
 /// Dispatch exactly one held native output without deleting any prior rows.
 /// Permission consumption belongs to the native writer under OutputClaims.
 pub fn retry_file(
@@ -713,6 +758,7 @@ pub fn retry_file(
     attempt: &solstone_core_system::work_retry::Attempt,
     child_environment: &solstone_core_system::process::ChildLaunchContext,
     timeout: Duration,
+    executor: Option<Arc<dyn SenseExecutor>>,
 ) -> Result<(), BatchError> {
     use solstone_core_system::work_retry::{Unit, raw};
     let refuse = |reason| BatchError::Unrepresentable { reason };
@@ -756,6 +802,32 @@ pub fn retry_file(
         return Err(refuse(
             "native failure handler does not match its source".into(),
         ));
+    }
+    if let Some(executor) = executor {
+        let context = crate::work::SegmentContext {
+            key: crate::work::SegmentKey {
+                day: day.clone(),
+                stream: Some(stream.clone()),
+                segment: segment.clone(),
+            },
+            cid: None,
+            source: None,
+            batch: true,
+            meta: None,
+        };
+        let cancel = AtomicBool::new(false);
+        let result = executor.execute(
+            handler,
+            &evidence.input_path,
+            &context,
+            Some(attempt),
+            &cancel,
+        );
+        return match result {
+            SenseJobResult::Finished(0) => Ok(()),
+            SenseJobResult::Finished(code) => Err(refuse(format!("{handler} exit {code}"))),
+            SenseJobResult::Hold => Err(refuse(format!("{handler} held"))),
+        };
     }
     let _lease = crate::lease::acquire_sense_day_lease(journal, day)?
         .ok_or_else(|| BatchError::LeaseContended { day: day.clone() })?;
@@ -835,7 +907,7 @@ fn run_batch_dispatcher(
             return Err(BatchError::Runtime);
         }
     };
-    runtime.block_on(crate::service::run_until(
+    let (_, workers_joined) = runtime.block_on(crate::service::run_until_checked(
         connection,
         dispatcher,
         receiver,
@@ -847,6 +919,10 @@ fn run_batch_dispatcher(
                     tokio::task::yield_now().await;
                 }
                 while !dispatching.is_idle() {
+                    if dispatching.execution_cancelled() {
+                        dispatching.stop();
+                        break;
+                    }
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
             };
@@ -863,6 +939,9 @@ fn run_batch_dispatcher(
             }
         },
     ));
+    if !workers_joined {
+        return Err(BatchError::WorkerJoin);
+    }
     if timed_out.load(Ordering::SeqCst) {
         return Err(BatchError::TimedOut {
             timeout: timeout_limit.expect("timed out batch has a limit"),

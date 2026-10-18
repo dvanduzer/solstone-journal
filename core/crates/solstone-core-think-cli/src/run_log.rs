@@ -83,6 +83,16 @@ impl<W: Write> RunLogWriter<W> {
     }
 
     pub(crate) fn log(&mut self, event: &str, now_ms: i64, fields: Map<String, Value>) {
+        self.log_checked(event, now_ms, fields, &|| Ok(()));
+    }
+
+    pub(crate) fn log_checked(
+        &mut self,
+        event: &str,
+        now_ms: i64,
+        fields: Map<String, Value>,
+        checkpoint: &dyn Fn() -> Result<(), String>,
+    ) {
         if event == "talent.skip" {
             self.skip_count += 1;
         }
@@ -93,11 +103,13 @@ impl<W: Write> RunLogWriter<W> {
         data.insert("event".to_owned(), Value::String(event.to_owned()));
         data.insert("ts".to_owned(), Value::from(now_ms));
         let result: Result<(), String> = (|| {
+            checkpoint()?;
             let mut record = serde_json::to_vec(&data).map_err(|error| error.to_string())?;
             record.push(b'\n');
             let mut sink = sink
                 .lock()
                 .map_err(|_| "think run log lock poisoned".to_owned())?;
+            checkpoint()?;
             sink.write_all(&record).map_err(|error| error.to_string())?;
             sink.flush().map_err(|error| error.to_string())?;
             Ok(())
@@ -107,7 +119,7 @@ impl<W: Write> RunLogWriter<W> {
         }
     }
 
-    fn remember_error(&self, detail: String) {
+    pub(crate) fn remember_error(&self, detail: String) {
         let mut first_error = self
             .first_error
             .lock()
@@ -176,6 +188,54 @@ mod tests {
     use serde_json::{Map, Value};
 
     use super::RunLogWriter;
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn cancelled_terminal_waiting_for_the_sink_cannot_append_success() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        use std::time::Duration;
+        for cancel in [false, true] {
+            let mut log = RunLogWriter::with_sink(PathBuf::from("fixture"), Vec::<u8>::new());
+            let sink = log.sink.as_ref().unwrap().clone();
+            let held = sink.lock().unwrap();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&cancelled);
+            let (checking, reached) = mpsc::channel();
+            let (ended, done) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                log.log_checked("talent.complete", 1, Map::new(), &|| {
+                    checking.send(()).unwrap();
+                    if flag.load(Ordering::Acquire) {
+                        Err("cancelled".into())
+                    } else {
+                        Ok(())
+                    }
+                });
+                ended.send(log.finish()).unwrap();
+            });
+            reached.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(done.recv_timeout(Duration::from_millis(50)).is_err());
+            cancelled.store(cancel, Ordering::Release);
+            drop(held);
+            let result = done.recv_timeout(Duration::from_secs(5)).unwrap();
+            worker.join().unwrap();
+            let bytes = sink.lock().unwrap();
+            if cancel {
+                assert!(result.is_err());
+                assert!(
+                    bytes.is_empty(),
+                    "no Finish may be appended after cancelled sink admission"
+                );
+            } else {
+                result.unwrap();
+                let record: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(record["event"], "talent.complete");
+            }
+        }
+    }
 
     struct PartialThenError(bool);
 

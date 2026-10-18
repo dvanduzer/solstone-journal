@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
+use std::fs::OpenOptions;
 use std::future::Future;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -22,6 +24,163 @@ use crate::process::{cancel_worker, spawn_worker};
 use crate::renewal::{Now, RenewalHandle, RenewalService, RenewalWorkerStart};
 use crate::state::{CortexState, Outbound};
 use crate::storage::CortexStore;
+
+pub struct CallableRoots<'a> {
+    pub talent_root: &'a Path,
+    pub apps_root: &'a Path,
+    pub templates_dir: &'a Path,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CallableUse {
+    pub use_id: String,
+    pub completed: bool,
+}
+
+pub struct CallableCortex {
+    journal: PathBuf,
+    store: CortexStore,
+}
+impl CallableCortex {
+    pub fn open(journal: &Path) -> Result<Self, String> {
+        let store = CortexStore::new(journal.to_path_buf()).map_err(|e| e.to_string())?;
+        store
+            .recover()
+            .map_err(|fatal| format_cortex_use_fatal(CortexUseOperation::Recovery, fatal))?;
+        Ok(Self {
+            journal: journal.to_path_buf(),
+            store,
+        })
+    }
+    pub fn execute(
+        &self,
+        roots: CallableRoots<'_>,
+        request: serde_json::Map<String, Value>,
+        generate: &dyn solstone_core_generate::GenerateExecutor,
+        now_ms: i64,
+        cancel: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<CallableUse, String> {
+        execute_callable_with_store(
+            &self.store,
+            &self.journal,
+            roots,
+            request,
+            generate,
+            now_ms,
+            cancel,
+        )
+    }
+}
+
+pub fn execute_callable_request(
+    journal: &Path,
+    roots: CallableRoots<'_>,
+    request: serde_json::Map<String, serde_json::Value>,
+    generate: &dyn solstone_core_generate::GenerateExecutor,
+    now_ms: i64,
+    cancel: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<CallableUse, String> {
+    if cancel() {
+        return Err("thinking cancelled".into());
+    }
+    let store = CortexStore::new(journal.to_path_buf()).map_err(|e| e.to_string())?;
+    execute_callable_with_store(&store, journal, roots, request, generate, now_ms, cancel)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_callable_with_store(
+    store: &CortexStore,
+    journal: &Path,
+    roots: CallableRoots<'_>,
+    mut request: serde_json::Map<String, Value>,
+    generate: &dyn solstone_core_generate::GenerateExecutor,
+    now_ms: i64,
+    cancel: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<CallableUse, String> {
+    if cancel() {
+        return Err("thinking cancelled".into());
+    }
+    let use_id = match request.get("use_id").and_then(Value::as_str) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            let id = solstone_core_journal_io::cortex_use::allocate_cortex_use_id(journal, now_ms)
+                .map_err(|e| e.to_string())?;
+            let s = id.to_string();
+            request.insert("use_id".to_string(), Value::String(s.clone()));
+            s
+        }
+    };
+
+    let name = request
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "request missing name".to_string())?;
+
+    if cancel() {
+        return Err("thinking cancelled".into());
+    }
+    let (active_path, identity) = match store.claim_checked(name, &use_id, &request, cancel) {
+        Ok(Some((path, identity))) => (path, identity),
+        Ok(None) => return Err(format!("cortex use {use_id} for {name} is already claimed")),
+        Err(err) => return Err(err.to_string()),
+    };
+
+    let runtime_paths = solstone_core_talent_runtime::prepare::RuntimePaths {
+        talent_root: roots.talent_root.to_path_buf(),
+        apps_root: roots.apps_root.to_path_buf(),
+        templates_dir: roots.templates_dir.to_path_buf(),
+    };
+    let execution_context = solstone_core_talent_runtime::ExecutionContext {
+        journal: journal.to_path_buf(),
+    };
+
+    let mut writer = Vec::new();
+    let outcome = solstone_core_talent_runtime::execute_request(
+        request.clone(),
+        &runtime_paths,
+        &execution_context,
+        generate,
+        &mut writer,
+        &solstone_core_generate::Cancellation::from_fn(cancel),
+    );
+    if cancel()
+        || matches!(
+            outcome,
+            solstone_core_talent_runtime::RuntimeOutcome::Cancelled
+        )
+    {
+        return Ok(CallableUse {
+            use_id,
+            completed: false,
+        });
+    }
+    solstone_core_talent_runtime::emit_outcome(&mut writer, outcome);
+
+    if !writer.is_empty() {
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&active_path)
+            .map_err(|e| e.to_string())?;
+        if cancel() {
+            return Ok(CallableUse {
+                use_id,
+                completed: false,
+            });
+        }
+        file.write_all(&writer).map_err(|e| e.to_string())?;
+    }
+
+    if cancel() {
+        return Ok(CallableUse {
+            use_id,
+            completed: false,
+        });
+    }
+
+    let completed = store.complete_checked(&use_id, name, identity, Some(&request), cancel);
+    Ok(CallableUse { use_id, completed })
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct CortexOptions {
@@ -525,5 +684,467 @@ mod tests {
         );
         assert!(text.contains("pyproject.toml"));
         assert_ne!(error.class(), "runtime");
+    }
+
+    fn mock_generated_response() -> solstone_core_generate::GenerateResponse {
+        solstone_core_generate::GenerateResponse::Generated(Box::new(
+            solstone_core_generate::GeneratedResponse {
+                id: None,
+                text: "{}".into(),
+                model: "test-model".into(),
+                usage: serde_json::json!({}),
+                finish_reason: "stop".into(),
+                thinking: None,
+                schema_validation: None,
+                input_budget: None,
+                request_budget: None,
+                inference: None,
+                hints_applied: Vec::new(),
+            },
+        ))
+    }
+
+    struct TestFixture {
+        _root: tempfile::TempDir,
+        journal: PathBuf,
+        talent_root: PathBuf,
+        apps_root: PathBuf,
+        templates_dir: PathBuf,
+    }
+
+    impl TestFixture {
+        fn new(talent_name: &str) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let journal = root.path().join("journal");
+            let talent_root = root.path().join("talent");
+            let apps_root = root.path().join("apps");
+            let templates_dir = root.path().join("templates");
+
+            std::fs::create_dir_all(&journal).unwrap();
+            std::fs::create_dir_all(journal.join("config")).unwrap();
+            std::fs::write(
+                journal.join("config/journal.json"),
+                r#"{"providers":{"active":{"provider":"test","model":"test-model"}}}"#,
+            )
+            .unwrap();
+
+            std::fs::create_dir_all(&talent_root).unwrap();
+            std::fs::create_dir_all(&apps_root).unwrap();
+            std::fs::create_dir_all(&templates_dir).unwrap();
+
+            std::fs::write(
+                talent_root.join(format!("{talent_name}.md")),
+                "{\n\"max_output_tokens\":1024\n}\nworker fixture",
+            )
+            .unwrap();
+
+            Self {
+                _root: root,
+                journal,
+                talent_root,
+                apps_root,
+                templates_dir,
+            }
+        }
+
+        fn roots(&self) -> CallableRoots<'_> {
+            CallableRoots {
+                talent_root: &self.talent_root,
+                apps_root: &self.apps_root,
+                templates_dir: &self.templates_dir,
+            }
+        }
+    }
+
+    #[test]
+    fn two_calls_with_same_now_ms_and_no_use_id_produce_increasing_ids() {
+        let fixture = TestFixture::new("call_talent");
+        let now_ms = 1_700_000_000_000;
+        let generate =
+            |_req: &solstone_core_generate::GenerateRequest| Ok(mock_generated_response());
+        let cancel = || false;
+
+        let req1 = serde_json::Map::from_iter([
+            ("name".into(), Value::String("call_talent".into())),
+            ("prompt".into(), Value::String("call1".into())),
+        ]);
+        let res1 = execute_callable_request(
+            &fixture.journal,
+            fixture.roots(),
+            req1,
+            &generate,
+            now_ms,
+            &cancel,
+        )
+        .unwrap();
+
+        let req2 = serde_json::Map::from_iter([
+            ("name".into(), Value::String("call_talent".into())),
+            ("prompt".into(), Value::String("call2".into())),
+        ]);
+        let res2 = execute_callable_request(
+            &fixture.journal,
+            fixture.roots(),
+            req2,
+            &generate,
+            now_ms,
+            &cancel,
+        )
+        .unwrap();
+
+        assert!(res1.completed);
+        assert!(res2.completed);
+        let id1: i64 = res1.use_id.parse().unwrap();
+        let id2: i64 = res2.use_id.parse().unwrap();
+        assert!(id2 > id1, "ids must be strictly increasing: {id2} > {id1}");
+
+        let talents_dir = fixture.journal.join("talents/call_talent");
+        assert!(talents_dir.join(format!("{}.jsonl", res1.use_id)).is_file());
+        assert!(
+            !talents_dir
+                .join(format!("{}_active.jsonl", res1.use_id))
+                .exists()
+        );
+        assert!(talents_dir.join(format!("{}.jsonl", res2.use_id)).is_file());
+        assert!(
+            !talents_dir
+                .join(format!("{}_active.jsonl", res2.use_id))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn cancelled_use_is_recovered_only_by_a_new_owner() {
+        let fixture = TestFixture::new("call_talent");
+        let owner = CallableCortex::open(&fixture.journal).unwrap();
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let generate = |_: &solstone_core_generate::GenerateRequest| {
+            cancelled.store(true, std::sync::atomic::Ordering::Release);
+            Ok(mock_generated_response())
+        };
+        let first = owner
+            .execute(
+                fixture.roots(),
+                Map::from_iter([
+                    ("name".into(), Value::String("call_talent".into())),
+                    ("prompt".into(), Value::String("first".into())),
+                ]),
+                &generate,
+                1_700_000_000_000,
+                &|| cancelled.load(std::sync::atomic::Ordering::Acquire),
+            )
+            .unwrap();
+        assert!(!first.completed);
+        let directory = fixture.journal.join("talents/call_talent");
+        let active = directory.join(format!("{}_active.jsonl", first.use_id));
+        let terminal = directory.join(format!("{}.jsonl", first.use_id));
+        assert!(active.is_file());
+        assert!(!terminal.exists());
+        drop(owner);
+        let restarted = CallableCortex::open(&fixture.journal).unwrap();
+        assert!(!active.exists());
+        assert!(terminal.is_file());
+        let second = restarted
+            .execute(
+                fixture.roots(),
+                Map::from_iter([
+                    ("name".into(), Value::String("call_talent".into())),
+                    ("prompt".into(), Value::String("second".into())),
+                ]),
+                &|_: &solstone_core_generate::GenerateRequest| Ok(mock_generated_response()),
+                1_700_000_000_001,
+                &|| false,
+            )
+            .unwrap();
+        assert!(second.completed);
+        assert_ne!(first.use_id, second.use_id);
+    }
+
+    #[test]
+    fn completed_use_second_call_with_same_use_id_refuses_and_does_not_call_generate() {
+        let fixture = TestFixture::new("call_talent");
+        let now_ms = 1_700_000_000_000;
+        let counter1 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter1_clone = Arc::clone(&counter1);
+        let generate1 = move |_req: &solstone_core_generate::GenerateRequest| {
+            counter1_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(mock_generated_response())
+        };
+        let cancel = || false;
+
+        let req1 = serde_json::Map::from_iter([
+            ("name".into(), Value::String("call_talent".into())),
+            ("prompt".into(), Value::String("call1".into())),
+        ]);
+        let res1 = execute_callable_request(
+            &fixture.journal,
+            fixture.roots(),
+            req1,
+            &generate1,
+            now_ms,
+            &cancel,
+        )
+        .unwrap();
+
+        assert!(res1.completed);
+        assert_eq!(counter1.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let term_path = fixture
+            .journal
+            .join("talents/call_talent")
+            .join(format!("{}.jsonl", res1.use_id));
+        let bytes_before = std::fs::read(&term_path).unwrap();
+
+        let counter2 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter2_clone = Arc::clone(&counter2);
+        let generate2 = move |_req: &solstone_core_generate::GenerateRequest| {
+            counter2_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(mock_generated_response())
+        };
+        let req2 = serde_json::Map::from_iter([
+            ("name".into(), Value::String("call_talent".into())),
+            ("use_id".into(), Value::String(res1.use_id.clone())),
+            ("prompt".into(), Value::String("call2".into())),
+        ]);
+        let res2 = execute_callable_request(
+            &fixture.journal,
+            fixture.roots(),
+            req2,
+            &generate2,
+            now_ms,
+            &cancel,
+        );
+
+        assert!(
+            res2.is_err(),
+            "second call with same use_id must return Err"
+        );
+        assert_eq!(
+            counter2.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "generate must not be called on second call"
+        );
+        let bytes_after = std::fs::read(&term_path).unwrap();
+        assert_eq!(
+            bytes_before, bytes_after,
+            "terminal bytes must be unchanged"
+        );
+    }
+
+    #[test]
+    fn generate_error_or_refusal_does_not_retry_and_leaves_terminal_record() {
+        let fixture = TestFixture::new("call_talent");
+        let now_ms = 1_700_000_000_000;
+        let cancel = || false;
+
+        // Part A: GenerateExecutor returns Err
+        let counter_err = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter_err_clone = Arc::clone(&counter_err);
+        let generate_err = move |_req: &solstone_core_generate::GenerateRequest| {
+            counter_err_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(solstone_core_generate::ClientError::Resolve(
+                "simulated transport error".into(),
+            ))
+        };
+        let req1 = serde_json::Map::from_iter([
+            ("name".into(), Value::String("call_talent".into())),
+            ("prompt".into(), Value::String("err".into())),
+        ]);
+        let res1 = execute_callable_request(
+            &fixture.journal,
+            fixture.roots(),
+            req1,
+            &generate_err,
+            now_ms,
+            &cancel,
+        )
+        .unwrap();
+
+        assert_eq!(
+            counter_err.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one invocation on Err"
+        );
+        assert!(res1.completed);
+        let term1 = fixture
+            .journal
+            .join("talents/call_talent")
+            .join(format!("{}.jsonl", res1.use_id));
+        assert!(
+            term1.is_file(),
+            "terminal record must exist for Err when cancel is false"
+        );
+
+        // Part B: GenerateExecutor returns RefusedResponse
+        let counter_refused = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter_refused_clone = Arc::clone(&counter_refused);
+        let generate_refused = move |_req: &solstone_core_generate::GenerateRequest| {
+            counter_refused_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(solstone_core_generate::GenerateResponse::Refused(
+                solstone_core_generate::RefusedResponse {
+                    id: None,
+                    reason: solstone_core_generate::RefusalReason::Unknown,
+                    reason_code: None,
+                    retryable: false,
+                    blocking: false,
+                    reset_at_ms: None,
+                    provider: Some("test".into()),
+                    detail: "quota exhausted".into(),
+                },
+            ))
+        };
+        let req2 = serde_json::Map::from_iter([
+            ("name".into(), Value::String("call_talent".into())),
+            ("prompt".into(), Value::String("refused".into())),
+        ]);
+        let res2 = execute_callable_request(
+            &fixture.journal,
+            fixture.roots(),
+            req2,
+            &generate_refused,
+            now_ms + 100,
+            &cancel,
+        )
+        .unwrap();
+
+        assert_eq!(
+            counter_refused.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one invocation on Refused"
+        );
+        assert!(res2.completed);
+        let term2 = fixture
+            .journal
+            .join("talents/call_talent")
+            .join(format!("{}.jsonl", res2.use_id));
+        assert!(
+            term2.is_file(),
+            "terminal record must exist for Refused when cancel is false"
+        );
+    }
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn callable_owner_keeps_a_live_use_while_another_use_completes() {
+        let fixture = TestFixture::new("call_talent");
+        let owner = Arc::new(CallableCortex::open(&fixture.journal).unwrap());
+        let (entered_send, entered) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let released = Mutex::new(released);
+        let first_owner = Arc::clone(&owner);
+        let talent = fixture.talent_root.clone();
+        let apps = fixture.apps_root.clone();
+        let templates = fixture.templates_dir.clone();
+        let first = thread::spawn(move || {
+            let generate = move |_: &solstone_core_generate::GenerateRequest| {
+                entered_send.send(()).unwrap();
+                released.lock().unwrap().recv().unwrap();
+                Ok(mock_generated_response())
+            };
+            first_owner
+                .execute(
+                    CallableRoots {
+                        talent_root: &talent,
+                        apps_root: &apps,
+                        templates_dir: &templates,
+                    },
+                    Map::from_iter([
+                        ("name".into(), Value::String("call_talent".into())),
+                        ("prompt".into(), Value::String("first".into())),
+                    ]),
+                    &generate,
+                    1_700_000_000_000,
+                    &|| false,
+                )
+                .unwrap()
+        });
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let directory = fixture.journal.join("talents/call_talent");
+        let active = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .ends_with("_active.jsonl")
+            })
+            .unwrap();
+        let second = owner
+            .execute(
+                fixture.roots(),
+                Map::from_iter([
+                    ("name".into(), Value::String("call_talent".into())),
+                    ("prompt".into(), Value::String("second".into())),
+                ]),
+                &|_: &solstone_core_generate::GenerateRequest| Ok(mock_generated_response()),
+                1_700_000_000_001,
+                &|| false,
+            )
+            .unwrap();
+        assert!(second.completed);
+        assert!(
+            active.is_file(),
+            "another live use must not be restart-recovered"
+        );
+        assert!(
+            !std::fs::read_to_string(&active)
+                .unwrap()
+                .contains("interrupted by")
+        );
+        release.send(()).unwrap();
+        assert!(first.join().unwrap().completed);
+        assert!(!active.exists());
+    }
+
+    #[test]
+    fn callable_cancellation_during_generate_leaves_no_finish_or_terminal_success() {
+        let fixture = TestFixture::new("call_talent");
+        let owner = CallableCortex::open(&fixture.journal).unwrap();
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let generate = |_: &solstone_core_generate::GenerateRequest| {
+            cancelled.store(true, std::sync::atomic::Ordering::Release);
+            Ok(mock_generated_response())
+        };
+        let result = owner
+            .execute(
+                fixture.roots(),
+                Map::from_iter([
+                    ("name".into(), Value::String("call_talent".into())),
+                    ("prompt".into(), Value::String("cancel".into())),
+                ]),
+                &generate,
+                1_700_000_000_000,
+                &|| cancelled.load(std::sync::atomic::Ordering::Acquire),
+            )
+            .unwrap();
+        assert!(!result.completed);
+        let directory = fixture.journal.join("talents/call_talent");
+        assert!(!directory.join(format!("{}.jsonl", result.use_id)).exists());
+        let active =
+            std::fs::read_to_string(directory.join(format!("{}_active.jsonl", result.use_id)))
+                .unwrap();
+        assert!(
+            !active
+                .lines()
+                .any(|line| serde_json::from_str::<Value>(line)
+                    .is_ok_and(|v| v["event"] == "finish"))
+        );
+        let positive = owner
+            .execute(
+                fixture.roots(),
+                Map::from_iter([
+                    ("name".into(), Value::String("call_talent".into())),
+                    ("prompt".into(), Value::String("positive".into())),
+                ]),
+                &|_: &solstone_core_generate::GenerateRequest| Ok(mock_generated_response()),
+                1_700_000_000_001,
+                &|| false,
+            )
+            .unwrap();
+        assert!(positive.completed);
+        assert!(
+            directory
+                .join(format!("{}.jsonl", positive.use_id))
+                .is_file()
+        );
     }
 }

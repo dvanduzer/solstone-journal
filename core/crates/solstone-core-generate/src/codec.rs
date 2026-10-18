@@ -279,6 +279,9 @@ pub fn encode_one_shot_response(response: &GenerateResponse) -> Result<String, S
             "provider": response.provider,
             "detail": response.detail,
         }),
+        GenerateResponse::Cancelled => {
+            return Err("cannot encode cancelled generate response".to_string());
+        }
     };
     serde_json::to_string(&value).map_err(|error| error.to_string())
 }
@@ -323,6 +326,9 @@ pub fn decode_session_response_line(line: &str) -> Result<GenerateResponse, Stri
     let id = match &response {
         GenerateResponse::Generated(value) => &value.id,
         GenerateResponse::Refused(value) => &value.id,
+        GenerateResponse::Cancelled => {
+            return Err("cancelled session response cannot have an id".to_owned());
+        }
     };
     if id.is_none() {
         return Err("session response id is required".to_owned());
@@ -334,6 +340,9 @@ pub fn encode_session_response_line(response: &GenerateResponse) -> Result<Strin
     let id = match response {
         GenerateResponse::Generated(value) => &value.id,
         GenerateResponse::Refused(value) => &value.id,
+        GenerateResponse::Cancelled => {
+            return Err("cannot encode cancelled session response".to_owned());
+        }
     };
     if id.is_none() {
         return Err("session response id is required".to_owned());
@@ -397,6 +406,7 @@ impl SessionCorrelation {
         let id = match response {
             GenerateResponse::Generated(value) => value.id.as_deref(),
             GenerateResponse::Refused(value) => value.id.as_deref(),
+            GenerateResponse::Cancelled => return Err(SessionError::MissingId),
         }
         .ok_or(SessionError::MissingId)?;
         if !self.outstanding.remove(id) || self.retired.contains(id) {

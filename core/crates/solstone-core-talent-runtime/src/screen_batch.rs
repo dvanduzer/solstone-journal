@@ -148,6 +148,9 @@ where
                     response: Box::new(response),
                 }));
             }
+            GenerateResponse::Cancelled => {
+                return Some(Err(RuntimeOutcome::Cancelled));
+            }
         }
     }
     Some(merge_outputs(&outputs).map_err(|detail| {

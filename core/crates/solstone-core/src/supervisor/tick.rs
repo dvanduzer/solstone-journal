@@ -37,14 +37,14 @@ use solstone_core_system::status_wire::{
 };
 
 use super::bus::{SupervisorProviderSink, SupervisorScheduleSink, emit};
-use super::config::{no_thinking_engine_chosen, processing_is_deferred};
 use super::runtime::{
-    AppExit, AppService, FlushState, ManagedAppProcess, PendingFlush, RetainedSenseStatus,
-    SupervisorState, apply_app_exit,
+    AppExit, AppService, FlushState, ManagedAppProcess, RetainedSenseStatus, SupervisorState,
+    apply_app_exit,
 };
+#[cfg(test)]
+use super::{config, runtime};
 
 const MAX_INBOUND_PER_TICK: usize = 256;
-const FLUSH_TIMEOUT: Duration = Duration::from_secs(3600);
 /// How often the supervisor reaps decoded-audio scratch a killed analysis or
 /// merge left behind. With the transcribe crate's age floor, a leftover outlives
 /// its writer by about two hours at most while the journal runs.
@@ -504,30 +504,8 @@ pub(crate) fn check_segment_flush(
     force_day: Option<&str>,
     now: Instant,
 ) {
-    if flush.pending.is_empty()
-        || !solstone_core_system::processing::processing_allowed(journal)
-        || no_thinking_engine_chosen(journal)
-    {
-        return;
-    }
-    flush.pending.retain(|stream, pending| {
-        let due = force_day == Some(pending.day.as_str())
-            || now.saturating_duration_since(pending.last_segment_ts) >= FLUSH_TIMEOUT;
-        if due {
-            let _ = submit_think(
-                queue,
-                flush_think_argv(&pending.day, &pending.segment, stream.as_deref()),
-                &pending.day,
-                format!("supervisor-flush-{}-{}", pending.day, pending.segment),
-            );
-        }
-        !due
-    });
+    solstone_core_think_cli::planner::check_segment_flush(journal, queue, flush, force_day, now);
 }
-
-/// How often the supervisor reads when each stream's activities next need a
-/// settle check.
-const SETTLE_SCAN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Run `think --settle` for each stream whose activities are due a settle
 /// check. The due times are kept on disk by the checks themselves, so a
@@ -540,97 +518,9 @@ pub(crate) fn check_activity_settle(
     now_ms: i64,
     today: &str,
 ) {
-    if tick.saturating_duration_since(*last_scan) < SETTLE_SCAN_INTERVAL
-        || !solstone_core_system::processing::processing_allowed(journal)
-        || no_thinking_engine_chosen(journal)
-    {
-        return;
-    }
-    *last_scan = tick;
-    for stream in solstone_core_think_cli::activity_settle_due(journal, now_ms) {
-        let reference = format!("supervisor-settle-{stream}");
-        if queue.contains_reference(&reference) {
-            continue;
-        }
-        let _ = submit_think(queue, settle_think_argv(&stream), today, reference);
-    }
-}
-
-fn settle_think_argv(stream: &str) -> Vec<String> {
-    canonical_journal_command(["think", "-v", "--settle", "--stream", stream])
-}
-
-/// How long after a day ends its daily run waits at least: a segment that
-/// began before midnight is sealed and delivered after it.
-const DAY_CLOSE_GRACE: Duration = Duration::from_secs(10 * 60);
-
-/// How long after a day ends its daily run waits at most for that day's last
-/// activities to be written.
-const DAY_CLOSE_LIMIT: Duration = Duration::from_secs(60 * 60);
-
-/// The day that ended within [`DAY_CLOSE_LIMIT`], while its last inputs are
-/// still arriving or being thought: within [`DAY_CLOSE_GRACE`] of its end, or
-/// while a segment, flush or activity task of it, or any settle check, is
-/// queued or running, or an activity of it is waiting to be written or still
-/// having its talents run. Its daily run starts once that stops, so it reads
-/// the day's final inputs once.
-pub(super) fn day_still_closing(
-    journal: &Path,
-    queue: &TaskQueue,
-    now: SystemTime,
-) -> Option<String> {
-    let local_day = |at: SystemTime| {
-        solstone_core_system::daily_coverage::local_day(journal, chrono::DateTime::from(at))
-    };
-    let day = local_day(now.checked_sub(DAY_CLOSE_LIMIT)?);
-    if day == local_day(now) {
-        return None;
-    }
-    let within_grace = now
-        .checked_sub(DAY_CLOSE_GRACE)
-        .is_some_and(|at| local_day(at) == day);
-    let flush = format!("supervisor-flush-{day}-");
-    let observed = format!("supervisor-observed-{day}-");
-    let activity = format!("\"day\":\"{day}\"");
-    // A settle check reads yesterday as well as today, whatever its stream.
-    let busy = || {
-        queue.any_reference(|reference| {
-            reference.starts_with(&flush)
-                || reference.starts_with(&observed)
-                || reference.starts_with("supervisor-settle-")
-                || reference.starts_with(&format!("supervisor-retry-raw-{day}-"))
-                || reference.starts_with(&format!("supervisor-retry-talent-{day}-"))
-                || reference.starts_with(&format!("supervisor-activity-{day}-"))
-                || (reference.starts_with("supervisor-activity-") && reference.contains(&activity))
-        })
-    };
-    (within_grace || busy() || solstone_core_think_cli::activity_settle_holds_day(journal, &day))
-        .then_some(day)
-}
-
-fn flush_think_argv(day: &str, segment: &str, stream: Option<&str>) -> Vec<String> {
-    let mut tail = vec![
-        "think".to_owned(),
-        "-v".to_owned(),
-        "--day".to_owned(),
-        day.to_owned(),
-        "--segment".to_owned(),
-        segment.to_owned(),
-        "--flush".to_owned(),
-    ];
-    if let Some(stream) = stream {
-        tail.extend(["--stream".to_owned(), stream.to_owned()]);
-    }
-    canonical_journal_command(tail)
-}
-
-fn submit_think(
-    queue: &TaskQueue,
-    argv: Vec<String>,
-    day: &str,
-    reference: String,
-) -> solstone_core_system::queue::SubmitOutcome {
-    submit_task(queue, argv, reference, Some(day), None)
+    solstone_core_think_cli::planner::check_activity_settle(
+        journal, queue, last_scan, tick, now_ms, today,
+    );
 }
 
 fn submit_task(
@@ -1151,74 +1041,17 @@ fn handle_segment_observed(state: &mut SupervisorState, message: &CallosumEnvelo
     let day = message_string(message, "day")
         .map(str::to_owned)
         .unwrap_or_else(|| owner_now(&state.journal).format("%Y%m%d").to_string());
-    if message_truthy(message, "batch") {
-        log::debug!("supervisor: batch observed segment held for daily catchup: {day}/{segment}");
-        return;
-    }
-    if processing_is_deferred(&state.journal) || no_thinking_engine_chosen(&state.journal) {
-        log::debug!(
-            "supervisor: observed segment held by processing configuration: {day}/{segment}"
-        );
-        return;
-    }
-    let stream = message_string(message, "stream").map(str::to_owned);
-    // ⛔ An MCP audit record is not an observation of the owner's world. The
-    // audit writer publishes into `chronicle/<day>/mcp.agent/<segment>/` and
-    // notifies Callosum like any other new segment, and the generic handler
-    // below would answer by submitting `journal think` for it — one process
-    // per agent tool call, writing an idle sense artifact into the very stream
-    // the owner-agent boundary keeps out of enrichment. Nothing is read and no
-    // model is called, so this is cost and contamination rather than a leak,
-    // but the plan's "audit records are excluded from sense/talent enrichment"
-    // has to hold for the process as well as the content.
-    //
-    if is_mcp_audit_segment(stream.as_deref()) {
-        log::debug!("supervisor: MCP audit segment is not enriched: {day}/{segment}");
-        return;
-    }
-    // Late evidence still gets thought, but cannot displace the newer
-    // segment whose live activity must be closed when this stream goes quiet.
-    if state.flush.pending.get(&stream).is_none_or(|pending| {
-        (day.as_str(), segment) >= (pending.day.as_str(), pending.segment.as_str())
-    }) {
-        state.flush.pending.insert(
-            stream.clone(),
-            PendingFlush {
-                last_segment_ts: Instant::now(),
-                day: day.clone(),
-                segment: segment.to_owned(),
-            },
-        );
-    }
-    let mut tail = vec![
-        "think".to_owned(),
-        "-v".to_owned(),
-        "--day".to_owned(),
-        day.clone(),
-        "--segment".to_owned(),
-        segment.to_owned(),
-    ];
-    if let Some(stream) = stream {
-        tail.extend(["--stream".to_owned(), stream]);
-    }
-    tail.push("--live".to_owned());
-    let argv = canonical_journal_command(tail);
-    let _ = submit_think(
+    let batch = message_truthy(message, "batch");
+    let stream = message_string(message, "stream");
+    solstone_core_think_cli::planner::plan_observed_segment(
+        &state.journal,
         &state.queue,
-        argv,
+        &mut state.flush,
         &day,
-        format!("supervisor-observed-{day}-{segment}"),
+        segment,
+        stream,
+        batch,
     );
-}
-
-/// Whether an observed segment is an MCP audit record.
-///
-/// ⚠ The stream name is duplicated from `solstone-core-mcp-audit`'s
-/// `AUDIT_STREAM` rather than imported: this guard must hold whether or not the
-/// endpoint feature is compiled into this build, because the records can
-/// predate the binary that finds them.
-pub(super) fn is_mcp_audit_segment(stream: Option<&str>) -> bool {
-    stream == Some("mcp.agent")
 }
 
 fn handle_think_daily_complete(state: &mut SupervisorState, message: &CallosumEnvelope) {
@@ -1545,7 +1378,13 @@ mod tests {
     };
     use tempfile::TempDir;
 
+    use super::config::no_thinking_engine_chosen;
+    use super::runtime::PendingFlush;
     use super::*;
+    use solstone_core_think_cli::planner::{
+        FLUSH_TIMEOUT, SETTLE_SCAN_INTERVAL, day_still_closing, flush_think_argv,
+        is_mcp_audit_segment, settle_think_argv, submit_think,
+    };
 
     #[test]
     fn scratch_sweep_runs_on_the_first_tick_and_then_hourly() {
@@ -1631,7 +1470,7 @@ mod tests {
         });
         let (local, parakeet) = super::super::test_support::stopped_providers(journal);
         SupervisorState {
-            discovery: super::super::work_discovery::WorkDiscovery::new(
+            discovery: super::super::WorkDiscovery::new(
                 journal.to_path_buf(),
                 queue.clone(),
                 false,

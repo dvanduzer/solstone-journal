@@ -15,8 +15,8 @@ use crate::run_log::RunLogWriter;
 use chrono::{TimeZone, Utc};
 use serde_json::{Map, Value};
 use solstone_core_facets::{
-    ActivityRecordStoreError, AppendOutcome, DeclaredFacetInventory, append_activity_record,
-    get_activity_record, observe_declared_facet_inventory,
+    ActivityRecordStoreError, AppendOutcome, DeclaredFacetInventory,
+    append_activity_record_checked, get_activity_record, observe_declared_facet_inventory,
 };
 use solstone_core_journal_io::{
     AtomicWriteOptions, DEFAULT_STREAM, FileLock, LockOptions, PathOrDay, atomic_replace,
@@ -26,10 +26,10 @@ use solstone_core_system::activity_state::{
     ActivityStateMachine, SHARED_ACTIVITY_STATE, activity_state_path,
 };
 use solstone_core_system_health::{
-    DataState, FilesystemHealthLogSource, SEGMENT_FLOOR_TALENTS, SEGMENT_NONGATING_TALENTS,
+    FilesystemHealthLogSource, SEGMENT_FLOOR_TALENTS, SEGMENT_NONGATING_TALENTS,
     detect_segment_change, find_segment_dir, is_floor_talent_capped, lookup_segment_progress,
     newest_segment_input_ms, read_segment_data_state, read_segment_progress, resolve_predecessor,
-    segment_thinking_is_current,
+    segment_fully_sensed, segment_thinking_is_current,
 };
 use solstone_core_talent_config::{
     TalentConfig, TalentFilter, get_output_path, load_talent_configs,
@@ -158,6 +158,9 @@ pub(crate) fn publish_saved_outputs(
     context: &ThinkContext,
     segment_dir: &std::path::Path,
 ) -> Result<(), String> {
+    if (context.cancel_checkpoint)() {
+        return Err("cancelled before publication".into());
+    }
     // Taken so a run thinking this segment does not change it underneath.
     let _turn = segment_turn(context, segment_dir);
     let before = newest_segment_input_ms(segment_dir).map_err(|error| error.to_string())?;
@@ -165,11 +168,15 @@ pub(crate) fn publish_saved_outputs(
     {
         return Ok(());
     }
-    solstone_core_system::segment_publication::publish(
+    if (context.cancel_checkpoint)() {
+        return Err("cancelled before publication".into());
+    }
+    solstone_core_system::segment_publication::publish_checked(
         &context.journal,
         segment_dir,
         before,
         |journal, path| context.index.rescan_file(journal, path),
+        &|| context.checkpoint(),
     )?;
     if before != newest_segment_input_ms(segment_dir).map_err(|error| error.to_string())? {
         return Err("segment input changed during publication".into());
@@ -232,11 +239,8 @@ fn think(
     let _turn = segment_turn(context, &segment_dir);
     let state =
         read_segment_data_state(&context.journal, &context.day, segment, stream, Utc::now());
-    let in_flight = state.0.values().any(|value| {
-        value == DataState::Pending.as_str() || value == DataState::Analyzing.as_str()
-    });
-    if in_flight {
-        // Source-derived, not measured: thinking.py:1485-1499 records this raw-media gate.
+    if !segment_fully_sensed(&state) {
+        // A retryable failure is still owed media analysis, not empty input.
         log_skip(log, context, "sense", segment, "raw_media_pending", stream);
         return Ok(ModeResult::default());
     }
@@ -717,7 +721,11 @@ pub(crate) fn retry_talent(
         );
         if !pending.contains(talent) {
             if let Some((unit, _)) = &context.retry {
-                solstone_core_system::work_retry::reconcile_accepted(&context.journal, unit)?;
+                solstone_core_system::work_retry::reconcile_accepted_checked(
+                    &context.journal,
+                    unit,
+                    &|| context.checkpoint(),
+                )?;
             }
             return Ok(ModeResult::default());
         }
@@ -1831,6 +1839,7 @@ fn replay_activity_state_selected(
             std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::btree_map::Entry::Vacant(entry) if hydrate_existing => {
                 turns.extend(state_turn(context, state_stream));
+                context.checkpoint()?;
                 let machine = ActivityStateMachine::hydrate(Some(&context.journal), state_stream);
                 #[cfg(test)]
                 state_probe::at(&context.journal, "hydrated");
@@ -1892,7 +1901,7 @@ fn replay_activity_state_selected(
         // from its day's capture-order rebuild; here the days are only marked.
         let published = if crate::settle::defers(stream.as_deref(), refresh) {
             crate::settle::note(
-                &context.journal,
+                context,
                 stream.as_deref().unwrap_or(DEFAULT_STREAM),
                 &[routing_day.as_str(), context.day.as_str()],
             )
@@ -2027,7 +2036,7 @@ fn flush_replay_machines(
         let changes = machine.close_active(&last_segment, context.now_ms);
         let published = if crate::settle::defers(stream.as_deref(), refresh) {
             crate::settle::note(
-                &context.journal,
+                context,
                 stream.as_deref().unwrap_or(DEFAULT_STREAM),
                 &[routing_day.as_str()],
             )
@@ -2128,11 +2137,7 @@ pub(crate) fn close_idle_activities(
         }
         let day = context.day.clone();
         let published = if crate::settle::defers(stream, false) {
-            crate::settle::note(
-                &context.journal,
-                stream.unwrap_or(DEFAULT_STREAM),
-                &[day.as_str()],
-            )
+            crate::settle::note(context, stream.unwrap_or(DEFAULT_STREAM), &[day.as_str()])
         } else {
             publish_ended_activities(
                 context,
@@ -2248,15 +2253,18 @@ fn persist_activity_state(
     stream: Option<&str>,
     machine: &ActivityStateMachine,
 ) -> Result<(), String> {
+    context.checkpoint()?;
     let path = activity_state_path(&context.journal, stream);
     let Some(parent) = path.parent() else {
         return Ok(());
     };
     std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     let bytes = serde_json::to_vec(&machine.snapshot()).map_err(|error| error.to_string())?;
+    context.checkpoint()?;
     atomic_replace(&path, &bytes, AtomicWriteOptions::default())
         .map_err(|error| error.to_string())?;
     if machine.adopted_shared() {
+        context.checkpoint()?;
         match std::fs::remove_file(context.journal.join(SHARED_ACTIVITY_STATE)) {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
                 return Err(error.to_string());
@@ -2336,7 +2344,7 @@ fn publish_ended_activities(
         if let Some(stream) = stream {
             record.insert("stream".to_owned(), Value::String(stream.to_owned()));
         }
-        let written = match append_own_activity(&context.journal, facet, routing_day, &mut record) {
+        let written = match append_own_activity(context, facet, routing_day, &mut record) {
             Ok(AppendOutcome::Written(_)) => true,
             Ok(AppendOutcome::AlreadyExists) => false,
             Err(error) => {
@@ -2397,6 +2405,7 @@ pub(crate) fn record_publication(
     skip_activity_prompts: bool,
     talents: &mut Vec<EndedActivity>,
 ) -> Result<(), String> {
+    context.checkpoint()?;
     // The ID it was published under: its own when another stream's
     // activity already held the one its type and first segment make.
     let published_id = record
@@ -2508,12 +2517,15 @@ pub(crate) fn rethink_if_input_changed(
 /// stream sits directly under the day and takes that layout's name. The choice
 /// holds on every later publish, because the first record stays where it is.
 pub(crate) fn append_own_activity(
-    journal: &std::path::Path,
+    context: &ThinkContext,
     facet: &str,
     day: &str,
     record: &mut Map<String, Value>,
 ) -> Result<AppendOutcome, ActivityRecordStoreError> {
-    let outcome = append_activity_record(journal, facet, day, record.clone())?;
+    let journal = &context.journal;
+    let outcome = append_activity_record_checked(journal, facet, day, record.clone(), || {
+        context.checkpoint()
+    })?;
     if !matches!(outcome, AppendOutcome::AlreadyExists) {
         return Ok(outcome);
     }
@@ -2550,7 +2562,7 @@ pub(crate) fn append_own_activity(
     }
     let own = format!("{activity}_{stream}_{since}");
     record.insert("id".to_owned(), Value::String(own));
-    append_activity_record(journal, facet, day, record.clone())
+    append_activity_record_checked(journal, facet, day, record.clone(), || context.checkpoint())
 }
 
 /// Run the talents of activities [`publish_ended_activities`] recorded. A run
@@ -2636,6 +2648,8 @@ pub(crate) fn activity_context(context: &ThinkContext, day: &str) -> Result<Thin
     day_context.cortex = context.cortex.clone();
     day_context.index = context.index.clone();
     day_context.status = context.status.clone();
+    day_context.cancel_checkpoint = Arc::clone(&context.cancel_checkpoint);
+    day_context.sense_executor = context.sense_executor.clone();
     Ok(day_context)
 }
 
@@ -2713,11 +2727,13 @@ pub(crate) fn write_activity_provenance(
     activity_id: &str,
     input_hash: &str,
 ) -> Result<(), String> {
+    context.checkpoint()?;
     let path = activity_provenance_path(context, day, facet, activity_id);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
     let bytes = serde_json::to_vec(&serde_json::json!({"schema_version":1,"facet":facet,"activity_id":activity_id,"input_hash":input_hash})).map_err(|error| error.to_string())?;
+    context.checkpoint()?;
     atomic_replace(&path, &bytes, AtomicWriteOptions::default()).map_err(|error| error.to_string())
 }
 
@@ -2729,6 +2745,10 @@ fn log_use_terminal(
     item: &PendingUse,
     outcome: DrainOutcome,
 ) {
+    if let Err(error) = context.checkpoint() {
+        log.remember_error(error);
+        return;
+    }
     let (event, state, carried_cause) = match &outcome {
         DrainOutcome::Finish => ("talent.complete", "finish", None),
         DrainOutcome::Fail { state, cause } => ("talent.fail", *state, cause.clone()),
@@ -2759,13 +2779,18 @@ fn log_use_terminal(
         if let Ok(id) = unit.id()
             && solstone_core_system::work_retry::read(&context.journal, &id)
                 .is_ok_and(|record| record.is_some_and(|record| record.held))
-            && let Err(error) =
-                solstone_core_system::work_retry::reconcile_accepted(&context.journal, &unit)
+            && let Err(error) = solstone_core_system::work_retry::reconcile_accepted_checked(
+                &context.journal,
+                &unit,
+                &|| context.checkpoint(),
+            )
         {
             log::warn!(
                 "could not release held {} for {segment}: {error}",
                 item.name
             );
+            log.remember_error(format!("retry reconciliation failed: {error}"));
+            return;
         }
     }
     if let Some(reason_code) = carried_cause {
@@ -2777,7 +2802,9 @@ fn log_use_terminal(
             fields.insert("detail".to_owned(), detail);
         }
     }
-    log.log(event, context.event_now_ms(), fields);
+    log.log_checked(event, context.event_now_ms(), fields, &|| {
+        context.checkpoint()
+    });
 }
 
 fn log_dispatch(
@@ -2901,6 +2928,9 @@ pub(crate) fn write_sense_and_change<W: std::io::Write>(
     segment: &std::path::Path,
     sense: &Map<String, Value>,
 ) -> Result<Value, String> {
+    if (context.cancel_checkpoint)() {
+        return Err("thinking cancelled".into());
+    }
     // Source-derived, not measured: sense_splitter.py:13-68 writes these
     // durable projections after both actual and no-input Sense completion.
     let talents = segment.join("talents");
@@ -2910,7 +2940,8 @@ pub(crate) fn write_sense_and_change<W: std::io::Write>(
     let mut assignment_published = false;
     let result: Result<Value, String> = (|| {
         let activity_path = talents.join("activity.md");
-        replace_text(
+        replace_text_checked(
+            context,
             &activity_path,
             sense
                 .get("activity_summary")
@@ -2920,7 +2951,7 @@ pub(crate) fn write_sense_and_change<W: std::io::Write>(
         published.insert(activity_path.clone());
 
         let sense_json_path = talents.join("sense.json");
-        replace_json(&sense_json_path, &Value::Object(sense.clone()))?;
+        replace_json_checked(context, &sense_json_path, &Value::Object(sense.clone()))?;
         published.insert(sense_json_path.clone());
 
         let inventory = observe_declared_facet_inventory(&context.journal)
@@ -2941,16 +2972,17 @@ pub(crate) fn write_sense_and_change<W: std::io::Write>(
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
         let assignment_changed = previous_facets.as_ref() != Some(&filtered_facets.0);
-        replace_json(&facets_json_path, &filtered_facets.0)?;
+        replace_json_checked(context, &facets_json_path, &filtered_facets.0)?;
         published.insert(facets_json_path.clone());
         assignment_published = assignment_changed;
 
         let sense_json_path = talents.join("sense.json");
-        replace_json(&sense_json_path, &Value::Object(sense.clone()))?;
+        replace_json_checked(context, &sense_json_path, &Value::Object(sense.clone()))?;
         published.insert(sense_json_path.clone());
 
         let density_json_path = talents.join("density.json");
-        replace_json(
+        replace_json_checked(
+            context,
             &density_json_path,
             &serde_json::json!({"classification":sense["density"],"timestamp":Utc::now().to_rfc3339()}),
         )?;
@@ -2995,7 +3027,8 @@ pub(crate) fn write_sense_and_change<W: std::io::Write>(
                 .collect::<Vec<_>>();
             if !lines.is_empty() {
                 let sense_md_path = talents.join("sense.md");
-                replace_text(
+                replace_text_checked(
+                    context,
                     &sense_md_path,
                     &format!("# Sense Entities\n\n{}", lines.join("\n")),
                 )?;
@@ -3004,7 +3037,8 @@ pub(crate) fn write_sense_and_change<W: std::io::Write>(
         }
         if sense.get("meeting_detected").is_some_and(python_truthy) {
             let speakers_json_path = talents.join("speakers.json");
-            replace_json(
+            replace_json_checked(
+                context,
                 &speakers_json_path,
                 &sense
                     .get("speakers")
@@ -3030,7 +3064,7 @@ pub(crate) fn write_sense_and_change<W: std::io::Write>(
             &Utc::now().to_rfc3339(),
         );
         let change_json_path = segment.join("talents/change.json");
-        replace_json(&change_json_path, &change)?;
+        replace_json_checked(context, &change_json_path, &change)?;
         published.insert(change_json_path.clone());
         publish_segment_topics(
             context,
@@ -3050,6 +3084,9 @@ pub(crate) fn write_sense_and_change<W: std::io::Write>(
     // Attempt each saved/dependent path once, including saves preceding an
     // ordinary publication error. Indexing never replaces that original error.
     for path in published {
+        if (context.cancel_checkpoint)() {
+            return Err("thinking cancelled".into());
+        }
         let attempt = solstone_core_indexer_store::attempt_saved_publication(
             &context.journal,
             &path,
@@ -3207,7 +3244,7 @@ fn publish_segment_topics<W: std::io::Write>(
 
     if markdown.is_some() || file_exists {
         let bytes = markdown.unwrap_or("");
-        match replace_text(&topics_path, bytes) {
+        match replace_text_checked(context, &topics_path, bytes) {
             Ok(()) => {
                 published.insert(topics_path);
             }
@@ -3251,7 +3288,7 @@ fn publish_segment_objects<W: std::io::Write>(
     if markdown.is_none() && !objects_path.exists() {
         return;
     }
-    match replace_text(&objects_path, markdown.as_deref().unwrap_or("")) {
+    match replace_text_checked(context, &objects_path, markdown.as_deref().unwrap_or("")) {
         Ok(()) => {
             published.insert(objects_path);
         }
@@ -3349,14 +3386,31 @@ pub(crate) fn named_stream<'a>(segment_dir: &'a std::path::Path, day: &str) -> O
     (parent != day).then_some(parent)
 }
 
+fn replace_text_checked(
+    context: &ThinkContext,
+    path: &std::path::Path,
+    text: &str,
+) -> Result<(), String> {
+    if (context.cancel_checkpoint)() {
+        return Err("thinking cancelled".into());
+    }
+    replace_text(path, text)
+}
+fn replace_json_checked(
+    context: &ThinkContext,
+    path: &std::path::Path,
+    value: &Value,
+) -> Result<(), String> {
+    let bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
+    if (context.cancel_checkpoint)() {
+        return Err("thinking cancelled".into());
+    }
+    atomic_replace(path, &bytes, AtomicWriteOptions::default()).map_err(|e| e.to_string())
+}
+
 fn replace_text(path: &std::path::Path, text: &str) -> Result<(), String> {
     atomic_replace(path, text.as_bytes(), AtomicWriteOptions::default())
         .map_err(|error| error.to_string())
-}
-
-fn replace_json(path: &std::path::Path, value: &Value) -> Result<(), String> {
-    let bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
-    atomic_replace(path, &bytes, AtomicWriteOptions::default()).map_err(|error| error.to_string())
 }
 
 fn segment_event(

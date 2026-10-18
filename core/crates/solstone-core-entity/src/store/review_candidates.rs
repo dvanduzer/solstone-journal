@@ -33,6 +33,7 @@ pub enum EntityReviewCandidateError {
     Lock(LockError),
     Write(AtomicWriteError),
     RecordedMerge(String),
+    PublicationRefused(String),
 }
 
 impl fmt::Display for EntityReviewCandidateError {
@@ -42,7 +43,9 @@ impl fmt::Display for EntityReviewCandidateError {
             Self::Store(error) => error.fmt(formatter),
             Self::Lock(error) => error.fmt(formatter),
             Self::Write(error) => error.fmt(formatter),
-            Self::RecordedMerge(error) => formatter.write_str(error),
+            Self::RecordedMerge(error) | Self::PublicationRefused(error) => {
+                formatter.write_str(error)
+            }
         }
     }
 }
@@ -54,7 +57,7 @@ impl Error for EntityReviewCandidateError {
             Self::Store(error) => Some(error),
             Self::Lock(error) => Some(error),
             Self::Write(error) => Some(error),
-            Self::RecordedMerge(_) => None,
+            Self::RecordedMerge(_) | Self::PublicationRefused(_) => None,
         }
     }
 }
@@ -74,13 +77,44 @@ pub fn record_merge_candidate(
     detections: Option<i64>,
     needs: Option<i64>,
 ) -> Result<(Value, bool), EntityReviewCandidateError> {
+    record_merge_candidate_checked(
+        journal_root,
+        facet,
+        day,
+        source,
+        source_slug,
+        target,
+        target_slug,
+        evidence,
+        basis,
+        detections,
+        needs,
+        &|| Ok(()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn record_merge_candidate_checked(
+    journal_root: &Path,
+    facet: &str,
+    day: &str,
+    source: &str,
+    source_slug: &str,
+    target: &str,
+    target_slug: &str,
+    evidence: &str,
+    basis: Option<&str>,
+    detections: Option<i64>,
+    needs: Option<i64>,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(Value, bool), EntityReviewCandidateError> {
     let _trust =
         hold_entity_trust_lock(journal_root).map_err(EntityReviewCandidateError::TrustLock)?;
     let census = super::census::scan_identity_census(journal_root)
         .map_err(EntityReviewCandidateError::Store)?;
     let key = candidate_key(facet, source_slug, target_slug);
     let basis = basis.unwrap_or(DEFAULT_BASIS);
-    mutate_candidates(journal_root, |rows| {
+    mutate_candidates_checked(journal_root, checkpoint, |rows| {
         let now = candidate_now_iso();
         if let Some(existing) = rows
             .iter_mut()
@@ -500,6 +534,14 @@ pub(crate) fn mutate_candidates<T>(
     journal_root: &Path,
     mutate: impl FnOnce(&mut Vec<Value>) -> Result<T, EntityReviewCandidateError>,
 ) -> Result<T, EntityReviewCandidateError> {
+    mutate_candidates_checked(journal_root, &|| Ok(()), mutate)
+}
+
+fn mutate_candidates_checked<T>(
+    journal_root: &Path,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+    mutate: impl FnOnce(&mut Vec<Value>) -> Result<T, EntityReviewCandidateError>,
+) -> Result<T, EntityReviewCandidateError> {
     let path = review_candidates_path(journal_root).map_err(EntityReviewCandidateError::Store)?;
     let _lock = hold_lock(
         &path,
@@ -511,11 +553,13 @@ pub(crate) fn mutate_candidates<T>(
     .map_err(EntityReviewCandidateError::Lock)?;
     let mut rows = read_candidate_rows(&path, MalformedPolicy::Raise)
         .map_err(EntityReviewCandidateError::Store)?;
+    checkpoint().map_err(EntityReviewCandidateError::PublicationRefused)?;
     let result = mutate(&mut rows)?;
     let contents = rows
         .iter()
         .map(|row| serde_json::to_string(row).expect("value serializes") + "\n")
         .collect::<String>();
+    checkpoint().map_err(EntityReviewCandidateError::PublicationRefused)?;
     write_text(&path, &contents, AtomicWriteOptions { mode: Some(0o600) })
         .map_err(EntityReviewCandidateError::Write)?;
     Ok(result)

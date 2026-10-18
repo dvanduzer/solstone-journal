@@ -238,9 +238,19 @@ pub fn read_health_marker(
 
 /// Advance the stream marker under its stable sidecar lock.
 pub fn bump_stream_marker(journal: &Path, day: &str) -> Result<u64, AtomicWriteError> {
+    bump_stream_marker_checked(journal, day, &|| Ok(()))
+}
+
+pub fn bump_stream_marker_checked(
+    journal: &Path,
+    day: &str,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<u64, AtomicWriteError> {
     let path = health_marker_path(journal, day, HealthMarkerKind::Stream);
+    checkpoint().map_err(|error| atomic_error(&path, error))?;
     let _lock =
         hold_lock(&path, LockOptions::default()).map_err(|error| atomic_error(&path, error))?;
+    checkpoint().map_err(|error| atomic_error(&path, error))?;
     let state = read_health_marker_path(&path).map_err(|error| atomic_error(&path, error))?;
     let (generation, fingerprint) = state
         .generation_and_fingerprint()
@@ -248,6 +258,7 @@ pub fn bump_stream_marker(journal: &Path, day: &str) -> Result<u64, AtomicWriteE
     let next = generation
         .checked_add(1)
         .ok_or_else(|| atomic_error(&path, "stream marker generation overflow"))?;
+    checkpoint().map_err(|error| atomic_error(&path, error))?;
     write_marker(
         &path,
         &HealthMarker {
@@ -595,6 +606,54 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn cancelled_stream_bump_waiting_for_the_real_lock_preserves_the_marker() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        for cancel in [false, true] {
+            let temporary = TempDir::new();
+            assert_eq!(bump_stream_marker(temporary.path(), DAY).unwrap(), 1);
+            let path = marker_path(temporary.path(), HealthMarkerKind::Stream);
+            let held = hold_lock(&path, LockOptions::default()).unwrap();
+            let root = temporary.path().to_path_buf();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&cancelled);
+            let (checking, reached) = mpsc::channel();
+            let (ended, done) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let result = bump_stream_marker_checked(&root, DAY, &|| {
+                    checking.send(()).unwrap();
+                    if flag.load(Ordering::Acquire) {
+                        Err("cancelled".into())
+                    } else {
+                        Ok(())
+                    }
+                });
+                ended.send(result).unwrap();
+            });
+            reached.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(done.recv_timeout(Duration::from_millis(50)).is_err());
+            cancelled.store(cancel, Ordering::Release);
+            drop(held);
+            let result = done.recv_timeout(Duration::from_secs(5)).unwrap();
+            worker.join().unwrap();
+            if cancel {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result.unwrap(), 2);
+            }
+            let state =
+                read_health_marker(temporary.path(), DAY, HealthMarkerKind::Stream).unwrap();
+            assert_eq!(
+                state.generation_and_fingerprint().unwrap().0,
+                if cancel { 1 } else { 2 }
+            );
+        }
     }
 
     #[test]

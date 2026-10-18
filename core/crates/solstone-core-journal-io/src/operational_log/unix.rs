@@ -102,7 +102,17 @@ pub(super) fn rename_stage(
     if super::create::force_publish_io() {
         return Err(io::Error::from_raw_os_error(nix::libc::EIO));
     }
-    crate::claim_remove::rename_no_replace(health.health(), staged.stage_name.as_os_str(), dest)
+    // Android's existing create-only publisher uses a descriptor-relative rename;
+    // generic claim/removal stays refused outside its teardown authority.
+    #[cfg(target_os = "android")]
+    {
+        crate::atomic::publish_exclusive_stage(health.health(), staged.stage_name.as_os_str(), dest)
+            .map_err(errno_io)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        crate::claim_remove::rename_no_replace(health.health(), staged.stage_name.as_os_str(), dest)
+    }
 }
 
 pub(super) fn inspect_named(health: &OplogDayHealth, name: &OsStr) -> io::Result<NamedOccupant> {

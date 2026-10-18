@@ -56,14 +56,49 @@ pub fn evidence_with_roots(
 /// Existing daily records already retain capped state beyond log retention.
 /// Project the input under a fixed contract so upgrades grant no permission.
 pub fn observe(journal: &Path, unit: &Unit) -> Result<Option<String>, String> {
-    observe_using(journal, unit, || evidence(journal, unit))
+    observe_checked(journal, unit, &|| Ok(()))
 }
 
+pub fn observe_checked(
+    journal: &Path,
+    unit: &Unit,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Option<String>, String> {
+    observe_using_checked(journal, unit, || evidence(journal, unit), checkpoint)
+}
+
+/// Observe the same durable retry contract using the embedded host's packaged resources.
+pub fn observe_with_roots_checked(
+    journal: &Path,
+    unit: &Unit,
+    talents: &Path,
+    apps: &Path,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Option<String>, String> {
+    observe_using_checked(
+        journal,
+        unit,
+        || evidence_with_roots(journal, unit, talents, apps),
+        checkpoint,
+    )
+}
+
+#[cfg(test)]
 fn observe_using(
     journal: &Path,
     unit: &Unit,
     read_evidence: impl FnOnce() -> Result<solstone_core_indexer::daily_evidence::DailyEvidence, String>,
 ) -> Result<Option<String>, String> {
+    observe_using_checked(journal, unit, read_evidence, &|| Ok(()))
+}
+
+fn observe_using_checked(
+    journal: &Path,
+    unit: &Unit,
+    read_evidence: impl FnOnce() -> Result<solstone_core_indexer::daily_evidence::DailyEvidence, String>,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Option<String>, String> {
+    checkpoint()?;
     let id = identity(unit)?;
     let Some(observed) = solstone_core_journal_io::load_daily_unit_record(journal, &id)
         .map_err(|e| e.to_string())?
@@ -77,6 +112,7 @@ fn observe_using(
     }
     let _claim =
         solstone_core_journal_io::claim_daily_execution(journal, &id).map_err(|e| e.to_string())?;
+    checkpoint()?;
     let Some(record) = solstone_core_journal_io::load_daily_unit_record(journal, &identity(unit)?)
         .map_err(|e| e.to_string())?
     else {
@@ -93,7 +129,7 @@ fn observe_using(
         .is_some()
     {
         if held.is_some() {
-            super::reconcile_accepted(journal, unit)?;
+            super::reconcile_accepted_checked(journal, unit, checkpoint)?;
         }
         return Ok(None);
     }
@@ -115,7 +151,7 @@ fn observe_using(
         .map(|r| r.reason.as_str())
         .or(record.reason_code.as_deref())
         .unwrap_or("daily_failed");
-    super::observe_held(journal, unit, reason, &baseline)?;
+    super::observe_held_checked(journal, unit, reason, &baseline, checkpoint)?;
     Ok(Some(current))
 }
 
