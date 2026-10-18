@@ -27,6 +27,7 @@ entries below describe the sequence after activation.
 - the installer no longer says solstone is set up before you've finished setup in your browser.
 - if setup saved a way of thinking that isn't running yet, home, health, stats and the thinking page no longer ask you to choose. they say what's left to set up and link to it.
 - when a conversation is too long to quote in full in a daily newsletter, its story uses a summary.
+- `solstone call health` didn't count a daily newsletter that drew on a story written from only part of a long activity. it now counts it as degraded and names the day.
 - archive imports now refuse conflicting file names.
 - a name that came up on several days in a week could be left out of a facet's entities when your journal sorted it as two kinds of thing, for example a project on three days and a tool on one. the daily entity review now goes by the kind it was given on the most days, and counts only the days it was that kind. when two kinds come up equally often, the name still waits.
 - on a journal with a long history, the nightly search update could run for an hour without finishing, and while it ran, new things in your journal couldn't be added to search. it finishes again, and the first run after you update adds anything it left out.

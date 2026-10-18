@@ -32,6 +32,10 @@ pub(super) struct Packet {
     pub coverage_preamble: String,
     pub gaps: Vec<String>,
     pub substantive_items: usize,
+    /// Included activities whose shown story was written from part of its
+    /// activity. Runtime state only: the model's request never carries it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partial_stories: Vec<String>,
 }
 #[derive(Clone, Debug)]
 struct Item {
@@ -45,6 +49,7 @@ struct Item {
     order: Vec<String>,
     path: Option<String>,
     result_id: Option<String>,
+    partial_story: bool,
 }
 struct ItemSpec {
     source_class: String,
@@ -105,12 +110,18 @@ pub(super) fn gather(journal: &Path, facet: &str, day: &str) -> Result<Packet, S
         .filter(|item| matches!(item.tier, 1 | 2))
         .count();
     counts.insert("substantive_items".to_owned(), substantive_items);
+    let partial_stories = included
+        .iter()
+        .filter(|item| item.partial_story)
+        .map(|item| item.origin.clone())
+        .collect();
     Ok(Packet {
         source_packet: render_packet(&included),
         source_counts: render_source_counts(&counts),
         coverage_preamble: render_coverage_preamble(&counts, &gaps),
         gaps,
         substantive_items,
+        partial_stories,
     })
 }
 
@@ -151,7 +162,7 @@ fn gather_activity_records(
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("activity-{index}"));
             let (text, clipped) = render_activity_record(row, &origin, gaps);
-            gather_item!(
+            let mut item = gather_item!(
                 "activity_record",
                 None,
                 None,
@@ -170,9 +181,25 @@ fn gather_activity_records(
                 ],
                 None,
                 None,
-            )
+            );
+            item.partial_story = shows_partial_story(row);
+            item
         })
         .collect()
+}
+/// The story writer sets `partial_input`, as an object, when its request was
+/// clipped. It counts only when the packet shows that story's body.
+fn shows_partial_story(record: &Map<String, Value>) -> bool {
+    record
+        .get("story")
+        .and_then(Value::as_object)
+        .is_some_and(|story| {
+            story
+                .get("body")
+                .and_then(Value::as_str)
+                .is_some_and(|body| !body.is_empty())
+                && story.get("partial_input").is_some_and(Value::is_object)
+        })
 }
 fn gather_activity_narratives(
     journal: &Path,
@@ -444,6 +471,7 @@ fn gather_item(spec: ItemSpec) -> Item {
         order: spec.order,
         path: spec.path,
         result_id: spec.result_id,
+        partial_story: false,
     }
 }
 
@@ -873,6 +901,28 @@ mod tests {
                 .iter()
                 .any(|gap| gap.starts_with("failed: activity_narrative"))
         );
+    }
+
+    #[test]
+    fn partial_stories_name_only_records_the_packet_includes() {
+        let root = tempfile::tempdir().unwrap();
+        solstone_core_facets::create_facet(root.path(), "work", "Work", "", "", "", None).unwrap();
+        let partial = json!({"dropped_entries": 1, "dropped_chars": 10});
+        let rows = (0..=MAX_ACTIVITY_RECORDS)
+            .map(|index| {
+                json!({"id": format!("a{index:02}"), "created_at": index, "title": "Work",
+                    "story": {"body": "You worked.", "partial_input": partial}})
+                .to_string()
+            })
+            .collect::<Vec<_>>();
+        let path = root.path().join("facets/work/activities/20260103.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, rows.join("\n") + "\n").unwrap();
+        let packet = gather(root.path(), "work", "20260103").unwrap();
+        let capped = format!("a{MAX_ACTIVITY_RECORDS:02}");
+        assert_eq!(packet.partial_stories.len(), MAX_ACTIVITY_RECORDS);
+        assert!(!packet.partial_stories.contains(&capped));
+        assert!(!packet.source_packet.contains("partial"));
     }
 
     #[test]

@@ -21,15 +21,15 @@ use crate::prepare::RuntimePaths;
 use crate::{ExecutionContext, RuntimeOutcome, execute_request};
 
 const CASES: &str = include_str!("story_source_conformance.json");
-const DAY: &str = "20260101";
-const SEGMENT: &str = "090000_300";
-const FACET: &str = "work";
-const ACTIVITY: &str = "activity_090000_300";
+pub(crate) const DAY: &str = "20260101";
+pub(crate) const SEGMENT: &str = "090000_300";
+pub(crate) const FACET: &str = "work";
+pub(crate) const ACTIVITY: &str = "activity_090000_300";
 
-struct Scripted {
-    text: String,
-    input_budget: Option<Value>,
-    requests: Mutex<Vec<GenerateRequest>>,
+pub(crate) struct Scripted {
+    pub(crate) text: String,
+    pub(crate) input_budget: Option<Value>,
+    pub(crate) requests: Mutex<Vec<GenerateRequest>>,
 }
 
 impl GenerateExecutor for Scripted {
@@ -53,7 +53,7 @@ impl GenerateExecutor for Scripted {
 
 /// A journal holding one activity over one segment of the case's files, and
 /// the shipped talent it names; `notes` is a custom copy of the Work Story.
-fn journal(root: &Path, case: &Value) -> (RuntimePaths, ExecutionContext) {
+pub(crate) fn journal(root: &Path, case: &Value) -> (RuntimePaths, ExecutionContext) {
     let journal = root.join("journal");
     let segment = journal
         .join("chronicle")
@@ -119,7 +119,7 @@ fn journal(root: &Path, case: &Value) -> (RuntimePaths, ExecutionContext) {
     )
 }
 
-fn activity(case: &Value) -> Value {
+pub(crate) fn activity(case: &Value) -> Value {
     json!({
         "id": ACTIVITY,
         "activity": case["activity_kind"],
@@ -174,7 +174,7 @@ fn run(case: &Value) -> Run {
     }
 }
 
-fn cases() -> Vec<Value> {
+pub(crate) fn cases() -> Vec<Value> {
     serde_json::from_str::<Value>(CASES).unwrap()["cases"]
         .as_array()
         .unwrap()
