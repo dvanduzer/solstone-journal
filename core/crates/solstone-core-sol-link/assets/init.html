@@ -109,6 +109,8 @@
     .radio-desc {
       font-size: 0.8rem; color: var(--ink-faint-paper);
     }
+    .radio-option.is-unavailable { opacity: 0.5; cursor: not-allowed; }
+    #requirements-link { color: var(--orange-text-aa); }
     .download-row {
       margin-top: 0.5rem; font-size: 0.85rem;
     }
@@ -165,7 +167,6 @@
             <button type="button" id="thinking-change" class="settings-preset-btn"></button>
           </div>
           <p id="thinking-choose-later" hidden></p>
-          <p id="thinking-blocked" class="error-message" hidden></p>
           <div id="thinking-options" hidden></div>
           <p><a id="requirements-link" href="https://github.com/solpbc/solstone-journal/blob/main/INSTALL.md#choosing-a-provider" target="_blank" rel="noopener noreferrer">requirements</a></p>
           <button type="submit" id="thinking-continue" class="cta-button"></button>
@@ -499,6 +500,14 @@
           wrap.appendChild(descSpan);
         }
 
+        if (choice.id === 'local') {
+          const reasonSpan = document.createElement('span');
+          reasonSpan.className = 'radio-desc';
+          reasonSpan.id = 'thinking-local-reason';
+          reasonSpan.hidden = true;
+          wrap.appendChild(reasonSpan);
+        }
+
         label.append(input, wrap);
         container.appendChild(label);
       });
@@ -576,30 +585,48 @@
         if (changeBtn) changeBtn.hidden = false;
       } else {
         if (summaryEl) {
-          summaryEl.textContent = '';
-          summaryEl.hidden = true;
+          summaryEl.textContent = (setupCopy && setupCopy.thinking && setupCopy.thinking.choose_later) || '';
+          summaryEl.hidden = false;
         }
         if (chooseLaterEl) {
-          chooseLaterEl.textContent = (setupCopy && setupCopy.thinking && setupCopy.thinking.choose_later) || '';
-          chooseLaterEl.hidden = false;
+          chooseLaterEl.textContent = '';
+          chooseLaterEl.hidden = true;
         }
         if (changeBtn) changeBtn.hidden = false;
       }
 
-      const blockedEl = document.getElementById('thinking-blocked');
-      if (blockedEl) {
-        if (stateCapability !== 'ok' && localCapability && Array.isArray(localCapability.checks)) {
-          const blockedChecks = localCapability.checks.filter(c => c && c.severity === 'blocked' && typeof c.detail === 'string' && c.detail.trim());
-          if (blockedChecks.length > 0) {
-            blockedEl.textContent = blockedChecks.map(c => c.detail.trim()).join(' ');
-            blockedEl.hidden = false;
+      const localBlocked = Boolean(localCapability && Array.isArray(localCapability.checks) && localCapability.checks.some(c => c && c.severity === 'blocked'));
+      const isBlocked = stateCapability === 'blocked' || localBlocked;
+
+      const localInput = document.querySelector('input[value="local"]');
+      if (localInput) {
+        localInput.disabled = isBlocked;
+        const localLabel = localInput.parentElement || localInput.parent;
+        if (localLabel && localLabel.classList) {
+          if (isBlocked) {
+            localLabel.classList.add('is-unavailable');
           } else {
-            blockedEl.textContent = '';
-            blockedEl.hidden = true;
+            localLabel.classList.remove('is-unavailable');
           }
+        }
+      }
+
+      let blockedDetail = '';
+      if (localCapability && Array.isArray(localCapability.checks)) {
+        const blockedChecks = localCapability.checks.filter(c => c && c.severity === 'blocked' && typeof c.detail === 'string' && c.detail.trim());
+        if (blockedChecks.length > 0) {
+          blockedDetail = blockedChecks.map(c => c.detail.trim()).join(' ');
+        }
+      }
+
+      const reasonEl = document.getElementById('thinking-local-reason');
+      if (reasonEl) {
+        if (blockedDetail) {
+          reasonEl.textContent = blockedDetail;
+          reasonEl.hidden = false;
         } else {
-          blockedEl.textContent = '';
-          blockedEl.hidden = true;
+          reasonEl.textContent = '';
+          reasonEl.hidden = true;
         }
       }
 

@@ -20,6 +20,10 @@ entries below describe the sequence after activation.
 
 ### Fixed
 
+- during setup on a computer that can't run local thinking, local shows as unavailable, with the reason beside it, instead of as an error.
+- home no longer shows "queued work status is unavailable" for the first few seconds after you open it.
+- the SSH command the installer prints for a computer without a desktop now forwards the agent port too, so an agent on that computer can finish connecting from your other computer's browser.
+- the installer no longer says solstone is set up before you've finished setup in your browser.
 - if setup saved a way of thinking that isn't running yet, home, health, stats and the thinking page no longer ask you to choose. they say what's left to set up and link to it.
 - when a conversation is too long to quote in full in a daily newsletter, its story uses a summary.
 - archive imports now refuse conflicting file names.

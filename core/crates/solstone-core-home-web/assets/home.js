@@ -50,6 +50,8 @@
   let pulseObservedAt = null;
   let heldWorkSnapshot = null;
   let heldWorkCurrent = false;
+  let pageLoadedAt = Date.now();
+  let queuedWorkAuthoritySeen = false;
   let heldWorkExpiry = null;
   let briefingSections = {};
   const ACTIVITY_PREVIEW = 6;
@@ -361,7 +363,8 @@
     const notes = [];
     const checked = at => at ? ' last check: ' + new Date(at).toLocaleString() + '.' : '';
     if (pulseReadFailed) notes.push({text:'service status is unavailable.' + checked(pulseObservedAt), href:'/app/health/'});
-    if (!workCurrent) notes.push({text:'queued work status is unavailable.' + checked(heldWorkSnapshot?.observedAt), href:'/app/health/#processingHolds'});
+    const workGrace = !queuedWorkAuthoritySeen && Date.now() - pageLoadedAt < 15000;
+    if (!workCurrent && !workGrace) notes.push({text:'queued work status is unavailable.' + checked(heldWorkSnapshot?.observedAt), href:'/app/health/#processingHolds'});
     const backupUnavailable = !backupCurrent && (pulse.backup || backupObservedAt);
     if (backupUnavailable) notes.push({text:'backup status is unavailable.' + checked(backupObservedAt), href:'/app/health/#backup'});
     if (current.length) {
@@ -372,7 +375,7 @@
       g.verdict = 'unavailable';
       g.severity = 'amber';
       g.headline = pulseReadFailed ? 'service status is unavailable right now.'
-        : !workCurrent ? 'queued work status is unavailable right now.' : 'backup status is unavailable right now.';
+        : (!workCurrent && !workGrace) ? 'queued work status is unavailable right now.' : 'backup status is unavailable right now.';
       g.last_observation = null;
       g.cta = null;
     }
@@ -1949,6 +1952,9 @@
   }
 
   function receiveSupervisorStatus(msg) {
+    if (msg.event === 'status' || msg.event === 'status-error') {
+      queuedWorkAuthoritySeen = true;
+    }
     if (msg.event === 'status-error') {
       invalidateHeldWork();
       return;

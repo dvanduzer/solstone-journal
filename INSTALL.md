@@ -14,14 +14,22 @@ The latest version of these instructions is at https://solstone.app/install.
 solstone --version 2>&1 && solstone journal service status 2>&1
 ```
 
-On linux, a missing PATH command can also mean an archive installation used `--no-path`; check its prefix before installing again. On mac, check for `/Applications/journal.app` instead. On windows, run `solstone journal --version` in a terminal; if windows cannot find `solstone`, see [install on windows](#install-on-windows). If it prints a version, run `solstone journal service status`; if that prints `Supervisor readiness: ready`, skip to [install the solstone app on your devices](#install-the-solstone-app-on-your-devices).
-On linux, if both commands succeed and the second command reports healthy, skip to [install the solstone app on your devices](#install-the-solstone-app-on-your-devices).
+On linux, a missing PATH command can also mean an archive installation used `--no-path`; check its prefix before installing again. On mac, check for `/Applications/journal.app` instead. On windows, run `solstone journal --version` in a terminal; if windows cannot find `solstone`, see [install on windows](#install-on-windows).
+On linux, if both commands succeed and the second command reports `state: running (systemd)`, skip to [install the solstone app on your devices](#install-the-solstone-app-on-your-devices).
 
-For an archive installation, run the linux `solstone` commands below through that installation's `current/bin/solstone`. The default full path is `~/.local/solstone-journal/current/bin/solstone`; use your chosen prefix if it differs. This also covers `--no-path` installations.
+For a curl installation, the prefix is `~/.local`, with binary `~/.local/current/bin/solstone` and receipt `~/.local/install-receipt`. For an archive installation, run the linux `solstone` commands below through that installation's `current/bin/solstone`. The default full path is `~/.local/solstone-journal/current/bin/solstone` (receipt `~/.local/solstone-journal/install-receipt`); use your chosen prefix if it differs. This also covers `--no-path` installations.
 
 ### Prerequisites
 
 The journal needs glibc 2.34 or newer and the GCC 11 C++ runtime. Ubuntu 22.04, Debian 12, RHEL 9, Fedora 35 and newer releases of each include both. Local transcription also needs the GCC 12 C++ runtime, which Ubuntu 22.04, Debian 12 and Fedora 36 or newer include and RHEL 9 does not.
+
+The installer refuses without `minisign` and the OpenMP runtime (`libgomp.so.1`):
+
+```bash
+sudo apt install minisign libgomp1
+sudo dnf install minisign libgomp
+sudo pacman -S minisign gcc-libs
+```
 
 ## Install the journal on linux
 
@@ -31,11 +39,19 @@ The journal needs glibc 2.34 or newer and the GCC 11 C++ runtime. Ubuntu 22.04, 
 
 The release channel is `updates.solstone.app`. The main installer lives in the [solstone repository](https://github.com/solpbc/solstone) and is served at `https://solstone.app/install.sh`. On linux it verifies the platform release, then delegates journal setup to the signed bootstrap versioned with that release. The journal bootstrap lives in this repository at `core/distribution/install.sh`; its compatibility URL is `https://updates.solstone.app/solstone-journal/install.sh`, and it refuses macos.
 
-One command does the whole thing, including signed-manifest verification and `solstone journal setup`:
+One command does the whole thing, including signed-manifest verification and `solstone journal setup`. For a human at a terminal:
 
 ```bash
 curl -fsSL https://solstone.app/install.sh | sh
 ```
+
+Pressing Enter on a terminal selects the journal; with no terminal and no component the installer shows a menu. Agents and non-interactive runs use:
+
+```bash
+curl -fsSL https://solstone.app/install.sh | sh -s -- --components journal
+```
+
+The curl route installs under prefix `~/.local`, with binary `~/.local/current/bin/solstone` and receipt `~/.local/install-receipt`.
 
 That follows the `release` lane's `latest` pointer, fetches the archive and signed release set from `updates.solstone.app`, verifies the manifest signature with the pinned minisign key, then checks the manifest digests for the selected archive, checksum, and release record. It installs and runs setup once. When a desktop is available, the installer opens the setup page; otherwise it prints the link and an SSH tunnel command for opening it from another computer. After setup, use the printed network-page link to make a pairing link for the solstone app. Pass `--version <version>` to pin a version instead of following `latest`. A tree downgrade with `--version` proceeds only when that exact build is still inside this release's three-directory `journal-v2` window; outside the epoch or window it refuses without touching the journal. The archive route below is the same operation with the files already on disk.
 
@@ -176,7 +192,7 @@ solstone journal setup
 
 This runs the setup readiness doctor battery and sets up your selected journal (`~/journal` by default). It fetches the local transcription model (~1 GB), installs the `solstone` skill for Claude Code, Codex, and Gemini when their configuration folders are already present, and installs the journal-side `solstone` and `journal` router skills so your agents can help tend your journal. It then starts a systemd user service listening on http://localhost:5015. The default port is shared across logins. A second journal on that port, including one started under another login, cannot bind it.
 
-Let your human know: **open http://localhost:5015/init in a browser on the journal's computer**. The first-run wizard walks them through setting their identity and choosing a provider.
+Let your human know: **open http://localhost:5015/init in a browser on the journal's computer**. The first-run wizard walks them through setting their identity and choosing a provider. If the computer has no browser, use the SSH command the installer prints and open the setup page from the other computer; it forwards the journal and the agent door.
 
 ⚠ **The tree carries the binaries the journal needs to run, not the transcription stack.** The Parakeet transcription helper and its model are fetched during setup, by `solstone journal install-models`. `solstone journal doctor --readiness` runs the actual binary before reporting it ready, and on linux it gives the exact package-manager command when the system OpenMP runtime is missing.
 
@@ -281,8 +297,8 @@ Your journal stays, including its models, keys, device connections and setup rec
 
 If an archive was installed only with `--role cli` and setup was never run, skip to step 2.
 
-1. Before removing a journal installation, run its setup cleanup. For a package installation, use `solstone journal setup --clean-uninstall --yes`. For an archive, use `~/.local/solstone-journal/current/bin/solstone journal setup --clean-uninstall --yes`, replacing the default prefix if you chose another. This removes its service and owned command wrappers. For the last installation, it also removes the journal-location config, setup backups, package-install receipt and rclone cache outside the journal. It prints where your journal remains and skips any cleanup directory containing it. If cleanup refuses or any step fails, stop before removing the program so you can retry through the same command.
-2. Remove the program through the route that installed it: `sudo apt remove solstone-journal`, `sudo dnf remove solstone-journal`, or remove your archive installation prefix. Check that the prefix does not contain your journal before deleting it. The archive installer's PATH block in `~/.profile`, marked `# BEGIN solstone-journal PATH` and `# END solstone-journal PATH`, can then be removed.
+1. Before removing a journal installation, run its setup cleanup. For a package installation, use `solstone journal setup --clean-uninstall --yes`. For a curl installation, use `~/.local/current/bin/solstone journal setup --clean-uninstall --yes`. For an archive, use `~/.local/solstone-journal/current/bin/solstone journal setup --clean-uninstall --yes`, replacing the default prefix if you chose another. This removes its service and owned command wrappers. For the last installation, it also removes the journal-location config, setup backups, package-install receipt and rclone cache outside the journal. It prints where your journal remains and skips any cleanup directory containing it. If cleanup refuses or any step fails, stop before removing the program so you can retry through the same command.
+2. Remove the program through the route that installed it: `sudo apt remove solstone-journal`, `sudo dnf remove solstone-journal`, or remove your archive installation prefix. Removing a curl installation removes its `current` link, its version directories, and `install-receipt` under `~/.local`, and leaves the rest of `~/.local`. Check that the prefix does not contain your journal before deleting it. The archive installer's PATH block in `~/.profile`, marked `# BEGIN solstone-journal PATH` and `# END solstone-journal PATH`, can then be removed.
 
 Small installation records stay to prevent old launchers from starting a removed installation. For the last installation, cleanup removes agent skill copies that match this runtime from `~/.claude/skills/solstone`, `~/.codex/skills/solstone` and `~/.gemini/skills/solstone`. Modified or unrecognized copies stay; older links pointing into this runtime are removed. The shared `~/.local/bin` PATH lines stay because other commands may use them.
 
