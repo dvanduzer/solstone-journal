@@ -17,7 +17,7 @@
   "PAIR_LINK_ADDRESSES_LINE": "this link points your devices to:",
   "DETAILS_DISCLOSURE": "verify this is really your journal",
   "CA_FP_LABEL": "fingerprint",
-  "CA_FP_NOTE": "your device checks this when it scans the code, so no one on your wifi can pretend to be your journal.",
+  "CA_FP_NOTE": "your device checks this when it connects, so no one in between can pretend to be your journal.",
   "PAIR_LINK_FIELD_LABEL": "pairing link",
   "PAIR_LINK_COPY_LABEL": "copy link",
   "PAIR_LINK_COPY_SUCCESS_TOAST": "pairing link copied",
