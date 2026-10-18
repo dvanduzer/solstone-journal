@@ -47,6 +47,29 @@ vm.runInNewContext(source, { window, document, console, Date:TestDate }, { filen
 const { renderVitalsHtml } = window.__vitals;
 assert(renderVitalsHtml, 'renderVitalsHtml exported');
 const { homeHealthGlance, receiveSupervisorStatus, invalidateHeldWork, refreshVitals, seedPulse } = window.__vitals;
+
+const okPulse = { health_glance: { verdict: 'ok', severity: 'green', headline: 'working', issues: [] }, narrative_content: null, needs_you_items: [] };
+for (const testNow of [1000, 1000 + 14999]) {
+  now = testNow;
+  const res = homeHealthGlance(okPulse);
+  assert.notStrictEqual(res.glance.verdict, 'unavailable');
+  assert.ok(!res.notes.some(n => n.href === '/app/health/#processingHolds'));
+}
+now = 1000 + 15000;
+const expiredGrace = homeHealthGlance(okPulse);
+assert.strictEqual(expiredGrace.glance.verdict, 'unavailable');
+assert.ok(expiredGrace.notes.some(n => n.href === '/app/health/#processingHolds'));
+
+now = 1000;
+receiveSupervisorStatus({
+  event: 'status',
+  queues: { daily: 1 },
+  held: [{ partition: 'daily', reasons: ['root_live'] }]
+});
+const heldRes = homeHealthGlance(okPulse);
+assert.strictEqual(heldRes.glance.verdict, 'attention');
+assert.ok(heldRes.glance.issues.some(i => i.href === '/app/health/#processingHolds'));
+
 receiveSupervisorStatus({event:'status'}); // authoritative empty queues for ordinary controls
 
 const css = fs.readFileSync(path.join(manifestDir, 'assets/workspace.html'), 'utf8');

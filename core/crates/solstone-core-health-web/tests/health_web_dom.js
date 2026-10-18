@@ -937,7 +937,8 @@ test('holds require queued work at their scope even while unrelated work is acti
 
 test('failed or expired status retains dated hold evidence and only a snapshot clears it', async () => {
   const env = createHeldWorkEnvironment();
-  assert.strictEqual(env.verdict().key, 'HEALTH_GLANCE_WORK_UNAVAILABLE');
+  env.state.loadedAt = env.clock.now;
+  assert.strictEqual(env.verdict().key, 'HEALTH_GLANCE_OK');
   env.context.window.location.hash = '#processingHolds';
   env.receive({ held: [{ partition: 'daily', reasons: ['root_live'] }], queues: { daily: 1 } });
   assert.strictEqual(env.section.scrolledIntoView, true);
@@ -964,6 +965,30 @@ test('failed or expired status retains dated hold evidence and only a snapshot c
   vm.runInContext('expireRealtime()', env.context);
   assert.strictEqual(env.verdict().key, 'HEALTH_GLANCE_WORK_UNAVAILABLE');
   assert.strictEqual(env.state.heldWorkCurrent, false);
+});
+
+test('held work grace window suppresses unavailable verdict before first authority status', async () => {
+  const env = createHeldWorkEnvironment();
+  assert.strictEqual(env.verdict().key, 'HEALTH_GLANCE_WORK_UNAVAILABLE');
+
+  env.state.loadedAt = env.clock.now;
+  assert.strictEqual(env.verdict().key, 'HEALTH_GLANCE_OK');
+
+  env.state.work = { error: 'unreadable' };
+  assert.strictEqual(env.verdict().key, 'HEALTH_GLANCE_WORK_UNAVAILABLE');
+
+  env.state.work = { inventory: { as_of_ms: env.clock.now - 180000 } };
+  assert.strictEqual(env.verdict().key, 'HEALTH_GLANCE_WORK_UNAVAILABLE');
+
+  env.state.work = null;
+  env.receive({ held: [{ partition: 'daily', reasons: ['root_live'] }], queues: { daily: 1 } });
+  assert.strictEqual(env.verdict().key, 'HEALTH_GLANCE_WORK_HELD');
+
+  const envExpired = createHeldWorkEnvironment();
+  envExpired.state.loadedAt = envExpired.clock.now;
+  envExpired.state.work = null;
+  envExpired.clock.now += 15000;
+  assert.strictEqual(envExpired.verdict().key, 'HEALTH_GLANCE_WORK_UNAVAILABLE');
 });
 
 test('set-aside units share one list, retain focus, and render retry errors as text', async () => {

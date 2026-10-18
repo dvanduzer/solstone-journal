@@ -6,6 +6,7 @@
     providers: {},
     keys: {},
     access: null,
+    savedLane: null,
     localModels: [],
     localAvailability: null,
     install: null,
@@ -977,6 +978,7 @@
         state.providers = payload.providers || {};
         state.keys = payload.keys || {};
         state.access = payload.access || null;
+        state.savedLane = payload.saved_lane ?? null;
         applyCopy(payload.copy || {});
         renderAll();
       } catch (_err) {}
@@ -990,6 +992,7 @@
       state.providers = payload.providers || {};
       state.keys = payload.keys || {};
       state.access = payload.access || null;
+      state.savedLane = payload.saved_lane ?? null;
       applyCopy(payload.copy || {});
       scheduleAccessUnknownReread();
       revealThinkingApp();
@@ -2624,9 +2627,23 @@
 
   function renderGlance() {
     const brain = state.providers.brain || {};
-    setText('thinkingIntro', brain.state === 'ready' ? 'your model is ready. you can change it in setup.'
-      : brain.reason_code === 'thinking_engine_not_chosen' ? 'choose where the thinking happens. your journal keeps everything until you do.'
-      : 'choose or check your model in setup.');
+    let intro;
+    if (brain.state === 'ready') {
+      intro = 'your model is ready. you can change it in setup.';
+    } else if (brain.reason_code === 'thinking_engine_not_chosen') {
+      if (state.savedLane === 'byo') {
+        intro = 'finish setting up your own model. your journal keeps everything until you do.';
+      } else if (state.savedLane === 'spp') {
+        intro = 'finish setting up confidential processing. your journal keeps everything until you do.';
+      } else if (state.savedLane === 'local') {
+        intro = 'finish setting up local thinking. your journal keeps everything until you do.';
+      } else {
+        intro = 'choose where the thinking happens. your journal keeps everything until you do.';
+      }
+    } else {
+      intro = 'choose or check your model in setup.';
+    }
+    setText('thinkingIntro', intro);
     const glance = $('brainGlance');
     const glanceLabel = $('thinkingActiveLane');
     const identity = brain.identity || {};

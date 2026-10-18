@@ -89,6 +89,8 @@
   let connectError = false;
 
   const state = {
+    loadedAt: Date.now(),
+    queuedWorkAuthoritySeen: false,
     backupView: { tone: 'unavailable', text: 'checking backup status…' },
     heldWorkSnapshot: null,
     heldWorkCurrent: false,
@@ -1233,8 +1235,12 @@
     const inventory = state.work?.inventory;
     const workStale = inventory && !(Date.now() >= inventory.as_of_ms
         && Date.now() - Math.max(inventory.as_of_ms, inventory.next_pass_ms ?? inventory.as_of_ms) < 180000);
-    if (!state.heldWorkCurrent || workStale || state.work?.error) {
+    if (workStale || state.work?.error) {
       return { key: 'HEALTH_GLANCE_WORK_UNAVAILABLE', vars: {}, action };
+    }
+    if (!state.heldWorkCurrent) {
+      const grace = state.queuedWorkAuthoritySeen !== true && typeof state.loadedAt === 'number' && Date.now() - state.loadedAt < 15000;
+      return grace ? null : { key: 'HEALTH_GLANCE_WORK_UNAVAILABLE', vars: {}, action };
     }
     return (queuedWorkHolds(state.heldWorkSnapshot).length + setAsideHolds().length)
       ? { key: 'HEALTH_GLANCE_WORK_HELD', vars: {}, action } : null;
@@ -3524,10 +3530,12 @@
   // Event handlers by tract
   function handleSupervisorEvent(msg) {
     if (msg.event === 'status-error') {
+      state.queuedWorkAuthoritySeen = true;
       invalidateRealtime();
       return;
     }
     if (msg.event === 'status') {
+      state.queuedWorkAuthoritySeen = true;
       state.supervisorSeen = true;
       state.supervisorStatusAt = Date.now();
       state.heldWorkSnapshot = {

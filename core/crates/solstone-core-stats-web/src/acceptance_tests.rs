@@ -441,4 +441,47 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn journal_status_reflects_saved_thinking_lane() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let now = Utc::now();
+        fs::create_dir_all(root.join("config")).unwrap();
+        fs::write(
+            root.join("config/journal.json"),
+            br#"{"setup":{"thinking_choice":"byo"}}"#,
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let body: Value = rt.block_on(async {
+            let resp = routes(root.to_path_buf(), make_clock(now))
+                .oneshot(
+                    Request::get("/app/stats/api/stats")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            serde_json::from_slice(&to_bytes(resp.into_body(), 1024 * 1024).await.unwrap()).unwrap()
+        });
+
+        assert_eq!(
+            body["stats"]["journal_status"]["not_yet"],
+            "awaiting_engine"
+        );
+        assert_eq!(
+            body["stats"]["journal_status"]["verdict"],
+            solstone_core_system_health::NotYet::AwaitingEngine(Some(
+                solstone_core_journal_config::SavedLane::Byo
+            ))
+            .text()
+        );
+    }
 }

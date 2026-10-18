@@ -15,7 +15,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 use solstone_core_check::{CheckReport, Severity, gather_host_inputs};
 use solstone_core_installation_identity::{GuardFields, SetupAdmission, service_guard_environment};
-use solstone_core_journal_config::get_journal_config_path;
+use solstone_core_journal_config::{get_journal_config_path, read_journal_config};
 use solstone_core_journal_config_write::{JournalConfigMutation, mutate_journal_config};
 use solstone_core_journal_io::{LockOptions, legacy_log_alias::cleanup_legacy_log_aliases};
 
@@ -1138,12 +1138,55 @@ fn narrate_step_result(context: &SetupContext<'_>, index: usize, result: &StepRe
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupClose {
+    SkipService,
+    FinishSetup,
+    OpenJournal,
+    HeldByInstaller,
+}
+
+fn determine_setup_close(
+    skip_service: bool,
+    installer_owns_handoff: bool,
+    complete: bool,
+) -> SetupClose {
+    if skip_service {
+        SetupClose::SkipService
+    } else if installer_owns_handoff {
+        SetupClose::HeldByInstaller
+    } else if complete {
+        SetupClose::OpenJournal
+    } else {
+        SetupClose::FinishSetup
+    }
+}
+
+fn filter_existing_artifacts(paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|path| Path::new(path).exists())
+        .cloned()
+        .collect()
+}
+
 fn narrate_success(context: &SetupContext<'_>, manifest: &SetupManifest) {
     if context.jsonl() {
         return;
     }
+    let complete = match read_journal_config(&context.journal_path) {
+        Ok(read) => read.config.as_ref().is_some_and(journal_is_created),
+        Err(err) => {
+            narrate_error(context, &err.to_string());
+            false
+        }
+    };
     println!();
-    println!("solstone is set up.");
+    if complete {
+        println!("solstone is set up.");
+    } else {
+        println!("solstone is installed.");
+    }
     println!();
     let skipped_prior = manifest
         .steps
@@ -1183,21 +1226,34 @@ fn narrate_success(context: &SetupContext<'_>, manifest: &SetupManifest) {
     if !paths.contains(&manifest_path) {
         paths.push(manifest_path);
     }
-    if paths.is_empty() {
+    let existing_paths = filter_existing_artifacts(&paths);
+    if existing_paths.is_empty() {
         println!("  none");
     } else {
-        for path in paths {
+        for path in existing_paths {
             println!("  {path}");
         }
     }
     // Last, because it is what an owner does next: the rest of setup, pairing a phone included,
     // happens in the browser, and nothing here said where.
-    println!();
+    let installer_owns_handoff =
+        std::env::var("SOLSTONE_INSTALLER_NO_HANDOFF").as_deref() == Ok("1");
+    let close = determine_setup_close(context.args.skip_service, installer_owns_handoff, complete);
     let url = journal_url(&context.journal_path, context.args.port);
-    if context.args.skip_service {
-        println!("once your journal is running, open it at {url}");
-    } else {
-        println!("open your journal: {url}");
+    match close {
+        SetupClose::SkipService => {
+            println!();
+            println!("once your journal is running, open it at {url}");
+        }
+        SetupClose::HeldByInstaller => {}
+        SetupClose::OpenJournal => {
+            println!();
+            println!("open your journal: {url}");
+        }
+        SetupClose::FinishSetup => {
+            println!();
+            println!("finish setup: {url}/init");
+        }
     }
 }
 
@@ -2517,6 +2573,128 @@ mod tests {
         assert_eq!(journal_url(&root, 5016), "http://localhost:5016");
         fs::write(root.join("health/convey.port"), "0").unwrap();
         assert_eq!(journal_url(&root, 5016), "http://localhost:5016");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn setup_close_and_completion_determination() {
+        // missing setup
+        let mut config = Map::new();
+        assert!(!journal_is_created(&config));
+        assert_eq!(
+            determine_setup_close(false, false, journal_is_created(&config)),
+            SetupClose::FinishSetup
+        );
+
+        // null completed_at
+        config.insert("setup".into(), json!({ "completed_at": null }));
+        assert!(!journal_is_created(&config));
+        assert_eq!(
+            determine_setup_close(false, false, journal_is_created(&config)),
+            SetupClose::FinishSetup
+        );
+
+        // 0 completed_at
+        config.insert("setup".into(), json!({ "completed_at": 0 }));
+        assert!(!journal_is_created(&config));
+        assert_eq!(
+            determine_setup_close(false, false, journal_is_created(&config)),
+            SetupClose::FinishSetup
+        );
+
+        // negative completed_at
+        config.insert("setup".into(), json!({ "completed_at": -1.0 }));
+        assert!(!journal_is_created(&config));
+        assert_eq!(
+            determine_setup_close(false, false, journal_is_created(&config)),
+            SetupClose::FinishSetup
+        );
+
+        // completed_at 1 -> complete -> OpenJournal
+        config.insert("setup".into(), json!({ "completed_at": 1.0 }));
+        assert!(journal_is_created(&config));
+        assert_eq!(
+            determine_setup_close(false, false, journal_is_created(&config)),
+            SetupClose::OpenJournal
+        );
+
+        // skip_service true -> SkipService even when installer owns handoff and even when complete
+        assert_eq!(
+            determine_setup_close(true, true, true),
+            SetupClose::SkipService
+        );
+        assert_eq!(
+            determine_setup_close(true, false, true),
+            SetupClose::SkipService
+        );
+        assert_eq!(
+            determine_setup_close(true, true, false),
+            SetupClose::SkipService
+        );
+        assert_eq!(
+            determine_setup_close(true, false, false),
+            SetupClose::SkipService
+        );
+
+        // installer owns handoff and skip is false -> HeldByInstaller for both complete and not complete
+        assert_eq!(
+            determine_setup_close(false, true, true),
+            SetupClose::HeldByInstaller
+        );
+        assert_eq!(
+            determine_setup_close(false, true, false),
+            SetupClose::HeldByInstaller
+        );
+    }
+
+    #[test]
+    fn setup_close_artifact_filter() {
+        let root = std::env::temp_dir().join(format!(
+            "solstone-core-setup-steps-artifact-filter-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let real_file = root.join("real.txt");
+        fs::write(&real_file, "data").unwrap();
+        let missing_file = root.join("missing.txt");
+
+        #[cfg(unix)]
+        let symlink_file = root.join("symlink.txt");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_file, &symlink_file).unwrap();
+
+        #[cfg(unix)]
+        let paths = vec![
+            real_file.to_string_lossy().into_owned(),
+            symlink_file.to_string_lossy().into_owned(),
+            missing_file.to_string_lossy().into_owned(),
+        ];
+        #[cfg(not(unix))]
+        let paths = vec![
+            real_file.to_string_lossy().into_owned(),
+            missing_file.to_string_lossy().into_owned(),
+        ];
+
+        let filtered = filter_existing_artifacts(&paths);
+        #[cfg(unix)]
+        assert_eq!(
+            filtered,
+            vec![
+                real_file.to_string_lossy().into_owned(),
+                symlink_file.to_string_lossy().into_owned(),
+            ]
+        );
+        #[cfg(not(unix))]
+        assert_eq!(filtered, vec![real_file.to_string_lossy().into_owned()]);
+
+        // Empty result is empty (the none branch)
+        let empty: Vec<String> = Vec::new();
+        assert!(filter_existing_artifacts(&empty).is_empty());
+        let all_missing = vec![missing_file.to_string_lossy().into_owned()];
+        assert!(filter_existing_artifacts(&all_missing).is_empty());
+
         let _ = fs::remove_dir_all(&root);
     }
 

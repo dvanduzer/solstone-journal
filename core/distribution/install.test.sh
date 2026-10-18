@@ -116,6 +116,7 @@ if [ "\${1:-}" = settings ]; then
     printf '{\n  "dashboard_url": "http://localhost:%s"\n}\n' "\${SOLSTONE_FIXTURE_PORT:-6123}"
     exit 0
 fi
+[ -z "\${SOLSTONE_HANDOFF_FLAG_LOG:-}" ] || printf "%s\n" "\${SOLSTONE_INSTALLER_NO_HANDOFF:-}" >"\$SOLSTONE_HANDOFF_FLAG_LOG"
 [ -z "\${SOLSTONE_SETUP_ARGS_LOG:-}" ] || printf "%s\n" "\$@" >"\$SOLSTONE_SETUP_ARGS_LOG"
 [ -z "\${SOLSTONE_SETUP_PATH_LOG:-}" ] || printf "%s\n" "\$PATH" >"\$SOLSTONE_SETUP_PATH_LOG"
 ${_setup_script}
@@ -502,39 +503,55 @@ fi
 # A nondefault journal port is carried through desktop and headless setup.
 HANDOFF_BIN=$BASE/handoff-bin
 HANDOFF_OPENED=$BASE/handoff-opened
+HANDOFF_FLAG_LOG=$BASE/handoff-flag.log
 mkdir -p "$HANDOFF_BIN"
 printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$@" >> "$HANDOFF_OPENED"' 'exit "${HANDOFF_OPEN_EXIT:-0}"' >"$HANDOFF_BIN/xdg-open"
 chmod 755 "$HANDOFF_BIN/xdg-open"
 export HANDOFF_OPENED
+rm -f "$HANDOFF_OPENED" "$HANDOFF_FLAG_LOG"
 if env PATH="$HANDOFF_BIN:$PATH" DISPLAY=:1 HOME="$BASE/handoff-home" \
+	SOLSTONE_HANDOFF_FLAG_LOG="$HANDOFF_FLAG_LOG" \
 	"$INSTALL" --prefix "$BASE/handoff-prefix" --no-path --archive "$ARCHIVE" --sha256 "$SHA" --release "$REL" >"$BASE/handoff.out" \
-	&& [ "$(cat "$HANDOFF_OPENED")" = 'http://localhost:6123/init' ]; then
+	&& [ "$(cat "$HANDOFF_OPENED")" = 'http://localhost:6123/init' ] \
+	&& [ "$(grep -c -F 'finish setup:' "$BASE/handoff.out" || true)" -eq 1 ] \
+	&& [ "$(cat "$HANDOFF_FLAG_LOG")" = '1' ]; then
 	pass "graphical install opens setup on the journal's published port once"
 else
 	fail "graphical install did not open setup once"
 fi
-rm -f "$HANDOFF_OPENED"
+rm -f "$HANDOFF_OPENED" "$HANDOFF_FLAG_LOG"
 if env PATH="$HANDOFF_BIN:$PATH" HOME="$BASE/handoff-headless-home" \
+	SOLSTONE_HANDOFF_FLAG_LOG="$HANDOFF_FLAG_LOG" \
 	"$INSTALL" --prefix "$BASE/handoff-headless-prefix" --no-path --archive "$ARCHIVE" --sha256 "$SHA" --release "$REL" >"$BASE/handoff-headless.out" \
 	&& grep -F -- '-L 6123:127.0.0.1:6123' "$BASE/handoff-headless.out" >/dev/null \
+	&& grep -F -- '-L 7659:127.0.0.1:7659' "$BASE/handoff-headless.out" >/dev/null \
 	&& grep -F 'http://localhost:6123/app/network/' "$BASE/handoff-headless.out" >/dev/null \
+	&& [ "$(grep -c -F 'finish setup:' "$BASE/handoff-headless.out" || true)" -eq 1 ] \
+	&& [ "$(cat "$HANDOFF_FLAG_LOG")" = '1' ] \
 	&& [ ! -e "$HANDOFF_OPENED" ]; then
 	pass "headless install prints the setup tunnel and pairing next step"
 else
 	fail "headless install lost its next step"
 fi
 for _handoff_flag in --no-start --upgrade; do
+	rm -f "$HANDOFF_FLAG_LOG"
 	if env PATH="$HANDOFF_BIN:$PATH" DISPLAY=:1 HOME="$BASE/handoff-home" \
+		SOLSTONE_HANDOFF_FLAG_LOG="$HANDOFF_FLAG_LOG" \
 		"$INSTALL" --prefix "$BASE/handoff-prefix" "$_handoff_flag" --no-path --archive "$ARCHIVE" --sha256 "$SHA" --release "$REL" >"$BASE/handoff-excluded.out" \
-		&& [ ! -e "$HANDOFF_OPENED" ]; then
+		&& [ ! -e "$HANDOFF_OPENED" ] \
+		&& [ -z "$(cat "$HANDOFF_FLAG_LOG" 2>/dev/null)" ]; then
 		pass "$_handoff_flag does not open a browser"
 	else
 		fail "$_handoff_flag opened a browser"
 	fi
 done
+rm -f "$HANDOFF_FLAG_LOG"
 if env PATH="$HANDOFF_BIN:$PATH" DISPLAY=:1 SOLSTONE_INSTALLER_NO_HANDOFF=1 HOME="$BASE/handoff-home" \
-	"$INSTALL" --prefix "$BASE/handoff-prefix" --no-path --archive "$ARCHIVE" --sha256 "$SHA" --release "$REL" >"$BASE/handoff-delegated.out" \
-	&& [ ! -e "$HANDOFF_OPENED" ]; then
+	SOLSTONE_HANDOFF_FLAG_LOG="$HANDOFF_FLAG_LOG" \
+	"$INSTALL" --prefix "$BASE/handoff-delegated-prefix" --no-path --archive "$ARCHIVE" --sha256 "$SHA" --release "$REL" >"$BASE/handoff-delegated.out" \
+	&& [ ! -e "$HANDOFF_OPENED" ] \
+	&& [ "$(cat "$HANDOFF_FLAG_LOG")" = '1' ] \
+	&& [ "$(grep -c -F 'finish setup:' "$BASE/handoff-delegated.out" || true)" -eq 0 ]; then
 	pass "delegated bootstrap leaves the browser to the umbrella installer"
 else
 	fail "delegated bootstrap opened a second browser"

@@ -585,6 +585,13 @@ async fn state(
     let journal = journal.as_ref();
     match config(&journal.0) {
         Ok(config) => {
+            let saved_lane = if solstone_core_journal_config::no_thinking_engine_chosen(&journal.0)
+            {
+                solstone_core_journal_config::saved_thinking_lane(&journal.0)
+                    .map(|lane| lane.as_str())
+            } else {
+                None
+            };
             let mut state_json = json!({
                 "providers": solstone_core_thinking::providers::payload(
                     &journal.0,
@@ -594,6 +601,7 @@ async fn state(
                 ),
                 "keys": solstone_core_thinking::providers::keys(&config),
                 "copy": solstone_core_thinking_copy::thinking_copy_payload(),
+                "saved_lane": saved_lane,
             });
             if derive_active_brain_lane(&config).lane.as_deref() == Some("spp") {
                 let access_snapshot = match override_runtime {

@@ -384,6 +384,33 @@ mod tests {
     }
 
     #[test]
+    fn saved_thinking_lane_is_reflected_on_health() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let now = Utc::now();
+        fs::create_dir_all(root.join("config")).unwrap();
+
+        for (choice, lane) in [
+            ("byo", solstone_core_journal_config::SavedLane::Byo),
+            ("spp", solstone_core_journal_config::SavedLane::Spp),
+            ("local", solstone_core_journal_config::SavedLane::Local),
+        ] {
+            fs::write(
+                root.join("config/journal.json"),
+                format!(r#"{{"setup":{{"thinking_choice":"{choice}"}}}}"#),
+            )
+            .unwrap();
+            let body = state_body(root, now);
+            assert_eq!(body["backlog"]["not_yet"], "awaiting_engine");
+            assert_eq!(
+                body["backlog"]["verdict"],
+                solstone_core_system_health::NotYet::AwaitingEngine(Some(lane)).text()
+            );
+            assert_eq!(body["search_index"]["text"], "");
+        }
+    }
+
+    #[test]
     fn test_10_routes_with_clock_uses_injected_clock() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();

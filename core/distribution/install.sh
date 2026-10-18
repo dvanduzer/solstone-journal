@@ -932,14 +932,14 @@ finish_journal_install() {
 	[ "$ROLE" = journal ] && [ "$UPGRADE" -eq 0 ] && [ "$NO_START" -eq 0 ] || return 0
 	[ "${SOLSTONE_INSTALLER_NO_HANDOFF:-0}" != 1 ] || return 0
 	if ! _handoff_status=$(run_journal_at "$CURRENT" "$VERSION" settings convey status --json); then
-		printf 'to finish setup, use the browser link printed by journal setup above.\n'
+		printf 'finish setup: http://localhost:5015/init\n'
 		return 0
 	fi
 	_handoff_url=$(printf '%s\n' "$_handoff_status" | sed -n 's/^[[:space:]]*"dashboard_url"[[:space:]]*:[[:space:]]*"\(http:\/\/localhost:[0-9][0-9]*\)"[[:space:]]*$/\1/p')
 	_handoff_port=${_handoff_url##*:}
 	case "$_handoff_port" in ''|*[!0-9]*|??????*) _handoff_port=0 ;; esac
 	if [ "$_handoff_port" -lt 1 ] || [ "$_handoff_port" -gt 65535 ]; then
-		printf 'to finish setup, use the browser link printed by journal setup above.\n'
+		printf 'finish setup: http://localhost:5015/init\n'
 		return 0
 	fi
 	printf 'finish setup: %s/init\n' "$_handoff_url"
@@ -948,8 +948,9 @@ finish_journal_install() {
 			printf 'the browser could not open. open the setup link above.\n'
 		fi
 	else
-		printf "from another computer, forward the journal's port over SSH:\n"
-		printf '  ssh -N -L %s:127.0.0.1:%s YOUR_LOGIN@JOURNAL_COMPUTER\n' "$_handoff_port" "$_handoff_port"
+		# The agent door is 7659 because convey status does not report it.
+		printf "from another computer, forward the journal's ports over SSH:\n"
+		printf '  ssh -N -L %s:127.0.0.1:%s -L 7659:127.0.0.1:7659 YOUR_LOGIN@JOURNAL_COMPUTER\n' "$_handoff_port" "$_handoff_port"
 		printf 'replace YOUR_LOGIN and JOURNAL_COMPUTER with this computer\047s SSH login and address. keep that terminal open, then open %s/init on the other computer.\n' "$_handoff_url"
 	fi
 	printf 'next: add the solstone app on this computer.\n'
@@ -1489,7 +1490,12 @@ run_setup() {
 	set -- --yes --installer-transaction
 	[ "$NO_START" -eq 0 ] || set -- "$@" --skip-service
 	[ "$NO_PATH" -eq 0 ] || set -- "$@" --skip-path
-	PATH="$_dest/bin:$PATH" run_journal_at "$_dest" "$VERSION" setup "$@"
+	# The child omits its browser link because this shell prints the handoff, and the assignment stays on this command so this shell still prints it.
+	if [ "$ROLE" = journal ] && [ "$UPGRADE" -eq 0 ] && [ "$NO_START" -eq 0 ] && [ "${SOLSTONE_INSTALLER_NO_HANDOFF:-0}" != 1 ]; then
+		SOLSTONE_INSTALLER_NO_HANDOFF=1 PATH="$_dest/bin:$PATH" run_journal_at "$_dest" "$VERSION" setup "$@"
+	else
+		PATH="$_dest/bin:$PATH" run_journal_at "$_dest" "$VERSION" setup "$@"
+	fi
 }
 
 stage_receipt() {

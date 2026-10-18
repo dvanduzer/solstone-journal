@@ -652,6 +652,7 @@ mod tests {
             "briefing_sections",
             "briefing_meta",
             "briefing_phase",
+            "briefing_saved_lane",
             "briefing_lateness",
             "briefing_exists",
             "briefing_analysis_day",
@@ -678,6 +679,7 @@ mod tests {
         [
             "exists",
             "phase",
+            "saved_lane",
             "summary",
             "meta",
             "sections",

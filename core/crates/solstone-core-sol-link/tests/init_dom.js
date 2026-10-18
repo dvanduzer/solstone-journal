@@ -936,10 +936,22 @@ async function runTests(manifestDir) {
     });
     await settle();
 
-    assert.strictEqual(envD.doc.getElementById('thinking-choose-later').hidden, false);
-    assert.strictEqual(envD.doc.getElementById('thinking-choose-later').textContent, stubCopy.thinking.choose_later);
-    assert.strictEqual(envD.doc.getElementById('thinking-blocked').hidden, false);
-    assert.ok(envD.doc.getElementById('thinking-blocked').textContent.includes('detail-blocked'));
+    const localInputD = envD.doc.querySelector('input[value="local"]');
+    assert.strictEqual(localInputD.disabled, true);
+    assert.strictEqual(envD.doc.querySelector('input[value="byo"]').disabled, false);
+    assert.strictEqual(envD.doc.querySelector('input[value="spp"]').disabled, false);
+    assert.strictEqual(envD.doc.querySelector('input[value="later"]').disabled, false);
+    assert.strictEqual(localInputD.parent.classList.contains('is-unavailable'), true);
+
+    const reasonSpanD = envD.doc.getElementById('thinking-local-reason');
+    assert.ok(reasonSpanD && reasonSpanD.textContent.includes('detail-blocked'));
+    assert.strictEqual(reasonSpanD.classList.contains('error-message'), false);
+    const errMsgsD = envD.doc.querySelectorAll('.error-message');
+    assert.ok(errMsgsD.every(el => !el.textContent.includes('detail-blocked')));
+
+    assert.strictEqual(envD.doc.getElementById('thinking-summary').hidden, false);
+    assert.strictEqual(envD.doc.getElementById('thinking-summary').textContent, stubCopy.thinking.choose_later);
+    assert.strictEqual(envD.doc.getElementById('thinking-choose-later').hidden, true);
     const checkedD = envD.doc.querySelectorAll('input[name="thinking-choice"]:checked');
     assert.strictEqual(checkedD.length, 0);
 
@@ -965,8 +977,14 @@ async function runTests(manifestDir) {
       capReqE.resolve({ overall: 'unknown', checks: [] });
       await settle();
     }
-    assert.strictEqual(envE.doc.getElementById('thinking-choose-later').hidden, false);
-    assert.strictEqual(envE.doc.getElementById('thinking-blocked').hidden, true);
+    const localInputE = envE.doc.querySelector('input[value="local"]');
+    assert.strictEqual(localInputE.disabled, false);
+    assert.strictEqual(localInputE.parent.classList.contains('is-unavailable'), false);
+    const reasonSpanE = envE.doc.getElementById('thinking-local-reason');
+    assert.strictEqual(reasonSpanE ? reasonSpanE.textContent : '', '');
+    assert.strictEqual(envE.doc.getElementById('thinking-summary').hidden, false);
+    assert.strictEqual(envE.doc.getElementById('thinking-summary').textContent, stubCopy.thinking.choose_later);
+    assert.strictEqual(envE.doc.getElementById('thinking-choose-later').hidden, true);
     assert.strictEqual(envE.doc.querySelectorAll('input[name="thinking-choice"]:checked').length, 0);
 
     // Twin F (capability failure)
@@ -984,8 +1002,10 @@ async function runTests(manifestDir) {
       capReqF.reject(new Error('probe failed'));
       await settle();
     }
-    assert.strictEqual(envF.doc.getElementById('thinking-blocked').textContent, '');
-    assert.strictEqual(envF.doc.getElementById('thinking-blocked').hidden, true);
+    const localInputF = envF.doc.querySelector('input[value="local"]');
+    assert.strictEqual(localInputF.disabled, false);
+    const reasonSpanF = envF.doc.getElementById('thinking-local-reason');
+    assert.strictEqual(reasonSpanF ? reasonSpanF.textContent : '', '');
 
     // Twin G (state capability ok, local-capability warning)
     const envG = createPageEnvironment(markup, scriptCode);
@@ -1004,9 +1024,13 @@ async function runTests(manifestDir) {
       checks: [{ name: 'gpu', severity: 'warning', detail: 'gpu slow' }]
     });
     await settle();
+    const localInputG = envG.doc.querySelector('input[value="local"]');
+    assert.strictEqual(localInputG.disabled, false);
+    assert.strictEqual(localInputG.parent.classList.contains('is-unavailable'), false);
     const summaryG = envG.doc.getElementById('thinking-summary').textContent;
     assert.strictEqual(summaryG, stubCopy.thinking.default_line.replace('{size}', '4 KB'));
-    assert.strictEqual(envG.doc.getElementById('thinking-blocked').hidden, true);
+    const reasonSpanG = envG.doc.getElementById('thinking-local-reason');
+    assert.strictEqual(reasonSpanG ? reasonSpanG.textContent : '', '');
 
     envG.doc.getElementById('thinking-continue').click();
     await settle();

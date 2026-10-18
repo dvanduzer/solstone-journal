@@ -304,6 +304,13 @@ fn build_pulse_context(context: &HomeContext) -> PulseContext {
     fields.insert("briefing_sections".to_owned(), briefing_sections);
     fields.insert("briefing_meta".to_owned(), briefing_meta);
     fields.insert("briefing_phase".to_owned(), briefing_phase.into());
+    let briefing_saved_lane = match briefing_not_yet {
+        Some(solstone_core_system_health::NotYet::AwaitingEngine(Some(lane))) => {
+            Value::String(lane.as_str().to_owned())
+        }
+        _ => Value::Null,
+    };
+    fields.insert("briefing_saved_lane".to_owned(), briefing_saved_lane);
     fields.insert("briefing_lateness".to_owned(), briefing_lateness);
     fields.insert("briefing_exists".to_owned(), briefing_exists.into());
     fields.insert("briefing_summary".to_owned(), briefing_summary.into());
@@ -351,7 +358,7 @@ fn build_pulse_context(context: &HomeContext) -> PulseContext {
     fields.insert("narrative_summary".to_owned(), narrative_summary.into());
     fields.insert("today_summary".to_owned(), today_parts.join(", ").into());
     fields.insert("needs_summary".to_owned(), needs_summary.into());
-    debug_assert_eq!(fields.len(), 38);
+    debug_assert_eq!(fields.len(), 39);
     PulseContext {
         fields,
         now: context.now_local(),
@@ -375,7 +382,7 @@ fn briefing_not_yet_phase(
         return None;
     }
     match not_yet? {
-        NotYet::AwaitingEngine => Some("awaiting_engine"),
+        NotYet::AwaitingEngine(_) => Some("awaiting_engine"),
         NotYet::FirstNight if has_content => Some("first_night"),
         NotYet::FirstNight => Some("first_night_empty"),
     }
@@ -388,6 +395,7 @@ pub fn briefing_payload(context: &HomeContext) -> Value {
     json!({
         "exists": field("briefing_exists"),
         "phase": field("briefing_phase"),
+        "saved_lane": field("briefing_saved_lane"),
         "summary": field("briefing_summary"),
         "meta": field("briefing_meta"),
         "sections": field("briefing_sections"),
@@ -659,7 +667,7 @@ mod tests {
             utc_day(),
         );
         let payload = pulse_payload(&context);
-        assert_eq!(payload.as_object().unwrap().len(), 37);
+        assert_eq!(payload.as_object().unwrap().len(), 38);
         assert_eq!(
             payload
                 .as_object()
@@ -690,6 +698,7 @@ mod tests {
                 "briefing_sections",
                 "briefing_meta",
                 "briefing_phase",
+                "briefing_saved_lane",
                 "briefing_lateness",
                 "briefing_exists",
                 "briefing_summary",
@@ -757,10 +766,58 @@ mod tests {
     }
 
     #[test]
+    fn saved_thinking_lane_in_pulse_and_briefing() {
+        let root = TempDir::new().unwrap();
+        let context = HomeContext::with_zone(
+            root.path(),
+            Utc.with_ymd_and_hms(2026, 8, 14, 22, 28, 35).unwrap(),
+            utc_day(),
+        );
+
+        // thinking_choice "byo" and no provider and no briefing
+        std::fs::create_dir_all(root.path().join("config")).unwrap();
+        std::fs::write(
+            root.path().join("config/journal.json"),
+            br#"{"setup":{"thinking_choice":"byo"}}"#,
+        )
+        .unwrap();
+
+        let payload = pulse_payload(&context);
+        assert_eq!(payload["briefing_phase"], "awaiting_engine");
+        assert_eq!(payload["briefing_saved_lane"], "byo");
+
+        let briefing = briefing_payload(&context);
+        assert_eq!(briefing["phase"], "awaiting_engine");
+        assert_eq!(briefing["saved_lane"], "byo");
+
+        // "later"
+        std::fs::write(
+            root.path().join("config/journal.json"),
+            br#"{"setup":{"thinking_choice":"later"}}"#,
+        )
+        .unwrap();
+        let payload = pulse_payload(&context);
+        assert_eq!(payload["briefing_saved_lane"], Value::Null);
+        let briefing = briefing_payload(&context);
+        assert_eq!(briefing["saved_lane"], Value::Null);
+
+        // non-empty active provider
+        std::fs::write(
+            root.path().join("config/journal.json"),
+            br#"{"setup":{"thinking_choice":"byo"},"providers":{"active":{"provider":"anthropic"}}}"#,
+        )
+        .unwrap();
+        let payload = pulse_payload(&context);
+        assert_eq!(payload["briefing_saved_lane"], Value::Null);
+        let briefing = briefing_payload(&context);
+        assert_eq!(briefing["saved_lane"], Value::Null);
+    }
+
+    #[test]
     fn briefing_before_the_first_night_says_when_it_is_due() {
         use solstone_core_system_health::NotYet;
         assert_eq!(
-            briefing_not_yet_phase(false, Some(NotYet::AwaitingEngine), true),
+            briefing_not_yet_phase(false, Some(NotYet::AwaitingEngine(None)), true),
             Some("awaiting_engine")
         );
         assert_eq!(
@@ -772,7 +829,7 @@ mod tests {
             Some("first_night_empty")
         );
         assert_eq!(
-            briefing_not_yet_phase(true, Some(NotYet::AwaitingEngine), true),
+            briefing_not_yet_phase(true, Some(NotYet::AwaitingEngine(None)), true),
             None
         );
         assert_eq!(briefing_not_yet_phase(false, None, true), None);

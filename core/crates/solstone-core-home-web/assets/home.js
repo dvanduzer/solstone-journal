@@ -50,6 +50,8 @@
   let pulseObservedAt = null;
   let heldWorkSnapshot = null;
   let heldWorkCurrent = false;
+  let pageLoadedAt = Date.now();
+  let queuedWorkAuthoritySeen = false;
   let heldWorkExpiry = null;
   let briefingSections = {};
   const ACTIVITY_PREVIEW = 6;
@@ -361,7 +363,8 @@
     const notes = [];
     const checked = at => at ? ' last check: ' + new Date(at).toLocaleString() + '.' : '';
     if (pulseReadFailed) notes.push({text:'service status is unavailable.' + checked(pulseObservedAt), href:'/app/health/'});
-    if (!workCurrent) notes.push({text:'queued work status is unavailable.' + checked(heldWorkSnapshot?.observedAt), href:'/app/health/#processingHolds'});
+    const workGrace = !queuedWorkAuthoritySeen && Date.now() - pageLoadedAt < 15000;
+    if (!workCurrent && !workGrace) notes.push({text:'queued work status is unavailable.' + checked(heldWorkSnapshot?.observedAt), href:'/app/health/#processingHolds'});
     const backupUnavailable = !backupCurrent && (pulse.backup || backupObservedAt);
     if (backupUnavailable) notes.push({text:'backup status is unavailable.' + checked(backupObservedAt), href:'/app/health/#backup'});
     if (current.length) {
@@ -372,7 +375,7 @@
       g.verdict = 'unavailable';
       g.severity = 'amber';
       g.headline = pulseReadFailed ? 'service status is unavailable right now.'
-        : !workCurrent ? 'queued work status is unavailable right now.' : 'backup status is unavailable right now.';
+        : (!workCurrent && !workGrace) ? 'queued work status is unavailable right now.' : 'backup status is unavailable right now.';
       g.last_observation = null;
       g.cta = null;
     }
@@ -603,7 +606,7 @@
       href = '/app/thinking/#confidential-setup';
       linkText = 'finish →';
     } else if (step === 'local') {
-      title = 'finish setting up thinking';
+      title = 'finish setting up local thinking';
       href = '/app/thinking/#local-setup';
       linkText = 'finish →';
     } else {
@@ -1475,6 +1478,7 @@
     return {
       exists: Boolean(pulse.briefing_exists),
       phase: pulse.briefing_phase || 'eod',
+      saved_lane: pulse.briefing_saved_lane ?? null,
       summary: pulse.briefing_summary || '',
       meta: pulse.briefing_meta || null,
       sections: isPlainObject(pulse.briefing_sections) ? pulse.briefing_sections : {},
@@ -1505,6 +1509,12 @@
     first_night_empty: 'your first briefing is due the morning after something goes into your journal.'
   });
 
+  const BRIEFING_AWAITING_ENGINE_LANES = Object.assign(Object.create(null), {
+    byo: 'morning briefings start once your own model is set up.',
+    spp: 'morning briefings start once confidential processing is set up.',
+    local: 'morning briefings start once local thinking is set up.'
+  });
+
   function briefingPlaceholderHtml(data, pulseContext) {
     if (data.exists) return '';
     // A briefing that was never prepared used to render nothing at all from ten
@@ -1514,6 +1524,10 @@
         + "your morning briefing wasn't prepared. "
         + '<a class="pulse-briefing-status-link" href="/app/thinking/#runs/' + esc(pulseContext?.briefing_analysis_day || '') + '/morning_briefing">see the run →</a>'
         + '</div>';
+    }
+    if (data.phase === 'awaiting_engine') {
+      const text = BRIEFING_AWAITING_ENGINE_LANES[data.saved_lane] || BRIEFING_NOT_YET.awaiting_engine;
+      return '<div class="pulse-briefing-placeholder">' + esc(text) + '</div>';
     }
     const notYet = BRIEFING_NOT_YET[data.phase];
     if (notYet) return '<div class="pulse-briefing-placeholder">' + esc(notYet) + '</div>';
@@ -1938,6 +1952,9 @@
   }
 
   function receiveSupervisorStatus(msg) {
+    if (msg.event === 'status' || msg.event === 'status-error') {
+      queuedWorkAuthoritySeen = true;
+    }
     if (msg.event === 'status-error') {
       invalidateHeldWork();
       return;
