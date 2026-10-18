@@ -30,13 +30,14 @@ mod args;
 mod audio;
 #[allow(dead_code)]
 mod backend;
+pub use backend::confidential::ConfidentialIoPhase;
 #[allow(dead_code)]
 mod config;
 #[cfg(all(feature = "embedded", unix))]
 mod embedded;
 #[cfg(all(feature = "embedded", unix))]
 pub use embedded::{
-    EmbeddedAsr, EmbeddedModelInfo, RetryContext, embedded_already_processed,
+    EmbeddedAsr, EmbeddedControl, EmbeddedModelInfo, RetryContext, embedded_already_processed,
     embedded_retry_context, embedded_retryable_failure, process_embedded,
 };
 #[allow(dead_code)]

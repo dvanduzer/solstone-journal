@@ -36,7 +36,7 @@ pub fn confidential_multipart_exchange(
     wav: &[u8],
     timeout: Duration,
 ) -> ConfidentialMultipart {
-    match send_multipart_request(stream, host, bearer, wav, timeout) {
+    match send_multipart_request(stream, host, bearer, wav, timeout, &|_| {}) {
         Ok(response) => ConfidentialMultipart::Received {
             status: response.status,
             body: response.body,

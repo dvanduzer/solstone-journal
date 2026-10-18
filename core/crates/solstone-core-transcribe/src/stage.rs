@@ -857,6 +857,7 @@ fn dispatch_backend(
                     config,
                     attestation_state,
                     &|| runtime.checkpoint(),
+                    runtime.service_io,
                 );
             }
             confidential::transcribe(statement_audio, journal_path, config, attestation_state)
@@ -2848,6 +2849,7 @@ mod tests {
             scratch: root.path(),
             asr: &stub_asr,
             cancel: &cancel_fn,
+            service_io: &|_| {},
         };
         let config = JournalConfigRead {
             present: false,

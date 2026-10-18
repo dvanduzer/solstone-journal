@@ -6,8 +6,9 @@
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use solstone_core_transcribe::{
-    TranscribeOutcome, discover_audio_files, embedded_already_processed, embedded_retry_context,
-    embedded_retryable_failure, process_embedded,
+    ConfidentialIoPhase, EmbeddedControl, TranscribeOutcome, discover_audio_files,
+    embedded_already_processed, embedded_retry_context, embedded_retryable_failure,
+    process_embedded,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -312,9 +313,20 @@ fn run(
                             models,
                             scratch,
                             &asr,
-                            &|| {
-                                state.cancelled(generation)
-                                    || authority.revalidate_canonical_binding().is_err()
+                            EmbeddedControl {
+                                cancelled: &|| {
+                                    state.cancelled(generation)
+                                        || authority.revalidate_canonical_binding().is_err()
+                                },
+                                service_io: &|phase| {
+                                    let mut status = state.status.lock().unwrap();
+                                    status["service_io"] = match phase {
+                                        ConfidentialIoPhase::RequestFlushed => {
+                                            json!("awaiting_response")
+                                        }
+                                        ConfidentialIoPhase::ResponseFinished => json!("finished"),
+                                    };
+                                },
                             },
                             retry.as_ref(),
                         );

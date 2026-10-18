@@ -9,6 +9,12 @@ use serde_json::Value;
 
 use crate::{TranscribeError, TranscribeFile, backend::parakeet_cpp};
 
+/// The caller's cancellation lifetime and content-free service-I/O observation.
+pub struct EmbeddedControl<'a> {
+    pub cancelled: &'a dyn Fn() -> bool,
+    pub service_io: &'a dyn Fn(crate::ConfidentialIoPhase),
+}
+
 /// Provenance of the model actually used by the embedded caller.
 pub struct EmbeddedModelInfo {
     /// Registered backend identifier.
@@ -35,6 +41,7 @@ pub(crate) struct EmbeddedContext<'a> {
     pub(crate) scratch: &'a Path,
     pub(crate) asr: &'a dyn EmbeddedAsr,
     pub(crate) cancel: &'a dyn Fn() -> bool,
+    pub(crate) service_io: &'a dyn Fn(crate::ConfidentialIoPhase),
 }
 
 pub(crate) fn select_backend(
@@ -152,14 +159,15 @@ pub fn process_embedded(
     models: &Path,
     scratch: &Path,
     asr: &dyn EmbeddedAsr,
-    cancel: &dyn Fn() -> bool,
+    control: EmbeddedControl<'_>,
     retry: Option<&RetryContext>,
 ) -> Result<TranscribeFile, TranscribeError> {
     let context = EmbeddedContext {
         models,
         scratch,
         asr,
-        cancel,
+        cancel: control.cancelled,
+        service_io: control.service_io,
     };
     context.checkpoint()?;
     std::fs::create_dir_all(scratch).map_err(|error| TranscribeError::VadTemporary {
@@ -273,6 +281,7 @@ mod tests {
                     scratch: Path::new("unused"),
                     asr: &LocalRecognizer,
                     cancel: &|| false,
+                    service_io: &|_| {},
                 };
                 assert_eq!(
                     select_backend(resolve(), Some(&context), requested, &config).unwrap(),
@@ -300,6 +309,7 @@ mod tests {
             scratch: Path::new("unused"),
             asr: &LocalRecognizer,
             cancel: &|| false,
+            service_io: &|_| {},
         };
         let selected = select_backend(
             Err(TranscribeError::SttSurface {
@@ -364,6 +374,7 @@ mod tests {
                 scratch: Path::new("unused"),
                 asr: &LocalRecognizer,
                 cancel: &|| false,
+                service_io: &|_| {},
             };
             assert_eq!(
                 select_backend(
@@ -402,7 +413,10 @@ mod tests {
             Path::new("unused-models"),
             &journal.path().join("scratch"),
             &LocalRecognizer,
-            &|| false,
+            EmbeddedControl {
+                cancelled: &|| false,
+                service_io: &|_| {},
+            },
             None,
         );
         assert!(
@@ -427,6 +441,7 @@ mod tests {
             scratch: Path::new("unused"),
             asr: &LocalMustNotRun,
             cancel: &|| false,
+            service_io: &|_| {},
         };
         let config = solstone_core_journal_config::JournalConfigRead {
             present: false,
@@ -465,6 +480,7 @@ mod tests {
             scratch: Path::new("unused"),
             asr: &asr,
             cancel: &cancel,
+            service_io: &|_| {},
         };
         assert!(matches!(
             context.transcribe(&[0.0; 16000]),
@@ -477,7 +493,10 @@ mod tests {
                 Path::new("unused"),
                 Path::new("unused"),
                 &asr,
-                &cancel,
+                EmbeddedControl {
+                    cancelled: &cancel,
+                    service_io: &|_| {}
+                },
                 None,
             ),
             Err(TranscribeError::Cancelled)
@@ -500,7 +519,10 @@ mod tests {
             Path::new("missing-models"),
             &root.path().join("scratch"),
             &asr,
-            &|| false,
+            EmbeddedControl {
+                cancelled: &|| false,
+                service_io: &|_| {},
+            },
             None,
         );
         assert!(

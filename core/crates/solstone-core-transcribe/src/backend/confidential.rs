@@ -3,6 +3,28 @@
 
 //! Confidential hosted-STT routing, attestation, and one-request transport.
 
+/// Content-free progress of the application request on an admitted channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfidentialIoPhase {
+    /// The complete request was flushed; response reading is about to begin.
+    RequestFlushed,
+    /// Response reading returned or unwound, including transport failure.
+    ResponseFinished,
+}
+
+struct TranscribeControl<'a> {
+    checkpoint: &'a dyn Fn() -> Result<(), TranscribeError>,
+    service_io: &'a dyn Fn(ConfidentialIoPhase),
+}
+
+struct ResponseObservation<'a>(&'a dyn Fn(ConfidentialIoPhase));
+
+impl Drop for ResponseObservation<'_> {
+    fn drop(&mut self) {
+        (self.0)(ConfidentialIoPhase::ResponseFinished);
+    }
+}
+
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -145,7 +167,10 @@ where
         state,
         readiness,
         establish,
-        &|| Ok(()),
+        TranscribeControl {
+            checkpoint: &|| Ok(()),
+            service_io: &|_| {},
+        },
     )
 }
 
@@ -156,7 +181,7 @@ fn transcribe_with_checkpoint<R, E, S>(
     state: &AttestationStateStore,
     readiness: R,
     establish: E,
-    checkpoint: &dyn Fn() -> Result<(), TranscribeError>,
+    control: TranscribeControl<'_>,
 ) -> Result<(TranscriptionResponse, ModelInfo), TranscribeError>
 where
     R: FnOnce(&Path) -> NvattestEnsureStatus,
@@ -167,7 +192,7 @@ where
         Duration,
     ) -> Result<(solstone_core_spp_ratls::CompositeVerdict, S), &'static str>,
 {
-    checkpoint()?;
+    (control.checkpoint)()?;
     let endpoint = confidential_endpoint(config)?;
     if endpoint.credential.is_none() {
         return Err(deferred(
@@ -211,7 +236,7 @@ where
         }
         deferred_from_attestation(state, now)
     })?;
-    checkpoint()?;
+    (control.checkpoint)()?;
     if let Err(error) = solstone_core_brain::clear_transcription_verification(journal_path) {
         log::warn!(
             "confidential transcription verification was not cleared for {}: {error}",
@@ -226,13 +251,14 @@ where
     ) {
         return Err(deferred(code, "the confidential admission probe failed"));
     }
-    checkpoint()?;
+    (control.checkpoint)()?;
     let response = send_multipart_request(
         &mut channel.stream,
         &channel.host,
         endpoint.credential.as_deref(),
         &wav,
         TRANSCRIBE_TIMEOUT,
+        control.service_io,
     )
     .map_err(hosted_transcribe_transport_error)?;
     hosted_response(response)
@@ -245,7 +271,7 @@ pub(crate) fn transcribe(
     config: &JournalConfigRead,
     state: &AttestationStateStore,
 ) -> Result<(TranscriptionResponse, ModelInfo), TranscribeError> {
-    transcribe_cancellable(audio, journal_path, config, state, &|| Ok(()))
+    transcribe_cancellable(audio, journal_path, config, state, &|| Ok(()), &|_| {})
 }
 
 pub(crate) fn transcribe_cancellable(
@@ -254,6 +280,7 @@ pub(crate) fn transcribe_cancellable(
     config: &JournalConfigRead,
     state: &AttestationStateStore,
     checkpoint: &dyn Fn() -> Result<(), TranscribeError>,
+    service_io: &dyn Fn(ConfidentialIoPhase),
 ) -> Result<(TranscriptionResponse, ModelInfo), TranscribeError> {
     #[cfg(not(windows))]
     let readiness = |_: &Path| match solstone_core_spp_ratls::resolve_nvattest_from_current_exe() {
@@ -272,7 +299,10 @@ pub(crate) fn transcribe_cancellable(
         state,
         readiness,
         establish_fresh_production_channel,
-        checkpoint,
+        TranscribeControl {
+            checkpoint,
+            service_io,
+        },
     )
 }
 
@@ -333,6 +363,7 @@ pub(crate) fn send_multipart_request(
     bearer: Option<&str>,
     wav: &[u8],
     timeout: Duration,
+    service_io: &dyn Fn(ConfidentialIoPhase),
 ) -> Result<HttpResponse, HttpError> {
     let (boundary, body) = multipart_body(wav)?;
     let mut request = format!(
@@ -345,6 +376,8 @@ pub(crate) fn send_multipart_request(
     write_all_retry_interrupted(stream, request.as_bytes()).map_err(HttpError::Transport)?;
     write_all_retry_interrupted(stream, &body).map_err(HttpError::Transport)?;
     retry_interrupted(|| stream.flush()).map_err(HttpError::Transport)?;
+    service_io(ConfidentialIoPhase::RequestFlushed);
+    let _observation = ResponseObservation(service_io);
     recv_bounded_http_response(stream)
 }
 
@@ -684,12 +717,15 @@ mod tests {
                     ),
                 ))
             },
-            &|| {
-                if cancelled.load(Ordering::SeqCst) {
-                    Err(TranscribeError::Cancelled)
-                } else {
-                    Ok(())
-                }
+            super::TranscribeControl {
+                checkpoint: &|| {
+                    if cancelled.load(Ordering::SeqCst) {
+                        Err(TranscribeError::Cancelled)
+                    } else {
+                        Ok(())
+                    }
+                },
+                service_io: &|_| panic!("cancelled request must have no service I/O"),
             },
         )
         .unwrap_err();
@@ -1297,6 +1333,120 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(channel_attempts.load(Ordering::SeqCst), 1);
         assert!(saw_established.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn service_io_observation_brackets_actual_response_read_after_request_flush() {
+        use super::ConfidentialIoPhase;
+        use std::{
+            cell::RefCell,
+            rc::Rc,
+            sync::{Arc, Mutex, atomic::AtomicBool},
+        };
+
+        struct ObservedStream {
+            inner: MockAttestedStream,
+            steps: Rc<RefCell<Vec<&'static str>>>,
+            flush_fails: bool,
+        }
+        impl std::io::Read for ObservedStream {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                assert!(matches!(
+                    self.steps.borrow().last(),
+                    Some(&"request_flushed" | &"read")
+                ));
+                self.steps.borrow_mut().push("read");
+                self.inner.read(bytes)
+            }
+        }
+        impl std::io::Write for ObservedStream {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.steps.borrow_mut().push("write");
+                self.inner.write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.steps.borrow_mut().push("flush");
+                if self.flush_fails {
+                    Err(std::io::ErrorKind::BrokenPipe.into())
+                } else {
+                    self.inner.flush()
+                }
+            }
+        }
+        impl AttestedIo for ObservedStream {
+            fn set_io_deadline(
+                &mut self,
+                deadline: Option<std::time::Instant>,
+            ) -> std::io::Result<()> {
+                self.inner.set_io_deadline(deadline)
+            }
+            fn set_io_timeout(&mut self, timeout: Option<Duration>) -> std::io::Result<()> {
+                self.inner.set_io_timeout(timeout)
+            }
+            fn trailing_after_body(
+                &mut self,
+            ) -> std::io::Result<solstone_core_spp_ratls::Trailing> {
+                self.inner.trailing_after_body()
+            }
+        }
+
+        for (flush_fails, read_fails) in [(false, false), (false, true), (true, false)] {
+            let written = Arc::new(Mutex::new(Vec::new()));
+            let mut inner = MockAttestedStream::with_responses(
+                vec![b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()],
+                written.clone(),
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(false)),
+            );
+            if read_fails {
+                inner.initial_read_error = Some(std::io::ErrorKind::TimedOut);
+            }
+            let steps = Rc::new(RefCell::new(Vec::new()));
+            let mut stream = ObservedStream {
+                inner,
+                steps: steps.clone(),
+                flush_fails,
+            };
+            let phases = RefCell::new(Vec::new());
+            let result = super::send_multipart_request(
+                &mut stream,
+                "synthetic.invalid",
+                Some("private-token"),
+                b"synthetic-wav",
+                Duration::from_secs(1),
+                &|phase| {
+                    if phase == ConfidentialIoPhase::RequestFlushed {
+                        assert_eq!(steps.borrow().last(), Some(&"flush"));
+                        let request = written.lock().unwrap();
+                        assert!(
+                            request
+                                .windows(b"synthetic-wav".len())
+                                .any(|w| w == b"synthetic-wav")
+                        );
+                        assert!(request.ends_with(b"--\r\n"));
+                        steps.borrow_mut().push("request_flushed");
+                    } else {
+                        assert_eq!(steps.borrow().last(), Some(&"read"));
+                        steps.borrow_mut().push("response_finished");
+                    }
+                    phases.borrow_mut().push(phase);
+                },
+            );
+            assert_eq!(result.is_ok(), !flush_fails && !read_fails);
+            if flush_fails {
+                assert!(phases.borrow().is_empty());
+                assert!(!steps.borrow().contains(&"read"));
+            } else {
+                assert_eq!(
+                    *phases.borrow(),
+                    [
+                        ConfidentialIoPhase::RequestFlushed,
+                        ConfidentialIoPhase::ResponseFinished
+                    ]
+                );
+                assert_eq!(steps.borrow().last(), Some(&"response_finished"));
+            }
+        }
     }
 
     #[test]
