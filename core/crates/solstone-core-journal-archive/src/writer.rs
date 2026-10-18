@@ -6,7 +6,7 @@ use std::fmt;
 use std::io::{Read, Seek, Write};
 
 use zip::write::SimpleFileOptions;
-use zip::{CompressionMethod, DateTime, ZipWriter};
+use zip::{CompressionMethod, DateTime, System, ZipWriter};
 
 use crate::encode::DayWindow;
 use crate::manifest::Manifest;
@@ -173,12 +173,14 @@ pub(crate) fn write_archive<W: Write + Seek>(
 
 fn directory_options(timestamp: DateTime) -> SimpleFileOptions {
     SimpleFileOptions::default()
+        .system(System::Unix)
         .last_modified_time(timestamp)
         .unix_permissions(0o700)
 }
 
 fn file_options(timestamp: DateTime) -> SimpleFileOptions {
     SimpleFileOptions::default()
+        .system(System::Unix)
         .compression_method(CompressionMethod::Deflated)
         .last_modified_time(timestamp)
         .large_file(true)
@@ -406,6 +408,7 @@ mod tests {
         for index in 0..4 {
             let member = archive.by_index(index).expect("directory member");
             assert!(member.is_dir());
+            assert_eq!(member.system(), System::Unix);
             assert_eq!(member.compression(), CompressionMethod::Stored);
             assert_eq!(member.unix_mode(), Some(0o40700));
             let timestamp = member.last_modified().expect("directory timestamp");
@@ -425,6 +428,7 @@ mod tests {
         for index in 4..archive.len() {
             let mut member = archive.by_index(index).expect("file member");
             assert!(!member.is_dir());
+            assert_eq!(member.system(), System::Unix);
             assert_eq!(member.compression(), CompressionMethod::Deflated);
             assert_eq!(member.unix_mode(), Some(0o100600));
             let timestamp = member.last_modified().expect("file timestamp");
