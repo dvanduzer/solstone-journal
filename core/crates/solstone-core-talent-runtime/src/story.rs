@@ -31,9 +31,9 @@ const MAX_QUOTE_CHARS: usize = 400;
 const MAX_SOURCE_BODY_CHARS: usize = 4_000;
 
 /// A Story body that quotes every word of a short activity source, framed by
-/// who the producer says wrote or said it: one imported conversation, one
-/// utterance by an unidentified speaker, or one terminal pane. `None` for any
-/// other talent or source, which keeps the model's own body.
+/// who the producer says wrote or said it: one imported conversation, or one
+/// utterance by an unidentified speaker. `None` for any other talent or
+/// source, which keeps the model's own body.
 pub(crate) fn source_body(
     name: &str,
     config: &Map<String, Value>,
@@ -78,7 +78,10 @@ pub(crate) fn source_body(
 }
 
 /// Each rendered line's framing and source words, or `None` when the file is
-/// not exactly one of the measured shapes.
+/// not exactly one of the measured shapes. Beside those words the model may
+/// read only fixed headings and producer-written ids, never other text that
+/// could set the words' context: a screen frame's session and window names
+/// and its description can, so screen sources keep the model's body.
 fn quoted_lines(source: &EntrySource) -> Option<Vec<(String, &str)>> {
     let stream = source.stream.as_deref().unwrap_or_default();
     // The line rendered from this record, at this position.
@@ -92,9 +95,10 @@ fn quoted_lines(source: &EntrySource) -> Option<Vec<(String, &str)>> {
             return None;
         }
         let (header, messages) = source.records.split_first()?;
-        if header.contains_key("start")
-            || !header.get("imported").is_some_and(Value::is_object)
+        let imported = header.get("imported").and_then(Value::as_object);
+        if !imported.is_some_and(|imported| imported.keys().eq(["id"]))
             || header.keys().any(|key| key != "imported" && key != "model")
+            || !header.get("model").is_none_or(Value::is_string)
             || messages.is_empty()
             || messages.len() != source.chunks.len()
         {
@@ -139,32 +143,6 @@ fn quoted_lines(source: &EntrySource) -> Option<Vec<(String, &str)>> {
         (source.chunks.len() == 1
             && rendered(0, record)? == format!("[{start}] Speaker {speaker}: {text}"))
         .then(|| vec![("An unidentified speaker said".to_owned(), text)])
-    } else if source.file.ends_with("screen.jsonl") {
-        let [frame] = source.records.as_slice() else {
-            return None;
-        };
-        if source.chunks.len() != 1
-            || frame.keys().any(|key| {
-                !matches!(
-                    key.as_str(),
-                    "frame_id" | "timestamp" | "requests" | "analysis" | "content"
-                )
-            })
-            || frame.get("analysis")?.get("primary")?.as_str()? != "tmux"
-        {
-            return None;
-        }
-        let content = frame.get("content")?.as_object()?;
-        if content.len() != 1 {
-            return None;
-        }
-        let [pane] = content.get("tmux")?.get("panes")?.as_array()?.as_slice() else {
-            return None;
-        };
-        let text = pane.get("content")?.as_str()?;
-        rendered(0, frame)?
-            .contains(&Value::String(text.to_owned()).to_string())
-            .then(|| vec![("Displayed text read".to_owned(), text)])
     } else {
         None
     }

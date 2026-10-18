@@ -29,7 +29,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - when today has no activities yet, the activities app still shows today's hours, with a line at the current time.
 - the note at the top of your morning briefing says what it drew on in plain words, and names anything that was missing. it no longer counts "source paths", which always read 0.
 - the first-run setup page opens with how your journal, the solstone app and thinking fit together. its thinking section now asks where the thinking happens and says your journal stays on your computer whichever you pick.
-- when an activity's whole source is short and is one imported AI conversation, one line from a speaker your journal doesn't recognize, or one terminal pane, its story now quotes that source word for word. it says which messages were yours and which were your agent's, and the date each message was sent. topics and relationships are written as before, and it takes no extra request to your thinking provider. stories already written stay as they are.
+- when an activity's whole source is short and is one imported AI conversation or one line from a speaker your journal doesn't recognize, its story now quotes that source word for word. it says which messages were yours and which were your agent's, and the date each message was sent. topics and relationships are written as before, and it takes no extra request to your thinking provider. stories already written stay as they are.
 
 ### Fixed
 

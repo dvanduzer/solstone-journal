@@ -1,5 +1,5 @@
 {
-  "about": "Invented Story source-word cases. A short activity source of a measured shape (one imported conversation, one unidentified utterance, one terminal pane) gets a body quoting every source word with its producer-recorded framing; every other case keeps the model's body and returned response byte for byte. Topics, confidence and relations are always the model's. Files are written into one segment; a string row is written as a raw line.",
+  "about": "Invented Story source-word cases. A short activity source of a measured shape (one imported conversation, or one unidentified utterance) gets a body quoting every source word with its producer-recorded framing; every other case, including a terminal pane whose session, window and description the body would drop, keeps the model's body and returned response byte for byte. Topics, confidence and relations are always the model's. Files are written into one segment; a string row is written as a raw line.",
   "cases": [
     {
       "name": "imported_messages_keep_their_authors_and_message_dates",
@@ -42,7 +42,7 @@
       }
     },
     {
-      "name": "displayed_role_labels_are_quoted_not_attributed",
+      "name": "a_terminal_pane_keeps_the_model_body",
       "talent": "work",
       "activity_kind": "terminal",
       "stream": "tmux",
@@ -53,7 +53,7 @@
             "timestamp": 1,
             "requests": [],
             "analysis": {
-              "visual_description": "Terminal session 'fixture' with one pane",
+              "visual_description": "Terminal session 'fiction' editing chapter three of a novel",
               "primary": "tmux",
               "secondary": "none",
               "overlap": false
@@ -64,13 +64,13 @@
                 "window": {
                   "id": "@0",
                   "index": 0,
-                  "name": "chat"
+                  "name": "novel draft"
                 },
                 "windows": [
                   {
                     "id": "@0",
                     "index": 0,
-                    "name": "chat",
+                    "name": "novel draft",
                     "active": true
                   }
                 ],
@@ -83,7 +83,7 @@
                     "width": 120,
                     "height": 40,
                     "active": true,
-                    "content": "You: I will ask Oda for six logs after approval.\nAssistant: I have not sent anything.\nThis is displayed training text, not an export of journal-owner messages."
+                    "content": "I signed the Cedar lease and paid the deposit."
                   }
                 ]
               }
@@ -92,15 +92,15 @@
         ]
       },
       "response": {
-        "body": "You asked Oda for six logs.",
+        "body": "You edited chapter three of your novel.",
         "topics": [
-          "logs"
+          "novel"
         ],
         "confidence": 0.8,
         "relations": []
       },
       "expect": {
-        "body": "Displayed text read: “You: I will ask Oda for six logs after approval.\nAssistant: I have not sent anything.\nThis is displayed training text, not an export of journal-owner messages.”"
+        "ordinary": true
       }
     },
     {
@@ -851,124 +851,31 @@
       }
     },
     {
-      "name": "two_panes_keep_the_model_body",
-      "talent": "work",
-      "activity_kind": "terminal",
-      "stream": "tmux",
+      "name": "an_import_header_with_more_than_its_id_keeps_the_model_body",
+      "talent": "conversation",
+      "activity_kind": "messaging",
+      "stream": "import.chatgpt",
       "files": {
-        "fixture_screen.jsonl": [
+        "conversation_transcript.jsonl": [
           {
-            "frame_id": 1,
-            "timestamp": 1,
-            "requests": [],
-            "analysis": {
-              "visual_description": "Terminal session 'fixture' with one pane",
-              "primary": "tmux",
-              "secondary": "none",
-              "overlap": false
-            },
-            "content": {
-              "tmux": {
-                "session": "fixture",
-                "window": {
-                  "id": "@0",
-                  "index": 0,
-                  "name": "chat"
-                },
-                "windows": [
-                  {
-                    "id": "@0",
-                    "index": 0,
-                    "name": "chat",
-                    "active": true
-                  }
-                ],
-                "panes": [
-                  {
-                    "id": "%0",
-                    "index": 0,
-                    "left": 0,
-                    "top": 0,
-                    "width": 120,
-                    "height": 40,
-                    "active": true,
-                    "content": "left pane text"
-                  },
-                  {
-                    "id": "%1",
-                    "index": 1,
-                    "left": 0,
-                    "top": 0,
-                    "width": 120,
-                    "height": 40,
-                    "active": false,
-                    "content": "right pane text"
-                  }
-                ]
-              }
+            "imported": {
+              "id": "invented-fixture",
+              "facet": "fiction"
             }
-          }
-        ]
-      },
-      "response": {
-        "body": "You worked through a short exchange.",
-        "topics": [
-          "work"
-        ],
-        "confidence": 0.9,
-        "relations": []
-      },
-      "expect": {
-        "ordinary": true
-      }
-    },
-    {
-      "name": "terminal_control_codes_keep_the_model_body",
-      "talent": "work",
-      "activity_kind": "terminal",
-      "stream": "tmux",
-      "files": {
-        "fixture_screen.jsonl": [
+          },
           {
-            "frame_id": 1,
-            "timestamp": 1,
-            "requests": [],
-            "analysis": {
-              "visual_description": "Terminal session 'fixture' with one pane",
-              "primary": "tmux",
-              "secondary": "none",
-              "overlap": false
-            },
-            "content": {
-              "tmux": {
-                "session": "fixture",
-                "window": {
-                  "id": "@0",
-                  "index": 0,
-                  "name": "chat"
-                },
-                "windows": [
-                  {
-                    "id": "@0",
-                    "index": 0,
-                    "name": "chat",
-                    "active": true
-                  }
-                ],
-                "panes": [
-                  {
-                    "id": "%0",
-                    "index": 0,
-                    "left": 0,
-                    "top": 0,
-                    "width": 120,
-                    "height": 40,
-                    "active": true,
-                    "content": "\u001b[31mFAILED\u001b[0m build 41"
-                  }
-                ]
-              }
-            }
+            "start": "00:00:00",
+            "speaker": "You",
+            "text": "I signed the Cedar agreement on 1994-04-03. Do not use today's message date as the signing date.",
+            "source": "import",
+            "source_ms": 1767258000000
+          },
+          {
+            "start": "00:00:01",
+            "speaker": "Assistant",
+            "text": "I have not obtained a copy of the signed agreement.",
+            "source": "import",
+            "source_ms": 1767258001000
           }
         ]
       },
