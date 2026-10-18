@@ -6,9 +6,15 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- your journal can start again after an unexpected stop, even if it had been running for days. recovery keeps its progress between startup attempts instead of starting over each time.
+
+## [2.0.50] - 2026-10-18
+
 ### Added
 
-- agents that can see the whole journal, and that have transcripts and facets, can read one week with `get_week`. memories on that page are generated. quotes are the owner's words. leaving an entry off the week page leaves that source visible to search and transcripts.
+- agents you've let see your whole journal, with transcripts and facets, can now read a week at a time with `get_week`. if you leave something out of a week, agents can still find its source through search and transcripts.
 - in its first week, a new journal's home page shows a "getting started" card. it shows which of your devices are adding to your journal, the local model and speech model downloads, and your first segment and whether thinking has read it. say a sentence out loud near one of your devices, and the card shows it as text once it's written out. its next steps are connect an agent, add your phone, and finish choosing where the thinking happens. each step leaves once it's done, and the card leaves when they all are and something you said has shown up as text.
 - when a device finishes pairing, the dialog names it by the name the device gave itself, and "didn't do this?" now has a button that unpairs that device straight away.
 - `solstone journal talent passages` copies passages from the source an activity's story is written from, word for word, with where each one sits in that source. each short part of the source is kept whole without asking your model anything. each longer part takes one request to your model to choose what to keep, and the passages are still the source's own words. stories are written the same way as before.
@@ -16,45 +22,39 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- journal exports now include your credentials and saved connections, along with your settings, app data and other journal files that were previously left out. processing logs, rebuildable indexes and caches, locks and temporary files stay out. merging keeps the receiving journal's settings and connections.
 - certificates for solstone.me and your own domain now follow the issuer's renewal schedule, including after a journal restart.
-- browser setup confirms the journal mark you see, then saves where thinking runs.
-- the reason under every thinking status now reads in plain words in the thinking app, health and `solstone journal top`, and `solstone journal top` and `solstone journal brain refresh` call it thinking, not brain. on a page opened from another device, the thinking app and health now say "your journal's computer", so it's clear which machine they mean.
-- setup commits the journal mark you see and saves your thinking choice. it opens home, with links to finish setting up your own model or confidential processing. finishing setup again keeps your completion time and settings.
+- setup confirms the journal mark you see and saves where thinking runs, then opens home, with links to finish setting up your own model or confidential processing. finishing setup again keeps your settings.
+- the status lines on home, the thinking app and health now say "thinking" where they said "processing", and say in plain words why thinking isn't set up. "processing needs a setup" is now "thinking isn't set up yet", with a reason such as "the local model isn't installed yet". a local model that has stopped now reads "local thinking isn't running". `solstone journal top` and `solstone journal brain refresh` call it thinking, not brain. on a page opened from another device, the thinking app and health now say "your journal's computer", so it's clear which machine they mean.
 - while no device is paired, home keeps "set one up →" next to anything that needs your attention. before, it disappeared whenever anything else showed, which on a new journal was almost always.
 - not having chosen where the thinking happens yet no longer counts as something that needs your attention on home. a note says your journal starts catching up once you choose, and links to the thinking app.
-- the status lines on home, the thinking app and health now say "thinking" where they said "processing", and say why thinking isn't set up in plain words. "processing needs a setup" is now "thinking isn't set up yet", with a reason such as "the local model isn't installed yet". a local model that has stopped now reads "local thinking isn't running".
 - when your journal's computer can't run local thinking, the thinking app says so in a card of its own instead of a greyed-out option.
 - the agents app now has a place in the side rail.
+- in the agents app, "your hostname" is now "your own domain" and walks you through setup. it first lists what you need: a domain whose DNS takes an A record and a CAA record, a linux server with a public IPv4 address, an SSH login with admin rights and port 443 open, and your journal's computer on and online. then it gives you one command to paste on your server, shows the two DNS records to add, and checks each step. your journal now holds the connection to your server itself, so there's no `ssh -R` to keep running, and it reconnects on its own after sleep or a network change. once your address works, it checks it from the outside, and if solstone.me is also on, it lists the agents to connect again at your domain. if you already forward port 443 yourself, that keeps working.
 - "pair a device" now asks what's joining (a phone, another computer or a terminal) and shows how that device pairs: scan the code, paste the pairing link, or save it as pairing-link.txt. the time left on the code counts down while the dialog is open, and a link that goes through your private network says the device can be anywhere.
-- when your journal is closed to devices on your network, "pair a device" says what opening it means before you choose, and on windows, that windows may ask too.
-- journal exports now keep your settings, saved connections and credentials, along with app data and other journal files that were previously left out. processing logs, rebuildable indexes and caches, locks and temporary files stay out. merging keeps the receiving journal's settings and connections.
-
-- home and your morning briefing now say "plans" for the meetings and deadlines the journal noticed in what you've shared, the same word the activities app uses.
+- when your journal is closed to devices on your network, "pair a device" says what opening it means before you choose, and that on windows, windows may also ask your permission.
+- home and your morning briefing now say "plans" where they said "anticipated activities", the same word the activities app uses.
 - when today has no activities yet, the activities app still shows today's hours, with a line at the current time.
 - the note at the top of your morning briefing says what it drew on in plain words, and names anything that was missing. it no longer counts "source paths", which always read 0.
 - the first-run setup page opens with how your journal, the solstone app and thinking fit together. its thinking section now asks where the thinking happens and says your journal stays on your computer whichever you pick.
-- a speech retry keeps going after you close the page and shows how far the download has gotten. on windows, speech that is already in the journal app needs no download, and a package that does not verify tells you to repair or reinstall the journal app and start your journal again.
+- retrying the speech model download keeps going after you close the page and shows how far the download has gotten. on windows, the speech model comes inside the journal app, so there's nothing to download, and a package that does not verify tells you to repair or reinstall the journal app and start your journal again.
 - when an activity's whole source is short and is one imported AI conversation or one line from a speaker your journal doesn't recognize, its story now quotes that source word for word. it says which messages were yours and which were your agent's, and the date each message was sent. topics and relationships are written as before, and it takes no extra request to your thinking provider. stories already written stay as they are.
 
 ### Fixed
 
-- your journal can start again after an unexpected stop, even if it had been running for days. recovery keeps its progress between startup attempts instead of starting over each time.
-
-- agent search and transcript reads now leave out deleted recordings without waiting for the search index to catch up.
 - security fix: a symbolic link in a recording's metadata could make a transcript page read time-zone information from outside your journal. those links are now refused.
+- your backup now clears older copies on schedule even after your computer's name changes, your journal moves to another folder, or you restore it onto a new computer. before, copies taken under the earlier name or folder were kept indefinitely. the first cleanup after you update removes the ones outside your retention setting. offloaded media stays as before.
+- agent search and transcript reads now leave out deleted recordings without waiting for the search index to catch up.
 - transcript reads by your agent now include the recording's reported time zone when its UTC offset differs from your journal's.
 - your agent can continue through facet and entity lists instead of stopping at the first page, and can tell when an entity description was shortened.
 - when thinking can't connect to its model, or the model answers in a way your journal can't use, the thinking app and health now say so. before, both showed "probe internal error".
 - on linux, the installer opens setup in your browser and shows where to add the solstone app. without a desktop, it prints the setup link and an SSH tunnel command for another computer.
-
-- agent reads leave out activities whose source has changed until your journal indexes them again. activity results also say whether they are hidden, even when a short preview does not.
+- agent reads leave out activities whose source has changed until your journal indexes them again.
 - transcripts warn when a sentence may contain words from more than one speaker.
 - linux: `solstone update` and the status pane now recognize installs made by the public installer.
-
 - on linux, if your journal is missing its transcription model, it now downloads the model on its own (about 1 GB) and then transcribes the recordings that were waiting. before, they waited until you ran `solstone journal install-provider parakeet`.
 - on mac, if your journal is missing its transcription model, it now downloads the model on its own (about 500 MB) and then transcribes the recordings that were waiting. before, each recording failed to transcribe, with a message telling you to run `solstone journal install-models --force --variant coreml`.
 - in the activities app, today's column now ends at the right hour, with its line at the current time. before, it ran far past the end of the day.
-- your backup now clears older copies on schedule even after your computer's name changes, your journal moves to another folder, or you restore it onto a new computer. before, copies taken under the earlier name or folder were kept indefinitely. the first cleanup after you update removes the ones outside your retention setting. offloaded media stays as before.
 - restoring your whole journal from a backup you set up in your own storage now works even after media offload has moved anything into that backup. before, the restore stopped and said "the list of backups is invalid". nothing in your backup was changed.
 - on windows, `solstone journal service stop`, `start` and `restart` work right away after you restore your journal from a backup. before, they said "your journal didn't report ready" until you restarted your computer.
 
