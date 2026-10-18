@@ -1,0 +1,1192 @@
+{
+  "about": "Invented Story source-word cases. A short activity source of a measured shape (one imported conversation, one unidentified utterance, one terminal pane) gets a body quoting every source word with its producer-recorded framing; every other case keeps the model's body and returned response byte for byte. Topics, confidence and relations are always the model's. Files are written into one segment; a string row is written as a raw line.",
+  "cases": [
+    {
+      "name": "imported_messages_keep_their_authors_and_message_dates",
+      "talent": "conversation",
+      "activity_kind": "messaging",
+      "stream": "import.chatgpt",
+      "files": {
+        "conversation_transcript.jsonl": [
+          {
+            "imported": {
+              "id": "invented-fixture"
+            }
+          },
+          {
+            "start": "00:00:00",
+            "speaker": "You",
+            "text": "I signed the Cedar agreement on 1994-04-03. Do not use today's message date as the signing date.",
+            "source": "import",
+            "source_ms": 1767258000000
+          },
+          {
+            "start": "00:00:01",
+            "speaker": "Assistant",
+            "text": "I have not obtained a copy of the signed agreement.",
+            "source": "import",
+            "source_ms": 1767258001000
+          }
+        ]
+      },
+      "response": {
+        "body": "You recorded signing the Cedar agreement today.",
+        "topics": [
+          "Cedar agreement"
+        ],
+        "confidence": 0.95,
+        "relations": []
+      },
+      "expect": {
+        "body": "You said in a message dated 2026-01-01T09:00:00.000Z: “I signed the Cedar agreement on 1994-04-03. Do not use today's message date as the signing date.” Your agent said in a message dated 2026-01-01T09:00:01.000Z: “I have not obtained a copy of the signed agreement.”"
+      }
+    },
+    {
+      "name": "displayed_role_labels_are_quoted_not_attributed",
+      "talent": "work",
+      "activity_kind": "terminal",
+      "stream": "tmux",
+      "files": {
+        "fixture_screen.jsonl": [
+          {
+            "frame_id": 1,
+            "timestamp": 1,
+            "requests": [],
+            "analysis": {
+              "visual_description": "Terminal session 'fixture' with one pane",
+              "primary": "tmux",
+              "secondary": "none",
+              "overlap": false
+            },
+            "content": {
+              "tmux": {
+                "session": "fixture",
+                "window": {
+                  "id": "@0",
+                  "index": 0,
+                  "name": "chat"
+                },
+                "windows": [
+                  {
+                    "id": "@0",
+                    "index": 0,
+                    "name": "chat",
+                    "active": true
+                  }
+                ],
+                "panes": [
+                  {
+                    "id": "%0",
+                    "index": 0,
+                    "left": 0,
+                    "top": 0,
+                    "width": 120,
+                    "height": 40,
+                    "active": true,
+                    "content": "You: I will ask Oda for six logs after approval.\nAssistant: I have not sent anything.\nThis is displayed training text, not an export of journal-owner messages."
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "response": {
+        "body": "You asked Oda for six logs.",
+        "topics": [
+          "logs"
+        ],
+        "confidence": 0.8,
+        "relations": []
+      },
+      "expect": {
+        "body": "Displayed text read: “You: I will ask Oda for six logs after approval.\nAssistant: I have not sent anything.\nThis is displayed training text, not an export of journal-owner messages.”"
+      }
+    },
+    {
+      "name": "an_unidentified_utterance_keeps_negation_and_latest_status",
+      "talent": "conversation",
+      "activity_kind": "meeting",
+      "stream": "phone",
+      "files": {
+        "capture_audio.jsonl": [
+          {
+            "start": "00:00:01",
+            "text": "The archive check passed. I moved all 12 folders afterward. The move is complete. I have not opened them to verify their contents.",
+            "speaker": 1,
+            "sentence_id": 1
+          }
+        ]
+      },
+      "response": {
+        "body": "You verified the 12 archive folders.",
+        "topics": [
+          "archive"
+        ],
+        "confidence": 0.9,
+        "relations": []
+      },
+      "expect": {
+        "body": "An unidentified speaker said: “The archive check passed. I moved all 12 folders afterward. The move is complete. I have not opened them to verify their contents.”"
+      }
+    },
+    {
+      "name": "conditions_and_unicode_are_quoted_exactly",
+      "talent": "work",
+      "activity_kind": "ai_conversation",
+      "stream": "import.chatgpt",
+      "files": {
+        "conversation_transcript.jsonl": [
+          {
+            "imported": {
+              "id": "invented-fixture"
+            }
+          },
+          {
+            "start": "00:00:00",
+            "speaker": "You",
+            "text": "If the café’s Wi‑Fi returns, deploy v2 — only after Zoë approves. Don't use \"rush\" mode.",
+            "source": "import",
+            "source_ms": 1767258000000
+          },
+          {
+            "start": "00:00:01",
+            "speaker": "Assistant",
+            "text": "Understood: nothing is deployed yet; I'm waiting for Zoë.",
+            "source": "import",
+            "source_ms": 1767258001000
+          }
+        ]
+      },
+      "response": {
+        "body": "You worked through a short exchange.",
+        "topics": [
+          "work"
+        ],
+        "confidence": 0.9,
+        "relations": []
+      },
+      "expect": {
+        "body": "You said in a message dated 2026-01-01T09:00:00.000Z: “If the café’s Wi‑Fi returns, deploy v2 — only after Zoë approves. Don't use \"rush\" mode.” Your agent said in a message dated 2026-01-01T09:00:01.000Z: “Understood: nothing is deployed yet; I'm waiting for Zoë.”"
+      }
+    },
+    {
+      "name": "a_corrected_line_is_quoted_as_corrected",
+      "talent": "conversation",
+      "activity_kind": "meeting",
+      "stream": "phone",
+      "files": {
+        "capture_audio.jsonl": [
+          {
+            "start": "00:00:01",
+            "text": "We shipped the burch build.",
+            "corrected": "We shipped the Birch build.",
+            "speaker": 2,
+            "sentence_id": 1
+          }
+        ]
+      },
+      "response": {
+        "body": "You worked through a short exchange.",
+        "topics": [
+          "work"
+        ],
+        "confidence": 0.9,
+        "relations": []
+      },
+      "expect": {
+        "body": "An unidentified speaker said: “We shipped the Birch build.”"
+      }
+    },
+    {
+      "name": "every_relation_kind_topic_and_confidence_survive",
+      "talent": "conversation",
+      "activity_kind": "messaging",
+      "stream": "import.chatgpt",
+      "files": {
+        "conversation_transcript.jsonl": [
+          {
+            "imported": {
+              "id": "invented-fixture"
+            }
+          },
+          {
+            "start": "00:00:00",
+            "speaker": "You",
+            "text": "I signed the Cedar agreement on 1994-04-03. Do not use today's message date as the signing date.",
+            "source": "import",
+            "source_ms": 1767258000000
+          },
+          {
+            "start": "00:00:01",
+            "speaker": "Assistant",
+            "text": "I have not obtained a copy of the signed agreement.",
+            "source": "import",
+            "source_ms": 1767258001000
+          }
+        ]
+      },
+      "response": {
+        "body": "Oda and Rhee signed the lease.",
+        "topics": [
+          "Cedar Agreement",
+          "cedar agreement",
+          " Lease "
+        ],
+        "confidence": 1.4,
+        "relations": [
+          {
+            "from": "Oda",
+            "to": "Rhee",
+            "kind": "works-with",
+            "note": "",
+            "quote": "Oda and Rhee"
+          },
+          {
+            "from": "Oda",
+            "to": "Cedar Labs",
+            "kind": "works-at",
+            "note": "",
+            "quote": "at Cedar Labs"
+          },
+          {
+            "from": "Rhee",
+            "to": "Mara Quill",
+            "kind": "reports-to",
+            "note": "",
+            "quote": "reports to Mara"
+          },
+          {
+            "from": "Oda",
+            "to": "Tamsin",
+            "kind": "family-of",
+            "note": "sister",
+            "quote": "her sister"
+          },
+          {
+            "from": "Rhee",
+            "to": "Tamsin",
+            "kind": "knows",
+            "note": "",
+            "quote": "knows Tamsin"
+          },
+          {
+            "from": "Oda",
+            "to": "Ledgerline",
+            "kind": "uses",
+            "note": "",
+            "quote": "uses Ledgerline"
+          },
+          {
+            "from": "Rhee",
+            "to": "Archive Tool",
+            "kind": "created",
+            "note": "",
+            "quote": "built the tool"
+          },
+          {
+            "from": "Oda",
+            "to": "Rhee",
+            "kind": "other",
+            "note": "co-signed the lease",
+            "quote": "co-signed"
+          }
+        ]
+      },
+      "expect": {
+        "body": "You said in a message dated 2026-01-01T09:00:00.000Z: “I signed the Cedar agreement on 1994-04-03. Do not use today's message date as the signing date.” Your agent said in a message dated 2026-01-01T09:00:01.000Z: “I have not obtained a copy of the signed agreement.”"
+      }
+    },
+    {
+      "name": "an_explicitly_whole_request_is_quoted",
+      "talent": "conversation",
+      "activity_kind": "messaging",
+      "stream": "import.chatgpt",
+      "files": {
+        "conversation_transcript.jsonl": [
+          {
+            "imported": {
+              "id": "invented-fixture"
+            }
+          },
+          {
+            "start": "00:00:00",
+            "speaker": "You",
+            "text": "I signed the Cedar agreement on 1994-04-03. Do not use today's message date as the signing date.",
+            "source": "import",
+            "source_ms": 1767258000000
+          },
+          {
+            "start": "00:00:01",
+            "speaker": "Assistant",
+            "text": "I have not obtained a copy of the signed agreement.",
+            "source": "import",
+            "source_ms": 1767258001000
+          }
+        ]
+      },
+      "response": {
+        "body": "You worked through a short exchange.",
+        "topics": [
+          "work"
+        ],
+        "confidence": 0.9,
+        "relations": []
+      },
+      "expect": {
+        "body": "You said in a message dated 2026-01-01T09:00:00.000Z: “I signed the Cedar agreement on 1994-04-03. Do not use today's message date as the signing date.” Your agent said in a message dated 2026-01-01T09:00:01.000Z: “I have not obtained a copy of the signed agreement.”"
+      },
+      "input_budget": {
+        "clipped": false,
+        "dropped_chars": 0,
+        "dropped_entries": 0,
+        "budget_tokens": 4096
+      }
+    },
+    {
+      "name": "a_clipped_request_keeps_the_model_body",
+      "talent": "conversation",
+      "activity_kind": "messaging",
+      "stream": "import.chatgpt",
+      "files": {
+        "conversation_transcript.jsonl": [
+          {
+            "imported": {
+              "id": "invented-fixture"
+            }
+          },
+          {
+            "start": "00:00:00",
+            "speaker": "You",
+            "text": "I signed the Cedar agreement on 1994-04-03. Do not use today's message date as the signing date.",
+            "source": "import",
+            "source_ms": 1767258000000
+          },
+          {
+            "start": "00:00:01",
+            "speaker": "Assistant",
+            "text": "I have not obtained a copy of the signed agreement.",
+            "source": "import",
+            "source_ms": 1767258001000
+          }
+        ]
+      },
+      "response": {
+        "body": "You worked through a short exchange.",
+        "topics": [
+          "work"
+        ],
+        "confidence": 0.9,
+        "relations": []
+      },
+      "expect": {
+        "ordinary": true,
+        "partial": true
+      },
+      "input_budget": {
+        "clipped": true,
+        "dropped_chars": 900,
+        "dropped_entries": 1,
+        "budget_tokens": 1024
+      }
+    },
+    {
+      "name": "an_unreadable_budget_keeps_the_model_body",
+      "talent": "conversation",
+      "activity_kind": "messaging",
+      "stream": "import.chatgpt",
+      "files": {
+        "conversation_transcript.jsonl": [
+          {
+            "imported": {
+              "id": "invented-fixture"
+            }
+          },
+          {
+            "start": "00:00:00",
+            "speaker": "You",
+            "text": "I signed the Cedar agreement on 1994-04-03. Do not use today's message date as the signing date.",
+            "source": "import",
+            "source_ms": 1767258000000
+          },
+          {
+            "start": "00:00:01",
+            "speaker": "Assistant",
+            "text": "I have not obtained a copy of the signed agreement.",
+            "source": "import",
+            "source_ms": 1767258001000
+          }
+        ]
+      },
+      "response": {
+        "body": "You worked through a short exchange.",
+        "topics": [
+          "work"
+        ],
+        "confidence": 0.9,
+        "relations": []
+      },
+      "expect": {
+        "ordinary": true
+      },
+      "input_budget": {
+        "clipped": "no"
+      }
+    },
+    {
+      "name": "a_curly_quote_in_the_source_keeps_the_model_body",
+      "talent": "conversation",
+      "activity_kind": "messaging",
+      "stream": "import.chatgpt",
+      "files": {
+        "conversation_transcript.jsonl": [
+          {
+            "imported": {
+              "id": "invented-fixture"
+            }
+          },
+          {
+            "start": "00:00:00",
+            "speaker": "You",
+            "text": "Call it the “Cedar” deal.",
+            "source": "import",
+            "source_ms": 1767258000000
+          }
+        ]
+      },
+      "response": {
+        "body": "You worked through a short exchange.",
+        "topics": [
+          "work"
+        ],
+        "confidence": 0.9,
+        "relations": []
+      },
+      "expect": {
+        "ordinary": true
+      }
+    },
+    {
+      "name": "a_message_over_the_quote_bound_keeps_the_model_body",
+      "talent": "conversation",
+      "activity_kind": "messaging",
+      "stream": "import.chatgpt",
+      "files": {
+        "conversation_transcript.jsonl": [
+          {
+            "imported": {
+              "id": "invented-fixture"
+            }
+          },
+          {
+            "start": "00:00:00",
+            "speaker": "You",
+            "text": "The Birch ledger stays closed until Friday. The Birch ledger stays closed until Friday. The Birch ledger stays closed until Friday. The Birch ledger stays closed until Friday. The Birch ledger stays closed until Friday. The Birch ledger stays closed until Friday. The Birch ledger stays closed until Friday. The Birch ledger stays closed until Friday. The Birch ledger stays closed until Friday. The B",
+            "source": "import",
+            "source_ms": 1767258000000
+          }
+        ]
+      },
+      "response": {
+        "body": "You worked through a short exchange.",
+        "topics": [
+          "work"
+        ],
+        "confidence": 0.9,
+        "relations": []
+      },
+      "expect": {
+        "ordinary": true
+      }
+    },
+    {
+      "name": "a_body_over_its_bound_keeps_the_model_body",
+      "talent": "conversation",
+      "activity_kind": "messaging",
+      "stream": "import.chatgpt",
+      "files": {
+        "conversation_transcript.jsonl": [
+          {
+            "imported": {
+              "id": "invented-fixture"
+            }
+          },
+          {
+            "start": "00:00:00",
+            "speaker": "You",
+            "text": "Line 00 of the Maple review is still pending and nothing has shipped. Line 00 of the Maple review is still pending and nothing has shipped. Line 00 of the Maple review is still pending and nothing has shipped. Line 00 of the Maple review is still pending and nothing has shipped. Line 00 of the Maple review is still pending and nothing has shipped. Line 00 of the Maple review is",
+            "source": "import",
+            "source_ms": 1767258000000
+          },
+          {
+            "start": "00:00:01",
+            "speaker": "Assistant",
+            "text": "Line 01 of the Maple review is still pending and nothing has shipped. Line 01 of the Maple review is still pending and nothing has shipped. Line 01 of the Maple review is still pending and nothing has shipped. Line 01 of the Maple review is still pending and nothing has shipped. Line 01 of the Maple review is still pending and nothing has shipped. Line 01 of the Maple review is",
+            "source": "import",
+            "source_ms": 1767258001000
+          },
+          {
+            "start": "00:00:02",
+            "speaker": "You",
+            "text": "Line 02 of the Maple review is still pending and nothing has shipped. Line 02 of the Maple review is still pending and nothing has shipped. Line 02 of the Maple review is still pending and nothing has shipped. Line 02 of the Maple review is still pending and nothing has shipped. Line 02 of the Maple review is still pending and nothing has shipped. Line 02 of the Maple review is",
+            "source": "import",
+            "source_ms": 1767258002000
+          },
+          {
+            "start": "00:00:03",
+            "speaker": "Assistant",
+            "text": "Line 03 of the Maple review is still pending and nothing has shipped. Line 03 of the Maple review is still pending and nothing has shipped. Line 03 of the Maple review is still pending and nothing has shipped. Line 03 of the Maple review is still pending and nothing has shipped. Line 03 of the Maple review is still pending and nothing has shipped. Line 03 of the Maple review is",
+            "source": "import",
+            "source_ms": 1767258003000
+          },
+          {
+            "start": "00:00:04",
+            "speaker": "You",
+            "text": "Line 04 of the Maple review is still pending and nothing has shipped. Line 04 of the Maple review is still pending and nothing has shipped. Line 04 of the Maple review is still pending and nothing has shipped. Line 04 of the Maple review is still pending and nothing has shipped. Line 04 of the Maple review is still pending and nothing has shipped. Line 04 of the Maple review is",
+            "source": "import",
+            "source_ms": 1767258004000
+          },
+          {
+            "start": "00:00:05",
+            "speaker": "Assistant",
+            "text": "Line 05 of the Maple review is still pending and nothing has shipped. Line 05 of the Maple review is still pending and nothing has shipped. Line 05 of the Maple review is still pending and nothing has shipped. Line 05 of the Maple review is still pending and nothing has shipped. Line 05 of the Maple review is still pending and nothing has shipped. Line 05 of the Maple review is",
+            "source": "import",
+            "source_ms": 1767258005000
+          },
+          {
+            "start": "00:00:06",
+            "speaker": "You",
+            "text": "Line 06 of the Maple review is still pending and nothing has shipped. Line 06 of the Maple review is still pending and nothing has shipped. Line 06 of the Maple review is still pending and nothing has shipped. Line 06 of the Maple review is still pending and nothing has shipped. Line 06 of the Maple review is still pending and nothing has shipped. Line 06 of the Maple review is",
+            "source": "import",
+            "source_ms": 1767258006000
+          },
+          {
+            "start": "00:00:07",
+            "speaker": "Assistant",
+            "text": "Line 07 of the Maple review is still pending and nothing has shipped. Line 07 of the Maple review is still pending and nothing has shipped. Line 07 of the Maple review is still pending and nothing has shipped. Line 07 of the Maple review is still pending and nothing has shipped. Line 07 of the Maple review is still pending and nothing has shipped. Line 07 of the Maple review is",
+            "source": "import",
+            "source_ms": 1767258007000
+          },
+          {
+            "start": "00:00:08",
+            "speaker": "You",
+            "text": "Line 08 of the Maple review is still pending and nothing has shipped. Line 08 of the Maple review is still pending and nothing has shipped. Line 08 of the Maple review is still pending and nothing has shipped. Line 08 of the Maple review is still pending and nothing has shipped. Line 08 of the Maple review is still pending and nothing has shipped. Line 08 of the Maple review is",
+            "source": "import",
+            "source_ms": 1767258008000
+          },
+          {
+            "start": "00:00:09",
+            "speaker": "Assistant",
+            "text": "Line 09 of the Maple review is still pending and nothing has shipped. Line 09 of the Maple review is still pending and nothing has shipped. Line 09 of the Maple review is still pending and nothing has shipped. Line 09 of the Maple review is still pending and nothing has shipped. Line 09 of the Maple review is still pending and nothing has shipped. Line 09 of the Maple review is",
+            "source": "import",
+            "source_ms": 1767258009000
+          },
+          {
+            "start": "00:00:10",
+            "speaker": "You",
+            "text": "Line 10 of the Maple review is still pending and nothing has shipped. Line 10 of the Maple review is still pending and nothing has shipped. Line 10 of the Maple review is still pending and nothing has shipped. Line 10 of the Maple review is still pending and nothing has shipped. Line 10 of the Maple review is still pending and nothing has shipped. Line 10 of the Maple review is",
+            "source": "import",
+            "source_ms": 1767258010000
+          },
+          {
+            "start": "00:00:11",
+            "speaker": "Assistant",
+            "text": "Line 11 of the Maple review is still pending and nothing has shipped. Line 11 of the Maple review is still pending and nothing has shipped. Line 11 of the Maple review is still pending and nothing has shipped. Line 11 of the Maple review is still pending and nothing has shipped. Line 11 of the Maple review is still pending and nothing has shipped. Line 11 of the Maple review is",
+            "source": "import",
+            "source_ms": 1767258011000
+          }
+        ]
+      },
+      "response": {
+        "body": "You worked through a short exchange.",
+        "topics": [
+          "work"
+        ],
+        "confidence": 0.9,
+        "relations": []
+      },
+      "expect": {
+        "ordinary": true
+      }
+    },
+    {
+      "name": "an_unrecognized_import_author_keeps_the_model_body",
+      "talent": "conversation",
+      "activity_kind": "messaging",
+      "stream": "import.chatgpt",
+      "files": {
+        "conversation_transcript.jsonl": [
+          {
+            "imported": {
+              "id": "invented-fixture"
+            }
+          },
+          {
+            "start": "00:00:00",
+            "speaker": "Unknown",
+            "text": "The Cedar copy is missing.",
+            "source": "import",
+            "source_ms": 1767258000000
+          }
+        ]
+      },
+      "response": {
+        "body": "You worked through a short exchange.",
+        "topics": [
+          "work"
+        ],
+        "confidence": 0.9,
+        "relations": []
+      },
+      "expect": {
+        "ordinary": true
+      }
+    },
+    {
+      "name": "a_message_without_an_integer_date_keeps_the_model_body",
+      "talent": "conversation",
+      "activity_kind": "messaging",
+      "stream": "import.chatgpt",
+      "files": {
+        "conversation_transcript.jsonl": [
+          {
+            "imported": {
+              "id": "invented-fixture"
+            }
+          },
+          {
+            "start": "00:00:00",
+            "speaker": "You",
+            "text": "The Cedar copy is missing.",
+            "source": "import",
+            "source_ms": 1767258000000.5
+          }
+        ]
+      },
+      "response": {
+        "body": "You worked through a short exchange.",
+        "topics": [
+          "work"
+        ],
+        "confidence": 0.9,
+        "relations": []
+      },
+      "expect": {
+        "ordinary": true
+      }
+    },
+    {
+      "name": "an_unreadable_line_keeps_the_model_body",
+      "talent": "conversation",
+      "activity_kind": "messaging",
+      "stream": "import.chatgpt",
+      "files": {
+        "conversation_transcript.jsonl": [
+          {
+            "imported": {
+              "id": "invented-fixture"
+            }
+          },
+          {
+            "start": "00:00:00",
+            "speaker": "You",
+            "text": "I signed the Cedar agreement on 1994-04-03. Do not use today's message date as the signing date.",
+            "source": "import",
+            "source_ms": 1767258000000
+          },
+          {
+            "start": "00:00:01",
+            "speaker": "Assistant",
+            "text": "I have not obtained a copy of the signed agreement.",
+            "source": "import",
+            "source_ms": 1767258001000
+          },
+          "{not json"
+        ]
+      },
+      "response": {
+        "body": "You worked through a short exchange.",
+        "topics": [
+          "work"
+        ],
+        "confidence": 0.9,
+        "relations": []
+      },
+      "expect": {
+        "ordinary": true
+      }
+    },
+    {
+      "name": "a_record_the_transcript_does_not_show_keeps_the_model_body",
+      "talent": "conversation",
+      "activity_kind": "messaging",
+      "stream": "import.chatgpt",
+      "files": {
+        "conversation_transcript.jsonl": [
+          {
+            "imported": {
+              "id": "invented-fixture"
+            }
+          },
+          {
+            "start": "00:00:00",
+            "speaker": "You",
+            "text": "I signed the Cedar agreement on 1994-04-03. Do not use today's message date as the signing date.",
+            "source": "import",
+            "source_ms": 1767258000000
+          },
+          {
+            "start": "00:00:01",
+            "speaker": "Assistant",
+            "text": "I have not obtained a copy of the signed agreement.",
+            "source": "import",
+            "source_ms": 1767258001000
+          },
+          {
+            "speaker": "You",
+            "text": "A private line with no start.",
+            "source": "import",
+            "source_ms": 1767258002000
+          }
+        ]
+      },
+      "response": {
+        "body": "You worked through a short exchange.",
+        "topics": [
+          "work"
+        ],
+        "confidence": 0.9,
+        "relations": []
+      },
+      "expect": {
+        "ordinary": true
+      }
+    },
+    {
+      "name": "a_named_speaker_keeps_the_model_body",
+      "talent": "conversation",
+      "activity_kind": "meeting",
+      "stream": "phone",
+      "files": {
+        "capture_audio.jsonl": [
+          {
+            "start": "00:00:01",
+            "text": "The Birch build shipped.",
+            "speaker": "Priya",
+            "sentence_id": 1
+          }
+        ]
+      },
+      "response": {
+        "body": "You worked through a short exchange.",
+        "topics": [
+          "work"
+        ],
+        "confidence": 0.9,
+        "relations": []
+      },
+      "expect": {
+        "ordinary": true
+      }
+    },
+    {
+      "name": "two_utterances_keep_the_model_body",
+      "talent": "conversation",
+      "activity_kind": "meeting",
+      "stream": "phone",
+      "files": {
+        "capture_audio.jsonl": [
+          {
+            "start": "00:00:01",
+            "text": "The Birch build shipped.",
+            "speaker": 1,
+            "sentence_id": 1
+          },
+          {
+            "start": "00:00:04",
+            "text": "It has not been announced.",
+            "speaker": 2,
+            "sentence_id": 2
+          }
+        ]
+      },
+      "response": {
+        "body": "You worked through a short exchange.",
+        "topics": [
+          "work"
+        ],
+        "confidence": 0.9,
+        "relations": []
+      },
+      "expect": {
+        "ordinary": true
+      }
+    },
+    {
+      "name": "an_emotion_note_keeps_the_model_body",
+      "talent": "conversation",
+      "activity_kind": "meeting",
+      "stream": "phone",
+      "files": {
+        "capture_audio.jsonl": [
+          {
+            "start": "00:00:01",
+            "text": "The Birch build shipped.",
+            "speaker": 1,
+            "sentence_id": 1,
+            "emotion": "excited"
+          }
+        ]
+      },
+      "response": {
+        "body": "You worked through a short exchange.",
+        "topics": [
+          "work"
+        ],
+        "confidence": 0.9,
+        "relations": []
+      },
+      "expect": {
+        "ordinary": true
+      }
+    },
+    {
+      "name": "two_panes_keep_the_model_body",
+      "talent": "work",
+      "activity_kind": "terminal",
+      "stream": "tmux",
+      "files": {
+        "fixture_screen.jsonl": [
+          {
+            "frame_id": 1,
+            "timestamp": 1,
+            "requests": [],
+            "analysis": {
+              "visual_description": "Terminal session 'fixture' with one pane",
+              "primary": "tmux",
+              "secondary": "none",
+              "overlap": false
+            },
+            "content": {
+              "tmux": {
+                "session": "fixture",
+                "window": {
+                  "id": "@0",
+                  "index": 0,
+                  "name": "chat"
+                },
+                "windows": [
+                  {
+                    "id": "@0",
+                    "index": 0,
+                    "name": "chat",
+                    "active": true
+                  }
+                ],
+                "panes": [
+                  {
+                    "id": "%0",
+                    "index": 0,
+                    "left": 0,
+                    "top": 0,
+                    "width": 120,
+                    "height": 40,
+                    "active": true,
+                    "content": "left pane text"
+                  },
+                  {
+                    "id": "%1",
+                    "index": 1,
+                    "left": 0,
+                    "top": 0,
+                    "width": 120,
+                    "height": 40,
+                    "active": false,
+                    "content": "right pane text"
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "response": {
+        "body": "You worked through a short exchange.",
+        "topics": [
+          "work"
+        ],
+        "confidence": 0.9,
+        "relations": []
+      },
+      "expect": {
+        "ordinary": true
+      }
+    },
+    {
+      "name": "terminal_control_codes_keep_the_model_body",
+      "talent": "work",
+      "activity_kind": "terminal",
+      "stream": "tmux",
+      "files": {
+        "fixture_screen.jsonl": [
+          {
+            "frame_id": 1,
+            "timestamp": 1,
+            "requests": [],
+            "analysis": {
+              "visual_description": "Terminal session 'fixture' with one pane",
+              "primary": "tmux",
+              "secondary": "none",
+              "overlap": false
+            },
+            "content": {
+              "tmux": {
+                "session": "fixture",
+                "window": {
+                  "id": "@0",
+                  "index": 0,
+                  "name": "chat"
+                },
+                "windows": [
+                  {
+                    "id": "@0",
+                    "index": 0,
+                    "name": "chat",
+                    "active": true
+                  }
+                ],
+                "panes": [
+                  {
+                    "id": "%0",
+                    "index": 0,
+                    "left": 0,
+                    "top": 0,
+                    "width": 120,
+                    "height": 40,
+                    "active": true,
+                    "content": "\u001b[31mFAILED\u001b[0m build 41"
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "response": {
+        "body": "You worked through a short exchange.",
+        "topics": [
+          "work"
+        ],
+        "confidence": 0.9,
+        "relations": []
+      },
+      "expect": {
+        "ordinary": true
+      }
+    },
+    {
+      "name": "two_sources_keep_the_model_body",
+      "talent": "conversation",
+      "activity_kind": "messaging",
+      "stream": "import.chatgpt",
+      "files": {
+        "conversation_transcript.jsonl": [
+          {
+            "imported": {
+              "id": "invented-fixture"
+            }
+          },
+          {
+            "start": "00:00:00",
+            "speaker": "You",
+            "text": "I signed the Cedar agreement on 1994-04-03. Do not use today's message date as the signing date.",
+            "source": "import",
+            "source_ms": 1767258000000
+          },
+          {
+            "start": "00:00:01",
+            "speaker": "Assistant",
+            "text": "I have not obtained a copy of the signed agreement.",
+            "source": "import",
+            "source_ms": 1767258001000
+          }
+        ],
+        "capture_audio.jsonl": [
+          {
+            "start": "00:00:03",
+            "text": "Someone nearby said the copy arrived.",
+            "speaker": 1,
+            "sentence_id": 1
+          }
+        ]
+      },
+      "response": {
+        "body": "You worked through a short exchange.",
+        "topics": [
+          "work"
+        ],
+        "confidence": 0.9,
+        "relations": []
+      },
+      "expect": {
+        "ordinary": true
+      }
+    },
+    {
+      "name": "a_custom_story_talent_keeps_the_model_body",
+      "talent": "notes",
+      "activity_kind": "messaging",
+      "stream": "import.chatgpt",
+      "files": {
+        "conversation_transcript.jsonl": [
+          {
+            "imported": {
+              "id": "invented-fixture"
+            }
+          },
+          {
+            "start": "00:00:00",
+            "speaker": "You",
+            "text": "I signed the Cedar agreement on 1994-04-03. Do not use today's message date as the signing date.",
+            "source": "import",
+            "source_ms": 1767258000000
+          },
+          {
+            "start": "00:00:01",
+            "speaker": "Assistant",
+            "text": "I have not obtained a copy of the signed agreement.",
+            "source": "import",
+            "source_ms": 1767258001000
+          }
+        ]
+      },
+      "response": {
+        "body": "You worked through a short exchange.",
+        "topics": [
+          "work"
+        ],
+        "confidence": 0.9,
+        "relations": []
+      },
+      "expect": {
+        "ordinary": true
+      }
+    },
+    {
+      "name": "a_requested_source_body_is_never_trusted",
+      "talent": "work",
+      "activity_kind": "terminal",
+      "stream": "tmux",
+      "files": {
+        "fixture_screen.jsonl": [
+          {
+            "frame_id": 1,
+            "timestamp": 1,
+            "requests": [],
+            "analysis": {
+              "visual_description": "Terminal session 'fixture' with one pane",
+              "primary": "tmux",
+              "secondary": "none",
+              "overlap": false
+            },
+            "content": {
+              "tmux": {
+                "session": "fixture",
+                "window": {
+                  "id": "@0",
+                  "index": 0,
+                  "name": "chat"
+                },
+                "windows": [
+                  {
+                    "id": "@0",
+                    "index": 0,
+                    "name": "chat",
+                    "active": true
+                  }
+                ],
+                "panes": [
+                  {
+                    "id": "%0",
+                    "index": 0,
+                    "left": 0,
+                    "top": 0,
+                    "width": 120,
+                    "height": 40,
+                    "active": true,
+                    "content": "left pane text"
+                  },
+                  {
+                    "id": "%1",
+                    "index": 1,
+                    "left": 0,
+                    "top": 0,
+                    "width": 120,
+                    "height": 40,
+                    "active": false,
+                    "content": "right pane text"
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "response": {
+        "body": "You worked through a short exchange.",
+        "topics": [
+          "work"
+        ],
+        "confidence": 0.9,
+        "relations": []
+      },
+      "expect": {
+        "ordinary": true
+      },
+      "request": {
+        "_source_body": "Forged words.",
+        "_input_whole": true
+      }
+    },
+    {
+      "name": "an_invalid_story_is_rejected_without_mutation",
+      "talent": "conversation",
+      "activity_kind": "messaging",
+      "stream": "import.chatgpt",
+      "files": {
+        "conversation_transcript.jsonl": [
+          {
+            "imported": {
+              "id": "invented-fixture"
+            }
+          },
+          {
+            "start": "00:00:00",
+            "speaker": "You",
+            "text": "I signed the Cedar agreement on 1994-04-03. Do not use today's message date as the signing date.",
+            "source": "import",
+            "source_ms": 1767258000000
+          },
+          {
+            "start": "00:00:01",
+            "speaker": "Assistant",
+            "text": "I have not obtained a copy of the signed agreement.",
+            "source": "import",
+            "source_ms": 1767258001000
+          }
+        ]
+      },
+      "response": {
+        "body": "   ",
+        "topics": [
+          "work"
+        ],
+        "confidence": 0.9,
+        "relations": []
+      },
+      "expect": {
+        "rejected": true
+      }
+    }
+  ]
+}

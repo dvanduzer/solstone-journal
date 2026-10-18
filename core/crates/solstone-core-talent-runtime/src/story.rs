@@ -2,7 +2,7 @@
 // Copyright (c) 2026 sol pbc
 
 use serde_json::{Map, Value, json};
-use solstone_core_transcripts::VoiceNames;
+use solstone_core_transcripts::{EntrySource, VoiceNames};
 
 use crate::contract::{CommitPlan, ParsedOutput, PrePostState};
 use crate::{AGENT_ACTOR, NamedActor, PreparedTalent, StageError, UNKNOWN_ACTOR, stage_error};
@@ -17,6 +17,192 @@ pub(crate) const RELATIONS: &[&str] = &[
     "created",
     "other",
 ];
+
+/// Runtime-owned config key: a Story body made of the activity's own source
+/// words, set at preparation when [`source_body`] admits its source.
+pub(crate) const SOURCE_BODY_KEY: &str = "_source_body";
+/// Runtime-owned config key: the response says its request reached the model
+/// whole, with nothing fitted away.
+pub(crate) const INPUT_WHOLE_KEY: &str = "_input_whole";
+
+/// The built-in Story talents whose source-word body was measured.
+const SOURCE_BODY_TALENTS: &[&str] = &["work", "conversation"];
+const MAX_QUOTE_CHARS: usize = 400;
+const MAX_SOURCE_BODY_CHARS: usize = 4_000;
+
+/// A Story body that quotes every word of a short activity source, framed by
+/// who the producer says wrote or said it: one imported conversation, one
+/// utterance by an unidentified speaker, or one terminal pane. `None` for any
+/// other talent or source, which keeps the model's own body.
+pub(crate) fn source_body(
+    name: &str,
+    config: &Map<String, Value>,
+    sources: &[Option<EntrySource>],
+) -> Option<String> {
+    if !SOURCE_BODY_TALENTS.contains(&name) || config.contains_key("messages") {
+        return None;
+    }
+    let hook = config.get("hook")?.as_object()?;
+    if hook.len() != 1 || hook.get("post")?.as_str()? != "story" {
+        return None;
+    }
+    let transcript = config.get("transcript")?.as_str()?;
+    let [Some(source)] = sources else {
+        return None;
+    };
+    // Every line of the file is one the model reads.
+    if source.unparsed_lines != 0
+        || !source
+            .chunks
+            .iter()
+            .all(|(rendered, _)| transcript.contains(rendered.as_str()))
+    {
+        return None;
+    }
+    let quotes = quoted_lines(source)?;
+    let mut body = Vec::with_capacity(quotes.len());
+    for (framing, text) in quotes {
+        let text = text.trim();
+        if text.is_empty()
+            || text.chars().count() > MAX_QUOTE_CHARS
+            || text
+                .chars()
+                .any(|c| c == '“' || c == '”' || (c.is_control() && c != '\n'))
+        {
+            return None;
+        }
+        body.push(format!("{framing}: “{text}”"));
+    }
+    let body = body.join(" ");
+    (body.chars().count() <= MAX_SOURCE_BODY_CHARS).then_some(body)
+}
+
+/// Each rendered line's framing and source words, or `None` when the file is
+/// not exactly one of the measured shapes.
+fn quoted_lines(source: &EntrySource) -> Option<Vec<(String, &str)>> {
+    let stream = source.stream.as_deref().unwrap_or_default();
+    // The line rendered from this record, at this position.
+    let rendered = |index: usize, record: &Map<String, Value>| -> Option<&str> {
+        let (text, from) = source.chunks.get(index)?;
+        (from == record).then_some(text.as_str())
+    };
+    if stream.starts_with("import.") {
+        // The conversation importer writes the owner's messages as "You".
+        if source.file != "conversation_transcript.jsonl" {
+            return None;
+        }
+        let (header, messages) = source.records.split_first()?;
+        if header.contains_key("start")
+            || !header.get("imported").is_some_and(Value::is_object)
+            || header.keys().any(|key| key != "imported" && key != "model")
+            || messages.is_empty()
+            || messages.len() != source.chunks.len()
+        {
+            return None;
+        }
+        messages
+            .iter()
+            .enumerate()
+            .map(|(index, record)| {
+                let speaker = record.get("speaker")?.as_str()?;
+                let framing = match speaker {
+                    "You" => "You said",
+                    "Assistant" => "Your agent said",
+                    _ => return None,
+                };
+                let start = record.get("start")?.as_str()?;
+                let text = shown_text(record)?;
+                if record.get("source")?.as_str()? != "import"
+                    || rendered(index, record)? != format!("[{start}] (import) {speaker}: {text}")
+                {
+                    return None;
+                }
+                let sent = record
+                    .get("source_ms")?
+                    .as_i64()
+                    .filter(|ms| *ms >= 0)
+                    .and_then(chrono::DateTime::from_timestamp_millis)?
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                Some((format!("{framing} in a message dated {sent}"), text))
+            })
+            .collect()
+    } else if source.file.ends_with("audio.jsonl") {
+        let [record] = source.records.as_slice() else {
+            return None;
+        };
+        // A speaker the journal recognizes is named, not numbered.
+        let Some(Value::Number(speaker)) = record.get("speaker") else {
+            return None;
+        };
+        let start = record.get("start")?.as_str()?;
+        let text = shown_text(record)?;
+        (source.chunks.len() == 1
+            && rendered(0, record)? == format!("[{start}] Speaker {speaker}: {text}"))
+        .then(|| vec![("An unidentified speaker said".to_owned(), text)])
+    } else if source.file.ends_with("screen.jsonl") {
+        let [frame] = source.records.as_slice() else {
+            return None;
+        };
+        if source.chunks.len() != 1
+            || frame.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "frame_id" | "timestamp" | "requests" | "analysis" | "content"
+                )
+            })
+            || frame.get("analysis")?.get("primary")?.as_str()? != "tmux"
+        {
+            return None;
+        }
+        let content = frame.get("content")?.as_object()?;
+        if content.len() != 1 {
+            return None;
+        }
+        let [pane] = content.get("tmux")?.get("panes")?.as_array()?.as_slice() else {
+            return None;
+        };
+        let text = pane.get("content")?.as_str()?;
+        rendered(0, frame)?
+            .contains(&Value::String(text.to_owned()).to_string())
+            .then(|| vec![("Displayed text read".to_owned(), text)])
+    } else {
+        None
+    }
+}
+
+/// The words a transcript line shows: its correction, else its text.
+fn shown_text(record: &Map<String, Value>) -> Option<&str> {
+    match record.get("corrected") {
+        None | Some(Value::Null) => record.get("text")?.as_str(),
+        Some(Value::String(corrected)) if corrected.is_empty() => record.get("text")?.as_str(),
+        Some(Value::String(corrected)) => Some(corrected),
+        Some(_) => None,
+    }
+}
+
+/// The source-word body this run's Story carries: only when preparation
+/// admitted one and the model read the whole request it was made from.
+fn admitted_source_body(prepared: &PreparedTalent) -> Option<&str> {
+    (prepared.config.get(INPUT_WHOLE_KEY) == Some(&Value::Bool(true)))
+        .then(|| prepared.config.get(SOURCE_BODY_KEY)?.as_str())
+        .flatten()
+}
+
+/// What a Story run returns: the stored Story when its body quotes the source,
+/// else the model's response unchanged.
+pub fn output(
+    response: &str,
+    prepared: &PreparedTalent,
+    state: &PrePostState,
+) -> Result<String, StageError> {
+    if admitted_source_body(prepared).is_none() {
+        return Ok(response.to_owned());
+    }
+    match parse(response, prepared, state)? {
+        ParsedOutput::Json(value) => Ok(value.to_string()),
+        _ => Err(error(prepared, "story output is not JSON")),
+    }
+}
 
 /// An empty body is a parse error, not a silent merge. No topics is a valid
 /// story: the talents are told to return `[]` when nothing is worth keeping.
@@ -74,6 +260,9 @@ pub fn parse(
     if !object.get("relations").is_some_and(Value::is_array) {
         return Err(error(prepared, "story output has invalid relations"));
     }
+    // A valid Story over a short source carries the source's own words; its
+    // topics, confidence and relations stay the model's.
+    let body = admitted_source_body(prepared).map_or(body, str::to_owned);
     object.insert("body".into(), Value::String(body));
     object.insert("topics".into(), json!(clean_topics));
     object.insert("confidence".into(), json!(clamped));
