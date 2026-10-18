@@ -1325,15 +1325,18 @@ fn portable_export_and_merge_preserve_colliding_owner_names() {
             "imports/.health-dedupe.sqlite.rebuild-journal",
             "chronicle/20260101/indexer/indexer.sqlite",
             "health/brain-fingerprint.key",
-            "mcp-endpoint/pop.ed25519.pk8",
             "config/.tmp_123_4.tmp",
         ];
+        // The owner's credentials travel in the export, but merge keeps the
+        // receiving journal's own identity.
+        let exported_identity = ["mcp-endpoint/pop.ed25519.pk8"];
         for (name, bytes) in kept
             .iter()
             .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
             .chain(
                 omitted
                     .iter()
+                    .chain(exported_identity.iter())
                     .map(|name| (*name, b"synthetic secret".as_slice())),
             )
         {
@@ -1362,8 +1365,16 @@ fn portable_export_and_merge_preserve_colliding_owner_names() {
         for name in omitted {
             assert!(zip.by_name(name).is_err(), "{name}");
         }
+        for name in exported_identity {
+            let mut actual = Vec::new();
+            zip.by_name(name).unwrap().read_to_end(&mut actual).unwrap();
+            assert_eq!(actual, b"synthetic secret", "{name}");
+        }
         drop(zip);
         let merged = merge_journal_archive(&archive, &target, &options(&tree), None).unwrap();
+        for name in exported_identity {
+            assert!(!target.join(name).exists(), "{name}");
+        }
         assert_eq!(merged.merge_summary.entities_created, 1, "{merged:?}");
         for (name, bytes) in &kept {
             let actual =
