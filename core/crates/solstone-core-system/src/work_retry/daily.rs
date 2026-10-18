@@ -67,6 +67,22 @@ pub fn observe_checked(
     observe_using_checked(journal, unit, || evidence(journal, unit), checkpoint)
 }
 
+/// Observe the same durable retry contract using the embedded host's packaged resources.
+pub fn observe_with_roots_checked(
+    journal: &Path,
+    unit: &Unit,
+    talents: &Path,
+    apps: &Path,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Option<String>, String> {
+    observe_using_checked(
+        journal,
+        unit,
+        || evidence_with_roots(journal, unit, talents, apps),
+        checkpoint,
+    )
+}
+
 #[cfg(test)]
 fn observe_using(
     journal: &Path,

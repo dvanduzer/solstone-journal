@@ -644,10 +644,14 @@ impl ForegroundProcessingHost {
                 }),
             );
             let discovery_checkpoint = Arc::clone(&cancelled);
-            let discovery = WorkDiscovery::new_with_checkpoint(
+            let discovery = WorkDiscovery::new_with_talent_roots_and_checkpoint(
                 journal.clone(),
                 queue.clone(),
                 true,
+                solstone_core_think_cli::planner::DiscoveryTalentRoots {
+                    talent: payload.join("solstone/talent"),
+                    apps: payload.join("solstone/apps"),
+                },
                 Arc::new(move || {
                     if discovery_checkpoint() {
                         Err("thinking cancelled".into())

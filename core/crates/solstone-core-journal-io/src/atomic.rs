@@ -733,7 +733,7 @@ pub fn atomic_replace_bound(
 // inode atomically and consumes the stage name. Unsupported kernels/filesystems
 // return their error; an overwrite-capable fallback would violate the contract.
 #[cfg(target_os = "android")]
-fn publish_exclusive_stage(
+pub(crate) fn publish_exclusive_stage(
     directory: &impl AsFd,
     stage: &OsStr,
     name: &OsStr,

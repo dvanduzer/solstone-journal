@@ -153,6 +153,62 @@ fn rest(
     }
 }
 
+/// Packaged talent resources admitted by an embedded host independently of its executable.
+#[derive(Clone)]
+pub struct DiscoveryTalentRoots {
+    pub talent: PathBuf,
+    pub apps: PathBuf,
+}
+
+impl DiscoveryTalentRoots {
+    fn revalidate(&self) -> Result<(), String> {
+        for directory in [&self.talent, &self.apps] {
+            if !directory.is_dir() {
+                return Err(format!(
+                    "packaged talent directory is unavailable: {}",
+                    directory.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn read_coverage(
+    journal: &Path,
+    day: &str,
+    roots: Option<&DiscoveryTalentRoots>,
+) -> Result<daily_coverage::DailyCoverage, String> {
+    match roots {
+        Some(roots) => {
+            roots.revalidate()?;
+            daily_coverage::read_daily_coverage_with_roots(journal, day, &roots.talent, &roots.apps)
+        }
+        None => daily_coverage::read_daily_coverage(journal, day),
+    }
+}
+
+fn observe_daily_retry(
+    journal: &Path,
+    unit: &Unit,
+    roots: Option<&DiscoveryTalentRoots>,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Option<String>, String> {
+    match roots {
+        Some(roots) => {
+            roots.revalidate()?;
+            work_retry::daily::observe_with_roots_checked(
+                journal,
+                unit,
+                &roots.talent,
+                &roots.apps,
+                checkpoint,
+            )
+        }
+        None => work_retry::daily::observe_checked(journal, unit, checkpoint),
+    }
+}
+
 pub struct WorkDiscovery {
     stopped: Arc<AtomicBool>,
     wake: mpsc::SyncSender<()>,
@@ -203,6 +259,33 @@ impl WorkDiscovery {
                     queue,
                     stopped,
                     automatic,
+                    reconcile_checkpoint.as_ref(),
+                )
+            },
+        )
+    }
+
+    pub fn new_with_talent_roots_and_checkpoint(
+        journal: PathBuf,
+        queue: TaskQueue,
+        automatic: bool,
+        roots: DiscoveryTalentRoots,
+        checkpoint: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+    ) -> Self {
+        let reconcile_checkpoint = Arc::clone(&checkpoint);
+        Self::with_reconciler_and_stop(
+            journal,
+            queue,
+            automatic,
+            Arc::new(AtomicBool::new(false)),
+            checkpoint,
+            move |journal, queue, stopped| {
+                reconcile_pass_with_roots(
+                    journal,
+                    queue,
+                    stopped,
+                    automatic,
+                    Some(&roots),
                     reconcile_checkpoint.as_ref(),
                 )
             },
@@ -366,6 +449,7 @@ struct Backlog {
     admitted: Vec<DiscoveredTask>,
     ranked: VecDeque<DiscoveredTask>,
     published: Option<WorkInventory>,
+    roots: Option<DiscoveryTalentRoots>,
 }
 
 impl Backlog {
@@ -402,6 +486,7 @@ impl Backlog {
             present,
             &mut self.ranked,
             &mut report,
+            self.roots.as_ref(),
             checkpoint,
         ) {
             Ok(admitted) => self.admitted = admitted,
@@ -698,6 +783,7 @@ fn daily_retries(
     journal: &Path,
     day: &str,
     coverage: &daily_coverage::DailyCoverage,
+    roots: Option<&DiscoveryTalentRoots>,
     intent: Option<&OwnerIntent>,
     imports: &[ImportThinking],
     policy: WorkPolicy,
@@ -720,7 +806,7 @@ fn daily_retries(
             talent: covered.identity.name.clone(),
             facet: covered.identity.facet.clone(),
         };
-        let Some(input) = work_retry::daily::observe_checked(journal, &unit, checkpoint)? else {
+        let Some(input) = observe_daily_retry(journal, &unit, roots, checkpoint)? else {
             continue;
         };
         let id = unit.id()?;
@@ -889,6 +975,7 @@ fn talent_retries(
 struct DaySources<'a> {
     imports: &'a [ImportThinking],
     archive_coordinates: &'a BTreeSet<Coordinate>,
+    roots: Option<&'a DiscoveryTalentRoots>,
 }
 
 #[allow(
@@ -1074,13 +1161,14 @@ fn inspect_day(
         let explicit = intent
             .map(|_| WorkBand::Waiting)
             .or_else(|| imported.then_some(WorkBand::Import));
-        let coverage = daily_coverage::read_daily_coverage(journal, day)?;
+        let coverage = read_coverage(journal, day, sources.roots)?;
         let p = daily_priority(priority(day, None, today, explicit), &coverage);
         let mut permanently_held_daily = BTreeSet::new();
         work.candidates.extend(daily_retries(
             journal,
             day,
             &coverage,
+            sources.roots,
             intent,
             sources.imports,
             policy,
@@ -1270,6 +1358,7 @@ impl solstone_core_system_health::SegmentSource for ExactSegmentSource<'_> {
 fn still_owed(
     journal: &Path,
     candidate: &DiscoveredTask,
+    roots: Option<&DiscoveryTalentRoots>,
     checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<bool, String> {
     #[cfg(test)]
@@ -1300,8 +1389,7 @@ fn still_owed(
                 {
                     return Ok(false);
                 }
-                let Some(input) =
-                    work_retry::daily::observe_checked(journal, &record.unit, checkpoint)?
+                let Some(input) = observe_daily_retry(journal, &record.unit, roots, checkpoint)?
                 else {
                     return Ok(false);
                 };
@@ -1379,15 +1467,17 @@ fn still_owed(
     {
         return Ok(false);
     }
-    Ok(daily_coverage::read_daily_coverage(journal, day)?
-        .state
-        .is_owed()
+    Ok(read_coverage(journal, day, roots)?.state.is_owed()
         && solstone_core_system_health::day_unpublished_segments(journal, day)?.is_some())
 }
 
 /// Hand the queue `current` and then the best of `ranked` still owed, up to
 /// its admission bound, replacing the discovered work it has not started.
 /// Returns what was handed over; `ranked` keeps what was not examined.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Admission retains the pass resources and publication checkpoint."
+)]
 fn admit(
     journal: &Path,
     queue: &TaskQueue,
@@ -1395,6 +1485,7 @@ fn admit(
     mut current: Vec<DiscoveredTask>,
     ranked: &mut VecDeque<DiscoveredTask>,
     report: &mut WorkInventory,
+    roots: Option<&DiscoveryTalentRoots>,
     checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<Vec<DiscoveredTask>, String> {
     if stopped.load(Ordering::Acquire) {
@@ -1406,7 +1497,7 @@ fn admit(
         if stopped.load(Ordering::Acquire) {
             return Ok(Vec::new());
         }
-        match still_owed(journal, &candidate, checkpoint) {
+        match still_owed(journal, &candidate, roots, checkpoint) {
             Ok(true) => {
                 current.push(candidate);
             }
@@ -1689,6 +1780,20 @@ fn reconcile_pass_checked(
     automatic: bool,
     checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<Backlog, String> {
+    reconcile_pass_with_roots(journal, queue, stopped, automatic, None, checkpoint)
+}
+
+fn reconcile_pass_with_roots(
+    journal: &Path,
+    queue: &TaskQueue,
+    stopped: &AtomicBool,
+    automatic: bool,
+    roots: Option<&DiscoveryTalentRoots>,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Backlog, String> {
+    if let Some(roots) = roots {
+        roots.revalidate()?;
+    }
     let external_checkpoint = checkpoint;
     let checkpoint = &|| {
         if stopped.load(Ordering::Acquire) {
@@ -1865,6 +1970,7 @@ fn reconcile_pass_checked(
             DaySources {
                 imports: &imports.imports,
                 archive_coordinates: &archive_coordinates,
+                roots,
             },
             policy,
             &mut day_report,
@@ -2062,6 +2168,7 @@ fn reconcile_pass_checked(
                     Vec::new(),
                     &mut early,
                     &mut report,
+                    roots,
                     checkpoint,
                 )?
                 .into_iter()
@@ -2104,6 +2211,7 @@ fn reconcile_pass_checked(
         Vec::new(),
         &mut ranked,
         &mut report,
+        roots,
         checkpoint,
     )?;
     if stopped.load(Ordering::Acquire) {
@@ -2131,6 +2239,7 @@ fn reconcile_pass_checked(
         admitted,
         ranked,
         published: Some(report),
+        roots: roots.cloned(),
     })
 }
 
@@ -2388,6 +2497,194 @@ mod tests {
             "{\"text\":\"A meeting about a garden.\"}\n",
         )
         .unwrap();
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[cfg(unix)]
+    #[test]
+    fn embedded_resources_survive_discovery_and_refill_outside_a_checkout() {
+        const CHILD: &str = "SOLSTONE_DISCOVERY_RESOURCE_TEST";
+        if let Some(payload) = std::env::var_os(CHILD) {
+            // The executable has no checkout or installed-share ancestor. This
+            // reproduces an app process even though the host supplied its assets.
+            assert!(daily_coverage::package_roots().is_err());
+            let resources = DiscoveryTalentRoots {
+                talent: PathBuf::from(&payload).join("solstone/talent"),
+                apps: PathBuf::from(&payload).join("solstone/apps"),
+            };
+            let root = fixture("local");
+            for second in 0..DISCOVERED_ADMISSION + 2 {
+                segment(root.path(), "19990101", &format!("1200{second:02}_60"));
+            }
+            let queue = queue(root.path());
+            let stopped = AtomicBool::new(false);
+            let negative = reconcile_pass(root.path(), &queue, &stopped, false).unwrap();
+            assert!(
+                negative
+                    .published
+                    .unwrap()
+                    .unreadable
+                    .iter()
+                    .any(|error| { error.contains("could not locate packaged talent roots") })
+            );
+            let mut backlog = reconcile_pass_with_roots(
+                root.path(),
+                &queue,
+                &stopped,
+                false,
+                Some(&resources),
+                &|| Ok(()),
+            )
+            .unwrap();
+            let inventory = backlog.published.as_ref().unwrap();
+            assert!(inventory.complete, "{:?}", inventory.unreadable);
+            assert!(inventory.unreadable.is_empty());
+            assert_eq!(backlog.admitted.len(), DISCOVERED_ADMISSION);
+            let next = backlog
+                .ranked
+                .front()
+                .expect("ranked work beyond admission")
+                .request
+                .reference
+                .clone();
+            queue.replace_discovered(Vec::new());
+            backlog.top_up(root.path(), &queue, &stopped, &|| Ok(()));
+            assert!(queue.contains_reference(&next));
+
+            // The daily refill/retry reads must use those same resources, rather
+            // than falling back to current_exe after the first pass succeeds.
+            let today = daily_coverage::local_day(root.path(), chrono::Utc::now());
+            let unit = Unit::Daily {
+                day: today.clone(),
+                talent: "daily_schedule".into(),
+                facet: None,
+            };
+            let evidence = work_retry::daily::evidence_with_roots(
+                root.path(),
+                &unit,
+                &resources.talent,
+                &resources.apps,
+            )
+            .unwrap();
+            let mut record = solstone_core_journal_io::DailyUnitRecord::new(
+                work_retry::daily::identity(&unit).unwrap(),
+                &evidence.revision,
+                &evidence.contract,
+            );
+            record.status = solstone_core_journal_io::DailyUnitStatus::Capped;
+            record.reason_code = Some("schema_invalid".into());
+            solstone_core_journal_io::save_daily_unit_record(root.path(), &record).unwrap();
+            assert!(observe_daily_retry(root.path(), &unit, None, &|| Ok(())).is_err());
+            let input = observe_daily_retry(root.path(), &unit, backlog.roots.as_ref(), &|| Ok(()))
+                .unwrap()
+                .unwrap();
+            assert!(
+                work_retry::read(root.path(), &unit.id().unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .permission(&input, work_retry::DECLARED_FIXES)
+                    .is_none()
+            );
+            work_retry::request(root.path(), &unit).unwrap();
+            let granted = work_retry::read(root.path(), &unit.id().unwrap())
+                .unwrap()
+                .unwrap()
+                .permission(&input, work_retry::DECLARED_FIXES)
+                .unwrap();
+            let retry = DiscoveredTask {
+                request: BusTaskRequest {
+                    cmd: TaskArgv::from_wire(canonical_journal_command([
+                        "think",
+                        "--day",
+                        &today,
+                        "--retry-unit",
+                        &unit.id().unwrap(),
+                        "--retry-cause",
+                        &granted.cause,
+                    ]))
+                    .unwrap(),
+                    reference: "resource-retry".into(),
+                    day: Some(today),
+                    scheduler_name: None,
+                    queue_if_active_cmd_differs: false,
+                    priority: None,
+                    daily_catchup_provenance: None,
+                },
+            };
+            assert!(still_owed(root.path(), &retry, backlog.roots.as_ref(), &|| Ok(())).unwrap());
+            assert!(still_owed(root.path(), &retry, None, &|| Ok(())).is_err());
+            reconcile_pass_with_roots(
+                root.path(),
+                &queue,
+                &stopped,
+                false,
+                Some(&resources),
+                &|| Ok(()),
+            )
+            .unwrap();
+            assert!(queue.contains_reference(&format!(
+                "supervisor-retry-daily-{}-{}",
+                unit.day(),
+                unit.id().unwrap()
+            )));
+            queue.replace_discovered(Vec::new());
+            backlog.ranked = VecDeque::from([retry.clone()]);
+            backlog.top_up(root.path(), &queue, &stopped, &|| Ok(()));
+            assert!(queue.contains_reference(&retry.request.reference));
+            queue.replace_discovered(Vec::new());
+            backlog.ranked = VecDeque::from([retry.clone()]);
+            stopped.store(true, Ordering::Release);
+            assert!(!backlog.top_up(root.path(), &queue, &stopped, &|| Ok(())));
+            assert!(!queue.contains_reference(&retry.request.reference));
+            let missing = DiscoveryTalentRoots {
+                talent: root.path().join("missing-payload"),
+                apps: resources.apps.clone(),
+            };
+            assert!(read_coverage(root.path(), unit.day(), Some(&missing)).is_err());
+            assert!(
+                reconcile_pass_with_roots(
+                    root.path(),
+                    &queue,
+                    &AtomicBool::new(false),
+                    false,
+                    Some(&missing),
+                    &|| Ok(())
+                )
+                .is_err()
+            );
+            queue.shutdown();
+            return;
+        }
+        fn copy_tree(from: &Path, to: &Path) {
+            std::fs::create_dir_all(to).unwrap();
+            for entry in std::fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let target = to.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_tree(&entry.path(), &target);
+                } else {
+                    std::fs::copy(entry.path(), target).unwrap();
+                }
+            }
+        }
+        let isolated = tempfile::tempdir().unwrap();
+        let executable = isolated.path().join("discovery-test");
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        let payload = isolated.path().join("payload");
+        copy_tree(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../payload"),
+            &payload,
+        );
+        let output = std::process::Command::new(executable)
+            .args(["--exact", "planner::tests::embedded_resources_survive_discovery_and_refill_outside_a_checkout", "--nocapture"])
+            .env(CHILD, payload)
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -2662,6 +2959,7 @@ mod tests {
             DaySources {
                 imports: &[],
                 archive_coordinates: &BTreeSet::new(),
+                roots: None,
             },
             policy,
             &mut report,
@@ -2696,6 +2994,7 @@ mod tests {
             DaySources {
                 imports: &[],
                 archive_coordinates: &BTreeSet::new(),
+                roots: None,
             },
             policy,
             &mut report,
@@ -2716,6 +3015,7 @@ mod tests {
             DaySources {
                 imports: &[],
                 archive_coordinates: &BTreeSet::new(),
+                roots: None,
             },
             policy,
             &mut report,
@@ -3777,6 +4077,7 @@ mod tests {
             DaySources {
                 imports: &[],
                 archive_coordinates: &BTreeSet::new(),
+                roots: None,
             },
             policy,
             &mut report,
@@ -4099,6 +4400,7 @@ mod tests {
             DaySources {
                 imports: &[],
                 archive_coordinates: &archive_coords_today,
+                roots: None,
             },
             policy,
             &mut report_today,
@@ -4145,6 +4447,7 @@ mod tests {
             DaySources {
                 imports: &[],
                 archive_coordinates: &BTreeSet::new(),
+                roots: None,
             },
             policy,
             &mut report_past_empty,
@@ -4173,6 +4476,7 @@ mod tests {
             DaySources {
                 imports: &[],
                 archive_coordinates: &past_archive_coords,
+                roots: None,
             },
             policy,
             &mut report_past_set,
@@ -4266,6 +4570,7 @@ mod tests {
             DaySources {
                 imports: &[],
                 archive_coordinates: &coords,
+                roots: None,
             },
             policy,
             &mut report,
@@ -4303,7 +4608,7 @@ mod tests {
             priority(day, None, chrono::Utc::now().date_naive(), None),
             None,
         );
-        assert!(!still_owed(root.path(), &daily, &|| Ok(())).unwrap());
+        assert!(!still_owed(root.path(), &daily, None, &|| Ok(())).unwrap());
         let unit = Unit::Daily {
             day: day.into(),
             talent: "schedule".into(),
@@ -4314,7 +4619,7 @@ mod tests {
         let mut wire = retry.request.cmd.as_wire().to_vec();
         wire.extend(["--retry-unit".into(), unit.id().unwrap()]);
         retry.request.cmd = TaskArgv::from_wire(wire).unwrap();
-        assert!(!still_owed(root.path(), &retry, &|| Ok(())).unwrap());
+        assert!(!still_owed(root.path(), &retry, None, &|| Ok(())).unwrap());
         // Even a selected Ready tile cannot release the day's other pending
         // archive prerequisite or complete its outstanding owner intent.
         thought_without_receipt(root.path(), day, &["120000_60"]);
@@ -4362,6 +4667,7 @@ mod tests {
             DaySources {
                 imports: &[],
                 archive_coordinates: &coords,
+                roots: None,
             },
             policy,
             &mut report,
@@ -4420,7 +4726,8 @@ mod tests {
                 None,
                 DaySources {
                     imports: &[],
-                    archive_coordinates: &coords
+                    archive_coordinates: &coords,
+                    roots: None,
                 },
                 policy,
                 &mut WorkInventory::default(),
@@ -4428,7 +4735,7 @@ mod tests {
             )
             .is_err()
         );
-        assert!(still_owed(root.path(), &daily, &|| Ok(())).is_err());
+        assert!(still_owed(root.path(), &daily, None, &|| Ok(())).is_err());
         std::fs::remove_file(poison).unwrap();
         let work = inspect_day(
             root.path(),
@@ -4438,6 +4745,7 @@ mod tests {
             DaySources {
                 imports: &[],
                 archive_coordinates: &coords,
+                roots: None,
             },
             policy,
             &mut WorkInventory::default(),
@@ -4456,7 +4764,7 @@ mod tests {
                 .iter()
                 .any(|arg| arg == "--daily-only")
         }));
-        assert!(!still_owed(root.path(), &daily, &|| Ok(())).unwrap());
+        assert!(!still_owed(root.path(), &daily, None, &|| Ok(())).unwrap());
         let coverage = daily_coverage::read_daily_coverage(root.path(), day).unwrap();
         let covered = coverage
             .units
@@ -4488,7 +4796,7 @@ mod tests {
         ]);
         valid_retry.request.cmd = TaskArgv::from_wire(wire).unwrap();
         assert!(
-            !still_owed(root.path(), &valid_retry, &|| Ok(())).unwrap(),
+            !still_owed(root.path(), &valid_retry, None, &|| Ok(())).unwrap(),
             "ordinary prerequisite also holds a genuinely granted daily retry"
         );
         std::fs::remove_dir_all(
@@ -4506,6 +4814,7 @@ mod tests {
             DaySources {
                 imports: &[],
                 archive_coordinates: &coords,
+                roots: None,
             },
             policy,
             &mut WorkInventory::default(),
@@ -4521,18 +4830,18 @@ mod tests {
                 .any(|arg| arg == "--daily-only")),
             "last archive prerequisite released and real daily work is admitted"
         );
-        assert!(still_owed(root.path(), &daily, &|| Ok(())).unwrap());
+        assert!(still_owed(root.path(), &daily, None, &|| Ok(())).unwrap());
         assert!(
-            still_owed(root.path(), &valid_retry, &|| Ok(())).unwrap(),
+            still_owed(root.path(), &valid_retry, None, &|| Ok(())).unwrap(),
             "granted daily retry resumes once prerequisites are Ready"
         );
         register_pending_tile(root.path(), "19990101_010101", day, "130000_300").unwrap();
         assert!(
-            !still_owed(root.path(), &valid_retry, &|| Ok(())).unwrap(),
+            !still_owed(root.path(), &valid_retry, None, &|| Ok(())).unwrap(),
             "pending archive also holds a valid retry grant"
         );
         retire_pending_tile(root.path(), "19990101_010101", day, "130000_300").unwrap();
-        assert!(still_owed(root.path(), &valid_retry, &|| Ok(())).unwrap());
+        assert!(still_owed(root.path(), &valid_retry, None, &|| Ok(())).unwrap());
     }
 
     #[cfg(all(unix, feature = "full-tests"))]
@@ -4585,8 +4894,8 @@ mod tests {
             ),
             None,
         );
-        let ordinary_result = still_owed(root.path(), &ordinary, &|| Ok(()));
-        let archive_result = still_owed(root.path(), &archive, &|| Ok(()));
+        let ordinary_result = still_owed(root.path(), &ordinary, None, &|| Ok(()));
+        let archive_result = still_owed(root.path(), &archive, None, &|| Ok(()));
         std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
             whole.is_err(),
@@ -4596,7 +4905,7 @@ mod tests {
         assert!(archive_result.unwrap());
         thought_without_receipt(root.path(), day, &["120000_60"]);
         assert!(
-            still_owed(root.path(), &ordinary, &|| Ok(())).unwrap(),
+            still_owed(root.path(), &ordinary, None, &|| Ok(())).unwrap(),
             "thought output still owes publication"
         );
         let target = root
@@ -4614,15 +4923,15 @@ mod tests {
         })
         .unwrap();
         assert!(
-            !still_owed(root.path(), &ordinary, &|| Ok(())).unwrap(),
+            !still_owed(root.path(), &ordinary, None, &|| Ok(())).unwrap(),
             "Ready target is not requeued"
         );
         assert!(
-            still_owed(root.path(), &archive, &|| Ok(())).unwrap(),
+            still_owed(root.path(), &archive, None, &|| Ok(())).unwrap(),
             "same-key archive remains independently owed"
         );
         std::fs::remove_dir_all(&target).unwrap();
-        assert!(!still_owed(root.path(), &ordinary, &|| Ok(())).unwrap());
+        assert!(!still_owed(root.path(), &ordinary, None, &|| Ok(())).unwrap());
         thought_without_receipt(root.path(), day, &["120000_60"]);
         std::fs::remove_dir_all(&same_key).unwrap();
         std::fs::rename(&target, &same_key).unwrap();
@@ -4638,7 +4947,7 @@ mod tests {
             }
         }
         assert!(
-            still_owed(root.path(), &archive, &|| Ok(())).unwrap(),
+            still_owed(root.path(), &archive, None, &|| Ok(())).unwrap(),
             "archive thinking alone still owes publication"
         );
         let input = solstone_core_system_health::newest_segment_input_ms(&same_key).unwrap();
@@ -4656,16 +4965,16 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !still_owed(root.path(), &archive, &|| Ok(())).unwrap(),
+            !still_owed(root.path(), &archive, None, &|| Ok(())).unwrap(),
             "Ready archive target is not requeued"
         );
         assert!(
-            !still_owed(root.path(), &ordinary, &|| Ok(())).unwrap(),
+            !still_owed(root.path(), &ordinary, None, &|| Ok(())).unwrap(),
             "other stream does not borrow archive readiness"
         );
         std::fs::remove_dir_all(same_key).unwrap();
-        assert!(!still_owed(root.path(), &archive, &|| Ok(())).unwrap());
-        assert!(!still_owed(root.path(), &ordinary, &|| Ok(())).unwrap());
+        assert!(!still_owed(root.path(), &archive, None, &|| Ok(())).unwrap());
+        assert!(!still_owed(root.path(), &ordinary, None, &|| Ok(())).unwrap());
     }
 
     #[cfg(feature = "full-tests")]
@@ -4685,7 +4994,7 @@ mod tests {
             priority(day, None, chrono::Utc::now().date_naive(), None),
             None,
         );
-        assert!(still_owed(root.path(), &candidate, &|| Ok(())).is_err());
+        assert!(still_owed(root.path(), &candidate, None, &|| Ok(())).is_err());
         assert!(
             inspect_day(
                 root.path(),
@@ -4694,7 +5003,8 @@ mod tests {
                 None,
                 DaySources {
                     imports: &[],
-                    archive_coordinates: &BTreeSet::new()
+                    archive_coordinates: &BTreeSet::new(),
+                    roots: None,
                 },
                 WorkPolicy::read(root.path()).unwrap(),
                 &mut WorkInventory::default(),
