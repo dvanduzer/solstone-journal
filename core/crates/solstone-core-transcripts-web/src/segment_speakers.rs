@@ -430,7 +430,8 @@ mod tests {
         let flagged = "é".as_bytes();
         let mut local = Vec::new();
         let mut offsets = Vec::new();
-        let members: [(&[u8], u16, &[u8], &[u8]); 3] = [
+        type ZipMember<'a> = (&'a [u8], u16, &'a [u8], &'a [u8]);
+        let members: [ZipMember<'_>; 3] = [
             (b"statement_ids.npy", UTF8_FLAG, &[], b"x"),
             (&[0x82], 0, &[], b"a"),
             (flagged, UTF8_FLAG, &[], b"b"),

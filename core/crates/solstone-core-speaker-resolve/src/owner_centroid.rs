@@ -470,35 +470,6 @@ fn owner_centroid_at(
     Ok(entity_memory_path(journal_root, principal_entity_id, create)?.join("owner_centroid.npz"))
 }
 
-#[cfg(test)]
-mod zip2_name_tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn load_owner_centroid_refuses_collision_instead_of_missing_member() {
-        let root = tempfile::tempdir().unwrap();
-        let entity = root.path().join("entities/owner");
-        std::fs::create_dir_all(&entity).unwrap();
-        std::fs::write(
-            entity.join("entity.json"),
-            json!({"id":"owner","name":"Owner","type":"Person","is_principal":true}).to_string(),
-        )
-        .unwrap();
-        std::fs::write(
-            entity.join("owner_centroid.npz"),
-            crate::zip_names::fixtures::colliding("centroid.npy", b"x"),
-        )
-        .unwrap();
-        let error = load_owner_centroid(root.path(), "owner").expect_err("collision");
-        assert!(matches!(error, OwnerCentroidError::Archive(_)), "{error:?}");
-        assert!(!matches!(
-            error,
-            OwnerCentroidError::MissingRequiredMember(_)
-        ));
-    }
-}
-
 fn base_members(
     centroid: &[f32],
     cluster_size: i32,
@@ -696,4 +667,33 @@ fn unicode_scalar(blob: &NpyBlob<'_>, name: &str) -> Result<String, OwnerCentroi
         value.push(character);
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod zip2_name_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn load_owner_centroid_refuses_collision_instead_of_missing_member() {
+        let root = tempfile::tempdir().unwrap();
+        let entity = root.path().join("entities/owner");
+        std::fs::create_dir_all(&entity).unwrap();
+        std::fs::write(
+            entity.join("entity.json"),
+            json!({"id":"owner","name":"Owner","type":"Person","is_principal":true}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            entity.join("owner_centroid.npz"),
+            crate::zip_names::fixtures::colliding("centroid.npy", b"x"),
+        )
+        .unwrap();
+        let error = load_owner_centroid(root.path(), "owner").expect_err("collision");
+        assert!(matches!(error, OwnerCentroidError::Archive(_)), "{error:?}");
+        assert!(!matches!(
+            error,
+            OwnerCentroidError::MissingRequiredMember(_)
+        ));
+    }
 }
