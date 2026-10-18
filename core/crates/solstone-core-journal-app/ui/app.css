@@ -200,6 +200,7 @@ button.danger { border-color: var(--danger); color: var(--danger); }
 .steps li.done::before { content: '✓ '; color: var(--success-ink); }
 .steps li.failed { color: var(--danger); }
 
+#firstrun { overflow-y: auto; max-height: 100%; justify-content: safe center; }
 .firstrun-card { width: 100%; max-width: 480px; }
 details.detail { margin-bottom: var(--space-3); }
 details.detail summary { cursor: pointer; color: var(--ink-soft); font-size: 13px; }

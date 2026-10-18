@@ -4,9 +4,9 @@
 //! `journal-app.exe`: the Windows journal app. It is what the Start menu
 //! opens, what sits in the taskbar, and what the installer runs: it keeps the
 //! journal running on this PC, shows its name, mark and run state, sets up a
-//! new owner's journal and opens the rest of its first run in their browser,
+//! new owner's journal and finishes its first run in the window,
 //! and updates itself and the journal together. The journal itself still opens
-//! in the owner's browser.
+//! in the owner's browser when the owner asks.
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 // The portable modules serve the Windows app; elsewhere only their tests use them.
@@ -14,6 +14,7 @@
 
 mod ico;
 mod setup_events;
+mod setup_flow;
 mod status;
 
 #[cfg(windows)]

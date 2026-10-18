@@ -107,13 +107,16 @@ impl Page {
                         let mut uri = PWSTR::null();
                         args.Request()?.Uri(&mut uri)?;
                         let uri = take_pwstr(uri);
-                        let path = uri
-                            .strip_prefix(origin)
-                            .unwrap_or("/")
-                            .split(['?', '#'])
-                            .next()
-                            .unwrap_or("/");
-                        let response = match asset(path) {
+                        let Some(path) = crate::setup_flow::app_asset_path(&uri) else {
+                            let response = responder.CreateWebResourceResponse(
+                                None,
+                                404,
+                                &HSTRING::from("Not Found"),
+                                &HSTRING::new(),
+                            )?;
+                            return args.SetResponse(&response);
+                        };
+                        let response = match asset(&path) {
                             Some((body, mime)) => {
                                 let stream = SHCreateMemStream(Some(body));
                                 let headers = HSTRING::from(format!(
@@ -143,6 +146,14 @@ impl Page {
                 .add_WebMessageReceived(
                     &WebMessageReceivedEventHandler::create(Box::new(move |_, args| {
                         let Some(args) = args else { return Ok(()) };
+                        let mut source = PWSTR::null();
+                        if args.Source(&mut source).is_err() {
+                            return Ok(());
+                        }
+                        let source = take_pwstr(source);
+                        if !crate::setup_flow::is_app_origin(&source) {
+                            return Ok(());
+                        }
                         let mut message = PWSTR::null();
                         if args.TryGetWebMessageAsString(&mut message).is_ok() {
                             on_message(take_pwstr(message));
@@ -160,7 +171,7 @@ impl Page {
                         let mut uri = PWSTR::null();
                         args.Uri(&mut uri)?;
                         let uri = take_pwstr(uri);
-                        args.SetCancel(!uri.starts_with(origin))
+                        args.SetCancel(!crate::setup_flow::is_app_origin(&uri))
                     })),
                     &mut token,
                 )

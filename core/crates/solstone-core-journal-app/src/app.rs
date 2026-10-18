@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-use crate::convey::{Convey, InitProbe, Refusal};
+use crate::convey::{Convey, Refusal};
 use crate::prefs::{self, CheckInterval};
 use crate::shell;
 use crate::status::{ServiceStatus, run_display};
@@ -70,26 +70,15 @@ fn asset(path: &str) -> Option<(&'static [u8], &'static str)> {
 
 /// The only journal routes the page may call, with the methods each takes.
 fn convey_route_allowed(method: &str, path: &str) -> bool {
-    matches!(
-        (method, path),
-        ("GET" | "PUT", "/app/settings/api/config")
-            | ("GET", "/app/link/api/identity")
-            | ("GET", "/app/network/api/devices")
-            | ("POST", "/app/network/pair-start")
-            | ("POST", "/app/network/unpair")
-            | ("GET", "/app/network/api/local-network")
-            | ("POST", "/app/network/local-network/open")
-            | ("POST", "/app/network/local-network/close")
-    )
+    crate::setup_flow::convey_route_allowed(method, path)
 }
 
 /// The pages the app opens in the owner's browser, by name, never by URL.
-/// The first run after setup is the journal's own page, the same on every
-/// computer, so the app opens it rather than repeating it.
+/// The window finishes setup itself. The journal UI still opens in the browser
+/// when the owner asks.
 fn journal_page(name: &str) -> Option<&'static str> {
     Some(match name {
-        "journal" => "/",
-        "init" => "/init",
+        "journal" => crate::setup_flow::APP_HOME_PATH,
         "backup" => "/app/backup",
         "devices" => "/app/network",
         _ => return None,
@@ -137,6 +126,128 @@ struct Context {
     launch: Launch,
     proxy: Proxy,
     updater: Updater,
+    session: std::rc::Rc<std::cell::RefCell<crate::setup_flow::Session>>,
+}
+
+fn dispatch_effects(context: &Context, effects: &[crate::setup_flow::Effect]) {
+    for effect in effects {
+        match effect {
+            crate::setup_flow::Effect::FetchCopy => {
+                let proxy = context.proxy.clone();
+                let current_gen = context.session.borrow().inflight.unwrap_or(0);
+                std::thread::spawn(move || {
+                    let result = crate::journal::setup_copy();
+                    proxy.send_event(UserEvent::Flow(crate::setup_flow::Event::CopyLoaded {
+                        generation: current_gen,
+                        result,
+                    }));
+                });
+            }
+            crate::setup_flow::Effect::FetchState => {
+                let proxy = context.proxy.clone();
+                let current_gen = context.session.borrow().inflight.unwrap_or(0);
+                std::thread::spawn(move || {
+                    let port = journal::status().ok().and_then(|s| s.port);
+                    let convey = Convey::new(port);
+                    let result = convey
+                        .get("/init/api/state")
+                        .map_err(|refusal| refusal.message);
+                    proxy.send_event(UserEvent::Flow(crate::setup_flow::Event::StateLoaded {
+                        generation: current_gen,
+                        result,
+                    }));
+                });
+            }
+            crate::setup_flow::Effect::PostAction(action) => {
+                let proxy = context.proxy.clone();
+                let current_gen = context.session.borrow().inflight.unwrap_or(0);
+                let body = crate::setup_flow::action_body(action);
+                std::thread::spawn(move || {
+                    let port = journal::status().ok().and_then(|s| s.port);
+                    let convey = Convey::new(port);
+                    let res = convey.post("/init/api/action", Some(&body));
+                    let result = match res {
+                        Ok(val) => Ok(val),
+                        Err(refusal) => Err(crate::setup_flow::ActionErrorPayload {
+                            reason_code: refusal.reason_code,
+                            message: refusal.message,
+                            is_transport: refusal.status.is_none(),
+                        }),
+                    };
+                    proxy.send_event(UserEvent::Flow(crate::setup_flow::Event::ActionCompleted {
+                        generation: current_gen,
+                        result,
+                    }));
+                });
+            }
+            crate::setup_flow::Effect::RunSetup {
+                journal,
+                task_installed,
+                start_at_sign_in,
+            } => {
+                let proxy = context.proxy.clone();
+                let progress_proxy = proxy.clone();
+                let inflight_gen = context.session.borrow().inflight.unwrap_or(0);
+                let args =
+                    crate::setup_flow::setup_argv(journal, *task_installed, *start_at_sign_in);
+                std::thread::spawn(move || {
+                    let result = journal::setup(&args, move |progress| {
+                        let message = json!({"type": "setup", "progress": progress});
+                        progress_proxy.send_event(UserEvent::Script(format!(
+                            "window.journalApp.receive({message});"
+                        )));
+                    });
+                    proxy.send_event(UserEvent::Flow(crate::setup_flow::Event::SetupFinished {
+                        generation: inflight_gen,
+                        result,
+                    }));
+                });
+            }
+            crate::setup_flow::Effect::SetSignInLaunch(on) => {
+                let _ = shell::set_sign_in_launch(*on);
+            }
+            crate::setup_flow::Effect::CheckModels { generation } => {
+                let proxy = context.proxy.clone();
+                let current_gen = *generation;
+                std::thread::spawn(move || {
+                    let result = journal::models_ready();
+                    proxy.send_event(UserEvent::Flow(
+                        crate::setup_flow::Event::ModelsCheckFinished {
+                            generation: current_gen,
+                            result,
+                        },
+                    ));
+                });
+            }
+            crate::setup_flow::Effect::InstallModels { generation } => {
+                let proxy = context.proxy.clone();
+                let current_gen = *generation;
+                std::thread::spawn(move || {
+                    let result = journal::install_models();
+                    proxy.send_event(UserEvent::Flow(
+                        crate::setup_flow::Event::ModelsInstallFinished {
+                            generation: current_gen,
+                            result,
+                        },
+                    ));
+                });
+            }
+            crate::setup_flow::Effect::Browser(browser_effect) => match browser_effect {
+                crate::setup_flow::BrowserEffect::OpenHome => {
+                    let port = journal::status().ok().and_then(|s| s.port);
+                    let base = format!(
+                        "http://127.0.0.1:{}",
+                        port.unwrap_or(crate::convey::DEFAULT_PORT)
+                    );
+                    if is_loopback_base(&base) {
+                        let _ = shell::open(&format!("{base}{}", crate::setup_flow::APP_HOME_PATH));
+                    }
+                }
+                crate::setup_flow::BrowserEffect::Rejected => {}
+                crate::setup_flow::BrowserEffect::None => {}
+            },
+        }
+    }
 }
 
 impl Context {
@@ -234,6 +345,7 @@ fn handle(context: &Context, window: &Window, message: &str) {
                 // The mark the owner locked in, as the app last drew it, so a
                 // stopped journal still shows its own mark.
                 "mark": prefs::load().icon_mark,
+                "flow": crate::setup_flow::view(&context.session.borrow()),
             })),
         ),
         "status" => context.spawn(id, read_status),
@@ -267,11 +379,44 @@ fn handle(context: &Context, window: &Window, message: &str) {
             });
         }
         "syncSignInLaunch" => {
-            let on = args.get("on").and_then(Value::as_bool).unwrap_or(true);
+            let Some(on) = args.get("on").and_then(Value::as_bool) else {
+                context.reply(&id, Err("missing on parameter".to_owned()));
+                return;
+            };
             context.reply(&id, shell::set_sign_in_launch(on).map(|()| Value::Null));
         }
-        "installModels" => context.spawn(id, || journal::install_models().map(|()| Value::Null)),
-        "modelsReady" => context.spawn(id, || Ok(json!(journal::models_ready()))),
+        "installModels" => {
+            let mut session = context.session.borrow_mut();
+            session.models_generation += 1;
+            let current_gen = session.models_generation;
+            let proxy = context.proxy.clone();
+            std::thread::spawn(move || {
+                let result = journal::install_models();
+                proxy.send_event(UserEvent::Flow(
+                    crate::setup_flow::Event::ModelsInstallFinished {
+                        generation: current_gen,
+                        result,
+                    },
+                ));
+            });
+            context.reply(&id, Ok(Value::Null));
+        }
+        "modelsReady" => {
+            let mut session = context.session.borrow_mut();
+            session.models_generation += 1;
+            let current_gen = session.models_generation;
+            let proxy = context.proxy.clone();
+            std::thread::spawn(move || {
+                let result = journal::models_ready();
+                proxy.send_event(UserEvent::Flow(
+                    crate::setup_flow::Event::ModelsCheckFinished {
+                        generation: current_gen,
+                        result,
+                    },
+                ));
+            });
+            context.reply(&id, Ok(Value::Null));
+        }
         "pickFolder" => {
             let start = text("start").map(PathBuf::from);
             let picked = shell::pick_folder(window.hwnd(), start.as_deref());
@@ -287,22 +432,6 @@ fn handle(context: &Context, window: &Window, message: &str) {
         "holdsJournal" => {
             let path = PathBuf::from(text("path").unwrap_or_default());
             context.reply(&id, Ok(json!(journal::holds_a_journal(&path))));
-        }
-        "setup" => {
-            let Some(path) = text("path").filter(|path| !path.trim().is_empty()) else {
-                context.reply(&id, Err("choose where your journal lives".to_owned()));
-                return;
-            };
-            let proxy = context.proxy.clone();
-            context.spawn(id, move || {
-                let models_missing = journal::setup(Path::new(&path), |progress| {
-                    let message = json!({"type": "setup", "progress": progress});
-                    proxy.send_event(UserEvent::Script(format!(
-                        "window.journalApp.receive({message});"
-                    )));
-                })?;
-                Ok(json!({"status": read_status()?, "models_missing": models_missing}))
-            });
         }
         "convey" => {
             let method = text("method").unwrap_or_else(|| "GET".to_owned());
@@ -338,20 +467,6 @@ fn handle(context: &Context, window: &Window, message: &str) {
             let nonce = text("nonce").unwrap_or_default();
             context.spawn_convey(id, move || Convey::new(port).pairing_status(&nonce));
         }
-        "initProbe" => {
-            let port = args
-                .get("port")
-                .and_then(Value::as_u64)
-                .and_then(|port| u16::try_from(port).ok());
-            context.spawn(id, move || {
-                Convey::new(port).init_probe().map(|probe| {
-                    json!(match probe {
-                        InitProbe::Complete => "complete",
-                        InitProbe::Incomplete => "incomplete",
-                    })
-                })
-            });
-        }
         "diskUsage" => {
             let path = PathBuf::from(text("path").unwrap_or_default());
             context.spawn(id, move || Ok(json!(disk_usage(&path))));
@@ -367,6 +482,20 @@ fn handle(context: &Context, window: &Window, message: &str) {
                 } else {
                     Err("that folder isn't there".to_owned())
                 }
+            } else if target == "journal" {
+                let step = crate::setup_flow::reduce(
+                    &context.session.borrow(),
+                    &crate::setup_flow::Event::OpenJournalClicked,
+                );
+                *context.session.borrow_mut() = step.session;
+                dispatch_effects(context, &step.effects);
+                match step.browser_effect() {
+                    crate::setup_flow::BrowserEffect::OpenHome => Ok(()),
+                    crate::setup_flow::BrowserEffect::Rejected => {
+                        Err("unexpected redirect destination".to_owned())
+                    }
+                    crate::setup_flow::BrowserEffect::None => Ok(()),
+                }
             } else if let Some(page) = journal_page(&target) {
                 // Only the journal's own loopback address opens from here.
                 if is_loopback_base(&base) {
@@ -378,6 +507,76 @@ fn handle(context: &Context, window: &Window, message: &str) {
                 Err("that page isn't one the app opens".to_owned())
             };
             context.reply(&id, result.map(|()| Value::Null));
+        }
+        "flow" => {
+            let intent = text("intent").unwrap_or_default();
+            let event = match intent.as_str() {
+                "boot" => {
+                    let Some(task_installed) = args.get("task_installed").and_then(Value::as_bool)
+                    else {
+                        context.reply(&id, Err("task_installed must be a boolean".to_owned()));
+                        return;
+                    };
+                    crate::setup_flow::Event::Boot { task_installed }
+                }
+                "acknowledge" | "acknowledge-welcome" | "acknowledgeWelcome" => {
+                    crate::setup_flow::Event::AcknowledgeWelcome
+                }
+                "choose-sign-in" | "chooseSignIn" => {
+                    let on = args
+                        .get("on")
+                        .or_else(|| args.get("start_at_sign_in"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
+                    crate::setup_flow::Event::ChooseSignIn(on)
+                }
+                "continue-sign-in" | "continueSignIn" => crate::setup_flow::Event::ContinueSignIn,
+                "choose-folder" | "chooseFolder" => crate::setup_flow::Event::ChooseFolder(
+                    PathBuf::from(text("path").unwrap_or_default()),
+                ),
+                "start-setup" | "startSetup" => {
+                    if let Some(path) = text("path").filter(|p| !p.trim().is_empty()) {
+                        context.session.borrow_mut().journal_path = PathBuf::from(path);
+                    }
+                    crate::setup_flow::Event::StartSetup
+                }
+                "retry-setup" | "retrySetup" => crate::setup_flow::Event::RetrySetup,
+                "retry-state" | "retryState" => crate::setup_flow::Event::RetryState,
+                "regenerate-mark" | "regenerateMark" => {
+                    crate::setup_flow::Event::RegenerateMarkClicked
+                }
+                "commit-mark" | "commitMark" => crate::setup_flow::Event::CommitMarkClicked,
+                "choose-thinking" | "chooseThinking" => {
+                    crate::setup_flow::Event::ChooseThinking(text("choice").unwrap_or_default())
+                }
+                "start-thinking-download" | "startThinkingDownload" => {
+                    crate::setup_flow::Event::StartThinkingDownloadClicked
+                }
+                "cancel-thinking-download" | "cancelThinkingDownload" => {
+                    crate::setup_flow::Event::CancelThinkingDownloadClicked
+                }
+                "retry-speech-download" | "retrySpeechDownload" => {
+                    crate::setup_flow::Event::RetrySpeechDownloadClicked
+                }
+                "finalize" => crate::setup_flow::Event::FinalizeClicked {
+                    timezone: text("timezone"),
+                },
+                "open-journal" | "openJournal" => crate::setup_flow::Event::OpenJournalClicked,
+                "retry-models" | "retryModels" => {
+                    crate::setup_flow::Event::RetryModelsInstallClicked
+                }
+                "refresh" => crate::setup_flow::Event::Refresh,
+                "dismiss-error" | "dismissError" => crate::setup_flow::Event::DismissError,
+                _ => {
+                    context.reply(&id, Err(format!("unknown flow intent {intent}")));
+                    return;
+                }
+            };
+            let step = crate::setup_flow::reduce(&context.session.borrow(), &event);
+            *context.session.borrow_mut() = step.session;
+            dispatch_effects(context, &step.effects);
+            let view = crate::setup_flow::view(&context.session.borrow());
+            context.reply(&id, Ok(view));
         }
         "adminTerminal" => {
             context.reply(
@@ -542,16 +741,28 @@ pub fn run(launch: Launch, update_feed: Option<String>) {
         }
     };
 
+    let session = std::rc::Rc::new(std::cell::RefCell::new(
+        crate::setup_flow::Session::default(),
+    ));
     let context = Context {
         launch,
         proxy,
         updater,
+        session: session.clone(),
     };
     let window = std::rc::Rc::new(window);
     let looped = window.clone();
     window.run(move |event| match event {
         WindowEvent::User(UserEvent::Ipc(message)) => handle(&context, &looped, &message),
         WindowEvent::User(UserEvent::Script(script)) => page.run_script(&script),
+        WindowEvent::User(UserEvent::Flow(flow_event)) => {
+            let step = crate::setup_flow::reduce(&context.session.borrow(), &flow_event);
+            *context.session.borrow_mut() = step.session;
+            dispatch_effects(&context, &step.effects);
+            let view = crate::setup_flow::view(&context.session.borrow());
+            let message = json!({"type": "flow", "view": view});
+            page.run_script(&format!("window.journalApp.receive({message});"));
+        }
         WindowEvent::User(UserEvent::Show) => {
             looped.bring_forward();
             page.fit(looped.hwnd(), false);
@@ -559,6 +770,21 @@ pub fn run(launch: Launch, update_feed: Option<String>) {
         WindowEvent::Activated => {
             page.focus();
             page.run_script("window.journalApp.receive({type:'shown'});");
+            if context.session.borrow().phase == crate::setup_flow::Phase::Home {
+                let mut session = context.session.borrow_mut();
+                session.models_generation += 1;
+                let current_gen = session.models_generation;
+                let proxy = context.proxy.clone();
+                std::thread::spawn(move || {
+                    let result = journal::models_ready();
+                    proxy.send_event(UserEvent::Flow(
+                        crate::setup_flow::Event::ModelsCheckFinished {
+                            generation: current_gen,
+                            result,
+                        },
+                    ));
+                });
+            }
         }
         WindowEvent::Resized { minimized } => page.fit(looped.hwnd(), minimized),
         WindowEvent::Moved => page.moved(),
@@ -567,38 +793,4 @@ pub fn run(launch: Launch, update_feed: Option<String>) {
             looped.close();
         }
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{convey_route_allowed, journal_page};
-
-    #[test]
-    fn the_page_reaches_only_the_routes_the_app_uses() {
-        assert!(convey_route_allowed("PUT", "/app/settings/api/config"));
-        assert!(convey_route_allowed("POST", "/app/network/unpair"));
-        assert!(!convey_route_allowed("DELETE", "/app/settings/api/config"));
-        assert!(!convey_route_allowed("GET", "/app/network/unpair"));
-        assert!(!convey_route_allowed(
-            "GET",
-            "/app/network/api/pair/nonce-status?nonce=x"
-        ));
-        assert!(!convey_route_allowed(
-            "GET",
-            "/app/settings/api/config/../../x"
-        ));
-        // The first run is the journal's own page in the browser; the window
-        // never takes its steps itself.
-        for (method, path) in [
-            ("GET", "/init/mark"),
-            ("POST", "/init/mark/regenerate"),
-            ("POST", "/init/mark/lock"),
-            ("POST", "/init/finalize"),
-        ] {
-            assert!(!convey_route_allowed(method, path), "{method} {path}");
-        }
-        assert_eq!(journal_page("init"), Some("/init"));
-        assert!(journal_page("backup").is_some());
-        assert!(journal_page("https://example.com").is_none());
-    }
 }

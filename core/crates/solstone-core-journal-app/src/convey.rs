@@ -2,8 +2,8 @@
 // Copyright (c) 2026 sol pbc
 
 //! The journal's own loopback routes, the same ones its browser pages and the
-//! Mac app call: the journal's name, its identity and mark, whether its first
-//! run is done, devices and pairing, whether the journal is open to the
+//! Mac app call: the journal's name, its identity and mark, setup state and actions,
+//! devices and pairing, whether the journal is open to the
 //! network, and the running version. Loopback callers need no credential; nothing here
 //! leaves this PC.
 
@@ -36,13 +36,6 @@ impl From<String> for Refusal {
             message,
         }
     }
-}
-
-/// What `GET /init` says about the first run.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InitProbe {
-    Complete,
-    Incomplete,
 }
 
 impl Convey {
@@ -145,21 +138,6 @@ impl Convey {
                     .map(str::to_owned)
             });
         (true, version)
-    }
-
-    /// `/init` redirects once the first run is finished, as the Mac app reads it.
-    pub fn init_probe(&self) -> Result<InitProbe, String> {
-        let response = self
-            .agent
-            .get(format!("{}/init", self.base))
-            .header("Accept", "text/html")
-            .call()
-            .map_err(|error| error.to_string())?;
-        match response.status().as_u16() {
-            300..=399 => Ok(InitProbe::Complete),
-            200 => Ok(InitProbe::Incomplete),
-            status => Err(format!("your journal answered {status}")),
-        }
     }
 }
 

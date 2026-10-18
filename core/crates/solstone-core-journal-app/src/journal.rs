@@ -86,8 +86,14 @@ pub fn install_models() -> Result<(), String> {
 
 /// Whether the models are all in place, however they got there: setup, the
 /// app's own button, or `solstone journal install-models` typed in a terminal.
-pub fn models_ready() -> bool {
-    run(&["install-models", "--check"]).is_ok()
+pub fn models_ready() -> Result<(), String> {
+    run(&["install-models", "--check"]).map(drop)
+}
+
+/// Read setup copy without requiring a journal, as `solstone journal setup-copy --json` does.
+pub fn setup_copy() -> Result<serde_json::Value, String> {
+    let text = run(&["setup-copy", "--json"])?;
+    serde_json::from_str(&text).map_err(|error| format!("invalid setup copy JSON: {error}"))
 }
 
 pub fn set_starts_at_sign_in(on: bool) -> Result<(), String> {
@@ -98,26 +104,24 @@ pub fn set_starts_at_sign_in(on: bool) -> Result<(), String> {
 /// everything else is in place and the journal is running.
 const MODELS_ONLY_FAILED: i32 = 80;
 
-/// `solstone journal setup` for a journal at `journal`, new or already there, with
+/// `solstone journal setup` with the given argv, with
 /// its progress handed to `progress` line by line. Setup registers the
 /// journal with Windows and starts it, exactly as it does from a terminal.
 /// `Ok(Some(reason))` means setup finished but the models did not download.
 pub fn setup(
-    journal: &Path,
+    args: &[String],
     mut progress: impl FnMut(SetupProgress),
 ) -> Result<Option<String>, String> {
-    let mut child = command(&[
-        "setup",
-        "--jsonl",
-        "--yes",
-        "--accept-existing-journal",
-        "--journal",
-    ])
-    .arg(journal)
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
-    .map_err(|error| format!("couldn't start setup: {error}"))?;
+    let mut cmd = Command::new(solstone_exe());
+    cmd.arg("journal")
+        .args(args)
+        .stdin(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|error| format!("couldn't start setup: {error}"))?;
     let stderr = child.stderr.take();
     let stderr_reader = std::thread::spawn(move || {
         let mut text = String::new();

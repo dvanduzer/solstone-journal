@@ -43,9 +43,6 @@ const COPY = {
   copiedAbout: 'copied',
   copyAboutFailed: "couldn't copy. select the text and copy it.",
   diskUsed: 'disk used',
-  modelsMissing: "your journal couldn't download its sound model, so it can't label sounds in your audio yet.",
-  modelsRetry: 'download it now',
-  modelsFailed: "that didn't download either. check that this PC is online, then try again. if it keeps failing, reinstall the journal app.",
   modelsDownloading: 'downloading…',
   devicesTitle: 'devices',
   yourDevices: 'your devices',
@@ -55,7 +52,7 @@ const COPY = {
   devicesNotRunningTitle: "your journal isn't running",
   devicesNotRunningBody: 'start the journal, then try again.',
   devicesLoadFailed: "couldn't load your devices",
-  addDevice: 'add a device',
+  addDevice: 'pair a device',
   unnamedDevice: 'unnamed device',
   peerJournals: 'peer journals',
   neverConnected: 'never connected',
@@ -71,16 +68,16 @@ const COPY = {
   close: 'close',
   pairThisPc: 'pair the solstone app on this PC',
   pairingOpening: 'opening pairing…',
-  pairingInstructions: 'scan this code or open the link on the device you want to add.',
-  pairingThisPc: "this link works only for the solstone app on this PC. it's copied, so paste it into the solstone app to pair.",
-  pairingThisPcCopy: 'this link works only for the solstone app on this PC. copy it, then paste it into the solstone app to pair.',
+  pairingInstructions: 'scan this code or open the pairing link on the device you want to add.',
+  pairingThisPc: "this pairing link works only for the solstone app on this PC. it's copied, so paste it into the solstone app to pair.",
+  pairingThisPcCopy: 'this pairing link works only for the solstone app on this PC. copy it, then paste it into the solstone app to pair.',
   pairingCode: 'pairing code',
-  copyLink: 'copy link',
+  copyLink: 'copy pairing link',
   copied: 'copied ✓',
   countdown: seconds => `expires in ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`,
-  linkExpiredTitle: 'link expired',
-  linkExpiredBody: 'open a fresh link to add a device.',
-  openFreshLink: 'open a fresh link',
+  linkExpiredTitle: 'pairing link expired',
+  linkExpiredBody: 'open a fresh pairing link to add a device.',
+  openFreshLink: 'open a fresh pairing link',
   pairingFailedTitle: "couldn't open pairing",
   pairingClosed: "your journal is closed to devices on your network, so another device can't reach it directly yet. open your journal to devices on your network, or turn on your private network to pair from anywhere. the solstone app on this PC can still pair.",
   relaySetup: 'turn on your private network in your journal →',
@@ -121,12 +118,6 @@ const COPY = {
     install_models: 'downloading models',
     service: 'starting your journal',
     brain: 'setting up the model',
-  },
-  // the rest of the first run is the journal's own page, in the browser
-  browserTitle: 'finish setting up in your browser',
-  browserLine: 'this window moves on when you finish.',
-  openBrowser: 'open the setup page',
-  browserFailed: "your browser didn't open.",
   adoptLandingLine: 'nothing moved. your journal was always here.',
   // updates (the Mac app's update words)
   updates: {
@@ -176,7 +167,7 @@ function call(cmd, args = {}) {
   });
 }
 
-const listeners = { setup: [], update: [], shown: [] };
+const listeners = { setup: [], update: [], shown: [], flow: [] };
 
 window.journalApp = {
   receive(message) {
@@ -217,8 +208,7 @@ const state = {
   update: null,
   pane: 'home',
   message: null,
-  modelsMissing: (() => { try { return localStorage.getItem('modelsMissing') === '1'; } catch { return false; } })(),
-  downloadingModels: false,
+  flow: null,
 };
 
 const $ = id => document.getElementById(id);
@@ -291,10 +281,6 @@ async function serviceAction(action) {
   state.pending = null;
   render();
   if (display() !== 'running') return;
-  if (!await firstRunDone()) {
-    waitForFirstRun();
-    return;
-  }
   await loadJournalFacts();
 }
 
@@ -362,81 +348,281 @@ function startPolling() {
   }, 3000);
 }
 
-// --- first run -----------------------------------------------------------
+// --- first-run flow: the window finishes setup ----------------------------
 
 const firstRun = {
   location: '',
   holdsJournal: false,
   steps: [],
-  current: null,
-  error: null,
   adopted: false,
 };
 
-function renderFirstRun(step) {
+let downloadWatchTimer = null;
+function syncDownloadWatch(watch) {
+  if (watch && downloadWatchTimer === null) {
+    downloadWatchTimer = setInterval(() => {
+      call('flow', { intent: 'refresh' }).catch(() => {});
+    }, 2000);
+  } else if (!watch && downloadWatchTimer !== null) {
+    clearInterval(downloadWatchTimer);
+    downloadWatchTimer = null;
+  }
+}
+
+function renderFlow(view) {
+  if (!view) return;
+  state.flow = view;
+  syncDownloadWatch(view.watch_downloads);
+
+  if (view.phase === 'home') {
+    landHome(view);
+    return;
+  }
+
   const root = $('firstrun');
   root.replaceChildren();
   const card = el('div', { class: 'firstrun-card' });
   root.append(card);
-  if (step === 'location') {
-    const locationInput = el('input', { type: 'text', value: firstRun.location, 'aria-label': COPY.location });
+
+  const copy = view.copy || {};
+
+  if (view.phase === 'opening') {
+    put(card,
+      view.error ? failure(COPY.setupStopped, view.error) : null,
+      view.error ? el('div', { class: 'actions centered' },
+        el('button', {
+          type: 'button',
+          disabled: Boolean(view.busy),
+          on: { click: () => call('flow', { intent: 'retry-state' }) }
+        }, document.createTextNode(COPY.tryAgain))
+      ) : null
+    );
+  } else if (view.phase === 'welcome') {
+    const welcome = copy.welcome || {};
+    const fits = Array.isArray(welcome.how_it_fits)
+      ? welcome.how_it_fits.map(line => el('p', { class: 'muted' }, document.createTextNode(line)))
+      : (welcome.how_it_fits ? [el('p', { class: 'muted' }, document.createTextNode(welcome.how_it_fits))] : []);
+    put(card,
+      welcome.title ? el('h1', {}, document.createTextNode(welcome.title)) : null,
+      welcome.body ? el('p', {}, document.createTextNode(welcome.body)) : null,
+      ...fits,
+      view.error ? el('p', { class: 'error' }, document.createTextNode(view.error)) : null,
+      el('div', { class: 'actions' },
+        el('button', {
+          type: 'button',
+          class: 'primary',
+          disabled: Boolean(view.busy),
+          on: { click: () => call('flow', { intent: 'acknowledge' }) }
+        }, document.createTextNode(COPY.continueButton))
+      )
+    );
+  } else if (view.phase === 'sign-in') {
+    const login = copy.login || {};
+    const checkbox = el('input', {
+      type: 'checkbox',
+      id: 'sign-in-check',
+      disabled: Boolean(view.busy),
+    });
+    checkbox.checked = view.sign_in !== false;
+    checkbox.addEventListener('change', () => {
+      call('flow', { intent: 'choose-sign-in', on: checkbox.checked });
+    });
+    put(card,
+      el('h1', {}, document.createTextNode(login.label || COPY.startAtSignIn)),
+      el('div', { class: 'field' },
+        el('div', { class: 'row' },
+          checkbox,
+          el('label', { for: 'sign-in-check' }, document.createTextNode(login.label || COPY.startAtSignIn))
+        ),
+        login.help ? el('p', { class: 'muted' }, document.createTextNode(login.help)) : null
+      ),
+      view.error ? el('p', { class: 'error' }, document.createTextNode(view.error)) : null,
+      el('div', { class: 'actions' },
+        el('button', {
+          type: 'button',
+          class: 'primary',
+          disabled: Boolean(view.busy),
+          on: { click: () => call('flow', { intent: 'continue-sign-in' }) }
+        }, document.createTextNode(COPY.continueButton))
+      )
+    );
+  } else if (view.phase === 'folder') {
+    const folderCopy = copy.folder || {};
+    if (!firstRun.location) {
+      firstRun.location = state.init?.default_location || '';
+    }
+    const locationInput = el('input', {
+      type: 'text',
+      value: firstRun.location,
+      'aria-label': COPY.location,
+      disabled: Boolean(view.busy),
+    });
     locationInput.addEventListener('change', async () => {
       firstRun.location = locationInput.value;
       firstRun.holdsJournal = await call('holdsJournal', { path: firstRun.location });
-      renderFirstRun('location');
+      renderFlow(state.flow);
     });
     put(card,
-      el('h1', {}, COPY.locationTitle),
+      el('h1', {}, document.createTextNode(folderCopy.title || COPY.locationTitle)),
+      folderCopy.help ? el('p', { class: 'muted' }, document.createTextNode(folderCopy.help)) : null,
       el('div', { class: 'field' },
-        el('h2', {}, COPY.location),
-        el('div', { class: 'row' }, locationInput,
-          el('button', { type: 'button', on: { click: async () => {
-            const picked = await call('pickFolder', { start: firstRun.location });
-            if (picked) {
-              firstRun.location = picked.path;
-              firstRun.holdsJournal = picked.holds_journal;
-              renderFirstRun('location');
-            }
-          } } }, COPY.chooseLocation)),
-        firstRun.holdsJournal ? el('p', { class: 'faint' }, COPY.journalFound) : null),
-      firstRun.error ? el('p', { class: 'error' }, firstRun.error) : null,
+        el('h2', {}, document.createTextNode(COPY.location)),
+        el('div', { class: 'row' },
+          locationInput,
+          el('button', {
+            type: 'button',
+            disabled: Boolean(view.busy),
+            on: { click: async () => {
+              const picked = await call('pickFolder', { start: firstRun.location });
+              if (picked) {
+                firstRun.location = picked.path;
+                firstRun.holdsJournal = picked.holds_journal;
+                renderFlow(state.flow);
+              }
+            }}
+          }, document.createTextNode(folderCopy.change || COPY.chooseLocation))
+        ),
+        firstRun.holdsJournal ? el('p', { class: 'faint' }, document.createTextNode(COPY.journalFound)) : null
+      ),
+      view.error ? el('p', { class: 'error' }, document.createTextNode(view.error)) : null,
       el('div', { class: 'actions' },
-        el('button', { type: 'button', class: 'primary', on: { click: runSetup } }, COPY.continueButton)),
+        el('button', {
+          type: 'button',
+          class: 'primary',
+          disabled: Boolean(view.busy),
+          on: { click: () => {
+            firstRun.adopted = firstRun.holdsJournal;
+            firstRun.steps = [];
+            call('flow', { intent: 'start-setup', path: firstRun.location });
+          }}
+        }, document.createTextNode(folderCopy.continue || COPY.continueButton))
+      )
     );
-    locationInput.focus();
-  } else if (step === 'setup') {
+  } else if (view.phase === 'setup') {
+    if (view.setup_running || view.setup_failed) {
+      put(card,
+        el('h1', {}, document.createTextNode(COPY.setupTitle)),
+        el('p', { class: 'muted' }, document.createTextNode(COPY.setupSubtitle)),
+        el('div', {}, el('ul', { class: 'steps' },
+          firstRun.steps.filter(item => COPY.steps[item.step]).map(item =>
+            el('li', { class: item.state }, document.createTextNode(COPY.steps[item.step]))
+          )
+        )),
+        view.error ? failure(COPY.setupStopped, view.error) : null,
+        view.error ? el('div', { class: 'actions centered' },
+          el('button', {
+            type: 'button',
+            disabled: Boolean(view.busy),
+            on: { click: () => call('flow', { intent: 'retry-setup' }) }
+          }, document.createTextNode(COPY.tryAgain))
+        ) : null
+      );
+    } else {
+      put(card,
+        view.error ? failure(COPY.setupStopped, view.error) : null,
+        view.error ? el('div', { class: 'actions centered' },
+          el('button', {
+            type: 'button',
+            disabled: Boolean(view.busy),
+            on: { click: () => call('flow', { intent: 'retry-state' }) }
+          }, document.createTextNode(COPY.tryAgain))
+        ) : null
+      );
+    }
+  } else if (view.phase === 'mark') {
+    const markCopy = copy.mark || {};
+    const markBox = el('div');
+    renderMarkCard(markBox, view.mark?.render);
     put(card,
-      el('h1', {}, COPY.setupTitle),
-      el('p', { class: 'muted' }, COPY.setupSubtitle),
-      // Only the steps that do something on Windows have words; the rest
-      // pass by unseen.
-      el('div', {}, el('ul', { class: 'steps' }, firstRun.steps.filter(item => COPY.steps[item.step]).map(item =>
-        el('li', { class: item.state }, COPY.steps[item.step])))),
-      firstRun.error ? failure(COPY.setupStopped, firstRun.error) : null,
-      firstRun.error ? el('div', { class: 'actions centered' },
-        el('button', { type: 'button', on: { click: runSetup } }, COPY.tryAgain)) : null,
+      markCopy.title ? el('h1', {}, document.createTextNode(markCopy.title)) : null,
+      markCopy.help ? el('p', { class: 'muted' }, document.createTextNode(markCopy.help)) : null,
+      markBox,
+      markCopy.permanence ? el('p', { class: 'faint' }, document.createTextNode(markCopy.permanence)) : null,
+      view.error ? el('p', { class: 'error' }, document.createTextNode(view.error)) : null,
+      el('div', { class: 'actions' },
+        markCopy.try_another ? el('button', {
+          type: 'button',
+          disabled: Boolean(view.busy),
+          on: { click: () => call('flow', { intent: 'regenerate-mark' }) }
+        }, document.createTextNode(markCopy.try_another)) : null,
+        el('button', {
+          type: 'button',
+          class: 'primary',
+          disabled: Boolean(view.busy),
+          on: { click: () => call('flow', { intent: 'commit-mark' }) }
+        }, document.createTextNode(markCopy.continue || COPY.continueButton))
+      )
     );
-  } else if (step === 'browser') {
+  } else if (view.phase === 'thinking') {
+    const thinkingCopy = copy.thinking || {};
+    const choices = thinkingCopy.choices || [];
+    const changeHeader = (view.thinking_saved && thinkingCopy.change)
+      ? el('p', { class: 'muted' }, document.createTextNode(thinkingCopy.change))
+      : null;
+    const choiceNodes = choices
+      .filter(choice => choice.id !== 'local' || view.local_offered)
+      .map(choice => {
+        let line = choice.sub;
+        if (choice.id === 'local' && view.local_offered && typeof view.default_line === 'string' && view.default_line.length > 0) {
+          line = view.default_line;
+        }
+        return el('div', { class: 'field' },
+          el('button', {
+            type: 'button',
+            disabled: Boolean(view.busy),
+            on: { click: () => call('flow', { intent: 'choose-thinking', choice: choice.id }) }
+          }, document.createTextNode(choice.label || choice.id)),
+          line ? el('p', { class: 'muted' }, document.createTextNode(line)) : null,
+          choice.description ? el('p', {}, document.createTextNode(choice.description)) : null
+        );
+      });
+    const laterButton = (thinkingCopy.later && typeof thinkingCopy.later === 'string')
+      ? el('button', {
+          type: 'button',
+          disabled: Boolean(view.busy),
+          on: { click: () => call('flow', { intent: 'choose-thinking', choice: 'later' }) }
+        }, document.createTextNode(thinkingCopy.later))
+      : null;
+    const finalizeButton = view.can_finalize ? el('button', {
+      type: 'button',
+      class: 'primary',
+      disabled: Boolean(view.busy),
+      on: { click: () => {
+        let tz = null;
+        try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch {}
+        call('flow', { intent: 'finalize', timezone: tz });
+      }}
+    }, document.createTextNode(thinkingCopy.continue || COPY.continueButton)) : null;
+
     put(card,
-      el('h1', {}, COPY.browserTitle),
-      el('p', { class: 'muted' }, COPY.browserLine),
-      firstRun.error ? el('p', { class: 'error', role: 'alert' }, firstRun.error) : null,
-      el('div', { class: 'actions centered' },
-        el('button', { type: 'button', on: { click: openFirstRunPage } }, COPY.openBrowser)),
+      thinkingCopy.title ? el('h1', {}, document.createTextNode(thinkingCopy.title)) : null,
+      changeHeader,
+      ...choiceNodes,
+      el('div', { class: 'actions' },
+        laterButton,
+        finalizeButton
+      ),
+      view.error ? el('p', { class: 'error' }, document.createTextNode(view.error)) : null
     );
   }
+
   show('firstrun');
 }
 
-function beginFirstRun(journalPath) {
-  firstRun.location = journalPath || state.init.default_location;
-  firstRun.error = null;
-  call('holdsJournal', { path: firstRun.location }).then(holds => {
-    firstRun.holdsJournal = holds;
-    renderFirstRun('location');
-  });
-  renderFirstRun('location');
+function landHome(view) {
+  if (firstRun.adopted) state.message = COPY.adoptLandingLine;
+  state.pane = 'home';
+  state.flow = view;
+  show('main');
+  render();
+  if (display() === 'running') {
+    loadJournalFacts();
+  }
 }
+
+listeners.flow.push(({ view }) => {
+  renderFlow(view);
+});
 
 listeners.setup.push(({ progress }) => {
   if (progress.kind === 'step-started') {
@@ -450,97 +636,10 @@ listeners.setup.push(({ progress }) => {
     const item = firstRun.steps.find(entry => entry.step === progress.step);
     if (item) item.state = 'failed';
   }
-  renderFirstRun('setup');
+  if (state.flow?.phase === 'setup') {
+    renderFlow(state.flow);
+  }
 });
-
-async function runSetup() {
-  if (!firstRun.location.trim()) return;
-  firstRun.adopted = firstRun.holdsJournal;
-  firstRun.steps = [];
-  firstRun.error = null;
-  renderFirstRun('setup');
-  try {
-    const result = await call('setup', { path: firstRun.location });
-    state.status = result.status;
-    setModelsMissing(result.models_missing != null);
-  } catch (error) {
-    firstRun.error = error.message;
-    renderFirstRun('setup');
-    return;
-  }
-  await routeAfterSetup();
-}
-
-// The same reading of the journal's first run the Mac app makes.
-async function routeAfterSetup() {
-  let probe;
-  try {
-    probe = await call('initProbe', { port: port() });
-  } catch (error) {
-    firstRun.error = error.message;
-    renderFirstRun('setup');
-    return;
-  }
-  if (probe === 'complete') {
-    await landHome();
-    return;
-  }
-  waitForFirstRun();
-}
-
-// Whether the journal's first run is done. An unreadable answer counts as
-// done, so the app never holds the owner away from their journal.
-async function firstRunDone() {
-  return await call('initProbe', { port: port() }).catch(() => 'complete') !== 'incomplete';
-}
-
-// The rest of the first run is the journal's own page, the one every journal
-// shows, in the owner's browser. The window waits until the journal says it
-// is done, then lands home. A sign-in start opens the page only once the
-// owner opens the window.
-const firstRunWait = { timer: null, opened: false, checking: false };
-
-function waitForFirstRun() {
-  firstRun.error = null;
-  renderFirstRun('browser');
-  if (firstRunWait.timer === null) firstRunWait.timer = setInterval(checkFirstRunDone, 2000);
-  if (!firstRunWait.opened && state.init.launch !== 'sign-in') openFirstRunPage();
-}
-
-async function openFirstRunPage() {
-  firstRunWait.opened = true;
-  firstRun.error = null;
-  try {
-    await call('open', { target: 'init', base: state.status?.base });
-  } catch {
-    firstRun.error = COPY.browserFailed;
-  }
-  if (firstRunWait.timer !== null) renderFirstRun('browser');
-}
-
-async function checkFirstRunDone() {
-  if (firstRunWait.checking || firstRunWait.timer === null) return;
-  firstRunWait.checking = true;
-  try {
-    if (await call('initProbe', { port: port() }) === 'complete' && firstRunWait.timer !== null) {
-      clearInterval(firstRunWait.timer);
-      firstRunWait.timer = null;
-      await landHome();
-    }
-  } catch { /* the next check asks again */ } finally {
-    firstRunWait.checking = false;
-  }
-}
-
-async function landHome() {
-  if (firstRun.adopted) state.message = COPY.adoptLandingLine;
-  state.pane = 'home';
-  await refreshStatus();
-  await call('syncSignInLaunch', { on: state.status?.service?.starts_at_sign_in ?? true }).catch(() => {});
-  show('main');
-  startPolling();
-  await loadJournalFacts();
-}
 
 // --- the main window -----------------------------------------------------
 
@@ -590,6 +689,88 @@ function openPage(target) {
   });
 }
 
+function speechBlock() {
+  const flow = state.flow;
+  const speech = flow?.downloads?.speech;
+  if (!speech) return null;
+  const copy = flow.copy?.downloads || {};
+  if (speech.state === 'complete') {
+    return copy.complete ? el('div', { class: 'notice' },
+      el('p', {}, document.createTextNode(copy.complete))
+    ) : null;
+  }
+  if (speech.state === 'idle') {
+    return copy.idle ? el('div', { class: 'notice' },
+      el('p', {}, document.createTextNode(copy.idle))
+    ) : null;
+  }
+  if (speech.state === 'error') {
+    const detail = speech.error?.detail;
+    const retry = flow.speech_retry ? el('button', {
+      type: 'button',
+      disabled: Boolean(flow.busy),
+      on: { click: () => call('flow', { intent: 'retry-speech-download' }) }
+    }, COPY.tryAgain) : null;
+    if (!detail && !retry) return null;
+    return el('div', { class: 'notice' },
+      detail ? el('p', {}, document.createTextNode(detail)) : null,
+      retry
+    );
+  }
+  if (speech.state === 'downloading') {
+    return copy.progress ? el('div', { class: 'notice' },
+      el('p', {}, document.createTextNode(copy.progress))
+    ) : null;
+  }
+  return null;
+}
+
+function thinkingBlock() {
+  const flow = state.flow;
+  const thinking = flow?.downloads?.thinking;
+  if (!thinking) return null;
+  const copy = flow.copy?.downloads || {};
+  if (thinking.state === 'complete') {
+    return copy.complete ? el('div', { class: 'notice' },
+      el('p', {}, document.createTextNode(copy.complete))
+    ) : null;
+  }
+  const text = thinking.state === 'downloading'
+    ? copy.progress
+    : thinking.error?.detail;
+  const retryButton = flow.thinking_retry ? el('button', {
+    type: 'button',
+    disabled: Boolean(flow.busy),
+    on: { click: () => call('flow', { intent: 'start-thinking-download' }) }
+  }, COPY.tryAgain) : null;
+  const cancelButton = (flow.thinking_cancel && copy.cancel) ? el('button', {
+    type: 'button',
+    disabled: Boolean(flow.busy),
+    on: { click: () => call('flow', { intent: 'cancel-thinking-download' }) }
+  }, copy.cancel) : null;
+
+  if (!text && !retryButton && !cancelButton) return null;
+
+  return el('div', { class: 'notice' },
+    text ? el('p', {}, document.createTextNode(text)) : null,
+    retryButton,
+    cancelButton
+  );
+}
+
+function modelsBlock() {
+  const flow = state.flow;
+  if (!flow?.models?.showing) return null;
+  return el('div', { class: 'notice' },
+    el('p', {}, document.createTextNode(flow.models.detail || '')),
+    el('button', {
+      type: 'button',
+      disabled: Boolean(flow.busy),
+      on: { click: () => call('flow', { intent: 'retry-models' }) }
+    }, COPY.tryAgain)
+  );
+}
+
 const panes = {
   home() {
     const markBox = el('div');
@@ -597,7 +778,12 @@ const panes = {
     const key = display();
     let offer = null;
     if (key === 'running') {
-      offer = el('button', { type: 'button', class: 'primary', on: { click: () => openPage('journal') } }, COPY.openJournal);
+      offer = el('button', {
+        type: 'button',
+        class: 'primary',
+        disabled: Boolean(state.flow?.busy),
+        on: { click: () => call('flow', { intent: 'open-journal' }) }
+      }, COPY.openJournal);
     } else if (key === 'stopped' || key === 'not-running') {
       offer = el('button', { type: 'button', class: 'primary', on: { click: () => serviceAction('start') } }, COPY.start);
     } else {
@@ -608,10 +794,9 @@ const panes = {
       markBox,
       statusLine(),
       message(),
-      state.modelsMissing ? el('div', { class: 'notice' },
-        el('p', {}, COPY.modelsMissing),
-        el('button', { type: 'button', disabled: state.downloadingModels, on: { click: downloadModels } },
-          state.downloadingModels ? COPY.modelsDownloading : COPY.modelsRetry)) : null,
+      speechBlock(),
+      thinkingBlock(),
+      modelsBlock(),
       el('p', { class: 'muted' }, COPY.homeLine),
       el('div', { class: 'actions' }, offer),
     ];
@@ -688,28 +873,6 @@ const panes = {
     return renderUpdates();
   },
 };
-
-// Kept with the window's own storage, so the notice outlives a restart of the app.
-function setModelsMissing(missing) {
-  state.modelsMissing = missing;
-  try {
-    if (missing) localStorage.setItem('modelsMissing', '1'); else localStorage.removeItem('modelsMissing');
-  } catch { /* the notice still shows for this run */ }
-}
-
-async function downloadModels() {
-  state.downloadingModels = true;
-  render();
-  try {
-    await call('installModels');
-    setModelsMissing(false);
-    state.message = null;
-  } catch {
-    state.message = COPY.modelsFailed;
-  }
-  state.downloadingModels = false;
-  render();
-}
 
 // --- devices and pairing --------------------------------------------------
 
@@ -1196,27 +1359,11 @@ listeners.update.push(({ view }) => {
 });
 
 listeners.shown.push(async () => {
-  if (firstRunWait.timer !== null) {
-    if (!firstRunWait.opened) openFirstRunPage();
-    await checkFirstRunDone();
-    return;
-  }
   if (!$('main').hidden) {
     await refreshStatus();
     if (display() === 'running') await loadJournalFacts();
-    await recheckModels();
   }
 });
-
-// The notice stays only while the models are still missing: a repair from a
-// terminal clears it the next time the window opens.
-async function recheckModels() {
-  if (!state.modelsMissing || state.downloadingModels) return;
-  if (await call('modelsReady').catch(() => false)) {
-    setModelsMissing(false);
-    render();
-  }
-}
 
 function render(force = false) {
   if ($('main').hidden) return;
@@ -1254,30 +1401,31 @@ async function main() {
   state.init = await call('init');
   // The locked mark the app last drew, until the running journal says.
   if (validMark(state.init.mark)) state.mark = state.init.mark;
-  const status = await refreshStatus();
-  if (!status?.set_up) {
-    beginFirstRun(status?.service?.journal);
+  await refreshStatus();
+
+  if (typeof state.status?.service?.installed !== 'boolean') {
+    $('loading').replaceChildren(el('p', { class: 'error' }, document.createTextNode(state.message || "couldn't read journal status")));
     return;
   }
-  show('main');
-  render();
-  startPolling();
+
   // Opening the app starts the journal, as opening the Mac app does. A
   // sign-in start leaves that to the journal's own task, and an update puts
   // it back only if the owner had it running.
-  if (state.init.launch === 'plain' && !['running', 'starting'].includes(display())) {
+  if (state.init.launch === 'plain' && !['running', 'starting'].includes(display()) && state.status?.set_up) {
     await serviceAction('start');
   }
-  await call('syncSignInLaunch', { on: state.status?.service?.starts_at_sign_in ?? true }).catch(() => {});
+
+  const flow = await call('flow', { intent: 'boot', task_installed: state.status.service.installed });
+  renderFlow(flow);
+
+  startPolling();
+
+  if (state.status?.service?.installed === true && typeof state.status?.service?.starts_at_sign_in === 'boolean') {
+    await call('syncSignInLaunch', { on: state.status.service.starts_at_sign_in }).catch(() => {});
+  }
   if (display() === 'running') {
-    // A journal set up from the terminal may not have finished its first run.
-    if (!await firstRunDone()) {
-      waitForFirstRun();
-      return;
-    }
     await loadJournalFacts();
   }
-  await recheckModels();
 }
 
 main().catch(error => {

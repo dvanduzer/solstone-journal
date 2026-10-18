@@ -34,6 +34,8 @@ pub enum UserEvent {
     Ipc(String),
     /// Script to run in the page.
     Script(String),
+    /// A setup flow event from a worker.
+    Flow(crate::setup_flow::Event),
     /// Another start asked this window to come forward.
     Show,
     /// Quit the app.
