@@ -76,6 +76,11 @@ impl State {
     fn snapshot(&self) -> Value {
         let mut status = self.status.lock().unwrap().clone();
         status["generation"] = json!(self.generation.load(Ordering::Acquire));
+        status["cancel_requested"] = json!(
+            self.stop.load(Ordering::Acquire)
+                || self.cancel.load(Ordering::Acquire)
+                || (self.external_cancelled)()
+        );
         status["recent_failures"] = json!(self.recent_failures.lock().unwrap().clone());
         status
     }

@@ -69,6 +69,7 @@ struct RemoteRequest {
     workspace: Bytes,
 }
 
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub(super) struct Options {
     pub version: u32,

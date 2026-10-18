@@ -4,8 +4,9 @@
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
+use solstone_core_assets::Platform;
 #[cfg(test)]
-use solstone_core_assets::{Platform, resolve};
+use solstone_core_assets::resolve;
 
 pub const LLAMA_SERVER_PINS: &[(&str, &str, &str, &str, &str)] = &[
     (
@@ -865,4 +866,141 @@ pub fn parakeet_pins_json() -> Value {
         "parakeet_cpu_pins": PARAKEET_CPU_PINS.iter().map(|p| json!({"artifact_key":p.0,"release_tag":p.1,"filename":p.2,"sha256":p.3,"binary_name":p.4})).collect::<Vec<_>>(),
         "parakeet_model": parakeet_model_identity(),
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThinkingDownloadRow {
+    pub unit: &'static str,
+    pub platform: Option<Platform>,
+    pub filename: Option<&'static str>,
+    pub packaged: bool,
+}
+
+fn platform_from_key(key: &str) -> Option<Platform> {
+    match key {
+        "aarch64-apple-darwin" => Some(Platform::MacosArm64),
+        "x86_64-unknown-linux-gnu" => Some(Platform::LinuxX64),
+        "aarch64-unknown-linux-gnu" => Some(Platform::LinuxArm64),
+        _ => None,
+    }
+}
+
+pub fn thinking_download_rows(
+    backend: crate::Backend,
+    platform_key: &str,
+) -> Option<Vec<ThinkingDownloadRow>> {
+    let model_id = model_identity("local/qwen3.5-4b")?;
+    let filename = model_id.get("filename")?.as_str()?;
+    let mmproj_filename = model_id.get("mmproj_filename")?.as_str()?;
+    let model_rows = vec![
+        ThinkingDownloadRow {
+            unit: "local-model",
+            platform: None,
+            filename: Some(
+                super::select_artifact("local-model", None, None, None, Some(filename))
+                    .ok()?
+                    .filename,
+            ),
+            packaged: false,
+        },
+        ThinkingDownloadRow {
+            unit: "local-model",
+            platform: None,
+            filename: Some(
+                super::select_artifact("local-model", None, None, None, Some(mmproj_filename))
+                    .ok()?
+                    .filename,
+            ),
+            packaged: false,
+        },
+    ];
+
+    if platform_key == "x86_64-windows" {
+        let mut rows = vec![ThinkingDownloadRow {
+            unit: "llama-server",
+            platform: None,
+            filename: None,
+            packaged: true,
+        }];
+        rows.extend(model_rows);
+        return Some(rows);
+    }
+
+    let unit = match backend {
+        crate::Backend::Vulkan => "llama-server-vulkan",
+        crate::Backend::Cuda => "llama-server-cuda",
+    };
+    let platform = platform_from_key(platform_key);
+    // Use the same selected, published runtime as the installer. CUDA's
+    // upstream build inputs are not transferred by the journal.
+    let artifact = super::select_artifact(unit, platform, None, Some(platform_key), None).ok()?;
+    let mut rows = vec![ThinkingDownloadRow {
+        unit,
+        platform,
+        filename: Some(artifact.filename),
+        packaged: false,
+    }];
+    rows.extend(model_rows);
+    Some(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thinking_download_rows_matches_identities_and_differentiates_cuda_vulkan() {
+        let model_id = model_identity("local/qwen3.5-4b").expect("model identity exists");
+        let model_filename = model_id["filename"].as_str().unwrap();
+        let model_mmproj = model_id["mmproj_filename"].as_str().unwrap();
+
+        let key = "x86_64-unknown-linux-gnu";
+        let cuda_rows = thinking_download_rows(crate::Backend::Cuda, key).expect("cuda rows");
+        let vulkan_rows = thinking_download_rows(crate::Backend::Vulkan, key).expect("vulkan rows");
+
+        let published_cuda = crate::install::select_artifact(
+            "llama-server-cuda",
+            Some(Platform::LinuxX64),
+            None,
+            Some(key),
+            None,
+        )
+        .expect("published journal runtime");
+
+        let actual_cuda_files: Vec<&str> = cuda_rows
+            .iter()
+            .filter(|r| r.unit == "llama-server-cuda")
+            .map(|r| r.filename.unwrap())
+            .collect();
+        assert_eq!(actual_cuda_files, vec![published_cuda.filename]);
+
+        let vulkan_file = vulkan_rows
+            .iter()
+            .find(|r| r.unit == "llama-server-vulkan")
+            .unwrap()
+            .filename
+            .unwrap();
+        assert!(!actual_cuda_files.contains(&vulkan_file));
+
+        for rows in [&cuda_rows, &vulkan_rows] {
+            let m1 = rows
+                .iter()
+                .find(|r| r.filename == Some(model_filename))
+                .expect("model filename present");
+            assert_eq!(m1.unit, "local-model");
+            let m2 = rows
+                .iter()
+                .find(|r| r.filename == Some(model_mmproj))
+                .expect("mmproj present");
+            assert_eq!(m2.unit, "local-model");
+        }
+
+        let win_rows =
+            thinking_download_rows(crate::Backend::Vulkan, "x86_64-windows").expect("win rows");
+        let win_runtime = &win_rows[0];
+        assert!(win_runtime.packaged);
+        assert!(
+            solstone_core_assets::resolve(win_runtime.unit, win_runtime.platform, None).is_empty()
+        );
+    }
 }

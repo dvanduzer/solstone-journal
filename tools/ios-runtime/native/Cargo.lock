@@ -1806,6 +1806,7 @@ dependencies = [
  "solstone-core-maintenance",
  "solstone-core-mcp-endpoint",
  "solstone-core-spl",
+ "solstone-core-transcribe",
  "tokio",
 ]
 
@@ -3823,6 +3824,7 @@ dependencies = [
  "solstone-core-journal-stats-cli",
  "solstone-core-segment",
  "solstone-core-sol-link",
+ "solstone-core-speaker-id",
  "solstone-core-speaker-resolve",
  "solstone-core-system",
  "solstone-core-system-health",
@@ -4569,6 +4571,7 @@ dependencies = [
  "solstone-core-journal-config",
  "solstone-core-journal-config-write",
  "solstone-core-journal-io",
+ "solstone-core-local",
  "solstone-core-sol-client",
  "solstone-core-thinking-copy",
  "spl-core",

@@ -24,6 +24,13 @@ pub fn assemble_backend_env(destination: &Destination) -> Result<Map<String, Val
                     "AWS_DEFAULT_REGION".to_owned(),
                     Value::String(ios_s3_region(&destination.repository, credentials)?),
                 );
+                // An operated destination's linked transport is create-only.
+                if credentials.get("append_only").and_then(Value::as_str) == Some("1") {
+                    env.insert(
+                        "SOLSTONE_APPEND_ONLY".to_owned(),
+                        Value::String("1".to_owned()),
+                    );
+                }
             }
             if let Some(token) = credentials
                 .get("session_token")

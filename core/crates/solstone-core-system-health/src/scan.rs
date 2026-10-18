@@ -487,7 +487,7 @@ fn markdown_transcript_files(files: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
-fn is_audio_jsonl(path: &Path) -> bool {
+pub fn is_audio_jsonl(path: &Path) -> bool {
     file_name(path).is_some_and(|name| {
         name == "audio.jsonl"
             || name.ends_with("_audio.jsonl")

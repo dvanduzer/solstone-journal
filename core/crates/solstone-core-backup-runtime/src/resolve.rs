@@ -57,17 +57,12 @@ pub struct ResolvedTools {
 }
 
 #[cfg(target_os = "ios")]
+// Operated storage needs no rclone here: the linked transport keeps an operated
+// destination's non-lock writes create-only.
 fn resolve_ios_tools(
     runner: &dyn ToolRunner,
     journal: &Path,
-    needs_rclone: bool,
 ) -> Result<ResolvedTools, ClosedToolError> {
-    if needs_rclone {
-        return Err(ClosedToolError::RcloneUnavailable {
-            detail: "ios_append_only_transport_unavailable".into(),
-            guidance: solstone_core_installed_payload::guidance::PACKAGE_MISMATCH.into(),
-        });
-    }
     let unavailable = |detail: &str| ClosedToolError::ResticUnavailable {
         detail: detail.into(),
         guidance: solstone_core_installed_payload::guidance::PACKAGE_MISMATCH.into(),
@@ -259,9 +254,7 @@ pub fn resolve_tools_for_platform(
 
     match platform {
         #[cfg(target_os = "ios")]
-        ToolPlatform::IosCallable => {
-            resolve_ios_tools(_runner, &capability.resolved_journal, needs_rclone)
-        }
+        ToolPlatform::IosCallable => resolve_ios_tools(_runner, &capability.resolved_journal),
         ToolPlatform::Desktop => {
             let package = admit_package(executable, needs_rclone)?;
             let restic_path = package.member(RESTIC_MEMBER).map_err(|refusal| {
@@ -368,11 +361,7 @@ pub fn resolve_operational_tools_for_platform(
     let needs_rclone = append_only && journal_is_operated(journal);
     match platform {
         #[cfg(target_os = "ios")]
-        ToolPlatform::IosCallable => resolve_ios_tools(
-            _runner,
-            journal,
-            needs_rclone || ios_configured_operated(journal),
-        ),
+        ToolPlatform::IosCallable => resolve_ios_tools(_runner, journal),
         ToolPlatform::Desktop => {
             let package = admit_package(executable, needs_rclone)?;
             let restic_path = package.member(RESTIC_MEMBER).map_err(|refusal| {
@@ -492,12 +481,6 @@ pub fn resolve_restic_member_for_platform(
     }
 }
 
-#[cfg(any(target_os = "ios", test))]
-fn ios_configured_operated(journal: &Path) -> bool {
-    get_backup_config(journal)
-        .is_ok_and(|config| config.get("mode").and_then(Value::as_str) == Some("operated"))
-}
-
 fn journal_is_operated(journal: &Path) -> bool {
     let Ok(config) = get_backup_config(journal) else {
         return false;
@@ -517,19 +500,6 @@ mod tests {
         render_installed_payload,
     };
     use std::fs;
-
-    #[test]
-    fn ios_operated_refusal_does_not_depend_on_enabled_state() {
-        let journal = configured_journal();
-        solstone_core_backup::set_enabled(journal.path(), false).unwrap();
-        assert!(!ios_configured_operated(journal.path()));
-        solstone_core_backup::set_mode(journal.path(), "operated").unwrap();
-        assert!(ios_configured_operated(journal.path()));
-        assert!(!journal_is_operated(journal.path()));
-        solstone_core_backup::set_enabled(journal.path(), true).unwrap();
-        assert!(ios_configured_operated(journal.path()));
-        assert!(journal_is_operated(journal.path()));
-    }
 
     struct NoOpRunner;
     impl ToolRunner for NoOpRunner {

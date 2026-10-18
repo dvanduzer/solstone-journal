@@ -224,7 +224,37 @@ impl ExecuteError {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_call<'a>(
+    authority: &AdmittedIosBackupAuthority,
+    args: &[String],
+    repository: &'a str,
+    password: &str,
+    next_password: Option<&str>,
+    env: Option<&'a BTreeMap<String, Option<String>>>,
+    cancellation: Option<&ArchiveCancellation>,
+) -> Result<repository::Repository<'a>, RunnerError> {
+    let validated = validate_call_shape(
+        authority,
+        args,
+        repository,
+        password,
+        next_password,
+        env,
+        cancellation,
+    );
+    if let Err(error) = &validated {
+        // Every refusal reason here is a static code, never built from inputs.
+        let reason = std::error::Error::source(error).map(ToString::to_string);
+        log::warn!(
+            "ios backup call refused before the bridge: {error}: {}",
+            reason.as_deref().unwrap_or("")
+        );
+    }
+    validated
+}
+
+fn validate_call_shape<'a>(
     authority: &AdmittedIosBackupAuthority,
     args: &[String],
     repository: &'a str,
@@ -403,6 +433,7 @@ fn execute(
             access,
             secret,
             token,
+            append_only,
         } => {
             state = authority
                 .installed
@@ -425,6 +456,13 @@ fn execute(
                     descriptor: state.as_fd(),
                 },
             };
+            // Options version 2 carries the create-only bit for an append-only
+            // (operated) destination; owner storage keeps ordinary writes.
+            let options = native::Options {
+                version: if append_only { 2 } else { options.version },
+                reserved1: u32::from(append_only),
+                ..*options
+            };
             native::Call::remote(
                 operation,
                 &password,
@@ -433,15 +471,38 @@ fn execute(
                 snapshot_source,
                 private_workspace,
                 selection,
-                options,
+                &options,
             )
         }
     }
-    .map_err(ExecuteError::Entry)?;
+    .map_err(|status| {
+        log::warn!("ios backup operation {operation} refused at entry: status {status}");
+        ExecuteError::Entry(status)
+    })?;
     let cancelled = || cancellation.is_some_and(ArchiveCancellation::is_cancelled);
     // All surrounding captured authorities, buffers, directories and the actual
     // caller's lifetime remain live until actual wait/result/free returns.
-    Ok(call.wait(timeout, Some(&cancelled), metadata))
+    let completed = call.wait(timeout, Some(&cancelled), metadata);
+    log_failure(operation, &completed);
+    Ok(completed)
+}
+
+// The bridge's diagnostic is a bounded code, never a credential or path.
+fn log_failure(operation: i32, completed: &native::Completed) {
+    if completed.fields.status == 0 {
+        return;
+    }
+    let end = completed
+        .fields
+        .diagnostic
+        .iter()
+        .position(|byte| *byte == 0);
+    let diagnostic = std::str::from_utf8(&completed.fields.diagnostic[..end.unwrap_or(0)])
+        .unwrap_or("unprintable");
+    log::warn!(
+        "ios backup operation {operation} failed: status {} diagnostic {diagnostic}",
+        completed.fields.status
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -561,11 +622,14 @@ fn restore(
     {
         return Err(refused("ios_backup_restore_target_mismatch"));
     }
+    // Restore writes only its repository lock remotely, so it needs no
+    // create-only condition.
     let repository::Repository::S3 {
         destination,
         access,
         secret,
         token,
+        ..
     } = repository
     else {
         return Err(refused("ios_backup_restore_local_unsupported"));
@@ -606,10 +670,15 @@ fn restore(
         snapshot,
         selector,
     )
-    .map_err(|status| ExecuteError::Entry(status).into_runner())?;
+    .map_err(|status| {
+        log::warn!("ios backup restore refused at entry: status {status}");
+        ExecuteError::Entry(status).into_runner()
+    })?;
     let cancelled = || cancellation.is_some_and(ArchiveCancellation::is_cancelled);
     // The target, state directory and credentials stay borrowed until wait/free.
-    Ok(call.wait(timeout, Some(&cancelled), true))
+    let completed = call.wait(timeout, Some(&cancelled), true);
+    log_failure(6, &completed);
+    Ok(completed)
 }
 
 #[allow(clippy::too_many_arguments)]

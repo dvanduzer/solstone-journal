@@ -440,9 +440,13 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
                     "root_current": current.root.revalidate_canonical_binding().is_ok(),
                 }))
             } else if current.handle()?.stop_handle().is_stopping() {
-                Ok(json!({"stopping":true,
-                    "failed":retirement::inspect() == retirement::Outcome::Failed,
-                    "root_current":current.root.revalidate_canonical_binding().is_ok()}))
+                let mut status = current.status()?;
+                let failed = status["failed"].as_bool().unwrap_or(false)
+                    || retirement::inspect() == retirement::Outcome::Failed;
+                status["stopping"] = json!(true);
+                status["failed"] = json!(failed);
+                status["root_current"] = json!(current.root.revalidate_canonical_binding().is_ok());
+                Ok(status)
             } else {
                 current.status()
             }
@@ -1330,6 +1334,10 @@ mod retirement_start_tests {
             );
             std::thread::park_timeout(Duration::from_millis(10));
         }
+        assert_eq!(
+            serving(&first, r#"{"op":"status"}"#).unwrap()["audio"]["cancel_requested"],
+            false
+        );
         // The real early Stop must signal all these owners while thinking is held.
         let held_thinking = THINKING.lock().unwrap();
         let cancellation_at = Instant::now();
@@ -1354,16 +1362,13 @@ mod retirement_start_tests {
         }
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            let state = {
-                let server = SERVING.lock().unwrap();
-                server.as_ref().unwrap().handle().unwrap().status()["audio"]["state"].clone()
-            };
-            if state == "cancelled" {
+            let audio = serving(&first, r#"{"op":"status"}"#).unwrap()["audio"].clone();
+            if audio["cancel_requested"] == true {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "audio must observe Stop before thinking is released: {state}"
+                "host audio must receive Stop before thinking is released: {audio}"
             );
             std::thread::park_timeout(Duration::from_millis(10));
         }

@@ -41,11 +41,17 @@ fn local_provider_val() -> Value {
     serde_json::from_str(LOCAL_PROVIDER_SELECTION).expect("valid local provider json")
 }
 
+pub use crate::setup_progress::{
+    SetupDownloadError, SetupDownloadTask, SetupDownloads, SetupProgress, SetupProgressError,
+    SetupProgressThinking, SetupRetryError, packaged_speech_retry, read_setup_progress,
+};
+
 pub trait SetupHost: Send + Sync {
     fn start_local(&self, journal_root: &Path) -> Result<(), String>;
     fn cancel_local(&self, journal_root: &Path, attempt_id: &str) -> Result<(), String>;
-    fn retry_speech(&self, journal_root: &Path) -> Result<(), String>;
-    fn project_downloads(&self, journal_root: &Path) -> SetupDownloads;
+    fn retry_speech(&self, journal_root: &Path) -> Result<(), SetupRetryError>;
+    fn project_downloads(&self, journal_root: &Path) -> Result<SetupDownloads, SetupProgressError>;
+    fn thinking_download_bytes(&self, journal: &Path) -> Option<u64>;
     fn catalog_facts(&self) -> SetupCatalogFacts;
 }
 
@@ -60,27 +66,38 @@ impl SetupHost for NoopSetupHost {
         Err("cancel_local unavailable in noop host".into())
     }
 
-    fn retry_speech(&self, _journal_root: &Path) -> Result<(), String> {
-        Err("retry_speech unavailable in noop host".into())
+    fn retry_speech(&self, _journal_root: &Path) -> Result<(), SetupRetryError> {
+        Err(SetupRetryError {
+            code: "retry_unavailable",
+            message: "retry unavailable",
+            detail: "speech retry is not available.".into(),
+        })
     }
 
-    fn project_downloads(&self, _journal_root: &Path) -> SetupDownloads {
-        SetupDownloads {
+    fn project_downloads(
+        &self,
+        _journal_root: &Path,
+    ) -> Result<SetupDownloads, SetupProgressError> {
+        Ok(SetupDownloads {
             speech: SetupDownloadTask {
                 state: "idle".into(),
                 attempt_id: None,
-                bytes_done: None,
+                bytes_done: 0,
                 bytes_total: None,
                 error: None,
             },
             thinking: SetupDownloadTask {
                 state: "idle".into(),
                 attempt_id: None,
-                bytes_done: None,
+                bytes_done: 0,
                 bytes_total: None,
                 error: None,
             },
-        }
+        })
+    }
+
+    fn thinking_download_bytes(&self, _journal: &Path) -> Option<u64> {
+        self.catalog_facts().thinking_download_bytes
     }
 
     fn catalog_facts(&self) -> SetupCatalogFacts {
@@ -92,27 +109,6 @@ impl SetupHost for NoopSetupHost {
 pub struct LinkHttpState {
     pub journal_root: PathBuf,
     pub host: Arc<dyn SetupHost>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SetupDownloads {
-    pub speech: SetupDownloadTask,
-    pub thinking: SetupDownloadTask,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SetupDownloadTask {
-    pub state: String,
-    pub attempt_id: Option<String>,
-    pub bytes_done: Option<u64>,
-    pub bytes_total: Option<u64>,
-    pub error: Option<SetupDownloadError>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SetupDownloadError {
-    pub code: String,
-    pub detail: String,
 }
 
 #[derive(Serialize)]
@@ -186,16 +182,16 @@ struct MarkResponse {
 }
 
 #[derive(Debug, PartialEq, Serialize)]
-struct LocalCapabilityResponse {
-    overall: &'static str,
-    checks: Vec<LocalCapabilityCheck>,
+pub(crate) struct LocalCapabilityResponse {
+    pub(crate) overall: &'static str,
+    pub(crate) checks: Vec<LocalCapabilityCheck>,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
-struct LocalCapabilityCheck {
-    name: &'static str,
-    severity: &'static str,
-    detail: String,
+pub(crate) struct LocalCapabilityCheck {
+    pub(crate) name: &'static str,
+    pub(crate) severity: &'static str,
+    pub(crate) detail: String,
 }
 
 #[derive(Default, Deserialize)]
@@ -466,16 +462,51 @@ async fn build_setup_state(
         _ => (None, false),
     };
     let capability = compute_local_capability(&state.journal_root).await.overall;
-    let catalog_facts = state.host.catalog_facts();
-    let download_bytes = catalog_facts.thinking_download_bytes;
+
+    let host = state.host.clone();
+    let journal = state.journal_root.clone();
+    let (downloads, download_bytes) = match tokio::task::spawn_blocking(move || {
+        let downloads = host.project_downloads(&journal)?;
+        let thinking_bytes = if downloads.thinking.state == "downloading" {
+            downloads
+                .thinking
+                .bytes_total
+                .or_else(|| host.thinking_download_bytes(&journal))
+        } else {
+            host.thinking_download_bytes(&journal)
+        };
+        Ok::<_, SetupProgressError>((downloads, thinking_bytes))
+    })
+    .await
+    {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(err)) => {
+            return Err(error_envelope(
+                err.code,
+                "Bad Request",
+                &err.detail,
+                StatusCode::BAD_REQUEST,
+            )
+            .into_response());
+        }
+        Err(err) => {
+            return Err(error_envelope(
+                "spawn_blocking_failed",
+                "Internal Server Error",
+                err.to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+            .into_response());
+        }
+    };
+
     let thinking = SetupThinkingState {
         choice,
         saved,
         capability,
         download_bytes,
     };
-
-    let downloads = state.host.project_downloads(&state.journal_root);
+    let catalog_facts = state.host.catalog_facts();
 
     let completed = setup_is_complete(config);
     let mut remaining_required_steps = Vec::new();
@@ -535,7 +566,7 @@ async fn init_local_capability(
 /// Answer "can this computer run local thinking" from the same platform, GPU and
 /// Mac memory rows `journal setup` reads before it chooses local. Those rows use
 /// the same memory bars the local model install refuses below.
-fn local_capability(report: &CheckReport) -> LocalCapabilityResponse {
+pub(crate) fn local_capability(report: &CheckReport) -> LocalCapabilityResponse {
     let rows = || {
         report
             .checks
@@ -898,8 +929,6 @@ async fn init_action(
         .into_response();
     };
 
-    let mut start_err_overlay: Option<String> = None;
-
     match action {
         "commit_mark" => {
             let Some(proposal_id) = req.proposal_id.filter(|s| !s.trim().is_empty()) else {
@@ -986,8 +1015,24 @@ async fn init_action(
                 let host = state.host.clone();
                 match tokio::task::spawn_blocking(move || host.start_local(&journal)).await {
                     Ok(Ok(())) => {}
-                    Ok(Err(error)) => start_err_overlay = Some(error),
-                    Err(error) => start_err_overlay = Some(error.to_string()),
+                    Ok(Err(error)) => {
+                        return error_envelope(
+                            "start_failed",
+                            "thinking download could not start",
+                            &error,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                        )
+                        .into_response();
+                    }
+                    Err(error) => {
+                        return error_envelope(
+                            "start_failed",
+                            "thinking download could not start",
+                            error.to_string(),
+                            StatusCode::SERVICE_UNAVAILABLE,
+                        )
+                        .into_response();
+                    }
                 }
             }
         }
@@ -1036,8 +1081,24 @@ async fn init_action(
             let host = state.host.clone();
             match tokio::task::spawn_blocking(move || host.start_local(&journal)).await {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) => start_err_overlay = Some(error),
-                Err(error) => start_err_overlay = Some(error.to_string()),
+                Ok(Err(error)) => {
+                    return error_envelope(
+                        "start_failed",
+                        "thinking download could not start",
+                        &error,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                    )
+                    .into_response();
+                }
+                Err(error) => {
+                    return error_envelope(
+                        "start_failed",
+                        "thinking download could not start",
+                        error.to_string(),
+                        StatusCode::SERVICE_UNAVAILABLE,
+                    )
+                    .into_response();
+                }
             }
         }
         "cancel_thinking_download" => {
@@ -1084,18 +1145,18 @@ async fn init_action(
             match retry_res {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
-                    return error_envelope(
-                        "retry_failed",
-                        "Bad Request",
-                        &err,
-                        StatusCode::BAD_REQUEST,
-                    )
-                    .into_response();
+                    let status = match err.code {
+                        "speech_package_unavailable" => StatusCode::CONFLICT,
+                        "speech_admission_pending" => StatusCode::SERVICE_UNAVAILABLE,
+                        _ => StatusCode::BAD_REQUEST,
+                    };
+                    return error_envelope(err.code, err.message, &err.detail, status)
+                        .into_response();
                 }
                 Err(err) => {
                     return error_envelope(
                         "retry_failed",
-                        "Internal Server Error",
+                        "retry failed",
                         err.to_string(),
                         StatusCode::INTERNAL_SERVER_ERROR,
                     )
@@ -1215,18 +1276,7 @@ async fn init_action(
         Err(_) => return corrupt_config(),
     };
     match build_setup_state(&state, &config).await {
-        Ok(mut state_resp) => {
-            if let Some(err) = start_err_overlay
-                && state_resp.downloads.thinking.state == "idle"
-            {
-                state_resp.downloads.thinking.state = "error".into();
-                state_resp.downloads.thinking.error = Some(SetupDownloadError {
-                    code: "start_failed".into(),
-                    detail: err,
-                });
-            }
-            Json(state_resp).into_response()
-        }
+        Ok(state_resp) => Json(state_resp).into_response(),
         Err(err_resp) => err_resp,
     }
 }

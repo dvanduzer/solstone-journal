@@ -457,7 +457,47 @@
   }
 
   function renderSayASentence() {
-    return '';
+    const proof = firstMinutesPayload?.proof;
+    const state = proof?.state;
+    if (!state || state === 'none') {
+      return '';
+    }
+
+    const time = proof.start_at
+      ? (window.JournalFormat ? window.JournalFormat.timestamp(proof.start_at) : proof.start_at)
+      : '';
+    const escTime = esc(time);
+
+    let innerHtml = '';
+    if (state !== 'heard') {
+      innerHtml += '<h4>say a sentence out loud</h4>'
+        + '<p>it appears here as text.</p>';
+    }
+
+    if (state === 'waiting') {
+      innerHtml += '<p>waiting for the next segment. this can take a few minutes.</p>';
+    } else if (state === 'no_audio') {
+      innerHtml += '<p>nothing with sound has reached your journal yet. turn on the microphone in the solstone app to try this.</p>';
+    } else if (state === 'transcribing') {
+      innerHtml += '<p>the segment from ' + escTime + ' hasn\'t been written out yet.</p>';
+    } else if (state === 'nothing_heard') {
+      innerHtml += '<p>no speech was found in the segment from ' + escTime + '. say something, and it shows up in the next one.</p>';
+    } else if (state === 'failed') {
+      innerHtml += '<p>the segment from ' + escTime + ' couldn\'t be written out.</p>'
+        + '<a href="' + esc(proof.href || '/app/health/') + '">see health →</a>';
+    } else if (state === 'heard') {
+      if (proof.fresh === true) {
+        innerHtml += '<p>from ' + escTime + ': <q>' + esc(proof.text || '') + '</q></p>'
+          + '<a href="' + esc(proof.href || '#') + '">open it →</a>';
+      } else {
+        innerHtml += '<p>speech from ' + escTime + ' was written out.</p>'
+          + '<a href="' + esc(proof.href || '#') + '">open it →</a>';
+      }
+    }
+
+    return '<div class="pulse-getting-started-step" data-proof-state="' + esc(state) + '">'
+      + innerHtml
+      + '</div>';
   }
 
   function agentCheckState() {
@@ -488,7 +528,8 @@
     const phoneNotDone = checks.phone !== true;
     const thinkingNotDone = checks.thinking !== true;
     const agentNotDone = !agentState.done;
-    return phoneNotDone || thinkingNotDone || agentNotDone;
+    const heardNotDone = checks.heard === false;
+    return phoneNotDone || thinkingNotDone || agentNotDone || heardNotDone;
   }
 
   function renderDeviceLine(device) {
@@ -743,7 +784,13 @@
       }
       return;
     }
-    if (hasActiveDownload()) {
+    const proof = firstMinutesPayload?.proof;
+    const proofNeedsTimer = proof && (
+      proof.state === 'waiting' ||
+      proof.state === 'transcribing' ||
+      (proof.state === 'heard' && proof.fresh === true)
+    );
+    if (hasActiveDownload() || proofNeedsTimer) {
       if (!downloadTimer) {
         downloadTimer = setTimeout(function () {
           downloadTimer = null;
@@ -778,11 +825,13 @@
           } else {
             firstMinutesPayload = data;
           }
+          scheduleOrClearDownloadTimer();
           updateGettingStartedSurface();
           return data;
         })
         .catch(function () {
           firstMinutesPayload = null;
+          scheduleOrClearDownloadTimer();
           updateGettingStartedSurface();
           return null;
         })
