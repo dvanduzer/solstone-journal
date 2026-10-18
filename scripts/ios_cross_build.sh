@@ -5,7 +5,7 @@
 # Compile and link the journal workspace for aarch64-apple-ios (device).
 #   prepare <dir>  acquire and verify the pinned iOS ONNX Runtime (network)
 #   ready <dir>    verify the prepared input only (offline, no repair)
-#   check <dir>    verify, then build the workspace and the MCP feature (offline inputs)
+#   check <dir>    verify, then build the workspace, the MCP feature and the linked-bridge backup lib (offline inputs)
 # This is compilation support. It does not package, install or run an iOS journal.
 set -eu
 
@@ -69,7 +69,10 @@ check() {
         --target "$target" --workspace --lib --bins --message-format=json-render-diagnostics
     env "${build_env[@]}" cargo build --manifest-path core/Cargo.toml --locked \
         --target "$target" -p solstone-core --lib --bins --features journal-mcp-endpoint --message-format=json-render-diagnostics
-    echo "check-rust-ios: workspace and journal-mcp-endpoint built for $target (minimum iOS $deployment_target)"
+    # The app's linked backup path: compiled here, linked only by the app with the Go archive.
+    env "${build_env[@]}" cargo build --manifest-path core/Cargo.toml --locked \
+        --target "$target" -p solstone-core-backup-runtime --lib --features ios-linked-bridge --message-format=json-render-diagnostics
+    echo "check-rust-ios: workspace, journal-mcp-endpoint and ios-linked-bridge built for $target (minimum iOS $deployment_target)"
 }
 
 case "$mode" in
