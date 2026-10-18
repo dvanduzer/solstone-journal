@@ -492,7 +492,7 @@ async fn init_state_reads_materialized_defaults_without_writing() {
 }
 
 #[tokio::test]
-async fn init_state_lanes_and_confidential_match_pre_move_fixture() {
+async fn init_state_transports_shared_lanes_and_keeps_confidential_fixture() {
     let temporary = TempDir::new();
     let response = request(
         temporary.path(),
@@ -503,10 +503,14 @@ async fn init_state_lanes_and_confidential_match_pre_move_fixture() {
     )
     .await;
     let actual = response_json(response).await;
-    let expected: Value = serde_json::from_str(include_str!(
+    let mut expected: Value = serde_json::from_str(include_str!(
         "../tests/fixtures/init_state_lanes_pre_move.json"
     ))
     .expect("pre-move init-state fixture parses");
+    // Shared lane words changed after this snapshot. The unchanged
+    // confidential detail remains pinned to the historical fixture.
+    expected["lanes"] =
+        serde_json::to_value(solstone_core_thinking_copy::LANES).expect("shared lanes serialize");
     assert_eq!(
         json!({
             "lanes": actual["lanes"].clone(),
@@ -621,7 +625,7 @@ async fn finalize_writes_journal_config_with_the_python_response_shape() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response_json(response).await,
-        json!({"success":true,"redirect":"/app/thinking#confidential-setup","warnings":[]})
+        json!({"success":true,"redirect":"/app/home","warnings":[]})
     );
     let config: Value = serde_json::from_slice(&fs::read(config_path).unwrap()).unwrap();
     assert_eq!(config["identity"]["name"], "Ada");
@@ -1108,12 +1112,8 @@ async fn cross_client_regenerate_and_commit_conflict() {
 
 #[tokio::test]
 async fn save_thinking_choices_persist_without_active_provider() {
-    for (choice, expected_redirect) in [
-        ("byo", "/app/thinking#byo-setup"),
-        ("spp", "/app/thinking#confidential-setup"),
-        ("later", "/app/home"),
-    ] {
-        let temporary = TempDir::new();
+    for choice in ["byo", "spp", "later"] {
+        let temporary = committed_journal();
         let res = response_json(
             request(
                 temporary.path(),
@@ -1127,7 +1127,20 @@ async fn save_thinking_choices_persist_without_active_provider() {
         .await;
         assert_eq!(res["thinking"]["choice"], choice);
         assert_eq!(res["thinking"]["saved"], true);
-        assert_eq!(res["redirect"], expected_redirect);
+        assert_eq!(res["redirect"], "/app/home");
+        let finalized = response_json(
+            request(
+                temporary.path(),
+                AccessBasis::Localhost,
+                Method::POST,
+                "/init/api/action",
+                Some(json!({"action": "finalize"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(finalized["done"], true);
+        assert_eq!(finalized["redirect"], "/app/home");
 
         let config: Value = serde_json::from_slice(
             &fs::read(temporary.path().join("config").join("journal.json")).unwrap(),
@@ -1460,7 +1473,7 @@ async fn old_finalize_lane_redirects_and_choice_storage() {
         .await,
     )
     .await;
-    assert_eq!(res["redirect"], "/app/thinking#confidential-setup");
+    assert_eq!(res["redirect"], "/app/home");
     let config: Value = serde_json::from_slice(
         &fs::read(temporary.path().join("config").join("journal.json")).unwrap(),
     )
@@ -1480,7 +1493,7 @@ async fn old_finalize_lane_redirects_and_choice_storage() {
         .await,
     )
     .await;
-    assert_eq!(res_byo["redirect"], "/app/thinking#byo-setup");
+    assert_eq!(res_byo["redirect"], "/app/home");
 
     // local completes even when host start returns Err
     let temp_local = committed_journal();
