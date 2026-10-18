@@ -328,8 +328,11 @@ UNIT
             curl --fail-with-body --silent --show-error \
                 -X POST -H "Content-Type: application/json" -d "{}" \
                 "$origin/init/mark/regenerate" >/tmp/init-mark-regenerate.json
+            # Locking commits the proposal the owner was shown, by its id.
+            proposal_id=$(sed -n '"'"'s/.*"proposal_id":"\([^"]*\)".*/\1/p'"'"' /tmp/init-mark-regenerate.json)
+            test -n "$proposal_id"
             curl --fail-with-body --silent --show-error \
-                -X POST -H "Content-Type: application/json" -d "{}" \
+                -X POST -H "Content-Type: application/json" -d "{\"proposal_id\":\"${proposal_id}\"}" \
                 "$origin/init/mark/lock" >/tmp/init-mark-lock.json
             curl --fail-with-body --silent --show-error \
                 -X POST -H "Content-Type: application/json" -d "{\"lane\":\"local\"}" \
