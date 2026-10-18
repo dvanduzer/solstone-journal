@@ -21,6 +21,7 @@ entries below describe the sequence after activation.
 ### Fixed
 
 - archive imports now refuse conflicting file names.
+- a name that came up on several days in a week could be left out of a facet's entities when your journal sorted it as two kinds of thing, for example a project on three days and a tool on one. the daily entity review now goes by the kind it was given on the most days, and counts only the days it was that kind. when two kinds come up equally often, the name still waits.
 - on a journal with a long history, the nightly search update could run for an hour without finishing, and while it ran, new things in your journal couldn't be added to search. it finishes again, and the first run after you update adds anything it left out.
 - your journal can start again after an unexpected stop, even if it had been running for days. recovery keeps its progress between startup attempts instead of starting over each time.
 

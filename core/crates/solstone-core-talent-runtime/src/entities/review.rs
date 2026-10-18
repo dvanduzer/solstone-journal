@@ -51,7 +51,23 @@ struct ReviewInputs {
     prior: Vec<Value>,
 }
 
-type CandidateBucket = (BTreeSet<String>, BTreeSet<String>, Vec<Value>);
+type CandidateBucket = (
+    BTreeSet<String>,
+    BTreeMap<String, BTreeSet<String>>,
+    Vec<Value>,
+);
+
+/// The type carried on the most days, with its day count. A tie for the most days has no
+/// dominant type.
+fn dominant_type(type_days: &BTreeMap<String, BTreeSet<String>>) -> Option<(&str, usize)> {
+    let most = type_days.values().map(BTreeSet::len).max()?;
+    let mut leaders = type_days.iter().filter(|(_, days)| days.len() == most);
+    let (entity_type, _) = leaders.next()?;
+    leaders
+        .next()
+        .is_none()
+        .then_some((entity_type.as_str(), most))
+}
 
 fn build_review_inputs(journal: &Path, facet: &str, day: &str) -> Result<ReviewInputs, String> {
     let mut buckets: BTreeMap<String, CandidateBucket> = BTreeMap::new();
@@ -81,7 +97,11 @@ fn build_review_inputs(journal: &Path, facet: &str, day: &str) -> Result<ReviewI
             }
             let bucket = buckets.entry(slug).or_default();
             bucket.0.insert(review_day.clone());
-            bucket.1.insert(entity_type.to_owned());
+            bucket
+                .1
+                .entry(entity_type.to_owned())
+                .or_default()
+                .insert(review_day.clone());
             bucket
                 .2
                 .push(serde_json::json!({"day":review_day,"name":name,"description":description}));
@@ -123,12 +143,11 @@ fn build_review_inputs(journal: &Path, facet: &str, day: &str) -> Result<ReviewI
         )
         .collect::<Vec<_>>();
     let mut eligible = Vec::new();
-    for (slug, (days, types, mut contexts)) in buckets {
-        if types.len() != 1 {
+    for (slug, (days, type_days, mut contexts)) in buckets {
+        let Some((entity_type, type_day_count)) = dominant_type(&type_days) else {
             continue;
-        }
-        let entity_type = types.into_iter().next().unwrap();
-        if days.len() < threshold(&entity_type) {
+        };
+        if type_day_count < threshold(entity_type) {
             continue;
         }
         contexts.sort_by_key(|context| {
@@ -944,6 +963,71 @@ mod tests {
                 .unwrap()
                 .hints,
             [("Ada".to_owned(), "Ada Lovelace".to_owned())]
+        );
+    }
+
+    fn detect_typed(root: &Path, day: &str, detections: &[(&str, &str)]) {
+        solstone_core_facets::upsert_detection_segment(
+            root,
+            "work",
+            day,
+            "090000_300",
+            &detections
+                .iter()
+                .map(
+                    |(name, entity_type)| solstone_core_facets::DetectedEntityInput {
+                        entity_type: (*entity_type).to_owned(),
+                        name: (*name).to_owned(),
+                        description: "Came up again.".to_owned(),
+                    },
+                )
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_name_is_judged_on_the_type_it_carries_on_the_most_days() {
+        let root = tempfile::tempdir().unwrap();
+        let days = [
+            "20260101", "20260102", "20260103", "20260104", "20260105", "20260106",
+        ];
+        // Per name, the type it carries on each day in the window.
+        let typed: [(&str, &[&str]); 6] = [
+            ("Atlas", &["Project", "Project", "Project", "Tool"]),
+            ("Beacon", &["Project", "Project", "Tool", "Tool"]),
+            ("Cleo", &["Person", "Person", "Company"]),
+            ("Delta", &["Project", "Project", "Tool"]),
+            (
+                "Ember",
+                &["Project", "Project", "Tool", "Tool", "Company", "Company"],
+            ),
+            ("Fern", &["Person", "Person"]),
+        ];
+        for (index, day) in days.iter().enumerate() {
+            let detections = typed
+                .iter()
+                .filter_map(|(name, types)| {
+                    types.get(index).map(|entity_type| (*name, *entity_type))
+                })
+                .collect::<Vec<_>>();
+            detect_typed(root.path(), day, &detections);
+        }
+        let inputs = build_review_inputs(root.path(), "work", "20260108").unwrap();
+        let eligible = inputs
+            .eligible
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate["name"].as_str().unwrap(),
+                    candidate["type"].as_str().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        // Beacon and Ember tie for the most days; Delta is short of the Project bar.
+        assert_eq!(
+            eligible,
+            [("Atlas", "Project"), ("Cleo", "Person"), ("Fern", "Person")]
         );
     }
 
