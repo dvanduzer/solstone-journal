@@ -2101,8 +2101,7 @@ fn brain_skip_reason(context: &SetupContext<'_>) -> SkipReason {
     }
 }
 
-/// The journal's own record that the owner finished creating it, the same
-/// field the create-your-journal page reads.
+/// The durable completion stamp written by journal setup finalization.
 fn journal_is_created(config: &Map<String, Value>) -> bool {
     config
         .get("setup")
@@ -2112,8 +2111,8 @@ fn journal_is_created(config: &Map<String, Value>) -> bool {
 }
 
 fn step_brain(context: &mut SetupContext<'_>) -> Result<StepResult, StepExecutionError> {
-    // Probe before taking the config lock: the host gate decides whether local
-    // may become the default, and the probe can take seconds.
+    // Probe before taking the config lock: readiness gates local bootstrap for
+    // a completed setup, and the probe can take seconds.
     let readiness = context
         .check_report_builder
         .local_provider_readiness(&context.journal_path);
@@ -2194,10 +2193,8 @@ fn step_brain(context: &mut SetupContext<'_>) -> Result<StepResult, StepExecutio
             SkipReason::LocalProviderUnavailable,
         ));
     }
-    // Until the owner creates the journal, every Thinking route answers with
-    // the create-your-journal page, so a bootstrap now cannot start. The owner
-    // installs their chosen provider from the Thinking page, where creating the
-    // journal lands them.
+    // Thinking routes require completed setup before bootstrap can start.
+    // The setup page owns the stated choice and its initial local download.
     if !journal_created {
         return Ok(skipped_result(
             StepName::Brain,

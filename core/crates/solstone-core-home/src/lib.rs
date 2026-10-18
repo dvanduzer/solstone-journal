@@ -23,6 +23,7 @@
 pub mod briefing;
 pub mod connections;
 pub mod context;
+pub mod first_minutes;
 pub mod formatting;
 pub mod health_glance;
 pub mod model;

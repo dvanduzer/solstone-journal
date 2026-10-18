@@ -516,3 +516,19 @@ fn recover_maps_receipt_shapes_without_consulting_policy() {
             .all(|record| record.get("requested_count").is_none())
     );
 }
+
+#[test]
+fn getting_started_render_card_structure() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let output = Command::new("node")
+        .arg(manifest_dir.join("tests/getting_started_render.js"))
+        .arg(manifest_dir)
+        .output()
+        .expect("getting-started render harness");
+    assert!(
+        output.status.success(),
+        "getting-started render harness: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

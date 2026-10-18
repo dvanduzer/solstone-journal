@@ -490,11 +490,7 @@ async fn build_setup_state(
 
     let done = completed;
 
-    let redirect = match thinking.choice.as_deref() {
-        Some("byo") => "/app/thinking#byo-setup",
-        Some("spp") => "/app/thinking#confidential-setup",
-        _ => "/app/home",
-    };
+    let redirect = "/app/home";
 
     let copy = solstone_core_thinking_copy::setup_copy(&catalog_facts);
     let retention_mode = nested_string(config, "retention", "raw_media");
@@ -1334,11 +1330,7 @@ async fn init_finalize(
             if setup_is_complete(config) {
                 return JournalConfigMutation {
                     changed: false,
-                    value: Ok((
-                        false,
-                        false,
-                        nested_string(config, "setup", "thinking_choice"),
-                    )),
+                    value: Ok((false, false)),
                 };
             }
             let (mut changed, start_local) =
@@ -1394,11 +1386,11 @@ async fn init_finalize(
             }
             JournalConfigMutation {
                 changed,
-                value: Ok((true, start_local, choice.to_owned())),
+                value: Ok((true, start_local)),
             }
         },
     );
-    let (wrote_first_completion, should_start_local, saved_choice) = match result {
+    let (wrote_first_completion, should_start_local) = match result {
         Ok(transaction) => match transaction.value {
             Ok(first) => first,
             Err(error) => return choice_error(error),
@@ -1421,12 +1413,7 @@ async fn init_finalize(
         }
     }
 
-    let redirect = match saved_choice.as_str() {
-        "byo" => "/app/thinking#byo-setup",
-        "spp" => "/app/thinking#confidential-setup",
-        _ => "/app/home",
-    }
-    .to_owned();
+    let redirect = "/app/home".to_owned();
 
     Json(FinalizeResponse {
         success: true,

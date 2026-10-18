@@ -109,8 +109,9 @@ fn corpus() -> Value {
     // built-in cloud model catalog with its picker copy (owners now type the
     // model id). One refusal contract moved on purpose: a state refusal carries
     // its owner words in `error`, the only field the page shows, and the generic
-    // save failure carries its next step there too. All other copy,
-    // provider state, and refusal contracts remain captured pins.
+    // save failure carries its next step there too. Shared lane descriptions
+    // use their current copy authority. Other copy, provider state, and refusal
+    // contracts remain captured pins.
     for cases in corpus["phases"]
         .as_object_mut()
         .expect("phases")
@@ -205,7 +206,8 @@ fn corpus() -> Value {
                 case["body_sha256_basis"] = json!("normalized-json");
                 projected = true;
             }
-            // The pair-a-device invitation joined the copy after the capture.
+            // The pair-a-device invitation joined the copy after the capture;
+            // shared lane descriptions also supersede their captured words.
             if let Some(copy) = case
                 .pointer_mut("/json/copy")
                 .and_then(Value::as_object_mut)
@@ -214,6 +216,7 @@ fn corpus() -> Value {
                     serde_json::to_value(solstone_core_thinking_copy::thinking_copy_payload())
                         .expect("copy serializes");
                 copy.insert("devices_invite".into(), live["devices_invite"].clone());
+                copy.insert("lanes".into(), live["lanes"].clone());
                 projected = true;
             }
             if let Some(labels) = case
