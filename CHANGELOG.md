@@ -17,6 +17,7 @@ entries below describe the sequence after activation.
 ### Changed
 
 - on windows, setup stays in the journal window through choosing your mark and where thinking runs, then reaches home. thinking download progress and model recovery stay available there.
+- when you pair a mac or windows computer, you can now open the pairing link on it and choose "open in the solstone app". pasting the link into the app still works.
 
 ### Fixed
 
