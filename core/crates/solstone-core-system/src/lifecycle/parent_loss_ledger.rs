@@ -547,17 +547,53 @@ impl ParentLossLedger {
                 // Computed before the match so the guard below reads one fact
                 // rather than re-deriving it per arm.
                 let coordinator_gone = coordinator_is_provably_gone(&active);
-                let outcome = match self.outcome_for_active(&active) {
-                    Ok(outcome) => outcome,
-                    // A record we cannot parse is bookkeeping; with closing
-                    // authority the admissions directory is the evidence and
-                    // the record is set aside by the closer.
-                    Err(ParentLossLedgerError::Json(_)) if closing.is_some() => {
-                        ParentLossReaderOutcome::MalformedState {
-                            artifact: "record.json".to_owned(),
+                let reused = match closing {
+                    Some((_, authority)) => super::parent_loss_closure::completed_recovery(
+                        self,
+                        active.generation,
+                        authority,
+                    )?,
+                    None => false,
+                };
+                if reused {
+                    let (_, authority) = closing.expect("recovery reuse requires the lease");
+                    for (instance, reason) in [
+                        (
+                            Some(active.supervisor),
+                            BootstrapRecoveryReason::SupervisorLive,
+                        ),
+                        (
+                            active.coordinator,
+                            BootstrapRecoveryReason::ActiveCoordinator,
+                        ),
+                    ] {
+                        if instance.is_some_and(|i| {
+                            matches!(
+                                authority.source.observe(&i),
+                                InstanceVerdict::SameLive { .. }
+                            )
+                        }) {
+                            return Err(ParentLossLedgerError::RecoveryRequired(reason));
                         }
                     }
-                    Err(error) => return Err(error),
+                }
+                let outcome = if reused {
+                    ParentLossReaderOutcome::RetiredExpected {
+                        generation: active.generation,
+                    }
+                } else {
+                    match self.outcome_for_active(&active) {
+                        Ok(outcome) => outcome,
+                        // A record we cannot parse is bookkeeping; with closing
+                        // authority the admissions directory is the evidence and
+                        // the record is set aside by the closer.
+                        Err(ParentLossLedgerError::Json(_)) if closing.is_some() => {
+                            ParentLossReaderOutcome::MalformedState {
+                                artifact: "record.json".to_owned(),
+                            }
+                        }
+                        Err(error) => return Err(error),
+                    }
                 };
                 match outcome {
                     ParentLossReaderOutcome::Completed { generation, .. }
@@ -731,6 +767,9 @@ impl ParentLossLedger {
         successor_generation: ParentLossGeneration,
         authority: &ClosingAuthority<'_>,
     ) -> Result<(), ParentLossLedgerError> {
+        if super::parent_loss_closure::completed_recovery(self, generation, authority)? {
+            return Ok(());
+        }
         let (record, set_aside) = load_record_for_closure(self, generation)?;
         if let Some(record) = record.as_ref()
             && matches!(

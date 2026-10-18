@@ -67,6 +67,9 @@ use crate::process::{
     SystemProcessInstanceSource, TerminationError, process_owner, signal_exact_instance,
 };
 
+#[path = "parent_loss_closure_publication.rs"]
+mod publication;
+
 pub const PARENT_LOSS_CLOSURE_SCHEMA_V1: u32 = 1;
 pub(crate) const PARENT_LOSS_RECOVERY_SCHEMA_V1: u32 = 1;
 pub(crate) const RECOVERY_BATCH_LIMIT: usize = 256;
@@ -80,6 +83,7 @@ const LIVE_REAP_GRACE_MS: u64 = 500;
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static PUBLICATION_STOP_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static PROVISIONAL_STOP_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -185,7 +189,21 @@ pub(crate) struct RecoveryBatchReceipt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AdmissionSourceSnapshot {
+    intent: Option<String>,
+    result: Option<String>,
+    acknowledgement: Option<String>,
+    spawn_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    environment_identity: Option<AdmissionIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    environment_journal: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CompletedBatchRow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) sources: Option<AdmissionSourceSnapshot>,
     pub(crate) launch_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) service: Option<HostedServiceKind>,
@@ -250,7 +268,7 @@ pub(crate) struct CensusObligationFile {
     pub(crate) schema: u32,
     pub(crate) generation: ParentLossGeneration,
     pub(crate) sealed_phase: ParentLossPhase,
-    pub(crate) obligations: HashMap<String, Vec<LiveDescendantIdentity>>,
+    pub(crate) obligations: HashMap<String, LiveRecoveryFile>,
     pub(crate) binding_digest: String,
 }
 
@@ -263,9 +281,9 @@ pub(crate) struct CensusRefusalFile {
 }
 
 pub(crate) fn compute_census_obligation_digest(
-    obligations: &HashMap<String, Vec<LiveDescendantIdentity>>,
+    obligations: &HashMap<String, LiveRecoveryFile>,
 ) -> Result<String, ParentLossLedgerError> {
-    let mut entries: Vec<(&String, &Vec<LiveDescendantIdentity>)> = obligations.iter().collect();
+    let mut entries: Vec<(&String, &LiveRecoveryFile)> = obligations.iter().collect();
     entries.sort_by_key(|(k, _)| *k);
     let bytes = canonical_json(&entries)?;
     Ok(digest_bytes(&bytes))
@@ -294,6 +312,8 @@ fn has_census_refusal_or_wedged(
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct LiveRecoveryFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) sources: Option<AdmissionSourceSnapshot>,
     pub(crate) schema: u32,
     pub(crate) kind: RecoveryArtifactKind,
     pub(crate) generation: ParentLossGeneration,
@@ -366,6 +386,7 @@ impl AdmissionDropDigests {
 
 #[derive(Debug, Clone)]
 pub(crate) struct DerivedAdmissionDrops {
+    pub(crate) sources: AdmissionSourceSnapshot,
     pub(crate) service: Option<HostedServiceKind>,
     pub(crate) instance: Option<ProcessInstance>,
     pub(crate) uid: Option<u32>,
@@ -492,7 +513,17 @@ pub(crate) fn completed_row_is_authorized(
         return false;
     }
 
-    let Ok(derived) = read_derived_admission_drops(ledger, generation, &row.launch_id) else {
+    let derived = match &row.sources {
+        Some(sources)
+            if sources.environment_identity.is_some()
+                && sources.environment_journal.as_deref() != ledger.canonical_root().to_str() =>
+        {
+            return false;
+        }
+        Some(sources) => derive_admission_source_facts(generation, &row.launch_id, sources),
+        None => read_derived_admission_drops(ledger, generation, &row.launch_id),
+    };
+    let Ok(derived) = derived else {
         return false;
     };
 
@@ -676,6 +707,48 @@ pub(crate) fn read_derived_admission_drops(
     let ack_bytes = read_drop_bytes(&admission_dir.join("acknowledgement.json"))?;
     let spawn_bytes = read_drop_bytes(&admission_dir.join("spawn-identity.json"))?;
 
+    let to_text = |bytes: Option<Vec<u8>>| -> Result<Option<String>, ParentLossLedgerError> {
+        bytes
+            .map(String::from_utf8)
+            .transpose()
+            .map_err(|_| unverifiable_admission())
+    };
+    let sources = AdmissionSourceSnapshot {
+        intent: to_text(intent_bytes)?,
+        result: to_text(result_bytes)?,
+        acknowledgement: to_text(ack_bytes)?,
+        spawn_identity: to_text(spawn_bytes)?,
+        environment_identity: None,
+        environment_journal: None,
+    };
+    let derived = derive_admission_source_facts(generation, launch_id, &sources)?;
+    #[cfg(target_os = "linux")]
+    if derived.finding == AdmissionFinding::NeverAcknowledged
+        && let Some(identity) =
+            find_live_process_by_launch_env(ledger.canonical_root(), generation, launch_id)
+    {
+        let mut observed_sources = sources;
+        observed_sources.environment_identity = Some(identity);
+        observed_sources.environment_journal = ledger.canonical_root().to_str().map(str::to_owned);
+        return derive_admission_source_facts(generation, launch_id, &observed_sources);
+    }
+    Ok(derived)
+}
+
+fn unverifiable_admission() -> ParentLossLedgerError {
+    ParentLossLedgerError::RecoveryRequired(BootstrapRecoveryReason::AbandonedAdmissionUnverifiable)
+}
+
+fn derive_admission_source_facts(
+    generation: ParentLossGeneration,
+    launch_id: &str,
+    sources: &AdmissionSourceSnapshot,
+) -> Result<DerivedAdmissionDrops, ParentLossLedgerError> {
+    validate_launch_id(launch_id).map_err(|_| unverifiable_admission())?;
+    let intent_bytes = sources.intent.as_ref().map(|s| s.as_bytes());
+    let result_bytes = sources.result.as_ref().map(|s| s.as_bytes());
+    let ack_bytes = sources.acknowledgement.as_ref().map(|s| s.as_bytes());
+    let spawn_bytes = sources.spawn_identity.as_ref().map(|s| s.as_bytes());
     let digests = AdmissionDropDigests {
         intent: intent_bytes.as_ref().map(|b| digest_bytes(b)),
         result: result_bytes.as_ref().map(|b| digest_bytes(b)),
@@ -684,18 +757,59 @@ pub(crate) fn read_derived_admission_drops(
     };
 
     let intent: Option<AdmissionIntent> = intent_bytes
-        .as_deref()
-        .and_then(|b| serde_json::from_slice(b).ok());
+        .map(serde_json::from_slice)
+        .transpose()
+        .map_err(|_| unverifiable_admission())?;
     let result: Option<AdmissionResult> = result_bytes
-        .as_deref()
-        .and_then(|b| serde_json::from_slice(b).ok());
+        .map(serde_json::from_slice)
+        .transpose()
+        .map_err(|_| unverifiable_admission())?;
     let acknowledgement: Option<AdmissionAcknowledgement> = ack_bytes
-        .as_deref()
-        .and_then(|b| serde_json::from_slice(b).ok());
+        .map(serde_json::from_slice)
+        .transpose()
+        .map_err(|_| unverifiable_admission())?;
     let spawn_identity: Option<AdmissionSpawnIdentity> = spawn_bytes
-        .as_deref()
-        .and_then(|b| serde_json::from_slice(b).ok());
+        .map(serde_json::from_slice)
+        .transpose()
+        .map_err(|_| unverifiable_admission())?;
 
+    if intent.as_ref().is_some_and(|v| v.schema != 1)
+        || result.as_ref().is_some_and(|v| v.schema != 1)
+        || acknowledgement.as_ref().is_some_and(|v| v.schema != 1)
+        || spawn_identity.as_ref().is_some_and(|v| v.schema != 1)
+    {
+        return Err(unverifiable_admission());
+    }
+    let identities: Vec<&AdmissionIdentity> = [
+        result.as_ref().and_then(|v| v.identity.as_ref()),
+        acknowledgement.as_ref().map(|v| &v.identity),
+        spawn_identity.as_ref().map(|v| &v.identity),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if identities.windows(2).any(|v| v[0] != v[1])
+        || identities.iter().any(|id| {
+            intent
+                .as_ref()
+                .is_some_and(|i| i.parent_launch_id != id.parent_launch_id)
+        })
+    {
+        return Err(unverifiable_admission());
+    }
+    if sources.environment_identity.is_some() != sources.environment_journal.is_some() {
+        return Err(unverifiable_admission());
+    }
+    if let Some(id) = &sources.environment_identity {
+        if id.parent_launch_id.is_some()
+            || !identities.is_empty()
+            || result.is_some()
+            || id.generation != generation
+            || id.launch_id != launch_id
+        {
+            return Err(unverifiable_admission());
+        }
+    }
     if let Some(i) = &intent {
         if i.generation != generation || i.launch_id != launch_id {
             return Err(ParentLossLedgerError::RecoveryRequired(
@@ -766,21 +880,10 @@ pub(crate) fn read_derived_admission_drops(
             Some(ack) => (Some(ack.identity), None),
             None => match spawn_identity {
                 Some(sp) => (Some(sp.identity), None),
-                None => {
-                    #[cfg(target_os = "linux")]
-                    {
-                        match find_live_process_by_launch_env(
-                            ledger.canonical_root(),
-                            generation,
-                            launch_id,
-                        ) {
-                            Some(id) => (Some(id), None),
-                            None => (None, Some(AdmissionFinding::NeverAcknowledged)),
-                        }
-                    }
-                    #[cfg(not(target_os = "linux"))]
-                    (None, Some(AdmissionFinding::NeverAcknowledged))
-                }
+                None => match sources.environment_identity.clone() {
+                    Some(id) => (Some(id), None),
+                    None => (None, Some(AdmissionFinding::NeverAcknowledged)),
+                },
             },
         },
     };
@@ -804,6 +907,7 @@ pub(crate) fn read_derived_admission_drops(
     };
 
     Ok(DerivedAdmissionDrops {
+        sources: sources.clone(),
         service,
         instance,
         uid,
@@ -923,12 +1027,188 @@ fn flush_batch_and_ids(
     Ok(())
 }
 
+fn census_refusal(
+    ledger: &ParentLossLedger,
+    generation: ParentLossGeneration,
+    reason: &str,
+) -> Result<(), ParentLossLedgerError> {
+    write_json(
+        ledger.census_refusal_path(generation),
+        &CensusRefusalFile {
+            schema: PARENT_LOSS_RECOVERY_SCHEMA_V1,
+            generation,
+            sealed_phase: ParentLossPhase::Sealed,
+            reason: reason.to_owned(),
+        },
+        json_options(),
+    )?;
+    Ok(())
+}
+
+fn read_retirement_census(
+    ledger: &ParentLossLedger,
+    generation: ParentLossGeneration,
+) -> Result<CensusObligationFile, ParentLossLedgerError> {
+    if has_census_refusal_or_wedged(ledger, generation) {
+        return Err(unverifiable_admission());
+    }
+    let path = ledger.census_obligation_path(generation);
+    if !path.exists() {
+        if ledger
+            .generation_path(generation)
+            .join("census-started.json")
+            .exists()
+        {
+            census_refusal(
+                ledger,
+                generation,
+                "authoritative census lost after retirement began",
+            )?;
+            return Err(unverifiable_admission());
+        }
+        return Ok(CensusObligationFile {
+            schema: PARENT_LOSS_RECOVERY_SCHEMA_V1,
+            generation,
+            sealed_phase: ParentLossPhase::Sealed,
+            obligations: HashMap::new(),
+            binding_digest: compute_census_obligation_digest(&HashMap::new())?,
+        });
+    }
+    let valid = match read_json_durable::<CensusObligationFile>(
+        ArtifactId::ParentLossCensusObligation,
+        &path,
+    ) {
+        Ok(DurableRead::Present(file))
+            if file.schema == PARENT_LOSS_RECOVERY_SCHEMA_V1
+                && file.generation == generation
+                && file.sealed_phase == ParentLossPhase::Sealed
+                && compute_census_obligation_digest(&file.obligations)
+                    .ok()
+                    .as_ref()
+                    == Some(&file.binding_digest)
+                && file.obligations.iter().all(|(id, live)| {
+                    validate_launch_id(id).is_ok()
+                        && live.launch_id == *id
+                        && live.schema == PARENT_LOSS_RECOVERY_SCHEMA_V1
+                        && live.generation == generation
+                        && live.sealed_phase == ParentLossPhase::Sealed
+                        && live.kind == RecoveryArtifactKind::Live
+                }) =>
+        {
+            Some(file)
+        }
+        _ => None,
+    };
+    match valid {
+        Some(file) => Ok(file),
+        None => {
+            census_refusal(
+                ledger,
+                generation,
+                "retirement census missing, damaged or contradictory",
+            )?;
+            Err(unverifiable_admission())
+        }
+    }
+}
+
+fn persist_live(
+    ledger: &ParentLossLedger,
+    generation: ParentLossGeneration,
+    live: &LiveRecoveryFile,
+) -> Result<(), ParentLossLedgerError> {
+    let mut live = live.clone();
+    live.binding_digest = compute_live_binding_digest(live.root, live.uid, &live.descendants)?;
+    let mut file = read_retirement_census(ledger, generation)?;
+    file.obligations
+        .insert(live.launch_id.clone(), live.clone());
+    file.binding_digest = compute_census_obligation_digest(&file.obligations)?;
+    // The authoritative census is durable first, including deadlines and source binding.
+    write_json(
+        ledger.census_obligation_path(generation),
+        &file,
+        json_options(),
+    )?;
+    let marker = ledger
+        .generation_path(generation)
+        .join("census-started.json");
+    if !marker.exists() {
+        write_json(
+            marker,
+            &serde_json::json!({"schema": 1, "generation": generation}),
+            json_options(),
+        )?;
+    }
+    write_json(
+        ledger.closure_recovery_live_path(generation, &live.launch_id),
+        &live,
+        json_options(),
+    )?;
+    Ok(())
+}
+
+fn discharge_census(
+    ledger: &ParentLossLedger,
+    generation: ParentLossGeneration,
+    launch_id: &str,
+) -> Result<(), ParentLossLedgerError> {
+    let mut file = read_retirement_census(ledger, generation)?;
+    file.obligations.remove(launch_id);
+    file.binding_digest = compute_census_obligation_digest(&file.obligations)?;
+    write_json(
+        ledger.census_obligation_path(generation),
+        &file,
+        json_options(),
+    )?;
+    Ok(())
+}
+
+fn begin_retained_descendants(
+    ledger: &ParentLossLedger,
+    generation: ParentLossGeneration,
+    authority: &ClosingAuthority<'_>,
+    live: &mut LiveRecoveryFile,
+) -> Result<Option<ClosureOutcome>, ParentLossLedgerError> {
+    for child in &live.descendants {
+        if matches!(
+            authority.source.observe(&child.instance),
+            InstanceVerdict::SameLive { .. }
+        ) && authority.retirer.owner(child.instance.pid) != ProcessOwner::Uid(child.uid)
+        {
+            return Ok(Some(ClosureOutcome::Refused(
+                BootstrapRecoveryReason::AbandonedAdmissionLive,
+            )));
+        }
+    }
+    for index in 0..live.descendants.len() {
+        let child = live.descendants[index].instance;
+        if !live.descendants[index].term_requested
+            && matches!(
+                authority.source.observe(&child),
+                InstanceVerdict::SameLive { .. }
+            )
+        {
+            live.descendants[index].term_requested = true;
+            live.descendants[index].escalate_at_unix_ms = unix_millis() + LIVE_ESCALATION_GRACE_MS;
+            persist_live(ledger, generation, live)?;
+            if authority.retirer.owner(child.pid) != ProcessOwner::Uid(live.uid) {
+                return Ok(Some(ClosureOutcome::Refused(
+                    BootstrapRecoveryReason::AbandonedAdmissionLive,
+                )));
+            }
+            let _ = authority.retirer.signal(child, SignalKind::Terminate);
+        }
+    }
+    live.binding_digest = compute_live_binding_digest(live.root, live.uid, &live.descendants)?;
+    Ok(None)
+}
+
 fn discharge_retained_descendants(
-    _ledger: &ParentLossLedger,
-    _generation: ParentLossGeneration,
+    ledger: &ParentLossLedger,
+    generation: ParentLossGeneration,
     authority: &ClosingAuthority<'_>,
     live_file: &mut LiveRecoveryFile,
-    live_path: &Path,
+    _live_path: &Path,
 ) -> Result<Option<ClosureOutcome>, ParentLossLedgerError> {
     let mut any_descendant_live = false;
     let mut need_persist = false;
@@ -938,7 +1218,9 @@ fn discharge_retained_descendants(
         let uid = live_file.descendants[i].uid;
         match authority.source.observe(&inst) {
             InstanceVerdict::SameLive { .. } => {
-                if authority.retirer.owner(inst.pid) != ProcessOwner::Uid(uid) {
+                if uid != live_file.uid
+                    || authority.retirer.owner(inst.pid) != ProcessOwner::Uid(uid)
+                {
                     return Ok(Some(ClosureOutcome::Refused(
                         BootstrapRecoveryReason::AbandonedAdmissionLive,
                     )));
@@ -955,12 +1237,17 @@ fn discharge_retained_descendants(
 
                 if !live_file.descendants[i].term_requested {
                     live_file.descendants[i].term_requested = true;
-                    write_json(live_path, live_file, json_options())?;
+                    live_file.descendants[i].escalate_at_unix_ms =
+                        unix_millis() + LIVE_ESCALATION_GRACE_MS;
+                    persist_live(ledger, generation, live_file)?;
                     need_persist = false;
-                    let _ = authority.retirer.signal(inst, SignalKind::Terminate);
-                } else {
-                    let _ = authority.retirer.signal(inst, SignalKind::Terminate);
                 }
+                if authority.retirer.owner(inst.pid) != ProcessOwner::Uid(uid) {
+                    return Ok(Some(ClosureOutcome::Refused(
+                        BootstrapRecoveryReason::AbandonedAdmissionLive,
+                    )));
+                }
+                let _ = authority.retirer.signal(inst, SignalKind::Terminate);
 
                 let now_ms = unix_millis();
                 let esc_ms = live_file.descendants[i].escalate_at_unix_ms;
@@ -995,8 +1282,13 @@ fn discharge_retained_descendants(
                         }
                         _ => {}
                     }
-                    write_json(live_path, live_file, json_options())?;
+                    persist_live(ledger, generation, live_file)?;
                     need_persist = false;
+                    if authority.retirer.owner(inst.pid) != ProcessOwner::Uid(uid) {
+                        return Ok(Some(ClosureOutcome::Refused(
+                            BootstrapRecoveryReason::AbandonedAdmissionLive,
+                        )));
+                    }
                     let _ = authority.retirer.signal(inst, SignalKind::Kill);
 
                     if let Some(reap_ms) = live_file.descendants[i].reap_deadline_unix_ms {
@@ -1040,10 +1332,25 @@ fn discharge_retained_descendants(
             }
             InstanceVerdict::NotSameOrExited => {}
         }
+        // A later wait may lose observability; only positive settlement discharges it.
+        match authority.source.observe(&inst) {
+            InstanceVerdict::NotSameOrExited => {}
+            InstanceVerdict::SameLive { .. } => any_descendant_live = true,
+            InstanceVerdict::Unverifiable => {
+                if !matches!(
+                    settle_unverifiable(authority, inst.pid, Some(uid)),
+                    Some(AdmissionFinding::Exited | AdmissionFinding::PidReusedByAnotherUser)
+                ) {
+                    return Ok(Some(ClosureOutcome::Refused(
+                        BootstrapRecoveryReason::AbandonedAdmissionUnverifiable,
+                    )));
+                }
+            }
+        }
     }
 
     if need_persist {
-        write_json(live_path, live_file, json_options())?;
+        persist_live(ledger, generation, live_file)?;
     }
 
     if any_descendant_live {
@@ -1072,121 +1379,46 @@ fn run_live_state_machine(
         )));
     }
 
-    let obligation_path = ledger.census_obligation_path(generation);
+    let census = read_retirement_census(ledger, generation)?;
+    if let Some(retained) = census.obligations.get(&live_file.launch_id) {
+        live_file = retained.clone();
+    } else if live_file.term_requested || live_file.escalated || !live_file.descendants.is_empty() {
+        census_refusal(
+            ledger,
+            generation,
+            "missing obligation after retirement began",
+        )?;
+        return Err(unverifiable_admission());
+    }
 
-    if live_file.term_requested || live_file.escalated {
-        if !obligation_path.is_file() {
-            let refusal = CensusRefusalFile {
-                schema: PARENT_LOSS_RECOVERY_SCHEMA_V1,
+    let derived = match &live_file.sources {
+        Some(sources)
+            if sources.environment_identity.is_some()
+                && sources.environment_journal.as_deref() != ledger.canonical_root().to_str() =>
+        {
+            census_refusal(
+                ledger,
                 generation,
-                sealed_phase: ParentLossPhase::Sealed,
-                reason: "missing obligation after retirement begun".to_string(),
-            };
-            let _ = write_json(
-                ledger.census_refusal_path(generation),
-                &refusal,
-                json_options(),
-            );
-            return Ok(Some(ClosureOutcome::Refused(
-                BootstrapRecoveryReason::AbandonedAdmissionUnverifiable,
-            )));
+                "environment observation belongs to another journal",
+            )?;
+            return Err(unverifiable_admission());
         }
-        match read_json_durable::<CensusObligationFile>(
-            ArtifactId::ParentLossCensusObligation,
-            &obligation_path,
-        ) {
-            Ok(DurableRead::Present(ob_file)) => {
-                let Ok(exp_digest) = compute_census_obligation_digest(&ob_file.obligations) else {
-                    let _ = set_aside(&obligation_path);
-                    let refusal = CensusRefusalFile {
-                        schema: PARENT_LOSS_RECOVERY_SCHEMA_V1,
-                        generation,
-                        sealed_phase: ParentLossPhase::Sealed,
-                        reason: "corrupt obligation digest".to_string(),
-                    };
-                    let _ = write_json(
-                        ledger.census_refusal_path(generation),
-                        &refusal,
-                        json_options(),
-                    );
-                    return Ok(Some(ClosureOutcome::Refused(
-                        BootstrapRecoveryReason::AbandonedAdmissionUnverifiable,
-                    )));
-                };
-                if ob_file.generation != generation
-                    || ob_file.sealed_phase != ParentLossPhase::Sealed
-                    || ob_file.binding_digest != exp_digest
-                {
-                    let _ = set_aside(&obligation_path);
-                    let refusal = CensusRefusalFile {
-                        schema: PARENT_LOSS_RECOVERY_SCHEMA_V1,
-                        generation,
-                        sealed_phase: ParentLossPhase::Sealed,
-                        reason: "invalid obligation envelope".to_string(),
-                    };
-                    let _ = write_json(
-                        ledger.census_refusal_path(generation),
-                        &refusal,
-                        json_options(),
-                    );
-                    return Ok(Some(ClosureOutcome::Refused(
-                        BootstrapRecoveryReason::AbandonedAdmissionUnverifiable,
-                    )));
-                }
-            }
-            _ => {
-                let refusal = CensusRefusalFile {
-                    schema: PARENT_LOSS_RECOVERY_SCHEMA_V1,
-                    generation,
-                    sealed_phase: ParentLossPhase::Sealed,
-                    reason: "corrupt or unreadable obligation".to_string(),
-                };
-                let _ = write_json(
-                    ledger.census_refusal_path(generation),
-                    &refusal,
-                    json_options(),
-                );
-                return Ok(Some(ClosureOutcome::Refused(
-                    BootstrapRecoveryReason::AbandonedAdmissionUnverifiable,
-                )));
-            }
-        }
+        Some(sources) => derive_admission_source_facts(generation, &live_file.launch_id, sources)?,
+        None => read_derived_admission_drops(ledger, generation, &live_file.launch_id)?,
+    };
+    if derived.instance != Some(live_file.root)
+        || derived.uid != Some(live_file.uid)
+        || derived.service != live_file.service
+        || derived.parent_launch_id != live_file.parent_launch_id
+    {
+        census_refusal(
+            ledger,
+            generation,
+            "retirement root is not authorized by its source evidence",
+        )?;
+        return Err(unverifiable_admission());
     }
-
-    // Derive root instance and uid from drops
-    let derived = read_derived_admission_drops(ledger, generation, &live_file.launch_id)?;
-    if derived.instance != Some(live_file.root) || derived.uid != Some(live_file.uid) {
-        if let Ok(aside) = set_aside(&live_path) {
-            let _ = aside;
-        }
-        let is_gone = match (derived.instance, derived.uid) {
-            (Some(inst), Some(_)) => {
-                matches!(
-                    authority.source.observe(&inst),
-                    InstanceVerdict::NotSameOrExited
-                )
-            }
-            _ => true,
-        };
-        if is_gone {
-            return Ok(Some(ClosureOutcome::Refused(
-                BootstrapRecoveryReason::AbandonedAdmissionUnverifiable,
-            )));
-        }
-        let (Some(inst), Some(uid)) = (derived.instance, derived.uid) else {
-            return Ok(Some(ClosureOutcome::Refused(
-                BootstrapRecoveryReason::AbandonedAdmissionUnverifiable,
-            )));
-        };
-        live_file.root = inst;
-        live_file.uid = uid;
-        live_file.descendants.clear();
-        live_file.binding_digest.clear();
-        live_file.term_requested = false;
-        live_file.escalated = false;
-        live_file.escalate_at_unix_ms = 0;
-        live_file.reap_deadline_unix_ms = None;
-    }
+    live_file.sources = Some(derived.sources.clone());
 
     #[cfg(any(test, feature = "test-hooks"))]
     if crate::process::retirement_skip_test_fault()
@@ -1203,7 +1435,7 @@ fn run_live_state_machine(
     let mut verdict = authority.source.observe(&live_file.root);
 
     if matches!(verdict, InstanceVerdict::SameLive { .. }) {
-        if live_file.binding_digest.is_empty() && !live_file.term_requested {
+        {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             {
                 let snapshot =
@@ -1235,108 +1467,39 @@ fn run_live_state_machine(
                         })
                     })
                     .collect();
-                live_file.descendants = descendants;
+                for mut descendant in descendants {
+                    if !live_file
+                        .descendants
+                        .iter()
+                        .any(|old| old.instance == descendant.instance)
+                    {
+                        descendant.escalate_at_unix_ms = unix_millis() + LIVE_ESCALATION_GRACE_MS;
+                        live_file.descendants.push(descendant);
+                    }
+                }
             }
 
             live_file.binding_digest =
                 compute_live_binding_digest(live_file.root, live_file.uid, &live_file.descendants)?;
 
-            // Write durable retirement-begun census obligation BEFORE any signal:
-            let mut obligations: HashMap<String, Vec<LiveDescendantIdentity>> = HashMap::new();
-            if obligation_path.is_file() {
-                match read_json_durable::<CensusObligationFile>(
-                    ArtifactId::ParentLossCensusObligation,
-                    &obligation_path,
-                ) {
-                    Ok(DurableRead::Present(existing)) => {
-                        let Ok(exp_digest) =
-                            compute_census_obligation_digest(&existing.obligations)
-                        else {
-                            let _ = set_aside(&obligation_path);
-                            let refusal = CensusRefusalFile {
-                                schema: PARENT_LOSS_RECOVERY_SCHEMA_V1,
-                                generation,
-                                sealed_phase: ParentLossPhase::Sealed,
-                                reason: "corrupt obligation digest".to_string(),
-                            };
-                            let _ = write_json(
-                                ledger.census_refusal_path(generation),
-                                &refusal,
-                                json_options(),
-                            );
-                            return Ok(Some(ClosureOutcome::Refused(
-                                BootstrapRecoveryReason::AbandonedAdmissionUnverifiable,
-                            )));
-                        };
-                        if existing.generation != generation
-                            || existing.sealed_phase != ParentLossPhase::Sealed
-                            || existing.binding_digest != exp_digest
-                        {
-                            let _ = set_aside(&obligation_path);
-                            let refusal = CensusRefusalFile {
-                                schema: PARENT_LOSS_RECOVERY_SCHEMA_V1,
-                                generation,
-                                sealed_phase: ParentLossPhase::Sealed,
-                                reason: "invalid obligation envelope".to_string(),
-                            };
-                            let _ = write_json(
-                                ledger.census_refusal_path(generation),
-                                &refusal,
-                                json_options(),
-                            );
-                            return Ok(Some(ClosureOutcome::Refused(
-                                BootstrapRecoveryReason::AbandonedAdmissionUnverifiable,
-                            )));
-                        }
-                        obligations = existing.obligations;
-                    }
-                    _ => {
-                        let _ = set_aside(&obligation_path);
-                        let refusal = CensusRefusalFile {
-                            schema: PARENT_LOSS_RECOVERY_SCHEMA_V1,
-                            generation,
-                            sealed_phase: ParentLossPhase::Sealed,
-                            reason: "corrupt or unreadable obligation".to_string(),
-                        };
-                        let _ = write_json(
-                            ledger.census_refusal_path(generation),
-                            &refusal,
-                            json_options(),
-                        );
-                        return Ok(Some(ClosureOutcome::Refused(
-                            BootstrapRecoveryReason::AbandonedAdmissionUnverifiable,
-                        )));
-                    }
-                }
-            }
-            obligations.insert(live_file.launch_id.clone(), live_file.descendants.clone());
-            let ob_digest = compute_census_obligation_digest(&obligations)?;
-            let ob_file = CensusObligationFile {
-                schema: PARENT_LOSS_RECOVERY_SCHEMA_V1,
-                generation,
-                sealed_phase: ParentLossPhase::Sealed,
-                obligations,
-                binding_digest: ob_digest,
-            };
-            write_json(&obligation_path, &ob_file, json_options())?;
-
             let now_ms = unix_millis();
-            live_file.escalate_at_unix_ms = now_ms + LIVE_ESCALATION_GRACE_MS;
-            live_file.reap_deadline_unix_ms = None;
-            live_file.term_requested = false;
-            live_file.escalated = false;
-            write_json(&live_path, &live_file, json_options())?;
-        } else {
-            let now_ms = unix_millis();
-            if live_file.escalate_at_unix_ms > now_ms + LIVE_ESCALATION_GRACE_MS {
+            if live_file.escalate_at_unix_ms == 0
+                || live_file.escalate_at_unix_ms > now_ms + LIVE_ESCALATION_GRACE_MS
+            {
                 live_file.escalate_at_unix_ms = now_ms + LIVE_ESCALATION_GRACE_MS;
-                write_json(&live_path, &live_file, json_options())?;
             }
+            persist_live(ledger, generation, &live_file)?;
         }
 
+        if let Some(outcome) =
+            begin_retained_descendants(ledger, generation, authority, &mut live_file)?
+        {
+            return Ok(Some(outcome));
+        }
         if !live_file.term_requested {
             live_file.term_requested = true;
-            write_json(&live_path, &live_file, json_options())?;
+            live_file.escalate_at_unix_ms = unix_millis() + LIVE_ESCALATION_GRACE_MS;
+            persist_live(ledger, generation, &live_file)?;
             if authority.retirer.owner(live_file.root.pid) == ProcessOwner::Uid(live_file.uid) {
                 let _ = authority
                     .retirer
@@ -1350,6 +1513,14 @@ fn run_live_state_machine(
             }
         }
 
+        #[cfg(feature = "test-hooks")]
+        if std::env::var("SOLSTONE_PARENT_LOSS_CLOSURE_SEAM").as_deref()
+            == Ok("after-retirement-term")
+        {
+            loop {
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
         verdict = authority.source.observe(&live_file.root);
         while matches!(verdict, InstanceVerdict::SameLive { .. }) {
             let now_ms = unix_millis();
@@ -1392,7 +1563,7 @@ fn run_live_state_machine(
                 need_write = true;
             }
             if need_write {
-                write_json(&live_path, &live_file, json_options())?;
+                persist_live(ledger, generation, &live_file)?;
             }
             if authority.retirer.owner(live_file.root.pid) == ProcessOwner::Uid(live_file.uid) {
                 let _ = authority.retirer.signal(live_file.root, SignalKind::Kill);
@@ -1463,6 +1634,7 @@ fn run_live_state_machine(
             )?;
 
             let row = CompletedBatchRow {
+                sources: Some(derived.sources.clone()),
                 launch_id: live_file.launch_id.clone(),
                 service: derived.service,
                 instance: Some(live_file.root),
@@ -1479,6 +1651,7 @@ fn run_live_state_machine(
             batch_buffer.push(row);
             flush_batch_and_ids(ledger, generation, *next_seq, batch_buffer, completed_ids)?;
             *next_seq += 1;
+            discharge_census(ledger, generation, &live_file.launch_id)?;
             let _ = fs::remove_file(&live_path);
             Ok(None)
         }
@@ -1520,6 +1693,7 @@ fn run_live_state_machine(
                         derived.digests.spawn_identity.as_deref(),
                     )?;
                     let row = CompletedBatchRow {
+                        sources: Some(derived.sources.clone()),
                         launch_id: live_file.launch_id.clone(),
                         service: derived.service,
                         instance: Some(live_file.root),
@@ -1542,6 +1716,7 @@ fn run_live_state_machine(
                         completed_ids,
                     )?;
                     *next_seq += 1;
+                    discharge_census(ledger, generation, &live_file.launch_id)?;
                     let _ = fs::remove_file(&live_path);
                     Ok(None)
                 }
@@ -1556,6 +1731,14 @@ fn run_live_state_machine(
     }
 }
 
+pub(crate) fn completed_recovery(
+    ledger: &ParentLossLedger,
+    generation: ParentLossGeneration,
+    authority: &ClosingAuthority<'_>,
+) -> Result<bool, ParentLossLedgerError> {
+    publication::completed(ledger, generation, authority)
+}
+
 /// Close one abandoned generation. The caller holds the active-generation lock
 /// and the coordinator lease, and its parent holds the supervisor lock.
 pub(crate) fn close_abandoned_generation(
@@ -1568,9 +1751,9 @@ pub(crate) fn close_abandoned_generation(
         generation,
         supervisor,
         coordinator,
-        record,
+        mut record,
         set_aside: mut set_aside_files,
-        mut notes,
+        notes,
     } = abandoned;
 
     // 1. SameLive supervisor and coordinator vetoes first.
@@ -1599,23 +1782,28 @@ pub(crate) fn close_abandoned_generation(
         },
     };
 
-    // Post-publication start: if already closed and sealed ledger digest matches, return Closed
-    if let Some(rec) = &record {
-        if rec.closure.is_some() {
-            if let Some(expected_digest) = &rec.sealed_ledger_digest {
-                let ledger_path = ledger.sealed_ledger_path(generation);
-                if ledger_path.is_file() {
-                    if let Ok(bytes) = fs::read(&ledger_path) {
-                        if &digest_bytes(&bytes) == expected_digest {
-                            return Ok(ClosureOutcome::Closed);
-                        }
-                    }
-                }
-            }
-            return Ok(ClosureOutcome::Refused(
-                BootstrapRecoveryReason::AbandonedAdmissionUnverifiable,
-            ));
+    if publication::completed(ledger, generation, authority)? {
+        return Ok(ClosureOutcome::Closed);
+    }
+    if record.as_ref().is_some_and(|r| r.closure.is_some())
+        && let Some(aside) = publication::supersede_overtaken_publication(ledger, generation)?
+    {
+        if let Some(name) = aside.file_name() {
+            set_aside_files.push(name.to_string_lossy().into_owned());
         }
+        record = None;
+    }
+    if record.as_ref().is_some_and(|r| r.closure.is_some()) {
+        if ledger
+            .closure_recovery_phase_dir(generation)
+            .join("publication.json")
+            .exists()
+        {
+            return Err(unverifiable_admission());
+        }
+        // Older releases published closure without a reusable exact-byte proof.
+        // Re-audit those admissions; their self-reported digest alone is insufficient.
+        record.as_mut().expect("legacy record present").closure = None;
     }
 
     if has_census_refusal_or_wedged(ledger, generation) {
@@ -1657,10 +1845,110 @@ pub(crate) fn close_abandoned_generation(
         },
     )?;
 
+    // Retained live obligations have priority over every historical payload.
+    let mut max_seq = fs::read_dir(ledger.closure_recovery_batches_dir(generation))?
+        .filter_map(Result::ok)
+        .filter_map(|e| e.path().file_stem()?.to_str()?.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0);
+    let mut next_seq = max_seq + 1;
+    let mut current_batch_buffer: Vec<CompletedBatchRow> = Vec::new();
+    let mut completed_ids: HashSet<String> = HashSet::new();
+    // 9. Process live files before read_dir.
+    let live_dir = ledger.closure_recovery_live_dir(generation);
+    let mut live_files = Vec::new();
+    let census = read_retirement_census(ledger, generation)?;
+    if let Ok(entries) = fs::read_dir(&live_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if let Some(id) = path.file_stem().and_then(|s| s.to_str())
+                && let Some(retained) = census.obligations.get(id)
+            {
+                live_files.push(retained.clone());
+                continue;
+            }
+            match read_json_durable_validated::<LiveRecoveryFile>(
+                ArtifactId::ParentLossClosureRecovery,
+                &path,
+                |l| {
+                    if l.schema != PARENT_LOSS_RECOVERY_SCHEMA_V1
+                        || l.generation != generation
+                        || l.sealed_phase != ParentLossPhase::Sealed
+                        || l.kind != RecoveryArtifactKind::Live
+                    {
+                        return Err("invalid live envelope".to_string());
+                    }
+                    Ok(())
+                },
+            ) {
+                Ok(DurableRead::Present(live_file)) => {
+                    live_files.push(live_file);
+                }
+                Ok(DurableRead::SetAside(aside)) => {
+                    if let Some(name) = aside.file_name() {
+                        set_aside_files.push(name.to_string_lossy().into_owned());
+                    }
+                    let launch_id = path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    if let Some(retained) = census.obligations.get(&launch_id) {
+                        live_files.push(retained.clone());
+                        continue;
+                    }
+                    let derived = read_derived_admission_drops(ledger, generation, &launch_id)?;
+                    let is_gone = match derived.instance {
+                        Some(inst) => matches!(
+                            authority.source.observe(&inst),
+                            InstanceVerdict::NotSameOrExited
+                        ),
+                        None => true,
+                    };
+                    if is_gone {
+                        census_refusal(ledger, generation, "live cache damaged after root exit")?;
+                        return Ok(ClosureOutcome::Refused(
+                            BootstrapRecoveryReason::AbandonedAdmissionUnverifiable,
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let census = read_retirement_census(ledger, generation)?;
+    for retained in census.obligations.into_values() {
+        if let Some(index) = live_files
+            .iter()
+            .position(|l| l.launch_id == retained.launch_id)
+        {
+            live_files[index] = retained;
+        } else {
+            live_files.push(retained);
+        }
+    }
+
+    for live_file in live_files {
+        if let Some(outcome) = run_live_state_machine(
+            ledger,
+            generation,
+            authority,
+            live_file,
+            &mut current_batch_buffer,
+            &mut next_seq,
+            &mut completed_ids,
+        )? {
+            return Ok(outcome);
+        }
+    }
+
+    completed_ids.clear();
     // 6. Discovery skip set: read ids files only.
     let mut raw_ids: HashMap<u64, (RecoveryIdsFile, std::path::PathBuf)> = HashMap::new();
     let mut batch_paths: HashMap<u64, std::path::PathBuf> = HashMap::new();
-    let mut max_seq: u64 = 0;
 
     let ids_dir = ledger.closure_recovery_ids_dir(generation);
     if let Ok(entries) = fs::read_dir(&ids_dir) {
@@ -1716,7 +2004,6 @@ pub(crate) fn close_abandoned_generation(
         }
     }
 
-    let mut completed_ids: HashSet<String> = HashSet::new();
     let mut valid_ids_seqs: Vec<u64> = Vec::new();
     let mut sorted_seqs: Vec<u64> = raw_ids.keys().chain(batch_paths.keys()).copied().collect();
     sorted_seqs.sort_unstable();
@@ -1754,31 +2041,6 @@ pub(crate) fn close_abandoned_generation(
                     continue;
                 };
 
-                let batch: RecoveryBatchFile = match serde_json::from_slice(&batch_bytes) {
-                    Ok(b) => b,
-                    Err(_) => {
-                        set_aside_all(&mut set_aside_files);
-                        continue;
-                    }
-                };
-
-                if batch.schema != PARENT_LOSS_RECOVERY_SCHEMA_V1
-                    || batch.generation != generation
-                    || batch.sealed_phase != ParentLossPhase::Sealed
-                    || batch.kind != RecoveryArtifactKind::Batch
-                    || batch.seq != seq
-                {
-                    set_aside_all(&mut set_aside_files);
-                    continue;
-                }
-
-                let batch_ids: Vec<String> =
-                    batch.entries.iter().map(|e| e.launch_id.clone()).collect();
-                if batch_ids != ids_file.ids {
-                    set_aside_all(&mut set_aside_files);
-                    continue;
-                }
-
                 if r_path.is_file() {
                     let Ok(receipt_bytes) = fs::read(&r_path) else {
                         set_aside_all(&mut set_aside_files);
@@ -1803,9 +2065,14 @@ pub(crate) fn close_abandoned_generation(
                         set_aside_all(&mut set_aside_files);
                         continue;
                     }
+                } else {
+                    set_aside_all(&mut set_aside_files);
+                    continue;
                 }
 
-                let all_valid = ids_file.ids.iter().all(|id| validate_launch_id(id).is_ok());
+                let unique_ids: HashSet<_> = ids_file.ids.iter().collect();
+                let all_valid = unique_ids.len() == ids_file.ids.len()
+                    && ids_file.ids.iter().all(|id| validate_launch_id(id).is_ok());
                 let has_dup = ids_file.ids.iter().any(|id| completed_ids.contains(id));
                 if !all_valid || has_dup {
                     set_aside_all(&mut set_aside_files);
@@ -1889,8 +2156,7 @@ pub(crate) fn close_abandoned_generation(
         }
     }
 
-    let mut next_seq = max_seq + 1;
-    let mut current_batch_buffer: Vec<CompletedBatchRow> = Vec::new();
+    next_seq = max_seq + 1;
 
     // 7. Load provisional files.
     let mut provisional_map: HashMap<String, ProvisionalFile> = HashMap::new();
@@ -2010,73 +2276,6 @@ pub(crate) fn close_abandoned_generation(
         }
     }
 
-    // 9. Process live files before read_dir.
-    let live_dir = ledger.closure_recovery_live_dir(generation);
-    let mut live_files = Vec::new();
-    if let Ok(entries) = fs::read_dir(&live_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            match read_json_durable_validated::<LiveRecoveryFile>(
-                ArtifactId::ParentLossClosureRecovery,
-                &path,
-                |l| {
-                    if l.schema != PARENT_LOSS_RECOVERY_SCHEMA_V1
-                        || l.generation != generation
-                        || l.sealed_phase != ParentLossPhase::Sealed
-                        || l.kind != RecoveryArtifactKind::Live
-                    {
-                        return Err("invalid live envelope".to_string());
-                    }
-                    Ok(())
-                },
-            ) {
-                Ok(DurableRead::Present(live_file)) => {
-                    live_files.push(live_file);
-                }
-                Ok(DurableRead::SetAside(aside)) => {
-                    if let Some(name) = aside.file_name() {
-                        set_aside_files.push(name.to_string_lossy().into_owned());
-                    }
-                    let launch_id = path
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    let derived = read_derived_admission_drops(ledger, generation, &launch_id)?;
-                    let is_gone = match derived.instance {
-                        Some(inst) => matches!(
-                            authority.source.observe(&inst),
-                            InstanceVerdict::NotSameOrExited
-                        ),
-                        None => true,
-                    };
-                    if is_gone {
-                        return Ok(ClosureOutcome::Refused(
-                            BootstrapRecoveryReason::AbandonedAdmissionUnverifiable,
-                        ));
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    for live_file in live_files {
-        if let Some(outcome) = run_live_state_machine(
-            ledger,
-            generation,
-            authority,
-            live_file,
-            &mut current_batch_buffer,
-            &mut next_seq,
-            &mut completed_ids,
-        )? {
-            return Ok(outcome);
-        }
-    }
-
     // 10. Scan admissions directory if not skipped by valid scan-complete.
     let mut seen_admission_dirs: HashSet<String> = HashSet::new();
     if !skip_dir_scan {
@@ -2184,6 +2383,7 @@ pub(crate) fn close_abandoned_generation(
                                     derived.digests.spawn_identity.as_deref(),
                                 )?;
                                 let row = CompletedBatchRow {
+                                    sources: Some(derived.sources.clone()),
                                     launch_id: launch_id.clone(),
                                     service: derived.service,
                                     instance: Some(instance),
@@ -2201,6 +2401,7 @@ pub(crate) fn close_abandoned_generation(
                             }
                             InstanceVerdict::SameLive { .. } => {
                                 let live_file = LiveRecoveryFile {
+                                    sources: None,
                                     schema: PARENT_LOSS_RECOVERY_SCHEMA_V1,
                                     kind: RecoveryArtifactKind::Live,
                                     generation,
@@ -2246,6 +2447,7 @@ pub(crate) fn close_abandoned_generation(
                                             derived.digests.spawn_identity.as_deref(),
                                         )?;
                                         let row = CompletedBatchRow {
+                                            sources: Some(derived.sources.clone()),
                                             launch_id: launch_id.clone(),
                                             service: derived.service,
                                             instance: Some(instance),
@@ -2277,7 +2479,7 @@ pub(crate) fn close_abandoned_generation(
                                 derived.service,
                                 None,
                                 None,
-                                None,
+                                derived.parent_launch_id.as_deref(),
                                 derived.finding,
                                 derived.parsed_result_state.as_deref(),
                                 derived.digests.intent.as_deref(),
@@ -2286,11 +2488,12 @@ pub(crate) fn close_abandoned_generation(
                                 derived.digests.spawn_identity.as_deref(),
                             )?;
                             let row = CompletedBatchRow {
+                                sources: Some(derived.sources.clone()),
                                 launch_id: launch_id.clone(),
                                 service: derived.service,
                                 instance: None,
                                 uid: None,
-                                parent_launch_id: None,
+                                parent_launch_id: derived.parent_launch_id,
                                 finding: derived.finding,
                                 parsed_result_state: derived.parsed_result_state,
                                 intent_digest: derived.digests.intent,
@@ -2386,6 +2589,7 @@ pub(crate) fn close_abandoned_generation(
                         derived.digests.spawn_identity.as_deref(),
                     )?;
                     let row = CompletedBatchRow {
+                        sources: Some(derived.sources.clone()),
                         launch_id: launch_id.clone(),
                         service: derived.service,
                         instance: Some(instance),
@@ -2409,6 +2613,7 @@ pub(crate) fn close_abandoned_generation(
                 }
                 InstanceVerdict::SameLive { .. } => {
                     let live_file = LiveRecoveryFile {
+                        sources: Some(derived.sources.clone()),
                         schema: PARENT_LOSS_RECOVERY_SCHEMA_V1,
                         kind: RecoveryArtifactKind::Live,
                         generation,
@@ -2454,6 +2659,7 @@ pub(crate) fn close_abandoned_generation(
                             derived.digests.spawn_identity.as_deref(),
                         )?;
                         let row = CompletedBatchRow {
+                            sources: Some(derived.sources.clone()),
                             launch_id: launch_id.clone(),
                             service: derived.service,
                             instance: Some(instance),
@@ -2492,7 +2698,6 @@ pub(crate) fn close_abandoned_generation(
             &mut current_batch_buffer,
             &mut completed_ids,
         )?;
-        next_seq += 1;
     }
 
     // 12. Check live directory is empty.
@@ -2537,9 +2742,15 @@ pub(crate) fn close_abandoned_generation(
     all_scanned_ids.dedup();
 
     let mut ids_seqs = valid_ids_seqs.clone();
-    for s in 1..next_seq {
-        if !ids_seqs.contains(&s) && ledger.closure_recovery_ids_path(generation, s).is_file() {
-            ids_seqs.push(s);
+    for entry in fs::read_dir(ledger.closure_recovery_ids_dir(generation))? {
+        let path = entry?.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("json")
+            && let Some(seq) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u64>().ok())
+        {
+            ids_seqs.push(seq);
         }
     }
     ids_seqs.sort_unstable();
@@ -2559,470 +2770,22 @@ pub(crate) fn close_abandoned_generation(
     };
     write_json(&scan_complete_path, &sc_file, json_options())?;
 
-    // 14. Publication under the same authority.deadline:
-    // Open each ids seq's batch, require completed_row_is_authorized on every row, and build closures from those rows plus provisional files.
-    let mut batch_rows_by_id: HashMap<String, CompletedBatchRow> = HashMap::new();
-    let mut failed_batch = false;
-    let mut failed_launch_ids: Vec<String> = Vec::new();
-
-    for seq in &ids_seqs {
-        if Instant::now() >= authority.deadline {
-            return Ok(ClosureOutcome::Refused(
-                BootstrapRecoveryReason::CoordinatorNotLive,
-            ));
-        }
-        let b_path = ledger.closure_recovery_batch_path(generation, *seq);
-        let i_path = ledger.closure_recovery_ids_path(generation, *seq);
-        let r_path = ledger.closure_recovery_receipt_path(generation, *seq);
-
-        let batch_bytes = match fs::read(&b_path) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                failed_batch = true;
-                if let Ok(aside) = set_aside(&b_path) {
-                    if let Some(name) = aside.file_name() {
-                        set_aside_files.push(name.to_string_lossy().into_owned());
-                    }
-                }
-                if let Ok(aside) = set_aside(&i_path) {
-                    if let Some(name) = aside.file_name() {
-                        set_aside_files.push(name.to_string_lossy().into_owned());
-                    }
-                }
-                if let Ok(aside) = set_aside(&r_path) {
-                    if let Some(name) = aside.file_name() {
-                        set_aside_files.push(name.to_string_lossy().into_owned());
-                    }
-                }
-                continue;
-            }
-        };
-        let b_digest = digest_bytes(&batch_bytes);
-
-        let ids_file_opt = match read_json_durable_validated::<RecoveryIdsFile>(
-            ArtifactId::ParentLossClosureRecovery,
-            &i_path,
-            |f| {
-                if f.schema != PARENT_LOSS_RECOVERY_SCHEMA_V1
-                    || f.generation != generation
-                    || f.sealed_phase != ParentLossPhase::Sealed
-                    || f.kind != RecoveryArtifactKind::Ids
-                    || f.seq != *seq
-                {
-                    return Err("invalid ids envelope".to_string());
-                }
-                Ok(())
-            },
-        ) {
-            Ok(DurableRead::Present(ids_file)) => Some(ids_file),
-            _ => None,
-        };
-
-        let receipt_opt = match read_json_durable_validated::<RecoveryBatchReceipt>(
-            ArtifactId::ParentLossClosureRecovery,
-            &r_path,
-            |r| {
-                if r.schema != PARENT_LOSS_RECOVERY_SCHEMA_V1
-                    || r.generation != generation
-                    || r.sealed_phase != ParentLossPhase::Sealed
-                    || r.kind != RecoveryArtifactKind::Receipt
-                    || r.seq != *seq
-                {
-                    return Err("invalid receipt envelope".to_string());
-                }
-                Ok(())
-            },
-        ) {
-            Ok(DurableRead::Present(receipt)) => Some(receipt),
-            _ => None,
-        };
-
-        let receipt_valid = match (&receipt_opt, &ids_file_opt) {
-            (Some(receipt), Some(ids_file)) => {
-                receipt.batch_bytes_digest == b_digest && receipt.ids == ids_file.ids
-            }
-            _ => false,
-        };
-
-        if receipt_valid {
-            match serde_json::from_slice::<RecoveryBatchFile>(&batch_bytes) {
-                Ok(batch) => {
-                    let batch_ids: Vec<String> =
-                        batch.entries.iter().map(|e| e.launch_id.clone()).collect();
-                    let receipt = receipt_opt.as_ref().unwrap();
-                    if batch_ids != receipt.ids {
-                        failed_batch = true;
-                        if let Ok(aside) = set_aside(&b_path) {
-                            if let Some(name) = aside.file_name() {
-                                set_aside_files.push(name.to_string_lossy().into_owned());
-                            }
-                        }
-                        if let Ok(aside) = set_aside(&i_path) {
-                            if let Some(name) = aside.file_name() {
-                                set_aside_files.push(name.to_string_lossy().into_owned());
-                            }
-                        }
-                        if let Ok(aside) = set_aside(&r_path) {
-                            if let Some(name) = aside.file_name() {
-                                set_aside_files.push(name.to_string_lossy().into_owned());
-                            }
-                        }
-                        failed_launch_ids.extend(batch_ids);
-                        failed_launch_ids.extend(receipt.ids.clone());
-                    } else {
-                        for row in batch.entries {
-                            batch_rows_by_id.insert(row.launch_id.clone(), row);
-                        }
-                    }
-                }
-                Err(_) => {
-                    failed_batch = true;
-                    if let Ok(aside) = set_aside(&b_path) {
-                        if let Some(name) = aside.file_name() {
-                            set_aside_files.push(name.to_string_lossy().into_owned());
-                        }
-                    }
-                    if let Ok(aside) = set_aside(&i_path) {
-                        if let Some(name) = aside.file_name() {
-                            set_aside_files.push(name.to_string_lossy().into_owned());
-                        }
-                    }
-                    if let Ok(aside) = set_aside(&r_path) {
-                        if let Some(name) = aside.file_name() {
-                            set_aside_files.push(name.to_string_lossy().into_owned());
-                        }
-                    }
-                    if let Some(ids_file) = &ids_file_opt {
-                        failed_launch_ids.extend(ids_file.ids.clone());
-                    }
-                }
-            }
-        } else {
-            // Receipt mismatch or absent: re-audit this batch
-            match serde_json::from_slice::<RecoveryBatchFile>(&batch_bytes) {
-                Ok(batch) => {
-                    let batch_ids: Vec<String> =
-                        batch.entries.iter().map(|e| e.launch_id.clone()).collect();
-                    let all_auth = batch
-                        .entries
-                        .iter()
-                        .all(|row| completed_row_is_authorized(ledger, generation, row));
-                    let matches_ids = match &ids_file_opt {
-                        Some(ids_file) => ids_file.ids == batch_ids,
-                        None => false,
-                    };
-                    if !all_auth || !matches_ids {
-                        failed_batch = true;
-                        if let Ok(aside) = set_aside(&b_path) {
-                            if let Some(name) = aside.file_name() {
-                                set_aside_files.push(name.to_string_lossy().into_owned());
-                            }
-                        }
-                        if let Ok(aside) = set_aside(&i_path) {
-                            if let Some(name) = aside.file_name() {
-                                set_aside_files.push(name.to_string_lossy().into_owned());
-                            }
-                        }
-                        if let Ok(aside) = set_aside(&r_path) {
-                            if let Some(name) = aside.file_name() {
-                                set_aside_files.push(name.to_string_lossy().into_owned());
-                            }
-                        }
-                        failed_launch_ids.extend(batch_ids);
-                        if let Some(ids_file) = &ids_file_opt {
-                            failed_launch_ids.extend(ids_file.ids.clone());
-                        }
-                    } else {
-                        let ids = batch_ids;
-                        let receipt = RecoveryBatchReceipt {
-                            schema: PARENT_LOSS_RECOVERY_SCHEMA_V1,
-                            kind: RecoveryArtifactKind::Receipt,
-                            generation,
-                            sealed_phase: ParentLossPhase::Sealed,
-                            seq: *seq,
-                            batch_bytes_digest: b_digest,
-                            ids,
-                        };
-                        if let Some(parent) = r_path.parent() {
-                            let _ = fs::create_dir_all(parent);
-                        }
-                        let _ = write_json(&r_path, &receipt, json_options());
-                        for row in batch.entries {
-                            batch_rows_by_id.insert(row.launch_id.clone(), row);
-                        }
-                    }
-                }
-                Err(_) => {
-                    failed_batch = true;
-                    if let Ok(aside) = set_aside(&b_path) {
-                        if let Some(name) = aside.file_name() {
-                            set_aside_files.push(name.to_string_lossy().into_owned());
-                        }
-                    }
-                    if let Ok(aside) = set_aside(&i_path) {
-                        if let Some(name) = aside.file_name() {
-                            set_aside_files.push(name.to_string_lossy().into_owned());
-                        }
-                    }
-                    if let Ok(aside) = set_aside(&r_path) {
-                        if let Some(name) = aside.file_name() {
-                            set_aside_files.push(name.to_string_lossy().into_owned());
-                        }
-                    }
-                    if let Some(ids_file) = &ids_file_opt {
-                        failed_launch_ids.extend(ids_file.ids.clone());
-                    }
-                }
-            }
-        }
-    }
-
-    if failed_batch {
-        if let Ok(aside) = set_aside(&scan_complete_path) {
-            if let Some(name) = aside.file_name() {
-                set_aside_files.push(name.to_string_lossy().into_owned());
-            }
-        }
-        failed_launch_ids.sort();
-        failed_launch_ids.dedup();
-        if Instant::now() >= authority.deadline || failed_launch_ids.is_empty() {
-            return Ok(ClosureOutcome::Refused(
-                BootstrapRecoveryReason::CoordinatorNotLive,
-            ));
-        }
-        for launch_id in failed_launch_ids {
-            let derived = read_derived_admission_drops(ledger, generation, &launch_id)?;
-            match (derived.instance, derived.uid) {
-                (Some(instance), Some(uid)) => {
-                    let verdict = authority.source.observe(&instance);
-                    match verdict {
-                        InstanceVerdict::NotSameOrExited => {
-                            let finding = AdmissionFinding::Exited;
-                            let binding_digest = compute_batch_row_binding_digest(
-                                &launch_id,
-                                derived.service,
-                                Some(instance),
-                                Some(uid),
-                                derived.parent_launch_id.as_deref(),
-                                finding,
-                                derived.parsed_result_state.as_deref(),
-                                derived.digests.intent.as_deref(),
-                                derived.digests.result.as_deref(),
-                                derived.digests.ack.as_deref(),
-                                derived.digests.spawn_identity.as_deref(),
-                            )?;
-                            let row = CompletedBatchRow {
-                                launch_id: launch_id.clone(),
-                                service: derived.service,
-                                instance: Some(instance),
-                                uid: Some(uid),
-                                parent_launch_id: derived.parent_launch_id,
-                                finding,
-                                parsed_result_state: derived.parsed_result_state,
-                                intent_digest: derived.digests.intent,
-                                result_digest: derived.digests.result,
-                                ack_digest: derived.digests.ack,
-                                spawn_identity_digest: derived.digests.spawn_identity,
-                                binding_digest,
-                            };
-                            batch_rows_by_id.insert(launch_id, row);
-                        }
-                        InstanceVerdict::SameLive { .. } => {
-                            return Ok(ClosureOutcome::Refused(
-                                BootstrapRecoveryReason::CoordinatorNotLive,
-                            ));
-                        }
-                        InstanceVerdict::Unverifiable => {
-                            return Ok(ClosureOutcome::Refused(
-                                BootstrapRecoveryReason::AbandonedAdmissionUnverifiable,
-                            ));
-                        }
-                    }
-                }
-                _ => match derived.finding {
-                    AdmissionFinding::SpawnFailed | AdmissionFinding::RejectedAndReaped => {
-                        let binding_digest = compute_batch_row_binding_digest(
-                            &launch_id,
-                            derived.service,
-                            None,
-                            None,
-                            None,
-                            derived.finding,
-                            derived.parsed_result_state.as_deref(),
-                            derived.digests.intent.as_deref(),
-                            derived.digests.result.as_deref(),
-                            derived.digests.ack.as_deref(),
-                            derived.digests.spawn_identity.as_deref(),
-                        )?;
-                        let row = CompletedBatchRow {
-                            launch_id: launch_id.clone(),
-                            service: derived.service,
-                            instance: None,
-                            uid: None,
-                            parent_launch_id: None,
-                            finding: derived.finding,
-                            parsed_result_state: derived.parsed_result_state,
-                            intent_digest: derived.digests.intent,
-                            result_digest: derived.digests.result,
-                            ack_digest: derived.digests.ack,
-                            spawn_identity_digest: derived.digests.spawn_identity,
-                            binding_digest,
-                        };
-                        batch_rows_by_id.insert(launch_id, row);
-                    }
-                    _ => {
-                        return Ok(ClosureOutcome::Refused(
-                            BootstrapRecoveryReason::AbandonedAdmissionUnverifiable,
-                        ));
-                    }
-                },
-            }
-        }
-    }
-
-    let mut closures = Vec::with_capacity(all_scanned_ids.len());
-    let mut sealed = Vec::new();
-
-    for launch_id in &all_scanned_ids {
-        if let Some(row) = batch_rows_by_id.remove(launch_id) {
-            closures.push(AdmissionClosure {
-                launch_id: row.launch_id.clone(),
-                service: row.service,
-                instance: row.instance,
-                uid: row.uid,
-                finding: row.finding,
-            });
-            if let (Some(instance), Some(uid)) = (row.instance, row.uid) {
-                sealed.push(SealedAdmission {
-                    launch_id: row.launch_id.clone(),
-                    service: row.service,
-                    identity: AdmissionIdentity {
-                        generation,
-                        launch_id: row.launch_id.clone(),
-                        instance,
-                        uid,
-                        parent_launch_id: row.parent_launch_id.clone(),
-                    },
-                });
-            }
-        } else if let Some(prov) = provisional_map.get(launch_id) {
-            closures.push(AdmissionClosure {
-                launch_id: prov.launch_id.clone(),
-                service: prov.service,
-                instance: None,
-                uid: None,
-                finding: prov.finding,
-            });
-        } else {
-            return Ok(ClosureOutcome::Refused(
-                BootstrapRecoveryReason::AbandonedAdmissionUnverifiable,
-            ));
-        }
-    }
-
-    sealed.sort_by(|a, b| a.launch_id.cmp(&b.launch_id));
-    closures.sort_by(|a, b| a.launch_id.cmp(&b.launch_id));
-
-    let ledger_path = ledger.sealed_ledger_path(generation);
-    let sealed_ledger_digest = if ledger_path.is_file() {
-        let existing_bytes = fs::read(&ledger_path)?;
-        let existing_val: Result<serde_json::Value, _> = serde_json::from_slice(&existing_bytes);
-        let current_val = serde_json::to_value(&sealed).ok();
-        if let (Ok(existing), Some(current)) = (existing_val, current_val)
-            && existing == current
-        {
-            digest_bytes(&existing_bytes)
-        } else {
-            if record
-                .as_ref()
-                .and_then(|r| r.sealed_ledger_digest.as_ref())
-                .is_some()
-            {
-                return Ok(ClosureOutcome::Refused(
-                    BootstrapRecoveryReason::AbandonedAdmissionUnverifiable,
-                ));
-            }
-            if let Ok(aside) = set_aside(&ledger_path) {
-                if let Some(name) = aside.file_name() {
-                    let name = name.to_string_lossy().into_owned();
-                    if !set_aside_files.contains(&name) {
-                        set_aside_files.push(name);
-                    }
-                }
-            }
-            ledger.write_sealed_ledger(generation, &sealed)?
-        }
-    } else {
-        ledger.write_sealed_ledger(generation, &sealed)?
-    };
-
-    #[cfg(feature = "test-hooks")]
-    if std::env::var("SOLSTONE_PARENT_LOSS_CLOSURE_SEAM").as_deref() == Ok("after-ledger") {
-        loop {
-            thread::sleep(Duration::from_millis(100));
-        }
-    }
-
-    let ledger_bytes = fs::read(&ledger_path)?;
-    let expected_digest = digest_bytes(&ledger_bytes);
-    if sealed_ledger_digest != expected_digest {
-        return Ok(ClosureOutcome::Refused(
-            BootstrapRecoveryReason::AbandonedAdmissionUnverifiable,
-        ));
-    }
-
-    let mut record = record.unwrap_or_else(|| ParentLossGenerationRecord {
-        schema: PARENT_LOSS_LEDGER_SCHEMA_V1,
+    publication::publish(
+        ledger,
         generation,
-        coordinator,
-        supervisor: supervisor.unwrap_or(authority.closed_by),
-        sealed_ledger_digest: None,
-        terminal: None,
-        supervisor_heartbeat: None,
-        closure: None,
-    });
-    if supervisor.is_none() {
-        notes.push("no supervisor identity was recorded; the record names the closer".to_owned());
-    }
-    if record.terminal.is_none() {
-        record.terminal = Some(ParentLossTerminalDisposition::Unresolved {
-            reason: ParentLossUnresolvedReason::AuthoritiesLost,
-        });
-    }
-    if let Some(existing_rec_digest) = &record.sealed_ledger_digest {
-        if existing_rec_digest != &expected_digest {
-            return Ok(ClosureOutcome::Refused(
-                BootstrapRecoveryReason::AbandonedAdmissionUnverifiable,
-            ));
-        }
-    } else {
-        record.sealed_ledger_digest = Some(expected_digest);
-    }
-
-    let heartbeat = match (record.supervisor_heartbeat.as_deref(), supervisor) {
-        (Some(filename), Some(instance)) => clear_supervisor_heartbeat(ledger, filename, instance),
-        _ => HeartbeatRetirement::NotRecorded,
-    };
-
-    let closure = AbandonedGenerationClosure {
-        schema: PARENT_LOSS_CLOSURE_SCHEMA_V1,
-        closed_by: authority.closed_by,
         successor_generation,
-        closed_at: unix_seconds(),
-        supervisor: supervisor_observation,
-        coordinator: coordinator_observation,
-        heartbeat,
-        set_aside: set_aside_files,
+        authority,
+        supervisor,
+        coordinator,
+        record,
+        supervisor_observation,
+        coordinator_observation,
+        set_aside_files,
         notes,
-        admissions: closures,
-    };
-    record.closure = Some(closure);
-    let record_path = ledger.record_path(generation);
-    if let Some(parent) = record_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    write_json(&record_path, &record, json_options())?;
-    Ok(ClosureOutcome::Closed)
+        all_scanned_ids,
+        ids_seqs,
+        &provisional_map,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -4011,6 +3774,7 @@ mod tests {
 
         // Row with omitted uid:
         let invalid_row_no_uid = CompletedBatchRow {
+            sources: None,
             launch_id: launch_id.to_string(),
             service: derived.service,
             instance: Some(inst),
@@ -4048,6 +3812,7 @@ mod tests {
             panic!("compute digest");
         };
         let row_changed_inst = CompletedBatchRow {
+            sources: None,
             launch_id: launch_id.to_string(),
             service: derived.service,
             instance: Some(changed_inst),
@@ -4125,6 +3890,7 @@ mod tests {
             ));
 
             let row = CompletedBatchRow {
+                sources: None,
                 launch_id: bad_id.to_string(),
                 service: None,
                 instance: None,
@@ -4147,12 +3913,81 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_nested_launch_closes_with_its_original_parent_provenance() {
+        let directory = TempDir::new().unwrap();
+        let (ledger, active) = open_generation(&directory);
+        let launch_id = "failed-child";
+        write_parent_loss_admission_intent(
+            directory.path(),
+            &AdmissionIntent::new(
+                active.generation,
+                launch_id,
+                None,
+                Some("parent-launch".into()),
+            ),
+        )
+        .unwrap();
+        write_parent_loss_admission_result(
+            directory.path(),
+            active.generation,
+            launch_id,
+            &AdmissionResult {
+                schema: 1,
+                identity: None,
+                state: AdmissionResultState::SpawnFailed {
+                    detail: "spawn failed".into(),
+                },
+            },
+        )
+        .unwrap();
+        let before = fs::read(
+            ledger
+                .generation_path(active.generation)
+                .join("admissions/failed-child/intent.json"),
+        )
+        .unwrap();
+        let (source, retirer) = fake(&[], &[], &[]);
+        let lease = acquire_lease(&ledger);
+        let next = ledger
+            .reserve_generation_closing_abandoned(
+                instance(11, 3),
+                [],
+                &lease,
+                &authority(&source, &retirer, Duration::from_secs(2)),
+            )
+            .expect("a failed nested launch must not permanently refuse publication");
+        assert!(next.generation > active.generation);
+        let closure = closure_of(&ledger, active.generation);
+        assert_eq!(closure.admissions.len(), 1);
+        assert_eq!(closure.admissions[0].finding, AdmissionFinding::SpawnFailed);
+        let batch: RecoveryBatchFile = serde_json::from_slice(
+            &fs::read(ledger.closure_recovery_batch_path(active.generation, 1)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            batch.entries[0].parent_launch_id.as_deref(),
+            Some("parent-launch")
+        );
+        assert_eq!(
+            fs::read(
+                ledger
+                    .generation_path(active.generation)
+                    .join("admissions/failed-child/intent.json")
+            )
+            .unwrap(),
+            before
+        );
+        assert!(retirer.signals.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn spawn_failed_with_invalid_parsed_result_state_does_not_authorize() {
         let directory = TempDir::new().expect("temporary root");
         let (ledger, active) = open_generation(&directory);
         let launch_id = "failed-launch";
 
         let invalid_spawn_failed = CompletedBatchRow {
+            sources: None,
             launch_id: launch_id.to_string(),
             service: Some(HostedServiceKind::Sense),
             instance: None,
@@ -4213,6 +4048,7 @@ mod tests {
         )
         .unwrap();
         let valid_spawn_failed = CompletedBatchRow {
+            sources: None,
             launch_id: launch_id.to_string(),
             service: Some(HostedServiceKind::Sense),
             instance: None,
@@ -4250,6 +4086,7 @@ mod tests {
 
         let unauth_inst = instance(5002, 200);
         let live_file = LiveRecoveryFile {
+            sources: None,
             schema: PARENT_LOSS_RECOVERY_SCHEMA_V1,
             kind: RecoveryArtifactKind::Live,
             generation: active.generation,
@@ -4348,6 +4185,7 @@ mod tests {
         )
         .unwrap();
         let row = CompletedBatchRow {
+            sources: None,
             launch_id: launch_id.to_string(),
             service: derived.service,
             instance: Some(inst),
@@ -4481,6 +4319,7 @@ mod tests {
         )
         .unwrap();
         let row_a = CompletedBatchRow {
+            sources: None,
             launch_id: id_a.to_string(),
             service: derived_a.service,
             instance: Some(inst_a),
@@ -4578,7 +4417,7 @@ mod tests {
 
         let descendants = vec![LiveDescendantIdentity {
             instance: desc_inst,
-            uid: 501,
+            uid: 9,
             ppid: root_inst.pid,
             pgid: root_inst.pid,
             escalate_at_unix_ms: 0,
@@ -4587,6 +4426,7 @@ mod tests {
             escalated: false,
         }];
         let live_file = LiveRecoveryFile {
+            sources: None,
             schema: PARENT_LOSS_RECOVERY_SCHEMA_V1,
             kind: RecoveryArtifactKind::Live,
             generation: active.generation,
@@ -4607,7 +4447,7 @@ mod tests {
         fs::create_dir_all(live_path.parent().unwrap()).unwrap();
         write_json(&live_path, &live_file, json_options()).unwrap();
 
-        let obligations = HashMap::from([(launch_id.to_string(), descendants.clone())]);
+        let obligations = HashMap::from([(launch_id.to_string(), live_file.clone())]);
         let ob_file = CensusObligationFile {
             schema: PARENT_LOSS_RECOVERY_SCHEMA_V1,
             generation: active.generation,
@@ -4624,7 +4464,7 @@ mod tests {
 
         // Root is exited (not in live), descendant is live with stored UID 501, but owner is UID 9:
         let (source, retirer) = fake_with_owners(
-            &[(desc_inst, 501)],
+            &[(desc_inst, 9)],
             &[],
             &[desc_inst.pid],
             &[(desc_inst.pid, ProcessOwner::Uid(9))],
@@ -4738,6 +4578,118 @@ mod tests {
     }
 
     #[test]
+    fn a_coherently_rehashed_receipt_cannot_change_the_admitted_uid() {
+        let directory = TempDir::new().expect("temporary root");
+        let (ledger, active) = open_generation(&directory);
+        let launch_id = "cached-uid";
+        let admitted = admit(
+            directory.path(),
+            active.generation,
+            launch_id,
+            Some(HostedServiceKind::Sense),
+            Some(instance(8101, 100)),
+        )
+        .expect("admitted identity");
+        let source_directory = admission_directory(&ledger, active.generation).join(launch_id);
+        let source_bytes: Vec<_> = ["intent.json", "result.json", "acknowledgement.json"]
+            .into_iter()
+            .map(|name| {
+                (
+                    name,
+                    fs::read(source_directory.join(name)).expect("source drop"),
+                )
+            })
+            .collect();
+        let derived = read_derived_admission_drops(&ledger, active.generation, launch_id)
+            .expect("derive original evidence");
+        let forged_uid = Some(admitted.uid + 1);
+        let binding_digest = compute_batch_row_binding_digest(
+            launch_id,
+            derived.service,
+            derived.instance,
+            forged_uid,
+            derived.parent_launch_id.as_deref(),
+            AdmissionFinding::Exited,
+            derived.parsed_result_state.as_deref(),
+            derived.digests.intent.as_deref(),
+            derived.digests.result.as_deref(),
+            derived.digests.ack.as_deref(),
+            derived.digests.spawn_identity.as_deref(),
+        )
+        .expect("coherent derived checksum");
+        let mut rows = vec![CompletedBatchRow {
+            sources: Some(derived.sources.clone()),
+            launch_id: launch_id.to_owned(),
+            service: derived.service,
+            instance: derived.instance,
+            uid: forged_uid,
+            parent_launch_id: derived.parent_launch_id,
+            finding: AdmissionFinding::Exited,
+            parsed_result_state: derived.parsed_result_state,
+            intent_digest: derived.digests.intent,
+            result_digest: derived.digests.result,
+            ack_digest: derived.digests.ack,
+            spawn_identity_digest: derived.digests.spawn_identity,
+            binding_digest,
+        }];
+        fs::create_dir_all(ledger.closure_recovery_batches_dir(active.generation))
+            .expect("batches directory");
+        fs::create_dir_all(ledger.closure_recovery_ids_dir(active.generation))
+            .expect("index directory");
+        flush_batch_and_ids(
+            &ledger,
+            active.generation,
+            1,
+            &mut rows,
+            &mut HashSet::new(),
+        )
+        .expect("seed coherent batch, index and receipt");
+
+        let (source, retirer) = fake(&[], &[], &[]);
+        let lease = acquire_lease(&ledger);
+        let refused = ledger
+            .reserve_generation_closing_abandoned(
+                instance(11, 3),
+                [],
+                &lease,
+                &authority(&source, &retirer, Duration::from_secs(2)),
+            )
+            .expect_err("a coherent cache cannot authorize allocation");
+        assert!(matches!(
+            refused,
+            ParentLossLedgerError::RecoveryRequired(BootstrapRecoveryReason::CoordinatorNotLive)
+        ));
+        assert_eq!(
+            ledger.active_generation().unwrap().unwrap().generation,
+            active.generation
+        );
+        ledger
+            .reserve_generation_closing_abandoned(
+                instance(11, 3),
+                [],
+                &lease,
+                &authority(&source, &retirer, Duration::from_secs(2)),
+            )
+            .expect("next start recovers from preserved original evidence");
+
+        for (name, expected) in source_bytes {
+            assert_eq!(fs::read(source_directory.join(name)).unwrap(), expected);
+        }
+
+        let closure = closure_of(&ledger, active.generation);
+        assert_eq!(closure.admissions.len(), 1);
+        assert_eq!(closure.admissions[0].uid, Some(admitted.uid));
+        let sealed: Vec<serde_json::Value> = serde_json::from_slice(
+            &fs::read(ledger.sealed_ledger_path(active.generation)).expect("sealed ledger"),
+        )
+        .expect("sealed identities");
+        assert_eq!(sealed.len(), 1);
+        let sealed_identity: AdmissionIdentity =
+            serde_json::from_value(sealed[0]["identity"].clone()).expect("sealed identity");
+        assert_eq!(sealed_identity, admitted);
+    }
+
+    #[test]
     fn recovery_checkpoint_resumes_without_reobserving_valid_cached_rows() {
         let directory = TempDir::new().expect("temporary root");
         let (ledger, active) = open_generation(&directory);
@@ -4780,6 +4732,7 @@ mod tests {
         )
         .unwrap();
         let row1 = CompletedBatchRow {
+            sources: Some(derived.sources.clone()),
             launch_id: launch1.to_string(),
             service: derived.service,
             instance: Some(inst1),
@@ -4843,7 +4796,12 @@ mod tests {
                 instance(11, 3),
                 [],
                 &lease,
-                &authority(&source, &retirer, Duration::from_secs(2)),
+                &authority(
+                    &source,
+                    &retirer,
+                    PARENT_LOSS_COORDINATOR_RETIREMENT_DEADLINE
+                        - PARENT_LOSS_COORDINATOR_TERMINAL_WRITE_BUDGET,
+                ),
             )
             .expect("closed");
 
@@ -4873,7 +4831,552 @@ mod tests {
     }
 
     #[test]
+    fn retained_census_restores_missing_or_corrupt_live_cache_after_root_exit() {
+        for corrupt_cache in [false, true] {
+            let directory = TempDir::new().unwrap();
+            let (ledger, active) = open_generation(&directory);
+            let root = instance(8801, 100);
+            let child = instance(8802, 200);
+            let launch_id = "lost-live-cache";
+            admit(
+                directory.path(),
+                active.generation,
+                launch_id,
+                None,
+                Some(root),
+            );
+            let derived =
+                read_derived_admission_drops(&ledger, active.generation, launch_id).unwrap();
+            let descendants = vec![LiveDescendantIdentity {
+                instance: child,
+                uid: 501,
+                ppid: root.pid,
+                pgid: root.pid,
+                escalate_at_unix_ms: unix_millis() + LIVE_ESCALATION_GRACE_MS,
+                reap_deadline_unix_ms: None,
+                term_requested: false,
+                escalated: false,
+            }];
+            let live = LiveRecoveryFile {
+                sources: Some(derived.sources),
+                schema: PARENT_LOSS_RECOVERY_SCHEMA_V1,
+                kind: RecoveryArtifactKind::Live,
+                generation: active.generation,
+                sealed_phase: ParentLossPhase::Sealed,
+                launch_id: launch_id.to_owned(),
+                service: None,
+                root,
+                uid: 501,
+                parent_launch_id: None,
+                binding_digest: compute_live_binding_digest(root, 501, &descendants).unwrap(),
+                descendants,
+                escalate_at_unix_ms: unix_millis() + LIVE_ESCALATION_GRACE_MS,
+                reap_deadline_unix_ms: None,
+                term_requested: true,
+                escalated: false,
+            };
+            persist_live(&ledger, active.generation, &live).unwrap();
+            let live_path = ledger.closure_recovery_live_path(active.generation, launch_id);
+            if corrupt_cache {
+                fs::write(&live_path, b"broken cache").unwrap();
+            } else {
+                fs::remove_file(&live_path).unwrap();
+            }
+            let (source, retirer) = fake(&[(child, 501)], &[child.pid], &[]);
+            let lease = acquire_lease(&ledger);
+            ledger
+                .reserve_generation_closing_abandoned(
+                    instance(11, 3),
+                    [],
+                    &lease,
+                    &authority(&source, &retirer, Duration::from_secs(2)),
+                )
+                .unwrap();
+            assert_eq!(*retirer.signals.lock().unwrap(), vec![(child.pid, "term")]);
+            assert!(
+                read_retirement_census(&ledger, active.generation)
+                    .unwrap()
+                    .obligations
+                    .is_empty()
+            );
+            assert_eq!(
+                closure_of(&ledger, active.generation).admissions[0].instance,
+                Some(root)
+            );
+        }
+    }
+
+    #[test]
+    fn a_descendant_that_loses_observability_or_uid_after_term_cannot_be_discharged_or_killed() {
+        struct ChangingRetirer {
+            inner: FakeRetirer,
+            lose_observability: bool,
+        }
+        impl AdmissionRetirer for ChangingRetirer {
+            fn owner(&self, pid: u32) -> ProcessOwner {
+                self.inner.owner(pid)
+            }
+            fn signal(
+                &self,
+                target: ProcessInstance,
+                signal: SignalKind,
+            ) -> Result<(), TerminationError> {
+                self.inner.signal(target, signal)?;
+                if matches!(signal, SignalKind::Terminate) {
+                    let mut table = self.inner.table.lock().unwrap();
+                    if self.lose_observability {
+                        table.unverifiable.insert(target.pid);
+                    } else {
+                        table.owners.insert(target.pid, ProcessOwner::Uid(9));
+                    }
+                }
+                Ok(())
+            }
+        }
+        for lose_observability in [true, false] {
+            let directory = TempDir::new().unwrap();
+            let (ledger, active) = open_generation(&directory);
+            let root = instance(8810, 100);
+            let child = instance(8811, 200);
+            let launch_id = "changing-descendant";
+            admit(
+                directory.path(),
+                active.generation,
+                launch_id,
+                None,
+                Some(root),
+            );
+            let derived =
+                read_derived_admission_drops(&ledger, active.generation, launch_id).unwrap();
+            let descendants = vec![LiveDescendantIdentity {
+                instance: child,
+                uid: 501,
+                ppid: root.pid,
+                pgid: root.pid,
+                escalate_at_unix_ms: unix_millis() - 1,
+                reap_deadline_unix_ms: None,
+                term_requested: true,
+                escalated: false,
+            }];
+            let live = LiveRecoveryFile {
+                sources: Some(derived.sources),
+                schema: PARENT_LOSS_RECOVERY_SCHEMA_V1,
+                kind: RecoveryArtifactKind::Live,
+                generation: active.generation,
+                sealed_phase: ParentLossPhase::Sealed,
+                launch_id: launch_id.to_owned(),
+                service: None,
+                root,
+                uid: 501,
+                parent_launch_id: None,
+                binding_digest: compute_live_binding_digest(root, 501, &descendants).unwrap(),
+                descendants,
+                escalate_at_unix_ms: unix_millis() - 1,
+                reap_deadline_unix_ms: None,
+                term_requested: true,
+                escalated: false,
+            };
+            persist_live(&ledger, active.generation, &live).unwrap();
+            let (source, inner) = fake(&[(child, 501)], &[], &[child.pid]);
+            let retirer = ChangingRetirer {
+                inner,
+                lose_observability,
+            };
+            let lease = acquire_lease(&ledger);
+            assert!(
+                ledger
+                    .reserve_generation_closing_abandoned(
+                        instance(11, 3),
+                        [],
+                        &lease,
+                        &authority(&source, &retirer, Duration::from_millis(100))
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                ledger.active_generation().unwrap().unwrap().generation,
+                active.generation
+            );
+            assert!(
+                !read_retirement_census(&ledger, active.generation)
+                    .unwrap()
+                    .obligations
+                    .is_empty()
+            );
+            assert_eq!(
+                *retirer.inner.signals.lock().unwrap(),
+                vec![(child.pid, "term")]
+            );
+        }
+    }
+
+    #[test]
+    fn a_legacy_closed_record_without_a_manifest_is_reaudited_without_changing_its_ledger() {
+        let directory = TempDir::new().unwrap();
+        let (ledger, active) = open_generation(&directory);
+        let expected = admit(
+            directory.path(),
+            active.generation,
+            "legacy-closed",
+            None,
+            Some(instance(8812, 300)),
+        )
+        .unwrap();
+        let (source, retirer) = fake(&[], &[], &[]);
+        let lease = acquire_lease(&ledger);
+        ledger
+            .reserve_generation_closing_abandoned(
+                instance(11, 3),
+                [],
+                &lease,
+                &authority(&source, &retirer, Duration::from_secs(2)),
+            )
+            .unwrap();
+        let original_ledger = fs::read(ledger.sealed_ledger_path(active.generation)).unwrap();
+        fs::remove_file(
+            ledger
+                .closure_recovery_phase_dir(active.generation)
+                .join("publication.json"),
+        )
+        .unwrap();
+        let mut old_pointer = active.clone();
+        old_pointer.phase = ParentLossPhase::Sealed;
+        write_json(ledger.active_path(), &old_pointer, json_options()).unwrap();
+        ledger
+            .reserve_generation_closing_abandoned(
+                instance(12, 4),
+                [],
+                &lease,
+                &authority(&source, &retirer, Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert_eq!(
+            closure_of(&ledger, active.generation).admissions[0].uid,
+            Some(expected.uid)
+        );
+        assert_eq!(
+            fs::read(ledger.sealed_ledger_path(active.generation)).unwrap(),
+            original_ledger
+        );
+    }
+
+    #[test]
+    fn late_acknowledgement_invalidates_prepared_publication_before_allocation() {
+        let directory = TempDir::new().unwrap();
+        let (ledger, active) = open_generation(&directory);
+        let launch_id = "late-before-publication";
+        admit(directory.path(), active.generation, launch_id, None, None);
+        let (source, retirer) = fake(&[], &[], &[]);
+        let lease = acquire_lease(&ledger);
+        PUBLICATION_STOP_FAULT.with(|fault| fault.set(true));
+        let first = ledger.reserve_generation_closing_abandoned(
+            instance(11, 3),
+            [],
+            &lease,
+            &authority(&source, &retirer, Duration::from_secs(2)),
+        );
+        PUBLICATION_STOP_FAULT.with(|fault| fault.set(false));
+        assert!(matches!(
+            first,
+            Err(ParentLossLedgerError::RecoveryRequired(
+                BootstrapRecoveryReason::CoordinatorNotLive
+            ))
+        ));
+        assert!(!ledger.sealed_ledger_path(active.generation).exists());
+        let expected = admit(
+            directory.path(),
+            active.generation,
+            launch_id,
+            None,
+            Some(instance(8804, 400)),
+        )
+        .unwrap();
+        ledger
+            .reserve_generation_closing_abandoned(
+                instance(12, 4),
+                [],
+                &lease,
+                &authority(&source, &retirer, Duration::from_secs(2)),
+            )
+            .unwrap();
+        let closure = closure_of(&ledger, active.generation);
+        assert_eq!(closure.admissions[0].instance, Some(expected.instance));
+        assert_eq!(closure.admissions[0].uid, Some(expected.uid));
+        let sealed: serde_json::Value = serde_json::from_slice(
+            &fs::read(ledger.sealed_ledger_path(active.generation)).unwrap(),
+        )
+        .unwrap();
+        let actual: AdmissionIdentity =
+            serde_json::from_value(sealed[0]["identity"].clone()).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn a_rehashed_prepared_chunk_cannot_override_its_unchanged_authorized_batch() {
+        let directory = TempDir::new().unwrap();
+        let (ledger, active) = open_generation(&directory);
+        let expected = admit(
+            directory.path(),
+            active.generation,
+            "prepared-uid",
+            None,
+            Some(instance(8806, 600)),
+        )
+        .unwrap();
+        let ack_path = ledger
+            .generation_path(active.generation)
+            .join("admissions/prepared-uid/acknowledgement.json");
+        let original_ack = fs::read(&ack_path).unwrap();
+        let (source, retirer) = fake(&[], &[], &[]);
+        let lease = acquire_lease(&ledger);
+        PUBLICATION_STOP_FAULT.with(|fault| fault.set(true));
+        let first = ledger.reserve_generation_closing_abandoned(
+            instance(11, 3),
+            [],
+            &lease,
+            &authority(&source, &retirer, Duration::from_secs(2)),
+        );
+        PUBLICATION_STOP_FAULT.with(|fault| fault.set(false));
+        assert!(first.is_err());
+        let phase = ledger.closure_recovery_phase_dir(active.generation);
+        fs::remove_file(phase.join("publication.json")).unwrap();
+        let chunk_path = phase.join("audited-000001.json");
+        let mut chunk: serde_json::Value =
+            serde_json::from_slice(&fs::read(&chunk_path).unwrap()).unwrap();
+        let batch_before =
+            fs::read(ledger.closure_recovery_batch_path(active.generation, 1)).unwrap();
+        let mut sealed: serde_json::Value =
+            serde_json::from_str(chunk["rows"][0]["sealed"].as_str().unwrap()).unwrap();
+        sealed["identity"]["uid"] = 502.into();
+        chunk["rows"][0]["sealed"] = serde_json::to_string(&sealed).unwrap().into();
+        let bytes = serde_json::to_vec(&chunk).unwrap();
+        fs::write(&chunk_path, &bytes).unwrap();
+        fs::write(phase.join("audited-000001.sha256"), digest_bytes(&bytes)).unwrap();
+        ledger
+            .reserve_generation_closing_abandoned(
+                instance(12, 4),
+                [],
+                &lease,
+                &authority(&source, &retirer, Duration::from_secs(2)),
+            )
+            .unwrap();
+        let sealed: serde_json::Value = serde_json::from_slice(
+            &fs::read(ledger.sealed_ledger_path(active.generation)).unwrap(),
+        )
+        .unwrap();
+        let actual: AdmissionIdentity =
+            serde_json::from_value(sealed[0]["identity"].clone()).unwrap();
+        assert_eq!(fs::read(&ack_path).unwrap(), original_ack);
+        assert_eq!(
+            fs::read(ledger.closure_recovery_batch_path(active.generation, 1)).unwrap(),
+            batch_before
+        );
+        assert_eq!(
+            actual, expected,
+            "prepared cache must agree with unchanged source-authorized identity"
+        );
+    }
+
+    #[test]
+    fn a_late_ack_after_record_publication_is_reaudited_even_after_record_set_aside() {
+        for interrupted_after_aside in [false, true] {
+            let directory = TempDir::new().unwrap();
+            let (ledger, active) = open_generation(&directory);
+            let launch_id = "late-after-record";
+            admit(directory.path(), active.generation, launch_id, None, None);
+            let (source, retirer) = fake(&[], &[], &[]);
+            let lease = acquire_lease(&ledger);
+            ledger
+                .reserve_generation_closing_abandoned(
+                    instance(11, 3),
+                    [],
+                    &lease,
+                    &authority(&source, &retirer, Duration::from_secs(2)),
+                )
+                .unwrap();
+            let published_record = fs::read(ledger.record_path(active.generation)).unwrap();
+            let mut sealed_pointer = active.clone();
+            sealed_pointer.phase = ParentLossPhase::Sealed;
+            write_json(ledger.active_path(), &sealed_pointer, json_options()).unwrap();
+            let expected = admit(
+                directory.path(),
+                active.generation,
+                launch_id,
+                None,
+                Some(instance(8805, 500)),
+            )
+            .unwrap();
+            if interrupted_after_aside {
+                let aside =
+                    publication::supersede_overtaken_publication(&ledger, active.generation)
+                        .unwrap()
+                        .expect("exact overtaken publication is preserved");
+                assert_eq!(fs::read(aside).unwrap(), published_record);
+                assert!(!ledger.record_path(active.generation).exists());
+            }
+            ledger
+                .reserve_generation_closing_abandoned(
+                    instance(12, 4),
+                    [],
+                    &lease,
+                    &authority(&source, &retirer, Duration::from_secs(2)),
+                )
+                .expect("late acknowledgement must not permanently wedge a sealed predecessor");
+            let closure = closure_of(&ledger, active.generation);
+            assert_eq!(closure.admissions[0].instance, Some(expected.instance));
+            let sealed: Vec<serde_json::Value> = serde_json::from_slice(
+                &fs::read(ledger.sealed_ledger_path(active.generation)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(sealed.len(), 1);
+            let actual: AdmissionIdentity =
+                serde_json::from_value(sealed[0]["identity"].clone()).unwrap();
+            assert_eq!(actual, expected);
+            assert!(
+                fs::read_dir(ledger.generation_path(active.generation))
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .any(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with("record.wedged-")
+                            && fs::read(entry.path()).is_ok_and(|b| b == published_record)
+                    })
+            );
+        }
+    }
+
+    #[test]
+    fn post_publication_retry_reuses_exact_audited_artifacts_and_refuses_a_changed_record() {
+        let directory = TempDir::new().unwrap();
+        let (ledger, active) = open_generation(&directory);
+        admit(
+            directory.path(),
+            active.generation,
+            "published",
+            None,
+            Some(instance(8803, 300)),
+        );
+        let (source, retirer) = fake(&[], &[], &[]);
+        let lease = acquire_lease(&ledger);
+        ledger
+            .reserve_generation_closing_abandoned(
+                instance(11, 3),
+                [],
+                &lease,
+                &authority(&source, &retirer, Duration::from_secs(2)),
+            )
+            .unwrap();
+        // Simulate death after record publication but before successor-pointer publication.
+        let mut sealed_pointer = active.clone();
+        sealed_pointer.phase = ParentLossPhase::Sealed;
+        write_json(ledger.active_path(), &sealed_pointer, json_options()).unwrap();
+        // Once both audited artifacts are published, scheduling caches are expendable.
+        fs::remove_file(ledger.closure_recovery_batch_path(active.generation, 1)).unwrap();
+        fs::remove_file(ledger.closure_recovery_ids_path(active.generation, 1)).unwrap();
+        let record_bytes = fs::read(ledger.record_path(active.generation)).unwrap();
+        let ledger_bytes = fs::read(ledger.sealed_ledger_path(active.generation)).unwrap();
+        ledger
+            .reserve_generation_closing_abandoned(
+                instance(12, 4),
+                [],
+                &lease,
+                &authority(&source, &retirer, Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read(ledger.record_path(active.generation)).unwrap(),
+            record_bytes
+        );
+        assert_eq!(
+            fs::read(ledger.sealed_ledger_path(active.generation)).unwrap(),
+            ledger_bytes
+        );
+        write_json(ledger.active_path(), &sealed_pointer, json_options()).unwrap();
+        let mut record: ParentLossGenerationRecord = serde_json::from_slice(&record_bytes).unwrap();
+        record.closure.as_mut().unwrap().admissions[0].uid = Some(502);
+        write_json(
+            ledger.record_path(active.generation),
+            &record,
+            json_options(),
+        )
+        .unwrap();
+        assert!(
+            ledger
+                .reserve_generation_closing_abandoned(
+                    instance(13, 5),
+                    [],
+                    &lease,
+                    &authority(&source, &retirer, Duration::from_secs(2))
+                )
+                .is_err()
+        );
+        assert_eq!(
+            ledger.active_generation().unwrap().unwrap().generation,
+            active.generation
+        );
+    }
+
+    #[test]
+    fn the_first_term_gets_its_full_grace_even_if_the_census_was_captured_earlier() {
+        let directory = TempDir::new().unwrap();
+        let (ledger, active) = open_generation(&directory);
+        let root = instance(8813, 400);
+        let launch_id = "unstarted-retirement";
+        admit(
+            directory.path(),
+            active.generation,
+            launch_id,
+            None,
+            Some(root),
+        );
+        let derived = read_derived_admission_drops(&ledger, active.generation, launch_id).unwrap();
+        let live = LiveRecoveryFile {
+            sources: Some(derived.sources),
+            schema: PARENT_LOSS_RECOVERY_SCHEMA_V1,
+            kind: RecoveryArtifactKind::Live,
+            generation: active.generation,
+            sealed_phase: ParentLossPhase::Sealed,
+            launch_id: launch_id.to_owned(),
+            service: None,
+            root,
+            uid: 501,
+            parent_launch_id: None,
+            descendants: Vec::new(),
+            binding_digest: compute_live_binding_digest(root, 501, &[]).unwrap(),
+            escalate_at_unix_ms: unix_millis() - 1,
+            reap_deadline_unix_ms: None,
+            term_requested: false,
+            escalated: false,
+        };
+        persist_live(&ledger, active.generation, &live).unwrap();
+        let (source, retirer) = fake(&[(root, 501)], &[], &[root.pid]);
+        let lease = acquire_lease(&ledger);
+        let before = unix_millis();
+        let error = ledger
+            .reserve_generation_closing_abandoned(
+                instance(11, 3),
+                [],
+                &lease,
+                &authority(&source, &retirer, Duration::from_millis(50)),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ParentLossLedgerError::RecoveryRequired(BootstrapRecoveryReason::CoordinatorNotLive)
+        ));
+        assert_eq!(*retirer.signals.lock().unwrap(), vec![(root.pid, "term")]);
+        let saved = read_retirement_census(&ledger, active.generation).unwrap();
+        assert!(saved.obligations[launch_id].escalate_at_unix_ms >= before + 12_500);
+        assert!(!saved.obligations[launch_id].escalated);
+    }
+
+    #[test]
     fn stored_timing_literals_12500_and_500_clamp_downward_and_past_reap_refuses_live() {
+        // Retirement policy is fixed independently of recovery's restart slice.
+        assert_eq!(LIVE_ESCALATION_GRACE_MS, 12_500);
+        assert_eq!(LIVE_REAP_GRACE_MS, 500);
         let directory = TempDir::new().expect("temporary root");
         let (ledger, active) = open_generation(&directory);
         let launch_id = "timing-test";
@@ -4888,22 +5391,9 @@ mod tests {
 
         // Plant far-future escalate_at
         let now_ms = unix_millis();
-        let obligations = HashMap::from([(launch_id.to_string(), Vec::new())]);
-        let ob_file = CensusObligationFile {
-            schema: PARENT_LOSS_RECOVERY_SCHEMA_V1,
-            generation: active.generation,
-            sealed_phase: ParentLossPhase::Sealed,
-            obligations: obligations.clone(),
-            binding_digest: compute_census_obligation_digest(&obligations).unwrap(),
-        };
-        write_json(
-            ledger.census_obligation_path(active.generation),
-            &ob_file,
-            json_options(),
-        )
-        .unwrap();
 
         let live_file = LiveRecoveryFile {
+            sources: None,
             schema: PARENT_LOSS_RECOVERY_SCHEMA_V1,
             kind: RecoveryArtifactKind::Live,
             generation: active.generation,
@@ -4920,6 +5410,21 @@ mod tests {
             escalated: false,
             binding_digest: compute_live_binding_digest(live_inst, 501, &[]).unwrap(),
         };
+        let obligations = HashMap::from([(launch_id.to_string(), live_file.clone())]);
+        let ob_file = CensusObligationFile {
+            schema: PARENT_LOSS_RECOVERY_SCHEMA_V1,
+            generation: active.generation,
+            sealed_phase: ParentLossPhase::Sealed,
+            obligations: obligations.clone(),
+            binding_digest: compute_census_obligation_digest(&obligations).unwrap(),
+        };
+        write_json(
+            ledger.census_obligation_path(active.generation),
+            &ob_file,
+            json_options(),
+        )
+        .unwrap();
+
         let live_path = ledger.closure_recovery_live_path(active.generation, launch_id);
         fs::create_dir_all(live_path.parent().unwrap()).unwrap();
         write_json(&live_path, &live_file, json_options()).unwrap();
@@ -4950,6 +5455,7 @@ mod tests {
 
         // Plant past reap deadline with process still SameLive:
         let past_reap_file = LiveRecoveryFile {
+            sources: None,
             schema: PARENT_LOSS_RECOVERY_SCHEMA_V1,
             kind: RecoveryArtifactKind::Live,
             generation: active.generation,
@@ -4966,7 +5472,7 @@ mod tests {
             escalated: false,
             binding_digest: compute_live_binding_digest(live_inst, 501, &[]).unwrap(),
         };
-        write_json(&live_path, &past_reap_file, json_options()).unwrap();
+        persist_live(&ledger, active.generation, &past_reap_file).unwrap();
 
         let error2 = ledger
             .reserve_generation_closing_abandoned(
@@ -5064,13 +5570,35 @@ mod tests {
         let (ledger, active) = open_generation(&directory);
         let (_guard, inst) = spawn_test_child(true);
 
-        admit(
+        write_parent_loss_admission_intent(
+            directory.path(),
+            &AdmissionIntent::new(
+                active.generation,
+                "stubborn-child",
+                Some(HostedServiceKind::Sense),
+                None,
+            ),
+        )
+        .unwrap();
+        let identity = AdmissionIdentity {
+            generation: active.generation,
+            launch_id: "stubborn-child".into(),
+            instance: inst,
+            uid: nix::unistd::getuid().as_raw(),
+            parent_launch_id: None,
+        };
+        acknowledge_parent_loss_admission(directory.path(), identity.clone()).unwrap();
+        write_parent_loss_admission_result(
             directory.path(),
             active.generation,
             "stubborn-child",
-            Some(HostedServiceKind::Sense),
-            Some(inst),
-        );
+            &AdmissionResult {
+                schema: 1,
+                identity: Some(identity),
+                state: AdmissionResultState::Admitted,
+            },
+        )
+        .unwrap();
 
         let source = SystemProcessInstanceSource;
         let retirer = SystemAdmissionRetirer;
@@ -5110,6 +5638,7 @@ mod tests {
         );
 
         let live_file = LiveRecoveryFile {
+            sources: None,
             schema: PARENT_LOSS_RECOVERY_SCHEMA_V1,
             kind: RecoveryArtifactKind::Live,
             generation: active.generation,
@@ -5151,7 +5680,7 @@ mod tests {
         };
         let live_path = ledger.closure_recovery_live_path(active.generation, launch_id);
         fs::create_dir_all(live_path.parent().unwrap()).unwrap();
-        write_json(&live_path, &live_file, json_options()).unwrap();
+        persist_live(&ledger, active.generation, &live_file).unwrap();
 
         // Root is exited, descendant is still live:
         let (source, retirer) = fake(&[(desc_inst, 501)], &[], &[desc_inst.pid]);
@@ -5224,7 +5753,10 @@ mod tests {
 
         let closure = closure_of(&ledger, active.generation);
         assert!(
-            closure.set_aside.iter().any(|s| s.contains("ledger.json")),
+            closure
+                .set_aside
+                .iter()
+                .any(|s| s.starts_with("ledger.wedged-") && s.ends_with(".json")),
             "conflicting ledger was set aside"
         );
     }
