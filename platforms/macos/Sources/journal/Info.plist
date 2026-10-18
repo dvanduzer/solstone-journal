@@ -51,5 +51,9 @@
 	<false/>
 	<key>SUShowReleaseNotes</key>
 	<true/>
+	<key>SolstoneSetupCapabilities</key>
+	<array>
+		<string>setup-sequence-v1</string>
+	</array>
 </dict>
 </plist>
