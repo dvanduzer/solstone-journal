@@ -539,6 +539,9 @@ mod applicable_credential_targets {
 
     fn read_request(stream: &mut TcpStream) -> WireRequest {
         stream
+            .set_nonblocking(false)
+            .expect("make actual caller request stream blocking");
+        stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         stream
