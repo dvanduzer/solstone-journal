@@ -37,7 +37,7 @@ pub const LANES: [Lane; 3] = [
     Lane {
         id: "confidential",
         label: "confidential processing",
-        sub: "paid · sign-in required",
+        sub: "operated by sol pbc",
         description: "sol pbc runs the model on confidential GPUs.",
     },
     Lane {
