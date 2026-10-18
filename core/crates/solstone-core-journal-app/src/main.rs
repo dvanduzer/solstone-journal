@@ -6,7 +6,8 @@
 //! journal running on this PC, shows its name, mark and run state, sets up a
 //! new owner's journal and finishes its first run in the window,
 //! and updates itself and the journal together. The journal itself still opens
-//! in the owner's browser when the owner asks.
+//! in the owner's browser when the owner asks. The owner can also continue in
+//! the installed solstone app from this window.
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 // The portable modules serve the Windows app; elsewhere only their tests use them.
@@ -25,6 +26,8 @@ mod convey;
 mod journal;
 #[cfg(any(windows, test))]
 mod prefs;
+#[cfg(any(windows, test))]
+mod setup_handoff;
 #[cfg(windows)]
 mod shell;
 #[cfg(any(windows, test))]

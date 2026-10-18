@@ -127,6 +127,7 @@ struct Context {
     proxy: Proxy,
     updater: Updater,
     session: std::rc::Rc<std::cell::RefCell<crate::setup_flow::Session>>,
+    generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 fn journal_port() -> Option<u16> {
@@ -237,6 +238,126 @@ fn dispatch_effect(context: &Context, effect: &crate::setup_flow::Effect, port: 
                 ));
             });
         }
+        crate::setup_flow::Effect::RecordPending {
+            generation,
+            timezone,
+        } => {
+            let proxy = context.proxy.clone();
+            let expected_gen = *generation;
+            let tz = timezone.clone();
+            std::thread::spawn(move || {
+                let local_appdata = match std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+                    Some(p) => p,
+                    None => {
+                        proxy.send_event(UserEvent::Flow(
+                            crate::setup_flow::Event::PendingRecorded {
+                                generation: expected_gen,
+                                timezone: tz,
+                                result: Err("could not save this step. try again.".to_owned()),
+                            },
+                        ));
+                        return;
+                    }
+                };
+                let contract = crate::setup_handoff::get_contract();
+                let lock_path = local_appdata.join("Solstone").join(&contract.files.lock);
+                let state_dir = crate::prefs::state_dir();
+                let mut clock = crate::setup_handoff::WallClock;
+                let outcome: Result<(), String> = (|| {
+                    let _lock = crate::setup_handoff::HandoffLock::acquire(
+                        &lock_path,
+                        contract.limits.lock_acquire_ms,
+                        &mut clock,
+                    )
+                    .map_err(|_| "could not save this step. try again.".to_owned())?;
+                    let id = crate::setup_handoff::generate_uuid();
+                    crate::setup_handoff::write_pending(&state_dir, &id)
+                        .map_err(|_| "could not save this step. try again.".to_owned())?;
+                    Ok(())
+                })();
+                proxy.send_event(UserEvent::Flow(crate::setup_flow::Event::PendingRecorded {
+                    generation: expected_gen,
+                    timezone: tz,
+                    result: outcome,
+                }));
+            });
+        }
+        crate::setup_flow::Effect::ContinueInSolstone { generation } => {
+            let proxy = context.proxy.clone();
+            let expected_gen = *generation;
+            let gen_arc = context.generation.clone();
+            std::thread::spawn(move || {
+                let local_appdata = match std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+                    Some(p) => p,
+                    None => {
+                        proxy.send_event(UserEvent::Flow(
+                            crate::setup_flow::Event::ContinueFinished {
+                                generation: expected_gen,
+                                outcome: crate::setup_flow::ContinueOutcome::Failed,
+                            },
+                        ));
+                        return;
+                    }
+                };
+                let Some(port) = port else {
+                    proxy.send_event(UserEvent::Flow(
+                        crate::setup_flow::Event::ContinueFinished {
+                            generation: expected_gen,
+                            outcome: crate::setup_flow::ContinueOutcome::Failed,
+                        },
+                    ));
+                    return;
+                };
+                let paths = crate::setup_handoff::HandoffPaths {
+                    local_appdata,
+                    state_dir: crate::prefs::state_dir(),
+                };
+                let convey = Convey::new(Some(port));
+                let collaborators = crate::setup_handoff::HandoffCollaborators {
+                    paths,
+                    endpoints: &convey,
+                    launch: |path, flag| shell::open_program(path, flag).map_err(|_| ()),
+                    still_current: move || {
+                        gen_arc.load(std::sync::atomic::Ordering::SeqCst) == expected_gen
+                    },
+                    clock: crate::setup_handoff::WallClock,
+                    new_id: crate::setup_handoff::generate_uuid,
+                };
+                let outcome = crate::setup_handoff::continue_in_solstone(collaborators);
+                proxy.send_event(UserEvent::Flow(
+                    crate::setup_flow::Event::ContinueFinished {
+                        generation: expected_gen,
+                        outcome,
+                    },
+                ));
+            });
+        }
+        crate::setup_flow::Effect::ObserveReceipt { generation } => {
+            let proxy = context.proxy.clone();
+            let expected_gen = *generation;
+            std::thread::spawn(move || {
+                let local_appdata = match std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+                    Some(p) => p,
+                    None => return,
+                };
+                let paths = crate::setup_handoff::HandoffPaths {
+                    local_appdata,
+                    state_dir: crate::prefs::state_dir(),
+                };
+                let mut clock = crate::setup_handoff::WallClock;
+                if let Ok(pending) = crate::setup_handoff::observe_receipt(&paths, &mut clock) {
+                    proxy.send_event(UserEvent::Flow(
+                        crate::setup_flow::Event::ContinuationObserved {
+                            generation: expected_gen,
+                            pending,
+                        },
+                    ));
+                }
+            });
+        }
+        crate::setup_flow::Effect::OpenSolstoneDownload => {
+            let _ = shell::open("https://solstone.app/download/windows");
+        }
         crate::setup_flow::Effect::Browser(crate::setup_flow::BrowserEffect::OpenHome) => {
             let Some(port) = port else {
                 return;
@@ -255,6 +376,10 @@ fn run_turn(context: &Context, step: crate::setup_flow::Step, reply: impl FnOnce
         crate::setup_flow::withhold_remote(&mut step.session, &mut step.effects, journal_port());
     let rendered = crate::setup_flow::view(&step.session);
     *context.session.borrow_mut() = step.session;
+    context.generation.store(
+        context.session.borrow().generation,
+        std::sync::atomic::Ordering::SeqCst,
+    );
     let port = bound.ok();
     crate::setup_flow::execute_turn(rendered, &step.effects, reply, |effect| {
         dispatch_effect(context, effect, port);
@@ -716,6 +841,7 @@ pub fn run(launch: Launch, update_feed: Option<String>) {
         proxy,
         updater,
         session: session.clone(),
+        generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
     let window = std::rc::Rc::new(window);
     let looped = window.clone();
@@ -748,6 +874,15 @@ pub fn run(launch: Launch, update_feed: Option<String>) {
                     let message = json!({"type": "flow", "view": view});
                     page.run_script(&format!("window.journalApp.receive({message});"));
                 });
+                if context.session.borrow().phase == crate::setup_flow::Phase::Home {
+                    let session = context.session.borrow().clone();
+                    let step =
+                        crate::setup_flow::reduce(&session, &crate::setup_flow::Event::HomeShown);
+                    run_turn(&context, step, |view| {
+                        let message = json!({"type": "flow", "view": view});
+                        page.run_script(&format!("window.journalApp.receive({message});"));
+                    });
+                }
             }
         }
         WindowEvent::Resized { minimized } => page.fit(looped.hwnd(), minimized),

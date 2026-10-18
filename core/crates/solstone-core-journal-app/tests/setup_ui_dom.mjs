@@ -293,6 +293,9 @@ const document = {
   querySelector(selector) {
     return query(document.body, selector);
   },
+  querySelectorAll(selector) {
+    return document.body.querySelectorAll(selector);
+  },
 };
 document.body = new DomElement('body');
 document.activeElement = document.body;
@@ -1303,5 +1306,64 @@ if (calls27.some(c => c.cmd === 'open' || (c.cmd === 'flow' && c.args?.intent ==
   throw new Error('called open or start-setup');
 }
 pass('status failure after setup retries without setup');
+
+// 28. continue in solstone app and download offer
+if (calls.some(c => c.cmd === 'flow' && c.args?.intent === 'continue-solstone')) {
+  throw new Error('found prior continue-solstone call');
+}
+const homeButtons = document.querySelectorAll('button');
+const continueBtn = homeButtons.find(b => b.getAttribute('data-intent') === 'continue-solstone');
+if (!continueBtn) throw new Error('continue-solstone button not found');
+const callsBeforeContinue = calls.length;
+continueBtn.click();
+await flush();
+const continueCalls = calls.slice(callsBeforeContinue);
+const continueCall = continueCalls.find(c => c.cmd === 'flow' && c.args?.intent === 'continue-solstone');
+if (!continueCall) {
+  throw new Error(`expected continue-solstone call, got: ${JSON.stringify(continueCalls)}`);
+}
+
+const callsBeforePaint = calls.length;
+paint(view({ phase: 'home', step: 5 }));
+await flush();
+const paintCalls = calls.slice(callsBeforePaint);
+if (paintCalls.some(c => c.cmd === 'open')) {
+  throw new Error(`paint triggered open call: ${JSON.stringify(paintCalls)}`);
+}
+
+paint(view({ phase: 'home', step: 5, solstone_download: true }));
+await flush();
+const dlButtons = document.querySelectorAll('button');
+const downloadBtn = dlButtons.find(b => b.getAttribute('data-intent') === 'download-solstone');
+if (!downloadBtn) throw new Error('download-solstone button not found');
+const callsBeforeDl = calls.length;
+downloadBtn.click();
+await flush();
+const dlCalls = calls.slice(callsBeforeDl);
+const dlCall = dlCalls.find(c => c.cmd === 'flow' && c.args?.intent === 'download-solstone');
+if (!dlCall) {
+  throw new Error(`expected download-solstone call, got: ${JSON.stringify(dlCalls)}`);
+}
+if (dlCall.args?.url != null || dlCall.args?.path != null || dlCall.args?.exe != null) {
+  throw new Error(`download call contained prohibited args: ${JSON.stringify(dlCall.args)}`);
+}
+
+click('devices');
+await flush();
+const deviceButtons = document.querySelectorAll('button');
+const thisPcBtn = deviceButtons.find(b => b.getAttribute('data-pairing') === 'this-pc');
+if (!thisPcBtn) throw new Error('this-pc button not found');
+const callsBeforeThisPc = calls.length;
+thisPcBtn.click();
+await flush();
+const thisPcCalls = calls.slice(callsBeforeThisPc);
+const pairStartCall = thisPcCalls.find(c => c.cmd === 'convey' && c.args?.path === '/app/network/pair-start');
+if (!pairStartCall || pairStartCall.args?.body?.same_machine !== true) {
+  throw new Error(`expected convey pair-start with same_machine: true, got: ${JSON.stringify(thisPcCalls)}`);
+}
+if (thisPcCalls.some(c => c.cmd === 'flow' && c.args?.intent === 'continue-solstone')) {
+  throw new Error('this-pc click added continue-solstone call');
+}
+pass('continue in solstone app and download offer');
 
 console.log(`DOM CASES: ${passed} passed`);

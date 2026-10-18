@@ -5724,10 +5724,14 @@ dependencies = [
 name = "solstone-core-journal-app"
 version = "2.0.50"
 dependencies = [
+ "getrandom 0.3.4",
+ "jsonschema",
  "quick-xml",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "solstone-core-about",
+ "spl-core",
  "svgtypes",
  "tempfile",
  "ureq",

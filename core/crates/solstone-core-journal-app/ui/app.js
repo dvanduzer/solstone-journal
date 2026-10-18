@@ -107,6 +107,8 @@ const COPY = {
   locationTitle: "let's create your journal on this PC",
   chooseLocation: 'choose',
   continueButton: 'continue',
+  continueInSolstone: 'continue in the solstone app',
+  downloadSolstone: 'download the solstone app for Windows',
   journalFound: 'journal found',
   setupTitle: 'setting up your journal',
   setupSubtitle: 'this can take a minute.',
@@ -1143,6 +1145,17 @@ const panes = {
     } else {
       offer = el('button', { type: 'button', on: { click: () => openPane('run') } }, COPY.runStateLink);
     }
+    const continueBtn = el('button', {
+      type: 'button',
+      'data-intent': 'continue-solstone',
+      disabled: Boolean(state.flow?.busy),
+      on: { click: () => call('flow', { intent: 'continue-solstone' }) }
+    }, COPY.continueInSolstone);
+    const downloadBtn = state.flow?.solstone_download ? el('button', {
+      type: 'button',
+      'data-intent': 'download-solstone',
+      on: { click: () => call('flow', { intent: 'download-solstone' }) }
+    }, COPY.downloadSolstone) : null;
     const authRetry = state.flow?.authoritative === false ? el('div', { class: 'actions centered' },
       el('button', {
         type: 'button',
@@ -1161,7 +1174,7 @@ const panes = {
       thinkingBlock(),
       modelsBlock(),
       el('p', { class: 'muted' }, COPY.homeLine),
-      el('div', { class: 'actions' }, offer),
+      el('div', { class: 'actions' }, offer, continueBtn, downloadBtn),
     ];
   },
 
@@ -1430,7 +1443,7 @@ function renderDevices() {
   body.push(
     el('div', { class: 'actions' },
       el('button', { type: 'button', class: 'primary', on: { click: () => openPairing('device') } }, COPY.addDevice),
-      el('button', { type: 'button', on: { click: () => openPairing('this-pc') } }, COPY.pairThisPc)),
+      el('button', { type: 'button', 'data-pairing': 'this-pc', on: { click: () => openPairing('this-pc') } }, COPY.pairThisPc)),
     networkSection());
   return body;
 }

@@ -70,6 +70,31 @@ pub fn open(target: &str) -> Result<(), String> {
     }
 }
 
+/// Launch an executable with parameters.
+pub fn open_program(path: &Path, parameters: &str) -> Result<(), String> {
+    let verb = wide("open");
+    let file = wide(path.as_os_str());
+    let params = wide(parameters);
+    // SAFETY: all strings are NUL-terminated and outlive the call; the other
+    // pointers are optional and null.
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            params.as_ptr(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // ShellExecute reports success as a value above 32.
+    if result as usize > 32 {
+        Ok(())
+    } else {
+        Err("could not continue in the solstone app. try again.".to_owned())
+    }
+}
+
 /// A plain Windows message box, for a failure that leaves no window to say it in.
 pub fn alert(title: &str, text: &str) {
     let title = wide(title);

@@ -35,6 +35,14 @@ pub enum BrowserEffect {
     Rejected,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContinueOutcome {
+    Published,
+    Failed,
+    Unsupported,
+    Superseded,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SetupAction {
     RegenerateMark,
@@ -63,6 +71,17 @@ pub enum Effect {
     InstallModels {
         generation: u64,
     },
+    RecordPending {
+        generation: u64,
+        timezone: Option<String>,
+    },
+    ContinueInSolstone {
+        generation: u64,
+    },
+    ObserveReceipt {
+        generation: u64,
+    },
+    OpenSolstoneDownload,
     Browser(BrowserEffect),
 }
 
@@ -131,6 +150,22 @@ pub enum Event {
     RetryState,
     Refresh,
     DismissError,
+    PendingRecorded {
+        generation: u64,
+        timezone: Option<String>,
+        result: Result<(), String>,
+    },
+    ContinueInSolstone,
+    ContinueFinished {
+        generation: u64,
+        outcome: ContinueOutcome,
+    },
+    DownloadSolstoneClicked,
+    HomeShown,
+    ContinuationObserved {
+        generation: u64,
+        pending: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -155,6 +190,8 @@ pub struct Session {
     pub initial_mark_pending: bool,
     pub continue_after_save: Option<(String, Option<String>)>,
     pub error: Option<String>,
+    pub continuation_pending: bool,
+    pub solstone_download: bool,
 }
 
 impl Default for Session {
@@ -180,6 +217,8 @@ impl Default for Session {
             initial_mark_pending: false,
             continue_after_save: None,
             error: None,
+            continuation_pending: false,
+            solstone_download: false,
         }
     }
 }
@@ -243,7 +282,10 @@ pub fn home_url(port: u16) -> String {
 fn is_remote(effect: &Effect) -> bool {
     matches!(
         effect,
-        Effect::FetchState | Effect::PostAction(_) | Effect::Browser(BrowserEffect::OpenHome)
+        Effect::FetchState
+            | Effect::PostAction(_)
+            | Effect::ContinueInSolstone { .. }
+            | Effect::Browser(BrowserEffect::OpenHome)
     )
 }
 
@@ -365,6 +407,8 @@ pub fn event_from_intent(intent: &str, args: &Value) -> Result<Event, String> {
         "retry-models" | "retryModels" => Event::RetryModelsInstallClicked,
         "refresh" => Event::Refresh,
         "dismiss-error" | "dismissError" => Event::DismissError,
+        "continue-solstone" => Event::ContinueInSolstone,
+        "download-solstone" => Event::DownloadSolstoneClicked,
         _ => return Err(format!("unknown flow intent {intent}")),
     })
 }
@@ -694,6 +738,8 @@ pub fn view(session: &Session) -> Value {
         "destination_rejected": destination_rejected,
         "authoritative": session.authoritative,
         "thinking_capability": thinking_capability,
+        "continuation_pending": session.continuation_pending,
+        "solstone_download": session.solstone_download,
     })
 }
 
@@ -1117,9 +1163,10 @@ pub fn reduce(session: &Session, event: &Event) -> Step {
             next.inflight = Some(next.generation);
             next.busy = true;
             next.error = None;
-            effects.push(Effect::PostAction(SetupAction::Finalize {
+            effects.push(Effect::RecordPending {
+                generation: next.generation,
                 timezone: timezone.clone(),
-            }));
+            });
         }
         Event::OpenJournalClicked => {
             if next.stored_redirect.as_deref() == Some(APP_HOME_PATH) {
@@ -1212,6 +1259,98 @@ pub fn reduce(session: &Session, event: &Event) -> Step {
         }
         Event::DismissError => {
             next.error = None;
+        }
+        Event::PendingRecorded {
+            generation,
+            timezone,
+            result,
+        } => {
+            if Some(*generation) != next.inflight {
+                return Step {
+                    session: next,
+                    effects,
+                };
+            }
+            match result {
+                Ok(()) => {
+                    effects.push(Effect::PostAction(SetupAction::Finalize {
+                        timezone: timezone.clone(),
+                    }));
+                }
+                Err(_) => {
+                    next.inflight = None;
+                    next.busy = false;
+                    next.error = Some("could not save this step. try again.".to_owned());
+                }
+            }
+        }
+        Event::ContinueInSolstone => {
+            if next.phase != Phase::Home || !next.authoritative || next.inflight.is_some() {
+                return Step {
+                    session: next,
+                    effects,
+                };
+            }
+            next.generation += 1;
+            next.inflight = Some(next.generation);
+            next.busy = true;
+            next.error = None;
+            next.solstone_download = false;
+            effects.push(Effect::ContinueInSolstone {
+                generation: next.generation,
+            });
+        }
+        Event::ContinueFinished {
+            generation,
+            outcome,
+        } => {
+            if Some(*generation) != next.inflight {
+                return Step {
+                    session: next,
+                    effects,
+                };
+            }
+            next.inflight = None;
+            next.busy = false;
+            match outcome {
+                ContinueOutcome::Published => {
+                    next.continuation_pending = true;
+                }
+                ContinueOutcome::Failed => {
+                    next.continuation_pending = true;
+                    next.error =
+                        Some("could not continue in the solstone app. try again.".to_owned());
+                }
+                ContinueOutcome::Unsupported => {
+                    next.continuation_pending = true;
+                    next.solstone_download = true;
+                }
+                ContinueOutcome::Superseded => {}
+            }
+        }
+        Event::DownloadSolstoneClicked => {
+            if next.phase == Phase::Home {
+                effects.push(Effect::OpenSolstoneDownload);
+            }
+        }
+        Event::HomeShown => {
+            if next.phase == Phase::Home && next.inflight.is_none() {
+                effects.push(Effect::ObserveReceipt {
+                    generation: next.generation,
+                });
+            }
+        }
+        Event::ContinuationObserved {
+            generation,
+            pending,
+        } => {
+            if *generation != next.generation || next.inflight.is_some() {
+                return Step {
+                    session: next,
+                    effects,
+                };
+            }
+            next.continuation_pending = *pending;
         }
     }
 
@@ -1308,7 +1447,7 @@ fn svg_has_geometry(svg: &str) -> bool {
     }
 }
 
-fn admit_mark_render(render: &Value) -> Result<(), ()> {
+pub(crate) fn admit_mark_render(render: &Value) -> Result<(), ()> {
     let obj = render.as_object().ok_or(())?;
     let icon1 = obj.get("icon1").and_then(Value::as_object).ok_or(())?;
     let icon2 = obj.get("icon2").and_then(Value::as_object).ok_or(())?;
@@ -1510,6 +1649,9 @@ fn apply_snapshot(session: &mut Session, effects: &mut Vec<Effect>, state: &Valu
         session.phase = Phase::Home;
         if !already_home {
             admit_models_job(session, effects, ModelsJob::Check);
+            effects.push(Effect::ObserveReceipt {
+                generation: session.generation,
+            });
         }
         return;
     }
@@ -1770,9 +1912,10 @@ mod tests {
 
         assert_eq!(
             step.effects,
-            vec![Effect::PostAction(SetupAction::Finalize {
+            vec![Effect::RecordPending {
+                generation: session.inflight.unwrap(),
                 timezone: Some("America/Denver".into()),
-            })]
+            }]
         );
         assert!(session.continue_after_save.is_none());
 
@@ -1809,7 +1952,12 @@ mod tests {
             },
         );
         assert_eq!(step.browser_effect(), BrowserEffect::None);
-        assert!(step.effects.is_empty());
+        assert_eq!(
+            step.effects,
+            vec![Effect::ObserveReceipt {
+                generation: step.session.generation,
+            }]
+        );
         session = step.session;
         assert_eq!(session.phase, Phase::Home);
     }
@@ -2037,7 +2185,10 @@ mod tests {
         session = step.session;
         assert_eq!(
             step.effects,
-            vec![Effect::PostAction(SetupAction::Finalize { timezone: None })]
+            vec![Effect::RecordPending {
+                generation: session.inflight.unwrap(),
+                timezone: None,
+            }]
         );
 
         session.models_notice = Some("bundled asset verification failed: wespeaker".into());
@@ -3256,7 +3407,12 @@ mod tests {
             },
         );
         assert_eq!(step_done.session.phase, Phase::Home);
-        assert!(step_done.effects.is_empty());
+        assert_eq!(
+            step_done.effects,
+            vec![Effect::ObserveReceipt {
+                generation: step_done.session.generation,
+            }]
+        );
         assert_eq!(step_done.session.models_generation, 1);
         assert_eq!(
             step_done.session.models_notice.as_deref(),
@@ -3574,7 +3730,10 @@ mod tests {
         );
         assert_eq!(
             complete.effects,
-            vec![Effect::PostAction(SetupAction::Finalize { timezone: None })]
+            vec![Effect::RecordPending {
+                generation: complete.session.inflight.unwrap(),
+                timezone: None,
+            }]
         );
     }
 
@@ -3619,7 +3778,10 @@ mod tests {
             );
             assert_eq!(
                 continued.effects,
-                vec![Effect::PostAction(SetupAction::Finalize { timezone: None })]
+                vec![Effect::RecordPending {
+                    generation: continued.session.inflight.unwrap(),
+                    timezone: None,
+                }]
             );
             assert!(continued.session.continue_after_save.is_none());
             let mut other_saved = state;
@@ -3650,5 +3812,163 @@ mod tests {
         }
         assert!(!path_has_geometry("M0 0"));
         assert!(!path_has_geometry("M0 0L"));
+    }
+
+    #[test]
+    fn pending_continuation_before_finalize_and_receipt_browser() {
+        let mut state = setup_state();
+        state["mark"]["state"] = json!("locked");
+        state["mark"]["render"] = sample_render();
+        state["thinking"]["saved"] = json!(true);
+        state["thinking"]["choice"] = json!("local");
+        state["remaining_required_steps"] = json!([]);
+        let mut session = Session::default();
+        apply_snapshot(&mut session, &mut vec![], &state);
+        assert_eq!(session.phase, Phase::Thinking);
+        assert!(session.authoritative);
+
+        let finalize = reduce(
+            &session,
+            &Event::FinalizeClicked {
+                timezone: Some("America/Denver".into()),
+            },
+        );
+        assert_eq!(finalize.browser_effect(), BrowserEffect::None);
+        let generation = finalize.session.inflight.unwrap();
+        assert_eq!(
+            finalize.effects,
+            vec![Effect::RecordPending {
+                generation,
+                timezone: Some("America/Denver".into()),
+            }]
+        );
+
+        let pending_err = reduce(
+            &finalize.session,
+            &Event::PendingRecorded {
+                generation,
+                timezone: Some("America/Denver".into()),
+                result: Err("disk full".into()),
+            },
+        );
+        assert_eq!(pending_err.session.phase, Phase::Thinking);
+        assert!(pending_err.effects.is_empty());
+        assert!(pending_err.session.inflight.is_none());
+        assert!(pending_err.session.error.is_some());
+
+        let pending_ok = reduce(
+            &finalize.session,
+            &Event::PendingRecorded {
+                generation,
+                timezone: Some("America/Denver".into()),
+                result: Ok(()),
+            },
+        );
+        assert_eq!(pending_ok.browser_effect(), BrowserEffect::None);
+        assert_eq!(
+            pending_ok.effects,
+            vec![Effect::PostAction(SetupAction::Finalize {
+                timezone: Some("America/Denver".into()),
+            })]
+        );
+
+        let mut boot_session = Session::default();
+        let mut boot_effects = Vec::new();
+        let mut uninstalled_state = setup_state();
+        uninstalled_state["task_installed"] = json!(false);
+        apply_snapshot(&mut boot_session, &mut boot_effects, &uninstalled_state);
+        let boot_step = Step {
+            session: boot_session,
+            effects: boot_effects,
+        };
+        assert_eq!(boot_step.browser_effect(), BrowserEffect::None);
+        assert!(
+            !boot_step
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::ContinueInSolstone { .. }))
+        );
+
+        let mut home_session = Session::default();
+        let mut home_effects = Vec::new();
+        let mut done_state = setup_state();
+        done_state["done"] = json!(true);
+        done_state["remaining_required_steps"] = json!([]);
+        apply_snapshot(&mut home_session, &mut home_effects, &done_state);
+        let home_step = Step {
+            session: home_session.clone(),
+            effects: home_effects.clone(),
+        };
+        assert_eq!(home_step.session.phase, Phase::Home);
+        assert_eq!(home_step.browser_effect(), BrowserEffect::None);
+        assert!(home_effects.contains(&Effect::ObserveReceipt {
+            generation: home_session.generation,
+        }));
+
+        let shown = reduce(&home_session, &Event::HomeShown);
+        assert_eq!(
+            shown.effects,
+            vec![Effect::ObserveReceipt {
+                generation: home_session.generation,
+            }]
+        );
+
+        let cont = reduce(&home_session, &Event::ContinueInSolstone);
+        let cont_gen = cont.session.inflight.unwrap();
+        assert_eq!(
+            cont.effects,
+            vec![Effect::ContinueInSolstone {
+                generation: cont_gen,
+            }]
+        );
+
+        let stale = reduce(
+            &cont.session,
+            &Event::ContinueFinished {
+                generation: cont_gen + 999,
+                outcome: ContinueOutcome::Published,
+            },
+        );
+        assert_eq!(stale.session.inflight, Some(cont_gen));
+        assert!(!stale.session.continuation_pending);
+
+        let published = reduce(
+            &cont.session,
+            &Event::ContinueFinished {
+                generation: cont_gen,
+                outcome: ContinueOutcome::Published,
+            },
+        );
+        assert_eq!(published.browser_effect(), BrowserEffect::None);
+        assert!(published.session.continuation_pending);
+        assert!(published.session.inflight.is_none());
+
+        let observed_false = reduce(
+            &published.session,
+            &Event::ContinuationObserved {
+                generation: published.session.generation,
+                pending: false,
+            },
+        );
+        assert!(!observed_false.session.continuation_pending);
+        let v = view(&observed_false.session);
+        assert_eq!(v["phase"], "home");
+        assert_eq!(v["step"], 5);
+        assert_eq!(v["continuation_pending"], false);
+
+        let cont_again = reduce(&observed_false.session, &Event::ContinueInSolstone);
+        assert_eq!(
+            cont_again.effects,
+            vec![Effect::ContinueInSolstone {
+                generation: cont_again.session.inflight.unwrap(),
+            }]
+        );
+
+        let dl_home = reduce(&home_session, &Event::DownloadSolstoneClicked);
+        assert_eq!(dl_home.effects, vec![Effect::OpenSolstoneDownload]);
+        assert_eq!(dl_home.browser_effect(), BrowserEffect::None);
+
+        let dl_off_home = reduce(&session, &Event::DownloadSolstoneClicked);
+        assert!(dl_off_home.effects.is_empty());
     }
 }
