@@ -316,7 +316,15 @@ fn dispatch_effect(context: &Context, effect: &crate::setup_flow::Effect, port: 
                 let collaborators = crate::setup_handoff::HandoffCollaborators {
                     paths,
                     endpoints: &convey,
-                    launch: |path, flag| shell::open_program(path, flag).map_err(|_| ()),
+                    prepare: |path| {
+                        crate::setup_receiver::PreparedReceiver::open(
+                            path,
+                            &crate::setup_handoff::get_contract(),
+                        )
+                    },
+                    launch: |receiver: &crate::setup_receiver::PreparedReceiver, _, flag| {
+                        receiver.launch(flag)
+                    },
                     still_current: move || {
                         gen_arc.load(std::sync::atomic::Ordering::SeqCst) == expected_gen
                     },

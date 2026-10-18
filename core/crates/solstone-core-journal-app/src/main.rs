@@ -29,6 +29,8 @@ mod prefs;
 #[cfg(any(windows, test))]
 mod setup_handoff;
 #[cfg(windows)]
+mod setup_receiver;
+#[cfg(windows)]
 mod shell;
 #[cfg(any(windows, test))]
 mod update;

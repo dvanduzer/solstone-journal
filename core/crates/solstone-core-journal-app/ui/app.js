@@ -108,7 +108,7 @@ const COPY = {
   chooseLocation: 'choose',
   continueButton: 'continue',
   continueInSolstone: 'continue in the solstone app',
-  downloadSolstone: 'download the solstone app for Windows',
+  downloadSolstone: 'download the solstone app for windows',
   journalFound: 'journal found',
   setupTitle: 'setting up your journal',
   setupSubtitle: 'this can take a minute.',
@@ -1136,19 +1136,20 @@ const panes = {
     if (key === 'running') {
       offer = el('button', {
         type: 'button',
-        class: 'primary',
+        'data-intent': 'open-journal',
         disabled: Boolean(state.flow?.busy),
         on: { click: () => call('flow', { intent: 'open-journal' }) }
       }, COPY.openJournal);
     } else if (key === 'stopped' || key === 'not-running') {
-      offer = el('button', { type: 'button', class: 'primary', on: { click: () => serviceAction('start') } }, COPY.start);
+      offer = el('button', { type: 'button', on: { click: () => serviceAction('start') } }, COPY.start);
     } else {
       offer = el('button', { type: 'button', on: { click: () => openPane('run') } }, COPY.runStateLink);
     }
     const continueBtn = el('button', {
       type: 'button',
+      class: 'primary',
       'data-intent': 'continue-solstone',
-      disabled: Boolean(state.flow?.busy),
+      disabled: state.flow?.authoritative !== true || Boolean(state.flow?.busy),
       on: { click: () => call('flow', { intent: 'continue-solstone' }) }
     }, COPY.continueInSolstone);
     const downloadBtn = state.flow?.solstone_download ? el('button', {
@@ -1174,7 +1175,7 @@ const panes = {
       thinkingBlock(),
       modelsBlock(),
       el('p', { class: 'muted' }, COPY.homeLine),
-      el('div', { class: 'actions' }, offer, continueBtn, downloadBtn),
+      el('div', { class: 'actions' }, continueBtn, downloadBtn, offer),
     ];
   },
 

@@ -8,11 +8,13 @@
 //! protocol defined in the setup handoff contract.
 
 use std::fs::{self, File, TryLockError};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use jsonschema::Draft;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use solstone_core_journal_io::{DetailedAtomicOutcome, atomic_replace_detailed};
 
 use crate::setup_flow::{ContinueOutcome, admit_mark_render};
 
@@ -264,10 +266,11 @@ pub fn generate_uuid() -> String {
 
 pub fn read_pending(state_dir: &Path) -> Result<Option<PendingContinuation>, String> {
     let path = state_dir.join("setup-continuation.json");
-    if !path.exists() {
-        return Ok(None);
-    }
-    let bytes = fs::read(&path).map_err(|e| e.to_string())?;
+    let bytes = match read_bounded(&path, 1024) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
     let pending: PendingContinuation = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     if !is_valid_uuid(&pending.handoff_id) {
         return Err("invalid handoff_id".to_string());
@@ -281,14 +284,39 @@ pub fn write_pending(state_dir: &Path, handoff_id: &str) -> Result<(), String> {
     }
     fs::create_dir_all(state_dir).map_err(|e| e.to_string())?;
     let target = state_dir.join("setup-continuation.json");
-    let tmp = state_dir.join("setup-continuation.json.tmp");
     let content = serde_json::to_string(&PendingContinuation {
         handoff_id: handoff_id.to_string(),
     })
     .map_err(|e| e.to_string())?;
-    fs::write(&tmp, content.as_bytes()).map_err(|e| e.to_string())?;
-    fs::rename(&tmp, &target).map_err(|e| e.to_string())?;
+    publish_record(&target, content.as_bytes())?;
     Ok(())
+}
+
+fn publish_record(target: &Path, bytes: &[u8]) -> Result<(), String> {
+    let outcome =
+        atomic_replace_detailed(target, bytes, 0o600).map_err(|error| error.to_string())?;
+    require_confirmed_publication(outcome)
+}
+
+fn require_confirmed_publication(outcome: DetailedAtomicOutcome) -> Result<(), String> {
+    match outcome {
+        DetailedAtomicOutcome::Published => Ok(()),
+        _ => Err("handoff publication could not be confirmed".to_owned()),
+    }
+}
+
+fn read_bounded(path: &Path, max: usize) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(max as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "handoff record is too large",
+        ));
+    }
+    Ok(bytes)
 }
 
 pub fn delete_pending(state_dir: &Path) -> Result<(), String> {
@@ -334,6 +362,7 @@ pub fn resolve_installed_executable(template: &str, root: &Path) -> Result<PathB
 
 pub trait WaitClock {
     fn now_ms(&self) -> u64;
+    fn monotonic_ms(&self) -> u64;
     fn sleep_ms(&mut self, ms: u64);
 }
 
@@ -345,6 +374,16 @@ impl WaitClock for WallClock {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0)
+    }
+
+    fn monotonic_ms(&self) -> u64 {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        START
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
     }
 
     fn sleep_ms(&mut self, ms: u64) {
@@ -397,12 +436,12 @@ impl HandoffLock {
             .open(lock_path)
             .map_err(|e| HandoffError::Io(e.to_string()))?;
 
-        let start = clock.now_ms();
+        let start = clock.monotonic_ms();
         loop {
             match file.try_lock() {
                 Ok(()) => return Ok(Self { file }),
                 Err(TryLockError::WouldBlock) => {
-                    let elapsed = clock.now_ms().saturating_sub(start);
+                    let elapsed = clock.monotonic_ms().saturating_sub(start);
                     if elapsed >= max_wait_ms {
                         return Err(HandoffError::Busy);
                     }
@@ -429,276 +468,38 @@ pub enum CapabilityResult {
     NoResource,
 }
 
-pub fn read_capabilities(
-    path: &Path,
-    contract_doc: &CapabilityDocumentContract,
-    max_bytes: usize,
-    res_type_id: u32,
-    res_name: &str,
-) -> CapabilityResult {
-    let bytes = match fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return CapabilityResult::Absent,
-        Err(_) => return CapabilityResult::Malformed,
-    };
-    read_capabilities_from_pe(&bytes, contract_doc, max_bytes, res_type_id, res_name)
-}
-
-pub fn read_capabilities_from_pe(
+pub fn admit_capability_document(
     bytes: &[u8],
     contract_doc: &CapabilityDocumentContract,
     max_bytes: usize,
-    res_type_id: u32,
-    res_name: &str,
 ) -> CapabilityResult {
-    if bytes.len() < 0x40 || &bytes[0..2] != b"MZ" {
-        return CapabilityResult::Malformed;
-    }
-    let e_lfanew = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
-    if e_lfanew + 4 > bytes.len() {
-        return CapabilityResult::Malformed;
-    }
-    if &bytes[e_lfanew..e_lfanew + 4] != b"PE\0\0" {
-        return CapabilityResult::Malformed;
-    }
-
-    let coff = e_lfanew + 4;
-    if coff + 20 > bytes.len() {
-        return CapabilityResult::Malformed;
-    }
-    let machine = u16::from_le_bytes(bytes[coff..coff + 2].try_into().unwrap());
-    if machine != 0x8664 {
-        return CapabilityResult::Malformed;
-    }
-    let num_sections = u16::from_le_bytes(bytes[coff + 2..coff + 4].try_into().unwrap()) as usize;
-    let opt_size = u16::from_le_bytes(bytes[coff + 16..coff + 18].try_into().unwrap()) as usize;
-
-    let opt = coff + 20;
-    if opt + opt_size > bytes.len() || opt_size < 136 {
-        return CapabilityResult::Malformed;
-    }
-    let magic = u16::from_le_bytes(bytes[opt..opt + 2].try_into().unwrap());
-    if magic != 0x20b {
-        return CapabilityResult::Malformed;
-    }
-
-    let num_rva_and_sizes = u32::from_le_bytes(bytes[opt + 108..opt + 112].try_into().unwrap());
-    if num_rva_and_sizes < 3 {
-        return CapabilityResult::NoResource;
-    }
-
-    let res_rva = u32::from_le_bytes(bytes[opt + 128..opt + 132].try_into().unwrap());
-    let res_size = u32::from_le_bytes(bytes[opt + 132..opt + 136].try_into().unwrap());
-    if res_rva == 0 || res_size == 0 {
-        return CapabilityResult::NoResource;
-    }
-
-    let sections_offset = opt + opt_size;
-    let sec_bytes = match num_sections.checked_mul(40) {
-        Some(b) => b,
-        None => return CapabilityResult::Malformed,
-    };
-    let sec_end = match sections_offset.checked_add(sec_bytes) {
-        Some(end) => end,
-        None => return CapabilityResult::Malformed,
-    };
-    if sec_end > bytes.len() {
-        return CapabilityResult::Malformed;
-    }
-
-    struct Section {
-        va: u32,
-        vsize: u32,
-        raw_ptr: u32,
-        raw_size: u32,
-    }
-    let mut sections = Vec::with_capacity(num_sections);
-    for i in 0..num_sections {
-        let s = sections_offset + i * 40;
-        let vsize = u32::from_le_bytes(bytes[s + 8..s + 12].try_into().unwrap());
-        let va = u32::from_le_bytes(bytes[s + 12..s + 16].try_into().unwrap());
-        let raw_size = u32::from_le_bytes(bytes[s + 16..s + 20].try_into().unwrap());
-        let raw_ptr = u32::from_le_bytes(bytes[s + 20..s + 24].try_into().unwrap());
-        sections.push(Section {
-            va,
-            vsize,
-            raw_ptr,
-            raw_size,
-        });
-    }
-
-    let rva_to_offset = |rva: u32| -> Option<usize> {
-        for s in &sections {
-            let span = s.vsize.max(s.raw_size);
-            if rva >= s.va && rva < s.va + span {
-                let off = s.raw_ptr as usize + (rva - s.va) as usize;
-                if off < bytes.len() {
-                    return Some(off);
-                }
-            }
-        }
-        None
-    };
-
-    let root_offset = match rva_to_offset(res_rva) {
-        Some(o) => o,
-        None => return CapabilityResult::Malformed,
-    };
-    let res_slice = &bytes[root_offset..];
-    if res_slice.len() < 16 {
-        return CapabilityResult::Malformed;
-    }
-
-    let num_named = u16::from_le_bytes(res_slice[12..14].try_into().unwrap()) as usize;
-    let num_id = u16::from_le_bytes(res_slice[14..16].try_into().unwrap()) as usize;
-    let total_l1 = num_named + num_id;
-    if total_l1 > 64 || 16 + total_l1 * 8 > res_slice.len() {
-        return CapabilityResult::Malformed;
-    }
-
-    let mut l2_offset = None;
-    for i in 0..total_l1 {
-        let entry = 16 + i * 8;
-        let id = u32::from_le_bytes(res_slice[entry..entry + 4].try_into().unwrap());
-        let data = u32::from_le_bytes(res_slice[entry + 4..entry + 8].try_into().unwrap());
-        if id == res_type_id && (data & 0x8000_0000) != 0 {
-            l2_offset = Some((data & 0x7fff_ffff) as usize);
-            break;
-        }
-    }
-    let l2_offset = match l2_offset {
-        Some(o) => o,
-        None => return CapabilityResult::NoResource,
-    };
-
-    if l2_offset + 16 > res_slice.len() {
-        return CapabilityResult::Malformed;
-    }
-    let num_named_l2 = u16::from_le_bytes(
-        res_slice[l2_offset + 12..l2_offset + 14]
-            .try_into()
-            .unwrap(),
-    ) as usize;
-    let num_id_l2 = u16::from_le_bytes(
-        res_slice[l2_offset + 14..l2_offset + 16]
-            .try_into()
-            .unwrap(),
-    ) as usize;
-    let total_l2 = num_named_l2 + num_id_l2;
-    if total_l2 > 64 || l2_offset + 16 + total_l2 * 8 > res_slice.len() {
-        return CapabilityResult::Malformed;
-    }
-
-    let mut l3_offset = None;
-    for i in 0..total_l2 {
-        let entry = l2_offset + 16 + i * 8;
-        let name_id = u32::from_le_bytes(res_slice[entry..entry + 4].try_into().unwrap());
-        let data = u32::from_le_bytes(res_slice[entry + 4..entry + 8].try_into().unwrap());
-        if (name_id & 0x8000_0000) != 0 {
-            let str_off = (name_id & 0x7fff_ffff) as usize;
-            if str_off + 2 <= res_slice.len() {
-                let u16_len =
-                    u16::from_le_bytes(res_slice[str_off..str_off + 2].try_into().unwrap())
-                        as usize;
-                if str_off + 2 + u16_len * 2 <= res_slice.len() {
-                    let mut u16_chars = Vec::with_capacity(u16_len);
-                    for c in 0..u16_len {
-                        let pos = str_off + 2 + c * 2;
-                        u16_chars.push(u16::from_le_bytes(
-                            res_slice[pos..pos + 2].try_into().unwrap(),
-                        ));
-                    }
-                    if let Ok(name_str) = String::from_utf16(&u16_chars) {
-                        if name_str == res_name && (data & 0x8000_0000) != 0 {
-                            l3_offset = Some((data & 0x7fff_ffff) as usize);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let l3_offset = match l3_offset {
-        Some(o) => o,
-        None => return CapabilityResult::NoResource,
-    };
-
-    if l3_offset + 16 > res_slice.len() {
-        return CapabilityResult::Malformed;
-    }
-    let num_named_l3 = u16::from_le_bytes(
-        res_slice[l3_offset + 12..l3_offset + 14]
-            .try_into()
-            .unwrap(),
-    ) as usize;
-    let num_id_l3 = u16::from_le_bytes(
-        res_slice[l3_offset + 14..l3_offset + 16]
-            .try_into()
-            .unwrap(),
-    ) as usize;
-    let total_l3 = num_named_l3 + num_id_l3;
-    if total_l3 > 64 || total_l3 == 0 || l3_offset + 16 + total_l3 * 8 > res_slice.len() {
-        return CapabilityResult::Malformed;
-    }
-
-    let entry_l3 = l3_offset + 16;
-    let data_entry_off =
-        u32::from_le_bytes(res_slice[entry_l3 + 4..entry_l3 + 8].try_into().unwrap()) as usize;
-    if (data_entry_off & 0x8000_0000) != 0 {
-        return CapabilityResult::Malformed;
-    }
-    if data_entry_off + 16 > res_slice.len() {
-        return CapabilityResult::Malformed;
-    }
-
-    let data_rva = u32::from_le_bytes(
-        res_slice[data_entry_off..data_entry_off + 4]
-            .try_into()
-            .unwrap(),
-    );
-    let data_size = u32::from_le_bytes(
-        res_slice[data_entry_off + 4..data_entry_off + 8]
-            .try_into()
-            .unwrap(),
-    ) as usize;
-
-    if data_size > max_bytes {
+    if bytes.len() > max_bytes {
         return CapabilityResult::Oversized;
     }
-
-    let data_file_offset = match rva_to_offset(data_rva) {
-        Some(o) => o,
-        None => return CapabilityResult::Malformed,
-    };
-    if data_file_offset + data_size > bytes.len() {
-        return CapabilityResult::Malformed;
-    }
-
-    let doc_bytes = &bytes[data_file_offset..data_file_offset + data_size];
-    let doc_val: Value = match serde_json::from_slice(doc_bytes) {
-        Ok(v) => v,
+    let value: Value = match serde_json::from_slice(bytes) {
+        Ok(value) => value,
         Err(_) => return CapabilityResult::Malformed,
     };
-
-    let expected_doc = match serde_json::to_value(contract_doc) {
-        Ok(v) => v,
-        Err(_) => return CapabilityResult::Unknown,
-    };
-
-    if doc_val != expected_doc {
-        return CapabilityResult::Unknown;
+    match serde_json::to_value(contract_doc) {
+        Ok(expected) if value == expected => CapabilityResult::Supported,
+        _ => CapabilityResult::Unknown,
     }
-
-    CapabilityResult::Supported
 }
 
 pub trait HandoffEndpoints {
+    fn is_current(&self) -> bool;
     fn get(&self, path: &str) -> Result<Value, String>;
     fn post(&self, path: &str, body: &Value) -> Result<Value, String>;
 }
 
 #[cfg(windows)]
 impl HandoffEndpoints for crate::convey::Convey {
+    fn is_current(&self) -> bool {
+        crate::journal::status()
+            .ok()
+            .and_then(|status| status.port)
+            .is_some_and(|port| self.base() == format!("http://127.0.0.1:{port}"))
+    }
     fn get(&self, path: &str) -> Result<Value, String> {
         self.get(path).map_err(|r| r.message)
     }
@@ -711,25 +512,29 @@ impl HandoffEndpoints for crate::convey::Convey {
 pub struct HandoffCollaborators<
     'a,
     E: HandoffEndpoints,
-    L: FnMut(&Path, &str) -> Result<(), ()>,
+    P: FnMut(&Path) -> Result<G, CapabilityResult>,
+    L: FnMut(&G, &Path, &str) -> Result<(), ()>,
     C: WaitClock,
     F: FnMut() -> String,
     S: Fn() -> bool,
+    G,
 > {
     pub paths: HandoffPaths,
     pub endpoints: &'a E,
+    pub prepare: P,
     pub launch: L,
     pub still_current: S,
     pub clock: C,
     pub new_id: F,
 }
 
-pub fn continue_in_solstone<E, L, C, F, S>(
-    mut collaborators: HandoffCollaborators<'_, E, L, C, F, S>,
+pub fn continue_in_solstone<E, P, L, C, F, S, G>(
+    mut collaborators: HandoffCollaborators<'_, E, P, L, C, F, S, G>,
 ) -> ContinueOutcome
 where
     E: HandoffEndpoints,
-    L: FnMut(&Path, &str) -> Result<(), ()>,
+    P: FnMut(&Path) -> Result<G, CapabilityResult>,
+    L: FnMut(&G, &Path, &str) -> Result<(), ()>,
     C: WaitClock,
     F: FnMut() -> String,
     S: Fn() -> bool,
@@ -798,17 +603,10 @@ where
         Ok(p) => p,
         Err(_) => return ContinueOutcome::Failed,
     };
-    let res_type_id = resource_type_id(&contract.resource.resource_type);
-    let cap = read_capabilities(
-        &exe_path,
-        &contract.capability_document,
-        contract.limits.capability_resource_max_bytes,
-        res_type_id,
-        &contract.resource.name,
-    );
-    if cap != CapabilityResult::Supported {
-        return ContinueOutcome::Unsupported;
-    }
+    let prepared = match (collaborators.prepare)(&exe_path) {
+        Ok(prepared) => prepared,
+        Err(_) => return ContinueOutcome::Unsupported,
+    };
 
     // 7. record request start timestamp and POST /app/network/pair-start
     let request_start = collaborators.clock.now_ms();
@@ -819,6 +617,21 @@ where
         Ok(v) => v,
         Err(_) => return ContinueOutcome::Failed,
     };
+
+    // A service restart or journal rebind during mint must not combine the
+    // previous instance with a new journal's link and CA expectation.
+    match collaborators.endpoints.get(&contract.identity.path) {
+        Ok(current)
+            if current.get("committed").and_then(Value::as_bool) == Some(true)
+                && current.get("instance_id").and_then(Value::as_str)
+                    == Some(instance_id.as_str())
+                && current.get("mark") == Some(mark) => {}
+        _ => return ContinueOutcome::Failed,
+    }
+
+    if !collaborators.endpoints.is_current() {
+        return ContinueOutcome::Failed;
+    }
 
     // 8. validate pair-start response (reads pair_link)
     let pairing_link = match pair_resp.get("pair_link").and_then(Value::as_str) {
@@ -937,12 +750,9 @@ where
         };
 
         let target_mailbox = solstone_dir.join(&contract.files.mailbox);
-        let tmp_mailbox = solstone_dir.join(format!("{}.tmp", &contract.files.mailbox));
-        if fs::write(&tmp_mailbox, &mailbox_bytes).is_err() {
-            return ContinueOutcome::Failed;
-        }
-        if fs::rename(&tmp_mailbox, &target_mailbox).is_err() {
-            let _ = fs::remove_file(&tmp_mailbox);
+        if collaborators.clock.now_ms() >= deadline
+            || publish_record(&target_mailbox, &mailbox_bytes).is_err()
+        {
             return ContinueOutcome::Failed;
         }
     }
@@ -953,7 +763,10 @@ where
     }
 
     // 12. launch installed executable with argv.cli_flag
-    match (collaborators.launch)(&exe_path, &contract.argv.cli_flag) {
+    if collaborators.clock.now_ms() >= deadline {
+        return ContinueOutcome::Failed;
+    }
+    match (collaborators.launch)(&prepared, &exe_path, &contract.argv.cli_flag) {
         Ok(()) => ContinueOutcome::Published,
         Err(()) => ContinueOutcome::Failed,
     }
@@ -977,7 +790,7 @@ pub fn observe_receipt<C: WaitClock>(paths: &HandoffPaths, clock: &mut C) -> Res
         return Ok(true);
     }
 
-    let receipt_bytes = match fs::read(&receipt_path) {
+    let receipt_bytes = match read_bounded(&receipt_path, contract.limits.receipt_max_bytes) {
         Ok(b) => b,
         Err(_) => return Ok(true),
     };
@@ -1022,95 +835,6 @@ mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
-
-    fn build_synthetic_pe(
-        res_type_id: u32,
-        res_name: &str,
-        res_data: &[u8],
-        zero_res_dir: bool,
-    ) -> Vec<u8> {
-        let mut buf = vec![0u8; 0x400];
-        // DOS header
-        buf[0..2].copy_from_slice(b"MZ");
-        buf[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes()); // e_lfanew = 0x40
-
-        // PE signature
-        buf[0x40..0x44].copy_from_slice(b"PE\0\0");
-
-        // COFF header at 0x44 (20 bytes)
-        buf[0x44..0x46].copy_from_slice(&0x8664u16.to_le_bytes()); // machine AMD64
-        buf[0x46..0x48].copy_from_slice(&1u16.to_le_bytes()); // 1 section
-        buf[0x54..0x56].copy_from_slice(&240u16.to_le_bytes()); // opt header size = 240
-
-        // Optional header at 0x58 (240 bytes)
-        buf[0x58..0x5a].copy_from_slice(&0x020bu16.to_le_bytes()); // magic PE32+
-        buf[0x58 + 108..0x58 + 112].copy_from_slice(&16u32.to_le_bytes()); // NumberOfRvaAndSizes
-
-        if !zero_res_dir {
-            // Data Directory entry 2 (Resource): RVA 0x1000, Size 0x200
-            buf[0x58 + 128..0x58 + 132].copy_from_slice(&0x1000u32.to_le_bytes());
-            buf[0x58 + 132..0x58 + 136].copy_from_slice(&0x200u32.to_le_bytes());
-        }
-
-        // Section header at 0x58 + 240 = 0x148 (40 bytes)
-        buf[0x148..0x150].copy_from_slice(b".rsrc\0\0\0");
-        buf[0x150..0x154].copy_from_slice(&0x1000u32.to_le_bytes()); // VirtualSize
-        buf[0x154..0x158].copy_from_slice(&0x1000u32.to_le_bytes()); // VirtualAddress
-        buf[0x158..0x15c].copy_from_slice(&0x1000u32.to_le_bytes()); // SizeOfRawData
-        buf[0x15c..0x160].copy_from_slice(&0x200u32.to_le_bytes()); // PointerToRawData
-
-        if zero_res_dir {
-            return buf;
-        }
-
-        // Section data starts at file offset 0x200 (RVA 0x1000)
-        let s = 0x200;
-        // Level 1 directory at s (16 bytes)
-        buf[s + 12..s + 14].copy_from_slice(&0u16.to_le_bytes()); // named = 0
-        buf[s + 14..s + 16].copy_from_slice(&1u16.to_le_bytes()); // id = 1
-        // L1 entry (8 bytes): type id, offset to L2 (0x80000018 = offset 24)
-        buf[s + 16..s + 20].copy_from_slice(&res_type_id.to_le_bytes());
-        buf[s + 20..s + 24].copy_from_slice(&0x8000_0018u32.to_le_bytes());
-
-        // Level 2 directory at s + 24 (16 bytes)
-        buf[s + 24 + 12..s + 24 + 14].copy_from_slice(&1u16.to_le_bytes()); // named = 1
-        buf[s + 24 + 14..s + 24 + 16].copy_from_slice(&0u16.to_le_bytes()); // id = 0
-        // L2 entry (8 bytes): name offset (0x80000030 = offset 48), offset to L3
-        let name_u16: Vec<u16> = res_name.encode_utf16().collect();
-        let name_str_len = 2 + name_u16.len() * 2;
-        let l3_off = 48 + name_str_len;
-        buf[s + 40..s + 44].copy_from_slice(&0x8000_0030u32.to_le_bytes());
-        buf[s + 44..s + 48].copy_from_slice(&(0x8000_0000u32 | (l3_off as u32)).to_le_bytes());
-
-        // String at s + 48
-        buf[s + 48..s + 50].copy_from_slice(&(name_u16.len() as u16).to_le_bytes());
-        for (i, &ch) in name_u16.iter().enumerate() {
-            buf[s + 50 + i * 2..s + 52 + i * 2].copy_from_slice(&ch.to_le_bytes());
-        }
-
-        // Level 3 directory at s + l3_off (16 bytes)
-        buf[s + l3_off + 12..s + l3_off + 14].copy_from_slice(&0u16.to_le_bytes());
-        buf[s + l3_off + 14..s + l3_off + 16].copy_from_slice(&1u16.to_le_bytes());
-        // L3 entry: lang 0, offset to Data Entry (high bit 0)
-        let data_entry_off = l3_off + 24;
-        buf[s + l3_off + 16..s + l3_off + 20].copy_from_slice(&0u32.to_le_bytes());
-        buf[s + l3_off + 20..s + l3_off + 24]
-            .copy_from_slice(&(data_entry_off as u32).to_le_bytes());
-
-        // Data Entry at s + data_entry_off (16 bytes)
-        let raw_data_off = data_entry_off + 16;
-        let raw_data_rva = 0x1000 + raw_data_off as u32;
-        buf[s + data_entry_off..s + data_entry_off + 4]
-            .copy_from_slice(&raw_data_rva.to_le_bytes());
-        buf[s + data_entry_off + 4..s + data_entry_off + 8]
-            .copy_from_slice(&(res_data.len() as u32).to_le_bytes());
-
-        // Write raw payload
-        buf.resize(s + raw_data_off + res_data.len(), 0);
-        buf[s + raw_data_off..s + raw_data_off + res_data.len()].copy_from_slice(res_data);
-
-        buf
-    }
 
     #[test]
     fn contract_provenance_and_mailbox_receipt_rules() {
@@ -1220,121 +944,43 @@ mod tests {
     }
 
     #[test]
-    fn capability_reader_distinguishes_pe_payloads() {
+    fn capability_document_is_bounded_and_exact() {
         let contract = get_contract();
-        let dir = tempdir().unwrap();
-        let res_type_id = resource_type_id(&contract.resource.resource_type);
-
-        // 1. Supported
-        let doc_bytes = serde_json::to_vec(&contract.capability_document).unwrap();
-        let pe_supported =
-            build_synthetic_pe(res_type_id, &contract.resource.name, &doc_bytes, false);
-        let p_supp = dir.path().join("supported.exe");
-        fs::write(&p_supp, &pe_supported).unwrap();
+        let expected = &contract.capability_document;
+        let max = contract.limits.capability_resource_max_bytes;
+        let valid = serde_json::to_vec(expected).unwrap();
         assert_eq!(
-            read_capabilities(
-                &p_supp,
-                &contract.capability_document,
-                contract.limits.capability_resource_max_bytes,
-                res_type_id,
-                &contract.resource.name,
-            ),
+            admit_capability_document(&valid, expected, max),
             CapabilityResult::Supported
         );
-
-        // 2. Absent
-        let p_absent = dir.path().join("missing.exe");
+        for malformed in [b"".as_slice(), b"MZ", b"{invalid}"] {
+            assert_eq!(
+                admit_capability_document(malformed, expected, max),
+                CapabilityResult::Malformed
+            );
+        }
         assert_eq!(
-            read_capabilities(
-                &p_absent,
-                &contract.capability_document,
-                contract.limits.capability_resource_max_bytes,
-                res_type_id,
-                &contract.resource.name,
-            ),
-            CapabilityResult::Absent
-        );
-
-        // 3. Malformed ("MZ" only)
-        let p_malformed = dir.path().join("malformed.exe");
-        fs::write(&p_malformed, b"MZ").unwrap();
-        assert_eq!(
-            read_capabilities(
-                &p_malformed,
-                &contract.capability_document,
-                contract.limits.capability_resource_max_bytes,
-                res_type_id,
-                &contract.resource.name,
-            ),
-            CapabilityResult::Malformed
-        );
-
-        // 4. Oversized
-        let huge_doc = vec![b' '; 5000];
-        let pe_oversized =
-            build_synthetic_pe(res_type_id, &contract.resource.name, &huge_doc, false);
-        let p_oversized = dir.path().join("oversized.exe");
-        fs::write(&p_oversized, &pe_oversized).unwrap();
-        assert_eq!(
-            read_capabilities(
-                &p_oversized,
-                &contract.capability_document,
-                contract.limits.capability_resource_max_bytes,
-                res_type_id,
-                &contract.resource.name,
-            ),
+            admit_capability_document(&vec![b' '; max + 1], expected, max),
             CapabilityResult::Oversized
         );
-
-        // 5. Unknown
-        let unknown_doc = serde_json::to_vec(&json!({
-            "schema": "nope",
-            "capabilities": ["other"],
-        }))
-        .unwrap();
-        let pe_unknown =
-            build_synthetic_pe(res_type_id, &contract.resource.name, &unknown_doc, false);
-        let p_unknown = dir.path().join("unknown.exe");
-        fs::write(&p_unknown, &pe_unknown).unwrap();
+        for unknown in [
+            json!({"schema":"unknown","capabilities":expected.capabilities}),
+            json!({"schema":expected.schema,"capabilities":[]}),
+            json!({"schema":expected.schema,"capabilities":expected.capabilities,"extra":true}),
+        ] {
+            assert_eq!(
+                admit_capability_document(&serde_json::to_vec(&unknown).unwrap(), expected, max),
+                CapabilityResult::Unknown
+            );
+        }
+        let root = Path::new("local-root");
         assert_eq!(
-            read_capabilities(
-                &p_unknown,
-                &contract.capability_document,
-                contract.limits.capability_resource_max_bytes,
-                res_type_id,
-                &contract.resource.name,
-            ),
-            CapabilityResult::Unknown
+            resolve_installed_executable(&contract.argv.installed_executable, root).unwrap(),
+            root.join("Solstone")
+                .join("current")
+                .join("solstone-windows-app.exe")
         );
-
-        // 6. NoResource (zeroed resource directory)
-        let pe_no_res = build_synthetic_pe(res_type_id, &contract.resource.name, &[], true);
-        let p_no_res = dir.path().join("no_res.exe");
-        fs::write(&p_no_res, &pe_no_res).unwrap();
-        assert_eq!(
-            read_capabilities(
-                &p_no_res,
-                &contract.capability_document,
-                contract.limits.capability_resource_max_bytes,
-                res_type_id,
-                &contract.resource.name,
-            ),
-            CapabilityResult::NoResource
-        );
-
-        // Path resolution tests
-        let res =
-            resolve_installed_executable(&contract.argv.installed_executable, dir.path()).unwrap();
-        assert!(
-            res.ends_with(
-                Path::new("Solstone")
-                    .join("current")
-                    .join("solstone-windows-app.exe")
-            )
-        );
-
-        let bad_template = "%OTHER%\\Solstone\\app.exe";
-        assert!(resolve_installed_executable(bad_template, dir.path()).is_err());
+        assert!(resolve_installed_executable("%OTHER%\\app.exe", root).is_err());
     }
 
     #[derive(Clone, Default)]
@@ -1359,6 +1005,10 @@ mod tests {
             self.now.load(std::sync::atomic::Ordering::SeqCst)
         }
 
+        fn monotonic_ms(&self) -> u64 {
+            self.now_ms()
+        }
+
         fn sleep_ms(&mut self, ms: u64) {
             self.now.fetch_add(ms, std::sync::atomic::Ordering::SeqCst);
             self.sleep_count
@@ -1369,6 +1019,8 @@ mod tests {
     }
 
     struct MockEndpoints {
+        authority_current: bool,
+        identity_after_mint: Option<Value>,
         identity: Result<Value, String>,
         pair_start: Result<Value, String>,
         pair_start_called: std::cell::Cell<bool>,
@@ -1376,7 +1028,15 @@ mod tests {
     }
 
     impl HandoffEndpoints for MockEndpoints {
+        fn is_current(&self) -> bool {
+            self.authority_current
+        }
         fn get(&self, _path: &str) -> Result<Value, String> {
+            if self.pair_start_called.get() {
+                if let Some(identity) = &self.identity_after_mint {
+                    return Ok(identity.clone());
+                }
+            }
             self.identity.clone()
         }
 
@@ -1451,16 +1111,9 @@ mod tests {
             state_dir: state_dir.clone(),
         };
 
-        // Write supported executable
         let exe_path =
             resolve_installed_executable(&contract.argv.installed_executable, &paths.local_appdata)
                 .unwrap();
-        fs::create_dir_all(exe_path.parent().unwrap()).unwrap();
-        let doc_bytes = serde_json::to_vec(&contract.capability_document).unwrap();
-        let res_type_id = resource_type_id(&contract.resource.resource_type);
-        let pe_supported =
-            build_synthetic_pe(res_type_id, &contract.resource.name, &doc_bytes, false);
-        fs::write(&exe_path, &pe_supported).unwrap();
 
         let fp_prefix = [0xa0u8; 16];
         let link = sample_v04_link(&fp_prefix);
@@ -1474,6 +1127,8 @@ mod tests {
 
         let mut launched = None;
         let endpoints = MockEndpoints {
+            authority_current: true,
+            identity_after_mint: None,
             identity: Ok(sample_identity()),
             pair_start: Ok(pair_resp.clone()),
             pair_start_called: std::cell::Cell::new(false),
@@ -1486,7 +1141,8 @@ mod tests {
         let collaborators = HandoffCollaborators {
             paths: paths.clone(),
             endpoints: &endpoints,
-            launch: |p: &Path, f: &str| {
+            prepare: |_| Ok(()),
+            launch: |_, p: &Path, f: &str| {
                 launched = Some((p.to_path_buf(), f.to_string()));
                 Ok(())
             },
@@ -1534,6 +1190,8 @@ mod tests {
             let multi_link = sample_v05_multi_link(&fp_prefix);
             let mut launched = false;
             let ep = MockEndpoints {
+                authority_current: true,
+                identity_after_mint: None,
                 identity: Ok(sample_identity()),
                 pair_start: Ok(json!({
                     "pair_link": multi_link,
@@ -1546,7 +1204,8 @@ mod tests {
             let c = HandoffCollaborators {
                 paths: paths.clone(),
                 endpoints: &ep,
-                launch: |_, _| {
+                prepare: |_| Ok(()),
+                launch: |_, _, _| {
                     launched = true;
                     Ok(())
                 },
@@ -1599,6 +1258,8 @@ mod tests {
             let _ = fs::remove_file(&mb_path);
             let mut launched = false;
             let ep = MockEndpoints {
+                authority_current: true,
+                identity_after_mint: None,
                 identity: Ok(id_val),
                 pair_start: Ok(p_resp),
                 pair_start_called: std::cell::Cell::new(false),
@@ -1607,7 +1268,8 @@ mod tests {
             let c = HandoffCollaborators {
                 paths: paths.clone(),
                 endpoints: &ep,
-                launch: |_, _| {
+                prepare: |_| Ok(()),
+                launch: |_, _, _| {
                     launched = true;
                     Ok(())
                 },
@@ -1626,6 +1288,8 @@ mod tests {
             let clock_now_clone = clock_now.clone();
             let mut launched = false;
             let ep = MockEndpoints {
+                authority_current: true,
+                identity_after_mint: None,
                 identity: Ok(sample_identity()),
                 pair_start: Ok(pair_resp.clone()),
                 pair_start_called: std::cell::Cell::new(false),
@@ -1636,7 +1300,8 @@ mod tests {
             let c = HandoffCollaborators {
                 paths: paths.clone(),
                 endpoints: &ep,
-                launch: |_, _| {
+                prepare: |_| Ok(()),
+                launch: |_, _, _| {
                     launched = true;
                     Ok(())
                 },
@@ -1660,6 +1325,8 @@ mod tests {
 
             let mut launched = false;
             let ep = MockEndpoints {
+                authority_current: true,
+                identity_after_mint: None,
                 identity: Ok(sample_identity()),
                 pair_start: Ok(pair_resp.clone()),
                 pair_start_called: std::cell::Cell::new(false),
@@ -1668,7 +1335,8 @@ mod tests {
             let c = HandoffCollaborators {
                 paths: paths.clone(),
                 endpoints: &ep,
-                launch: |_, _| {
+                prepare: |_| Ok(()),
+                launch: |_, _, _| {
                     launched = true;
                     Ok(())
                 },
@@ -1687,6 +1355,8 @@ mod tests {
             fs::create_dir_all(&mb_path).unwrap();
             let mut launched = false;
             let ep = MockEndpoints {
+                authority_current: true,
+                identity_after_mint: None,
                 identity: Ok(sample_identity()),
                 pair_start: Ok(pair_resp.clone()),
                 pair_start_called: std::cell::Cell::new(false),
@@ -1695,7 +1365,8 @@ mod tests {
             let c = HandoffCollaborators {
                 paths: paths.clone(),
                 endpoints: &ep,
-                launch: |_, _| {
+                prepare: |_| Ok(()),
+                launch: |_, _, _| {
                     launched = true;
                     Ok(())
                 },
@@ -1712,6 +1383,8 @@ mod tests {
         {
             let mut launched = false;
             let ep = MockEndpoints {
+                authority_current: true,
+                identity_after_mint: None,
                 identity: Ok(sample_identity()),
                 pair_start: Ok(pair_resp.clone()),
                 pair_start_called: std::cell::Cell::new(false),
@@ -1720,7 +1393,8 @@ mod tests {
             let c = HandoffCollaborators {
                 paths: paths.clone(),
                 endpoints: &ep,
-                launch: |_, _| {
+                prepare: |_| Ok(()),
+                launch: |_, _, _| {
                     launched = true;
                     Ok(())
                 },
@@ -1738,6 +1412,8 @@ mod tests {
             let _ = fs::remove_file(&mb_path);
             let state_dir_clone = state_dir.clone();
             let ep = MockEndpoints {
+                authority_current: true,
+                identity_after_mint: None,
                 identity: Ok(sample_identity()),
                 pair_start: Ok(pair_resp.clone()),
                 pair_start_called: std::cell::Cell::new(false),
@@ -1750,7 +1426,8 @@ mod tests {
             let c = HandoffCollaborators {
                 paths: paths.clone(),
                 endpoints: &ep,
-                launch: |_, _| {
+                prepare: |_| Ok(()),
+                launch: |_, _, _| {
                     launched = true;
                     Ok(())
                 },
@@ -1767,6 +1444,8 @@ mod tests {
         {
             write_pending(&state_dir, &fixed_id).unwrap();
             let ep = MockEndpoints {
+                authority_current: true,
+                identity_after_mint: None,
                 identity: Ok(sample_identity()),
                 pair_start: Ok(pair_resp.clone()),
                 pair_start_called: std::cell::Cell::new(false),
@@ -1775,7 +1454,8 @@ mod tests {
             let c = HandoffCollaborators {
                 paths: paths.clone(),
                 endpoints: &ep,
-                launch: |_, _| Err(()),
+                prepare: |_| Ok(()),
+                launch: |_, _, _| Err(()),
                 still_current: || true,
                 clock: VirtualClock::new(1000),
                 new_id: || fixed_id.clone(),
@@ -1840,6 +1520,272 @@ mod tests {
         assert_eq!(observe_receipt(&paths, &mut clk).unwrap(), false);
         assert!(!state_dir.join("setup-continuation.json").exists());
         assert!(rc_path.exists());
+    }
+
+    struct LockWaitClock {
+        wall: u64,
+        monotonic: u64,
+        held: std::rc::Rc<std::cell::RefCell<Option<File>>>,
+        release_on_sleep: bool,
+    }
+
+    impl WaitClock for LockWaitClock {
+        fn now_ms(&self) -> u64 {
+            self.wall
+        }
+        fn monotonic_ms(&self) -> u64 {
+            self.monotonic
+        }
+        fn sleep_ms(&mut self, ms: u64) {
+            self.monotonic += ms;
+            assert!(
+                self.monotonic <= 5000,
+                "lock wait exceeded the monotonic budget"
+            );
+            if self.release_on_sleep {
+                self.wall += 3000;
+                self.held.borrow_mut().take();
+            } else {
+                self.wall = self.wall.saturating_sub(1000);
+            }
+        }
+    }
+
+    #[test]
+    fn expiry_during_publication_lock_wait_preserves_prior_mailbox() {
+        let contract = get_contract();
+        let root = tempdir().unwrap();
+        let paths = HandoffPaths {
+            local_appdata: root.path().join("local"),
+            state_dir: root.path().join("state"),
+        };
+        fs::create_dir_all(paths.solstone_dir()).unwrap();
+        let mailbox = paths.solstone_dir().join(&contract.files.mailbox);
+        fs::write(&mailbox, b"prior handoff").unwrap();
+        let lock_path = paths.solstone_dir().join(&contract.files.lock);
+        let held = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let lock_slot = held.clone();
+        let endpoints = MockEndpoints {
+            authority_current: true,
+            identity_after_mint: None,
+            identity: Ok(sample_identity()),
+            pair_start: Ok(
+                json!({"pair_link": sample_v04_link(&[0xa0;16]), "ca_fingerprint":"a0".repeat(32), "expires_in":1}),
+            ),
+            pair_start_called: std::cell::Cell::new(false),
+            on_pair_start: Some(Box::new(move || {
+                let file = File::options()
+                    .read(true)
+                    .write(true)
+                    .open(&lock_path)
+                    .unwrap();
+                file.try_lock().unwrap();
+                *lock_slot.borrow_mut() = Some(file);
+            })),
+        };
+        let mut launched = false;
+        let outcome = continue_in_solstone(HandoffCollaborators {
+            paths: paths.clone(),
+            endpoints: &endpoints,
+            prepare: |_| Ok(()),
+            launch: |_, _, _| {
+                launched = true;
+                Ok(())
+            },
+            still_current: || true,
+            clock: LockWaitClock {
+                wall: 1000,
+                monotonic: 0,
+                held,
+                release_on_sleep: true,
+            },
+            new_id: || "01234567-89ab-4cde-8f01-23456789abcd".into(),
+        });
+        assert_eq!(outcome, ContinueOutcome::Failed);
+        assert!(!launched);
+        assert_eq!(fs::read(mailbox).unwrap(), b"prior handoff");
+        assert!(read_pending(&paths.state_dir).unwrap().is_some());
+    }
+
+    #[test]
+    fn unsupported_image_or_changed_authority_never_publishes_or_launches() {
+        let contract = get_contract();
+        for case in 0..3 {
+            let root = tempdir().unwrap();
+            let paths = HandoffPaths {
+                local_appdata: root.path().join("local"),
+                state_dir: root.path().join("state"),
+            };
+            let mut other = sample_identity();
+            other["instance_id"] = json!("replacement-instance");
+            let endpoints = MockEndpoints {
+                authority_current: case != 2,
+                identity_after_mint: if case == 1 { Some(other) } else { None },
+                identity: Ok(sample_identity()),
+                pair_start: Ok(
+                    json!({"pair_link": sample_v04_link(&[0xa0;16]), "ca_fingerprint":"a0".repeat(32), "expires_in":60}),
+                ),
+                pair_start_called: std::cell::Cell::new(false),
+                on_pair_start: None,
+            };
+            let mut launched = false;
+            let outcome = continue_in_solstone(HandoffCollaborators {
+                paths: paths.clone(),
+                endpoints: &endpoints,
+                prepare: |_| {
+                    if case == 0 {
+                        Err(CapabilityResult::NoResource)
+                    } else {
+                        Ok(())
+                    }
+                },
+                launch: |_, _, _| {
+                    launched = true;
+                    Ok(())
+                },
+                still_current: || true,
+                clock: VirtualClock::new(1000),
+                new_id: || "01234567-89ab-4cde-8f01-23456789abcd".into(),
+            });
+            assert_eq!(
+                outcome,
+                if case == 0 {
+                    ContinueOutcome::Unsupported
+                } else {
+                    ContinueOutcome::Failed
+                }
+            );
+            assert!(!launched);
+            assert!(!paths.solstone_dir().join(&contract.files.mailbox).exists());
+            if case == 0 {
+                assert!(!endpoints.pair_start_called.get());
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_image_lives_through_launch_and_expiry_is_rechecked_after_publication() {
+        struct ImageGuard(std::rc::Rc<std::cell::Cell<bool>>);
+        impl Drop for ImageGuard {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        let contract = get_contract();
+        for expire_before_launch in [false, true] {
+            let root = tempdir().unwrap();
+            let paths = HandoffPaths {
+                local_appdata: root.path().join("local"),
+                state_dir: root.path().join("state"),
+            };
+            let endpoints = MockEndpoints {
+                authority_current: true,
+                identity_after_mint: None,
+                identity: Ok(sample_identity()),
+                pair_start: Ok(
+                    json!({"pair_link":sample_v04_link(&[0xa0;16]),"ca_fingerprint":"a0".repeat(32),"expires_in":60}),
+                ),
+                pair_start_called: std::cell::Cell::new(false),
+                on_pair_start: None,
+            };
+            let alive = std::rc::Rc::new(std::cell::Cell::new(false));
+            let clock = VirtualClock::new(1000);
+            let now = clock.now.clone();
+            let checks = std::cell::Cell::new(0);
+            let mut launched = false;
+            let outcome = continue_in_solstone(HandoffCollaborators {
+                paths: paths.clone(),
+                endpoints: &endpoints,
+                prepare: |_| {
+                    alive.set(true);
+                    Ok(ImageGuard(alive.clone()))
+                },
+                launch: |guard: &ImageGuard, _, _| {
+                    assert!(guard.0.get());
+                    launched = true;
+                    Ok(())
+                },
+                still_current: || {
+                    checks.set(checks.get() + 1);
+                    if expire_before_launch && checks.get() == 6 {
+                        now.store(61_000, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    true
+                },
+                clock,
+                new_id: || "01234567-89ab-4cde-8f01-23456789abcd".into(),
+            });
+            assert_eq!(
+                outcome,
+                if expire_before_launch {
+                    ContinueOutcome::Failed
+                } else {
+                    ContinueOutcome::Published
+                }
+            );
+            assert_eq!(launched, !expire_before_launch);
+            assert!(!alive.get());
+            let mailbox: Value = serde_json::from_slice(
+                &fs::read(paths.solstone_dir().join(&contract.files.mailbox)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(mailbox["expires_at_unix_ms"], 61_000);
+            assert!(read_pending(&paths.state_dir).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn backward_wall_clock_does_not_extend_lock_budget() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("handoff.lock");
+        let file = File::create(&path).unwrap();
+        file.try_lock().unwrap();
+        let held = std::rc::Rc::new(std::cell::RefCell::new(Some(file)));
+        let mut clock = LockWaitClock {
+            wall: 100_000,
+            monotonic: 0,
+            held,
+            release_on_sleep: false,
+        };
+        assert!(matches!(
+            HandoffLock::acquire(&path, 5000, &mut clock),
+            Err(HandoffError::Busy)
+        ));
+        assert_eq!(clock.monotonic, 5000);
+        assert_eq!(clock.wall, 0);
+    }
+
+    #[test]
+    fn pending_publication_and_bounded_read_fail_closed() {
+        let root = tempdir().unwrap();
+        let id = "01234567-89ab-4cde-8f01-23456789abcd";
+        write_pending(root.path(), id).unwrap();
+        assert_eq!(read_pending(root.path()).unwrap().unwrap().handoff_id, id);
+        let path = root.path().join("setup-continuation.json");
+        fs::write(&path, vec![b' '; 1025]).unwrap();
+        assert!(read_pending(root.path()).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(write_pending(root.path(), id).is_err());
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn uncertain_publication_never_advances() {
+        use std::io::Error;
+        assert!(require_confirmed_publication(DetailedAtomicOutcome::Published).is_ok());
+        for outcome in [
+            DetailedAtomicOutcome::PublishedDurabilityUncertain {
+                source: Error::other("sync failed"),
+            },
+            DetailedAtomicOutcome::PublishedParentPathRaced { sync_error: None },
+            DetailedAtomicOutcome::PublishedParentPathUnverified {
+                observation: Error::other("observation failed"),
+                sync_error: None,
+            },
+        ] {
+            assert!(require_confirmed_publication(outcome).is_err());
+        }
     }
 
     #[test]

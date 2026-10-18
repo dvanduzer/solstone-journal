@@ -1243,9 +1243,9 @@ statusPlan.push({
 });
 paint(view({ phase: 'home', step: 5 }));
 await flush();
-const primaryBtn = buttons().find(b => b.classList.contains('primary'));
-if (!primaryBtn || primaryBtn.textContent.trim() !== 'open your journal') {
-  throw new Error(`primary button is not open your journal: saw ${primaryBtn?.textContent.trim()}`);
+const journalAction = buttons().find(b => b.getAttribute('data-intent') === 'open-journal');
+if (!journalAction) {
+  throw new Error('fresh status did not expose the existing journal-open action');
 }
 pass('fresh setup refreshes status before the home action');
 
@@ -1308,6 +1308,8 @@ if (calls27.some(c => c.cmd === 'open' || (c.cmd === 'flow' && c.args?.intent ==
 pass('status failure after setup retries without setup');
 
 // 28. continue in solstone app and download offer
+paint(view({ phase: 'home', step: 5, authoritative: true }));
+await flush();
 if (calls.some(c => c.cmd === 'flow' && c.args?.intent === 'continue-solstone')) {
   throw new Error('found prior continue-solstone call');
 }
@@ -1321,6 +1323,13 @@ const continueCalls = calls.slice(callsBeforeContinue);
 const continueCall = continueCalls.find(c => c.cmd === 'flow' && c.args?.intent === 'continue-solstone');
 if (!continueCall) {
   throw new Error(`expected continue-solstone call, got: ${JSON.stringify(continueCalls)}`);
+}
+
+for (const admission of [{authoritative:false}, {authoritative:true, busy:true}]) {
+  paint(view({phase:'home', step:5, ...admission}));
+  await flush();
+  const unavailable = document.querySelectorAll('button').find(b => b.getAttribute('data-intent') === 'continue-solstone');
+  if (!unavailable?.disabled) throw new Error('continuation available without current idle authority');
 }
 
 const callsBeforePaint = calls.length;

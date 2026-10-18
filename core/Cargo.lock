@@ -5731,6 +5731,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "solstone-core-about",
+ "solstone-core-journal-io",
  "spl-core",
  "svgtypes",
  "tempfile",
