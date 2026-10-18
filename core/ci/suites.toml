@@ -4444,6 +4444,19 @@ required_features = ["host", "test-hooks"]
 runtime = "none"
 
 [[suites]]
+id = "solstone-core-sol-link::init_dom"
+package = "solstone-core-sol-link"
+target = "init_dom"
+set = "component"
+areas = ["services"]
+platforms = ["linux", "macos"]
+prerequisites = ["cargo-cache"]
+timeout = "standard"
+default_full = true
+required_features = []
+runtime = "none"
+
+[[suites]]
 id = "solstone-core-sound-tags::tag_audio"
 package = "solstone-core-sound-tags"
 target = "tag_audio"
@@ -5146,6 +5159,19 @@ runtime = "none"
 id = "solstone-core-journal-app::updater_transport"
 package = "solstone-core-journal-app"
 target = "updater_transport"
+set = "component"
+areas = ["journal"]
+platforms = ["linux", "macos", "windows"]
+prerequisites = ["cargo-cache"]
+timeout = "standard"
+default_full = true
+required_features = ["full-tests"]
+runtime = "none"
+
+[[suites]]
+id = "solstone-core-journal-app::setup_ui_dom"
+package = "solstone-core-journal-app"
+target = "setup_ui_dom"
 set = "component"
 areas = ["journal"]
 platforms = ["linux", "macos", "windows"]

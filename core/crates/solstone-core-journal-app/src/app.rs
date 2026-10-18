@@ -129,123 +129,135 @@ struct Context {
     session: std::rc::Rc<std::cell::RefCell<crate::setup_flow::Session>>,
 }
 
-fn dispatch_effects(context: &Context, effects: &[crate::setup_flow::Effect]) {
-    for effect in effects {
-        match effect {
-            crate::setup_flow::Effect::FetchCopy => {
-                let proxy = context.proxy.clone();
-                let current_gen = context.session.borrow().inflight.unwrap_or(0);
-                std::thread::spawn(move || {
-                    let result = crate::journal::setup_copy();
-                    proxy.send_event(UserEvent::Flow(crate::setup_flow::Event::CopyLoaded {
+fn journal_port() -> Option<u16> {
+    journal::status().ok().and_then(|status| status.port)
+}
+
+fn dispatch_effect(context: &Context, effect: &crate::setup_flow::Effect, port: Option<u16>) {
+    match effect {
+        crate::setup_flow::Effect::FetchCopy => {
+            let proxy = context.proxy.clone();
+            let current_gen = context.session.borrow().inflight.unwrap_or(0);
+            std::thread::spawn(move || {
+                let result = crate::journal::setup_copy();
+                proxy.send_event(UserEvent::Flow(crate::setup_flow::Event::CopyLoaded {
+                    generation: current_gen,
+                    result,
+                }));
+            });
+        }
+        crate::setup_flow::Effect::FetchState => {
+            let Some(port) = port else {
+                return;
+            };
+            let proxy = context.proxy.clone();
+            let current_gen = context.session.borrow().inflight.unwrap_or(0);
+            std::thread::spawn(move || {
+                let result = Convey::new(Some(port))
+                    .get("/init/api/state")
+                    .map_err(|refusal| refusal.message);
+                proxy.send_event(UserEvent::Flow(crate::setup_flow::Event::StateLoaded {
+                    generation: current_gen,
+                    result,
+                }));
+            });
+        }
+        crate::setup_flow::Effect::PostAction(action) => {
+            let Some(port) = port else {
+                return;
+            };
+            let proxy = context.proxy.clone();
+            let current_gen = context.session.borrow().inflight.unwrap_or(0);
+            let body = crate::setup_flow::action_body(action);
+            std::thread::spawn(move || {
+                let result = match Convey::new(Some(port)).post("/init/api/action", Some(&body)) {
+                    Ok(val) => Ok(val),
+                    Err(refusal) => Err(crate::setup_flow::ActionErrorPayload {
+                        reason_code: refusal.reason_code,
+                        message: refusal.message,
+                        is_transport: refusal.status.is_none(),
+                    }),
+                };
+                proxy.send_event(UserEvent::Flow(crate::setup_flow::Event::ActionCompleted {
+                    generation: current_gen,
+                    result,
+                }));
+            });
+        }
+        crate::setup_flow::Effect::RunSetup {
+            journal,
+            task_installed,
+            start_at_sign_in,
+        } => {
+            let proxy = context.proxy.clone();
+            let progress_proxy = proxy.clone();
+            let inflight_gen = context.session.borrow().inflight.unwrap_or(0);
+            let args = crate::setup_flow::setup_argv(journal, *task_installed, *start_at_sign_in);
+            std::thread::spawn(move || {
+                let result = journal::setup(&args, move |progress| {
+                    let message = json!({"type": "setup", "progress": progress});
+                    progress_proxy.send_event(UserEvent::Script(format!(
+                        "window.journalApp.receive({message});"
+                    )));
+                });
+                proxy.send_event(UserEvent::Flow(crate::setup_flow::Event::SetupFinished {
+                    generation: inflight_gen,
+                    result,
+                }));
+            });
+        }
+        crate::setup_flow::Effect::SetSignInLaunch(on) => {
+            let _ = shell::set_sign_in_launch(*on);
+        }
+        crate::setup_flow::Effect::CheckModels { generation } => {
+            let proxy = context.proxy.clone();
+            let current_gen = *generation;
+            std::thread::spawn(move || {
+                let result = journal::models_ready();
+                proxy.send_event(UserEvent::Flow(
+                    crate::setup_flow::Event::ModelsCheckFinished {
                         generation: current_gen,
                         result,
-                    }));
-                });
-            }
-            crate::setup_flow::Effect::FetchState => {
-                let proxy = context.proxy.clone();
-                let current_gen = context.session.borrow().inflight.unwrap_or(0);
-                std::thread::spawn(move || {
-                    let port = journal::status().ok().and_then(|s| s.port);
-                    let convey = Convey::new(port);
-                    let result = convey
-                        .get("/init/api/state")
-                        .map_err(|refusal| refusal.message);
-                    proxy.send_event(UserEvent::Flow(crate::setup_flow::Event::StateLoaded {
+                    },
+                ));
+            });
+        }
+        crate::setup_flow::Effect::InstallModels { generation } => {
+            let proxy = context.proxy.clone();
+            let current_gen = *generation;
+            std::thread::spawn(move || {
+                let result = journal::install_models();
+                proxy.send_event(UserEvent::Flow(
+                    crate::setup_flow::Event::ModelsInstallFinished {
                         generation: current_gen,
                         result,
-                    }));
-                });
-            }
-            crate::setup_flow::Effect::PostAction(action) => {
-                let proxy = context.proxy.clone();
-                let current_gen = context.session.borrow().inflight.unwrap_or(0);
-                let body = crate::setup_flow::action_body(action);
-                std::thread::spawn(move || {
-                    let port = journal::status().ok().and_then(|s| s.port);
-                    let convey = Convey::new(port);
-                    let res = convey.post("/init/api/action", Some(&body));
-                    let result = match res {
-                        Ok(val) => Ok(val),
-                        Err(refusal) => Err(crate::setup_flow::ActionErrorPayload {
-                            reason_code: refusal.reason_code,
-                            message: refusal.message,
-                            is_transport: refusal.status.is_none(),
-                        }),
-                    };
-                    proxy.send_event(UserEvent::Flow(crate::setup_flow::Event::ActionCompleted {
-                        generation: current_gen,
-                        result,
-                    }));
-                });
-            }
-            crate::setup_flow::Effect::RunSetup {
-                journal,
-                task_installed,
-                start_at_sign_in,
-            } => {
-                let proxy = context.proxy.clone();
-                let progress_proxy = proxy.clone();
-                let inflight_gen = context.session.borrow().inflight.unwrap_or(0);
-                let args =
-                    crate::setup_flow::setup_argv(journal, *task_installed, *start_at_sign_in);
-                std::thread::spawn(move || {
-                    let result = journal::setup(&args, move |progress| {
-                        let message = json!({"type": "setup", "progress": progress});
-                        progress_proxy.send_event(UserEvent::Script(format!(
-                            "window.journalApp.receive({message});"
-                        )));
-                    });
-                    proxy.send_event(UserEvent::Flow(crate::setup_flow::Event::SetupFinished {
-                        generation: inflight_gen,
-                        result,
-                    }));
-                });
-            }
-            crate::setup_flow::Effect::SetSignInLaunch(on) => {
-                let _ = shell::set_sign_in_launch(*on);
-            }
-            crate::setup_flow::Effect::CheckModels { generation } => {
-                let proxy = context.proxy.clone();
-                let current_gen = *generation;
-                std::thread::spawn(move || {
-                    let result = journal::models_ready();
-                    proxy.send_event(UserEvent::Flow(
-                        crate::setup_flow::Event::ModelsCheckFinished {
-                            generation: current_gen,
-                            result,
-                        },
-                    ));
-                });
-            }
-            crate::setup_flow::Effect::InstallModels { generation } => {
-                let proxy = context.proxy.clone();
-                let current_gen = *generation;
-                std::thread::spawn(move || {
-                    let result = journal::install_models();
-                    proxy.send_event(UserEvent::Flow(
-                        crate::setup_flow::Event::ModelsInstallFinished {
-                            generation: current_gen,
-                            result,
-                        },
-                    ));
-                });
-            }
-            crate::setup_flow::Effect::Browser(browser_effect) => match browser_effect {
-                crate::setup_flow::BrowserEffect::OpenHome => {
-                    let port = journal::status().ok().and_then(|s| s.port);
-                    let base = format!(
-                        "http://127.0.0.1:{}",
-                        port.unwrap_or(crate::convey::DEFAULT_PORT)
-                    );
-                    if is_loopback_base(&base) {
-                        let _ = shell::open(&format!("{base}{}", crate::setup_flow::APP_HOME_PATH));
-                    }
-                }
-                crate::setup_flow::BrowserEffect::Rejected => {}
-                crate::setup_flow::BrowserEffect::None => {}
-            },
+                    },
+                ));
+            });
+        }
+        crate::setup_flow::Effect::Browser(crate::setup_flow::BrowserEffect::OpenHome) => {
+            let Some(port) = port else {
+                return;
+            };
+            let _ = shell::open(&crate::setup_flow::home_url(port));
+        }
+        crate::setup_flow::Effect::Browser(
+            crate::setup_flow::BrowserEffect::Rejected | crate::setup_flow::BrowserEffect::None,
+        ) => {}
+    }
+}
+
+fn run_turn(context: &Context, step: crate::setup_flow::Step, reply: impl FnOnce(Value)) {
+    let mut step = step;
+    let bound =
+        crate::setup_flow::withhold_remote(&mut step.session, &mut step.effects, journal_port());
+    let rendered = crate::setup_flow::view(&step.session);
+    *context.session.borrow_mut() = step.session;
+    let port = bound.ok();
+    for item in crate::setup_flow::execution_order(&step.effects) {
+        match item {
+            crate::setup_flow::TurnItem::Reply => reply(rendered.clone()),
+            crate::setup_flow::TurnItem::Effect(effect) => dispatch_effect(context, &effect, port),
         }
     }
 }
@@ -386,20 +398,11 @@ fn handle(context: &Context, window: &Window, message: &str) {
             context.reply(&id, shell::set_sign_in_launch(on).map(|()| Value::Null));
         }
         "installModels" => {
-            let mut session = context.session.borrow_mut();
-            session.models_generation += 1;
-            let current_gen = session.models_generation;
-            let proxy = context.proxy.clone();
-            std::thread::spawn(move || {
-                let result = journal::install_models();
-                proxy.send_event(UserEvent::Flow(
-                    crate::setup_flow::Event::ModelsInstallFinished {
-                        generation: current_gen,
-                        result,
-                    },
-                ));
-            });
-            context.reply(&id, Ok(Value::Null));
+            let step = crate::setup_flow::reduce(
+                &context.session.borrow(),
+                &crate::setup_flow::Event::RetryModelsInstallClicked,
+            );
+            run_turn(context, step, |view| context.reply(&id, Ok(view)));
         }
         "modelsReady" => {
             let mut session = context.session.borrow_mut();
@@ -483,14 +486,27 @@ fn handle(context: &Context, window: &Window, message: &str) {
                     Err("that folder isn't there".to_owned())
                 }
             } else if target == "journal" {
-                let step = crate::setup_flow::reduce(
+                let mut step = crate::setup_flow::reduce(
                     &context.session.borrow(),
                     &crate::setup_flow::Event::OpenJournalClicked,
                 );
+                let wanted = step.browser_effect();
+                let bound = crate::setup_flow::withhold_remote(
+                    &mut step.session,
+                    &mut step.effects,
+                    journal_port(),
+                );
                 *context.session.borrow_mut() = step.session;
-                dispatch_effects(context, &step.effects);
-                match step.browser_effect() {
-                    crate::setup_flow::BrowserEffect::OpenHome => Ok(()),
+                match wanted {
+                    crate::setup_flow::BrowserEffect::OpenHome => match bound {
+                        Ok(port) => shell::open(&crate::setup_flow::home_url(port)),
+                        Err(()) => Err(context
+                            .session
+                            .borrow()
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "the journal isn't answering".to_owned())),
+                    },
                     crate::setup_flow::BrowserEffect::Rejected => {
                         Err("unexpected redirect destination".to_owned())
                     }
@@ -510,73 +526,20 @@ fn handle(context: &Context, window: &Window, message: &str) {
         }
         "flow" => {
             let intent = text("intent").unwrap_or_default();
-            let event = match intent.as_str() {
-                "boot" => {
-                    let Some(task_installed) = args.get("task_installed").and_then(Value::as_bool)
-                    else {
-                        context.reply(&id, Err("task_installed must be a boolean".to_owned()));
-                        return;
-                    };
-                    crate::setup_flow::Event::Boot { task_installed }
+            if matches!(intent.as_str(), "start-setup" | "startSetup") {
+                if let Some(path) = text("path").filter(|path| !path.trim().is_empty()) {
+                    context.session.borrow_mut().journal_path = PathBuf::from(path);
                 }
-                "acknowledge" | "acknowledge-welcome" | "acknowledgeWelcome" => {
-                    crate::setup_flow::Event::AcknowledgeWelcome
-                }
-                "choose-sign-in" | "chooseSignIn" => {
-                    let on = args
-                        .get("on")
-                        .or_else(|| args.get("start_at_sign_in"))
-                        .and_then(Value::as_bool)
-                        .unwrap_or(true);
-                    crate::setup_flow::Event::ChooseSignIn(on)
-                }
-                "continue-sign-in" | "continueSignIn" => crate::setup_flow::Event::ContinueSignIn,
-                "choose-folder" | "chooseFolder" => crate::setup_flow::Event::ChooseFolder(
-                    PathBuf::from(text("path").unwrap_or_default()),
-                ),
-                "start-setup" | "startSetup" => {
-                    if let Some(path) = text("path").filter(|p| !p.trim().is_empty()) {
-                        context.session.borrow_mut().journal_path = PathBuf::from(path);
-                    }
-                    crate::setup_flow::Event::StartSetup
-                }
-                "retry-setup" | "retrySetup" => crate::setup_flow::Event::RetrySetup,
-                "retry-state" | "retryState" => crate::setup_flow::Event::RetryState,
-                "regenerate-mark" | "regenerateMark" => {
-                    crate::setup_flow::Event::RegenerateMarkClicked
-                }
-                "commit-mark" | "commitMark" => crate::setup_flow::Event::CommitMarkClicked,
-                "choose-thinking" | "chooseThinking" => {
-                    crate::setup_flow::Event::ChooseThinking(text("choice").unwrap_or_default())
-                }
-                "start-thinking-download" | "startThinkingDownload" => {
-                    crate::setup_flow::Event::StartThinkingDownloadClicked
-                }
-                "cancel-thinking-download" | "cancelThinkingDownload" => {
-                    crate::setup_flow::Event::CancelThinkingDownloadClicked
-                }
-                "retry-speech-download" | "retrySpeechDownload" => {
-                    crate::setup_flow::Event::RetrySpeechDownloadClicked
-                }
-                "finalize" => crate::setup_flow::Event::FinalizeClicked {
-                    timezone: text("timezone"),
-                },
-                "open-journal" | "openJournal" => crate::setup_flow::Event::OpenJournalClicked,
-                "retry-models" | "retryModels" => {
-                    crate::setup_flow::Event::RetryModelsInstallClicked
-                }
-                "refresh" => crate::setup_flow::Event::Refresh,
-                "dismiss-error" | "dismissError" => crate::setup_flow::Event::DismissError,
-                _ => {
-                    context.reply(&id, Err(format!("unknown flow intent {intent}")));
+            }
+            let event = match crate::setup_flow::event_from_intent(&intent, &args) {
+                Ok(event) => event,
+                Err(error) => {
+                    context.reply(&id, Err(error));
                     return;
                 }
             };
             let step = crate::setup_flow::reduce(&context.session.borrow(), &event);
-            *context.session.borrow_mut() = step.session;
-            dispatch_effects(context, &step.effects);
-            let view = crate::setup_flow::view(&context.session.borrow());
-            context.reply(&id, Ok(view));
+            run_turn(context, step, |view| context.reply(&id, Ok(view)));
         }
         "adminTerminal" => {
             context.reply(
@@ -757,11 +720,10 @@ pub fn run(launch: Launch, update_feed: Option<String>) {
         WindowEvent::User(UserEvent::Script(script)) => page.run_script(&script),
         WindowEvent::User(UserEvent::Flow(flow_event)) => {
             let step = crate::setup_flow::reduce(&context.session.borrow(), &flow_event);
-            *context.session.borrow_mut() = step.session;
-            dispatch_effects(&context, &step.effects);
-            let view = crate::setup_flow::view(&context.session.borrow());
-            let message = json!({"type": "flow", "view": view});
-            page.run_script(&format!("window.journalApp.receive({message});"));
+            run_turn(&context, step, |view| {
+                let message = json!({"type": "flow", "view": view});
+                page.run_script(&format!("window.journalApp.receive({message});"));
+            });
         }
         WindowEvent::User(UserEvent::Show) => {
             looped.bring_forward();

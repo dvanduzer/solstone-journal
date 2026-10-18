@@ -17,6 +17,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 
 - on windows, the journal window finishes welcome, the sign-in choice, folder, mark, and thinking itself, and "open your journal" opens home only when you ask. the first time you set your journal up, you can leave start-at-sign-in on or turn it off, and setting up again keeps the choice already registered. speech that is already in the app and fails its check tells you to repair or reinstall rather than offering a download retry, and a failed model check stays on the window in the check's own words until a later check succeeds. the devices action says pair a device, and the dialog says pairing link.
+- browser setup confirms the journal mark you see, then saves where thinking runs.
+- on windows, the journal window takes you through welcome and how it fits, the sign-in choice you can still change, your folder, the mark you see, and where thinking runs, then shows home once. speech and thinking downloads show their progress on that step and at home, and a later update leaves the page and the pairing dialog you already have open.
 - setup commits the journal mark you see and saves your thinking choice. it opens home, with links to finish setting up your own model or confidential processing. finishing setup again keeps your completion time and settings.
 - while no device is paired, home keeps "set one up →" next to anything that needs your attention. before, it disappeared whenever anything else showed, which on a new journal was almost always.
 - not having chosen where the thinking happens yet no longer counts as something that needs your attention on home. a note says your journal starts catching up once you choose, and links to the thinking app.

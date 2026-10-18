@@ -1307,6 +1307,7 @@ pub fn setup_copy(_facts: &SetupCatalogFacts) -> serde_json::Value {
         .collect::<Vec<_>>();
     serde_json::json!({
         "schema": "solstone.setup-copy.v1",
+        "heading": "your journal",
         "welcome": {
             "title": "welcome to solstone.",
             "body": "the solstone app takes in what you share with it, and all of it goes into your journal.",
@@ -1315,6 +1316,15 @@ pub fn setup_copy(_facts: &SetupCatalogFacts) -> serde_json::Value {
                 "the solstone app takes in what you share with it, and all of it goes into your journal.",
                 "your journal is always private, only yours."
             ]
+        },
+        "fits": {
+            "title": "how it fits together",
+            "journal_term": "your journal",
+            "journal": "lives on your journal's computer and keeps everything that goes into it.",
+            "app_term": "the solstone app",
+            "app": "runs on each device you choose and takes in what you share with it. all of it goes into your journal.",
+            "thinking_term": "thinking",
+            "thinking": "helps your journal make sense of what it keeps. choose where it happens below, or later."
         },
         "login": {
             "label": "start your journal when you sign in",
@@ -1329,6 +1339,7 @@ pub fn setup_copy(_facts: &SetupCatalogFacts) -> serde_json::Value {
         "mark": {
             "title": "your journal mark",
             "help": "a unique visual mark created for your journal.",
+            "error": "your journal mark could not be loaded. try again.",
             "permanence": "continue makes this your journal's mark for good.",
             "try_another": "try another",
             "continue": "continue"
@@ -1446,12 +1457,34 @@ mod tests {
         let copy = setup_copy(&facts);
         assert_eq!(copy["schema"], "solstone.setup-copy.v1");
         assert!(copy.get("welcome").is_some());
+        assert!(copy.get("fits").is_some());
         assert!(copy.get("login").is_some());
         assert!(copy.get("folder").is_some());
         assert!(copy.get("mark").is_some());
         assert!(copy.get("thinking").is_some());
         assert!(copy.get("downloads").is_some());
         assert!(copy.get("footer").is_some());
+
+        for key in [
+            "title",
+            "journal_term",
+            "journal",
+            "app_term",
+            "app",
+            "thinking_term",
+            "thinking",
+        ] {
+            assert!(
+                copy["fits"][key]
+                    .as_str()
+                    .is_some_and(|text| !text.is_empty())
+            );
+        }
+        assert!(
+            copy["mark"]["error"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+        );
 
         let welcome = &copy["welcome"];
         assert_eq!(welcome["title"], "welcome to solstone.");

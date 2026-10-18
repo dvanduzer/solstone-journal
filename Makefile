@@ -1464,6 +1464,10 @@ ci-contained:
 
 ci-under-poison:
 	@test "$$SOLSTONE_CI_POISONED" = 1 || { echo "ci-under-poison is internal; run 'make ci'" >&2; exit 2; }
+	@if [ -f core/crates/solstone-core-journal-app/ui/app.js ]; then \
+	  node --check --input-type=module < core/crates/solstone-core-journal-app/ui/app.js && \
+	  node --check --input-type=module < core/crates/solstone-core-journal-app/ui/mark.js; \
+	fi
 	@$(MAKE) check-rust-fmt
 	@$(MAKE) check-rust-ci-topology
 	@$(MAKE) check-rust-clippy

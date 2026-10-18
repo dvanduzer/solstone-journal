@@ -4735,6 +4735,7 @@ dependencies = [
  "solstone-core-about",
  "tempfile",
  "ureq",
+ "url",
  "velopack",
  "webview2-com",
  "windows 0.61.3",

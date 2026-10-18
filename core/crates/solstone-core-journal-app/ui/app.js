@@ -118,6 +118,7 @@ const COPY = {
     install_models: 'downloading models',
     service: 'starting your journal',
     brain: 'setting up the model',
+  },
   adoptLandingLine: 'nothing moved. your journal was always here.',
   // updates (the Mac app's update words)
   updates: {
@@ -162,7 +163,7 @@ let nextId = 1;
 function call(cmd, args = {}) {
   return new Promise((resolve, reject) => {
     const id = nextId++;
-    waiting.set(id, { resolve, reject });
+    waiting.set(id, { resolve, reject, cmd });
     window.chrome.webview.postMessage(JSON.stringify({ id, cmd, args }));
   });
 }
@@ -175,6 +176,15 @@ window.journalApp = {
       const entry = waiting.get(message.id);
       if (!entry) return;
       waiting.delete(message.id);
+      if (entry.cmd === 'flow') {
+        if (message.ok) {
+          renderFlow(message.value);
+        } else {
+          const text = typeof message.error === 'string' ? message.error : String(message.error ?? '');
+          if (state.flow) renderFlow({ ...state.flow, busy: false, error: text });
+          else $('loading').replaceChildren(el('p', { class: 'error' }, document.createTextNode(text)));
+        }
+      }
       if (message.ok) {
         entry.resolve(message.value);
       } else {
@@ -369,22 +379,118 @@ function syncDownloadWatch(watch) {
   }
 }
 
+let thinkingChoicesOpen = false;
+let homeLanded = false;
+
+function stepSequence(view) {
+  const copy = view.copy || {};
+  const labels = [
+    copy.welcome?.title || copy.heading || '',
+    copy.folder?.title || '',
+    copy.mark?.title || '',
+    copy.thinking?.title || '',
+  ];
+  const items = labels.map((text, index) => {
+    const number = index + 1;
+    const item = el('li', {}, document.createTextNode(text || String(number)));
+    if (view.step === number) item.setAttribute('aria-current', 'step');
+    return item;
+  });
+  const home = el('li', {}, document.createTextNode('5'));
+  if (view.step === 5) home.setAttribute('aria-current', 'step');
+  items.push(home);
+  return el('ol', { class: 'setup-steps' }, ...items);
+}
+
+function fitsLines(fits) {
+  const lines = [];
+  if (fits.title) lines.push(el('h2', {}, document.createTextNode(fits.title)));
+  for (const key of ['journal', 'app', 'thinking']) {
+    if (fits[`${key}_term`]) lines.push(el('p', {}, document.createTextNode(fits[`${key}_term`])));
+    if (fits[key]) lines.push(el('p', { class: 'muted' }, document.createTextNode(fits[key])));
+  }
+  return lines;
+}
+
+function thinkingChoiceNodes(view) {
+  const thinkingCopy = view.copy?.thinking || {};
+  const choices = Array.isArray(thinkingCopy.choices) ? thinkingCopy.choices : [];
+  const savedId = view.thinking_choice;
+  const saved = view.thinking_saved && ['local', 'spp', 'byo', 'later'].includes(savedId);
+  if (saved && !thinkingChoicesOpen) {
+    const label = savedId === 'later'
+      ? (thinkingCopy.later || '')
+      : (choices.find(choice => choice.id === savedId)?.label || '');
+    return [
+      el('p', {}, document.createTextNode(label)),
+      thinkingCopy.change ? el('button', {
+        type: 'button',
+        disabled: Boolean(view.busy),
+        on: { click: () => { thinkingChoicesOpen = true; renderFlow(state.flow); } },
+      }, document.createTextNode(thinkingCopy.change)) : null,
+    ];
+  }
+  const nodes = [];
+  for (const choice of choices) {
+    if (choice.id === 'local' && !view.local_offered) {
+      nodes.push(el('div', { class: 'field' },
+        el('p', {}, document.createTextNode(choice.label || '')),
+        choice.sub ? el('p', { class: 'muted' }, document.createTextNode(choice.sub)) : null));
+      continue;
+    }
+    let line = choice.sub;
+    if (choice.id === 'local' && view.local_offered && typeof view.default_line === 'string' && view.default_line) {
+      line = view.default_line;
+    }
+    nodes.push(el('div', { class: 'field' },
+      el('button', {
+        type: 'button',
+        disabled: Boolean(view.busy),
+        on: { click: () => call('flow', { intent: 'choose-thinking', choice: choice.id }) },
+      }, document.createTextNode(choice.label || choice.id)),
+      line ? el('p', { class: 'muted' }, document.createTextNode(line)) : null));
+  }
+  if (typeof thinkingCopy.later === 'string' && thinkingCopy.later) {
+    nodes.push(el('button', {
+      type: 'button',
+      disabled: Boolean(view.busy),
+      on: { click: () => call('flow', { intent: 'choose-thinking', choice: 'later' }) },
+    }, document.createTextNode(thinkingCopy.later)));
+  }
+  return nodes;
+}
+
 function renderFlow(view) {
   if (!view) return;
+  const previousPhase = state.flow?.phase ?? null;
   state.flow = view;
   syncDownloadWatch(view.watch_downloads);
+  if (view.phase !== previousPhase) thinkingChoicesOpen = false;
 
+  if (view.resting) {
+    show('main');
+    render();
+    return;
+  }
   if (view.phase === 'home') {
     landHome(view);
     return;
   }
 
   const root = $('firstrun');
+  const focused = document.activeElement;
+  if (view.phase === previousPhase && focused && focused.tagName === 'INPUT' && root.contains(focused)) {
+    return;
+  }
+
   root.replaceChildren();
+  root.setAttribute('data-phase', view.phase);
   const card = el('div', { class: 'firstrun-card' });
   root.append(card);
-
   const copy = view.copy || {};
+  if (['welcome', 'sign-in', 'folder', 'mark', 'thinking'].includes(view.phase)) {
+    card.append(stepSequence(view));
+  }
 
   if (view.phase === 'opening') {
     put(card,
@@ -393,26 +499,23 @@ function renderFlow(view) {
         el('button', {
           type: 'button',
           disabled: Boolean(view.busy),
-          on: { click: () => call('flow', { intent: 'retry-state' }) }
+          on: { click: () => call('flow', { intent: 'retry-state' }) },
         }, document.createTextNode(COPY.tryAgain))
       ) : null
     );
   } else if (view.phase === 'welcome') {
     const welcome = copy.welcome || {};
-    const fits = Array.isArray(welcome.how_it_fits)
-      ? welcome.how_it_fits.map(line => el('p', { class: 'muted' }, document.createTextNode(line)))
-      : (welcome.how_it_fits ? [el('p', { class: 'muted' }, document.createTextNode(welcome.how_it_fits))] : []);
     put(card,
-      welcome.title ? el('h1', {}, document.createTextNode(welcome.title)) : null,
+      el('h1', {}, document.createTextNode(welcome.title || copy.heading || '')),
       welcome.body ? el('p', {}, document.createTextNode(welcome.body)) : null,
-      ...fits,
+      ...fitsLines(copy.fits || {}),
       view.error ? el('p', { class: 'error' }, document.createTextNode(view.error)) : null,
       el('div', { class: 'actions' },
         el('button', {
           type: 'button',
           class: 'primary',
           disabled: Boolean(view.busy),
-          on: { click: () => call('flow', { intent: 'acknowledge' }) }
+          on: { click: () => call('flow', { intent: 'acknowledge' }) },
         }, document.createTextNode(COPY.continueButton))
       )
     );
@@ -442,7 +545,7 @@ function renderFlow(view) {
           type: 'button',
           class: 'primary',
           disabled: Boolean(view.busy),
-          on: { click: () => call('flow', { intent: 'continue-sign-in' }) }
+          on: { click: () => call('flow', { intent: 'continue-sign-in' }) },
         }, document.createTextNode(COPY.continueButton))
       )
     );
@@ -479,7 +582,7 @@ function renderFlow(view) {
                 firstRun.holdsJournal = picked.holds_journal;
                 renderFlow(state.flow);
               }
-            }}
+            } },
           }, document.createTextNode(folderCopy.change || COPY.chooseLocation))
         ),
         firstRun.holdsJournal ? el('p', { class: 'faint' }, document.createTextNode(COPY.journalFound)) : null
@@ -494,7 +597,7 @@ function renderFlow(view) {
             firstRun.adopted = firstRun.holdsJournal;
             firstRun.steps = [];
             call('flow', { intent: 'start-setup', path: firstRun.location });
-          }}
+          } },
         }, document.createTextNode(folderCopy.continue || COPY.continueButton))
       )
     );
@@ -513,7 +616,7 @@ function renderFlow(view) {
           el('button', {
             type: 'button',
             disabled: Boolean(view.busy),
-            on: { click: () => call('flow', { intent: 'retry-setup' }) }
+            on: { click: () => call('flow', { intent: 'retry-setup' }) },
           }, document.createTextNode(COPY.tryAgain))
         ) : null
       );
@@ -524,100 +627,89 @@ function renderFlow(view) {
           el('button', {
             type: 'button',
             disabled: Boolean(view.busy),
-            on: { click: () => call('flow', { intent: 'retry-state' }) }
+            on: { click: () => call('flow', { intent: 'retry-state' }) },
           }, document.createTextNode(COPY.tryAgain))
         ) : null
       );
     }
   } else if (view.phase === 'mark') {
     const markCopy = copy.mark || {};
+    const proposalId = typeof view.mark?.proposal_id === 'string' ? view.mark.proposal_id : '';
     const markBox = el('div');
-    renderMarkCard(markBox, view.mark?.render);
+    const markMissing = view.mark?.render == null;
+    if (!markMissing) renderMarkCard(markBox, view.mark.render);
     put(card,
-      markCopy.title ? el('h1', {}, document.createTextNode(markCopy.title)) : null,
+      markCopy.title ? el('h1', {}, document.createTextNode(markCopy.title)) : el('h1', {}, document.createTextNode('')),
       markCopy.help ? el('p', { class: 'muted' }, document.createTextNode(markCopy.help)) : null,
-      markBox,
+      markMissing
+        ? (markCopy.error ? el('p', { class: 'error' }, document.createTextNode(markCopy.error)) : null)
+        : markBox,
       markCopy.permanence ? el('p', { class: 'faint' }, document.createTextNode(markCopy.permanence)) : null,
       view.error ? el('p', { class: 'error' }, document.createTextNode(view.error)) : null,
       el('div', { class: 'actions' },
         markCopy.try_another ? el('button', {
           type: 'button',
           disabled: Boolean(view.busy),
-          on: { click: () => call('flow', { intent: 'regenerate-mark' }) }
+          on: { click: () => call('flow', { intent: 'regenerate-mark' }) },
         }, document.createTextNode(markCopy.try_another)) : null,
         el('button', {
           type: 'button',
           class: 'primary',
           disabled: Boolean(view.busy),
-          on: { click: () => call('flow', { intent: 'commit-mark' }) }
+          on: { click: () => call('flow', { intent: 'commit-mark', proposal_id: proposalId }) },
         }, document.createTextNode(markCopy.continue || COPY.continueButton))
       )
     );
   } else if (view.phase === 'thinking') {
-    const thinkingCopy = copy.thinking || {};
-    const choices = thinkingCopy.choices || [];
-    const changeHeader = (view.thinking_saved && thinkingCopy.change)
-      ? el('p', { class: 'muted' }, document.createTextNode(thinkingCopy.change))
-      : null;
-    const choiceNodes = choices
-      .filter(choice => choice.id !== 'local' || view.local_offered)
-      .map(choice => {
-        let line = choice.sub;
-        if (choice.id === 'local' && view.local_offered && typeof view.default_line === 'string' && view.default_line.length > 0) {
-          line = view.default_line;
-        }
-        return el('div', { class: 'field' },
-          el('button', {
-            type: 'button',
-            disabled: Boolean(view.busy),
-            on: { click: () => call('flow', { intent: 'choose-thinking', choice: choice.id }) }
-          }, document.createTextNode(choice.label || choice.id)),
-          line ? el('p', { class: 'muted' }, document.createTextNode(line)) : null,
-          choice.description ? el('p', {}, document.createTextNode(choice.description)) : null
-        );
-      });
-    const laterButton = (thinkingCopy.later && typeof thinkingCopy.later === 'string')
-      ? el('button', {
-          type: 'button',
-          disabled: Boolean(view.busy),
-          on: { click: () => call('flow', { intent: 'choose-thinking', choice: 'later' }) }
-        }, document.createTextNode(thinkingCopy.later))
-      : null;
+    const thinkingCopy = view.copy?.thinking || {};
     const finalizeButton = view.can_finalize ? el('button', {
       type: 'button',
       class: 'primary',
       disabled: Boolean(view.busy),
       on: { click: () => {
         let tz = null;
-        try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch {}
+        try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch { /* the journal can place the day */ }
         call('flow', { intent: 'finalize', timezone: tz });
-      }}
+      } },
     }, document.createTextNode(thinkingCopy.continue || COPY.continueButton)) : null;
-
     put(card,
-      thinkingCopy.title ? el('h1', {}, document.createTextNode(thinkingCopy.title)) : null,
-      changeHeader,
-      ...choiceNodes,
-      el('div', { class: 'actions' },
-        laterButton,
-        finalizeButton
-      ),
-      view.error ? el('p', { class: 'error' }, document.createTextNode(view.error)) : null
+      thinkingCopy.title ? el('h1', {}, document.createTextNode(thinkingCopy.title)) : el('h1', {}, document.createTextNode('')),
+      ...thinkingChoiceNodes(view),
+      speechBlock(),
+      thinkingBlock(),
+      modelsBlock(),
+      view.error ? el('p', { class: 'error' }, document.createTextNode(view.error)) : null,
+      el('div', { class: 'actions' }, finalizeButton)
     );
   }
 
   show('firstrun');
+  if (view.phase !== previousPhase) {
+    const heading = card.querySelector('h1');
+    if (heading) {
+      heading.tabIndex = -1;
+      heading.focus();
+    }
+  }
 }
 
 function landHome(view) {
-  if (firstRun.adopted) state.message = COPY.adoptLandingLine;
-  state.pane = 'home';
   state.flow = view;
-  show('main');
-  render();
-  if (display() === 'running') {
-    loadJournalFacts();
+  if (!homeLanded) {
+    homeLanded = true;
+    state.pane = 'home';
+    show('main');
+    if (firstRun.adopted) state.message = COPY.adoptLandingLine;
+    render(true);
+    const heading = $('pane').querySelector('h1');
+    if (heading) {
+      heading.tabIndex = -1;
+      heading.focus();
+    }
+    if (display() === 'running') loadJournalFacts();
+    return;
   }
+  if (!$('main').hidden && state.pane === 'home') render(false);
 }
 
 listeners.flow.push(({ view }) => {
@@ -678,6 +770,11 @@ function message() {
   return state.message ? el('p', { class: 'muted' }, state.message) : null;
 }
 
+function flowError() {
+  const text = state.flow?.error;
+  return text ? el('p', { class: 'error' }, document.createTextNode(text)) : null;
+}
+
 function info(label, value) {
   return el('div', { class: 'info' }, el('h2', {}, label), el('div', { class: 'value' }, value));
 }
@@ -689,40 +786,45 @@ function openPage(target) {
   });
 }
 
+function retryWord(copy) {
+  return typeof copy.retry === 'string' && copy.retry ? copy.retry : COPY.tryAgain;
+}
+
+function showsBytes(download) {
+  return typeof download.bytes_total === 'number'
+    || (typeof download.bytes_done === 'number' && download.bytes_done > 0)
+    || download.state === 'downloading';
+}
+
+function byteText(download) {
+  const done = typeof download.bytes_done === 'number' ? String(download.bytes_done) : '';
+  const total = typeof download.bytes_total === 'number' ? String(download.bytes_total) : '';
+  return [done, total].filter(Boolean).join(' ');
+}
+
 function speechBlock() {
   const flow = state.flow;
   const speech = flow?.downloads?.speech;
   if (!speech) return null;
   const copy = flow.copy?.downloads || {};
-  if (speech.state === 'complete') {
-    return copy.complete ? el('div', { class: 'notice' },
-      el('p', {}, document.createTextNode(copy.complete))
-    ) : null;
+  const parts = [];
+  if (copy.speech) parts.push(el('p', {}, document.createTextNode(copy.speech)));
+  if (speech.state === 'idle' && copy.idle) parts.push(el('p', { class: 'muted' }, document.createTextNode(copy.idle)));
+  if (speech.state === 'complete' && copy.complete) parts.push(el('p', { class: 'muted' }, document.createTextNode(copy.complete)));
+  if (speech.state === 'cancelled' && copy.cancelled) parts.push(el('p', { class: 'muted' }, document.createTextNode(copy.cancelled)));
+  if (speech.state === 'error' && speech.error?.detail) {
+    parts.push(el('p', {}, document.createTextNode(speech.error.detail)));
   }
-  if (speech.state === 'idle') {
-    return copy.idle ? el('div', { class: 'notice' },
-      el('p', {}, document.createTextNode(copy.idle))
-    ) : null;
-  }
-  if (speech.state === 'error') {
-    const detail = speech.error?.detail;
-    const retry = flow.speech_retry ? el('button', {
+  if (showsBytes(speech)) parts.push(el('p', { class: 'bytes' }, document.createTextNode(byteText(speech))));
+  if (speech.state === 'error' && flow.speech_retry) {
+    parts.push(el('button', {
       type: 'button',
       disabled: Boolean(flow.busy),
-      on: { click: () => call('flow', { intent: 'retry-speech-download' }) }
-    }, COPY.tryAgain) : null;
-    if (!detail && !retry) return null;
-    return el('div', { class: 'notice' },
-      detail ? el('p', {}, document.createTextNode(detail)) : null,
-      retry
-    );
+      on: { click: () => call('flow', { intent: 'retry-speech-download' }) },
+    }, document.createTextNode(retryWord(copy))));
   }
-  if (speech.state === 'downloading') {
-    return copy.progress ? el('div', { class: 'notice' },
-      el('p', {}, document.createTextNode(copy.progress))
-    ) : null;
-  }
-  return null;
+  if (!parts.length) return null;
+  return el('div', { class: 'notice', 'data-download': 'speech' }, ...parts);
 }
 
 function thinkingBlock() {
@@ -730,32 +832,32 @@ function thinkingBlock() {
   const thinking = flow?.downloads?.thinking;
   if (!thinking) return null;
   const copy = flow.copy?.downloads || {};
-  if (thinking.state === 'complete') {
-    return copy.complete ? el('div', { class: 'notice' },
-      el('p', {}, document.createTextNode(copy.complete))
-    ) : null;
+  const parts = [];
+  if (copy.thinking) parts.push(el('p', {}, document.createTextNode(copy.thinking)));
+  if (thinking.state === 'idle' && copy.idle) parts.push(el('p', { class: 'muted' }, document.createTextNode(copy.idle)));
+  if (thinking.state === 'complete' && copy.complete) parts.push(el('p', { class: 'muted' }, document.createTextNode(copy.complete)));
+  if (thinking.state === 'cancelled' && copy.cancelled) parts.push(el('p', { class: 'muted' }, document.createTextNode(copy.cancelled)));
+  if (thinking.state === 'error' && thinking.error?.detail) {
+    parts.push(el('p', {}, document.createTextNode(thinking.error.detail)));
   }
-  const text = thinking.state === 'downloading'
-    ? copy.progress
-    : thinking.error?.detail;
-  const retryButton = flow.thinking_retry ? el('button', {
-    type: 'button',
-    disabled: Boolean(flow.busy),
-    on: { click: () => call('flow', { intent: 'start-thinking-download' }) }
-  }, COPY.tryAgain) : null;
-  const cancelButton = (flow.thinking_cancel && copy.cancel) ? el('button', {
-    type: 'button',
-    disabled: Boolean(flow.busy),
-    on: { click: () => call('flow', { intent: 'cancel-thinking-download' }) }
-  }, copy.cancel) : null;
-
-  if (!text && !retryButton && !cancelButton) return null;
-
-  return el('div', { class: 'notice' },
-    text ? el('p', {}, document.createTextNode(text)) : null,
-    retryButton,
-    cancelButton
-  );
+  if (showsBytes(thinking)) parts.push(el('p', { class: 'bytes' }, document.createTextNode(byteText(thinking))));
+  if (flow.thinking_retry && ['error', 'cancelled', 'idle'].includes(thinking.state)) {
+    parts.push(el('button', {
+      type: 'button',
+      disabled: Boolean(flow.busy),
+      on: { click: () => call('flow', { intent: 'start-thinking-download' }) },
+    }, document.createTextNode(retryWord(copy))));
+  }
+  const paintedAttempt = typeof thinking.attempt_id === 'string' ? thinking.attempt_id : '';
+  if (flow.thinking_cancel && paintedAttempt.trim()) {
+    parts.push(el('button', {
+      type: 'button',
+      disabled: Boolean(flow.busy),
+      on: { click: () => call('flow', { intent: 'cancel-thinking-download', attempt_id: paintedAttempt }) },
+    }, document.createTextNode(copy.cancel || COPY.cancel)));
+  }
+  if (!parts.length) return null;
+  return el('div', { class: 'notice', 'data-download': 'thinking' }, ...parts);
 }
 
 function modelsBlock() {
@@ -765,9 +867,9 @@ function modelsBlock() {
     el('p', {}, document.createTextNode(flow.models.detail || '')),
     el('button', {
       type: 'button',
-      disabled: Boolean(flow.busy),
-      on: { click: () => call('flow', { intent: 'retry-models' }) }
-    }, COPY.tryAgain)
+      disabled: Boolean(flow.models.pending) || Boolean(flow.busy),
+      on: { click: () => call('flow', { intent: 'retry-models' }) },
+    }, document.createTextNode(COPY.tryAgain))
   );
 }
 
@@ -794,6 +896,7 @@ const panes = {
       markBox,
       statusLine(),
       message(),
+      flowError(),
       speechBlock(),
       thinkingBlock(),
       modelsBlock(),
@@ -822,6 +925,7 @@ const panes = {
       el('h1', {}, COPY.panes.run),
       statusLine(),
       message(),
+      flowError(),
       el('div', { class: 'actions spaced' },
         el('button', { type: 'button', disabled: busy, on: { click: () => serviceAction('start') } }, COPY.start),
         el('button', { type: 'button', disabled: busy, on: { click: () => serviceAction('stop') } }, COPY.stop),
@@ -1415,8 +1519,7 @@ async function main() {
     await serviceAction('start');
   }
 
-  const flow = await call('flow', { intent: 'boot', task_installed: state.status.service.installed });
-  renderFlow(flow);
+  await call('flow', { intent: 'boot', task_installed: state.status.service.installed });
 
   startPolling();
 
