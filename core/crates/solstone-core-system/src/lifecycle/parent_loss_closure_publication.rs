@@ -23,6 +23,25 @@ struct PreparedChunk {
 }
 
 #[derive(Serialize, Deserialize)]
+struct AuditedInput {
+    batch_digest: String,
+    ids_digest: String,
+    chunk_digest: String,
+}
+
+/// Writer-owned commit of completed source validation. A prepared chunk and
+/// its adjacent checksum cannot authorize themselves. This commit is replaced
+/// only after its exact inputs have passed source validation and its canonical
+/// output has been durably written.
+#[derive(Serialize, Deserialize)]
+struct AuditProgress {
+    schema: u32,
+    generation: ParentLossGeneration,
+    sealed_phase: ParentLossPhase,
+    inputs: HashMap<u64, AuditedInput>,
+}
+
+#[derive(Serialize, Deserialize)]
 struct Publication {
     schema: u32,
     generation: ParentLossGeneration,
@@ -283,6 +302,28 @@ pub(super) fn publish(
         }
         provisional_sources.insert(id.clone(), derived.sources);
     }
+    let progress_path = dir.join("audit-progress.json");
+    let mut progress = match read_json_durable_validated::<AuditProgress>(
+        ArtifactId::ParentLossClosureRecovery,
+        &progress_path,
+        |p| {
+            if p.schema != 1
+                || p.generation != generation
+                || p.sealed_phase != ParentLossPhase::Sealed
+            {
+                return Err("invalid audit progress envelope".to_owned());
+            }
+            Ok(())
+        },
+    )? {
+        DurableRead::Present(p) => p,
+        _ => AuditProgress {
+            schema: 1,
+            generation,
+            sealed_phase: ParentLossPhase::Sealed,
+            inputs: HashMap::new(),
+        },
+    };
     let mut rows = HashMap::new();
     let mut inputs = Vec::new();
     for seq in seqs {
@@ -293,77 +334,32 @@ pub(super) fn publish(
         }
         let batch_path = ledger.closure_recovery_batch_path(generation, seq);
         let ids_path = ledger.closure_recovery_ids_path(generation, seq);
-        let batch_bytes = fs::read(&batch_path)?;
-        let ids_bytes = fs::read(&ids_path)?;
-        let batch_digest = digest_bytes(&batch_bytes);
-        let ids_digest = digest_bytes(&ids_bytes);
-        let prepared_path = dir.join(format!("audited-{seq:06}.json"));
-        let stamp_path = dir.join(format!("audited-{seq:06}.sha256"));
-        let batch: RecoveryBatchFile = serde_json::from_slice(&batch_bytes)?;
-        let index: RecoveryIdsFile = serde_json::from_slice(&ids_bytes)?;
-        let roster: Vec<_> = batch.entries.iter().map(|r| r.launch_id.clone()).collect();
-        if batch.schema != PARENT_LOSS_RECOVERY_SCHEMA_V1
-            || batch.generation != generation
-            || batch.sealed_phase != ParentLossPhase::Sealed
-            || batch.kind != RecoveryArtifactKind::Batch
-            || batch.seq != seq
-            || index.seq != seq
-            || index.generation != generation
-            || index.schema != PARENT_LOSS_RECOVERY_SCHEMA_V1
-            || index.kind != RecoveryArtifactKind::Ids
-            || index.sealed_phase != ParentLossPhase::Sealed
-            || roster != index.ids
-            || !batch
-                .entries
-                .iter()
-                .all(|row| completed_row_is_authorized(ledger, generation, row))
-        {
-            // These are derived caches; preserve them and revisit original evidence next time.
-            for path in [
-                &batch_path,
-                &ids_path,
-                &ledger.closure_recovery_receipt_path(generation, seq),
-            ] {
+        let receipt_path = ledger.closure_recovery_receipt_path(generation, seq);
+        let preserve_invalid = || -> Result<ClosureOutcome, ParentLossLedgerError> {
+            // No derived payload can make a scheduling hint authoritative. Drop
+            // the hint with the damaged payload so the next scan reads originals.
+            for path in [&batch_path, &ids_path, &receipt_path] {
                 if path.exists() {
                     set_aside(path)?;
                 }
             }
-            return Ok(ClosureOutcome::Refused(
+            Ok(ClosureOutcome::Refused(
                 BootstrapRecoveryReason::CoordinatorNotLive,
-            ));
-        }
-        let mut prepared = Vec::with_capacity(batch.entries.len());
-        for row in batch.entries {
-            let closure = AdmissionClosure {
-                launch_id: row.launch_id.clone(),
-                service: row.service,
-                instance: row.instance,
-                uid: row.uid,
-                finding: row.finding,
-            };
-            let sealed = match (row.instance, row.uid) {
-                (Some(instance), Some(uid)) => Some(serde_json::to_string(&SealedAdmission {
-                    launch_id: row.launch_id.clone(),
-                    service: row.service,
-                    identity: AdmissionIdentity {
-                        generation,
-                        launch_id: row.launch_id.clone(),
-                        instance,
-                        uid,
-                        parent_launch_id: row.parent_launch_id,
-                    },
-                })?),
-                _ => None,
-            };
-            prepared.push(PreparedAdmission {
-                launch_id: row.launch_id,
-                closure: serde_json::to_string(&closure)?,
-                sealed,
-            });
-        }
-        let retained = fs::read(&prepared_path).ok().and_then(|bytes| {
-            let stamp = fs::read_to_string(&stamp_path).ok()?;
-            if digest_bytes(&bytes) != stamp {
+            ))
+        };
+        let (Ok(batch_bytes), Ok(ids_bytes)) = (fs::read(&batch_path), fs::read(&ids_path)) else {
+            return preserve_invalid();
+        };
+        let batch_digest = digest_bytes(&batch_bytes);
+        let ids_digest = digest_bytes(&ids_bytes);
+        let prepared_path = dir.join(format!("audited-{seq:06}.json"));
+        let stamp_path = dir.join(format!("audited-{seq:06}.sha256"));
+        let retained = progress.inputs.get(&seq).and_then(|committed| {
+            if committed.batch_digest != batch_digest || committed.ids_digest != ids_digest {
+                return None;
+            }
+            let bytes = fs::read(&prepared_path).ok()?;
+            if digest_bytes(&bytes) != committed.chunk_digest {
                 return None;
             }
             let chunk: PreparedChunk = serde_json::from_slice(&bytes).ok()?;
@@ -374,9 +370,73 @@ pub(super) fn publish(
                 && chunk.ids_digest == ids_digest)
                 .then_some(chunk)
         });
-        let chunk = if let Some(chunk) = retained.filter(|chunk| chunk.rows == prepared) {
+        let chunk = if let Some(chunk) = retained {
             chunk
         } else {
+            let parsed = (|| {
+                let batch: RecoveryBatchFile = serde_json::from_slice(&batch_bytes).ok()?;
+                let index: RecoveryIdsFile = serde_json::from_slice(&ids_bytes).ok()?;
+                let receipt: RecoveryBatchReceipt =
+                    serde_json::from_slice(&fs::read(&receipt_path).ok()?).ok()?;
+                let roster: Vec<_> = batch.entries.iter().map(|r| r.launch_id.clone()).collect();
+                (batch.schema == PARENT_LOSS_RECOVERY_SCHEMA_V1
+                    && batch.generation == generation
+                    && batch.sealed_phase == ParentLossPhase::Sealed
+                    && batch.kind == RecoveryArtifactKind::Batch
+                    && batch.seq == seq
+                    && index.seq == seq
+                    && index.generation == generation
+                    && index.schema == PARENT_LOSS_RECOVERY_SCHEMA_V1
+                    && index.kind == RecoveryArtifactKind::Ids
+                    && index.sealed_phase == ParentLossPhase::Sealed
+                    && receipt.schema == PARENT_LOSS_RECOVERY_SCHEMA_V1
+                    && receipt.generation == generation
+                    && receipt.seq == seq
+                    && receipt.sealed_phase == ParentLossPhase::Sealed
+                    && receipt.kind == RecoveryArtifactKind::Receipt
+                    && receipt.batch_bytes_digest == batch_digest
+                    && receipt.ids == index.ids
+                    && roster == index.ids
+                    && batch
+                        .entries
+                        .iter()
+                        .all(|row| completed_row_is_authorized(ledger, generation, row)))
+                .then_some(batch)
+            })();
+            let Some(batch) = parsed else {
+                return preserve_invalid();
+            };
+            #[cfg(test)]
+            AUDIT_VALIDATED_ROWS.with(|count| count.set(count.get() + batch.entries.len()));
+            let mut prepared = Vec::with_capacity(batch.entries.len());
+            for row in batch.entries {
+                let closure = AdmissionClosure {
+                    launch_id: row.launch_id.clone(),
+                    service: row.service,
+                    instance: row.instance,
+                    uid: row.uid,
+                    finding: row.finding,
+                };
+                let sealed = match (row.instance, row.uid) {
+                    (Some(instance), Some(uid)) => Some(serde_json::to_string(&SealedAdmission {
+                        launch_id: row.launch_id.clone(),
+                        service: row.service,
+                        identity: AdmissionIdentity {
+                            generation,
+                            launch_id: row.launch_id.clone(),
+                            instance,
+                            uid,
+                            parent_launch_id: row.parent_launch_id,
+                        },
+                    })?),
+                    _ => None,
+                };
+                prepared.push(PreparedAdmission {
+                    launch_id: row.launch_id,
+                    closure: serde_json::to_string(&closure)?,
+                    sealed,
+                });
+            }
             let chunk = PreparedChunk {
                 schema: 1,
                 generation,
@@ -385,8 +445,8 @@ pub(super) fn publish(
                 ids_digest: ids_digest.clone(),
                 rows: prepared,
             };
-            // Preserve reusable bytes, but always compare them with authorized source projections.
             let bytes = serde_json::to_vec(&chunk)?;
+            let chunk_digest = digest_bytes(&bytes);
             atomic_replace(
                 &prepared_path,
                 &bytes,
@@ -394,9 +454,33 @@ pub(super) fn publish(
             )?;
             atomic_replace(
                 &stamp_path,
-                digest_bytes(&bytes).as_bytes(),
+                chunk_digest.as_bytes(),
                 AtomicWriteOptions { mode: Some(0o600) },
             )?;
+            progress.inputs.insert(
+                seq,
+                AuditedInput {
+                    batch_digest: batch_digest.clone(),
+                    ids_digest: ids_digest.clone(),
+                    chunk_digest,
+                },
+            );
+            // The committed expected digest is independent of the weak chunk
+            // checksum, and is never regenerated from unvalidated retained data.
+            write_json(&progress_path, &progress, json_options())?;
+            #[cfg(test)]
+            if AUDIT_STOP_AFTER_BATCH.with(|remaining| {
+                let value = remaining.get();
+                if value == 0 {
+                    return false;
+                }
+                remaining.set(value - 1);
+                value == 1
+            }) {
+                return Ok(ClosureOutcome::Refused(
+                    BootstrapRecoveryReason::CoordinatorNotLive,
+                ));
+            }
             chunk
         };
         inputs.push((seq, batch_digest, ids_digest));
