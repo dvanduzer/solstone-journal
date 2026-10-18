@@ -244,7 +244,12 @@ fn validate_call<'a>(
         cancellation,
     );
     if let Err(error) = &validated {
-        log::warn!("ios backup call refused before the bridge: {error}");
+        // Every refusal reason here is a static code, never built from inputs.
+        let reason = std::error::Error::source(error).map(ToString::to_string);
+        log::warn!(
+            "ios backup call refused before the bridge: {error}: {}",
+            reason.as_deref().unwrap_or("")
+        );
     }
     validated
 }
@@ -470,26 +475,34 @@ fn execute(
             )
         }
     }
-    .map_err(ExecuteError::Entry)?;
+    .map_err(|status| {
+        log::warn!("ios backup operation {operation} refused at entry: status {status}");
+        ExecuteError::Entry(status)
+    })?;
     let cancelled = || cancellation.is_some_and(ArchiveCancellation::is_cancelled);
     // All surrounding captured authorities, buffers, directories and the actual
     // caller's lifetime remain live until actual wait/result/free returns.
     let completed = call.wait(timeout, Some(&cancelled), metadata);
-    if completed.fields.status != 0 {
-        // The bridge's diagnostic is a bounded code, never a credential or path.
-        let end = completed
-            .fields
-            .diagnostic
-            .iter()
-            .position(|byte| *byte == 0);
-        let diagnostic = std::str::from_utf8(&completed.fields.diagnostic[..end.unwrap_or(0)])
-            .unwrap_or("unprintable");
-        log::warn!(
-            "ios backup operation {operation} failed: status {} diagnostic {diagnostic}",
-            completed.fields.status
-        );
-    }
+    log_failure(operation, &completed);
     Ok(completed)
+}
+
+// The bridge's diagnostic is a bounded code, never a credential or path.
+fn log_failure(operation: i32, completed: &native::Completed) {
+    if completed.fields.status == 0 {
+        return;
+    }
+    let end = completed
+        .fields
+        .diagnostic
+        .iter()
+        .position(|byte| *byte == 0);
+    let diagnostic = std::str::from_utf8(&completed.fields.diagnostic[..end.unwrap_or(0)])
+        .unwrap_or("unprintable");
+    log::warn!(
+        "ios backup operation {operation} failed: status {} diagnostic {diagnostic}",
+        completed.fields.status
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -657,10 +670,15 @@ fn restore(
         snapshot,
         selector,
     )
-    .map_err(|status| ExecuteError::Entry(status).into_runner())?;
+    .map_err(|status| {
+        log::warn!("ios backup restore refused at entry: status {status}");
+        ExecuteError::Entry(status).into_runner()
+    })?;
     let cancelled = || cancellation.is_some_and(ArchiveCancellation::is_cancelled);
     // The target, state directory and credentials stay borrowed until wait/free.
-    Ok(call.wait(timeout, Some(&cancelled), true))
+    let completed = call.wait(timeout, Some(&cancelled), true);
+    log_failure(6, &completed);
+    Ok(completed)
 }
 
 #[allow(clippy::too_many_arguments)]
