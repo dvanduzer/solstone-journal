@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>create your journal · solstone</title>
+  <title></title>
   <link rel="icon" href="/favicon.ico">
   <link rel="stylesheet" href="/static/tokens.css">
   <link rel="stylesheet" href="/static/tokens-dark.css">
@@ -17,18 +17,56 @@
       color: var(--ink);
       border: 1px solid var(--hairline);
     }
-    input[type="checkbox"], input[type="radio"], input[type="range"] {
+    input[type="checkbox"], input[type="radio"] {
       accent-color: var(--orange-ink);
     }
-    svg[aria-label="solstone"] { width: 140px; height: 140px; margin: 0 auto 1rem; display: block; }
     .init-container { max-width: 520px; width: 90vw; }
-    .config-path { font-size: 0.8rem; color: var(--ink-faint-paper); text-align: center; margin: 0 0 1.5rem; word-break: break-all; }
-    h1 { text-align: center; font-family: var(--font-display); font-weight: 700; letter-spacing: 0.1em; color: var(--ink); font-size: 2.5rem; text-transform: lowercase; margin-bottom: 0.5rem; }
-    .product-tagline { text-align: center; font-family: var(--font-display); color: var(--ink-faint-paper); text-transform: lowercase; margin: 0 0 2rem; font-size: 0.95rem; }
-    .init-section { margin-bottom: 2rem; }
-    .init-section h3 { font-size: 1.25rem; font-weight: 600; border-bottom: 1px solid var(--hairline); padding-bottom: 0.5rem; margin-bottom: 0.75rem; }
-    .section-hint { font-size: 0.85rem; color: var(--ink-soft-paper); margin: 0 0 0.75rem; }
-    .section-hint a { color: var(--orange-text-aa); }
+    h1 {
+      text-align: center; font-family: var(--font-display); font-weight: 700;
+      letter-spacing: 0.05em; color: var(--ink); font-size: 2.2rem;
+      text-transform: lowercase; margin-bottom: 0.5rem;
+    }
+    h2 {
+      font-family: var(--font-display); font-size: 1.25rem; font-weight: 600;
+      border-bottom: 1px solid var(--hairline); padding-bottom: 0.5rem; margin-bottom: 0.75rem;
+    }
+    .error-message {
+      margin-top: 0.75rem;
+      padding: 0.75rem 0.9rem;
+      border: 1px solid var(--danger);
+      border-radius: 8px;
+      background: var(--danger-wash);
+      color: var(--danger);
+      font-size: 0.85rem;
+      line-height: 1.4;
+    }
+    .cta-button {
+      display: inline-block; margin-top: 1rem; padding: 12px 24px; background: var(--orange);
+      color: var(--ink-on-brand); border: none; border-radius: 8px; font-size: 0.95rem; cursor: pointer;
+      font-family: var(--font-display); text-transform: lowercase;
+    }
+    .cta-button:hover { filter: brightness(0.94); }
+    .cta-button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .settings-preset-btn {
+      padding: 0.5em 0.9em; border: 1px solid var(--hairline-2); border-radius: 4px;
+      background: var(--paper); color: var(--ink-soft-paper); cursor: pointer; font-size: 0.85rem;
+    }
+    .settings-preset-btn:hover { border-color: var(--ink-faint-paper); }
+    .settings-preset-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .mark-display { display: flex; justify-content: center; min-height: 64px; margin: 0 0 0.85rem; }
+    .mark-card { display: inline-flex; flex-direction: column; align-items: center; gap: 0.55rem; background: var(--cream-bright); border: 1px solid var(--hairline-2); border-radius: 12px; padding: 1.15rem 1.4rem; }
+    .mark-chips { display: flex; gap: 0.7rem; }
+    .mark-chip { width: 48px; height: 48px; display: flex; align-items: center; justify-content: center; border: 2px solid var(--hairline-2); border-radius: 12px; box-sizing: border-box; }
+    .mark-chip svg { width: 28px; height: 28px; display: block; }
+    .mark-words { display: flex; align-items: center; gap: 0.5rem; font-family: var(--font-display); font-size: 1.1rem; letter-spacing: .3px; color: var(--ink); }
+    .mark-words .mark-sep { color: var(--ink-faint); }
+    .mark-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 0.75rem; margin-top: 0.25rem; }
+    .mark-permanence { flex-basis: 100%; text-align: center; font-size: 0.85rem; color: var(--ink-soft-paper); margin: 0; }
+    @media (prefers-reduced-motion: no-preference) {
+      .mark-card.pop { animation: mark-pop .26s ease-out; }
+      @keyframes mark-pop { from { opacity: 0; transform: translateY(4px) scale(.98); } to { opacity: 1; transform: none; } }
+    }
+    [hidden] { display: none !important; }
     .machine-card {
       margin-bottom: 2rem;
       padding: 1rem;
@@ -52,162 +90,31 @@
     @media (max-width: 480px) {
       .setup-row { grid-template-columns: 1fr; gap: 0.1rem; }
     }
-    .field-group { margin-bottom: 0.75rem; }
-    .field-group label { display: block; font-size: 0.85rem; color: var(--ink-soft-paper); margin-bottom: 0.25rem; }
-    .field-group input:not([type="checkbox"]):not([type="radio"]) {
-      width: 100%; padding: 10px 12px; border: 2px solid var(--hairline-2); border-radius: 8px;
-      background: var(--paper); color: var(--ink); font-size: 0.95rem; box-sizing: border-box;
+    .thinking-summary-row {
+      display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.5rem;
     }
-    .field-group input:not([type="checkbox"]):not([type="radio"]):focus { outline: none; border-color: var(--orange); }
-    .field-group input:not([type="checkbox"]):not([type="radio"]):disabled { background: var(--cream); color: var(--ink-faint-paper); }
-    .field-status { display: block; font-size: 0.8rem; min-height: 1.2em; margin-top: 0.25rem; }
-    p.field-status { margin-bottom: 0; }
-    .error-message {
-      margin-top: 0.75rem;
-      padding: 0.75rem 0.9rem;
-      border: 1px solid var(--danger);
-      border-radius: 8px;
-      background: var(--danger-wash);
-      color: var(--danger);
-      font-size: 0.85rem;
-      line-height: 1.4;
+    .thinking-summary-row p { margin: 0; }
+    .radio-option {
+      display: flex; align-items: flex-start; gap: 0.5rem; margin-bottom: 0.75rem; cursor: pointer;
     }
-    .cta-button {
-      display: inline-block; margin-top: 1rem; padding: 12px 24px; background: var(--orange);
-      color: var(--ink-on-brand); border: none; border-radius: 8px; font-size: 0.95rem; cursor: pointer;
-      font-family: var(--font-display); text-transform: lowercase;
+    .radio-content {
+      display: flex; flex-direction: column; gap: 0.2rem;
     }
-    .cta-button:hover { filter: brightness(0.94); }
-    .cta-button[hidden] { display: none; }
-    .lanes { display: grid; grid-template-columns: 1fr; gap: 10px; }
-    .laneslot { min-width: 0; }
-    .lane {
-      border: 1.5px solid var(--hairline-2);
-      border-radius: 9px;
-      padding: 15px 16px;
-      background: var(--cream-bright);
-      cursor: pointer;
-      display: flex;
-      gap: 14px;
-      align-items: flex-start;
-      text-decoration: none;
-      color: inherit;
-      font: inherit;
-      text-align: left;
-      width: 100%;
-      min-width: 0;
-      margin: 0;
-      box-sizing: border-box;
-      appearance: none;
-      -webkit-appearance: none;
+    .radio-label {
+      font-weight: 500; color: var(--ink);
     }
-    .lane:hover { background: var(--paper); }
-    .lane.active {
-      border-color: var(--orange);
-      background: var(--paper);
-      box-shadow: 0 0 0 3px color-mix(in srgb, var(--orange) 14%, transparent);
+    .radio-sub {
+      font-size: 0.85rem; color: var(--ink-soft-paper);
     }
-    .lane .lanebody { flex: 1 1 auto; min-width: 0; }
-    .lane .lanetop { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-    .lane .lanename { font-weight: 700; font-size: 1.02rem; color: var(--ink); }
-    .lane .lanesub { font-size: .82rem; color: var(--ink-faint); margin-top: 2px; }
-    .lane .lanedesc { font-size: .86rem; color: var(--ink-faint); margin-top: 3px; line-height: 1.45; }
-    .lane.greyed { background: var(--cream); border-color: var(--hairline); cursor: default; }
-    .lane.greyed .lanename { color: var(--ink-faint); }
-    .lane .laneverdict { font-size: .82rem; color: var(--ink-faint); margin-top: 7px; line-height: 1.45; }
-    .lane .reqlink { color: var(--orange-text-aa); font-weight: 600; text-decoration: none; }
-    .lane .lanetag {
-      border: 1px solid var(--hairline);
-      color: var(--ink-faint);
-      background: var(--cream-bright);
-      border-radius: 999px;
-      padding: 2px 8px;
-      font-size: .72rem;
-      font-weight: 600;
-      line-height: 1.3;
+    .radio-desc {
+      font-size: 0.8rem; color: var(--ink-faint-paper);
     }
-    .lanemore {
-      background: none;
-      border: none;
-      padding: 0;
-      cursor: pointer;
-      font: inherit;
-      font-size: .84rem;
-      font-weight: 600;
-      color: var(--orange-text-aa);
-      margin: 7px 0 0 17px;
+    .download-row {
+      margin-top: 0.5rem; font-size: 0.85rem;
     }
-    .lanedetail {
-      margin: 8px 0 0 17px;
-      border: 1px solid var(--hairline);
-      border-radius: 9px;
-      background: var(--cream-bright);
-      color: var(--ink-faint);
-      padding: 11px 13px;
-      font-size: .84rem;
-      line-height: 1.5;
+    #setup-footer {
+      font-size: 0.8rem; color: var(--ink-faint-paper); margin-top: 1.5rem; text-align: center;
     }
-    .lanedetail[hidden] { display: none; }
-    .lanedetail-heading {
-      font-family: var(--font-display);
-      font-weight: 700;
-      color: var(--ink);
-      margin-bottom: 2px;
-    }
-    .lanedetail-sub { color: var(--ink-soft); margin-bottom: 8px; }
-    .lanedetail-line { margin-top: 7px; }
-    .lanedetail-claims { color: var(--ink-soft); font-weight: 600; margin-top: 9px; }
-    .routenote {
-      font-size: .84rem;
-      color: var(--ink-faint);
-      background: var(--cream-bright);
-      border: 1px dashed var(--hairline-2);
-      border-radius: 9px;
-      padding: 11px 13px;
-      margin-top: 16px;
-      line-height: 1.5;
-    }
-    .routenote b { color: var(--ink-soft); }
-    .deferlink { font-size: .86rem; color: var(--ink-faint); margin-top: 16px; }
-    .deferlink a { color: var(--orange-text-aa); font-weight: 600; text-decoration: none; }
-    .footer-note { font-size: 0.8rem; color: var(--ink-faint-paper); margin-top: 1.5rem; text-align: center; }
-    .settings-preset-btn {
-      padding: 0.5em 0.9em; border: 1px solid var(--hairline-2); border-radius: 4px;
-      background: var(--paper); color: var(--ink-soft-paper); cursor: pointer; font-size: 0.85rem;
-    }
-    .settings-preset-btn:hover { border-color: var(--ink-faint-paper); }
-    .settings-preset-btn.active { border-color: var(--orange); color: var(--orange-text-aa); }
-    .retention-options { display: flex; flex-direction: column; gap: 0.5rem; }
-    .retention-option { display: flex; flex-direction: column; gap: 0.4rem; cursor: pointer; }
-    .retention-option-label { font-size: 0.95rem; }
-    .retention-days-row { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.5rem; }
-    .retention-days-row input[type="number"] {
-      width: 5em; padding: 0.35em 0.5em; border: 2px solid var(--hairline-2); border-radius: 8px;
-      background: var(--paper); color: var(--ink); font-size: 0.95rem; box-sizing: border-box;
-    }
-    .retention-days-row input[type="number"]:focus { outline: none; border-color: var(--orange); }
-    .retention-days-row.is-disabled { opacity: 0.5; cursor: not-allowed; }
-    .retention-days-suffix { font-size: 0.85rem; color: var(--ink-soft-paper); }
-    .mark-display { display: flex; justify-content: center; min-height: 64px; margin: 0 0 0.85rem; }
-    .mark-card { display: inline-flex; flex-direction: column; align-items: center; gap: 0.55rem; background: var(--cream-bright); border: 1px solid var(--hairline-2); border-radius: 12px; padding: 1.15rem 1.4rem; }
-    .mark-card.locked { border-color: var(--success); box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 8%, transparent); }
-    .mark-chips { display: flex; gap: 0.7rem; }
-    .mark-chip { width: 48px; height: 48px; display: flex; align-items: center; justify-content: center; border: 2px solid var(--hairline-2); border-radius: 12px; box-sizing: border-box; }
-    .mark-chip svg { width: 28px; height: 28px; display: block; }
-    .mark-words { display: flex; align-items: center; gap: 0.5rem; font-family: var(--font-display); font-size: 1.1rem; letter-spacing: .3px; color: var(--ink); }
-    .mark-words .mark-sep { color: var(--ink-faint); }
-    .mark-actions { display: flex; align-items: center; justify-content: center; gap: 0.75rem; margin-top: 0.25rem; }
-    .mark-permanence { text-align: center; }
-    .mark-locked { display: flex; align-items: center; justify-content: center; gap: 0.4rem; color: var(--success-ink); font-size: 0.92rem; margin-top: 0.5rem; font-weight: 600; }
-    .mark-locked svg { width: 16px; height: 16px; flex: none; }
-    .mark-locked[hidden] { display: none; }
-    .mark-chip-generic { width: 48px; height: 48px; }
-    .mark-chip-generic svg { display: block; }
-    @media (prefers-reduced-motion: no-preference) {
-      .mark-card.pop { animation: mark-pop .26s ease-out; }
-      @keyframes mark-pop { from { opacity: 0; transform: translateY(4px) scale(.98); } to { opacity: 1; transform: none; } }
-    }
-    .cta-button:disabled { opacity: 0.5; cursor: not-allowed; }
   </style>
   <script src="/static/error-handler.js"></script>
   <script src="/static/api.js"></script>
@@ -215,680 +122,1109 @@
 <body>
   <main>
     <div class="init-container">
-    <svg xmlns="http://www.w3.org/2000/svg" viewBox="2.5 2.5 27 27" role="img" aria-label="solstone">
-      <title>solstone</title>
-      <path fill="var(--gold)" d="M16 2.5 Q17.057687783 5.007810543 18.589661566 7.257449068 A9.118033989 9.118033989 0 0 0 13.410338434 7.257449068 Q14.942312217 5.007810543 16 2.5 Z M23.935100906 5.078270576 Q23.316734245 7.728825204 23.233822722 10.449292599 A9.118033989 9.118033989 0 0 0 19.043662288 7.404962845 Q21.605359462 6.485438643 23.935100906 5.078270576 Z M28.83926297 11.828270576 Q26.781036911 13.609147511 25.114909466 15.761317696 A9.118033989 9.118033989 0 0 0 23.514410599 10.83548868 Q26.127349912 11.597305794 28.83926297 11.828270576 Z M28.83926297 20.171729424 Q26.127349912 20.402694206 23.514410599 21.16451132 A9.118033989 9.118033989 0 0 0 25.114909466 16.238682304 Q26.781036911 18.390852489 28.83926297 20.171729424 Z M23.935100906 26.921729424 Q21.605359462 25.514561357 19.043662288 24.595037155 A9.118033989 9.118033989 0 0 0 23.233822722 21.550707401 Q23.316734245 24.271174796 23.935100906 26.921729424 Z M16 29.5 Q14.942312217 26.992189457 13.410338434 24.742550932 A9.118033989 9.118033989 0 0 0 18.589661566 24.742550932 Q17.057687783 26.992189457 16 29.5 Z M8.064899094 26.921729424 Q8.683265755 24.271174796 8.766177278 21.550707401 A9.118033989 9.118033989 0 0 0 12.956337712 24.595037155 Q10.394640538 25.514561357 8.064899094 26.921729424 Z M3.16073703 20.171729424 Q5.218963089 18.390852489 6.885090534 16.238682304 A9.118033989 9.118033989 0 0 0 8.485589401 21.16451132 Q5.872650088 20.402694206 3.16073703 20.171729424 Z M3.16073703 11.828270576 Q5.872650088 11.597305794 8.485589401 10.83548868 A9.118033989 9.118033989 0 0 0 6.885090534 15.761317696 Q5.218963089 13.609147511 3.16073703 11.828270576 Z M8.064899094 5.078270576 Q10.394640538 6.485438643 12.956337712 7.404962845 A9.118033989 9.118033989 0 0 0 8.766177278 10.449292599 Q8.683265755 7.728825204 8.064899094 5.078270576 Z"/>
-      <circle cx="16" cy="16" r="6.5" fill="none" stroke="var(--orange)" stroke-width="1.736067977"/>
-    </svg>
-    <p class="config-path">journal version <span id="init-version"></span> at <code id="journal-path"></code></p>
-    <h1>create your journal</h1>
-    <p class="product-tagline">welcome to solstone.</p>
+      <h1 id="setup-heading" tabindex="-1"></h1>
 
-    <section id="section-machine-card" class="section machine-card" aria-labelledby="machine-card-headline">
-      <h2 class="machine-card-headline" id="machine-card-headline">how it fits together</h2>
-      <dl class="setup-rows">
-        <div class="setup-row">
-          <dt>your journal</dt>
-          <dd>lives on this computer and keeps everything that goes into it.</dd>
+      <div id="welcome-beats"></div>
+
+      <section id="section-machine-card" class="machine-card" aria-labelledby="machine-card-headline">
+        <h2 class="machine-card-headline" id="machine-card-headline"></h2>
+        <dl class="setup-rows">
+          <div class="setup-row">
+            <dt id="fits-journal-term"></dt>
+            <dd id="fits-journal"></dd>
+          </div>
+          <div class="setup-row">
+            <dt id="fits-app-term"></dt>
+            <dd id="fits-app"></dd>
+          </div>
+          <div class="setup-row">
+            <dt id="fits-thinking-term"></dt>
+            <dd id="fits-thinking"></dd>
+          </div>
+        </dl>
+      </section>
+
+      <section id="setup-mark" aria-labelledby="mark-title">
+        <h2 id="mark-title" tabindex="-1"></h2>
+        <p id="mark-help"></p>
+        <div id="journal-mark-display" class="mark-display" aria-live="polite"></div>
+        <div id="mark-error" class="error-message" role="alert" tabindex="-1" hidden></div>
+        <button type="button" id="setup-retry" class="settings-preset-btn" hidden></button>
+        <div class="mark-actions">
+          <button type="button" id="mark-try-another" class="settings-preset-btn"></button>
+          <button type="button" id="mark-continue" class="cta-button" disabled></button>
+          <p id="mark-permanence" class="mark-permanence"></p>
         </div>
-        <div class="setup-row">
-          <dt>the solstone app</dt>
-          <dd>runs on each device you choose and takes in what you share with it. all of it goes into your journal.</dd>
+      </section>
+
+      <section id="setup-thinking" hidden>
+        <h2 id="thinking-title" tabindex="-1"></h2>
+        <form id="thinking-form">
+          <div class="thinking-summary-row">
+            <p id="thinking-summary"></p>
+            <button type="button" id="thinking-change" class="settings-preset-btn"></button>
+          </div>
+          <p id="thinking-choose-later" hidden></p>
+          <p id="thinking-blocked" class="error-message" hidden></p>
+          <div id="thinking-options" hidden></div>
+          <p><a id="requirements-link" href="https://github.com/solpbc/solstone-journal/blob/main/INSTALL.md#choosing-a-provider" target="_blank" rel="noopener noreferrer">requirements</a></p>
+          <button type="submit" id="thinking-continue" class="cta-button"></button>
+          <div id="thinking-error" class="error-message" role="alert" tabindex="-1" hidden></div>
+        </form>
+      </section>
+
+      <div id="downloads" hidden>
+        <div id="download-thinking" class="download-row" hidden>
+          <span class="download-label"></span>
+          <span class="download-status"></span>
+          <button type="button" id="download-thinking-cancel" class="settings-preset-btn" hidden></button>
+          <button type="button" id="download-thinking-retry" class="settings-preset-btn" hidden></button>
         </div>
-        <div class="setup-row">
-          <dt>thinking</dt>
-          <dd>helps your journal make sense of what it keeps. choose where it happens below, or later.</dd>
+        <div id="download-speech" class="download-row" hidden>
+          <span class="download-label"></span>
+          <span class="download-status"></span>
+          <button type="button" id="download-speech-retry" class="settings-preset-btn" hidden></button>
         </div>
-      </dl>
-    </section>
-
-    <section class="init-section" id="section-journal-mark">
-      <h3>this is your journal</h3>
-      <p class="section-hint">every journal has its own mark: two symbols and two words, unique to yours. you'll recognize it whenever you connect a device.</p>
-      <div id="journal-mark-display" class="mark-display" aria-live="polite"></div>
-      <div id="journal-mark-error" class="error-message" hidden></div>
-      <button type="button" id="journal-mark-retry" class="settings-preset-btn" hidden>try again</button>
-      <div class="mark-actions">
-        <button type="button" id="journal-mark-regenerate" class="settings-preset-btn">try another</button>
-        <button type="button" id="journal-mark-lock" class="cta-button">lock it in</button>
       </div>
-      <p class="section-hint mark-permanence">lock it in and this mark is your journal's, for good. it can't be changed later. try as many as you like first.</p>
-      <p id="journal-mark-locked" class="mark-locked" hidden><svg viewBox="0 0 24 24" fill="none" stroke="var(--success)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>locked in · this is your journal's mark, for good.</p>
-    </section>
 
-    <form id="init-form" onsubmit="finalize(event); return false;">
-    <section class="init-section" id="section-identity">
-      <h3>who are you?</h3>
-      <p class="section-hint">optional. used to address you by name.</p>
-      <div class="field-group">
-        <label for="name">full name</label>
-        <input type="text" id="name">
-        <small class="field-status" aria-live="polite">&nbsp;</small>
-      </div>
-      <div class="field-group">
-        <label for="preferred">preferred name</label>
-        <input type="text" id="preferred">
-        <small class="field-status" aria-live="polite">&nbsp;</small>
-      </div>
-    </section>
-
-    <section class="init-section" id="section-provider">
-      <h3>where does the thinking happen?</h3>
-      <p class="section-hint">your journal stays on this computer whatever you choose. this only decides where your journal content goes when there's thinking to do. you can change it anytime in <b>thinking</b>.</p>
-      <div class="lanes" id="provider-lanes" aria-live="polite"></div>
-      <div class="routenote">when you finish, <b>thinking</b> opens to the lane you picked. the fork lives in thinking from here on. switch anytime.</div>
-      <p class="deferlink"><a href="#" id="provider-skip">set up thinking later</a>. your journal keeps what you add from day one. choose a thinking option whenever you're ready.</p>
-    </section>
-
-    <section class="init-section" id="section-observed-media">
-      <h3>your original media (audio, video, screen frames)</h3>
-      <p class="section-hint">by default, your journal keeps your original media so you can access it again later. you can also list it for removal after a set number of days, or list originals for removal after processing. audio with no speech has its own switch in storage settings, and by default it's listed for removal after processing. nothing is deleted until you say so. <a href="https://solpbc.org/privacy#recording-laws" target="_blank" rel="noopener">recording-consent laws</a> may apply in your jurisdiction.</p>
-      <div class="field-group">
-        <div class="retention-options">
-          <label class="retention-option">
-            <input type="radio" name="retention_mode" value="keep">
-            <span class="retention-option-label">keep everything</span>
-          </label>
-          <label class="retention-option">
-            <input type="radio" name="retention_mode" value="days">
-            <span class="retention-option-label">list originals for removal after a set number of days</span>
-            <div class="retention-days-row">
-              <input type="number" id="retention-days-input" min="1" value="30">
-              <span class="retention-days-suffix">days</span>
-              <button type="button" class="settings-preset-btn" data-days="7">7</button>
-              <button type="button" class="settings-preset-btn" data-days="30">30</button>
-              <button type="button" class="settings-preset-btn" data-days="90">90</button>
-            </div>
-          </label>
-          <label class="retention-option">
-            <input type="radio" name="retention_mode" value="processed">
-            <span class="retention-option-label">list originals for removal after processing</span>
-          </label>
-        </div>
-        <p class="field-status" id="retention-status">&nbsp;</p>
-      </div>
-    </section>
-
-    <button type="submit" class="cta-button" disabled>finish welcome setup</button>
-    </form>
-    <div id="finalize-error" class="error-message" hidden></div>
-
-    <p class="footer-note">your journal stays on this computer. nothing leaves unless you send it.</p>
-    <p class="footer-note">questions or feedback? <a href="https://bsky.app/profile/solstone.app" target="_blank" rel="noopener noreferrer">@solstone.app on bluesky</a> &middot; <a href="https://github.com/solpbc/solstone/issues" target="_blank" rel="noopener noreferrer">github issues</a> &middot; <a href="https://support.solstone.app" target="_blank" rel="noopener noreferrer">support.solstone.app</a></p>
+      <p id="setup-footer"></p>
     </div>
   </main>
 
+  <script type="application/json" id="setup-copy-bootstrap"></script>
+
   <script>
-    const LOCAL_REQUIREMENTS_URL = 'https://github.com/solpbc/solstone-journal/blob/main/INSTALL.md#choosing-a-provider';
-    const SEVERITY_RANK = { ok: 0, unknown: 1, warning: 2, blocked: 3 };
-    let selectedLane = null;
-    let confidentialDetailOpen = false;
-    let confidentialDetail = null;
-    let laneData = [];
-    let localCapability = { overall: 'pending', checks: [] };
+    const STATE_POLL_MS = 1000;
+    const STATE_READ_DEADLINE_MS = 8000;
 
-    function laneDisplayLabel(lane) {
-      if (lane.id === 'byo') return lane.label || 'BYO';
-      return (lane.label || lane.id || '').toLowerCase();
+    let setupState = null;
+    let setupCopy = null;
+    let displayGeneration = 0;
+    let markRefreshSeq = 0;
+    let displayedProposalId = null;
+    let markIsLocked = false;
+    let proposalMutationInFlight = false;
+    let localCapability = null;
+    let capabilityLoaded = false;
+    let userPicked = false;
+    let pickedChoice = null;
+    let selectionEpoch = 0;
+    let pollIntervalId = null;
+    let stateReadInFlight = false;
+    let thinkingContinueInFlight = false;
+    let saveThinkingInFlight = false;
+    let downloadsNeedReconciliation = false;
+    let finalizeInFlight = false;
+
+    let requestSeq = 0;
+    let newestAppliedSeq = 0;
+    let displayedThinkingAttemptId = null;
+    let displayedSpeechAttemptId = null;
+    const retiredSpeechAttemptIds = new Set();
+    const retiredAttemptIds = new Set();
+    const cancelledAttemptIds = new Set();
+    const pendingCancelIds = new Set();
+
+    function errorText(err) {
+      if (!err) return '';
+      if (typeof err.rawDetail === 'string' && err.rawDetail.trim()) return err.rawDetail;
+      if (typeof err.serverMessage === 'string' && err.serverMessage.trim()) return err.serverMessage;
+      if (typeof err.message === 'string' && err.message.trim()) return err.message;
+      return String(err);
     }
 
-    function highestSeverityCheck(checks) {
-      return (checks || [])
-        .filter(check => check && check.name !== 'platform')
-        .reduce((winner, check) => {
-          const rank = SEVERITY_RANK[check.severity] ?? SEVERITY_RANK.unknown;
-          const winnerRank = winner ? (SEVERITY_RANK[winner.severity] ?? SEVERITY_RANK.unknown) : -1;
-          return rank > winnerRank ? check : winner;
-        }, null);
+    function formatByteSize(bytes) {
+      if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes < 0) return null;
+      if (bytes < 1000) return `${bytes} B`;
+      const units = ['KB', 'MB', 'GB', 'TB'];
+      let val = bytes / 1000;
+      let unitIdx = 0;
+      while (val >= 1000 && unitIdx < units.length - 1) {
+        val /= 1000;
+        unitIdx++;
+      }
+      const formatted = Number.isInteger(val) ? String(val) : (Math.round(val * 10) / 10).toFixed(1);
+      return `${formatted} ${units[unitIdx]}`;
     }
 
-    function localCapabilityState() {
-      if (localCapability.overall === 'ok' || localCapability.overall === 'warning') return 'capable';
-      if (localCapability.overall === 'blocked') return 'incapable';
-      if (localCapability.overall === 'unknown') return 'unknown';
-      return 'pending';
+    async function apiCall(endpoint, options = {}) {
+      const opts = { ...options, noAuthRedirect: true };
+      return await window.apiJson(endpoint, opts);
     }
 
-    function localCapabilityDetail() {
-      const check = highestSeverityCheck(localCapability.checks);
-      return check && check.detail ? check.detail : '';
+    async function postAction(payload) {
+      return await apiCall('/init/api/action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
     }
 
-    function renderLocalVerdict(parent) {
-      const state = localCapabilityState();
-      const detail = localCapabilityDetail();
-      const verdict = document.createElement('div');
-      verdict.className = 'laneverdict';
-      if (state === 'capable') {
-        verdict.textContent = detail ? `this computer can run it: ${detail}` : 'this computer can run it.';
-      } else if (state === 'incapable') {
-        verdict.textContent = detail;
-        const link = document.createElement('a');
-        link.className = 'reqlink';
-        link.href = LOCAL_REQUIREMENTS_URL;
-        link.target = '_blank';
-        link.rel = 'noopener noreferrer';
-        link.textContent = 'requirements ↗';
-        verdict.append(' ', link);
-      } else if (state === 'unknown') {
-        verdict.textContent = "couldn't check this computer. you can still choose local; thinking will check again.";
+    function showMarkError(msg) {
+      const el = document.getElementById('mark-error');
+      if (el) {
+        el.textContent = msg || '';
+        el.hidden = !msg;
+        if (msg) {
+          const retry = document.getElementById('setup-retry');
+          if (retry) retry.hidden = false;
+          if (typeof el.focus === 'function') el.focus();
+        }
+      }
+    }
+
+    function clearMarkError() {
+      showMarkError('');
+    }
+
+    function showThinkingError(msg) {
+      const el = document.getElementById('thinking-error');
+      if (el) {
+        el.textContent = msg || '';
+        el.hidden = !msg;
+        if (msg && typeof el.focus === 'function') {
+          el.focus();
+        }
+      }
+    }
+
+    function clearThinkingError() {
+      showThinkingError('');
+    }
+
+    function showCurrentError(msg) {
+      const thinkingSec = document.getElementById('setup-thinking');
+      if (thinkingSec && !thinkingSec.hidden) {
+        showThinkingError(msg);
       } else {
-        verdict.textContent = 'checking this computer…';
+        showMarkError(msg);
       }
-      parent.appendChild(verdict);
     }
 
-    function buildConfidentialDetailPanel(detail) {
-      const panel = document.createElement('div');
-      panel.className = 'lanedetail';
-      panel.id = 'lane-detail-confidential';
-      panel.hidden = !confidentialDetailOpen;
-
-      const heading = document.createElement('div');
-      heading.className = 'lanedetail-heading';
-      heading.textContent = detail.heading || '';
-      const sub = document.createElement('div');
-      sub.className = 'lanedetail-sub';
-      sub.textContent = detail.sub || '';
-      panel.append(heading, sub);
-
-      ['mechanism', 'egress'].forEach(key => {
-        const line = document.createElement('div');
-        line.className = 'lanedetail-line';
-        line.textContent = detail[key] || '';
-        panel.appendChild(line);
-      });
-
-      const claims = document.createElement('div');
-      claims.className = 'lanedetail-claims';
-      claims.textContent = detail.claims || '';
-      panel.appendChild(claims);
-
-      ['attestation', 'early_access'].forEach(key => {
-        const line = document.createElement('div');
-        line.className = 'lanedetail-line';
-        line.textContent = detail[key] || '';
-        panel.appendChild(line);
-      });
-
-      return panel;
-    }
-
-    function renderProviderLanes() {
-      const container = document.getElementById('provider-lanes');
-      if (!container || !laneData.length) return;
-      const activeId = document.activeElement && document.activeElement.id;
-      const focusedLaneId = activeId && activeId.startsWith('provider-lane-') ? activeId : '';
-      container.innerHTML = '';
-      laneData.forEach(lane => {
-        const localState = lane.id === 'local' ? localCapabilityState() : null;
-        const blocked = lane.id === 'local' && localState === 'incapable';
-        const active = selectedLane === lane.id && !blocked;
-        const hasConfidentialDetail = lane.id === 'confidential' && confidentialDetail && Object.keys(confidentialDetail).length > 0;
-        const button = document.createElement('button');
-        button.type = 'button';
-        button.id = `provider-lane-${lane.id}`;
-        button.className = `lane${active ? ' active' : ''}${blocked ? ' greyed' : ''}`;
-        if (blocked) {
-          button.setAttribute('aria-disabled', 'true');
-        } else {
-          button.addEventListener('click', () => selectProviderLane(lane.id));
-        }
-
-        const body = document.createElement('div');
-        body.className = 'lanebody';
-        const top = document.createElement('div');
-        top.className = 'lanetop';
-        const name = document.createElement('span');
-        name.className = 'lanename';
-        name.textContent = laneDisplayLabel(lane);
-        top.appendChild(name);
-        if (lane.tag) {
-          const tag = document.createElement('span');
-          tag.className = 'lanetag';
-          tag.textContent = lane.tag;
-          top.appendChild(tag);
-        }
-        const sub = document.createElement('div');
-        sub.className = 'lanesub';
-        sub.textContent = lane.sub || '';
-        const desc = document.createElement('div');
-        desc.className = 'lanedesc';
-        desc.textContent = lane.description || '';
-
-        body.appendChild(top);
-        if (lane.sub) body.appendChild(sub);
-        body.appendChild(desc);
-        if (lane.id === 'local') renderLocalVerdict(body);
-        button.append(body);
-        if (hasConfidentialDetail) {
-          const slot = document.createElement('div');
-          slot.className = 'laneslot';
-          const more = document.createElement('button');
-          more.type = 'button';
-          more.className = 'lanemore';
-          more.textContent = 'how it works →';
-          more.setAttribute('aria-controls', 'lane-detail-confidential');
-          more.setAttribute('aria-expanded', confidentialDetailOpen ? 'true' : 'false');
-          const panel = buildConfidentialDetailPanel(confidentialDetail);
-          more.addEventListener('click', () => {
-            confidentialDetailOpen = !confidentialDetailOpen;
-            panel.hidden = !confidentialDetailOpen;
-            more.setAttribute('aria-expanded', confidentialDetailOpen ? 'true' : 'false');
-          });
-          slot.append(button, more, panel);
-          container.appendChild(slot);
-        } else {
-          container.appendChild(button);
-        }
-      });
-      if (focusedLaneId) {
-        const focusedLane = document.getElementById(focusedLaneId);
-        if (focusedLane && focusedLane.getAttribute('aria-disabled') !== 'true') {
-          focusedLane.focus();
+    function updateMarkButtons() {
+      const tryAnother = document.getElementById('mark-try-another');
+      const continueBtn = document.getElementById('mark-continue');
+      if (tryAnother) {
+        tryAnother.disabled = proposalMutationInFlight || !displayedProposalId;
+        if (markIsLocked) {
+          tryAnother.hidden = true;
         }
       }
-    }
-
-    function selectProviderLane(lane) {
-      if (lane === 'local' && localCapabilityState() === 'incapable') return;
-      selectedLane = lane;
-      renderProviderLanes();
-    }
-
-    function applyLocalCapability(payload) {
-      localCapability = payload || { overall: 'unknown', checks: [] };
-      if (selectedLane === 'local' && localCapabilityState() === 'incapable') {
-        selectedLane = null;
-      } else if (selectedLane === null && localCapabilityState() === 'capable') {
-        selectedLane = 'local';
-      }
-      renderProviderLanes();
-    }
-
-    async function loadLocalCapability() {
-      try {
-        const payload = await window.apiJson('/init/api/local-capability', {noAuthRedirect: true});
-        applyLocalCapability(payload);
-      } catch (err) {
-        if (window.logError) window.logError(err, { context: 'init-local-capability' });
-        applyLocalCapability({ overall: 'unknown', checks: [] });
+      const retry = document.getElementById('setup-retry');
+      if (retry) retry.disabled = proposalMutationInFlight;
+      if (continueBtn) {
+        continueBtn.disabled = proposalMutationInFlight || !displayedProposalId;
       }
     }
 
-    async function hydrateInitState() {
-      const state = await window.apiJson('/init/api/state', {noAuthRedirect: true});
-      document.getElementById('init-version').textContent = state.version || '';
-      document.getElementById('journal-path').textContent = state.journal_path || '';
-      document.getElementById('name').value = state.identity_name || '';
-      document.getElementById('preferred').value = state.identity_preferred || '';
-      const mode = state.retention_mode || 'keep';
-      const modeInput = document.querySelector(`input[name="retention_mode"][value="${mode}"]`);
-      if (modeInput) modeInput.checked = true;
-      document.getElementById('retention-days-input').value = state.retention_days || 30;
-      confidentialDetail = (state.confidential && state.confidential.lane_detail) || null;
-      laneData = Array.isArray(state.lanes) ? state.lanes : [];
-      renderProviderLanes();
-    }
-
-    document.addEventListener('DOMContentLoaded', () => {
-      hydrateInitState().catch((err) => {
-        const errorEl = document.getElementById('finalize-error');
-        if (errorEl) {
-          errorEl.textContent = (err && err.serverMessage) || "couldn't load setup state.";
-          errorEl.hidden = false;
-        }
-        if (window.logError) window.logError(err, { context: 'init-state' });
-      });
-      loadLocalCapability();
-    });
-
-    let detectedTimezone = '';
-    const RESULT_DISPLAY_MS = 1200;
-
-    function deriveRetention(daysValue, mode) {
-      if (mode === 'processed') return { mode, days: null, statusText: 'currently: list originals for removal after processing.' };
-      if (mode === 'days') {
-        const n = parseInt(daysValue, 10);
-        const unit = n === 1 ? 'day' : 'days';
-        if (Number.isFinite(n) && n >= 1) return { mode, days: n, statusText: `currently: list originals for removal after ${n} ${unit}, and audio with no speech after processing.` };
-        return { mode, days: null, statusText: 'currently: keep everything except audio with no speech. set a positive number of days.' };
-      }
-      return { mode: 'keep', days: null, statusText: 'currently: keep everything except audio with no speech.' };
-    }
-
-    function updateRetentionUI() {
-      const modeInput = document.querySelector('input[name="retention_mode"]:checked');
-      const mode = modeInput ? modeInput.value : 'keep';
-      const daysRow = document.querySelector('#section-observed-media .retention-days-row');
-      const daysInput = document.getElementById('retention-days-input');
-      const presetButtons = document.querySelectorAll('#section-observed-media .settings-preset-btn');
-      const statusEl = document.getElementById('retention-status');
-      const disabled = mode !== 'days';
-
-      const { statusText } = deriveRetention(daysInput.value, mode);
-      statusEl.textContent = statusText;
-      daysRow.classList.toggle('is-disabled', disabled);
-      daysInput.disabled = disabled;
-      daysInput.setAttribute('aria-disabled', disabled ? 'true' : 'false');
-
-      const activeDays = disabled ? null : parseInt(daysInput.value, 10);
-      presetButtons.forEach(btn => {
-        const isActive = Number.isFinite(activeDays) && parseInt(btn.dataset.days, 10) === activeDays;
-        btn.classList.toggle('active', isActive);
-        btn.disabled = disabled;
-        btn.setAttribute('aria-disabled', disabled ? 'true' : 'false');
-      });
-    }
-
-    document.addEventListener('DOMContentLoaded', () => {
-      detectedTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-
-      const deferProvider = document.getElementById('provider-skip');
-
-      deferProvider.addEventListener('click', e => {
-        e.preventDefault();
-        selectedLane = 'defer';
-        renderProviderLanes();
-      });
-
-      document.querySelectorAll('input[name="retention_mode"]').forEach(radio => {
-        radio.addEventListener('change', updateRetentionUI);
-      });
-      document.querySelectorAll('#section-observed-media .settings-preset-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-          document.getElementById('retention-days-input').value = btn.dataset.days;
-          document.querySelector('input[name="retention_mode"][value="days"]').checked = true;
-          updateRetentionUI();
-        });
-      });
-      document.getElementById('retention-days-input').addEventListener('input', updateRetentionUI);
-      updateRetentionUI();
-    });
-
-    let journalMarkLocked = false;
-
-    function showMarkError(message) {
-      const errorEl = document.getElementById('journal-mark-error');
-      if (!errorEl) return;
-      errorEl.textContent = message;
-      errorEl.hidden = false;
-    }
-
-    // The org-wide no-identity-yet treatment (journal-mark.md § 4.3): dashed,
-    // glyph-less chips in the locked mark palette plus the words "your" /
-    // "journal", spoken as one accessible unit. Renders in place of an error
-    // state whenever the served spec is malformed, absent, or not yet
-    // committed — never a hidden section, never a retry affordance.
-    function renderGenericMark(display) {
-      if (!display) return;
-      display.innerHTML = '<div class="mark-card generic" role="img" aria-label="your journal, not set up yet">' +
-        '<div class="mark-chips">' +
-        '<div class="mark-chip-generic"><svg viewBox="0 0 48 48" width="48" height="48" aria-hidden="true"><rect x="1" y="1" width="46" height="46" rx="12" ry="12" fill="var(--orange)" fill-opacity="0.07" stroke="var(--orange)" stroke-width="2" stroke-dasharray="5.7 4.3"/></svg></div>' +
-        '<div class="mark-chip-generic" style="transform: rotate(45deg)"><svg viewBox="0 0 48 48" width="48" height="48" aria-hidden="true"><rect x="1" y="1" width="46" height="46" rx="12" ry="12" fill="var(--gold)" fill-opacity="0.07" stroke="var(--gold)" stroke-width="2" stroke-dasharray="5.7 4.3"/></svg></div>' +
-        '</div>' +
-        '<div class="mark-words"><span>your</span><span class="mark-sep">·</span><span>journal</span></div>' +
-        '</div>';
-      const errorEl = document.getElementById('journal-mark-error');
-      if (errorEl) {
-        errorEl.textContent = '';
-        errorEl.hidden = true;
-      }
-      const retryButton = document.getElementById('journal-mark-retry');
-      if (retryButton) retryButton.hidden = true;
-    }
-
-    function renderUnavailableMark(display) {
-      if (!display) return;
-      display.innerHTML = '<div class="mark-card unavailable" role="img" aria-label="your journal\'s mark, unavailable right now">' +
-        '<div class="mark-chips">' +
-        '<div class="mark-chip-unavailable" style="width: 48px; height: 48px; display: flex; align-items: center; justify-content: center; border: 2px solid var(--hairline); background: var(--cream-bright); border-radius: 12px; box-sizing: border-box;"><span style="font-size: 24px; font-weight: 700; color: var(--ink-faint);">?</span></div>' +
-        '<div class="mark-chip-unavailable" style="width: 48px; height: 48px; display: flex; align-items: center; justify-content: center; border: 2px solid var(--hairline); background: var(--cream-bright); border-radius: 12px; box-sizing: border-box;"><span style="font-size: 24px; font-weight: 700; color: var(--ink-faint);">?</span></div>' +
-        '</div>' +
-        '<div class="mark-words"><span>mark</span><span class="mark-sep">·</span><span>unavailable</span></div>' +
-        '</div>';
-    }
-
-    function applyLockState(locked) {
-      journalMarkLocked = locked === true;
-      const regenerateButton = document.getElementById('journal-mark-regenerate');
-      const lockButton = document.getElementById('journal-mark-lock');
-      const permanence = document.querySelector('.mark-permanence');
-      const lockedMessage = document.getElementById('journal-mark-locked');
-      const finishButton = document.querySelector('button[type="submit"].cta-button');
-
-      if (regenerateButton) regenerateButton.hidden = journalMarkLocked;
-      if (lockButton) lockButton.hidden = journalMarkLocked;
-      if (permanence) permanence.hidden = journalMarkLocked;
-      if (lockedMessage) lockedMessage.hidden = !journalMarkLocked;
-      if (finishButton) finishButton.disabled = !journalMarkLocked;
-    }
-
-    function validMarkSpec(spec) {
-      const icons = spec ? [spec.icon1, spec.icon2] : [];
-      const words = Array.isArray(spec && spec.words) ? spec.words : [];
-      return icons.length === 2 && icons.every(icon => icon && icon.svg && icon.color && icon.color.hex) && words.length === 2;
-    }
-
-    function renderMark(spec, locked) {
+    function renderMark(spec) {
       const display = document.getElementById('journal-mark-display');
-      const errorEl = document.getElementById('journal-mark-error');
-      const retryButton = document.getElementById('journal-mark-retry');
-      const icons = spec ? [spec.icon1, spec.icon2] : [];
-      const words = Array.isArray(spec && spec.words) ? spec.words : [];
-
-      if (!display) return;
-      if (!validMarkSpec(spec)) {
-        renderGenericMark(display);
-        return;
+      if (!display) return false;
+      if (!spec || !spec.icon1 || !spec.icon2 || !Array.isArray(spec.words) || spec.words.length !== 2) {
+        display.innerHTML = '';
+        return false;
       }
-
-      display.innerHTML = '<div class="mark-card' + (locked ? ' locked' : '') + ' pop" role="img"><div class="mark-chips"><div class="mark-chip"></div><div class="mark-chip"></div></div><div class="mark-words"><span></span><span class="mark-sep">·</span><span></span></div></div>';
+      const icons = [spec.icon1, spec.icon2];
+      const words = spec.words;
+      display.innerHTML = '<div class="mark-card pop" role="img"><div class="mark-chips"><div class="mark-chip"></div><div class="mark-chip"></div></div><div class="mark-words"><span></span><span class="mark-sep">·</span><span></span></div></div>';
       const card = display.querySelector('.mark-card');
-      if (card) {
+      if (card && icons[0].color && icons[1].color) {
         card.setAttribute('aria-label', `${icons[0].color.name}, ${icons[1].color.name} · ${words[0]} ${words[1]}`);
       }
       const chips = display.querySelectorAll('.mark-chip');
       chips.forEach((chip, index) => {
         const icon = icons[index];
+        if (!icon || !icon.color) return;
         chip.style.borderColor = icon.color.hex;
         chip.style.background = icon.color.hex + '1f';
         if (icon.rot === 45) chip.style.transform = 'rotate(45deg)';
         chip.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="${icon.color.hex}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${icon.svg}</svg>`;
       });
-
       const wordSpans = display.querySelectorAll('.mark-words span:not(.mark-sep)');
-      wordSpans[0].textContent = words[0];
-      wordSpans[1].textContent = words[1];
-      if (errorEl) {
-        errorEl.textContent = '';
-        errorEl.hidden = true;
+      if (wordSpans.length >= 2) {
+        wordSpans[0].textContent = words[0];
+        wordSpans[1].textContent = words[1];
       }
-      if (retryButton) retryButton.hidden = true;
-      applyLockState(locked);
+      return wordSpans.length === 2 && chips.length === 2;
+    }
+
+    function isValidMarkSnapshot(markObj) {
+      if (!markObj || !['proposed', 'locked'].includes(markObj.state)) return false;
+      const nonblank = value => typeof value === 'string' && value.trim().length > 0;
+      if (!nonblank(markObj.proposal_id)) return false;
+      const r = markObj.render;
+      if (!r || !Array.isArray(r.words) || r.words.length !== 2 || !r.words.every(nonblank)) return false;
+      const glyph = /^(?:\s*<(?:path\s+d="[Mm][0-9a-z .,+-]*"|(?:circle|ellipse|rect)(?:\s+(?:cx|cy|r|rx|ry|x|y|width|height)="[-0-9.]+")+)\s*\/>\s*)+$/i;
+      return [r.icon1, r.icon2].every(icon => icon && nonblank(icon.svg)
+        && glyph.test(icon.svg) && icon.color && nonblank(icon.color.name)
+        && typeof icon.color.hex === 'string' && /^#[0-9a-f]{6}$/i.test(icon.color.hex));
+    }
+
+    function adoptMark(markObj) {
+      if (markObj && markObj.state === 'locked') markIsLocked = true;
+      if (markIsLocked && markObj && markObj.state !== 'locked') return false;
+      if (!isValidMarkSnapshot(markObj) || !renderMark(markObj.render)) {
+        showMarkError((setupCopy && setupCopy.mark && setupCopy.mark.error) || '');
+        displayedProposalId = null;
+        document.getElementById('journal-mark-display').innerHTML = '';
+        const retry = document.getElementById('setup-retry');
+        if (retry) retry.hidden = false;
+        updateMarkButtons();
+        return false;
+      }
+      clearMarkError();
+      displayGeneration++;
+      displayedProposalId = markObj.proposal_id;
+      markIsLocked = markObj.state === 'locked';
+      const retry = document.getElementById('setup-retry');
+      if (retry) retry.hidden = true;
+      updateMarkButtons();
+      return true;
+    }
+
+    function applyCopy() {
+      if (!setupCopy) return;
+      if (setupCopy.heading) {
+        document.title = setupCopy.heading;
+        const h1 = document.getElementById('setup-heading');
+        if (h1) h1.textContent = setupCopy.heading;
+      }
+      const welcome = document.getElementById('welcome-beats');
+      if (welcome && setupCopy.welcome && Array.isArray(setupCopy.welcome.how_it_fits)) {
+        welcome.textContent = '';
+        setupCopy.welcome.how_it_fits.forEach(beat => {
+          const p = document.createElement('p');
+          p.textContent = beat;
+          welcome.appendChild(p);
+        });
+      }
+      const fits = setupCopy.fits;
+      if (fits) {
+        const headline = document.getElementById('machine-card-headline');
+        if (headline) headline.textContent = fits.title || '';
+        const jTerm = document.getElementById('fits-journal-term');
+        if (jTerm) jTerm.textContent = fits.journal_term || '';
+        const jDesc = document.getElementById('fits-journal');
+        if (jDesc) jDesc.textContent = fits.journal || '';
+        const aTerm = document.getElementById('fits-app-term');
+        if (aTerm) aTerm.textContent = fits.app_term || '';
+        const aDesc = document.getElementById('fits-app');
+        if (aDesc) aDesc.textContent = fits.app || '';
+        const tTerm = document.getElementById('fits-thinking-term');
+        if (tTerm) tTerm.textContent = fits.thinking_term || '';
+        const tDesc = document.getElementById('fits-thinking');
+        if (tDesc) tDesc.textContent = fits.thinking || '';
+      }
+      const setupRetry = document.getElementById('setup-retry');
+      if (setupRetry) {
+        setupRetry.textContent = (setupCopy && setupCopy.downloads && setupCopy.downloads.retry) || '';
+      }
+      if (setupCopy.mark) {
+        document.getElementById('mark-title').textContent = setupCopy.mark.title || '';
+        document.getElementById('mark-help').textContent = setupCopy.mark.help || '';
+        const tryAnother = document.getElementById('mark-try-another');
+        if (tryAnother) tryAnother.textContent = setupCopy.mark.try_another || '';
+        const permanence = document.getElementById('mark-permanence');
+        if (permanence) permanence.textContent = setupCopy.mark.permanence || '';
+        const cont = document.getElementById('mark-continue');
+        if (cont) cont.textContent = setupCopy.mark.continue || '';
+      }
+      if (setupCopy.thinking) {
+        const tTitle = document.getElementById('thinking-title');
+        if (tTitle) tTitle.textContent = setupCopy.thinking.title || '';
+        const tChange = document.getElementById('thinking-change');
+        if (tChange) tChange.textContent = setupCopy.thinking.change || '';
+        const tCont = document.getElementById('thinking-continue');
+        if (tCont) tCont.textContent = setupCopy.thinking.continue || '';
+      }
+      if (setupCopy.downloads) {
+        const tCancel = document.getElementById('download-thinking-cancel');
+        if (tCancel) tCancel.textContent = setupCopy.downloads.cancel || '';
+        const tRetry = document.getElementById('download-thinking-retry');
+        if (tRetry) tRetry.textContent = setupCopy.downloads.retry || '';
+        const sRetry = document.getElementById('download-speech-retry');
+        if (sRetry) sRetry.textContent = setupCopy.downloads.retry || '';
+      }
+      const footer = document.getElementById('setup-footer');
+      if (footer && setupCopy.footer) footer.textContent = setupCopy.footer;
+    }
+
+    function renderThinkingOptions() {
+      const container = document.getElementById('thinking-options');
+      if (!container || !setupCopy || !setupCopy.thinking) return;
+      if (container.children.length > 0) return;
+
+      const choices = Array.isArray(setupCopy.thinking.choices) ? setupCopy.thinking.choices : [];
+      choices.forEach(choice => {
+        const label = document.createElement('label');
+        label.className = 'radio-option';
+        const input = document.createElement('input');
+        input.type = 'radio';
+        input.name = 'thinking-choice';
+        input.value = choice.id;
+        input.addEventListener('change', () => {
+          if (input.checked) {
+            userPicked = true;
+            pickedChoice = choice.id;
+            selectionEpoch++;
+            renderThinkingUI();
+          }
+        });
+        input.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            handleThinkingSubmit();
+          }
+        });
+
+        const wrap = document.createElement('div');
+        wrap.className = 'radio-content';
+
+        const labelSpan = document.createElement('span');
+        labelSpan.className = 'radio-label';
+        labelSpan.textContent = choice.label || choice.id;
+        wrap.appendChild(labelSpan);
+
+        if (choice.sub) {
+          const subSpan = document.createElement('span');
+          subSpan.className = 'radio-sub';
+          subSpan.textContent = choice.sub;
+          wrap.appendChild(subSpan);
+        }
+
+        if (choice.description) {
+          const descSpan = document.createElement('span');
+          descSpan.className = 'radio-desc';
+          descSpan.textContent = choice.description;
+          wrap.appendChild(descSpan);
+        }
+
+        label.append(input, wrap);
+        container.appendChild(label);
+      });
+
+      const laterLabel = document.createElement('label');
+      laterLabel.className = 'radio-option';
+      const laterInput = document.createElement('input');
+      laterInput.type = 'radio';
+      laterInput.name = 'thinking-choice';
+      laterInput.value = 'later';
+      laterInput.addEventListener('change', () => {
+        if (laterInput.checked) {
+          userPicked = true;
+          pickedChoice = 'later';
+          selectionEpoch++;
+          renderThinkingUI();
+        }
+      });
+      laterInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          handleThinkingSubmit();
+        }
+      });
+      const laterSpan = document.createElement('span');
+      laterSpan.textContent = (setupCopy && setupCopy.thinking && setupCopy.thinking.later) || '';
+      laterLabel.append(laterInput, laterSpan);
+      container.appendChild(laterLabel);
+    }
+
+    function renderThinkingUI() {
+      renderThinkingOptions();
+
+      const stateCapability = (setupState && setupState.thinking && setupState.thinking.capability) || 'unknown';
+      const saved = setupState && setupState.thinking && setupState.thinking.saved === true && ['local', 'byo', 'spp', 'later'].includes(setupState.thinking.choice);
+      const savedChoice = saved ? setupState.thinking.choice : null;
+
+      const summaryEl = document.getElementById('thinking-summary');
+      const chooseLaterEl = document.getElementById('thinking-choose-later');
+      const changeBtn = document.getElementById('thinking-change');
+
+      const activeChoiceId = userPicked ? pickedChoice : savedChoice;
+
+      if (activeChoiceId === 'byo' || activeChoiceId === 'spp') {
+        const choiceObj = setupCopy && setupCopy.thinking && Array.isArray(setupCopy.thinking.choices)
+          ? setupCopy.thinking.choices.find(c => c.id === activeChoiceId)
+          : null;
+        if (summaryEl) {
+          summaryEl.textContent = (choiceObj && choiceObj.label) || activeChoiceId;
+          summaryEl.hidden = false;
+        }
+        if (chooseLaterEl) chooseLaterEl.hidden = true;
+        if (changeBtn) changeBtn.hidden = false;
+      } else if (activeChoiceId === 'later') {
+        if (summaryEl) {
+          summaryEl.textContent = (setupCopy && setupCopy.thinking && setupCopy.thinking.later) || '';
+          summaryEl.hidden = false;
+        }
+        if (chooseLaterEl) chooseLaterEl.hidden = true;
+        if (changeBtn) changeBtn.hidden = false;
+      } else if (activeChoiceId === 'local' || (!activeChoiceId && stateCapability === 'ok')) {
+        const bytes = setupState && setupState.thinking && setupState.thinking.download_bytes;
+        const isFiniteBytes = typeof bytes === 'number' && Number.isFinite(bytes);
+        const formatted = isFiniteBytes ? formatByteSize(bytes) : null;
+        const sizeStr = (formatted !== null) ? formatted : ((setupCopy && setupCopy.thinking && setupCopy.thinking.size_unknown) || '');
+        if (summaryEl) {
+          if (setupCopy && setupCopy.thinking && setupCopy.thinking.default_line) {
+            summaryEl.textContent = setupCopy.thinking.default_line.replace('{size}', sizeStr);
+          } else {
+            summaryEl.textContent = sizeStr;
+          }
+          summaryEl.hidden = false;
+        }
+        if (chooseLaterEl) chooseLaterEl.hidden = true;
+        if (changeBtn) changeBtn.hidden = false;
+      } else {
+        if (summaryEl) {
+          summaryEl.textContent = '';
+          summaryEl.hidden = true;
+        }
+        if (chooseLaterEl) {
+          chooseLaterEl.textContent = (setupCopy && setupCopy.thinking && setupCopy.thinking.choose_later) || '';
+          chooseLaterEl.hidden = false;
+        }
+        if (changeBtn) changeBtn.hidden = false;
+      }
+
+      const blockedEl = document.getElementById('thinking-blocked');
+      if (blockedEl) {
+        if (stateCapability !== 'ok' && localCapability && Array.isArray(localCapability.checks)) {
+          const blockedChecks = localCapability.checks.filter(c => c && c.severity === 'blocked' && typeof c.detail === 'string' && c.detail.trim());
+          if (blockedChecks.length > 0) {
+            blockedEl.textContent = blockedChecks.map(c => c.detail.trim()).join(' ');
+            blockedEl.hidden = false;
+          } else {
+            blockedEl.textContent = '';
+            blockedEl.hidden = true;
+          }
+        } else {
+          blockedEl.textContent = '';
+          blockedEl.hidden = true;
+        }
+      }
+
+      const defaultChoice = stateCapability === 'ok' ? 'local' : null;
+      const radioValueToSelect = userPicked ? pickedChoice : (savedChoice ? savedChoice : defaultChoice);
+      const radios = document.querySelectorAll('input[name="thinking-choice"]');
+      radios.forEach(radio => {
+        radio.checked = Boolean(radioValueToSelect && radio.value === radioValueToSelect);
+      });
+    }
+
+    async function loadLocalCapabilityOnce() {
+      if (capabilityLoaded) return;
+      capabilityLoaded = true;
+      try {
+        const res = await apiCall('/init/api/local-capability');
+        localCapability = res;
+      } catch (_) {
+        localCapability = {
+          overall: (setupState && setupState.thinking && setupState.thinking.capability) || 'unknown',
+          checks: []
+        };
+      }
+      renderThinkingUI();
+    }
+
+    function showThinkingSection() {
+      const markSec = document.getElementById('setup-mark');
+      if (markSec) markSec.hidden = true;
+      const thinkingSec = document.getElementById('setup-thinking');
+      if (thinkingSec) {
+        thinkingSec.hidden = false;
+        const title = document.getElementById('thinking-title');
+        if (title && typeof title.focus === 'function') title.focus();
+      }
+      loadLocalCapabilityOnce();
+      renderThinkingUI();
+    }
+
+    function applyDownloadsSnapshot(incomingDownloads, seq) {
+      if (!incomingDownloads) return;
+      if (typeof seq === 'number' && seq < newestAppliedSeq) return;
+      if (typeof seq === 'number') {
+        newestAppliedSeq = seq;
+      }
+      if (!setupState) {
+        setupState = { downloads: incomingDownloads };
+      }
+      if (!setupState.downloads) {
+        setupState.downloads = incomingDownloads;
+      }
+
+      const speech = incomingDownloads.speech;
+      if (speech && !retiredSpeechAttemptIds.has(speech.attempt_id)
+          && !(speech.state === 'idle' && !speech.attempt_id && displayedSpeechAttemptId)) {
+        if (speech.attempt_id && speech.attempt_id !== displayedSpeechAttemptId) {
+          if (displayedSpeechAttemptId) retiredSpeechAttemptIds.add(displayedSpeechAttemptId);
+          displayedSpeechAttemptId = speech.attempt_id;
+        }
+        setupState.downloads.speech = speech;
+      }
+
+      const incomingThinking = incomingDownloads.thinking;
+      if (incomingThinking) {
+        const incId = incomingThinking.attempt_id;
+        const isRetired = incId && retiredAttemptIds.has(incId);
+
+        if (isRetired) {
+          // ignore retired thinking snapshot
+        } else if (!incId && displayedThinkingAttemptId && incomingThinking.state === 'idle') {
+          // do not revert an active attempt to idle
+        } else {
+          if (incId) {
+            if (displayedThinkingAttemptId && displayedThinkingAttemptId !== incId) {
+              retiredAttemptIds.add(displayedThinkingAttemptId);
+            }
+            displayedThinkingAttemptId = incId;
+          }
+          let effThinking = { ...incomingThinking };
+          if (incId && cancelledAttemptIds.has(incId) && effThinking.state === 'downloading') {
+            effThinking.state = 'cancelled';
+          }
+          if (effThinking.state === 'cancelled' && incId) {
+            cancelledAttemptIds.add(incId);
+          }
+          setupState.downloads.thinking = effThinking;
+        }
+      }
+
+      updateDownloadsUI();
+    }
+
+    function applyActionDownloads(downloads, seq) {
+      if (seq < newestAppliedSeq) {
+        // Delivery order does not make an old action snapshot authoritative.
+        // Ask the journal again, including when the last read said idle.
+        reconcileDownloadsSoon();
+      } else {
+        applyDownloadsSnapshot(downloads, seq);
+      }
+    }
+
+    function mergeSetupResponse(response) {
+      const downloads = setupState && setupState.downloads;
+      setupState = response ? { ...response, downloads } : response;
+    }
+
+    function reconcileDownloadsSoon() {
+      downloadsNeedReconciliation = true;
+      managePollInterval();
+    }
+
+    function updateDownloadsUI() {
+      const downloadsContainer = document.getElementById('downloads');
+      if (!downloadsContainer || !setupState || !setupState.downloads) return;
+
+      const downloads = setupState.downloads;
+      const thinking = downloads.thinking || { state: 'idle' };
+      const speech = downloads.speech || { state: 'idle' };
+
+      const activeStates = ['downloading', 'complete', 'error', 'cancelled'];
+      const hasActive = activeStates.includes(thinking.state) || activeStates.includes(speech.state);
+      downloadsContainer.hidden = !hasActive;
+
+      // Thinking row
+      const tRow = document.getElementById('download-thinking');
+      if (tRow) {
+        if (!activeStates.includes(thinking.state)) {
+          tRow.hidden = true;
+        } else {
+          tRow.hidden = false;
+          const label = tRow.querySelector('.download-label');
+          if (label && setupCopy && setupCopy.downloads) label.textContent = setupCopy.downloads.thinking || '';
+          const status = tRow.querySelector('.download-status');
+
+          if (thinking.state === 'cancelled' && displayedThinkingAttemptId) {
+            cancelledAttemptIds.add(displayedThinkingAttemptId);
+          }
+
+          const cancelBtn = document.getElementById('download-thinking-cancel');
+          const retryBtn = document.getElementById('download-thinking-retry');
+
+          if (thinking.state === 'downloading') {
+            const progress = (setupCopy && setupCopy.downloads && setupCopy.downloads.progress) || '';
+            if (typeof thinking.bytes_total === 'number') {
+              status.textContent = progress ? `${progress} (${thinking.bytes_done}/${thinking.bytes_total})` : `(${thinking.bytes_done}/${thinking.bytes_total})`;
+            } else if (thinking.bytes_done != null) {
+              status.textContent = progress ? `${progress} ${thinking.bytes_done}` : `${thinking.bytes_done}`;
+            } else {
+              status.textContent = progress;
+            }
+            if (cancelBtn) {
+              cancelBtn.hidden = displayedThinkingAttemptId ? cancelledAttemptIds.has(displayedThinkingAttemptId) : false;
+              cancelBtn.disabled = pendingCancelIds.has(displayedThinkingAttemptId);
+            }
+            if (retryBtn) retryBtn.hidden = true;
+          } else if (thinking.state === 'complete') {
+            status.textContent = (setupCopy && setupCopy.downloads && setupCopy.downloads.complete) || '';
+            if (cancelBtn) cancelBtn.hidden = true;
+            if (retryBtn) retryBtn.hidden = true;
+          } else if (thinking.state === 'cancelled') {
+            status.textContent = (setupCopy && setupCopy.downloads && setupCopy.downloads.cancelled) || '';
+            if (cancelBtn) cancelBtn.hidden = true;
+            if (retryBtn) {
+              retryBtn.hidden = false;
+              retryBtn.textContent = (setupCopy && setupCopy.downloads && setupCopy.downloads.retry) || '';
+              retryBtn.disabled = false;
+            }
+          } else if (thinking.state === 'error') {
+            status.textContent = (setupCopy && setupCopy.downloads && setupCopy.downloads.error) || '';
+            if (cancelBtn) cancelBtn.hidden = true;
+            if (retryBtn) {
+              retryBtn.hidden = false;
+              retryBtn.textContent = (setupCopy && setupCopy.downloads && setupCopy.downloads.retry) || '';
+              retryBtn.disabled = false;
+            }
+          }
+        }
+      }
+
+      // Speech row
+      const sRow = document.getElementById('download-speech');
+      if (sRow) {
+        if (!activeStates.includes(speech.state)) {
+          sRow.hidden = true;
+        } else {
+          sRow.hidden = false;
+          const sLabel = sRow.querySelector('.download-label');
+          const status = sRow.querySelector('.download-status');
+          const retryBtn = document.getElementById('download-speech-retry');
+
+          if (speech.state === 'downloading') {
+            if (sLabel) {
+              sLabel.textContent = (setupCopy && setupCopy.downloads && setupCopy.downloads.speech) || '';
+              sLabel.hidden = false;
+            }
+            const progress = (setupCopy && setupCopy.downloads && setupCopy.downloads.progress) || '';
+            if (typeof speech.bytes_total === 'number') {
+              status.textContent = progress ? `${progress} (${speech.bytes_done}/${speech.bytes_total})` : `(${speech.bytes_done}/${speech.bytes_total})`;
+            } else if (speech.bytes_done != null) {
+              status.textContent = progress ? `${progress} ${speech.bytes_done}` : `${speech.bytes_done}`;
+            } else {
+              status.textContent = progress;
+            }
+            if (retryBtn) retryBtn.hidden = true;
+          } else if (speech.state === 'complete') {
+            if (sLabel) {
+              sLabel.textContent = (setupCopy && setupCopy.downloads && setupCopy.downloads.speech) || '';
+              sLabel.hidden = false;
+            }
+            status.textContent = (setupCopy && setupCopy.downloads && setupCopy.downloads.complete) || '';
+            if (retryBtn) retryBtn.hidden = true;
+          } else if (speech.state === 'cancelled') {
+            if (sLabel) {
+              sLabel.textContent = (setupCopy && setupCopy.downloads && setupCopy.downloads.speech) || '';
+              sLabel.hidden = false;
+            }
+            status.textContent = (setupCopy && setupCopy.downloads && setupCopy.downloads.cancelled) || '';
+            if (retryBtn) retryBtn.hidden = true;
+          } else if (speech.state === 'error') {
+            if (speech.error && speech.error.code === 'speech_package_unavailable') {
+              if (sLabel) {
+                sLabel.textContent = '';
+                sLabel.hidden = true;
+              }
+              status.textContent = (speech.error && speech.error.detail) || '';
+              if (retryBtn) retryBtn.hidden = true;
+            } else {
+              if (sLabel) {
+                sLabel.textContent = (setupCopy && setupCopy.downloads && setupCopy.downloads.speech) || '';
+                sLabel.hidden = false;
+              }
+              status.textContent = (setupCopy && setupCopy.downloads && setupCopy.downloads.error) || '';
+              if (retryBtn) {
+                retryBtn.hidden = false;
+                retryBtn.disabled = false;
+              }
+            }
+          }
+        }
+      }
+
+      managePollInterval();
+    }
+
+    function shouldPoll() {
+      if (saveThinkingInFlight || downloadsNeedReconciliation) return true;
+      if (!setupState || !setupState.downloads) return false;
+      const d = setupState.downloads;
+      const thinkingDownloading = d.thinking && d.thinking.state === 'downloading';
+      const speechDownloading = d.speech && d.speech.state === 'downloading';
+      const speechAwaitingAdmission = d.speech && d.speech.state === 'idle' && setupState.done !== true;
+      return thinkingDownloading || speechDownloading || speechAwaitingAdmission;
+    }
+
+    function managePollInterval() {
+      if (shouldPoll()) {
+        if (pollIntervalId === null) {
+          pollIntervalId = setInterval(pollTick, STATE_POLL_MS);
+        }
+      } else {
+        if (pollIntervalId !== null) {
+          clearInterval(pollIntervalId);
+          pollIntervalId = null;
+        }
+      }
+    }
+
+    async function pollTick() {
+      if (stateReadInFlight) return;
+      stateReadInFlight = true;
+      const seq = ++requestSeq;
+      const reconciling = downloadsNeedReconciliation;
+      downloadsNeedReconciliation = false;
+
+      const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      let deadlineTimeout = null;
+      if (controller) {
+        deadlineTimeout = setTimeout(() => {
+          controller.abort();
+        }, STATE_READ_DEADLINE_MS);
+      }
+
+      try {
+        const opts = controller ? { signal: controller.signal } : {};
+        const freshState = await apiCall('/init/api/state', opts);
+        if (deadlineTimeout) clearTimeout(deadlineTimeout);
+        if (freshState && freshState.downloads) {
+          applyDownloadsSnapshot(freshState.downloads, seq);
+        }
+      } catch (err) {
+        if (deadlineTimeout) clearTimeout(deadlineTimeout);
+        if (reconciling) downloadsNeedReconciliation = true;
+        showCurrentError(errorText(err));
+      } finally {
+        stateReadInFlight = false;
+        managePollInterval();
+      }
+    }
+
+    async function runInitialStateRead() {
+      if (stateReadInFlight || proposalMutationInFlight) return;
+      proposalMutationInFlight = true;
+      updateMarkButtons();
+      stateReadInFlight = true;
+      let ownsStateRead = true;
+      const seq = ++requestSeq;
+
+      const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      let didAbort = false;
+      let deadlineTimeout = null;
+      if (controller) {
+        deadlineTimeout = setTimeout(() => {
+          didAbort = true;
+          controller.abort();
+        }, STATE_READ_DEADLINE_MS);
+      }
+
+      try {
+        const opts = controller ? { signal: controller.signal } : {};
+        const freshState = await apiCall('/init/api/state', opts);
+        stateReadInFlight = false;
+        ownsStateRead = false;
+        if (deadlineTimeout) clearTimeout(deadlineTimeout);
+        if (didAbort || (controller && controller.signal.aborted)) {
+          return;
+        }
+
+        if (freshState && freshState.done === true && freshState.redirect) {
+          window.location.href = freshState.redirect;
+          return;
+        }
+        const setupRetry = document.getElementById('setup-retry');
+        if (setupRetry) setupRetry.hidden = true;
+
+        setupState = freshState;
+        if (freshState && freshState.copy) {
+          setupCopy = freshState.copy;
+          applyCopy();
+        }
+        if (freshState && freshState.downloads) {
+          applyDownloadsSnapshot(freshState.downloads, seq);
+        }
+
+        const mark = freshState && freshState.mark;
+        if (!mark) {
+          adoptMark(null);
+        } else if (mark.state === 'locked') {
+          if (adoptMark(mark)) showThinkingSection();
+        } else if (mark.state === 'unavailable') {
+          proposalMutationInFlight = true;
+          updateMarkButtons();
+          try {
+            const actionSeq = ++requestSeq;
+            const res = await postAction({ action: 'regenerate_mark' });
+            mergeSetupResponse(res);
+            if (res.downloads) applyActionDownloads(res.downloads, actionSeq);
+            adoptMark(res.mark);
+          } catch (err) {
+            showMarkError(errorText(err));
+          }
+        } else {
+          adoptMark(mark);
+        }
+      } catch (err) {
+        if (deadlineTimeout) clearTimeout(deadlineTimeout);
+        showMarkError(errorText(err));
+        const setupRetry = document.getElementById('setup-retry');
+        if (setupRetry) {
+          setupRetry.hidden = false;
+          setupRetry.disabled = false;
+        }
+      } finally {
+        if (ownsStateRead) stateReadInFlight = false;
+        proposalMutationInFlight = false;
+        updateMarkButtons();
+        if (deadlineTimeout) clearTimeout(deadlineTimeout);
+      }
+    }
+
+    async function handleThinkingSubmit(e) {
+      if (e && typeof e.preventDefault === 'function') e.preventDefault();
+      if (thinkingContinueInFlight || finalizeInFlight) return;
+      thinkingContinueInFlight = true;
+      const thinkingContinueBtn = document.getElementById('thinking-continue');
+      if (thinkingContinueBtn) thinkingContinueBtn.disabled = true;
+      clearThinkingError();
+
+      const currentEpoch = selectionEpoch;
+      const stateCap = (setupState && setupState.thinking && setupState.thinking.capability) || 'unknown';
+      const saved = setupState && setupState.thinking && setupState.thinking.saved === true && ['local', 'byo', 'spp', 'later'].includes(setupState.thinking.choice);
+      const effectiveChoice = userPicked ? pickedChoice : (saved ? setupState.thinking.choice : (stateCap === 'ok' ? 'local' : 'later'));
+      const needsSave = !saved || (userPicked && pickedChoice !== setupState.thinking.choice);
+
+      if (needsSave) {
+        saveThinkingInFlight = true;
+        managePollInterval();
+        const seq = ++requestSeq;
+        try {
+          const saveRes = await postAction({ action: 'save_thinking', choice: effectiveChoice });
+          saveThinkingInFlight = false;
+          if (saveRes && saveRes.downloads) applyActionDownloads(saveRes.downloads, seq);
+          managePollInterval();
+          if (currentEpoch !== selectionEpoch) {
+            thinkingContinueInFlight = false;
+            if (thinkingContinueBtn) thinkingContinueBtn.disabled = false;
+            return;
+          }
+          const existingDownloads = setupState ? setupState.downloads : undefined;
+          setupState = saveRes ? {
+            ...saveRes,
+            downloads: existingDownloads
+          } : saveRes;
+        } catch (err) {
+          saveThinkingInFlight = false;
+          reconcileDownloadsSoon();
+          thinkingContinueInFlight = false;
+          if (thinkingContinueBtn) thinkingContinueBtn.disabled = false;
+          showThinkingError(errorText(err));
+          return;
+        }
+      }
+
+      finalizeInFlight = true;
+      try {
+        const finRes = await postAction({ action: 'finalize' });
+        thinkingContinueInFlight = false;
+        finalizeInFlight = false;
+        if (thinkingContinueBtn) thinkingContinueBtn.disabled = false;
+        if (finRes && finRes.done === true && currentEpoch === selectionEpoch) {
+          if (finRes.redirect) {
+            window.location.href = finRes.redirect;
+          }
+        }
+      } catch (err) {
+        thinkingContinueInFlight = false;
+        finalizeInFlight = false;
+        if (thinkingContinueBtn) thinkingContinueBtn.disabled = false;
+        showThinkingError(errorText(err));
+      }
     }
 
     document.addEventListener('DOMContentLoaded', () => {
-      const retryButton = document.getElementById('journal-mark-retry');
-      const regenerateButton = document.getElementById('journal-mark-regenerate');
-      const lockButton = document.getElementById('journal-mark-lock');
-      const finishButton = document.querySelector('button[type="submit"].cta-button');
-      let currentProposalId = null;
-      let markGeneration = 0;
-
-      async function loadMark() {
-        const generation = ++markGeneration;
-        const originalLabel = retryButton ? retryButton.textContent : '';
-        if (retryButton && !retryButton.hidden) {
-          retryButton.disabled = true;
-          retryButton.textContent = 'trying…';
-        }
-        if (regenerateButton) regenerateButton.disabled = true;
-        if (lockButton) lockButton.disabled = true;
-        const display = document.getElementById('journal-mark-display');
+      const bootstrapEl = document.getElementById('setup-copy-bootstrap');
+      if (bootstrapEl && typeof bootstrapEl.textContent === 'string' && bootstrapEl.textContent.trim()) {
         try {
-          const data = await window.apiJson('/init/mark');
-          if (generation !== markGeneration) return;
-          if (!data || data.availability === 'none') {
-            currentProposalId = null;
-            renderGenericMark(display);
-            applyLockState(false);
-          } else if ((data.availability === 'candidate' || data.availability === 'ready') && validMarkSpec(data.mark)) {
-            currentProposalId = data.proposal_id || null;
-            renderMark(data.mark, data.locked);
-          } else {
-            currentProposalId = data.proposal_id || null;
-            renderUnavailableMark(display);
-            if (data && data.locked) applyLockState(true);
-            else applyLockState(false);
-          }
-        } catch (err) {
-          if (generation !== markGeneration) return;
-          renderUnavailableMark(display);
-          showMarkError((err && err.serverMessage) || "couldn't load your mark. try again.");
-          if (retryButton) retryButton.hidden = false;
-          if (finishButton) finishButton.disabled = true;
-        } finally {
-          if (generation === markGeneration) {
-            if (retryButton && !retryButton.hidden) {
-              retryButton.textContent = originalLabel || 'try again';
-              retryButton.disabled = false;
-            }
-            if (regenerateButton) regenerateButton.disabled = false;
-            if (lockButton && !lockButton.hidden) lockButton.disabled = false;
-          }
-        }
+          setupCopy = JSON.parse(bootstrapEl.textContent);
+          applyCopy();
+        } catch (_) {}
       }
 
-      if (retryButton) retryButton.addEventListener('click', loadMark);
-      if (regenerateButton) {
-        regenerateButton.addEventListener('click', async () => {
-          const generation = ++markGeneration;
-          const originalLabel = regenerateButton.textContent;
-          regenerateButton.disabled = true;
-          regenerateButton.textContent = 'trying…';
-          if (lockButton) lockButton.disabled = true;
+      const setupRetryBtn = document.getElementById('setup-retry');
+      if (setupRetryBtn) {
+        setupRetryBtn.addEventListener('click', () => {
+          runInitialStateRead();
+        });
+      }
+
+      const tryAnotherBtn = document.getElementById('mark-try-another');
+      if (tryAnotherBtn) {
+        tryAnotherBtn.addEventListener('click', async () => {
+          if (proposalMutationInFlight) return;
+          proposalMutationInFlight = true;
+          updateMarkButtons();
+          clearMarkError();
+          markRefreshSeq++;
           try {
-            const data = await window.apiJson('/init/mark/regenerate', {method: 'POST'});
-            if (generation !== markGeneration) return;
-            currentProposalId = data.proposal_id || null;
-            renderMark(data.mark, false);
+            const actionSeq = ++requestSeq;
+            const res = await postAction({ action: 'regenerate_mark' });
+            mergeSetupResponse(res);
+            if (res.downloads) applyActionDownloads(res.downloads, actionSeq);
+            adoptMark(res.mark);
           } catch (err) {
-            if (generation !== markGeneration) return;
-            showMarkError((err && err.serverMessage) || "couldn't regenerate. try again.");
+            showMarkError(errorText(err));
           } finally {
-            if (generation === markGeneration) {
-              regenerateButton.textContent = originalLabel;
-              regenerateButton.disabled = false;
-              if (lockButton && !lockButton.hidden) lockButton.disabled = false;
-            }
+            proposalMutationInFlight = false;
+            updateMarkButtons();
           }
         });
       }
-      if (lockButton) {
-        lockButton.addEventListener('click', async () => {
-          const generation = ++markGeneration;
-          const originalLabel = lockButton.textContent;
-          lockButton.disabled = true;
-          lockButton.textContent = 'locking…';
-          if (regenerateButton) regenerateButton.disabled = true;
+
+      const markContinueBtn = document.getElementById('mark-continue');
+      if (markContinueBtn) {
+        markContinueBtn.addEventListener('click', async () => {
+          if (proposalMutationInFlight) return;
+          if (!displayedProposalId) return;
+          proposalMutationInFlight = true;
+          updateMarkButtons();
+          clearMarkError();
+          const postingProposalId = displayedProposalId;
+          const actionSeq = ++requestSeq;
           try {
-            const data = await window.apiJson('/init/mark/lock', {
-              method: 'POST',
-              headers: {'Content-Type': 'application/json'},
-              body: JSON.stringify({proposal_id: currentProposalId})
-            });
-            if (generation !== markGeneration) return;
-            currentProposalId = data.proposal_id || null;
-            renderMark(data.mark, true);
+            const res = await postAction({ action: 'commit_mark', proposal_id: postingProposalId });
+            proposalMutationInFlight = false;
+            mergeSetupResponse(res);
+            if (res.downloads) applyActionDownloads(res.downloads, actionSeq);
+            if (res.mark && res.mark.state === 'locked') {
+              if (adoptMark(res.mark)) showThinkingSection();
+            } else {
+              updateMarkButtons();
+            }
           } catch (err) {
-            if (generation !== markGeneration) return;
-            showMarkError((err && err.serverMessage) || "couldn't lock it in. try again.");
-            applyLockState(false);
-          } finally {
-            if (generation === markGeneration) {
-              if (!lockButton.hidden) {
-                lockButton.textContent = originalLabel;
-                lockButton.disabled = false;
+            if (err && err.reasonCode === 'proposal_conflict') {
+              showMarkError(err.rawDetail || errorText(err));
+              const startMarkSeq = ++markRefreshSeq;
+              const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+              let deadlineTimeout = null;
+              let didAbort = false;
+              if (controller) {
+                deadlineTimeout = setTimeout(() => {
+                  didAbort = true;
+                  controller.abort();
+                }, STATE_READ_DEADLINE_MS);
               }
-              if (regenerateButton) regenerateButton.disabled = false;
+              try {
+                const readSeq = ++requestSeq;
+                const opts = controller ? { signal: controller.signal } : {};
+                const freshState = await apiCall('/init/api/state', opts);
+                if (deadlineTimeout) clearTimeout(deadlineTimeout);
+                if (didAbort || (controller && controller.signal.aborted)) {
+                  return;
+                }
+                if (startMarkSeq < markRefreshSeq) {
+                  return;
+                }
+                mergeSetupResponse(freshState);
+                if (freshState && freshState.downloads) applyDownloadsSnapshot(freshState.downloads, readSeq);
+                if (freshState && freshState.mark) {
+                  if (adoptMark(freshState.mark)) showMarkError(err.rawDetail || errorText(err));
+                }
+              } catch (readErr) {
+                if (deadlineTimeout) clearTimeout(deadlineTimeout);
+                showMarkError(errorText(readErr));
+              } finally {
+                proposalMutationInFlight = false;
+                updateMarkButtons();
+              }
+            } else {
+              proposalMutationInFlight = false;
+              updateMarkButtons();
+              showMarkError(errorText(err));
             }
           }
         });
       }
-      loadMark();
-    });
 
-    function showFinalizeError(errorEl, message) {
-      if (!errorEl) return;
-      errorEl.textContent = message;
-      errorEl.hidden = false;
-    }
-
-    async function finalize(event) {
-      if (event) event.preventDefault();
-      const errorEl = document.getElementById('finalize-error');
-      const button = document.querySelector('button[type="submit"].cta-button');
-      const originalLabel = button ? button.textContent : '';
-      if (button) {
-        button.disabled = true;
-        button.textContent = 'saving…';
-      }
-      if (errorEl) {
-        errorEl.hidden = true;
-        errorEl.textContent = '';
-      }
-      try {
-        const daysInput = document.getElementById('retention-days-input');
-        const modeInput = document.querySelector('input[name="retention_mode"]:checked');
-        const selectedMode = modeInput ? modeInput.value : 'keep';
-        const { mode, days } = deriveRetention(daysInput.value, selectedMode);
-        const payload = {
-          name: document.getElementById('name').value.trim(),
-          preferred: document.getElementById('preferred').value.trim(),
-          timezone: detectedTimezone,
-          retention_mode: mode,
-          retention_days: days
-        };
-        if (selectedLane && selectedLane !== 'defer') payload.lane = selectedLane;
-        const data = await window.apiJson('/init/finalize', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify(payload)
+      const thinkingChangeBtn = document.getElementById('thinking-change');
+      if (thinkingChangeBtn) {
+        thinkingChangeBtn.addEventListener('click', () => {
+          const opts = document.getElementById('thinking-options');
+          if (opts) opts.hidden = false;
         });
-        if (data && data.success && data.redirect) {
-          if (data.warnings && data.warnings.length) {
-            showFinalizeError(errorEl, data.warnings.join(' '));
-            if (button) button.textContent = 'redirecting…';
-            setTimeout(() => {
-              window.location.href = data.redirect;
-            }, RESULT_DISPLAY_MS);
-            return;
-          }
-          if (button) button.textContent = 'redirecting…';
-          window.location.href = data.redirect;
-          return;
-        }
-        if (data && data.error) {
-          showFinalizeError(errorEl, data.error);
-        } else {
-          showFinalizeError(errorEl, "your journal couldn't finish setup. try again.");
-        }
-      } catch (err) {
-        let message = err && err.serverMessage;
-        if (!message) {
-          message = err && err.message ? `couldn't finalize setup: ${err.message}` : "couldn't finalize setup. check your connection and try again.";
-        }
-        showFinalizeError(errorEl, message);
-        if (window.logError) window.logError(err, { context: 'init-finalize' });
-        else if (window.console) console.error('init-finalize', err);
-      } finally {
-        if (button && !button.textContent.includes('redirecting')) {
-          button.disabled = false;
-          button.textContent = originalLabel;
-        }
       }
-    }
+
+      const thinkingForm = document.getElementById('thinking-form');
+      if (thinkingForm) {
+        thinkingForm.addEventListener('submit', (e) => {
+          handleThinkingSubmit(e);
+        });
+      }
+
+      const cancelThinkingBtn = document.getElementById('download-thinking-cancel');
+      if (cancelThinkingBtn) {
+        cancelThinkingBtn.addEventListener('click', async () => {
+          const attemptToCancel = displayedThinkingAttemptId;
+          if (!attemptToCancel) return;
+          if (pendingCancelIds.has(attemptToCancel)) return;
+          pendingCancelIds.add(attemptToCancel);
+          cancelThinkingBtn.disabled = true;
+          const seq = ++requestSeq;
+          try {
+            const res = await postAction({ action: 'cancel_thinking_download', attempt_id: attemptToCancel });
+            if (res && res.downloads) {
+              applyActionDownloads(res.downloads, seq);
+            }
+          } catch (err) {
+            reconcileDownloadsSoon();
+            showCurrentError(errorText(err));
+          } finally {
+            pendingCancelIds.delete(attemptToCancel);
+            updateDownloadsUI();
+          }
+        });
+      }
+
+      const retryThinkingBtn = document.getElementById('download-thinking-retry');
+      if (retryThinkingBtn) {
+        retryThinkingBtn.addEventListener('click', async () => {
+          retryThinkingBtn.disabled = true;
+          const seq = ++requestSeq;
+          try {
+            const res = await postAction({ action: 'start_thinking_download' });
+            if (res && res.downloads) {
+              applyActionDownloads(res.downloads, seq);
+            }
+          } catch (err) {
+            reconcileDownloadsSoon();
+            showCurrentError(errorText(err));
+          } finally {
+            retryThinkingBtn.disabled = false;
+          }
+        });
+      }
+
+      const retrySpeechBtn = document.getElementById('download-speech-retry');
+      if (retrySpeechBtn) {
+        retrySpeechBtn.addEventListener('click', async () => {
+          retrySpeechBtn.disabled = true;
+          const seq = ++requestSeq;
+          try {
+            const res = await postAction({ action: 'retry_speech_download' });
+            if (res && res.downloads) {
+              applyActionDownloads(res.downloads, seq);
+            }
+          } catch (err) {
+            reconcileDownloadsSoon();
+            showCurrentError(errorText(err));
+          } finally {
+            retrySpeechBtn.disabled = false;
+          }
+        });
+      }
+
+      runInitialStateRead();
+    });
   </script>
 </body>
 </html>

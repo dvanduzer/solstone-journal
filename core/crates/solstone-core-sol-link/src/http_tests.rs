@@ -25,7 +25,6 @@ use crate::ledger::{AuthorizationLedger, ClientEntry, ClientRole};
 use crate::mark::mark_from_jid;
 
 const VALID_CID: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const INIT_HTML: &str = include_str!("../assets/init.html");
 
 #[tokio::test]
 async fn init_routes_reject_linked_devices_and_serve_localhost() {
@@ -537,7 +536,21 @@ async fn init_reads_defaults_without_writing() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    assert_eq!(body.as_ref(), INIT_HTML.as_bytes());
+    let expected = crate::http::injected_init_html();
+    assert_eq!(body.as_ref(), expected.as_bytes());
+    let html = std::str::from_utf8(&body).unwrap();
+    let bootstrap = html
+        .split_once("<script type=\"application/json\" id=\"setup-copy-bootstrap\">")
+        .unwrap()
+        .1
+        .split_once("</script>")
+        .unwrap()
+        .0;
+    let copy: Value = serde_json::from_str(bootstrap).unwrap();
+    assert_eq!(
+        copy,
+        solstone_core_thinking_copy::setup_copy(&solstone_core_thinking_copy::current_setup_facts())
+    );
     assert!(
         !temporary
             .path()

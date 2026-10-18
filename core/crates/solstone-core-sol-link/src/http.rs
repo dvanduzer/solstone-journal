@@ -611,6 +611,20 @@ fn local_unavailable_reason(row: &str) -> String {
         .unwrap_or_default()
 }
 
+pub(crate) fn injected_init_html() -> String {
+    let copy = solstone_core_thinking_copy::setup_copy(
+        &solstone_core_thinking_copy::current_setup_facts(),
+    );
+    let serialized = serde_json::to_string(&copy)
+        .unwrap_or_default()
+        .replace('<', "\\u003c");
+    const TARGET: &str = "<script type=\"application/json\" id=\"setup-copy-bootstrap\"></script>";
+    let replacement = format!(
+        "<script type=\"application/json\" id=\"setup-copy-bootstrap\">{serialized}</script>"
+    );
+    INIT_HTML.replace(TARGET, &replacement)
+}
+
 async fn init(
     Extension(basis): Extension<AccessBasis>,
     State(state): State<LinkHttpState>,
@@ -629,7 +643,7 @@ async fn init(
             .insert(LOCATION, HeaderValue::from_static("/"));
         return response;
     }
-    Html(INIT_HTML).into_response()
+    Html(injected_init_html()).into_response()
 }
 
 async fn init_mark(

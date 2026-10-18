@@ -15,6 +15,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- browser setup confirms the journal mark you see, then saves where thinking runs.
 - setup commits the journal mark you see and saves your thinking choice. it opens home, with links to finish setting up your own model or confidential processing. finishing setup again keeps your completion time and settings.
 - while no device is paired, home keeps "set one up →" next to anything that needs your attention. before, it disappeared whenever anything else showed, which on a new journal was almost always.
 - not having chosen where the thinking happens yet no longer counts as something that needs your attention on home. a note says your journal starts catching up once you choose, and links to the thinking app.

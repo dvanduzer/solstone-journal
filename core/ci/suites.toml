@@ -4444,6 +4444,19 @@ required_features = ["host", "test-hooks"]
 runtime = "none"
 
 [[suites]]
+id = "solstone-core-sol-link::init_dom"
+package = "solstone-core-sol-link"
+target = "init_dom"
+set = "component"
+areas = ["services"]
+platforms = ["linux", "macos"]
+prerequisites = ["cargo-cache"]
+timeout = "standard"
+default_full = true
+required_features = []
+runtime = "none"
+
+[[suites]]
 id = "solstone-core-sound-tags::tag_audio"
 package = "solstone-core-sound-tags"
 target = "tag_audio"
