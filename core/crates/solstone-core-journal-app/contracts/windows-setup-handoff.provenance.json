@@ -1,0 +1,7 @@
+{
+  "repository": "https://github.com/solpbc/solstone-windows",
+  "source_commit": "2e861e61eb3fe1d6e54388e7184e96605ba50c09",
+  "source_path": "setup-handoff-contract.json",
+  "sha256": "7703935e5a179bfb7e7b73fe95df3cc8313051e1cb879ce826003a3c8da5ec68",
+  "generator": "cargo run --locked -p xtask -- contract"
+}

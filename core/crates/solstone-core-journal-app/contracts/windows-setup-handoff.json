@@ -1,0 +1,101 @@
+{
+  "_generated": "DO NOT EDIT — run make contract",
+  "argv": {
+    "cli_flag": "--setup-handoff",
+    "control_verb": "reload-setup\n",
+    "installed_executable": "%LOCALAPPDATA%\\Solstone\\current\\solstone-windows-app.exe"
+  },
+  "capability_document": {
+    "capabilities": [
+      "setup-sequence-v1"
+    ],
+    "schema": "solstone.windows-setup-capabilities.v1"
+  },
+  "desktop": {
+    "canonical_prefix": "https://go.solstone.app/p#",
+    "host": "pair",
+    "paths": [
+      "",
+      "/"
+    ],
+    "scheme": "solstone"
+  },
+  "fields": {
+    "mailbox": {
+      "unknown_fields": "forbidden",
+      "required": [
+        {
+          "name": "schema",
+          "type": "string"
+        },
+        {
+          "name": "handoff_id",
+          "type": "uuid"
+        },
+        {
+          "name": "step",
+          "type": "integer",
+          "const": 5
+        },
+        {
+          "name": "expected_instance_id",
+          "type": "string"
+        },
+        {
+          "name": "expected_ca_fingerprint",
+          "type": "sha256-hex"
+        },
+        {
+          "name": "pairing_link",
+          "type": "https-pair-link"
+        },
+        {
+          "name": "expires_at_unix_ms",
+          "type": "unix-milliseconds"
+        }
+      ]
+    },
+    "receipt": {
+      "unknown_fields": "forbidden",
+      "required": [
+        {
+          "name": "schema",
+          "type": "string"
+        },
+        {
+          "name": "handoff_id",
+          "type": "uuid"
+        },
+        {
+          "name": "accepted",
+          "type": "boolean",
+          "const": true
+        }
+      ]
+    }
+  },
+  "files": {
+    "lock": "solstone-setup-handoff.lock",
+    "mailbox": "solstone-setup-handoff.json",
+    "receipt": "solstone-setup-handoff-receipt.json"
+  },
+  "identity": {
+    "method": "GET",
+    "path": "/app/link/api/identity"
+  },
+  "limits": {
+    "mailbox_max_bytes": 16384,
+    "receipt_max_bytes": 4096,
+    "capability_resource_max_bytes": 4096,
+    "lock_acquire_ms": 5000,
+    "unpaired_draft_max_age_secs": 900
+  },
+  "resource": {
+    "name": "SOLSTONE_SETUP_CAPABILITIES",
+    "type": "RT_RCDATA"
+  },
+  "schemas": {
+    "mailbox": "solstone.windows-setup-handoff.v1",
+    "receipt": "solstone.windows-setup-receipt.v1"
+  }
+}
