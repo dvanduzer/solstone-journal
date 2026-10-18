@@ -6,10 +6,13 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-The new setup sequence is prepared but remains off in this build. The setup
-entries below describe the sequence after activation.
+## [2.0.51] - 2026-10-18
 
 ### Added
+
+- with the latest solstone app on this mac, you can now choose your folder, lock in your mark and choose where thinking happens in the journal app. setup then continues in the solstone app, and your journal opens in the browser at the end.
+
+- if start at login can't be changed, the journal app keeps the previous setting and shows an error.
 
 - when you first set up your journal on windows, you can choose whether it starts when you sign in. leaving that choice out keeps the current default, and setting up your journal again keeps your existing choice.
 - after setup on windows, the journal window can continue in the solstone app. if that app is missing or too old, the window offers the download page for the solstone app for windows, and you can try again after installing it.
