@@ -134,6 +134,7 @@ pub struct IdentityMapCacheLoad {
 /// Failure while changing durable entity-store state.
 #[derive(Debug)]
 pub enum EntityWriteError {
+    PublicationRefused(String),
     TrustLock(EntityTrustLockError),
     Read(EntityStoreError),
     InvalidIdentity {
@@ -209,6 +210,7 @@ impl fmt::Display for EntityWriteError {
                     "invalid entity identity {identity_id:?}: {detail}"
                 )
             }
+            Self::PublicationRefused(detail) => formatter.write_str(detail),
             Self::InvalidOperationContext { detail } => {
                 write!(formatter, "invalid entity operation context: {detail}")
             }
@@ -293,7 +295,8 @@ impl Error for EntityWriteError {
             | Self::CacheWriteAfterCommit(error) => Some(error),
             Self::PreparedEventRemoval(error) => Some(error),
             Self::AmbiguityLock(error) => Some(error),
-            Self::InvalidIdentity { .. }
+            Self::PublicationRefused(_)
+            | Self::InvalidIdentity { .. }
             | Self::InvalidOperationContext { .. }
             | Self::AmbiguityRowInvalid { .. }
             | Self::AmbiguityCountOverflow { .. }
@@ -618,6 +621,14 @@ pub fn record_ambiguity_observation(
     journal_root: &Path,
     observation: &AmbiguityObservation,
 ) -> Result<Value, EntityWriteError> {
+    record_ambiguity_observation_checked(journal_root, observation, &|| Ok(()))
+}
+
+pub fn record_ambiguity_observation_checked(
+    journal_root: &Path,
+    observation: &AmbiguityObservation,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Value, EntityWriteError> {
     let _trust = hold_entity_trust_lock(journal_root)?;
     let census =
         super::census::scan_identity_census(journal_root).map_err(EntityWriteError::Read)?;
@@ -625,7 +636,7 @@ pub fn record_ambiguity_observation(
     let typo_enabled = solstone_core_journal_config::entity_tier8_typo_acceptance_enabled(
         config_read.as_ref().and_then(|r| r.config.as_ref()),
     );
-    mutate_ambiguities(journal_root, |rows| {
+    mutate_ambiguities_checked(journal_root, checkpoint, |rows| {
         let scope_key = ambiguity_scope_key(&observation.scope)?;
         let key = format!("{scope_key}|{}", observation.normalized_query);
         let origin_key = origin_key(&observation.origin)?;
@@ -1154,6 +1165,17 @@ pub(super) fn mutate_ambiguities<F>(
 where
     F: FnOnce(&mut Vec<Value>) -> Result<Value, EntityWriteError>,
 {
+    mutate_ambiguities_checked(journal_root, &|| Ok(()), mutate)
+}
+
+fn mutate_ambiguities_checked<F>(
+    journal_root: &Path,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+    mutate: F,
+) -> Result<Value, EntityWriteError>
+where
+    F: FnOnce(&mut Vec<Value>) -> Result<Value, EntityWriteError>,
+{
     let path = ambiguities_path(journal_root)?;
     let _lock = hold_lock(
         &path,
@@ -1164,6 +1186,7 @@ where
     )
     .map_err(EntityWriteError::AmbiguityLock)?;
     let mut rows = super::ambiguity::read_ambiguities(journal_root, MalformedPolicy::Raise)?;
+    checkpoint().map_err(EntityWriteError::PublicationRefused)?;
     let result = mutate(&mut rows)?;
     for row in &rows {
         let object = row.as_object().expect("strict reader returns objects");
@@ -1172,6 +1195,7 @@ where
         })?;
     }
     let contents = serialize_ambiguity_rows(&rows).map_err(EntityWriteError::AmbiguityWrite)?;
+    checkpoint().map_err(EntityWriteError::PublicationRefused)?;
     write_text(&path, &contents, AtomicWriteOptions { mode: Some(0o600) })
         .map_err(EntityWriteError::AmbiguityWrite)?;
     Ok(result)

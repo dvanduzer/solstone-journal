@@ -58,7 +58,11 @@ pub fn freeze(
         }
         if !prepared.config.contains_key("skip_reason") {
             if let Some(build) = stage.build {
-                match build(&mut prepared, context) {
+                match build(
+                    &mut prepared,
+                    context,
+                    &solstone_core_generate::Cancellation::never(),
+                ) {
                     Ok(value) => state = value,
                     Err(RuntimeOutcome::Skipped { reason, .. }) if no_output_reason(&reason) => {
                         prepared

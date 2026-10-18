@@ -70,6 +70,7 @@ fn response_id_and_text(response: GenerateResponse) -> (String, String) {
     match response {
         GenerateResponse::Generated(response) => (response.id.unwrap(), response.text),
         GenerateResponse::Refused(response) => (response.id.unwrap(), response.detail),
+        GenerateResponse::Cancelled => panic!("unexpected cancelled response"),
     }
 }
 

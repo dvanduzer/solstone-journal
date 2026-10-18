@@ -149,10 +149,16 @@ pub enum Trailing {
 /// Read/write transport carrying application requests after attestation.
 pub trait AttestedIo: Read + Write {
     fn set_io_timeout(&mut self, timeout: Option<Duration>) -> std::io::Result<()>;
+    /// Bound any nested transport work within a read, write, or flush operation.
+    fn set_io_deadline(&mut self, deadline: Option<Instant>) -> std::io::Result<()>;
     fn trailing_after_body(&mut self) -> std::io::Result<Trailing>;
 }
 
 impl AttestedIo for TcpStream {
+    fn set_io_deadline(&mut self, _deadline: Option<Instant>) -> std::io::Result<()> {
+        Ok(())
+    }
+
     fn set_io_timeout(&mut self, timeout: Option<Duration>) -> std::io::Result<()> {
         self.set_read_timeout(timeout)?;
         self.set_write_timeout(timeout)
@@ -175,6 +181,10 @@ impl AttestedIo for TcpStream {
 }
 
 impl<T: AttestedIo + ?Sized> AttestedIo for Box<T> {
+    fn set_io_deadline(&mut self, deadline: Option<Instant>) -> std::io::Result<()> {
+        (**self).set_io_deadline(deadline)
+    }
+
     fn set_io_timeout(&mut self, timeout: Option<Duration>) -> std::io::Result<()> {
         (**self).set_io_timeout(timeout)
     }
@@ -337,11 +347,17 @@ impl RecordFramingTracker {
 pub struct CountingReader<'a> {
     sock: &'a mut TcpStream,
     tracker: &'a mut RecordFramingTracker,
+    deadline: Option<Instant>,
 }
 
 impl<'a> Read for CountingReader<'a> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.sock.read(buf)?;
+        let n = DeadlineIo {
+            stream: &mut *self.sock,
+            deadline: self.deadline,
+            now: Instant::now,
+        }
+        .read(buf)?;
         if n > 0 {
             self.tracker.observe(&buf[..n]);
         }
@@ -362,6 +378,7 @@ pub struct AttestedChannel {
     saw_eof: bool,
     /// The TLS layer rejected a record; nothing more is read or sent.
     tls_failed: bool,
+    io_deadline: Option<Instant>,
 }
 
 impl AttestedChannel {
@@ -398,6 +415,7 @@ impl AttestedChannel {
         let mut reader = CountingReader {
             sock: &mut self.sock,
             tracker: &mut self.tracker,
+            deadline: self.io_deadline,
         };
         let res = self.conn.read_tls(&mut reader);
         let restore_ok = self.sock.set_nonblocking(false).is_ok();
@@ -416,18 +434,21 @@ impl AttestedChannel {
     /// only drains ciphertext, so an interrupt can never duplicate request bytes.
     /// Any other socket error is returned with its original kind.
     fn drain_tls(&mut self) -> std::io::Result<()> {
-        while self.conn.wants_write() {
-            match self.conn.write_tls(&mut self.sock) {
-                Ok(_) => {}
-                Err(error) if error.kind() == ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(())
+        drain_tls_to(
+            &mut self.conn,
+            &mut self.sock,
+            self.io_deadline,
+            Instant::now,
+        )
     }
 }
 
 impl AttestedIo for AttestedChannel {
+    fn set_io_deadline(&mut self, deadline: Option<Instant>) -> std::io::Result<()> {
+        self.io_deadline = deadline;
+        Ok(())
+    }
+
     fn set_io_timeout(&mut self, timeout: Option<Duration>) -> std::io::Result<()> {
         self.sock.set_read_timeout(timeout)?;
         self.sock.set_write_timeout(timeout)
@@ -453,6 +474,7 @@ impl AttestedIo for AttestedChannel {
         let mut reader = CountingReader {
             sock: &mut self.sock,
             tracker: &mut self.tracker,
+            deadline: self.io_deadline,
         };
         let res = self.conn.read_tls(&mut reader);
         let restore_ok = self.sock.set_nonblocking(false).is_ok();
@@ -493,6 +515,7 @@ impl Read for AttestedChannel {
                     let mut reader = CountingReader {
                         sock: &mut self.sock,
                         tracker: &mut self.tracker,
+                        deadline: self.io_deadline,
                     };
                     if self.conn.read_tls(&mut reader)? == 0 {
                         self.saw_eof = true;
@@ -527,7 +550,12 @@ impl Write for AttestedChannel {
     fn flush(&mut self) -> std::io::Result<()> {
         self.conn.writer().flush()?;
         self.drain_tls()?;
-        retry_interrupted(|| self.sock.flush())
+        let mut io = DeadlineIo {
+            stream: &mut self.sock,
+            deadline: self.io_deadline,
+            now: Instant::now,
+        };
+        retry_interrupted(|| io.flush())
     }
 }
 
@@ -942,6 +970,7 @@ fn establish_at_address(
         admission: provisional,
         saw_eof: false,
         tls_failed: false,
+        io_deadline: None,
     };
 
     let request = format!(
@@ -1058,44 +1087,133 @@ pub fn append_bearer_header(request: &mut String, bearer: Option<&str>) {
     }
 }
 
+struct DeadlineIo<'a, T: AttestedIo + ?Sized, F> {
+    stream: &'a mut T,
+    deadline: Option<Instant>,
+    now: F,
+}
+
+impl<T: AttestedIo + ?Sized, F: FnMut() -> Instant> DeadlineIo<'_, T, F> {
+    fn prepare_io(&mut self) -> std::io::Result<()> {
+        if let Some(deadline) = self.deadline {
+            let remaining = deadline
+                .checked_duration_since((self.now)())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(|| std::io::Error::from(ErrorKind::TimedOut))?;
+            self.stream.set_io_timeout(Some(remaining))?;
+        }
+        Ok(())
+    }
+}
+
+impl<T: AttestedIo + ?Sized, F: FnMut() -> Instant> Read for DeadlineIo<'_, T, F> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.prepare_io()?;
+        self.stream.read(buf)
+    }
+}
+
+impl<T: AttestedIo + ?Sized, F: FnMut() -> Instant> Write for DeadlineIo<'_, T, F> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.prepare_io()?;
+        self.stream.write(buf)
+    }
+
+    fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
+        self.prepare_io()?;
+        self.stream.write_vectored(bufs)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.prepare_io()?;
+        self.stream.flush()
+    }
+}
+
+fn drain_tls_to(
+    connection: &mut ClientConnection,
+    stream: &mut impl AttestedIo,
+    deadline: Option<Instant>,
+    now: impl FnMut() -> Instant,
+) -> std::io::Result<()> {
+    let mut io = DeadlineIo {
+        stream,
+        deadline,
+        now,
+    };
+    while connection.wants_write() {
+        match connection.write_tls(&mut io) {
+            Ok(0) => return Err(std::io::Error::from(ErrorKind::WriteZero)),
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 /// Sends an admission probe over an attested transport before content requests.
 pub fn send_admission_probe(
     stream: &mut dyn AttestedIo,
     host: &str,
     bearer: Option<&str>,
+    deadline: Duration,
 ) -> Result<(), &'static str> {
-    let mut request = format!("GET /solstone-admission HTTP/1.1\r\nHost: {host}\r\n");
-    append_bearer_header(&mut request, bearer);
-    request.push_str("\r\n");
-    if write_all_retry_interrupted(stream, request.as_bytes()).is_err() {
-        return Err("local_endpoint_unreachable");
-    }
+    send_admission_probe_with_clock(stream, host, bearer, deadline, Instant::now)
+}
 
-    let mut counting = CountingStream {
-        stream,
-        bytes_read: 0,
-    };
-    let response = match recv_bounded_http_response(
-        &mut counting,
-        MAX_PROOF_RESPONSE_HEADERS,
-        MAX_PROOF_RESPONSE_BYTES,
-    ) {
-        Ok(resp) => resp,
-        Err(_) => return Err("local_endpoint_unreachable"),
-    };
-    let status = match response_status(&response.status_line) {
-        Ok(s) => s,
-        Err(_) => return Err("local_endpoint_unreachable"),
-    };
-    if status == 401 {
-        return Err("confidential_access_ended");
-    }
-    if status == 503 {
-        return Err("local_endpoint_unreachable");
-    }
-    match stream.trailing_after_body() {
-        Ok(Trailing::None) => Ok(()),
-        _ => Err("local_endpoint_unreachable"),
+fn send_admission_probe_with_clock(
+    stream: &mut dyn AttestedIo,
+    host: &str,
+    bearer: Option<&str>,
+    deadline: Duration,
+    mut now: impl FnMut() -> Instant,
+) -> Result<(), &'static str> {
+    let start = now();
+    let deadline_instant = start.checked_add(deadline).unwrap_or(start);
+    let result = (|| {
+        if now() >= deadline_instant {
+            return Err("local_endpoint_unreachable");
+        }
+        stream
+            .set_io_deadline(Some(deadline_instant))
+            .map_err(|_| "local_endpoint_unreachable")?;
+        let mut io = DeadlineIo {
+            stream: &mut *stream,
+            deadline: Some(deadline_instant),
+            now,
+        };
+        let mut request = format!("GET /solstone-admission HTTP/1.1\r\nHost: {host}\r\n");
+        append_bearer_header(&mut request, bearer);
+        request.push_str("\r\n");
+        write_all_retry_interrupted(&mut io, request.as_bytes())
+            .map_err(|_| "local_endpoint_unreachable")?;
+        let response = recv_bounded_http_response(
+            &mut io,
+            MAX_PROOF_RESPONSE_HEADERS,
+            MAX_PROOF_RESPONSE_BYTES,
+        )
+        .map_err(|_| "local_endpoint_unreachable")?;
+        let status =
+            response_status(&response.status_line).map_err(|_| "local_endpoint_unreachable")?;
+        if status == 401 {
+            return Err("confidential_access_ended");
+        }
+        if status == 503 {
+            return Err("local_endpoint_unreachable");
+        }
+        match io.stream.trailing_after_body() {
+            Ok(Trailing::None) => Ok(()),
+            _ => Err("local_endpoint_unreachable"),
+        }
+    })();
+    let reset_deadline = stream.set_io_deadline(None);
+    let reset_timeout = stream.set_io_timeout(None);
+    match result {
+        Ok(()) if reset_deadline.is_err() || reset_timeout.is_err() => {
+            Err("local_endpoint_unreachable")
+        }
+        other => other,
     }
 }
 
@@ -1235,6 +1353,7 @@ pub(crate) fn send_transcription_request(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::io::Cursor;
 
     use super::*;
@@ -1465,6 +1584,13 @@ mod tests {
     }
 
     impl AttestedIo for ScriptedIo {
+        fn set_io_deadline(
+            &mut self,
+            _deadline: Option<std::time::Instant>,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
         fn set_io_timeout(&mut self, _timeout: Option<Duration>) -> std::io::Result<()> {
             Ok(())
         }
@@ -1631,6 +1757,13 @@ mod tests {
         }
     }
     impl AttestedIo for ResetOnWrite {
+        fn set_io_deadline(
+            &mut self,
+            _deadline: Option<std::time::Instant>,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
         fn set_io_timeout(&mut self, _timeout: Option<Duration>) -> std::io::Result<()> {
             Ok(())
         }
@@ -1671,5 +1804,323 @@ mod tests {
             true,
         );
         assert!(matches!(other, Err(AttestedHttpError::Transport(_))));
+    }
+
+    #[test]
+    fn probe_expired_deadline_returns_unreachable_without_io() {
+        let mut io = ScriptedIo {
+            written: Vec::new(),
+            unread: Cursor::new(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()),
+        };
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let result =
+            send_admission_probe_with_clock(&mut io, "host", None, Duration::from_secs(5), || {
+                let cur = clock.get();
+                clock.set(start + Duration::from_secs(6));
+                cur
+            });
+        assert_eq!(result, Err("local_endpoint_unreachable"));
+        assert!(io.written.is_empty());
+    }
+
+    struct DripReader<'a> {
+        bytes: Vec<u8>,
+        pos: usize,
+        written: Vec<u8>,
+        step_advance: Duration,
+        clock: &'a Cell<Instant>,
+    }
+
+    impl Read for DripReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.clock.set(self.clock.get() + self.step_advance);
+            if self.pos < self.bytes.len() && !buf.is_empty() {
+                buf[0] = self.bytes[self.pos];
+                self.pos += 1;
+                Ok(1)
+            } else {
+                Ok(0)
+            }
+        }
+    }
+    impl Write for DripReader<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl AttestedIo for DripReader<'_> {
+        fn set_io_deadline(
+            &mut self,
+            _deadline: Option<std::time::Instant>,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn set_io_timeout(&mut self, _timeout: Option<Duration>) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn trailing_after_body(&mut self) -> std::io::Result<Trailing> {
+            Ok(Trailing::None)
+        }
+    }
+
+    #[test]
+    fn probe_slow_drip_reader_exhausts_deadline() {
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let mut io = DripReader {
+            bytes: b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            pos: 0,
+            written: Vec::new(),
+            step_advance: Duration::from_secs(2),
+            clock: &clock,
+        };
+        let result =
+            send_admission_probe_with_clock(&mut io, "host", None, Duration::from_secs(3), || {
+                clock.get()
+            });
+        assert_eq!(result, Err("local_endpoint_unreachable"));
+    }
+
+    struct InterruptedWriter<'a> {
+        _written: Vec<u8>,
+        step_advance: Duration,
+        clock: &'a Cell<Instant>,
+    }
+
+    impl Read for InterruptedWriter<'_> {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+    impl Write for InterruptedWriter<'_> {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            self.clock.set(self.clock.get() + self.step_advance);
+            Err(std::io::Error::from(ErrorKind::Interrupted))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl AttestedIo for InterruptedWriter<'_> {
+        fn set_io_deadline(
+            &mut self,
+            _deadline: Option<std::time::Instant>,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn set_io_timeout(&mut self, _timeout: Option<Duration>) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn trailing_after_body(&mut self) -> std::io::Result<Trailing> {
+            Ok(Trailing::None)
+        }
+    }
+
+    #[test]
+    fn probe_continuous_interrupted_exhausts_deadline() {
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let mut io = InterruptedWriter {
+            _written: Vec::new(),
+            step_advance: Duration::from_secs(2),
+            clock: &clock,
+        };
+        let result =
+            send_admission_probe_with_clock(&mut io, "host", None, Duration::from_secs(5), || {
+                clock.get()
+            });
+        assert_eq!(result, Err("local_endpoint_unreachable"));
+    }
+
+    #[test]
+    fn probe_success_within_deadline_returns_ok() {
+        let mut io = ScriptedIo {
+            written: Vec::new(),
+            unread: Cursor::new(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()),
+        };
+        let start = Instant::now();
+        let result =
+            send_admission_probe_with_clock(&mut io, "host", None, Duration::from_secs(10), || {
+                start
+            });
+        assert_eq!(result, Ok(()));
+        assert!(
+            io.written
+                .starts_with(b"GET /solstone-admission HTTP/1.1\r\nHost: host\r\n\r\n")
+        );
+    }
+
+    #[cfg(feature = "full-tests")]
+    struct InterruptedRawIo<'a> {
+        clock: &'a Cell<Instant>,
+        step: Duration,
+        interruptions: usize,
+        calls: usize,
+        written: Vec<u8>,
+        fail_deadline: bool,
+        fail_timeout: bool,
+    }
+
+    #[cfg(feature = "full-tests")]
+    impl InterruptedRawIo<'_> {
+        fn attempt(&mut self) -> std::io::Result<()> {
+            self.calls += 1;
+            self.clock.set(self.clock.get() + self.step);
+            if self.interruptions > 0 {
+                self.interruptions -= 1;
+                Err(std::io::Error::from(ErrorKind::Interrupted))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(feature = "full-tests")]
+    impl Read for InterruptedRawIo<'_> {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            self.attempt()?;
+            Ok(0)
+        }
+    }
+
+    #[cfg(feature = "full-tests")]
+    impl Write for InterruptedRawIo<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.attempt()?;
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.attempt()
+        }
+    }
+
+    #[cfg(feature = "full-tests")]
+    impl AttestedIo for InterruptedRawIo<'_> {
+        fn set_io_deadline(&mut self, _deadline: Option<Instant>) -> std::io::Result<()> {
+            if self.fail_deadline {
+                Err(std::io::Error::other("deadline installation refused"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn set_io_timeout(&mut self, _timeout: Option<Duration>) -> std::io::Result<()> {
+            if self.fail_timeout {
+                Err(std::io::Error::other("timeout installation refused"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn trailing_after_body(&mut self) -> std::io::Result<Trailing> {
+            Ok(Trailing::None)
+        }
+    }
+
+    #[cfg(feature = "full-tests")]
+    fn interrupted_raw_io(clock: &Cell<Instant>, interruptions: usize) -> InterruptedRawIo<'_> {
+        InterruptedRawIo {
+            clock,
+            step: Duration::from_secs(1),
+            interruptions,
+            calls: 0,
+            written: Vec::new(),
+            fail_deadline: false,
+            fail_timeout: false,
+        }
+    }
+
+    #[cfg(feature = "full-tests")]
+    fn pending_tls_connection() -> ClientConnection {
+        let config = ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        ClientConnection::new(Arc::new(config), "localhost".try_into().unwrap()).unwrap()
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn internal_tls_write_interruptions_exhaust_deadline_and_can_recover() {
+        for (interruptions, expected) in [(100, Err(ErrorKind::TimedOut)), (2, Ok(()))] {
+            let start = Instant::now();
+            let clock = Cell::new(start);
+            let mut stream = interrupted_raw_io(&clock, interruptions);
+            let mut connection = pending_tls_connection();
+            assert!(connection.wants_write());
+            let result = drain_tls_to(
+                &mut connection,
+                &mut stream,
+                Some(start + Duration::from_secs(10)),
+                || clock.get(),
+            )
+            .map_err(|error| error.kind());
+            assert_eq!(result, expected);
+            if result.is_ok() {
+                assert!(!stream.written.is_empty());
+                assert!(!connection.wants_write());
+            } else {
+                assert!(stream.written.is_empty());
+                assert!(stream.calls <= 10);
+            }
+        }
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn internal_tls_read_and_flush_interruptions_exhaust_deadline_and_can_recover() {
+        for flush in [false, true] {
+            for (interruptions, succeeds) in [(100, false), (2, true)] {
+                let start = Instant::now();
+                let clock = Cell::new(start);
+                let mut stream = interrupted_raw_io(&clock, interruptions);
+                let mut connection = pending_tls_connection();
+                let mut io = DeadlineIo {
+                    stream: &mut stream,
+                    deadline: Some(start + Duration::from_secs(10)),
+                    now: || clock.get(),
+                };
+                let result = if flush {
+                    retry_interrupted(|| io.flush())
+                } else {
+                    retry_interrupted(|| connection.read_tls(&mut io)).map(|_| ())
+                };
+                assert_eq!(result.is_ok(), succeeds);
+                if !succeeds {
+                    assert_eq!(result.unwrap_err().kind(), ErrorKind::TimedOut);
+                    assert!(stream.calls <= 10);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn probe_deadline_and_timeout_installation_failures_refuse_before_request_bytes() {
+        for fail_deadline in [false, true] {
+            let start = Instant::now();
+            let clock = Cell::new(start);
+            let mut stream = interrupted_raw_io(&clock, 0);
+            stream.fail_deadline = fail_deadline;
+            stream.fail_timeout = !fail_deadline;
+            let result = send_admission_probe_with_clock(
+                &mut stream,
+                "host",
+                None,
+                Duration::from_secs(10),
+                || clock.get(),
+            );
+            assert_eq!(result, Err("local_endpoint_unreachable"));
+            assert!(stream.written.is_empty());
+            assert_eq!(stream.calls, 0);
+        }
     }
 }

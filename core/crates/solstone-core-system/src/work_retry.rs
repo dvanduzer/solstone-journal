@@ -14,6 +14,7 @@ use solstone_core_journal_io::{JsonWriteOptions, LockOptions, hold_lock, write_j
 pub mod daily;
 pub mod input;
 pub mod raw;
+pub use raw::RetryContext;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -186,7 +187,7 @@ pub struct Record {
     pub reason: String,
     pub input: String,
     pub owner: Option<String>,
-    consumed: BTreeSet<String>,
+    pub consumed: BTreeSet<String>,
     pub attempt: Option<Attempt>,
     #[serde(default)]
     failure_count: u32,
@@ -303,13 +304,24 @@ fn update<T>(
     unit: &Unit,
     mutate: impl FnOnce(&mut Option<Record>) -> Result<T, String>,
 ) -> Result<T, String> {
+    update_checked(journal, unit, &|| Ok(()), mutate)
+}
+
+fn update_checked<T>(
+    journal: &Path,
+    unit: &Unit,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+    mutate: impl FnOnce(&mut Option<Record>) -> Result<T, String>,
+) -> Result<T, String> {
     let id = unit.id()?;
     let path = path(journal, &id)?;
     std::fs::create_dir_all(directory(journal)).map_err(|e| e.to_string())?;
     let _lock = hold_lock(&path, LockOptions::default()).map_err(|e| e.to_string())?;
+    checkpoint()?;
     let mut record = read(journal, &id)?;
     let result = mutate(&mut record)?;
     if let Some(record) = record {
+        checkpoint()?;
         write_json(path, &record, JsonWriteOptions::default()).map_err(|e| e.to_string())?;
     }
     Ok(result)
@@ -481,7 +493,17 @@ pub fn finish(
     attempt: &Attempt,
     remaining_reason: Option<&str>,
 ) -> Result<(), String> {
-    update(journal, unit, |slot| {
+    finish_checked(journal, unit, attempt, remaining_reason, &|| Ok(()))
+}
+
+pub fn finish_checked(
+    journal: &Path,
+    unit: &Unit,
+    attempt: &Attempt,
+    remaining_reason: Option<&str>,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    update_checked(journal, unit, checkpoint, |slot| {
         let record = slot.as_mut().ok_or("missing retry evidence")?;
         if record.attempt.as_ref() != Some(attempt) {
             return Ok(());
@@ -530,7 +552,18 @@ pub fn record_floor_outcome(
     failure: Option<&str>,
     now_ms: i64,
 ) -> Result<(), String> {
-    update(journal, unit, |slot| {
+    record_floor_outcome_checked(journal, unit, input, failure, now_ms, &|| Ok(()))
+}
+
+pub fn record_floor_outcome_checked(
+    journal: &Path,
+    unit: &Unit,
+    input: &str,
+    failure: Option<&str>,
+    now_ms: i64,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    update_checked(journal, unit, checkpoint, |slot| {
         let record = slot.get_or_insert_with(|| Record {
             version: 1,
             unit: unit.clone(),
@@ -569,6 +602,72 @@ pub fn record_floor_outcome(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn cancelled_retry_terminal_publication_after_record_lock_wait_and_positive_twins() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+        for finishing in [false, true] {
+            for cancel in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let unit = unit();
+                let id = unit.id().unwrap();
+                observe_held(root.path(), &unit, "schema_invalid", "input-a").unwrap();
+                request(root.path(), &unit).unwrap();
+                let grant = read(root.path(), &id)
+                    .unwrap()
+                    .unwrap()
+                    .permission("input-a", &[])
+                    .unwrap();
+                consume(root.path(), &unit, &grant, "schema_invalid", "input-a", &[]).unwrap();
+                let path = path(root.path(), &id).unwrap();
+                let before = std::fs::read(&path).unwrap();
+                let held = hold_lock(&path, LockOptions::default()).unwrap();
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let flag = cancelled.clone();
+                let journal = root.path().to_path_buf();
+                let (started, ready) = mpsc::channel();
+                let (checkpoint, reached) = mpsc::channel();
+                let worker = std::thread::spawn(move || {
+                    started.send(()).unwrap();
+                    let check = || {
+                        checkpoint.send(()).unwrap();
+                        if flag.load(Ordering::SeqCst) {
+                            Err("cancelled".into())
+                        } else {
+                            Ok(())
+                        }
+                    };
+                    if finishing {
+                        finish_checked(&journal, &unit, &grant, None, &check)
+                    } else {
+                        record_floor_outcome_checked(
+                            &journal,
+                            &unit,
+                            "input-a",
+                            Some("transport"),
+                            1,
+                            &check,
+                        )
+                    }
+                });
+                ready.recv_timeout(Duration::from_secs(2)).unwrap();
+                assert!(reached.recv_timeout(Duration::from_millis(100)).is_err());
+                cancelled.store(cancel, Ordering::SeqCst);
+                drop(held);
+                let result = worker.join().unwrap();
+                if cancel {
+                    assert_eq!(result.unwrap_err(), "cancelled");
+                    assert_eq!(std::fs::read(&path).unwrap(), before);
+                } else {
+                    result.unwrap();
+                    assert_ne!(std::fs::read(&path).unwrap(), before);
+                }
+            }
+        }
+    }
+
     use super::*;
     #[test]
     fn floor_hold_outlives_logs_and_has_no_version_or_tick_reset() {

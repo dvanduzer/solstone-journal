@@ -48,7 +48,11 @@ pub fn assemble_prompt_preview(
             }
         }
         let state = match stage.build {
-            Some(build) => match build(&mut prepared, context) {
+            Some(build) => match build(
+                &mut prepared,
+                context,
+                &solstone_core_generate::Cancellation::never(),
+            ) {
                 Ok(state) => state,
                 Err(RuntimeOutcome::Skipped { reason, .. }) => {
                     return would_not_run(request, &reason);
@@ -524,7 +528,14 @@ mod tests {
         .clone();
         let generate = solstone_core_generate::OneShotClient::at_path(&provider);
         let mut events = Vec::new();
-        let outcome = crate::execute_request(request, &paths, &context, &generate, &mut events);
+        let outcome = crate::execute_request(
+            request,
+            &paths,
+            &context,
+            &generate,
+            &mut events,
+            &solstone_core_generate::Cancellation::never(),
+        );
         assert!(
             matches!(outcome, crate::RuntimeOutcome::Finished { .. }),
             "{outcome:?}"
@@ -602,8 +613,14 @@ mod tests {
         .expect("untyped request object")
         .clone();
         let mut events = Vec::new();
-        let outcome =
-            crate::execute_request(untyped_request, &paths, &context, &generate, &mut events);
+        let outcome = crate::execute_request(
+            untyped_request,
+            &paths,
+            &context,
+            &generate,
+            &mut events,
+            &solstone_core_generate::Cancellation::never(),
+        );
         assert!(
             matches!(outcome, crate::RuntimeOutcome::Finished { .. }),
             "{outcome:?}"

@@ -26,6 +26,7 @@ pub(crate) struct TerminalWrite<'a> {
         Option<&'a solstone_core_local::install::capability_status::CapabilityStatus>,
     pub(crate) segment_meta: Option<&'a Map<String, Value>>,
     pub(crate) redo: bool,
+    pub(crate) attempt: Option<&'a solstone_core_system::work_retry::Attempt>,
 }
 
 /// A writer failure used by the terminal test seam.
@@ -147,13 +148,24 @@ fn build_terminal_request(
             request.processing.clone(),
         ),
     ]);
-    solstone_core_system::work_retry::raw::stamp_failed_input(
-        header
-            .get_mut("_solstone_processing")
-            .expect("processing record"),
-        request.raw_path,
-    )
-    .map_err(|detail| TranscribeError::TerminalWrite { detail })?;
+    if let Some(attempt) = request.attempt {
+        solstone_core_system::work_retry::raw::stamp_failed_input_from(
+            header
+                .get_mut("_solstone_processing")
+                .expect("processing record"),
+            request.raw_path,
+            attempt,
+        )
+        .map_err(|detail| TranscribeError::TerminalWrite { detail })?;
+    } else {
+        solstone_core_system::work_retry::raw::stamp_failed_input(
+            header
+                .get_mut("_solstone_processing")
+                .expect("processing record"),
+            request.raw_path,
+        )
+        .map_err(|detail| TranscribeError::TerminalWrite { detail })?;
+    }
     if let Some(sound_tags) = request.sound_tags {
         header.insert("sound_tags".to_owned(), sound_tags.clone());
     } else if let Some(sound_tag_status) = request.sound_tag_status {
@@ -225,6 +237,7 @@ mod tests {
                 sound_tag_status: None,
                 segment_meta: None,
                 redo: false,
+                attempt: None,
             },
             |_| {
                 Err(TerminalWriteFailure::Typed(
@@ -278,6 +291,7 @@ mod tests {
             sound_tag_status: sound_tag_status.as_ref(),
             segment_meta: Some(&meta),
             redo: false,
+            attempt: None,
         })
         .unwrap();
 

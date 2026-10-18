@@ -83,7 +83,19 @@ pub fn publish_news_replacement(
     allow_before: bool,
     receipt: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
+    publish_news_replacement_checked(root, batch, allow_before, || Ok(()), receipt)
+}
+
+/// Publish a prepared newsletter after rechecking the caller at the owner lock.
+pub fn publish_news_replacement_checked(
+    root: &Path,
+    batch: &PreparedNewsReplacement,
+    allow_before: bool,
+    checkpoint: impl Fn() -> Result<(), String>,
+    receipt: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
     let _trust = hold_facet_trust_lock(root).map_err(|e| e.to_string())?;
+    checkpoint()?;
     super::declaration::require_facet_write_identity(root, &batch.facet, &batch.facet_id)?;
     let current =
         read_news_file(root, &batch.facet, &batch.relative_path).map_err(|e| e.to_string())?;
@@ -91,6 +103,7 @@ pub fn publish_news_replacement(
         if !allow_before || current != batch.before {
             return Err("conflict: newsletter changed after preparation".into());
         }
+        checkpoint()?;
         write_news_file(root, &batch.facet, &batch.relative_path, &batch.after)
             .map_err(|e| e.to_string())?;
     }

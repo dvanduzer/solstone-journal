@@ -76,6 +76,7 @@ fn response_id(completion: SessionCompletion) -> String {
     match response {
         GenerateResponse::Generated(response) => response.id.unwrap(),
         GenerateResponse::Refused(response) => response.id.unwrap(),
+        GenerateResponse::Cancelled => panic!("unexpected cancelled response"),
     }
 }
 

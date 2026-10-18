@@ -282,20 +282,32 @@ where
     Ok(resolved)
 }
 
+use solstone_core_system::work_retry::RetryContext;
+
 /// Independent guards for batch discovery, `_process_one`, and `process_audio`.
 pub(crate) fn should_skip_batch_processed(audio_path: &Path, redo: bool) -> bool {
-    already_processed(audio_path, redo)
+    already_processed(audio_path, redo, None, None)
 }
 
-pub(crate) fn should_skip_process_one_processed(audio_path: &Path, redo: bool) -> bool {
-    already_processed(audio_path, redo)
+pub(crate) fn should_skip_process_one_processed(
+    audio_path: &Path,
+    redo: bool,
+    journal: Option<&Path>,
+    retry: Option<&RetryContext>,
+) -> bool {
+    already_processed(audio_path, redo, journal, retry)
 }
 
 pub(crate) fn should_skip_process_audio_processed(audio_path: &Path, redo: bool) -> bool {
-    already_processed(audio_path, redo)
+    already_processed(audio_path, redo, None, None)
 }
 
-fn already_processed(audio_path: &Path, redo: bool) -> bool {
+fn already_processed(
+    audio_path: &Path,
+    redo: bool,
+    journal: Option<&Path>,
+    retry: Option<&RetryContext>,
+) -> bool {
     if redo {
         return false;
     }
@@ -304,14 +316,30 @@ fn already_processed(audio_path: &Path, redo: bool) -> bool {
         return false;
     }
     let record = solstone_core_processing_record::read_processing_record_header(&jsonl);
-    !solstone_core_processing_record::should_reenter_analysis_output(
+    if solstone_core_processing_record::should_reenter_analysis_output(
         record.as_ref(),
         &jsonl,
         solstone_core_processing_record::vocab::HANDLER_TRANSCRIBE,
-    ) && !solstone_core_system::work_retry::raw::waiting_from_environment(
+    ) {
+        return false;
+    }
+    if solstone_core_system::work_retry::raw::waiting_from_environment(
         &jsonl,
         solstone_core_processing_record::vocab::HANDLER_TRANSCRIBE,
-    )
+    ) {
+        return false;
+    }
+    if let (Some(context), Some(journal)) = (retry, journal)
+        && solstone_core_system::work_retry::raw::waiting_context(
+            journal,
+            &jsonl,
+            solstone_core_processing_record::vocab::HANDLER_TRANSCRIBE,
+            context,
+        )
+    {
+        return false;
+    }
+    true
 }
 
 fn journal_relative_candidate(audio_path: &Path, journal_path: &Path) -> PathBuf {
@@ -632,10 +660,10 @@ mod tests {
         let audio = temporary.path().join("120000_60.wav");
         fs::write(audio.with_extension("jsonl"), b"done").unwrap();
         assert!(should_skip_batch_processed(&audio, false));
-        assert!(should_skip_process_one_processed(&audio, false));
+        assert!(should_skip_process_one_processed(&audio, false, None, None));
         assert!(should_skip_process_audio_processed(&audio, false));
         assert!(!should_skip_batch_processed(&audio, true));
-        assert!(!should_skip_process_one_processed(&audio, true));
+        assert!(!should_skip_process_one_processed(&audio, true, None, None));
         assert!(!should_skip_process_audio_processed(&audio, true));
     }
 
@@ -650,7 +678,9 @@ mod tests {
         )
         .unwrap();
         assert!(!should_skip_batch_processed(&audio, false));
-        assert!(!should_skip_process_one_processed(&audio, false));
+        assert!(!should_skip_process_one_processed(
+            &audio, false, None, None
+        ));
         assert!(!should_skip_process_audio_processed(&audio, false));
 
         fs::write(
@@ -659,7 +689,7 @@ mod tests {
         )
         .unwrap();
         assert!(should_skip_batch_processed(&audio, false));
-        assert!(should_skip_process_one_processed(&audio, false));
+        assert!(should_skip_process_one_processed(&audio, false, None, None));
         assert!(should_skip_process_audio_processed(&audio, false));
     }
 

@@ -345,8 +345,14 @@ fn run(v: Value) -> Result<Value, String> {
                 .ok_or("serving is stopped")?;
             let raw = v["payload"].as_str().ok_or("missing thinking request")?;
             let generate = |request: &solstone_core_generate::GenerateRequest| {
-                solstone_core_generate_wire::respond(request, &GENERATE, p, |_| None)
-                    .map_err(solstone_core_generate::ClientError::Decode)
+                solstone_core_generate_wire::respond(
+                    request,
+                    &GENERATE,
+                    p,
+                    |_| None,
+                    &solstone_core_generate::Cancellation::never(),
+                )
+                .map_err(solstone_core_generate::ClientError::Decode)
             };
             if op == "serve-generate" {
                 let request = solstone_core_generate_wire::parse_one_shot_request(raw)?;
@@ -371,6 +377,7 @@ fn run(v: Value) -> Result<Value, String> {
                 &context,
                 &generate,
                 &mut events,
+                &solstone_core_generate::Cancellation::never(),
             );
             Ok(json!({"outcome":format!("{outcome:?}"),
                 "events":String::from_utf8(events).map_err(|e|e.to_string())?}))

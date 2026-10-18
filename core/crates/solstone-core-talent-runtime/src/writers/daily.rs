@@ -545,6 +545,27 @@ pub fn publish_daily_publication(
     changed_paths: &mut Vec<String>,
     admission: Option<FileLock>,
 ) -> Result<CommitDisposition, StageError> {
+    publish_daily_publication_cancellable(
+        authority,
+        token,
+        publication,
+        context,
+        changed_paths,
+        admission,
+        &solstone_core_generate::Cancellation::never(),
+    )
+}
+
+pub(crate) fn publish_daily_publication_cancellable(
+    authority: &mut DailyUnitAuthority,
+    token: &str,
+    publication: &PreparedDailyPublication,
+    context: &ExecutionContext,
+    changed_paths: &mut Vec<String>,
+    admission: Option<FileLock>,
+    cancellation: &solstone_core_generate::Cancellation,
+) -> Result<CommitDisposition, StageError> {
+    super::check_cancellation(cancellation).map_err(error)?;
     let record = authority
         .record()
         .cloned()
@@ -581,6 +602,7 @@ pub fn publish_daily_publication(
         .map_err(|e| make_error(e.to_string()))?;
     let admission = std::cell::RefCell::new(admission);
     for (index, action) in publication.actions.iter().enumerate() {
+        super::check_cancellation(cancellation).map_err(error)?;
         authority
             .require_token(token)
             .map_err(|e| make_error(e.to_string()))?;
@@ -612,6 +634,7 @@ pub fn publish_daily_publication(
         }
         let auth_cell = std::cell::RefCell::new(&mut *authority);
         let start = || -> Result<(), String> {
+            super::check_cancellation(cancellation)?;
             let mut auth = auth_cell.borrow_mut();
             auth.require_token(token).map_err(|e| e.to_string())?;
             let receipts = &mut auth
@@ -632,7 +655,7 @@ pub fn publish_daily_publication(
                 auth.checkpoint().map_err(|e| e.to_string())?;
                 drop(admission.borrow_mut().take());
             }
-            Ok(())
+            super::check_cancellation(cancellation)
         };
         let receipt = || -> Result<(), String> {
             let mut auth = auth_cell.borrow_mut();
@@ -675,30 +698,34 @@ pub fn publish_daily_publication(
         } else {
             None
         };
+        super::check_cancellation(cancellation).map_err(error)?;
         match action {
             PreparedDailyAction::Observation { batch } => {
-                solstone_core_facets::publish_observation_batch(
+                solstone_core_facets::publish_observation_batch_checked(
                     &context.journal,
                     batch,
                     allow_before,
+                    || super::check_cancellation(cancellation),
                     receipt,
                 )
                 .map_err(make_error)?
             }
             PreparedDailyAction::Anticipation { batch } => {
-                solstone_core_facets::publish_anticipation_batch(
+                solstone_core_facets::publish_anticipation_batch_checked(
                     &context.journal,
                     batch,
                     allow_before,
+                    || super::check_cancellation(cancellation),
                     receipt,
                 )
                 .map_err(make_error)?
             }
             PreparedDailyAction::Newsletter { batch } => {
-                solstone_core_facets::publish_news_replacement(
+                solstone_core_facets::publish_news_replacement_checked(
                     &context.journal,
                     batch,
                     allow_before,
+                    || super::check_cancellation(cancellation),
                     receipt,
                 )
                 .map_err(make_error)?
@@ -745,10 +772,11 @@ pub fn publish_daily_publication(
                 .map_err(make_review)?
             }
             PreparedDailyAction::DailyTime { batch } => {
-                solstone_core_system::schedule::publish_daily_time(
+                solstone_core_system::schedule::publish_daily_time_checked(
                     &context.journal.join("config/schedules.json"),
                     batch,
                     allow_before,
+                    || super::check_cancellation(cancellation),
                     receipt,
                 )
                 .map_err(make_error)?

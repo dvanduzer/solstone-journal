@@ -669,6 +669,25 @@ pub fn apply_result(
     facet: &str,
     day: &str,
 ) -> Result<(), String> {
+    apply_result_cancellable(
+        journal,
+        output,
+        facet,
+        day,
+        &solstone_core_generate::Cancellation::never(),
+    )
+}
+
+pub(crate) fn apply_result_cancellable(
+    journal: &std::path::Path,
+    output: &str,
+    facet: &str,
+    day: &str,
+    cancellation: &solstone_core_generate::Cancellation,
+) -> Result<(), String> {
+    let _trust = solstone_core_facets::hold_facet_trust_lock(journal).map_err(|e| e.to_string())?;
+    crate::writers::check_cancellation(cancellation)?;
+
     let mut counts = BTreeMap::from([
         ("promoted", 0usize),
         ("aliased", 0),
@@ -720,6 +739,7 @@ pub fn apply_result(
             }
             let canonical_name = candidate["name"].as_str().unwrap_or_default();
             let canonical_slug = candidate["slug"].as_str().unwrap_or_default();
+            crate::writers::check_cancellation(cancellation)?;
             let entity_id = match solstone_core_facets::attach_or_reactivate_entity(
                 journal,
                 facet,
@@ -766,6 +786,7 @@ pub fn apply_result(
                     *counts.get_mut("skipped").unwrap() += 1;
                     continue;
                 }
+                crate::writers::check_cancellation(cancellation)?;
                 match solstone_core_facets::add_entity_aka(journal, facet, &entity_id, alias) {
                     Ok(_) => *counts.get_mut("aliased").unwrap() += 1,
                     Err(solstone_core_facets::FacetEntityWriteError::AkaConflict { .. }) => {
@@ -820,7 +841,7 @@ pub fn apply_result(
                 *counts.get_mut("skipped").unwrap() += 1;
                 continue;
             }
-            match solstone_core_entity::record_merge_candidate(
+            match solstone_core_entity::record_merge_candidate_checked(
                 journal,
                 facet,
                 day,
@@ -832,6 +853,7 @@ pub fn apply_result(
                 Some("name-variant"),
                 None,
                 None,
+                &|| crate::writers::check_cancellation(cancellation),
             ) {
                 Ok(_) => *counts.get_mut("merges").unwrap() += 1,
                 Err(error_value) => {
@@ -845,6 +867,7 @@ pub fn apply_result(
     if let Err(detail) = result {
         error = Some(detail);
     }
+    crate::writers::check_cancellation(cancellation)?;
     write_outcome(journal, facet, day, &counts, error.as_deref());
     Ok(())
 }

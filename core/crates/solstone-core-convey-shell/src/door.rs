@@ -1750,7 +1750,9 @@ mod tests {
                 br#"{"setup":{"completed_at":1},"pairing":{"local_network":false}}"#,
             )
             .expect("config");
-            let port = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            // This fixture later binds every interface. A loopback-only probe
+            // can select a port already occupied on another local interface.
+            let port = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
                 .and_then(|probe| probe.local_addr())
                 .expect("free port")
                 .port();

@@ -964,6 +964,9 @@ fn interpret_generate(response: Result<GenerateResponse, ClientError>) -> Descri
         Ok(GenerateResponse::Refused(refusal)) => DescriptionOutcome::Unavailable {
             reason: format!("{}: {}", refusal.reason.as_str(), refusal.detail),
         },
+        Ok(GenerateResponse::Cancelled) => DescriptionOutcome::Unavailable {
+            reason: "generate cancelled".to_owned(),
+        },
         Err(error @ ClientError::Protocol(_)) => DescriptionOutcome::Unavailable {
             reason: error.to_string(),
         },

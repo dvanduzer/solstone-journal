@@ -75,6 +75,86 @@ pub(super) fn admission() -> Outcome {
     }
 }
 
+pub(super) fn inspect() -> Outcome {
+    match EXECUTOR.get() {
+        None => Outcome::Stopped,
+        Some(Err(())) => Outcome::Failed,
+        Some(Ok(executor)) => inspect_executor(executor),
+    }
+}
+
+fn inspect_executor(executor: &Executor) -> Outcome {
+    let current = match executor.current.try_lock() {
+        Ok(current) => current,
+        Err(TryLockError::WouldBlock) => return Outcome::Pending,
+        Err(TryLockError::Poisoned(_)) => return Outcome::Failed,
+    };
+    let Some(record) = current.as_ref() else {
+        return Outcome::Stopped;
+    };
+    inspect_record(record)
+}
+
+fn inspect_record(record: &Record) -> Outcome {
+    if record.failed.load(Ordering::Acquire) {
+        return Outcome::Failed;
+    }
+    let panics = match record.panics.try_lock() {
+        Ok(panics) => panics,
+        Err(TryLockError::WouldBlock) => return Outcome::Pending,
+        Err(TryLockError::Poisoned(_)) => return Outcome::Failed,
+    };
+    if !panics.is_empty() {
+        return Outcome::Failed;
+    }
+    drop(panics);
+
+    if record.joined.load(Ordering::Acquire) {
+        return Outcome::Stopped;
+    }
+
+    let task = match record.task.try_lock() {
+        Ok(task) => task,
+        Err(TryLockError::WouldBlock) => return Outcome::Pending,
+        Err(TryLockError::Poisoned(_)) => return Outcome::Failed,
+    };
+
+    let finished = match &*task {
+        Task::Unscheduled => return Outcome::Pending,
+        Task::Running(handle) => {
+            if !handle.is_finished() {
+                return Outcome::Pending;
+            }
+            true
+        }
+        Task::Finished(Err(_)) => return Outcome::Failed,
+        Task::Finished(Ok(())) => true,
+    };
+    drop(task);
+
+    if finished {
+        let worker = match record.worker.try_lock() {
+            Ok(worker) => worker,
+            Err(TryLockError::WouldBlock) => return Outcome::Pending,
+            Err(TryLockError::Poisoned(_)) => return Outcome::Failed,
+        };
+        let panics = match record.panics.try_lock() {
+            Ok(panics) => panics,
+            Err(TryLockError::WouldBlock) => return Outcome::Pending,
+            Err(TryLockError::Poisoned(_)) => return Outcome::Failed,
+        };
+        if worker.is_some() || !panics.is_empty() || record.failed.load(Ordering::Acquire) {
+            return Outcome::Failed;
+        }
+        if !record.owner_retired.load(Ordering::Acquire) {
+            return Outcome::Failed;
+        }
+        return Outcome::Stopped;
+    }
+
+    Outcome::Pending
+}
+
 pub(super) fn wait_for_process(timeout: Duration) -> Outcome {
     let deadline = Instant::now()
         .checked_add(timeout)
@@ -628,5 +708,77 @@ mod tests {
         assert_eq!(collect(&executor), Outcome::Failed);
         assert!(weak.upgrade().is_some());
         std::mem::forget(executor);
+    }
+}
+
+#[cfg(test)]
+mod inspect_tests {
+    use super::*;
+
+    #[test]
+    fn inspect_on_finished_record_is_idempotent_and_retains_executor() {
+        let executor = Executor::new().unwrap();
+        let record = Arc::new(Record {
+            _owner: Arc::new(()),
+            _root: Arc::new(()),
+            worker: Mutex::new(None),
+            task: Mutex::new(Task::Finished(Ok(()))),
+            panics: Mutex::new(Vec::new()),
+            failed: AtomicBool::new(false),
+            owner_retired: AtomicBool::new(true),
+            joined: AtomicBool::new(false),
+        });
+        *executor.current.lock().unwrap() = Some(record.clone());
+
+        assert_eq!(inspect_executor(&executor), Outcome::Stopped);
+        // Idempotent: repeated inspect produces the same outcome
+        assert_eq!(inspect_executor(&executor), Outcome::Stopped);
+        // Retains executor record in current, unlike collect() which would clear it
+        let current = executor.current.try_lock().unwrap();
+        assert!(current.is_some());
+        drop(current);
+
+        match &*record.task.lock().unwrap() {
+            Task::Finished(Ok(())) => {}
+            _ => panic!("task state must be preserved"),
+        }
+        assert!(!record.failed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn inspect_on_running_record_reports_pending_without_mutating() {
+        let executor = Executor::new().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = executor.runtime.spawn(async move {
+            let _ = rx.recv();
+        });
+        let record = Arc::new(Record {
+            _owner: Arc::new(()),
+            _root: Arc::new(()),
+            worker: Mutex::new(None),
+            task: Mutex::new(Task::Running(handle)),
+            panics: Mutex::new(Vec::new()),
+            failed: AtomicBool::new(false),
+            owner_retired: AtomicBool::new(false),
+            joined: AtomicBool::new(false),
+        });
+        *executor.current.lock().unwrap() = Some(record.clone());
+
+        assert_eq!(inspect_executor(&executor), Outcome::Pending);
+        assert_eq!(inspect_executor(&executor), Outcome::Pending);
+
+        // Verify record and task state were not mutated
+        let current = executor.current.try_lock().unwrap();
+        assert!(current.is_some());
+        drop(current);
+
+        assert!(!record.failed.load(Ordering::Acquire));
+        assert!(!record.joined.load(Ordering::Acquire));
+        match &*record.task.lock().unwrap() {
+            Task::Running(_) => {}
+            _ => panic!("task state must remain running without mutation"),
+        }
+
+        let _ = tx.send(());
     }
 }

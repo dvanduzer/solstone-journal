@@ -8,7 +8,7 @@ use std::ffi::{CStr, CString, OsStr, c_char};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 mod retirement;
@@ -55,13 +55,73 @@ impl ServingInstance {
 }
 
 static SERVING: std::sync::Mutex<Option<ServingInstance>> = std::sync::Mutex::new(None);
+static SERVING_STOP: std::sync::Mutex<Option<journal_mobile_serving::MobileServingStop>> =
+    std::sync::Mutex::new(None);
+
+fn request_serving_stop() {
+    close_thinking_admission(&THINKING_GENERATION);
+    let stop = SERVING_STOP
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    if let Some(stop) = stop {
+        stop.request_stop();
+    }
+}
+
 static GENERATE: std::sync::LazyLock<solstone_core_generate_wire::EndpointRuntime> =
     std::sync::LazyLock::new(solstone_core_generate_wire::EndpointRuntime::default);
 static THINKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+// The low bit closes admission. Only a successful start in the same generation
+// can reopen it; diagnostic `begin` only resets the separate probe flag.
+static THINKING_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn close_thinking_admission(state: &AtomicU64) {
+    let _ = state.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |generation| {
+        Some(generation.wrapping_add(2) | 1)
+    });
+}
+
+fn open_thinking_admission(state: &AtomicU64, generation: u64) -> bool {
+    state
+        .compare_exchange(
+            generation,
+            generation & !1,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_ok()
+}
+
+fn admitted_generation(command: &Value, state: &AtomicU64) -> Result<u64, String> {
+    let generation = command["admission_generation"]
+        .as_u64()
+        .ok_or("thinking admission generation required")?;
+    if state.load(Ordering::SeqCst) != generation {
+        return Err("thinking admission changed".into());
+    }
+    Ok(generation)
+}
+
+fn thinking_cancelled(state: &AtomicU64, generation: u64, root: &jio::JournalRoot) -> bool {
+    state.load(Ordering::SeqCst) != generation || root.revalidate_canonical_binding().is_err()
+}
 
 fn serving(root: &Path, command: &str) -> Result<Value, String> {
     let command: Value = serde_json::from_str(command).map_err(|e| e.to_string())?;
     let operation = command["op"].as_str().ok_or("serving op required")?;
+    if operation == "stop" {
+        request_serving_stop();
+    }
+    // Capture before any wait, so a request cannot adopt a later lifetime.
+    let generation = if matches!(operation, "generate" | "talent" | "start" | "audio-enable") {
+        admitted_generation(&command, &THINKING_GENERATION)?
+    } else {
+        THINKING_GENERATION.load(Ordering::SeqCst)
+    };
+    if matches!(operation, "generate" | "talent" | "audio-enable") && generation & 1 != 0 {
+        return Err("thinking is stopped".into());
+    }
     // Stop drains the bounded provider operation before retiring its journal.
     // Keep owner status and network controls independent of this wait.
     let _thinking = if matches!(operation, "generate" | "talent" | "stop") {
@@ -70,6 +130,9 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
         None
     };
     if matches!(operation, "generate" | "talent") {
+        if THINKING_GENERATION.load(Ordering::SeqCst) != generation {
+            return Err("thinking is stopped".into());
+        }
         // Thinking runs independently of serving controls and never retains the
         // serving mutex across a provider call.
         let binding = {
@@ -85,6 +148,8 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
             }
             std::sync::Arc::clone(&current.root)
         };
+        let cancelled = || thinking_cancelled(&THINKING_GENERATION, generation, &binding);
+        let cancellation = solstone_core_generate::Cancellation::from_fn(&cancelled);
         let root = binding.canonical_path();
         let raw = command["payload"]
             .as_str()
@@ -96,8 +161,14 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
             binding
                 .revalidate_canonical_binding()
                 .map_err(|e| solstone_core_generate::ClientError::Decode(e.to_string()))?;
-            let response = solstone_core_generate_wire::respond(request, &GENERATE, root, |_| None)
-                .map_err(solstone_core_generate::ClientError::Decode)?;
+            let response = solstone_core_generate_wire::respond(
+                request,
+                &GENERATE,
+                root,
+                |_| None,
+                &cancellation,
+            )
+            .map_err(solstone_core_generate::ClientError::Decode)?;
             binding
                 .revalidate_canonical_binding()
                 .map_err(|e| solstone_core_generate::ClientError::Decode(e.to_string()))?;
@@ -106,6 +177,12 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
         if operation == "generate" {
             let request = solstone_core_generate_wire::parse_one_shot_request(raw)?;
             let response = generate(&request).map_err(|e| e.to_string())?;
+            if matches!(
+                response,
+                solstone_core_generate::GenerateResponse::Cancelled
+            ) {
+                return Err("generate cancelled".into());
+            }
             return serde_json::from_str(&solstone_core_generate::encode_one_shot_response(
                 &response,
             )?)
@@ -132,6 +209,7 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
             &context,
             &generate,
             &mut events,
+            &cancellation,
         );
         return Ok(json!({"outcome":format!("{outcome:?}"),
             "events":String::from_utf8(events).map_err(|e|e.to_string())?}));
@@ -157,8 +235,31 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
                     }
                 }
             }
-            if server.is_some() {
-                return Err("server already started".into());
+            // Rebind observes the same live owner; it cannot reopen a stopping lifetime.
+            admitted_generation(&command, &THINKING_GENERATION)?;
+            if let Some(current) = server.as_ref() {
+                let handle = current.handle()?;
+                if generation & 1 != 0 || handle.stop_handle().is_stopping() {
+                    return Err("server stop pending".into());
+                }
+                current
+                    .root
+                    .revalidate_canonical_binding()
+                    .map_err(|e| e.to_string())?;
+                if fs::canonicalize(root).map_err(|e| e.to_string())?
+                    != current.root.canonical_path()
+                {
+                    return Err("thinking journal does not match the serving journal".into());
+                }
+                let status = handle.status();
+                if command["address"]
+                    .as_str()
+                    .and_then(|address| address.parse().ok())
+                    != Some(handle.interface_address())
+                {
+                    return Err("server already started".into());
+                }
+                return Ok(status);
             }
             let address = command["address"]
                 .as_str()
@@ -173,17 +274,29 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
             let binding =
                 std::sync::Arc::new(jio::JournalRoot::open(root).map_err(|e| e.to_string())?);
             let handle =
-                match journal_mobile_serving::MobileServing::start_with_payload_for_retirement(
+                match journal_mobile_serving::MobileServing::start_with_payload_for_retirement_observed(
                     root.to_path_buf(),
                     address,
                     root.parent()
                         .ok_or("app directory missing")?
                         .join("journal-payload"),
+                    std::sync::Arc::new(move || {
+                        THINKING_GENERATION.load(Ordering::SeqCst) & !1 != generation & !1
+                    }),
+                    std::sync::Arc::new(move |stop| {
+                        *SERVING_STOP.lock().unwrap_or_else(|p| p.into_inner()) =
+                            Some(stop.clone());
+                        if THINKING_GENERATION.load(Ordering::SeqCst) & !1 != generation & !1 {
+                            stop.request_stop();
+                        }
+                    }),
                 ) {
                     Ok(handle) => handle,
                     Err(failure) => {
                         let (message, owner) = failure.into_parts();
                         if let Some(owner) = owner {
+                            *SERVING_STOP.lock().unwrap_or_else(|p| p.into_inner()) =
+                                Some(owner.stop_handle());
                             let mut current = ServingInstance {
                                 handle: Some(*owner),
                                 retirement: None,
@@ -195,11 +308,18 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
                         return Err(message);
                     }
                 };
+            *SERVING_STOP.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle.stop_handle());
             *server = Some(ServingInstance {
                 handle: Some(handle),
                 retirement: None,
                 root: binding,
             });
+            if !open_thinking_admission(&THINKING_GENERATION, generation) {
+                let current = server.as_mut().unwrap();
+                current.handle()?.stop_handle().request_stop();
+                current.begin_retirement()?;
+                return Err("stop requested during startup; journal retained".into());
+            }
             Ok(server.as_ref().unwrap().handle()?.status())
         }
         "stop" => {
@@ -227,22 +347,34 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
                     return Err("server stop failed; journal retained".into());
                 }
             }
+            *SERVING_STOP.lock().unwrap_or_else(|p| p.into_inner()) = None;
             *server = None;
             GENERATE.drain_idle_pool();
             Ok(json!({"stopped":true}))
         }
         "status" => {
             let Some(current) = server.as_ref() else {
-                return match retirement::admission() {
+                return match retirement::inspect() {
                     retirement::Outcome::Stopped => Err("server stopped".into()),
                     retirement::Outcome::Pending => Ok(json!({"stopping":true,"failed":false})),
                     retirement::Outcome::Failed => Ok(json!({"stopping":true,"failed":true})),
                 };
             };
             if current.retirement.is_some() {
-                Ok(
-                    json!({"stopping":true,"failed":retirement::admission()==retirement::Outcome::Failed,"root_current":current.root.revalidate_canonical_binding().is_ok()}),
-                )
+                let (stopping, failed) = match retirement::inspect() {
+                    retirement::Outcome::Pending => (true, false),
+                    retirement::Outcome::Stopped => (false, false),
+                    retirement::Outcome::Failed => (true, true),
+                };
+                Ok(json!({
+                    "stopping": stopping,
+                    "failed": failed,
+                    "root_current": current.root.revalidate_canonical_binding().is_ok(),
+                }))
+            } else if current.handle()?.stop_handle().is_stopping() {
+                Ok(json!({"stopping":true,
+                    "failed":retirement::inspect() == retirement::Outcome::Failed,
+                    "root_current":current.root.revalidate_canonical_binding().is_ok()}))
             } else {
                 Ok(current.handle()?.status())
             }
@@ -263,15 +395,31 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
             )
         }
         "audio-enable" => {
+            // Repeat after SERVING acquisition; Stop may have arrived during that wait.
+            admitted_generation(&command, &THINKING_GENERATION)?;
+            if generation & 1 != 0 {
+                return Err("thinking is stopped".into());
+            }
+            let current = server.as_ref().ok_or("server stopped")?;
+            current
+                .root
+                .revalidate_canonical_binding()
+                .map_err(|e| e.to_string())?;
+            if fs::canonicalize(root).map_err(|e| e.to_string())? != current.root.canonical_path() {
+                return Err("thinking journal does not match the serving journal".into());
+            }
             let files = root.parent().ok_or("app files missing")?;
             server
                 .as_mut()
                 .ok_or("server stopped")?
                 .handle_mut()?
-                .enable_audio(
+                .enable_audio_with_cancellation(
                     files.join("audio-models"),
                     files.join("audio-models/tdt-0.6b-v3-q8_0.gguf"),
                     files.join("audio-scratch"),
+                    std::sync::Arc::new(move || {
+                        THINKING_GENERATION.load(Ordering::SeqCst) != generation
+                    }),
                 )?;
             Ok(server.as_ref().unwrap().handle()?.status())
         }
@@ -526,6 +674,9 @@ fn resources(root: &Path) -> Result<Value, Box<dyn std::error::Error>> {
 }
 
 fn run(root: &Path, op: &str, count: usize) -> Result<Value, Box<dyn std::error::Error>> {
+    if op == "thinking-generation" {
+        return Ok(json!({"generation":THINKING_GENERATION.load(Ordering::SeqCst)}));
+    }
     if op == "identity" {
         return Ok(
             json!({"pid":std::process::id(),"uid":unsafe{libc::getuid()},"selinux":fs::read_to_string("/proc/self/attr/current")?,"maps":fs::read_to_string("/proc/self/maps")?.lines().filter(|l|l.contains("journal_runtime")||l.contains("journalbridge")).collect::<Vec<_>>(),"sqlite_version":rusqlite::version()}),
@@ -536,6 +687,7 @@ fn run(root: &Path, op: &str, count: usize) -> Result<Value, Box<dyn std::error:
     }
     if op == "cancel" {
         CANCEL.store(true, Ordering::Release);
+        request_serving_stop();
         return Ok(json!({"cancel_requested":true}));
     }
     if op == "begin" {
@@ -834,6 +986,66 @@ pub unsafe extern "C" fn journal_free(value: *mut c_char) {
     }
 }
 
+#[cfg(all(test, feature = "full-tests"))]
+mod thinking_admission_tests {
+    use super::*;
+
+    #[test]
+    fn original_root_binding_cancels_a_replacement_without_poisoning_restored_binding() {
+        struct Temporary(std::path::PathBuf);
+        impl Drop for Temporary {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let temp = Temporary(std::env::temp_dir().join(format!(
+            "journal-thinking-root-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        )));
+        fs::create_dir(&temp.0).unwrap();
+        let root = temp.0.join("journal");
+        fs::create_dir(&root).unwrap();
+        let binding = jio::JournalRoot::open(&root).unwrap();
+        let state = AtomicU64::new(0);
+        assert!(!thinking_cancelled(&state, 0, &binding));
+        fs::rename(&root, temp.0.join("original")).unwrap();
+        fs::create_dir(&root).unwrap();
+        let replacement = jio::JournalRoot::open(&root).unwrap();
+        assert!(thinking_cancelled(&state, 0, &binding));
+        drop(replacement);
+        fs::remove_dir_all(&root).unwrap();
+        fs::rename(temp.0.join("original"), &root).unwrap();
+        assert!(!thinking_cancelled(&state, 0, &binding));
+        close_thinking_admission(&state);
+        assert!(thinking_cancelled(&state, 0, &binding));
+    }
+
+    #[test]
+    fn stop_between_java_ticket_check_and_native_capture_keeps_admission_closed() {
+        let state = AtomicU64::new(1);
+        assert!(open_thinking_admission(&state, 1));
+        let admitted = state.load(Ordering::SeqCst);
+        let old_command = json!({"admission_generation":admitted});
+        assert_eq!(admitted_generation(&old_command, &state).unwrap(), admitted);
+        assert_eq!(admitted & 1, 0); // Java ticket has passed its check.
+        close_thinking_admission(&state); // Stop arrives before Native.run.
+        let native_capture = state.load(Ordering::SeqCst);
+        assert_ne!(native_capture & 1, 0); // An old request cannot adopt this epoch.
+        assert_ne!(native_capture, admitted); // In-flight requests also cancel.
+        assert!(admitted_generation(&old_command, &state).is_err());
+        assert!(!open_thinking_admission(&state, admitted)); // Stale start cannot reopen.
+        assert!(open_thinking_admission(&state, native_capture));
+        let replacement = state.load(Ordering::SeqCst);
+        assert_eq!(replacement & 1, 0);
+        assert_ne!(replacement, admitted);
+        assert!(admitted_generation(&old_command, &state).is_err());
+        let start = state.load(Ordering::SeqCst);
+        close_thinking_admission(&state);
+        assert!(!open_thinking_admission(&state, start)); // Stop during startup wins.
+        assert_ne!(state.load(Ordering::SeqCst) & 1, 0);
+    }
+}
+
 #[cfg(all(test, feature = "full-tests", target_os = "linux"))]
 mod retirement_start_tests {
     use super::*;
@@ -986,9 +1198,13 @@ mod retirement_start_tests {
         drop(probe);
         let library = std::env::var("SOLSTONE_JNI_TEST_ONNX_LIBRARY")
             .expect("maintained pinned host ONNX input required");
-        let start = json!({"op":"start","address":address,"onnx_library":library}).to_string();
+        let start = || {
+            json!({"op":"start","address":address,"onnx_library":library,
+            "admission_generation":THINKING_GENERATION.load(Ordering::SeqCst)})
+            .to_string()
+        };
         for root in [&first, &second] {
-            assert_eq!(serving(root, &start).unwrap_err(), "server stop pending");
+            assert_eq!(serving(root, &start()).unwrap_err(), "server stop pending");
             assert!(SERVING.lock().unwrap().is_none());
         }
         assert_eq!(
@@ -1012,7 +1228,80 @@ mod retirement_start_tests {
             serving(&first, "{\"op\":\"stop\"}").unwrap()["stopped"],
             true
         );
-        assert_eq!(serving(&first, &start).unwrap()["root_current"], true);
+        assert_eq!(serving(&first, &start()).unwrap()["root_current"], true);
+        let active_epoch = THINKING_GENERATION.load(Ordering::SeqCst);
+        let live = serving(&first, &start()).unwrap();
+        assert_eq!(live["root_current"], true);
+        assert_eq!(
+            SERVING
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .handle()
+                .unwrap()
+                .interface_address()
+                .to_string(),
+            address
+        );
+        // This fixture has not finalized first-run setup; its device door stays withheld.
+        assert_eq!(live["door_address"], Value::Null);
+        assert_eq!(THINKING_GENERATION.load(Ordering::SeqCst), active_epoch);
+        assert!(
+            serving(&second, &start()).is_err(),
+            "rebind must not adopt a different root"
+        );
+        let audio = json!({"op":"audio-enable","admission_generation":active_epoch}).to_string();
+        serving(&first, &audio).unwrap();
+        let audio_generation = serving(&first, &audio).unwrap()["audio"]["generation"].clone();
+        assert_eq!(audio_generation, 0);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while serving(&first, r#"{"op":"status"}"#).unwrap()["audio"]["state"] != "ready" {
+            assert!(
+                Instant::now() < deadline,
+                "actual audio worker did not become ready"
+            );
+            std::thread::park_timeout(Duration::from_millis(10));
+        }
+        // The real early Stop must signal all these owners while thinking is held.
+        let held_thinking = THINKING.lock().unwrap();
+        let cancellation_at = Instant::now();
+        run(&first, "cancel", 1).unwrap();
+        assert!(cancellation_at.elapsed() < Duration::from_millis(500));
+        assert_eq!(
+            serving(&first, r#"{"op":"status"}"#).unwrap()["stopping"],
+            true
+        );
+        assert!(
+            serving(&first, &audio).is_err(),
+            "queued old audio-enable cannot install or reset work"
+        );
+        assert_eq!(
+            serving(&first, &start()).unwrap_err(),
+            "server stop pending"
+        );
+        {
+            let server = SERVING.lock().unwrap();
+            let owner = server.as_ref().unwrap().handle().unwrap();
+            assert!(owner.stop_handle().is_stopping());
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let state = {
+                let server = SERVING.lock().unwrap();
+                server.as_ref().unwrap().handle().unwrap().status()["audio"]["state"].clone()
+            };
+            if state == "cancelled" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "audio must observe Stop before thinking is released: {state}"
+            );
+            std::thread::park_timeout(Duration::from_millis(10));
+        }
+        drop(held_thinking);
+
         assert!(SERVING.lock().unwrap().as_ref().unwrap().handle.is_some());
         assert_eq!(
             serving(&first, "{\"op\":\"stop\"}").unwrap()["stopped"],
@@ -1032,7 +1321,7 @@ mod retirement_start_tests {
         drop(failed);
         for root in [&first, &second] {
             assert_eq!(
-                serving(root, &start).unwrap_err(),
+                serving(root, &start()).unwrap_err(),
                 "server stop failed; journal retained"
             );
         }

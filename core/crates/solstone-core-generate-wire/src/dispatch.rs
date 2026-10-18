@@ -19,6 +19,7 @@ pub fn respond(
     endpoint_runtime: &crate::EndpointRuntime,
     journal: &Path,
     acquire_local_inference_authority: impl FnOnce(&Path) -> Option<LocalInferenceAuthority>,
+    cancellation: &solstone_core_generate::Cancellation,
 ) -> Result<solstone_core_generate::GenerateResponse, String> {
     let config = match read_journal_config(journal) {
         Ok(read) => read.config.unwrap_or_default(),
@@ -31,6 +32,7 @@ pub fn respond(
         &config,
         acquire_local_inference_authority,
         true,
+        cancellation,
     )
 }
 
@@ -46,6 +48,7 @@ pub fn respond_with_config(
     journal: &Path,
     config: &serde_json::Map<String, Value>,
     acquire_local_inference_authority: impl FnOnce(&Path) -> Option<LocalInferenceAuthority>,
+    cancellation: &solstone_core_generate::Cancellation,
 ) -> Result<solstone_core_generate::GenerateResponse, String> {
     respond_config(
         request,
@@ -54,6 +57,7 @@ pub fn respond_with_config(
         config,
         acquire_local_inference_authority,
         false,
+        cancellation,
     )
 }
 
@@ -64,6 +68,7 @@ fn respond_config(
     config: &serde_json::Map<String, Value>,
     acquire_local_inference_authority: impl FnOnce(&Path) -> Option<LocalInferenceAuthority>,
     process_overrides: bool,
+    cancellation: &solstone_core_generate::Cancellation,
 ) -> Result<solstone_core_generate::GenerateResponse, String> {
     let request_id = request.id.clone();
     let (provider, outcome) = if process_overrides {
@@ -358,6 +363,13 @@ fn respond_config(
             unreachable!("lane resolution cannot return an arm failure")
         }
     };
+    if matches!(
+        response,
+        solstone_core_generate::GenerateResponse::Generated(_)
+    ) && cancellation.is_cancelled()
+    {
+        return Ok(solstone_core_generate::GenerateResponse::Cancelled);
+    }
     Ok(response)
 }
 
@@ -660,5 +672,178 @@ mod tests {
             response.thinking,
             Some(json!({"type": "thinking", "thinking": "work"}))
         );
+    }
+
+    #[test]
+    #[cfg(all(test, feature = "full-tests"))]
+    fn direct_generate_cancellation_discards_provider_success() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        struct SyncBarrier {
+            entered: Mutex<bool>,
+            entered_cvar: Condvar,
+            released: Mutex<bool>,
+            released_cvar: Condvar,
+        }
+        let sync_barrier = Arc::new(SyncBarrier {
+            entered: Mutex::new(false),
+            entered_cvar: Condvar::new(),
+            released: Mutex::new(false),
+            released_cvar: Condvar::new(),
+        });
+        let sync_barrier_clone = Arc::clone(&sync_barrier);
+
+        let server_thread = thread::spawn(move || {
+            // First run: provider blocks until released
+            let (mut stream, _) = listener.accept().expect("accept 1");
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf);
+            {
+                let mut entered = sync_barrier_clone.entered.lock().unwrap();
+                *entered = true;
+                sync_barrier_clone.entered_cvar.notify_all();
+            }
+            {
+                let mut released = sync_barrier_clone.released.lock().unwrap();
+                while !*released {
+                    released = sync_barrier_clone.released_cvar.wait(released).unwrap();
+                }
+            }
+            let body = json!({
+                "choices": [{"message": {"content": "provider output"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
+            })
+            .to_string();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.flush();
+            drop(stream);
+
+            // Second run: provider returns success directly
+            let (mut stream2, _) = listener.accept().expect("accept 2");
+            let mut buf2 = [0_u8; 1024];
+            let _ = stream2.read(&mut buf2);
+            let _ = stream2.write_all(header.as_bytes());
+            let _ = stream2.write_all(body.as_bytes());
+            let _ = stream2.flush();
+            drop(stream2);
+        });
+
+        let temp_journal = std::path::PathBuf::from(format!(
+            "/var/tmp/solstone-generate-wire-dispatch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_journal);
+        std::fs::create_dir_all(&temp_journal).unwrap();
+        let journal_path = temp_journal.as_path();
+        let config = json!({
+            "providers": {
+                "active": {"provider": "local"},
+                "local": {
+                    "endpoint_url": format!("http://{addr}"),
+                    "served_model_id": "served",
+                    "served_context_window": 4096
+                }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let request = solstone_core_generate::GenerateRequest {
+            id: Some("req-1".into()),
+            context: "test".into(),
+            contents: vec![solstone_core_generate::ContentPart::Text {
+                text: "hello".into(),
+            }],
+            system_instruction: None,
+            temperature: 0.0,
+            max_output_tokens: 16,
+            timeout_s: Some(10.0),
+            json_output: false,
+            json_schema: None,
+            attempt_index: 0,
+            exclusive_admission: false,
+            transport_retries: None,
+        };
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_clone = Arc::clone(&cancelled);
+
+        let req_clone = request.clone();
+        let config_clone = config.clone();
+        let runtime = crate::EndpointRuntime::default();
+        let jpath = journal_path.to_path_buf();
+        let client_thread = thread::spawn(move || {
+            let check_fn = move || cancelled_clone.load(Ordering::SeqCst);
+            let cancellation = solstone_core_generate::Cancellation::from_fn(&check_fn);
+            respond_with_config(
+                &req_clone,
+                &runtime,
+                &jpath,
+                &config_clone,
+                |_| None,
+                &cancellation,
+            )
+        });
+
+        // Wait until provider blocks
+        {
+            let mut entered = sync_barrier.entered.lock().unwrap();
+            while !*entered {
+                entered = sync_barrier.entered_cvar.wait(entered).unwrap();
+            }
+        }
+
+        // Test cancels
+        cancelled.store(true, Ordering::SeqCst);
+
+        // Test releases
+        {
+            let mut released = sync_barrier.released.lock().unwrap();
+            *released = true;
+            sync_barrier.released_cvar.notify_all();
+        }
+
+        let result = client_thread
+            .join()
+            .unwrap()
+            .expect("respond_with_config ok");
+        assert_eq!(result, solstone_core_generate::GenerateResponse::Cancelled);
+
+        // The same fixture without cancel returns the provider success
+        let runtime2 = crate::EndpointRuntime::default();
+        let success_result = respond_with_config(
+            &request,
+            &runtime2,
+            journal_path,
+            &config,
+            |_| None,
+            &solstone_core_generate::Cancellation::never(),
+        )
+        .expect("respond_with_config ok");
+
+        let solstone_core_generate::GenerateResponse::Generated(generated) = success_result else {
+            panic!("expected Generated response, got {success_result:?}");
+        };
+        assert_eq!(generated.text, "provider output");
+
+        server_thread.join().unwrap();
+        let _ = std::fs::remove_dir_all(&temp_journal);
     }
 }

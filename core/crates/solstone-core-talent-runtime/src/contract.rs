@@ -31,8 +31,11 @@ pub struct HookBinding {
 }
 
 pub type GateFn = fn(&PreparedTalent, &ExecutionContext) -> Result<GateDecision, StageError>;
-pub type BuildFn =
-    fn(&mut PreparedTalent, &ExecutionContext) -> Result<PrePostState, RuntimeOutcome>;
+pub type BuildFn = fn(
+    &mut PreparedTalent,
+    &ExecutionContext,
+    &solstone_core_generate::Cancellation,
+) -> Result<PrePostState, RuntimeOutcome>;
 pub type PromptOverrideFn = fn(&mut PreparedTalent, &PrePostState) -> Result<(), StageError>;
 pub type ParseOutputFn =
     fn(&str, &PreparedTalent, &PrePostState) -> Result<ParsedOutput, StageError>;
@@ -41,8 +44,12 @@ pub type CommitFn =
 pub type UnavailableCommitFn =
     fn(&str, &PreparedTalent, &PrePostState) -> Result<CommitPlan, StageError>;
 pub type UnavailableBeforeGenerateFn = fn(&PrePostState) -> Option<&'static str>;
-pub type WriteIntentFn =
-    fn(CommitPlan, &ExecutionContext, &PreparedTalent) -> Result<CommitDisposition, StageError>;
+pub type WriteIntentFn = fn(
+    CommitPlan,
+    &ExecutionContext,
+    &PreparedTalent,
+    &solstone_core_generate::Cancellation,
+) -> Result<CommitDisposition, StageError>;
 pub type OutputOverrideFn = fn(&str, &PreparedTalent, &PrePostState) -> Result<String, StageError>;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -196,7 +203,7 @@ pub static STORY: StageSpec = StageSpec {
 pub static PULSE: StageSpec = StageSpec {
     stage: StageId::Pulse,
     gate: Some(crate::pulse::gate),
-    build: Some(crate::pulse::build),
+    build: Some(|prepared, context, _| crate::pulse::build(prepared, context)),
     prompt_override: Some(crate::pulse::apply_prompt_override),
     commit: Some(CommitSpec {
         parse: crate::pulse::parse,
@@ -210,7 +217,7 @@ pub static PULSE: StageSpec = StageSpec {
 pub static MORNING_BRIEFING: StageSpec = StageSpec {
     stage: StageId::MorningBriefing,
     gate: Some(crate::morning_briefing::gate),
-    build: Some(crate::morning_briefing::build),
+    build: Some(|prepared, context, _| crate::morning_briefing::build(prepared, context)),
     prompt_override: Some(crate::morning_briefing::apply_prompt_override),
     commit: None,
     unavailable_commit: None,
@@ -221,7 +228,7 @@ pub static MORNING_BRIEFING: StageSpec = StageSpec {
 pub static ENTITY_DESCRIBE: StageSpec = StageSpec {
     stage: StageId::EntityDescribe,
     gate: Some(crate::entities::describe::gate),
-    build: Some(crate::entities::describe::build),
+    build: Some(|prepared, context, _| crate::entities::describe::build(prepared, context)),
     prompt_override: Some(crate::entities::describe::apply_prompt_override),
     commit: None,
     unavailable_commit: None,
@@ -260,7 +267,7 @@ pub static SCHEDULE: StageSpec = StageSpec {
 pub static DAILY_SCHEDULE: StageSpec = StageSpec {
     stage: StageId::DailySchedule,
     gate: None,
-    build: Some(crate::daily_schedule::build),
+    build: Some(|prepared, context, _| crate::daily_schedule::build(prepared, context)),
     prompt_override: Some(crate::daily_schedule::apply_prompt_override),
     commit: Some(CommitSpec {
         parse: crate::daily_schedule::parse,
@@ -274,7 +281,7 @@ pub static DAILY_SCHEDULE: StageSpec = StageSpec {
 pub static FACET_NEWSLETTER: StageSpec = StageSpec {
     stage: StageId::FacetNewsletter,
     gate: Some(crate::facet_newsletter::gate),
-    build: Some(crate::facet_newsletter::build),
+    build: Some(|prepared, context, _| crate::facet_newsletter::build(prepared, context)),
     prompt_override: Some(crate::facet_newsletter::apply_prompt_override),
     commit: Some(CommitSpec {
         parse: crate::facet_newsletter::parse,
@@ -288,7 +295,7 @@ pub static FACET_NEWSLETTER: StageSpec = StageSpec {
 pub static ENTITY_DETECTION: StageSpec = StageSpec {
     stage: StageId::EntityDetection,
     gate: Some(crate::entities::detection::gate),
-    build: Some(crate::entities::detection::build),
+    build: Some(|prepared, context, _| crate::entities::detection::build(prepared, context)),
     prompt_override: Some(crate::entities::detection::apply_prompt_override),
     commit: Some(CommitSpec {
         parse: crate::entities::detection::parse,
@@ -302,7 +309,7 @@ pub static ENTITY_DETECTION: StageSpec = StageSpec {
 pub static ENTITIES_REVIEW: StageSpec = StageSpec {
     stage: StageId::EntitiesReview,
     gate: Some(crate::entities::review::gate),
-    build: Some(crate::entities::review::build),
+    build: Some(|prepared, context, _| crate::entities::review::build(prepared, context)),
     prompt_override: Some(crate::entities::review::apply_prompt_override),
     commit: Some(CommitSpec {
         parse: crate::entities::review::parse,
@@ -316,7 +323,7 @@ pub static ENTITIES_REVIEW: StageSpec = StageSpec {
 pub static ENTITY_SUGGEST: StageSpec = StageSpec {
     stage: StageId::EntitySuggest,
     gate: Some(crate::entities::suggest::gate),
-    build: Some(crate::entities::suggest::build),
+    build: Some(|prepared, context, _| crate::entities::suggest::build(prepared, context)),
     prompt_override: Some(crate::entities::suggest::apply_prompt_override),
     commit: Some(CommitSpec {
         parse: crate::entities::suggest::parse,
@@ -330,7 +337,7 @@ pub static ENTITY_SUGGEST: StageSpec = StageSpec {
 pub static ENTITY_OBSERVER: StageSpec = StageSpec {
     stage: StageId::EntityObserver,
     gate: Some(crate::entities::observer::gate),
-    build: Some(crate::entities::observer::build),
+    build: Some(|prepared, context, _| crate::entities::observer::build(prepared, context)),
     prompt_override: Some(crate::entities::observer::apply_prompt_override),
     commit: Some(CommitSpec {
         parse: crate::entities::observer::parse,
@@ -344,7 +351,9 @@ pub static ENTITY_OBSERVER: StageSpec = StageSpec {
 pub static SPEAKER_ATTRIBUTION: StageSpec = StageSpec {
     stage: StageId::SpeakerAttribution,
     gate: None,
-    build: Some(crate::speaker_attribution::build),
+    build: Some(|prepared, context, cancellation| {
+        crate::speaker_attribution::build_cancellable(prepared, context, cancellation)
+    }),
     prompt_override: Some(crate::speaker_attribution::apply_prompt_override),
     commit: Some(CommitSpec {
         parse: crate::speaker_attribution::parse,
@@ -358,7 +367,7 @@ pub static SPEAKER_ATTRIBUTION: StageSpec = StageSpec {
 pub static WEEKLY_REFLECTION: StageSpec = StageSpec {
     stage: StageId::WeeklyReflection,
     gate: None,
-    build: Some(crate::weekly_reflection::build),
+    build: Some(|prepared, context, _| crate::weekly_reflection::build(prepared, context)),
     prompt_override: Some(crate::weekly_reflection::apply_prompt_override),
     commit: Some(CommitSpec {
         parse: crate::weekly_reflection::parse,

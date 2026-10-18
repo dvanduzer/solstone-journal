@@ -12,7 +12,7 @@ use solstone_core_convey_shell::EmbeddedConveyHandle;
 #[cfg(target_os = "ios")]
 use solstone_core_convey_shell::bind_embedded_device_door_with_root;
 #[cfg(not(target_os = "ios"))]
-use solstone_core_convey_shell::bind_embedded_device_door_with_routes;
+use solstone_core_convey_shell::bind_embedded_device_door_with_routes_and_startup;
 use solstone_core_journal_io::JournalRoot;
 use std::{
     net::SocketAddrV4,
@@ -45,12 +45,38 @@ pub struct MobileServing {
     handle: EmbeddedConveyHandle,
     runtime: tokio::runtime::Runtime,
     root: Arc<JournalRoot>,
+    interface_address: SocketAddrV4,
     services: Mutex<Option<AppServices>>,
+    stop: MobileServingStop,
     shutdown_complete: std::sync::atomic::AtomicBool,
     shutdown_failed: std::sync::atomic::AtomicBool,
     service_failures: Mutex<Vec<tokio::task::JoinError>>,
     #[cfg(all(test, feature = "full-tests"))]
     shutdown_test_fault: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+/// Clone-only early-stop signal. The serving owner retains every worker and runtime.
+#[derive(Clone)]
+pub struct MobileServingStop {
+    convey: solstone_core_convey_shell::EmbeddedConveyStop,
+    services: watch::Sender<bool>,
+    backup: solstone_core_backup_web::BackupRouteLifetime,
+}
+
+struct ServingStartup {
+    cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+    stop_ready: Arc<dyn Fn(MobileServingStop) + Send + Sync>,
+}
+
+impl MobileServingStop {
+    pub fn request_stop(&self) {
+        self.backup.request_stop();
+        self.services.send_replace(true);
+        self.convey.request_stop();
+    }
+    pub fn is_stopping(&self) -> bool {
+        *self.services.borrow()
+    }
 }
 
 #[derive(Debug)]
@@ -91,6 +117,13 @@ struct AppServices {
 }
 
 impl MobileServing {
+    pub fn stop_handle(&self) -> MobileServingStop {
+        self.stop.clone()
+    }
+    pub fn interface_address(&self) -> SocketAddrV4 {
+        self.interface_address
+    }
+
     pub fn start(root: PathBuf, address: SocketAddrV4) -> Result<Self, String> {
         Self::start_using(root, address, None)
     }
@@ -108,7 +141,7 @@ impl MobileServing {
         address: SocketAddrV4,
         payload_root: Option<PathBuf>,
     ) -> Result<Self, String> {
-        Self::start_using_owned(root, address, payload_root).map_err(|failure| {
+        Self::start_using_owned(root, address, payload_root, None).map_err(|failure| {
             let (message, owner) = failure.into_parts();
             if let Some(owner) = owner {
                 // Existing synchronous callers keep the complete owner until
@@ -125,13 +158,35 @@ impl MobileServing {
         address: SocketAddrV4,
         payload_root: PathBuf,
     ) -> Result<Self, StartupFailure> {
-        Self::start_using_owned(root, address, Some(payload_root))
+        Self::start_using_owned(root, address, Some(payload_root), None)
+    }
+
+    /// Install the embedding app's stop signal before listener exposure or
+    /// registration waits. A refused startup still returns its actual owner.
+    #[cfg(not(target_os = "ios"))]
+    pub fn start_with_payload_for_retirement_observed(
+        root: PathBuf,
+        address: SocketAddrV4,
+        payload_root: PathBuf,
+        cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+        stop_ready: Arc<dyn Fn(MobileServingStop) + Send + Sync>,
+    ) -> Result<Self, StartupFailure> {
+        Self::start_using_owned(
+            root,
+            address,
+            Some(payload_root),
+            Some(ServingStartup {
+                cancelled,
+                stop_ready,
+            }),
+        )
     }
 
     fn start_using_owned(
         root: PathBuf,
         address: SocketAddrV4,
         payload_root: Option<PathBuf>,
+        startup: Option<ServingStartup>,
     ) -> Result<Self, StartupFailure> {
         if address.ip().is_unspecified() || address.ip().is_multicast() || address.port() == 0 {
             return Err("an explicit interface address and nonzero port are required".into());
@@ -156,6 +211,17 @@ impl MobileServing {
                 root.canonical_path().join("health/callosum.sock"),
             ))
             .map_err(|e| e.to_string())?;
+        let (shutdown, mut stop) = watch::channel(false);
+        let early_shutdown = shutdown.clone();
+        let cancelled = startup
+            .as_ref()
+            .map(|startup| Arc::clone(&startup.cancelled))
+            .unwrap_or_else(|| Arc::new(|| false));
+        let stop_ready = startup
+            .as_ref()
+            .map(|startup| Arc::clone(&startup.stop_ready))
+            .unwrap_or_else(|| Arc::new(|_| {}));
+        let early_cancelled = Arc::clone(&cancelled);
         let handle = runtime
             .block_on(async {
                 #[cfg(target_os = "ios")]
@@ -166,16 +232,31 @@ impl MobileServing {
                     solstone_core_mcp_endpoint::owner_routes(root.canonical_path().to_path_buf()),
                 );
                 #[cfg(not(target_os = "ios"))]
-                let binding = bind_embedded_device_door_with_routes(
+                let binding = bind_embedded_device_door_with_routes_and_startup(
                     root.canonical_path().to_path_buf(),
                     address,
                     payload_root,
                     solstone_core_mcp_endpoint::owner_routes(root.canonical_path().to_path_buf()),
+                    solstone_core_convey_shell::EmbeddedStartup {
+                        cancelled: Arc::clone(&cancelled),
+                        stop_ready: Arc::new(move |convey, backup| {
+                            let signal = MobileServingStop {
+                                convey,
+                                services: early_shutdown.clone(),
+                                backup,
+                            };
+                            stop_ready(signal.clone());
+                            if early_cancelled() {
+                                signal.request_stop();
+                            }
+                        }),
+                    },
                 );
                 binding.await
             })
             .map_err(|e| e.to_string())?;
-        let (shutdown, mut stop) = watch::channel(false);
+        #[cfg(target_os = "ios")]
+        let _ = (early_shutdown, early_cancelled, stop_ready);
         let (ready, registered) = oneshot::channel();
         let brain_task = runtime.spawn(brain::run(Arc::clone(&root), stop.clone(), ready));
         let (backup_ready, subscribed) = oneshot::channel();
@@ -233,13 +314,20 @@ impl MobileServing {
                 }
             }
         });
+        let stop_handle = MobileServingStop {
+            convey: handle.stop_handle(),
+            services: shutdown.clone(),
+            backup: handle.backup_dependencies().lifetime(),
+        };
         let owner = Self {
+            stop: stop_handle,
             #[cfg(feature = "audio")]
             audio: None,
             bus,
             handle,
             runtime,
             root,
+            interface_address: address,
             services: Mutex::new(Some(AppServices {
                 shutdown,
                 tasks: vec![brain_task, relay_task, mcp_task],
@@ -259,6 +347,12 @@ impl MobileServing {
         brain_registered: oneshot::Receiver<()>,
         backup_registered: oneshot::Receiver<()>,
     ) -> Result<Self, StartupFailure> {
+        if self.stop.is_stopping() {
+            return Err(StartupFailure {
+                message: "stop requested during startup; journal retained".into(),
+                owner: Some(Box::new(self)),
+            });
+        }
         for (registered, message) in [
             (brain_registered, "embedded Brain consumer did not register"),
             (
@@ -272,6 +366,12 @@ impl MobileServing {
                     Ok(Ok(()))
                 )
             });
+            if self.stop.is_stopping() {
+                return Err(StartupFailure {
+                    message: "stop requested during startup; journal retained".into(),
+                    owner: Some(Box::new(self)),
+                });
+            }
             if !ready {
                 self.handle.backup_dependencies().lifetime().request_stop();
                 self.handle.shutdown();
@@ -335,11 +435,32 @@ impl MobileServing {
         if self.audio.is_some() {
             return Err("audio worker already enabled".into());
         }
-        self.audio = Some(audio::AudioWorker::start(
+        self.enable_audio_with_cancellation(models, model, scratch, std::sync::Arc::new(|| false))
+    }
+
+    #[cfg(feature = "audio")]
+    pub fn enable_audio_with_cancellation(
+        &mut self,
+        models: PathBuf,
+        model: PathBuf,
+        scratch: PathBuf,
+        cancelled: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<(), String> {
+        if self.stop.is_stopping() || cancelled() {
+            return Err("server stop pending".into());
+        }
+        self.root
+            .revalidate_canonical_binding()
+            .map_err(|e| e.to_string())?;
+        if self.audio.is_some() {
+            return Ok(());
+        }
+        self.audio = Some(audio::AudioWorker::start_with_cancellation(
             self.root.canonical_path().to_path_buf(),
             models,
             model,
             scratch,
+            cancelled,
         )?);
         Ok(())
     }
@@ -415,6 +536,7 @@ impl MobileServing {
         if self.shutdown_complete.load(Ordering::Acquire) {
             return Ok(());
         }
+        self.stop.request_stop();
         #[cfg(feature = "audio")]
         if let Some(audio) = &self.audio {
             audio.stop();
@@ -502,6 +624,8 @@ impl Drop for MobileServing {
 
 #[cfg(all(test, feature = "full-tests"))]
 #[path = "../../android-runtime/native/src/retirement.rs"]
+// JNI uses additional registry accessors outside this partial host test import.
+#[allow(dead_code)]
 mod android_retirement;
 
 #[cfg(all(test, feature = "full-tests"))]
@@ -556,6 +680,110 @@ mod tests {
         assert_eq!(retirement.wait(Duration::from_millis(25)), Outcome::Pending);
         assert_eq!(runtime.block_on(runtime.spawn(async { 46 })).unwrap(), 46);
         release.send(()).unwrap();
+        runtime.block_on(worker).unwrap();
+        assert_eq!(retirement.wait(Duration::from_secs(5)), Outcome::Stopped);
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    #[test]
+    fn stop_before_listener_exposure_retains_startup_owner_until_real_join() {
+        use crate::android_retirement::{Outcome, Retirement};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (server, directory) = fixture();
+        let address = server.interface_address();
+        let mark = server.request_owner("GET", "/init/mark", "").unwrap();
+        let proposal: Value = serde_json::from_str(&mark.body).unwrap();
+        let lock = json!({"proposal_id":proposal["proposal_id"]}).to_string();
+        assert_eq!(
+            server
+                .request_owner("POST", "/init/mark/lock", &lock)
+                .unwrap()
+                .status,
+            200
+        );
+        assert_eq!(
+            server
+                .request_owner("POST", "/init/finalize", "{}")
+                .unwrap()
+                .status,
+            200
+        );
+        assert_eq!(server.status()["door_address"], address.to_string());
+        server.shutdown();
+        drop(server);
+
+        let (published, observed) = std::sync::mpsc::channel();
+        let (release_start, start_held) = std::sync::mpsc::channel();
+        let start_held = Mutex::new(start_held);
+        let (release_work, work_held) = std::sync::mpsc::channel();
+        let work_held = Mutex::new(Some(work_held));
+        let first = AtomicBool::new(true);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let input_cancelled = cancelled.clone();
+        let root = directory.path().to_path_buf();
+        let constructor = std::thread::spawn(move || {
+            MobileServing::start_with_payload_for_retirement_observed(
+                root,
+                address,
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../core/payload"),
+                Arc::new(move || input_cancelled.load(Ordering::SeqCst)),
+                Arc::new(move |stop| {
+                    if first.swap(false, Ordering::SeqCst) {
+                        let permit = stop.backup.admit_maintenance().unwrap();
+                        let held = work_held.lock().unwrap().take().unwrap();
+                        let runtime = tokio::runtime::Handle::current();
+                        let worker = runtime.spawn_blocking(move || {
+                            let _permit = permit;
+                            held.recv_timeout(Duration::from_secs(10)).unwrap();
+                        });
+                        published.send((stop, runtime, worker)).unwrap();
+                        start_held
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(10))
+                            .unwrap();
+                    }
+                }),
+            )
+        });
+        let (stop, runtime, worker) = observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            std::net::TcpStream::connect(address).is_err(),
+            "hook precedes exposure"
+        );
+        cancelled.store(true, Ordering::SeqCst);
+        let requested = Instant::now();
+        stop.request_stop();
+        assert!(requested.elapsed() < Duration::from_millis(500));
+        assert!(stop.is_stopping());
+        assert!(stop.backup.admit_maintenance().is_err());
+        assert!(
+            !constructor.is_finished(),
+            "actual startup remains owned while held"
+        );
+        assert_eq!(runtime.block_on(runtime.spawn(async { 47 })).unwrap(), 47);
+        release_start.send(()).unwrap();
+        let failure = match constructor.join().unwrap() {
+            Ok(_) => panic!("cancelled startup must refuse"),
+            Err(failure) => failure,
+        };
+        let (message, owner) = failure.into_parts();
+        assert_eq!(message, "stop requested during startup; journal retained");
+        let owner = owner.expect("actual exposed startup owner retained");
+        assert_eq!(owner.status()["door_address"], Value::Null);
+        assert_eq!(
+            owner.request_owner("GET", "/init/mark", "").unwrap().status,
+            503
+        );
+        assert!(!owner.shutdown_complete.load(Ordering::Acquire));
+        let root = owner.root.clone();
+        let mut retirement = Retirement::start_isolated((*owner, directory), root, |owner| {
+            owner.0.shutdown_for_retirement().map_err(|_| ())
+        })
+        .ok()
+        .unwrap();
+        assert_eq!(retirement.wait(Duration::from_millis(25)), Outcome::Pending);
+        release_work.send(()).unwrap();
         runtime.block_on(worker).unwrap();
         assert_eq!(retirement.wait(Duration::from_secs(5)), Outcome::Stopped);
     }
@@ -768,6 +996,32 @@ mod tests {
             .unwrap();
         assert_eq!(finalized.status, 200, "{}", finalized.body);
         assert_eq!(server.status()["door_address"], address.to_string());
+        let early_stop = server.stop_handle();
+        let requested_at = std::time::Instant::now();
+        early_stop.request_stop();
+        assert!(requested_at.elapsed() < std::time::Duration::from_millis(500));
+        assert!(early_stop.is_stopping());
+        assert_eq!(server.status()["door_address"], Value::Null);
+        assert!(
+            server
+                .handle
+                .backup_dependencies()
+                .lifetime()
+                .admit_maintenance()
+                .is_err()
+        );
+        assert!(
+            !server
+                .shutdown_complete
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert_eq!(
+            server
+                .runtime
+                .block_on(server.runtime.spawn(async { 43 }))
+                .unwrap(),
+            43
+        );
         server.shutdown();
         assert_eq!(server.status()["door_address"], Value::Null);
     }

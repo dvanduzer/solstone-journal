@@ -378,6 +378,9 @@ fn interpret_generate(
             refusal.blocking,
             refusal.reason_code.map(|code| code.as_wire().to_owned()),
         )),
+        Ok(GenerateResponse::Cancelled) => {
+            Err(wire_error("generate cancelled".to_owned(), true, None))
+        }
         Err(error @ ClientError::Protocol(_)) => Err(wire_error(error.to_string(), true, None)),
         Err(ClientError::Decode(detail)) => Err(wire_error(detail, true, None)),
         Err(

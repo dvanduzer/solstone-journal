@@ -13,9 +13,14 @@ final class JournalExecution {
     final ExecutorService thinking = Executors.newSingleThreadExecutor();
     final ThinkingAdmission admission = new ThinkingAdmission();
 
-    void retire(Runnable stop) {
+    void beginStop(Runnable cancel) {
         admission.stop();
-        work.execute(()->{
+        cancel.run();
+    }
+
+    void retire(Runnable cancel, Runnable stop) {
+        beginStop(cancel);
+        work.execute(() -> {
             admission.awaitIdle();
             stop.run();
         });

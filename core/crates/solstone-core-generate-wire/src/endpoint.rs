@@ -175,6 +175,29 @@ pub fn endpoint_generate_with<T: EndpointTransport>(
     transport: &mut T,
     now: Instant,
 ) -> EndpointResult {
+    endpoint_generate_internal(
+        request,
+        journal_path,
+        endpoint,
+        config,
+        runtime,
+        transport,
+        now,
+        Instant::now(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn endpoint_generate_internal<T: EndpointTransport>(
+    request: &GenerateRequest,
+    journal_path: &Path,
+    endpoint: &ByoEndpoint,
+    config: &Map<String, Value>,
+    runtime: &EndpointRuntime,
+    transport: &mut T,
+    now: Instant,
+    started: Instant,
+) -> EndpointResult {
     let Some(max_tokens) = completion_ceiling(request, endpoint, config) else {
         return failure("provider_response_invalid");
     };
@@ -185,7 +208,6 @@ pub fn endpoint_generate_with<T: EndpointTransport>(
         Err(reason_code) => return failure(reason_code),
     };
     let timeout = request_timeout(request.timeout_s, thinking_headroom(endpoint, config));
-    let started = Instant::now();
     let Some(admission_timeout) = remaining_timeout(started, timeout) else {
         return failure("local_capacity_exhausted");
     };
@@ -425,7 +447,7 @@ fn endpoint_post<T: EndpointTransport>(
         })
 }
 
-fn remaining_timeout(started: Instant, timeout: Duration) -> Option<Duration> {
+pub(crate) fn remaining_timeout(started: Instant, timeout: Duration) -> Option<Duration> {
     timeout.checked_sub(started.elapsed())
 }
 

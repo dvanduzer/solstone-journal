@@ -107,6 +107,39 @@ impl EmbeddedContext<'_> {
     }
 }
 
+pub use solstone_core_system::work_retry::raw::RetryContext;
+
+pub fn embedded_retry_context(
+    journal: &Path,
+    audio: &Path,
+) -> Result<Option<RetryContext>, String> {
+    solstone_core_system::work_retry::raw::context_for_output(
+        journal,
+        &audio.with_extension("jsonl"),
+        solstone_core_processing_record::vocab::HANDLER_TRANSCRIBE,
+    )
+}
+
+pub fn embedded_already_processed(
+    journal: &Path,
+    audio: &Path,
+    retry: Option<&RetryContext>,
+) -> bool {
+    crate::args::should_skip_process_one_processed(audio, false, Some(journal), retry)
+}
+
+pub fn embedded_retryable_failure(audio: &Path) -> bool {
+    use solstone_core_processing_record::{
+        is_failure_exhausted, read_processing_record_header, vocab,
+    };
+    read_processing_record_header(&audio.with_extension("jsonl")).is_some_and(|record| {
+        record["schema"] == vocab::SCHEMA
+            && record["handler"] == vocab::HANDLER_TRANSCRIBE
+            && record["state"] == vocab::STATE_FAILED
+            && !is_failure_exhausted(&record)
+    })
+}
+
 /// Run the normal claimed decode/VAD/ASR/speaker/publication pipeline in process.
 ///
 /// The caller opts in explicitly and supplies app-private pinned model and scratch
@@ -120,6 +153,7 @@ pub fn process_embedded(
     scratch: &Path,
     asr: &dyn EmbeddedAsr,
     cancel: &dyn Fn() -> bool,
+    retry: Option<&RetryContext>,
 ) -> Result<TranscribeFile, TranscribeError> {
     let context = EmbeddedContext {
         models,
@@ -151,6 +185,7 @@ pub fn process_embedded(
         &config,
         &solstone_core_spp_ratls::AttestationStateStore::new(),
         Some(&context),
+        retry,
     )?;
     Ok(crate::record_transcribe_file(outcome, audio))
 }
@@ -368,6 +403,7 @@ mod tests {
             &journal.path().join("scratch"),
             &LocalRecognizer,
             &|| false,
+            None,
         );
         assert!(
             matches!(result, Err(TranscribeError::ProcessingClaim { detail, .. })
@@ -441,7 +477,8 @@ mod tests {
                 Path::new("unused"),
                 Path::new("unused"),
                 &asr,
-                &cancel
+                &cancel,
+                None,
             ),
             Err(TranscribeError::Cancelled)
         ));
@@ -464,6 +501,7 @@ mod tests {
             &root.path().join("scratch"),
             &asr,
             &|| false,
+            None,
         );
         assert!(
             matches!(result, Err(TranscribeError::ParakeetCppDeferred { reason, .. }) if reason == "embedded-duration-budget")

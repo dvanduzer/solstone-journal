@@ -930,6 +930,29 @@ pub fn apply_result(
     served_ids: &BTreeSet<String>,
     shown_observation_ids: &BTreeMap<String, BTreeSet<u64>>,
 ) -> Result<(), String> {
+    apply_result_cancellable(
+        journal,
+        output,
+        facet,
+        day,
+        served_ids,
+        shown_observation_ids,
+        &solstone_core_generate::Cancellation::never(),
+    )
+}
+
+pub(crate) fn apply_result_cancellable(
+    journal: &Path,
+    output: &str,
+    facet: &str,
+    day: &str,
+    served_ids: &BTreeSet<String>,
+    shown_observation_ids: &BTreeMap<String, BTreeSet<u64>>,
+    cancellation: &solstone_core_generate::Cancellation,
+) -> Result<(), String> {
+    let _trust = solstone_core_facets::hold_facet_trust_lock(journal).map_err(|e| e.to_string())?;
+    crate::writers::check_cancellation(cancellation)?;
+
     let mut counts = empty_counts();
     let mut error = None;
     let result = (|| -> Result<(), String> {
@@ -999,6 +1022,7 @@ pub fn apply_result(
             if clean.is_empty() {
                 continue;
             }
+            crate::writers::check_cancellation(cancellation)?;
             match solstone_core_facets::record_observation_ops_strict(
                 journal,
                 facet,
@@ -1023,6 +1047,7 @@ pub fn apply_result(
     if let Err(detail) = result {
         error = Some(detail);
     }
+    crate::writers::check_cancellation(cancellation)?;
     write_outcome(journal, facet, day, &counts, served_ids, error.as_deref())
 }
 

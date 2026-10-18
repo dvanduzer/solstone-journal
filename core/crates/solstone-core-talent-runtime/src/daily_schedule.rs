@@ -93,6 +93,18 @@ pub fn commit(
 }
 
 pub fn apply_result(journal: &std::path::Path, output: &str) -> Result<(), String> {
+    apply_result_cancellable(
+        journal,
+        output,
+        &solstone_core_generate::Cancellation::never(),
+    )
+}
+
+pub(crate) fn apply_result_cancellable(
+    journal: &std::path::Path,
+    output: &str,
+    cancellation: &solstone_core_generate::Cancellation,
+) -> Result<(), String> {
     // Preserve solstone/talent/daily_schedule.py:167-203: invalid output is ignored.
     let Ok(Value::Object(value)) = serde_json::from_str(output) else {
         return Ok(());
@@ -103,11 +115,23 @@ pub fn apply_result(journal: &std::path::Path, output: &str) -> Result<(), Strin
     if NaiveTime::parse_from_str(primary, "%H:%M").is_err() {
         return Ok(());
     }
-    solstone_core_system::schedule::set_schedule_metadata(
+    solstone_core_system::schedule::mutate_schedule_entries(
         &journal.join("config/schedules.json"),
-        &Map::from_iter([("daily_time".to_owned(), Value::String(primary.to_owned()))]),
+        |raw| {
+            if cancellation.is_cancelled() {
+                return solstone_core_system::schedule::ScheduleMutation {
+                    changed: false,
+                    value: Err("cancelled".to_owned()),
+                };
+            }
+            raw.insert("daily_time".to_owned(), Value::String(primary.to_owned()));
+            solstone_core_system::schedule::ScheduleMutation {
+                changed: true,
+                value: Ok(()),
+            }
+        },
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?
 }
 
 fn generate_span_summary(

@@ -286,6 +286,9 @@ pub fn classify_image_reply(
             };
             ImageCheck::Unchecked { reason }
         }
+        GenerateResponse::Cancelled => ImageCheck::Unchecked {
+            reason: CheckReason::Other,
+        },
     }
 }
 

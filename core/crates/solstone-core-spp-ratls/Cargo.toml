@@ -20,6 +20,7 @@ x509-parser = "=0.16.0"
 nix = { workspace = true, features = ["fs"] }
 
 [features]
+full-tests = []
 test-hooks = []
 nvattest-directory = ["test-hooks", "solstone-core-spp-attest/test-hooks"]
 
@@ -31,6 +32,7 @@ socket2.workspace = true
 [[test]]
 name = "attested_channels"
 path = "tests/attested_channels.rs"
+required-features = ["full-tests"]
 
 [[example]]
 name = "qualification_probe"

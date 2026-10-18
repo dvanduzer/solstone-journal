@@ -2144,6 +2144,7 @@ fn generate_for_page(
         Ok(GenerateResponse::Refused(response)) => {
             Err(format!("model refused: {}", response.reason.as_str()))
         }
+        Ok(GenerateResponse::Cancelled) => Err("generate cancelled".to_owned()),
         Err(error) => Err(collapse_line(&format!("{error}"))),
     }
 }
