@@ -238,6 +238,9 @@ pub fn clean_uninstall_refusal(args: &SetupArgs) -> Option<String> {
     if args.step_timeout_seconds_supplied() {
         incompatible.push("--step-timeout-seconds");
     }
+    if args.initial_start_at_sign_in.is_some() {
+        incompatible.push("--initial-start-at-sign-in");
+    }
     if args.dry_run {
         incompatible.push("--dry-run");
     }
@@ -1360,6 +1363,29 @@ mod tests {
         assert_eq!(
             clean_uninstall_refusal(&args(&["--clean-uninstall", "--port", "5015", "--force"])),
             Some("--clean-uninstall cannot be combined with --port, --force".into())
+        );
+        assert_eq!(
+            clean_uninstall_refusal(&args(&["--clean-uninstall", "--yes"])),
+            None
+        );
+    }
+    #[test]
+    fn clean_uninstall_refuses_initial_start_at_sign_in() {
+        assert!(
+            clean_uninstall_refusal(&args(&[
+                "--clean-uninstall",
+                "--initial-start-at-sign-in",
+                "off"
+            ]))
+            .is_some()
+        );
+        assert!(
+            clean_uninstall_refusal(&args(&[
+                "--clean-uninstall",
+                "--initial-start-at-sign-in",
+                "on"
+            ]))
+            .is_some()
         );
         assert_eq!(
             clean_uninstall_refusal(&args(&["--clean-uninstall", "--yes"])),

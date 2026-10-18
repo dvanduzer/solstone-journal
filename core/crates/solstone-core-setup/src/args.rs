@@ -21,7 +21,39 @@ pub const USAGE: &str = concat!(
     "                     [--skip-brain] [--skip-skills] [--skip-service] [--skip-wrapper]\n",
     "                     [--skip-path]\n",
     "                     [--accept-existing-journal] [--force] [--clean-uninstall]\n",
+    "                     [--initial-start-at-sign-in {on,off}] (Windows only)\n",
 );
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InitialStartAtSignIn {
+    On,
+    Off,
+}
+
+impl InitialStartAtSignIn {
+    pub fn parse_token(token: &str) -> Option<Self> {
+        match token {
+            "on" => Some(Self::On),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+
+    /// On is true, off is false. Callers wrap this in `Option`: `None` is omission.
+    pub fn as_bool(self) -> bool {
+        match self {
+            Self::On => true,
+            Self::Off => false,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -51,6 +83,7 @@ pub struct SetupArgs {
     pub accept_existing_journal: bool,
     pub force: bool,
     pub clean_uninstall: bool,
+    pub initial_start_at_sign_in: Option<InitialStartAtSignIn>,
     /// Private phase marker used by the archive installer transaction.
     pub(crate) installer_transaction: bool,
     supplied: SuppliedFlags,
@@ -121,6 +154,7 @@ pub fn parse_args_at(arguments: &[OsString], cwd: &Path) -> Result<SetupArgs, Us
         accept_existing_journal: false,
         force: false,
         clean_uninstall: false,
+        initial_start_at_sign_in: None,
         installer_transaction: false,
         supplied: SuppliedFlags::default(),
     };
@@ -188,12 +222,42 @@ pub fn parse_args_at(arguments: &[OsString], cwd: &Path) -> Result<SetupArgs, Us
             parsed.force = true;
         } else if argument == OsStr::new("--clean-uninstall") {
             parsed.clean_uninstall = true;
+        } else if argument == OsStr::new("--initial-start-at-sign-in") {
+            parsed.initial_start_at_sign_in = Some(parse_initial_start_at_sign_in(
+                value("--initial-start-at-sign-in")?,
+                parsed.initial_start_at_sign_in,
+            )?);
+            index += 1;
+        } else if let Some(value) = equals_value(argument, "--initial-start-at-sign-in") {
+            parsed.initial_start_at_sign_in = Some(parse_initial_start_at_sign_in(
+                value,
+                parsed.initial_start_at_sign_in,
+            )?);
         } else {
             return Err(UsageError("unrecognized arguments".to_owned()));
         }
         index += 1;
     }
     Ok(parsed)
+}
+
+fn parse_initial_start_at_sign_in(
+    value: &OsStr,
+    current: Option<InitialStartAtSignIn>,
+) -> Result<InitialStartAtSignIn, UsageError> {
+    if current.is_some() {
+        return Err(UsageError(
+            "argument --initial-start-at-sign-in: must not be repeated".into(),
+        ));
+    }
+    let value = value.to_str().ok_or_else(|| {
+        UsageError("argument --initial-start-at-sign-in: expected on or off".into())
+    })?;
+    InitialStartAtSignIn::parse_token(value).ok_or_else(|| {
+        UsageError(format!(
+            "argument --initial-start-at-sign-in: invalid choice: {value} (choose from on, off)"
+        ))
+    })
 }
 
 fn equals_value<'a>(argument: &'a OsStr, name: &str) -> Option<&'a OsStr> {
@@ -375,6 +439,15 @@ pub fn resolve_setup(args: &SetupArgs, context: &ResolutionContext) -> ResolvedS
         "is_source_checkout",
         resolved(json!(context.is_source_checkout), "detected"),
     );
+    let (initial_start_at_sign_in_val, initial_start_at_sign_in_src) =
+        match args.initial_start_at_sign_in {
+            None => (json!(null), "default"),
+            Some(choice) => (json!(choice.as_str()), "cli"),
+        };
+    values.insert(
+        "initial_start_at_sign_in",
+        resolved(initial_start_at_sign_in_val, initial_start_at_sign_in_src),
+    );
     ResolvedSetup {
         journal_path,
         journal_source,
@@ -501,8 +574,8 @@ fn normalize_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        ResolutionContext, SetupMode, USAGE, parse_args_at, resolve_clean_uninstall_journal,
-        resolve_mode, resolve_setup,
+        InitialStartAtSignIn, ResolutionContext, SetupMode, USAGE, parse_args_at,
+        resolve_clean_uninstall_journal, resolve_mode, resolve_setup,
     };
     use crate::user_config::{config_path, write_user_config};
     use std::ffi::OsString;
@@ -602,7 +675,15 @@ mod tests {
         let resolved = resolve_setup(&parsed, &context);
         assert_eq!(resolved.journal_path, context.current_dir.join("from-env"));
         assert_eq!(resolved.journal_source, "env");
-        assert_eq!(resolved.args_resolved.len(), 18);
+        assert_eq!(resolved.args_resolved.len(), 19);
+        assert_eq!(
+            resolved.args_resolved["initial_start_at_sign_in"]["value"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            resolved.args_resolved["initial_start_at_sign_in"]["source"],
+            "default"
+        );
         assert_eq!(resolved.args_resolved["port"]["value"], 5016);
         assert_eq!(resolved.args_resolved["port"]["source"], "cli");
         assert_eq!(resolved.args_resolved["variant"]["value"], "cpu");
@@ -624,6 +705,120 @@ mod tests {
             resolved.args_resolved["is_source_checkout"]["source"],
             "detected"
         );
+    }
+
+    #[test]
+    fn initial_start_at_sign_in_resolution_and_validation() {
+        let context = fixture("sign-in");
+        let omitted = parse_args_at(&[], &context.current_dir).unwrap();
+        let resolved_omitted = resolve_setup(&omitted, &context);
+        assert_eq!(omitted.initial_start_at_sign_in, None);
+        assert_eq!(
+            resolved_omitted.args_resolved["initial_start_at_sign_in"]["value"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            resolved_omitted.args_resolved["initial_start_at_sign_in"]["source"],
+            "default"
+        );
+
+        let on_parsed = parse_args_at(
+            &[
+                OsString::from("--initial-start-at-sign-in"),
+                OsString::from("on"),
+            ],
+            &context.current_dir,
+        )
+        .unwrap();
+        let resolved_on = resolve_setup(&on_parsed, &context);
+        assert_eq!(
+            on_parsed.initial_start_at_sign_in,
+            Some(InitialStartAtSignIn::On)
+        );
+        assert_eq!(
+            resolved_on.args_resolved["initial_start_at_sign_in"]["value"],
+            "on"
+        );
+        assert_eq!(
+            resolved_on.args_resolved["initial_start_at_sign_in"]["source"],
+            "cli"
+        );
+
+        let off_equals_parsed = parse_args_at(
+            &[OsString::from("--initial-start-at-sign-in=off")],
+            &context.current_dir,
+        )
+        .unwrap();
+        let resolved_off_equals = resolve_setup(&off_equals_parsed, &context);
+        assert_eq!(
+            off_equals_parsed.initial_start_at_sign_in,
+            Some(InitialStartAtSignIn::Off)
+        );
+        assert_eq!(
+            resolved_off_equals.args_resolved["initial_start_at_sign_in"]["value"],
+            "off"
+        );
+        assert_eq!(
+            resolved_off_equals.args_resolved["initial_start_at_sign_in"]["source"],
+            "cli"
+        );
+
+        let off_tokens_parsed = parse_args_at(
+            &[
+                OsString::from("--initial-start-at-sign-in"),
+                OsString::from("off"),
+            ],
+            &context.current_dir,
+        )
+        .unwrap();
+        assert_eq!(
+            off_tokens_parsed.initial_start_at_sign_in,
+            Some(InitialStartAtSignIn::Off)
+        );
+
+        assert_ne!(
+            resolved_omitted.args_resolved["initial_start_at_sign_in"],
+            resolved_on.args_resolved["initial_start_at_sign_in"]
+        );
+        assert_ne!(
+            resolved_omitted.args_resolved["initial_start_at_sign_in"],
+            resolved_off_equals.args_resolved["initial_start_at_sign_in"]
+        );
+        assert_ne!(
+            resolved_on.args_resolved["initial_start_at_sign_in"],
+            resolved_off_equals.args_resolved["initial_start_at_sign_in"]
+        );
+
+        for invalid_args in [
+            &["--initial-start-at-sign-in"][..],
+            &["--initial-start-at-sign-in", "ON"],
+            &["--initial-start-at-sign-in", "true"],
+            &["--initial-start-at-sign-in", "yes"],
+            &["--initial-start-at-sign-in", "0"],
+            &["--initial-start-at-sign-in", "1"],
+            &["--initial-start-at-sign-in="],
+            &[
+                "--initial-start-at-sign-in",
+                "off",
+                "--initial-start-at-sign-in",
+                "off",
+            ],
+            &[
+                "--initial-start-at-sign-in=off",
+                "--initial-start-at-sign-in=on",
+            ],
+            &[
+                "--initial-start-at-sign-in",
+                "on",
+                "--initial-start-at-sign-in=off",
+            ],
+        ] {
+            let os_args: Vec<OsString> = invalid_args.iter().map(OsString::from).collect();
+            assert!(
+                parse_args_at(&os_args, &context.current_dir).is_err(),
+                "expected error for {invalid_args:?}"
+            );
+        }
     }
 
     #[test]

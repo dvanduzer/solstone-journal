@@ -1210,6 +1210,16 @@ fn journal_url(journal: &Path, configured_port: u16) -> String {
     format!("http://localhost:{}", published.unwrap_or(configured_port))
 }
 
+fn append_initial_start_at_sign_in(
+    args: &mut Vec<String>,
+    initial_start_at_sign_in: Option<crate::args::InitialStartAtSignIn>,
+) {
+    if let Some(choice) = initial_start_at_sign_in {
+        args.push("--initial-start-at-sign-in".to_owned());
+        args.push(choice.as_str().to_owned());
+    }
+}
+
 fn command_for_step(context: &SetupContext<'_>, name: StepName) -> Option<Vec<String>> {
     let journal = |args: Vec<String>| {
         [
@@ -1261,12 +1271,14 @@ fn command_for_step(context: &SetupContext<'_>, name: StepName) -> Option<Vec<St
             "all".into(),
         ])),
         StepName::Service if !context.sol_already_keeps_journal() || context.args.skip_service => {
-            Some(journal(vec![
+            let mut args = vec![
                 "service".into(),
                 "install".into(),
                 "--port".into(),
                 context.args.port.to_string(),
-            ]))
+            ];
+            append_initial_start_at_sign_in(&mut args, context.args.initial_start_at_sign_in);
+            Some(journal(args))
         }
         StepName::Brain => Some(sol(vec![
             "call".into(),
@@ -1961,25 +1973,27 @@ fn step_service_with_guard(
     // Save all guards before releasing those locks and waiting for the child.
     #[cfg(windows)]
     drop(context.installation_admission.take());
+    let mut args = vec![
+        "journal".into(),
+        "service".into(),
+        "install".into(),
+        "--port".into(),
+        context.args.port.to_string(),
+        "--installation-namespace".into(),
+        service_guard["SOLSTONE_INSTALLATION_NAMESPACE"].clone(),
+        "--installation-id".into(),
+        service_guard["SOLSTONE_INSTALLATION_ID"].clone(),
+        "--installation-generation".into(),
+        service_guard["SOLSTONE_INSTALLATION_GENERATION"].clone(),
+        "--installation-journal-token".into(),
+        service_guard["SOLSTONE_INSTALLATION_JOURNAL_TOKEN"].clone(),
+    ];
+    append_initial_start_at_sign_in(&mut args, context.args.initial_start_at_sign_in);
     let output = context
         .runner
         .run(&CommandRequest {
             program: solstone_executable(&context.install_bin_dir),
-            args: vec![
-                "journal".into(),
-                "service".into(),
-                "install".into(),
-                "--port".into(),
-                context.args.port.to_string(),
-                "--installation-namespace".into(),
-                service_guard["SOLSTONE_INSTALLATION_NAMESPACE"].clone(),
-                "--installation-id".into(),
-                service_guard["SOLSTONE_INSTALLATION_ID"].clone(),
-                "--installation-generation".into(),
-                service_guard["SOLSTONE_INSTALLATION_GENERATION"].clone(),
-                "--installation-journal-token".into(),
-                service_guard["SOLSTONE_INSTALLATION_JOURNAL_TOKEN"].clone(),
-            ],
+            args,
             timeout_seconds: None,
             env: Vec::new(),
         })
@@ -3283,6 +3297,276 @@ mod tests {
                 "--installation-journal-token".to_owned(),
                 expected["SOLSTONE_INSTALLATION_JOURNAL_TOKEN"].clone(),
             ]
+        );
+    }
+
+    struct TrackingServiceOps {
+        up_count: usize,
+    }
+    impl ServiceOps for TrackingServiceOps {
+        fn is_installed(
+            &mut self,
+            _runner: &mut dyn CommandRunner,
+            _journal: &Path,
+        ) -> Result<bool, String> {
+            Ok(false)
+        }
+        fn health_check(
+            &mut self,
+            _runner: &mut dyn CommandRunner,
+            _journal: &Path,
+        ) -> Result<bool, String> {
+            Ok(false)
+        }
+        fn restart(
+            &mut self,
+            _runner: &mut dyn CommandRunner,
+            _journal: &Path,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn up(&mut self, _runner: &mut dyn CommandRunner, _journal: &Path) -> Result<i32, String> {
+            self.up_count += 1;
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn service_install_argv_composition_and_up_dispatch() {
+        let (args_on, resolved_on, root_on, home_on) = fixture(
+            "service-on",
+            &["--port", "5016", "--initial-start-at-sign-in", "on"],
+        );
+        let mut runner_on = FakeRunner::new(vec![Ok(CommandOutput {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: false,
+        })]);
+        let mut prompt_on = Prompt(false);
+        let mut service_ops_on = TrackingServiceOps { up_count: 0 };
+        let mut setup_on = context(
+            &args_on,
+            &resolved_on,
+            &root_on,
+            &home_on,
+            &mut runner_on,
+            &mut prompt_on,
+            None,
+        );
+        let cmd_on =
+            command_for_step(&setup_on, StepName::Service).expect("command for service on");
+        assert_eq!(
+            cmd_on,
+            vec![
+                setup_on
+                    .install_bin_dir
+                    .join("solstone")
+                    .to_string_lossy()
+                    .into_owned(),
+                "journal".to_owned(),
+                "service".to_owned(),
+                "install".to_owned(),
+                "--port".to_owned(),
+                "5016".to_owned(),
+                "--initial-start-at-sign-in".to_owned(),
+                "on".to_owned(),
+            ]
+        );
+        let guard_on = GuardFields::from_binding(
+            setup_on
+                .installation_admission
+                .as_ref()
+                .expect("admission on")
+                .binding(),
+        );
+        let expected_on = service_guard_environment(&guard_on);
+        setup_on.service_ops = &mut service_ops_on;
+        let result_on = step_service_with_guard(&mut setup_on, None).expect("install on");
+        assert_eq!(result_on.status, StepStatus::Ok);
+        drop(setup_on);
+        assert_eq!(service_ops_on.up_count, 1);
+        assert_eq!(runner_on.requests.len(), 1);
+        assert_eq!(
+            runner_on.requests[0].args,
+            vec![
+                "journal".to_owned(),
+                "service".to_owned(),
+                "install".to_owned(),
+                "--port".to_owned(),
+                "5016".to_owned(),
+                "--installation-namespace".to_owned(),
+                expected_on["SOLSTONE_INSTALLATION_NAMESPACE"].clone(),
+                "--installation-id".to_owned(),
+                expected_on["SOLSTONE_INSTALLATION_ID"].clone(),
+                "--installation-generation".to_owned(),
+                expected_on["SOLSTONE_INSTALLATION_GENERATION"].clone(),
+                "--installation-journal-token".to_owned(),
+                expected_on["SOLSTONE_INSTALLATION_JOURNAL_TOKEN"].clone(),
+                "--initial-start-at-sign-in".to_owned(),
+                "on".to_owned(),
+            ]
+        );
+
+        let (args_off, resolved_off, root_off, home_off) = fixture(
+            "service-off",
+            &["--port", "5016", "--initial-start-at-sign-in", "off"],
+        );
+        let mut runner_off = FakeRunner::new(vec![Ok(CommandOutput {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: false,
+        })]);
+        let mut prompt_off = Prompt(false);
+        let mut service_ops_off = TrackingServiceOps { up_count: 0 };
+        let mut setup_off = context(
+            &args_off,
+            &resolved_off,
+            &root_off,
+            &home_off,
+            &mut runner_off,
+            &mut prompt_off,
+            None,
+        );
+        setup_off.service_ops = &mut service_ops_off;
+        let guard_off = GuardFields::from_binding(
+            setup_off
+                .installation_admission
+                .as_ref()
+                .expect("admission")
+                .binding(),
+        );
+        let expected_off = service_guard_environment(&guard_off);
+        drop(setup_off.installation_admission.take());
+        let result_off =
+            step_service_with_guard(&mut setup_off, Some(guard_off)).expect("install off");
+        assert_eq!(result_off.status, StepStatus::Ok);
+        assert_ne!(result_off.status, StepStatus::Skipped);
+        drop(setup_off);
+        assert_eq!(service_ops_off.up_count, 1);
+        assert_eq!(runner_off.requests.len(), 1);
+        assert_eq!(
+            runner_off.requests[0].args,
+            vec![
+                "journal".to_owned(),
+                "service".to_owned(),
+                "install".to_owned(),
+                "--port".to_owned(),
+                "5016".to_owned(),
+                "--installation-namespace".to_owned(),
+                expected_off["SOLSTONE_INSTALLATION_NAMESPACE"].clone(),
+                "--installation-id".to_owned(),
+                expected_off["SOLSTONE_INSTALLATION_ID"].clone(),
+                "--installation-generation".to_owned(),
+                expected_off["SOLSTONE_INSTALLATION_GENERATION"].clone(),
+                "--installation-journal-token".to_owned(),
+                expected_off["SOLSTONE_INSTALLATION_JOURNAL_TOKEN"].clone(),
+                "--initial-start-at-sign-in".to_owned(),
+                "off".to_owned(),
+            ]
+        );
+
+        let (args_fail, resolved_fail, root_fail, home_fail) = fixture(
+            "service-fail",
+            &["--port", "5016", "--initial-start-at-sign-in", "on"],
+        );
+        let mut runner_fail = FakeRunner::new(vec![Ok(CommandOutput {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "failed".into(),
+            timed_out: false,
+        })]);
+        let mut prompt_fail = Prompt(false);
+        let mut service_ops_fail = TrackingServiceOps { up_count: 0 };
+        let mut setup_fail = context(
+            &args_fail,
+            &resolved_fail,
+            &root_fail,
+            &home_fail,
+            &mut runner_fail,
+            &mut prompt_fail,
+            None,
+        );
+        setup_fail.service_ops = &mut service_ops_fail;
+        let result_fail = step_service_with_guard(&mut setup_fail, None).expect("failed install");
+        assert_eq!(result_fail.status, StepStatus::Failed);
+        drop(setup_fail);
+        assert_eq!(service_ops_fail.up_count, 0);
+
+        let (args_omitted, resolved_omitted, root_omitted, home_omitted) =
+            fixture("service-explain-omitted", &["--port", "5016"]);
+        let mut runner_omitted = FakeRunner::new(vec![Ok(CommandOutput {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: false,
+        })]);
+        let mut prompt_omitted = Prompt(false);
+        let mut service_ops_omitted = TrackingServiceOps { up_count: 0 };
+        let mut setup_omitted = context(
+            &args_omitted,
+            &resolved_omitted,
+            &root_omitted,
+            &home_omitted,
+            &mut runner_omitted,
+            &mut prompt_omitted,
+            None,
+        );
+        let cmd_omitted =
+            command_for_step(&setup_omitted, StepName::Service).expect("command for service");
+        assert_eq!(
+            cmd_omitted,
+            vec![
+                setup_omitted
+                    .install_bin_dir
+                    .join("solstone")
+                    .to_string_lossy()
+                    .into_owned(),
+                "journal".to_owned(),
+                "service".to_owned(),
+                "install".to_owned(),
+                "--port".to_owned(),
+                "5016".to_owned(),
+            ]
+        );
+        let guard_omitted = GuardFields::from_binding(
+            setup_omitted
+                .installation_admission
+                .as_ref()
+                .expect("admission omitted")
+                .binding(),
+        );
+        let expected_omitted = service_guard_environment(&guard_omitted);
+        setup_omitted.service_ops = &mut service_ops_omitted;
+        let result_omitted =
+            step_service_with_guard(&mut setup_omitted, None).expect("install omitted");
+        assert_eq!(result_omitted.status, StepStatus::Ok);
+        drop(setup_omitted);
+        assert_eq!(service_ops_omitted.up_count, 1);
+        assert_eq!(runner_omitted.requests.len(), 1);
+        assert_eq!(
+            runner_omitted.requests[0].args,
+            vec![
+                "journal".to_owned(),
+                "service".to_owned(),
+                "install".to_owned(),
+                "--port".to_owned(),
+                "5016".to_owned(),
+                "--installation-namespace".to_owned(),
+                expected_omitted["SOLSTONE_INSTALLATION_NAMESPACE"].clone(),
+                "--installation-id".to_owned(),
+                expected_omitted["SOLSTONE_INSTALLATION_ID"].clone(),
+                "--installation-generation".to_owned(),
+                expected_omitted["SOLSTONE_INSTALLATION_GENERATION"].clone(),
+                "--installation-journal-token".to_owned(),
+                expected_omitted["SOLSTONE_INSTALLATION_JOURNAL_TOKEN"].clone(),
+            ]
+        );
+        assert!(
+            !runner_omitted.requests[0]
+                .args
+                .contains(&"--initial-start-at-sign-in".to_owned())
         );
     }
     #[test]

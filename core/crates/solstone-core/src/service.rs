@@ -122,13 +122,25 @@ fn run_inner(action: ServiceAction) -> Result<ExitCode, String> {
     ) {
         return Err(WINDOWS_ONLY.to_owned());
     }
+    if let ServiceAction::Install {
+        port: _,
+        installation_guard: _,
+        initial_start_at_sign_in: Some(_),
+    } = &action
+    {
+        return Err(WINDOWS_ONLY.to_owned());
+    }
     let platform = platform()?;
     let home = discover_binary_home().map_err(|error| format!("service home: {error:?}"))?;
     match action {
         ServiceAction::Install {
             port,
             installation_guard,
+            initial_start_at_sign_in,
         } => {
+            if initial_start_at_sign_in.is_some() {
+                return Err(WINDOWS_ONLY.to_owned());
+            }
             let guard = resolve_installation_guard(installation_guard, || {
                 load_existing_installation_guard(&home)
             })?;
@@ -2822,5 +2834,20 @@ mod tests {
             systemd_route_repair_port(&legacy_snapshot, &unit_path).unwrap(),
             "5015"
         );
+    }
+
+    #[test]
+    fn explicit_initial_sign_in_is_refused_before_install() {
+        for choice in [
+            solstone_core_setup::args::InitialStartAtSignIn::On,
+            solstone_core_setup::args::InitialStartAtSignIn::Off,
+        ] {
+            let action = ServiceAction::Install {
+                port: None,
+                installation_guard: None,
+                initial_start_at_sign_in: Some(choice),
+            };
+            assert_eq!(run_inner(action), Err(WINDOWS_ONLY.to_owned()));
+        }
     }
 }

@@ -21,7 +21,8 @@ pub use systemd::{
     systemd_unit_port,
 };
 pub use windows_task::{
-    WINDOWS_TASK_RECOVERY_INTERVAL, WindowsTaskInput, WindowsTaskProfile, render_windows_task_xml,
+    WINDOWS_TASK_RECOVERY_INTERVAL, WindowsRegistrationProfile, WindowsTaskInput,
+    WindowsTaskProfile, render_windows_task_xml, windows_registration_profile,
 };
 
 pub use windows_action::{

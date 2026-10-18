@@ -866,6 +866,13 @@ fn run_owner_setup_with_io_with_resolution_env<W: Write, E: Write>(
         }
         return ExitCode::from(outcome.exit_code as u8);
     }
+    if cfg!(unix) && args.initial_start_at_sign_in.is_some() {
+        let _ = writeln!(
+            stderr,
+            "solstone journal setup: --initial-start-at-sign-in is only available on Windows"
+        );
+        return ExitCode::from(2);
+    }
     let resolved = resolve_setup(&args, &resolution);
     let mode = resolve_mode(&args, stdin_is_tty, stdout_is_tty);
     if !resolved.should_short_circuit()
@@ -3893,5 +3900,87 @@ mod tests {
         .unwrap();
         assert_eq!(record.lifecycle, LifecycleState::Tombstoned);
         assert_eq!(record.generation, binding.generation);
+    }
+
+    struct PanickingRunner;
+    impl CommandRunner for PanickingRunner {
+        fn run(&mut self, _request: &CommandRequest) -> Result<CommandOutput, String> {
+            panic!("command runner must not be called when setup refuses argument on Unix");
+        }
+    }
+
+    struct PanickingServiceOps;
+    impl ServiceOps for PanickingServiceOps {
+        fn is_installed(
+            &mut self,
+            _runner: &mut dyn CommandRunner,
+            _journal: &Path,
+        ) -> Result<bool, String> {
+            panic!("service ops must not be called");
+        }
+        fn health_check(
+            &mut self,
+            _runner: &mut dyn CommandRunner,
+            _journal: &Path,
+        ) -> Result<bool, String> {
+            panic!("service ops must not be called");
+        }
+        fn restart(
+            &mut self,
+            _runner: &mut dyn CommandRunner,
+            _journal: &Path,
+        ) -> Result<(), String> {
+            panic!("service ops must not be called");
+        }
+        fn up(&mut self, _runner: &mut dyn CommandRunner, _journal: &Path) -> Result<i32, String> {
+            panic!("service up must not be called");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_refuses_explicit_initial_start_at_sign_in_before_any_runner_or_step() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let executable_dir = temp.path().join("bin");
+        let root = temp.path().join("root");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&executable_dir).unwrap();
+        fs::create_dir_all(&root).unwrap();
+
+        for choice in ["on", "off"] {
+            let parsed_args = parse_args_at(
+                &[
+                    OsString::from("--yes"),
+                    OsString::from("--initial-start-at-sign-in"),
+                    OsString::from(choice),
+                ],
+                &root,
+            )
+            .unwrap();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let exit = run_owner_setup_with_io_with_resolution_env(
+                parsed_args,
+                home.clone(),
+                executable_dir.clone(),
+                root.clone(),
+                None,
+                None,
+                false,
+                false,
+                Seams {
+                    runner: Box::new(PanickingRunner),
+                    service_ops: Box::new(PanickingServiceOps),
+                    check_report_builder: Box::new(Check),
+                    already_keeps_journal_probe: no_probe,
+                    prompt: Box::new(Prompt),
+                    confirm_clean_uninstall: Box::new(|| true),
+                },
+                &mut stdout,
+                &mut stderr,
+            );
+            assert_eq!(exit, ExitCode::from(2));
+        }
     }
 }

@@ -8,6 +8,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- on Windows, the first registration of the journal service can be told not to start when you sign in. leaving that choice out still starts at sign-in, and a service that is already registered keeps its current choice.
 - in its first week, a new journal's home page shows a "getting started" card. it shows which of your devices are adding to your journal, the local model and speech model downloads, and your first segment and whether thinking has read it. its next steps are connect an agent, add your phone, and finish choosing where the thinking happens. each step leaves once it's done, and the card leaves when they all are.
 - when a device finishes pairing, the dialog names it by the name the device gave itself, and "didn't do this?" now has a button that unpairs that device straight away.
 - `solstone journal talent passages` copies passages from the source an activity's story is written from, word for word, with where each one sits in that source. each short part of the source is kept whole without asking your model anything. each longer part takes one request to your model to choose what to keep, and the passages are still the source's own words. stories are written the same way as before.

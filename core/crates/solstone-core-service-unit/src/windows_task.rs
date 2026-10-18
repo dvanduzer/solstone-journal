@@ -21,6 +21,26 @@ pub struct WindowsTaskInput<'a> {
     pub starts_at_sign_in: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WindowsRegistrationProfile {
+    pub port: u16,
+    pub enabled: bool,
+    pub starts_at_sign_in: bool,
+}
+
+pub fn windows_registration_profile(
+    initial: Option<bool>,
+    existing_starts_at_sign_in: Option<bool>,
+    enabled: bool,
+    port: u16,
+) -> WindowsRegistrationProfile {
+    WindowsRegistrationProfile {
+        port,
+        enabled,
+        starts_at_sign_in: existing_starts_at_sign_in.unwrap_or(initial.unwrap_or(true)),
+    }
+}
+
 /// Which generation of the managed task profile a registration carries.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WindowsTaskProfile {

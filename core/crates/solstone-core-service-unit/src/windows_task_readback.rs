@@ -347,6 +347,7 @@ fn normalize_readback(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::windows_task::{WindowsRegistrationProfile, windows_registration_profile};
     use solstone_core_installation_identity::{Generation, InstallationId, NamespaceName};
 
     fn xml() -> String {
@@ -852,5 +853,95 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    fn render_profile(profile: WindowsRegistrationProfile) -> String {
+        let action = WindowsServiceAction {
+            port: profile.port,
+            journal: "C:\\Users\\Zoë\\Journal & notes\\".to_owned(),
+            guard: solstone_core_installation_identity::GuardFields {
+                namespace: NamespaceName::parse(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .unwrap(),
+                id: InstallationId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+                generation: Generation::new(7).unwrap(),
+                journal_token: solstone_core_installation_identity::journal_token_from_path(
+                    std::path::Path::new(if cfg!(windows) {
+                        "C:\\journal"
+                    } else {
+                        "/journal"
+                    }),
+                )
+                .unwrap(),
+            },
+        };
+        render_windows_task_xml(&WindowsTaskInput {
+            principal_sid: "S-1-5-21-1-2-3-1001",
+            command: "C:\\Program Files\\Solstone\\journal.exe",
+            working_directory: &action.journal,
+            action: &action,
+            enabled: profile.enabled,
+            starts_at_sign_in: profile.starts_at_sign_in,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn registration_profile_resolution_and_rendered_task_properties() {
+        // fresh initial: Some(false), existing None, enabled true -> parsed starts_at_sign_in == false, enabled == true
+        let profile = windows_registration_profile(Some(false), None, true, 6123);
+        assert_eq!(profile.port, 6123);
+        assert!(profile.enabled);
+        assert!(!profile.starts_at_sign_in);
+        let task = parse_windows_task_xml(&render_profile(profile)).unwrap();
+        assert!(!task.starts_at_sign_in);
+        assert!(task.enabled);
+        assert_eq!(task.action.port, 6123);
+
+        // fresh Some(true) and fresh None -> starts_at_sign_in == true
+        let p_on = windows_registration_profile(Some(true), None, true, 6123);
+        assert!(p_on.starts_at_sign_in);
+        let task_on = parse_windows_task_xml(&render_profile(p_on)).unwrap();
+        assert!(task_on.starts_at_sign_in);
+
+        let p_none = windows_registration_profile(None, None, true, 6123);
+        assert!(p_none.starts_at_sign_in);
+        let task_none = parse_windows_task_xml(&render_profile(p_none)).unwrap();
+        assert!(task_none.starts_at_sign_in);
+
+        // existing Some(true) wins over initial Some(false)
+        let p_ex_true = windows_registration_profile(Some(false), Some(true), true, 6123);
+        assert!(p_ex_true.starts_at_sign_in);
+        let task_ex_true = parse_windows_task_xml(&render_profile(p_ex_true)).unwrap();
+        assert!(task_ex_true.starts_at_sign_in);
+
+        // existing Some(false) wins over initial Some(true) and over None
+        let p_ex_false1 = windows_registration_profile(Some(true), Some(false), true, 6123);
+        assert!(!p_ex_false1.starts_at_sign_in);
+        let task_ex_false1 = parse_windows_task_xml(&render_profile(p_ex_false1)).unwrap();
+        assert!(!task_ex_false1.starts_at_sign_in);
+
+        let p_ex_false2 = windows_registration_profile(None, Some(false), true, 6123);
+        assert!(!p_ex_false2.starts_at_sign_in);
+        let task_ex_false2 = parse_windows_task_xml(&render_profile(p_ex_false2)).unwrap();
+        assert!(!task_ex_false2.starts_at_sign_in);
+
+        // enabled false stays false; enabled true stays true
+        let p_dis = windows_registration_profile(Some(false), None, false, 6123);
+        assert!(!p_dis.enabled);
+        let task_dis = parse_windows_task_xml(&render_profile(p_dis)).unwrap();
+        assert!(!task_dis.enabled);
+
+        let p_en = windows_registration_profile(Some(false), None, true, 6123);
+        assert!(p_en.enabled);
+        let task_en = parse_windows_task_xml(&render_profile(p_en)).unwrap();
+        assert!(task_en.enabled);
+
+        // port 6123 is returned unchanged for both an "explicit" and an "existing" injected port. The function does not choose the port.
+        let p_port1 = windows_registration_profile(None, None, true, 6123);
+        assert_eq!(p_port1.port, 6123);
+        let p_port2 = windows_registration_profile(None, None, true, 5015);
+        assert_eq!(p_port2.port, 5015);
     }
 }

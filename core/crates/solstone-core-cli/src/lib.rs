@@ -4372,7 +4372,7 @@ fn parse_service_logs(args: &[OsString]) -> ServiceLogsArgs {
 #[doc(hidden)]
 pub const SERVICE_USAGE: &str = concat!(
     "Usage: solstone journal service <install|uninstall|start|stop|restart|status|logs>\n",
-    "       solstone journal service install [--port PORT]  (default: 5015)\n",
+    "       solstone journal service install [--port PORT] [--initial-start-at-sign-in {on,off}]  (default: 5015; Windows only)\n",
     "       solstone journal service restart [--if-installed]  (restart; --if-installed noops if not installed)\n",
     "       solstone journal up                             (start + status; service must be installed)\n",
     "       solstone journal down                           (stop)\n",
@@ -4402,6 +4402,7 @@ pub enum ServiceAction {
         /// its own port -- measured on Windows, true everywhere.
         port: Option<solstone_core_operational_logs::ServicePort>,
         installation_guard: Option<ServiceInstallationGuardArguments>,
+        initial_start_at_sign_in: Option<solstone_core_setup::args::InitialStartAtSignIn>,
     },
     Uninstall,
     Start,
@@ -4536,6 +4537,10 @@ impl SafeServiceDiagnostic {
         Self(format!("error: unexpected argument '{text}'{remedy}"))
     }
 
+    fn invalid_initial_start_at_sign_in() -> Self {
+        Self("error: --initial-start-at-sign-in expects on or off".to_owned())
+    }
+
     fn unknown_subcommand(value: &OsStr) -> Self {
         // The retained Python owner prints this guidance on two lines. This pure
         // foundation deliberately keeps dynamic failures to one physical line.
@@ -4623,12 +4628,14 @@ pub fn parse_service_port_argv_opt(
     Ok(None)
 }
 
+#[allow(clippy::type_complexity)]
 fn parse_service_install_argv(
     args: &[OsString],
 ) -> Result<
     (
         Option<solstone_core_operational_logs::ServicePort>,
         Option<ServiceInstallationGuardArguments>,
+        Option<solstone_core_setup::args::InitialStartAtSignIn>,
     ),
     SafeServiceDiagnostic,
 > {
@@ -4637,6 +4644,7 @@ fn parse_service_install_argv(
     let mut id = None;
     let mut generation = None;
     let mut journal_token = None;
+    let mut initial_start_at_sign_in = None;
     let mut index = 0;
     while index < args.len() {
         let argument = args[index].as_os_str();
@@ -4649,6 +4657,33 @@ fn parse_service_install_argv(
             continue;
         }
         if name.starts_with("--port=") {
+            index += 1;
+            continue;
+        }
+        if name == "--initial-start-at-sign-in" {
+            if initial_start_at_sign_in.is_some() {
+                return Err(SafeServiceDiagnostic::invalid_initial_start_at_sign_in());
+            }
+            let Some(value) = args.get(index + 1).and_then(|v| v.to_str()) else {
+                return Err(SafeServiceDiagnostic::invalid_initial_start_at_sign_in());
+            };
+            let Some(choice) = solstone_core_setup::args::InitialStartAtSignIn::parse_token(value)
+            else {
+                return Err(SafeServiceDiagnostic::invalid_initial_start_at_sign_in());
+            };
+            initial_start_at_sign_in = Some(choice);
+            index += 2;
+            continue;
+        }
+        if let Some(value) = name.strip_prefix("--initial-start-at-sign-in=") {
+            if initial_start_at_sign_in.is_some() {
+                return Err(SafeServiceDiagnostic::invalid_initial_start_at_sign_in());
+            }
+            let Some(choice) = solstone_core_setup::args::InitialStartAtSignIn::parse_token(value)
+            else {
+                return Err(SafeServiceDiagnostic::invalid_initial_start_at_sign_in());
+            };
+            initial_start_at_sign_in = Some(choice);
             index += 1;
             continue;
         }
@@ -4674,7 +4709,7 @@ fn parse_service_install_argv(
         index += 2;
     }
     match (namespace, id, generation, journal_token) {
-        (None, None, None, None) => Ok((port, None)),
+        (None, None, None, None) => Ok((port, None, initial_start_at_sign_in)),
         (Some(namespace), Some(id), Some(generation), Some(journal_token)) => Ok((
             port,
             Some(ServiceInstallationGuardArguments {
@@ -4683,6 +4718,7 @@ fn parse_service_install_argv(
                 generation,
                 journal_token,
             }),
+            initial_start_at_sign_in,
         )),
         _ => Err(SafeServiceDiagnostic::incomplete_installation_guard()),
     }
@@ -4719,10 +4755,11 @@ pub fn parse_service_args(args: &[OsString]) -> ServiceParseOutcome {
     let rest = &args[1..];
     if command == OsStr::new("install") {
         return match parse_service_install_argv(rest) {
-            Ok((port, installation_guard)) => {
+            Ok((port, installation_guard, initial_start_at_sign_in)) => {
                 ServiceParseOutcome::Dispatch(ServiceAction::Install {
                     port,
                     installation_guard,
+                    initial_start_at_sign_in,
                 })
             }
             Err(stderr) => ServiceParseOutcome::Exit {
@@ -6123,6 +6160,7 @@ mod tests {
                 ServiceParseOutcome::Dispatch(ServiceAction::Install {
                     port: Some(solstone_core_operational_logs::parse_service_port("7").unwrap()),
                     installation_guard: None,
+                    initial_start_at_sign_in: None,
                 }),
             ),
             (
@@ -6258,6 +6296,7 @@ mod tests {
             ServiceParseOutcome::Dispatch(ServiceAction::Install {
                 port: None,
                 installation_guard: None,
+                initial_start_at_sign_in: None,
             })
         );
         assert_eq!(
@@ -6265,6 +6304,7 @@ mod tests {
             ServiceParseOutcome::Dispatch(ServiceAction::Install {
                 port: Some(solstone_core_operational_logs::parse_service_port("6123").unwrap()),
                 installation_guard: None,
+                initial_start_at_sign_in: None,
             })
         );
     }
@@ -6307,10 +6347,12 @@ mod tests {
         assert!(matches!(
             parse_service_args(&all),
             ServiceParseOutcome::Dispatch(ServiceAction::Install {
+                port: None,
                 installation_guard: Some(_),
-                ..
+                initial_start_at_sign_in: None,
             })
         ));
+
         let partial = args(&[
             "install",
             "--installation-id",
@@ -6328,6 +6370,96 @@ mod tests {
             stderr.as_str(),
             "Error: installation identity arguments must be supplied together"
         );
+    }
+
+    #[test]
+    fn service_install_initial_start_at_sign_in_parsing_and_rejections() {
+        use solstone_core_setup::args::InitialStartAtSignIn;
+
+        assert_eq!(
+            parse_service_args(&args(&["install"])),
+            ServiceParseOutcome::Dispatch(ServiceAction::Install {
+                port: None,
+                installation_guard: None,
+                initial_start_at_sign_in: None,
+            })
+        );
+        assert_eq!(
+            parse_service_args(&args(&["install", "--initial-start-at-sign-in", "on"])),
+            ServiceParseOutcome::Dispatch(ServiceAction::Install {
+                port: None,
+                installation_guard: None,
+                initial_start_at_sign_in: Some(InitialStartAtSignIn::On),
+            })
+        );
+        assert_eq!(
+            parse_service_args(&args(&["install", "--initial-start-at-sign-in=off"])),
+            ServiceParseOutcome::Dispatch(ServiceAction::Install {
+                port: None,
+                installation_guard: None,
+                initial_start_at_sign_in: Some(InitialStartAtSignIn::Off),
+            })
+        );
+
+        let full_all = args(&[
+            "install",
+            "--port",
+            "6123",
+            "--initial-start-at-sign-in",
+            "on",
+            "--installation-namespace",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--installation-id",
+            "0123456789abcdef0123456789abcdef",
+            "--installation-generation",
+            "1",
+            "--installation-journal-token",
+            "2f6a6f75726e616c",
+        ]);
+        assert_eq!(
+            parse_service_args(&full_all),
+            ServiceParseOutcome::Dispatch(ServiceAction::Install {
+                port: Some(solstone_core_operational_logs::parse_service_port("6123").unwrap()),
+                installation_guard: Some(ServiceInstallationGuardArguments {
+                    namespace: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_owned(),
+                    id: "0123456789abcdef0123456789abcdef".to_owned(),
+                    generation: "1".to_owned(),
+                    journal_token: "2f6a6f75726e616c".to_owned(),
+                }),
+                initial_start_at_sign_in: Some(InitialStartAtSignIn::On),
+            })
+        );
+
+        for invalid in [
+            args(&["install", "--initial-start-at-sign-in"]),
+            args(&["install", "--initial-start-at-sign-in", "ON"]),
+            args(&["install", "--initial-start-at-sign-in", "true"]),
+            args(&["install", "--initial-start-at-sign-in", "yes"]),
+            args(&["install", "--initial-start-at-sign-in", "0"]),
+            args(&["install", "--initial-start-at-sign-in", "1"]),
+            args(&["install", "--initial-start-at-sign-in="]),
+            args(&[
+                "install",
+                "--initial-start-at-sign-in",
+                "on",
+                "--initial-start-at-sign-in",
+                "off",
+            ]),
+            args(&[
+                "install",
+                "--initial-start-at-sign-in=on",
+                "--initial-start-at-sign-in=on",
+            ]),
+        ] {
+            assert!(
+                matches!(
+                    parse_service_args(&invalid),
+                    ServiceParseOutcome::Exit { code: 1, .. }
+                ),
+                "expected exit 1 for {invalid:?}"
+            );
+        }
     }
 
     #[cfg(unix)]

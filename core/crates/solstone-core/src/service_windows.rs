@@ -21,8 +21,9 @@ use solstone_core_journal::resolve_identity_root_from_executable_dir;
 use solstone_core_service_unit::{
     WindowsServiceAction, WindowsTaskDefinition, WindowsTaskInput, WindowsTaskProfile,
     encode_windows_task_xml, parse_windows_task_xml, render_windows_task_xml,
-    windows_service_update_plan,
+    windows_registration_profile, windows_service_update_plan,
 };
+use solstone_core_setup::args::InitialStartAtSignIn;
 use solstone_core_setup::clean_uninstall::{
     CleanUninstallMark, CleanUninstallPreflight, CleanUninstallPreflightState, CleanUninstallState,
     CleanUninstallStepResult, clean_uninstall_preflight,
@@ -57,10 +58,12 @@ pub(crate) fn run(action: ServiceAction) -> ExitCode {
         ServiceAction::Install {
             port,
             installation_guard,
+            initial_start_at_sign_in,
         } => run_install_action(
             port.as_ref()
                 .map(|port| port.canonical_decimal().to_owned()),
             installation_guard,
+            initial_start_at_sign_in,
         ),
         ServiceAction::Uninstall => run_uninstall_action(),
         ServiceAction::Start => run_start_action(),
@@ -272,7 +275,11 @@ fn validate_task(
 /// The port a first installation takes when nothing names one.
 const DEFAULT_SERVICE_PORT: u16 = 5015;
 
-fn install_task(ctx: &ServiceContext, requested_port: Option<u16>) -> Result<(), ExitCode> {
+fn install_task(
+    ctx: &ServiceContext,
+    requested_port: Option<u16>,
+    initial_start_at_sign_in: Option<InitialStartAtSignIn>,
+) -> Result<(), ExitCode> {
     let deadline = Instant::now() + STOP_TIMEOUT;
     let before = inspect_task(ctx, deadline)?;
     let registered = if before.present {
@@ -297,26 +304,29 @@ fn install_task(ctx: &ServiceContext, requested_port: Option<u16>) -> Result<(),
         .public_solstone_exe
         .to_str()
         .ok_or_else(|| task_error("installed command contains invalid text"))?;
-    let action = WindowsServiceAction {
-        port,
-        journal: journal_display.to_owned(),
-        guard: ctx.guard.clone(),
-    };
     let enabled = registered.as_ref().is_none_or(|definition| {
         registered_run_intent(ctx, definition, !before.instances.is_empty())
     });
-    // The owner's sign-in choice is kept the way the port is; a first
-    // installation starts at sign-in.
-    let starts_at_sign_in = registered
-        .as_ref()
-        .is_none_or(|definition| definition.starts_at_sign_in);
+    let profile = windows_registration_profile(
+        initial_start_at_sign_in.map(InitialStartAtSignIn::as_bool),
+        registered
+            .as_ref()
+            .map(|definition| definition.starts_at_sign_in),
+        enabled,
+        port,
+    );
+    let action = WindowsServiceAction {
+        port: profile.port,
+        journal: journal_display.to_owned(),
+        guard: ctx.guard.clone(),
+    };
     let xml = render_windows_task_xml(&WindowsTaskInput {
         principal_sid: &ctx.sid,
         command,
         action: &action,
         working_directory: journal_display,
-        enabled,
-        starts_at_sign_in,
+        enabled: profile.enabled,
+        starts_at_sign_in: profile.starts_at_sign_in,
     })
     .map_err(task_error)?;
     // The Scheduler accepts an update only against an idle task, so a
@@ -1275,6 +1285,7 @@ fn remove_app_paths(
 fn run_install_action(
     port: Option<String>,
     supplied: Option<ServiceInstallationGuardArguments>,
+    initial_start_at_sign_in: Option<InitialStartAtSignIn>,
 ) -> ExitCode {
     let ctx = match resolve_context() {
         Ok(ctx) => ctx,
@@ -1330,7 +1341,7 @@ fn run_install_action(
         }
         None => None,
     };
-    match install_task(&ctx, port) {
+    match install_task(&ctx, port, initial_start_at_sign_in) {
         Ok(()) => ExitCode::SUCCESS,
         Err(code) => code,
     }
@@ -1598,7 +1609,7 @@ fn run_up() -> ExitCode {
         if let Err(code) = validate_task(&ctx, &before) {
             return code;
         }
-    } else if let Err(code) = install_task(&ctx, None) {
+    } else if let Err(code) = install_task(&ctx, None, None) {
         return code;
     }
     match start_task(&ctx) {
@@ -2138,7 +2149,7 @@ fn resume_after_update(ctx: &ServiceContext) -> Result<&'static str, ExitCode> {
     if !inspect_task(ctx, Instant::now() + STOP_TIMEOUT)?.present {
         return Ok("not-installed");
     }
-    install_task(ctx, None)?;
+    install_task(ctx, None, None)?;
     let after = inspect_task(ctx, Instant::now() + STOP_TIMEOUT)?;
     if !validate_task(ctx, &after)?.enabled {
         return Ok("stopped");
