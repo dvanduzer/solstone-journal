@@ -4,6 +4,8 @@
 //! Bounded audit chunks and reusable final bytes for abandoned closure.
 use super::*;
 use solstone_core_journal_io::{AtomicWriteOptions, atomic_replace, write_bytes_exclusive};
+#[path = "parent_loss_closure_assembly.rs"]
+mod assembly;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct PreparedAdmission {
@@ -98,15 +100,6 @@ pub(super) fn inventory(
     Ok(ids)
 }
 
-fn inputs_match(ledger: &ParentLossLedger, proof: &Publication) -> bool {
-    proof.inputs.iter().all(|(seq, batch, ids)| {
-        fs::read(ledger.closure_recovery_batch_path(proof.generation, *seq))
-            .is_ok_and(|b| digest_bytes(&b) == *batch)
-            && fs::read(ledger.closure_recovery_ids_path(proof.generation, *seq))
-                .is_ok_and(|b| digest_bytes(&b) == *ids)
-    })
-}
-
 fn provisional_matches(ledger: &ParentLossLedger, proof: &Publication) -> bool {
     proof.provisional_sources.iter().all(|(id, snapshot)| {
         read_derived_admission_drops(ledger, proof.generation, id)
@@ -198,6 +191,7 @@ pub(super) enum PublicationOutcome {
     Closed,
     BudgetExpired,
     RebuildRequired,
+    InputsChanged,
     #[cfg(test)]
     Paused,
 }
@@ -244,6 +238,65 @@ fn finish(ledger: &ParentLossLedger, proof: &Publication) -> Result<(), ParentLo
     }
     seam("after-record");
     Ok(())
+}
+
+fn proof_still_current(
+    ledger: &ParentLossLedger,
+    proof: &Publication,
+) -> Result<bool, ParentLossLedgerError> {
+    Ok(inventory(ledger, proof.generation)? == proof.inventory
+        && provisional_matches(ledger, proof)
+        && read_retirement_census(ledger, proof.generation)?
+            .obligations
+            .is_empty())
+}
+
+fn finish_current(
+    ledger: &ParentLossLedger,
+    proof: &Publication,
+) -> Result<PublicationOutcome, ParentLossLedgerError> {
+    // Both callers checked the exact current sources immediately before this
+    // stage. Recheck after writes as acknowledgement writers may run meanwhile.
+    finish(ledger, proof)?;
+    #[cfg(test)]
+    inject_finalization_ack(ledger, &FINISH_ACK_FAULT);
+    if !proof_still_current(ledger, proof)? {
+        return Ok(PublicationOutcome::InputsChanged);
+    }
+    Ok(PublicationOutcome::Closed)
+}
+
+/// The final writer-owned commit authorizes exact prepared bytes independently
+/// of historical scheduling caches, including the scan-complete hint.
+pub(super) fn resume_prepared(
+    ledger: &ParentLossLedger,
+    generation: ParentLossGeneration,
+    authority: &ClosingAuthority<'_>,
+    record: Option<&ParentLossGenerationRecord>,
+) -> Result<Option<PublicationOutcome>, ParentLossLedgerError> {
+    let Some(proof) = read_publication(ledger, generation)? else {
+        return Ok(None);
+    };
+    if proof.schema != 1
+        || proof.generation != generation
+        || !read_retirement_census(ledger, generation)?
+            .obligations
+            .is_empty()
+        || inventory(ledger, generation)? != proof.inventory
+        || !provisional_matches(ledger, &proof)
+    {
+        return Ok(None);
+    }
+    if record
+        .and_then(|r| r.sealed_ledger_digest.as_ref())
+        .is_some_and(|digest| *digest != proof.ledger_digest)
+    {
+        return Err(unverifiable_admission());
+    }
+    if Instant::now() >= authority.deadline {
+        return Ok(Some(PublicationOutcome::BudgetExpired));
+    }
+    finish_current(ledger, &proof).map(Some)
 }
 
 fn seam(_name: &str) {
@@ -296,31 +349,8 @@ pub(super) fn publish(
     provisional: &HashMap<String, ProvisionalFile>,
 ) -> Result<PublicationOutcome, ParentLossLedgerError> {
     let dir = phase(ledger, generation);
-    if let Some(proof) = read_publication(ledger, generation)?
-        && proof.schema == 1
-        && proof.generation == generation
-        && proof.inventory == all_ids
-        && proof
-            .inputs
-            .iter()
-            .map(|(seq, _, _)| *seq)
-            .collect::<Vec<_>>()
-            == seqs
-        && proof.provisional_sources.len() == provisional.len()
-        && provisional
-            .keys()
-            .all(|id| proof.provisional_sources.contains_key(id))
-        && inputs_match(ledger, &proof)
-        && provisional_matches(ledger, &proof)
-    {
-        if record
-            .as_ref()
-            .and_then(|r| r.sealed_ledger_digest.as_ref())
-            .is_some_and(|digest| *digest != proof.ledger_digest)
-        {
-            return Err(unverifiable_admission());
-        }
-        return finish(ledger, &proof).map(|()| PublicationOutcome::Closed);
+    if let Some(outcome) = resume_prepared(ledger, generation, authority, record.as_ref())? {
+        return Ok(outcome);
     }
     let Some(provisional_sources) = current_provisional_sources(ledger, generation, provisional)?
     else {
@@ -348,7 +378,7 @@ pub(super) fn publish(
             inputs: HashMap::new(),
         },
     };
-    let mut rows = HashMap::new();
+    let mut runs = Vec::new();
     let mut inputs = Vec::new();
     for seq in seqs {
         if Instant::now() >= authority.deadline {
@@ -371,6 +401,21 @@ pub(super) fn publish(
             return preserve_invalid();
         };
         let ids_digest = digest_bytes(&ids_bytes);
+        if let Some(committed) = progress.inputs.get(&seq)
+            && committed.ids_digest == ids_digest
+            && let Some(run) = assembly::cached_run(
+                &dir,
+                generation,
+                seq,
+                &committed.chunk_digest,
+                &ids_digest,
+                &ids_bytes,
+            )?
+        {
+            inputs.push((seq, committed.batch_digest.clone(), ids_digest));
+            runs.push(run);
+            continue;
+        }
         let prepared_path = dir.join(format!("audited-{seq:06}.json"));
         let stamp_path = dir.join(format!("audited-{seq:06}.sha256"));
         let retained = progress.inputs.get(&seq).and_then(|committed| {
@@ -509,14 +554,23 @@ pub(super) fn publish(
             }
             (batch_digest, chunk)
         };
+        let committed = progress
+            .inputs
+            .get(&seq)
+            .ok_or_else(unverifiable_admission)?;
+        runs.push(assembly::commit_run(
+            &dir,
+            generation,
+            seq,
+            &committed.chunk_digest,
+            &ids_digest,
+            &ids_bytes,
+            chunk.rows,
+        )?);
         inputs.push((seq, batch_digest, ids_digest));
-        for row in chunk.rows {
-            if rows.insert(row.launch_id.clone(), row).is_some() {
-                return Err(unverifiable_admission());
-            }
-        }
         seam("during-finalization");
     }
+    let mut provisional_rows = Vec::new();
     for prov in provisional.values() {
         let closure = AdmissionClosure {
             launch_id: prov.launch_id.clone(),
@@ -525,43 +579,39 @@ pub(super) fn publish(
             uid: None,
             finding: prov.finding,
         };
-        if rows
-            .insert(
-                prov.launch_id.clone(),
-                PreparedAdmission {
-                    launch_id: prov.launch_id.clone(),
-                    closure: serde_json::to_string(&closure)?,
-                    sealed: None,
-                },
-            )
-            .is_some()
-        {
-            return Err(unverifiable_admission());
-        }
+        provisional_rows.push(PreparedAdmission {
+            launch_id: prov.launch_id.clone(),
+            closure: serde_json::to_string(&closure)?,
+            sealed: None,
+        });
     }
-    if rows.len() != all_ids.len() || inventory(ledger, generation)? != all_ids {
-        return Err(unverifiable_admission());
-    }
+    runs.extend(assembly::provisional_runs(&dir, provisional_rows)?);
+    // The caller established this roster. The post-copy publication veto checks
+    // the fresh inventory again before it can authorize a successor.
+    let Some(spools) = assembly::merge(
+        &dir,
+        generation,
+        authority,
+        &runs,
+        &all_ids,
+        &provisional_sources,
+    )?
+    else {
+        return Ok(PublicationOutcome::BudgetExpired);
+    };
     if Instant::now() >= authority.deadline {
         return Ok(PublicationOutcome::BudgetExpired);
     }
-    let mut closures = Vec::new();
-    let mut sealed = Vec::new();
-    for id in &all_ids {
-        let row = rows.remove(id).ok_or_else(unverifiable_admission)?;
-        closures.push(row.closure);
-        if let Some(identity) = row.sealed {
-            sealed.push(identity);
-        }
-    }
-    let mut ledger_bytes = format!("[{}]\n", sealed.join(",")).into_bytes();
+    let mut existing_ledger = None;
     let ledger_path = ledger.sealed_ledger_path(generation);
     if ledger_path.exists() {
         let existing_bytes = fs::read(&ledger_path)?;
-        let existing: serde_json::Value = serde_json::from_slice(&existing_bytes)?;
-        let expected: serde_json::Value = serde_json::from_slice(&ledger_bytes)?;
-        if existing == expected {
-            ledger_bytes = existing_bytes;
+        if spools.existing_ledger_matches(&existing_bytes)? {
+            #[cfg(test)]
+            if LEGACY_LEDGER_MUTATION_FAULT.with(|fault| fault.get()) {
+                fs::write(&ledger_path, b"[]")?;
+            }
+            existing_ledger = Some(existing_bytes);
         } else if record
             .as_ref()
             .and_then(|r| r.sealed_ledger_digest.as_ref())
@@ -576,7 +626,17 @@ pub(super) fn publish(
             }
         }
     }
-    let ledger_digest = digest_bytes(&ledger_bytes);
+    let ledger_digest = if let Some(bytes) = existing_ledger {
+        let expected = digest_bytes(&bytes);
+        atomic_replace(
+            dir.join("ledger.prepared"),
+            &bytes,
+            AtomicWriteOptions { mode: Some(0o600) },
+        )?;
+        expected
+    } else {
+        spools.write_array(&dir.join("ledger.prepared"), true, b"[", b"]\n")?
+    };
     let mut record = record.unwrap_or_else(|| ParentLossGenerationRecord {
         schema: PARENT_LOSS_LEDGER_SCHEMA_V1,
         generation,
@@ -624,23 +684,17 @@ pub(super) fn publish(
     if !header.contains(needle) {
         return Err(unverifiable_admission());
     }
-    let record_bytes = header
-        .replacen(
-            needle,
-            &format!("\"admissions\":[{}]", closures.join(",")),
-            1,
-        )
-        .into_bytes();
-    // Establish exact expected record and ledger before publishing either one.
-    atomic_replace(
-        dir.join("ledger.prepared"),
-        &ledger_bytes,
-        AtomicWriteOptions { mode: Some(0o600) },
-    )?;
-    atomic_replace(
-        dir.join("record.prepared"),
-        &record_bytes,
-        AtomicWriteOptions { mode: Some(0o600) },
+    let (before, after) = header
+        .split_once(needle)
+        .ok_or_else(unverifiable_admission)?;
+    let prefix = format!("{before}\"admissions\":[");
+    let suffix = format!("]{after}");
+    // Expected digests come from authenticated input spans and writer literals.
+    let record_digest = spools.write_array(
+        &dir.join("record.prepared"),
+        false,
+        prefix.as_bytes(),
+        suffix.as_bytes(),
     )?;
     let proof = Publication {
         schema: 1,
@@ -651,8 +705,13 @@ pub(super) fn publish(
         inputs,
         provisional_sources,
         ledger_digest,
-        record_digest: digest_bytes(&record_bytes),
+        record_digest,
     };
+    #[cfg(test)]
+    inject_finalization_ack(ledger, &FINALIZATION_ACK_FAULT);
+    if !proof_still_current(ledger, &proof)? {
+        return Ok(PublicationOutcome::InputsChanged);
+    }
     write_json(dir.join("publication.json"), &proof, json_options())?;
     #[cfg(test)]
     if PUBLICATION_STOP_FAULT.with(|fault| fault.get()) {
@@ -662,5 +721,5 @@ pub(super) fn publish(
     if Instant::now() >= authority.deadline {
         return Ok(PublicationOutcome::BudgetExpired);
     }
-    finish(ledger, &proof).map(|()| PublicationOutcome::Closed)
+    finish_current(ledger, &proof)
 }
