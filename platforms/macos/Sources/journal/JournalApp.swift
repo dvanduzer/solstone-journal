@@ -41,7 +41,11 @@ final class JournalAppModel {
             startSupervisor: { [supervisor] root in
                 await supervisor.start(journalRoot: root)
             },
-            windowModel: windowModel
+            windowModel: windowModel,
+            supervisorIsLive: { [supervisor] root in
+                supervisor.state == .running
+                    && supervisor.activeJournalRoot?.standardizedFileURL.path == root.standardizedFileURL.path
+            }
         )
     }
 

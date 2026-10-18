@@ -381,6 +381,10 @@ struct FirstRunModelFixture {
     let initClient: FakeInitClient
     let browser: FakeBrowser
     let routeLog: RouteLog
+    let mailbox: SetupMailboxStore
+    let continuation: JournalSetupContinuationStore
+    var openJournalCalls = 0
+    var backupOpens = 0
 
     @MainActor var routes: [JournalFirstRunRoute] { routeLog.routes }
 }
@@ -432,7 +436,20 @@ func makeModel(
     fetchIdentity: JournalWindowModel.IdentityFetch? = nil,
     onIdentityMark: JournalWindowModel.IdentityMarkObserver? = nil,
     opens: Bool = true,
-    browserPollInterval: Duration = .milliseconds(1)
+    browserPollInterval: Duration = .milliseconds(1),
+    localSetupCapability: @escaping @Sendable () -> Bool = { false },
+    loadSetupCopy: @escaping @Sendable () async -> JournalSetupCopy? = { nil },
+    peer injectedPeer: (any JournalSetupPeerResolving)? = nil,
+    setupClient: any JournalSetupClienting = SilentSetupClient(),
+    identity: any JournalIdentityResolving = SilentIdentity(),
+    mailbox injectedMailbox: SetupMailboxStore? = nil,
+    continuation injectedContinuation: JournalSetupContinuationStore? = nil,
+    supervisorIsLive: @escaping @MainActor (URL) -> Bool = { _ in false },
+    externalSupervisorIsLive: @escaping @Sendable (URL) -> Bool = { _ in false },
+    refreshSleep: @escaping @Sendable () async -> Void = {
+        try? await Task.sleep(for: .seconds(60))
+    },
+    attachWindow: Bool = true
 ) -> FirstRunModelFixture {
     let config = config ?? makeConfig()
     let supervisor = JournalSupervisor()
@@ -457,6 +474,11 @@ func makeModel(
     let initClient = injectedInitClient ?? fakeInitClient
     let starts = StartSequence(trace: trace, results: startResults)
     let browser = FakeBrowser(result: opens)
+    let peer = injectedPeer ?? SilentPeer()
+    let mailbox = injectedMailbox ?? SetupMailboxStore(directory: makeIsolatedDirectory("mailbox"))
+    let continuation = injectedContinuation ?? JournalSetupContinuationStore(
+        directory: makeIsolatedDirectory("continuation")
+    )
     let model = JournalFirstRunModel(
         config: config,
         setupRunner: setupRunner,
@@ -469,7 +491,17 @@ func makeModel(
         discoveryQualificationTimeout: discoveryQualificationTimeout,
         openURL: { browser.open($0) },
         browserPollInterval: browserPollInterval,
-        windowModel: windowModel
+        windowModel: attachWindow ? windowModel : nil,
+        supervisorIsLive: supervisorIsLive,
+        externalSupervisorIsLive: externalSupervisorIsLive,
+        loadSetupCopy: loadSetupCopy,
+        localSetupCapability: localSetupCapability,
+        peer: peer,
+        setupClient: setupClient,
+        identity: identity,
+        mailbox: mailbox,
+        continuation: continuation,
+        refreshSleep: refreshSleep
     )
     let routeLog = RouteLog()
     routeLog.track(model)
@@ -480,8 +512,17 @@ func makeModel(
         setupRunner: setupRunner,
         initClient: fakeInitClient,
         browser: browser,
-        routeLog: routeLog
+        routeLog: routeLog,
+        mailbox: mailbox,
+        continuation: continuation
     )
+}
+
+private func makeIsolatedDirectory(_ name: String) -> URL {
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent("journal-first-run-\(name)-\(UUID().uuidString)", isDirectory: true)
+    try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    return url
 }
 
 @MainActor
@@ -565,9 +606,11 @@ final class FakeSetupRunner: JournalSetupRunning, @unchecked Sendable {
     private let error: Error?
     private let lock = NSLock()
     private var roots: [URL] = []
+    private var skipFlags: [Bool] = []
 
     var calls: Int { lock.withLock { roots.count } }
     var rootsSnapshot: [URL] { lock.withLock { roots } }
+    var skipModelInstallFlags: [Bool] { lock.withLock { skipFlags } }
 
     init(trace: FirstRunTrace, error: Error? = nil) {
         self.trace = trace
@@ -577,10 +620,14 @@ final class FakeSetupRunner: JournalSetupRunning, @unchecked Sendable {
     func run(
         journalRoot: URL,
         skipService: Bool,
+        skipModelInstall: Bool,
         progress: @escaping @Sendable (JournalSetupProgressEvent) async -> Void
     ) async throws -> JournalSetupResult {
         _ = skipService
-        lock.withLock { roots.append(journalRoot.standardizedFileURL) }
+        lock.withLock {
+            roots.append(journalRoot.standardizedFileURL)
+            skipFlags.append(skipModelInstall)
+        }
         await trace.append("setup")
         if let error {
             throw error
@@ -737,8 +784,13 @@ private actor CancellationAwareSetupRunner: JournalSetupRunning {
         for await _ in entry.stream { return }
     }
 
-    func run(journalRoot: URL, skipService: Bool,
-             progress: @escaping @Sendable (JournalSetupProgressEvent) async -> Void) async throws -> JournalSetupResult {
+    func run(
+        journalRoot: URL,
+        skipService: Bool,
+        skipModelInstall: Bool,
+        progress: @escaping @Sendable (JournalSetupProgressEvent) async -> Void
+    ) async throws -> JournalSetupResult {
+        _ = skipModelInstall
         entered = true
         entry.continuation.yield(())
         entry.continuation.finish()
@@ -750,4 +802,29 @@ private actor CancellationAwareSetupRunner: JournalSetupRunning {
         }
         throw CancellationError()
     }
+}
+
+@MainActor
+final class SilentPeer: JournalSetupPeerResolving {
+    func resolve() -> URL? { nil }
+    func verify(_ url: URL) async -> Bool { false }
+    func launch(_ url: URL) async throws {}
+}
+
+final class SilentSetupClient: JournalSetupClienting, @unchecked Sendable {
+    func state() async throws -> JournalSetupState {
+        throw JournalSetupClientError.decoding
+    }
+
+    func perform(_ action: JournalSetupAction) async throws -> JournalSetupState {
+        throw JournalSetupClientError.decoding
+    }
+
+    func networkStatus() async throws -> JournalNetworkStatus {
+        JournalNetworkStatus(caFingerprint: nil, instanceID: nil)
+    }
+}
+
+final class SilentIdentity: JournalIdentityResolving, @unchecked Sendable {
+    func resolveIdentity(baseURL: String) async -> JournalIdentityResolution { .absent }
 }

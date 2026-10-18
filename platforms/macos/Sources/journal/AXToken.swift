@@ -20,7 +20,11 @@ enum JournalDevicesCopiedState: CaseIterable {
 
 enum JournalFirstRunRouteState: CaseIterable {
     case deciding
+    case welcome
+    case folder
     case nameLocation
+    case mark
+    case thinking
     case setupProgress
     case finishInBrowser
     case adopting
@@ -108,12 +112,19 @@ extension JournalDevicesCopiedState {
 }
 
 extension JournalFirstRunRouteState {
-    static let axTokens = ["deciding", "name_location", "setup_progress", "finish_in_browser", "adopting", "home"]
+    static let axTokens = [
+        "deciding", "welcome", "folder", "name_location", "mark", "thinking",
+        "setup_progress", "finish_in_browser", "adopting", "home"
+    ]
 
     var axToken: String {
         switch self {
         case .deciding: return "deciding"
+        case .welcome: return "welcome"
+        case .folder: return "folder"
         case .nameLocation: return "name_location"
+        case .mark: return "mark"
+        case .thinking: return "thinking"
         case .setupProgress: return "setup_progress"
         case .finishInBrowser: return "finish_in_browser"
         case .adopting: return "adopting"
@@ -141,8 +152,16 @@ extension JournalFirstRunRoute {
         switch self {
         case .deciding:
             return JournalFirstRunRouteState.deciding.axToken
+        case .ritual(.welcome):
+            return JournalFirstRunRouteState.welcome.axToken
+        case .ritual(.folder):
+            return JournalFirstRunRouteState.folder.axToken
         case .ritual(.nameLocation):
             return JournalFirstRunRouteState.nameLocation.axToken
+        case .ritual(.mark):
+            return JournalFirstRunRouteState.mark.axToken
+        case .ritual(.thinking):
+            return JournalFirstRunRouteState.thinking.axToken
         case .ritual(.setupProgress):
             return JournalFirstRunRouteState.setupProgress.axToken
         case .ritual(.finishInBrowser):

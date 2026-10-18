@@ -92,6 +92,17 @@ final class JournalAppConfig {
         applyLaunchAtLoginPreference()
     }
 
+    func setLaunchAtLoginEnabledReportingFailure(_ enabled: Bool) throws {
+        if enabled {
+            if loginItemEligibility() {
+                try loginItemManager.register()
+            }
+        } else {
+            try loginItemManager.unregister()
+        }
+        defaults.set(enabled, forKey: Keys.launchAtLoginEnabled)
+    }
+
     var iconMarkAppliedAtLeastOnce: Bool {
         get {
             defaults.bool(forKey: Keys.journalIconMarkAppliedAtLeastOnce)
