@@ -97,6 +97,9 @@ const LIVE_REAP_GRACE_MS: u64 = 500;
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static LEGACY_STOP_AFTER_SEGMENT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static LEGACY_DECODED_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static LEGACY_PAYLOAD_WRITE_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static FINALIZATION_ACK_FAULT: std::cell::RefCell<Option<AdmissionIdentity>> = const { std::cell::RefCell::new(None) };
     pub(crate) static FINISH_ACK_FAULT: std::cell::RefCell<Option<AdmissionIdentity>> = const { std::cell::RefCell::new(None) };
     pub(crate) static ASSEMBLY_SEGMENT_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -5233,6 +5236,127 @@ mod tests {
         let actual: AdmissionIdentity =
             serde_json::from_value(sealed[0]["identity"].clone()).unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn a_complete_large_merge_can_publish_within_its_remaining_slice() {
+        let directory = TempDir::new().unwrap();
+        let (ledger, active) = open_generation(&directory);
+        for ordinal in 0..=RECOVERY_BATCH_LIMIT {
+            admit(
+                directory.path(),
+                active.generation,
+                &format!("same-slice-{ordinal:04}"),
+                None,
+                Some(instance(8823, 600)),
+            );
+        }
+        let (source, retirer) = fake(&[], &[], &[]);
+        let lease = acquire_lease(&ledger);
+        ledger
+            .reserve_generation_closing_abandoned(
+                instance(12, 4),
+                [],
+                &lease,
+                &authority(&source, &retirer, Duration::from_secs(10)),
+            )
+            .unwrap();
+        assert_eq!(
+            closure_of(&ledger, active.generation).admissions.len(),
+            RECOVERY_BATCH_LIMIT + 1
+        );
+    }
+
+    #[test]
+    fn malformed_legacy_suffix_after_committed_comparison_refuses_without_replacing_evidence() {
+        for unequal in [false, true] {
+            for damage in 0..6 {
+                let directory = TempDir::new().unwrap();
+                let (ledger, active) = open_generation(&directory);
+                let rows: Vec<_> = ["a", "b"]
+                    .into_iter()
+                    .map(|id| {
+                        let identity = admit(
+                            directory.path(),
+                            active.generation,
+                            id,
+                            None,
+                            Some(instance(8840, 600)),
+                        )
+                        .unwrap();
+                        serde_json::to_string(&SealedAdmission {
+                            launch_id: id.to_owned(),
+                            service: None,
+                            identity,
+                        })
+                        .unwrap()
+                    })
+                    .collect();
+                let first = if unequal {
+                    rows[0].replace("501", "502")
+                } else {
+                    rows[0].clone()
+                };
+                let second = &rows[1];
+                let bytes = match damage {
+                    0 => format!("[{first}{second}]"),
+                    1 => format!("[{first},,{second}]"),
+                    2 => format!("[{first},{second},]"),
+                    3 => format!("[{first},{second}"),
+                    4 => format!("[{first},{second}] trailing"),
+                    _ => format!("[{first},{{\"broken\":"),
+                }
+                .into_bytes();
+                let path = ledger.sealed_ledger_path(active.generation);
+                fs::write(&path, &bytes).unwrap();
+                let (source, retirer) = fake(&[], &[], &[]);
+                let lease = acquire_lease(&ledger);
+                ASSEMBLY_SEGMENT_LIMIT.with(|n| n.set(1));
+                LEGACY_STOP_AFTER_SEGMENT.with(|n| n.set(1));
+                let first = ledger.reserve_generation_closing_abandoned(
+                    instance(12, 4),
+                    [],
+                    &lease,
+                    &authority(&source, &retirer, Duration::from_secs(10)),
+                );
+                ASSEMBLY_SEGMENT_LIMIT.with(|n| n.set(0));
+                LEGACY_STOP_AFTER_SEGMENT.with(|n| n.set(0));
+                assert!(first.is_err());
+                let phase = ledger.closure_recovery_phase_dir(active.generation);
+                let progress: serde_json::Value = serde_json::from_slice(
+                    &fs::read(phase.join("legacy-comparison-progress.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(progress["segments"].as_array().unwrap().len(), 1);
+                let names = || {
+                    let mut paths: Vec<_> = fs::read_dir(ledger.generation_path(active.generation))
+                        .unwrap()
+                        .map(|e| e.unwrap().file_name())
+                        .collect();
+                    paths.sort();
+                    paths
+                };
+                let before = names();
+                assert!(
+                    ledger
+                        .reserve_generation_closing_abandoned(
+                            instance(13, 5),
+                            [],
+                            &lease,
+                            &authority(&source, &retirer, Duration::from_secs(10))
+                        )
+                        .is_err(),
+                    "unequal={unequal}, damage={damage}"
+                );
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+                assert_eq!(names(), before, "legacy was not set aside or replaced");
+                assert_eq!(
+                    ledger.active_generation().unwrap().unwrap().generation,
+                    active.generation
+                );
+                assert!(!phase.join("publication.json").exists());
+            }
+        }
     }
 
     fn pause_after_publication(
