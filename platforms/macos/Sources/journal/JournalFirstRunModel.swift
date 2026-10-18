@@ -67,6 +67,7 @@ final class JournalFirstRunModel {
     @ObservationIgnored private let externalSupervisorIsLive: @Sendable (URL) -> Bool
     @ObservationIgnored private let loadSetupCopy: @Sendable () async -> JournalSetupCopy?
     @ObservationIgnored private let localSetupCapability: @Sendable () -> Bool
+    @ObservationIgnored private let stepAsideAfterHandoff: @MainActor () -> Void
     @ObservationIgnored private let peer: any JournalSetupPeerResolving
     @ObservationIgnored private let setupClient: any JournalSetupClienting
     @ObservationIgnored private let identity: any JournalIdentityResolving
@@ -147,6 +148,9 @@ final class JournalFirstRunModel {
             journalSupportsSetupSequence(Bundle.main.object(forInfoDictionaryKey: "SolstoneSetupCapabilities"))
         },
         peer: any JournalSetupPeerResolving = JournalSetupPeerResolver(),
+        // Once setup continues in the solstone app, this window steps aside so a
+        // system prompt closing over it hands focus back to the solstone app.
+        stepAsideAfterHandoff: @escaping @MainActor () -> Void = { NSApp?.hide(nil) },
         setupClient: any JournalSetupClienting = JournalSetupClient(),
         identity: any JournalIdentityResolving = JournalIdentityResolver(),
         mailbox: SetupMailboxStore = SetupMailboxStore(),
@@ -171,6 +175,7 @@ final class JournalFirstRunModel {
         self.loadSetupCopy = loadSetupCopy
         self.localSetupCapability = localSetupCapability
         self.peer = peer
+        self.stepAsideAfterHandoff = stepAsideAfterHandoff
         self.setupClient = setupClient
         self.identity = identity
         self.mailbox = mailbox
@@ -1399,6 +1404,8 @@ final class JournalFirstRunModel {
         if operationError == .outbound { operationError = .none }
         handoffError = nil
         await landHomeIfCurrent(captured)
+        guard stillCurrent(captured) else { return }
+        stepAsideAfterHandoff()
     }
 
     private func presentInteractiveState(_ state: JournalSetupState) {

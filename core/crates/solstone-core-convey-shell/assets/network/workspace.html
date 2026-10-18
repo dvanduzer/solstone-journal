@@ -229,10 +229,8 @@
         </div>
         <p id="link-pairing-network-line" class="modal-warning" data-copy="PAIR_NETWORK_LINE"></p>
         <div id="link-pairing-for-phone">
-          <ol class="link-pairing-steps">
-            <li data-copy="PHONE_STEP_1"></li>
-            <li data-copy="PHONE_STEP_2"></li>
-          </ol>
+          <p class="link-pairing-lead" data-copy="PHONE_STEP_1"></p>
+          <p class="link-pairing-alt" data-copy="PHONE_STEP_2"></p>
           <div id="link-pairing-qr" class="link-pairing-qr"></div>
         </div>
         <div id="link-pairing-for-computer" hidden>
@@ -400,6 +398,9 @@
   .link-vpn-candidates { display: flex; flex-direction: column; gap: 0.4em; }
   .link-device-addresses { display: flex; flex-direction: column; gap: 0.4em; }
   .link-pairing-addresses-list { margin: 0.25em 0 0; padding-left: 1.2em; }
+  .link-pairing-addresses { margin-bottom: 0.9em; }
+  .link-pairing-lead { margin: 0.6em 0 0.2em; }
+  .link-pairing-alt { margin: 0 0 0.6em; color: var(--ink-soft); }
   .link-vpn-candidate { display: flex; gap: 0.45em; align-items: baseline; flex-wrap: wrap; }
   .link-vpn-candidate-label { color: var(--ink-soft); font-weight: 500; }
   .link-vpn-candidate-use { color: var(--ink-faint); font-size: 0.85em; }
