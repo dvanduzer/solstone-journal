@@ -693,7 +693,8 @@ impl McpEndpointTlsService {
     }
 }
 
-#[cfg(all(test, feature = "full-tests", unix))]
+#[cfg(all(test, feature = "full-tests"))]
+#[cfg(unix)]
 #[path = "acme_process_tests.rs"]
 mod acme_test_driver;
 
