@@ -7834,10 +7834,7 @@ fn activity_changes_stay_out_until_the_file_is_indexed_again() {
     assert_eq!(legacy_fetch["text"], "legacysavedprose");
     let legacy_reference = legacy_hits[0]["reference"].as_str().unwrap().to_owned();
 
-    fs::File::open(&day_path)
-        .unwrap()
-        .set_modified(mtime)
-        .unwrap();
+    restore_mtime(&day_path, mtime);
     write_activity(
         journal.path(),
         day,
@@ -7851,10 +7848,7 @@ fn activity_changes_stay_out_until_the_file_is_indexed_again() {
             })
         ),
     );
-    fs::File::open(&day_path)
-        .unwrap()
-        .set_modified(mtime)
-        .unwrap();
+    restore_mtime(&day_path, mtime);
     assert!(activity_hits_for(&journal, "legacysavedprose").is_empty());
     assert!(activity_hits_for(&journal, "secondstoryneedle").is_empty());
     assert_eq!(
@@ -7886,10 +7880,7 @@ fn activity_changes_stay_out_until_the_file_is_indexed_again() {
             json!({"id":"three","title":"Third","story":{"body":"thirdstoryneedle"}})
         ),
     );
-    fs::File::open(&day_path)
-        .unwrap()
-        .set_modified(second_mtime)
-        .unwrap();
+    restore_mtime(&day_path, second_mtime);
     assert!(activity_hits_for(&journal, "secondstoryneedle").is_empty());
     assert!(activity_hits_for(&journal, "thirdstoryneedle").is_empty());
     solstone_core_indexer_store::scan::scan_journal(journal.path(), false).unwrap();
@@ -8232,7 +8223,12 @@ fn grant_chosen_facet(journal: &Path, facet_id: &str) {
 }
 
 fn restore_mtime(path: &Path, mtime: std::time::SystemTime) {
-    fs::File::open(path).unwrap().set_modified(mtime).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
 }
 
 #[test]

@@ -275,7 +275,9 @@ mod tests {
             rel,
             "{\"id\":\"two\",\"title\":\"Second\",\"hidden\":true}\n",
         );
-        File::open(&path)
+        File::options()
+            .write(true)
+            .open(&path)
             .expect("reopen")
             .set_modified(mtime)
             .expect("keep mtime");
@@ -303,7 +305,9 @@ mod tests {
             rel,
             "{\"id\":\"two\",\"title\":\"Second\",\"hidden\":true}\n",
         );
-        File::open(&path)
+        File::options()
+            .write(true)
+            .open(&path)
             .expect("reopen legacy")
             .set_modified(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000))
             .expect("set mtime");
@@ -543,15 +547,21 @@ mod tests {
             "{\"title\":\"Alias\",\"summary\":\"aliaschangedneedle\"}\n",
         );
         write(&root, named, "# Activity\n\nagentchangedneedle\n");
-        File::open(&shaped_path)
+        File::options()
+            .write(true)
+            .open(&shaped_path)
             .expect("shaped")
             .set_modified(shaped_mtime)
             .expect("keep shaped mtime");
-        File::open(&alias_path)
+        File::options()
+            .write(true)
+            .open(&alias_path)
             .expect("alias")
             .set_modified(alias_mtime)
             .expect("keep alias mtime");
-        File::open(&named_path)
+        File::options()
+            .write(true)
+            .open(&named_path)
             .expect("named")
             .set_modified(named_mtime)
             .expect("keep named mtime");
@@ -575,7 +585,9 @@ mod tests {
             shaped,
             "{\"id\":\"two\",\"title\":\"Second\",\"hidden\":false}\n",
         );
-        File::open(&shaped_path)
+        File::options()
+            .write(true)
+            .open(&shaped_path)
             .expect("reopen legacy")
             .set_modified(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_100))
             .expect("align mtime");
@@ -605,7 +617,9 @@ mod tests {
             .expect("third mtime")
             .modified()
             .expect("modified");
-        File::open(&shaped_path)
+        File::options()
+            .write(true)
+            .open(&shaped_path)
             .expect("third")
             .set_modified(current)
             .expect("keep third mtime");
