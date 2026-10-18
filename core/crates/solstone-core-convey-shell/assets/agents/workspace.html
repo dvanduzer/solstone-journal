@@ -311,7 +311,7 @@
     const manualSocket = b.ingress === 'loopback'
       ? `<p class="note">on a public server you control, forward TCP port 443 through OpenSSH to this address on your journal computer, keeping the encrypted bytes intact.</p><dl class="lane-row"><dt>local address</dt><dd><code>${esc(b.socket_path || '')}</code></dd></dl><dl class="lane-row"><dt>from this computer</dt><dd><code>${esc(sshCommand)}</code><button class="btn sm" data-copy="${esc(sshCommand)}">copy</button></dd></dl><p class="note">the server's OpenSSH must let this forward listen publicly on port 443: set GatewayPorts to yes, and use a login that may listen on that port.</p><dl class="lane-row"><dt>local address</dt><dd>${b.socket_listening ? 'listening here' : 'closed here'}</dd></dl>`
       : `<p class="note">on a public server you control, forward TCP port 443 through OpenSSH to this socket on your journal computer, keeping the encrypted bytes intact. the SSH process must run under the same login as your journal.</p><dl class="lane-row"><dt>local socket</dt><dd><code>${esc(b.socket_path || '')}</code></dd></dl><dl class="lane-row"><dt>socket</dt><dd>${b.socket_listening ? 'listening here' : 'closed here'}</dd></dl>`;
-    const manual = host ? `<details><summary>forward port 443 yourself instead</summary>${manualSocket}</details>` : '';
+    const manual = host ? `<details><summary>forward port 443 yourself instead</summary>${manualSocket}<p class="note">a tunnel that ends HTTPS can read your agent's traffic and reuse its credential to reach your journal.</p></details>` : '';
 
     // 1 · your journal's address
     const step1 = host
