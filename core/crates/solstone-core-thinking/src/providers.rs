@@ -6,23 +6,28 @@
 use std::env;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::Utc;
 use serde_json::{Map, Value, json};
 use solstone_core_brain::{
-    StoredCredentialBinding, attach_credential_binding, classify_stored_binding,
-    derive_active_brain_lane, generate_fingerprint_key, load_existing_fingerprint_key,
-    managed_credential_binding_hmac, strip_credential_binding,
+    FingerprintKeyMaterial, StoredCredentialBinding, attach_credential_binding,
+    classify_stored_binding, derive_active_brain_lane, generate_fingerprint_key,
+    managed_credential_binding_hmac, read_fingerprint_key_material, strip_credential_binding,
 };
 use solstone_core_facets::append_action_log;
+pub use solstone_core_generate::Cancellation;
 use solstone_core_generate::{
     ClientError, ContentPart, GenerateRequest, GenerateResponse, OneShotClient,
 };
 use solstone_core_generate_wire::overrides::{
     API_KEY_OVERRIDE_ENV, MODEL_OVERRIDE_ENV, PROVIDER_OVERRIDE_ENV,
 };
-use solstone_core_journal_config_write::{JournalConfigMutation, mutate_journal_config};
+use solstone_core_journal_config_write::{
+    JournalConfigMutation, mutate_journal_config, mutate_journal_config_checked,
+};
+use solstone_core_journal_io::{JournalRoot, ObjectIdentity};
 use solstone_core_local::endpoint::{LocalEndpointResolution, resolve_local_endpoint};
 
 use crate::{MutationError, brain, local, read_config};
@@ -356,8 +361,11 @@ pub fn validate_keys_with(
     json!({"key_validation":validation})
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn save_key(
     journal: &Path,
+    admitted: &JournalRoot,
+    cancellation: &Cancellation<'_>,
     env_var: &str,
     provider: &str,
     value: &str,
@@ -367,87 +375,94 @@ pub fn save_key(
 ) -> Result<Value, MutationError> {
     let value = value.trim().to_owned();
     let prior_key = normalize_credential(pre_probe_key).to_owned();
+    let identity = admitted.identity();
+    let rejected = AtomicBool::new(false);
     let binding_key = if value.is_empty() {
         None
     } else {
-        match load_existing_fingerprint_key(journal) {
-            Some(key) => Some(key),
-            None => match generate_fingerprint_key(journal) {
-                Ok(key) => Some(key),
-                Err(error) => {
-                    log::warn!("credential binding key was not created: {error}");
-                    return Err(MutationError::StaleProbe);
-                }
-            },
+        prepare_binding_key(journal, admitted, identity, cancellation, &rejected)?
+    };
+    let checkpoint = || match admit_still(admitted, identity, cancellation) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            rejected.store(true, Ordering::SeqCst);
+            Err(error)
         }
     };
-    let transaction = mutate_journal_config(journal, Default::default(), |config| {
-        let old_value = config
-            .get("env")
-            .and_then(Value::as_object)
-            .and_then(|env| env.get(env_var))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
-        let stored = normalize_credential(old_value.as_deref().unwrap_or("")).to_owned();
-        let prior_validation = stored_validation(config, provider).cloned();
-        if !value.is_empty() {
-            let installing = stored == prior_key && stored != value;
-            if stored != value && stored != prior_key {
-                return JournalConfigMutation {
-                    changed: false,
-                    value: SaveLock::Stale,
+    let transaction =
+        mutate_journal_config_checked(journal, Default::default(), &checkpoint, |config| {
+            let old_value = config
+                .get("env")
+                .and_then(Value::as_object)
+                .and_then(|env| env.get(env_var))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let stored = normalize_credential(old_value.as_deref().unwrap_or("")).to_owned();
+            let prior_validation = stored_validation(config, provider).cloned();
+            if !value.is_empty() {
+                let installing = stored == prior_key && stored != value;
+                if stored != value && stored != prior_key {
+                    return JournalConfigMutation {
+                        changed: false,
+                        value: SaveLock::Stale,
+                    };
+                }
+                let Some(hmac_key) = binding_key else {
+                    return JournalConfigMutation {
+                        changed: false,
+                        value: SaveLock::Stale,
+                    };
                 };
+                let probe = validation
+                    .clone()
+                    .expect("nonblank keys have a validation result");
+                let Ok(bound) = bound_validation(
+                    installing,
+                    &hmac_key,
+                    provider,
+                    &value,
+                    prior_validation.as_ref(),
+                    pre_probe_entry,
+                    &probe,
+                ) else {
+                    return JournalConfigMutation {
+                        changed: false,
+                        value: SaveLock::Stale,
+                    };
+                };
+                object_at(config, "env").insert(env_var.to_owned(), Value::String(value.clone()));
+                object_at(object_at(config, "providers"), "key_validation")
+                    .insert(provider.to_owned(), bound);
+            } else {
+                object_at(config, "env").remove(env_var);
+                object_at(object_at(config, "providers"), "key_validation").remove(provider);
+                if let Some(byo_models) = config
+                    .get_mut("providers")
+                    .and_then(Value::as_object_mut)
+                    .and_then(|providers| providers.get_mut("byo_models"))
+                    .and_then(Value::as_object_mut)
+                {
+                    byo_models.remove(provider);
+                }
             }
-            let Some(hmac_key) = binding_key else {
-                return JournalConfigMutation {
-                    changed: false,
-                    value: SaveLock::Stale,
-                };
-            };
-            let probe = validation
-                .clone()
-                .expect("nonblank keys have a validation result");
-            let Ok(bound) = bound_validation(
-                installing,
-                &hmac_key,
-                provider,
-                &value,
-                prior_validation.as_ref(),
-                pre_probe_entry,
-                &probe,
-            ) else {
-                return JournalConfigMutation {
-                    changed: false,
-                    value: SaveLock::Stale,
-                };
-            };
-            object_at(config, "env").insert(env_var.to_owned(), Value::String(value.clone()));
-            object_at(object_at(config, "providers"), "key_validation")
-                .insert(provider.to_owned(), bound);
-        } else {
-            object_at(config, "env").remove(env_var);
-            object_at(object_at(config, "providers"), "key_validation").remove(provider);
-            if let Some(byo_models) = config
-                .get_mut("providers")
-                .and_then(Value::as_object_mut)
-                .and_then(|providers| providers.get_mut("byo_models"))
-                .and_then(Value::as_object_mut)
-            {
-                byo_models.remove(provider);
+            let next_validation = stored_validation(config, provider).cloned();
+            let changed = old_value.as_deref() != (!value.is_empty()).then_some(value.as_str())
+                || prior_validation != next_validation;
+            JournalConfigMutation {
+                changed,
+                value: SaveLock::Done {
+                    previous: old_value,
+                    projected: keys(config),
+                },
             }
-        }
-        let next_validation = stored_validation(config, provider).cloned();
-        let changed = old_value.as_deref() != (!value.is_empty()).then_some(value.as_str())
-            || prior_validation != next_validation;
-        JournalConfigMutation {
-            changed,
-            value: SaveLock::Done {
-                previous: old_value,
-                projected: keys(config),
-            },
-        }
-    })
-    .map_err(MutationError::config)?;
+        })
+        .map_err(|error| {
+            if rejected.load(Ordering::SeqCst) {
+                MutationError::StaleProbe
+            } else {
+                MutationError::config(error)
+            }
+        })?;
     let SaveLock::Done {
         previous,
         projected,
@@ -455,6 +470,10 @@ pub fn save_key(
     else {
         return Err(MutationError::StaleProbe);
     };
+    if let Err(error) = admit_still(admitted, identity, cancellation) {
+        log::warn!("credential binding action was not recorded: {error}");
+        return Err(MutationError::StaleProbe);
+    }
     if previous.as_deref() != (!value.is_empty()).then_some(value.as_str()) {
         append_action_log(
             journal,
@@ -466,6 +485,7 @@ pub fn save_key(
         )
         .map_err(|error| MutationError::ActionLog(error.to_string()))?;
     }
+    let validation = validation.as_ref().map(presented_validation);
     Ok(
         json!({"success":true,"env_var":env_var,"set":!value.is_empty(),"validation":validation,"api_keys":projected["api_keys"],"env":projected["env"],"key_validation":projected["key_validation"]}),
     )
@@ -483,6 +503,12 @@ pub fn persist_key_validations(
     journal: &Path,
     validator: &dyn ManagedKeyValidator,
 ) -> Result<Value, MutationError> {
+    let admitted = JournalRoot::open(journal).map_err(|error| {
+        log::warn!("credential binding was not persisted: {error}");
+        MutationError::StaleProbe
+    })?;
+    let identity = admitted.identity();
+    let cancellation = Cancellation::never();
     let snapshot = read_config(journal).map_err(MutationError::Read)?;
     let env = snapshot.get("env").and_then(Value::as_object);
     let snapshots = CLOUD.map(|(provider, env_var)| {
@@ -514,74 +540,80 @@ pub fn persist_key_validations(
                 (provider.to_string(), Value::Object(result))
             }),
     );
+    let rejected = AtomicBool::new(false);
     let hmac_key = if snapshots.iter().any(|(_, _, value, _)| !value.is_empty()) {
-        match load_existing_fingerprint_key(journal) {
-            Some(key) => Some(key),
-            None => match generate_fingerprint_key(journal) {
-                Ok(key) => Some(key),
-                Err(error) => {
-                    log::warn!("credential binding key was not created: {error}");
-                    return Err(MutationError::StaleProbe);
-                }
-            },
-        }
+        prepare_binding_key(journal, &admitted, identity, &cancellation, &rejected)?
     } else {
         None
     };
-    let transaction = mutate_journal_config(journal, Default::default(), |config| {
-        let currents = snapshots
-            .iter()
-            .map(|(_, env_var, _, _)| stored_env(config, env_var))
-            .collect::<Vec<_>>();
-        let existing = object_at(object_at(config, "providers"), "key_validation");
-        let mut changed = false;
-        for ((provider, _, snapshot_value, snapshot_entry), current) in
-            snapshots.iter().zip(currents.iter())
-        {
-            if current != snapshot_value {
-                continue;
-            }
-            if snapshot_value.is_empty() {
-                if computed.get(*provider).is_none() && existing.remove(*provider).is_some() {
+    let checkpoint = || match admit_still(&admitted, identity, &cancellation) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            rejected.store(true, Ordering::SeqCst);
+            Err(error)
+        }
+    };
+    let transaction =
+        mutate_journal_config_checked(journal, Default::default(), &checkpoint, |config| {
+            let currents = snapshots
+                .iter()
+                .map(|(_, env_var, _, _)| stored_env(config, env_var))
+                .collect::<Vec<_>>();
+            let existing = object_at(object_at(config, "providers"), "key_validation");
+            let mut changed = false;
+            for ((provider, _, snapshot_value, snapshot_entry), current) in
+                snapshots.iter().zip(currents.iter())
+            {
+                if current != snapshot_value {
+                    continue;
+                }
+                if snapshot_value.is_empty() {
+                    if computed.get(*provider).is_none() && existing.remove(*provider).is_some() {
+                        changed = true;
+                    }
+                    continue;
+                }
+                let Some(result) = computed.get(*provider) else {
+                    continue;
+                };
+                let Some(hmac_key) = hmac_key.as_ref() else {
+                    continue;
+                };
+                let stored_entry = existing.get(*provider);
+                if !persist_allows(
+                    stored_entry,
+                    snapshot_entry.as_ref(),
+                    result,
+                    hmac_key,
+                    provider,
+                    snapshot_value,
+                ) {
+                    continue;
+                }
+                let bound = bind_validation(result, hmac_key, provider, snapshot_value);
+                if existing.get(*provider) != Some(&bound) {
+                    existing.insert((*provider).to_owned(), bound);
                     changed = true;
                 }
-                continue;
             }
-            let Some(result) = computed.get(*provider) else {
-                continue;
-            };
-            let Some(hmac_key) = hmac_key.as_ref() else {
-                continue;
-            };
-            let stored_entry = existing.get(*provider);
-            if !persist_allows(
-                stored_entry,
-                snapshot_entry.as_ref(),
-                result,
-                hmac_key,
-                provider,
-                snapshot_value,
-            ) {
-                continue;
+            let persisted = Map::from_iter(CLOUD.into_iter().filter_map(|(provider, _)| {
+                existing
+                    .get(provider)
+                    .cloned()
+                    .map(|value| (provider.to_owned(), value))
+            }));
+            JournalConfigMutation {
+                changed,
+                value: Value::Object(persisted),
             }
-            let bound = bind_validation(result, hmac_key, provider, snapshot_value);
-            if existing.get(*provider) != Some(&bound) {
-                existing.insert((*provider).to_owned(), bound);
-                changed = true;
+        })
+        .map_err(|error| {
+            if rejected.load(Ordering::SeqCst) {
+                MutationError::StaleProbe
+            } else {
+                MutationError::config(error)
             }
-        }
-        let persisted = Map::from_iter(CLOUD.into_iter().filter_map(|(provider, _)| {
-            existing
-                .get(provider)
-                .cloned()
-                .map(|value| (provider.to_owned(), value))
-        }));
-        JournalConfigMutation {
-            changed,
-            value: Value::Object(persisted),
-        }
-    })
-    .map_err(MutationError::config)?;
+        })?;
     let mut returned = transaction.value;
     strip_credential_binding(&mut returned);
     Ok(json!({"success":true,"key_validation":returned}))
@@ -1085,10 +1117,92 @@ fn bind_validation(
     provider: &str,
     credential: &str,
 ) -> Value {
-    let mut object = validation.as_object().cloned().unwrap_or_default();
+    let mut object = Map::new();
+    if let Some(source) = validation.as_object() {
+        for key in ["valid", "reason_code", "probe_reason_code", "timestamp"] {
+            if let Some(field) = source.get(key) {
+                object.insert(key.to_owned(), field.clone());
+            }
+        }
+    }
     let hmac = managed_credential_binding_hmac(hmac_key, provider, credential);
     attach_credential_binding(&mut object, &hmac);
     Value::Object(object)
+}
+
+fn presented_validation(validation: &Value) -> Value {
+    let mut kept = Map::new();
+    if let Some(source) = validation.as_object() {
+        for key in ["valid", "reason_code", "probe_reason_code", "timestamp"] {
+            if let Some(field) = source.get(key) {
+                kept.insert(key.to_owned(), field.clone());
+            }
+        }
+    }
+    Value::Object(kept)
+}
+
+fn binding_fields_present(config: &Map<String, Value>) -> bool {
+    config
+        .get("providers")
+        .and_then(Value::as_object)
+        .and_then(|providers| providers.get("key_validation"))
+        .and_then(Value::as_object)
+        .is_some_and(|entries| {
+            entries.values().any(|entry| {
+                entry.as_object().is_some_and(|object| {
+                    object.contains_key("binding_version") || object.contains_key("credential_hmac")
+                })
+            })
+        })
+}
+
+fn admit_still(
+    admitted: &JournalRoot,
+    identity: ObjectIdentity,
+    cancellation: &Cancellation<'_>,
+) -> Result<(), String> {
+    admitted
+        .revalidate_canonical_binding()
+        .map_err(|error| error.to_string())?;
+    if admitted.identity() != identity {
+        return Err("admitted journal root changed".to_owned());
+    }
+    if cancellation.is_cancelled() {
+        return Err("cancelled".to_owned());
+    }
+    Ok(())
+}
+
+fn prepare_binding_key(
+    journal: &Path,
+    admitted: &JournalRoot,
+    identity: ObjectIdentity,
+    cancellation: &Cancellation<'_>,
+    rejected: &AtomicBool,
+) -> Result<Option<[u8; 32]>, MutationError> {
+    match read_fingerprint_key_material(journal) {
+        FingerprintKeyMaterial::Ready(key) => Ok(Some(key)),
+        FingerprintKeyMaterial::Unavailable => Err(MutationError::StaleProbe),
+        FingerprintKeyMaterial::Absent => {
+            if let Err(error) = admit_still(admitted, identity, cancellation) {
+                rejected.store(true, Ordering::SeqCst);
+                log::warn!("credential binding key was not created: {error}");
+                return Err(MutationError::StaleProbe);
+            }
+            let config = read_config(journal).map_err(MutationError::Read)?;
+            if binding_fields_present(&config) {
+                return Err(MutationError::StaleProbe);
+            }
+            match generate_fingerprint_key(journal) {
+                Ok(key) => Ok(Some(key)),
+                Err(error) => {
+                    log::warn!("credential binding key was not created: {error}");
+                    Err(MutationError::StaleProbe)
+                }
+            }
+        }
+    }
 }
 
 fn may_replace_bound_rejection(result: &Value) -> bool {
@@ -1408,9 +1522,33 @@ mod tests {
     use super::OneShotKeyValidator;
     use super::{
         ManagedKeyValidator, ProviderRequestError, ProviderUpdate, ProviderUpdateError,
-        classify_key_probe, classify_model_probe, resolve_provider_update, save_key,
-        update_providers, validate_keys_with, validation_request,
+        classify_key_probe, classify_model_probe, resolve_provider_update, update_providers,
+        validate_keys_with, validation_request,
     };
+
+    fn save_key(
+        journal: &std::path::Path,
+        env_var: &str,
+        provider: &str,
+        value: &str,
+        validation: Option<Value>,
+        pre_probe_key: &str,
+        pre_probe_entry: Option<&Value>,
+    ) -> Result<Value, crate::MutationError> {
+        let admitted = solstone_core_journal_io::JournalRoot::open(journal).expect("journal root");
+        let cancellation = solstone_core_generate::Cancellation::never();
+        super::save_key(
+            journal,
+            &admitted,
+            &cancellation,
+            env_var,
+            provider,
+            value,
+            validation,
+            pre_probe_key,
+            pre_probe_entry,
+        )
+    }
     use crate::read_config;
 
     struct PanicValidator;
@@ -1514,7 +1652,11 @@ mod tests {
         let stored = &config["providers"]["key_validation"]["openai"];
         assert_eq!(stored["valid"], validation["valid"]);
         assert_eq!(stored["reason_code"], validation["reason_code"]);
-        assert_eq!(stored["error"], validation["error"]);
+        assert!(stored.get("error").is_none());
+        assert!(stored.get("detail").is_none());
+        assert!(saved["validation"].get("error").is_none());
+        assert!(!stored.to_string().contains("provider said no"));
+        assert!(!saved.to_string().contains("provider said no"));
         assert_eq!(stored["binding_version"], 1);
         let hmac = stored["credential_hmac"].as_str().expect("binding hmac");
         assert_eq!(hmac.len(), 64);
@@ -1533,7 +1675,9 @@ mod tests {
                 .get("binding_version")
                 .is_none()
         );
-        assert!(solstone_core_brain::brain_fingerprint_key_path(&journal).is_file());
+        let key_bytes =
+            fs::read(solstone_core_brain::brain_fingerprint_key_path(&journal)).expect("key bytes");
+        assert_eq!(key_bytes.len(), 32);
         let _ = fs::remove_dir_all(journal);
     }
 
@@ -1756,7 +1900,7 @@ mod tests {
             fs::read(journal.join("config/journal.json")).expect("config bytes"),
             before
         );
-        let saved = save_key(
+        let error = save_key(
             &journal,
             "OPENAI_API_KEY",
             "openai",
@@ -1765,22 +1909,62 @@ mod tests {
             "alpha-key",
             Some(&corrupt),
         )
-        .expect("matching success replaces the corrupt claim");
-        let config = read_config(&journal).expect("config reads");
+        .expect_err("an absent key is not minted over an existing binding");
+        assert!(matches!(error, crate::MutationError::StaleProbe));
         assert_eq!(
-            config["providers"]["key_validation"]["openai"]["valid"],
-            true
+            fs::read(journal.join("config/journal.json")).expect("config bytes"),
+            before
         );
-        let hmac = config["providers"]["key_validation"]["openai"]["credential_hmac"]
-            .as_str()
-            .expect("replacement hmac");
-        assert_eq!(hmac.len(), 64);
-        assert_ne!(hmac, "zzzz");
-        assert!(
-            saved["key_validation"]["openai"]
-                .get("credential_hmac")
-                .is_none()
+        assert!(!solstone_core_brain::brain_fingerprint_key_path(&journal).exists());
+        let _ = fs::remove_dir_all(journal);
+    }
+
+    #[test]
+    fn ready_key_success_replaces_corrupt_same_key_claim() {
+        let journal = binding_journal(
+            "ready-corrupt",
+            json!({
+                "env": {"OPENAI_API_KEY": "alpha-key"},
+                "providers": {
+                    "key_validation": {
+                        "openai": {
+                            "valid": false,
+                            "reason_code": "provider_key_invalid",
+                            "binding_version": 1,
+                            "credential_hmac": "zzzz"
+                        }
+                    }
+                }
+            }),
         );
+        let key = [4u8; 32];
+        let path = solstone_core_brain::brain_fingerprint_key_path(&journal);
+        fs::create_dir_all(path.parent().expect("health")).expect("health");
+        fs::write(&path, key).expect("ready key");
+        let stored = read_config(&journal).expect("config reads");
+        let corrupt = stored["providers"]["key_validation"]["openai"].clone();
+        let saved = save_key(
+            &journal,
+            "OPENAI_API_KEY",
+            "openai",
+            "alpha-key",
+            Some(json!({"valid":true,"error":"provider said no"})),
+            "alpha-key",
+            Some(&corrupt),
+        )
+        .expect("a ready key can replace a corrupt claim");
+        assert_eq!(saved["success"], true);
+        assert!(saved["validation"].get("error").is_none());
+        assert_eq!(fs::read(&path).expect("key bytes"), key);
+        let config = read_config(&journal).expect("config reads");
+        let entry = &config["providers"]["key_validation"]["openai"];
+        assert_eq!(entry["valid"], true);
+        assert!(entry.get("error").is_none());
+        assert_eq!(
+            entry["credential_hmac"],
+            solstone_core_brain::managed_credential_binding_hmac(&key, "openai", "alpha-key")
+        );
+        assert_ne!(entry["credential_hmac"], "zzzz");
         let _ = fs::remove_dir_all(journal);
     }
 
@@ -1801,6 +1985,12 @@ mod tests {
                 }
             }),
         );
+        fs::create_dir_all(journal.join("health")).expect("health");
+        fs::write(
+            solstone_core_brain::brain_fingerprint_key_path(&journal),
+            [3u8; 32],
+        )
+        .expect("ready key");
         struct MutatingUnavailable {
             journal: std::path::PathBuf,
         }
@@ -1869,12 +2059,15 @@ mod tests {
         assert!(!public.contains("credential_hmac"));
         assert!(!public.contains("binding_version"));
         assert!(!public.contains(key));
+        assert!(!public.contains("authentication failed"));
+        assert!(saved["validation"].get("error").is_none());
         let config = read_config(&journal).expect("config reads");
         let stored = config["providers"]["key_validation"]["openai"].clone();
         assert_eq!(stored["binding_version"], 1);
         let hmac = stored["credential_hmac"].as_str().expect("disk hmac");
         assert_eq!(hmac.len(), 64);
         assert!(!stored.to_string().contains(key));
+        assert!(stored.get("error").is_none());
         assert_eq!(config["env"]["OPENAI_API_KEY"], key);
         let projected = super::keys(&config);
         assert!(
@@ -1919,6 +2112,186 @@ mod tests {
                 .is_none()
         );
         let _ = fs::remove_dir_all(journal);
+    }
+
+    fn plant_ready_key(journal: &std::path::Path) {
+        let path = solstone_core_brain::brain_fingerprint_key_path(journal);
+        fs::create_dir_all(path.parent().expect("health")).expect("health");
+        fs::write(&path, [9u8; 32]).expect("ready key");
+    }
+
+    #[test]
+    fn wrong_length_fingerprint_key_is_unchanged_by_unavailable_save() {
+        let journal = binding_journal(
+            "wrong-length",
+            json!({"env":{"OPENAI_API_KEY":"alpha-key"}}),
+        );
+        let path = solstone_core_brain::brain_fingerprint_key_path(&journal);
+        fs::create_dir_all(path.parent().expect("health")).expect("health");
+        let original = b"not-32-bytes".to_vec();
+        fs::write(&path, &original).expect("short key");
+        let before = fs::read(journal.join("config/journal.json")).expect("config");
+        let error = save_key(
+            &journal,
+            "OPENAI_API_KEY",
+            "openai",
+            "alpha-key",
+            Some(
+                json!({"valid":false,"reason_code":"validation_unavailable","error":"provider said no"}),
+            ),
+            "alpha-key",
+            None,
+        )
+        .expect_err("unavailable material");
+        assert!(matches!(error, crate::MutationError::StaleProbe));
+        assert_eq!(fs::read(&path).expect("key bytes"), original);
+        assert_eq!(
+            fs::read(journal.join("config/journal.json")).expect("config"),
+            before
+        );
+        let _ = fs::remove_dir_all(journal);
+    }
+
+    #[test]
+    fn save_key_cancellation_before_publication_refuses_the_write() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let journal = binding_journal(
+            "cancel-publish",
+            json!({"env":{"OPENAI_API_KEY":"alpha-key"}}),
+        );
+        plant_ready_key(&journal);
+        let before_config = fs::read(journal.join("config/journal.json")).expect("config");
+        let before_key =
+            fs::read(solstone_core_brain::brain_fingerprint_key_path(&journal)).expect("key");
+        let calls = AtomicUsize::new(0);
+        let check = || calls.fetch_add(1, Ordering::SeqCst) >= 2;
+        let cancellation = solstone_core_generate::Cancellation::from_fn(&check);
+        let admitted = solstone_core_journal_io::JournalRoot::open(&journal).expect("root");
+        let error = super::save_key(
+            &journal,
+            &admitted,
+            &cancellation,
+            "OPENAI_API_KEY",
+            "openai",
+            "beta-key",
+            Some(json!({"valid":true})),
+            "alpha-key",
+            None,
+        )
+        .expect_err("cancelled before publication");
+        assert!(matches!(error, crate::MutationError::StaleProbe));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            fs::read(journal.join("config/journal.json")).expect("config"),
+            before_config
+        );
+        assert_eq!(
+            fs::read(solstone_core_brain::brain_fingerprint_key_path(&journal)).expect("key"),
+            before_key
+        );
+        let _ = fs::remove_dir_all(journal);
+    }
+
+    #[test]
+    fn save_key_cancellation_at_post_lock_refuses_before_publication() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let journal = binding_journal("cancel-lock", json!({"env":{"OPENAI_API_KEY":"alpha-key"}}));
+        plant_ready_key(&journal);
+        let before_config = fs::read(journal.join("config/journal.json")).expect("config");
+        let calls = AtomicUsize::new(0);
+        let check = || calls.fetch_add(1, Ordering::SeqCst) >= 1;
+        let cancellation = solstone_core_generate::Cancellation::from_fn(&check);
+        let admitted = solstone_core_journal_io::JournalRoot::open(&journal).expect("root");
+        let error = super::save_key(
+            &journal,
+            &admitted,
+            &cancellation,
+            "OPENAI_API_KEY",
+            "openai",
+            "beta-key",
+            Some(json!({"valid":true})),
+            "alpha-key",
+            None,
+        )
+        .expect_err("cancelled after the lock");
+        assert!(matches!(error, crate::MutationError::StaleProbe));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            fs::read(journal.join("config/journal.json")).expect("config"),
+            before_config
+        );
+        let _ = fs::remove_dir_all(journal);
+    }
+
+    #[test]
+    fn save_after_admitted_root_rename_does_not_recreate_the_old_path() {
+        let journal = binding_journal("rename-save", json!({"env":{"OPENAI_API_KEY":"alpha-key"}}));
+        let admitted = solstone_core_journal_io::JournalRoot::open(&journal).expect("root");
+        let before = fs::read(journal.join("config/journal.json")).expect("config");
+        let moved = journal.with_file_name(format!(
+            "{}-moved",
+            journal.file_name().expect("name").to_string_lossy()
+        ));
+        fs::rename(&journal, &moved).expect("rename admitted root");
+        let other = journal.with_file_name(format!(
+            "{}-other",
+            journal.file_name().expect("name").to_string_lossy()
+        ));
+        fs::create_dir_all(other.join("config")).expect("other config");
+        let other_bytes = br#"{"env":{"OPENAI_API_KEY":"other-key"}}"#;
+        fs::write(other.join("config/journal.json"), other_bytes).expect("other config");
+        let cancellation = solstone_core_generate::Cancellation::never();
+        let error = super::save_key(
+            &journal,
+            &admitted,
+            &cancellation,
+            "OPENAI_API_KEY",
+            "openai",
+            "beta-key",
+            Some(json!({"valid":true})),
+            "alpha-key",
+            None,
+        )
+        .expect_err("renamed root");
+        assert!(matches!(error, crate::MutationError::StaleProbe));
+        assert!(!journal.exists());
+        assert!(!journal.join("health/brain-fingerprint.key").exists());
+        assert!(!journal.join("config/journal.json").exists());
+        assert!(!journal.join("config/journal.json.lock").exists());
+        assert!(!journal.join("config/actions").exists());
+        assert_eq!(
+            fs::read(moved.join("config/journal.json")).expect("moved config"),
+            before
+        );
+        assert_eq!(
+            fs::read(other.join("config/journal.json")).expect("other config"),
+            other_bytes
+        );
+        let other_key = other.join("health/brain-fingerprint.key");
+        fs::create_dir_all(other_key.parent().expect("health")).expect("other health");
+        let planted = [5u8; 32];
+        fs::write(&other_key, planted).expect("other key");
+        let error = super::save_key(
+            &journal,
+            &admitted,
+            &cancellation,
+            "OPENAI_API_KEY",
+            "openai",
+            "",
+            None,
+            "other-key",
+            None,
+        )
+        .expect_err("empty delete uses the same checkpoint");
+        assert!(matches!(error, crate::MutationError::StaleProbe));
+        assert!(!journal.exists());
+        assert_eq!(fs::read(&other_key).expect("other key bytes"), planted);
+        assert_eq!(
+            fs::read(other.join("config/journal.json")).expect("other config"),
+            other_bytes
+        );
+        let _ = fs::remove_dir_all(&moved);
+        let _ = fs::remove_dir_all(&other);
     }
 
     #[test]
@@ -3277,5 +3650,360 @@ mod tests {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             self.models.clone()
         }
+    }
+}
+
+/// Desktop key probe. `OneShotKeyValidator::at_path` is the process arm:
+/// `OneShotClient::at_path`, the three override environment variables, and
+/// `execute` of the canned validation request. This is not `respond`.
+#[cfg(all(test, feature = "full-tests"))]
+mod desktop_probe {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    use serde_json::{Value, json};
+    use solstone_core_generate::{Cancellation, ContentPart, GenerateRequest, GenerateResponse};
+    use solstone_core_generate_wire::overrides::{
+        API_KEY_OVERRIDE_ENV, BASE_URL_OVERRIDE_ENV, MODEL_OVERRIDE_ENV, PROVIDER_OVERRIDE_ENV,
+    };
+
+    use super::ManagedKeyValidator;
+
+    const CASE: &str = "desktop_oneshot_at_path_posts_the_canned_probe_and_content_posts_nothing";
+    const MARKER: &str = "SOLSTONE_DESKTOP_PROBE_CHILD";
+    const JOURNAL_ENV: &str = "SOLSTONE_DESKTOP_PROBE_JOURNAL";
+    const RECEIPT_LINE: &str = "SOLSTONE_DESKTOP_PROBE_RECEIPT ";
+    const CANNED: &str = "Reply with the single word OK.";
+    const CANDIDATE: &str = "openai-candidate-secret";
+    const OTHER_KEY: &str = "anthropic-stored-key";
+    const PROVIDER_BODY: &str = "DESKTOP-PROBE-BODY";
+    const CONTENT_CANARY: &str = "desktop-content-canary";
+
+    #[test]
+    fn desktop_oneshot_at_path_posts_the_canned_probe_and_content_posts_nothing() {
+        if std::env::var(MARKER).ok().as_deref() == Some(CASE) {
+            let journal = PathBuf::from(std::env::var(JOURNAL_ENV).expect("probe journal"));
+            let runtime = solstone_core_generate_wire::EndpointRuntime::default();
+            let cancellation = Cancellation::never();
+            let reason = reason_code(solstone_core_generate_wire::respond(
+                &content_request(),
+                &runtime,
+                &journal,
+                |_| None,
+                &cancellation,
+            ));
+            println!("{RECEIPT_LINE}{reason}");
+            return;
+        }
+
+        let parent_env = [
+            API_KEY_OVERRIDE_ENV,
+            PROVIDER_OVERRIDE_ENV,
+            MODEL_OVERRIDE_ENV,
+            BASE_URL_OVERRIDE_ENV,
+        ]
+        .map(|name| (name, std::env::var(name).ok()));
+
+        let root = PathBuf::from("/var/tmp").join(format!(
+            "solstone-desktop-probe-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let journal = root.join("journal");
+        std::fs::create_dir_all(journal.join("config")).expect("journal config");
+        let key = solstone_core_brain::generate_fingerprint_key(&journal).expect("binding key");
+        let candidate_hmac =
+            solstone_core_brain::managed_credential_binding_hmac(&key, "openai", CANDIDATE);
+        let other_hmac =
+            solstone_core_brain::managed_credential_binding_hmac(&key, "anthropic", OTHER_KEY);
+        let mut openai_entry = serde_json::Map::new();
+        openai_entry.insert("valid".to_owned(), Value::Bool(false));
+        openai_entry.insert(
+            "reason_code".to_owned(),
+            Value::String("provider_key_invalid".to_owned()),
+        );
+        solstone_core_brain::attach_credential_binding(&mut openai_entry, &candidate_hmac);
+        let mut anthropic_entry = serde_json::Map::new();
+        anthropic_entry.insert("valid".to_owned(), Value::Bool(false));
+        anthropic_entry.insert(
+            "reason_code".to_owned(),
+            Value::String("provider_key_invalid".to_owned()),
+        );
+        solstone_core_brain::attach_credential_binding(&mut anthropic_entry, &other_hmac);
+        let config = json!({
+            "env": {"ANTHROPIC_API_KEY": OTHER_KEY},
+            "providers": {
+                "active": {"provider": "anthropic", "model": "claude-binding"},
+                "key_validation": {
+                    "openai": openai_entry,
+                    "anthropic": anthropic_entry
+                }
+            }
+        });
+        let config_path = journal.join("config/journal.json");
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec(&config).expect("config bytes"),
+        )
+        .expect("config");
+        let config_before = std::fs::read(&config_path).expect("config");
+        let active_before = config["providers"]["active"].clone();
+        let other_before = config["providers"]["key_validation"]["anthropic"].clone();
+        assert!(!config_text(&config_before).contains(CANDIDATE));
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback");
+        let port = listener.local_addr().expect("port").port();
+        let receipt_path = root.join("receipt.json");
+        let stub = root.join("desktop-probe-stub");
+        assert_ne!(
+            stub,
+            std::env::current_exe().expect("test executable"),
+            "the desktop probe stub is a temp executable"
+        );
+        std::fs::write(&stub, stub_script(port, &receipt_path)).expect("stub");
+        make_executable(&stub);
+
+        let validator = super::OneShotKeyValidator::at_path(&stub);
+        let probe = std::thread::spawn(move || validator.validate("openai", CANDIDATE));
+        let (mut stream, body) =
+            accept_request(&listener, Duration::from_secs(5)).expect("canned desktop probe");
+        assert_eq!(body.matches(CANNED).count(), 1);
+        assert!(!body.contains(CONTENT_CANARY));
+        write_http(&mut stream, PROVIDER_BODY);
+        drop(stream);
+        let validation = probe.join().expect("probe thread").expect("probe");
+        assert_eq!(validation.get("valid").and_then(Value::as_bool), Some(true));
+        assert_eq!(std::fs::read(&config_path).expect("config"), config_before);
+
+        let receipt: Value =
+            serde_json::from_slice(&std::fs::read(&receipt_path).expect("receipt"))
+                .expect("receipt json");
+        assert_eq!(receipt["provider"], "openai");
+        assert_eq!(receipt["model"], "solstone-key-check");
+        assert_eq!(receipt["secret"], CANDIDATE);
+        assert!(receipt_path.starts_with(&root));
+        assert!(!receipt_path.starts_with(&journal));
+
+        let child = spawn_content_child(&journal, port);
+        assert!(accept_request(&listener, Duration::from_secs(2)).is_none());
+        let output = child.wait_with_output().expect("content child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "content child failed: {stdout}{stderr}"
+        );
+        let reason = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(RECEIPT_LINE))
+            .expect("content receipt");
+        assert_eq!(reason, "provider_key_invalid");
+
+        let stored = std::fs::read(&config_path).expect("config");
+        assert_eq!(stored, config_before);
+        let parsed: Value = serde_json::from_slice(&stored).expect("config json");
+        assert_eq!(parsed["providers"]["active"], active_before);
+        assert_eq!(parsed["env"]["ANTHROPIC_API_KEY"], OTHER_KEY);
+        assert_eq!(
+            parsed["providers"]["key_validation"]["anthropic"],
+            other_before
+        );
+        let text = config_text(&stored);
+        assert!(!text.contains(CANDIDATE));
+        assert!(!text.contains(PROVIDER_BODY));
+        for (name, before) in parent_env {
+            assert_eq!(std::env::var(name).ok(), before, "{name}");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn content_request() -> GenerateRequest {
+        GenerateRequest {
+            id: None,
+            context: "segment.thought".to_owned(),
+            contents: vec![ContentPart::Text {
+                text: CONTENT_CANARY.to_owned(),
+            }],
+            system_instruction: None,
+            temperature: 0.2,
+            max_output_tokens: 32,
+            timeout_s: Some(5.0),
+            json_output: false,
+            json_schema: None,
+            attempt_index: 0,
+            exclusive_admission: false,
+            transport_retries: Some(0),
+        }
+    }
+
+    fn reason_code(result: Result<GenerateResponse, String>) -> String {
+        match result {
+            Ok(GenerateResponse::Generated(_)) => "generated".to_owned(),
+            Ok(GenerateResponse::Cancelled) => "cancelled".to_owned(),
+            Ok(GenerateResponse::Refused(refusal)) => refusal
+                .reason_code
+                .as_ref()
+                .map(|code| code.as_wire().to_owned())
+                .unwrap_or_else(|| "refused".to_owned()),
+            Err(error) => error,
+        }
+    }
+
+    fn config_text(bytes: &[u8]) -> String {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+
+    fn stub_script(port: u16, receipt_path: &Path) -> String {
+        format!(
+            r#"#!/usr/bin/env python3
+import json, os, socket, sys
+stdin = sys.stdin.read()
+receipt = {{
+    "provider": os.environ.get({provider_env:?}, ""),
+    "model": os.environ.get({model_env:?}, ""),
+    "secret": os.environ.get({secret_env:?}, ""),
+}}
+with open({receipt_path:?}, "w", encoding="utf-8") as handle:
+    json.dump(receipt, handle)
+sentence = "Reply with the single word OK."
+payload = sentence.encode() if sentence in stdin else b"STDIN-LACKS-CANNED-SENTENCE"
+request = (
+    b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: %d\r\nConnection: close\r\n\r\n"
+    % len(payload)
+) + payload
+sock = socket.create_connection(("127.0.0.1", {port}), 30)
+sock.sendall(request)
+data = b""
+while True:
+    chunk = sock.recv(4096)
+    if not chunk:
+        break
+    data += chunk
+head, _, _body = data.partition(b"\r\n\r\n")
+status = int(head.split()[1])
+if status != 200:
+    sys.stderr.write(data.decode("utf-8", "replace"))
+    sys.exit(1)
+sys.stdout.write(json.dumps({{
+    "schema": "solstone-generate-response-v2",
+    "outcome": "generated",
+    "text": "OK",
+    "model": "solstone-key-check",
+    "usage": {{}},
+    "finish_reason": "stop",
+}}))
+"#,
+            provider_env = PROVIDER_OVERRIDE_ENV,
+            model_env = MODEL_OVERRIDE_ENV,
+            secret_env = API_KEY_OVERRIDE_ENV,
+            receipt_path = receipt_path,
+            port = port,
+        )
+    }
+
+    fn make_executable(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .expect("stub mode");
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+        }
+    }
+
+    fn spawn_content_child(journal: &Path, port: u16) -> std::process::Child {
+        Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg(format!("providers::desktop_probe::{CASE}"))
+            .arg("--nocapture")
+            .env_clear()
+            .env("PATH", "")
+            .env(MARKER, CASE)
+            .env(JOURNAL_ENV, journal)
+            .env(API_KEY_OVERRIDE_ENV, CANDIDATE)
+            .env(PROVIDER_OVERRIDE_ENV, "openai")
+            .env(BASE_URL_OVERRIDE_ENV, format!("http://127.0.0.1:{port}"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("content child")
+    }
+
+    fn accept_request(listener: &TcpListener, timeout: Duration) -> Option<(TcpStream, String)> {
+        listener.set_nonblocking(true).expect("nonblocking");
+        let deadline = Instant::now() + timeout;
+        let accepted = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break Some(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        break None;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("accept: {error}"),
+            }
+        };
+        listener.set_nonblocking(false).expect("blocking");
+        let mut stream = accepted?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let body = read_http(&mut stream);
+        Some((stream, body))
+    }
+
+    fn read_http(stream: &mut TcpStream) -> String {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 2048];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => {
+                    buffer.extend_from_slice(&chunk[..count]);
+                    if let Some(split) = buffer.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        let headers = String::from_utf8_lossy(&buffer[..split]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if buffer.len() >= split + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&buffer).into_owned()
+    }
+
+    fn write_http(stream: &mut TcpStream, body: &str) {
+        let message = format!(
+            "HTTP/1.1 200 Desktop\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(message.as_bytes()).expect("response");
+        stream.flush().expect("flush");
     }
 }

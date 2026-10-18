@@ -7,14 +7,18 @@ use std::path::Path;
 
 use serde_json::{Map, Value};
 use solstone_core_brain::{
-    StoredCredentialBinding, attach_credential_binding, classify_stored_binding,
-    endpoint_credential_binding_hmac, generate_fingerprint_key, load_existing_fingerprint_key,
-    managed_credential_binding_hmac,
+    FingerprintKeyMaterial, StoredCredentialBinding, attach_credential_binding,
+    classify_stored_binding, endpoint_credential_binding_hmac, generate_fingerprint_key,
+    load_existing_fingerprint_key, managed_credential_binding_hmac, read_fingerprint_key_material,
 };
 use solstone_core_generate::{ContentPart, GenerateRequest, HEALTH_BRAIN_GENERATE_CONTEXT};
-use solstone_core_journal_config_write::{JournalConfigMutation, mutate_journal_config};
+use solstone_core_journal_config::read_journal_config;
+use solstone_core_journal_config_write::{JournalConfigMutation, mutate_journal_config_checked};
 use solstone_core_journal_io::{JournalRoot, ObjectIdentity};
 use solstone_core_local::endpoint::{LocalEndpointResolution, resolve_local_endpoint};
+
+use crate::lane::resolve_lane_with;
+use crate::overrides::{configured_api_key_with, non_blank_process_env};
 
 /// Admission and retain context for one dispatch call.
 ///
@@ -22,6 +26,7 @@ use solstone_core_local::endpoint::{LocalEndpointResolution, resolve_local_endpo
 pub(crate) struct ContentGate<'a> {
     pub journal: &'a Path,
     pub admit_content: bool,
+    pub process_overrides: bool,
     pub cancellation: &'a solstone_core_generate::Cancellation<'a>,
 }
 
@@ -131,7 +136,7 @@ pub(crate) fn retain_provider_key_rejection(
     provider: &str,
     status: Option<u16>,
     body: &str,
-    credential_present: bool,
+    _credential_present: bool,
     confidential: bool,
     bundled: bool,
 ) -> bool {
@@ -140,8 +145,8 @@ pub(crate) fn retain_provider_key_rejection(
     };
     match provider {
         "openai" | "anthropic" => status == 401,
-        "google" => status == 401 || body.contains("API_KEY_INVALID"),
-        "local" => status == 401 && credential_present && !confidential && !bundled,
+        "google" => crate::google::classify_http_failure(status, body) == "provider_key_invalid",
+        "local" => status == 401 && !confidential && !bundled,
         _ => false,
     }
 }
@@ -162,25 +167,46 @@ pub(crate) fn retain_managed_rejection(
     sent_secret: &str,
     status: u16,
     body: &str,
-) {
-    if !gate.admit_content || gate.cancellation.is_cancelled() || canned_probe(request) {
-        return;
+) -> Result<(), String> {
+    if !gate.admit_content || canned_probe(request) {
+        return Ok(());
     }
     if !retain_provider_key_rejection(provider, Some(status), body, true, false, false) {
-        return;
+        return Ok(());
     }
     let Some(witness) = witness else {
-        log::warn!("provider key rejection was not retained");
-        return;
+        return retain_err("admitted journal root was not witnessed");
     };
-    let Some(key) = binding_key(gate.journal) else {
-        return;
+    if let Err(error) = revalidate_witness(witness) {
+        return retain_err(error);
+    }
+    let config = match read_journal_config(gate.journal) {
+        Ok(read) => read.config.unwrap_or_default(),
+        Err(error) => return retain_err(error.to_string()),
+    };
+    if !still_sent(
+        &config,
+        gate.process_overrides,
+        env_var,
+        provider,
+        sent_secret,
+    ) {
+        return Ok(());
+    }
+    let key = match binding_material(gate.journal, witness, gate.cancellation) {
+        Ok(key) => key,
+        Err(error) => return retain_err(error),
     };
     let hmac = managed_credential_binding_hmac(&key, provider, sent_secret);
     retain_under_lock(gate, witness, provider, &hmac, |config| {
-        file_active_provider(config) == provider
-            && config_env_value(config, env_var).as_deref() == Some(sent_secret)
-    });
+        still_sent(
+            config,
+            gate.process_overrides,
+            env_var,
+            provider,
+            sent_secret,
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -192,36 +218,133 @@ pub(crate) fn retain_endpoint_rejection(
     sent_credential: &str,
     status: u16,
     body: &str,
-) {
-    if !gate.admit_content || gate.cancellation.is_cancelled() || canned_probe(request) {
-        return;
+) -> Result<(), String> {
+    if !gate.admit_content || canned_probe(request) {
+        return Ok(());
     }
-    if !retain_provider_key_rejection("local", Some(status), body, true, false, false) {
-        return;
+    if !retain_provider_key_rejection("local", Some(status), body, false, false, false) {
+        return Ok(());
     }
     let Some(witness) = witness else {
-        log::warn!("provider key rejection was not retained");
-        return;
+        return retain_err("admitted journal root was not witnessed");
     };
-    let Some(key) = binding_key(gate.journal) else {
-        return;
+    if let Err(error) = revalidate_witness(witness) {
+        return retain_err(error);
+    }
+    let config = match read_journal_config(gate.journal) {
+        Ok(read) => read.config.unwrap_or_default(),
+        Err(error) => return retain_err(error.to_string()),
+    };
+    if resolved_provider(&config, gate.process_overrides) != "local"
+        || !endpoint_still_sent(&config, sent_base, sent_credential)
+    {
+        return Ok(());
+    }
+    let key = match binding_material(gate.journal, witness, gate.cancellation) {
+        Ok(key) => key,
+        Err(error) => return retain_err(error),
     };
     let hmac = endpoint_credential_binding_hmac(&key, sent_base, sent_credential);
     retain_under_lock(gate, witness, "local", &hmac, |config| {
-        file_active_provider(config) == "local"
+        resolved_provider(config, gate.process_overrides) == "local"
             && endpoint_still_sent(config, sent_base, sent_credential)
-    });
+    })
 }
 
-fn binding_key(journal: &Path) -> Option<[u8; 32]> {
-    if let Some(key) = load_existing_fingerprint_key(journal) {
-        return Some(key);
+fn retain_err(error: impl std::fmt::Display) -> Result<(), String> {
+    let error = error.to_string();
+    log::warn!("provider key rejection was not retained: {error}");
+    Err(error)
+}
+
+fn revalidate_witness(witness: &RootWitness) -> Result<(), String> {
+    witness
+        .root
+        .revalidate_canonical_binding()
+        .map_err(|error| error.to_string())?;
+    if witness.root.identity() != witness.identity {
+        return Err("admitted journal root changed".to_owned());
     }
-    match generate_fingerprint_key(journal) {
-        Ok(key) => Some(key),
-        Err(error) => {
-            log::warn!("provider key rejection was not retained: {error}");
-            None
+    Ok(())
+}
+
+fn checkpoint_witness(
+    witness: &RootWitness,
+    cancellation: &solstone_core_generate::Cancellation,
+) -> Result<(), String> {
+    revalidate_witness(witness)?;
+    if cancellation.is_cancelled() {
+        return Err("cancelled".to_owned());
+    }
+    Ok(())
+}
+
+fn resolved_provider(config: &Map<String, Value>, process_overrides: bool) -> String {
+    if process_overrides {
+        resolve_lane_with(config, non_blank_process_env).0
+    } else {
+        resolve_lane_with(config, |_| None).0
+    }
+}
+
+fn resolved_secret(
+    config: &Map<String, Value>,
+    env_var: &str,
+    process_overrides: bool,
+) -> Option<String> {
+    if process_overrides {
+        configured_api_key_with(config, env_var, non_blank_process_env)
+    } else {
+        configured_api_key_with(config, env_var, |_| None)
+    }
+}
+
+fn still_sent(
+    config: &Map<String, Value>,
+    process_overrides: bool,
+    env_var: &str,
+    sent_provider: &str,
+    sent_secret: &str,
+) -> bool {
+    resolved_provider(config, process_overrides) == sent_provider
+        && resolved_secret(config, env_var, process_overrides).as_deref() == Some(sent_secret)
+}
+
+fn binding_fields_present(config: &Map<String, Value>) -> bool {
+    config
+        .get("providers")
+        .and_then(Value::as_object)
+        .and_then(|providers| providers.get("key_validation"))
+        .and_then(Value::as_object)
+        .is_some_and(|entries| {
+            entries.values().any(|entry| {
+                entry.as_object().is_some_and(|object| {
+                    object.contains_key("binding_version") || object.contains_key("credential_hmac")
+                })
+            })
+        })
+}
+
+fn binding_material(
+    journal: &Path,
+    witness: &RootWitness,
+    cancellation: &solstone_core_generate::Cancellation,
+) -> Result<[u8; 32], String> {
+    match read_fingerprint_key_material(journal) {
+        FingerprintKeyMaterial::Ready(key) => Ok(key),
+        FingerprintKeyMaterial::Unavailable => Err("fingerprint key is unavailable".to_owned()),
+        FingerprintKeyMaterial::Absent => {
+            let config = read_journal_config(journal)
+                .map_err(|error| error.to_string())?
+                .config
+                .unwrap_or_default();
+            if binding_fields_present(&config) {
+                return Err(
+                    "fingerprint key is absent while a credential binding exists".to_owned(),
+                );
+            }
+            checkpoint_witness(witness, cancellation)?;
+            generate_fingerprint_key(journal).map_err(|error| error.to_string())
         }
     }
 }
@@ -232,18 +355,18 @@ fn retain_under_lock(
     provider: &str,
     hmac: &str,
     accept_config: impl FnOnce(&Map<String, Value>) -> bool,
-) {
-    let retained = mutate_journal_config(gate.journal, Default::default(), |config| {
-        let accept = witness.root.revalidate_canonical_binding().is_ok()
-            && witness.root.identity() == witness.identity
-            && !gate.cancellation.is_cancelled()
-            && accept_config(config);
+) -> Result<(), String> {
+    let checkpoint = || checkpoint_witness(witness, gate.cancellation);
+    mutate_journal_config_checked(gate.journal, Default::default(), &checkpoint, |config| {
+        let accept = accept_config(config);
         let changed = accept && store_rejection(config, provider, hmac);
         JournalConfigMutation { changed, value: () }
-    });
-    if let Err(error) = retained {
+    })
+    .map(|_| ())
+    .map_err(|error| {
         log::warn!("provider key rejection was not retained: {error}");
-    }
+        error.to_string()
+    })
 }
 
 fn endpoint_still_sent(
@@ -256,7 +379,7 @@ fn endpoint_still_sent(
             !endpoint.is_confidential
                 && !endpoint.is_bundled
                 && endpoint.base_url == sent_base
-                && endpoint.credential.as_deref() == Some(sent_credential)
+                && endpoint.credential.as_deref().unwrap_or("") == sent_credential
         }
         LocalEndpointResolution::Bundled => false,
     }
@@ -306,31 +429,6 @@ fn stored_validation<'a>(config: &'a Map<String, Value>, provider: &str) -> Opti
         .and_then(|providers| providers.get("key_validation"))
         .and_then(Value::as_object)
         .and_then(|entries| entries.get(provider))
-}
-
-fn file_active_provider(config: &Map<String, Value>) -> String {
-    config
-        .get("providers")
-        .and_then(Value::as_object)
-        .and_then(|providers| providers.get("active"))
-        .and_then(Value::as_object)
-        .and_then(|active| active.get("provider"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("none")
-        .to_owned()
-}
-
-fn config_env_value(config: &Map<String, Value>, env_var: &str) -> Option<String> {
-    config
-        .get("env")
-        .and_then(Value::as_object)
-        .and_then(|env| env.get(env_var))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -418,7 +516,7 @@ mod tests {
             false,
             false
         ));
-        assert!(retain_provider_key_rejection(
+        assert!(!retain_provider_key_rejection(
             "google",
             Some(400),
             "{\"error\":\"API_KEY_INVALID\"}",
@@ -428,8 +526,40 @@ mod tests {
         ));
         assert!(retain_provider_key_rejection(
             "google",
+            Some(400),
+            "{\"error\":{\"status\":\"API_KEY_INVALID\"}}",
+            true,
+            false,
+            false
+        ));
+        assert!(retain_provider_key_rejection(
+            "google",
+            Some(400),
+            "{\"error\":{\"status\":\"INVALID_ARGUMENT\",\"details\":[{\"reason\":\"API_KEY_INVALID\"}]}}",
+            true,
+            false,
+            false
+        ));
+        assert!(!retain_provider_key_rejection(
+            "google",
             Some(403),
             "API_KEY_INVALID",
+            true,
+            false,
+            false
+        ));
+        assert!(!retain_provider_key_rejection(
+            "google",
+            Some(429),
+            "API_KEY_INVALID",
+            true,
+            false,
+            false
+        ));
+        assert!(!retain_provider_key_rejection(
+            "google",
+            Some(500),
+            "{\"error\":{\"message\":\"API_KEY_INVALID\"}}",
             true,
             false,
             false
@@ -440,7 +570,7 @@ mod tests {
     fn retain_skips_opaque_google_403_quota_network_and_5xx() {
         assert_eq!(
             crate::google::classify_http_failure(403, "{}"),
-            "provider_key_invalid"
+            "provider_response_invalid"
         );
         assert!(!retain_provider_key_rejection(
             "google",
@@ -477,7 +607,7 @@ mod tests {
         assert!(!retain_provider_key_rejection(
             "google", None, "", true, false, false
         ));
-        assert!(!retain_provider_key_rejection(
+        assert!(retain_provider_key_rejection(
             "local",
             Some(401),
             "{}",
@@ -747,6 +877,185 @@ mod tests {
         let gate = ContentGate {
             journal: &path,
             admit_content: false,
+            process_overrides: true,
+            cancellation: &cancellation,
+        };
+        let retained = retain_managed_rejection(
+            &gate,
+            Some(&witness),
+            &content_request(),
+            "openai",
+            "OPENAI_API_KEY",
+            "synthetic-key",
+            401,
+            "{}",
+        );
+        assert!(retained.is_ok());
+        let after = std::fs::read(path.join("config/journal.json")).expect("config bytes");
+        assert_eq!(after, before);
+        assert!(!String::from_utf8_lossy(&after).contains("key_validation"));
+        assert!(!path.join("health/brain-fingerprint.key").is_file());
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    fn planted_openai(name: &str) -> std::path::PathBuf {
+        let path = journal(name);
+        std::fs::create_dir_all(path.join("config")).expect("config directory");
+        std::fs::write(
+            path.join("config/journal.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "env": {"OPENAI_API_KEY": "synthetic-key"},
+                "providers": {"active": {"provider": "openai", "model": "gpt-binding"}}
+            }))
+            .expect("config bytes"),
+        )
+        .expect("config writes");
+        std::fs::write(path.join("health/brain-fingerprint.key"), [9u8; 32]).expect("ready key");
+        path
+    }
+
+    #[test]
+    fn retain_cancellation_before_publication_refuses_the_write() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let path = planted_openai("retain-cancel-publish");
+        let before = std::fs::read(path.join("config/journal.json")).expect("config");
+        let key_before = std::fs::read(path.join("health/brain-fingerprint.key")).expect("key");
+        let witness = capture_root_witness(&path).expect("root witness");
+        let calls = AtomicUsize::new(0);
+        let check = || calls.fetch_add(1, Ordering::SeqCst) >= 2;
+        let cancellation = solstone_core_generate::Cancellation::from_fn(&check);
+        let gate = ContentGate {
+            journal: &path,
+            admit_content: true,
+            process_overrides: true,
+            cancellation: &cancellation,
+        };
+        let retained = retain_managed_rejection(
+            &gate,
+            Some(&witness),
+            &content_request(),
+            "openai",
+            "OPENAI_API_KEY",
+            "synthetic-key",
+            401,
+            "{}",
+        );
+        assert!(retained.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            std::fs::read(path.join("config/journal.json")).expect("config"),
+            before
+        );
+        assert_eq!(
+            std::fs::read(path.join("health/brain-fingerprint.key")).expect("key"),
+            key_before
+        );
+        assert!(!path.join("config/actions").exists());
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn retain_cancellation_at_post_lock_refuses_before_publication() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let path = planted_openai("retain-cancel-lock");
+        let before = std::fs::read(path.join("config/journal.json")).expect("config");
+        let witness = capture_root_witness(&path).expect("root witness");
+        let calls = AtomicUsize::new(0);
+        let check = || calls.fetch_add(1, Ordering::SeqCst) >= 1;
+        let cancellation = solstone_core_generate::Cancellation::from_fn(&check);
+        let gate = ContentGate {
+            journal: &path,
+            admit_content: true,
+            process_overrides: true,
+            cancellation: &cancellation,
+        };
+        let retained = retain_managed_rejection(
+            &gate,
+            Some(&witness),
+            &content_request(),
+            "openai",
+            "OPENAI_API_KEY",
+            "synthetic-key",
+            401,
+            "{}",
+        );
+        assert!(retained.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            std::fs::read(path.join("config/journal.json")).expect("config"),
+            before
+        );
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn retain_after_admitted_root_rename_creates_nothing() {
+        let path = planted_openai("retain-rename");
+        let before = std::fs::read(path.join("config/journal.json")).expect("config");
+        let witness = capture_root_witness(&path).expect("root witness");
+        let moved = path.with_file_name(format!(
+            "{}-moved",
+            path.file_name().expect("name").to_string_lossy()
+        ));
+        std::fs::rename(&path, &moved).expect("rename admitted root");
+        let other = path.with_file_name(format!(
+            "{}-other",
+            path.file_name().expect("name").to_string_lossy()
+        ));
+        std::fs::create_dir_all(other.join("config")).expect("other config");
+        std::fs::create_dir_all(other.join("health")).expect("other health");
+        let other_config = br#"{"env":{"OPENAI_API_KEY":"other-key"}}"#;
+        let other_key = [6u8; 32];
+        std::fs::write(other.join("config/journal.json"), other_config).expect("other config");
+        std::fs::write(other.join("health/brain-fingerprint.key"), other_key).expect("other key");
+        let cancellation = solstone_core_generate::Cancellation::never();
+        let gate = ContentGate {
+            journal: &path,
+            admit_content: true,
+            process_overrides: true,
+            cancellation: &cancellation,
+        };
+        let retained = retain_managed_rejection(
+            &gate,
+            Some(&witness),
+            &content_request(),
+            "openai",
+            "OPENAI_API_KEY",
+            "synthetic-key",
+            401,
+            "{}",
+        );
+        assert!(retained.is_err());
+        assert!(!path.exists());
+        assert!(!path.join("health/brain-fingerprint.key").exists());
+        assert!(!path.join("config/journal.json").exists());
+        assert!(!path.join("config/journal.json.lock").exists());
+        assert!(!path.join("config/actions").exists());
+        assert_eq!(
+            std::fs::read(moved.join("config/journal.json")).expect("moved config"),
+            before
+        );
+        assert_eq!(
+            std::fs::read(other.join("config/journal.json")).expect("other config"),
+            other_config
+        );
+        assert_eq!(
+            std::fs::read(other.join("health/brain-fingerprint.key")).expect("other key"),
+            other_key
+        );
+        let _ = std::fs::remove_dir_all(&moved);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn config_only_retain_binds_the_config_secret() {
+        let path = planted_openai("config-only");
+        let witness = capture_root_witness(&path).expect("root witness");
+        let cancellation = solstone_core_generate::Cancellation::never();
+        let gate = ContentGate {
+            journal: &path,
+            admit_content: true,
+            process_overrides: false,
             cancellation: &cancellation,
         };
         retain_managed_rejection(
@@ -758,11 +1067,126 @@ mod tests {
             "synthetic-key",
             401,
             "{}",
+        )
+        .expect("config secret is retained");
+        let config = std::fs::read_to_string(path.join("config/journal.json")).expect("config");
+        let stored: serde_json::Value = serde_json::from_str(&config).expect("json");
+        let hmac = stored["providers"]["key_validation"]["openai"]["credential_hmac"]
+            .as_str()
+            .expect("hmac")
+            .to_owned();
+        assert_eq!(
+            hmac,
+            managed_credential_binding_hmac(&[9u8; 32], "openai", "synthetic-key")
         );
-        let after = std::fs::read(path.join("config/journal.json")).expect("config bytes");
-        assert_eq!(after, before);
-        assert!(!String::from_utf8_lossy(&after).contains("key_validation"));
-        assert!(!path.join("health/brain-fingerprint.key").is_file());
+        let before = std::fs::read(path.join("config/journal.json")).expect("config bytes");
+        retain_managed_rejection(
+            &gate,
+            Some(&witness),
+            &content_request(),
+            "openai",
+            "OPENAI_API_KEY",
+            "other-secret",
+            401,
+            "{}",
+        )
+        .expect("a different sent secret writes nothing");
+        assert_eq!(
+            std::fs::read(path.join("config/journal.json")).expect("config bytes"),
+            before
+        );
+        let reread =
+            std::fs::read_to_string(path.join("config/journal.json")).expect("config text");
+        assert!(!reread.contains("other-secret"));
+        assert!(reread.contains(&hmac));
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn retain_absent_key_with_existing_binding_returns_err() {
+        let path = journal("retain-absent-binding");
+        std::fs::create_dir_all(path.join("config")).expect("config");
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "env": {"OPENAI_API_KEY": "synthetic-key"},
+            "providers": {
+                "active": {"provider": "openai", "model": "gpt-binding"},
+                "key_validation": {
+                    "openai": {
+                        "valid": false,
+                        "reason_code": "provider_key_invalid",
+                        "credential_hmac": "abcd"
+                    }
+                }
+            }
+        }))
+        .expect("config bytes");
+        std::fs::write(path.join("config/journal.json"), &bytes).expect("config");
+        let key_path = path.join("health/brain-fingerprint.key");
+        assert!(!key_path.exists());
+        let witness = capture_root_witness(&path).expect("root witness");
+        let cancellation = solstone_core_generate::Cancellation::never();
+        let gate = ContentGate {
+            journal: &path,
+            admit_content: true,
+            process_overrides: false,
+            cancellation: &cancellation,
+        };
+        let retained = retain_managed_rejection(
+            &gate,
+            Some(&witness),
+            &content_request(),
+            "openai",
+            "OPENAI_API_KEY",
+            "synthetic-key",
+            401,
+            "{}",
+        );
+        assert!(retained.is_err());
+        assert!(!key_path.exists());
+        assert_eq!(
+            std::fs::read(path.join("config/journal.json")).expect("config"),
+            bytes
+        );
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn retain_wrong_length_key_returns_err_and_preserves_the_file() {
+        let path = journal("retain-short-key");
+        std::fs::create_dir_all(path.join("config")).expect("config");
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "env": {"OPENAI_API_KEY": "synthetic-key"},
+            "providers": {"active": {"provider": "openai", "model": "gpt-binding"}}
+        }))
+        .expect("config bytes");
+        std::fs::write(path.join("config/journal.json"), &bytes).expect("config");
+        let key_path = path.join("health/brain-fingerprint.key");
+        let original = b"not-32-bytes".to_vec();
+        std::fs::write(&key_path, &original).expect("short key");
+        let witness = capture_root_witness(&path).expect("root witness");
+        let cancellation = solstone_core_generate::Cancellation::never();
+        let gate = ContentGate {
+            journal: &path,
+            admit_content: true,
+            process_overrides: false,
+            cancellation: &cancellation,
+        };
+        let retained = retain_managed_rejection(
+            &gate,
+            Some(&witness),
+            &content_request(),
+            "openai",
+            "OPENAI_API_KEY",
+            "synthetic-key",
+            401,
+            "{}",
+        );
+        assert!(retained.is_err());
+        assert_eq!(std::fs::read(&key_path).expect("key bytes"), original);
+        assert_eq!(
+            std::fs::read(path.join("config/journal.json")).expect("config"),
+            bytes
+        );
         let _ = std::fs::remove_dir_all(path);
     }
 }
@@ -1327,12 +1751,76 @@ mod loopback {
                 &cancellation,
             )
         });
-        let (mut stream, body) =
-            accept_request(&endpoint_listener, Duration::from_secs(5)).expect("config post");
-        assert!(body.contains(CANARY));
-        write_http(&mut stream, 200, "{}");
-        let _ = posted.join().expect("config respond");
+        assert!(
+            accept_request(&endpoint_listener, Duration::from_secs(2)).is_none(),
+            "bound arbitrary content does not post"
+        );
+        let blocked = posted.join().expect("config respond");
+        assert_eq!(reason_code(blocked), "provider_key_invalid");
         let _ = std::fs::remove_dir_all(cleanup);
+
+        let fresh = journal_dir("config-content");
+        let fresh_endpoint = endpoint.clone();
+        let unbound = json!({
+            "providers": {
+                "active": {"provider": "local", "model": "served-model"},
+                "local": {
+                    "endpoint_url": fresh_endpoint,
+                    "served_model_id": "served-model",
+                    "credential": "endpoint-secret"
+                }
+            }
+        });
+        let unbound = unbound.as_object().expect("config").clone();
+        let runtime = crate::EndpointRuntime::default();
+        let cancellation = Cancellation::never();
+        let fresh_journal = fresh.clone();
+        let first = std::thread::spawn(move || {
+            crate::respond_with_config(
+                &content_request(),
+                &runtime,
+                &fresh_journal,
+                &unbound,
+                |_| None,
+                &cancellation,
+            )
+        });
+        let (mut stream, body) =
+            accept_request(&endpoint_listener, Duration::from_secs(5)).expect("unbound post");
+        assert!(body.contains(CANARY));
+        write_http(&mut stream, 401, "{}");
+        let refused = first.join().expect("first config respond");
+        assert_eq!(reason_code(refused), "provider_key_invalid");
+        assert!(binding_present(&fresh));
+        let stored: Value = serde_json::from_str(&config_text(&fresh)).expect("stored config");
+        let key = solstone_core_brain::load_existing_fingerprint_key(&fresh).expect("key");
+        let expected = solstone_core_brain::endpoint_credential_binding_hmac(
+            &key,
+            &endpoint,
+            "endpoint-secret",
+        );
+        assert_eq!(
+            stored["providers"]["key_validation"]["local"]["credential_hmac"],
+            expected
+        );
+        let unbound = stored.as_object().expect("object").clone();
+        let runtime = crate::EndpointRuntime::default();
+        let cancellation = Cancellation::never();
+        let fresh_journal = fresh.clone();
+        let second = std::thread::spawn(move || {
+            crate::respond_with_config(
+                &content_request(),
+                &runtime,
+                &fresh_journal,
+                &unbound,
+                |_| None,
+                &cancellation,
+            )
+        });
+        assert!(accept_request(&endpoint_listener, Duration::from_secs(2)).is_none());
+        let again = second.join().expect("second config respond");
+        assert_eq!(reason_code(again), "provider_key_invalid");
+        let _ = std::fs::remove_dir_all(fresh);
     }
 
     #[test]
@@ -1601,5 +2089,514 @@ mod loopback {
         assert_eq!(receipt["reason"], "provider_key_invalid");
         assert_eq!(receipt["bound"], true);
         let _ = std::fs::remove_dir_all(journal);
+    }
+
+    #[test]
+    fn loopback_google_opaque_403_does_not_bind_and_structured_400_does() {
+        const CASE: &str = "loopback_google_opaque_403_does_not_bind_and_structured_400_does";
+        if is_child(CASE) {
+            let journal = child_journal();
+            let mut reasons = Vec::new();
+            for _ in 0..3 {
+                reasons.push(respond_content());
+            }
+            emit(&json!({"reasons": reasons, "bound": binding_present(&journal)}));
+            return;
+        }
+        let journal = journal_dir("google-class");
+        write_config(
+            &journal,
+            &managed_config("google", "GOOGLE_API_KEY", Some(SECRET), "gemini-binding"),
+        );
+        let (listener, port) = bind_listener();
+        let (name, base) = base_env(port);
+        let child = spawn_child(CASE, &journal, &[(&name, &base)]);
+        let (mut stream, body) =
+            accept_request(&listener, Duration::from_secs(5)).expect("opaque 403");
+        assert!(body.contains(CANARY));
+        write_http(&mut stream, 403, "{}");
+        let (mut stream, body) =
+            accept_request(&listener, Duration::from_secs(5)).expect("structured 400");
+        assert!(body.contains(CANARY));
+        write_http(
+            &mut stream,
+            400,
+            r#"{"error":{"status":"INVALID_ARGUMENT","details":[{"reason":"API_KEY_INVALID"}]}}"#,
+        );
+        assert!(accept_request(&listener, Duration::from_secs(2)).is_none());
+        let receipt = finish_child(child);
+        assert_eq!(receipt["reasons"][0], "provider_response_invalid");
+        assert_eq!(receipt["reasons"][1], "provider_key_invalid");
+        assert_eq!(receipt["reasons"][2], "provider_key_invalid");
+        assert_eq!(receipt["bound"], true);
+        let stored = config_text(&journal);
+        assert!(stored.contains("provider_key_invalid"));
+        assert!(!stored.contains("API_KEY_INVALID"));
+        let _ = std::fs::remove_dir_all(journal);
+    }
+
+    #[test]
+    fn loopback_override_secret_is_retained_and_blocks_the_same_override() {
+        const CASE: &str = "loopback_override_secret_is_retained_and_blocks_the_same_override";
+        const OVERRIDE: &str = "sk-binding-override";
+        if is_child(CASE) {
+            let journal = child_journal();
+            emit(&json!({"reason": respond_content(), "bound": binding_present(&journal)}));
+            return;
+        }
+        let journal = journal_dir("override-secret");
+        write_config(
+            &journal,
+            &managed_config("openai", "OPENAI_API_KEY", Some(SECRET), "gpt-binding"),
+        );
+        let (listener, port) = bind_listener();
+        let (name, base) = base_env(port);
+        let key_name = crate::overrides::API_KEY_OVERRIDE_ENV.to_owned();
+        let first = spawn_child(CASE, &journal, &[(&name, &base), (&key_name, OVERRIDE)]);
+        let (mut stream, body) =
+            accept_request(&listener, Duration::from_secs(5)).expect("override post");
+        assert!(body.contains(CANARY));
+        assert!(!body.contains(OVERRIDE));
+        assert!(!body.contains(SECRET));
+        write_http(&mut stream, 401, "{}");
+        let receipt = finish_child(first);
+        assert_eq!(receipt["reason"], "provider_key_invalid");
+        assert_eq!(receipt["bound"], true);
+        let key = solstone_core_brain::load_existing_fingerprint_key(&journal).expect("key");
+        let stored: Value = serde_json::from_str(&config_text(&journal)).expect("config");
+        assert_eq!(stored["env"]["OPENAI_API_KEY"], SECRET);
+        assert_eq!(
+            stored["providers"]["key_validation"]["openai"]["credential_hmac"],
+            solstone_core_brain::managed_credential_binding_hmac(&key, "openai", OVERRIDE)
+        );
+        assert_ne!(
+            stored["providers"]["key_validation"]["openai"]["credential_hmac"],
+            solstone_core_brain::managed_credential_binding_hmac(&key, "openai", SECRET)
+        );
+        let blocked = spawn_child(CASE, &journal, &[(&name, &base), (&key_name, OVERRIDE)]);
+        assert!(accept_request(&listener, Duration::from_secs(2)).is_none());
+        let blocked = finish_child(blocked);
+        assert_eq!(blocked["reason"], "provider_key_invalid");
+        let config_call = spawn_child(CASE, &journal, &[(&name, &base)]);
+        let (mut stream, body) =
+            accept_request(&listener, Duration::from_secs(5)).expect("config key still posts");
+        assert!(body.contains(CANARY));
+        write_http(
+            &mut stream,
+            200,
+            r#"{"model":"gpt-binding","status":"completed","output":[{"content":[{"type":"output_text","text":"OK"}]}]}"#,
+        );
+        let posted = finish_child(config_call);
+        assert_eq!(posted["reason"], "generated");
+        let after: Value = serde_json::from_str(&config_text(&journal)).expect("config");
+        assert_eq!(after["env"]["OPENAI_API_KEY"], SECRET);
+        assert_eq!(
+            after["providers"]["key_validation"]["openai"]["credential_hmac"],
+            stored["providers"]["key_validation"]["openai"]["credential_hmac"]
+        );
+        let _ = std::fs::remove_dir_all(journal);
+    }
+
+    #[test]
+    fn loopback_context_endpoint_binds_config_credential_not_override() {
+        const CASE: &str = "loopback_context_endpoint_binds_config_credential_not_override";
+        const OTHER: &str = "sk-binding-other";
+        if is_child(CASE) {
+            emit(&json!({"reason": respond_context()}));
+            return;
+        }
+        let (listener, port) = bind_listener();
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let journal = journal_dir("context-endpoint");
+        write_config(
+            &journal,
+            &json!({
+                "providers": {
+                    "active": {"provider": "local", "model": "served-model"},
+                    "local": {
+                        "endpoint_url": endpoint,
+                        "served_model_id": "served-model",
+                        "credential": SECRET
+                    }
+                }
+            }),
+        );
+        let key_name = crate::overrides::API_KEY_OVERRIDE_ENV.to_owned();
+        let base_name = crate::overrides::BASE_URL_OVERRIDE_ENV.to_owned();
+        let child = spawn_child(
+            CASE,
+            &journal,
+            &[(&key_name, OTHER), (&base_name, "http://127.0.0.1:1")],
+        );
+        let (mut stream, body) =
+            accept_request(&listener, Duration::from_secs(5)).expect("config endpoint post");
+        assert!(body.contains(CANARY));
+        assert!(!body.contains(OTHER));
+        write_http(&mut stream, 401, "{}");
+        let receipt = finish_child(child);
+        assert_eq!(receipt["reason"], "provider_key_invalid");
+        let key = solstone_core_brain::load_existing_fingerprint_key(&journal).expect("key");
+        let stored: Value = serde_json::from_str(&config_text(&journal)).expect("config");
+        assert_eq!(
+            stored["providers"]["key_validation"]["local"]["credential_hmac"],
+            solstone_core_brain::endpoint_credential_binding_hmac(&key, &endpoint, SECRET)
+        );
+        assert_ne!(
+            stored["providers"]["key_validation"]["local"]["credential_hmac"],
+            solstone_core_brain::endpoint_credential_binding_hmac(&key, &endpoint, OTHER)
+        );
+        assert!(!config_text(&journal).contains(OTHER));
+        let blocked = spawn_child(
+            CASE,
+            &journal,
+            &[(&key_name, OTHER), (&base_name, "http://127.0.0.1:1")],
+        );
+        assert!(accept_request(&listener, Duration::from_secs(2)).is_none());
+        let blocked = finish_child(blocked);
+        assert_eq!(blocked["reason"], "provider_key_invalid");
+        let _ = std::fs::remove_dir_all(journal);
+    }
+
+    #[test]
+    fn loopback_keyless_custom_401_blocks_the_second_post() {
+        let (listener, port) = bind_listener();
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let journal = journal_dir("keyless-401");
+        write_config(
+            &journal,
+            &json!({
+                "providers": {
+                    "active": {"provider": "local", "model": "served-model"},
+                    "local": {
+                        "endpoint_url": endpoint,
+                        "served_model_id": "served-model"
+                    }
+                }
+            }),
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+        let statuses = Arc::new(Mutex::new(std::collections::VecDeque::<u16>::new()));
+        let stop_thread = stop.clone();
+        let bodies_thread = bodies.clone();
+        let statuses_thread = statuses.clone();
+        let server = std::thread::spawn(move || {
+            while !stop_thread.load(Ordering::Relaxed) {
+                if let Some((mut stream, body)) =
+                    accept_request(&listener, Duration::from_millis(50))
+                {
+                    bodies_thread.lock().expect("bodies").push(body);
+                    let status = statuses_thread
+                        .lock()
+                        .expect("statuses")
+                        .pop_front()
+                        .unwrap_or(200);
+                    write_http(&mut stream, status, "{}");
+                }
+            }
+        });
+        let runtime = crate::EndpointRuntime::default();
+        let cancellation = Cancellation::never();
+        statuses.lock().expect("statuses").push_back(200);
+        let posted = crate::respond(
+            &content_request(),
+            &runtime,
+            &journal,
+            |_| None,
+            &cancellation,
+        )
+        .expect("keyless 200");
+        let posted_reason = reason_code(Ok(posted));
+        assert_ne!(posted_reason, "provider_key_invalid");
+        assert_ne!(posted_reason, "provider_key_missing");
+        assert!(!binding_present(&journal));
+        assert_eq!(bodies.lock().expect("bodies").len(), 1);
+        statuses.lock().expect("statuses").push_back(401);
+        let refused = crate::respond(
+            &content_request(),
+            &runtime,
+            &journal,
+            |_| None,
+            &cancellation,
+        )
+        .expect("keyless 401");
+        assert_eq!(reason_code(Ok(refused)), "provider_key_missing");
+        assert!(binding_present(&journal));
+        let stored: Value = serde_json::from_str(&config_text(&journal)).expect("config");
+        assert_eq!(
+            stored["providers"]["key_validation"]["local"]["reason_code"],
+            "provider_key_invalid"
+        );
+        let key = solstone_core_brain::load_existing_fingerprint_key(&journal).expect("key");
+        assert_eq!(
+            stored["providers"]["key_validation"]["local"]["credential_hmac"],
+            solstone_core_brain::endpoint_credential_binding_hmac(&key, &endpoint, "")
+        );
+        let blocked = crate::respond(
+            &content_request(),
+            &runtime,
+            &journal,
+            |_| None,
+            &cancellation,
+        )
+        .expect("bound keyless");
+        assert_eq!(reason_code(Ok(blocked)), "provider_key_invalid");
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(bodies.lock().expect("bodies").len(), 2);
+        let mut config = stored;
+        config["providers"]["local"]["credential"] = json!("later-secret");
+        write_config(&journal, &config);
+        statuses.lock().expect("statuses").push_back(200);
+        let changed = crate::respond(
+            &content_request(),
+            &runtime,
+            &journal,
+            |_| None,
+            &cancellation,
+        )
+        .expect("changed credential");
+        assert_ne!(reason_code(Ok(changed)), "provider_key_invalid");
+        assert_eq!(bodies.lock().expect("bodies").len(), 3);
+        assert!(bodies.lock().expect("bodies")[2].contains(CANARY));
+        stop.store(true, Ordering::Relaxed);
+        let _ = server.join();
+        let _ = std::fs::remove_dir_all(journal);
+    }
+
+    #[test]
+    fn loopback_oneshot_child_override_posts_canned_and_content_posts_nothing() {
+        const CASE: &str = "loopback_oneshot_child_override_posts_canned_and_content_posts_nothing";
+        const OVERRIDE: &str = "sk-binding-override";
+        if is_child(CASE) {
+            let journal = child_journal();
+            let content = respond_content();
+            let canned = respond_canned();
+            emit(&json!({
+                "content": content,
+                "canned": canned,
+                "bound": binding_present(&journal)
+            }));
+            return;
+        }
+        let journal = journal_dir("oneshot-override");
+        let rejection = plant_managed_rejection(&journal, "openai", OVERRIDE);
+        let mut config = managed_config("openai", "OPENAI_API_KEY", Some(SECRET), "gpt-binding");
+        config["providers"]["key_validation"] = json!({"openai": rejection});
+        write_config(&journal, &config);
+        let before = config_text(&journal);
+        let (listener, port) = bind_listener();
+        let (name, base) = base_env(port);
+        let key_name = crate::overrides::API_KEY_OVERRIDE_ENV.to_owned();
+        let child = spawn_child(CASE, &journal, &[(&name, &base), (&key_name, OVERRIDE)]);
+        let (mut stream, body) =
+            accept_request(&listener, Duration::from_secs(5)).expect("canned override post");
+        assert!(body.contains(CANNED_TEXT));
+        assert!(!body.contains(CANARY));
+        write_http(&mut stream, 200, "{}");
+        assert!(accept_request(&listener, Duration::from_secs(1)).is_none());
+        let receipt = finish_child(child);
+        assert_eq!(receipt["content"], "provider_key_invalid");
+        assert_ne!(receipt["canned"], "provider_key_invalid");
+        assert_eq!(config_text(&journal), before);
+        let _ = std::fs::remove_dir_all(journal);
+    }
+
+    #[test]
+    fn loopback_embedded_respond_with_config_posts_canned_and_content_posts_nothing() {
+        let (listener, port) = bind_listener();
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let journal = journal_dir("embedded-config");
+        let key = solstone_core_brain::generate_fingerprint_key(&journal).expect("key");
+        let hmac = solstone_core_brain::endpoint_credential_binding_hmac(&key, &endpoint, SECRET);
+        let config = json!({
+            "env": {"ANTHROPIC_API_KEY": "anthropic-stored-key"},
+            "providers": {
+                "active": {"provider": "local", "model": "served-model"},
+                "local": {
+                    "endpoint_url": endpoint,
+                    "served_model_id": "served-model",
+                    "credential": SECRET
+                },
+                "key_validation": {
+                    "local": {
+                        "valid": false,
+                        "reason_code": "provider_key_invalid",
+                        "binding_version": 1,
+                        "credential_hmac": hmac
+                    },
+                    "anthropic": {
+                        "valid": false,
+                        "reason_code": "provider_key_invalid",
+                        "binding_version": 1,
+                        "credential_hmac": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    }
+                }
+            }
+        });
+        write_config(&journal, &config);
+        let config_before = std::fs::read(journal.join("config/journal.json")).expect("config");
+        let active_before = config["providers"]["active"].clone();
+        let other_before = config["providers"]["key_validation"]["anthropic"].clone();
+        let config = config.as_object().expect("config").clone();
+        let runtime = crate::EndpointRuntime::default();
+        let cancellation = Cancellation::never();
+        let journal_for_content = journal.clone();
+        let content_config = config.clone();
+        let content = std::thread::spawn(move || {
+            crate::respond_with_config(
+                &content_request(),
+                &runtime,
+                &journal_for_content,
+                &content_config,
+                |_| None,
+                &cancellation,
+            )
+        });
+        assert!(accept_request(&listener, Duration::from_secs(2)).is_none());
+        assert_eq!(
+            reason_code(content.join().expect("content")),
+            "provider_key_invalid"
+        );
+        let runtime = crate::EndpointRuntime::default();
+        let cancellation = Cancellation::never();
+        let journal_for_canned = journal.clone();
+        let canned = std::thread::spawn(move || {
+            crate::respond_with_config(
+                &canned_request(),
+                &runtime,
+                &journal_for_canned,
+                &config,
+                |_| None,
+                &cancellation,
+            )
+        });
+        let (mut stream, body) =
+            accept_request(&listener, Duration::from_secs(5)).expect("canned config post");
+        assert!(body.contains(CANNED_TEXT));
+        assert!(!body.contains(CANARY));
+        write_http(&mut stream, 200, "{}");
+        assert_ne!(
+            reason_code(canned.join().expect("canned")),
+            "provider_key_invalid"
+        );
+        let stored = std::fs::read(journal.join("config/journal.json")).expect("config");
+        assert_eq!(stored, config_before);
+        let parsed: Value = serde_json::from_slice(&stored).expect("config json");
+        assert_eq!(parsed["providers"]["active"], active_before);
+        assert_eq!(
+            parsed["providers"]["key_validation"]["anthropic"],
+            other_before
+        );
+        assert_eq!(parsed["env"]["ANTHROPIC_API_KEY"], "anthropic-stored-key");
+        let _ = std::fs::remove_dir_all(journal);
+    }
+
+    #[test]
+    fn loopback_interrupted_retain_is_not_durable_in_a_later_process() {
+        const CASE: &str = "loopback_interrupted_retain_is_not_durable_in_a_later_process";
+        if is_child(CASE) {
+            let journal = child_journal();
+            emit(&json!({"reason": respond_content(), "bound": binding_present(&journal)}));
+            return;
+        }
+        let journal = journal_dir("interrupted");
+        write_config(
+            &journal,
+            &managed_config("openai", "OPENAI_API_KEY", Some(SECRET), "gpt-binding"),
+        );
+        std::fs::create_dir_all(journal.join("health")).expect("health");
+        std::fs::write(journal.join("health/brain-fingerprint.key"), [9u8; 32]).expect("key");
+        let before = std::fs::read(journal.join("config/journal.json")).expect("config");
+        let witness = super::capture_root_witness(&journal).expect("witness");
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let check = || calls.fetch_add(1, Ordering::SeqCst) >= 2;
+        let cancellation = Cancellation::from_fn(&check);
+        let gate = super::ContentGate {
+            journal: &journal,
+            admit_content: true,
+            process_overrides: true,
+            cancellation: &cancellation,
+        };
+        let retained = super::retain_managed_rejection(
+            &gate,
+            Some(&witness),
+            &content_request(),
+            "openai",
+            "OPENAI_API_KEY",
+            SECRET,
+            401,
+            "{}",
+        );
+        assert!(retained.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            std::fs::read(journal.join("config/journal.json")).expect("config"),
+            before
+        );
+        assert!(!binding_present(&journal));
+        let (listener, port) = bind_listener();
+        let (name, base) = base_env(port);
+        let child = spawn_child(CASE, &journal, &[(&name, &base)]);
+        let (mut stream, body) =
+            accept_request(&listener, Duration::from_secs(5)).expect("later process posts");
+        assert!(body.contains(CANARY));
+        write_http(
+            &mut stream,
+            200,
+            r#"{"model":"gpt-binding","status":"completed","output":[{"content":[{"type":"output_text","text":"OK"}]}]}"#,
+        );
+        let receipt = finish_child(child);
+        assert_eq!(receipt["reason"], "generated");
+        let _ = std::fs::remove_dir_all(journal);
+    }
+
+    #[test]
+    fn loopback_renamed_root_retain_creates_nothing_at_the_old_path() {
+        let journal = journal_dir("rename-retain");
+        write_config(
+            &journal,
+            &managed_config("openai", "OPENAI_API_KEY", Some(SECRET), "gpt-binding"),
+        );
+        let before = std::fs::read(journal.join("config/journal.json")).expect("config");
+        let witness = super::capture_root_witness(&journal).expect("witness");
+        let moved = journal.with_extension("moved");
+        std::fs::rename(&journal, &moved).expect("rename");
+        let other = journal.with_extension("other");
+        std::fs::create_dir_all(other.join("config")).expect("other");
+        let other_bytes = br#"{"env":{"OPENAI_API_KEY":"other-key"}}"#;
+        std::fs::write(other.join("config/journal.json"), other_bytes).expect("other config");
+        let cancellation = Cancellation::never();
+        let gate = super::ContentGate {
+            journal: &journal,
+            admit_content: true,
+            process_overrides: true,
+            cancellation: &cancellation,
+        };
+        let retained = super::retain_managed_rejection(
+            &gate,
+            Some(&witness),
+            &content_request(),
+            "openai",
+            "OPENAI_API_KEY",
+            SECRET,
+            401,
+            "{}",
+        );
+        assert!(retained.is_err());
+        assert!(!journal.exists());
+        assert!(!journal.join("config/journal.json").exists());
+        assert!(!journal.join("config/journal.json.lock").exists());
+        assert!(!journal.join("health/brain-fingerprint.key").exists());
+        assert!(!journal.join("config/actions").exists());
+        assert_eq!(
+            std::fs::read(moved.join("config/journal.json")).expect("moved"),
+            before
+        );
+        assert_eq!(
+            std::fs::read(other.join("config/journal.json")).expect("other"),
+            other_bytes
+        );
+        let _ = std::fs::remove_dir_all(&moved);
+        let _ = std::fs::remove_dir_all(&other);
     }
 }

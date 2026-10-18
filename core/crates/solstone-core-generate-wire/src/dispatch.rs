@@ -48,8 +48,9 @@ pub fn respond(
 }
 
 /// Run the same dispatch against an explicit owner-selected configuration.
-/// Candidate credential/model probes use this without mutating journal or
-/// process configuration. The caller owns admission of the configuration.
+/// Process overrides are ignored. Arbitrary content is admitted and retained
+/// for the caller-supplied configuration. The existing exact canned probe is
+/// the only exemption.
 ///
 /// # Errors
 /// Returns response encoding or local-runtime errors; provider refusals stay typed.
@@ -68,7 +69,7 @@ pub fn respond_with_config(
         config,
         acquire_local_inference_authority,
         false,
-        false,
+        true,
         &GenerateCallContext {
             priority: solstone_core_journal_config::work_priority::WorkPriority::from_environment(
             )?,
@@ -122,6 +123,7 @@ fn respond_config(
     let gate = crate::credential_binding::ContentGate {
         journal,
         admit_content,
+        process_overrides,
         cancellation,
     };
     let request_id = request.id.clone();

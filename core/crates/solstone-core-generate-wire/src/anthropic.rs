@@ -206,7 +206,7 @@ fn anthropic_generate_with_lookup<T: AnthropicTransport>(
     };
     if !(200..300).contains(&response.status) {
         if let Some(gate) = gate {
-            crate::credential_binding::retain_managed_rejection(
+            let _ = crate::credential_binding::retain_managed_rejection(
                 gate,
                 witness.as_ref(),
                 request,

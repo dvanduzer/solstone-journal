@@ -243,7 +243,7 @@ fn google_generate_with_lookup<T: GoogleTransport>(
     };
     if !(200..300).contains(&response.status) {
         if let Some(gate) = gate {
-            crate::credential_binding::retain_managed_rejection(
+            let _ = crate::credential_binding::retain_managed_rejection(
                 gate,
                 witness.as_ref(),
                 request,
@@ -447,8 +447,8 @@ fn normalize_finish_reason(candidate: &Value) -> String {
 
 pub(crate) fn classify_http_failure(status: u16, body: &str) -> &'static str {
     match status {
-        401 | 403 => "provider_key_invalid",
-        400 if body.contains("API_KEY_INVALID") => "provider_key_invalid",
+        401 => "provider_key_invalid",
+        400 if google_api_key_invalid(body) => "provider_key_invalid",
         404 => "model_not_found",
         429 => "provider_quota_exceeded",
         400 if is_context_window_error(body) => "context_window_exceeded",
@@ -458,6 +458,28 @@ pub(crate) fn classify_http_failure(status: u16, body: &str) -> &'static str {
         // Other HTTP status classes do not establish a valid provider response.
         _ => "provider_response_invalid",
     }
+}
+
+/// Structured Gemini key rejection. Field equality only: a substring in a
+/// message, a 403, a 429, or a 5xx body is not this signal.
+fn google_api_key_invalid(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    let Some(error) = value.get("error").and_then(Value::as_object) else {
+        return false;
+    };
+    if error.get("status").and_then(Value::as_str) == Some("API_KEY_INVALID") {
+        return true;
+    }
+    error
+        .get("details")
+        .and_then(Value::as_array)
+        .is_some_and(|details| {
+            details.iter().any(|detail| {
+                detail.get("reason").and_then(Value::as_str) == Some("API_KEY_INVALID")
+            })
+        })
 }
 
 fn is_context_window_error(body: &str) -> bool {
@@ -1057,9 +1079,18 @@ mod tests {
                     status: 403,
                     body: "{}".into(),
                 }),
-                "provider_key_invalid",
-                true,
+                "provider_response_invalid",
+                false,
             ),
+            (
+                Ok(HttpResponse {
+                    status: 403,
+                    body: "API_KEY_INVALID".into(),
+                }),
+                "provider_response_invalid",
+                false,
+            ),
+            (Ok(api_key_invalid()), "provider_key_invalid", true),
             (
                 Ok(HttpResponse {
                     status: 429,
@@ -1673,7 +1704,7 @@ mod tests {
                     status: 403,
                     body: "{}".into(),
                 }),
-                "provider_key_invalid",
+                "provider_response_invalid",
             ),
             (
                 Ok(api_key_invalid()),

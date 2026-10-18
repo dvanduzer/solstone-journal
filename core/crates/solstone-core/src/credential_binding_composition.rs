@@ -150,8 +150,12 @@ fn bound_rejection_composition_posts_retained_bytes_after_correction() {
     );
     assert_eq!(inspection.projection.aggregate_state, "unhealthy");
     let entry = config["providers"]["key_validation"]["openai"].clone();
+    let admitted = solstone_core_journal_io::JournalRoot::open(&journal).expect("journal root");
+    let cancellation = Cancellation::never();
     solstone_core_thinking::providers::save_key(
         &journal,
+        &admitted,
+        &cancellation,
         "OPENAI_API_KEY",
         "openai",
         CORRECTED,
@@ -185,6 +189,272 @@ fn bound_rejection_composition_posts_retained_bytes_after_correction() {
     assert!(!body.contains(CORRECTED));
     write_http(&mut stream, 200, "{}");
     let _ = child.wait_with_output().expect("corrected child");
+    assert!(!journal.join("health/work-retry").exists());
+    let _ = std::fs::remove_dir_all(journal);
+}
+
+const OWNER_CASE: &str =
+    "credential_binding_composition::owner_correction_keeps_the_unprocessed_segment";
+
+#[test]
+fn owner_correction_keeps_the_unprocessed_segment() {
+    if std::env::var(MARKER).ok().as_deref() == Some(OWNER_CASE) {
+        let journal = PathBuf::from(std::env::var(JOURNAL_ENV).expect("journal"));
+        let phase = std::env::var("SOLSTONE_BINDING_PHASE").unwrap_or_default();
+        let runtime = solstone_core_generate_wire::EndpointRuntime::default();
+        let cancellation = Cancellation::never();
+        if phase == "probe" {
+            let request = GenerateRequest {
+                id: None,
+                context: "settings.cloud.validate_key".to_owned(),
+                contents: vec![ContentPart::Text {
+                    text: "Reply with the single word OK.".to_owned(),
+                }],
+                system_instruction: None,
+                temperature: 0.0,
+                max_output_tokens: 512,
+                timeout_s: Some(30.0),
+                json_output: false,
+                json_schema: None,
+                attempt_index: 0,
+                exclusive_admission: false,
+                transport_retries: Some(0),
+            };
+            let result = solstone_core_generate_wire::respond(
+                &request,
+                &runtime,
+                &journal,
+                |_| None,
+                &cancellation,
+            );
+            let valid = matches!(
+                result,
+                Ok(solstone_core_generate::GenerateResponse::Generated(_))
+            );
+            println!("{RECEIPT}{{\"valid\":{valid}}}");
+            return;
+        }
+        let source = PathBuf::from(std::env::var("SOLSTONE_BINDING_SOURCE").expect("source"));
+        let text = String::from_utf8(std::fs::read(&source).expect("source bytes")).expect("text");
+        let request = GenerateRequest {
+            id: None,
+            context: "segment.thought".to_owned(),
+            contents: vec![ContentPart::Text { text }],
+            system_instruction: None,
+            temperature: 0.2,
+            max_output_tokens: 32,
+            timeout_s: Some(30.0),
+            json_output: false,
+            json_schema: None,
+            attempt_index: 0,
+            exclusive_admission: false,
+            transport_retries: Some(0),
+        };
+        let result = solstone_core_generate_wire::respond(
+            &request,
+            &runtime,
+            &journal,
+            |_| None,
+            &cancellation,
+        );
+        let reason = match result {
+            Ok(solstone_core_generate::GenerateResponse::Refused(refusal)) => refusal
+                .reason_code
+                .as_ref()
+                .map(|code| code.as_wire().to_owned())
+                .unwrap_or_else(|| "refused".to_owned()),
+            Ok(solstone_core_generate::GenerateResponse::Generated(_)) => "generated".to_owned(),
+            Ok(solstone_core_generate::GenerateResponse::Cancelled) => "cancelled".to_owned(),
+            Err(_) => "dispatch_error".to_owned(),
+        };
+        println!("{RECEIPT}{{\"reason\":\"{reason}\"}}");
+        return;
+    }
+
+    let journal = PathBuf::from("/var/tmp").join(format!(
+        "solstone-binding-owner-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let segment = journal.join("chronicle/20260812/capture/120000_1");
+    std::fs::create_dir_all(journal.join("config")).expect("config");
+    std::fs::create_dir_all(&segment).expect("segment");
+    let source = segment.join("audio.flac");
+    std::fs::write(&source, CANARY.as_bytes()).expect("source");
+    std::fs::write(
+        journal.join("config/journal.json"),
+        serde_json::to_vec(&json!({
+            "env": {"OPENAI_API_KEY": SECRET},
+            "providers": {"active": {"provider": "openai", "model": "gpt-binding"}}
+        }))
+        .expect("config"),
+    )
+    .expect("config writes");
+    let day = journal.join("chronicle/20260812");
+    let identity = solstone_core_sense::batch::scan_unprocessed(&journal, &day, None, None, None)
+        .expect("scan");
+    assert_eq!(identity.len(), 1);
+    let identity = identity.into_iter().next().expect("segment");
+    assert_eq!(
+        std::fs::read(&identity.path).expect("source bytes"),
+        CANARY.as_bytes()
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+    let port = listener.local_addr().expect("port").port();
+    let base = format!("http://127.0.0.1:{port}");
+    let spawn = |phase: &str, extra: &[(&str, &str)]| {
+        let mut child = Command::new(std::env::current_exe().expect("test executable"));
+        child
+            .arg("--exact")
+            .arg(OWNER_CASE)
+            .arg("--nocapture")
+            .env_clear()
+            .env("PATH", "")
+            .env(MARKER, OWNER_CASE)
+            .env(JOURNAL_ENV, &journal)
+            .env("SOLSTONE_BINDING_PHASE", phase)
+            .env("SOLSTONE_BINDING_SOURCE", &source)
+            .env(
+                solstone_core_generate_wire::overrides::BASE_URL_OVERRIDE_ENV,
+                &base,
+            )
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (key, value) in extra {
+            child.env(key, value);
+        }
+        child.spawn().expect("owner child")
+    };
+    let finish = |child: std::process::Child| {
+        let output = child.wait_with_output().expect("child output");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}{stderr}");
+        let line = stdout
+            .lines()
+            .find(|line| line.starts_with(RECEIPT))
+            .expect("receipt");
+        serde_json::from_str::<serde_json::Value>(&line[RECEIPT.len()..]).expect("receipt json")
+    };
+    let same_identity = || {
+        let again = solstone_core_sense::batch::scan_unprocessed(&journal, &day, None, None, None)
+            .expect("scan");
+        assert_eq!(again, vec![identity.clone()]);
+        assert_eq!(
+            std::fs::read(&identity.path).expect("source bytes"),
+            CANARY.as_bytes()
+        );
+    };
+
+    let child = spawn("post", &[]);
+    let (mut stream, body) = accept_request(&listener);
+    assert!(body.contains(CANARY));
+    assert!(!body.contains(SECRET));
+    write_http(&mut stream, 401, "{}");
+    let receipt = finish(child);
+    assert_eq!(receipt["reason"], "provider_key_invalid");
+    let config = solstone_core_thinking::read_config(&journal).expect("config");
+    assert!(
+        config["providers"]["key_validation"]["openai"]["credential_hmac"]
+            .as_str()
+            .is_some()
+    );
+    assert!(!solstone_core_brain::brain_state_path(&journal).exists());
+    let inspection =
+        solstone_core_brain::inspect_brain_state(&journal, &config, chrono::Utc::now());
+    assert_eq!(
+        inspection.projection.reason_code.as_deref(),
+        Some("provider_key_invalid")
+    );
+    assert_eq!(inspection.projection.aggregate_state, "unhealthy");
+    assert!(inspection.projection.fingerprint_sha256.is_none());
+    same_identity();
+    assert!(!journal.join("health/work-retry").exists());
+
+    let mut edited: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(journal.join("config/journal.json")).expect("text"),
+    )
+    .expect("json");
+    let hmac = edited["providers"]["key_validation"]["openai"]["credential_hmac"].clone();
+    edited["providers"]["active"]["model"] = json!("gpt-binding-other");
+    std::fs::write(
+        journal.join("config/journal.json"),
+        serde_json::to_vec(&edited).expect("bytes"),
+    )
+    .expect("model write");
+    same_identity();
+    struct Unavailable;
+    impl solstone_core_thinking::providers::ManagedKeyValidator for Unavailable {
+        fn validate(&self, _provider: &str, _key: &str) -> Result<serde_json::Value, String> {
+            Ok(json!({"valid": false, "reason_code": "validation_unavailable"}))
+        }
+    }
+    solstone_core_thinking::providers::persist_key_validations(&journal, &Unavailable)
+        .expect("unavailable persist");
+    let kept = solstone_core_thinking::read_config(&journal).expect("config");
+    assert_eq!(
+        kept["providers"]["key_validation"]["openai"]["reason_code"],
+        "provider_key_invalid"
+    );
+    assert_eq!(
+        kept["providers"]["key_validation"]["openai"]["credential_hmac"],
+        hmac
+    );
+    same_identity();
+
+    let admitted = solstone_core_journal_io::JournalRoot::open(&journal).expect("root");
+    let cancellation = Cancellation::never();
+    let probe = spawn(
+        "probe",
+        &[(
+            solstone_core_generate_wire::overrides::API_KEY_OVERRIDE_ENV,
+            CORRECTED,
+        )],
+    );
+    let (mut stream, body) = accept_request(&listener);
+    assert!(body.contains("Reply with the single word OK."));
+    write_http(
+        &mut stream,
+        200,
+        r#"{"model":"gpt-binding","status":"completed","output":[{"content":[{"type":"output_text","text":"OK"}]}]}"#,
+    );
+    let probed = finish(probe);
+    assert_eq!(probed["valid"], true);
+    let validation = json!({"valid": probed["valid"]});
+    let entry = solstone_core_thinking::read_config(&journal).expect("config")["providers"]
+        ["key_validation"]["openai"]
+        .clone();
+    solstone_core_thinking::providers::save_key(
+        &journal,
+        &admitted,
+        &cancellation,
+        "OPENAI_API_KEY",
+        "openai",
+        CORRECTED,
+        Some(validation),
+        SECRET,
+        Some(&entry),
+    )
+    .expect("correction from the canned probe");
+    same_identity();
+
+    let child = spawn("again", &[]);
+    let (mut stream, body) = accept_request(&listener);
+    assert!(body.contains(CANARY));
+    assert!(!body.contains(CORRECTED));
+    write_http(
+        &mut stream,
+        200,
+        r#"{"model":"gpt-binding-other","status":"completed","output":[{"content":[{"type":"output_text","text":"OK"}]}]}"#,
+    );
+    let receipt = finish(child);
+    assert_eq!(receipt["reason"], "generated");
+    same_identity();
+    assert_eq!(std::fs::read(&source).expect("source"), CANARY.as_bytes());
     assert!(!journal.join("health/work-retry").exists());
     let _ = std::fs::remove_dir_all(journal);
 }

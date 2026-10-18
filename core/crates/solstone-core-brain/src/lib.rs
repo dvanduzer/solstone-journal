@@ -25,10 +25,11 @@ pub use fingerprint::{
     managed_credential_binding_hmac, strip_credential_binding,
 };
 pub use inspect::{
-    BrainInspection, BrainProjection, BundledRuntimePrerequisiteAssessment, InspectionStatus,
-    assess_bundled_runtime_prerequisite, brain_fingerprint_key_path, brain_refresh_lease_path,
-    brain_state_path, inspect_brain_state, inspect_brain_state_with_clock,
-    load_existing_fingerprint_key, probe_file_lease_held, project_brain_state,
+    BrainInspection, BrainProjection, BundledRuntimePrerequisiteAssessment, FingerprintKeyMaterial,
+    InspectionStatus, assess_bundled_runtime_prerequisite, brain_fingerprint_key_path,
+    brain_refresh_lease_path, brain_state_path, inspect_brain_state,
+    inspect_brain_state_with_clock, load_existing_fingerprint_key, probe_file_lease_held,
+    project_brain_state, read_fingerprint_key_material,
 };
 pub use presentation::{
     BrainEvidencePresentation, BrainPresentation, brain_reason_text, lane_label,

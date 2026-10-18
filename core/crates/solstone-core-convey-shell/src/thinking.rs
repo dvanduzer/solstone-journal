@@ -1355,6 +1355,13 @@ async fn save_key(Extension(journal): Extension<Arc<JournalRoot>>, body: Bytes) 
             return mutation_error(solstone_core_thinking::MutationError::Read(error));
         }
     };
+    let admitted = match solstone_core_journal_io::JournalRoot::open(&journal.0) {
+        Ok(root) => root,
+        Err(error) => {
+            log::warn!("thinking key save refused the journal root: {error}");
+            return mutation_error(solstone_core_thinking::MutationError::StaleProbe);
+        }
+    };
     let validation = (!value.is_empty()).then(|| {
         let result = validator.validate(provider, value).unwrap_or_else(
             |error| json!({"valid":false,"reason_code":"validation_unavailable","error":error}),
@@ -1368,6 +1375,8 @@ async fn save_key(Extension(journal): Extension<Arc<JournalRoot>>, body: Bytes) 
     });
     match solstone_core_thinking::providers::save_key(
         &journal.0,
+        &admitted,
+        &solstone_core_thinking::providers::Cancellation::never(),
         env_var,
         provider,
         value,
@@ -1849,14 +1858,8 @@ fn browser_validation(result: Value, identity: Value) -> Response {
             "reason_code".to_owned(),
             result.get("reason_code").cloned().unwrap_or(Value::Null),
         );
-        response.insert(
-            "message".to_owned(),
-            result
-                .get("error")
-                .cloned()
-                .unwrap_or_else(|| Value::String(String::new())),
-        );
-    } else if let Some(reason) = result.get("probe_reason_code") {
+    }
+    if let Some(reason) = result.get("probe_reason_code") {
         response.insert("probe_reason_code".to_owned(), reason.clone());
     }
     json_response(Value::Object(response))
@@ -3960,9 +3963,13 @@ mod tests {
         ));
         fs::create_dir_all(root.join("config")).unwrap();
         fs::write(root.join("config/journal.json"), b"{}").unwrap();
+        let admitted = solstone_core_journal_io::JournalRoot::open(&root).expect("journal root");
+        let cancellation = solstone_core_thinking::providers::Cancellation::never();
         let rejection = json!({"valid":false,"reason_code":"provider_key_invalid"});
         let committed = solstone_core_thinking::providers::save_key(
             &root,
+            &admitted,
+            &cancellation,
             "OPENAI_API_KEY",
             "openai",
             "key-b",
@@ -3977,6 +3984,8 @@ mod tests {
         let before = fs::read(root.join("config/journal.json")).unwrap();
         let stale = solstone_core_thinking::providers::save_key(
             &root,
+            &admitted,
+            &cancellation,
             "OPENAI_API_KEY",
             "openai",
             "key-a",
@@ -4009,6 +4018,235 @@ mod tests {
         let rejected_body = to_bytes(rejected.into_body(), usize::MAX).await.unwrap();
         let rejected_body = String::from_utf8(rejected_body.to_vec()).unwrap();
         assert!(!rejected_body.contains("\"success\":true"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(feature = "full-tests", unix, not(target_os = "android")))]
+    #[test]
+    fn http_save_keeps_the_key_that_won_the_probe() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::os::unix::fs::PermissionsExt;
+        use std::thread;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        use axum::body::Bytes;
+        use axum::extract::Extension;
+
+        const SECRET_A: &str = "alpha-save-secret";
+        const SECRET_B: &str = "beta-save-secret";
+        const BODY_CANARY: &str = "PROVIDER-BODY-CANARY";
+
+        struct SiblingGuard {
+            path: PathBuf,
+            previous: Option<Vec<u8>>,
+        }
+        impl Drop for SiblingGuard {
+            fn drop(&mut self) {
+                match &self.previous {
+                    Some(bytes) => {
+                        let _ = fs::write(&self.path, bytes);
+                    }
+                    None => {
+                        let _ = fs::remove_file(&self.path);
+                    }
+                }
+            }
+        }
+
+        let root = PathBuf::from("/var/tmp").join(format!(
+            "solstone-thinking-http-save-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("config")).expect("config");
+        fs::write(root.join("config/journal.json"), b"{}").expect("config");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback");
+        let port = listener.local_addr().expect("port").port();
+        let sibling = std::env::current_exe()
+            .expect("test executable")
+            .parent()
+            .expect("deps")
+            .join(format!("solstone-core{}", std::env::consts::EXE_SUFFIX));
+        let previous = fs::read(&sibling).ok();
+        let script = format!(
+            r#"#!/usr/bin/env python3
+import json, socket, sys
+stdin = sys.stdin.read()
+sentence = "Reply with the single word OK."
+payload = sentence.encode() if sentence in stdin else b"STDIN-LACKS-CANNED-SENTENCE"
+request = (
+    b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: %d\r\nConnection: close\r\n\r\n"
+    % len(payload)
+) + payload
+sock = socket.create_connection(("127.0.0.1", {port}), 30)
+sock.sendall(request)
+data = b""
+while True:
+    chunk = sock.recv(4096)
+    if not chunk:
+        break
+    data += chunk
+head, _, body = data.partition(b"\r\n\r\n")
+status = int(head.split()[1])
+text = body.decode()
+if status == 200:
+    out = {{
+        "schema": "solstone-generate-response-v2",
+        "outcome": "generated",
+        "text": "OK",
+        "model": "solstone-key-check",
+        "usage": {{}},
+        "finish_reason": "stop",
+    }}
+else:
+    out = {{
+        "schema": "solstone-generate-response-v2",
+        "outcome": "refused",
+        "reason": "provider-response-invalid",
+        "reason_code": "provider_key_invalid",
+        "retryable": False,
+        "blocking": True,
+        "detail": text,
+    }}
+sys.stdout.write(json.dumps(out))
+"#
+        );
+        fs::write(&sibling, script).expect("stub");
+        fs::set_permissions(&sibling, fs::Permissions::from_mode(0o755)).expect("stub mode");
+        let _guard = SiblingGuard {
+            path: sibling,
+            previous,
+        };
+
+        fn invoke(root: PathBuf, body: String) -> (StatusCode, String) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async {
+                let response = super::save_key(
+                    Extension(Arc::new(crate::JournalRoot(root))),
+                    Bytes::from(body),
+                )
+                .await;
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("body");
+                (status, String::from_utf8(bytes.to_vec()).expect("utf8"))
+            })
+        }
+        fn read_http(stream: &mut std::net::TcpStream) -> String {
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+                .expect("timeout");
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 2048];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        buffer.extend_from_slice(&chunk[..count]);
+                        if let Some(split) =
+                            buffer.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            let headers = String::from_utf8_lossy(&buffer[..split]);
+                            let length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().ok())?
+                                })
+                                .unwrap_or(0);
+                            if buffer.len() >= split + 4 + length {
+                                break;
+                            }
+                        }
+                    }
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            || error.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+            String::from_utf8_lossy(&buffer).into_owned()
+        }
+        fn write_http(stream: &mut std::net::TcpStream, status: u16, body: &str) {
+            let message = format!(
+                "HTTP/1.1 {status} Save\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(message.as_bytes()).expect("response");
+        }
+
+        let root_a = root.clone();
+        let save_a = thread::spawn(move || {
+            invoke(
+                root_a,
+                format!(r#"{{"env_var":"OPENAI_API_KEY","value":"{SECRET_A}"}}"#),
+            )
+        });
+        let (mut stream_a, request_a) = {
+            let (mut stream, _) = listener.accept().expect("save A probe");
+            let request = read_http(&mut stream);
+            (stream, request)
+        };
+        assert!(request_a.contains("Reply with the single word OK."));
+        let root_b = root.clone();
+        let save_b = thread::spawn(move || {
+            invoke(
+                root_b,
+                format!(r#"{{"env_var":"OPENAI_API_KEY","value":"{SECRET_B}"}}"#),
+            )
+        });
+        let (mut stream_b, request_b) = {
+            let (mut stream, _) = listener.accept().expect("save B probe");
+            let request = read_http(&mut stream);
+            (stream, request)
+        };
+        assert!(request_b.contains("Reply with the single word OK."));
+        write_http(&mut stream_b, 200, "OK");
+        let (status_b, body_b) = save_b.join().expect("save B");
+        assert_eq!(status_b, StatusCode::OK);
+        assert!(body_b.contains("\"success\":true"));
+        write_http(&mut stream_a, 401, BODY_CANARY);
+        let (_status_a, body_a) = save_a.join().expect("save A");
+        assert!(!body_a.contains("\"success\":true"));
+        assert!(!body_a.contains(SECRET_A));
+        assert!(!body_a.contains(BODY_CANARY));
+
+        let config = solstone_core_thinking::read_config(&root).expect("config");
+        assert_eq!(config["env"]["OPENAI_API_KEY"], SECRET_B);
+        assert!(
+            config["providers"]["key_validation"]["openai"]["credential_hmac"]
+                .as_str()
+                .is_some()
+        );
+        assert_ne!(config["env"]["OPENAI_API_KEY"], SECRET_A);
+        fn walk(path: &std::path::Path, secret: &str, canary: &str) {
+            if path.is_dir() {
+                for entry in fs::read_dir(path).expect("dir") {
+                    walk(&entry.expect("entry").path(), secret, canary);
+                }
+                return;
+            }
+            if path.file_name().and_then(|name| name.to_str()) == Some("brain-fingerprint.key") {
+                return;
+            }
+            let bytes = fs::read(path).expect("file");
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(!text.contains(secret), "{}", path.display());
+            assert!(!text.contains(canary), "{}", path.display());
+        }
+        walk(&root, SECRET_A, BODY_CANARY);
         let _ = fs::remove_dir_all(root);
     }
 }

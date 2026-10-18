@@ -363,13 +363,13 @@ pub(crate) fn endpoint_generate_internal_with_context<T: EndpointTransport>(
     };
     let secret = endpoint.credential.as_deref().unwrap_or("");
     if !(200..300).contains(&response.status) {
-        if let (Some(gate), Some(credential)) = (gate, endpoint.credential.as_deref()) {
-            crate::credential_binding::retain_endpoint_rejection(
+        if let Some(gate) = gate {
+            let _ = crate::credential_binding::retain_endpoint_rejection(
                 gate,
                 witness.as_ref(),
                 request,
                 &endpoint.base_url,
-                credential,
+                endpoint.credential.as_deref().unwrap_or(""),
                 response.status,
                 &response.body,
             );
