@@ -13,6 +13,7 @@ from tools.local_thinking_install.harness import (
     RUNTIME_TERMINAL_PHASES,
     MODEL_TOTAL_BYTES,
     PrerequisiteError,
+    RUNTIME_DOWNLOAD_BYTES,
     classify_bootstrap_response,
     classify_hardware_refusal,
     find_or_build_helper,
@@ -22,6 +23,10 @@ from tools.local_thinking_install.harness import (
     wait_until_mlx_replaced,
 )
 from tools.local_thinking_install.portal import HttpResponse, PortalProcess
+
+LINUX_VULKAN_DOWNLOAD_TOTAL = (
+    MODEL_TOTAL_BYTES + RUNTIME_DOWNLOAD_BYTES["llama-b11669-bin-ubuntu-vulkan-x64.tar.gz"]
+)
 
 
 class TestPortalShutdown(unittest.TestCase):
@@ -65,12 +70,12 @@ class TestBootstrapClassifier(unittest.TestCase):
             HttpResponse(200, {}, "", {
                 "install_state": "downloading",
                 "progress_bytes_received": 1,
-                "progress_bytes_total": MODEL_TOTAL_BYTES,
+                "progress_bytes_total": LINUX_VULKAN_DOWNLOAD_TOTAL,
             }, None),
             HttpResponse(200, {}, "", {
                 "install_state": "downloading",
-                "progress_bytes_received": MODEL_TOTAL_BYTES,
-                "progress_bytes_total": MODEL_TOTAL_BYTES,
+                "progress_bytes_received": LINUX_VULKAN_DOWNLOAD_TOTAL,
+                "progress_bytes_total": LINUX_VULKAN_DOWNLOAD_TOTAL,
             }, None),
             HttpResponse(200, {}, "", {"install_state": "installed"}, None),
             HttpResponse(200, {}, "", {"install_state": "installed"}, None),

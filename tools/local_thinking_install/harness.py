@@ -22,6 +22,16 @@ from .portal import HttpResponse, PortalProcess, PortalStartupError, find_free_p
 
 SPAWN_UNAVAILABLE_SNIPPET = "local install can't be started from this build yet"
 MODEL_TOTAL_BYTES = 2_740_937_888 + 672_423_616  # 3,413,361,504
+# Download progress also counts the pinned llama-server runtime the install
+# fetches for its platform and backend (solstone-core-assets, b11669).
+RUNTIME_DOWNLOAD_BYTES = {
+    "llama-b11669-bin-linux-cuda13-amd64-sol1.tar.gz": 592_895_506,
+    "llama-b11669-bin-linux-cuda13-arm64-sol1.tar.gz": 700_854_480,
+    "llama-b11669-bin-macos-arm64.tar.gz": 12_191_582,
+    "llama-b11669-bin-ubuntu-vulkan-arm64.tar.gz": 24_187_561,
+    "llama-b11669-bin-ubuntu-vulkan-x64.tar.gz": 30_497_889,
+}
+EXPECTED_DOWNLOAD_TOTALS = {MODEL_TOTAL_BYTES + size for size in RUNTIME_DOWNLOAD_BYTES.values()}
 # macOS has the smallest supported sockaddr_un.sun_path budget: 104 bytes
 # including its trailing NUL.
 UNIX_SOCKET_PATH_MAX_BYTES = 103
@@ -620,19 +630,20 @@ def run_post_admit_checks(
     # Validate progress samples for green fresh case
     if case_name == "fresh":
         dl_samples = [s for s in progress_samples if s["install_state"] == "downloading"
-                      and s.get("progress_bytes_total") == MODEL_TOTAL_BYTES]
+                      and s.get("progress_bytes_total") in EXPECTED_DOWNLOAD_TOTALS]
         if not dl_samples:
             return "fresh_missing_download_progress", None, None
 
-        has_model_total = any(s.get("progress_bytes_total") == MODEL_TOTAL_BYTES for s in dl_samples)
-        if not has_model_total:
+        totals = {s["progress_bytes_total"] for s in dl_samples}
+        if len(totals) != 1:
             return "fresh_missing_expected_bytes_total", None, None
+        expected_total = totals.pop()
 
         rx_values = [s["progress_bytes_received"] for s in dl_samples if s.get("progress_bytes_received") is not None]
         if not rx_values:
             return "fresh_missing_bytes_received", None, None
 
-        if any(v < 0 or v > MODEL_TOTAL_BYTES for v in rx_values):
+        if any(v < 0 or v > expected_total for v in rx_values):
             return "fresh_progress_out_of_bounds", None, None
         if any(b < a for a, b in zip(rx_values, rx_values[1:])):
             return "fresh_progress_decreased", None, None
