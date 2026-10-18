@@ -439,7 +439,7 @@ class AudioQualification(serving.Qualification):
                    client_sha256=hashlib.sha256(pathlib.Path(self.args.client).read_bytes()).hexdigest(),
                    fixture_manifest=json.loads((pathlib.Path(self.args.fixtures)/'manifest.json').read_text()))
         mark = self.owner('GET', '/init/mark')
-        if not mark['locked']: self.owner('POST', '/init/mark/lock', {})
+        if not mark['locked']: self.owner('POST', '/init/mark/lock', {'proposal_id': mark['proposal_id']})
         self.owner('POST', '/init/finalize', {})
         self.owner('POST', '/app/network/local-network/open', {})
         pair = self.owner('POST', '/app/network/pair-start', {'device_label': self.marker, 'role': ''})

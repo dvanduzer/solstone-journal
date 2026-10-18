@@ -289,7 +289,7 @@ fn run_cli_with_deps(
         runner,
         http,
         clock: &clock,
-        restic_path: None,
+        restic: None,
         rclone_path: None,
         version: env!("CARGO_PKG_VERSION"),
         journal_maintenance: &restore_hooks,
@@ -314,7 +314,7 @@ fn run_cli_with_deps(
             match resolve_operational_tools(runner, journal, append_only, executable) {
                 Ok(tools) => {
                     let backup_services = BackupServices {
-                        restic_path: Some(&tools.restic_path),
+                        restic: Some(tools.restic.invocation()),
                         rclone_path: tools.rclone_path.as_deref(),
                         ..placeholder
                     };
@@ -384,7 +384,7 @@ fn run_admitted_backup(
         Ok(capability) => match resolve_tools(&capability, runner, executable) {
             Ok(tools) => {
                 let services = BackupServices {
-                    restic_path: Some(&tools.restic_path),
+                    restic: Some(tools.restic.invocation()),
                     rclone_path: tools.rclone_path.as_deref(),
                     ..placeholder
                 };
@@ -625,7 +625,7 @@ mod composed_tests {
             runner: &runner,
             http: &http,
             clock: &clock,
-            restic_path: Some(Path::new("/fixture/bin/restic")),
+            restic: Some((Path::new("/fixture/bin/restic")).into()),
             rclone_path: None,
             version: "test",
             journal_maintenance: &hooks,
@@ -1987,7 +1987,7 @@ mod resolution_tests {
                 runner: &runner,
                 http: &UnusedHttp,
                 clock: &clock,
-                restic_path: None,
+                restic: None,
                 rclone_path: None,
                 version: env!("CARGO_PKG_VERSION"),
                 journal_maintenance: &maintenance,
@@ -2191,7 +2191,7 @@ mod resolution_tests {
                 runner: &runner,
                 http: &http,
                 clock: &clock,
-                restic_path: Some(Path::new("/fixture/bin/restic")),
+                restic: Some((Path::new("/fixture/bin/restic")).into()),
                 rclone_path: None,
                 version: "test",
                 journal_maintenance: &maintenance,
@@ -2248,7 +2248,7 @@ mod resolution_tests {
                     runner: &runner,
                     http: &http,
                     clock: &clock,
-                    restic_path: Some(Path::new("/fixture/bin/restic")),
+                    restic: Some((Path::new("/fixture/bin/restic")).into()),
                     rclone_path: None,
                     version: "test",
                     journal_maintenance: &maintenance,

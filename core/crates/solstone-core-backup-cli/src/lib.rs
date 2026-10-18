@@ -266,7 +266,7 @@ fn run_cli_with_deps(
         runner,
         http,
         clock: &clock,
-        restic_path: None,
+        restic: None,
         rclone_path: None,
         version: env!("CARGO_PKG_VERSION"),
         journal_maintenance: &maintenance,
@@ -280,7 +280,7 @@ fn run_cli_with_deps(
             match resolve_operational_tools(runner, journal, append_only, executable) {
                 Ok(tools) => {
                     let services = BackupServices {
-                        restic_path: Some(&tools.restic_path),
+                        restic: Some(tools.restic.invocation()),
                         rclone_path: tools.rclone_path.as_deref(),
                         ..placeholder
                     };
@@ -815,6 +815,10 @@ fn init_error(error: solstone_core_backup_runtime::repo::RepoError) -> CliRun {
         solstone_core_backup_runtime::repo::RepoError::Failed => {
             runtime_error("repository initialization failed.".into())
         }
+        #[cfg(target_os = "ios")]
+        solstone_core_backup_runtime::repo::RepoError::Callable(_) => runtime_error(
+            "repository initialization failed; retained operation state requires review.".into(),
+        ),
     }
 }
 
@@ -1296,7 +1300,7 @@ fn run_admitted_backup(
         Ok(capability) => match resolve_tools(&capability, runner, executable) {
             Ok(tools) => {
                 let services = BackupServices {
-                    restic_path: Some(&tools.restic_path),
+                    restic: Some(tools.restic.invocation()),
                     rclone_path: tools.rclone_path.as_deref(),
                     ..placeholder
                 };
@@ -1983,7 +1987,7 @@ mod tests {
             runner,
             http,
             clock,
-            restic_path: None,
+            restic: None,
             rclone_path: None,
             version: "test",
             journal_maintenance: maintenance,
@@ -2000,7 +2004,7 @@ mod tests {
             runner,
             http,
             clock,
-            restic_path: None,
+            restic: None,
             rclone_path: None,
             version: "test",
             journal_maintenance: maintenance,
@@ -2998,7 +3002,7 @@ mod tests {
             runner: &runner,
             http: &http,
             clock: &clock,
-            restic_path: Some(Path::new("/fixture/restic")),
+            restic: Some((Path::new("/fixture/restic")).into()),
             rclone_path: None,
             version: "test",
             journal_maintenance: &maintenance,
@@ -4660,7 +4664,7 @@ mod resolution_tests {
                 runner: &runner,
                 http: &UnusedHttp,
                 clock: &clock,
-                restic_path: None,
+                restic: None,
                 rclone_path: None,
                 version: env!("CARGO_PKG_VERSION"),
                 journal_maintenance: &maintenance,
@@ -4843,7 +4847,7 @@ mod resolution_tests {
         let runner = RecordingRunner::new();
         let tools = resolve_operational_tools(&runner, journal.path(), false, &exe)
             .expect("restore resolves its pinned restic dependency");
-        assert_eq!(tools.restic_path, expected);
+        assert_eq!(tools.restic.executable_path().unwrap(), expected.as_path());
         assert!(tools.rclone_path.is_none());
     }
 

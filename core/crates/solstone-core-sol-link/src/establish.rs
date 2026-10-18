@@ -17,12 +17,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use solstone_core_journal_io::{
-    JsonWriteOptions, LockError, LockOptions, StagedDirOptions, StagedWriteError, hold_lock,
-    publish_staged_dir, write_json,
+    JsonWriteOptions, LockError, LockOptions, StagedDirOptions, StagedWriteError,
+    hold_existing_lock, hold_lock, publish_staged_dir, write_json,
 };
 
 use crate::ca::{CaError, LocalCa, generate_ca, jid_from_spki, load_ca};
-use crate::mark::{Mark, MarkError, mark_from_jid, mark_words_from_jid};
+use crate::mark::{Mark, MarkError, MarkRenderSpec, mark_from_jid, mark_words_from_jid};
 use crate::publish_checkpoint::PublishCheckpoint;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +32,30 @@ pub struct LinkState {
     pub locked_at: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkState {
+    Locked,
+    Proposed,
+    Unavailable,
+}
+
+impl MarkState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Locked => "locked",
+            Self::Proposed => "proposed",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkSnapshot {
+    pub state: MarkState,
+    pub proposal_id: Option<String>,
+    pub render: Option<MarkRenderSpec>,
+}
+
 #[derive(Debug)]
 pub enum EstablishError {
     Lock(LockError),
@@ -39,6 +63,8 @@ pub enum EstablishError {
     Ca(CaError),
     Mark(MarkError),
     NoCandidate,
+    ProposalConflict,
+    AlreadyLocked,
     State(String),
 }
 
@@ -50,6 +76,8 @@ impl fmt::Display for EstablishError {
             Self::Ca(error) => error.fmt(formatter),
             Self::Mark(error) => error.fmt(formatter),
             Self::NoCandidate => formatter.write_str("no staged link identity candidate exists"),
+            Self::ProposalConflict => formatter.write_str("identity proposal conflict"),
+            Self::AlreadyLocked => formatter.write_str("journal id already locked"),
             Self::State(message) => write!(formatter, "invalid local link state: {message}"),
         }
     }
@@ -62,7 +90,9 @@ impl std::error::Error for EstablishError {
             Self::Publish(error) => Some(error),
             Self::Ca(error) => Some(error),
             Self::Mark(error) => Some(error),
-            Self::NoCandidate | Self::State(_) => None,
+            Self::NoCandidate | Self::ProposalConflict | Self::AlreadyLocked | Self::State(_) => {
+                None
+            }
         }
     }
 }
@@ -121,6 +151,16 @@ fn lock_in_with_interruption(
 
     let candidate = candidate_path(journal_root);
     let ca = load_candidate_for_promotion(&candidate)?;
+    promote_candidate(journal_root, &ca, interruption)
+}
+
+fn promote_candidate(
+    journal_root: &Path,
+    ca: &LocalCa,
+    interruption: &dyn PublishInterruption,
+) -> Result<LinkState, EstablishError> {
+    let bundle = bundle_path(journal_root);
+    let candidate = candidate_path(journal_root);
     let instance_id = jid_from_spki(ca.spki_der())?;
     let home_label = mark_words_from_jid(&instance_id)?;
     let state = LinkState {
@@ -128,9 +168,110 @@ fn lock_in_with_interruption(
         home_label,
         locked_at: now_ms(),
     };
-    publish_bundle(&bundle, &ca, &state, interruption)?;
+    publish_bundle(&bundle, ca, &state, interruption)?;
     discard_candidate_unlocked(&candidate);
     Ok(state)
+}
+
+pub fn read_mark_snapshot(journal_root: &Path) -> Result<MarkSnapshot, EstablishError> {
+    let lock_path = identity_lock_path(journal_root);
+    let lock = hold_existing_lock(&lock_path, LockOptions::default())?;
+    let snapshot = read_mark_snapshot_unlocked(journal_root);
+    if lock.is_some() {
+        return snapshot;
+    }
+    // A first writer may have created the authority while the unlocked read ran.
+    // Re-read under that same sidecar if it appeared; never create one for a GET.
+    let born_lock = hold_existing_lock(&lock_path, LockOptions::default())?;
+    if born_lock.is_some() {
+        read_mark_snapshot_unlocked(journal_root)
+    } else {
+        snapshot
+    }
+}
+
+/// The retained preview route may create the first proposal, under the same
+/// identity lock that guards regeneration and commit.
+pub fn ensure_mark_snapshot(journal_root: &Path) -> Result<MarkSnapshot, EstablishError> {
+    let _lock = hold_lock(identity_lock_path(journal_root), LockOptions::default())?;
+    let snapshot = read_mark_snapshot_unlocked(journal_root)?;
+    if snapshot.state != MarkState::Unavailable {
+        return Ok(snapshot);
+    }
+    generate_and_publish_candidate(&candidate_path(journal_root))?;
+    read_mark_snapshot_unlocked(journal_root)
+}
+
+fn read_mark_snapshot_unlocked(journal_root: &Path) -> Result<MarkSnapshot, EstablishError> {
+    if let Some(state) = load_committed(journal_root)? {
+        let render = mark_from_jid(&state.instance_id)?.to_render_spec();
+        return Ok(MarkSnapshot {
+            state: MarkState::Locked,
+            proposal_id: Some(state.instance_id),
+            render: Some(render),
+        });
+    }
+
+    let candidate = candidate_path(journal_root);
+    match load_candidate_for_promotion(&candidate) {
+        Ok(ca) => {
+            let instance_id = jid_from_spki(ca.spki_der())?;
+            let render = mark_from_jid(&instance_id)?.to_render_spec();
+            Ok(MarkSnapshot {
+                state: MarkState::Proposed,
+                proposal_id: Some(instance_id),
+                render: Some(render),
+            })
+        }
+        Err(EstablishError::NoCandidate) => Ok(MarkSnapshot {
+            state: MarkState::Unavailable,
+            proposal_id: None,
+            render: None,
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn commit_proposal(
+    journal_root: &Path,
+    proposal_id: &str,
+) -> Result<LinkState, EstablishError> {
+    let _lock = hold_lock(identity_lock_path(journal_root), LockOptions::default())?;
+    let bundle = bundle_path(journal_root);
+    if bundle.exists() {
+        let state = load_bundle(&bundle)?;
+        if state.instance_id == proposal_id {
+            return Ok(state);
+        } else {
+            return Err(EstablishError::ProposalConflict);
+        }
+    }
+
+    let candidate = candidate_path(journal_root);
+    let ca = match load_candidate_for_promotion(&candidate) {
+        Ok(ca) => ca,
+        Err(EstablishError::NoCandidate) => return Err(EstablishError::ProposalConflict),
+        Err(e) => return Err(e),
+    };
+    let candidate_id = jid_from_spki(ca.spki_der())?;
+    if candidate_id != proposal_id {
+        return Err(EstablishError::ProposalConflict);
+    }
+    promote_candidate(journal_root, &ca, &NoopInterruption)
+}
+
+pub fn regenerate_proposal(journal_root: &Path) -> Result<LocalCa, EstablishError> {
+    let _lock = hold_lock(identity_lock_path(journal_root), LockOptions::default())?;
+    if load_committed(journal_root)?.is_some() {
+        return Err(EstablishError::AlreadyLocked);
+    }
+    let candidate = candidate_path(journal_root);
+    match load_candidate_for_promotion(&candidate) {
+        Ok(_) | Err(EstablishError::NoCandidate) => {}
+        Err(error) => return Err(error),
+    }
+    discard_candidate_required(&candidate)?;
+    generate_and_publish_candidate(&candidate)
 }
 
 #[cfg(all(feature = "host", feature = "test-hooks"))]
@@ -212,10 +353,13 @@ pub fn candidate_mark(ca: &LocalCa) -> Result<Mark, EstablishError> {
 
 pub fn load_committed(journal_root: &Path) -> Result<Option<LinkState>, EstablishError> {
     let bundle = bundle_path(journal_root);
-    if !bundle.exists() {
-        return Ok(None);
+    match fs::symlink_metadata(&bundle) {
+        Ok(_) => load_bundle(&bundle).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(EstablishError::State(format!(
+            "identity directory: {error}"
+        ))),
     }
-    load_bundle(&bundle).map(Some)
 }
 
 pub fn bundle_path(journal_root: &Path) -> PathBuf {
@@ -494,6 +638,50 @@ mod tests {
         let error = lock_in(temporary.path()).unwrap_err();
 
         assert!(error.to_string().contains("invalid local link state"));
+    }
+
+    #[test]
+    fn concurrent_commit_and_regeneration_never_lock_an_unseen_proposal() {
+        let temporary = TempDir::new();
+        let offered = ensure_mark_snapshot(temporary.path()).unwrap();
+        let expected_id = offered.proposal_id.clone().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let commit_root = temporary.path().to_owned();
+        let commit_barrier = barrier.clone();
+        let commit_id = expected_id.clone();
+        let commit = std::thread::spawn(move || {
+            commit_barrier.wait();
+            commit_proposal(&commit_root, &commit_id)
+        });
+        let regenerate_root = temporary.path().to_owned();
+        let regenerate_barrier = barrier.clone();
+        let regenerate = std::thread::spawn(move || {
+            regenerate_barrier.wait();
+            regenerate_proposal(&regenerate_root)
+        });
+        barrier.wait();
+        let committed = commit.join().unwrap();
+        let regenerated = regenerate.join().unwrap();
+        let snapshot = read_mark_snapshot(temporary.path()).unwrap();
+        match (committed, regenerated) {
+            (Ok(locked), Err(EstablishError::AlreadyLocked)) => {
+                assert_eq!(locked.instance_id, expected_id);
+                assert_eq!(snapshot.state, MarkState::Locked);
+                assert_eq!(snapshot.proposal_id, Some(expected_id));
+                assert_eq!(
+                    serde_json::to_value(snapshot.render).unwrap(),
+                    serde_json::to_value(offered.render).unwrap()
+                );
+            }
+            (Err(EstablishError::ProposalConflict), Ok(candidate)) => {
+                assert!(load_committed(temporary.path()).unwrap().is_none());
+                assert_eq!(snapshot.state, MarkState::Proposed);
+                let new_id = jid_from_spki(candidate.spki_der()).unwrap();
+                assert_ne!(new_id, expected_id);
+                assert_eq!(snapshot.proposal_id, Some(new_id));
+            }
+            _ => panic!("commit and regeneration did not share identity authority"),
+        }
     }
 
     #[test]

@@ -17,7 +17,9 @@ use solstone_core_journal_io::paths::{
 };
 use solstone_core_transcripts::segment_clock;
 
-use crate::dispatch::{DispatchPrincipal, boundary, codec, segment_assignment_probe_path};
+use crate::dispatch::{
+    DispatchPrincipal, boundary, codec, differing_capture_zone, segment_assignment_probe_path,
+};
 use crate::permissions::ConnectionReadSnapshot;
 use crate::references::{ReferenceTarget, SegmentReference};
 
@@ -53,6 +55,7 @@ pub(crate) struct LinkSubject<'a> {
     pub more_segments: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn issue_segment_links(
     journal_root: &Path,
     principal: DispatchPrincipal<'_>,
@@ -60,6 +63,7 @@ pub(crate) fn issue_segment_links(
     subjects: &mut [LinkSubject<'_>],
     per_result: usize,
     response_budget: usize,
+    response_checks: &mut usize,
     checker: &mut dyn TranscriptPageCheck,
 ) {
     if !snapshot.categories.contains(&AdmittedCategory::Transcripts) {
@@ -69,9 +73,9 @@ pub(crate) fn issue_segment_links(
         return;
     };
     let transcript_boundary = boundary(snapshot, Some(AdmittedCategory::Transcripts), None);
+    let owner_zone = solstone_core_journal_config::owner_zone(journal_root);
 
     let mut day_cache: BTreeMap<String, Vec<Segment>> = BTreeMap::new();
-    let mut response_checks = 0;
 
     for subject in subjects.iter_mut() {
         let candidates = resolve_candidates(journal_root, subject, &mut day_cache);
@@ -95,12 +99,20 @@ pub(crate) fn issue_segment_links(
             if !transcript_boundary.allows_classification(&classification) {
                 continue;
             }
-            if subject_checks == per_result || response_checks == response_budget {
+            if !crate::source_release::check_segment_transcript_release(
+                journal_root,
+                &day,
+                identity.stream,
+                identity.name,
+            ) {
+                continue;
+            }
+            if subject_checks == per_result || *response_checks == response_budget {
                 subject.more_segments = true;
                 break;
             }
             subject_checks += 1;
-            response_checks += 1;
+            *response_checks += 1;
             if let Ok(Some(version)) = checker.check_first_page(journal_root, &candidate) {
                 let target = ReferenceTarget::Segment(SegmentReference {
                     day: day.clone(),
@@ -112,10 +124,16 @@ pub(crate) fn issue_segment_links(
                     statement_ordinal: None,
                 });
                 if let Ok(token) = codec().mint(principal.connection, snapshot.generation, target) {
-                    subject.segments.push(json!({
+                    let mut link_val = json!({
                         "time": clock.label,
                         "reference": token,
-                    }));
+                    });
+                    if let Some(zone) =
+                        differing_capture_zone(&owner_zone, &day, identity.name, &candidate)
+                    {
+                        link_val["capture_zone"] = zone;
+                    }
+                    subject.segments.push(link_val);
                 }
             }
         }

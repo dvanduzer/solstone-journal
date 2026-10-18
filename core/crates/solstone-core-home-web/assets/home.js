@@ -4,6 +4,10 @@
 (function () {
   const PULSE_URL = '/app/home/api/pulse';
   const BRIEFING_URL = '/app/home/api/briefing';
+  const FIRST_MINUTES_URL = '/app/home/api/first-minutes';
+  const SETUP_STATE_URL = '/init/api/state';
+  const AGENTS_STATE_URL = '/app/agents/api/state';
+  const SETUP_ACTION_URL = '/init/api/action';
   const SECTION_STATE_KEY = 'pulse-section-state';
   const SECTION_IDS = ['pulse-narrative', 'pulse-today', 'pulse-needs'];
   // Collapsed-by-default is right on a day with nothing in it. On a day with
@@ -51,6 +55,17 @@
   let briefingSections = {};
   const ACTIVITY_PREVIEW = 6;
   let todayActivitiesExpanded = false;
+
+  let firstMinutesPayload = null;
+  let firstMinutesClosed = false;
+  let setupPayload = null;
+  let agentsPayload = null;
+  let agentsSettled = false;
+  let firstMinutesRequest = null;
+  let setupRequest = null;
+  let agentsRequest = null;
+  let downloadTimer = null;
+  let speechRetryInFlight = false;
 
   function esc(value) {
     return String(value ?? '')
@@ -248,8 +263,8 @@
   // card that was not on the page before.
   function cardOrder(pulse) {
     return dayHasMaterial(pulse)
-      ? ['vitals', 'narrative', 'today', 'yesterday', 'briefing', 'reflection', 'needs', 'connections']
-      : ['vitals', 'yesterday', 'briefing', 'narrative', 'reflection', 'today', 'needs', 'connections'];
+      ? ['vitals', 'getting-started', 'narrative', 'today', 'yesterday', 'briefing', 'reflection', 'needs', 'connections']
+      : ['vitals', 'getting-started', 'yesterday', 'briefing', 'narrative', 'reflection', 'today', 'needs', 'connections'];
   }
 
   // The order the page was actually painted with. refreshVitals and
@@ -266,7 +281,10 @@
   // The live order is the only one that leads with the narrative, so the same
   // frozen list also says which section defaults the page was painted with.
   function activeDayIsLive() {
-    return activeCardOrder()[1] === 'narrative';
+    const orderWithoutGettingStarted = activeCardOrder().filter(function (name) {
+      return name !== 'getting-started';
+    });
+    return orderWithoutGettingStarted[1] === 'narrative';
   }
 
   function predecessors(name) {
@@ -285,7 +303,11 @@
     briefingSections = isPlainObject(data.briefing_sections) ? data.briefing_sections : {};
     const cards = [renderVitalsHtml(data)];
     if (data.home_state === 'welcome') {
-      cards.push(renderWelcomeHtml());
+      if (isGettingStartedVisible()) {
+        cards.push(renderGettingStartedHtml());
+      } else {
+        cards.push(renderWelcomeHtml());
+      }
       const needs = welcomeNeedsYouHtml(data);
       if (needs) cards.push(needs);
       setSurfaceHtml(cards.join(''));
@@ -370,14 +392,14 @@
         html += '<a class="pulse-vitals-chip ' + esc(issue.severity || 'amber') + '" href="' + esc(issue.href || '#') + '">'
           + esc(issue.text || '') + ' →</a>';
       });
-    } else {
-      if (g.last_observation) {
-        html += '<div class="pulse-vitals-sep"></div><div class="pulse-vitals-item">last reached your journal ' + esc(g.last_observation) + '</div>';
-      }
-      if (g.cta) {
-        html += '<div class="pulse-vitals-sep"></div><a class="pulse-vitals-item pulse-vitals-cta" href="' + esc(g.cta.href || '#') + '">'
-          + esc(g.cta.text || '') + '</a>';
-      }
+    } else if (g.last_observation) {
+      html += '<div class="pulse-vitals-sep"></div><div class="pulse-vitals-item">last reached your journal ' + esc(g.last_observation) + '</div>';
+    }
+    // The way to add a device stays beside any count: a journal with no
+    // devices needs it most on its first day.
+    if (g.cta) {
+      html += '<div class="pulse-vitals-sep"></div><a class="pulse-vitals-item pulse-vitals-cta" href="' + esc(g.cta.href || '#') + '">'
+        + esc(g.cta.text || '') + '</a>';
     }
     notes.forEach(note => {
       html += '<a class="pulse-vitals-note" href="' + esc(note.href) + '">' + esc(note.text) + ' →</a>';
@@ -416,6 +438,447 @@
       + '<h2>welcome to your journal</h2>'
       + '<p>this is where your day comes together: narrative summaries, calendar events, and tasks. as the solstone app takes in what you share with it, and all of it goes into your journal, sections will appear automatically.</p>'
       + '</div>';
+  }
+
+  function formatDownloadQuantity(done, total) {
+    if (!Number.isFinite(done) || !Number.isFinite(total) || total <= 0) {
+      return '';
+    }
+    const doneGb = (done / 1e9).toFixed(1);
+    const totalGb = (total / 1e9).toFixed(1);
+    return ' · ' + doneGb + ' GB of ' + totalGb + ' GB';
+  }
+
+  function renderDownloadBar(kind, done, total) {
+    if (!Number.isFinite(done) || !Number.isFinite(total) || total <= 0) {
+      return '';
+    }
+    return '<progress class="pulse-progress" data-download-bar="' + esc(kind) + '" value="' + esc(done) + '" max="' + esc(total) + '"></progress>';
+  }
+
+  function renderSayASentence() {
+    return '';
+  }
+
+  function agentCheckState() {
+    if (!agentsSettled) {
+      return { inFlight: true, done: false, showStep: false };
+    }
+    if (agentsPayload && agentsPayload.failed) {
+      return { inFlight: false, done: true, showStep: false };
+    }
+    if (!agentsPayload || !Array.isArray(agentsPayload.connections)) {
+      return { inFlight: false, done: false, showStep: false };
+    }
+    if (agentsPayload.connections.length > 0) {
+      return { inFlight: false, done: true, showStep: false };
+    }
+    return { inFlight: false, done: false, showStep: true };
+  }
+
+  function isGettingStartedVisible() {
+    if (!firstMinutesPayload || firstMinutesPayload.window_open !== true) {
+      return false;
+    }
+    const agentState = agentCheckState();
+    if (agentState.inFlight) {
+      return false;
+    }
+    const checks = firstMinutesPayload.checks || {};
+    const phoneNotDone = checks.phone !== true;
+    const thinkingNotDone = checks.thinking !== true;
+    const agentNotDone = !agentState.done;
+    return phoneNotDone || thinkingNotDone || agentNotDone;
+  }
+
+  function renderDeviceLine(device) {
+    const state = device.state || 'other';
+    const name = esc(device.name || '');
+    let copy = '';
+    if (state === 'awaiting_first') {
+      copy = 'the solstone app on ' + name + ' is paired. what you share with it arrives in your journal about every 5 minutes.';
+    } else if (state === 'receiving' || state === 'quiet') {
+      if (device.last_added_label) {
+        copy = 'the solstone app on ' + name + ' last added to your journal ' + esc(device.last_added_label) + '.';
+      } else {
+        copy = 'the solstone app on ' + name + ' is paired.';
+      }
+    } else {
+      copy = 'the solstone app on ' + name + ' is paired.';
+    }
+    return '<div class="pulse-device-line" data-device-state="' + esc(state) + '">'
+      + '<p>' + copy + '</p>'
+      + '</div>';
+  }
+
+  function renderAgentStepHtml() {
+    let commandBlock = '';
+    const door = agentsPayload?.local_door;
+    if (door && door.enabled === true && door.listening === true && typeof door.address === 'string') {
+      const address = door.address;
+      const cmd = 'claude mcp add --transport http journal "' + address + '"';
+      commandBlock = '<div class="pulse-agent-command" data-agent-command>'
+        + '<p>on your journal\'s computer, run:</p>'
+        + '<pre><code>' + esc(cmd) + '</code></pre>'
+        + '<button type="button" class="pulse-copy-button" data-copy-agent-command data-command="' + esc(cmd) + '">copy</button>'
+        + '<p>then type <code>/mcp</code> in Claude Code, choose <code>journal</code> and authenticate.</p>'
+        + '</div>';
+    }
+    return '<div class="pulse-getting-started-step" data-agent-step>'
+      + '<h4>connect an agent</h4>'
+      + '<p>let Claude Code or another agent read your journal.</p>'
+      + commandBlock
+      + '<a href="/app/agents/">other agents and pairing codes →</a>'
+      + '</div>';
+  }
+
+  function renderPhoneStepHtml() {
+    return '<div class="pulse-getting-started-step" data-phone-step>'
+      + '<h4>add your phone</h4>'
+      + '<p>get solstone on your phone at solstone.app/phone, then pair it with your journal.</p>'
+      + '<a href="/app/network/#devices">pair a device →</a>'
+      + '</div>';
+  }
+
+  function renderThinkingStepHtml(step) {
+    let title = '';
+    let body = '';
+    let href = '';
+    let linkText = '';
+    if (step === 'choose') {
+      title = 'choose where the thinking happens';
+      body = '<p>your journal keeps everything until you do.</p>';
+      href = '/app/thinking/';
+      linkText = 'choose →';
+    } else if (step === 'cant_run') {
+      title = 'your journal\'s computer can\'t run local thinking';
+      body = '<p>choose another way when you\'re ready. your journal keeps everything until then.</p>';
+      href = '/app/thinking/';
+      linkText = 'choose →';
+    } else if (step === 'byo') {
+      title = 'finish setting up your own model';
+      href = '/app/thinking/#byo-setup';
+      linkText = 'finish →';
+    } else if (step === 'confidential') {
+      title = 'finish setting up confidential processing';
+      href = '/app/thinking/#confidential-setup';
+      linkText = 'finish →';
+    } else if (step === 'local') {
+      title = 'finish setting up thinking';
+      href = '/app/thinking/#local-setup';
+      linkText = 'finish →';
+    } else {
+      return '';
+    }
+    return '<div class="pulse-getting-started-step" data-thinking-step="' + esc(step) + '">'
+      + '<h4>' + esc(title) + '</h4>'
+      + body
+      + '<a href="' + esc(href) + '">' + esc(linkText) + '</a>'
+      + '</div>';
+  }
+
+  function renderGettingStartedHtml() {
+    if (!firstMinutesPayload) return '';
+
+    let html = '<div class="pulse-getting-started" id="getting-started" data-home-surface="getting-started">'
+      + '<h2>getting started</h2>';
+
+    if (firstMinutesPayload.devices_known !== false && Array.isArray(firstMinutesPayload.devices)) {
+      firstMinutesPayload.devices.forEach(function (device) {
+        html += renderDeviceLine(device);
+      });
+    }
+
+    if (setupPayload && setupPayload.downloads) {
+      const dl = setupPayload.downloads;
+      if (dl.thinking) {
+        const state = dl.thinking.state;
+        if (state === 'downloading') {
+          const qty = formatDownloadQuantity(dl.thinking.bytes_done, dl.thinking.bytes_total);
+          const bar = renderDownloadBar('thinking', dl.thinking.bytes_done, dl.thinking.bytes_total);
+          html += '<div class="pulse-download" data-download="thinking" data-download-state="downloading">'
+            + '<p>downloading the local model' + qty + '</p>'
+            + bar
+            + '<a href="/app/thinking/#local-setup">cancel on the thinking page →</a>'
+            + '</div>';
+        } else if (state === 'error' || state === 'cancelled') {
+          html += '<div class="pulse-download" data-download="thinking" data-download-state="' + esc(state) + '">'
+            + '<p>the local model didn&#39;t finish downloading.</p>'
+            + '<a href="/app/thinking/#local-setup">try again on the thinking page →</a>'
+            + '</div>';
+        }
+      }
+      if (dl.speech) {
+        const state = dl.speech.state;
+        if (state === 'downloading') {
+          const qty = formatDownloadQuantity(dl.speech.bytes_done, dl.speech.bytes_total);
+          const bar = renderDownloadBar('speech', dl.speech.bytes_done, dl.speech.bytes_total);
+          html += '<div class="pulse-download" data-download="speech" data-download-state="downloading">'
+            + '<p>downloading the speech model' + qty + '</p>'
+            + bar
+            + '</div>';
+        } else if (state === 'error' || state === 'cancelled') {
+          // A missing bundled speech package is fixed by repairing the
+          // install, not by downloading again: say what the journal says to
+          // do, and offer no retry.
+          const packageMissing = dl.speech.error?.code === 'speech_package_unavailable';
+          const guidance = packageMissing && typeof dl.speech.error.detail === 'string'
+            ? '<p data-speech-guidance>' + esc(dl.speech.error.detail) + '</p>' : '';
+          // Nothing was downloaded in that case, only a bundle checked, so the
+          // download line would be false: the journal's guidance stands alone.
+          if (packageMissing) {
+            if (guidance) {
+              html += '<div class="pulse-download" data-download="speech" data-download-state="' + esc(state) + '">'
+                + guidance + '</div>';
+            }
+          } else {
+            html += '<div class="pulse-download" data-download="speech" data-download-state="' + esc(state) + '">'
+              + '<p>the speech model didn&#39;t finish downloading.</p>'
+              + '<button type="button" data-speech-retry' + (speechRetryInFlight ? ' disabled' : '') + '>try again</button>'
+              + '</div>';
+          }
+        }
+      }
+    }
+
+    if (firstMinutesPayload.first_segment) {
+      const seg = firstMinutesPayload.first_segment;
+      const time = window.JournalFormat ? window.JournalFormat.timestamp(seg.start_at) : seg.start_at;
+      let text = '';
+      if (seg.thinking === 'read') {
+        text = 'your first segment, from ' + esc(time) + ', has arrived, and thinking has read it.';
+      } else if (seg.thinking === 'pending') {
+        text = 'your first segment, from ' + esc(time) + ', has arrived. thinking hasn\'t caught up with it yet.';
+      } else {
+        text = 'your first segment, from ' + esc(time) + ', has arrived.';
+      }
+      html += '<div class="pulse-first-segment" data-segment-thinking="' + esc(seg.thinking || 'none') + '">'
+        + '<p>' + text + '</p>'
+        + '<a href="' + esc(seg.href || '#') + '">open it →</a>'
+        + '</div>';
+    }
+
+    html += renderSayASentence();
+
+    const stepsHtml = [];
+    const agentState = agentCheckState();
+    if (agentState.showStep) {
+      stepsHtml.push(renderAgentStepHtml());
+    }
+    const checks = firstMinutesPayload.checks || {};
+    if (checks.phone === false) {
+      stepsHtml.push(renderPhoneStepHtml());
+    }
+    let step = firstMinutesPayload.thinking?.step;
+    const capability = setupPayload?.thinking?.capability;
+    const thinkingDownloadState = setupPayload?.downloads?.thinking?.state;
+    // Setup saves a choice before any lane is active, so "nothing chosen"
+    // can still have a saved intention behind it: continue that lane. Once a
+    // lane is active the brain decides, so a later change by the owner wins.
+    const savedChoice = setupPayload?.thinking?.choice;
+    if (step === 'choose' && savedChoice === 'byo') {
+      step = 'byo';
+    } else if (step === 'choose' && savedChoice === 'spp') {
+      step = 'confidential';
+    } else if (step === 'choose' && savedChoice === 'local') {
+      step = 'local';
+    }
+    if (step === 'choose' && capability === 'blocked') {
+      step = 'cant_run';
+    }
+    if (step === 'local' && thinkingDownloadState === 'downloading') {
+      step = 'none';
+    }
+    if (step && step !== 'none') {
+      const thHtml = renderThinkingStepHtml(step);
+      if (thHtml) stepsHtml.push(thHtml);
+    }
+
+    if (stepsHtml.length > 0) {
+      html += '<h3 data-getting-started-next>next</h3>' + stepsHtml.join('');
+    }
+
+    html += '</div>';
+    return html;
+  }
+
+  function updateGettingStartedSurface() {
+    if (!surface) return;
+    const isVisible = isGettingStartedVisible();
+    const isWelcome = lastPulse && lastPulse.home_state === 'welcome';
+    const currentGettingStarted = surface.querySelector('[data-home-surface="getting-started"]');
+    const currentWelcome = surface.querySelector('[data-home-surface="welcome"]');
+
+    if (isVisible) {
+      const html = renderGettingStartedHtml();
+      if (currentGettingStarted) {
+        currentGettingStarted.outerHTML = html;
+      } else if (currentWelcome) {
+        currentWelcome.outerHTML = html;
+      } else {
+        replaceHomeSurface('getting-started', html, predecessors('getting-started'));
+      }
+    } else {
+      if (currentGettingStarted) {
+        if (isWelcome) {
+          currentGettingStarted.outerHTML = renderWelcomeHtml();
+        } else {
+          currentGettingStarted.remove();
+        }
+      }
+    }
+  }
+
+  function hasActiveDownload() {
+    if (!setupPayload || !setupPayload.downloads) return false;
+    const dl = setupPayload.downloads;
+    return dl.thinking?.state === 'downloading' || dl.speech?.state === 'downloading';
+  }
+
+  function scheduleOrClearDownloadTimer() {
+    if (firstMinutesClosed) {
+      if (downloadTimer) {
+        clearTimeout(downloadTimer);
+        downloadTimer = null;
+      }
+      return;
+    }
+    if (hasActiveDownload()) {
+      if (!downloadTimer) {
+        downloadTimer = setTimeout(function () {
+          downloadTimer = null;
+          if (!firstMinutesClosed) {
+            readFirstMinutes();
+            readSetup();
+          }
+        }, 15000);
+      }
+    } else {
+      if (downloadTimer) {
+        clearTimeout(downloadTimer);
+        downloadTimer = null;
+      }
+    }
+  }
+
+  function readFirstMinutes() {
+    if (firstMinutesClosed) return Promise.resolve(null);
+    if (!firstMinutesRequest) {
+      firstMinutesRequest = apiJson(FIRST_MINUTES_URL)
+        .then(function (data) {
+          if (!data || typeof data.window_open !== 'boolean') {
+            firstMinutesPayload = null;
+          } else if (data.window_open === false) {
+            firstMinutesClosed = true;
+            firstMinutesPayload = null;
+            if (downloadTimer) {
+              clearTimeout(downloadTimer);
+              downloadTimer = null;
+            }
+          } else {
+            firstMinutesPayload = data;
+          }
+          updateGettingStartedSurface();
+          return data;
+        })
+        .catch(function () {
+          firstMinutesPayload = null;
+          updateGettingStartedSurface();
+          return null;
+        })
+        .finally(function () {
+          firstMinutesRequest = null;
+        });
+    }
+    return firstMinutesRequest;
+  }
+
+  function readSetup() {
+    if (firstMinutesClosed) return Promise.resolve(null);
+    if (typeof window.apiJson !== 'function') return Promise.resolve(null);
+    if (!setupRequest) {
+      setupRequest = window.apiJson(SETUP_STATE_URL, { noAuthRedirect: true })
+        .then(function (data) {
+          setupPayload = isPlainObject(data) ? data : null;
+          scheduleOrClearDownloadTimer();
+          updateGettingStartedSurface();
+          return data;
+        })
+        .catch(function () {
+          setupPayload = null;
+          scheduleOrClearDownloadTimer();
+          updateGettingStartedSurface();
+          return null;
+        })
+        .finally(function () {
+          setupRequest = null;
+        });
+    }
+    return setupRequest;
+  }
+
+  function readAgents() {
+    if (firstMinutesClosed) return Promise.resolve(null);
+    if (typeof window.apiJson !== 'function') {
+      agentsSettled = true;
+      agentsPayload = { failed: true };
+      updateGettingStartedSurface();
+      return Promise.resolve(null);
+    }
+    if (!agentsRequest) {
+      agentsRequest = window.apiJson(AGENTS_STATE_URL, { noAuthRedirect: true })
+        .then(function (data) {
+          agentsSettled = true;
+          agentsPayload = isPlainObject(data) ? data : { connections: null };
+          updateGettingStartedSurface();
+          return data;
+        })
+        .catch(function () {
+          agentsSettled = true;
+          agentsPayload = { failed: true };
+          updateGettingStartedSurface();
+          return null;
+        })
+        .finally(function () {
+          agentsRequest = null;
+        });
+    }
+    return agentsRequest;
+  }
+
+  function handleSpeechRetry(button) {
+    if (speechRetryInFlight) return;
+    speechRetryInFlight = true;
+    if (button) button.disabled = true;
+    if (typeof window.apiJson !== 'function') {
+      speechRetryInFlight = false;
+      if (button) button.disabled = false;
+      return;
+    }
+    window.apiJson(SETUP_ACTION_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'retry_speech_download' }),
+      noAuthRedirect: true,
+    })
+      .then(function () {
+        speechRetryInFlight = false;
+        readSetup();
+      })
+      .catch(function () {
+        speechRetryInFlight = false;
+        if (button) button.disabled = false;
+      });
+  }
+
+  function handleCopyAgentCommand(button) {
+    const cmd = button.getAttribute('data-command') || '';
+    if (!cmd) return;
+    if (window.convey && typeof window.convey.copyToClipboard === 'function') {
+      window.convey.copyToClipboard(cmd);
+    } else if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      navigator.clipboard.writeText(cmd).catch(function () {});
+    }
   }
 
   // "pulse" is the name of the run that wrote this, not a thing the owner has
@@ -771,7 +1234,7 @@
       ? welcomeNeedsYouHtml(pulse)
       : renderNeedsYouHtml(pulse);
     const anchors = lastPulse && lastPulse.home_state === 'welcome'
-      ? ['vitals', 'welcome']
+      ? (isGettingStartedVisible() ? ['vitals', 'getting-started'] : ['vitals', 'welcome'])
       : predecessors('needs');
     replaceHomeSurface('needs', html, anchors);
   }
@@ -963,6 +1426,9 @@
 
   const CARD_RENDERERS = {
     vitals: renderVitalsHtml,
+    'getting-started': function () {
+      return isGettingStartedVisible() ? renderGettingStartedHtml() : '';
+    },
     yesterday: renderYesterdayProcessingHtml,
     briefing: renderBriefingShellHtml,
     narrative: renderNarrativeHtml,
@@ -1001,7 +1467,7 @@
   // Before the nightly run has had its first chance, say when the first
   // briefing is due rather than calling it late or missing.
   const BRIEFING_NOT_YET = Object.assign(Object.create(null), {
-    awaiting_engine: 'morning briefings start once processing is set up.',
+    awaiting_engine: 'morning briefings start once you choose where the thinking happens.',
     first_night: "your first briefing is due by 10 am, after your journal's first night.",
     first_night_empty: 'your first briefing is due the morning after something goes into your journal.'
   });
@@ -1120,6 +1586,10 @@
   }
 
   function refreshVitals() {
+    if (!firstMinutesClosed) {
+      readFirstMinutes();
+      readSetup();
+    }
     if (!vitalsRequest) {
       vitalsRequest = readVitals().finally(function () { vitalsRequest = null; });
     }
@@ -1337,6 +1807,18 @@
       }
       return;
     }
+    const speechRetry = closest(target, '[data-speech-retry]');
+    if (speechRetry) {
+      event.preventDefault();
+      handleSpeechRetry(speechRetry);
+      return;
+    }
+    const copyCmd = closest(target, '[data-copy-agent-command]');
+    if (copyCmd) {
+      event.preventDefault();
+      handleCopyAgentCommand(copyCmd);
+      return;
+    }
   }
 
   function handleDashboardKeydown(event) {
@@ -1381,6 +1863,18 @@
       } catch (error) {
         logError(error, 'home: needs-you parse');
       }
+      return;
+    }
+    const speechRetry = closest(target, '[data-speech-retry]');
+    if (speechRetry) {
+      event.preventDefault();
+      handleSpeechRetry(speechRetry);
+      return;
+    }
+    const copyCmd = closest(target, '[data-copy-agent-command]');
+    if (copyCmd) {
+      event.preventDefault();
+      handleCopyAgentCommand(copyCmd);
       return;
     }
   }
@@ -1430,6 +1924,10 @@
   // A finished narrative or a recovered connection invalidates any earlier
   // observation. Follow an in-flight read once, even if several events arrive.
   function refreshChangedPulse() {
+    if (!firstMinutesClosed) {
+      readFirstMinutes();
+      readSetup();
+    }
     if (trailingPulseRefresh) return trailingPulseRefresh;
     const pending = [pulseRequest, vitalsRequest, narrativeRequest].filter(Boolean);
     const refresh = function () { return Promise.all([refreshVitals(), refreshNarrative()]); };
@@ -1484,7 +1982,16 @@
     wireInteractions();
     wireRealtime();
     loadPulse();
+    readFirstMinutes();
+    readSetup();
+    readAgents();
   }
+
+  document.addEventListener('visibilitychange', function () {
+    if (!firstMinutesClosed) {
+      readAgents();
+    }
+  });
 
   window.toggleBriefingCard = toggleBriefingCard;
   window.toggleYesterdayCard = toggleYesterdayCard;

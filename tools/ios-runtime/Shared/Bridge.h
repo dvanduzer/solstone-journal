@@ -14,3 +14,9 @@ char *journal_ios_verifier_admission_diagnostic(void);
 bool journal_ios_verifier_register_callback(journal_ios_transport_fn transport);
 void journal_ios_verifier_cancel(void);
 bool journal_ios_verifier_drain_ready(void);
+
+// Fixed startup admission only; these are not journal owner IPC operations.
+bool journal_ios_backup_admit(void);
+char *journal_ios_backup_admission_diagnostic(void);
+char *journal_ios_backup_private_root(void);
+void journal_ios_backup_private_root_free(char *result);

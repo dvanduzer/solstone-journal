@@ -142,6 +142,7 @@ mod relay_admission;
 #[cfg(feature = "host")]
 pub mod session;
 pub mod session_gate;
+mod setup_host;
 pub mod source_link;
 mod speakers;
 mod speakers_attribution;
@@ -432,6 +433,35 @@ pub async fn bind_embedded_device_door_with_routes(
     bind_embedded_with_dependencies(journal_root, address, payload_root, Some(agents_routes)).await
 }
 
+/// Compose iOS backup routes and the door using the app's actual retained root.
+#[cfg(all(feature = "host", target_os = "ios"))]
+pub async fn bind_embedded_device_door_with_root(
+    root: Arc<solstone_core_journal_io::JournalRoot>,
+    address: std::net::SocketAddrV4,
+    payload_root: Option<PathBuf>,
+    agents_routes: Router,
+) -> Result<EmbeddedConveyHandle, ConveyServeError> {
+    root.revalidate_canonical_binding()
+        .map_err(ConveyServeError::EmbeddedRoot)?;
+    let journal_root = root.canonical_path().to_path_buf();
+    let roots = payload_root
+        .map(|payload| thinking_sol_reads::TalentRoots::from_payload_root(&payload))
+        .transpose()
+        .map_err(ConveyServeError::EmbeddedPayload)?;
+    let backup_deps = solstone_core_backup_web::BackupWebDeps::with_ios_root(root.clone())
+        .map_err(ConveyServeError::EmbeddedRoot)?;
+    let app = router_with_roots(
+        journal_root.clone(),
+        None,
+        Some(agents_routes),
+        roots,
+        Some(backup_deps.clone()),
+    );
+    root.revalidate_canonical_binding()
+        .map_err(ConveyServeError::EmbeddedRoot)?;
+    bind_embedded_router(journal_root, address, app, backup_deps, Some(root)).await
+}
+
 #[cfg(feature = "host")]
 async fn bind_embedded_with_dependencies(
     journal_root: PathBuf,
@@ -451,7 +481,7 @@ async fn bind_embedded_with_dependencies(
         roots,
         Some(backup_deps.clone()),
     );
-    bind_embedded_router(journal_root, address, app, backup_deps).await
+    bind_embedded_router(journal_root, address, app, backup_deps, None).await
 }
 
 #[cfg(feature = "host")]
@@ -460,6 +490,7 @@ async fn bind_embedded_router(
     address: std::net::SocketAddrV4,
     app: Router,
     backup_deps: solstone_core_backup_web::BackupWebDeps,
+    _retained_root: Option<Arc<solstone_core_journal_io::JournalRoot>>,
 ) -> Result<EmbeddedConveyHandle, ConveyServeError> {
     use solstone_core_sol_link::ledger::AuthorizedClientsRead;
     use tokio::sync::watch;
@@ -474,10 +505,24 @@ async fn bind_embedded_router(
     let (sender, receiver) = watch::channel(DeviceDoorAuthorization::from(
         AuthorizedClientsRead::Missing,
     ));
+    #[cfg(not(target_os = "ios"))]
     let binding = Arc::new(
         solstone_core_journal_io::JournalRoot::open(&journal_root)
             .map_err(ConveyServeError::EmbeddedRoot)?,
     );
+    #[cfg(target_os = "ios")]
+    let binding = match _retained_root {
+        Some(binding) => {
+            binding
+                .revalidate_canonical_binding()
+                .map_err(ConveyServeError::EmbeddedRoot)?;
+            binding
+        }
+        None => Arc::new(
+            solstone_core_journal_io::JournalRoot::open(&journal_root)
+                .map_err(ConveyServeError::EmbeddedRoot)?,
+        ),
+    };
     let cache: link_health_cache::RelayHealthCacheStore = Arc::new(std::sync::Mutex::new(None));
     let router = app.layer(Extension(cache.clone()));
     let door_router = authorization_gate::authorized_router_with_router(
@@ -1379,8 +1424,9 @@ fn router_with_roots(
             Some(roots) => thinking::router_with_roots(route_journal_root.clone(), roots),
             None => thinking::router(route_journal_root.clone()),
         })
-        .merge(solstone_core_sol_link::http::init_router(
+        .merge(solstone_core_sol_link::http::init_router_with_host(
             journal_root.clone(),
+            Arc::new(setup_host::ConveySetupHost),
         ))
         .merge(solstone_core_facets_web::routes(
             journal_root.clone(),

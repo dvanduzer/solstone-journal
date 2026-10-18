@@ -2,6 +2,7 @@
 // Copyright (c) 2026 sol pbc
 
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::path::Path;
 use std::time::Duration;
 
@@ -16,13 +17,14 @@ pub struct DestinationStatus {
     pub reason_code: &'static str,
     pub message: &'static str,
 }
-pub fn validate_destination(
+pub fn validate_destination<'invocation>(
     runner: &dyn ToolRunner,
     destination: &Destination,
     password: &str,
-    restic_path: &Path,
+    restic_path: impl Into<crate::runner::ResticInvocation<'invocation>>,
     timeout: Option<Duration>,
 ) -> Result<DestinationStatus, BackupError> {
+    let restic_path = restic_path.into();
     let raw = assemble_backend_env(destination)?;
     let backend = raw
         .into_iter()

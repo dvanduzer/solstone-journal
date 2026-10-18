@@ -799,7 +799,7 @@ mod tests {
         assert_eq!(payload["latest_weekly_reflection"]["state"], "first");
         assert_eq!(
             payload["latest_weekly_reflection"]["line"],
-            "your first week comes once processing is set up."
+            "your first week comes once you choose where the thinking happens."
         );
         assert_eq!(briefing_payload(&context), reference["briefing"]);
     }

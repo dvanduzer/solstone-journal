@@ -217,7 +217,7 @@ mod tests {
             runner,
             http,
             clock,
-            restic_path: Some(Path::new("/fixture/bin/restic")),
+            restic: Some((Path::new("/fixture/bin/restic")).into()),
             rclone_path: None,
             version: "test",
             journal_maintenance: hooks,

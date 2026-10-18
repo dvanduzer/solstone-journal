@@ -19,17 +19,78 @@ use solstone_core_spp_attest::android_service_tools::{
 const RESTIC_MEMBER: &str = "lib/solstone-restic/restic";
 const RCLONE_MEMBER: &str = "lib/solstone-rclone/rclone";
 
-/// Absolute paths of pinned restic and, when required, rclone binaries.
+/// Captured pinned executable or admitted linked iOS implementation.
+#[derive(Debug)]
+pub enum ResolvedResticInvocation {
+    Executable(PathBuf),
+    #[cfg(target_os = "ios")]
+    Callable(std::sync::Arc<crate::ios_callable::AdmittedIosBackupAuthority>),
+}
+
+impl ResolvedResticInvocation {
+    pub fn invocation(&self) -> crate::runner::ResticInvocation<'_> {
+        match self {
+            Self::Executable(path) => path.into(),
+            #[cfg(target_os = "ios")]
+            Self::Callable(authority) => {
+                crate::runner::ResticInvocation::Callable(authority.as_ref())
+            }
+        }
+    }
+
+    pub fn executable_path(&self) -> Option<&Path> {
+        self.invocation().executable_path()
+    }
+}
+
+impl From<PathBuf> for ResolvedResticInvocation {
+    fn from(path: PathBuf) -> Self {
+        Self::Executable(path)
+    }
+}
+
+/// Explicit execution and, when needed, append-only transport capabilities.
 #[derive(Debug)]
 pub struct ResolvedTools {
-    pub restic_path: PathBuf,
+    pub restic: ResolvedResticInvocation,
     pub rclone_path: Option<PathBuf>,
+}
+
+#[cfg(target_os = "ios")]
+fn resolve_ios_tools(
+    runner: &dyn ToolRunner,
+    journal: &Path,
+    needs_rclone: bool,
+) -> Result<ResolvedTools, ClosedToolError> {
+    if needs_rclone {
+        return Err(ClosedToolError::RcloneUnavailable {
+            detail: "ios_append_only_transport_unavailable".into(),
+            guidance: solstone_core_installed_payload::guidance::PACKAGE_MISMATCH.into(),
+        });
+    }
+    let unavailable = |detail: &str| ClosedToolError::ResticUnavailable {
+        detail: detail.into(),
+        guidance: solstone_core_installed_payload::guidance::PACKAGE_MISMATCH.into(),
+    };
+    let root = runner
+        .ios_journal_root()
+        .ok_or_else(|| unavailable("ios_journal_root_unavailable"))?;
+    if root.canonical_path() != journal || root.revalidate_canonical_binding().is_err() {
+        return Err(unavailable("ios_journal_root_changed"));
+    }
+    let authority = crate::ios_callable::admitted_ios_backup(std::sync::Arc::clone(root))?;
+    Ok(ResolvedTools {
+        restic: ResolvedResticInvocation::Callable(authority),
+        rclone_path: None,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolPlatform {
     Desktop,
     AndroidAarch64,
+    #[cfg(target_os = "ios")]
+    IosCallable,
 }
 
 #[must_use]
@@ -38,7 +99,11 @@ pub fn host_tool_platform() -> ToolPlatform {
     {
         ToolPlatform::AndroidAarch64
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(target_os = "ios")]
+    {
+        ToolPlatform::IosCallable
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         ToolPlatform::Desktop
     }
@@ -106,7 +171,7 @@ fn resolve_android_tools(
         None
     };
     Ok(ResolvedTools {
-        restic_path,
+        restic: restic_path.into(),
         rclone_path,
     })
 }
@@ -193,6 +258,10 @@ pub fn resolve_tools_for_platform(
     let needs_rclone = matches!(capability.mode, AdmittedBackupMode::Operated { .. });
 
     match platform {
+        #[cfg(target_os = "ios")]
+        ToolPlatform::IosCallable => {
+            resolve_ios_tools(_runner, &capability.resolved_journal, needs_rclone)
+        }
         ToolPlatform::Desktop => {
             let package = admit_package(executable, needs_rclone)?;
             let restic_path = package.member(RESTIC_MEMBER).map_err(|refusal| {
@@ -212,7 +281,7 @@ pub fn resolve_tools_for_platform(
                 None
             };
             Ok(ResolvedTools {
-                restic_path,
+                restic: restic_path.into(),
                 rclone_path,
             })
         }
@@ -255,7 +324,7 @@ fn resolve_tools_windows(
         None
     };
     Ok(ResolvedTools {
-        restic_path,
+        restic: restic_path.into(),
         rclone_path,
     })
 }
@@ -298,6 +367,12 @@ pub fn resolve_operational_tools_for_platform(
 ) -> Result<ResolvedTools, ClosedToolError> {
     let needs_rclone = append_only && journal_is_operated(journal);
     match platform {
+        #[cfg(target_os = "ios")]
+        ToolPlatform::IosCallable => resolve_ios_tools(
+            _runner,
+            journal,
+            needs_rclone || ios_configured_operated(journal),
+        ),
         ToolPlatform::Desktop => {
             let package = admit_package(executable, needs_rclone)?;
             let restic_path = package.member(RESTIC_MEMBER).map_err(|refusal| {
@@ -317,7 +392,7 @@ pub fn resolve_operational_tools_for_platform(
                 None
             };
             Ok(ResolvedTools {
-                restic_path,
+                restic: restic_path.into(),
                 rclone_path,
             })
         }
@@ -361,7 +436,7 @@ fn resolve_operational_tools_windows(
         None
     };
     Ok(ResolvedTools {
-        restic_path,
+        restic: restic_path.into(),
         rclone_path,
     })
 }
@@ -396,6 +471,11 @@ pub fn resolve_restic_member_for_platform(
     android_authority: &dyn AndroidAuthority,
 ) -> Result<PathBuf, ClosedToolError> {
     match platform {
+        #[cfg(target_os = "ios")]
+        ToolPlatform::IosCallable => Err(ClosedToolError::ResticUnavailable {
+            detail: "ios_executable_backup_tool_unavailable".into(),
+            guidance: solstone_core_installed_payload::guidance::PACKAGE_MISMATCH.into(),
+        }),
         ToolPlatform::Desktop => {
             let package = admit_package(executable, false)?;
             package
@@ -410,6 +490,12 @@ pub fn resolve_restic_member_for_platform(
             resolve_android_restic_member(android_authority)
         }
     }
+}
+
+#[cfg(any(target_os = "ios", test))]
+fn ios_configured_operated(journal: &Path) -> bool {
+    get_backup_config(journal)
+        .is_ok_and(|config| config.get("mode").and_then(Value::as_str) == Some("operated"))
 }
 
 fn journal_is_operated(journal: &Path) -> bool {
@@ -431,6 +517,19 @@ mod tests {
         render_installed_payload,
     };
     use std::fs;
+
+    #[test]
+    fn ios_operated_refusal_does_not_depend_on_enabled_state() {
+        let journal = configured_journal();
+        solstone_core_backup::set_enabled(journal.path(), false).unwrap();
+        assert!(!ios_configured_operated(journal.path()));
+        solstone_core_backup::set_mode(journal.path(), "operated").unwrap();
+        assert!(ios_configured_operated(journal.path()));
+        assert!(!journal_is_operated(journal.path()));
+        solstone_core_backup::set_enabled(journal.path(), true).unwrap();
+        assert!(ios_configured_operated(journal.path()));
+        assert!(journal_is_operated(journal.path()));
+    }
 
     struct NoOpRunner;
     impl ToolRunner for NoOpRunner {
@@ -500,12 +599,18 @@ mod tests {
         let capability = prepare(journal.path(), &clock).unwrap();
 
         let resolved = resolve_tools(&capability, &NoOpRunner, &exe).unwrap();
-        assert_eq!(resolved.restic_path, pkg.path().join(RESTIC_MEMBER));
+        assert_eq!(
+            resolved.restic.executable_path().unwrap().to_path_buf(),
+            pkg.path().join(RESTIC_MEMBER)
+        );
         assert_eq!(resolved.rclone_path, None);
 
         let op_resolved =
             resolve_operational_tools(&NoOpRunner, journal.path(), false, &exe).unwrap();
-        assert_eq!(op_resolved.restic_path, pkg.path().join(RESTIC_MEMBER));
+        assert_eq!(
+            op_resolved.restic.executable_path().unwrap().to_path_buf(),
+            pkg.path().join(RESTIC_MEMBER)
+        );
         assert_eq!(op_resolved.rclone_path, None);
     }
 
@@ -888,7 +993,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            tools.restic_path,
+            tools.restic.executable_path().unwrap().to_path_buf(),
             PathBuf::from("/data/app/lib/arm64/librestic.so")
         );
 

@@ -418,13 +418,39 @@ fn clone_outcome(outcome: &DoorOutcome) -> DoorOutcome {
     }
 }
 
-/// After a successful `/init/finalize`, start the door that boot withheld.
+/// After a successful `/init/finalize` or `action=finalize`, start the door that boot withheld.
 pub(super) async fn open_after_finalize(
     axum::extract::State(door): axum::extract::State<Arc<DoorLifecycle>>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let is_finalize = request.method() == Method::POST && request.uri().path() == "/init/finalize";
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let (is_finalize, request) = if method == Method::POST && path == "/init/finalize" {
+        (true, request)
+    } else if method == Method::POST && path == "/init/api/action" {
+        let (parts, body) = request.into_parts();
+        match axum::body::to_bytes(body, 64 * 1024).await {
+            Ok(bytes) => {
+                let is_finalize = serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("action")
+                            .and_then(serde_json::Value::as_str)
+                            .map(|a| a == "finalize")
+                    })
+                    .unwrap_or(false);
+                let restored = Request::from_parts(parts, Body::from(bytes));
+                (is_finalize, restored)
+            }
+            Err(_) => {
+                let restored = Request::from_parts(parts, Body::empty());
+                (false, restored)
+            }
+        }
+    } else {
+        (false, request)
+    };
     let response = next.run(request).await;
     if !is_finalize || !response.status().is_success() {
         return response;

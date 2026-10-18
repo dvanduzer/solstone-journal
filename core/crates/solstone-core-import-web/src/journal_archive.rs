@@ -210,7 +210,7 @@ mod tests {
         let members = zip_members(&body);
         assert_eq!(members, expected_members);
         assert!(members.contains("config/"));
-        assert!(!members.contains("config/journal.json"));
+        assert!(members.contains("config/journal.json"));
         assert!(members.contains("notes/owner-note.txt"));
         assert_no_zip_residue(&root);
     }

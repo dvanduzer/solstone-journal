@@ -8,12 +8,14 @@ use solstone_core_journal_io::operational_log::{
     OplogFormat, OplogNameClassification, classify_oplog_name,
 };
 
-/// Portable export includes owner trees. It omits installation identity,
-/// service credentials, and the throwaway paths listed here.
-/// Backups keep ordinary configuration through a separate copy policy.
-const PRUNED_ROOTS: &[&str] = &["mcp-endpoint", "peers"];
+/// Portable export preserves journal data, settings, and credentials.
+/// Only identified runtime, rebuildable, and temporary state is omitted.
+/// Backup membership remains governed by the shared copy policy.
+const PRUNED_ROOTS: &[&str] = &["indexer", "cache", ".cache"];
 
 const EXTRA_PREFIXES: &[&str] = &[
+    "mcp-endpoint/byo/ingress.sock",
+    "mcp-endpoint/byo/cutover.sock",
     "imports/archive-merge-work",
     "awareness/activity_state",
     "awareness/activity_settle",
@@ -25,10 +27,9 @@ const EXTRA_PREFIXES: &[&str] = &[
 ];
 
 const OMITTED_REGULAR_FILES: &[&str] = &[
-    "config/journal.json",
-    "config/push-vapid.json",
-    "config/push-registry.json",
-    "backup/hosted/binding.json",
+    "mcp-endpoint/local-door-state.json",
+    "mcp-endpoint/lan-door-state.json",
+    "mcp-endpoint/byo-door-state.json",
     "awareness/discovery_clusters.json",
     "awareness/activity_state.json",
     "health/heartbeat.log",
@@ -51,7 +52,7 @@ pub(crate) fn deny_top_level(name: &str) -> DenyAction {
     let name = name.as_str();
     if PRUNED_ROOTS.contains(&name) {
         DenyAction::TreePrune
-    } else if copy_excluded(original_name) {
+    } else if portable_copy_excluded(original_name) {
         DenyAction::Skip
     } else {
         DenyAction::Include
@@ -60,28 +61,17 @@ pub(crate) fn deny_top_level(name: &str) -> DenyAction {
 
 pub(crate) fn deny_member(member: &str, regular_file: bool) -> bool {
     let original_member = member;
-    if copy_excluded(member) || (regular_file && copy_file_excluded(member)) {
+    if portable_copy_excluded(member) || (regular_file && copy_file_excluded(member)) {
         return true;
     }
     #[cfg(windows)]
-    if windows_credential_state(member) {
+    if windows_runtime_state(member) {
         return true;
     }
     #[cfg(windows)]
     let member = member.to_ascii_lowercase();
     #[cfg(windows)]
     let member = member.as_str();
-    #[cfg(windows)]
-    if member.starts_with("config/chatgpt-sign-in.json") {
-        return true;
-    }
-    // Device labels are owner settings; all other link state belongs to this installation.
-    if (member == "link" && regular_file)
-        || (member.starts_with("link/")
-            && (member != "link/client-descriptions.json" || !regular_file))
-    {
-        return true;
-    }
     if PRUNED_ROOTS
         .iter()
         .chain(EXTRA_PREFIXES.iter())
@@ -112,15 +102,33 @@ pub(crate) fn deny_member(member: &str, regular_file: bool) -> bool {
     false
 }
 
+// These shared backup exclusions protect installation credentials. A full
+// owner export retains them, while their runtime candidates and removal pivots
+// remain throwaway state. All other shared rules apply without modification.
+fn portable_copy_excluded(member: &str) -> bool {
+    if member == "mcp-endpoint"
+        || member.starts_with("mcp-endpoint/")
+        || member.starts_with("config/chatgpt-sign-in.json")
+    {
+        return member.split('/').any(|part| {
+            part.starts_with(".removing_")
+                || part.starts_with(".tmp")
+                || part.ends_with(".tmp")
+                || part.ends_with(".lock")
+        });
+    }
+    copy_excluded(member)
+}
+
 #[cfg(windows)]
-fn windows_credential_state(member: &str) -> bool {
+fn windows_runtime_state(member: &str) -> bool {
     let Some((root, tail)) = member.split_once('/') else {
         return false;
     };
     let root = root.to_ascii_lowercase();
-    // Recognize aliases of credential namespaces without changing shared leaf patterns.
-    ["config", "link", "backup"].contains(&root.as_str())
-        && copy_excluded(&format!("{root}/{tail}"))
+    // Recognize runtime namespaces without changing shared leaf patterns.
+    ["config", "link", "backup", "mcp-endpoint"].contains(&root.as_str())
+        && portable_copy_excluded(&format!("{root}/{tail}"))
 }
 
 fn is_root_supervisor_log(member: &str) -> bool {
@@ -208,31 +216,34 @@ mod tests {
             "backup",
             "solstone",
             "link",
+            "mcp-endpoint",
+            "peers",
         ] {
             assert_eq!(deny_top_level(root), DenyAction::Include, "{root}");
         }
-        for root in ["mcp-endpoint", "peers"] {
+        for root in ["indexer", "cache", ".cache"] {
             assert_eq!(deny_top_level(root), DenyAction::TreePrune, "{root}");
         }
-        assert_eq!(deny_top_level("indexer"), DenyAction::Skip);
+        assert_eq!(deny_top_level("indexer"), DenyAction::TreePrune);
 
         let canonical_log_path = format!("chronicle/20260101/health/{LOG_LEAF}");
         let denied = [
-            "config/journal.json",
-            "config/push-vapid.json",
-            "config/push-registry.json",
-            "backup/hosted/binding.json",
+            "mcp-endpoint/byo/cutover.sock",
+            "mcp-endpoint/byo/ingress.sock",
+            "mcp-endpoint/local-door-state.json",
+            "mcp-endpoint/lan-door-state.json",
+            "mcp-endpoint/byo-door-state.json",
+            "mcp-endpoint/.create.lock",
+            "mcp-endpoint/tls/.tmp_candidate",
+            "mcp-endpoint/nested/.removing_old/key",
+            "config/chatgpt-sign-in.json.tmp",
+            "config/chatgpt-sign-in.json.lock",
             "awareness/discovery_clusters.json",
             "awareness/activity_state.json",
             "health/heartbeat.log",
             "health/steward.log",
             "health/service.log",
             "imports/archive-merge-work/extract/x",
-            "peers/remote/client.key",
-            "mcp-endpoint/pop.ed25519.pk8",
-            "link/client.json",
-            "link/service-ca.key",
-            "link",
             ".agents/skills/journal",
             "apps/support/portal/index.html",
             "supervisor.log",
@@ -252,6 +263,17 @@ mod tests {
         let malformed_log_path = format!("chronicle/20260101/health/{MALFORMED_LEAF}");
         let nested_log_path = format!("chronicle/20260101/health/nested/{LOG_LEAF}");
         let kept = [
+            "config/journal.json",
+            "config/push-vapid.json",
+            "config/push-registry.json",
+            "backup/hosted/binding.json",
+            "peers/remote/client.key",
+            "mcp-endpoint/pop.ed25519.pk8",
+            "link/client.json",
+            "link/service-ca.key",
+            "link",
+            "config/chatgpt-sign-in.json",
+            "config/chatgpt-sign-in.json.unreadable-1",
             "imports/batch/config/journal.json",
             "imports/item/config/journal.json",
             "imports/item/peers/original.txt",
@@ -273,9 +295,10 @@ mod tests {
             assert!(!deny_member(path, true), "{path}");
         }
 
+        assert!(!deny_member("mcp-endpoint/local-door-state.json", false));
         assert!(!deny_member("stats.json", false));
         assert!(!deny_member("link", false));
-        assert!(deny_member("link/client-descriptions.json", false));
+        assert!(!deny_member("link/client-descriptions.json", false));
         assert!(!deny_member("supervisor.log", false));
         assert!(!deny_member(&canonical_log_path, false));
     }

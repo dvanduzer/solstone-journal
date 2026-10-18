@@ -26,6 +26,7 @@ fn replay_convey_home_corpus() {
     let corpus: Value = serde_json::from_slice(CORPUS).unwrap();
     let groups = corpus["cases"].as_object().unwrap();
     let mut asserted = 0_usize;
+    let mut no_device_cta_divergences = 0_usize;
     for case in groups["briefing_phase"].as_array().unwrap() {
         eq(
             &briefing::compute_phase(
@@ -276,9 +277,21 @@ fn replay_convey_home_corpus() {
             asserted += 1;
             *expected.pointer_mut("/severity").unwrap() = json!("neutral");
         }
+        if input["capture"] == "no_observers" && expected["cta"].is_null() {
+            // A journal with no devices keeps its way to add one under every
+            // verdict; the reference dropped it whenever anything else showed.
+            assert_eq!(
+                actual.pointer("/cta/href"),
+                Some(&json!("/app/network/#devices"))
+            );
+            no_device_cta_divergences += 1;
+            expected["cta"] = actual["cta"].clone();
+        }
         eq(&actual, &expected, "health glance");
         asserted += 1;
     }
+    assert!(no_device_cta_divergences > 0);
+    asserted += no_device_cta_divergences;
     let utils = &groups["convey_utils"][0];
     for case in utils["format_date"].as_array().unwrap() {
         eq(
@@ -296,7 +309,7 @@ fn replay_convey_home_corpus() {
         );
         asserted += 1;
     }
-    assert_eq!(asserted, 1168);
+    assert_eq!(asserted, 1262);
 }
 
 fn rewrite_sol_urls_in_value(value: &mut Value) {

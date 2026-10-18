@@ -107,15 +107,9 @@ fn component(record: Option<&Value>, name: &str) -> Value {
     })
 }
 
+/// A component's reason reads in the same words as the brain's own.
 fn reason_text(reason: &str) -> String {
-    match reason {
-        "thinking_engine_not_chosen" => "no model chosen".to_owned(),
-        "configuration_invalid" => "configuration invalid".to_owned(),
-        "stale_expected_fingerprint" => "stale expected fingerprint".to_owned(),
-        "lost_fence" => "refresh fence lost".to_owned(),
-        "busy" => "check already running".to_owned(),
-        _ => reason.replace('_', " "),
-    }
+    solstone_core_brain::brain_reason_text(Some(reason))
 }
 
 fn action(

@@ -21,6 +21,37 @@ use solstone_core_distribution::windows_payload::{WINDOWS_RCLONE_WORKER, WINDOWS
 use std::sync::Arc;
 use thiserror::Error;
 
+/// Execution authority captured by resolution and retained for each operation.
+#[derive(Clone, Copy, Debug)]
+pub enum ResticInvocation<'a> {
+    Executable(&'a Path),
+    #[cfg(target_os = "ios")]
+    Callable(&'a crate::ios_callable::AdmittedIosBackupAuthority),
+}
+
+impl<'a> ResticInvocation<'a> {
+    /// Executable-only operations must refuse a callable capability explicitly.
+    pub fn executable_path(self) -> Option<&'a Path> {
+        match self {
+            Self::Executable(path) => Some(path),
+            #[cfg(target_os = "ios")]
+            Self::Callable(_) => None,
+        }
+    }
+}
+
+impl<'a> From<&'a Path> for ResticInvocation<'a> {
+    fn from(path: &'a Path) -> Self {
+        Self::Executable(path)
+    }
+}
+
+impl<'a> From<&'a std::path::PathBuf> for ResticInvocation<'a> {
+    fn from(path: &'a std::path::PathBuf) -> Self {
+        Self::Executable(path.as_path())
+    }
+}
+
 /// An inherited OS handle explicitly passed to a backup child process.
 ///
 /// Windows backup execution does not support inherited handles; keeping this
@@ -94,6 +125,17 @@ pub trait ToolRunner {
     }
 
     fn cancellation(&self) -> Option<&ArchiveCancellation> {
+        None
+    }
+
+    #[cfg(target_os = "ios")]
+    fn ios_journal_root(&self) -> Option<&std::sync::Arc<solstone_core_journal_io::JournalRoot>> {
+        None
+    }
+
+    /// The admitted target of the whole-journal restore this runner serves, if any.
+    #[cfg(target_os = "ios")]
+    fn ios_restore_target(&self) -> Option<&crate::ios_callable::RestoreTarget> {
         None
     }
 }
@@ -591,12 +633,12 @@ pub(crate) fn is_explicit_program_path(path: &Path) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)] // Mirrors restic's independent process-boundary inputs.
-pub fn run_restic(
+pub fn run_restic<'invocation>(
     runner: &dyn ToolRunner,
     args: &[String],
     repository: &str,
     password: &str,
-    restic_path: &Path,
+    restic_path: impl Into<ResticInvocation<'invocation>>,
     backend_env: Option<&BTreeMap<String, Option<String>>>,
     json: bool,
     max_repack_size: Option<&str>,
@@ -619,12 +661,12 @@ pub fn run_restic(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_restic_with_stdin(
+pub(crate) fn run_restic_with_stdin<'invocation>(
     runner: &dyn ToolRunner,
     args: &[String],
     repository: &str,
     password: &str,
-    restic_path: &Path,
+    restic_path: impl Into<ResticInvocation<'invocation>>,
     backend_env: Option<&BTreeMap<String, Option<String>>>,
     json: bool,
     max_repack_size: Option<&str>,
@@ -632,6 +674,31 @@ pub(crate) fn run_restic_with_stdin(
     pass_fds: &[PassedHandle<'_>],
     stdin: Option<Vec<u8>>,
 ) -> Result<ResticResult, RunnerError> {
+    let invocation = restic_path.into();
+    #[cfg(target_os = "ios")]
+    if let ResticInvocation::Callable(authority) = invocation {
+        return crate::ios_callable::run(
+            authority,
+            args,
+            repository,
+            password,
+            backend_env,
+            json,
+            max_repack_size,
+            timeout,
+            pass_fds,
+            stdin,
+            runner.cancellation(),
+            runner.ios_restore_target(),
+        );
+    }
+    let restic_path = invocation.executable_path().ok_or_else(|| {
+        RunnerError::Process(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "executable backup authority required",
+        ))
+    })?;
+
     if !is_explicit_program_path(restic_path) {
         return Err(RunnerError::BareProgram);
     }
@@ -687,13 +754,14 @@ pub(crate) fn run_restic_with_stdin(
     })
 }
 
+#[cfg_attr(target_os = "ios", allow(dead_code))] // rotation is refused on iOS
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_restic_with_stdin_cancellable(
+pub(crate) fn run_restic_with_stdin_cancellable<'invocation>(
     runner: &dyn ToolRunner,
     args: &[String],
     repository: &str,
     password: &str,
-    restic_path: &Path,
+    restic_path: impl Into<ResticInvocation<'invocation>>,
     backend_env: Option<&BTreeMap<String, Option<String>>>,
     json: bool,
     max_repack_size: Option<&str>,
@@ -702,6 +770,31 @@ pub(crate) fn run_restic_with_stdin_cancellable(
     stdin: Option<Vec<u8>>,
     cancellation: &ArchiveCancellation,
 ) -> Result<ResticResult, RunnerError> {
+    let invocation = restic_path.into();
+    #[cfg(target_os = "ios")]
+    if let ResticInvocation::Callable(authority) = invocation {
+        return crate::ios_callable::run(
+            authority,
+            args,
+            repository,
+            password,
+            backend_env,
+            json,
+            max_repack_size,
+            timeout,
+            pass_fds,
+            stdin,
+            Some(cancellation),
+            runner.ios_restore_target(),
+        );
+    }
+    let restic_path = invocation.executable_path().ok_or_else(|| {
+        RunnerError::Process(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "executable backup authority required",
+        ))
+    })?;
+
     if !is_explicit_program_path(restic_path) {
         return Err(RunnerError::BareProgram);
     }

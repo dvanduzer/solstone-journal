@@ -63,6 +63,14 @@ impl ToolRunner for CancelledRunner<'_> {
     ) -> std::io::Result<ToolOutput> {
         self.run(request)
     }
+    fn cancellation(&self) -> Option<&ArchiveCancellation> {
+        Some(self.cancellation)
+    }
+
+    #[cfg(target_os = "ios")]
+    fn ios_journal_root(&self) -> Option<&Arc<JournalRoot>> {
+        self.inner.ios_journal_root()
+    }
 }
 
 struct CancelledHttp<'a> {

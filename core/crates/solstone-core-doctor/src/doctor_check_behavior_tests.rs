@@ -1644,7 +1644,7 @@ fn brain_ready_and_checking_records_are_healthy() {
     assert_eq!(row.status, Status::Ok, "{}", row.detail);
     assert_eq!(
         row.detail,
-        "processing is ready; state=ready; reason=ok; component=none; evidence_age=1m"
+        "thinking is ready; state=ready; reason=ok; component=none; evidence_age=1m"
     );
 
     let checking = fixture();
@@ -1653,7 +1653,7 @@ fn brain_ready_and_checking_records_are_healthy() {
     assert_eq!(row.status, Status::Ok, "{}", row.detail);
     assert_eq!(
         row.detail,
-        "checking how processing runs; state=checking; reason=brain check in progress; component=none; evidence_age=unknown"
+        "checking on thinking; state=checking; reason=brain check in progress; component=none; evidence_age=unknown"
     );
 }
 

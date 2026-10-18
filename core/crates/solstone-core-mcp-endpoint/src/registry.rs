@@ -76,7 +76,7 @@ pub(crate) const TOOLS: &[ToolEntry] = &[
         tool_name: crate::jsonrpc::ToolName::ListFacets,
         wire_name: "list_facets",
         title: "list facets",
-        description: "List the facets this connection may see: the areas the owner sorts their journal into, such as work or personal.",
+        description: "List the facets this connection may see: the areas the owner sorts their journal into, such as work or personal. When more remain, pass next_cursor as cursor to continue.",
         input_schema: list_facets_input_schema,
         requires: NOTHING,
         audit_name: solstone_core_mcp_audit::ToolName::ListFacets,
@@ -121,7 +121,7 @@ pub(crate) const TOOLS: &[ToolEntry] = &[
         tool_name: crate::jsonrpc::ToolName::ListEntities,
         wire_name: "list_entities",
         title: "list people and projects",
-        description: "List the people, projects and other entities this connection may see. To learn who or what one is, call get_entity with its reference.",
+        description: "List the people, projects and other entities this connection may see. When more remain, pass next_cursor as cursor to continue. To learn who or what one is, call get_entity with its reference.",
         input_schema: list_entities_input_schema,
         requires: ENTITIES,
         audit_name: solstone_core_mcp_audit::ToolName::ListEntities,
@@ -459,6 +459,7 @@ fn list_facets_input_schema(_context: &SchemaContext<'_>) -> Value {
         "additionalProperties": false,
         "properties": {
             "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+            "cursor": { "type": "string", "minLength": 1, "maxLength": MAX_OPAQUE_REFERENCE_BYTES },
         }
     })
 }
@@ -518,6 +519,7 @@ fn list_entities_input_schema(context: &SchemaContext<'_>) -> Value {
         "additionalProperties": false,
         "properties": {
             "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+            "cursor": { "type": "string", "minLength": 1, "maxLength": MAX_OPAQUE_REFERENCE_BYTES },
         }
     });
     with_scoped_facet(schema, context)
@@ -825,7 +827,7 @@ mod tests {
             list_entities_input_schema(&context),
         ] {
             assert_eq!(schema["additionalProperties"], false);
-            assert!(schema["properties"].get("cursor").is_none());
+            assert!(schema["properties"].get("cursor").is_some());
         }
         let transcript_schema = list_transcripts_input_schema(&context);
         assert_eq!(transcript_schema["additionalProperties"], false);
@@ -843,10 +845,12 @@ mod tests {
             search_input_schema(&context)["properties"]["query"]["maxLength"],
             MAX_QUERY_BYTES
         );
-        assert!(crate::tools::facets::validate(Some(&json!({"cursor": "nope"}))).is_err());
+        assert!(crate::tools::facets::validate(Some(&json!({"cursor": "nope"}))).is_ok());
+        assert!(crate::tools::facets::validate(Some(&json!({"cursor": ""}))).is_err());
         assert!(crate::tools::transcripts::validate_list(Some(&json!({"cursor": "nope"}))).is_ok());
         assert!(crate::tools::transcripts::validate_list(Some(&json!({"cursor": ""}))).is_err());
-        assert!(crate::tools::entities::validate_list(Some(&json!({"cursor": "nope"}))).is_err());
+        assert!(crate::tools::entities::validate_list(Some(&json!({"cursor": "nope"}))).is_ok());
+        assert!(crate::tools::entities::validate_list(Some(&json!({"cursor": ""}))).is_err());
     }
 
     #[test]
@@ -855,12 +859,21 @@ mod tests {
         let facet_ids = vec![FACET_A.to_owned()];
         let context = context(&categories, &facet_ids);
         let opaque = "x".repeat(MAX_OPAQUE_REFERENCE_BYTES);
+        let too_long = "x".repeat(MAX_OPAQUE_REFERENCE_BYTES + 1);
         assert_eq!(
             search_input_schema(&context)["properties"]["cursor"]["maxLength"],
             MAX_OPAQUE_REFERENCE_BYTES
         );
         assert_eq!(
             list_transcripts_input_schema(&context)["properties"]["cursor"]["maxLength"],
+            MAX_OPAQUE_REFERENCE_BYTES
+        );
+        assert_eq!(
+            list_facets_input_schema(&context)["properties"]["cursor"]["maxLength"],
+            MAX_OPAQUE_REFERENCE_BYTES
+        );
+        assert_eq!(
+            list_entities_input_schema(&context)["properties"]["cursor"]["maxLength"],
             MAX_OPAQUE_REFERENCE_BYTES
         );
         assert_eq!(
@@ -880,6 +893,30 @@ mod tests {
             crate::tools::search::validate(Some(&json!({
                 "query": "query",
                 "day": "x".repeat(MAX_DAY_BYTES + 1)
+            })))
+            .is_err()
+        );
+        assert!(
+            crate::tools::facets::validate(Some(&json!({
+                "cursor": opaque,
+            })))
+            .is_ok()
+        );
+        assert!(
+            crate::tools::facets::validate(Some(&json!({
+                "cursor": too_long,
+            })))
+            .is_err()
+        );
+        assert!(
+            crate::tools::entities::validate_list(Some(&json!({
+                "cursor": opaque,
+            })))
+            .is_ok()
+        );
+        assert!(
+            crate::tools::entities::validate_list(Some(&json!({
+                "cursor": too_long,
             })))
             .is_err()
         );

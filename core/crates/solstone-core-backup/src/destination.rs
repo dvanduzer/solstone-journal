@@ -18,6 +18,13 @@ pub fn assemble_backend_env(destination: &Destination) -> Result<Map<String, Val
                 "AWS_SECRET_ACCESS_KEY".to_owned(),
                 Value::String(required(credentials, "secret_access_key")?),
             );
+            #[cfg(target_os = "ios")]
+            {
+                env.insert(
+                    "AWS_DEFAULT_REGION".to_owned(),
+                    Value::String(ios_s3_region(&destination.repository, credentials)?),
+                );
+            }
             if let Some(token) = credentials
                 .get("session_token")
                 .and_then(Value::as_str)
@@ -44,6 +51,45 @@ pub fn assemble_backend_env(destination: &Destination) -> Result<Map<String, Val
     }
 }
 
+/// The iOS signer needs the signing region that desktop restic discovers on its own.
+/// An owner-supplied region wins; otherwise use the endpoint's `s3.<region>.` or
+/// `s3-<region>.` host label, else S3's default. A wrong region fails authentication.
+#[cfg(any(target_os = "ios", test))]
+fn ios_s3_region(
+    repository: &str,
+    credentials: &Map<String, Value>,
+) -> Result<String, BackupError> {
+    let valid = |region: &str| {
+        !region.is_empty()
+            && region.len() <= 64
+            && region
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    };
+    match credentials.get("region") {
+        Some(Value::String(region)) if valid(region) => return Ok(region.clone()),
+        Some(_) => return Err(BackupError::InvalidDestinationShape),
+        None => {}
+    }
+    let location = repository.strip_prefix("s3:").unwrap_or(repository);
+    let location = location
+        .strip_prefix("https://")
+        .or_else(|| location.strip_prefix("//"))
+        .unwrap_or(location);
+    let host = location.split('/').next().unwrap_or_default();
+    let host = host.rsplit_once(':').map_or(host, |(name, _)| name);
+    let labels: Vec<&str> = host.split('.').collect();
+    let derived = match labels.as_slice() {
+        ["s3", region, _, _, ..] => Some(*region),
+        [first, _, _, ..] => first.strip_prefix("s3-"),
+        _ => None,
+    };
+    Ok(derived
+        .filter(|region| valid(region))
+        .unwrap_or("us-east-1")
+        .to_owned())
+}
+
 fn required(credentials: &Map<String, Value>, key: &'static str) -> Result<String, BackupError> {
     credentials
         .get(key)
@@ -56,6 +102,47 @@ fn required(credentials: &Map<String, Value>, key: &'static str) -> Result<Strin
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn ios_region_prefers_owner_value_then_endpoint_then_default() {
+        let explicit = serde_json::from_value(json!({"region":"eu-central-1"})).unwrap();
+        assert_eq!(
+            ios_s3_region("s3:s3.us-west-004.backblazeb2.com/b/p", &explicit).unwrap(),
+            "eu-central-1"
+        );
+        for region in [
+            json!(null),
+            json!(""),
+            json!("UPPER"),
+            json!("a b"),
+            json!("a\nb"),
+            json!("a".repeat(65)),
+        ] {
+            let credentials = serde_json::from_value(json!({"region":region})).unwrap();
+            assert!(ios_s3_region("s3:s3.us-west-004.backblazeb2.com/b", &credentials).is_err());
+        }
+        for (repository, region) in [
+            (
+                "s3:https://s3.us-west-004.backblazeb2.com/bucket/prefix",
+                "us-west-004",
+            ),
+            ("s3:s3.eu-west-2.amazonaws.com/bucket", "eu-west-2"),
+            ("s3://s3-ap-south-1.amazonaws.com/bucket", "ap-south-1"),
+            (
+                "s3:https://s3.us-east-2.wasabisys.com:443/bucket",
+                "us-east-2",
+            ),
+            ("s3:s3.amazonaws.com/bucket", "us-east-1"),
+            ("s3:https://minio.home.example:9000/bucket", "us-east-1"),
+            ("s3:https://[2001:db8::1]:443/bucket", "us-east-1"),
+        ] {
+            assert_eq!(
+                ios_s3_region(repository, &Map::new()).unwrap(),
+                region,
+                "{repository}"
+            );
+        }
+    }
 
     #[test]
     fn s3_projects_exact_required_environment_without_session_token() {

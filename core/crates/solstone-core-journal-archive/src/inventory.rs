@@ -299,6 +299,9 @@ mod membership_tests {
         let temporary = TempDir::new("owner-names");
         let root = journal(&temporary);
         for member in [
+            "mcp-endpoint/pop.ed25519.pk8",
+            "peers/remote/client.key",
+            "peers/remote/client.crt",
             "entities/cache/entity.json",
             "entities/indexer/entity.json",
             "facets/cache/facet.json",
@@ -329,16 +332,13 @@ mod membership_tests {
             "imports/.health-dedupe.sqlite.rebuild-journal",
             "chronicle/20260101/indexer/indexer.sqlite",
             "health/brain-fingerprint.key",
-            "mcp-endpoint/pop.ed25519.pk8",
             "config/.tmp_123_4.tmp",
-            "peers/remote/client.key",
-            "peers/remote/client.crt",
         ] {
             write(&root, member, b"operational secret control");
         }
         let source = ArchiveSource::open(&root).unwrap();
         let names = members(&source);
-        assert_eq!(names.len(), 17, "{names:?}");
+        assert_eq!(names.len(), 20, "{names:?}");
         assert!(names.contains(&"entities/cache/entity.json".to_owned()));
         assert!(names.contains(&"facets/indexer/facet.json".to_owned()));
         assert!(names.contains(&"chronicle/20260101/indexer/120000_60/slides.key".to_owned()));
@@ -350,7 +350,7 @@ mod membership_tests {
     }
 
     #[test]
-    fn included_owner_roots_keep_apps_and_config_and_prune_peers() {
+    fn included_owner_roots_keep_apps_configuration_and_connections() {
         let temporary = TempDir::new("ac3");
         let root = journal(&temporary);
         write(&root, "config/journal.json", b"{}");
@@ -366,12 +366,15 @@ mod membership_tests {
             vec![
                 "apps/observer/x.json".to_owned(),
                 "chronicle/20260101/a.txt".to_owned(),
+                "config/journal.json".to_owned(),
                 "imports/item/peers/original.txt".to_owned(),
+                "peers/remote/client.crt".to_owned(),
+                "peers/remote/client.key".to_owned(),
             ]
         );
-        assert!(!names.contains(&"config/journal.json".to_owned()));
-        assert!(!names.contains(&"peers/remote/client.key".to_owned()));
-        assert!(!names.contains(&"peers/remote/client.crt".to_owned()));
+        assert!(names.contains(&"config/journal.json".to_owned()));
+        assert!(names.contains(&"peers/remote/client.key".to_owned()));
+        assert!(names.contains(&"peers/remote/client.crt".to_owned()));
         assert_eq!(
             source
                 .inventory()
@@ -379,7 +382,7 @@ mod membership_tests {
                 .iter()
                 .map(|name| name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["peers"]
+            Vec::<&str>::new()
         );
         let included = source
             .inventory()

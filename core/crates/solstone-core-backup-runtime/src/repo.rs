@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 #[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd};
+#[cfg(test)]
 use std::path::Path;
 use std::time::Duration;
 
@@ -29,10 +30,25 @@ impl fmt::Display for ResticKeyError {
     }
 }
 impl std::error::Error for ResticKeyError {}
+/// Actual current-call fields from the iOS callable boundary. These fields do
+/// not claim remote rollback, completed cleanup or durable IDs after restart.
+#[cfg(target_os = "ios")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IosCallableFailure {
+    pub native_status: i32,
+    pub diagnostic: String,
+    pub key_id: Option<String>,
+    pub snapshot_id: Option<String>,
+    pub cancellation_requested: bool,
+    pub deadline_requested: bool,
+    pub monitor_failed: bool,
+}
 #[derive(Debug)]
 pub enum RepoError {
     Backup(BackupError),
     Key(ResticKeyError),
+    #[cfg(target_os = "ios")]
+    Callable(IosCallableFailure),
     Failed,
 }
 impl From<BackupError> for RepoError {
@@ -55,14 +71,15 @@ fn backend(destination: &Destination) -> Result<BTreeMap<String, Option<String>>
         })
         .collect())
 }
-pub fn init_repository(
+pub fn init_repository<'invocation>(
     runner: &dyn ToolRunner,
     destination: &Destination,
     daily_key: &str,
     recovery_key: &str,
-    restic_path: &Path,
+    restic_path: impl Into<crate::runner::ResticInvocation<'invocation>>,
     timeout: Option<Duration>,
 ) -> Result<(), RepoError> {
+    let restic_path = restic_path.into();
     let daily = validate_destination(runner, destination, daily_key, restic_path, timeout)?;
     if daily.reason_code == "repo_missing" {
         run(
@@ -112,14 +129,15 @@ fn windows_add_key_request_parts(new_password: &str, labels: &[String]) -> (Vec<
     (args, format!("{new_password}\n").into_bytes())
 }
 
-pub fn add_recovery_key(
+pub fn add_recovery_key<'invocation>(
     runner: &dyn ToolRunner,
     destination: &Destination,
     daily_key: &str,
     recovery_key: &str,
-    restic_path: &Path,
+    restic_path: impl Into<crate::runner::ResticInvocation<'invocation>>,
     timeout: Option<Duration>,
 ) -> Result<(), RepoError> {
+    let restic_path = restic_path.into();
     add_key(
         runner,
         destination,
@@ -133,16 +151,30 @@ pub fn add_recovery_key(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn add_key(
+fn add_key<'invocation>(
     runner: &dyn ToolRunner,
     destination: &Destination,
     password: &str,
     new_password: &str,
     labels: &[String],
     env: &BTreeMap<String, Option<String>>,
-    restic_path: &Path,
+    restic_path: impl Into<crate::runner::ResticInvocation<'invocation>>,
     timeout: Option<Duration>,
 ) -> Result<(), RepoError> {
+    let restic_path = restic_path.into();
+    #[cfg(target_os = "ios")]
+    if let crate::runner::ResticInvocation::Callable(authority) = restic_path {
+        return crate::ios_callable::add_key(
+            authority,
+            destination,
+            password,
+            new_password,
+            labels,
+            env,
+            timeout,
+            runner.cancellation(),
+        );
+    }
     #[cfg(unix)]
     {
         let (reader, writer) = nix::unistd::pipe().map_err(|_| RepoError::Failed)?;
@@ -202,23 +234,25 @@ fn add_key(
         Err(RepoError::Failed)
     }
 }
-pub fn capture_current_key_id(
+pub fn capture_current_key_id<'invocation>(
     runner: &dyn ToolRunner,
     destination: &Destination,
     password: &str,
-    restic_path: &Path,
+    restic_path: impl Into<crate::runner::ResticInvocation<'invocation>>,
     timeout: Option<Duration>,
 ) -> Result<String, RepoError> {
+    let restic_path = restic_path.into();
     current_key(runner, destination, password, None, restic_path, timeout)
 }
-pub fn remove_key(
+pub fn remove_key<'invocation>(
     runner: &dyn ToolRunner,
     destination: &Destination,
     password: &str,
     key_id: &str,
-    restic_path: &Path,
+    restic_path: impl Into<crate::runner::ResticInvocation<'invocation>>,
     timeout: Option<Duration>,
 ) -> Result<(), RepoError> {
+    let restic_path = restic_path.into();
     run(
         runner,
         &["key".into(), "remove".into(), key_id.into()],
@@ -231,28 +265,32 @@ pub fn remove_key(
     )
 }
 
-pub(crate) fn capture_rotation_key_id(
+#[cfg_attr(target_os = "ios", allow(dead_code))] // rotation is refused on iOS
+pub(crate) fn capture_rotation_key_id<'invocation>(
     runner: &dyn ToolRunner,
     destination: &Destination,
     password: &str,
-    restic_path: &Path,
+    restic_path: impl Into<crate::runner::ResticInvocation<'invocation>>,
     timeout: Option<Duration>,
 ) -> Result<String, RepoError> {
+    let restic_path = restic_path.into();
     strict_key_list(runner, destination, password, restic_path, timeout)?
         .into_iter()
         .find(|(_, current)| *current)
         .map(|(id, _)| id)
         .ok_or(RepoError::Failed)
 }
-pub(crate) fn remove_rotation_key(
+#[cfg_attr(target_os = "ios", allow(dead_code))] // rotation is refused on iOS
+pub(crate) fn remove_rotation_key<'invocation>(
     runner: &dyn ToolRunner,
     destination: &Destination,
     password: &str,
     key_id: &str,
-    restic_path: &Path,
+    restic_path: impl Into<crate::runner::ResticInvocation<'invocation>>,
     timeout: Option<Duration>,
     cancellation: &ArchiveCancellation,
 ) -> Result<(), RepoError> {
+    let restic_path = restic_path.into();
     let result = run_restic_with_stdin_cancellable(
         runner,
         &["key".into(), "remove".into(), key_id.into()],
@@ -277,14 +315,16 @@ pub(crate) fn remove_rotation_key(
     }
 }
 
-pub(crate) fn strict_key_list_absence(
+#[cfg_attr(target_os = "ios", allow(dead_code))] // rotation is refused on iOS
+pub(crate) fn strict_key_list_absence<'invocation>(
     runner: &dyn ToolRunner,
     destination: &Destination,
     password: &str,
     target_key_id: &str,
-    restic_path: &Path,
+    restic_path: impl Into<crate::runner::ResticInvocation<'invocation>>,
     timeout: Option<Duration>,
 ) -> Result<bool, RepoError> {
+    let restic_path = restic_path.into();
     Ok(
         strict_key_list(runner, destination, password, restic_path, timeout)?
             .iter()
@@ -292,13 +332,15 @@ pub(crate) fn strict_key_list_absence(
     )
 }
 
-fn strict_key_list(
+#[cfg_attr(target_os = "ios", allow(dead_code))] // rotation is refused on iOS
+fn strict_key_list<'invocation>(
     runner: &dyn ToolRunner,
     destination: &Destination,
     password: &str,
-    restic_path: &Path,
+    restic_path: impl Into<crate::runner::ResticInvocation<'invocation>>,
     timeout: Option<Duration>,
 ) -> Result<Vec<(String, bool)>, RepoError> {
+    let restic_path = restic_path.into();
     let args: Vec<String> = vec!["key".into(), "list".into()];
     let result = run_restic(
         runner,
@@ -372,14 +414,15 @@ struct KeyRecord {
 /// removed, so the repository is never left without a key for either secret.
 /// A key file neither secret opens is not the journal's to judge and stays.
 /// Removal needs a credential that can delete.
-pub fn neutralize_key_labels(
+pub fn neutralize_key_labels<'invocation>(
     runner: &dyn ToolRunner,
     destination: &Destination,
     daily_key: &str,
     recovery_key: &str,
-    restic_path: &Path,
+    restic_path: impl Into<crate::runner::ResticInvocation<'invocation>>,
     timeout: Option<Duration>,
 ) -> Result<KeyLabelOutcome, RepoError> {
+    let restic_path = restic_path.into();
     let mut outcome = KeyLabelOutcome::default();
     if list_keys(runner, destination, daily_key, None, restic_path, timeout)?
         .iter()
@@ -465,14 +508,15 @@ pub fn log_key_label_outcome(outcome: Result<KeyLabelOutcome, RepoError>) {
     }
 }
 
-fn add_neutral_key(
+fn add_neutral_key<'invocation>(
     runner: &dyn ToolRunner,
     destination: &Destination,
     secret: &str,
     before: &[KeyRecord],
-    restic_path: &Path,
+    restic_path: impl Into<crate::runner::ResticInvocation<'invocation>>,
     timeout: Option<Duration>,
 ) -> Result<String, RepoError> {
+    let restic_path = restic_path.into();
     let mut env = backend(destination)?;
     // Restic stamps `created` in local time; UTC keeps the owner's offset out.
     env.insert("TZ".into(), Some("UTC".into()));
@@ -500,14 +544,15 @@ fn add_neutral_key(
     }
 }
 
-fn current_key(
+fn current_key<'invocation>(
     runner: &dyn ToolRunner,
     destination: &Destination,
     password: &str,
     hint: Option<&str>,
-    restic_path: &Path,
+    restic_path: impl Into<crate::runner::ResticInvocation<'invocation>>,
     timeout: Option<Duration>,
 ) -> Result<String, RepoError> {
+    let restic_path = restic_path.into();
     list_keys(runner, destination, password, hint, restic_path, timeout)?
         .into_iter()
         .find(|key| key.current)
@@ -515,14 +560,15 @@ fn current_key(
         .ok_or(RepoError::Failed)
 }
 
-fn list_keys(
+fn list_keys<'invocation>(
     runner: &dyn ToolRunner,
     destination: &Destination,
     password: &str,
     hint: Option<&str>,
-    restic_path: &Path,
+    restic_path: impl Into<crate::runner::ResticInvocation<'invocation>>,
     timeout: Option<Duration>,
 ) -> Result<Vec<KeyRecord>, RepoError> {
+    let restic_path = restic_path.into();
     let mut args: Vec<String> = vec!["key".into(), "list".into()];
     if let Some(hint) = hint {
         args.extend(["--key-hint".into(), hint.into()]);
@@ -565,29 +611,31 @@ fn list_keys(
         })
         .collect()
 }
-fn verify_recovery_key(
+fn verify_recovery_key<'invocation>(
     runner: &dyn ToolRunner,
     destination: &Destination,
     recovery_key: &str,
-    restic_path: &Path,
+    restic_path: impl Into<crate::runner::ResticInvocation<'invocation>>,
     timeout: Option<Duration>,
 ) -> Result<(), RepoError> {
+    let restic_path = restic_path.into();
     let status = validate_destination(runner, destination, recovery_key, restic_path, timeout)?;
     (status.repo_exists && status.reason_code == "repo_exists")
         .then_some(())
         .ok_or(RepoError::Failed)
 }
 #[allow(clippy::too_many_arguments)]
-fn run(
+fn run<'invocation>(
     runner: &dyn ToolRunner,
     args: &[String],
     destination: &Destination,
     password: &str,
-    restic_path: &Path,
+    restic_path: impl Into<crate::runner::ResticInvocation<'invocation>>,
     timeout: Option<Duration>,
     pass_fds: &[PassedHandle<'_>],
     stdin: Option<Vec<u8>>,
 ) -> Result<(), RepoError> {
+    let restic_path = restic_path.into();
     run_in(
         runner,
         args,
@@ -601,17 +649,18 @@ fn run(
     )
 }
 #[allow(clippy::too_many_arguments)]
-fn run_in(
+fn run_in<'invocation>(
     runner: &dyn ToolRunner,
     args: &[String],
     destination: &Destination,
     env: &BTreeMap<String, Option<String>>,
     password: &str,
-    restic_path: &Path,
+    restic_path: impl Into<crate::runner::ResticInvocation<'invocation>>,
     timeout: Option<Duration>,
     pass_fds: &[PassedHandle<'_>],
     stdin: Option<Vec<u8>>,
 ) -> Result<(), RepoError> {
+    let restic_path = restic_path.into();
     let result = run_restic_with_stdin(
         runner,
         args,

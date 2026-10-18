@@ -2005,3 +2005,196 @@ fn an_abandoned_generation_boots_unattended_after_a_control_group_kill() {
     let unit = format!("solstone-abandoned-generation-{}", std::process::id());
     exercise_abandoned_generation_boots_unattended(Some(&unit));
 }
+
+#[cfg(feature = "full-tests")]
+#[test]
+fn an_abandoned_large_generation_recovers_across_repeated_restarts() {
+    use std::collections::HashSet;
+
+    let journal = TempJournal::new();
+    let ledger = ParentLossLedger::open(&journal.0).expect("open parent-loss ledger");
+    let source = SystemProcessInstanceSource;
+
+    let dead_sup = solstone_core_system::process::ProcessInstance {
+        pid: 99998,
+        birth: solstone_core_system::process::ProcessBirth::linux(1, 1, 100),
+    };
+    let dead_coord = solstone_core_system::process::ProcessInstance {
+        pid: 99999,
+        birth: solstone_core_system::process::ProcessBirth::linux(2, 1, 100),
+    };
+    let active = ledger
+        .reserve_generation(
+            dead_sup,
+            [solstone_core_system::lifecycle::HostedServiceKind::Sense],
+        )
+        .expect("reserve generation");
+    ledger.initialize_record(&active).expect("record");
+    let active = ledger
+        .persist_coordinator_identity(active.generation, dead_coord)
+        .expect("coordinator identity");
+    let active = ledger
+        .mark_admitting(active.generation, dead_coord)
+        .expect("admitting state");
+
+    let mut child1 = Command::new("sh")
+        .args(["-c", "trap '' TERM; while true; do sleep 1; done"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn child 1");
+    let mut child2 = Command::new("sh")
+        .args(["-c", "trap '' TERM; while true; do sleep 1; done"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn child 2");
+
+    let inst1 = match source.inspect(child1.id()) {
+        solstone_core_system::process::InspectResult::Present { instance, .. } => instance,
+        other => panic!("child 1 inspectable: {other:?}"),
+    };
+    let inst2 = match source.inspect(child2.id()) {
+        solstone_core_system::process::InspectResult::Present { instance, .. } => instance,
+        other => panic!("child 2 inspectable: {other:?}"),
+    };
+
+    let launch1 = "launch-child-1".to_string();
+    let launch2 = "launch-child-2".to_string();
+
+    for (launch_id, inst) in [(&launch1, inst1), (&launch2, inst2)] {
+        solstone_core_system::lifecycle::write_parent_loss_admission_intent(
+            &journal.0,
+            &solstone_core_system::lifecycle::AdmissionIntent::new(
+                active.generation,
+                launch_id,
+                Some(solstone_core_system::lifecycle::HostedServiceKind::Sense),
+                None,
+            ),
+        )
+        .expect("write intent");
+
+        let identity = solstone_core_system::lifecycle::AdmissionIdentity {
+            generation: active.generation,
+            launch_id: launch_id.clone(),
+            instance: inst,
+            uid: nix::unistd::getuid().as_raw(),
+            parent_launch_id: None,
+        };
+        solstone_core_system::lifecycle::write_parent_loss_admission_spawn_identity(
+            &journal.0, &identity,
+        )
+        .expect("write spawn identity");
+    }
+
+    let ready_path = journal.0.join("health/parent-loss/bootstrap-ready.json");
+
+    let mut first = start_with_convey_argv_in(&journal, None, None);
+    let first_start_time = Instant::now();
+    let first_deadline = first_start_time + Duration::from_secs(30);
+
+    loop {
+        if ready_path.exists() {
+            panic!("the first start must not reach bootstrap-ready.json");
+        }
+        if let Some(_status) = first.try_wait().expect("try_wait first") {
+            break;
+        }
+        if Instant::now() >= first_deadline {
+            let _ = first.kill();
+            panic!("first supervisor did not exit within deadline");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !ready_path.exists(),
+        "first start must not reach bootstrap-ready"
+    );
+
+    let first_exit_time = Instant::now();
+
+    let window_start = Instant::now();
+    let mut attempts = 1;
+    let mut last_exit_time = first_exit_time;
+    let mut second_guard: Option<SupervisorGuard> = None;
+
+    while attempts < 10 && Instant::now().duration_since(window_start) < Duration::from_secs(120) {
+        let elapsed_since_exit = Instant::now().duration_since(last_exit_time);
+        if elapsed_since_exit < Duration::from_secs(5) {
+            thread::sleep(Duration::from_secs(5) - elapsed_since_exit);
+        }
+        assert!(
+            Instant::now().duration_since(last_exit_time) >= Duration::from_secs(5),
+            "gap must be at least 5 seconds"
+        );
+
+        let mut sup = start_with_convey_argv_in(&journal, None, None);
+        attempts += 1;
+
+        let attempt_deadline = Instant::now() + Duration::from_secs(45);
+        let mut succeeded = false;
+        loop {
+            if ready_path.exists() {
+                succeeded = true;
+                break;
+            }
+            if let Some(_status) = sup.try_wait().expect("try_wait") {
+                last_exit_time = Instant::now();
+                break;
+            }
+            if Instant::now() >= attempt_deadline {
+                let _ = sup.kill();
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        if succeeded {
+            second_guard = Some(sup);
+            break;
+        }
+    }
+
+    assert!(ready_path.exists(), "successor bootstrap-ready.json exists");
+    let mut supervisor = second_guard.expect("supervisor running");
+
+    let record = ledger
+        .record(active.generation)
+        .expect("record read")
+        .expect("predecessor record exists");
+    assert!(record.closure.is_some(), "predecessor record has closure");
+
+    let ledger_path = ledger.sealed_ledger_path(active.generation);
+    assert!(ledger_path.exists(), "ledger.json exists");
+    let ledger_bytes = fs::read(&ledger_path).expect("read sealed ledger");
+    let ledger_entries: Vec<serde_json::Value> =
+        serde_json::from_slice(&ledger_bytes).expect("parse sealed ledger");
+    let ledger_launch_ids: HashSet<String> = ledger_entries
+        .into_iter()
+        .filter_map(|e| e["launch_id"].as_str().map(|s| s.to_string()))
+        .collect();
+
+    let admissions_dir = ledger.generation_path(active.generation).join("admissions");
+    let dir_names: HashSet<String> = fs::read_dir(&admissions_dir)
+        .expect("read admissions dir")
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+
+    assert_eq!(
+        ledger_launch_ids, dir_names,
+        "ledger.json launch ids equal admission directory names"
+    );
+
+    assert!(admissions_dir.join(&launch1).join("intent.json").exists());
+    assert!(admissions_dir.join(&launch2).join("intent.json").exists());
+
+    let _ = child1.kill();
+    let _ = child1.wait();
+    let _ = child2.kill();
+    let _ = child2.wait();
+    let _ = supervisor.shutdown_and_wait(Duration::from_secs(30));
+}

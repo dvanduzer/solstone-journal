@@ -200,7 +200,7 @@ fn restic(
         .revalidate_for_target()
         .map_err(|_| RESTORE_REASON_DESTINATION_ADMISSION_FAILED)?;
     let restic_path = services
-        .restic_path()
+        .restic_invocation()
         .map_err(|_| RESTORE_REASON_RESTIC_UNAVAILABLE)?;
     run_restic(
         services.runner,
@@ -223,7 +223,13 @@ fn restic(
             }
         },
     )
-    .map_err(|_| runner_error_reason)
+    .map_err(|error| {
+        log::warn!(
+            "restore step {} refused: {error:?}",
+            args.first().map_or("", String::as_str)
+        );
+        runner_error_reason
+    })
 }
 
 fn recognized_returncode_reason(returncode: i32) -> Option<&'static str> {
@@ -295,6 +301,7 @@ pub fn restore_pending_rotation_refusal(journal: &Path) -> Option<&'static str> 
 /// resident leaves its service unable to recognise or stop it. Each pattern is
 /// rooted at the restored subtree, so owner files with the same name elsewhere
 /// in the journal still restore.
+#[cfg_attr(target_os = "ios", allow(dead_code))]
 pub(crate) const RESTORE_KEEPS_LOCAL: [&str; 2] = [
     "/health/supervisor.process_instance",
     "/health/callosum.pipe-*",
@@ -302,18 +309,60 @@ pub(crate) const RESTORE_KEEPS_LOCAL: [&str; 2] = [
 
 /// The restic argv that restores one journal snapshot's tree onto `target`.
 pub(crate) fn restore_args(snapshot_id: &str, tree_path: &str, target: &str) -> Vec<String> {
+    #[cfg_attr(target_os = "ios", allow(unused_mut))]
     let mut args = vec![
         "restore".to_owned(),
         format!("{snapshot_id}:{tree_path}"),
         "--target".to_owned(),
         target.to_owned(),
     ];
+    // These name a desktop journal's own resident; iOS runs none, reads neither
+    // file, and its linked restore takes no exclusions, so it emits none.
+    #[cfg(not(target_os = "ios"))]
     for pattern in RESTORE_KEEPS_LOCAL {
         args.extend(["--exclude".to_owned(), pattern.to_owned()]);
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     args.extend(["--exclude".to_owned(), "backup-activity.lock".to_owned()]);
     args
+}
+
+#[cfg(target_os = "ios")]
+struct IosTargetRunner<'a> {
+    inner: &'a dyn crate::runner::ToolRunner,
+    target: &'a crate::ios_callable::RestoreTarget,
+}
+
+#[cfg(target_os = "ios")]
+impl crate::runner::ToolRunner for IosTargetRunner<'_> {
+    fn run(
+        &self,
+        request: &crate::runner::ToolRequest<'_>,
+    ) -> std::io::Result<crate::runner::ToolOutput> {
+        self.inner.run(request)
+    }
+
+    fn run_cancellable(
+        &self,
+        request: &crate::runner::ToolRequest<'_>,
+        cancellation: &solstone_core_backup::archive_admission::ArchiveCancellation,
+    ) -> std::io::Result<crate::runner::ToolOutput> {
+        self.inner.run_cancellable(request, cancellation)
+    }
+
+    fn cancellation(
+        &self,
+    ) -> Option<&solstone_core_backup::archive_admission::ArchiveCancellation> {
+        self.inner.cancellation()
+    }
+
+    fn ios_journal_root(&self) -> Option<&std::sync::Arc<solstone_core_journal_io::JournalRoot>> {
+        self.inner.ios_journal_root()
+    }
+
+    fn ios_restore_target(&self) -> Option<&crate::ios_callable::RestoreTarget> {
+        Some(self.target)
+    }
 }
 
 /// Restore a BYO repository. The three config setters remain purposefully independent.
@@ -329,6 +378,18 @@ pub fn restore_journal(
         Err(_) => {
             return unrecorded_outcome(error_draft(RESTORE_REASON_DESTINATION_ADMISSION_FAILED));
         }
+    };
+    // iOS: the linked restore copies into exactly this admitted target, whose
+    // native lease is held through every later step until `admitted` drops.
+    #[cfg(target_os = "ios")]
+    let targeted_runner = IosTargetRunner {
+        inner: services.runner,
+        target: admitted.ios_restore_target(),
+    };
+    #[cfg(target_os = "ios")]
+    let services = &BackupServices {
+        runner: &targeted_runner,
+        ..*services
     };
     #[cfg(windows)]
     let admitted = std::sync::Arc::new(admitted);
@@ -368,7 +429,7 @@ pub fn restore_journal(
             draft.resumable = false;
             return unrecorded_outcome(draft);
         }
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "ios"))]
         {
             let mut draft = draft;
             if admitted.revalidate_for_target().is_err() {
@@ -390,7 +451,7 @@ pub fn restore_journal(
             }
             outcome
         }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "ios")))]
         {
             if admitted.revalidate_for_target().is_err() {
                 return unrecorded_outcome(error_draft(
@@ -563,7 +624,7 @@ pub fn restore_journal(
         )
     };
     let admission_failed = || {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "ios"))]
         {
             finish(
                 journal,
@@ -577,7 +638,7 @@ pub fn restore_journal(
                 ),
             )
         }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "ios")))]
         {
             unrecorded_outcome(error_draft(RESTORE_REASON_DESTINATION_ADMISSION_FAILED))
         }
@@ -875,7 +936,7 @@ mod tests {
             runner,
             http: &HTTP,
             clock,
-            restic_path: Some(Path::new("/fixture/restic")),
+            restic: Some((Path::new("/fixture/restic")).into()),
             rclone_path: None,
             version: "test",
             journal_maintenance: maintenance,
@@ -935,7 +996,7 @@ mod tests {
         let maintenance = Maintenance;
         let recorder = Recorder::new();
         let mut runtime = services(&runner, &clock, &maintenance);
-        runtime.restic_path = None;
+        runtime.restic = None;
 
         let outcome = restore_journal(
             journal.path(),

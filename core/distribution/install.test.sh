@@ -6,6 +6,11 @@
 
 set -eu
 
+# Browser-launch tests use an explicit stub, never the host desktop.
+DISPLAY=
+WAYLAND_DISPLAY=
+export DISPLAY WAYLAND_DISPLAY
+
 SOLSTONE_LIBC_VERSION=2.34
 SOLSTONE_LIBSTDCXX_GLIBCXX="GLIBCXX_3.4.29 GLIBCXX_3.4.30"
 SOLSTONE_LIBGOMP=present
@@ -106,6 +111,10 @@ if [ "\${1:-}" = "--version" ]; then
 	fi
 	printf 'journal (solstone) %s\n' "\$_ver"
 	exit 0
+fi
+if [ "\${1:-}" = settings ]; then
+    printf '{\n  "dashboard_url": "http://localhost:%s"\n}\n' "\${SOLSTONE_FIXTURE_PORT:-6123}"
+    exit 0
 fi
 [ -z "\${SOLSTONE_SETUP_ARGS_LOG:-}" ] || printf "%s\n" "\$@" >"\$SOLSTONE_SETUP_ARGS_LOG"
 [ -z "\${SOLSTONE_SETUP_PATH_LOG:-}" ] || printf "%s\n" "\$PATH" >"\$SOLSTONE_SETUP_PATH_LOG"
@@ -488,6 +497,47 @@ if [ ! -e "$PREFIX/.solstone-route.lock" ]; then
 	pass "successful install releases the route lock"
 else
 	fail "successful install left the route lock"
+fi
+
+# A nondefault journal port is carried through desktop and headless setup.
+HANDOFF_BIN=$BASE/handoff-bin
+HANDOFF_OPENED=$BASE/handoff-opened
+mkdir -p "$HANDOFF_BIN"
+printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$@" >> "$HANDOFF_OPENED"' 'exit "${HANDOFF_OPEN_EXIT:-0}"' >"$HANDOFF_BIN/xdg-open"
+chmod 755 "$HANDOFF_BIN/xdg-open"
+export HANDOFF_OPENED
+if env PATH="$HANDOFF_BIN:$PATH" DISPLAY=:1 HOME="$BASE/handoff-home" \
+	"$INSTALL" --prefix "$BASE/handoff-prefix" --no-path --archive "$ARCHIVE" --sha256 "$SHA" --release "$REL" >"$BASE/handoff.out" \
+	&& [ "$(cat "$HANDOFF_OPENED")" = 'http://localhost:6123/init' ]; then
+	pass "graphical install opens setup on the journal's published port once"
+else
+	fail "graphical install did not open setup once"
+fi
+rm -f "$HANDOFF_OPENED"
+if env PATH="$HANDOFF_BIN:$PATH" HOME="$BASE/handoff-headless-home" \
+	"$INSTALL" --prefix "$BASE/handoff-headless-prefix" --no-path --archive "$ARCHIVE" --sha256 "$SHA" --release "$REL" >"$BASE/handoff-headless.out" \
+	&& grep -F -- '-L 6123:127.0.0.1:6123' "$BASE/handoff-headless.out" >/dev/null \
+	&& grep -F 'http://localhost:6123/app/network/' "$BASE/handoff-headless.out" >/dev/null \
+	&& [ ! -e "$HANDOFF_OPENED" ]; then
+	pass "headless install prints the setup tunnel and pairing next step"
+else
+	fail "headless install lost its next step"
+fi
+for _handoff_flag in --no-start --upgrade; do
+	if env PATH="$HANDOFF_BIN:$PATH" DISPLAY=:1 HOME="$BASE/handoff-home" \
+		"$INSTALL" --prefix "$BASE/handoff-prefix" "$_handoff_flag" --no-path --archive "$ARCHIVE" --sha256 "$SHA" --release "$REL" >"$BASE/handoff-excluded.out" \
+		&& [ ! -e "$HANDOFF_OPENED" ]; then
+		pass "$_handoff_flag does not open a browser"
+	else
+		fail "$_handoff_flag opened a browser"
+	fi
+done
+if env PATH="$HANDOFF_BIN:$PATH" DISPLAY=:1 SOLSTONE_INSTALLER_NO_HANDOFF=1 HOME="$BASE/handoff-home" \
+	"$INSTALL" --prefix "$BASE/handoff-prefix" --no-path --archive "$ARCHIVE" --sha256 "$SHA" --release "$REL" >"$BASE/handoff-delegated.out" \
+	&& [ ! -e "$HANDOFF_OPENED" ]; then
+	pass "delegated bootstrap leaves the browser to the umbrella installer"
+else
+	fail "delegated bootstrap opened a second browser"
 fi
 
 # A caught termination signal after the route flip must leave the candidate

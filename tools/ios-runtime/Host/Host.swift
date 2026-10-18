@@ -855,6 +855,11 @@ final class PendingReply: @unchecked Sendable {
   func start() async {
     guard !started else { return }
     started = true
+    let backupAdmitted = journal_ios_backup_admit()
+    let backupDiagnosticPointer = journal_ios_backup_admission_diagnostic()
+    let backupDiagnostic = backupDiagnosticPointer.map { String(cString: $0) } ?? "unavailable"
+    journal_runtime_free(backupDiagnosticPointer)
+    log("backup.admission", ["admitted": backupAdmitted, "diagnostic": backupDiagnostic])
     UIApplication.shared.isIdleTimerDisabled = true
     UIDevice.current.isBatteryMonitoringEnabled = true
     guard args.contains("--qualify") || args.contains("--serve") else { return }

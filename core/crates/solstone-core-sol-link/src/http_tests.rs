@@ -5,6 +5,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use axum::Extension;
 use axum::body::{Body, to_bytes};
@@ -12,10 +13,11 @@ use axum::http::{Method, Request, StatusCode};
 use serde_json::{Value, json};
 use solstone_core_convey_http::identity::{AccessBasis, Carrier, LinkedDeviceCid};
 use solstone_core_journal_config::materialized_defaults;
+use solstone_core_thinking_copy::SetupCatalogFacts;
 use tower::ServiceExt;
 
 use crate::establish;
-use crate::http::router;
+use crate::http::{SetupDownloadTask, SetupDownloads, SetupHost, init_router_with_host, router};
 use crate::ledger::{AuthorizationLedger, ClientEntry, ClientRole};
 use crate::mark::mark_from_jid;
 
@@ -32,6 +34,7 @@ async fn init_routes_reject_linked_devices_and_serve_localhost() {
         (Method::GET, "/init/mark"),
         (Method::POST, "/init/mark/regenerate"),
         (Method::POST, "/init/mark/lock"),
+        (Method::POST, "/init/api/action"),
         (Method::POST, "/init/finalize"),
     ];
 
@@ -70,6 +73,7 @@ async fn init_routes_are_registered_and_observers_remain_deferred() {
         (Method::GET, "/init/mark"),
         (Method::POST, "/init/mark/regenerate"),
         (Method::POST, "/init/mark/lock"),
+        (Method::POST, "/init/api/action"),
         (Method::POST, "/init/finalize"),
     ];
 
@@ -311,15 +315,22 @@ async fn the_committed_mark_is_the_last_previewed_mark() {
         "the candidate must survive between requests, not be minted per request"
     );
 
+    let proposal_id = regenerated["proposal_id"]
+        .as_str()
+        .expect("proposal_id")
+        .to_string();
     let locked = request(
         temporary.path(),
         AccessBasis::Localhost,
         Method::POST,
         "/init/mark/lock",
-        None,
+        Some(json!({"proposal_id": proposal_id})),
     )
     .await;
     assert_eq!(locked.status(), StatusCode::OK);
+    let locked_json = response_json(locked).await;
+    assert_eq!(locked_json["proposal_id"], proposal_id);
+    assert_eq!(locked_json["mark"], previewed_again["mark"]);
 
     let committed = response_json(
         request(
@@ -342,6 +353,17 @@ async fn the_committed_mark_is_the_last_previewed_mark() {
 #[tokio::test]
 async fn mark_preview_returns_only_a_render_spec_and_lock_requires_a_candidate() {
     let temporary = TempDir::new();
+    let state_resp = request(
+        temporary.path(),
+        AccessBasis::Localhost,
+        Method::GET,
+        "/init/api/state",
+        None,
+    )
+    .await;
+    assert_eq!(state_resp.status(), StatusCode::OK);
+    assert!(!temporary.path().join("link").join("ca-staging").exists());
+
     let no_candidate = request(
         temporary.path(),
         AccessBasis::Localhost,
@@ -353,8 +375,23 @@ async fn mark_preview_returns_only_a_render_spec_and_lock_requires_a_candidate()
     assert_eq!(no_candidate.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
         response_json(no_candidate).await["reason_code"],
-        "invalid_operation_for_state"
+        "invalid_request"
     );
+
+    let stale = request(
+        temporary.path(),
+        AccessBasis::Localhost,
+        Method::POST,
+        "/init/mark/lock",
+        Some(json!({"proposal_id": "stale"})),
+    )
+    .await;
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(stale).await["reason_code"],
+        "proposal_conflict"
+    );
+    assert!(!temporary.path().join("link").join("ca").exists());
 
     let preview = request(
         temporary.path(),
@@ -417,7 +454,7 @@ async fn committed_mark_returns_the_locked_identity_mark() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response_json(response).await,
-        json!({"availability":"ready","locked":true,"mark":expected_mark})
+        json!({"availability":"ready","locked":true,"mark":expected_mark,"proposal_id":committed.instance_id})
     );
 }
 
@@ -455,7 +492,7 @@ async fn init_state_reads_materialized_defaults_without_writing() {
 }
 
 #[tokio::test]
-async fn init_state_lanes_and_confidential_match_pre_move_fixture() {
+async fn init_state_transports_shared_lanes_and_keeps_confidential_fixture() {
     let temporary = TempDir::new();
     let response = request(
         temporary.path(),
@@ -466,10 +503,14 @@ async fn init_state_lanes_and_confidential_match_pre_move_fixture() {
     )
     .await;
     let actual = response_json(response).await;
-    let expected: Value = serde_json::from_str(include_str!(
+    let mut expected: Value = serde_json::from_str(include_str!(
         "../tests/fixtures/init_state_lanes_pre_move.json"
     ))
     .expect("pre-move init-state fixture parses");
+    // Shared lane words changed after this snapshot. The unchanged
+    // confidential detail remains pinned to the historical fixture.
+    expected["lanes"] =
+        serde_json::to_value(solstone_core_thinking_copy::LANES).expect("shared lanes serialize");
     assert_eq!(
         json!({
             "lanes": actual["lanes"].clone(),
@@ -514,7 +555,7 @@ async fn init_redirects_after_finalize() {
         AccessBasis::Localhost,
         Method::POST,
         "/init/finalize",
-        Some(json!({"lane":"local"})),
+        Some(json!({"lane":"later"})),
     )
     .await;
     assert_eq!(finalize.status(), StatusCode::OK);
@@ -584,7 +625,7 @@ async fn finalize_writes_journal_config_with_the_python_response_shape() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response_json(response).await,
-        json!({"success":true,"redirect":"/app/thinking#confidential-setup","warnings":[]})
+        json!({"success":true,"redirect":"/app/home","warnings":[]})
     );
     let config: Value = serde_json::from_slice(&fs::read(config_path).unwrap()).unwrap();
     assert_eq!(config["identity"]["name"], "Ada");
@@ -614,6 +655,13 @@ async fn finalize_does_not_write_convey_config() {
     .await;
 
     assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["redirect"], "/app/home");
+    let config: Value = serde_json::from_slice(
+        &fs::read(temporary.path().join("config").join("journal.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(config["setup"]["thinking_choice"], "later");
     assert!(!convey_path.exists());
 }
 
@@ -643,7 +691,7 @@ async fn finalize_preserves_non_object_sections_as_corrupt_config() {
 }
 
 #[tokio::test]
-async fn finalize_treats_malformed_json_as_an_empty_request() {
+async fn finalize_rejects_malformed_json() {
     let temporary = committed_journal();
     let response = request_body(
         temporary.path(),
@@ -655,10 +703,10 @@ async fn finalize_treats_malformed_json_as_an_empty_request() {
     )
     .await;
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        response_json(response).await,
-        json!({"success":true,"redirect":"/app/thinking","warnings":[]})
+        response_json(response).await["reason_code"],
+        "invalid_request"
     );
 }
 
@@ -747,6 +795,723 @@ async fn response_json(response: axum::response::Response) -> Value {
     serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
 }
 
+async fn request_with_host(
+    journal: &Path,
+    host: Arc<dyn SetupHost>,
+    basis: AccessBasis,
+    method: Method,
+    uri: &str,
+    body: Option<Value>,
+) -> axum::response::Response {
+    let (body, content_type) = if let Some(body) = body {
+        (Body::from(body.to_string()), Some("application/json"))
+    } else {
+        (Body::empty(), None)
+    };
+    request_body_with_host(journal, host, basis, method, uri, body, content_type).await
+}
+
+async fn request_body_with_host(
+    journal: &Path,
+    host: Arc<dyn SetupHost>,
+    basis: AccessBasis,
+    method: Method,
+    uri: &str,
+    body: Body,
+    content_type: Option<&str>,
+) -> axum::response::Response {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(content_type) = content_type {
+        builder = builder.header("content-type", content_type);
+    }
+    init_router_with_host(journal, host)
+        .layer(Extension(basis))
+        .oneshot(builder.body(body).unwrap())
+        .await
+        .unwrap()
+}
+
+#[derive(Default)]
+struct FakeSetupHost {
+    start_calls: std::sync::Mutex<Vec<PathBuf>>,
+    cancel_calls: std::sync::Mutex<Vec<(PathBuf, String)>>,
+    retry_speech_calls: std::sync::Mutex<Vec<PathBuf>>,
+    start_error: std::sync::Mutex<Option<String>>,
+    projected: std::sync::Mutex<Option<SetupDownloads>>,
+}
+
+impl SetupHost for FakeSetupHost {
+    fn start_local(&self, journal_root: &Path) -> Result<(), String> {
+        self.start_calls
+            .lock()
+            .unwrap()
+            .push(journal_root.to_path_buf());
+        if let Some(err) = self.start_error.lock().unwrap().as_ref() {
+            return Err(err.clone());
+        }
+        Ok(())
+    }
+
+    fn cancel_local(&self, journal_root: &Path, attempt_id: &str) -> Result<(), String> {
+        self.cancel_calls
+            .lock()
+            .unwrap()
+            .push((journal_root.to_path_buf(), attempt_id.to_string()));
+        Ok(())
+    }
+
+    fn retry_speech(&self, journal_root: &Path) -> Result<(), String> {
+        self.retry_speech_calls
+            .lock()
+            .unwrap()
+            .push(journal_root.to_path_buf());
+        Ok(())
+    }
+
+    fn project_downloads(&self, _journal_root: &Path) -> SetupDownloads {
+        if let Some(p) = self.projected.lock().unwrap().clone() {
+            return p;
+        }
+        SetupDownloads {
+            speech: SetupDownloadTask {
+                state: "idle".into(),
+                attempt_id: None,
+                bytes_done: None,
+                bytes_total: None,
+                error: None,
+            },
+            thinking: SetupDownloadTask {
+                state: "idle".into(),
+                attempt_id: None,
+                bytes_done: None,
+                bytes_total: None,
+                error: None,
+            },
+        }
+    }
+
+    fn catalog_facts(&self) -> SetupCatalogFacts {
+        solstone_core_thinking_copy::current_setup_facts()
+    }
+}
+
+#[tokio::test]
+async fn action_route_rejects_linked_device() {
+    let temporary = TempDir::new();
+    let linked = request(
+        temporary.path(),
+        AccessBasis::LinkedDevice {
+            carrier: Carrier::Direct,
+            cid: LinkedDeviceCid::try_from(VALID_CID).unwrap(),
+            leaf_spki: vec![0x30, 0x00],
+        },
+        Method::POST,
+        "/init/api/action",
+        Some(json!({"action": "save_thinking", "choice": "later"})),
+    )
+    .await;
+    assert_eq!(linked.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        response_json(linked).await["reason_code"],
+        "init_local_only"
+    );
+}
+
+#[tokio::test]
+async fn fresh_get_init_api_state_reports_uninitialized() {
+    let temporary = TempDir::new();
+    let res = request(
+        temporary.path(),
+        AccessBasis::Localhost,
+        Method::GET,
+        "/init/api/state",
+        None,
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = response_json(res).await;
+    assert_eq!(body["mark"]["state"], "unavailable");
+    assert!(body["mark"]["render"].is_null());
+    assert!(body["mark"]["proposal_id"].is_null());
+    assert_eq!(body["thinking"]["saved"], false);
+    assert_eq!(
+        body["remaining_required_steps"],
+        json!(["mark", "thinking"])
+    );
+    assert_eq!(body["done"], false);
+    assert_eq!(body["redirect"], "/app/home");
+    assert!(!temporary.path().join("link").join("ca").exists());
+    assert!(!temporary.path().join("link").join("ca-staging").exists());
+}
+
+#[tokio::test]
+async fn regenerate_mark_and_commit_proposal_locks_and_is_idempotent() {
+    let temporary = TempDir::new();
+    let regen = response_json(
+        request(
+            temporary.path(),
+            AccessBasis::Localhost,
+            Method::POST,
+            "/init/api/action",
+            Some(json!({"action": "regenerate_mark"})),
+        )
+        .await,
+    )
+    .await;
+    let proposal_id = regen["mark"]["proposal_id"]
+        .as_str()
+        .expect("proposal_id")
+        .to_string();
+    let expected_render =
+        serde_json::to_value(mark_from_jid(&proposal_id).unwrap().to_render_spec()).unwrap();
+    assert_eq!(regen["mark"]["render"], expected_render);
+
+    // Missing proposal_id
+    let missing = request(
+        temporary.path(),
+        AccessBasis::Localhost,
+        Method::POST,
+        "/init/api/action",
+        Some(json!({"action": "commit_mark"})),
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(missing).await["reason_code"],
+        "proposal_required"
+    );
+    assert!(!temporary.path().join("link").join("ca").exists());
+
+    // Commit with proposal_id
+    let committed = response_json(
+        request(
+            temporary.path(),
+            AccessBasis::Localhost,
+            Method::POST,
+            "/init/api/action",
+            Some(json!({"action": "commit_mark", "proposal_id": proposal_id})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(committed["mark"]["state"], "locked");
+    assert_eq!(committed["mark"]["render"], expected_render);
+
+    // Repeat commit_mark
+    let repeat = request(
+        temporary.path(),
+        AccessBasis::Localhost,
+        Method::POST,
+        "/init/api/action",
+        Some(json!({"action": "commit_mark", "proposal_id": proposal_id})),
+    )
+    .await;
+    assert_eq!(repeat.status(), StatusCode::OK);
+
+    // Repeat POST /init/mark/lock
+    let repeat_lock = request(
+        temporary.path(),
+        AccessBasis::Localhost,
+        Method::POST,
+        "/init/mark/lock",
+        Some(json!({"proposal_id": proposal_id})),
+    )
+    .await;
+    assert_eq!(repeat_lock.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn regenerate_again_after_commit_is_invalid_operation() {
+    let temporary = committed_journal();
+    let resp = request(
+        temporary.path(),
+        AccessBasis::Localhost,
+        Method::POST,
+        "/init/api/action",
+        Some(json!({"action": "regenerate_mark"})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(resp).await["reason_code"],
+        "invalid_operation_for_state"
+    );
+    assert!(!temporary.path().join("link").join("ca-staging").exists());
+}
+
+#[tokio::test]
+async fn cross_client_regenerate_and_commit_conflict() {
+    let temporary = TempDir::new();
+    let regen_a = response_json(
+        request(
+            temporary.path(),
+            AccessBasis::Localhost,
+            Method::POST,
+            "/init/mark/regenerate",
+            None,
+        )
+        .await,
+    )
+    .await;
+    let id_a = regen_a["proposal_id"].as_str().unwrap().to_string();
+
+    let regen_b = response_json(
+        request(
+            temporary.path(),
+            AccessBasis::Localhost,
+            Method::POST,
+            "/init/mark/regenerate",
+            None,
+        )
+        .await,
+    )
+    .await;
+    let id_b = regen_b["proposal_id"].as_str().unwrap().to_string();
+    assert_ne!(id_a, id_b);
+
+    // Commit A fails with 409
+    let commit_a = request(
+        temporary.path(),
+        AccessBasis::Localhost,
+        Method::POST,
+        "/init/mark/lock",
+        Some(json!({"proposal_id": id_a})),
+    )
+    .await;
+    assert_eq!(commit_a.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(commit_a).await["reason_code"],
+        "proposal_conflict"
+    );
+    assert!(!temporary.path().join("link").join("ca").exists());
+
+    // Commit B succeeds
+    let commit_b = request(
+        temporary.path(),
+        AccessBasis::Localhost,
+        Method::POST,
+        "/init/mark/lock",
+        Some(json!({"proposal_id": id_b})),
+    )
+    .await;
+    assert_eq!(commit_b.status(), StatusCode::OK);
+    let state = response_json(
+        request(
+            temporary.path(),
+            AccessBasis::Localhost,
+            Method::GET,
+            "/init/api/state",
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(state["mark"]["state"], "locked");
+    assert_eq!(state["mark"]["proposal_id"], id_b);
+}
+
+#[tokio::test]
+async fn save_thinking_choices_persist_without_active_provider() {
+    for choice in ["byo", "spp", "later"] {
+        let temporary = committed_journal();
+        let res = response_json(
+            request(
+                temporary.path(),
+                AccessBasis::Localhost,
+                Method::POST,
+                "/init/api/action",
+                Some(json!({"action": "save_thinking", "choice": choice})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(res["thinking"]["choice"], choice);
+        assert_eq!(res["thinking"]["saved"], true);
+        assert_eq!(res["redirect"], "/app/home");
+        let finalized = response_json(
+            request(
+                temporary.path(),
+                AccessBasis::Localhost,
+                Method::POST,
+                "/init/api/action",
+                Some(json!({"action": "finalize"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(finalized["done"], true);
+        assert_eq!(finalized["redirect"], "/app/home");
+
+        let config: Value = serde_json::from_slice(
+            &fs::read(temporary.path().join("config").join("journal.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config["setup"]["thinking_choice"], choice);
+        assert!(config["providers"].get("active").is_none());
+        assert!(
+            config
+                .get("services")
+                .and_then(|s| s.get("confidential"))
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn save_thinking_local_respects_capability() {
+    for capability in ["ok", "blocked", "unknown"] {
+        let temporary = TempDir::new();
+        crate::http::setup_probe_test::capability(temporary.path(), capability);
+        let host = Arc::new(FakeSetupHost::default());
+        let response = request_with_host(
+            temporary.path(),
+            host.clone(),
+            AccessBasis::Localhost,
+            Method::POST,
+            "/init/api/action",
+            Some(json!({"action":"save_thinking", "choice":"local"})),
+        )
+        .await;
+        if capability == "ok" {
+            assert_eq!(response.status(), StatusCode::OK);
+            let state = response_json(response).await;
+            assert_eq!(state["thinking"]["choice"], "local");
+            assert_eq!(state["thinking"]["saved"], true);
+            let config: Value = serde_json::from_slice(
+                &fs::read(temporary.path().join("config/journal.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                config["providers"]["active"],
+                json!({"provider":"local", "model":"local/qwen3.5-4b"})
+            );
+            assert_eq!(
+                config["setup"]["thinking_selection"],
+                config["providers"]["active"]
+            );
+            assert_eq!(host.start_calls.lock().unwrap().len(), 1);
+        } else {
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response_json(response).await["reason_code"],
+                "local_unavailable"
+            );
+            let state = response_json(
+                request_with_host(
+                    temporary.path(),
+                    host.clone(),
+                    AccessBasis::Localhost,
+                    Method::GET,
+                    "/init/api/state",
+                    None,
+                )
+                .await,
+            )
+            .await;
+            assert!(state["thinking"]["choice"].is_null());
+            assert_eq!(state["thinking"]["saved"], false);
+            assert!(host.start_calls.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn save_thinking_later_cleans_up_matched_selection() {
+    let temporary = TempDir::new();
+    let host = Arc::new(FakeSetupHost::default());
+    let config_path = temporary.path().join("config").join("journal.json");
+    fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    let local_val = json!({"provider": "local", "model": "local/qwen3.5-4b"});
+    fs::write(
+        &config_path,
+        json!({
+            "setup": {"thinking_choice": "local", "thinking_selection": local_val.clone()},
+            "providers": {"active": local_val.clone()}
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let _ = request_with_host(
+        temporary.path(),
+        host.clone(),
+        AccessBasis::Localhost,
+        Method::POST,
+        "/init/api/action",
+        Some(json!({"action": "save_thinking", "choice": "later"})),
+    )
+    .await;
+
+    let config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    assert_eq!(config["setup"]["thinking_choice"], "later");
+    assert!(config["setup"].get("thinking_selection").is_none());
+    assert!(config["providers"].get("active").is_none());
+
+    // A different owner providers.active with no matching selection stays
+    let custom_val = json!({"provider": "custom", "model": "gpt-4"});
+    fs::write(
+        &config_path,
+        json!({
+            "setup": {"thinking_choice": "byo"},
+            "providers": {"active": custom_val.clone()}
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let _ = request_with_host(
+        temporary.path(),
+        host.clone(),
+        AccessBasis::Localhost,
+        Method::POST,
+        "/init/api/action",
+        Some(json!({"action": "save_thinking", "choice": "later"})),
+    )
+    .await;
+
+    let config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    assert_eq!(config["providers"]["active"], custom_val);
+}
+
+#[tokio::test]
+async fn start_thinking_download_validations() {
+    let temporary = TempDir::new();
+    let host = Arc::new(FakeSetupHost::default());
+
+    // Without saved local choice
+    let res = request_with_host(
+        temporary.path(),
+        host.clone(),
+        AccessBasis::Localhost,
+        Method::POST,
+        "/init/api/action",
+        Some(json!({"action": "start_thinking_download"})),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(res).await["reason_code"],
+        "thinking_choice_required"
+    );
+
+    // Save choice as byo
+    let _ = request_with_host(
+        temporary.path(),
+        host.clone(),
+        AccessBasis::Localhost,
+        Method::POST,
+        "/init/api/action",
+        Some(json!({"action": "save_thinking", "choice": "byo"})),
+    )
+    .await;
+    let res = request_with_host(
+        temporary.path(),
+        host.clone(),
+        AccessBasis::Localhost,
+        Method::POST,
+        "/init/api/action",
+        Some(json!({"action": "start_thinking_download"})),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(res).await["reason_code"],
+        "thinking_choice_required"
+    );
+}
+
+#[tokio::test]
+async fn fake_start_error_overlays_on_idle() {
+    let temporary = TempDir::new();
+    let host = Arc::new(FakeSetupHost::default());
+    *host.start_error.lock().unwrap() = Some("disk full".into());
+
+    let state = response_json(
+        request_with_host(
+            temporary.path(),
+            host.clone(),
+            AccessBasis::Localhost,
+            Method::GET,
+            "/init/api/state",
+            None,
+        )
+        .await,
+    )
+    .await;
+    if state["thinking"]["capability"] == "ok" {
+        let res = request_with_host(
+            temporary.path(),
+            host.clone(),
+            AccessBasis::Localhost,
+            Method::POST,
+            "/init/api/action",
+            Some(json!({"action": "save_thinking", "choice": "local"})),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = response_json(res).await;
+        assert_eq!(body["thinking"]["choice"], "local");
+        assert_eq!(body["thinking"]["saved"], true);
+        assert_eq!(body["downloads"]["thinking"]["state"], "error");
+        assert_eq!(
+            body["downloads"]["thinking"]["error"]["code"],
+            "start_failed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unknown_action_and_choice_rejected() {
+    let temporary = TempDir::new();
+    let config_path = temporary.path().join("config").join("journal.json");
+
+    let res = request(
+        temporary.path(),
+        AccessBasis::Localhost,
+        Method::POST,
+        "/init/api/action",
+        Some(json!({"action": "unknown_action"})),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    let res = request(
+        temporary.path(),
+        AccessBasis::Localhost,
+        Method::POST,
+        "/init/api/action",
+        Some(json!({"action": "save_thinking", "choice": "invalid_choice"})),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    let res = request_body(
+        temporary.path(),
+        AccessBasis::Localhost,
+        Method::POST,
+        "/init/api/action",
+        Body::from("{not json"),
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    assert!(!config_path.exists());
+}
+
+#[tokio::test]
+async fn float_completed_at_preserves_completion_and_leaves_config_untouched() {
+    let temporary = committed_journal();
+    let config_path = temporary.path().join("config").join("journal.json");
+    fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    let initial_json = json!({
+        "setup": {"completed_at": 1791570000.0},
+        "retention": {"raw_media": "days", "raw_media_days": 14}
+    });
+    fs::write(&config_path, initial_json.to_string()).unwrap();
+
+    let state = response_json(
+        request(
+            temporary.path(),
+            AccessBasis::Localhost,
+            Method::GET,
+            "/init/api/state",
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(state["done"], true);
+    assert_eq!(state["remaining_required_steps"], json!([]));
+
+    // POST /init/finalize with different retention
+    let fin_resp = request(
+        temporary.path(),
+        AccessBasis::Localhost,
+        Method::POST,
+        "/init/finalize",
+        Some(json!({"retention_mode": "keep", "lane": "byo"})),
+    )
+    .await;
+    assert_eq!(fin_resp.status(), StatusCode::OK);
+
+    let config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    assert_eq!(config["setup"]["completed_at"], 1791570000.0);
+    assert_eq!(config["retention"]["raw_media"], "days");
+    assert_eq!(config["retention"]["raw_media_days"], 14);
+    assert!(config["setup"].get("thinking_choice").is_none());
+
+    // action=finalize
+    let action_resp = request(
+        temporary.path(),
+        AccessBasis::Localhost,
+        Method::POST,
+        "/init/api/action",
+        Some(json!({"action": "finalize"})),
+    )
+    .await;
+    assert_eq!(action_resp.status(), StatusCode::OK);
+
+    let config2: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    assert_eq!(config2["setup"]["completed_at"], 1791570000.0);
+    assert_eq!(config2["retention"]["raw_media"], "days");
+    assert_eq!(config2["retention"]["raw_media_days"], 14);
+    assert!(config2["setup"].get("thinking_choice").is_none());
+}
+
+#[tokio::test]
+async fn old_finalize_lane_redirects_and_choice_storage() {
+    let temporary = committed_journal();
+    let res = response_json(
+        request(
+            temporary.path(),
+            AccessBasis::Localhost,
+            Method::POST,
+            "/init/finalize",
+            Some(json!({"lane": "confidential"})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(res["redirect"], "/app/home");
+    let config: Value = serde_json::from_slice(
+        &fs::read(temporary.path().join("config").join("journal.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(config["setup"]["thinking_choice"], "spp");
+
+    // byo
+    let temp_byo = committed_journal();
+    let res_byo = response_json(
+        request(
+            temp_byo.path(),
+            AccessBasis::Localhost,
+            Method::POST,
+            "/init/finalize",
+            Some(json!({"lane": "byo"})),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(res_byo["redirect"], "/app/home");
+
+    // local completes even when host start returns Err
+    let temp_local = committed_journal();
+    crate::http::setup_probe_test::capability(temp_local.path(), "ok");
+    let host = Arc::new(FakeSetupHost::default());
+    *host.start_error.lock().unwrap() = Some("model download blocked".into());
+    let res_local = request_with_host(
+        temp_local.path(),
+        host,
+        AccessBasis::Localhost,
+        Method::POST,
+        "/init/finalize",
+        Some(json!({"lane": "local"})),
+    )
+    .await;
+    assert_eq!(res_local.status(), StatusCode::OK);
+}
+
 fn assert_mark_render_spec(mark: &Value) {
     assert_eq!(
         mark.as_object().unwrap().keys().collect::<Vec<_>>(),
@@ -776,6 +1541,257 @@ fn committed_journal() -> TempDir {
     temporary
 }
 
+#[tokio::test]
+async fn first_setup_state_read_does_not_create_any_journal_files() {
+    let temporary = TempDir::new();
+    let response = request(
+        temporary.path(),
+        AccessBasis::Localhost,
+        Method::GET,
+        "/init/api/state",
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let state = response_json(response).await;
+    assert_eq!(state["mark"]["state"], "unavailable");
+    assert_eq!(state["done"], false);
+    assert!(fs::read_dir(temporary.path()).unwrap().next().is_none());
+}
+
+#[tokio::test]
+async fn mark_and_saved_choice_are_not_done_until_finalize_commits() {
+    let temporary = TempDir::new();
+    let proposal = establish::ensure_mark_snapshot(temporary.path()).unwrap();
+    establish::commit_proposal(temporary.path(), proposal.proposal_id.as_deref().unwrap()).unwrap();
+    let saved = request(
+        temporary.path(),
+        AccessBasis::Localhost,
+        Method::POST,
+        "/init/api/action",
+        Some(json!({"action":"save_thinking","choice":"later"})),
+    )
+    .await;
+    assert_eq!(saved.status(), StatusCode::OK);
+    assert_eq!(response_json(saved).await["done"], false);
+    let state = request(
+        temporary.path(),
+        AccessBasis::Localhost,
+        Method::GET,
+        "/init/api/state",
+        None,
+    )
+    .await;
+    assert_eq!(response_json(state).await["done"], false);
+    let finished = request(
+        temporary.path(),
+        AccessBasis::Localhost,
+        Method::POST,
+        "/init/api/action",
+        Some(json!({"action":"finalize"})),
+    )
+    .await;
+    assert_eq!(finished.status(), StatusCode::OK);
+    assert_eq!(response_json(finished).await["done"], true);
+}
+
+#[tokio::test]
+async fn repeated_local_save_does_not_restart_a_cancelled_attempt() {
+    let temporary = TempDir::new();
+    let local = json!({"provider":"local","model":"local/qwen3.5-4b"});
+    fs::create_dir_all(temporary.path().join("config")).unwrap();
+    fs::write(
+        temporary.path().join("config/journal.json"),
+        serde_json::to_vec(&json!({
+            "setup":{"thinking_choice":"local","thinking_selection":local},
+            "providers":{"active":local}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let host = Arc::new(FakeSetupHost::default());
+    let mut projected = host.project_downloads(temporary.path());
+    projected.thinking.state = "cancelled".into();
+    projected.thinking.attempt_id = Some("cancelled-attempt".into());
+    *host.projected.lock().unwrap() = Some(projected);
+    let response = request_with_host(
+        temporary.path(),
+        host.clone(),
+        AccessBasis::Localhost,
+        Method::POST,
+        "/init/api/action",
+        Some(json!({"action":"save_thinking","choice":"local"})),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(host.start_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn retained_finalize_releases_only_its_own_local_selection() {
+    for (lane, choice) in [("later", "later"), ("byo", "byo"), ("confidential", "spp")] {
+        for owner_changed in [false, true] {
+            let temporary = TempDir::new();
+            let proposal = establish::ensure_mark_snapshot(temporary.path()).unwrap();
+            establish::commit_proposal(temporary.path(), proposal.proposal_id.as_deref().unwrap())
+                .unwrap();
+            let local = json!({"provider":"local","model":"local/qwen3.5-4b"});
+            let owner = json!({"provider":"openai","model":"owner-model"});
+            fs::create_dir_all(temporary.path().join("config")).unwrap();
+            fs::write(
+                temporary.path().join("config/journal.json"),
+                serde_json::to_vec(&json!({
+                    "setup":{"thinking_choice":"local","thinking_selection":local},
+                    "providers":{"active":if owner_changed { &owner } else { &local }}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let response = request(
+                temporary.path(),
+                AccessBasis::Localhost,
+                Method::POST,
+                "/init/finalize",
+                Some(json!({"lane":lane})),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let config: Value = serde_json::from_slice(
+                &fs::read(temporary.path().join("config/journal.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(config["setup"]["thinking_choice"], choice);
+            if owner_changed {
+                assert_eq!(config["providers"]["active"], owner);
+            } else {
+                assert!(config["providers"].get("active").is_none());
+            }
+            assert!(config["setup"].get("thinking_selection").is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn corrupt_proposal_is_visible_and_never_silently_replaced() {
+    let temporary = TempDir::new();
+    establish::ensure_mark_snapshot(temporary.path()).unwrap();
+    let key = temporary.path().join("link/ca-staging/private.pem");
+    fs::write(&key, b"corrupt fixture").unwrap();
+    for (method, route, body) in [
+        (Method::GET, "/init/api/state", None),
+        (Method::GET, "/init/mark", None),
+        (
+            Method::POST,
+            "/init/api/action",
+            Some(json!({"action":"regenerate_mark"})),
+        ),
+    ] {
+        let response = request(
+            temporary.path(),
+            AccessBasis::Localhost,
+            method,
+            route,
+            body,
+        )
+        .await;
+        assert!(!response.status().is_success(), "{route}");
+        assert_eq!(fs::read(&key).unwrap(), b"corrupt fixture");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_retry_cannot_reactivate_local_after_another_client_saves_later() {
+    let temporary = TempDir::new();
+    let root = temporary.path().to_owned();
+    let local = json!({"provider":"local","model":"local/qwen3.5-4b"});
+    fs::create_dir_all(root.join("config")).unwrap();
+    fs::write(root.join("config/journal.json"), serde_json::to_vec(&json!({"setup":{"thinking_choice":"local","thinking_selection":local},"providers":{"active":local}})).unwrap()).unwrap();
+    let host = Arc::new(FakeSetupHost::default());
+    let (reached, release) = crate::http::setup_probe_test::pause(&root);
+    let retry_root = root.clone();
+    let retry_host = host.clone();
+    let retry = tokio::spawn(async move {
+        request_with_host(
+            &retry_root,
+            retry_host,
+            AccessBasis::Localhost,
+            Method::POST,
+            "/init/api/action",
+            Some(json!({"action":"start_thinking_download"})),
+        )
+        .await
+    });
+    tokio::task::spawn_blocking(move || {
+        reached
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let later = request_with_host(
+        &root,
+        host.clone(),
+        AccessBasis::Localhost,
+        Method::POST,
+        "/init/api/action",
+        Some(json!({"action":"save_thinking","choice":"later"})),
+    )
+    .await;
+    assert_eq!(later.status(), StatusCode::OK);
+    release.send(()).unwrap();
+    assert_eq!(retry.await.unwrap().status(), StatusCode::CONFLICT);
+    assert!(host.start_calls.lock().unwrap().is_empty());
+    let config: Value =
+        serde_json::from_slice(&fs::read(root.join("config/journal.json")).unwrap()).unwrap();
+    assert_eq!(config["setup"]["thinking_choice"], "later");
+    assert!(config["providers"].get("active").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_finalize_rechecks_provider_eligibility_after_probe() {
+    let temporary = TempDir::new();
+    let root = temporary.path().to_owned();
+    let proposal = establish::ensure_mark_snapshot(&root).unwrap();
+    establish::commit_proposal(&root, proposal.proposal_id.as_deref().unwrap()).unwrap();
+    let host = Arc::new(FakeSetupHost::default());
+    let (reached, release) = crate::http::setup_probe_test::pause(&root);
+    let finalize_root = root.clone();
+    let finalize_host = host.clone();
+    let finalize = tokio::spawn(async move {
+        request_with_host(
+            &finalize_root,
+            finalize_host,
+            AccessBasis::Localhost,
+            Method::POST,
+            "/init/finalize",
+            Some(json!({"lane":"local"})),
+        )
+        .await
+    });
+    tokio::task::spawn_blocking(move || {
+        reached
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    solstone_core_journal_config_write::mutate_journal_config(&root, Default::default(), |config| {
+        config.insert("providers".into(), json!({"local":{"endpoint_url":"http://127.0.0.1:9","served_model_id":"owner-model"}}));
+        solstone_core_journal_config_write::JournalConfigMutation { changed:true, value:() }
+    }).unwrap();
+    release.send(()).unwrap();
+    assert_eq!(finalize.await.unwrap().status(), StatusCode::BAD_REQUEST);
+    assert!(host.start_calls.lock().unwrap().is_empty());
+    let config: Value =
+        serde_json::from_slice(&fs::read(root.join("config/journal.json")).unwrap()).unwrap();
+    assert!(config["providers"].get("active").is_none());
+    assert!(config["setup"].get("completed_at").is_none());
+    assert_eq!(
+        config["providers"]["local"]["served_model_id"],
+        "owner-model"
+    );
+}
+
 struct TempDir {
     path: PathBuf,
 }
@@ -799,6 +1815,7 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
+        crate::http::setup_probe_test::clear(&self.path);
         let _ = fs::remove_dir_all(&self.path);
     }
 }

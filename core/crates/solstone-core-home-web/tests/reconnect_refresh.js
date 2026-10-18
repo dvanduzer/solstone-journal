@@ -16,16 +16,19 @@ source = source.replace(
   window.toggleBriefingCard = toggleBriefingCard;\n`,
 );
 
+let firstMinutesResponse = null;
 const requests = [];
 const connectionHandlers = [];
 const window = {
   location: { href: '' },
-  document: { readyState: 'loading', addEventListener() {}, querySelector() { return null; } },
+  document: { readyState: 'loading', addEventListener() {}, querySelector() { return null; }, getElementById() { return null; } },
   addEventListener() {},
-  // A request that never settles: this harness counts what Home asks for, it does not render.
   apiJson(url) {
     requests.push(url);
-    return new Promise(() => {});
+    if (url === '/app/home/api/first-minutes' && firstMinutesResponse) {
+      return Promise.resolve(firstMinutesResponse);
+    }
+    return Promise.resolve({});
   },
   appEvents: {
     listen() {},
@@ -66,36 +69,72 @@ const tolerant = connectionRecovery(() => { throw new Error('unexpected refresh'
 tolerant(undefined);
 tolerant(null);
 
-// The wiring Home installs: a real disconnect and reconnect re-reads pulse (vitals and
-// narrative) and the briefing, once each per refresher, and nothing on the baseline state.
-wireRealtime();
-assert.strictEqual(connectionHandlers.length, 1, 'Home subscribes to connection state exactly once');
-const notify = connectionHandlers[0];
-notify({ connected: true, state: 'connected' });
-assert.deepStrictEqual(requests, [], 'the baseline connected state requests nothing');
-notify({ connected: false, state: 'disconnected' });
-assert.deepStrictEqual(requests, [], 'a disconnect requests nothing');
-notify({ connected: true, state: 'connected' });
-assert.deepStrictEqual(
-  requests.slice().sort(),
-  ['/app/home/api/briefing', '/app/home/api/pulse'],
-  'reconnect re-reads pulse for vitals and narrative, and the briefing',
-);
-notify({ connected: true, state: 'connected' });
-assert.strictEqual(requests.length, 2, 'a repeated connected state does not reconcile again');
+async function main() {
+  // The wiring Home installs: a real disconnect and reconnect re-reads pulse (vitals and
+  // narrative), the briefing, first-minutes, and setup state when the window is open.
+  wireRealtime();
+  requests.length = 0;
+  assert.strictEqual(connectionHandlers.length, 1, 'Home subscribes to connection state exactly once');
+  const notify = connectionHandlers[0];
+  notify({ connected: true, state: 'connected' });
+  assert.deepStrictEqual(requests, [], 'the baseline connected state requests nothing');
+  notify({ connected: false, state: 'disconnected' });
+  assert.deepStrictEqual(requests, [], 'a disconnect requests nothing');
+  notify({ connected: true, state: 'connected' });
+  assert.deepStrictEqual(
+    requests.slice().sort(),
+    ['/app/home/api/briefing', '/app/home/api/first-minutes', '/app/home/api/pulse', '/init/api/state'],
+    'open window reconnect re-reads briefing, pulse, first-minutes, and setup',
+  );
+  notify({ connected: true, state: 'connected' });
+  assert.strictEqual(requests.length, 4, 'a repeated connected state does not reconcile again');
 
-// A shell without the connection-state API keeps Home's event wiring working.
-const bareRequests = [];
-const bare = {
-  location: { href: '' },
-  document: { readyState: 'loading', addEventListener() {}, querySelector() { return null; } },
-  addEventListener() {},
-  apiJson(url) { bareRequests.push(url); return new Promise(() => {}); },
-  appEvents: { listen() {} },
-};
-bare.window = bare;
-bare.document.defaultView = bare;
-vm.runInNewContext(source, { window: bare, document: bare.document, console }, { filename: 'home.js' });
-assert.doesNotThrow(() => bare.__home.wireRealtime());
+  // Let first reconnect settle
+  await new Promise((resolve) => setImmediate(resolve));
 
-console.log('home reconnect reconciliation passed');
+  // Next reconnect resolves window_open: false for first-minutes
+  firstMinutesResponse = { window_open: false };
+  notify({ connected: false, state: 'disconnected' });
+  requests.length = 0;
+  notify({ connected: true, state: 'connected' });
+  assert.deepStrictEqual(
+    requests.slice().sort(),
+    ['/app/home/api/briefing', '/app/home/api/first-minutes', '/app/home/api/pulse', '/init/api/state'],
+  );
+  // Allow promise to resolve and latch firstMinutesClosed
+  await new Promise((resolve) => setImmediate(resolve));
+
+  // Subsequent reconnect requests only briefing and pulse
+  requests.length = 0;
+  notify({ connected: false, state: 'disconnected' });
+  assert.deepStrictEqual(requests, [], 'a disconnect requests nothing');
+  notify({ connected: true, state: 'connected' });
+  assert.deepStrictEqual(
+    requests.slice().sort(),
+    ['/app/home/api/briefing', '/app/home/api/pulse'],
+    'after window closed, reconnect requests only briefing and pulse',
+  );
+  notify({ connected: true, state: 'connected' });
+  assert.strictEqual(requests.length, 2, 'a repeated connected state does not reconcile again');
+
+  // A shell without the connection-state API keeps Home's event wiring working.
+  const bareRequests = [];
+  const bare = {
+    location: { href: '' },
+    document: { readyState: 'loading', addEventListener() {}, querySelector() { return null; } },
+    addEventListener() {},
+    apiJson(url) { bareRequests.push(url); return Promise.resolve({}); },
+    appEvents: { listen() {} },
+  };
+  bare.window = bare;
+  bare.document.defaultView = bare;
+  vm.runInNewContext(source, { window: bare, document: bare.document, console }, { filename: 'home.js' });
+  assert.doesNotThrow(() => bare.__home.wireRealtime());
+
+  console.log('home reconnect reconciliation passed');
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

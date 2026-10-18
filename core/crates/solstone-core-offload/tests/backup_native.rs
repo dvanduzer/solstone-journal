@@ -280,7 +280,7 @@ fn backup_native_round_trip() {
         runner: &runner,
         http: &UreqHttpTransport,
         clock: &clock,
-        restic_path: Some(&restic),
+        restic: Some((&restic).into()),
         rclone_path: Some(&rclone),
         version: "native-fixture",
         journal_maintenance: &NativeJournalMaintenance,

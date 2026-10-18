@@ -60,7 +60,7 @@ pub fn valid_four_root_journal(temp: &TempDir) -> PathBuf {
     write(&root, "entities/alice/entity.json", b"{}");
     write(&root, "facets/work/facet.json", b"{}");
     write(&root, "imports/import-1/source.bin", b"source");
-    write(&root, "config/journal.json", b"{}");
+    directory(&root, "config");
     root
 }
 

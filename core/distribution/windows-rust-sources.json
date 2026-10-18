@@ -1,9 +1,9 @@
 {
-  "cargo_lock_sha256": "eeebcf4df91a77565920bcf33b91707b6123eac4d6a2ddf303492c4d6eeef2c9",
+  "cargo_lock_sha256": "16cdde2968457e5fbf48a61d8369feeac47499aa2ef26358a059b2416ded278e",
   "dependency_source_companion": {
-    "bytes": 98966700,
-    "filename": "windows-rust-dependencies-eeebcf4df91a7756.tar.gz",
-    "sha256": "d2fcb0c69b1457c27534be18239029c188b51518b6e54306f642a21742e635f0"
+    "bytes": 101147103,
+    "filename": "windows-rust-dependencies-16cdde2968457e5f.tar.gz",
+    "sha256": "5649e3d13d111836e09ed8f78661cc78f2423815ab84afa407f3f530ec96a95f"
   },
   "notice_texts": [
     {
@@ -27130,7 +27130,7 @@
     "metadata_feature_scope": "workspace unified; conservative inclusion, not exact PE link graph",
     "notices": "non-dev dependency closure from Windows inventory binary roots in Windows-filtered Cargo metadata",
     "query": "cargo metadata --manifest-path core/Cargo.toml --locked --offline --format-version 1 --filter-platform x86_64-pc-windows-msvc --features solstone-core/journal-mcp-endpoint; inventory roots; follow non-dev dependency edges",
-    "query_utc": "2026-10-17T22:33:56.458138+00:00",
+    "query_utc": "2026-10-18T00:31:03.802249+00:00",
     "shipped_feature_arguments": [
       "--features",
       "solstone-core/journal-mcp-endpoint"

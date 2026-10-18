@@ -28,21 +28,21 @@ pub struct ConfidentialLaneDetail {
 pub const LANES: [Lane; 3] = [
     Lane {
         id: "local",
-        label: "Local",
-        sub: "on your device",
-        description: "a model runs right on this computer. nothing leaves this machine to be processed.",
+        label: "local",
+        sub: "on your journal's computer",
+        description: "model requests stay on your journal's computer.",
     },
     Lane {
         id: "confidential",
-        label: "Confidential processing",
-        sub: "operated by sol pbc",
+        label: "confidential processing",
+        sub: "paid · sign-in required",
         description: "sol pbc runs the model on confidential GPUs.",
     },
     Lane {
         id: "byo",
         label: "your own model",
         sub: "your key, or your own endpoint",
-        description: "bring a provider key (Claude, Gemini, or GPT) or point processing at your own endpoint. the key stays in your journal; sol pbc is never in the path.",
+        description: "your journal sends model requests to the provider or endpoint you choose. provider keys stay in your journal.",
     },
 ];
 
@@ -1226,4 +1226,242 @@ pub const THINKING_COPY_PAYLOAD: CopyValue = CopyValue::Object(&[
 
 pub fn thinking_copy_payload() -> CopyValue {
     THINKING_COPY_PAYLOAD
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SetupCatalogFacts {
+    pub platform: &'static str,
+    pub thinking_download_bytes: Option<u64>,
+    pub speech_download_bytes: Option<u64>,
+}
+
+pub fn current_setup_facts() -> SetupCatalogFacts {
+    let platform = match std::env::consts::OS {
+        "macos" => "mac",
+        "windows" => "windows",
+        "linux" => "linux",
+        other => other,
+    };
+
+    let model_assets = solstone_core_assets::resolve("local-model", None, None);
+    let gguf = model_assets
+        .iter()
+        .find(|a| a.filename == "Qwen3.5-4B-Q4_K_M.gguf");
+    let mmproj = model_assets
+        .iter()
+        .find(|a| a.filename == "mmproj-F16.gguf");
+
+    let model_sum = match (gguf, mmproj) {
+        (Some(g), Some(m)) => Some(g.size_bytes.saturating_add(m.size_bytes)),
+        _ => None,
+    };
+
+    let thinking_download_bytes = match std::env::consts::OS {
+        "windows" => model_sum,
+        "macos" if std::env::consts::ARCH == "aarch64" => {
+            let macos_runtime = solstone_core_assets::resolve(
+                "llama-server-vulkan",
+                Some(solstone_core_assets::Platform::MacosArm64),
+                None,
+            );
+            if macos_runtime.len() == 1 {
+                model_sum.map(|sum| sum.saturating_add(macos_runtime[0].size_bytes))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+
+    let speech_download_bytes = if std::env::consts::OS == "windows" {
+        None
+    } else {
+        let speech_assets = solstone_core_assets::resolve("parakeet-model", None, None);
+        speech_assets
+            .iter()
+            .find(|a| a.filename == "tdt-0.6b-v3-q8_0.gguf")
+            .map(|a| a.size_bytes)
+    };
+
+    SetupCatalogFacts {
+        platform,
+        thinking_download_bytes,
+        speech_download_bytes,
+    }
+}
+
+/// Shared copy uses named placeholders; measured download facts live in setup state.
+/// This stays callable before a journal exists or a runtime install plan is selected.
+pub fn setup_copy(_facts: &SetupCatalogFacts) -> serde_json::Value {
+    let choices = LANES
+        .into_iter()
+        .map(|mut lane| {
+            // Setup actions use spp; the existing Thinking page uses confidential.
+            if lane.id == "confidential" {
+                lane.id = "spp";
+            }
+            lane
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "schema": "solstone.setup-copy.v1",
+        "welcome": {
+            "title": "welcome to solstone.",
+            "body": "the solstone app takes in what you share with it, and all of it goes into your journal.",
+            "how_it_fits": [
+                "welcome to solstone.",
+                "the solstone app takes in what you share with it, and all of it goes into your journal.",
+                "your journal is always private, only yours."
+            ]
+        },
+        "login": {
+            "label": "start your journal when you sign in",
+            "help": "start automatically after you sign in to your journal's computer."
+        },
+        "folder": {
+            "title": "journal folder",
+            "help": "where your journal is kept on your journal's computer.",
+            "change": "change folder",
+            "continue": "continue"
+        },
+        "mark": {
+            "title": "your journal mark",
+            "help": "a unique visual mark created for your journal.",
+            "permanence": "continue makes this your journal's mark for good.",
+            "try_another": "try another",
+            "continue": "continue"
+        },
+        "thinking": {
+            "title": "thinking",
+            "choices": choices,
+            "default_line": "on your journal's computer · {size}",
+            "size_unknown": "download size unavailable",
+            "choose_later": "choose thinking when you're ready",
+            "change": "change",
+            "later": "decide later",
+            "continue": "continue"
+        },
+        "downloads": {
+            "speech": "speech recognition",
+            "thinking": "local thinking",
+            "progress": "downloading…",
+            "cancel": "cancel",
+            "retry": "try again",
+            "error": "download failed. try again.",
+            "idle": "not started",
+            "complete": "ready",
+            "cancelled": "cancelled"
+        },
+        "footer": "your journal is kept on your journal's computer. thinking uses the option you choose."
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setup_copy_contains_required_groups() {
+        let facts = current_setup_facts();
+        let copy = setup_copy(&facts);
+        assert_eq!(copy["schema"], "solstone.setup-copy.v1");
+        assert!(copy.get("welcome").is_some());
+        assert!(copy.get("login").is_some());
+        assert!(copy.get("folder").is_some());
+        assert!(copy.get("mark").is_some());
+        assert!(copy.get("thinking").is_some());
+        assert!(copy.get("downloads").is_some());
+        assert!(copy.get("footer").is_some());
+
+        let welcome = &copy["welcome"];
+        assert_eq!(welcome["title"], "welcome to solstone.");
+        assert_eq!(
+            welcome["body"],
+            "the solstone app takes in what you share with it, and all of it goes into your journal."
+        );
+        let beats = welcome["how_it_fits"]
+            .as_array()
+            .expect("how_it_fits array");
+        assert_eq!(beats.len(), 3);
+        assert_eq!(beats[0], "welcome to solstone.");
+        assert_eq!(
+            beats[1],
+            "the solstone app takes in what you share with it, and all of it goes into your journal."
+        );
+        assert_eq!(beats[2], "your journal is always private, only yours.");
+    }
+
+    #[test]
+    fn setup_copy_is_pure_over_facts() {
+        let with_sizes = SetupCatalogFacts {
+            platform: "testbox",
+            thinking_download_bytes: Some(123),
+            speech_download_bytes: Some(456),
+        };
+        let without_sizes = SetupCatalogFacts {
+            platform: "otherbox",
+            thinking_download_bytes: None,
+            speech_download_bytes: None,
+        };
+        let copy = setup_copy(&with_sizes);
+        assert_eq!(copy, setup_copy(&without_sizes));
+        assert!(
+            copy["thinking"]["default_line"]
+                .as_str()
+                .unwrap()
+                .contains("{size}")
+        );
+    }
+
+    #[test]
+    fn setup_choice_ids_are_action_ids_and_copy_comes_from_shared_lanes() {
+        let copy = setup_copy(&current_setup_facts());
+        let choices = copy["thinking"]["choices"].as_array().unwrap();
+        let mut ids = choices
+            .iter()
+            .map(|choice| choice["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, ["byo", "local", "spp"]);
+        for (choice, lane) in choices.iter().zip(LANES) {
+            assert_eq!(choice["label"], lane.label);
+            assert_eq!(choice["sub"], lane.sub);
+            assert_eq!(choice["description"], lane.description);
+        }
+    }
+
+    #[test]
+    fn thinking_copy_payload_stays_callable_and_unchanged() {
+        let payload = thinking_copy_payload();
+        let value = serde_json::to_value(payload).expect("serializes");
+        assert!(value.is_object());
+        assert!(value.get("heading").is_some());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_facts_omit_thinking_size() {
+        let facts = current_setup_facts();
+        assert_eq!(facts.platform, "linux");
+        assert!(facts.thinking_download_bytes.is_none());
+        assert!(facts.speech_download_bytes.is_some());
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_facts_omit_speech_size() {
+        let facts = current_setup_facts();
+        assert_eq!(facts.platform, "windows");
+        assert!(facts.speech_download_bytes.is_none());
+        assert!(facts.thinking_download_bytes.is_some());
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn macos_arm64_facts_include_both_sizes() {
+        let facts = current_setup_facts();
+        assert_eq!(facts.platform, "mac");
+        assert!(facts.thinking_download_bytes.is_some());
+        assert!(facts.speech_download_bytes.is_some());
+    }
 }

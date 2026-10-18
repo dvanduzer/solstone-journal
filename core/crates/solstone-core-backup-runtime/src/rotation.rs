@@ -7,6 +7,7 @@ use std::fmt;
 use std::path::Path;
 
 use crate::engine::BackupServices;
+#[cfg(not(target_os = "ios"))]
 use crate::runner::reason_for_returncode;
 
 pub const ROTATION_TIMEOUT_SECONDS: u64 = 5 * 60;
@@ -44,6 +45,7 @@ fn error(reason: impl Into<String>) -> RotationResult {
         recovery_key_display: None,
     }
 }
+#[cfg(not(target_os = "ios"))]
 fn map_error(repo_error: crate::repo::RepoError) -> RotationResult {
     match repo_error {
         crate::repo::RepoError::Key(key) => error(reason_for_returncode(key.returncode)),
@@ -76,9 +78,16 @@ pub fn pause_after_remote_removal() {
     }
 }
 
+#[cfg(not(target_os = "ios"))]
 mod transaction;
 
 /// Publish and confirm replacement material before revoking the recorded original.
 pub fn rotate_recovery_key(journal: &Path, services: &BackupServices<'_>) -> RotationResult {
+    #[cfg(target_os = "ios")]
+    {
+        let _ = (journal, services);
+        error("restic_unavailable")
+    }
+    #[cfg(not(target_os = "ios"))]
     transaction::rotate_recovery_key(journal, services)
 }

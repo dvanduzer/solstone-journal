@@ -28,6 +28,8 @@ pub mod destination;
 pub mod destination_admission;
 pub mod engine;
 pub mod hosted_runtime;
+#[cfg(target_os = "ios")]
+pub mod ios_callable;
 pub mod repo;
 pub mod resolve;
 pub mod restore;
@@ -93,12 +95,15 @@ pub use repo::{
     KeyLabelOutcome, NEUTRAL_KEY_LABEL, ResticKeyError, add_recovery_key, capture_current_key_id,
     init_repository, log_key_label_outcome, neutralize_key_labels, remove_key,
 };
-pub use resolve::{ResolvedTools, resolve_operational_tools, resolve_restic_member, resolve_tools};
+pub use resolve::{
+    ResolvedResticInvocation, ResolvedTools, resolve_operational_tools, resolve_restic_member,
+    resolve_tools,
+};
 pub use restore::{RestoreDraft, RestoreOutcome, publish_restore_outcome, restore_journal};
 pub use rotation::{RotationResult, rotate_recovery_key};
 pub use runner::{
-    PassedHandle, ResticResult, SystemToolRunner, ToolOutput, ToolRequest, ToolRunner,
-    reason_for_returncode, run_restic, select_summary,
+    PassedHandle, ResticInvocation, ResticResult, SystemToolRunner, ToolOutput, ToolRequest,
+    ToolRunner, reason_for_returncode, run_restic, select_summary,
 };
 pub use s3_wipe::{DELETE_OBJECT_BATCH_SIZE, S3Credentials, WipeResult};
 pub use teardown_admission::{

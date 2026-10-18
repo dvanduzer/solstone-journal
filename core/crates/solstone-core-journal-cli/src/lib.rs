@@ -400,6 +400,7 @@ pub fn dispatch(command: JournalCommand, spawner: &dyn ProcessSpawner) -> Outcom
                     }
                 }
             }
+            Some(manifest::Primitive::SetupCopy) => run_setup_copy(&rest),
             None => dispatch_process(token, &rest, verbose, spawner),
         },
         JournalCommand::Local { token, rest, .. } => local_ops::dispatch(token, &rest),
@@ -471,6 +472,34 @@ fn dispatch_native_process(
             stderr: format!("native journal process launch failed: {error}\n"),
             exit: 70,
         },
+    }
+}
+
+pub const SETUP_COPY_USAGE: &str = "usage: solstone journal setup-copy [-h] [--json]\n";
+
+pub fn run_setup_copy(rest: &[OsString]) -> Outcome {
+    if host::is_help_only(rest) {
+        Outcome::LocalSuccess {
+            stdout: SETUP_COPY_USAGE.into(),
+            stderr: String::new(),
+        }
+    } else if rest.len() == 1 && rest[0] == "--json" {
+        let facts = solstone_core_thinking_copy::current_setup_facts();
+        let copy = solstone_core_thinking_copy::setup_copy(&facts);
+        let output = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&copy).expect("setup copy serializes")
+        );
+        Outcome::LocalSuccess {
+            stdout: output,
+            stderr: String::new(),
+        }
+    } else {
+        Outcome::LocalFailure {
+            stdout: String::new(),
+            stderr: SETUP_COPY_USAGE.into(),
+            exit: 2,
+        }
     }
 }
 
@@ -674,7 +703,7 @@ mod tests {
             .iter()
             .map(|path| path.join("\u{0}"))
             .collect::<BTreeSet<_>>();
-        assert_eq!(JOURNAL_COMMAND_COUNT, 55);
+        assert_eq!(JOURNAL_COMMAND_COUNT, 56);
         assert_eq!(paths.len(), JOURNAL_COMMAND_COUNT);
         assert_eq!(unique.len(), JOURNAL_COMMAND_COUNT);
         assert_eq!(JOURNAL_HOST_COMMAND_COUNT, 39);
@@ -795,7 +824,7 @@ mod tests {
                 &spawner,
             ),
             Outcome::LocalSuccess {
-                stdout: "Usage: solstone journal archive export [--out PATH] [--quiet] [--day YYYYMMDD | --from YYYYMMDD [--to YYYYMMDD] | --to YYYYMMDD]\n".to_owned(),
+                stdout: "Usage: solstone journal archive export [--out PATH] [--quiet] [--day YYYYMMDD | --from YYYYMMDD [--to YYYYMMDD] | --to YYYYMMDD]\n\ncreate a ZIP of your journal, including settings and credentials.\nprocessing logs, rebuildable indexes and caches, locks and temporary files are left out.\nwith a date filter, only the selected days are included.\n".to_owned(),
                 stderr: String::new(),
             }
         );
@@ -863,6 +892,71 @@ mod tests {
                 assert!(stderr.contains("--drain requires --apply"));
             }
             other => panic!("expected LocalFailure with exit 64, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn setup_copy_dispatches_cleanly_without_journal_config() {
+        let help = run_setup_copy(&[OsString::from("-h")]);
+        match help {
+            Outcome::LocalSuccess { stdout, stderr } => {
+                assert_eq!(stdout, SETUP_COPY_USAGE);
+                assert!(stderr.is_empty());
+            }
+            other => panic!("expected LocalSuccess for -h, got {other:?}"),
+        }
+
+        let help_long = run_setup_copy(&[OsString::from("--help")]);
+        match help_long {
+            Outcome::LocalSuccess { stdout, stderr } => {
+                assert_eq!(stdout, SETUP_COPY_USAGE);
+                assert!(stderr.is_empty());
+            }
+            other => panic!("expected LocalSuccess for --help, got {other:?}"),
+        }
+
+        let json = run_setup_copy(&[OsString::from("--json")]);
+        match json {
+            Outcome::LocalSuccess { stdout, stderr } => {
+                assert!(stderr.is_empty());
+                let expected = format!(
+                    "{}\n",
+                    serde_json::to_string_pretty(&solstone_core_thinking_copy::setup_copy(
+                        &solstone_core_thinking_copy::current_setup_facts()
+                    ))
+                    .expect("setup copy serializes")
+                );
+                assert_eq!(stdout, expected);
+            }
+            other => panic!("expected LocalSuccess for --json, got {other:?}"),
+        }
+
+        let empty = run_setup_copy(&[]);
+        match empty {
+            Outcome::LocalFailure {
+                stdout,
+                stderr,
+                exit,
+            } => {
+                assert!(stdout.is_empty());
+                assert_eq!(stderr, SETUP_COPY_USAGE);
+                assert_eq!(exit, 2);
+            }
+            other => panic!("expected LocalFailure with exit 2, got {other:?}"),
+        }
+
+        let unknown = run_setup_copy(&[OsString::from("--unknown")]);
+        match unknown {
+            Outcome::LocalFailure {
+                stdout,
+                stderr,
+                exit,
+            } => {
+                assert!(stdout.is_empty());
+                assert_eq!(stderr, SETUP_COPY_USAGE);
+                assert_eq!(exit, 2);
+            }
+            other => panic!("expected LocalFailure with exit 2, got {other:?}"),
         }
     }
 }

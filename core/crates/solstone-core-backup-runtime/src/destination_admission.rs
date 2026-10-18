@@ -3,7 +3,7 @@
 
 use std::fmt;
 use std::path::Path;
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "ios")))]
 use std::path::PathBuf;
 
 #[cfg(any(windows, target_os = "linux", target_os = "android"))]
@@ -64,8 +64,13 @@ pub struct AdmittedDestination {
     child_lock: OwnedFd,
     #[cfg(any(target_os = "linux", target_os = "android"))]
     callback_path: PathBuf,
-    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    #[cfg(all(
+        unix,
+        not(any(target_os = "linux", target_os = "android", target_os = "ios"))
+    ))]
     path: PathBuf,
+    #[cfg(target_os = "ios")]
+    target: crate::ios_callable::RestoreTarget,
 }
 
 impl AdmittedDestination {
@@ -111,11 +116,26 @@ impl AdmittedDestination {
             admitted.revalidate_for_target()?;
             Ok(admitted)
         }
-        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+        #[cfg(all(
+            unix,
+            not(any(target_os = "linux", target_os = "android", target_os = "ios"))
+        ))]
         {
             Ok(Self {
                 path: path.to_path_buf(),
             })
+        }
+        #[cfg(target_os = "ios")]
+        {
+            // The native activity lease on the journal root lasts until this
+            // admission drops, through every later restore step.
+            let root = std::sync::Arc::new(
+                solstone_core_journal_io::JournalRoot::open(path)
+                    .map_err(|_| DestinationAdmissionError::Failed)?,
+            );
+            let target = crate::ios_callable::RestoreTarget::admit(root)
+                .map_err(|_| DestinationAdmissionError::Failed)?;
+            Ok(Self { target })
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -153,9 +173,19 @@ impl AdmittedDestination {
                 .map_err(|_| DestinationAdmissionError::Failed)?;
             Ok(self.root.canonical_path())
         }
-        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+        #[cfg(all(
+            unix,
+            not(any(target_os = "linux", target_os = "android", target_os = "ios"))
+        ))]
         {
             Ok(&self.path)
+        }
+        #[cfg(target_os = "ios")]
+        {
+            self.target
+                .revalidate()
+                .map_err(|_| DestinationAdmissionError::Failed)?;
+            Ok(self.target.path())
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -172,14 +202,26 @@ impl AdmittedDestination {
         {
             self.root.canonical_path()
         }
-        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+        #[cfg(all(
+            unix,
+            not(any(target_os = "linux", target_os = "android", target_os = "ios"))
+        ))]
         {
             &self.path
+        }
+        #[cfg(target_os = "ios")]
+        {
+            self.target.path()
         }
         #[cfg(not(any(unix, windows)))]
         {
             Path::new("")
         }
+    }
+
+    #[cfg(target_os = "ios")]
+    pub(crate) fn ios_restore_target(&self) -> &crate::ios_callable::RestoreTarget {
+        &self.target
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]

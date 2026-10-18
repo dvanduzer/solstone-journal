@@ -351,14 +351,17 @@ mod tests {
         write(&root, "chronicle/20260101/segment.jsonl", b"segment");
         write(&root, "entities/alice/entity.json", b"entity");
         write(&root, "facets/work/facet.json", b"facet");
-        write(&root, "config/journal.json", b"omitted");
+        write(&root, "config/journal.json", b"settings");
         (temporary, root)
     }
 
     #[test]
-    fn windows_export_preserves_owner_names_and_omits_operational_secrets() {
+    fn windows_export_preserves_owner_names_and_credentials() {
         let (_temporary, root) = fixture("owner-names");
         let kept = [
+            "mcp-endpoint/pop.ed25519.pk8",
+            "peers/remote/client.key",
+            "peers/remote/client.crt",
             "entities/cache/entity.json",
             "entities/indexer/entity.json",
             "facets/cache/facet.json",
@@ -389,15 +392,22 @@ mod tests {
             "imports/.health-dedupe.sqlite.rebuild-journal",
             "chronicle/20260101/indexer/indexer.sqlite",
             "health/brain-fingerprint.key",
-            "mcp-endpoint/pop.ed25519.pk8",
             "config/.tmp_123_4.tmp",
-            "peers/remote/client.key",
-            "peers/remote/client.crt",
         ];
         for member in omitted {
             write(&root, member, b"secret control");
         }
         let new_kept = [
+            (
+                "config/journal.json",
+                b"kept settings and provider credentials" as &[u8],
+            ),
+            ("config/chatgpt-sign-in.json", b"kept authorization"),
+            ("backup/hosted/binding.json", b"kept binding"),
+            ("config/push-vapid.json", b"kept vapid"),
+            ("config/push-registry.json", b"kept push registry"),
+            ("link/service-ca.key", b"kept pairing private key"),
+            ("link/authorized_clients.json", b"kept client authorization"),
             ("backup/hosted/note.txt", b"kept hosted note" as &[u8]),
             ("config/schedules.json", b"kept schedules"),
             ("awareness/current.json", b"kept awareness"),
@@ -410,14 +420,18 @@ mod tests {
             write(&root, member, bytes);
         }
         let new_omitted = [
-            ("backup/hosted/binding.json", b"omitted binding" as &[u8]),
-            ("config/push-vapid.json", b"omitted vapid"),
-            ("config/push-registry.json", b"omitted push registry"),
-            ("awareness/discovery_clusters.json", b"omitted clusters"),
-            ("link/service-ca.key", b"omitted pairing private key"),
             (
-                "link/authorized_clients.json",
-                b"omitted client authorization",
+                "mcp-endpoint/local-door-state.json",
+                b"omitted listener status" as &[u8],
+            ),
+            (
+                "awareness/discovery_clusters.json",
+                b"omitted clusters" as &[u8],
+            ),
+            ("mcp-endpoint/.create.lock", b"omitted lock"),
+            (
+                "mcp-endpoint/tls/.tmp_candidate",
+                b"omitted temporary candidate",
             ),
         ];
         for (member, bytes) in new_omitted {
@@ -437,11 +451,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             fs::read(root.join("peers/remote/client.key")).unwrap(),
-            b"secret control"
+            b"owner bytes"
         );
         assert_eq!(
             fs::read(root.join("peers/remote/client.crt")).unwrap(),
-            b"secret control"
+            b"owner bytes"
         );
         for member in kept {
             let entry = source
@@ -495,7 +509,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_export_classifies_installation_paths_with_windows_casing() {
+    fn windows_export_keeps_credentials_with_windows_casing() {
         let temporary = TempDir::new("reserved-path-casing");
         let root = temporary.path.join("journal");
         fs::create_dir(&root).unwrap();
@@ -506,6 +520,14 @@ mod tests {
             LOG_LEAF.replace(".log", ".jsonl")
         );
         let kept = [
+            ("Config/Journal.JSON", b"owner credential" as &[u8]),
+            ("Config/Push-Vapid.JSON", b"owner credential" as &[u8]),
+            ("Config/Push-Registry.JSON", b"owner credential" as &[u8]),
+            ("Config/ChatGPT-Sign-In.JSON", b"owner credential" as &[u8]),
+            ("Link/Service-CA.KEY", b"owner credential" as &[u8]),
+            ("Peers/remote/Client.KEY", b"owner credential" as &[u8]),
+            ("MCP-Endpoint/POP.ed25519.pk8", b"owner credential" as &[u8]),
+            ("Backup/Hosted/Binding.JSON", b"owner credential" as &[u8]),
             ("Link/Client-Descriptions.JSON", b"owner labels" as &[u8]),
             ("Config/Owner-Preferences.JSON", b"owner settings"),
             ("imports/item/Config/Push-Vapid.JSON", b"owner original"),
@@ -520,22 +542,20 @@ mod tests {
             ),
         ];
         let omitted = [
-            "Config/Journal.JSON",
-            "Config/Push-Vapid.JSON",
-            "Config/Push-Registry.JSON",
-            "Config/ChatGPT-Sign-In.JSON",
+            "MCP-Endpoint/byo/ingress.sock",
+            "MCP-Endpoint/byo/cutover.sock",
+            "MCP-Endpoint/LAN-Door-State.JSON",
+            "MCP-Endpoint/.create.lock",
+            "MCP-Endpoint/tls/.tmp_candidate",
+            "MCP-Endpoint/nested/.removing_old/key",
             "Config/.tmp_fixture.tmp",
-            "Link/Service-CA.KEY",
-            "Peers/remote/Client.KEY",
-            "MCP-Endpoint/POP.ed25519.pk8",
-            "Backup/Hosted/Binding.JSON",
             log_path.as_str(),
         ];
         for (member, bytes) in kept {
             write(&root, member, bytes);
         }
         for member in omitted {
-            write(&root, member, b"installation credential");
+            write(&root, member, b"throwaway state");
         }
         let source = ArchiveSource::open(&root).unwrap();
         let path = temporary.path.join("cased.zip");
@@ -564,12 +584,9 @@ mod tests {
         for member in omitted {
             assert!(
                 archive.by_name(member).is_err(),
-                "credential included: {member}"
+                "throwaway state included: {member}"
             );
-            assert_eq!(
-                fs::read(root.join(member)).unwrap(),
-                b"installation credential"
-            );
+            assert_eq!(fs::read(root.join(member)).unwrap(), b"throwaway state");
         }
     }
 
@@ -587,6 +604,7 @@ mod tests {
             members,
             [
                 "chronicle/20260101/segment.jsonl",
+                "config/journal.json",
                 "entities/alice/entity.json",
                 "facets/work/facet.json",
             ]

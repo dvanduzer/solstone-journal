@@ -58,6 +58,8 @@ const fn content_date_nav(one: &'static str, other: &'static str, none: &'static
     }
 }
 
+/// Agents are how an owner puts their journal to work, and nothing else in
+/// the journal links to them, so they keep a management rail slot.
 pub static AGENTS_APP: AppDefinition = AppDefinition {
     name: "agents",
     icon: "🤖",
@@ -65,8 +67,8 @@ pub static AGENTS_APP: AppDefinition = AppDefinition {
     lucide_icon: "bot",
     launcher_group: AppLauncherGroup::Manage,
     launcher_rank: 2,
-    rail_group: None,
-    rail_rank: 0,
+    rail_group: Some(RailGroup::Management),
+    rail_rank: 3,
     date_nav: None,
     has_background: false,
 };

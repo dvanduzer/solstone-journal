@@ -35,6 +35,10 @@ pub struct Nonce {
     pub same_machine: bool,
     #[serde(default)]
     pub kind: NonceKind,
+    /// The client this nonce paired, so the owner's dialog can name the device
+    /// and remove it. Recorded after the ledger write; absent until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paired_cid: Option<String>,
 }
 
 impl fmt::Debug for Nonce {
@@ -49,6 +53,7 @@ impl fmt::Debug for Nonce {
             .field("role", &self.role)
             .field("same_machine", &self.same_machine)
             .field("kind", &self.kind)
+            .field("paired_cid", &self.paired_cid)
             .finish()
     }
 }
@@ -143,6 +148,7 @@ impl NonceStore {
             role,
             same_machine,
             kind,
+            paired_cid: None,
         };
         let _lock = hold_lock(&self.path, LockOptions::default()).map_err(NonceStoreError::Lock)?;
         let mut entries = self.read_entries();
@@ -171,6 +177,19 @@ impl NonceStore {
         let consumed = entry.clone();
         self.write_entries(&entries)?;
         Ok(Some(consumed))
+    }
+
+    /// Record which client a consumed nonce paired. A missing or unused entry is
+    /// left alone and returns `false`.
+    pub fn record_paired_client(&self, value: &str, cid: &str) -> Result<bool, NonceStoreError> {
+        let _lock = hold_lock(&self.path, LockOptions::default()).map_err(NonceStoreError::Lock)?;
+        let mut entries = self.read_entries();
+        let Some(entry) = entries.get_mut(value).filter(|entry| entry.used) else {
+            return Ok(false);
+        };
+        entry.paired_cid = Some(cid.to_owned());
+        self.write_entries(&entries)?;
+        Ok(true)
     }
 
     /// Read one nonce without locking or collecting. This is deliberately not a
@@ -297,6 +316,10 @@ fn nonce_from_json(value: &serde_json::Value) -> Option<Nonce> {
             .to_owned(),
         same_machine: python_bool(object.get("same_machine")),
         kind: nonce_kind(object.get("kind")),
+        paired_cid: object
+            .get("paired_cid")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
     })
 }
 
@@ -409,6 +432,35 @@ mod tests {
         names.sort();
         assert_eq!(names, ["nonces.json", "nonces.json.lock"]);
         assert!(!names.iter().any(|name| name.starts_with(".tmp_")));
+    }
+
+    #[test]
+    fn a_consumed_nonce_records_the_client_it_paired() {
+        let (_temporary, store) = store();
+        store
+            .add("live".into(), "".into(), "".into(), false, 10)
+            .expect("live");
+        assert!(
+            !store
+                .record_paired_client("live", "sha256:a")
+                .expect("unused")
+        );
+        assert_eq!(store.peek("live").expect("live").paired_cid, None);
+        assert!(
+            !store
+                .record_paired_client("missing", "sha256:a")
+                .expect("missing")
+        );
+        store.consume("live", 11).expect("consume");
+        assert!(
+            store
+                .record_paired_client("live", "sha256:a")
+                .expect("record")
+        );
+        assert_eq!(
+            store.peek("live").expect("used").paired_cid.as_deref(),
+            Some("sha256:a")
+        );
     }
 
     #[test]

@@ -135,8 +135,8 @@ def main():
     try:
         phone.launch(['--audio'])
         phone.owner('GET', '/init/api/state')
-        phone.owner('GET', '/init/mark')
-        phone.owner('POST', '/init/mark/lock', {})
+        mark = phone.owner('GET', '/init/mark')
+        phone.owner('POST', '/init/mark/lock', {'proposal_id': mark['proposal_id']})
         phone.owner('POST', '/init/finalize', {'name': 'Synthetic iOS audio', 'timezone': 'America/Denver'})
         link = phone.owner('POST', '/app/network/pair-start', {'device_label': 'ios-audio-laptop'})
         assert client.call('pair', link=link['pair_link'], label='ios-audio-laptop')['ok']

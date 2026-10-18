@@ -113,17 +113,29 @@ class Phone:
             'op': op, 'journal': self.args.suite, 'root': '', 'count': count,
             'seconds': 0, 'revision': 0, 'mode': mode, 'storage': 'serving', 'payload': payload}})
         descriptor = os.open(command, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        matches = lambda r: r['event'] == 'owner.reply' and r['value'].get('id') == identifier
         try:
             with os.fdopen(descriptor, 'w') as stream:
                 stream.write(data)
-            subprocess.run(['xcrun', 'devicectl', 'device', 'copy', 'to', '--device', self.args.device,
-                            '--domain-type', 'appDataContainer', '--domain-identifier', BUNDLE,
-                            '--source', str(command), '--destination', 'Documents/owner-command.json'],
-                           check=True, stdout=subprocess.DEVNULL)
+            reply = None
+            # A successful devicectl copy can still leave the previous command on
+            # the device. The host consumes each ID once, so resending the same
+            # command until it is consumed never replays it.
+            for _attempt in range(8):
+                subprocess.run(['xcrun', 'devicectl', 'device', 'copy', 'to', '--device', self.args.device,
+                                '--domain-type', 'appDataContainer', '--domain-identifier', BUNDLE,
+                                '--source', str(command), '--destination', 'Documents/owner-command.json'],
+                               check=True, stdout=subprocess.DEVNULL)
+                try:
+                    reply = self.wait(matches, seconds=20)['value']
+                    break
+                except queue.Empty:
+                    continue
         finally:
             command.unlink(missing_ok=True)
         try:
-            reply = self.wait(lambda r: r['event'] == 'owner.reply' and r['value'].get('id') == identifier)['value']
+            if reply is None:
+                reply = self.wait(matches)['value']
         except queue.Empty:
             with self.device_file('owner-reply.json') as downloaded:
                 assert downloaded.stat().st_size <= 32 * 1024 * 1024, 'owner reply exceeds bound'
@@ -238,8 +250,8 @@ def main():
         phone.launch()
         phone.control('serve-status')
         phone.owner('GET', '/init/api/state')
-        phone.owner('GET', '/init/mark')
-        phone.owner('POST', '/init/mark/lock', {})
+        mark = phone.owner('GET', '/init/mark')
+        phone.owner('POST', '/init/mark/lock', {'proposal_id': mark['proposal_id']})
         phone.owner('POST', '/init/finalize', {'name': 'Synthetic iOS LAN', 'timezone': 'America/Denver'})
         status = native(phone.control('serve-status'))
         assert status['door_address'] == f'{args.host}:{args.port}', status

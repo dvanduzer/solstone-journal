@@ -13,6 +13,8 @@ import shutil
 import struct
 import subprocess
 
+import build_backup
+
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 APPRAISAL_BUNDLE_ID = "app.solstone.journal.runtime.dev.gpu-appraisal"
 APPRAISAL_EXTENSION_ID = APPRAISAL_BUNDLE_ID
@@ -241,6 +243,8 @@ def main() -> int:
     parser.add_argument("--nvattest-lib", type=pathlib.Path, required=True)
     parser.add_argument("--appraisal-build-record", type=pathlib.Path, required=True)
     parser.add_argument("--appraisal-resources", type=pathlib.Path, required=True)
+    parser.add_argument("--backup-lib", type=pathlib.Path, required=True)
+    parser.add_argument("--backup-work", type=pathlib.Path, required=True)
     parser.add_argument(
         "--keychain",
         default=str(
@@ -262,6 +266,12 @@ def main() -> int:
         / "derived/Build/Intermediates.noindex/JournalRuntimeDev.build/Debug-iphoneos"
     )
     app = products / "JournalRuntimeDev.app"
+    backup_record, backup_archive = build_backup.validate_output(args.backup_work.resolve())
+    if build_backup.read_regular(args.backup_lib, 256 * 1024 * 1024) != backup_archive:
+        raise ValueError("linked backup archive differs from its measured recipe")
+    for name, bundle in [("JournalRuntimeDev", app), ("JournalWorker", app / "Extensions/JournalWorker.appex")]:
+        build_backup.confirm_resource(bundle / "BackupRuntime", backup_record)
+        build_backup.check_symbols(bundle / name)
     appraisal = app / "Extensions/Appraisal.appex"
     rims = appraisal / "RIMs"
     prepare_rim_directory(
@@ -395,6 +405,8 @@ def main() -> int:
         )
     if package_members(appraisal) != expected_members:
         raise ValueError("codesigning changed a receipt-bound appraisal member")
+    for bundle in [app, app / "Extensions/JournalWorker.appex"]:
+        build_backup.confirm_resource(bundle / "BackupRuntime", backup_record)
     subprocess.run(["codesign", "--verify", "--deep", "--strict", str(app)], check=True)
     print("Packaged appraisal closure and verified development signatures")
     return 0
