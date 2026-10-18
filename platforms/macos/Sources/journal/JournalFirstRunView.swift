@@ -229,7 +229,7 @@ struct JournalFirstRunView: View {
                     .foregroundStyle(.red)
                 AXStateCompanion(id: AXID.Journal.Adopt.errorState, value: error)
                 Button {
-                    Task { await model.adoptFromHandoff() }
+                    Task { await model.retryAdopt() }
                 } label: {
                     Label(JournalFirstRunCopy.tryAgain, systemImage: "arrow.clockwise")
                 }

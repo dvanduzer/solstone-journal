@@ -439,6 +439,17 @@ final class JournalFirstRunModel {
         }
     }
 
+    /// Qualified adoption retries stay on the native ceremony. Legacy adoption repeats the browser handoff.
+    func retryAdopt() async {
+        guard !isTerminating else { return }
+        if nativeQualified {
+            epoch &+= 1
+            await adoptQualified(captured: epoch)
+        } else {
+            await adoptFromHandoff()
+        }
+    }
+
     private func completeAdoptAfterSuccessfulStart() async throws {
         let probe = try await initClient.probeSetupComplete()
         try handoffStore.consume()
@@ -1153,24 +1164,33 @@ final class JournalFirstRunModel {
         adoptMessage = JournalFirstRunCopy.adoptOpening
         errorMessage = nil
         do {
-            guard let handoff = try handoffStore.load() else {
+            let handoff = try handoffStore.load()
+            let root: URL
+            if let handoff {
+                root = URL(fileURLWithPath: handoff.journalRootPath, isDirectory: true).standardizedFileURL
+                assignRoot(root)
+                config.journalRoot = root
+                try await runSetup(at: root, skipModelInstall: true)
+                guard stillCurrent(captured) else { return }
+            } else if let configured = config.journalRoot?.standardizedFileURL {
+                root = configured
+                assignRoot(root)
+            } else {
                 showWelcome()
                 return
             }
-            let root = URL(fileURLWithPath: handoff.journalRootPath, isDirectory: true).standardizedFileURL
-            assignRoot(root)
-            config.journalRoot = root
-            try await runSetup(at: root, skipModelInstall: true)
-            guard stillCurrent(captured) else { return }
             guard await ensureSupervisor(root) else {
+                guard stillCurrent(captured) else { return }
                 errorMessage = supervisorFailureMessage()
                 return
             }
             guard stillCurrent(captured) else { return }
-            try handoffStore.consume()
-            adoptMessage = JournalFirstRunCopy.adoptLandingLine
             let probe = try await initClient.probeSetupComplete()
             guard stillCurrent(captured) else { return }
+            if handoff != nil {
+                try handoffStore.consume()
+            }
+            adoptMessage = JournalFirstRunCopy.adoptLandingLine
             switch probe {
             case .complete:
                 await landHomeIfCurrent(captured)
@@ -1178,6 +1198,7 @@ final class JournalFirstRunModel {
                 await presentServerStep(root: root, captured: captured)
             }
         } catch {
+            guard stillCurrent(captured) else { return }
             errorMessage = readableMessage(for: error)
         }
     }

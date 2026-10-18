@@ -418,6 +418,54 @@ struct JournalFirstRunModelTests {
         #expect(adopt.model.route != .ritual(.finishInBrowser))
     }
 
+    @Test func qualifiedAdoptProbeFailureRetriesWithoutInstallingModelsOrOpeningTheBrowser() async throws {
+        let copy = try loadQualifiedSetupCopy()
+        let adoptRoot = try makeTemporaryDirectory()
+        let adoptStore = FakeFirstRunHandoffStore(handoff: migrationHandoff(root: adoptRoot))
+        let adopt = makeModel(
+            startResults: [true],
+            probeResults: [.incomplete],
+            probeErrors: [URLError(.cannotConnectToHost)],
+            handoffStore: adoptStore,
+            localSetupCapability: { true },
+            loadSetupCopy: { copy },
+            peer: QualifiedPeer()
+        )
+
+        await adopt.model.reconcileActivation()
+        #expect(adopt.model.route == .adopting)
+        #expect(adopt.model.errorMessage != nil)
+        #expect(adoptStore.consumeCount == 0)
+        #expect(adopt.setupRunner.skipModelInstallFlags == [true])
+        #expect(adopt.browser.opened.isEmpty)
+
+        await adopt.model.retryAdopt()
+        #expect(adopt.setupRunner.skipModelInstallFlags == [true, true])
+        #expect(adopt.browser.opened.isEmpty)
+        #expect(adopt.model.route != .ritual(.finishInBrowser))
+        #expect(adopt.model.route != .ritual(.nameLocation))
+        #expect(adoptStore.consumeCount == 1)
+    }
+
+    @Test func unqualifiedAdoptRetryKeepsModelInstall() async throws {
+        let root = try makeTemporaryDirectory()
+        let handoffStore = FakeFirstRunHandoffStore(handoff: migrationHandoff(root: root))
+        let fixture = makeModel(
+            startResults: [true],
+            probeResults: [],
+            setupError: JournalSetupRunnerError.setupFailed(
+                errorCode: "fixture",
+                message: "fixture setup failed"
+            ),
+            handoffStore: handoffStore
+        )
+
+        await fixture.model.reconcileActivation()
+        await fixture.model.retryAdopt()
+
+        #expect(fixture.setupRunner.skipModelInstallFlags == [false, false])
+    }
+
 }
 
 struct FirstRunModelFixture {
