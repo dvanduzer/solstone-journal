@@ -728,8 +728,21 @@ fn validate_mobile_native_receipt(
     let Some(obj) = value.as_object() else {
         return Err(receipt_invalid("object"));
     };
+    // The maintained driver leaves `complete` false for component builds.
+    // Admit only the exact service-tool subset; never relabel it full-stack.
+    let service_tool_subset = obj.get("complete").and_then(|value| value.as_bool()) == Some(false)
+        && obj
+            .get("scope")
+            .and_then(|value| value.as_array())
+            .is_some_and(|scope| {
+                scope.len() == 3
+                    && ["restic", "rclone", "nvattest"].iter().all(|component| {
+                        scope.iter().any(|value| value.as_str() == Some(component))
+                    })
+            });
     if obj.get("status").and_then(|value| value.as_str()) != Some("passed")
-        || obj.get("complete").and_then(|value| value.as_bool()) != Some(true)
+        || (obj.get("complete").and_then(|value| value.as_bool()) != Some(true)
+            && !service_tool_subset)
         || obj.get("exit").and_then(|value| value.as_i64()) != Some(0)
         || obj.get("platform").and_then(|value| value.as_str()) != Some("android")
     {
@@ -840,8 +853,10 @@ fn validate_relative_path(path: &str) -> Result<(), AndroidServiceToolsRefusal> 
 /// Renders `solstone.android-service-tools.v1` for one native-library directory
 /// and one resource root.
 ///
-/// `receipt_bytes` is a mobile-native-build receipt. It must record a passed,
-/// complete Android build whose driver, inputs file, nvattest patch, Regorus
+/// `receipt_bytes` is a mobile-native-build receipt. It must record a passed
+/// Android build: either a complete stack or the exact restic/rclone/nvattest
+/// component scope, which retains `complete=false`. Its driver, inputs file,
+/// nvattest patch, Regorus
 /// build-revision patch, and every driver-consumed native input match the
 /// compiled sources. Its artifact hashes must equal the packaged
 /// `librestic.so`, `librclone.so`, `libnvattest.so`, `libnvat.so`, and
@@ -1715,6 +1730,62 @@ mod tests {
     }
 
     #[test]
+    fn successful_service_tool_subset_keeps_full_stack_incomplete() {
+        let native = tempdir().unwrap();
+        let resources = tempdir().unwrap();
+        setup_fixture_roots(native.path(), resources.path());
+        let mut receipt: serde_json::Value =
+            serde_json::from_slice(&receipt_for_tree(native.path(), resources.path())).unwrap();
+        receipt["complete"] = false.into();
+        let bytes = serde_json::to_vec(&receipt).unwrap();
+        let manifest =
+            render_android_service_tools_manifest(native.path(), resources.path(), &bytes).unwrap();
+        let admitted =
+            admit_android_service_tools(native.path(), resources.path(), &manifest, &bytes)
+                .unwrap();
+        admitted.revalidate().unwrap();
+
+        for (field, value, code) in [
+            (
+                "driver_sha256",
+                serde_json::json!("0".repeat(64)),
+                "pin-mismatch",
+            ),
+            ("status", serde_json::json!("failed"), "receipt-invalid"),
+            ("exit", serde_json::json!(7), "receipt-invalid"),
+            ("complete", serde_json::Value::Null, "receipt-invalid"),
+        ] {
+            let previous = receipt[field].take();
+            receipt[field] = value;
+            let err = render_android_service_tools_manifest(
+                native.path(),
+                resources.path(),
+                &serde_json::to_vec(&receipt).unwrap(),
+            )
+            .unwrap_err();
+            assert_eq!(err.code(), code);
+            receipt[field] = previous;
+        }
+
+        for scope in [
+            serde_json::json!(["restic", "rclone"]),
+            serde_json::json!(["restic", "rclone", "restic"]),
+            serde_json::json!(["restic", "rclone", "nvattest", "rust"]),
+            serde_json::json!(["restic", "rclone", null]),
+            serde_json::Value::Null,
+        ] {
+            receipt["scope"] = scope;
+            let err = render_android_service_tools_manifest(
+                native.path(),
+                resources.path(),
+                &serde_json::to_vec(&receipt).unwrap(),
+            )
+            .unwrap_err();
+            assert_eq!(err.code(), "receipt-invalid");
+        }
+    }
+
+    #[test]
     fn appraisal_staging_requires_installed_authority() {
         let err = create_android_appraisal_staging().unwrap_err();
         assert_eq!(err.code(), "member-missing");
@@ -2326,10 +2397,8 @@ mod tests {
         )
         .unwrap();
 
-        // Replace native directory with a new directory at the same path
-        fs::remove_dir_all(&native_dir).unwrap();
-        let dummy = parent.path().join("dummy");
-        fs::create_dir(&dummy).unwrap();
+        // Keep the original inode live while substituting a new directory.
+        fs::rename(&native_dir, parent.path().join("original-native")).unwrap();
         fs::create_dir(&native_dir).unwrap();
         fs::write(native_dir.join(ANDROID_RESTIC_FILENAME), &restic_bytes).unwrap();
         fs::write(native_dir.join(ANDROID_RCLONE_FILENAME), &rclone_bytes).unwrap();
@@ -2362,10 +2431,8 @@ mod tests {
         )
         .unwrap();
 
-        // Replace resource directory with a new directory at the same path
-        fs::remove_dir_all(&resource_dir).unwrap();
-        let dummy = parent.path().join("dummy");
-        fs::create_dir(&dummy).unwrap();
+        // Keep the original inode live while substituting a new directory.
+        fs::rename(&resource_dir, parent.path().join("original-resource")).unwrap();
         fs::create_dir(&resource_dir).unwrap();
         let ca_bytes = solstone_core_distribution::read_test_ca_bundle_pem().unwrap();
         fs::write(resource_dir.join(ANDROID_CA_BUNDLE_FILENAME), &ca_bytes).unwrap();
