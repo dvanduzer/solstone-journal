@@ -82,6 +82,21 @@ fn with_byo_routes(router: Router) -> Router {
             "/app/agents/api/byo/account/replace",
             post(replace_byo_account),
         )
+        .route(
+            "/app/agents/api/byo/relay",
+            put(set_byo_relay).delete(remove_byo_relay),
+        )
+        .route(
+            "/app/agents/api/byo/relay/commands",
+            get(byo_relay_commands),
+        )
+        .route("/app/agents/api/byo/relay/check", post(byo_relay_check))
+        .route(
+            "/app/agents/api/byo/relay/trust-again",
+            post(byo_relay_trust_again),
+        )
+        .route("/app/agents/api/byo/outside-check", post(byo_outside_check))
+        .route("/app/agents/api/byo/dns-check", post(byo_dns_check))
 }
 
 async fn admit_owner(request: Request<Body>, next: Next) -> Response {
@@ -99,7 +114,12 @@ async fn admit_owner(request: Request<Body>, next: Next) -> Response {
 fn refusal(code: &'static str, detail: impl ToString, status: StatusCode) -> Response {
     (
         status,
-        Json(json!({"error": code, "reason_code": code, "detail": detail.to_string()})),
+        Json(json!({
+            "code": code,
+            "error": code,
+            "reason_code": code,
+            "detail": detail.to_string()
+        })),
     )
         .into_response()
 }
@@ -517,8 +537,21 @@ pub(crate) fn state_value_with_iface(
         "dns_spoofing_outside_check"
     ]);
 
+    let relay_config = solstone_core_journal_config::byo_relay_config(&config);
+
     let mut byo_json = match byo_config {
         solstone_core_journal_config::ByoHostnameConfigStatus::None => {
+            let relay_obj = match &relay_config {
+                solstone_core_journal_config::ByoRelayConfig::Valid { address, port } => {
+                    json!({
+                        "address": address.to_string(),
+                        "port": port,
+                        "state": "none",
+                        "observed_at": Value::Null,
+                    })
+                }
+                _ => Value::Null,
+            };
             json!({
                 "hostname": Value::Null,
                 "enabled": false,
@@ -529,8 +562,12 @@ pub(crate) fn state_value_with_iface(
                     "account_uri": Value::Null,
                     "validation_method": "tls-alpn-01",
                 },
+                "caa_record": Value::Null,
                 "dns_verdict": "unchecked",
                 "dns_observed_at": Value::Null,
+                "dns_addresses": [],
+                "diagnostics": [],
+                "relay": relay_obj,
                 "socket_listening": false,
                 "certificate_active": false,
                 "socket_path": socket_path,
@@ -540,6 +577,17 @@ pub(crate) fn state_value_with_iface(
             })
         }
         solstone_core_journal_config::ByoHostnameConfigStatus::Invalid => {
+            let relay_obj = match &relay_config {
+                solstone_core_journal_config::ByoRelayConfig::Valid { address, port } => {
+                    json!({
+                        "address": address.to_string(),
+                        "port": port,
+                        "state": "none",
+                        "observed_at": Value::Null,
+                    })
+                }
+                _ => Value::Null,
+            };
             json!({
                 "hostname": Value::Null,
                 "enabled": false,
@@ -550,8 +598,12 @@ pub(crate) fn state_value_with_iface(
                     "account_uri": Value::Null,
                     "validation_method": "tls-alpn-01",
                 },
+                "caa_record": Value::Null,
                 "dns_verdict": "unchecked",
                 "dns_observed_at": Value::Null,
+                "dns_addresses": [],
+                "diagnostics": [],
+                "relay": relay_obj,
                 "socket_listening": false,
                 "certificate_active": false,
                 "socket_path": socket_path,
@@ -584,6 +636,7 @@ pub(crate) fn state_value_with_iface(
                             crate::tls::McpEndpointTlsService::for_byo_cert_directory(
                                 cert_dir,
                                 h.clone(),
+                                cfg.generation,
                             ) {
                         service.ordinary_certificate_is_active()
                     } else {
@@ -595,37 +648,107 @@ pub(crate) fn state_value_with_iface(
                 }
             };
 
-            let (dns_verdict_str, dns_observed_at, raw_socket_listening, socket_blocker) =
+            let (
+                matches_current,
+                dns_verdict_str,
+                dns_observed_at,
+                raw_socket_listening,
+                socket_blocker,
+            ) = if let Some(state) = &byo_state {
+                let age = Utc::now().signed_duration_since(state.observed_at);
+                let current = state.hostname == cfg.hostname
+                    && state.generation == cfg.generation
+                    && state.enabled == cfg.enabled
+                    && age >= Duration::seconds(-5)
+                    && age <= Duration::seconds(5);
+                (
+                    current,
+                    if current {
+                        state.dns_verdict.as_deref().unwrap_or("unchecked")
+                    } else {
+                        "unchecked"
+                    },
+                    if current { state.dns_observed_at } else { None },
+                    current && state.socket_listening,
+                    if current {
+                        state
+                            .socket_blocker
+                            .map(|b| serde_json::to_value(b).unwrap_or(Value::Null))
+                    } else {
+                        None
+                    },
+                )
+            } else {
+                (false, "unchecked", None, false, None)
+            };
+
+            let relay_obj = match &relay_config {
+                solstone_core_journal_config::ByoRelayConfig::Valid { address, port } => {
+                    let (r_state, r_obs) = if matches_current {
+                        if let Some(state) = &byo_state {
+                            (
+                                state.relay_state.as_str(),
+                                state
+                                    .relay_observed_at
+                                    .map(|t| json!(t))
+                                    .unwrap_or(Value::Null),
+                            )
+                        } else {
+                            ("none", Value::Null)
+                        }
+                    } else {
+                        ("none", Value::Null)
+                    };
+                    json!({
+                        "address": address.to_string(),
+                        "port": port,
+                        "state": r_state,
+                        "observed_at": r_obs,
+                    })
+                }
+                _ => Value::Null,
+            };
+
+            let dns_addresses_val = if matches_current {
                 if let Some(state) = &byo_state {
-                    let age = Utc::now().signed_duration_since(state.observed_at);
-                    let matches_current = state.hostname == cfg.hostname
-                        && state.generation == cfg.generation
-                        && state.enabled == cfg.enabled
-                        && age >= Duration::seconds(-5)
-                        && age <= Duration::seconds(5);
-                    (
-                        if matches_current {
-                            state.dns_verdict.as_deref().unwrap_or("unchecked")
-                        } else {
-                            "unchecked"
-                        },
-                        if matches_current {
-                            state.dns_observed_at
-                        } else {
-                            None
-                        },
-                        matches_current && state.socket_listening,
-                        if matches_current {
-                            state
-                                .socket_blocker
-                                .map(|b| serde_json::to_value(b).unwrap_or(Value::Null))
-                        } else {
-                            None
-                        },
-                    )
+                    json!(state.dns_addresses)
                 } else {
-                    ("unchecked", None, false, None)
-                };
+                    json!([])
+                }
+            } else {
+                json!([])
+            };
+
+            let diagnostics_val = if matches_current {
+                if let Some(state) = &byo_state {
+                    let verdict = state.dns_verdict.as_deref().unwrap_or("unchecked");
+                    if verdict == "lookup_error" || verdict == "lookup_timeout" {
+                        json!([])
+                    } else {
+                        let relay_ip = match &relay_config {
+                            solstone_core_journal_config::ByoRelayConfig::Valid {
+                                address, ..
+                            } => Some(address),
+                            _ => None,
+                        };
+                        let diags = crate::byo_dns::compute_byo_diagnostics(
+                            relay_ip.copied(),
+                            &state.dns_addresses,
+                        );
+                        json!(diags)
+                    }
+                } else {
+                    json!([])
+                }
+            } else {
+                json!([])
+            };
+
+            let caa_record = account_uri.as_ref().map(|uri| {
+                format!(
+                    "0 issue \"letsencrypt.org; accounturi={uri}; validationmethods=tls-alpn-01\""
+                )
+            });
 
             let dns_fresh = dns_observed_at
                 .is_some_and(|obs| (Utc::now() - obs) <= chrono::Duration::seconds(60));
@@ -662,8 +785,12 @@ pub(crate) fn state_value_with_iface(
                 "generation": cfg.generation,
                 "account_uri": account_uri,
                 "caa": caa_obj,
+                "caa_record": caa_record,
                 "dns_verdict": dns_verdict_str,
                 "dns_observed_at": dns_observed_at,
+                "dns_addresses": dns_addresses_val,
+                "diagnostics": diagnostics_val,
+                "relay": relay_obj,
                 "socket_listening": socket_listening,
                 "certificate_active": certificate_active,
                 "socket_path": socket_path,
@@ -910,6 +1037,7 @@ async fn remove_byo_hostname(Extension(journal): Extension<Arc<PathBuf>>) -> Res
         byo_obj.insert("enabled".to_string(), json!(next.enabled));
         byo_obj.insert("generation".to_string(), json!(next.generation));
         endpoint.insert("byo_hostname".to_string(), Value::Object(byo_obj));
+        endpoint.remove("byo_relay");
         JournalConfigMutation {
             changed: true,
             value: Ok(()),
@@ -919,6 +1047,7 @@ async fn remove_byo_hostname(Extension(journal): Extension<Arc<PathBuf>>) -> Res
     match mutation {
         Ok(trans) => match trans.value {
             Ok(()) => {
+                let _ = crate::byo_relay::delete_known_host(&journal);
                 if trans.changed {
                     perform_byo_cutover(journal).await
                 } else {
@@ -933,6 +1062,474 @@ async fn remove_byo_hostname(Extension(journal): Extension<Arc<PathBuf>>) -> Res
             StatusCode::INTERNAL_SERVER_ERROR,
         ),
     }
+}
+
+pub(crate) async fn set_byo_relay(
+    Extension(journal): Extension<Arc<PathBuf>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(obj) = body.as_object() else {
+        return refusal(
+            "relay_invalid",
+            "payload must be an object",
+            StatusCode::BAD_REQUEST,
+        );
+    };
+    let Some(addr_val) = obj.get("address") else {
+        return refusal(
+            "relay_invalid",
+            "address is required",
+            StatusCode::BAD_REQUEST,
+        );
+    };
+    let Some(addr_str) = addr_val.as_str() else {
+        return refusal(
+            "relay_invalid",
+            "address must be a string",
+            StatusCode::BAD_REQUEST,
+        );
+    };
+    let Ok(addr) = addr_str.parse::<std::net::Ipv4Addr>() else {
+        return refusal(
+            "relay_invalid",
+            "address must be a valid ipv4 address",
+            StatusCode::BAD_REQUEST,
+        );
+    };
+    if !solstone_core_journal_config::is_public_relay_address(addr) {
+        return refusal(
+            "relay_address_not_public",
+            "relay address is not public",
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    let port: u16 = match obj.get("port") {
+        None | Some(Value::Null) => 22,
+        Some(Value::Number(n)) => match n.as_u64() {
+            Some(p) if (1..=65535).contains(&p) => p as u16,
+            _ => {
+                return refusal(
+                    "relay_port_invalid",
+                    "port must be between 1 and 65535",
+                    StatusCode::BAD_REQUEST,
+                );
+            }
+        },
+        _ => {
+            return refusal(
+                "relay_port_invalid",
+                "port must be an integer",
+                StatusCode::BAD_REQUEST,
+            );
+        }
+    };
+
+    let mutation = mutate_journal_config(&journal, LockOptions::default(), move |config| {
+        let existing = solstone_core_journal_config::byo_relay_config_from_map(config);
+        let endpoint = config
+            .entry("mcp_endpoint".to_owned())
+            .or_insert_with(|| json!({}));
+        let Some(endpoint) = endpoint.as_object_mut() else {
+            return JournalConfigMutation {
+                changed: false,
+                value: Err("mcp_endpoint setting is not an object".to_string()),
+            };
+        };
+        let mut relay_obj = serde_json::Map::new();
+        relay_obj.insert("address".to_string(), json!(addr.to_string()));
+        relay_obj.insert("port".to_string(), json!(port));
+        endpoint.insert("byo_relay".to_string(), Value::Object(relay_obj));
+
+        let changed_target = match existing {
+            solstone_core_journal_config::ByoRelayConfig::Valid {
+                address: a,
+                port: p,
+            } => a != addr || p != port,
+            _ => true,
+        };
+        JournalConfigMutation {
+            changed: true,
+            value: Ok(changed_target),
+        }
+    });
+
+    match mutation {
+        Ok(trans) => match trans.value {
+            Ok(changed_target) => {
+                if changed_target {
+                    let _ = crate::byo_relay::delete_known_host(&journal);
+                }
+                perform_byo_cutover(journal).await
+            }
+            Err(e) => refusal("byo_relay_mutation_failed", e, StatusCode::CONFLICT),
+        },
+        Err(err) => refusal(
+            "byo_relay_mutation_failed",
+            err.to_string(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+pub(crate) async fn remove_byo_relay(Extension(journal): Extension<Arc<PathBuf>>) -> Response {
+    let mutation = mutate_journal_config(&journal, LockOptions::default(), |config| {
+        let endpoint = config
+            .entry("mcp_endpoint".to_owned())
+            .or_insert_with(|| json!({}));
+        let Some(endpoint) = endpoint.as_object_mut() else {
+            return JournalConfigMutation {
+                changed: false,
+                value: Err("mcp_endpoint setting is not an object".to_string()),
+            };
+        };
+        let changed = endpoint.remove("byo_relay").is_some();
+        JournalConfigMutation {
+            changed,
+            value: Ok(()),
+        }
+    });
+
+    match mutation {
+        Ok(trans) => match trans.value {
+            Ok(()) => {
+                let _ = crate::byo_relay::delete_known_host(&journal);
+                if trans.changed {
+                    perform_byo_cutover(journal).await
+                } else {
+                    state(Extension(journal)).await
+                }
+            }
+            Err(e) => refusal("byo_relay_mutation_failed", e, StatusCode::CONFLICT),
+        },
+        Err(err) => refusal(
+            "byo_relay_mutation_failed",
+            err.to_string(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+async fn byo_relay_commands(Extension(journal): Extension<Arc<PathBuf>>) -> Response {
+    match crate::byo_relay::ensure_or_read_client_key(&journal) {
+        Ok((_, pub_key)) => {
+            let root = std::path::Path::new("/");
+            // Paste-ready: run as a script under sudo, so a refusal ends the script
+            // rather than the admin's interactive shell.
+            let setup = format!(
+                "sudo sh -s <<'SETUP'\n{}SETUP\n",
+                crate::byo_relay::generate_setup_script(root, &pub_key)
+            );
+            let remove = format!(
+                "sudo sh -s <<'REMOVE'\n{}REMOVE\n",
+                crate::byo_relay::generate_remove_script(root)
+            );
+            Json(json!({
+                "setup": setup,
+                "remove": remove,
+            }))
+            .into_response()
+        }
+        Err(_) => refusal(
+            "client_key_failed",
+            "client key could not be stored",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+pub(crate) async fn byo_relay_check(Extension(journal): Extension<Arc<PathBuf>>) -> Response {
+    let config = read_journal_config(&journal).ok();
+    let relay_cfg = config
+        .as_ref()
+        .map(solstone_core_journal_config::byo_relay_config)
+        .unwrap_or(solstone_core_journal_config::ByoRelayConfig::Absent);
+    let (relay_addr, relay_port) = match relay_cfg {
+        solstone_core_journal_config::ByoRelayConfig::Valid { address, port } => (address, port),
+        _ => return Json(json!({"code": "relay_not_configured"})).into_response(),
+    };
+
+    let byo_cfg = config
+        .as_ref()
+        .map(solstone_core_journal_config::byo_hostname_config);
+    let byo_state = crate::byo_door::read_byo_door_state(&journal);
+
+    let (_matches_current, bound) = if let (
+        Some(state),
+        Some(solstone_core_journal_config::ByoHostnameConfigStatus::Configured(cfg)),
+    ) = (&byo_state, &byo_cfg)
+    {
+        let age = Utc::now().signed_duration_since(state.observed_at);
+        let cur = state.hostname == cfg.hostname
+            && state.generation == cfg.generation
+            && state.enabled == cfg.enabled
+            && age >= Duration::seconds(-5)
+            && age <= Duration::seconds(5);
+        (cur, cur && state.socket_listening)
+    } else {
+        (false, false)
+    };
+
+    if bound && let Some(state) = &byo_state {
+        match state.relay_state.as_str() {
+            "connecting" => return Json(json!({"code": "relay_connecting"})).into_response(),
+            "connected" => return Json(json!({"code": "relay_ok"})).into_response(),
+            "unreachable" => return Json(json!({"code": "relay_unreachable"})).into_response(),
+            "auth_refused" => return Json(json!({"code": "relay_auth_refused"})).into_response(),
+            "forward_refused" => {
+                return Json(json!({"code": "relay_forward_refused"})).into_response();
+            }
+            "host_key_changed" => {
+                return Json(json!({"code": "relay_host_key_changed"})).into_response();
+            }
+            _ => {}
+        }
+    }
+
+    let code =
+        match crate::byo_relay::execute_byo_relay_check(&journal, relay_addr, relay_port).await {
+            Ok(()) => "relay_ok",
+            Err("host_key_changed") => "relay_host_key_changed",
+            Err("unreachable") => "relay_unreachable",
+            Err("auth_refused") => "relay_auth_refused",
+            Err("forward_refused") => "relay_forward_refused",
+            Err(e) => e,
+        };
+    Json(json!({"code": code})).into_response()
+}
+
+pub(crate) async fn byo_relay_trust_again(Extension(journal): Extension<Arc<PathBuf>>) -> Response {
+    let _ = crate::byo_relay::delete_known_host(&journal);
+    Json(json!({"ok": true})).into_response()
+}
+
+async fn byo_dns_check(Extension(journal): Extension<Arc<PathBuf>>) -> Response {
+    let config = read_journal_config(&journal).ok();
+    let byo_cfg = config
+        .as_ref()
+        .map(solstone_core_journal_config::byo_hostname_config);
+    let hostname = match byo_cfg {
+        Some(solstone_core_journal_config::ByoHostnameConfigStatus::Configured(ref c)) => {
+            c.hostname.clone()
+        }
+        _ => None,
+    };
+    let Some(hostname) = hostname else {
+        return refusal(
+            "hostname_not_configured",
+            "hostname not configured",
+            StatusCode::BAD_REQUEST,
+        );
+    };
+
+    let account_uri = {
+        if let Ok(root_jr) = solstone_core_journal_io::journal_root::JournalRoot::open(&journal)
+            && let Ok(byo_dir) = crate::unix::open_byo_directory(&root_jr)
+            && let Ok(acc_dir) = crate::unix::open_byo_account_directory(&byo_dir, &hostname)
+        {
+            crate::unix::read_byo_account_uri(&acc_dir).ok().flatten()
+        } else {
+            None
+        }
+    };
+    let uri_str = account_uri.as_deref().unwrap_or("");
+
+    let (verdict, addresses) =
+        crate::byo_dns::resolve_byo_dns(&hostname, uri_str, Utc::now()).await;
+    let verdict_code = verdict.code.as_str();
+
+    let diagnostics = if verdict.code == crate::byo_dns::DnsVerdictCode::LookupError
+        || verdict.code == crate::byo_dns::DnsVerdictCode::LookupTimeout
+    {
+        Vec::new()
+    } else {
+        let relay_cfg = config
+            .as_ref()
+            .map(solstone_core_journal_config::byo_relay_config);
+        let relay_ip = match relay_cfg {
+            Some(solstone_core_journal_config::ByoRelayConfig::Valid { address, .. }) => {
+                Some(address)
+            }
+            _ => None,
+        };
+        crate::byo_dns::compute_byo_diagnostics(relay_ip, &addresses)
+    };
+
+    Json(json!({
+        "verdict": verdict_code,
+        "addresses": addresses,
+        "diagnostics": diagnostics,
+    }))
+    .into_response()
+}
+
+#[derive(Debug)]
+struct OutsideCheckVerifier {
+    expected_leaf_der: Vec<u8>,
+    seen_different_leaf: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for OutsideCheckVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if end_entity.as_ref() == self.expected_leaf_der.as_slice() {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            self.seen_different_leaf
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::General("tls 1.3 required".to_string()))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+pub(crate) async fn byo_outside_check(Extension(journal): Extension<Arc<PathBuf>>) -> Response {
+    let config = read_journal_config(&journal).ok();
+    let byo_cfg = config
+        .as_ref()
+        .map(solstone_core_journal_config::byo_hostname_config);
+    let (hostname, generation) = match byo_cfg {
+        Some(solstone_core_journal_config::ByoHostnameConfigStatus::Configured(ref c)) => {
+            (c.hostname.clone(), c.generation)
+        }
+        _ => (None, 0),
+    };
+    let Some(hostname) = hostname else {
+        return Json(json!({"code": "outside_not_ready"})).into_response();
+    };
+
+    let (cert_active, held_leaf_der) = if let Ok(root_jr) =
+        solstone_core_journal_io::journal_root::JournalRoot::open(&journal)
+        && let Ok(byo_dir) = crate::unix::open_byo_directory(&root_jr)
+        && let Ok(cert_dir) = crate::unix::open_byo_cert_directory(&byo_dir, &hostname, generation)
+        && let Ok(service) = crate::tls::McpEndpointTlsService::for_byo_cert_directory(
+            cert_dir,
+            hostname.clone(),
+            generation,
+        ) {
+        (
+            service.ordinary_certificate_is_active(),
+            service.active_ordinary_leaf_der(),
+        )
+    } else {
+        (false, None)
+    };
+
+    if !cert_active || held_leaf_der.is_none() {
+        return Json(json!({"code": "outside_not_ready"})).into_response();
+    }
+    let expected_leaf_der = held_leaf_der.unwrap();
+
+    let dial_future = async {
+        let dial_addrs: Vec<std::net::SocketAddr> = {
+            #[cfg(all(test, feature = "test-hooks"))]
+            {
+                if let Some(override_addr) = *crate::byo_dns::BYO_TEST_SEAM
+                    .outside_check_addr_override
+                    .read()
+                    .unwrap()
+                {
+                    vec![override_addr]
+                } else {
+                    tokio::net::lookup_host(format!("{hostname}:443"))
+                        .await
+                        .map(|iter| iter.collect())
+                        .unwrap_or_default()
+                }
+            }
+            #[cfg(not(all(test, feature = "test-hooks")))]
+            {
+                tokio::net::lookup_host(format!("{hostname}:443"))
+                    .await
+                    .map(|iter| iter.collect())
+                    .unwrap_or_default()
+            }
+        };
+
+        if dial_addrs.is_empty() {
+            return "outside_unreachable";
+        }
+
+        let seen_different_leaf = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let verifier = Arc::new(OutsideCheckVerifier {
+            expected_leaf_der,
+            seen_different_leaf: seen_different_leaf.clone(),
+        });
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let client_config = match rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+        {
+            Ok(b) => b
+                .dangerous()
+                .with_custom_certificate_verifier(verifier)
+                .with_no_client_auth(),
+            Err(_) => return "outside_unreachable",
+        };
+
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+        let server_name = match rustls::pki_types::ServerName::try_from(hostname.as_str()) {
+            Ok(sn) => sn.to_owned(),
+            Err(_) => return "outside_unreachable",
+        };
+
+        let tcp_stream = match tokio::net::TcpStream::connect(dial_addrs[0]).await {
+            Ok(s) => s,
+            Err(_) => return "outside_unreachable",
+        };
+
+        match connector.connect(server_name, tcp_stream).await {
+            Ok(_tls_stream) => "outside_ok",
+            Err(_) => {
+                if seen_different_leaf.load(std::sync::atomic::Ordering::SeqCst) {
+                    "outside_wrong_certificate"
+                } else {
+                    "outside_unreachable"
+                }
+            }
+        }
+    };
+
+    let code = tokio::time::timeout(std::time::Duration::from_secs(10), dial_future)
+        .await
+        .unwrap_or("outside_unreachable");
+
+    Json(json!({"code": code})).into_response()
 }
 
 /// Apply an owner-hostname change on Windows and wait for the door to confirm
@@ -998,6 +1595,10 @@ pub(crate) async fn perform_byo_cutover(journal: Arc<PathBuf>) -> Response {
             caa: None,
             dns_verdict: None,
             dns_observed_at: None,
+            dns_addresses: Vec::new(),
+            relay_state: "none".to_string(),
+            relay_detail: None,
+            relay_observed_at: None,
             socket_listening: false,
             certificate_active: false,
             socket_path: None,
@@ -1007,6 +1608,10 @@ pub(crate) async fn perform_byo_cutover(journal: Arc<PathBuf>) -> Response {
         });
     current_state.socket_listening = false;
     current_state.socket_blocker = None;
+    current_state.relay_state = "none".to_string();
+    current_state.relay_detail = None;
+    current_state.relay_observed_at = None;
+    current_state.dns_addresses = Vec::new();
     current_state.observed_at = Utc::now();
     crate::byo_door::write_byo_door_state(&journal, &current_state);
     state(Extension(journal)).await
@@ -1091,6 +1696,10 @@ async fn perform_byo_cutover(journal: Arc<PathBuf>) -> Response {
                         caa: None,
                         dns_verdict: None,
                         dns_observed_at: None,
+                        dns_addresses: Vec::new(),
+                        relay_state: "none".to_string(),
+                        relay_detail: None,
+                        relay_observed_at: None,
                         socket_listening: false,
                         certificate_active: false,
                         socket_path: None,
@@ -1101,6 +1710,10 @@ async fn perform_byo_cutover(journal: Arc<PathBuf>) -> Response {
                 });
             current_state.socket_listening = false;
             current_state.socket_blocker = None;
+            current_state.relay_state = "none".to_string();
+            current_state.relay_detail = None;
+            current_state.relay_observed_at = None;
+            current_state.dns_addresses = Vec::new();
             current_state.observed_at = Utc::now();
             crate::byo_door::write_byo_door_state(&journal, &current_state);
             state(Extension(journal)).await
@@ -1123,33 +1736,19 @@ pub async fn register_acme_account(key_der: &[u8]) -> Result<String, String> {
             return registrar(key_der);
         }
     }
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let client_config = Arc::new(
-        rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .map_err(|e| e.to_string())?
-        .with_root_certificates(root_store)
-        .with_no_client_auth(),
-    );
-    let directory = rustls_acme::acme::Directory::discover(
-        &client_config,
-        rustls_acme::acme::LETS_ENCRYPT_PRODUCTION_DIRECTORY,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    let empty_contact: [String; 0] = [];
-    let account = rustls_acme::acme::Account::create_with_keypair(
-        &client_config,
-        directory,
-        empty_contact.iter(),
-        key_der,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    Ok(account.kid)
+    let client = crate::acme_http::McpEndpointHttpClient::new();
+    let pkcs8_der = rustls::pki_types::PrivatePkcs8KeyDer::from(key_der.to_vec());
+    let instant_key =
+        instant_acme::Key::from_pkcs8_der(pkcs8_der.clone_key()).map_err(|e| e.to_string())?;
+    let pki_key = rustls::pki_types::PrivateKeyDer::Pkcs8(pkcs8_der);
+    let (account, _creds) = instant_acme::Account::builder_with_http(Box::new(client))
+        .create_from_key(
+            (instant_key, pki_key),
+            instant_acme::LetsEncrypt::Production.url().to_string(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(account.id().to_owned())
 }
 
 async fn register_byo_account(Extension(journal): Extension<Arc<PathBuf>>) -> Response {
@@ -1731,8 +2330,7 @@ async fn generate_pairing(
             StatusCode::BAD_REQUEST,
         );
     };
-    if !matches!(door_str.as_str(), "local" | "relay" | "lan") && !(cfg!(unix) && door_str == "byo")
-    {
+    if !matches!(door_str.as_str(), "local" | "relay" | "lan" | "byo") {
         return refusal(
             "pairing_create_failed",
             "unsupported door",
@@ -2376,7 +2974,7 @@ mod tests {
             .iter()
             .find(|notice| notice["id"] == hostname_id)
             .unwrap();
-        assert_eq!(hostname_notice["door"], "your hostname");
+        assert_eq!(hostname_notice["door"], "your own domain");
 
         for _ in 0..15 {
             replay_one(&relay, &client.id, &client.client_id, "relay", "192.0.2.1");
@@ -2386,9 +2984,9 @@ mod tests {
         assert_eq!(notices.len(), 16);
         assert!(!notices.iter().any(|notice| notice["id"] == oldest));
         assert!(
-            notices
-                .iter()
-                .any(|notice| { notice["id"] == hostname_id && notice["door"] == "your hostname" })
+            notices.iter().any(|notice| {
+                notice["id"] == hostname_id && notice["door"] == "your own domain"
+            })
         );
     }
 
@@ -3179,6 +3777,10 @@ mod tests {
             caa: Some("admitted".to_string()),
             dns_verdict: Some("admitted".to_string()),
             dns_observed_at: Some(Utc::now()),
+            dns_addresses: Vec::new(),
+            relay_state: "none".to_string(),
+            relay_detail: None,
+            relay_observed_at: None,
             socket_listening: true,
             certificate_active: true,
             socket_path: Some(
@@ -3237,6 +3839,10 @@ mod tests {
             caa: Some("admitted".to_string()),
             dns_verdict: Some("admitted".to_string()),
             dns_observed_at: Some(Utc::now()),
+            dns_addresses: Vec::new(),
+            relay_state: "none".to_string(),
+            relay_detail: None,
+            relay_observed_at: None,
             socket_listening: true,
             certificate_active: false,
             socket_path: None,
@@ -3344,5 +3950,314 @@ mod tests {
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
         let val: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(val["door"], "local");
+
+        // 9. Valid door "byo" when hostname is configured -> 200
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        std::fs::write(
+            root.join("config/journal.json"),
+            r#"{"mcp_endpoint":{"byo_hostname":{"hostname":"mcp.example.com","enabled":true,"generation":1}}}"#,
+        )
+        .unwrap();
+        let resp = generate_pairing(
+            Extension(journal.clone()),
+            axum::body::Bytes::from(r#"{"door": "byo"}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let val: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["door"], "byo");
+    }
+
+    #[test]
+    fn caa_record_format_and_policy_admission() {
+        let account_uri = "https://acme-v02.api.letsencrypt.org/acme/acct/12345";
+        let caa_record_str = format!(
+            "0 issue \"letsencrypt.org; accounturi={account_uri}; validationmethods=tls-alpn-01\""
+        );
+
+        let parts: Vec<&str> = caa_record_str.splitn(3, ' ').collect();
+        assert_eq!(parts.len(), 3);
+        let flags: u8 = parts[0].parse().unwrap();
+        assert_eq!(flags, 0);
+        let tag = parts[1];
+        assert_eq!(tag, "issue");
+        let val_unquoted = parts[2].trim_matches('"');
+        assert_eq!(
+            val_unquoted,
+            format!("letsencrypt.org; accounturi={account_uri}; validationmethods=tls-alpn-01")
+        );
+
+        let mut records_by_domain = std::collections::HashMap::new();
+        records_by_domain.insert(
+            "mcp.example.com".to_string(),
+            crate::byo_dns::HostDnsRecords {
+                a: vec![std::net::Ipv4Addr::new(203, 0, 113, 10)],
+                aaaa: Vec::new(),
+                cname: Vec::new(),
+                caa: vec![crate::byo_dns::CaaRecord {
+                    flags,
+                    tag: tag.to_string(),
+                    value: val_unquoted.to_string(),
+                }],
+            },
+        );
+
+        let verdict = crate::byo_dns::evaluate_byo_dns_policy(
+            "mcp.example.com",
+            account_uri,
+            &records_by_domain,
+            Utc::now(),
+        );
+        assert_eq!(verdict.code, crate::byo_dns::DnsVerdictCode::Admitted);
+    }
+
+    #[test]
+    fn byo_owner_state_projection_diagnostics_and_relay_expiry() {
+        let dir = tempfile::Builder::new()
+            .prefix("solstone-mcp-byo-proj-test-")
+            .tempdir_in(crate::test_scratch())
+            .unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        std::fs::write(
+            root.join("config/journal.json"),
+            r#"{"mcp_endpoint":{"byo_hostname":{"hostname":"mcp.example.com","enabled":true,"generation":1},"byo_relay":{"address":"203.0.113.10","port":22}}}"#,
+        )
+        .unwrap();
+
+        // 1. Current lookup_error file with empty addresses -> empty diagnostics
+        let mut door_state = crate::byo_door::ByoDoorState {
+            hostname: Some("mcp.example.com".to_string()),
+            enabled: true,
+            generation: 1,
+            account_uri: None,
+            caa: None,
+            dns_verdict: Some("lookup_error".to_string()),
+            dns_observed_at: Some(Utc::now()),
+            dns_addresses: Vec::new(),
+            relay_state: "connected".to_string(),
+            relay_detail: None,
+            relay_observed_at: Some(Utc::now()),
+            socket_listening: true,
+            certificate_active: false,
+            socket_path: None,
+            socket_blocker: None,
+            next_action: None,
+            observed_at: Utc::now(),
+        };
+        crate::byo_door::write_byo_door_state(root, &door_state);
+        let val = state_value(root).unwrap();
+        assert_eq!(val["byo"]["diagnostics"], json!([]));
+        assert_eq!(val["byo"]["relay"]["state"], "connected");
+
+        // 2. Current admitted file whose dns_addresses do not match relay -> ["address_mismatch"]
+        door_state.dns_verdict = Some("admitted".to_string());
+        door_state.dns_addresses = vec!["198.51.100.5".to_string()];
+        crate::byo_door::write_byo_door_state(root, &door_state);
+        let val = state_value(root).unwrap();
+        assert_eq!(val["byo"]["diagnostics"], json!(["address_mismatch"]));
+
+        // 3. A connected file with observed_at older than 5 seconds projects relay.state "none"
+        door_state.observed_at = Utc::now() - Duration::seconds(6);
+        crate::byo_door::write_byo_door_state(root, &door_state);
+        let val = state_value(root).unwrap();
+        assert_eq!(val["byo"]["relay"]["state"], "none");
+    }
+
+    #[tokio::test]
+    async fn byo_config_and_relay_mutations() {
+        use axum::body::to_bytes;
+
+        let dir = tempfile::Builder::new()
+            .prefix("solstone-mcp-byo-mut-test-")
+            .tempdir_in(crate::test_scratch())
+            .unwrap();
+        let root = dir.path();
+        let journal = Arc::new(root.to_path_buf());
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        std::fs::write(
+            root.join("config/journal.json"),
+            r#"{"mcp_endpoint":{"byo_hostname":{"hostname":"initial.example.com","enabled":false,"generation":1},"byo_relay":{"address":"203.0.113.10","port":22}}}"#,
+        )
+        .unwrap();
+
+        // 1. Hostname save keeps byo_relay
+        let resp = set_byo_hostname(
+            Extension(journal.clone()),
+            Json(SetByoRequest {
+                hostname: Some("updated.example.com".to_string()),
+                enabled: false,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let cfg = read_journal_config(root).unwrap();
+        let relay = solstone_core_journal_config::byo_relay_config(&cfg);
+        assert!(
+            matches!(relay, solstone_core_journal_config::ByoRelayConfig::Valid { address, port } if address == "203.0.113.10".parse::<std::net::Ipv4Addr>().unwrap() && port == 22)
+        );
+
+        // 2. PUT private address returns relay_address_not_public and does not write
+        let resp = set_byo_relay(
+            Extension(journal.clone()),
+            Json(json!({"address": "192.168.1.1", "port": 22})),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let val: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["code"], "relay_address_not_public");
+        let cfg = read_journal_config(root).unwrap();
+        let relay = solstone_core_journal_config::byo_relay_config(&cfg);
+        assert!(
+            matches!(relay, solstone_core_journal_config::ByoRelayConfig::Valid { address, .. } if address == "203.0.113.10".parse::<std::net::Ipv4Addr>().unwrap())
+        );
+
+        // 3. Bad port returns relay_port_invalid
+        let resp = set_byo_relay(
+            Extension(journal.clone()),
+            Json(json!({"address": "203.0.113.20", "port": 70000})),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let val: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["code"], "relay_port_invalid");
+
+        // 4. Hostname removal deletes byo_relay
+        let resp = remove_byo_hostname(Extension(journal.clone())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let cfg = read_journal_config(root).unwrap();
+        let relay = solstone_core_journal_config::byo_relay_config(&cfg);
+        assert!(matches!(
+            relay,
+            solstone_core_journal_config::ByoRelayConfig::Absent
+        ));
+    }
+
+    #[tokio::test]
+    async fn byo_dns_check_writes_no_door_file_and_uses_override() {
+        use axum::body::to_bytes;
+
+        let dir = tempfile::Builder::new()
+            .prefix("solstone-mcp-byo-dns-test-")
+            .tempdir_in(crate::test_scratch())
+            .unwrap();
+        let root = dir.path();
+        let journal = Arc::new(root.to_path_buf());
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        std::fs::write(
+            root.join("config/journal.json"),
+            r#"{"mcp_endpoint":{"byo_hostname":{"hostname":"mcp.example.com","enabled":true,"generation":1},"byo_relay":{"address":"203.0.113.10","port":22}}}"#,
+        )
+        .unwrap();
+
+        *crate::byo_dns::TEST_VERDICT_OVERRIDE.write().unwrap() = Some((
+            crate::byo_dns::DnsVerdict::new(crate::byo_dns::DnsVerdictCode::Admitted, Utc::now()),
+            vec!["203.0.113.10".to_string()],
+        ));
+
+        let door_path = root.join(crate::byo_door::BYO_DOOR_STATE_PATH);
+        assert!(!door_path.exists());
+
+        let resp = byo_dns_check(Extension(journal.clone())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let val: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["verdict"], "admitted");
+        assert_eq!(val["addresses"], json!(["203.0.113.10"]));
+        assert_eq!(val["diagnostics"], json!([]));
+
+        assert!(!door_path.exists());
+
+        *crate::byo_dns::TEST_VERDICT_OVERRIDE.write().unwrap() = None;
+    }
+
+    #[tokio::test]
+    async fn byo_relay_check_codes() {
+        use axum::body::to_bytes;
+
+        let dir = tempfile::Builder::new()
+            .prefix("solstone-mcp-byo-check-test-")
+            .tempdir_in(crate::test_scratch())
+            .unwrap();
+        let root = dir.path();
+        let journal = Arc::new(root.to_path_buf());
+
+        // 1. Relay not configured
+        let resp = byo_relay_check(Extension(journal.clone())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let val: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["code"], "relay_not_configured");
+
+        // 2. Configured and bound in state:
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        std::fs::write(
+            root.join("config/journal.json"),
+            r#"{"mcp_endpoint":{"byo_hostname":{"hostname":"mcp.example.com","enabled":true,"generation":1},"byo_relay":{"address":"203.0.113.10","port":22}}}"#,
+        )
+        .unwrap();
+        let mut state = crate::byo_door::ByoDoorState {
+            hostname: Some("mcp.example.com".to_string()),
+            enabled: true,
+            generation: 1,
+            account_uri: None,
+            caa: None,
+            dns_verdict: None,
+            dns_observed_at: None,
+            dns_addresses: Vec::new(),
+            relay_state: "connecting".to_string(),
+            relay_detail: None,
+            relay_observed_at: Some(Utc::now()),
+            socket_listening: true,
+            certificate_active: false,
+            socket_path: None,
+            socket_blocker: None,
+            next_action: None,
+            observed_at: Utc::now(),
+        };
+        crate::byo_door::write_byo_door_state(root, &state);
+
+        let resp = byo_relay_check(Extension(journal.clone())).await;
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let val: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["code"], "relay_connecting");
+
+        state.relay_state = "connected".to_string();
+        crate::byo_door::write_byo_door_state(root, &state);
+        let resp = byo_relay_check(Extension(journal.clone())).await;
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let val: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["code"], "relay_ok");
+
+        state.relay_state = "unreachable".to_string();
+        crate::byo_door::write_byo_door_state(root, &state);
+        let resp = byo_relay_check(Extension(journal.clone())).await;
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let val: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["code"], "relay_unreachable");
+
+        state.relay_state = "auth_refused".to_string();
+        crate::byo_door::write_byo_door_state(root, &state);
+        let resp = byo_relay_check(Extension(journal.clone())).await;
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let val: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["code"], "relay_auth_refused");
+
+        state.relay_state = "forward_refused".to_string();
+        crate::byo_door::write_byo_door_state(root, &state);
+        let resp = byo_relay_check(Extension(journal.clone())).await;
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let val: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["code"], "relay_forward_refused");
+
+        state.relay_state = "host_key_changed".to_string();
+        crate::byo_door::write_byo_door_state(root, &state);
+        let resp = byo_relay_check(Extension(journal.clone())).await;
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let val: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["code"], "relay_host_key_changed");
     }
 }

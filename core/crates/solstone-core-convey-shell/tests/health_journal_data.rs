@@ -417,7 +417,7 @@ async fn rich_fixture_matches_the_complete_report_contract() {
             ],
             "brain_health":{
                 "snapshot":{
-                    "state":"unknown","headline":"thinking status unavailable","reason_code":"configuration_invalid","reason_text":"configuration invalid","failing_component":null,
+                    "state":"unknown","headline":"thinking status unavailable","reason_code":"configuration_invalid","reason_text":"the thinking settings need fixing","failing_component":null,
                     "action":{"label":"open thinking","href":"/app/thinking/#main"},
                     "identity":{"lane":null,"provider":"test","model":""},
                     "evidence":{"observed_at":null,"age_seconds":null,"age_text":null},
@@ -426,7 +426,7 @@ async fn rich_fixture_matches_the_complete_report_contract() {
                     },
                     "progressing":false
                 },
-                "lines":["Brain Health","  thinking status unavailable","  configuration invalid","  → open thinking: /app/thinking/#main"]
+                "lines":["Thinking Health","  thinking status unavailable","  the thinking settings need fixing","  → open thinking: /app/thinking/#main"]
             }
         })
     );

@@ -1976,7 +1976,7 @@ fn replay_door_label(resource: Option<&str>) -> String {
         None => "solstone.me".to_owned(),
         Some(solstone_core_journal_config::MCP_LAN_DOOR_RESOURCE) => "your network".to_owned(),
         Some(solstone_core_journal_config::MCP_LOCAL_DOOR_RESOURCE) => "this computer".to_owned(),
-        Some(value) if value.starts_with("https://") => "your hostname".to_owned(),
+        Some(value) if value.starts_with("https://") => "your own domain".to_owned(),
         Some(_) => "solstone.me".to_owned(),
     }
 }

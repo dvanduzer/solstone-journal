@@ -182,6 +182,10 @@ pub(crate) fn check_segment_transcript_release(
         Ok(OwnerDeletionState::Occupied) => MarkerState::Occupied,
         Err(_) => MarkerState::Unreadable,
     };
+    #[cfg(feature = "test-hooks")]
+    crate::source_freeze_barrier::checkpoint(
+        crate::source_freeze_barrier::FreezePoint::MarkerSampled,
+    );
     let Ok(root) = JournalRoot::open(journal_root).map(Arc::new) else {
         return allows_source_release(
             RequestedSource::TranscriptSegment,

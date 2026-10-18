@@ -3848,15 +3848,15 @@ fn run_brain_refresh_session(options: BrainRefreshSessionOptions) -> ExitCode {
             }));
         }
         Err(solstone_core_brain::BeginRefreshError::ExpectedFingerprintStale(error)) => {
-            eprintln!("brain refresh failed: {error}");
+            eprintln!("thinking check failed: {error}");
             return ExitCode::from(EXIT_DATAERR);
         }
         Err(solstone_core_brain::BeginRefreshError::InvalidArgument(error)) => {
-            eprintln!("brain refresh failed: {error}");
+            eprintln!("thinking check failed: {error}");
             return ExitCode::from(EXIT_USAGE);
         }
         Err(solstone_core_brain::BeginRefreshError::Writer(error)) => {
-            eprintln!("brain refresh failed: {error}");
+            eprintln!("thinking check failed: {error}");
             return ExitCode::from(EXIT_UNAVAILABLE);
         }
     };
@@ -3964,7 +3964,7 @@ fn run_refresh_session_loop(
         ) {
             Ok(_) => write_refresh_projection(&journal_path),
             Err(error) => {
-                eprintln!("brain refresh failed: {error}");
+                eprintln!("thinking check failed: {error}");
                 ExitCode::from(EXIT_UNAVAILABLE)
             }
         },
@@ -4470,7 +4470,7 @@ fn write_brain_projection(journal_path: &std::path::Path, result_schema: &str) -
     let config = match read_journal_config(journal_path) {
         Ok(read) => read.config.unwrap_or_default(),
         Err(error) => {
-            eprintln!("brain refresh failed: could not read journal config: {error}");
+            eprintln!("thinking check failed: could not read journal config: {error}");
             return ExitCode::from(EXIT_UNAVAILABLE);
         }
     };
@@ -4507,7 +4507,7 @@ fn write_session_result(output: Value) -> ExitCode {
     {
         ExitCode::SUCCESS
     } else {
-        eprintln!("brain refresh failed: stdout I/O error");
+        eprintln!("thinking check failed: stdout I/O error");
         ExitCode::from(EXIT_IOERR)
     }
 }
@@ -5081,7 +5081,7 @@ fn run_mcp_pairing_at(journal_root: &Path, command: McpPairingCommand) -> ExitCo
                             println!("It works only through solstone.me.");
                         }
                         Some("hostname") => {
-                            println!("It works only at your hostname.");
+                            println!("It works only at your own domain.");
                         }
                         Some(_) => {
                             println!("It works only for an agent on this computer.");

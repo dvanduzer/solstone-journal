@@ -65,6 +65,9 @@ pub(crate) struct EntryReference {
     pub path: String,
     pub idx: i64,
     pub row_id: i64,
+    /// File digest bound into an activity reference. Absent for every other entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_proof: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -99,6 +102,9 @@ pub(crate) struct CursorReference {
     pub idx: i64,
     pub row_id: i64,
     pub content_fingerprint: String,
+    /// File digest bound into an activity cursor. Absent for every other cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_proof: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -140,7 +146,6 @@ pub(crate) struct EntityListCursor {
     pub facet: Option<String>,
     pub last_facet_id: String,
     pub last_entity_id: String,
-    pub last_relationship_dir: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -315,6 +320,7 @@ mod tests {
                     path: "notes/private.md".to_owned(),
                     idx: 2,
                     row_id: 9,
+                    activity_proof: None,
                 }),
             )
             .unwrap();
@@ -389,7 +395,6 @@ mod tests {
                     facet: None,
                     last_facet_id: "facet-1".to_owned(),
                     last_entity_id: "ent-1".to_owned(),
-                    last_relationship_dir: "rel-1".to_owned(),
                 }),
             )
             .unwrap();
@@ -397,5 +402,19 @@ mod tests {
             codec.resolve(&entity_token, ReferenceKind::FacetList, "bearer:a", 1),
             Err(ReferenceError::NotFound)
         );
+    }
+
+    #[test]
+    fn entry_without_activity_proof_decodes_as_absent() {
+        let entry: EntryReference = serde_json::from_str(
+            r#"{"day":"20260914","stream":"default","path":"notes/private.md","idx":2,"row_id":9}"#,
+        )
+        .expect("legacy entry");
+        assert!(entry.activity_proof.is_none());
+        let cursor: super::CursorReference = serde_json::from_str(
+            r#"{"query_hash":"abc","categories":[],"scope_ids":[],"whole_journal":true,"day":"20260914","stream":"default","path":"notes/private.md","idx":2,"row_id":9,"content_fingerprint":"def"}"#,
+        )
+        .expect("legacy cursor");
+        assert!(cursor.activity_proof.is_none());
     }
 }

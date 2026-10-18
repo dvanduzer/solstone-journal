@@ -42,6 +42,8 @@ use crate::{McpEndpointBootstrapError, McpEndpointOwnerContext};
 const ENDPOINT_DIRECTORY: &str = "mcp-endpoint";
 const TLS_DIRECTORY: &str = "tls";
 const TLS_STATE_FILE: &str = "state.json";
+const TLS_RENEWAL_FILE: &str = "renewal.json";
+const TLS_ISSUANCE_FILE: &str = "issuance.json";
 const TLS_STAGING_ACCOUNT_FILE: &str = "account-staging.pk8";
 const TLS_PRODUCTION_ACCOUNT_FILE: &str = "account-production.pk8";
 /// `hold_lock` appends `.lock`, giving the same `.create.lock` name as Unix.
@@ -56,6 +58,8 @@ const MAX_BYO_ACCOUNT_URI_BYTES: usize = 2048;
 const MAX_POP_PKCS8_DER_BYTES: usize = 512;
 pub(crate) const MAX_TLS_STATE_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_TLS_ACME_ACCOUNT_BYTES: usize = 1024;
+pub(crate) const MAX_TLS_RENEWAL_BYTES: usize = 8192;
+pub(crate) const MAX_TLS_ISSUANCE_BYTES: usize = 16384;
 /// Inert on Windows beyond validation; kept equal to the Unix file mode.
 const FILE_MODE: u32 = 0o600;
 
@@ -170,6 +174,24 @@ pub(crate) fn read_tls_state_bytes(directory: &TlsStateDirectory) -> io::Result<
     read_bounded(&directory.path.join(TLS_STATE_FILE), MAX_TLS_STATE_BYTES)
 }
 
+/// Read the renewal schedule file bounded at 8192 bytes.
+pub(crate) fn read_tls_renewal_bytes(directory: &TlsStateDirectory) -> io::Result<Option<Vec<u8>>> {
+    read_bounded(
+        &directory.path.join(TLS_RENEWAL_FILE),
+        MAX_TLS_RENEWAL_BYTES,
+    )
+}
+
+/// Read the issuance record file bounded at 16384 bytes.
+pub(crate) fn read_tls_issuance_bytes(
+    directory: &TlsStateDirectory,
+) -> io::Result<Option<Vec<u8>>> {
+    read_bounded(
+        &directory.path.join(TLS_ISSUANCE_FILE),
+        MAX_TLS_ISSUANCE_BYTES,
+    )
+}
+
 /// Durably replace the TLS state file. A publication with any durability or
 /// final-name uncertainty is a failure.
 #[allow(dead_code)] // Called by the same-crate certificate lifecycle owner.
@@ -178,6 +200,32 @@ pub(crate) fn persist_tls_state_bytes(
     bytes: &[u8],
 ) -> io::Result<()> {
     persist_bounded(directory, TLS_STATE_FILE, bytes, MAX_TLS_STATE_BYTES)
+}
+
+/// Durably replace the renewal schedule file bounded at 8192 bytes.
+pub(crate) fn persist_tls_renewal_bytes(
+    directory: &TlsStateDirectory,
+    bytes: &[u8],
+) -> io::Result<()> {
+    persist_bounded(directory, TLS_RENEWAL_FILE, bytes, MAX_TLS_RENEWAL_BYTES)
+}
+
+/// Durably replace the issuance record file bounded at 16384 bytes.
+pub(crate) fn persist_tls_issuance_bytes(
+    directory: &TlsStateDirectory,
+    bytes: &[u8],
+) -> io::Result<()> {
+    persist_bounded(directory, TLS_ISSUANCE_FILE, bytes, MAX_TLS_ISSUANCE_BYTES)
+}
+
+/// Delete the issuance record file if present.
+pub(crate) fn delete_tls_issuance_file(directory: &TlsStateDirectory) -> io::Result<()> {
+    let p = directory.path.join(TLS_ISSUANCE_FILE);
+    match std::fs::remove_file(p) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Load the bounded ACME account key for exactly one certificate environment.
@@ -292,6 +340,70 @@ pub(crate) fn delete_byo_account_pair(dir: &TlsStateDirectory) -> io::Result<()>
     for name in [BYO_ACCOUNT_KEY_FILE, BYO_ACCOUNT_URI_FILE] {
         let _ = fs::remove_file(dir.path.join(name));
     }
+    Ok(())
+}
+
+pub(crate) const BYO_RELAY_DIR: &str = "relay";
+pub(crate) const BYO_RELAY_CLIENT_KEY_FILE: &str = "client-key";
+pub(crate) const BYO_RELAY_KNOWN_HOST_FILE: &str = "known-host";
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ExclusiveCreate {
+    Created,
+    Present(Vec<u8>),
+}
+
+pub(crate) fn create_exclusive_or_read(
+    dir: &TlsStateDirectory,
+    name: &str,
+    bytes: &[u8],
+) -> io::Result<ExclusiveCreate> {
+    require_real_directory(&dir.path)?;
+    let path = dir.path.join(name);
+    match write_bytes_exclusive(
+        &path,
+        bytes,
+        AtomicWriteOptions {
+            mode: Some(FILE_MODE),
+        },
+    ) {
+        Ok(()) => Ok(ExclusiveCreate::Created),
+        Err(AtomicWriteError::Io { source, .. })
+            if source.kind() == io::ErrorKind::AlreadyExists =>
+        {
+            let existing = read_bounded(&path, 64 * 1024)?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "file missing on re-read")
+            })?;
+            Ok(ExclusiveCreate::Present(existing))
+        }
+        Err(e) => Err(io::Error::other(e)),
+    }
+}
+
+pub(crate) fn open_byo_relay_directory(byo_dir: &ByoDirectory) -> io::Result<TlsStateDirectory> {
+    require_real_directory(&byo_dir.path)?;
+    let path = open_real_directory(&byo_dir.path.join(BYO_RELAY_DIR))?;
+    Ok(TlsStateDirectory { path })
+}
+
+pub(crate) fn read_byo_relay_client_key(dir: &TlsStateDirectory) -> io::Result<Option<Vec<u8>>> {
+    read_bounded(&dir.path.join(BYO_RELAY_CLIENT_KEY_FILE), 64 * 1024)
+}
+
+pub(crate) fn read_byo_relay_known_host(dir: &TlsStateDirectory) -> io::Result<Option<Vec<u8>>> {
+    read_bounded(&dir.path.join(BYO_RELAY_KNOWN_HOST_FILE), 64 * 1024)
+}
+
+pub(crate) fn persist_byo_relay_known_host(
+    dir: &TlsStateDirectory,
+    bytes: &[u8],
+) -> io::Result<()> {
+    persist_bounded(dir, BYO_RELAY_KNOWN_HOST_FILE, bytes, 64 * 1024)
+}
+
+pub(crate) fn delete_byo_relay_known_host(dir: &TlsStateDirectory) -> io::Result<()> {
+    require_real_directory(&dir.path)?;
+    let _ = fs::remove_file(dir.path.join(BYO_RELAY_KNOWN_HOST_FILE));
     Ok(())
 }
 

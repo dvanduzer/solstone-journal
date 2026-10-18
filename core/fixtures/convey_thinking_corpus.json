@@ -239,7 +239,7 @@
               },
               "lane_label": "processing with",
               "local": {
-                "detail": "runs right on this computer. nothing leaves this machine to be processed",
+                "detail": "runs right on your journal's computer. nothing leaves it to be processed",
                 "value": "a model on your device"
               },
               "none": {
@@ -262,11 +262,11 @@
               "setup_key": "a saved key",
               "target_label": "switch to",
               "to_byo_note": "processing will use your own model. {setup} is still here.",
-              "to_local_note": "processing will run right on this computer. your {current} setup stays saved. switch back anytime."
+              "to_local_note": "processing will run right on your journal's computer. your {current} setup stays saved. switch back anytime."
             },
             "lanes": [
               {
-                "description": "a model runs right on this computer. nothing leaves this machine to be processed.",
+                "description": "a model runs right on your journal's computer. nothing leaves it to be processed.",
                 "id": "local",
                 "label": "Local",
                 "sub": "on your device"
@@ -292,12 +292,12 @@
               "failed_reason": "local setup stopped before it finished.",
               "failed_verdict": "local setup didn't finish",
               "gpu_memory_insufficient": "the selected GPU has less than the 6 GB of GPU memory needed for local thinking.",
-              "gpu_memory_unknown": "couldn't check GPU memory on this computer.",
+              "gpu_memory_unknown": "couldn't check GPU memory on your journal's computer.",
               "gpu_unavailable": "couldn't find a supported GPU for local thinking.",
               "install": "install local model",
               "integrity_failed": "the downloaded files couldn't be verified. try setup again.",
               "interrupted_verdict": "installation stopped",
-              "memory_failed": "this computer doesn't have enough memory for local thinking.",
+              "memory_failed": "your journal's computer doesn't have enough memory for local thinking.",
               "notice_inflight": "local thinking will stay in your journal once setup finishes.",
               "package_failed": "some files needed for local thinking are missing. update the journal and try setup again.",
               "package_invalid": "some files needed for local thinking couldn't be verified. update the journal and try setup again.",
@@ -312,7 +312,7 @@
               "retry": "try setup again",
               "stopped_reason": "you can try setup again when you're ready.",
               "unidentified_failed": "couldn't tell why local setup stopped. check the diagnostic console for details.",
-              "unsupported_failed": "this local model isn't supported on this computer."
+              "unsupported_failed": "this local model isn't supported on your journal's computer."
             },
             "local_recovery": {
               "retry": "try starting local again",
@@ -324,7 +324,7 @@
                 },
                 "checking": {
                   "pill": "checking",
-                  "reason": "checking the selected model and this computer.",
+                  "reason": "checking the selected model and your journal's computer.",
                   "verdict": "checking local setup"
                 },
                 "cleanup_failed": {
@@ -354,7 +354,7 @@
                 },
                 "gpu_probe_failed": {
                   "pill": "couldn't check",
-                  "reason": "couldn't read GPU memory on this computer. try checking again in a moment.",
+                  "reason": "couldn't read GPU memory on your journal's computer. try checking again in a moment.",
                   "verdict": "couldn't check GPU memory"
                 },
                 "local_probe_failed": {
@@ -364,7 +364,7 @@
                 },
                 "ready": {
                   "pill": "on",
-                  "reason": "a model is running on this computer.",
+                  "reason": "a model is running on your journal's computer.",
                   "verdict": "local thinking is ready"
                 },
                 "ready_proof_unavailable": {
@@ -399,12 +399,12 @@
                 },
                 "unsupported": {
                   "pill": "unavailable",
-                  "reason": "local thinking needs supported hardware on this computer.",
-                  "verdict": "this computer can't run this local model"
+                  "reason": "local thinking needs supported hardware on your journal's computer.",
+                  "verdict": "your journal's computer can't run this local model"
                 },
                 "waiting": {
                   "pill": "waiting",
-                  "reason": "it will start when this computer is ready.",
+                  "reason": "it will start when your journal's computer is ready.",
                   "verdict": "local thinking is waiting"
                 }
               }
@@ -2484,7 +2484,7 @@
               },
               "lane_label": "processing with",
               "local": {
-                "detail": "runs right on this computer. nothing leaves this machine to be processed",
+                "detail": "runs right on your journal's computer. nothing leaves it to be processed",
                 "value": "a model on your device"
               },
               "none": {
@@ -2507,11 +2507,11 @@
               "setup_key": "a saved key",
               "target_label": "switch to",
               "to_byo_note": "processing will use your own model. {setup} is still here.",
-              "to_local_note": "processing will run right on this computer. your {current} setup stays saved. switch back anytime."
+              "to_local_note": "processing will run right on your journal's computer. your {current} setup stays saved. switch back anytime."
             },
             "lanes": [
               {
-                "description": "a model runs right on this computer. nothing leaves this machine to be processed.",
+                "description": "a model runs right on your journal's computer. nothing leaves it to be processed.",
                 "id": "local",
                 "label": "Local",
                 "sub": "on your device"
@@ -2537,12 +2537,12 @@
               "failed_reason": "local setup stopped before it finished.",
               "failed_verdict": "local setup didn't finish",
               "gpu_memory_insufficient": "the selected GPU has less than the 6 GB of GPU memory needed for local thinking.",
-              "gpu_memory_unknown": "couldn't check GPU memory on this computer.",
+              "gpu_memory_unknown": "couldn't check GPU memory on your journal's computer.",
               "gpu_unavailable": "couldn't find a supported GPU for local thinking.",
               "install": "install local model",
               "integrity_failed": "the downloaded files couldn't be verified. try setup again.",
               "interrupted_verdict": "installation stopped",
-              "memory_failed": "this computer doesn't have enough memory for local thinking.",
+              "memory_failed": "your journal's computer doesn't have enough memory for local thinking.",
               "notice_inflight": "local thinking will stay in your journal once setup finishes.",
               "package_failed": "some files needed for local thinking are missing. update the journal and try setup again.",
               "package_invalid": "some files needed for local thinking couldn't be verified. update the journal and try setup again.",
@@ -2557,7 +2557,7 @@
               "retry": "try setup again",
               "stopped_reason": "you can try setup again when you're ready.",
               "unidentified_failed": "couldn't tell why local setup stopped. check the diagnostic console for details.",
-              "unsupported_failed": "this local model isn't supported on this computer."
+              "unsupported_failed": "this local model isn't supported on your journal's computer."
             },
             "local_recovery": {
               "retry": "try starting local again",
@@ -2569,7 +2569,7 @@
                 },
                 "checking": {
                   "pill": "checking",
-                  "reason": "checking the selected model and this computer.",
+                  "reason": "checking the selected model and your journal's computer.",
                   "verdict": "checking local setup"
                 },
                 "cleanup_failed": {
@@ -2599,7 +2599,7 @@
                 },
                 "gpu_probe_failed": {
                   "pill": "couldn't check",
-                  "reason": "couldn't read GPU memory on this computer. try checking again in a moment.",
+                  "reason": "couldn't read GPU memory on your journal's computer. try checking again in a moment.",
                   "verdict": "couldn't check GPU memory"
                 },
                 "local_probe_failed": {
@@ -2609,7 +2609,7 @@
                 },
                 "ready": {
                   "pill": "on",
-                  "reason": "a model is running on this computer.",
+                  "reason": "a model is running on your journal's computer.",
                   "verdict": "local thinking is ready"
                 },
                 "ready_proof_unavailable": {
@@ -2644,12 +2644,12 @@
                 },
                 "unsupported": {
                   "pill": "unavailable",
-                  "reason": "local thinking needs supported hardware on this computer.",
-                  "verdict": "this computer can't run this local model"
+                  "reason": "local thinking needs supported hardware on your journal's computer.",
+                  "verdict": "your journal's computer can't run this local model"
                 },
                 "waiting": {
                   "pill": "waiting",
-                  "reason": "it will start when this computer is ready.",
+                  "reason": "it will start when your journal's computer is ready.",
                   "verdict": "local thinking is waiting"
                 }
               }
@@ -4727,7 +4727,7 @@
               },
               "lane_label": "processing with",
               "local": {
-                "detail": "runs right on this computer. nothing leaves this machine to be processed",
+                "detail": "runs right on your journal's computer. nothing leaves it to be processed",
                 "value": "a model on your device"
               },
               "none": {
@@ -4750,11 +4750,11 @@
               "setup_key": "a saved key",
               "target_label": "switch to",
               "to_byo_note": "processing will use your own model. {setup} is still here.",
-              "to_local_note": "processing will run right on this computer. your {current} setup stays saved. switch back anytime."
+              "to_local_note": "processing will run right on your journal's computer. your {current} setup stays saved. switch back anytime."
             },
             "lanes": [
               {
-                "description": "a model runs right on this computer. nothing leaves this machine to be processed.",
+                "description": "a model runs right on your journal's computer. nothing leaves it to be processed.",
                 "id": "local",
                 "label": "Local",
                 "sub": "on your device"
@@ -4780,12 +4780,12 @@
               "failed_reason": "local setup stopped before it finished.",
               "failed_verdict": "local setup didn't finish",
               "gpu_memory_insufficient": "the selected GPU has less than the 6 GB of GPU memory needed for local thinking.",
-              "gpu_memory_unknown": "couldn't check GPU memory on this computer.",
+              "gpu_memory_unknown": "couldn't check GPU memory on your journal's computer.",
               "gpu_unavailable": "couldn't find a supported GPU for local thinking.",
               "install": "install local model",
               "integrity_failed": "the downloaded files couldn't be verified. try setup again.",
               "interrupted_verdict": "installation stopped",
-              "memory_failed": "this computer doesn't have enough memory for local thinking.",
+              "memory_failed": "your journal's computer doesn't have enough memory for local thinking.",
               "notice_inflight": "local thinking will stay in your journal once setup finishes.",
               "package_failed": "some files needed for local thinking are missing. update the journal and try setup again.",
               "package_invalid": "some files needed for local thinking couldn't be verified. update the journal and try setup again.",
@@ -4800,7 +4800,7 @@
               "retry": "try setup again",
               "stopped_reason": "you can try setup again when you're ready.",
               "unidentified_failed": "couldn't tell why local setup stopped. check the diagnostic console for details.",
-              "unsupported_failed": "this local model isn't supported on this computer."
+              "unsupported_failed": "this local model isn't supported on your journal's computer."
             },
             "local_recovery": {
               "retry": "try starting local again",
@@ -4812,7 +4812,7 @@
                 },
                 "checking": {
                   "pill": "checking",
-                  "reason": "checking the selected model and this computer.",
+                  "reason": "checking the selected model and your journal's computer.",
                   "verdict": "checking local setup"
                 },
                 "cleanup_failed": {
@@ -4842,7 +4842,7 @@
                 },
                 "gpu_probe_failed": {
                   "pill": "couldn't check",
-                  "reason": "couldn't read GPU memory on this computer. try checking again in a moment.",
+                  "reason": "couldn't read GPU memory on your journal's computer. try checking again in a moment.",
                   "verdict": "couldn't check GPU memory"
                 },
                 "local_probe_failed": {
@@ -4852,7 +4852,7 @@
                 },
                 "ready": {
                   "pill": "on",
-                  "reason": "a model is running on this computer.",
+                  "reason": "a model is running on your journal's computer.",
                   "verdict": "local thinking is ready"
                 },
                 "ready_proof_unavailable": {
@@ -4887,12 +4887,12 @@
                 },
                 "unsupported": {
                   "pill": "unavailable",
-                  "reason": "local thinking needs supported hardware on this computer.",
-                  "verdict": "this computer can't run this local model"
+                  "reason": "local thinking needs supported hardware on your journal's computer.",
+                  "verdict": "your journal's computer can't run this local model"
                 },
                 "waiting": {
                   "pill": "waiting",
-                  "reason": "it will start when this computer is ready.",
+                  "reason": "it will start when your journal's computer is ready.",
                   "verdict": "local thinking is waiting"
                 }
               }
@@ -6954,7 +6954,7 @@
               },
               "lane_label": "processing with",
               "local": {
-                "detail": "runs right on this computer. nothing leaves this machine to be processed",
+                "detail": "runs right on your journal's computer. nothing leaves it to be processed",
                 "value": "a model on your device"
               },
               "none": {
@@ -6977,11 +6977,11 @@
               "setup_key": "a saved key",
               "target_label": "switch to",
               "to_byo_note": "processing will use your own model. {setup} is still here.",
-              "to_local_note": "processing will run right on this computer. your {current} setup stays saved. switch back anytime."
+              "to_local_note": "processing will run right on your journal's computer. your {current} setup stays saved. switch back anytime."
             },
             "lanes": [
               {
-                "description": "a model runs right on this computer. nothing leaves this machine to be processed.",
+                "description": "a model runs right on your journal's computer. nothing leaves it to be processed.",
                 "id": "local",
                 "label": "Local",
                 "sub": "on your device"
@@ -7007,12 +7007,12 @@
               "failed_reason": "local setup stopped before it finished.",
               "failed_verdict": "local setup didn't finish",
               "gpu_memory_insufficient": "the selected GPU has less than the 6 GB of GPU memory needed for local thinking.",
-              "gpu_memory_unknown": "couldn't check GPU memory on this computer.",
+              "gpu_memory_unknown": "couldn't check GPU memory on your journal's computer.",
               "gpu_unavailable": "couldn't find a supported GPU for local thinking.",
               "install": "install local model",
               "integrity_failed": "the downloaded files couldn't be verified. try setup again.",
               "interrupted_verdict": "installation stopped",
-              "memory_failed": "this computer doesn't have enough memory for local thinking.",
+              "memory_failed": "your journal's computer doesn't have enough memory for local thinking.",
               "notice_inflight": "local thinking will stay in your journal once setup finishes.",
               "package_failed": "some files needed for local thinking are missing. update the journal and try setup again.",
               "package_invalid": "some files needed for local thinking couldn't be verified. update the journal and try setup again.",
@@ -7027,7 +7027,7 @@
               "retry": "try setup again",
               "stopped_reason": "you can try setup again when you're ready.",
               "unidentified_failed": "couldn't tell why local setup stopped. check the diagnostic console for details.",
-              "unsupported_failed": "this local model isn't supported on this computer."
+              "unsupported_failed": "this local model isn't supported on your journal's computer."
             },
             "local_recovery": {
               "retry": "try starting local again",
@@ -7039,7 +7039,7 @@
                 },
                 "checking": {
                   "pill": "checking",
-                  "reason": "checking the selected model and this computer.",
+                  "reason": "checking the selected model and your journal's computer.",
                   "verdict": "checking local setup"
                 },
                 "cleanup_failed": {
@@ -7069,7 +7069,7 @@
                 },
                 "gpu_probe_failed": {
                   "pill": "couldn't check",
-                  "reason": "couldn't read GPU memory on this computer. try checking again in a moment.",
+                  "reason": "couldn't read GPU memory on your journal's computer. try checking again in a moment.",
                   "verdict": "couldn't check GPU memory"
                 },
                 "local_probe_failed": {
@@ -7079,7 +7079,7 @@
                 },
                 "ready": {
                   "pill": "on",
-                  "reason": "a model is running on this computer.",
+                  "reason": "a model is running on your journal's computer.",
                   "verdict": "local thinking is ready"
                 },
                 "ready_proof_unavailable": {
@@ -7114,12 +7114,12 @@
                 },
                 "unsupported": {
                   "pill": "unavailable",
-                  "reason": "local thinking needs supported hardware on this computer.",
-                  "verdict": "this computer can't run this local model"
+                  "reason": "local thinking needs supported hardware on your journal's computer.",
+                  "verdict": "your journal's computer can't run this local model"
                 },
                 "waiting": {
                   "pill": "waiting",
-                  "reason": "it will start when this computer is ready.",
+                  "reason": "it will start when your journal's computer is ready.",
                   "verdict": "local thinking is waiting"
                 }
               }
@@ -9358,7 +9358,7 @@
               },
               "lane_label": "processing with",
               "local": {
-                "detail": "runs right on this computer. nothing leaves this machine to be processed",
+                "detail": "runs right on your journal's computer. nothing leaves it to be processed",
                 "value": "a model on your device"
               },
               "none": {
@@ -9381,11 +9381,11 @@
               "setup_key": "a saved key",
               "target_label": "switch to",
               "to_byo_note": "processing will use your own model. {setup} is still here.",
-              "to_local_note": "processing will run right on this computer. your {current} setup stays saved. switch back anytime."
+              "to_local_note": "processing will run right on your journal's computer. your {current} setup stays saved. switch back anytime."
             },
             "lanes": [
               {
-                "description": "a model runs right on this computer. nothing leaves this machine to be processed.",
+                "description": "a model runs right on your journal's computer. nothing leaves it to be processed.",
                 "id": "local",
                 "label": "Local",
                 "sub": "on your device"
@@ -9411,12 +9411,12 @@
               "failed_reason": "local setup stopped before it finished.",
               "failed_verdict": "local setup didn't finish",
               "gpu_memory_insufficient": "the selected GPU has less than the 6 GB of GPU memory needed for local thinking.",
-              "gpu_memory_unknown": "couldn't check GPU memory on this computer.",
+              "gpu_memory_unknown": "couldn't check GPU memory on your journal's computer.",
               "gpu_unavailable": "couldn't find a supported GPU for local thinking.",
               "install": "install local model",
               "integrity_failed": "the downloaded files couldn't be verified. try setup again.",
               "interrupted_verdict": "installation stopped",
-              "memory_failed": "this computer doesn't have enough memory for local thinking.",
+              "memory_failed": "your journal's computer doesn't have enough memory for local thinking.",
               "notice_inflight": "local thinking will stay in your journal once setup finishes.",
               "package_failed": "some files needed for local thinking are missing. update the journal and try setup again.",
               "package_invalid": "some files needed for local thinking couldn't be verified. update the journal and try setup again.",
@@ -9431,7 +9431,7 @@
               "retry": "try setup again",
               "stopped_reason": "you can try setup again when you're ready.",
               "unidentified_failed": "couldn't tell why local setup stopped. check the diagnostic console for details.",
-              "unsupported_failed": "this local model isn't supported on this computer."
+              "unsupported_failed": "this local model isn't supported on your journal's computer."
             },
             "local_recovery": {
               "retry": "try starting local again",
@@ -9443,7 +9443,7 @@
                 },
                 "checking": {
                   "pill": "checking",
-                  "reason": "checking the selected model and this computer.",
+                  "reason": "checking the selected model and your journal's computer.",
                   "verdict": "checking local setup"
                 },
                 "cleanup_failed": {
@@ -9473,7 +9473,7 @@
                 },
                 "gpu_probe_failed": {
                   "pill": "couldn't check",
-                  "reason": "couldn't read GPU memory on this computer. try checking again in a moment.",
+                  "reason": "couldn't read GPU memory on your journal's computer. try checking again in a moment.",
                   "verdict": "couldn't check GPU memory"
                 },
                 "local_probe_failed": {
@@ -9483,7 +9483,7 @@
                 },
                 "ready": {
                   "pill": "on",
-                  "reason": "a model is running on this computer.",
+                  "reason": "a model is running on your journal's computer.",
                   "verdict": "local thinking is ready"
                 },
                 "ready_proof_unavailable": {
@@ -9518,12 +9518,12 @@
                 },
                 "unsupported": {
                   "pill": "unavailable",
-                  "reason": "local thinking needs supported hardware on this computer.",
-                  "verdict": "this computer can't run this local model"
+                  "reason": "local thinking needs supported hardware on your journal's computer.",
+                  "verdict": "your journal's computer can't run this local model"
                 },
                 "waiting": {
                   "pill": "waiting",
-                  "reason": "it will start when this computer is ready.",
+                  "reason": "it will start when your journal's computer is ready.",
                   "verdict": "local thinking is waiting"
                 }
               }
@@ -11079,7 +11079,7 @@
             },
             "progressing": false,
             "reason_code": "brain_config_changed",
-            "reason_text": "brain config changed",
+            "reason_text": "the last check is out of date",
             "state": "unknown"
           },
           "byo_models": {},
@@ -12881,7 +12881,7 @@
               },
               "lane_label": "processing with",
               "local": {
-                "detail": "runs right on this computer. nothing leaves this machine to be processed",
+                "detail": "runs right on your journal's computer. nothing leaves it to be processed",
                 "value": "a model on your device"
               },
               "none": {
@@ -12904,11 +12904,11 @@
               "setup_key": "a saved key",
               "target_label": "switch to",
               "to_byo_note": "processing will use your own model. {setup} is still here.",
-              "to_local_note": "processing will run right on this computer. your {current} setup stays saved. switch back anytime."
+              "to_local_note": "processing will run right on your journal's computer. your {current} setup stays saved. switch back anytime."
             },
             "lanes": [
               {
-                "description": "a model runs right on this computer. nothing leaves this machine to be processed.",
+                "description": "a model runs right on your journal's computer. nothing leaves it to be processed.",
                 "id": "local",
                 "label": "Local",
                 "sub": "on your device"
@@ -12934,12 +12934,12 @@
               "failed_reason": "local setup stopped before it finished.",
               "failed_verdict": "local setup didn't finish",
               "gpu_memory_insufficient": "the selected GPU has less than the 6 GB of GPU memory needed for local thinking.",
-              "gpu_memory_unknown": "couldn't check GPU memory on this computer.",
+              "gpu_memory_unknown": "couldn't check GPU memory on your journal's computer.",
               "gpu_unavailable": "couldn't find a supported GPU for local thinking.",
               "install": "install local model",
               "integrity_failed": "the downloaded files couldn't be verified. try setup again.",
               "interrupted_verdict": "installation stopped",
-              "memory_failed": "this computer doesn't have enough memory for local thinking.",
+              "memory_failed": "your journal's computer doesn't have enough memory for local thinking.",
               "notice_inflight": "local thinking will stay in your journal once setup finishes.",
               "package_failed": "some files needed for local thinking are missing. update the journal and try setup again.",
               "package_invalid": "some files needed for local thinking couldn't be verified. update the journal and try setup again.",
@@ -12954,7 +12954,7 @@
               "retry": "try setup again",
               "stopped_reason": "you can try setup again when you're ready.",
               "unidentified_failed": "couldn't tell why local setup stopped. check the diagnostic console for details.",
-              "unsupported_failed": "this local model isn't supported on this computer."
+              "unsupported_failed": "this local model isn't supported on your journal's computer."
             },
             "local_recovery": {
               "retry": "try starting local again",
@@ -12966,7 +12966,7 @@
                 },
                 "checking": {
                   "pill": "checking",
-                  "reason": "checking the selected model and this computer.",
+                  "reason": "checking the selected model and your journal's computer.",
                   "verdict": "checking local setup"
                 },
                 "cleanup_failed": {
@@ -12996,7 +12996,7 @@
                 },
                 "gpu_probe_failed": {
                   "pill": "couldn't check",
-                  "reason": "couldn't read GPU memory on this computer. try checking again in a moment.",
+                  "reason": "couldn't read GPU memory on your journal's computer. try checking again in a moment.",
                   "verdict": "couldn't check GPU memory"
                 },
                 "local_probe_failed": {
@@ -13006,7 +13006,7 @@
                 },
                 "ready": {
                   "pill": "on",
-                  "reason": "a model is running on this computer.",
+                  "reason": "a model is running on your journal's computer.",
                   "verdict": "local thinking is ready"
                 },
                 "ready_proof_unavailable": {
@@ -13041,12 +13041,12 @@
                 },
                 "unsupported": {
                   "pill": "unavailable",
-                  "reason": "local thinking needs supported hardware on this computer.",
-                  "verdict": "this computer can't run this local model"
+                  "reason": "local thinking needs supported hardware on your journal's computer.",
+                  "verdict": "your journal's computer can't run this local model"
                 },
                 "waiting": {
                   "pill": "waiting",
-                  "reason": "it will start when this computer is ready.",
+                  "reason": "it will start when your journal's computer is ready.",
                   "verdict": "local thinking is waiting"
                 }
               }
@@ -13137,7 +13137,7 @@
               },
               "progressing": false,
               "reason_code": "brain_record_missing",
-              "reason_text": "brain record missing",
+              "reason_text": "not checked yet",
               "state": "unknown"
             },
             "byo_models": {},
@@ -13351,7 +13351,7 @@
             },
             "progressing": false,
             "reason_code": "brain_record_missing",
-            "reason_text": "brain record missing",
+            "reason_text": "not checked yet",
             "state": "unknown"
           },
           "byo_models": {},
@@ -13565,7 +13565,7 @@
             },
             "progressing": false,
             "reason_code": "brain_record_missing",
-            "reason_text": "brain record missing",
+            "reason_text": "not checked yet",
             "state": "unknown"
           },
           "byo_models": {},
@@ -13795,7 +13795,7 @@
             },
             "progressing": false,
             "reason_code": "brain_record_missing",
-            "reason_text": "brain record missing",
+            "reason_text": "not checked yet",
             "state": "unknown"
           },
           "byo_models": {},

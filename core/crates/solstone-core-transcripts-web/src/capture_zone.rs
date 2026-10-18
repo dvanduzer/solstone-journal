@@ -63,7 +63,7 @@ pub(crate) fn day_zones(
         capture_zone_view(
             day,
             &segment.key,
-            solstone_core_callosum::read_reported_zone(&dir),
+            solstone_core_callosum::read_reported_zone(root, &dir),
             home,
         )
     });

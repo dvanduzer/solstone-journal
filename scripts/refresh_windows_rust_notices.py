@@ -311,8 +311,8 @@ def classify_external_delta(
             for field in set(old_row) | set(new_row)
             if old_row.get(field) != new_row.get(field)
         } == {"dependencies"}
-        if edges_only and old_source.startswith("registry+"):
-            # Same source and checksum, so the vendored bytes cannot differ; a
+        if edges_only and old_source.startswith(("registry+", "git+")):
+            # Same source, pin and checksum, so the vendored bytes cannot differ; a
             # feature elsewhere in the workspace only re-resolved this package's
             # edges. Whether that moves anything into or out of Windows reach
             # is the notice-closure check's to decide, after this.
@@ -551,36 +551,47 @@ def _workspace_existing_deps_only(
     right_deps = right_rest.pop("dependencies", None)
     if left_rest != right_rest or left_deps == right_deps:
         return False
-    moved = set(left_deps or []) ^ set(right_deps or [])
-    for token in moved:
-        old = _resolve_lock_dependency(token, old_lock["package"])
-        new = _resolve_lock_dependency(token, new_lock["package"])
-        if old is None and new is not None and new in added:
+    # Cargo qualifies an existing edge when another version of the same name
+    # enters the lock. Resolve each token in the lock that actually contains it,
+    # then compare identities; a newly ambiguous bare name must not be guessed.
+    old_edges = {
+        _resolve_lock_dependency(token, old_lock["package"])
+        for token in left_deps or []
+    }
+    new_edges = {
+        _resolve_lock_dependency(token, new_lock["package"])
+        for token in right_deps or []
+    }
+    if None in old_edges or None in new_edges:
+        return False
+    for identity in old_edges ^ new_edges:
+        old_row = next(
+            (p for p in old_lock["package"] if
+             (p["name"], p["version"], p.get("source", "")) == identity), None
+        )
+        new_row = next(
+            (p for p in new_lock["package"] if
+             (p["name"], p["version"], p.get("source", "")) == identity), None
+        )
+        if old_row is None and new_row is not None and identity in added:
             continue
-        if new is None and old is not None and not old[2] and old[0] in removed_workspace:
+        if new_row is None and old_row is not None and not identity[2] and identity[0] in removed_workspace:
             continue
-        if old is None and new is not None and not new[2] and new[0] in added_workspace:
+        if old_row is None and new_row is not None and not identity[2] and identity[0] in added_workspace:
             continue
-        if old is None or new is None:
-            return False
         # Workspace version moves remain permitted even when an unrelated git
         # pin moved elsewhere in the lock. External identities require the
         # referenced package itself to retain its source and notice identity.
-        if old[2] or new[2]:
-            old_row = next(
-                (p for p in old_lock["package"] if
-                 (p["name"], p["version"], p.get("source", "")) == old), None
-            )
-            new_row = next(
-                (p for p in new_lock["package"] if
-                 (p["name"], p["version"], p.get("source", "")) == new), None
-            )
-            if (old != new or old_row is None or new_row is None
+        if identity[2]:
+            if (old_row is None or new_row is None
                     or old_row.get("checksum") != new_row.get("checksum")):
                 return False
-        elif old[0] != new[0]:
+        elif not all(
+            any(p["name"] == identity[0] and not p.get("source") for p in lock["package"])
+            for lock in (old_lock, new_lock)
+        ):
             return False
-    return bool(moved)
+    return True
 
 
 def declared_workspace_crates(repo: Path) -> frozenset[str]:
@@ -1102,6 +1113,7 @@ PERMISSIVE_LICENSE_IDS = frozenset(
     {
         "0BSD",
         "Apache-2.0",
+        "BSD-1-Clause",
         "BSD-2-Clause",
         "BSD-3-Clause",
         "BSL-1.0",

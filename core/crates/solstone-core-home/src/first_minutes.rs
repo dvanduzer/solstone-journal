@@ -792,7 +792,10 @@ fn read_first_minutes_with(
                                         )
                                     {
                                         if let Some(zone) =
-                                            solstone_core_callosum::read_reported_zone(&segment_dir)
+                                            solstone_core_callosum::read_reported_zone(
+                                                context.journal_root(),
+                                                &segment_dir,
+                                            )
                                         {
                                             (zone.tz, zone.utc_offset_seconds)
                                         } else {
@@ -1318,7 +1321,7 @@ mod tests {
 
     #[test]
     fn reader_closed_window_proof() {
-        let temp = tempfile::tempdir_in("/var/tmp").unwrap();
+        let temp = tempfile::tempdir().unwrap();
         let journal = temp.path();
 
         // 1. config/journal.json: {"identity":{"timezone":"UTC"},"setup":{"completed_at":1000000000000}}
@@ -1398,7 +1401,7 @@ mod tests {
         );
 
         // Missing completed_at on copy of journal
-        let temp_missing = tempfile::tempdir_in("/var/tmp").unwrap();
+        let temp_missing = tempfile::tempdir().unwrap();
         let journal_missing = temp_missing.path();
         std::fs::create_dir_all(journal_missing.join("config")).unwrap();
         std::fs::write(
@@ -1416,7 +1419,7 @@ mod tests {
         );
 
         // Non-numeric completed_at on copy of journal
-        let temp_nonnum = tempfile::tempdir_in("/var/tmp").unwrap();
+        let temp_nonnum = tempfile::tempdir().unwrap();
         let journal_nonnum = temp_nonnum.path();
         std::fs::create_dir_all(journal_nonnum.join("config")).unwrap();
         std::fs::write(
@@ -2126,7 +2129,7 @@ mod tests {
 
     #[test]
     fn test_read_segment_words_filesystem() {
-        let temp = tempfile::tempdir_in("/var/tmp").unwrap();
+        let temp = tempfile::tempdir().unwrap();
         let seg_dir = temp.path();
 
         let header =
@@ -2154,7 +2157,7 @@ mod tests {
         assert_eq!(read_segment_words(seg_dir), Some("clip speech".into()));
 
         // Case 2: audio.jsonl then mic_audio.jsonl concatenate in filename order
-        let temp2 = tempfile::tempdir_in("/var/tmp").unwrap();
+        let temp2 = tempfile::tempdir().unwrap();
         let seg2 = temp2.path();
         std::fs::write(
             seg2.join("mic_audio.jsonl"),
@@ -2172,7 +2175,7 @@ mod tests {
         );
 
         // Case 3: Sibling audio jsonl with bad UTF-8 skipped
-        let temp3 = tempfile::tempdir_in("/var/tmp").unwrap();
+        let temp3 = tempfile::tempdir().unwrap();
         let seg3 = temp3.path();
         std::fs::write(
             seg3.join("audio.jsonl"),
@@ -2183,7 +2186,7 @@ mod tests {
         assert_eq!(read_segment_words(seg3), Some("readable audio".into()));
 
         // Case 4: corrected "" and text "hello" -> hello; whitespace corrected falls through; non-empty corrected wins
-        let temp4 = tempfile::tempdir_in("/var/tmp").unwrap();
+        let temp4 = tempfile::tempdir().unwrap();
         let seg4 = temp4.path();
         let row1 = "{\"corrected\":\"\",\"text\":\"hello\"}\n";
         let row2 = "{\"corrected\":\"   \",\"text\":\"world\"}\n";
@@ -2196,7 +2199,7 @@ mod tests {
         assert_eq!(read_segment_words(seg4), Some("hello world fixed".into()));
 
         // Case 5: rows carrying start, speaker, emotion, beside *_transcript.md
-        let temp5 = tempfile::tempdir_in("/var/tmp").unwrap();
+        let temp5 = tempfile::tempdir().unwrap();
         let seg5 = temp5.path();
         let extra_row = "{\"start\":\"12:00:00\",\"speaker\":1,\"emotion\":\"neutral\",\"text\":\"only speech\"}\n";
         std::fs::write(seg5.join("audio.jsonl"), format!("{header}{extra_row}")).unwrap();
@@ -2210,7 +2213,7 @@ mod tests {
 
     #[test]
     fn test_paired_streams_read_first_minutes() {
-        let temp = tempfile::tempdir_in("/var/tmp").unwrap();
+        let temp = tempfile::tempdir().unwrap();
         let journal = temp.path();
 
         let completed_at = 1_000_000_000_000i64;

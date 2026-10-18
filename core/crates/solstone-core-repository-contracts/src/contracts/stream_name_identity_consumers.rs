@@ -319,6 +319,12 @@ fn expected_consumers() -> BTreeSet<(String, String)> {
         ),
         // reviewed display-only consumer
         ("solstone-core-home/src/provenance.rs", "load_stream_labels"),
+        // reviewed read-only getting-started derivation; binds a stream to a
+        // paired client by the record's cid, never by its name
+        (
+            "solstone-core-home/src/first_minutes.rs",
+            "read_first_minutes_with",
+        ),
         // name-keyed unlink of streams/<name>.json; no production caller today
         (
             "solstone-core-segment/src/stream_record.rs",

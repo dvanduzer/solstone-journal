@@ -17,43 +17,43 @@ fn all_retained_render_sources_transform_to_approved_digests() {
     let expected = [
         (
             "empty",
-            "e9165028656015630b313878995ebd1b9e27a8819238e06cfd272ec8d3bc2970",
+            "cdd22bc3b6bb2f1018b132755e6966e8438fe6894c32932fe15a9ffa2646f2a2",
         ),
         (
             "one",
-            "39cfb6308a1ab4954a398279c945207c54f6d029ba4c122c2587b0f0381daa53",
+            "598d82eba14164dba4951b52ef84571837fdb0b6a12af90319230879f55c0884",
         ),
         (
             "full",
-            "f78dbb5fb690b0678dbc9673e5634aa00ebc86069cc52e3c3a0b53c9a1645fbd",
+            "90885b8c5e26147b90a7c58a54214299410fc95888f724d2532580cc4013ac05",
         ),
         (
             "wide",
-            "5a3a92938eb680c9765d6149c9eff393283e5c264749d2a66b7cfb1b9abeaadc",
+            "6be69f202db3cf5620e37d0c09011fbbc8be6c48b079254d707d55f6fca692cd",
         ),
         (
             "think-failed",
-            "8493a9f454681050557f278c01faf35cffd9951ce2ece44a6d5ca439de42bf87",
+            "405d90ec63ef6d2577bf88685ec156fec6f1d4a4a639261a9dc2044e5964da20",
         ),
         (
             "brain-supplied",
-            "f92b0db46ca66c903c19269f0654ce12090056f05d6e8ba77b4e5e870ec1f53a",
+            "8d312ca8d0655e682da231273803b6a29f86c467f6cd92ce781c45fbb0a6d686",
         ),
         (
             "observe-idle",
-            "1f274d78da18dc25dce5cb805325ce0711f4dc5452d23ded99dcc17d684622e2",
+            "078d6b6fe1fa77efa61dbb95c5abd93c1e4235fe44632e51435a244cf45f0184",
         ),
         (
             "observe-tmux-yellow",
-            "f9350f4b41cea62cb47a594b40e42adcf8287ca0645742d2efdf2b9f03d1bd6a",
+            "b5f08a2c306d2e8ff5df15d29d51992ebde193f3b45845b5d382e5b1b8351549",
         ),
         (
             "observe-tmux-yellow-upper",
-            "f9350f4b41cea62cb47a594b40e42adcf8287ca0645742d2efdf2b9f03d1bd6a",
+            "b5f08a2c306d2e8ff5df15d29d51992ebde193f3b45845b5d382e5b1b8351549",
         ),
         (
             "last-selected",
-            "4bbeeac020a3d722fef905d09117c632a9d4d3bd5a78b143c19f546c0c72427a",
+            "6e3bea31c41525cb96cc957ba3736789646754b4ad565e959c7b71b58e1a50ed",
         ),
     ];
     for case in fixture["renders"].as_array().unwrap() {

@@ -101,6 +101,25 @@ class ExistingDependencyEdges(unittest.TestCase):
         self.assertEqual(refresh._resolve_lock_dependency(f"digest 1.0.0 ({SOURCE})", packages), ("digest", "1.0.0", SOURCE))
         self.assertIsNone(refresh._resolve_lock_dependency("digest 1.0.0 (unknown)", packages))
 
+    def test_second_version_qualifies_an_existing_workspace_edge(self):
+        extra = package("digest", version="2.0.0", source=SOURCE)
+        self.new["package"].append(extra)
+        self.new["package"][0]["dependencies"] = ["indexer", "digest 1.0.0"]
+        self.new["package"][1]["dependencies"] = ["digest 1.0.0"]
+        self.assertEqual(
+            refresh.workspace_version_or_existing_dependency_edge_delta(
+                self.old, self.new, external_unchanged=False,
+                added=frozenset({("digest", "2.0.0", SOURCE)}),
+            ),
+            ["app", "indexer"],
+        )
+        self.new["package"][1]["dependencies"] = ["digest"]
+        with self.assertRaises(refresh.RefreshError):
+            refresh.workspace_version_or_existing_dependency_edge_delta(
+                self.old, self.new, external_unchanged=False,
+                added=frozenset({("digest", "2.0.0", SOURCE)}),
+            )
+
     def test_existing_workspace_edge_and_version_move_remain_supported(self):
         self.new["package"][1]["dependencies"] = ["app"]
         self.new["package"][0]["version"] = "2.0.0"
@@ -153,6 +172,12 @@ class ExternalPopulationDigest(unittest.TestCase):
 
 class GitPinVendorDelta(unittest.TestCase):
     prefix = "vendor/spl-transport-0.1.0/"
+
+    def test_unchanged_git_pin_survives_lock_dependency_disambiguation(self):
+        source = "git+https://example.invalid/spl?tag=v1#" + "a" * 40
+        before = [package("spl-core", source=source, dependencies=["nix"])]
+        after = [package("spl-core", source=source, dependencies=["nix 0.30.1"])]
+        self.assertEqual(refresh.classify_external_delta(before, after), ([], []))
 
     def test_git_pin_may_change_resolved_edges_before_closure_check(self):
         old_source = "git+https://example.invalid/spl?tag=v1#" + "a" * 40
@@ -266,7 +291,7 @@ class RegistryAdditionOutsideClosure(unittest.TestCase):
         return {"packages": [{"name": "resolver", "version": "1.0.0", "source": SOURCE, "license": license}]}
 
     def test_permissive_licences_are_admitted(self):
-        for license in ("MIT OR Apache-2.0", "MIT/Apache-2.0", "(MIT OR Apache-2.0) AND Unicode-3.0"):
+        for license in ("MIT OR Apache-2.0", "MIT/Apache-2.0", "(MIT OR Apache-2.0) AND Unicode-3.0", "MIT OR Apache-2.0 OR BSD-1-Clause"):
             refresh.require_permissive_additions(self.meta(license), [self.added()])
 
     def test_copyleft_or_missing_licence_refuses(self):

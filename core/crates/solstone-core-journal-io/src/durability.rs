@@ -23,8 +23,8 @@ use crate::atomic::{AtomicWriteOptions, atomic_replace};
 /// What the journal may do with an artifact it cannot read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DurabilityClass {
-    /// The owner's configuration. Written atomically, never healed: an
-    /// unreadable one is an error the owner has to see.
+    /// Authority that cannot be reconstructed safely. Written atomically,
+    /// preserved on damage, and never silently healed.
     MustBeValid,
     /// Derived state the next run rebuilds from its sources.
     RegenerableCache,
@@ -58,6 +58,9 @@ pub enum ArtifactId {
     ParentLossActive,
     ParentLossRecord,
     ParentLossClosureRecovery,
+    ParentLossCensusObligation,
+    ParentLossCensusStarted,
+    ParentLossCensusRefusal,
     Entity,
     FacetDeclaration,
     SchedulerState,
@@ -156,10 +159,31 @@ pub const JOURNAL_ARTIFACTS: &[DurableArtifact] = &[
     },
     DurableArtifact {
         id: ArtifactId::ParentLossClosureRecovery,
-        path: "health/parent-loss/generations/*/closure-recovery.json",
+        path: "health/parent-loss/generations/*/closure-recovery/*/*.json",
         class: DurabilityClass::Healable,
         parser: ParserKind::WholeJson,
-        rationale: "checkpoint for abandoned generation closure; set aside on corruption and rebuilt from surviving admission drops",
+        rationale: "derived scheduling, audited chunks and prepared publication bytes are rebuilt from retained source evidence; only full audited publication authorizes a successor",
+    },
+    DurableArtifact {
+        id: ArtifactId::ParentLossCensusObligation,
+        path: "health/parent-loss/generations/*/census-obligation.json",
+        class: DurabilityClass::MustBeValid,
+        parser: ParserKind::WholeJson,
+        rationale: "preserve authoritative retirement evidence and refuse on damage; admission drops cannot rebuild past ancestry",
+    },
+    DurableArtifact {
+        id: ArtifactId::ParentLossCensusStarted,
+        path: "health/parent-loss/generations/*/census-started.json",
+        class: DurabilityClass::MustBeValid,
+        parser: ParserKind::WholeJson,
+        rationale: "retirement has begun; losing the authoritative census must refuse even if the live cache was also lost",
+    },
+    DurableArtifact {
+        id: ArtifactId::ParentLossCensusRefusal,
+        path: "health/parent-loss/generations/*/census-refusal.json",
+        class: DurabilityClass::MustBeValid,
+        parser: ParserKind::WholeJson,
+        rationale: "preserve authoritative retirement evidence and refuse on damage; admission drops cannot rebuild past ancestry",
     },
     DurableArtifact {
         id: ArtifactId::Entity,
@@ -903,18 +927,27 @@ mod tests {
     }
 
     #[test]
-    fn the_config_class_alone_refuses_an_unreadable_artifact() {
-        let directory = TempDir::new().expect("temporary root");
-        let path = directory.path().join("journal.json");
-        fs::write(&path, b"{ not json").expect("write");
-        let error = read_json_durable::<serde_json::Value>(ArtifactId::JournalConfig, &path)
-            .expect_err("must-be-valid refuses");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(path.is_file(), "the config is never moved");
+    fn strict_authorities_refuse_damage_and_preserve_the_original_bytes() {
+        for id in [
+            ArtifactId::JournalConfig,
+            ArtifactId::ParentLossCensusObligation,
+            ArtifactId::ParentLossCensusStarted,
+            ArtifactId::ParentLossCensusRefusal,
+        ] {
+            let directory = TempDir::new().expect("temporary root");
+            let path = directory.path().join("authority.json");
+            let damaged = b"{ not json";
+            fs::write(&path, damaged).expect("write");
+            let error = read_json_durable::<serde_json::Value>(id, &path)
+                .expect_err("must-be-valid refuses");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(fs::read(&path).unwrap(), damaged);
+            assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        }
     }
 
     #[test]
-    fn non_config_classes_set_aside_and_keep_evidence() {
+    fn rebuildable_classes_set_aside_and_keep_evidence() {
         for id in [
             ArtifactId::SchedulerState,
             ArtifactId::CatchupState,
@@ -1032,13 +1065,21 @@ mod tests {
     }
 
     #[test]
-    fn the_inventory_declares_exactly_one_must_be_valid_artifact() {
+    fn the_inventory_preserves_configuration_and_irreplaceable_retirement_evidence() {
         let strict: Vec<_> = JOURNAL_ARTIFACTS
             .iter()
             .filter(|artifact| artifact.class == DurabilityClass::MustBeValid)
             .map(|artifact| artifact.path)
             .collect();
-        assert_eq!(strict, vec!["config/journal.json"]);
+        assert_eq!(
+            strict,
+            vec![
+                "config/journal.json",
+                "health/parent-loss/generations/*/census-obligation.json",
+                "health/parent-loss/generations/*/census-started.json",
+                "health/parent-loss/generations/*/census-refusal.json",
+            ]
+        );
         for artifact in JOURNAL_ARTIFACTS {
             assert!(
                 !artifact.rationale.is_empty(),

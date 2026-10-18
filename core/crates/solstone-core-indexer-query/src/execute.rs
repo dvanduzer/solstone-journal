@@ -692,6 +692,148 @@ pub fn read_indexed_entry(
     })
 }
 
+/// Indexed activity text, the file digest that produced it, and its stored
+/// hidden flag. Owner search results do not carry the digest.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ActivityObservation {
+    pub content: String,
+    pub digest: [u8; 32],
+    pub hidden: bool,
+}
+
+/// One bounded observation of text, written family, and optional Activity proof.
+/// Missing rows never authorize an earlier search candidate. Legacy rows whose
+/// agent cannot be Activity remain readable; ambiguous rows need writer refresh.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ActivityObservationRead {
+    Absent,
+    Unproven,
+    Unavailable,
+    NonActivity(String),
+    Ready(ActivityObservation),
+}
+
+/// Reads text and family together; malformed digests are projected to NULL
+/// before allocation. This reader never repairs the index or opens a sidecar.
+pub fn read_activity_observation(
+    journal: &Path,
+    boundary: QueryBoundary,
+    path: &str,
+    idx: i64,
+    row_id: i64,
+    max_bytes: u64,
+) -> Result<ActivityObservationRead, IndexAccessError> {
+    let reader = match open_index_reader(journal, &boundary) {
+        Ok(reader) => reader,
+        Err(IndexAccessError::Absent { .. } | IndexAccessError::Empty { .. }) => {
+            return Ok(ActivityObservationRead::Absent);
+        }
+        Err(error) => return Err(error),
+    };
+    let mut clause = String::from(
+        "chunks.rowid=? AND chunks.path=? AND chunks.idx=? AND NOT (\
+         chunks.path LIKE '________/chat/%/chat.jsonl' OR \
+         chunks.path LIKE 'chronicle/________/chat/%/chat.jsonl')",
+    );
+    let mut values = vec![
+        Value::Integer(i64::try_from(max_bytes).unwrap_or(i64::MAX)),
+        Value::Integer(row_id),
+        Value::Text(path.to_string()),
+        Value::Integer(idx),
+    ];
+    if let QueryBoundary::Connection(connection_boundary) = &boundary {
+        let mut plan = SqlPlan {
+            where_clause: clause,
+            params: Vec::new(),
+            has_live_match_expression: false,
+        };
+        append_connection_prefilter(&mut plan, connection_boundary);
+        clause = plan.where_clause;
+        values.extend(plan.params.into_iter().map(Value::Text));
+    }
+    let table_exists = |table: &str| -> Result<bool, IndexAccessError> {
+        reader
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?)",
+                [table],
+                |row| row.get(0),
+            )
+            .map_err(|e| reader.classify(e))
+    };
+    let proof_table = table_exists("activity_provenance")?;
+    let kind_table = table_exists("activity_membership")?;
+    let proof_columns = if proof_table {
+        "CASE WHEN p.rowid IS NOT NULL THEN 1 ELSE 0 END,
+         CASE WHEN typeof(p.digest)='blob' AND length(p.digest)=32 THEN p.digest ELSE NULL END,
+         CASE WHEN typeof(p.hidden)='integer' AND p.hidden IN (0,1) THEN p.hidden ELSE NULL END"
+    } else {
+        "0, NULL, NULL"
+    };
+    let kind_column = if kind_table {
+        "CASE WHEN typeof(m.is_activity)='integer' AND m.is_activity IN (0,1) THEN m.is_activity ELSE NULL END"
+    } else {
+        "NULL"
+    };
+    let proof_join = if proof_table {
+        "LEFT JOIN activity_provenance AS p ON p.rowid=chunks.rowid"
+    } else {
+        ""
+    };
+    let kind_join = if kind_table {
+        "LEFT JOIN activity_membership AS m ON m.rowid=chunks.rowid"
+    } else {
+        ""
+    };
+    let found = reader.connection.query_row(
+        &format!("SELECT CASE WHEN length(CAST(chunks.content AS BLOB)) <= ? THEN chunks.content ELSE NULL END,
+                    {proof_columns}, {kind_column},
+                    CASE WHEN chunks.agent IS NOT NULL AND chunks.agent != 'activity' THEN 1 ELSE 0 END
+             FROM chunks {proof_join} {kind_join} WHERE {clause} LIMIT 1"),
+        params_from_iter(values.iter()),
+        |row| Ok((row.get::<_,Option<String>>(0)?, row.get::<_,i64>(1)?,
+            row.get::<_,Option<Vec<u8>>>(2)?, row.get::<_,Option<i64>>(3)?,
+            row.get::<_,Option<i64>>(4)?, row.get::<_,bool>(5)?)),
+    ).optional().map_err(|error| reader.classify(error))?;
+    let Some((content, proof_present, digest, hidden, kind, legacy_non_activity)) = found else {
+        return Ok(ActivityObservationRead::Absent);
+    };
+    let Some(content) = content else {
+        return Ok(ActivityObservationRead::Unavailable);
+    };
+    if kind == Some(0) {
+        return Ok(if proof_present == 0 {
+            ActivityObservationRead::NonActivity(content)
+        } else {
+            ActivityObservationRead::Unavailable
+        });
+    }
+    if proof_present == 0 {
+        let canonical_activity = solstone_core_format::content::classify(path)
+            == solstone_core_format::content::ContentResolution::Indexed(
+                solstone_core_format::content::Family::Activity,
+            );
+        return Ok(
+            if kind.is_none() && legacy_non_activity && !canonical_activity {
+                ActivityObservationRead::NonActivity(content)
+            } else {
+                ActivityObservationRead::Unproven
+            },
+        );
+    }
+    let (Some(digest), Some(hidden)) = (digest, hidden) else {
+        return Ok(ActivityObservationRead::Unavailable);
+    };
+    let Ok(digest) = <[u8; 32]>::try_from(digest.as_slice()) else {
+        return Ok(ActivityObservationRead::Unavailable);
+    };
+    Ok(ActivityObservationRead::Ready(ActivityObservation {
+        content,
+        digest,
+        hidden: hidden == 1,
+    }))
+}
+
 /// The indexed entries one source file produced, in file order, inside a
 /// connection's boundary.
 pub struct IndexedPathEntries {

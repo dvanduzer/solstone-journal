@@ -1912,6 +1912,20 @@ required_features = []
 runtime = "none"
 
 [[suites]]
+id = "solstone-core::parent_loss_closure_resume"
+package = "solstone-core"
+target = "parent_loss_closure_resume"
+set = "component"
+areas = ["core"]
+platforms = ["linux", "macos"]
+prerequisites = ["cargo-cache"]
+timeout = "extended"
+serial_group = "local-services"
+default_full = true
+required_features = ["full-tests", "test-hooks"]
+runtime = "none"
+
+[[suites]]
 id = "solstone-core::darwin_hosted_parent_lifetime"
 package = "solstone-core"
 target = "darwin_hosted_parent_lifetime"

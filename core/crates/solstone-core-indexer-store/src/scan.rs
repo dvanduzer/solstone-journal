@@ -31,6 +31,11 @@ use solstone_core_indexer::stream::extract_stream;
 use solstone_core_memory_original::{OriginalRead, read_original};
 
 use crate::StoreError;
+use crate::activity_provenance::{
+    activity_membership_current, activity_source_current, delete_activity_provenance, digest_bytes,
+    hidden_flag, missing_activity_memberships, record_activity_membership,
+    record_activity_provenance,
+};
 use crate::chunk_sources::{
     CHUNK_SOURCES_LOOKUP_ROWIDS, chunk_path_lookup_ready, delete_chunk_source_rowids,
     record_chunk_source, require_chunk_path_lookup,
@@ -296,6 +301,7 @@ fn delete_file_chunks(
         for id in rows {
             statement.execute(params![id, path])?;
         }
+        delete_activity_provenance(conn, rows)?;
         delete_chunk_source_rowids(conn, rows)?;
     } else {
         require_chunk_path_lookup(conn)?;
@@ -307,6 +313,7 @@ fn delete_file_chunks(
         for id in &rowids {
             delete_stmt.execute(params![id, path])?;
         }
+        delete_activity_provenance(conn, &rowids)?;
         delete_chunk_source_rowids(conn, &rowids)?;
     }
     delete_chunk_classification(conn, path)?;
@@ -474,6 +481,7 @@ fn scan_journal_pass(
     let files = discover_indexable_files(journal)?;
 
     let db_mtimes = load_file_mtimes(&conn)?;
+    let missing_memberships = missing_activity_memberships(&conn)?;
     let mut to_index = Vec::new();
     for (rel, path) in &files {
         let memory_note = is_memory_note(rel);
@@ -484,9 +492,14 @@ fn scan_journal_pass(
         };
         match observed_mtime {
             Ok(mtime) => {
-                let needs_index = if memory_note {
-                    // Readiness can change while a newer sibling preserves the
-                    // composite mtime. Validate before considering a cache hit.
+                let needs_index = if memory_note
+                    || written_activity(path, rel)
+                    || missing_memberships.contains(rel)
+                {
+                    // Memory readiness and activity file bytes can change inside
+                    // one mtime second. Queue them and decide from the bytes.
+                    // The activity decision is the written family, including a
+                    // sibling shape sidecar, matching the index pass below.
                     true
                 } else {
                     db_mtimes.get(rel) != Some(&mtime)
@@ -587,6 +600,12 @@ fn scan_journal_pass(
             {
                 continue;
             }
+        }
+        if family == Family::Activity
+            && db_mtimes.get(rel.as_str()) == Some(mtime)
+            && activity_source_current(&conn, rel, path)?
+        {
+            continue;
         }
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let chunk_rows = pending_chunks.take(&tx, rel)?;
@@ -1364,6 +1383,7 @@ fn migrate_segment_aggregate(
             .query_map([rel_segment], |row| row.get::<_, i64>(0))?
             .collect::<Result<Vec<_>, _>>()?
     };
+    delete_activity_provenance(&tx, &segment_rowids)?;
     delete_chunk_source_rowids(&tx, &segment_rowids)?;
     tx.execute(
         "DELETE FROM chunks WHERE path=? AND agent='segment'",
@@ -1433,6 +1453,7 @@ fn index_entity_search_build(
                 for id in ids {
                     delete.execute(params![id, path])?;
                 }
+                delete_activity_provenance(conn, ids)?;
                 delete_chunk_source_rowids(conn, ids)?;
             }
             delete_chunk_classification(conn, &path)?;
@@ -1451,6 +1472,7 @@ fn index_entity_search_build(
                 .query_map([], |row| row.get::<_, i64>(0))?
                 .collect::<Result<Vec<_>, _>>()?
         };
+        delete_activity_provenance(conn, &legacy_entity_rowids)?;
         delete_chunk_source_rowids(conn, &legacy_entity_rowids)?;
         conn.execute(
             "DELETE FROM chunks WHERE path LIKE 'entities/%/entity.json'",
@@ -1615,6 +1637,8 @@ fn ensure_file_current(
         .optional()?;
     if !matches!(update, FileUpdate::Force)
         && stored_mtime == Some(mtime)
+        && activity_membership_current(conn, rel)?
+        && (family != Family::Activity || activity_source_current(conn, rel, path)?)
         && (family != Family::AgentMemory
             || (memory_original.is_some() && memory_original_exists(conn, rel)?))
     {
@@ -1656,6 +1680,7 @@ fn index_file(
         fs::read_to_string(path)
             .map_err(|error| format!("content read failed for {rel}: {error}"))?
     };
+    let activity_digest = (family == Family::Activity).then(|| digest_bytes(text.as_bytes()));
     let produced = produce_chunks(family, rel, &text);
     let metadata = extract_path_metadata(rel);
     let facet = metadata.facet.to_lowercase();
@@ -1692,7 +1717,14 @@ fn index_file(
             ],
         )
         .map_err(|error| format!("chunk insert failed for {rel}: {error}"))?;
-        record_chunk_source(conn, None, Some(rel), stream.as_deref())
+        let rowid = conn.last_insert_rowid();
+        record_activity_membership(conn, rowid, family == Family::Activity)
+            .map_err(|error| format!("activity membership insert failed for {rel}: {error}"))?;
+        if let Some(digest) = activity_digest {
+            record_activity_provenance(conn, rowid, &digest, hidden_flag(chunk.source.as_ref()))
+                .map_err(|error| format!("activity provenance insert failed for {rel}: {error}"))?;
+        }
+        record_chunk_source(conn, Some(rowid), Some(rel), stream.as_deref())
             .map_err(|error| format!("chunk source mapping failed for {rel}: {error}"))?;
     }
     replace_chunk_classification(conn, &classification)
@@ -1747,6 +1779,10 @@ pub(crate) fn file_mtime_secs(path: &Path) -> Result<i64, StoreError> {
         StoreError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     })?;
     Ok(duration.as_secs() as i64)
+}
+
+fn written_activity(path: &Path, rel: &str) -> bool {
+    resolve_content_shape(path, rel) == ContentResolution::Indexed(Family::Activity)
 }
 
 pub(crate) fn is_memory_note(rel: &str) -> bool {

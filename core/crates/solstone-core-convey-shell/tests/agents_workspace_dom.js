@@ -30,7 +30,7 @@ const LAN_B = 'https://[fd7a:115c:a1e0::5]:7660/mcp';
 const FP = 'AB:CD:EF:01';
 const BYO_URI = 'https://acme-v02.api.letsencrypt.org/acme/acct/12345';
 function byo(extra = {}) {
-  return {byo: {hostname: 'journal.example.com', enabled: false, account_uri: BYO_URI, dns_verdict: 'unchecked', socket_listening: false, certificate_active: false, socket_path: '/home/owner/journal/mcp-endpoint/byo/ingress.sock', next_action: 'publish_caa', ...extra}};
+  return {byo: {hostname: 'journal.example.com', enabled: false, account_uri: BYO_URI, caa_record: `0 issue "letsencrypt.org; accounturi=${BYO_URI}; validationmethods=tls-alpn-01"`, dns_verdict: 'unchecked', socket_listening: false, certificate_active: false, socket_path: '/home/owner/journal/mcp-endpoint/byo/ingress.sock', next_action: 'publish_caa', ...extra}};
 }
 function lan(extra, addresses = [{url: LAN_A, listening: true}, {url: LAN_B, listening: true}]) {
   return {lan_door: {enabled: true, listening: true, port: 7660, fingerprint: FP, addresses, ...extra}};
@@ -45,18 +45,34 @@ async function boot(state, {enable = null, pairingResponse, journal = null, acti
   const calls = [];
   const opened = [];
   const popups = [];
+  const notifications = [];
   const timers = new Map();
   let timerId = 0;
   const watched = journal || {now: '2026-09-24T12:00:00Z', today: '20260924', pairing: null, connections: []};
-  const fields = Object.fromEntries(['outcome', 'tool', 'agent', 'from', 'to'].map(key => [`a-${key}`, {value: ''}]));
+  const fields = Object.fromEntries(['outcome', 'tool', 'agent', 'from', 'to', 'byo-hostname', 'byo-relay-address', 'byo-relay-port'].map(key => [key.startsWith('byo-') ? key : `a-${key}`, {value: ''}]));
   const view = {
     _html: '',
     get innerHTML() { return this._html; },
-    set innerHTML(value) { this._html = value; for (const field of Object.values(fields)) field.value = ''; },
+    set innerHTML(value) {
+      this._html = value;
+      for (const [key, field] of Object.entries(fields)) {
+        if (key.startsWith('a-')) field.value = '';
+        else {
+          const match = value.match(new RegExp(`id="${key}"[^>]*value="([^"]*)"`));
+          if (match) field.value = match[1];
+        }
+      }
+    },
     listeners: {},
     addEventListener(name, listener) { (this.listeners[name] ||= []).push(listener); },
     querySelector(selector) {
       if (selector === '.modal' && this._html.includes('<div class="modal"')) return {remove: () => { this._html = this._html.slice(0, this._html.indexOf('<div class="modal"')); }};
+      if (selector === '.modal-card:last-of-type' && this._html.includes('modal-card')) {
+        const view = this;
+        return {insertAdjacentHTML(_position, text) { view._html += text; }};
+      }
+      const idMatch = selector.match(/^#([a-zA-Z0-9_-]+)$/);
+      if (idMatch && fields[idMatch[1]]) return fields[idMatch[1]];
       return null;
     },
     insertAdjacentHTML(_, text) { this._html += text; },
@@ -74,7 +90,12 @@ async function boot(state, {enable = null, pairingResponse, journal = null, acti
   const window = {
     location,
     top: null,
-    AppServices: {escapeHtml: value => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')},
+    AppServices: {
+      escapeHtml: value => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'),
+      notifications: {
+        show: opts => { notifications.push(opts); },
+      },
+    },
     apiJson: async (url, options = {}) => {
       const method = options.method || 'GET';
       calls.push({url, method, body: options.body ? JSON.parse(options.body) : undefined});
@@ -89,6 +110,12 @@ async function boot(state, {enable = null, pairingResponse, journal = null, acti
       }
       if (url === '/app/agents/api/local-door' || url === '/app/agents/api/lan-door' || url === '/app/agents/api/capability' || url === '/app/agents/api/byo') return {changed: true};
       if (url === '/app/agents/api/byo/account' || url === '/app/agents/api/byo/account/replace') return {changed: true};
+      if (url === '/app/agents/api/byo/relay') return {changed: true};
+      if (url === '/app/agents/api/byo/relay/check') return {code: 'relay_ok'};
+      if (url === '/app/agents/api/byo/relay/trust-again') return {ok: true};
+      if (url === '/app/agents/api/byo/relay/commands') return {setup: 'useradd solstone-relay', remove: 'userdel solstone-relay'};
+      if (url === '/app/agents/api/byo/dns-check') return {verdict: 'admitted', addresses: ['203.0.113.10'], diagnostics: []};
+      if (url === '/app/agents/api/byo/outside-check') return {code: 'outside_ok'};
       if (url === '/app/agents/api/solstone-me/account/replace' || url === '/app/agents/api/solstone-me/account/notice/dismiss') return {changed: true};
       if (url.startsWith('/app/agents/api/activity')) return activity ? JSON.parse(JSON.stringify(activity)) : {entries: [], counts: {}, examination_complete: true};
       if (url === '/app/agents/api/enable') return {operation: method === 'POST' ? (enable || {phase: 'waiting', portal_url: 'https://services.example/consent'}) : (enable || null)};
@@ -114,7 +141,7 @@ async function boot(state, {enable = null, pairingResponse, journal = null, acti
   window.window = window;
   window.top = window;
   const document = {
-    getElementById: id => (id === 'agents-view' ? view : id.startsWith('a-') ? fields[id] : null),
+    getElementById: id => (id === 'agents-view' ? view : fields[id] || null),
     querySelectorAll: () => [],
     addEventListener(name, listener) { (view.listeners[name] ||= []).push(listener); },
   };
@@ -159,7 +186,7 @@ async function boot(state, {enable = null, pairingResponse, journal = null, acti
     await settle();
     return event;
   };
-  return {view, calls, click, opened, popups, location, tick, fields, keydown, journal: watched};
+  return {view, calls, click, opened, popups, location, tick, fields, keydown, journal: watched, notifications};
 }
 async function settle() { for (let i = 0; i < 6; i += 1) await new Promise(resolve => setImmediate(resolve)); }
 function has(view, text, why) { assert(view.innerHTML.includes(text), why || `missing: ${text}`); }
@@ -254,16 +281,28 @@ async function test(name, body) {
     assert(!calls.some(call => call.url === '/app/agents/api/enable'), 'nothing started a solstone.me consent');
   });
 
-  await test('your hostname shows the account CAA pin, protected socket and separate local readiness', async () => {
-    const {view, click, calls} = await boot(baseState({...door({listening: true}), ...byo()}));
+  await test('your own domain shows the account CAA pin, protected socket and separate local readiness', async () => {
+    const {view, click, calls} = await boot(baseState({...door({listening: true}), ...byo({relay: {address: '203.0.113.10', port: 22, state: 'none'}})}));
     await click({lane: 'byo'});
     has(view, 'journal.example.com');
     has(view, `accounturi=${BYO_URI}; validationmethods=tls-alpn-01`);
     has(view, '/home/owner/journal/mcp-endpoint/byo/ingress.sock');
-    has(view, 'these checks cannot show whether the public route reaches this journal');
-    has(view, 'turn on public route');
+    has(view, 'data-action="byo-on"');
     await click({action: 'byo-on'});
     assert(calls.some(call => call.url === '/app/agents/api/byo' && call.method === 'PUT' && call.body.enabled === true));
+  });
+
+  await test('an owner who forwards port 443 themselves still sees the CAA record and can turn the route on and off', async () => {
+    const {view, click, calls} = await boot(baseState({...door({listening: true}), ...byo()}));
+    await click({lane: 'byo'});
+    has(view, `accounturi=${BYO_URI}; validationmethods=tls-alpn-01`);
+    has(view, 'data-action="byo-on"');
+    await click({action: 'byo-on'});
+    assert(calls.some(call => call.url === '/app/agents/api/byo' && call.method === 'PUT' && call.body.enabled === true));
+    const {view: vOn, click: cOn} = await boot(baseState({...door({listening: true}), ...byo({enabled: true, dns_verdict: 'admitted', socket_listening: true, certificate_active: true, next_action: 'none'})}));
+    await cOn({lane: 'byo'});
+    has(vOn, 'data-action="byo-off"');
+    lacks(vOn, 'connected to your server');
   });
 
   await test('a Windows hostname route names its loopback address and an OpenSSH command, not a socket', async () => {
@@ -285,7 +324,7 @@ async function test(name, body) {
 
   await test('a ready owner hostname gets its own pairing code and never borrows another door code', async () => {
     const {view, click, calls} = await boot(baseState({...door({listening: true}), ...byo({enabled:true, dns_verdict:'admitted', socket_listening:true, certificate_active:true, next_action:'none'}), connections:[connection('oauth', 'b1', 'cloud agent', 'byo')]}));
-    has(view, 'cloud agent<span class="chip">your hostname</span>');
+    has(view, 'cloud agent<span class="chip">your domain</span>');
     await click({action:'connect'});
     await click({way:'byo'});
     has(view, 'https://journal.example.com/mcp');
@@ -517,13 +556,23 @@ async function test(name, body) {
   }
 
   await test('the enable notice can be dismissed and the activity filter asks for activity', async () => {
-    const {view, click, calls} = await boot(baseState({enabled: false, ...door({listening: true})}), {enable: {phase: 'error'}});
+    const activity = {entries: [
+      {agent_identity: 'test-agent', timestamp: '2026-09-24T12:01:30Z', tool: 'get_transcript', outcome: 'served', request: {arguments: {}}, result: {targets: ['20260308/room/120000_1']}},
+      {agent_identity: 'test-agent', timestamp: '2026-09-24T12:02:30Z', tool: 'get_week', outcome: 'served', request: {arguments: {}}, result: {targets: ['week:20260308']}},
+    ], counts: {served: 2}, examination_complete: true};
+    const {view, click, calls, fields} = await boot(baseState({enabled: false, ...door({listening: true})}), {enable: {phase: 'error'}, activity});
     await click({lane: 'me'});
     has(view, 'data-action="dismiss-enable"');
     await click({action: 'dismiss-enable'});
     lacks(view, 'data-action="dismiss-enable"');
+    fields['a-tool'].value = 'get_week';
     await click({action: 'filter-activity'});
-    assert(calls.some(call => call.url.startsWith('/app/agents/api/activity') && call.method === 'GET'), 'filter asks for activity');
+    assert(calls.some(call => call.url.startsWith('/app/agents/api/activity?tool=get_week') && call.method === 'GET'), 'filter asks for get_week');
+    has(view, '<option>get_week</option>');
+    await click({activityIndex: '0'});
+    has(view, 'href="/app/transcripts/20260308"');
+    await click({activityIndex: '1'});
+    has(view, 'href="/app/home/week/20260308"');
   });
 
   await test('connect dialog open pairing states and code door attribute', async () => {
@@ -945,6 +994,72 @@ async function test(name, body) {
     assert.strictEqual(capableSession.location.assigned, 'https://services.example/consent', 'capable mode assigns portal url');
     assert.strictEqual(capableSession.popups.length, 0, 'capable mode does not open window');
     assert.strictEqual(defaultPrevented, true, 'capable mode prevents default');
+  });
+
+  await test('byo relay, dns check, outside check, move notice, and trouble state assertions', async () => {
+    // 1. unset lane has a set-it-up action
+    const {view, click, calls, fields, notifications} = await boot(baseState({...door({listening: true}), ...byo({hostname: null, caa_record: null})}));
+    await click({lane: 'byo'});
+    has(view, 'data-action="byo-setup"');
+
+    // 2. saving the address issues PUT /byo then the account POST
+    await click({action: 'byo-setup'});
+    has(view, 'id="byo-hostname"');
+    fields['byo-hostname'].value = 'journal.example.com';
+    await click({action: 'byo-save'});
+    const putByo = calls.find(c => c.url === '/app/agents/api/byo' && c.method === 'PUT');
+    const postAccount = calls.find(c => c.url === '/app/agents/api/byo/account' && c.method === 'POST');
+    assert(putByo && putByo.body && putByo.body.hostname === 'journal.example.com');
+    assert(postAccount);
+    assert(calls.indexOf(putByo) < calls.indexOf(postAccount));
+
+    // 3. the server step issues PUT /byo/relay and POST /byo/relay/check
+    fields['byo-relay-address'].value = '203.0.113.10';
+    fields['byo-relay-port'].value = '22';
+    await click({action: 'byo-relay-save'});
+    await click({action: 'byo-relay-check'});
+    const putRelay = calls.find(c => c.url === '/app/agents/api/byo/relay' && c.method === 'PUT');
+    const checkRelay = calls.find(c => c.url === '/app/agents/api/byo/relay/check' && c.method === 'POST');
+    assert(putRelay && putRelay.body && putRelay.body.address === '203.0.113.10' && putRelay.body.port === 22);
+    assert(checkRelay);
+    assert(calls.indexOf(putRelay) < calls.indexOf(checkRelay));
+
+    // 4. the CAA value read is state.byo.caa_record
+    const caaRecord = '0 issue "letsencrypt.org; accounturi=' + BYO_URI + '; validationmethods=tls-alpn-01"';
+    const {view: vCaa, click: cCaa, calls: cCaaCalls} = await boot(baseState({...door({listening: true}), ...byo({hostname: 'journal.example.com', account_uri: BYO_URI, caa_record: caaRecord, relay: {address: '203.0.113.10', port: 22, state: 'none'}})}));
+    await cCaa({lane: 'byo'});
+    has(vCaa, caaRecord.replace(/"/g, '&quot;'));
+
+    // 5. the DNS step calls POST /byo/dns-check
+    await cCaa({action: 'byo-dns-check'});
+    assert(cCaaCalls.some(c => c.url === '/app/agents/api/byo/dns-check' && c.method === 'POST'));
+
+    // 6. byoReady() triggers one POST /byo/outside-check
+    const readyState = baseState({...door({listening: true}), ...byo({hostname: 'journal.example.com', enabled: true, socket_listening: true, certificate_active: true, relay: {address: '203.0.113.10', port: 22, state: 'connected', observed_at: '2026-09-24T12:00:00Z'}})});
+    const {calls: cReadyCalls} = await boot(readyState);
+    const outsideChecks = cReadyCalls.filter(c => c.url === '/app/agents/api/byo/outside-check' && c.method === 'POST');
+    assert.strictEqual(outsideChecks.length, 1);
+
+    // 7. with relay-door connections and relay connected, the move notice lists them and its buttons open the byo connect dialog
+    const moveState = baseState({...door({listening: true}), ...ME_ON, ...byo({hostname: 'journal.example.com', enabled: true, socket_listening: true, certificate_active: true, relay: {address: '203.0.113.10', port: 22, state: 'connected', observed_at: '2026-09-24T12:00:00Z'}}), connections: [connection('oauth', 'ag1', 'Agent One', 'relay')]});
+    const {view: vMove, click: cMove} = await boot(moveState);
+    has(vMove, 'connect Agent One at your domain');
+    await cMove({moveByo: 'ag1'});
+    has(vMove, 'aria-label="connect an agent"');
+
+    // 8. any other relay state makes byoReady() false, shows no move notice, and host_key_changed shows the trust-again action
+    const hkcState = baseState({...door({listening: true}), ...ME_ON, ...byo({hostname: 'journal.example.com', enabled: true, socket_listening: true, certificate_active: true, relay: {address: '203.0.113.10', port: 22, state: 'host_key_changed', observed_at: '2026-09-24T12:00:00Z'}}), connections: [connection('oauth', 'ag1', 'Agent One', 'relay')]});
+    const {view: vHkc, click: cHkc, calls: cHkcCalls} = await boot(hkcState);
+    lacks(vHkc, 'connect Agent One at your domain');
+    await cHkc({lane: 'byo'});
+    has(vHkc, 'trust it again');
+    await cHkc({action: 'byo-relay-trust-again'});
+    assert(cHkcCalls.some(c => c.url === '/app/agents/api/byo/relay/trust-again' && c.method === 'POST'));
+
+    // 9. notify calls pass message
+    fields['byo-hostname'].value = '';
+    await click({action: 'byo-save'});
+    assert(notifications.some(n => n.title === 'agents' && typeof n.message === 'string' && n.message.length > 0 && n.body === undefined));
   });
 
   console.log(`DOM CASES: ${cases} passed`);

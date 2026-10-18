@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use serde_json::{Map, Value, json};
-use solstone_core_indexer_query::AdmittedCategory;
+use solstone_core_indexer_query::{AdmittedCategory, ConnectionScope};
 
 use crate::permissions::{ConnectionReadSnapshot, PermissionDecision};
 use crate::tools::search::MAX_QUERY_BYTES;
@@ -17,6 +17,7 @@ use crate::tools::{DAY_DESCRIPTION, DAY_PATTERN, MAX_DAY_BYTES, MAX_OPAQUE_REFER
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ToolRequirement {
     pub(crate) read: &'static [AdmittedCategory],
+    pub(crate) whole_journal: bool,
 }
 
 /// Everything schema generation may know about a connection.
@@ -44,12 +45,21 @@ pub(crate) struct ToolEntry {
     pub(crate) audit_name: solstone_core_mcp_audit::ToolName,
 }
 
-const NOTHING: ToolRequirement = ToolRequirement { read: &[] };
+const NOTHING: ToolRequirement = ToolRequirement {
+    read: &[],
+    whole_journal: false,
+};
 const TRANSCRIPTS: ToolRequirement = ToolRequirement {
     read: &[AdmittedCategory::Transcripts],
+    whole_journal: false,
 };
 const ENTITIES: ToolRequirement = ToolRequirement {
     read: &[AdmittedCategory::Entities],
+    whole_journal: false,
+};
+const WEEK: ToolRequirement = ToolRequirement {
+    read: &[AdmittedCategory::Transcripts, AdmittedCategory::Facets],
+    whole_journal: true,
 };
 
 /// The single registry used for advertisement, dispatch, validation, and auditing.
@@ -85,7 +95,7 @@ pub(crate) const TOOLS: &[ToolEntry] = &[
         tool_name: crate::jsonrpc::ToolName::Search,
         wire_name: "search",
         title: "search the journal",
-        description: "Search what this connection may see of the owner's journal: short summaries of conversations and work sessions, activities and their stories, imported documents and calendar events, and notes about people and projects. Use a few keywords such as names or topics, not a sentence. Days are YYYYMMDD or YYYY-MM-DD. Search does not read conversations word for word. When a result lists transcript segments, read them with get_transcript before saying who said, promised or decided something. When a result shows more_segments, fetch it for more.",
+        description: "search what this connection may see of the owner's journal: short summaries of conversations and work sessions, activities and their stories, imported documents and calendar events, and notes about people and projects. use a few keywords such as names or topics, not a sentence. days are YYYYMMDD or YYYY-MM-DD. search does not read conversations word for word. when a result lists transcript segments, read them with get_transcript before saying who said, promised or decided something. when a result shows more_segments, fetch it for more. an activity result includes hidden, true or false. trust that field. the text can mention hidden without the activity being hidden. if an activity you just saw disappears, search again; a changed activity file stays out until the journal indexes it.",
         input_schema: search_input_schema,
         requires: TRANSCRIPTS,
         audit_name: solstone_core_mcp_audit::ToolName::Search,
@@ -94,7 +104,7 @@ pub(crate) const TOOLS: &[ToolEntry] = &[
         tool_name: crate::jsonrpc::ToolName::Fetch,
         wire_name: "fetch",
         title: "read a journal entry",
-        description: "Read the full text of an entry returned by search. Pass its reference unchanged. When the entry lists transcript segments, read them with get_transcript. If it still shows more_segments, call list_transcripts for that day and the entry's time.",
+        description: "read the full text of an entry returned by search. pass its reference unchanged. when the entry lists transcript segments, read them with get_transcript. if it still shows more_segments, call list_transcripts for that day and the entry's time. an activity includes hidden, true or false, along with its text. trust that field. the text can mention hidden without the activity being hidden. if the reference does not resolve, search again.",
         input_schema: fetch_input_schema,
         requires: TRANSCRIPTS,
         audit_name: solstone_core_mcp_audit::ToolName::Fetch,
@@ -135,6 +145,15 @@ pub(crate) const TOOLS: &[ToolEntry] = &[
         requires: ENTITIES,
         audit_name: solstone_core_mcp_audit::ToolName::GetEntity,
     },
+    ToolEntry {
+        tool_name: crate::jsonrpc::ToolName::GetWeek,
+        wire_name: "get_week",
+        title: "read a week",
+        description: "read one week. memories are generated and are not the owner's words. quotes are the owner's words. each day state describes that day's memory. leaving an entry off the week page leaves that source visible to the other tools. pass week as the sunday it starts, YYYYMMDD, or omit it for the newest week.",
+        input_schema: week_input_schema,
+        requires: WEEK,
+        audit_name: solstone_core_mcp_audit::ToolName::GetWeek,
+    },
 ];
 
 pub(crate) fn tool_by_wire_name(name: &str) -> Option<&'static ToolEntry> {
@@ -149,11 +168,32 @@ pub(crate) fn find_tool(name: crate::jsonrpc::ToolName) -> &'static ToolEntry {
 }
 
 pub(crate) fn snapshot_allows(snapshot: &ConnectionReadSnapshot, entry: &ToolEntry) -> bool {
-    entry
+    requirement_refusal(snapshot, entry).is_none()
+}
+
+pub(crate) fn requirement_refusal(
+    snapshot: &ConnectionReadSnapshot,
+    entry: &ToolEntry,
+) -> Option<String> {
+    let missing = entry
         .requires
         .read
         .iter()
-        .all(|category| snapshot.categories.contains(category))
+        .filter(|category| !snapshot.categories.contains(category))
+        .map(category_token)
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Some(format!(
+            "this connection does not have the {} category",
+            missing.join(" and ")
+        ));
+    }
+    if entry.requires.whole_journal && !matches!(snapshot.scope, ConnectionScope::WholeJournal) {
+        return Some(
+            "this connection can read a week only with access to the whole journal.".to_owned(),
+        );
+    }
+    None
 }
 
 /// The tool list one connection may see, with each schema naming only what that
@@ -533,6 +573,20 @@ fn transcript_input_schema(_context: &SchemaContext<'_>) -> Value {
         "properties": {
             "reference": { "type": "string", "minLength": 1, "maxLength": MAX_OPAQUE_REFERENCE_BYTES },
             "cursor": { "type": "string", "minLength": 1, "maxLength": MAX_OPAQUE_REFERENCE_BYTES },
+        }
+    })
+}
+
+fn week_input_schema(_context: &SchemaContext<'_>) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "week": {
+                "type": "string",
+                "pattern": "^[0-9]{8}$",
+                "description": "the sunday a week starts, as YYYYMMDD. omit it to read the newest week.",
+            }
         }
     })
 }

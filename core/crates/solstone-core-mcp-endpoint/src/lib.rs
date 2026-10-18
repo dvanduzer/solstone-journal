@@ -19,7 +19,10 @@ use solstone_core_journal_io::journal_root::JournalRoot;
 
 #[allow(dead_code)]
 mod account_wire;
+pub(crate) mod acme_http;
+pub(crate) mod acme_lifecycle;
 mod activity;
+mod activity_admit;
 mod audit;
 #[cfg(all(test, feature = "full-tests"))]
 mod boundary_tests;
@@ -29,6 +32,10 @@ mod bridge_pop;
 mod bridge_session;
 pub mod byo_dns;
 pub mod byo_door;
+mod byo_relay;
+#[cfg(unix)]
+#[cfg(all(test, feature = "full-tests"))]
+mod byo_relay_tests;
 mod dispatch;
 mod http1;
 mod jsonrpc;
