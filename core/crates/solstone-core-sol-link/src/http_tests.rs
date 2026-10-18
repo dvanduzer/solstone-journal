@@ -17,12 +17,14 @@ use solstone_core_thinking_copy::SetupCatalogFacts;
 use tower::ServiceExt;
 
 use crate::establish;
-use crate::http::{SetupDownloadTask, SetupDownloads, SetupHost, init_router_with_host, router};
+use crate::http::{
+    SetupDownloadTask, SetupDownloads, SetupHost, SetupProgressError, SetupRetryError,
+    init_router_with_host, router,
+};
 use crate::ledger::{AuthorizationLedger, ClientEntry, ClientRole};
 use crate::mark::mark_from_jid;
 
 const VALID_CID: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const INIT_HTML: &str = include_str!("../assets/init.html");
 
 #[tokio::test]
 async fn init_routes_reject_linked_devices_and_serve_localhost() {
@@ -534,7 +536,21 @@ async fn init_reads_defaults_without_writing() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    assert_eq!(body.as_ref(), INIT_HTML.as_bytes());
+    let expected = crate::http::injected_init_html();
+    assert_eq!(body.as_ref(), expected.as_bytes());
+    let html = std::str::from_utf8(&body).unwrap();
+    let bootstrap = html
+        .split_once("<script type=\"application/json\" id=\"setup-copy-bootstrap\">")
+        .unwrap()
+        .1
+        .split_once("</script>")
+        .unwrap()
+        .0;
+    let copy: Value = serde_json::from_str(bootstrap).unwrap();
+    assert_eq!(
+        copy,
+        solstone_core_thinking_copy::setup_copy(&solstone_core_thinking_copy::current_setup_facts())
+    );
     assert!(
         !temporary
             .path()
@@ -836,8 +852,11 @@ struct FakeSetupHost {
     start_calls: std::sync::Mutex<Vec<PathBuf>>,
     cancel_calls: std::sync::Mutex<Vec<(PathBuf, String)>>,
     retry_speech_calls: std::sync::Mutex<Vec<PathBuf>>,
+    retry_speech_error: std::sync::Mutex<Option<SetupRetryError>>,
     start_error: std::sync::Mutex<Option<String>>,
     projected: std::sync::Mutex<Option<SetupDownloads>>,
+    project_error: std::sync::Mutex<Option<SetupProgressError>>,
+    thinking_bytes: std::sync::Mutex<Option<Option<u64>>>,
 }
 
 impl SetupHost for FakeSetupHost {
@@ -860,34 +879,50 @@ impl SetupHost for FakeSetupHost {
         Ok(())
     }
 
-    fn retry_speech(&self, journal_root: &Path) -> Result<(), String> {
+    fn retry_speech(&self, journal_root: &Path) -> Result<(), SetupRetryError> {
         self.retry_speech_calls
             .lock()
             .unwrap()
             .push(journal_root.to_path_buf());
+        if let Some(err) = self.retry_speech_error.lock().unwrap().as_ref() {
+            return Err(err.clone());
+        }
         Ok(())
     }
 
-    fn project_downloads(&self, _journal_root: &Path) -> SetupDownloads {
-        if let Some(p) = self.projected.lock().unwrap().clone() {
-            return p;
+    fn project_downloads(
+        &self,
+        _journal_root: &Path,
+    ) -> Result<SetupDownloads, SetupProgressError> {
+        if let Some(err) = self.project_error.lock().unwrap().as_ref() {
+            return Err(err.clone());
         }
-        SetupDownloads {
+        if let Some(p) = self.projected.lock().unwrap().clone() {
+            return Ok(p);
+        }
+        Ok(SetupDownloads {
             speech: SetupDownloadTask {
                 state: "idle".into(),
                 attempt_id: None,
-                bytes_done: None,
+                bytes_done: 0,
                 bytes_total: None,
                 error: None,
             },
             thinking: SetupDownloadTask {
                 state: "idle".into(),
                 attempt_id: None,
-                bytes_done: None,
+                bytes_done: 0,
                 bytes_total: None,
                 error: None,
             },
+        })
+    }
+
+    fn thinking_download_bytes(&self, _journal: &Path) -> Option<u64> {
+        if let Some(b) = *self.thinking_bytes.lock().unwrap() {
+            return b;
         }
+        self.catalog_facts().thinking_download_bytes
     }
 
     fn catalog_facts(&self) -> SetupCatalogFacts {
@@ -1321,43 +1356,27 @@ async fn start_thinking_download_validations() {
 }
 
 #[tokio::test]
-async fn fake_start_error_overlays_on_idle() {
+async fn packaged_speech_retry_transports_the_journal_guidance_verbatim() {
     let temporary = TempDir::new();
     let host = Arc::new(FakeSetupHost::default());
-    *host.start_error.lock().unwrap() = Some("disk full".into());
-
-    let state = response_json(
-        request_with_host(
-            temporary.path(),
-            host.clone(),
-            AccessBasis::Localhost,
-            Method::GET,
-            "/init/api/state",
-            None,
-        )
-        .await,
+    let error =
+        crate::setup_progress::packaged_speech_retry(Err("broken package".into())).unwrap_err();
+    let detail = error.detail.clone();
+    *host.retry_speech_error.lock().unwrap() = Some(error);
+    let response = request_with_host(
+        temporary.path(),
+        host,
+        AccessBasis::Localhost,
+        Method::POST,
+        "/init/api/action",
+        Some(json!({"action": "retry_speech_download"})),
     )
     .await;
-    if state["thinking"]["capability"] == "ok" {
-        let res = request_with_host(
-            temporary.path(),
-            host.clone(),
-            AccessBasis::Localhost,
-            Method::POST,
-            "/init/api/action",
-            Some(json!({"action": "save_thinking", "choice": "local"})),
-        )
-        .await;
-        assert_eq!(res.status(), StatusCode::OK);
-        let body = response_json(res).await;
-        assert_eq!(body["thinking"]["choice"], "local");
-        assert_eq!(body["thinking"]["saved"], true);
-        assert_eq!(body["downloads"]["thinking"]["state"], "error");
-        assert_eq!(
-            body["downloads"]["thinking"]["error"]["code"],
-            "start_failed"
-        );
-    }
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = response_json(response).await;
+    assert_eq!(body["reason_code"], "speech_package_unavailable");
+    assert_eq!(body["detail"], detail);
+    assert_eq!(body["error"], "speech recognition needs repair");
 }
 
 #[tokio::test]
@@ -1610,7 +1629,7 @@ async fn repeated_local_save_does_not_restart_a_cancelled_attempt() {
     )
     .unwrap();
     let host = Arc::new(FakeSetupHost::default());
-    let mut projected = host.project_downloads(temporary.path());
+    let mut projected = host.project_downloads(temporary.path()).unwrap();
     projected.thinking.state = "cancelled".into();
     projected.thinking.attempt_id = Some("cancelled-attempt".into());
     *host.projected.lock().unwrap() = Some(projected);
@@ -1818,4 +1837,45 @@ impl Drop for TempDir {
         crate::http::setup_probe_test::clear(&self.path);
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+#[tokio::test]
+async fn thinking_line_uses_the_admitted_transfer_total_before_reprobing_the_host() {
+    let temporary = TempDir::new();
+    let host = Arc::new(FakeSetupHost::default());
+    *host.thinking_bytes.lock().unwrap() = Some(Some(99));
+    let mut downloads = host.project_downloads(temporary.path()).unwrap();
+    downloads.thinking.state = "downloading".into();
+    downloads.thinking.attempt_id = Some("admitted".into());
+    downloads.thinking.bytes_total = Some(42);
+    *host.projected.lock().unwrap() = Some(downloads.clone());
+    let response = request_with_host(
+        temporary.path(),
+        host.clone(),
+        AccessBasis::Localhost,
+        Method::GET,
+        "/init/api/state",
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await["thinking"]["download_bytes"],
+        42
+    );
+    downloads.thinking.state = "idle".into();
+    *host.projected.lock().unwrap() = Some(downloads);
+    let response = request_with_host(
+        temporary.path(),
+        host,
+        AccessBasis::Localhost,
+        Method::GET,
+        "/init/api/state",
+        None,
+    )
+    .await;
+    assert_eq!(
+        response_json(response).await["thinking"]["download_bytes"],
+        99
+    );
 }

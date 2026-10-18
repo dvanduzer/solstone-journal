@@ -50,6 +50,8 @@ mod publish_checkpoint;
 mod serve;
 #[cfg(feature = "host")]
 pub mod service_identity;
+#[cfg(feature = "host")]
+pub mod setup_progress;
 
 #[cfg(feature = "host")]
 pub use acceptor::{

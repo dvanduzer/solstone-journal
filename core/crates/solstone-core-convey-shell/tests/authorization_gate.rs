@@ -645,3 +645,115 @@ async fn about_facts_use_the_production_authorization_and_pairing_layers() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(value, revoked_body());
 }
+
+/// Home's getting-started card reads setup progress through first minutes, the
+/// one route a linked device can reach; `/init/api/state` stays local-only.
+#[tokio::test]
+async fn first_minutes_serves_setup_progress_to_a_linked_device_and_not_a_pairing_peer() {
+    let fixture = Fixture::established(1);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as i64;
+    fs::write(
+        fixture.root.join("config/journal.json"),
+        json!({"setup": {"completed_at": now_ms, "thinking_choice": "byo"}}).to_string(),
+    )
+    .expect("open-window config");
+    // `/init/api/state` reads the mark from the committed identity bundle.
+    fs::write(
+        fixture.root.join("link/ca/state.json"),
+        json!({"instance_id": fixture.instance_id, "home_label": "test home", "locked_at": 1})
+            .to_string(),
+    )
+    .expect("committed identity state");
+    // Two controlled records: an abandoned thinking download (in flight, no
+    // installer holding it) and a failed speech download.
+    fs::create_dir_all(fixture.root.join("health/providers")).expect("providers directory");
+    let record = |provider: &str, state: &str, error_code: Option<&str>| {
+        json!({
+            "schema_version": 1,
+            "provider": provider,
+            "revision": 3,
+            "install_state": state,
+            "attempt_id": format!("{provider}-attempt"),
+            "target_fingerprint_json": null,
+            "target_fingerprint_sha256": null,
+            "started_at": null,
+            "last_transition_at": null,
+            "last_progress_at": null,
+            "completed_at": null,
+            "progress_bytes_received": 512,
+            "progress_bytes_total": 2048,
+            "install_error": error_code.map(|_| "stopped"),
+            "error_code": error_code,
+            "owner": null,
+        })
+        .to_string()
+    };
+    fs::write(
+        fixture.root.join("health/providers/local.json"),
+        record("local", "downloading", None),
+    )
+    .expect("thinking record");
+    fs::write(
+        fixture.root.join("health/providers/parakeet.json"),
+        record("parakeet", "failed", Some("install_failed")),
+    )
+    .expect("speech record");
+
+    let (_, receiver) = watch::channel(posture(&fixture));
+    let app = authorized_router(fixture.root.clone(), receiver).into_inner();
+    let listed = linked_device(&fixture, 0);
+
+    let (status, local_state) =
+        request(app.clone(), "/init/api/state", Some(AccessBasis::Localhost)).await;
+    assert_eq!(status, StatusCode::OK, "{local_state}");
+    let (status, _) = request(app.clone(), "/init/api/state", Some(listed.clone())).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "init state stays local-only");
+
+    for (basis, actions) in [(AccessBasis::Localhost, true), (listed, false)] {
+        let (status, body) = request(
+            app.clone(),
+            "/app/home/api/first-minutes",
+            Some(basis.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{basis:?}: {body}");
+        assert_eq!(body["window_open"], true, "{basis:?}");
+        let setup = &body["setup"];
+        assert_eq!(setup["downloads"], local_state["downloads"], "{basis:?}");
+        assert_eq!(
+            setup["thinking"]["capability"], local_state["thinking"]["capability"],
+            "{basis:?}"
+        );
+        assert_eq!(
+            setup["thinking"]["choice"], local_state["thinking"]["choice"],
+            "{basis:?}"
+        );
+        assert_eq!(setup["thinking"]["choice"], "byo");
+        assert_eq!(setup["actions"], actions, "{basis:?}");
+        // No setup or mark data beyond progress and the saved choice.
+        let mut keys = setup
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(keys, ["actions", "downloads", "thinking"]);
+    }
+    assert_eq!(local_state["downloads"]["thinking"]["state"], "error");
+    assert_eq!(local_state["downloads"]["speech"]["state"], "error");
+
+    for carrier in [Carrier::Direct, Carrier::ViaSpl] {
+        let (status, body) = request(
+            app.clone(),
+            "/app/home/api/first-minutes",
+            Some(AccessBasis::PairingPeer { carrier }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.get("setup").is_none());
+    }
+}

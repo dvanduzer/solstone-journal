@@ -167,6 +167,10 @@ pub async fn run_local_door_async(
             socket_path: None,
             socket_blocker: None,
             next_action: None,
+            relay_state: "none".to_string(),
+            relay_detail: None,
+            relay_observed_at: None,
+            dns_addresses: Vec::new(),
             observed_at: chrono::Utc::now(),
         },
     );

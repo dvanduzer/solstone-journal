@@ -943,7 +943,7 @@ async fn unestablished_loopback_serves_the_init_wizard() {
         "expected 200 from /init, got:\n{body}"
     );
     assert!(
-        body.contains("create your journal"),
+        body.contains("/init/api/action"),
         "expected wizard HTML, got:\n{body}"
     );
 }

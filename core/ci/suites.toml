@@ -1080,7 +1080,7 @@ prerequisites = ["cargo-cache"]
 timeout = "standard"
 default_full = true
 runtime = "none"
-features = ["full-tests", "runtime-fetch-test"]
+features = ["full-tests", "runtime-fetch-test", "test-hooks"]
 
 [[package_suites]]
 id = "package::solstone-core-maintenance"
@@ -4441,6 +4441,19 @@ prerequisites = ["cargo-cache"]
 timeout = "standard"
 default_full = true
 required_features = ["host", "test-hooks"]
+runtime = "none"
+
+[[suites]]
+id = "solstone-core-sol-link::init_dom"
+package = "solstone-core-sol-link"
+target = "init_dom"
+set = "component"
+areas = ["services"]
+platforms = ["linux", "macos"]
+prerequisites = ["cargo-cache"]
+timeout = "standard"
+default_full = true
+required_features = []
 runtime = "none"
 
 [[suites]]

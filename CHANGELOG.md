@@ -17,6 +17,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 
 - certificates for solstone.me and your own domain now follow the issuer's renewal schedule, including after a journal restart.
+- browser setup confirms the journal mark you see, then saves where thinking runs.
 - setup commits the journal mark you see and saves your thinking choice. it opens home, with links to finish setting up your own model or confidential processing. finishing setup again keeps your completion time and settings.
 - while no device is paired, home keeps "set one up →" next to anything that needs your attention. before, it disappeared whenever anything else showed, which on a new journal was almost always.
 - not having chosen where the thinking happens yet no longer counts as something that needs your attention on home. a note says your journal starts catching up once you choose, and links to the thinking app.
@@ -31,6 +32,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - when today has no activities yet, the activities app still shows today's hours, with a line at the current time.
 - the note at the top of your morning briefing says what it drew on in plain words, and names anything that was missing. it no longer counts "source paths", which always read 0.
 - the first-run setup page opens with how your journal, the solstone app and thinking fit together. its thinking section now asks where the thinking happens and says your journal stays on your computer whichever you pick.
+- a speech retry keeps going after you close the page and shows how far the download has gotten. on windows, speech that is already in the journal app needs no download, and a package that does not verify tells you to repair or reinstall the journal app and start your journal again.
 - when an activity's whole source is short and is one imported AI conversation or one line from a speaker your journal doesn't recognize, its story now quotes that source word for word. it says which messages were yours and which were your agent's, and the date each message was sent. topics and relationships are written as before, and it takes no extra request to your thinking provider. stories already written stay as they are.
 
 ### Fixed

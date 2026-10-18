@@ -10,6 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use solstone_core_convey_http::identity::AccessBasis;
 use solstone_core_convey_http::owner_read::{OwnerReadRole, spawn_blocking_response};
 
 mod assets;
@@ -103,7 +104,13 @@ pub fn routes(journal_root: PathBuf, clock: Clock, is_moment: fn(&str) -> bool) 
         )
         .route(
             "/app/home/api/first-minutes",
-            get(move || first_minutes(first_minutes_root.clone(), first_minutes_clock.clone())),
+            get(move |basis: Option<Extension<AccessBasis>>| {
+                first_minutes(
+                    first_minutes_root.clone(),
+                    first_minutes_clock.clone(),
+                    basis.map(|Extension(basis)| basis),
+                )
+            }),
         )
         .route(
             "/app/home/api/briefing",
@@ -113,12 +120,20 @@ pub fn routes(journal_root: PathBuf, clock: Clock, is_moment: fn(&str) -> bool) 
         .with_state(journal_root)
 }
 
-async fn first_minutes(journal_root: PathBuf, clock: Clock) -> Response {
+async fn first_minutes(
+    journal_root: PathBuf,
+    clock: Clock,
+    basis: Option<AccessBasis>,
+) -> Response {
     let now = clock.now();
+    // Setup actions answer only on the journal's own computer, the same rule
+    // `/init/api/action` applies; a linked device sees progress and no action.
+    let setup_actions = matches!(basis, Some(AccessBasis::Localhost));
     spawn_blocking_response(OwnerReadRole::HomeFirstMinutes, move || {
         let context = solstone_core_home::HomeContext::new(journal_root, now);
         Json(solstone_core_home::first_minutes::read_first_minutes(
             &context,
+            setup_actions,
         ))
         .into_response()
     })
@@ -365,6 +380,8 @@ mod tests {
         assert_eq!(body, json!({"window_open": false}));
     }
 
+    // An open window reads setup progress, which probes this computer.
+    #[cfg(feature = "full-tests")]
     #[tokio::test]
     async fn first_minutes_route_window_timing() {
         let root = TempDir::new().expect("temporary journal");
@@ -388,6 +405,8 @@ mod tests {
         assert_eq!(response.0, StatusCode::OK);
         let body: Value = serde_json::from_slice(&response.3).expect("JSON");
         assert_eq!(body["window_open"], true);
+        // No access basis is no setup action.
+        assert_eq!(body["setup"]["actions"], false);
 
         // 2. Just under 7 days: 604_799_999 ms after completed_at
         let just_under_time =
