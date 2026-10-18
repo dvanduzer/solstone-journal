@@ -43,7 +43,7 @@ use crate::process::{
 /// this duration after a confirmed supervisor loss.
 pub const PARENT_LOSS_COORDINATOR_RETIREMENT_DEADLINE: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
-const PARENT_LOSS_COORDINATOR_TERMINAL_WRITE_BUDGET: Duration = Duration::from_secs(1);
+pub(crate) const PARENT_LOSS_COORDINATOR_TERMINAL_WRITE_BUDGET: Duration = Duration::from_secs(1);
 const ADMISSION_SEAL_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const BOOTSTRAP_SCHEMA: u32 = 1;
 const FILE_MODE: u32 = 0o600;
