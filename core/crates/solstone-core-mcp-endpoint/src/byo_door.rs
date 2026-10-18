@@ -170,13 +170,23 @@ mod ingress {
     pub(super) fn release(_byo_dir: &unix::ByoDirectory, _bound: Bound) {}
 }
 
-struct ByoBoundResources {
-    ingress_task: tokio::task::JoinHandle<()>,
-    acme_task: Option<tokio::task::JoinHandle<()>>,
-    ingress_bound: ingress::Bound,
+pub(super) struct ByoBoundResources {
+    pub(super) ingress_task: tokio::task::JoinHandle<()>,
+    pub(super) acme_task: Option<tokio::task::JoinHandle<()>>,
+    pub(super) ingress_bound: ingress::Bound,
 }
 
-struct ByoServiceRuntime {
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RelayTestState {
+    ManualForwarding,
+    #[cfg_attr(not(feature = "full-tests"), allow(dead_code))]
+    RelayConfiguredNotConnected,
+    #[cfg_attr(not(feature = "full-tests"), allow(dead_code))]
+    RelayConnected,
+}
+
+pub(super) struct ByoServiceRuntime {
     hostname: String,
     generation: u64,
     oauth: Arc<OAuthRuntime>,
@@ -187,14 +197,16 @@ struct ByoServiceRuntime {
     account_dir: unix::TlsStateDirectory,
     service_shutdown_tx: watch::Sender<bool>,
     service_shutdown_rx: watch::Receiver<bool>,
-    bound_resources: Option<ByoBoundResources>,
+    pub(super) bound_resources: Option<ByoBoundResources>,
     last_dns_verdict: Option<crate::byo_dns::DnsVerdict>,
     last_dns_account_uri: Option<String>,
     last_dns_check: tokio::time::Instant,
+    #[cfg(test)]
+    pub(crate) relay_test_state: RelayTestState,
 }
 
 impl ByoServiceRuntime {
-    fn new(
+    pub(super) fn new(
         journal_root: &Path,
         byo_dir: &unix::ByoDirectory,
         hostname: String,
@@ -227,7 +239,59 @@ impl ByoServiceRuntime {
             last_dns_verdict: None,
             last_dns_account_uri: None,
             last_dns_check: tokio::time::Instant::now() - Duration::from_secs(120),
+            #[cfg(test)]
+            relay_test_state: RelayTestState::ManualForwarding,
         })
+    }
+
+    #[cfg(test)]
+    #[cfg_attr(not(feature = "full-tests"), allow(dead_code))]
+    pub(crate) fn set_relay_test_state(&mut self, state: RelayTestState) {
+        self.relay_test_state = state;
+    }
+
+    fn renewal_spawn_allowed(&self) -> bool {
+        #[cfg(test)]
+        match self.relay_test_state {
+            RelayTestState::ManualForwarding => true,
+            RelayTestState::RelayConfiguredNotConnected => false,
+            RelayTestState::RelayConnected => true,
+        }
+        #[cfg(not(test))]
+        true
+    }
+
+    fn spawn_acme_renewal_task(
+        &self,
+        byo_dir: &unix::ByoDirectory,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let acc_dir_clone = unix::open_byo_account_directory(byo_dir, &self.hostname).ok()?;
+        let tls_clone = Arc::clone(&self.tls_service);
+        let mut acme_shutdown = self.service_shutdown_rx.clone();
+        Some(tokio::spawn(async move {
+            let mut backoff = 30_u64;
+            loop {
+                match tls_clone
+                    .run_byo_acme_renewal(&acc_dir_clone, &mut acme_shutdown)
+                    .await
+                {
+                    Ok(()) => break,
+                    Err(_err) => {
+                        log::error!("BYO ACME renewal failed");
+                        tokio::select! {
+                            changed = acme_shutdown.changed() => {
+                                if changed.is_err() || *acme_shutdown.borrow() {
+                                    break;
+                                }
+                            }
+                            _ = tokio::time::sleep(Duration::from_secs(backoff)) => {
+                                backoff = (backoff * 2).min(3600);
+                            }
+                        }
+                    }
+                }
+            }
+        }))
     }
 
     /// Withdraw the ingress. It returns once the accept task has ended, so the
@@ -250,12 +314,12 @@ impl ByoServiceRuntime {
         }
     }
 
-    async fn stop(&mut self, byo_dir: &unix::ByoDirectory) {
+    pub(super) async fn stop(&mut self, byo_dir: &unix::ByoDirectory) {
         let _ = self.service_shutdown_tx.send(true);
         self.unbind_ingress(byo_dir).await;
     }
 
-    async fn tick_service_admission(
+    pub(super) async fn tick_service_admission(
         &mut self,
         journal_root: &Path,
         byo_dir: &unix::ByoDirectory,
@@ -362,13 +426,6 @@ impl ByoServiceRuntime {
 
         // 3. Both account and DNS are valid! Bind if not already bound.
         if self.bound_resources.is_none() {
-            let acc_dir_clone = match unix::open_byo_account_directory(byo_dir, &self.hostname) {
-                Ok(d) => d,
-                Err(_) => {
-                    self.last_dns_verdict = None;
-                    return;
-                }
-            };
             let (ingress_listener, ingress_bound) = match ingress::bind(byo_dir, journal_root) {
                 Ok(bound) => bound,
                 Err(blocker) => {
@@ -393,34 +450,6 @@ impl ByoServiceRuntime {
                     return;
                 }
             };
-
-            // ACME renewal task
-            let tls_clone = Arc::clone(&self.tls_service);
-            let mut acme_shutdown = self.service_shutdown_rx.clone();
-            let acme_task = tokio::spawn(async move {
-                let mut backoff = 30_u64;
-                loop {
-                    match tls_clone
-                        .run_byo_acme_renewal(&acc_dir_clone, &mut acme_shutdown)
-                        .await
-                    {
-                        Ok(()) => break,
-                        Err(_err) => {
-                            log::error!("BYO ACME renewal failed");
-                            tokio::select! {
-                                changed = acme_shutdown.changed() => {
-                                    if changed.is_err() || *acme_shutdown.borrow() {
-                                        break;
-                                    }
-                                }
-                                _ = tokio::time::sleep(Duration::from_secs(backoff)) => {
-                                    backoff = (backoff * 2).min(3600);
-                                }
-                            }
-                        }
-                    }
-                }
-            });
 
             // Ingress accept task
             let ingress_root = Arc::new(journal_root.to_path_buf());
@@ -479,9 +508,26 @@ impl ByoServiceRuntime {
 
             self.bound_resources = Some(ByoBoundResources {
                 ingress_task,
-                acme_task: Some(acme_task),
+                acme_task: None,
                 ingress_bound,
             });
+        }
+
+        // Single spawn site for ACME renewal:
+        // Manual forwarding spawns when ingress binds.
+        // Unconnected relay leaves acme_task as None.
+        // Connected relay on a later tick spawns then, without unbinding or rebinding ingress.
+        let should_spawn = self
+            .bound_resources
+            .as_ref()
+            .map(|b| b.acme_task.is_none())
+            .unwrap_or(false)
+            && self.renewal_spawn_allowed();
+        if should_spawn {
+            let task = self.spawn_acme_renewal_task(byo_dir);
+            if let Some(ref mut bound) = self.bound_resources {
+                bound.acme_task = task;
+            }
         }
 
         let cert_active = self.tls_service.ordinary_certificate_is_active();
@@ -1330,6 +1376,80 @@ mod full_tests {
             !cutover_path.exists(),
             "cutover socket must be unlinked on shutdown"
         );
+    }
+
+    #[tokio::test]
+    async fn relay_spawn_lifecycle_governed_by_relay_state() {
+        let _serial = BYO_TEST_SERIAL.lock().await;
+        let _guard = TestOverridesGuard;
+        let (dir, root) = test_journal();
+        let journal_path = dir.path().to_path_buf();
+        let byo_dir = unix::open_byo_directory(&root).unwrap();
+        let host = "mcp.example.com";
+        let generation = 1;
+        let acc_dir = unix::open_byo_account_directory(&byo_dir, host).unwrap();
+
+        let keypair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        unix::persist_byo_account_key(&acc_dir, &keypair.serialize_der()).unwrap();
+        unix::persist_byo_account_uri(
+            &acc_dir,
+            "https://acme-v02.api.letsencrypt.org/acme/acct/12345",
+        )
+        .unwrap();
+
+        if let Ok(mut g) = crate::byo_dns::TEST_VERDICT_OVERRIDE.write() {
+            *g = Some(DnsVerdict {
+                code: DnsVerdictCode::Admitted,
+                observed_at: Utc::now(),
+            });
+        }
+
+        {
+            let mut rt =
+                ByoServiceRuntime::new(&journal_path, &byo_dir, host.to_string(), generation)
+                    .expect("runtime");
+            assert_eq!(rt.relay_test_state, RelayTestState::ManualForwarding);
+            rt.tick_service_admission(&journal_path, &byo_dir, "mcp-endpoint/byo/ingress.sock")
+                .await;
+            let bound = rt.bound_resources.as_ref().expect("bound resources");
+            assert!(
+                bound.acme_task.is_some(),
+                "ManualForwarding must spawn ACME renewal task"
+            );
+            rt.stop(&byo_dir).await;
+        }
+
+        {
+            let mut rt =
+                ByoServiceRuntime::new(&journal_path, &byo_dir, host.to_string(), generation)
+                    .expect("runtime");
+            rt.set_relay_test_state(RelayTestState::RelayConfiguredNotConnected);
+            rt.tick_service_admission(&journal_path, &byo_dir, "mcp-endpoint/byo/ingress.sock")
+                .await;
+            let initial_ingress_id = {
+                let bound = rt.bound_resources.as_ref().expect("ingress bound");
+                assert!(
+                    bound.acme_task.is_none(),
+                    "RelayConfiguredNotConnected must not spawn ACME task"
+                );
+                bound.ingress_task.id()
+            };
+
+            rt.set_relay_test_state(RelayTestState::RelayConnected);
+            rt.tick_service_admission(&journal_path, &byo_dir, "mcp-endpoint/byo/ingress.sock")
+                .await;
+            let bound = rt.bound_resources.as_ref().expect("ingress still bound");
+            assert!(
+                bound.acme_task.is_some(),
+                "RelayConnected must spawn ACME task on later tick"
+            );
+            assert_eq!(
+                bound.ingress_task.id(),
+                initial_ingress_id,
+                "ingress task id must be unchanged (no second bind)"
+            );
+            rt.stop(&byo_dir).await;
+        }
     }
 }
 

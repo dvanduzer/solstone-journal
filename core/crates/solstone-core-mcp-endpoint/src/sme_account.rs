@@ -49,6 +49,17 @@ pub(crate) fn account_uri_has_expected_shape(uri: &str, production: bool) -> boo
     })
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
+static CUSTOM_DIRECTORY_HOST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn set_custom_directory_host(host: Option<&str>) {
+    if let Ok(mut guard) = CUSTOM_DIRECTORY_HOST.lock() {
+        *guard = host.map(str::to_string);
+    }
+}
+
 /// Load the door's account key for this environment, creating and storing one
 /// if none exists, then learn its account URL through `register`.
 pub(crate) async fn establish_account_uri<R, F>(
@@ -84,7 +95,34 @@ where
     };
     let uri = register(key).await.map_err(|_| SmeAccountError::Register)?;
     if !account_uri_has_expected_shape(&uri, production) {
-        return Err(SmeAccountError::Shape);
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            let is_custom_ok = (|| -> Option<bool> {
+                if uri.len() > 2048 {
+                    return Some(false);
+                }
+                let parsed = axum::http::Uri::try_from(uri.as_str()).ok()?;
+                if parsed.scheme_str() != Some("https") {
+                    return Some(false);
+                }
+                if parsed.authority().is_some_and(|a| a.as_str().contains('@')) {
+                    return Some(false);
+                }
+                let uri_host = parsed.host()?;
+                let guard = CUSTOM_DIRECTORY_HOST.lock().ok()?;
+                let expected_host = guard.as_ref()?;
+                Some(uri_host == expected_host)
+            })()
+            .unwrap_or(false);
+
+            if !is_custom_ok {
+                return Err(SmeAccountError::Shape);
+            }
+        }
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        {
+            return Err(SmeAccountError::Shape);
+        }
     }
     Ok(uri)
 }
@@ -259,5 +297,47 @@ mod tests {
             "https://acme-v02.api.letsencrypt.org/acme/acct/123456789012345678901",
             true
         ));
+    }
+
+    #[test]
+    fn custom_directory_account_url_shapes_under_test_hooks() {
+        struct HostGuard;
+        impl Drop for HostGuard {
+            fn drop(&mut self) {
+                set_custom_directory_host(None);
+            }
+        }
+        let _host = HostGuard;
+        let (_temp, directory) = tls_directory();
+        set_custom_directory_host(Some("custom.example"));
+
+        // Succeeded on custom host
+        let valid = runtime()
+            .block_on(establish_account_uri(&directory, true, |_| async {
+                Ok("https://custom.example/acct/42".to_string())
+            }))
+            .expect("valid custom host");
+        assert_eq!(valid, "https://custom.example/acct/42");
+
+        // Fails on different host
+        let wrong_host = runtime().block_on(establish_account_uri(&directory, true, |_| async {
+            Ok("https://other.example/acct/42".to_string())
+        }));
+        assert_eq!(wrong_host, Err(SmeAccountError::Shape));
+
+        // Fails on non-https
+        let non_https = runtime().block_on(establish_account_uri(&directory, true, |_| async {
+            Ok("http://custom.example/acct/42".to_string())
+        }));
+        assert_eq!(non_https, Err(SmeAccountError::Shape));
+
+        // Fails with userinfo
+        let userinfo = runtime().block_on(establish_account_uri(&directory, true, |_| async {
+            Ok("https://user:pass@custom.example/acct/42".to_string())
+        }));
+        assert_eq!(userinfo, Err(SmeAccountError::Shape));
+
+        // Reset
+        set_custom_directory_host(None);
     }
 }

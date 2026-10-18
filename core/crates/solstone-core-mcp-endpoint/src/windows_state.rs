@@ -43,6 +43,7 @@ const ENDPOINT_DIRECTORY: &str = "mcp-endpoint";
 const TLS_DIRECTORY: &str = "tls";
 const TLS_STATE_FILE: &str = "state.json";
 const TLS_RENEWAL_FILE: &str = "renewal.json";
+const TLS_ISSUANCE_FILE: &str = "issuance.json";
 const TLS_STAGING_ACCOUNT_FILE: &str = "account-staging.pk8";
 const TLS_PRODUCTION_ACCOUNT_FILE: &str = "account-production.pk8";
 /// `hold_lock` appends `.lock`, giving the same `.create.lock` name as Unix.
@@ -58,6 +59,7 @@ const MAX_POP_PKCS8_DER_BYTES: usize = 512;
 pub(crate) const MAX_TLS_STATE_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_TLS_ACME_ACCOUNT_BYTES: usize = 1024;
 pub(crate) const MAX_TLS_RENEWAL_BYTES: usize = 8192;
+pub(crate) const MAX_TLS_ISSUANCE_BYTES: usize = 16384;
 /// Inert on Windows beyond validation; kept equal to the Unix file mode.
 const FILE_MODE: u32 = 0o600;
 
@@ -180,6 +182,16 @@ pub(crate) fn read_tls_renewal_bytes(directory: &TlsStateDirectory) -> io::Resul
     )
 }
 
+/// Read the issuance record file bounded at 16384 bytes.
+pub(crate) fn read_tls_issuance_bytes(
+    directory: &TlsStateDirectory,
+) -> io::Result<Option<Vec<u8>>> {
+    read_bounded(
+        &directory.path.join(TLS_ISSUANCE_FILE),
+        MAX_TLS_ISSUANCE_BYTES,
+    )
+}
+
 /// Durably replace the TLS state file. A publication with any durability or
 /// final-name uncertainty is a failure.
 #[allow(dead_code)] // Called by the same-crate certificate lifecycle owner.
@@ -196,6 +208,24 @@ pub(crate) fn persist_tls_renewal_bytes(
     bytes: &[u8],
 ) -> io::Result<()> {
     persist_bounded(directory, TLS_RENEWAL_FILE, bytes, MAX_TLS_RENEWAL_BYTES)
+}
+
+/// Durably replace the issuance record file bounded at 16384 bytes.
+pub(crate) fn persist_tls_issuance_bytes(
+    directory: &TlsStateDirectory,
+    bytes: &[u8],
+) -> io::Result<()> {
+    persist_bounded(directory, TLS_ISSUANCE_FILE, bytes, MAX_TLS_ISSUANCE_BYTES)
+}
+
+/// Delete the issuance record file if present.
+pub(crate) fn delete_tls_issuance_file(directory: &TlsStateDirectory) -> io::Result<()> {
+    let p = directory.path.join(TLS_ISSUANCE_FILE);
+    match std::fs::remove_file(p) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Load the bounded ACME account key for exactly one certificate environment.

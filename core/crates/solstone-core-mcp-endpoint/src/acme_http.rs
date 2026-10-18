@@ -277,6 +277,32 @@ pub fn parse_retry_after(header: Option<&str>, now_unix: i64) -> AriRetry {
     }
 }
 
+/// Parse an RFC 9110 `Retry-After` header value for ACME issuance.
+///
+/// Unlike the ARI refresh parser (which caps at 24 hours), issuance Retry-After
+/// may specify a multi-day delay or HTTP-date. Only an absurd value above 30 days
+/// is capped.
+///
+/// Returns `Some(retry_at_unix)` if a valid delta-seconds or HTTP-date was provided.
+/// Missing or malformed values return `None` (calling code falls back to 30s..3600s doubling).
+pub fn parse_issuance_retry_after(header: Option<&str>, now_unix: i64) -> Option<i64> {
+    const MIN_DELAY: i64 = 1;
+    const MAX_DELAY: i64 = 30 * 86400; // 30 days
+
+    let s = header.map(str::trim).filter(|s| !s.is_empty())?;
+    let delay = if let Ok(secs) = s.parse::<u64>() {
+        i64::try_from(secs).unwrap_or(MAX_DELAY)
+    } else if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(s) {
+        let target = dt.timestamp();
+        target.saturating_sub(now_unix)
+    } else {
+        return None;
+    };
+
+    let clamped = delay.clamp(MIN_DELAY, MAX_DELAY);
+    Some(now_unix.saturating_add(clamped))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,5 +354,53 @@ mod tests {
         let r = parse_retry_after(Some(&date_str), now);
         assert_eq!(r.delay_seconds, 1);
         assert_eq!(r.retry_at, now + 1);
+    }
+
+    #[test]
+    fn parse_issuance_retry_after_handles_all_prescribed_shapes() {
+        let now = 1_700_000_000_i64;
+
+        // Missing or malformed returns None
+        assert_eq!(parse_issuance_retry_after(None, now), None);
+        assert_eq!(parse_issuance_retry_after(Some("   "), now), None);
+        assert_eq!(parse_issuance_retry_after(Some("not-a-number"), now), None);
+
+        // Delta-seconds within bounds
+        assert_eq!(
+            parse_issuance_retry_after(Some("120"), now),
+            Some(now + 120)
+        );
+
+        // Minimum clamp (0s -> 1s)
+        assert_eq!(parse_issuance_retry_after(Some("0"), now), Some(now + 1));
+
+        // Multi-day delta (10 days) is NOT capped at 24h
+        assert_eq!(
+            parse_issuance_retry_after(Some("864000"), now),
+            Some(now + 864000)
+        );
+
+        // Absurd delta (> 30 days) is capped at 30 days
+        let thirty_days = 30 * 86400;
+        assert_eq!(
+            parse_issuance_retry_after(Some("3456000"), now),
+            Some(now + thirty_days)
+        );
+
+        // Valid RFC 2822 HTTP-date (7 days in future)
+        let future_dt = chrono::DateTime::from_timestamp(now + 7 * 86400, 0).unwrap();
+        let date_str = future_dt.to_rfc2822();
+        assert_eq!(
+            parse_issuance_retry_after(Some(&date_str), now),
+            Some(now + 7 * 86400)
+        );
+
+        // HTTP-date in the past -> clamped to 1s
+        let past_dt = chrono::DateTime::from_timestamp(now - 300, 0).unwrap();
+        let date_str = past_dt.to_rfc2822();
+        assert_eq!(
+            parse_issuance_retry_after(Some(&date_str), now),
+            Some(now + 1)
+        );
     }
 }

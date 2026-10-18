@@ -32,6 +32,7 @@ const ENDPOINT_DIRECTORY: &str = "mcp-endpoint";
 const TLS_DIRECTORY: &str = "tls";
 const TLS_STATE_FILE: &str = "state.json";
 const TLS_RENEWAL_FILE: &str = "renewal.json";
+const TLS_ISSUANCE_FILE: &str = "issuance.json";
 const TLS_STAGING_ACCOUNT_FILE: &str = "account-staging.pk8";
 const TLS_PRODUCTION_ACCOUNT_FILE: &str = "account-production.pk8";
 const CREATE_LOCK: &str = ".create.lock";
@@ -43,6 +44,7 @@ const POP_PKCS8_READ_LIMIT: u64 = MAX_POP_PKCS8_DER_BYTES + 1;
 pub(crate) const MAX_TLS_STATE_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_TLS_ACME_ACCOUNT_BYTES: usize = 1024;
 pub(crate) const MAX_TLS_RENEWAL_BYTES: usize = 8192;
+pub(crate) const MAX_TLS_ISSUANCE_BYTES: usize = 16384;
 
 const DIRECTORY_OPEN_FLAGS: OFlag = OFlag::O_RDONLY
     .union(OFlag::O_DIRECTORY)
@@ -239,6 +241,17 @@ pub(crate) fn read_tls_renewal_bytes(directory: &TlsStateDirectory) -> io::Resul
         directory,
         OsStr::new(TLS_RENEWAL_FILE),
         MAX_TLS_RENEWAL_BYTES,
+    )
+}
+
+/// Read the issuance record file bounded at 16384 bytes.
+pub(crate) fn read_tls_issuance_bytes(
+    directory: &TlsStateDirectory,
+) -> io::Result<Option<Vec<u8>>> {
+    read_tls_named_bytes(
+        directory,
+        OsStr::new(TLS_ISSUANCE_FILE),
+        MAX_TLS_ISSUANCE_BYTES,
     )
 }
 
@@ -602,6 +615,31 @@ pub(crate) fn persist_tls_renewal_bytes(
         bytes,
         MAX_TLS_RENEWAL_BYTES,
     )
+}
+
+/// Persist the issuance record file bounded at 16384 bytes.
+pub(crate) fn persist_tls_issuance_bytes(
+    directory: &TlsStateDirectory,
+    bytes: &[u8],
+) -> io::Result<()> {
+    persist_tls_named_bytes(
+        directory,
+        OsStr::new(TLS_ISSUANCE_FILE),
+        bytes,
+        MAX_TLS_ISSUANCE_BYTES,
+    )
+}
+
+/// Delete the issuance record file if present.
+pub(crate) fn delete_tls_issuance_file(directory: &TlsStateDirectory) -> io::Result<()> {
+    match nix::unistd::unlinkat(
+        &directory.file,
+        OsStr::new(TLS_ISSUANCE_FILE),
+        nix::unistd::UnlinkatFlags::NoRemoveDir,
+    ) {
+        Ok(()) | Err(Errno::ENOENT) => Ok(()),
+        Err(e) => Err(errno_error(e)),
+    }
 }
 
 fn persist_tls_named_bytes(
