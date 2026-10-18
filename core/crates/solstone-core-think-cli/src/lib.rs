@@ -14,6 +14,7 @@ mod args;
 mod cadence;
 mod cadence_state;
 mod context;
+pub use context::{CortexBoundary, DispatchFailure, IndexBoundary, ThinkContext};
 mod daily;
 mod daily_lifecycle;
 mod day;
@@ -24,6 +25,7 @@ mod gate;
 mod helpers;
 mod objects;
 mod phase_process;
+pub mod planner;
 mod repair;
 mod retry;
 mod run_log;
@@ -414,224 +416,17 @@ where
             event_clock,
         )
         .map_err(|message| CliError::InvalidDay { message })?;
-        if parsed.dry_run {
-            return Ok(CliRun {
-                stdout: dry_run::run(&context, &parsed, default_segment_workers)
-                    .map_err(|message| CliError::InvalidDay { message })?,
-                stderr: String::new(),
-                exit_code: 0,
-            });
-        }
-        let timeout = (!parsed.no_timeout).then_some(std::time::Duration::from_secs(610));
-        if parsed.cadence {
-            let configs = cadence::configured(&context)
-                .map_err(|message| CliError::InvalidDay { message })?;
-            // `thinking.py:2969-2972` returns before creating the cadence sidecar
-            // when no cadence talent is configured.
-            if configs.is_empty() {
-                return Ok(CliRun {
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    exit_code: 0,
-                });
-            }
-            let (mut log, run) = open_run_log(&parsed, journal, now_ms, &selected_day);
-            let result = cadence::run(&context, configs, &mut log, parsed.refresh);
-            return logged_mode_outcome(log, run, result);
-        }
-
-        if let Some(id) = parsed.retry_unit.as_deref() {
-            let (mut log, run) = open_run_log(&parsed, journal, now_ms, &selected_day);
-            let result = retry::run(
-                &context,
-                &mut log,
-                id,
-                parsed
-                    .retry_cause
-                    .as_deref()
-                    .expect("validated retry cause"),
-                sense_child_environment,
-            );
-            return logged_mode_outcome(log, run, result);
-        }
-        if let Some(activity_id) = parsed.activity.as_deref() {
-            let (mut log, run) = open_run_log(&parsed, journal, now_ms, &selected_day);
-            let result = activity::run(
-                &context,
-                &mut log,
-                activity_id,
-                parsed.facet.as_deref().expect("validated activity facet"),
-                parsed.refresh,
-                parsed.reactivate,
-                parsed.jobs,
-            );
-            // Another run holds this activity's work: the run that recorded
-            // it, or a retry already under way. That run finishes the work or
-            // leaves it recorded, so there is nothing to do here.
-            let result = match result {
-                Err(error) if error == activity_work::CLAIMED => {
-                    Ok(dispatch::ModeResult::default())
-                }
-                result => result,
-            };
-            return logged_mode_outcome(log, run, result);
-        }
-        if parsed.flush {
-            let (mut log, run) = open_run_log(&parsed, journal, now_ms, &selected_day);
-            let result = flush::run(
-                &context,
-                &mut log,
-                parsed.segment.as_deref().expect("validated flush segment"),
-                parsed.stream.as_deref(),
-                parsed.jobs,
-                parsed.no_activity_prompts,
-            );
-            return logged_mode_outcome(log, run, result);
-        }
-        if parsed.settle {
-            let (mut log, run) = open_run_log(&parsed, journal, now_ms, &selected_day);
-            let result = settle::run(
-                &context,
-                &mut log,
-                parsed.stream.as_deref(),
-                parsed.jobs,
-                parsed.no_activity_prompts,
-            );
-            return logged_mode_outcome(log, run, result);
-        }
-        if parsed.segments {
-            let (mut log, run) = open_run_log(&parsed, journal, now_ms, &selected_day);
-            let source = solstone_core_system_health::FilesystemSegmentSource;
-            let segments: Vec<(String, Option<String>)> =
-                match solstone_core_system_health::scan_day(
-                    &source,
-                    &context.journal,
-                    &context.day,
-                    chrono::Utc::now(),
-                ) {
-                    Ok((_, _, entries)) => entries
-                        .into_iter()
-                        .map(|entry| (entry.key, Some(entry.stream)))
-                        .collect(),
-                    Err(error) => return logged_mode_outcome(log, run, Err(error.to_string())),
-                };
-            let skip_talents = parsed
-                .skip_talents
-                .split(',')
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-                .collect::<Vec<_>>();
-            let workers =
-                usize::try_from(parsed.segment_workers.unwrap_or(
-                    i64::try_from(default_segment_workers).expect("worker count fits i64"),
-                ))
-                .expect("validated segment workers");
-            let result = segment::run_repair_batch_with_activity(
-                &context,
-                &mut log,
-                segments.clone(),
-                parsed.refresh,
-                parsed.jobs,
-                workers,
-                timeout,
-                skip_talents,
-                parsed.no_activity_prompts,
-                segment::CurrentSegment::Rethink,
-            );
-            return logged_mode_outcome(log, run, result);
-        }
-        if let Some(segment) = parsed.segment.as_deref() {
-            let (mut log, run) = open_run_log(&parsed, journal, now_ms, &selected_day);
-            if parsed.repair_segment {
-                let result = repair::run(
-                    &context,
-                    &mut log,
-                    &parsed,
-                    timeout,
-                    sense_child_environment,
-                );
-                return logged_mode_outcome(log, run, result);
-            }
-            let skip_talents = parsed
-                .skip_talents
-                .split(',')
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-                .collect::<Vec<_>>();
-            // Source-derived, not measured: thinking.py:4709 gives the
-            // direct segment path its sole optional overall deadline.
-            let result = segment::run(
-                &context,
-                &mut log,
-                segment,
-                parsed.refresh,
-                parsed.stream.as_deref(),
-                parsed.jobs,
-                timeout,
-                parsed.live,
-                &skip_talents,
-            );
-            // Direct and live runs share the ordered live-state tail. Older
-            // coordinates are thought without advancing that stream's state.
-            let result = result.map(|mut result| {
-                if let Err(error) = segment::replay_activity_state(
-                    &context,
-                    &mut log,
-                    &[(segment.to_owned(), parsed.stream.clone())],
-                    parsed.refresh,
-                    parsed.jobs,
-                    parsed.no_activity_prompts,
-                    true,
-                ) {
-                    dispatch::record_followup_failure(&mut result, "activity replay", &error);
-                }
-                result
-            });
-            return logged_mode_outcome(log, run, result);
-        }
-        let (mut log, run) = open_run_log(&parsed, journal, now_ms, &selected_day);
-        if let Some(id) = &parsed.work_intent
-            && let Err(error) =
-                solstone_core_system::work_intent::claim_from_scratch(journal, &selected_day, id)
-        {
-            return logged_mode_outcome(log, run, Err(error));
-        }
-        let result = if parsed.weekly {
-            weekly::run(
-                &context,
-                &mut log,
-                parsed.refresh,
-                parsed.stream.as_deref(),
-                parsed.jobs,
-            )
-        } else {
-            daily_lifecycle::run(
-                &context,
-                &mut log,
-                &parsed,
-                default_segment_workers,
-                timeout,
-                sense_child_environment,
-            )
-        };
-        let outcome = logged_mode_outcome(log, run, result);
-        if let Some(id) = &parsed.work_intent {
-            let success = outcome.as_ref().is_ok_and(|run| run.exit_code == 0);
-            if let Err(error) = solstone_core_system::work_intent::finish_from_scratch(
-                journal,
-                &selected_day,
-                id,
-                success,
-            ) {
-                return Ok(CliRun {
-                    stdout: String::new(),
-                    stderr: format!("could not record reprocess outcome: {error}\n"),
-                    exit_code: 1,
-                });
-            }
-        }
-        outcome
+        execute_parsed_command(
+            &context,
+            &parsed,
+            default_segment_workers,
+            sense_child_environment,
+        )
     })();
+    format_cli_run(result)
+}
+
+fn format_cli_run(result: Result<CliRun, CliError>) -> CliRun {
     match result {
         Ok(run) => run,
         Err(CliError::Usage { message }) => CliRun {
@@ -655,6 +450,283 @@ where
             exit_code: 1,
         },
     }
+}
+
+pub fn run_hosted_command(
+    context: &ThinkContext,
+    raw_args: &[String],
+    sense_child_environment: &solstone_core_system::process::ChildLaunchContext,
+) -> CliRun {
+    let result = (|| {
+        let parsed = match args::parse(raw_args).map_err(|message| CliError::Usage { message })? {
+            args::ParseOutcome::Help => {
+                return Ok(CliRun {
+                    stdout: THINK_USAGE.to_owned(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                });
+            }
+            args::ParseOutcome::Args(parsed) => parsed,
+        };
+        let (uses_local, endpoint) =
+            solstone_core_journal_config::read_journal_config(&context.journal)
+                .ok()
+                .and_then(|read| read.config)
+                .map(|config| {
+                    let uses_local = config
+                        .get("providers")
+                        .and_then(serde_json::Value::as_object)
+                        .and_then(|providers| providers.get("active"))
+                        .and_then(serde_json::Value::as_object)
+                        .and_then(|active| active.get("provider"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("local");
+                    (uses_local, resolve_local_endpoint(&config))
+                })
+                .unwrap_or((false, LocalEndpointResolution::Bundled));
+        let cpu_count = std::thread::available_parallelism()
+            .ok()
+            .map(|count| count.get());
+        let bundled_slots = workers::bundled_slots(&context.journal);
+        let default_segment_workers = workers::default_segment_workers(
+            cpu_count,
+            uses_local,
+            endpoint.clone(),
+            bundled_slots,
+        );
+        validate(&parsed, cpu_count, uses_local, endpoint, bundled_slots)?;
+        execute_parsed_command(
+            context,
+            &parsed,
+            default_segment_workers,
+            sense_child_environment,
+        )
+    })();
+    format_cli_run(result)
+}
+
+fn execute_parsed_command(
+    context: &ThinkContext,
+    parsed: &args::ThinkArgs,
+    default_segment_workers: usize,
+    sense_child_environment: &solstone_core_system::process::ChildLaunchContext,
+) -> Result<CliRun, CliError> {
+    if parsed.dry_run {
+        return Ok(CliRun {
+            stdout: dry_run::run(context, parsed, default_segment_workers)
+                .map_err(|message| CliError::InvalidDay { message })?,
+            stderr: String::new(),
+            exit_code: 0,
+        });
+    }
+    let timeout = (!parsed.no_timeout).then_some(std::time::Duration::from_secs(610));
+    if parsed.cadence {
+        let configs =
+            cadence::configured(context).map_err(|message| CliError::InvalidDay { message })?;
+        // `thinking.py:2969-2972` returns before creating the cadence sidecar
+        // when no cadence talent is configured.
+        if configs.is_empty() {
+            return Ok(CliRun {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+            });
+        }
+        let (mut log, run) = open_run_log(parsed, &context.journal, context.now_ms, &context.day);
+        let result = cadence::run(context, configs, &mut log, parsed.refresh);
+        return logged_mode_outcome(log, run, result);
+    }
+
+    if let Some(id) = parsed.retry_unit.as_deref() {
+        let (mut log, run) = open_run_log(parsed, &context.journal, context.now_ms, &context.day);
+        let result = retry::run(
+            context,
+            &mut log,
+            id,
+            parsed
+                .retry_cause
+                .as_deref()
+                .expect("validated retry cause"),
+            sense_child_environment,
+        );
+        return logged_mode_outcome(log, run, result);
+    }
+    if let Some(activity_id) = parsed.activity.as_deref() {
+        let (mut log, run) = open_run_log(parsed, &context.journal, context.now_ms, &context.day);
+        let result = activity::run(
+            context,
+            &mut log,
+            activity_id,
+            parsed.facet.as_deref().expect("validated activity facet"),
+            parsed.refresh,
+            parsed.reactivate,
+            parsed.jobs,
+        );
+        // Another run holds this activity's work: the run that recorded
+        // it, or a retry already under way. That run finishes the work or
+        // leaves it recorded, so there is nothing to do here.
+        let result = match result {
+            Err(error) if error == activity_work::CLAIMED => Ok(dispatch::ModeResult::default()),
+            result => result,
+        };
+        return logged_mode_outcome(log, run, result);
+    }
+    if parsed.flush {
+        let (mut log, run) = open_run_log(parsed, &context.journal, context.now_ms, &context.day);
+        let result = flush::run(
+            context,
+            &mut log,
+            parsed.segment.as_deref().expect("validated flush segment"),
+            parsed.stream.as_deref(),
+            parsed.jobs,
+            parsed.no_activity_prompts,
+        );
+        return logged_mode_outcome(log, run, result);
+    }
+    if parsed.settle {
+        let (mut log, run) = open_run_log(parsed, &context.journal, context.now_ms, &context.day);
+        let result = settle::run(
+            context,
+            &mut log,
+            parsed.stream.as_deref(),
+            parsed.jobs,
+            parsed.no_activity_prompts,
+        );
+        return logged_mode_outcome(log, run, result);
+    }
+    if parsed.segments {
+        let (mut log, run) = open_run_log(parsed, &context.journal, context.now_ms, &context.day);
+        let source = solstone_core_system_health::FilesystemSegmentSource;
+        let segments: Vec<(String, Option<String>)> = match solstone_core_system_health::scan_day(
+            &source,
+            &context.journal,
+            &context.day,
+            chrono::Utc::now(),
+        ) {
+            Ok((_, _, entries)) => entries
+                .into_iter()
+                .map(|entry| (entry.key, Some(entry.stream)))
+                .collect(),
+            Err(error) => return logged_mode_outcome(log, run, Err(error.to_string())),
+        };
+        let skip_talents = parsed
+            .skip_talents
+            .split(',')
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let workers = usize::try_from(
+            parsed
+                .segment_workers
+                .unwrap_or(i64::try_from(default_segment_workers).expect("worker count fits i64")),
+        )
+        .expect("validated segment workers");
+        let result = segment::run_repair_batch_with_activity(
+            context,
+            &mut log,
+            segments.clone(),
+            parsed.refresh,
+            parsed.jobs,
+            workers,
+            timeout,
+            skip_talents,
+            parsed.no_activity_prompts,
+            segment::CurrentSegment::Rethink,
+        );
+        return logged_mode_outcome(log, run, result);
+    }
+    if let Some(segment) = parsed.segment.as_deref() {
+        let (mut log, run) = open_run_log(parsed, &context.journal, context.now_ms, &context.day);
+        if parsed.repair_segment {
+            let result = repair::run(context, &mut log, parsed, timeout, sense_child_environment);
+            return logged_mode_outcome(log, run, result);
+        }
+        let skip_talents = parsed
+            .skip_talents
+            .split(',')
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        // Source-derived, not measured: thinking.py:4709 gives the
+        // direct segment path its sole optional overall deadline.
+        let result = segment::run(
+            context,
+            &mut log,
+            segment,
+            parsed.refresh,
+            parsed.stream.as_deref(),
+            parsed.jobs,
+            timeout,
+            parsed.live,
+            &skip_talents,
+        );
+        // Direct and live runs share the ordered live-state tail. Older
+        // coordinates are thought without advancing that stream's state.
+        let result = result.map(|mut result| {
+            if let Err(error) = context.checkpoint() {
+                dispatch::record_followup_failure(&mut result, "activity replay", &error);
+                return result;
+            }
+            if let Err(error) = segment::replay_activity_state(
+                context,
+                &mut log,
+                &[(segment.to_owned(), parsed.stream.clone())],
+                parsed.refresh,
+                parsed.jobs,
+                parsed.no_activity_prompts,
+                true,
+            ) {
+                dispatch::record_followup_failure(&mut result, "activity replay", &error);
+            }
+            result
+        });
+        return logged_mode_outcome(log, run, result);
+    }
+    let (mut log, run) = open_run_log(parsed, &context.journal, context.now_ms, &context.day);
+    if let Some(id) = &parsed.work_intent
+        && let Err(error) = solstone_core_system::work_intent::claim_from_scratch(
+            &context.journal,
+            &context.day,
+            id,
+        )
+    {
+        return logged_mode_outcome(log, run, Err(error));
+    }
+    let result = if parsed.weekly {
+        weekly::run(
+            context,
+            &mut log,
+            parsed.refresh,
+            parsed.stream.as_deref(),
+            parsed.jobs,
+        )
+    } else {
+        daily_lifecycle::run(
+            context,
+            &mut log,
+            parsed,
+            default_segment_workers,
+            timeout,
+            sense_child_environment,
+        )
+    };
+    let outcome = logged_mode_outcome(log, run, result);
+    if let Some(id) = &parsed.work_intent {
+        let success = outcome.as_ref().is_ok_and(|run| run.exit_code == 0);
+        if let Err(error) = solstone_core_system::work_intent::finish_from_scratch(
+            &context.journal,
+            &context.day,
+            id,
+            success,
+        ) {
+            return Ok(CliRun {
+                stdout: String::new(),
+                stderr: format!("could not record reprocess outcome: {error}\n"),
+                exit_code: 1,
+            });
+        }
+    }
+    outcome
 }
 
 fn mode_outcome(result: dispatch::ModeResult) -> CliRun {

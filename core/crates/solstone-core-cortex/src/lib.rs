@@ -12,8 +12,8 @@ mod storage;
 
 pub use embedded_renewal::EmbeddedSppRenewal;
 pub use service::{
-    CortexOptions, CortexServiceError, ShutdownMode, run_native_service,
-    run_native_service_with_hosted_parent, run_until,
+    CallableCortex, CallableRoots, CallableUse, CortexOptions, CortexServiceError, ShutdownMode,
+    execute_callable_request, run_native_service, run_native_service_with_hosted_parent, run_until,
 };
 
 // Gated on `test-hooks` as well as `test` so `tests/cortex_child_supervisor.rs`

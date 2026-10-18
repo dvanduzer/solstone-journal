@@ -18,6 +18,12 @@ struct ServingInstance {
     handle: Option<journal_mobile_serving::MobileServing>,
     retirement: Option<retirement::Retirement>,
     root: std::sync::Arc<jio::JournalRoot>,
+    host: Option<journal_mobile_serving::foreground::ForegroundProcessingHost>,
+}
+
+struct RetiringServing {
+    handle: journal_mobile_serving::MobileServing,
+    host: Option<journal_mobile_serving::foreground::ForegroundProcessingHost>,
 }
 
 impl ServingInstance {
@@ -29,15 +35,23 @@ impl ServingInstance {
             .handle
             .take()
             .ok_or("server stop failed; journal retained")?;
-        match retirement::Retirement::start(handle, std::sync::Arc::clone(&self.root), |owner| {
-            owner.shutdown_for_retirement().map_err(|_| ())
+        let owner = RetiringServing {
+            handle,
+            host: self.host.take(),
+        };
+        match retirement::Retirement::start(owner, std::sync::Arc::clone(&self.root), |owner| {
+            if let Some(host) = &owner.host {
+                host.shutdown().map_err(|_| ())?;
+            }
+            owner.handle.shutdown_for_retirement().map_err(|_| ())
         }) {
             Ok(retirement) => {
                 self.retirement = Some(retirement);
                 Ok(())
             }
-            Err(handle) => {
-                self.handle = Some(handle);
+            Err(owner) => {
+                self.handle = Some(owner.handle);
+                self.host = owner.host;
                 Err("could not start server retirement; journal retained".into())
             }
         }
@@ -47,10 +61,15 @@ impl ServingInstance {
             .as_ref()
             .ok_or_else(|| "server stop pending".into())
     }
-    fn handle_mut(&mut self) -> Result<&mut journal_mobile_serving::MobileServing, String> {
-        self.handle
-            .as_mut()
-            .ok_or_else(|| "server stop pending".into())
+    fn status(&self) -> Result<Value, String> {
+        let mut status = self.handle()?.status();
+        if let Some(host) = self.host.as_ref() {
+            status["audio"] = host.audio_status();
+            if host.failed() {
+                status["failed"] = json!(true);
+            }
+        }
+        Ok(status)
     }
 }
 
@@ -58,8 +77,18 @@ static SERVING: std::sync::Mutex<Option<ServingInstance>> = std::sync::Mutex::ne
 static SERVING_STOP: std::sync::Mutex<Option<journal_mobile_serving::MobileServingStop>> =
     std::sync::Mutex::new(None);
 
+static PROCESSING_STOP: std::sync::Mutex<Option<std::sync::Arc<AtomicBool>>> =
+    std::sync::Mutex::new(None);
+
 fn request_serving_stop() {
     close_thinking_admission(&THINKING_GENERATION);
+    let processing_stop = PROCESSING_STOP
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    if let Some(stop) = processing_stop {
+        stop.store(true, Ordering::Release);
+    }
     let stop = SERVING_STOP
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -238,6 +267,9 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
             // Rebind observes the same live owner; it cannot reopen a stopping lifetime.
             admitted_generation(&command, &THINKING_GENERATION)?;
             if let Some(current) = server.as_ref() {
+                if current.host.as_ref().is_some_and(|host| host.failed()) {
+                    return Err("server stop failed; journal retained".into());
+                }
                 let handle = current.handle()?;
                 if generation & 1 != 0 || handle.stop_handle().is_stopping() {
                     return Err("server stop pending".into());
@@ -251,7 +283,7 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
                 {
                     return Err("thinking journal does not match the serving journal".into());
                 }
-                let status = handle.status();
+                let status = current.status()?;
                 if command["address"]
                     .as_str()
                     .and_then(|address| address.parse().ok())
@@ -273,6 +305,10 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
             ort::init_from(library).map_err(|e| e.to_string())?.commit();
             let binding =
                 std::sync::Arc::new(jio::JournalRoot::open(root).map_err(|e| e.to_string())?);
+            let payload_dir = root
+                .parent()
+                .ok_or("app directory missing")?
+                .join("journal-payload");
             let handle =
                 match journal_mobile_serving::MobileServing::start_with_payload_for_retirement_observed(
                     root.to_path_buf(),
@@ -301,6 +337,7 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
                                 handle: Some(*owner),
                                 retirement: None,
                                 root: binding,
+                                host: None,
                             };
                             let _ = current.begin_retirement();
                             *server = Some(current);
@@ -309,10 +346,41 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
                     }
                 };
             *SERVING_STOP.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle.stop_handle());
+            let processing_stop = std::sync::Arc::new(AtomicBool::new(false));
+            *PROCESSING_STOP.lock().unwrap_or_else(|p| p.into_inner()) =
+                Some(std::sync::Arc::clone(&processing_stop));
+            let mut host = match journal_mobile_serving::foreground::ForegroundProcessingHost::open_with_cancellation(
+                std::sync::Arc::clone(&binding), &payload_dir,
+                std::sync::Arc::new(move || THINKING_GENERATION.load(Ordering::SeqCst) & !1 != generation & !1),
+                processing_stop,
+            ) {
+                Ok(host) => host,
+                Err(error) => {
+                    let mut current = ServingInstance {
+                        handle: Some(handle), retirement: None, root: binding, host: None,
+                    };
+                    let _ = current.begin_retirement();
+                    *server = Some(current);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = host.start_workers() {
+                let mut current = ServingInstance {
+                    handle: Some(handle),
+                    retirement: None,
+                    root: binding,
+                    host: Some(host),
+                };
+                let _ = current.begin_retirement();
+                *server = Some(current);
+                return Err(error);
+            }
+
             *server = Some(ServingInstance {
                 handle: Some(handle),
                 retirement: None,
                 root: binding,
+                host: Some(host),
             });
             if !open_thinking_admission(&THINKING_GENERATION, generation) {
                 let current = server.as_mut().unwrap();
@@ -320,7 +388,7 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
                 current.begin_retirement()?;
                 return Err("stop requested during startup; journal retained".into());
             }
-            Ok(server.as_ref().unwrap().handle()?.status())
+            server.as_ref().unwrap().status()
         }
         "stop" => {
             if let Some(current) = server.as_mut() {
@@ -376,7 +444,7 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
                     "failed":retirement::inspect() == retirement::Outcome::Failed,
                     "root_current":current.root.revalidate_canonical_binding().is_ok()}))
             } else {
-                Ok(current.handle()?.status())
+                current.status()
             }
         }
         "index" => server.as_ref().ok_or("server stopped")?.handle()?.index(),
@@ -409,35 +477,34 @@ fn serving(root: &Path, command: &str) -> Result<Value, String> {
                 return Err("thinking journal does not match the serving journal".into());
             }
             let files = root.parent().ok_or("app files missing")?;
-            server
-                .as_mut()
-                .ok_or("server stopped")?
-                .handle_mut()?
-                .enable_audio_with_cancellation(
-                    files.join("audio-models"),
-                    files.join("audio-models/tdt-0.6b-v3-q8_0.gguf"),
-                    files.join("audio-scratch"),
-                    std::sync::Arc::new(move || {
-                        THINKING_GENERATION.load(Ordering::SeqCst) != generation
-                    }),
-                )?;
-            Ok(server.as_ref().unwrap().handle()?.status())
+            let host = current
+                .host
+                .as_ref()
+                .ok_or("foreground processing stopped")?;
+            host.enable_audio(
+                files.join("audio-models"),
+                files.join("audio-models/tdt-0.6b-v3-q8_0.gguf"),
+                files.join("audio-scratch"),
+            )?;
+            current.status()
         }
         "audio-cancel" => {
-            server
+            let current = server.as_ref().ok_or("server stopped")?;
+            let host = current
+                .host
                 .as_ref()
-                .ok_or("server stopped")?
-                .handle()?
-                .cancel_audio()?;
-            Ok(json!({"cancel_requested":true}))
+                .ok_or("foreground processing stopped")?;
+            host.cancel_audio();
+            Ok(json!({"cancel_requested": true}))
         }
         "audio-resume" => {
-            server
+            let current = server.as_ref().ok_or("server stopped")?;
+            let host = current
+                .host
                 .as_ref()
-                .ok_or("server stopped")?
-                .handle()?
-                .resume_audio()?;
-            Ok(json!({"resumed":true}))
+                .ok_or("foreground processing stopped")?;
+            host.resume_audio();
+            Ok(json!({"resumed": true}))
         }
         "owner" => {
             let response = server

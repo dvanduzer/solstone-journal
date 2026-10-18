@@ -96,4 +96,4 @@ pub use wire::{
     CallosumStoppedReason, TokioRetrySource, request_local_inference_snapshot,
     request_local_inference_snapshot_sync,
 };
-pub use writer::{CallosumWriteError, append_durable_event};
+pub use writer::{CallosumWriteError, append_durable_event, append_durable_event_checked};

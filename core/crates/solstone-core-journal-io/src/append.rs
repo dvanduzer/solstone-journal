@@ -57,11 +57,20 @@ pub fn append_jsonl_no_follow<T: Serialize>(
     path: impl AsRef<Path>,
     record: &T,
 ) -> Result<(), AppendError> {
+    append_jsonl_no_follow_checked(path, record, &|| Ok(()))
+}
+
+#[cfg(any(unix, windows))]
+pub fn append_jsonl_no_follow_checked<T: Serialize>(
+    path: impl AsRef<Path>,
+    record: &T,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), AppendError> {
     let path = path.as_ref();
     let mut contents = serde_json::to_vec(record)
         .map_err(|source| io_error(path, io::Error::new(io::ErrorKind::InvalidData, source)))?;
     contents.push(b'\n');
-    append_record_no_follow(path, &contents)
+    append_record_no_follow(path, &contents, checkpoint)
 }
 
 #[cfg(unix)]
@@ -112,7 +121,16 @@ fn write_and_sync(path: &Path, mut file: fs::File, contents: &[u8]) -> Result<()
     Ok(())
 }
 
-fn append_record_no_follow(path: &Path, contents: &[u8]) -> Result<(), AppendError> {
+fn append_record_no_follow(
+    path: &Path,
+    contents: &[u8],
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), AppendError> {
+    let check = || {
+        checkpoint()
+            .map_err(|detail| io_error(path, io::Error::new(io::ErrorKind::Interrupted, detail)))
+    };
+    check()?;
     // A newly created file's directory entry is made durable too, as `append_record`
     // does. `symlink_metadata` does not follow the leaf, so a link is not "new".
     #[cfg(unix)]
@@ -121,6 +139,7 @@ fn append_record_no_follow(path: &Path, contents: &[u8]) -> Result<(), AppendErr
         Err(error) if error.kind() == io::ErrorKind::NotFound
     );
     let file = open_no_follow(path).map_err(|source| io_error(path, source))?;
+    check()?;
     write_and_sync(path, file, contents)?;
     #[cfg(unix)]
     if is_new {

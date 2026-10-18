@@ -29,7 +29,12 @@ mod backup;
 mod brain;
 
 #[cfg(feature = "audio")]
-mod audio;
+pub(crate) mod audio;
+
+#[cfg(any(feature = "audio", feature = "processing"))]
+mod custody;
+#[cfg(feature = "processing")]
+pub mod foreground;
 
 pub struct OwnerResponse {
     pub status: u16,

@@ -41,7 +41,8 @@ pub use crate::queue_hold::{
     RootObservation, evaluate_hold_proof, verdict_after_owner_recheck,
 };
 use crate::queue_hold::{HoldPrelude, QueueHoldReason, QueueHoldStatus};
-use crate::request::{ActiveTaskSnapshot, DailyCatchupProvenance, ExecutionRequest};
+pub use crate::request::ExecutionRequest;
+use crate::request::{ActiveTaskSnapshot, DailyCatchupProvenance};
 
 /// The byte-identical Python status label consumed downstream for deadline termination.
 pub const TIMEOUT_EXIT_STATUS: &str = "timeout";
@@ -737,6 +738,30 @@ pub struct TaskQueue {
     inner: Arc<QueueInner>,
 }
 
+#[derive(Clone)]
+pub struct CallableTaskContext {
+    pub cancelled: Arc<std::sync::atomic::AtomicBool>,
+    pub priority: WorkPriority,
+    pub deadline: Instant,
+}
+impl CallableTaskContext {
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Acquire) || Instant::now() >= self.deadline
+    }
+}
+pub type CallableQueueWorker = Arc<dyn Fn(&[String], CallableTaskContext) -> i32 + Send + Sync>;
+
+pub type CallableAdmission = Arc<dyn Fn(&[String]) -> bool + Send + Sync>;
+
+struct CallableTaskHandle {
+    #[cfg(all(test, feature = "full-tests"))]
+    reference: String,
+    stop_flag: Arc<std::sync::atomic::AtomicBool>,
+    worker: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
+    observer: Option<thread::JoinHandle<()>>,
+    joined: Arc<std::sync::atomic::AtomicBool>,
+}
+
 struct QueueInner {
     options: QueueOptions,
     #[cfg(test)]
@@ -760,6 +785,11 @@ struct QueueInner {
     worker_threads_changed: Condvar,
     #[cfg(test)]
     held_persist_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    callable_worker: Option<CallableQueueWorker>,
+    callable_admission: Option<CallableAdmission>,
+    callable_workers: Mutex<Vec<CallableTaskHandle>>,
+    callable_join_failed: Arc<std::sync::atomic::AtomicBool>,
+    callable_panics: Arc<Mutex<Vec<Box<dyn std::any::Any + Send>>>>,
 }
 
 impl QueueInner {
@@ -1030,6 +1060,26 @@ fn insert_loaded_record(
 
 impl TaskQueue {
     pub fn new(options: TaskQueueOptions) -> Self {
+        Self::construct(options, None, None)
+    }
+
+    pub fn with_callable_worker(options: TaskQueueOptions, worker: CallableQueueWorker) -> Self {
+        Self::construct(options, Some(worker), None)
+    }
+
+    pub fn with_callable_worker_and_admission(
+        options: TaskQueueOptions,
+        worker: CallableQueueWorker,
+        admission: CallableAdmission,
+    ) -> Self {
+        Self::construct(options, Some(worker), Some(admission))
+    }
+
+    fn construct(
+        options: TaskQueueOptions,
+        callable_worker: Option<CallableQueueWorker>,
+        callable_admission: Option<CallableAdmission>,
+    ) -> Self {
         #[cfg(windows)]
         let spawner: QueueProcessSpawner = {
             let grants = options.read_file_grants.clone();
@@ -1315,13 +1365,33 @@ impl TaskQueue {
                 worker_threads_changed: Condvar::new(),
                 #[cfg(test)]
                 held_persist_hook: Mutex::new(None),
+                callable_worker,
+                callable_admission,
+                callable_workers: Mutex::new(Vec::new()),
+                callable_join_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                callable_panics: Arc::new(Mutex::new(Vec::new())),
             }),
         }
+    }
+
+    pub fn admits_command(&self, command: &[String]) -> bool {
+        self.inner
+            .callable_admission
+            .as_ref()
+            .is_none_or(|admit| admit(command))
     }
 
     pub fn submit(&self, request: ExecutionRequest) -> SubmitOutcome {
         let selection = Selection::read(&self.inner);
         let submission = normalize_request(request, self.inner.options.cap_resolver.as_ref());
+        if self
+            .inner
+            .callable_admission
+            .as_ref()
+            .is_some_and(|admit| !admit(&submission.command))
+        {
+            return SubmitOutcome::Rejected;
+        }
         let partition = submission.partition.clone();
         let (outcome, dispatch, event) = {
             let mut state = self.inner.state.lock().expect("queue state lock poisoned");
@@ -1357,7 +1427,11 @@ impl TaskQueue {
     /// Replace only discovery's unstarted contributions. An ordinary request
     /// coalesced into the same command retains its own priority and authority.
     /// Reservation, execution and safety holds are outside this operation.
-    pub fn replace_discovered(&self, candidates: Vec<DiscoveredTask>) {
+    pub fn replace_discovered(&self, mut candidates: Vec<DiscoveredTask>) {
+        // Admission can inspect disk, so run it before the queue state lock.
+        if let Some(admit) = &self.inner.callable_admission {
+            candidates.retain(|candidate| admit(candidate.request.cmd.as_wire()));
+        }
         let selection = Selection::read(&self.inner);
         let (dispatches, events) = {
             let mut state = self.inner.state.lock().expect("queue state");
@@ -2360,6 +2434,74 @@ impl TaskQueue {
         }
     }
 
+    fn stop_callable_workers(&self) -> bool {
+        let mut workers = self
+            .inner
+            .callable_workers
+            .lock()
+            .expect("callable workers lock poisoned");
+        for entry in workers.iter() {
+            entry
+                .stop_flag
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        // is_finished() reports the thread body, not completion of TLS teardown.
+        // Only the observer's successful native join authorizes reclamation.
+        workers.retain(|entry| !entry.joined.load(std::sync::atomic::Ordering::Acquire));
+        !workers.is_empty() || self.callable_workers_failed()
+    }
+
+    pub fn callable_workers_failed(&self) -> bool {
+        self.inner
+            .callable_join_failed
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Only an actual retirement owner may use this unbounded drain. Ordinary
+    /// deadline shutdown retains live handles in the queue and reports pending.
+    pub fn join_callable_workers(&self) -> Result<(), String> {
+        let workers = {
+            let mut workers = self
+                .inner
+                .callable_workers
+                .lock()
+                .map_err(|_| "callable workers lock poisoned")?;
+            for entry in workers.iter() {
+                entry
+                    .stop_flag
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            std::mem::take(&mut *workers)
+        };
+        for entry in workers {
+            if let Some(observer) = entry.observer
+                && let Err(payload) = observer.join()
+            {
+                record_callable_panic(&self.inner, payload);
+            }
+            // Observer spawn failure leaves the original handle in this cell.
+            let worker = entry
+                .worker
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
+            if let Some(worker) = worker
+                && let Err(payload) = worker.join()
+            {
+                record_callable_panic(&self.inner, payload);
+            }
+        }
+        if self
+            .inner
+            .callable_join_failed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            Err("callable worker failed to join".into())
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn shutdown(&self) -> TaskQueueShutdownReport {
         self.shutdown_with_timeout(TASK_QUEUE_SHUTDOWN_TIMEOUT)
     }
@@ -2381,10 +2523,17 @@ impl TaskQueue {
                     ));
                 }
             }
-            let active_count = state.active.len() + state.held.len();
+            let callable_active_count = self
+                .inner
+                .callable_workers
+                .lock()
+                .expect("callable workers lock poisoned")
+                .len();
+            let active_count = state.active.len() + state.held.len() + callable_active_count;
             let initial_forced = !state.held.is_empty();
             (active_count, active, initial_forced)
         };
+        let callable_pending = self.stop_callable_workers();
         let mut threads = Vec::new();
         let references = snapshot
             .iter()
@@ -2403,7 +2552,7 @@ impl TaskQueue {
                 threads.push(handle);
             }
         }
-        let mut forced = initial_forced;
+        let mut forced = initial_forced || callable_pending;
         for thread in threads {
             forced |= thread.join().unwrap_or(false);
         }
@@ -2451,16 +2600,23 @@ impl TaskQueue {
                     ));
                 }
             }
-            let active_count = state.active.len() + state.held.len();
+            let callable_active_count = self
+                .inner
+                .callable_workers
+                .lock()
+                .expect("callable workers lock poisoned")
+                .len();
+            let active_count = state.active.len() + state.held.len() + callable_active_count;
             let initial_forced = !state.held.is_empty();
             (active_count, active, initial_forced)
         };
+        let callable_pending = self.stop_callable_workers();
         let references = snapshot
             .iter()
             .map(|(reference, _)| reference.clone())
             .collect::<Vec<_>>();
         let (completed_send, completed_receive) = std::sync::mpsc::channel();
-        let mut forced = initial_forced;
+        let mut forced = initial_forced || callable_pending;
         for (_, process) in snapshot {
             if Instant::now() >= deadline {
                 forced = true;
@@ -2973,6 +3129,17 @@ fn is_analysis_command(command: &[String]) -> bool {
         && alias.get(1).is_some_and(|v| v == "think")
 }
 
+fn record_callable_panic(inner: &QueueInner, payload: Box<dyn std::any::Any + Send>) {
+    inner
+        .callable_panics
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(payload);
+    inner
+        .callable_join_failed
+        .store(true, std::sync::atomic::Ordering::Release);
+}
+
 fn start_dispatch(inner: Arc<QueueInner>, mut dispatch: Dispatch) {
     if is_analysis_command(&dispatch.submission.command)
         && (!crate::processing::processing_allowed(&inner.options.journal_root)
@@ -3044,6 +3211,144 @@ fn start_dispatch(inner: Arc<QueueInner>, mut dispatch: Dispatch) {
                 return;
             }
         }
+    }
+    if let Some(callable_worker) = inner.callable_worker.as_ref().cloned() {
+        let partition = dispatch.submission.partition.clone();
+        let reference = dispatch.submission.reference.clone();
+        let worker_inner = Arc::clone(&inner);
+        let worker_dispatch = dispatch.clone();
+        let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop_flag);
+        let deadline = Instant::now() + dispatch.submission.cap;
+        let worker_reference = reference.clone();
+        let worker_partition = partition.clone();
+        // Publish the actual handle under the same lock order used by shutdown.
+        // Completion cannot acquire state until registration is finished.
+        let state = inner.state.lock().expect("queue state lock poisoned");
+        if state.shutdown {
+            drop(state);
+            record_completion(&inner, &dispatch, -1, "shutdown".to_owned());
+            for next in finish_worker(&inner, &partition, &reference) {
+                start_dispatch(Arc::clone(&inner), next);
+            }
+            return;
+        }
+        let mut workers = inner
+            .callable_workers
+            .lock()
+            .expect("callable workers lock poisoned");
+        workers.retain(|entry| !entry.joined.load(std::sync::atomic::Ordering::Acquire));
+        let spawned = thread::Builder::new().spawn(move || {
+            let _lease = WorkerLease {
+                inner: Arc::clone(&worker_inner),
+                partition: worker_partition,
+                reference: worker_reference,
+            };
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                callable_worker(
+                    &worker_dispatch.submission.command,
+                    CallableTaskContext {
+                        cancelled: Arc::clone(&worker_stop),
+                        priority: worker_dispatch.priority,
+                        deadline,
+                    },
+                )
+            }));
+            let result = match result {
+                Ok(code) => Some(code),
+                Err(payload) => {
+                    record_callable_panic(&worker_inner, payload);
+                    None
+                }
+            };
+            let (exit_code, status) = if Instant::now() >= deadline {
+                (-1, "timeout")
+            } else if worker_stop.load(std::sync::atomic::Ordering::Acquire) {
+                (-15, "cancelled")
+            } else {
+                match result {
+                    Some(code) => (code, exit_status_for_code(code)),
+                    None => (-1, "error"),
+                }
+            };
+            record_completion(
+                &worker_inner,
+                &worker_dispatch,
+                exit_code,
+                status.to_owned(),
+            );
+            // The registry retains the handle through the actual thread exit.
+        });
+        match spawned {
+            Ok(handle) => {
+                let worker = Arc::new(Mutex::new(Some(handle)));
+                let joined = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let join_worker = Arc::clone(&worker);
+                let join_done = Arc::clone(&joined);
+                let join_failed = Arc::clone(&inner.callable_join_failed);
+                let panics = Arc::clone(&inner.callable_panics);
+                let join = move || {
+                    let worker = join_worker.lock().unwrap_or_else(|p| p.into_inner()).take();
+                    if let Some(worker) = worker {
+                        if let Err(payload) = worker.join() {
+                            panics
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .push(payload);
+                            join_failed.store(true, std::sync::atomic::Ordering::Release);
+                        }
+                    } else {
+                        join_failed.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    // This observer retains no job/root owner after actual join.
+                    // Dropping its handle during later reclamation cannot detach work.
+                    join_done.store(true, std::sync::atomic::Ordering::Release);
+                };
+                #[cfg(test)]
+                let observer = {
+                    let spawner = Arc::clone(
+                        &inner
+                            .worker_thread_spawner
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner()),
+                    );
+                    spawner(Box::new(join))
+                };
+                #[cfg(not(test))]
+                let observer = thread::Builder::new()
+                    .name("callable-join".into())
+                    .spawn(join);
+                let observer = match observer {
+                    Ok(handle) => Some(handle),
+                    Err(_) => {
+                        inner
+                            .callable_join_failed
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        None
+                    }
+                };
+                workers.push(CallableTaskHandle {
+                    #[cfg(all(test, feature = "full-tests"))]
+                    reference: reference.clone(),
+                    stop_flag,
+                    worker,
+                    observer,
+                    joined,
+                });
+            }
+            Err(_) => {
+                drop(workers);
+                drop(state);
+                record_completion(&inner, &dispatch, -1, "spawn_failed".to_owned());
+                for next in finish_worker(&inner, &partition, &reference) {
+                    start_dispatch(Arc::clone(&inner), next);
+                }
+                return;
+            }
+        }
+        drop(workers);
+        drop(state);
+        return;
     }
     let rollback = dispatch.clone();
     let worker_dispatch = dispatch.clone();
@@ -8805,5 +9110,385 @@ mod tests {
         let snap = queue.collect_status_snapshot(Instant::now());
         assert_eq!(snap.held.len(), 1);
         assert_eq!(snap.held[0].partition.as_str(), "svc");
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn callable_worker_preserves_unavailable_policy_and_runs_available_twin() {
+        use solstone_core_journal_config::work_priority::WorkBand;
+
+        let root = tempfile::tempdir().unwrap();
+        let (sent, received) = mpsc::channel();
+        let callable = Arc::new(move |command: &[String], _control: CallableTaskContext| {
+            sent.send(command.to_vec()).unwrap();
+            0
+        });
+        let queue = TaskQueue::with_callable_worker(
+            TaskQueueOptions {
+                #[cfg(windows)]
+                read_file_grants: Vec::new(),
+                journal_root: root.path().to_path_buf(),
+                cap_resolver: Arc::new(FixedCap(10)),
+                process_state_probe: Arc::new(UnreachableProcessStateProbe),
+                queue_sink: None,
+                process_sink: None,
+                ready: true,
+                before_deadline_commit: None,
+                child_environment: BTreeMap::new(),
+                task_binary: None,
+            },
+            callable,
+        );
+        assert_eq!(
+            read_work_policy(&queue.inner).lane,
+            ThinkingLane::Unavailable
+        );
+
+        let command = vec![
+            "solstone".to_owned(),
+            "journal".to_owned(),
+            "think".to_owned(),
+            "--day".to_owned(),
+            "20261012".to_owned(),
+        ];
+        let submission = Submission {
+            discovered: false,
+            partition: Partition::new("think"),
+            cap: Duration::from_secs(60),
+            command: command.clone(),
+            reference: "analysis-test-ref".to_owned(),
+            day: Some("20261012".to_owned()),
+            scheduler_name: None,
+            daily_catchup_provenance: None,
+            priority: PriorityIntent::default(),
+        };
+        let dispatch = Dispatch {
+            priority: WorkPriority {
+                band: WorkBand::Recent,
+                source_time: 20261012000000,
+            },
+            sources: vec![submission.clone()],
+            submission,
+            references: vec!["analysis-test-ref".to_owned()],
+            daily_catchup_admission: None,
+        };
+
+        start_dispatch(Arc::clone(&queue.inner), dispatch);
+        assert!(received.recv_timeout(Duration::from_millis(30)).is_err());
+        assert!(queue.contains_reference("analysis-test-ref"));
+        *queue.inner.work_policy_override.lock().unwrap() = Some(local_spending());
+        queue.resume_processing();
+        let dispatched = received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("command should be dispatched to callable worker");
+        assert_eq!(dispatched, command);
+        let _ = queue.shutdown();
+        queue.join_callable_workers().unwrap();
+    }
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn callable_deadline_shutdown_retains_the_real_worker_until_join() {
+        let root = tempfile::tempdir().unwrap();
+        let (entered_send, entered) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let released = Mutex::new(released);
+        let worker: CallableQueueWorker = Arc::new(move |_, stop| {
+            entered_send.send(stop.cancelled).unwrap();
+            released.lock().unwrap().recv().unwrap();
+            0
+        });
+        let queue = TaskQueue::with_callable_worker(
+            TaskQueueOptions {
+                #[cfg(windows)]
+                read_file_grants: Vec::new(),
+                journal_root: root.path().to_path_buf(),
+                cap_resolver: Arc::new(FixedCap(10)),
+                process_state_probe: Arc::new(UnreachableProcessStateProbe),
+                queue_sink: None,
+                process_sink: None,
+                ready: true,
+                before_deadline_commit: None,
+                child_environment: BTreeMap::new(),
+                task_binary: None,
+            },
+            worker,
+        );
+        queue.submit(request("callable-held"));
+        let stop = entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let started = Instant::now();
+        let report = queue.shutdown_until(Instant::now() + Duration::from_millis(20));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(report.forced);
+        assert!(stop.load(std::sync::atomic::Ordering::Acquire));
+        {
+            let workers = queue.inner.callable_workers.lock().unwrap();
+            let entry = workers
+                .iter()
+                .find(|entry| entry.reference == "callable-held")
+                .unwrap();
+            assert!(
+                !entry.joined.load(std::sync::atomic::Ordering::Acquire)
+                    && entry.observer.is_some(),
+                "pending shutdown must retain the observer owning the actual native join"
+            );
+        }
+        release.send(()).unwrap();
+        queue.join_callable_workers().unwrap();
+        assert!(queue.inner.callable_workers.lock().unwrap().is_empty());
+        assert!(!queue.contains_reference("callable-held"));
+    }
+
+    #[test]
+    fn callable_admission_refuses_held_daily_before_catchup_attempt() {
+        let root = tempfile::tempdir().unwrap();
+        let queue = TaskQueue::with_callable_worker_and_admission(
+            TaskQueueOptions {
+                #[cfg(windows)]
+                read_file_grants: Vec::new(),
+                journal_root: root.path().to_path_buf(),
+                cap_resolver: Arc::new(FixedCap(10)),
+                process_state_probe: Arc::new(UnreachableProcessStateProbe),
+                queue_sink: None,
+                process_sink: None,
+                ready: true,
+                before_deadline_commit: None,
+                child_environment: BTreeMap::new(),
+                task_binary: None,
+            },
+            Arc::new(|_, _| panic!("held work must not execute")),
+            Arc::new(|_| false),
+        );
+        let outcome = queue.submit(command_request(
+            &[
+                "solstone",
+                "journal",
+                "think",
+                "--day",
+                "20261012",
+                "--daily-only",
+            ],
+            "held-daily",
+            Some(DailyCatchupProvenance {
+                day: "20261012".into(),
+            }),
+        ));
+        assert!(matches!(outcome, SubmitOutcome::Rejected));
+        assert!(!queue.contains_reference("held-daily"));
+        assert!(!root.path().join("health/catchup-state.json").exists());
+        let _ = queue.shutdown();
+        queue.join_callable_workers().unwrap();
+    }
+
+    #[cfg(feature = "full-tests")]
+    fn callable_control_queue(
+        worker: CallableQueueWorker,
+        cap: Duration,
+        sink: Option<Arc<dyn TaskQueueEventSink>>,
+    ) -> TaskQueue {
+        struct TestCap(Duration);
+        impl CapResolver for TestCap {
+            fn cap_for(&self, _: &Partition) -> Duration {
+                self.0
+            }
+        }
+        let queue = TaskQueue::with_callable_worker(
+            TaskQueueOptions {
+                #[cfg(windows)]
+                read_file_grants: Vec::new(),
+                journal_root: PathBuf::new(),
+                cap_resolver: Arc::new(TestCap(cap)),
+                process_state_probe: Arc::new(UnreachableProcessStateProbe),
+                queue_sink: sink,
+                process_sink: None,
+                ready: true,
+                before_deadline_commit: None,
+                child_environment: BTreeMap::new(),
+                task_binary: None,
+            },
+            worker,
+        );
+        *queue.inner.work_policy_override.lock().unwrap() = Some(local_spending());
+        queue
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn callable_context_preserves_explicit_priority_and_expires_at_the_task_cap() {
+        use solstone_core_journal_config::work_priority::WorkBand;
+        let (send, received) = mpsc::channel();
+        let worker: CallableQueueWorker = Arc::new(move |_, context| {
+            thread::sleep(
+                context.deadline.saturating_duration_since(Instant::now())
+                    + Duration::from_millis(5),
+            );
+            send.send((context.priority, context.is_cancelled()))
+                .unwrap();
+            0
+        });
+        let sink = Arc::new(RecordingEventSink(Mutex::new(Vec::new())));
+        let queue = callable_control_queue(worker, Duration::from_millis(50), Some(sink.clone()));
+        let expected = WorkPriority {
+            band: WorkBand::Import,
+            source_time: 20200101120000,
+        };
+        let mut request = request("callable-cap");
+        let ExecutionRequest::Bus(bus) = &mut request else {
+            unreachable!()
+        };
+        bus.priority = Some(expected);
+        let began = Instant::now();
+        queue.submit(request);
+        let (priority, cancelled) = received.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(priority, expected);
+        assert!(
+            cancelled,
+            "the actual task cap must reach the callable checkpoint"
+        );
+        assert!(began.elapsed() < Duration::from_secs(1));
+        queue.join_callable_workers().unwrap();
+        assert!(sink.0.lock().unwrap().iter().any(|event| matches!(event,
+            TaskQueueEvent::Stopped { reference, exit_code: -1, .. } if reference == "callable-cap")));
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn callable_reference_reuse_retains_both_threads_through_tls_retirement() {
+        struct ExitWait {
+            entered: mpsc::Sender<()>,
+            gate: Arc<(Mutex<bool>, Condvar)>,
+        }
+        impl Drop for ExitWait {
+            fn drop(&mut self) {
+                self.entered.send(()).unwrap();
+                let (lock, ready) = &*self.gate;
+                let mut released = lock.lock().unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !*released {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return;
+                    }
+                    released = ready.wait_timeout(released, remaining).unwrap().0;
+                }
+            }
+        }
+        thread_local! { static EXIT_WAIT: std::cell::RefCell<Option<ExitWait>> = const { std::cell::RefCell::new(None) }; }
+        struct Release(Arc<(Mutex<bool>, Condvar)>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                *self.0.0.lock().unwrap() = true;
+                self.0.1.notify_all();
+            }
+        }
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = Release(Arc::clone(&gate));
+        let (entered_send, entered) = mpsc::channel();
+        let worker: CallableQueueWorker = Arc::new(move |_, _| {
+            EXIT_WAIT.with(|slot| {
+                *slot.borrow_mut() = Some(ExitWait {
+                    entered: entered_send.clone(),
+                    gate: Arc::clone(&gate),
+                })
+            });
+            0
+        });
+        let queue = callable_control_queue(worker, Duration::from_secs(30), None);
+        queue.submit(request("reused-reference"));
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            !queue.contains_reference("reused-reference"),
+            "logical completion precedes TLS exit"
+        );
+        queue.submit(request("reused-reference"));
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let retained = {
+            let workers = queue.inner.callable_workers.lock().unwrap();
+            workers
+                .iter()
+                .filter(|entry| !entry.joined.load(std::sync::atomic::Ordering::Acquire))
+                .count()
+        };
+        let began = Instant::now();
+        let report = queue.shutdown_until(Instant::now() + Duration::from_millis(20));
+        let elapsed = began.elapsed();
+        drop(release);
+        queue.join_callable_workers().unwrap();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "TLS teardown must not block bounded shutdown: {elapsed:?}"
+        );
+        assert_eq!(
+            retained, 2,
+            "a reused reference must not replace the first live handle"
+        );
+        assert!(report.forced, "TLS retirement is real pending work");
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn callable_observer_spawn_failure_retains_the_original_worker_for_retirement() {
+        let (entered_send, entered) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let released = Mutex::new(released);
+        let queue = callable_control_queue(
+            Arc::new(move |_, _| {
+                entered_send.send(()).unwrap();
+                released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+                0
+            }),
+            Duration::from_secs(30),
+            None,
+        );
+        queue.set_worker_thread_spawner(Arc::new(|_| {
+            Err(io::Error::other("join observer spawn refused"))
+        }));
+        queue.submit(request("observer-failure"));
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let began = Instant::now();
+        let report = queue.shutdown_until(Instant::now() + Duration::from_millis(20));
+        assert!(began.elapsed() < Duration::from_millis(500));
+        assert!(report.forced);
+        {
+            let workers = queue.inner.callable_workers.lock().unwrap();
+            assert_eq!(workers.len(), 1);
+            assert!(workers[0].observer.is_none());
+            assert!(workers[0].worker.lock().unwrap().is_some());
+            assert!(!workers[0].joined.load(std::sync::atomic::Ordering::Acquire));
+        }
+        release.send(()).unwrap();
+        assert!(
+            queue.join_callable_workers().is_err(),
+            "observer failure stays failed after real drain"
+        );
+        assert!(queue.inner.callable_workers.lock().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn callable_panic_payload_is_retained_and_failure_stays_sticky() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Payload(Arc<AtomicBool>);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let payload_flag = Arc::clone(&dropped);
+        let queue = callable_control_queue(
+            Arc::new(move |_, _| std::panic::panic_any(Payload(Arc::clone(&payload_flag)))),
+            Duration::from_secs(30),
+            None,
+        );
+        queue.submit(request("callable-panic"));
+        assert!(queue.join_callable_workers().is_err());
+        assert!(queue.callable_workers_failed());
+        assert_eq!(queue.inner.callable_panics.lock().unwrap().len(), 1);
+        assert!(!dropped.load(Ordering::Acquire));
+        assert!(queue.join_callable_workers().is_err());
     }
 }

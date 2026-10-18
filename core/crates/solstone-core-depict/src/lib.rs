@@ -72,6 +72,7 @@ pub enum DepictError {
     },
     Metadata(String),
     Output(String),
+    Cancelled,
 }
 
 impl DepictError {
@@ -82,6 +83,7 @@ impl DepictError {
             Self::Wire { .. } => "generate-wire-failed",
             Self::Metadata(_) => "metadata-invalid",
             Self::Output(_) => "output-unwritable",
+            Self::Cancelled => "depict-cancelled",
         }
     }
 
@@ -96,6 +98,7 @@ impl DepictError {
     pub fn detail(&self) -> &str {
         match self {
             Self::Help => USAGE,
+            Self::Cancelled => "depict cancelled",
             Self::Usage(detail)
             | Self::Image(detail)
             | Self::Wire { detail, .. }
@@ -107,18 +110,24 @@ impl DepictError {
     pub fn blocking(&self) -> bool {
         match self {
             Self::Wire { blocking, .. } => *blocking,
-            Self::Help | Self::Usage(_) | Self::Image(_) | Self::Metadata(_) | Self::Output(_) => {
-                false
-            }
+            Self::Help
+            | Self::Usage(_)
+            | Self::Image(_)
+            | Self::Metadata(_)
+            | Self::Output(_)
+            | Self::Cancelled => false,
         }
     }
 
     pub fn reason_code(&self) -> Option<&str> {
         match self {
             Self::Wire { reason_code, .. } => reason_code.as_deref(),
-            Self::Help | Self::Usage(_) | Self::Image(_) | Self::Metadata(_) | Self::Output(_) => {
-                None
-            }
+            Self::Help
+            | Self::Usage(_)
+            | Self::Image(_)
+            | Self::Metadata(_)
+            | Self::Output(_)
+            | Self::Cancelled => None,
         }
     }
 }
@@ -424,12 +433,57 @@ pub fn run_with_clients(
     wire: &dyn WireClient,
     detector: &dyn Detector,
 ) -> Result<RunOutcome, DepictError> {
+    let attempt = solstone_core_system::work_retry::raw::retry_attempt_from_environment()
+        .map_err(DepictError::Output)?;
+    run_with_clients_and_checkpoint(
+        image_path,
+        redo,
+        wire,
+        detector,
+        &|| false,
+        attempt.as_ref(),
+    )
+}
+
+fn stamp_attempt(
+    record: &mut Value,
+    attempt: Option<&solstone_core_system::work_retry::Attempt>,
+) -> Result<(), String> {
+    match attempt {
+        Some(attempt) => solstone_core_system::work_retry::raw::stamp_attempt_from(record, attempt),
+        None => solstone_core_system::work_retry::raw::stamp_attempt(record),
+    }
+}
+
+fn stamp_failed_input(
+    record: &mut Value,
+    input: &Path,
+    attempt: Option<&solstone_core_system::work_retry::Attempt>,
+) -> Result<(), String> {
+    match attempt {
+        Some(attempt) => {
+            solstone_core_system::work_retry::raw::stamp_failed_input_from(record, input, attempt)
+        }
+        None => solstone_core_system::work_retry::raw::stamp_failed_input(record, input),
+    }
+}
+
+pub fn run_with_clients_and_checkpoint(
+    image_path: &Path,
+    redo: bool,
+    wire: &dyn WireClient,
+    detector: &dyn Detector,
+    checkpoint: &dyn Fn() -> bool,
+    attempt: Option<&solstone_core_system::work_retry::Attempt>,
+) -> Result<RunOutcome, DepictError> {
     run_depict(
         image_path,
         redo,
         wire,
         detector,
         &FailurePublicationHooks::default(),
+        checkpoint,
+        attempt,
     )
 }
 
@@ -445,19 +499,62 @@ fn run_depict(
     wire: &dyn WireClient,
     detector: &dyn Detector,
     hooks: &FailurePublicationHooks<'_>,
+    checkpoint: &dyn Fn() -> bool,
+    attempt: Option<&solstone_core_system::work_retry::Attempt>,
 ) -> Result<RunOutcome, DepictError> {
+    if checkpoint() {
+        return Err(DepictError::Cancelled);
+    }
     validate_image_path(image_path)?;
     let output_path = image_path.with_extension("jsonl");
     let claims = OutputClaims::acquire([output_path.clone()], LockOptions::default())
         .map_err(|error| DepictError::Output(error.to_string()))?;
     let input = InputObservation::capture(&claims, image_path)
         .map_err(|error| DepictError::Output(error.to_string()))?;
-    let admitted = !redo
-        && solstone_core_system::work_retry::raw::consume_for_output(
+    if checkpoint() {
+        return Err(DepictError::Cancelled);
+    }
+    let admitted = if redo {
+        false
+    } else if let Some(attempt) = attempt {
+        let journal = image_path
+            .ancestors()
+            .find(|p| p.join("chronicle").is_dir())
+            .ok_or_else(|| DepictError::Output("native retry journal unavailable".into()))?;
+        let unit = solstone_core_system::work_retry::raw::unit_for_output(
+            journal,
             &output_path,
             vocab::HANDLER_DEPICT,
         )
         .map_err(DepictError::Output)?;
+        solstone_core_system::work_retry::raw::consume_context_checked(
+            journal,
+            &output_path,
+            vocab::HANDLER_DEPICT,
+            &solstone_core_system::work_retry::raw::RetryContext {
+                unit_id: unit.id().map_err(DepictError::Output)?,
+                attempt: attempt.clone(),
+            },
+            &|| {
+                if checkpoint() {
+                    Err("depict cancelled".into())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .map_err(DepictError::Output)?
+        .is_some()
+    } else {
+        solstone_core_system::work_retry::raw::consume_for_output(
+            &output_path,
+            vocab::HANDLER_DEPICT,
+        )
+        .map_err(DepictError::Output)?
+    };
+    if checkpoint() {
+        return Err(DepictError::Cancelled);
+    }
     if !redo && output_path.exists() {
         let record = read_processing_record_header(&output_path);
         if !admitted
@@ -483,6 +580,8 @@ fn run_depict(
                 vocab::REASON_CORRUPT_INPUT,
                 redo,
                 hooks,
+                checkpoint,
+                attempt,
             );
         }
     };
@@ -495,6 +594,8 @@ fn run_depict(
                 vocab::REASON_CORRUPT_INPUT,
                 redo,
                 hooks,
+                checkpoint,
+                attempt,
             );
         }
     };
@@ -508,6 +609,8 @@ fn run_depict(
                 vocab::REASON_CORRUPT_INPUT,
                 redo,
                 hooks,
+                checkpoint,
+                attempt,
             );
         }
     };
@@ -522,6 +625,8 @@ fn run_depict(
                 vocab::REASON_ANALYSIS_FAILED,
                 redo,
                 hooks,
+                checkpoint,
+                attempt,
             );
         }
     };
@@ -537,10 +642,11 @@ fn run_depict(
             "input_size": source.len() as u64,
         }),
     );
-    solstone_core_system::work_retry::raw::stamp_attempt(
+    stamp_attempt(
         header
             .get_mut("_solstone_processing")
             .expect("processing record"),
+        attempt,
     )
     .map_err(DepictError::Output)?;
     let mut entry = Map::new();
@@ -556,9 +662,15 @@ fn run_depict(
         Ok(None) => {}
         Err(_) => insert_detection_error(&mut entry),
     }
+    if checkpoint() {
+        return Err(DepictError::Cancelled);
+    }
     let _commit = input
         .commit(&claims)
         .map_err(|error| DepictError::Output(error.to_string()))?;
+    if checkpoint() {
+        return Err(DepictError::Cancelled);
+    }
     write_jsonl(
         &output_path,
         [Value::Object(header), Value::Object(entry)],
@@ -586,6 +698,8 @@ fn publish_failed_analysis(
     reason_code: &str,
     redo: bool,
     hooks: &FailurePublicationHooks<'_>,
+    checkpoint: &dyn Fn() -> bool,
+    attempt: Option<&solstone_core_system::work_retry::Attempt>,
 ) -> Result<RunOutcome, DepictError> {
     let FailurePublication {
         output_path,
@@ -594,6 +708,9 @@ fn publish_failed_analysis(
         input,
     } = publication;
     let input_size = input.input_size();
+    if checkpoint() {
+        return Err(DepictError::Cancelled);
+    }
     if let Some(before_lock) = hooks.before_lock {
         before_lock();
     }
@@ -625,12 +742,19 @@ fn publish_failed_analysis(
     } else {
         0
     };
-    let header = match failure_document(image_path, input_size, reason_code, previous + 1) {
+    let header = match failure_document(image_path, input_size, reason_code, previous + 1, attempt)
+    {
         Ok(header) => header,
         Err(persist) => return Err(join_persistence(error, persist.detail())),
     };
+    if checkpoint() {
+        return Err(DepictError::Cancelled);
+    }
     if let Some(before_replace) = hooks.before_replace {
         before_replace();
+    }
+    if checkpoint() {
+        return Err(DepictError::Cancelled);
     }
     if let Err(persist) = write_jsonl(
         output_path,
@@ -647,6 +771,7 @@ fn failure_document(
     input_size: u64,
     reason_code: &str,
     attempts: i64,
+    attempt: Option<&solstone_core_system::work_retry::Attempt>,
 ) -> Result<Map<String, Value>, DepictError> {
     let mut header = build_header(&image_path.file_name().unwrap_or_default().to_string_lossy())?;
     header.insert(
@@ -661,11 +786,12 @@ fn failure_document(
             "attempts": attempts,
         }),
     );
-    solstone_core_system::work_retry::raw::stamp_failed_input(
+    stamp_failed_input(
         header
             .get_mut("_solstone_processing")
             .expect("failed record"),
         image_path,
+        attempt,
     )
     .map_err(DepictError::Output)?;
     Ok(header)
@@ -1805,6 +1931,8 @@ mod tests {
                 before_lock: Some(&publish_success),
                 before_replace: None,
             },
+            &|| false,
+            None,
         )
         .unwrap_err();
         assert!(matches!(error, DepictError::Wire { .. }));
@@ -1872,6 +2000,8 @@ mod tests {
                     before_lock: None,
                     before_replace: Some(&before_replace),
                 },
+                &|| false,
+                None,
             )
         });
         checked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -2075,5 +2205,119 @@ mod tests {
         )
         .unwrap();
         assert!(map_rfdetr_detect_completion(false, &planted).is_err());
+    }
+
+    #[test]
+    fn checkpoint_skips_success_degraded_and_failure_files() {
+        let _env = lock_depict_env();
+
+        // 1. Success case: checkpoint returns true, returns DepictError::Cancelled and writes no file.
+        let (_root, image) = fixture_image();
+        let output = image.with_extension("jsonl");
+        let result = run_with_clients_and_checkpoint(
+            &image,
+            false,
+            &SuccessWire,
+            &NoDetector,
+            &|| true,
+            None,
+        );
+        assert_eq!(result.unwrap_err(), DepictError::Cancelled);
+        assert!(!output.exists());
+
+        // Uncancelled twin writes success output.
+        let result = run_with_clients_and_checkpoint(
+            &image,
+            false,
+            &SuccessWire,
+            &NoDetector,
+            &|| false,
+            None,
+        );
+        assert_eq!(result.unwrap(), RunOutcome::Written);
+        assert!(output.exists());
+
+        // 2. Degraded case: BrokenDetector produces detection error.
+        let (_root, image) = fixture_image();
+        let output = image.with_extension("jsonl");
+        let result = run_with_clients_and_checkpoint(
+            &image,
+            false,
+            &SuccessWire,
+            &BrokenDetector,
+            &|| true,
+            None,
+        );
+        assert_eq!(result.unwrap_err(), DepictError::Cancelled);
+        assert!(!output.exists());
+
+        // Uncancelled twin writes degraded output.
+        let result = run_with_clients_and_checkpoint(
+            &image,
+            false,
+            &SuccessWire,
+            &BrokenDetector,
+            &|| false,
+            None,
+        );
+        assert_eq!(result.unwrap(), RunOutcome::Written);
+        assert!(output.exists());
+        let content = fs::read_to_string(&output).unwrap();
+        assert!(content.contains("detection_error"));
+
+        // 3. Failure case: FailingWire produces refusal/failure.
+        let (_root, image) = fixture_image();
+        let output = image.with_extension("jsonl");
+        let result = run_with_clients_and_checkpoint(
+            &image,
+            false,
+            &FailingWire,
+            &NoDetector,
+            &|| true,
+            None,
+        );
+        assert_eq!(result.unwrap_err(), DepictError::Cancelled);
+        assert!(!output.exists());
+
+        // Uncancelled twin writes failure record.
+        let result = run_with_clients_and_checkpoint(
+            &image,
+            false,
+            &FailingWire,
+            &NoDetector,
+            &|| false,
+            None,
+        );
+        assert!(result.is_err());
+        assert_ne!(result.unwrap_err(), DepictError::Cancelled);
+        assert!(output.exists());
+        let content = fs::read_to_string(&output).unwrap();
+        assert!(content.contains("state\":\"failed\"") || content.contains("\"failed\""));
+    }
+
+    #[test]
+    fn explicit_attempt_is_stamped_with_no_environment_set() {
+        let _env = lock_depict_env();
+        let (_root, image) = fixture_image();
+        let attempt = solstone_core_system::work_retry::Attempt {
+            cause: "test_failure".to_owned(),
+            input: "test_input_hash".to_owned(),
+            reason: "test_reason".to_owned(),
+        };
+        let input_size = fs::metadata(&image).unwrap().len();
+        let doc = failure_document(&image, input_size, "test_code", 1, Some(&attempt)).unwrap();
+        let proc = doc.get("_solstone_processing").expect("processing record");
+        let retry_val = proc
+            .get("retry_attempt")
+            .expect("retry_attempt should be stamped");
+        assert_eq!(retry_val["cause"], "test_failure");
+        assert_eq!(retry_val["reason"], "test_reason");
+        assert_eq!(retry_val["input"], "test_input_hash");
+
+        let doc_none = failure_document(&image, input_size, "test_code", 1, None).unwrap();
+        let proc_none = doc_none
+            .get("_solstone_processing")
+            .expect("processing record");
+        assert!(proc_none.get("retry_attempt").is_none());
     }
 }

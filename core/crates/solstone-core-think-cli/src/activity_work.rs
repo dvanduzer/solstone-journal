@@ -54,6 +54,7 @@ pub(crate) struct ActivityWork {
     path: PathBuf,
     record: Record,
     _claim: FileLock,
+    cancelled: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 fn directory(journal: &Path) -> PathBuf {
@@ -147,6 +148,7 @@ impl ActivityWork {
         };
         let path = path(&context.journal, &identity)?;
         let claim = claim(context, &identity)?;
+        context.checkpoint()?;
         let Some(record) = read(&path)? else {
             return Ok(None);
         };
@@ -157,6 +159,7 @@ impl ActivityWork {
             path,
             record,
             _claim: claim,
+            cancelled: std::sync::Arc::clone(&context.cancel_checkpoint),
         }))
     }
     pub(crate) fn begin(
@@ -194,6 +197,7 @@ impl ActivityWork {
             Some(held) => held,
             None => claim(context, &identity)?,
         };
+        context.checkpoint()?;
         let old = read(&path)?;
         if let Some(old) = old.as_ref()
             && (refresh || old.input_hash != input_hash)
@@ -255,6 +259,7 @@ impl ActivityWork {
             path,
             record,
             _claim: claim,
+            cancelled: std::sync::Arc::clone(&context.cancel_checkpoint),
         };
         work.save()?;
         Ok(work)
@@ -318,11 +323,12 @@ impl ActivityWork {
     ) -> Result<(), String> {
         self.record.parked.insert(name.to_owned());
         self.record.reasons.insert(name.into(), reason.into());
-        solstone_core_system::work_retry::observe_held(
+        solstone_core_system::work_retry::observe_held_checked(
             &context.journal,
             &retry_unit(&self.record.identity, name),
             reason,
             &self.record.input_hash,
+            &|| context.checkpoint(),
         )?;
         self.save()
     }
@@ -350,7 +356,13 @@ impl ActivityWork {
             .ok_or("activity work has no journal root")?;
         let unit = retry_unit(&self.record.identity, name);
         let _execution = solstone_core_system::work_retry::execution_claim(journal, &unit)?;
-        solstone_core_system::work_retry::reconcile_accepted(journal, &unit)?;
+        solstone_core_system::work_retry::reconcile_accepted_checked(journal, &unit, &|| {
+            if (self.cancelled)() {
+                Err("thinking cancelled".into())
+            } else {
+                Ok(())
+            }
+        })?;
         self.record.remaining.remove(name);
         self.record.uses.remove(name);
         self.record.parked.remove(name);
@@ -358,6 +370,9 @@ impl ActivityWork {
         self.save()
     }
     pub(crate) fn finish(&mut self, context: &ThinkContext) -> Result<(), String> {
+        if (context.cancel_checkpoint)() {
+            return Err("cancelled before publication".into());
+        }
         if self.record.remaining.is_empty() {
             crate::segment::write_activity_provenance(
                 context,
@@ -368,6 +383,7 @@ impl ActivityWork {
             )?;
             // If interrupted after publication, a later retry sees the completed
             // empty record and repeats only this cleanup, never model execution.
+            context.checkpoint()?;
             std::fs::remove_file(&self.path).map_err(|e| e.to_string())?;
         } else {
             self.record.next_attempt_ms = context
@@ -378,7 +394,18 @@ impl ActivityWork {
         Ok(())
     }
     fn save(&self) -> Result<(), String> {
+        self.save_checked(&|| {
+            if (self.cancelled)() {
+                Err("thinking cancelled".into())
+            } else {
+                Ok(())
+            }
+        })
+    }
+    fn save_checked(&self, checkpoint: &dyn Fn() -> Result<(), String>) -> Result<(), String> {
+        checkpoint()?;
         let bytes = serde_json::to_vec(&self.record).map_err(|e| e.to_string())?;
+        checkpoint()?;
         atomic_replace(&self.path, &bytes, AtomicWriteOptions::default()).map_err(|e| e.to_string())
     }
 }
@@ -625,6 +652,16 @@ pub fn activity_retry_due(
 /// upgrade. Existing work records are never replaced. Historical days are not
 /// implicitly regenerated; durable records themselves have no age cutoff.
 pub fn seed_activity_retries(journal: &Path, day: &str, now_ms: i64) -> Result<(), String> {
+    seed_activity_retries_checked(journal, day, now_ms, &|| Ok(()))
+}
+
+pub(crate) fn seed_activity_retries_checked(
+    journal: &Path,
+    day: &str,
+    now_ms: i64,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    checkpoint()?;
     use solstone_core_system_health::{
         FilesystemHealthLogSource, TerminalEvent, read_terminal_states,
     };
@@ -684,6 +721,7 @@ pub fn seed_activity_retries(journal: &Path, day: &str, now_ms: i64) -> Result<(
             },
         )
         .map_err(|e| e.to_string())?;
+        checkpoint()?;
         if read(&path)?.is_some() {
             continue;
         }
@@ -698,6 +736,7 @@ pub fn seed_activity_retries(journal: &Path, day: &str, now_ms: i64) -> Result<(
         ActivityWork {
             path,
             _claim: claim,
+            cancelled: std::sync::Arc::clone(&context.cancel_checkpoint),
             record: Record {
                 version: 1,
                 identity,
@@ -713,7 +752,7 @@ pub fn seed_activity_retries(journal: &Path, day: &str, now_ms: i64) -> Result<(
                 next_attempt_ms: 0,
             },
         }
-        .save()?;
+        .save_checked(checkpoint)?;
     }
     Ok(())
 }

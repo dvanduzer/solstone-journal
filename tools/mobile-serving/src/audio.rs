@@ -4,6 +4,7 @@
 //! A bounded foreground processing pass over durable input, with no job ledger.
 
 use serde_json::{Value, json};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use solstone_core_transcribe::{
     ConfidentialIoPhase, EmbeddedControl, TranscribeOutcome, discover_audio_files,
@@ -13,8 +14,6 @@ use solstone_core_transcribe::{
 use std::{
     cell::{Cell, RefCell},
     collections::{HashSet, VecDeque},
-    fs::File,
-    io::Read,
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex,
@@ -97,6 +96,17 @@ impl State {
 pub(super) struct AudioWorker {
     state: Arc<State>,
     thread: Option<JoinHandle<()>>,
+    #[cfg(feature = "processing")]
+    host_config: Option<HostAudioConfig>,
+}
+
+#[cfg(feature = "processing")]
+struct HostAudioConfig {
+    root: Arc<solstone_core_journal_io::JournalRoot>,
+    models: PathBuf,
+    model: PathBuf,
+    scratch: PathBuf,
+    held: Mutex<(u64, HashSet<PathBuf>)>,
 }
 
 impl AudioWorker {
@@ -150,7 +160,138 @@ impl AudioWorker {
         Ok(Self {
             state,
             thread: Some(thread),
+            #[cfg(feature = "processing")]
+            host_config: None,
         })
+    }
+
+    #[cfg(feature = "processing")]
+    pub(crate) fn for_host(
+        root: Arc<solstone_core_journal_io::JournalRoot>,
+        models: PathBuf,
+        model: PathBuf,
+        scratch: PathBuf,
+        external_cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Self {
+        Self {
+            state: Arc::new(State {
+                stop: AtomicBool::new(false),
+                cancel: AtomicBool::new(false),
+                generation: AtomicU64::new(0),
+                external_cancelled,
+                status: Mutex::new(json!({"state":"ready"})),
+                recent_failures: Mutex::new(VecDeque::new()),
+                wake: Condvar::new(),
+            }),
+            thread: None,
+            host_config: Some(HostAudioConfig {
+                root,
+                models,
+                model,
+                scratch,
+                held: Mutex::new((0, HashSet::new())),
+            }),
+        }
+    }
+
+    #[cfg(feature = "processing")]
+    pub(crate) fn process_host_input(
+        &self,
+        input: &Path,
+        attempt: Option<&solstone_core_system::work_retry::Attempt>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<bool, String> {
+        let config = self
+            .host_config
+            .as_ref()
+            .ok_or("audio configuration unavailable")?;
+        config
+            .root
+            .revalidate_canonical_binding()
+            .map_err(|e| e.to_string())?;
+        let generation = self.state.generation.load(Ordering::Acquire);
+        let cancel = || {
+            self.state.cancelled(generation)
+                || self.state.stop.load(Ordering::Acquire)
+                || cancelled()
+                || config.root.revalidate_canonical_binding().is_err()
+                || !accepted_input(config.root.canonical_path(), input).unwrap_or(false)
+        };
+        if cancel() {
+            return Ok(false);
+        }
+        let retry = {
+            let mut held = config.held.lock().unwrap();
+            if held.0 != generation {
+                *held = (generation, HashSet::new());
+            }
+            match decide_input(config.root.canonical_path(), input, &held.1) {
+                InputDecision::Skip => return Ok(false),
+                InputDecision::Hold(error) => {
+                    held.1.insert(input.to_path_buf());
+                    self.state.input_failed(generation, input, &error);
+                    return Err(error);
+                }
+                InputDecision::Process(retry) => retry,
+            }
+        };
+        if attempt.is_some_and(|attempt| retry.as_ref().map(|r| &r.attempt) != Some(attempt)) {
+            return Err("audio retry permission changed".into());
+        }
+        *self.state.status.lock().unwrap() = json!({"state":"processing","input":input});
+        let started = Instant::now();
+        let asr = LocalAsr {
+            model: &config.model,
+            scratch: &config.scratch,
+            loaded: RefCell::new(None),
+            load_ms: Cell::new(None),
+        };
+        let result = process_embedded(
+            input,
+            config.root.canonical_path(),
+            &config.models,
+            &config.scratch,
+            &asr,
+            EmbeddedControl {
+                cancelled: &cancel,
+                service_io: &|phase| {
+                    self.state.status.lock().unwrap()["service_io"] = match phase {
+                        ConfidentialIoPhase::RequestFlushed => json!("awaiting_response"),
+                        ConfidentialIoPhase::ResponseFinished => json!("finished"),
+                    };
+                },
+            },
+            retry.as_ref(),
+        );
+        if cancel() {
+            self.state.status.lock().unwrap()["state"] = json!("cancelled");
+            return Ok(false);
+        }
+        match result {
+            Ok(result) => {
+                *self.state.status.lock().unwrap() = json!({
+                    "state":"ready",
+                    "last":{"input":input,"outcome":format!("{:?}",result.outcome),
+                    "transcript":result.transcript_path,
+                    "processing_ms":started.elapsed().as_secs_f64()*1000.}
+                });
+                Ok(result.outcome != TranscribeOutcome::Skipped)
+            }
+            Err(error) => {
+                if !matches!(
+                    error,
+                    solstone_core_transcribe::TranscribeError::ConfidentialDeferred { .. }
+                ) || !embedded_retryable_failure(input)
+                {
+                    config.held.lock().unwrap().1.insert(input.to_path_buf());
+                }
+                self.state
+                    .input_failed(generation, input, &error.to_string());
+                *self.state.status.lock().unwrap() =
+                    json!({"state":"failed","input":input,"error":error.to_string()});
+                Err(error.to_string())
+            }
+        }
     }
 
     pub fn status(&self) -> Value {
@@ -381,66 +522,8 @@ fn run(
     Ok(())
 }
 
-/// Publication before receipt persistence is not a completed network input.
-/// Match the accepted custody receipt before giving these bytes to a processor.
 fn accepted_input(root: &Path, input: &Path) -> Result<bool, String> {
-    let segment = input.parent().ok_or("audio segment missing")?;
-    let relative = segment
-        .strip_prefix(root.join("chronicle"))
-        .map_err(|e| e.to_string())?;
-    let parts = relative
-        .iter()
-        .map(|p| p.to_string_lossy())
-        .collect::<Vec<_>>();
-    if parts.len() != 3 {
-        return Ok(false);
-    }
-    let report =
-        solstone_core_callosum::read_device_ingest_events(segment).map_err(|e| e.to_string())?;
-    if report.unparseable != 0 {
-        return Err(format!(
-            "unreadable audio custody receipt: {}",
-            segment.display()
-        ));
-    }
-    let name = input
-        .file_name()
-        .ok_or("audio filename missing")?
-        .to_string_lossy();
-    let files = report
-        .records
-        .iter()
-        .filter(|r| {
-            r.outcome == "accepted"
-                && r.day == parts[0]
-                && r.stream == parts[1]
-                && r.segment == parts[2]
-        })
-        .flat_map(|r| &r.files)
-        .filter(|f| f.written == name)
-        .collect::<Vec<_>>();
-    if files.is_empty() {
-        return Ok(false);
-    }
-    let mut file = File::open(input).map_err(|e| e.to_string())?;
-    let size = file.metadata().map_err(|e| e.to_string())?.len();
-    if size > 16 * 1024 * 1024 {
-        return Err("embedded audio exceeds 16 MiB encoded input limit".into());
-    }
-    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
-        return Err("audio input is not a regular file".into());
-    }
-    let mut hash = Sha256::new();
-    let mut bytes = [0u8; 65536];
-    loop {
-        let n = file.read(&mut bytes).map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
-        }
-        hash.update(&bytes[..n]);
-    }
-    let hash = format!("{:x}", hash.finalize());
-    Ok(files.iter().any(|f| f.size == size && f.sha256 == hash))
+    crate::custody::accepted_input(root, input)
 }
 
 #[cfg(test)]
@@ -450,6 +533,7 @@ mod tests {
         DeviceIngestEvent, DurableEvent, FileDescriptor, append_durable_event,
     };
     use solstone_core_transcribe::TranscribeError;
+    use std::fs::File;
 
     fn setup_fixture_audio(
         root: &Path,
@@ -950,6 +1034,8 @@ mod tests {
         let worker = AudioWorker {
             state: Arc::new(state),
             thread: None,
+            #[cfg(feature = "processing")]
+            host_config: None,
         };
         worker.resume(); // resume before inference returns
         let state = &worker.state;
@@ -976,6 +1062,8 @@ mod tests {
                 wake: Condvar::new(),
             }),
             thread: None,
+            #[cfg(feature = "processing")]
+            host_config: None,
         };
         worker.state.input_failed(
             7,

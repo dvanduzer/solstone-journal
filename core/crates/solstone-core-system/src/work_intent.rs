@@ -60,13 +60,24 @@ fn mutate<T>(
     journal: &Path,
     update: impl FnOnce(&mut BTreeMap<String, OwnerIntent>) -> Result<T, String>,
 ) -> Result<T, String> {
+    mutate_checked(journal, &|| Ok(()), update)
+}
+
+fn mutate_checked<T>(
+    journal: &Path,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+    update: impl FnOnce(&mut BTreeMap<String, OwnerIntent>) -> Result<T, String>,
+) -> Result<T, String> {
+    checkpoint()?;
     let path = journal.join(artifact(ArtifactId::WorkIntent).path);
     std::fs::create_dir_all(path.parent().expect("health parent"))
         .map_err(|error| error.to_string())?;
     let _lock = hold_lock(path.with_extension("lock"), LockOptions::default())
         .map_err(|error| error.to_string())?;
     let mut days = read(journal)?;
+    checkpoint()?;
     let result = update(&mut days)?;
+    checkpoint()?;
     write_json(
         path,
         &Store { version: 1, days },
@@ -130,7 +141,16 @@ pub fn finish_from_scratch(
 
 /// Called only after the discovery reader has verified current source coverage.
 pub fn retire_current(journal: &Path, day: &str, id: &str) -> Result<(), String> {
-    mutate(journal, |days| {
+    retire_current_checked(journal, day, id, &|| Ok(()))
+}
+
+pub fn retire_current_checked(
+    journal: &Path,
+    day: &str,
+    id: &str,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    mutate_checked(journal, checkpoint, |days| {
         if days
             .get(day)
             .is_some_and(|intent| intent.id == id && !intent.from_scratch)

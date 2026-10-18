@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use solstone_core_facets::{
     AppendOutcome, get_activity_record, load_activity_records, observe_declared_facet_inventory,
-    update_activity_record,
+    update_activity_record_checked,
 };
 use solstone_core_journal_io::{
     AtomicWriteOptions, DEFAULT_STREAM, LockOptions, PathOrDay, atomic_replace, hold_lock,
@@ -149,11 +149,22 @@ struct Publishing {
 /// List `days` as being written by this check, and drop listings this
 /// stream's earlier checks left behind. Returns the listing to remove once
 /// the talents have run.
+#[cfg(test)]
 pub(crate) fn list_publishing(
     journal: &Path,
     stream: &str,
     days: BTreeSet<String>,
 ) -> Option<PathBuf> {
+    list_publishing_checked(journal, stream, days, &|| Ok(()))
+}
+
+fn list_publishing_checked(
+    journal: &Path,
+    stream: &str,
+    days: BTreeSet<String>,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Option<PathBuf> {
+    checkpoint().ok()?;
     let dir = publishing_dir(journal);
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.filter_map(Result::ok) {
@@ -168,6 +179,7 @@ pub(crate) fn list_publishing(
                 .to_str()
                 .is_some_and(|name| name.starts_with(&format!("{stream}-")));
             if stale && ours {
+                checkpoint().ok()?;
                 let _ = std::fs::remove_file(entry.path());
             }
         }
@@ -182,6 +194,7 @@ pub(crate) fn list_publishing(
     ));
     let bytes = serde_json::to_vec(&Publishing { days }).ok()?;
     std::fs::create_dir_all(&dir).ok()?;
+    checkpoint().ok()?;
     atomic_replace(&path, &bytes, AtomicWriteOptions::default()).ok()?;
     Some(path)
 }
@@ -196,7 +209,12 @@ fn read_pending(path: &Path) -> Pending {
     }
 }
 
-fn write_pending(path: &Path, pending: &Pending) -> Result<(), String> {
+fn write_pending(
+    path: &Path,
+    pending: &Pending,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    checkpoint()?;
     if pending.days.is_empty() {
         return match std::fs::remove_file(path) {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.to_string()),
@@ -207,11 +225,14 @@ fn write_pending(path: &Path, pending: &Pending) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
     let bytes = serde_json::to_vec(pending).map_err(|error| error.to_string())?;
+    checkpoint()?;
     atomic_replace(path, &bytes, AtomicWriteOptions::default()).map_err(|error| error.to_string())
 }
 
 /// Mark `days` of `stream` for the next settle check.
-pub(crate) fn note(journal: &Path, stream: &str, days: &[&str]) -> Result<(), String> {
+pub(crate) fn note(context: &ThinkContext, stream: &str, days: &[&str]) -> Result<(), String> {
+    context.checkpoint()?;
+    let journal = &context.journal;
     if !safe_stream(stream) {
         return Ok(());
     }
@@ -224,6 +245,7 @@ pub(crate) fn note(journal: &Path, stream: &str, days: &[&str]) -> Result<(), St
         },
     )
     .map_err(|error| error.to_string())?;
+    context.checkpoint()?;
     let mut pending = read_pending(&path);
     let before = pending.days.len();
     for day in days {
@@ -232,7 +254,7 @@ pub(crate) fn note(journal: &Path, stream: &str, days: &[&str]) -> Result<(), St
     if pending.days.len() == before {
         return Ok(());
     }
-    write_pending(&path, &pending)
+    write_pending(&path, &pending, &|| context.checkpoint())
 }
 
 /// Streams whose next settle check is due by `now_ms`.
@@ -356,6 +378,7 @@ pub(crate) fn check(
     skip_activity_prompts: bool,
     max_concurrency: i64,
 ) -> Result<(), String> {
+    context.checkpoint()?;
     if !safe_stream(stream) {
         return Ok(());
     }
@@ -382,6 +405,7 @@ pub(crate) fn check(
                 None
             }
         };
+        context.checkpoint()?;
         let mut pending = read_pending(&path);
         // A day this run is already working past is over too.
         let today = local_day(&context.journal, now).max(context.day.clone());
@@ -390,6 +414,7 @@ pub(crate) fn check(
         days.extend([today.clone(), yesterday]);
         let mut due: Option<i64> = None;
         for day in days {
+            context.checkpoint()?;
             let mut seen = pending.days.remove(&day).unwrap_or_default();
             let settled = activity_context(context, &day).and_then(|day_context| {
                 settle_day(
@@ -422,19 +447,20 @@ pub(crate) fn check(
         #[cfg(test)]
         crate::segment::state_probe::at(&context.journal, "settled");
         if turn.is_some()
-            && let Err(error) = write_pending(&path, &pending)
+            && let Err(error) = write_pending(&path, &pending, &|| context.checkpoint())
         {
             errors.push(error);
         }
         // Listed before the turn is given up, so the days stay held from
         // the moment they leave the pending list until their talents finish.
-        publishing = list_publishing(
+        publishing = list_publishing_checked(
             &context.journal,
             stream,
             talents
                 .iter()
                 .map(|talent| talent.day().to_owned())
                 .collect(),
+            &|| context.checkpoint(),
         );
     }
     // Talents can run for minutes; no writer waits on them.
@@ -442,6 +468,7 @@ pub(crate) fn check(
         errors.push(error);
     }
     if let Some(publishing) = publishing {
+        context.checkpoint()?;
         let _ = std::fs::remove_file(publishing);
     }
     if errors.is_empty() {
@@ -764,7 +791,7 @@ fn publish(
         record.insert("stream".to_owned(), Value::String(stream.to_owned()));
     }
     record.insert("settled_at".to_owned(), Value::from(context.now_ms));
-    let outcome = append_own_activity(&context.journal, &facet, day, &mut record)
+    let outcome = append_own_activity(context, &facet, day, &mut record)
         .map_err(|error| format!("{facet}/{id}: {error}"))?;
     let published = match outcome {
         AppendOutcome::Written(_) => Published::Written,
@@ -842,7 +869,7 @@ fn grow(
         .single()
         .unwrap_or_else(Utc::now)
         .to_rfc3339();
-    update_activity_record(
+    update_activity_record_checked(
         &context.journal,
         facet,
         day,
@@ -851,6 +878,7 @@ fn grow(
         "activity",
         "grew with later evidence",
         &timestamp,
+        || context.checkpoint(),
     )
     .map_err(|error| format!("{facet}/{id}: {error}"))?
     .map_or(Ok(Published::Refused), |_| Ok(Published::Grown))

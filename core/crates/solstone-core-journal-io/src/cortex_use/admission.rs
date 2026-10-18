@@ -108,6 +108,7 @@ impl CortexAdmittedUse {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CortexAdmissionClass {
+    Cancelled,
     AlreadyClaimed,
     EmptyFirstRow,
     TalentDirectoryUnsafe,
@@ -124,6 +125,7 @@ enum CortexAdmissionClass {
 impl CortexAdmissionClass {
     const fn token(self) -> &'static str {
         match self {
+            Self::Cancelled => "cortex_admission_cancelled",
             Self::AlreadyClaimed => "cortex_admission_already_claimed",
             Self::EmptyFirstRow => "cortex_admission_empty_first_row",
             Self::TalentDirectoryUnsafe => "cortex_admission_talent_directory_unsafe",
@@ -341,6 +343,40 @@ pub fn complete_active_use(
     )
 }
 
+pub fn admit_active_use_checked(
+    authority: &CortexNamespaceAuthority,
+    talent_name: &str,
+    use_id: &str,
+    first_row: &[u8],
+    cancelled: &dyn Fn() -> bool,
+) -> Result<CortexAdmittedUse, CortexAdmissionError> {
+    admit_with_timing_checked(
+        authority,
+        talent_name,
+        use_id,
+        first_row,
+        LockTiming::Default,
+        cancelled,
+    )
+}
+
+pub fn complete_active_use_checked(
+    authority: &CortexNamespaceAuthority,
+    talent_name: &str,
+    use_id: &str,
+    identity: CortexUseFileIdentity,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(), CortexAdmissionError> {
+    complete_with_timing_checked(
+        authority,
+        talent_name,
+        use_id,
+        identity,
+        LockTiming::Default,
+        cancelled,
+    )
+}
+
 /// Complete `{use_id}_active.jsonl` to `{use_id}.jsonl` without a prior identity.
 ///
 /// Recovery has no admit-time inode: the active leaf must exist as a regular
@@ -415,12 +451,33 @@ fn admit_with_timing(
     first_row: &[u8],
     timing: LockTiming,
 ) -> Result<CortexAdmittedUse, CortexAdmissionError> {
+    admit_with_timing_checked(authority, talent_name, use_id, first_row, timing, &|| false)
+}
+
+fn check_cancelled(cancelled: &dyn Fn() -> bool) -> Result<(), CortexAdmissionError> {
+    if cancelled() {
+        Err(CortexAdmissionError::new(CortexAdmissionClass::Cancelled))
+    } else {
+        Ok(())
+    }
+}
+
+fn admit_with_timing_checked(
+    authority: &CortexNamespaceAuthority,
+    talent_name: &str,
+    use_id: &str,
+    first_row: &[u8],
+    timing: LockTiming,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<CortexAdmittedUse, CortexAdmissionError> {
+    check_cancelled(cancelled)?;
     if first_row.is_empty() {
         return Err(CortexAdmissionError::new(
             CortexAdmissionClass::EmptyFirstRow,
         ));
     }
     let _lock = acquire_lock(authority, timing)?;
+    check_cancelled(cancelled)?;
     let projected = talent_directory_name(talent_name);
     checkpoint(CortexAdmissionPrimitive::TalentDirectoryOpen)?;
     let talent = create_talent_directory(authority, &projected)?;
@@ -439,6 +496,7 @@ fn admit_with_timing(
         ));
     }
     checkpoint(CortexAdmissionPrimitive::Write)?;
+    check_cancelled(cancelled)?;
     let identity = exclusive_write(&talent, OsStr::new(&active), first_row)?;
     Ok(CortexAdmittedUse {
         use_id: use_id.to_owned(),
@@ -453,7 +511,27 @@ fn complete_with_timing(
     active_path_identity: CortexUseFileIdentity,
     timing: LockTiming,
 ) -> Result<(), CortexAdmissionError> {
+    complete_with_timing_checked(
+        authority,
+        talent_name,
+        use_id,
+        active_path_identity,
+        timing,
+        &|| false,
+    )
+}
+
+fn complete_with_timing_checked(
+    authority: &CortexNamespaceAuthority,
+    talent_name: &str,
+    use_id: &str,
+    active_path_identity: CortexUseFileIdentity,
+    timing: LockTiming,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(), CortexAdmissionError> {
+    check_cancelled(cancelled)?;
     let _lock = acquire_lock(authority, timing)?;
+    check_cancelled(cancelled)?;
     let projected = talent_directory_name(talent_name);
     checkpoint(CortexAdmissionPrimitive::TalentDirectoryOpen)?;
     let talent = open_talent_directory(authority, &projected)?;
@@ -475,6 +553,7 @@ fn complete_with_timing(
         ));
     }
     checkpoint(CortexAdmissionPrimitive::Rename)?;
+    check_cancelled(cancelled)?;
     rename_active_to_completed(&talent, OsStr::new(&active), OsStr::new(&completed))
 }
 
@@ -1329,6 +1408,96 @@ mod tests {
         admit_active_use_with_test_timing(&authority, TALENT, USE, &first_row(), ZERO, ZERO)
             .unwrap();
         assert!(active_path(root).exists());
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn cancelled_completion_after_namespace_wait_preserves_the_active_use() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        for cancel in [false, true] {
+            let temporary = temp();
+            let root = temporary.path();
+            let authority = authority(root);
+            let admitted = admit_active_use(&authority, TALENT, USE, &first_row()).unwrap();
+            let held =
+                acquire_cortex_namespace_lock_with_test_timing(&authority, ZERO, ZERO).unwrap();
+            let stopped = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&stopped);
+            let (checking, reached) = mpsc::channel();
+            let (ended, done) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let result = complete_active_use_checked(
+                    &authority,
+                    TALENT,
+                    USE,
+                    admitted.identity(),
+                    &|| {
+                        checking.send(()).unwrap();
+                        flag.load(Ordering::Acquire)
+                    },
+                );
+                ended.send(result).unwrap();
+            });
+            reached.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(done.recv_timeout(Duration::from_millis(50)).is_err());
+            stopped.store(cancel, Ordering::Release);
+            drop(held);
+            let result = done.recv_timeout(Duration::from_secs(5)).unwrap();
+            worker.join().unwrap();
+            if cancel {
+                expect_token(result.unwrap_err(), "cortex_admission_cancelled");
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(active_path(root).exists(), cancel);
+            assert_eq!(completed_path(root).exists(), !cancel);
+        }
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn cancelled_admission_after_namespace_wait_cannot_create_an_active_use() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        for cancel in [false, true] {
+            let temporary = temp();
+            let root = temporary.path();
+            let authority = authority(root);
+            let held =
+                acquire_cortex_namespace_lock_with_test_timing(&authority, ZERO, ZERO).unwrap();
+            let stopped = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&stopped);
+            let (checking, reached) = mpsc::channel();
+            let (ended, done) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let result =
+                    admit_active_use_checked(&authority, TALENT, USE, &first_row(), &|| {
+                        checking.send(()).unwrap();
+                        flag.load(Ordering::Acquire)
+                    });
+                ended.send(result).unwrap();
+            });
+            reached.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(done.recv_timeout(Duration::from_millis(50)).is_err());
+            stopped.store(cancel, Ordering::Release);
+            drop(held);
+            let result = done.recv_timeout(Duration::from_secs(5)).unwrap();
+            worker.join().unwrap();
+            if cancel {
+                expect_token(result.unwrap_err(), "cortex_admission_cancelled");
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(active_path(root).exists(), !cancel);
+            assert!(!completed_path(root).exists());
+        }
     }
 
     #[test]

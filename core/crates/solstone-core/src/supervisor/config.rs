@@ -3,13 +3,16 @@
 
 //! Narrow supervisor-only reads from the journal configuration.
 
+#[cfg(test)]
 use std::path::Path;
 
+#[cfg(test)]
 pub(crate) fn processing_is_deferred(journal: &Path) -> bool {
     // A broken policy holds live analysis until it can be read again.
     solstone_core_system::processing::is_deferred(journal).unwrap_or(true)
 }
 
+#[cfg(test)]
 pub(crate) fn no_thinking_engine_chosen(journal: &Path) -> bool {
     solstone_core_journal_config::no_thinking_engine_chosen(journal)
 }

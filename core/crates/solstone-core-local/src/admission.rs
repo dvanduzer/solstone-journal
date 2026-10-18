@@ -88,6 +88,18 @@ pub fn run_confidential_call<T>(
     call: impl FnOnce(Duration) -> T,
     failed: impl FnOnce(&T) -> bool,
 ) -> Result<T, String> {
+    run_confidential_call_checked(journal_path, priority, timeout, &|| Ok(()), call, failed)
+}
+
+pub fn run_confidential_call_checked<T>(
+    journal_path: &Path,
+    priority: WorkPriority,
+    timeout: Duration,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+    call: impl FnOnce(Duration) -> T,
+    failed: impl FnOnce(&T) -> bool,
+) -> Result<T, String> {
+    checkpoint()?;
     if !priority.band.is_background() {
         return Ok(call(timeout));
     }
@@ -95,6 +107,7 @@ pub fn run_confidential_call<T>(
     let root = confidential_background_dir(journal_path);
     let _permit = acquire_local_slot(&root, 1, Some(timeout), false, priority)
         .map_err(|error| format!("confidential background admission: {error:?}"))?;
+    checkpoint()?;
     let remaining = timeout
         .checked_sub(waiting.elapsed())
         .filter(|remaining| !remaining.is_zero())
@@ -102,6 +115,7 @@ pub fn run_confidential_call<T>(
     let started = Instant::now();
     let result = call(remaining);
     if failed(&result) {
+        checkpoint()?;
         let pause = started.elapsed().clamp(FAILURE_PAUSE, LONGEST_PAUSE);
         let until = SystemTime::now() + pause;
         // Best effort: the call already failed, and its own result says why.
@@ -823,6 +837,104 @@ mod tests {
         let ran =
             run_confidential_call(journal.path(), older, ACQUIRE_DEADLINE, |_| "ok", |_| false);
         assert_eq!(ran, Ok("ok"));
+    }
+
+    #[test]
+    fn cancellation_after_background_slot_wait_refuses_content_and_preserves_the_positive_twin() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc,
+        };
+        for cancel in [false, true] {
+            let journal = tempfile::tempdir().unwrap();
+            let root = confidential_background_dir(journal.path());
+            let priority: WorkPriority = "4:20200101120000".parse().unwrap();
+            let held =
+                acquire_local_slot(&root, 1, Some(ACQUIRE_DEADLINE), false, priority).unwrap();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&cancelled);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let count = Arc::clone(&calls);
+            let path = journal.path().to_path_buf();
+            let (checking, reached) = mpsc::channel();
+            let (ended, done) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let result = run_confidential_call_checked(
+                    &path,
+                    priority,
+                    ACQUIRE_DEADLINE,
+                    &|| {
+                        checking.send(()).unwrap();
+                        if flag.load(Ordering::Acquire) {
+                            Err("cancelled".into())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    |_| {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        "ok"
+                    },
+                    |_| false,
+                );
+                ended.send(result).unwrap();
+            });
+            reached.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(
+                done.recv_timeout(Duration::from_millis(50)).is_err(),
+                "the real background slot is held"
+            );
+            cancelled.store(cancel, Ordering::Release);
+            drop(held);
+            let result = done.recv_timeout(Duration::from_secs(5)).unwrap();
+            worker.join().unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(!cancel));
+            if cancel {
+                assert_eq!(result.unwrap_err(), "cancelled");
+            } else {
+                assert_eq!(result.unwrap(), "ok");
+            }
+            assert!(
+                lock_released(|| confidential_background_open(journal.path())),
+                "cancellation must not publish a failure pause"
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_after_background_work_does_not_publish_a_late_failure_pause() {
+        use std::cell::Cell;
+        for cancel in [false, true] {
+            let journal = tempfile::tempdir().unwrap();
+            let cancelled = Cell::new(false);
+            let result = run_confidential_call_checked(
+                journal.path(),
+                "4:1".parse().unwrap(),
+                ACQUIRE_DEADLINE,
+                &|| {
+                    if cancelled.get() {
+                        Err("cancelled".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_| {
+                    cancelled.set(cancel);
+                    "failed"
+                },
+                |_| true,
+            );
+            if cancel {
+                assert_eq!(result.unwrap_err(), "cancelled");
+                assert!(lock_released(|| confidential_background_open(
+                    journal.path()
+                )));
+            } else {
+                assert_eq!(result.unwrap(), "failed");
+                assert!(!confidential_background_open(journal.path()));
+            }
+        }
     }
 
     #[test]

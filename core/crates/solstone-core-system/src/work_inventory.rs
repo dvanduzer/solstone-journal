@@ -138,6 +138,14 @@ impl WorkInventory {
         now_ms >= self.as_of_ms && now_ms - until < CURRENT_FOR_MS
     }
     pub fn publish(&self, journal: &Path) -> Result<(), String> {
+        self.publish_checked(journal, &|| Ok(()))
+    }
+    pub fn publish_checked(
+        &self,
+        journal: &Path,
+        checkpoint: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
+        checkpoint()?;
         solstone_core_journal_io::write_json(
             journal.join(artifact(ArtifactId::WorkInventory).path),
             self,

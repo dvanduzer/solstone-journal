@@ -12,10 +12,10 @@ use solstone_core_journal_io::append_jsonl;
 use solstone_core_journal_io::cortex_use::{
     CortexNamespaceAuthority, CortexRecoveryDisposition, CortexUseCandidateRead,
     CortexUseDestinationCheck, CortexUseFatal, CortexUseFileIdentity, CortexUseRefusal,
-    CortexUseRefusalCounts, admit_active_use, build_recovery_catalog, census_cortex_namespace,
-    check_cortex_use_destination, complete_active_use, create_or_admit_cortex_namespace,
-    parse_cortex_lifecycle_name, read_cortex_use_request, recover_active_use,
-    talent_directory_name,
+    CortexUseRefusalCounts, admit_active_use_checked, build_recovery_catalog,
+    census_cortex_namespace, check_cortex_use_destination, complete_active_use,
+    complete_active_use_checked, create_or_admit_cortex_namespace, parse_cortex_lifecycle_name,
+    read_cortex_use_request, recover_active_use, talent_directory_name,
 };
 use solstone_core_journal_io::journal_root::{JournalEntryKind, JournalRoot};
 
@@ -70,8 +70,18 @@ impl CortexStore {
         use_id: &str,
         request: &Map<String, Value>,
     ) -> io::Result<Option<(PathBuf, CortexUseFileIdentity)>> {
+        self.claim_checked(name, use_id, request, &|| false)
+    }
+
+    pub(crate) fn claim_checked(
+        &self,
+        name: &str,
+        use_id: &str,
+        request: &Map<String, Value>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> io::Result<Option<(PathBuf, CortexUseFileIdentity)>> {
         let first_row = serde_json::to_vec(&Value::Object(request.clone()))?;
-        match admit_active_use(&self.authority, name, use_id, &first_row) {
+        match admit_active_use_checked(&self.authority, name, use_id, &first_row, cancelled) {
             Ok(admitted) => Ok(Some((self.active_path(name, use_id), admitted.identity()))),
             Err(error) if error.is_already_claimed() => Ok(None),
             Err(error) => Err(io::Error::other(error.to_string())),
@@ -161,6 +171,27 @@ impl CortexStore {
         true
     }
 
+    pub(crate) fn complete_checked(
+        &self,
+        use_id: &str,
+        name: &str,
+        identity: CortexUseFileIdentity,
+        request: Option<&Map<String, Value>>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> bool {
+        if complete_active_use_checked(&self.authority, name, use_id, identity, cancelled).is_err()
+        {
+            return false;
+        }
+        let completed = self
+            .active_path(name, use_id)
+            .with_file_name(format!("{use_id}.jsonl"));
+        if let Some(request) = request {
+            self.append_day_index_internal(use_id, request, &completed, Some(cancelled));
+        }
+        !cancelled()
+    }
+
     pub(crate) fn has_finish(&self, active: &Path) -> bool {
         let Ok(text) = fs::read_to_string(active) else {
             return false;
@@ -184,6 +215,19 @@ impl CortexStore {
         request: &Map<String, Value>,
         completed: &Path,
     ) {
+        self.append_day_index_internal(use_id, request, completed, None);
+    }
+
+    fn append_day_index_internal(
+        &self,
+        use_id: &str,
+        request: &Map<String, Value>,
+        completed: &Path,
+        cancelled: Option<&dyn Fn() -> bool>,
+    ) {
+        if cancelled.is_some_and(|check| check()) {
+            return;
+        }
         let zone = owner_zone(&self.journal);
         let day = request
             .get("day")
@@ -298,7 +342,22 @@ impl CortexStore {
         // row and interleaved concurrent rows; the shared helper builds the whole
         // line and appends it in a single write.
         let path = self.talents.join(format!("{day}.jsonl"));
-        if let Err(error) = append_jsonl(&path, &summary) {
+        let result = if let Some(cancelled) = cancelled {
+            solstone_core_journal_io::append::append_jsonl_no_follow_checked(
+                &path,
+                &summary,
+                &|| {
+                    if cancelled() {
+                        Err("thinking cancelled".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+        } else {
+            append_jsonl(&path, &summary)
+        };
+        if let Err(error) = result {
             log::warn!("cortex: failed to append day index row for {use_id}: {error}");
         }
     }

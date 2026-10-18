@@ -330,10 +330,21 @@ fn update_checked<T>(
 /// Seed legacy evidence conservatively. Repeated discovery cannot reset an
 /// attempt or adopt changed input as its baseline. Owning writers use finish.
 pub fn observe_held(journal: &Path, unit: &Unit, reason: &str, input: &str) -> Result<(), String> {
+    observe_held_checked(journal, unit, reason, input, &|| Ok(()))
+}
+
+pub fn observe_held_checked(
+    journal: &Path,
+    unit: &Unit,
+    reason: &str,
+    input: &str,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    checkpoint()?;
     if reason.is_empty() || input.is_empty() {
         return Err("missing held evidence".into());
     }
-    update(journal, unit, |slot| {
+    update_checked(journal, unit, checkpoint, |slot| {
         if let Some(record) = slot {
             record.reason = reason.into();
             if !record.held {
@@ -430,10 +441,20 @@ pub fn request(journal: &Path, unit: &Unit) -> Result<String, String> {
 /// Expand an existing durable day intent once for this unit. Repeated scans
 /// must not turn the same owner ask into fresh permission after consumption.
 pub fn request_with_id(journal: &Path, unit: &Unit, id: &str) -> Result<(), String> {
+    request_with_id_checked(journal, unit, id, &|| Ok(()))
+}
+
+pub fn request_with_id_checked(
+    journal: &Path,
+    unit: &Unit,
+    id: &str,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    checkpoint()?;
     if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("invalid owner retry identity".into());
     }
-    update(journal, unit, |slot| {
+    update_checked(journal, unit, checkpoint, |slot| {
         let record = slot
             .as_mut()
             .filter(|r| r.held)
@@ -460,7 +481,19 @@ pub fn consume(
     input: &str,
     fixes: &[DeclaredFix],
 ) -> Result<(), String> {
-    update(journal, unit, |slot| {
+    consume_checked(journal, unit, selected, reason, input, fixes, &|| Ok(()))
+}
+
+pub fn consume_checked(
+    journal: &Path,
+    unit: &Unit,
+    selected: &Attempt,
+    reason: &str,
+    input: &str,
+    fixes: &[DeclaredFix],
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    update_checked(journal, unit, checkpoint, |slot| {
         let record = slot.as_mut().ok_or("missing retry evidence")?;
         if reason != record.reason
             || selected.reason != reason
@@ -527,7 +560,16 @@ pub fn finish_checked(
 /// The domain owner has reconciled an accepted terminal receipt while holding
 /// its execution claim. Acceptance stays in that domain's durable record.
 pub fn reconcile_accepted(journal: &Path, unit: &Unit) -> Result<(), String> {
-    update(journal, unit, |slot| {
+    reconcile_accepted_checked(journal, unit, &|| Ok(()))
+}
+
+pub fn reconcile_accepted_checked(
+    journal: &Path,
+    unit: &Unit,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    checkpoint()?;
+    update_checked(journal, unit, checkpoint, |slot| {
         if let Some(record) = slot {
             record.held = false;
             record.attempt = None;

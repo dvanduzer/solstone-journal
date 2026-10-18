@@ -460,7 +460,7 @@ mod tests {
             app_processes.push(app);
         }
         let state = SupervisorState {
-            discovery: super::super::work_discovery::WorkDiscovery::new(
+            discovery: super::super::WorkDiscovery::new(
                 journal.path().to_path_buf(),
                 queue.clone(),
                 false,

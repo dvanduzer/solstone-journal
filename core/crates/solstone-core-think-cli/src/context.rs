@@ -13,12 +13,12 @@ use solstone_core_cortex_client::{
 use crate::helpers::ThinkStatus;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum DispatchFailure {
+pub enum DispatchFailure {
     Unavailable,
     NotClaimed { use_id: String },
 }
 
-pub(crate) trait CortexBoundary: Send + Sync {
+pub trait CortexBoundary: Send + Sync {
     fn dispatch(
         &self,
         runtime: &tokio::runtime::Runtime,
@@ -41,7 +41,7 @@ pub(crate) trait CortexBoundary: Send + Sync {
     ) -> Result<WaitForUsesReport, String>;
 }
 
-pub(crate) trait IndexBoundary: Send + Sync {
+pub trait IndexBoundary: Send + Sync {
     fn rescan_file(
         &self,
         journal: &Path,
@@ -140,7 +140,7 @@ impl CortexBoundary for NativeCortexBoundary {
 }
 
 #[derive(Clone)]
-pub(crate) struct ThinkContext {
+pub struct ThinkContext {
     pub(crate) journal: PathBuf,
     pub(crate) day: String,
     pub(crate) day_dir: PathBuf,
@@ -155,9 +155,45 @@ pub(crate) struct ThinkContext {
         solstone_core_system::work_retry::Unit,
         solstone_core_system::work_retry::Attempt,
     )>,
+    pub(crate) cancel_checkpoint: Arc<dyn Fn() -> bool + Send + Sync>,
+    pub(crate) sense_executor: Option<Arc<dyn solstone_core_sense::SenseExecutor>>,
 }
 
 impl ThinkContext {
+    #[allow(clippy::too_many_arguments)]
+    pub fn hosted(
+        journal: &Path,
+        day: String,
+        day_dir: PathBuf,
+        now_ms: i64,
+        talent_root: PathBuf,
+        apps_root: PathBuf,
+        cortex: Arc<dyn CortexBoundary>,
+        index: Arc<dyn IndexBoundary>,
+        event_clock: Arc<dyn Fn() -> i64 + Send + Sync>,
+        retry: Option<(
+            solstone_core_system::work_retry::Unit,
+            solstone_core_system::work_retry::Attempt,
+        )>,
+        cancel_checkpoint: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Self {
+        Self {
+            journal: journal.to_path_buf(),
+            day,
+            day_dir,
+            now_ms,
+            event_clock,
+            talent_root,
+            apps_root,
+            cortex,
+            index,
+            status: ThinkStatus::default(),
+            retry,
+            cancel_checkpoint,
+            sense_executor: None,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn new(
         journal: &Path,
@@ -197,7 +233,25 @@ impl ThinkContext {
             index: Arc::new(NativeIndexBoundary),
             status: ThinkStatus::default(),
             retry: None,
+            cancel_checkpoint: Arc::new(|| false),
+            sense_executor: None,
         })
+    }
+
+    pub fn with_sense_executor(
+        mut self,
+        executor: Arc<dyn solstone_core_sense::SenseExecutor>,
+    ) -> Self {
+        self.sense_executor = Some(executor);
+        self
+    }
+
+    pub(crate) fn checkpoint(&self) -> Result<(), String> {
+        if (self.cancel_checkpoint)() {
+            Err("thinking cancelled".into())
+        } else {
+            Ok(())
+        }
     }
 
     pub(crate) fn event_now_ms(&self) -> i64 {

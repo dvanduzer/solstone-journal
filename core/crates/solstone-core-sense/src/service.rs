@@ -133,6 +133,19 @@ where
         .shutdown
 }
 
+pub(crate) async fn run_until_checked<F, T>(
+    connection: CallosumSocketConnection,
+    dispatcher: Arc<SenseDispatcher>,
+    receiver: mpsc::Receiver<Outbound>,
+    shutdown: F,
+) -> (Option<T>, bool)
+where
+    F: Future<Output = T> + Send + 'static,
+{
+    let result = run_until_with_shutdown_status(connection, dispatcher, receiver, shutdown).await;
+    (result.shutdown, result.service_runner_stopped)
+}
+
 struct ServiceLoopOutcome<T> {
     shutdown: Option<T>,
     service_runner_stopped: bool,

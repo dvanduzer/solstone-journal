@@ -270,26 +270,36 @@ fn update_catchup_state(
     prune_records: bool,
     update: impl FnOnce(&mut Map<String, Value>) -> bool,
 ) {
-    // The journal path is a parameter; the reference's ambient journal-root
-    // creation remains at the caller.
+    if let Err(error) = update_catchup_state_checked(journal, prune_records, &|| Ok(()), update) {
+        eprintln!("failed to update catchup state: {error}");
+    }
+}
+
+fn update_catchup_state_checked(
+    journal: &Path,
+    prune_records: bool,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+    update: impl FnOnce(&mut Map<String, Value>) -> bool,
+) -> Result<(), CatchupError> {
+    checkpoint().map_err(CatchupError::State)?;
     let path = catchup_state_path(journal);
-    let Ok(_lock) = hold_lock(&path, LockOptions::default()) else {
-        eprintln!("failed to lock catchup state");
-        return;
-    };
+    let _lock = hold_lock(&path, LockOptions::default())
+        .map_err(|error| CatchupError::State(error.to_string()))?;
+    checkpoint().map_err(CatchupError::State)?;
     let mut state = read_catchup_state(journal);
     let Some(entries) = state.get_mut("entries").and_then(Value::as_object_mut) else {
-        return;
+        return Ok(());
     };
     if !update(entries) {
-        return;
+        return Ok(());
     }
     if prune_records {
         prune(entries, journal);
     }
-    if write_json(path, &state, JsonWriteOptions::default()).is_err() {
-        eprintln!("failed to write catchup state");
-    }
+    checkpoint().map_err(CatchupError::State)?;
+    write_json(&path, &state, JsonWriteOptions::default())
+        .map_err(|error| CatchupError::State(error.to_string()))?;
+    Ok(())
 }
 
 /// Record daily progress.  Unlike repair records, this deliberately never prunes.
@@ -617,13 +627,34 @@ pub fn reconcile_stale_catchup_attempts(
     journal: &Path,
     now: SystemTime,
 ) -> Result<(), CatchupError> {
-    reconcile_stale_catchup_attempts_with_capability(journal, now, catchup_marker_capability)
+    reconcile_stale_catchup_attempts_checked(journal, now, &|| Ok(()))
 }
 
+pub fn reconcile_stale_catchup_attempts_checked(
+    journal: &Path,
+    now: SystemTime,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), CatchupError> {
+    reconcile_stale_catchup_attempts_controlled(journal, now, catchup_marker_capability, checkpoint)
+}
+
+#[cfg(test)]
 pub(crate) fn reconcile_stale_catchup_attempts_with_capability<Capability>(
     journal: &Path,
     now: SystemTime,
     capability: Capability,
+) -> Result<(), CatchupError>
+where
+    Capability: FnOnce() -> Result<(), CatchupError>,
+{
+    reconcile_stale_catchup_attempts_controlled(journal, now, capability, &|| Ok(()))
+}
+
+pub(crate) fn reconcile_stale_catchup_attempts_controlled<Capability>(
+    journal: &Path,
+    now: SystemTime,
+    capability: Capability,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<(), CatchupError>
 where
     Capability: FnOnce() -> Result<(), CatchupError>,
@@ -634,7 +665,7 @@ where
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
-        update_catchup_state(journal, false, |entries| {
+        update_catchup_state_checked(journal, false, checkpoint, |entries| {
             let keys = entries.keys().cloned().collect::<Vec<_>>();
             let mut changed = false;
             for key in keys {
@@ -731,7 +762,7 @@ where
                 changed = true;
             }
             changed
-        });
+        })?;
         Ok(())
     }
 }

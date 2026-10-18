@@ -205,7 +205,7 @@ fn write_output_cancellable(
     Ok(true)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "full-tests"))]
 pub(crate) fn write_output_with_sources(
     path: PathBuf,
     output: &str,

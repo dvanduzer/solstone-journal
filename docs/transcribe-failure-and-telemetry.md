@@ -1,5 +1,7 @@
 # Transcribe: failure semantics & telemetry
 
+The Python-specific exit and event descriptions below are historical. For current native behavior, follow `solstone-core-transcribe/src/{lib,stage}.rs` and the native retry ownership described below.
+
 How `solstone journal transcribe` reports what happened, and what the `observe.transcribed`
 event carries. Two rules govern everything here:
 
@@ -29,28 +31,17 @@ The deferral path was previously a bare `return`, which exited `0` and made
 `sense.py` log "Handler completed successfully" for a segment that was never
 transcribed. That is the bug this contract closes.
 
-## How the retry actually happens
+## How native retry happens
 
-A deferral writes nothing, so the audio stays on disk without its output and stays owed.
-Nothing counts attempts and nothing gives up.
+Native transcription failures can leave durable processing and retry evidence without a successful transcript. The shared retry owner in `solstone-core-system/src/work_retry/raw.rs` derives eligibility from that evidence, the current input, declared fixes and ordinary owner retry permission. Repeated discovery, resume or restart must not grant fresh permission for an unchanged held input.
 
-The re-attempt comes from the supervisor's work discovery
-(`solstone-core/src/supervisor/work_discovery.rs`), which re-checks for owed work at
-least every 60 seconds (`MIN_REST`) and re-picks any input that still lacks its output.
-Older days that make no progress back off, to at most once a day
-(`solstone-core-system/src/catchup.rs`, `apply_no_progress_backoff`), and are still
-retried. So once the missing engine is available (for example after
-`solstone journal install-provider parakeet` publishes its port), deferred audio
-transcribes on the next pass without a restart.
+The shared discovery worker in `solstone-core-think-cli/src/planner.rs` reconstructs owed work and submits eligible work to TaskQueue. Automatic passes rest for at least 60 seconds, or nine times the previous pass duration when that is longer. Explicit wakes and queue top-ups can act sooner. Historical no-progress backoff remains owned by `solstone-core-system/src/catchup.rs`.
 
-A supervisor started with `--no-daily` does not run work discovery, so a deferral there
-stays put until something else re-runs sensing.
+The embedded audio worker also discovers eligible retained inputs through this shared retry contract. It preserves the selected provider and accepted custody record. An unavailable engine leaves work owed; automatic recovery depends on eligibility and the existing admission checks.
 
-This is why a deferral must not write a placeholder or an empty output: doing so would
-mark the segment done and the audio would never be retried.
+The supervisor's `--no-daily` option disables automatic discovery passes. Explicit discovery wakes remain possible.
 
-`solstone journal transcribe --all` absorbs a deferral per file, moves on to the next
-one, and reports the count in its summary.
+A failed or held processing record is not a successful transcript. Do not reset retry evidence or write a placeholder success to make retained input appear complete.
 
 ## Defer vs. fail
 

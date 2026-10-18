@@ -17,7 +17,8 @@ mod tick;
 #[cfg(all(test, feature = "full-tests"))]
 #[cfg(unix)]
 mod user_skill_refresh;
-mod work_discovery;
+
+pub use solstone_core_think_cli::planner::WorkDiscovery;
 
 pub use host::{
     ALREADY_RUNNING_COPY, InstallationBindingRefusal, LifecycleBootError, ShutdownCause,

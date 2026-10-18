@@ -209,6 +209,17 @@ pub fn fulfill(
     segments: BTreeSet<Coordinate>,
     days: BTreeSet<String>,
 ) -> Result<(), String> {
+    fulfill_checked(journal, import, segments, days, &|| Ok(()))
+}
+
+pub fn fulfill_checked(
+    journal: &Path,
+    import: &ImportThinking,
+    segments: BTreeSet<Coordinate>,
+    days: BTreeSet<String>,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    checkpoint()?;
     if !segments.is_subset(&import.segments) || !days.is_subset(&import.days) {
         return Err("fulfillment outside import scope".into());
     }
@@ -223,6 +234,7 @@ pub fn fulfill(
     let directory = journal.join("imports").join(&import.id);
     let _lock = hold_lock(directory.join("thinking.lock"), LockOptions::default())
         .map_err(|error| error.to_string())?;
+    checkpoint()?;
     let Some(current) = inspect(journal, &import.id)? else {
         return Err("import publication disappeared".into());
     };
@@ -238,6 +250,7 @@ pub fn fulfill(
             .days
             .insert(day.clone(), import.day_scopes[&day].clone());
     }
+    checkpoint()?;
     write_json(
         directory.join("thinking.json"),
         &fulfilled,

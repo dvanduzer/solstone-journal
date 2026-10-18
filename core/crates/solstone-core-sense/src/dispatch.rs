@@ -51,6 +51,26 @@ pub struct Outbound {
     pub fields: Map<String, Value>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SenseJobResult {
+    Finished(i32),
+    Hold,
+}
+
+pub trait SenseExecutor: Send + Sync {
+    fn cancelled(&self) -> bool {
+        false
+    }
+    fn execute(
+        &self,
+        handler: &str,
+        path: &std::path::Path,
+        context: &crate::work::SegmentContext,
+        attempt: Option<&solstone_core_system::work_retry::Attempt>,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> SenseJobResult;
+}
+
 struct Job {
     item: WorkItem,
     spec: HandlerSpec,
@@ -108,6 +128,7 @@ struct WorkerContext {
     tally: Arc<JobTally>,
     cleanups: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
     hosted_parent: Option<Arc<HostedServiceParentRuntime>>,
+    executor: Option<Arc<dyn SenseExecutor>>,
 }
 
 /// Per-run handler outcome counts. Incremented as `run_job` finishes, then
@@ -164,6 +185,7 @@ pub struct SenseDispatcher {
     admission: Admission,
     batch: BatchContext,
     pub(crate) tally: Arc<JobTally>,
+    executor: Option<Arc<dyn SenseExecutor>>,
 }
 
 fn archive_pending_files_in(state: &State) -> usize {
@@ -254,6 +276,32 @@ impl SenseDispatcher {
                 ..BatchContext::default()
             },
             hosted_parent,
+            None,
+        )
+    }
+
+    pub fn new_with_executor(
+        journal: PathBuf,
+        verbose: bool,
+        debug: bool,
+        outbound: mpsc::Sender<Outbound>,
+        child_environment: solstone_core_system::process::ChildLaunchContext,
+        hosted_parent: Option<Arc<HostedServiceParentRuntime>>,
+        executor: Arc<dyn SenseExecutor>,
+    ) -> Self {
+        Self::new_inner(
+            journal,
+            verbose,
+            debug,
+            outbound,
+            Admission::new(Arc::new(SystemMemoryProbe)),
+            resolve_program_from_current_exe(),
+            BatchContext {
+                child_environment,
+                ..BatchContext::default()
+            },
+            hosted_parent,
+            Some(executor),
         )
     }
 
@@ -273,6 +321,7 @@ impl SenseDispatcher {
             admission,
             Ok(program),
             BatchContext::default(),
+            None,
             None,
         )
     }
@@ -322,6 +371,33 @@ impl SenseDispatcher {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_batch_with_executor(
+        journal: PathBuf,
+        verbose: bool,
+        debug: bool,
+        outbound: mpsc::Sender<Outbound>,
+        describe_workers: usize,
+        child_environment: solstone_core_system::process::ChildLaunchContext,
+        executor: Arc<dyn SenseExecutor>,
+    ) -> Self {
+        Self::new_inner(
+            journal,
+            verbose,
+            debug,
+            outbound,
+            Admission::new(Arc::new(SystemMemoryProbe)),
+            resolve_program_from_current_exe(),
+            BatchContext {
+                describe_workers: Some(describe_workers),
+                child_environment,
+                marker_policy: BatchMarkerPolicy::AdvanceStream,
+            },
+            None,
+            Some(executor),
+        )
+    }
+
     /// Construct a batch dispatcher that uses the built fixture handler.
     #[cfg(feature = "test-stubs")]
     pub(crate) fn new_batch_with_fixture_program(
@@ -364,6 +440,7 @@ impl SenseDispatcher {
             program,
             batch,
             None,
+            None,
         )
     }
 
@@ -377,6 +454,7 @@ impl SenseDispatcher {
         program: Result<PathBuf, DispatcherResolveError>,
         batch: BatchContext,
         hosted_parent: Option<Arc<HostedServiceParentRuntime>>,
+        executor: Option<Arc<dyn SenseExecutor>>,
     ) -> Self {
         let state = Arc::new(Mutex::new(State {
             segments: HashMap::new(),
@@ -414,6 +492,7 @@ impl SenseDispatcher {
                     tally: Arc::clone(&tally),
                     cleanups: Arc::clone(&cleanups),
                     hosted_parent: hosted_parent.clone(),
+                    executor: executor.clone(),
                 };
                 let worker = thread::Builder::new()
                     .name(format!("{handler}-worker"))
@@ -433,6 +512,7 @@ impl SenseDispatcher {
             admission,
             batch,
             tally,
+            executor,
         }
     }
 
@@ -926,9 +1006,19 @@ impl SenseDispatcher {
                     ts: Some(chrono::Utc::now().timestamp_millis()),
                     extra,
                 };
-                if let Err(error) = solstone_core_callosum::append_durable_event(
+                if self.execution_cancelled() {
+                    continue;
+                }
+                if let Err(error) = solstone_core_callosum::append_durable_event_checked(
                     &dir,
                     &solstone_core_callosum::DurableEvent::Callosum(envelope),
+                    &|| {
+                        if self.execution_cancelled() {
+                            Err("Sense cancelled".into())
+                        } else {
+                            Ok(())
+                        }
+                    },
                 ) {
                     log::warn!(
                         "failed to record observe.interrupted event to {}: {error}",
@@ -938,6 +1028,12 @@ impl SenseDispatcher {
             }
         }
         self.join_workers()
+    }
+
+    pub(crate) fn execution_cancelled(&self) -> bool {
+        self.executor
+            .as_ref()
+            .is_some_and(|executor| executor.cancelled())
     }
 
     pub(crate) fn is_idle(&self) -> bool {
@@ -1155,6 +1251,129 @@ fn run_job(
     let segment_context = job.item.context.clone();
     let key = segment_context.key.clone();
     let file = job.item.file_path.clone();
+    if let Some(executor) = &worker_context.executor {
+        let admitted = worker_context.admission.wait(
+            &stage,
+            &job.config,
+            || admission_stopping() || executor.cancelled(),
+            |available, floor| {
+                let _ = outbound.send(Outbound {
+                    tract: "observe",
+                    event: "memory_throttle_started",
+                    fields: events::throttle_started(
+                        &stage,
+                        available / (1024 * 1024),
+                        floor / (1024 * 1024),
+                    ),
+                });
+            },
+            |waited| {
+                let _ = outbound.send(Outbound {
+                    tract: "observe",
+                    event: "memory_throttle_completed",
+                    fields: events::throttle_completed(&stage, waited),
+                });
+            },
+        );
+        if !admitted {
+            return;
+        }
+        let mut job_slot = Some(job);
+        {
+            let mut q = queue.lock().expect("sense handler queue");
+            if q.requeue_if_preempted(&mut job_slot) {
+                return;
+            }
+        }
+        let job = job_slot.expect("job was not preempted");
+        let cancel =
+            std::sync::atomic::AtomicBool::new(state.lock().expect("sense state").stopping);
+        let result = if executor.cancelled() {
+            SenseJobResult::Hold
+        } else {
+            executor.execute(&job.item.handler, &file, &segment_context, None, &cancel)
+        };
+        let result = if executor.cancelled() {
+            SenseJobResult::Hold
+        } else if result == SenseJobResult::Finished(0)
+            && unfinished_output(&file, &job.item.handler).is_some()
+        {
+            SenseJobResult::Finished(1)
+        } else {
+            result
+        };
+        match result {
+            SenseJobResult::Finished(0) => {
+                state.lock().expect("sense state").health.success();
+                let marker_succeeded = complete_checked(
+                    state,
+                    outbound,
+                    &worker_context.journal,
+                    &key,
+                    Some(&file),
+                    None,
+                    None,
+                    worker_context.batch.marker_policy,
+                    &|| executor.cancelled(),
+                );
+                if marker_succeeded {
+                    worker_context.tally.success();
+                } else {
+                    worker_context.tally.failure();
+                }
+                return;
+            }
+            SenseJobResult::Finished(code) => {
+                let stopped = state.lock().expect("sense state").stopping;
+                if !stopped {
+                    state
+                        .lock()
+                        .expect("sense state")
+                        .health
+                        .failure(&format!("{} exit {code}", job.item.handler));
+                }
+                worker_context.tally.failure();
+                let outcome = format!("{} exit {code}", job.item.handler);
+                complete_checked(
+                    state,
+                    outbound,
+                    &worker_context.journal,
+                    &key,
+                    Some(&file),
+                    Some(outcome),
+                    None,
+                    worker_context.batch.marker_policy,
+                    &|| executor.cancelled(),
+                );
+                return;
+            }
+            SenseJobResult::Hold => {
+                worker_context.tally.defer();
+                let mut state = state.lock().expect("sense state");
+                state
+                    .pending_files
+                    .retain(|(_, candidate)| candidate != &file);
+                let empty = if let Some(segment) = state.segments.get_mut(&key) {
+                    segment.hold_note = Some("handler_deferred");
+                    segment.pending.remove(&file);
+                    segment.pending.is_empty()
+                } else {
+                    false
+                };
+                if empty {
+                    state.segments.remove(&key);
+                    if !state
+                        .segments
+                        .keys()
+                        .any(|candidate| candidate.day == key.day)
+                    {
+                        state.day_leases.remove(&key.day);
+                    }
+                }
+                return;
+            }
+        }
+    }
     let program = match &worker_context.program {
         Ok(program) => program,
         Err(error) => {
@@ -1664,8 +1883,36 @@ fn complete(
     note: Option<&str>,
     marker_policy: BatchMarkerPolicy,
 ) -> bool {
+    complete_checked(
+        state,
+        outbound,
+        journal,
+        key,
+        file,
+        error,
+        note,
+        marker_policy,
+        &|| false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn complete_checked(
+    state: &Arc<Mutex<State>>,
+    outbound: &mpsc::Sender<Outbound>,
+    journal: &Path,
+    key: &SegmentKey,
+    file: Option<&Path>,
+    error: Option<String>,
+    note: Option<&str>,
+    marker_policy: BatchMarkerPolicy,
+    cancelled: &dyn Fn() -> bool,
+) -> bool {
     let completed = {
         let mut state = state.lock().expect("sense state");
+        if cancelled() {
+            return false;
+        }
         if let Some(file) = file {
             state
                 .pending_files
@@ -1707,14 +1954,30 @@ fn complete(
     };
     let mut marker_succeeded = true;
     if let Some(mut segment) = completed {
+        if cancelled() {
+            return false;
+        }
         if marker_policy == BatchMarkerPolicy::AdvanceStream
-            && let Err(error) =
-                solstone_core_journal_io::bump_stream_marker(journal, &segment.context.key.day)
+            && segment.hold_note != Some("handler_deferred")
+            && let Err(error) = solstone_core_journal_io::health_marker::bump_stream_marker_checked(
+                journal,
+                &segment.context.key.day,
+                &|| {
+                    if cancelled() {
+                        Err("Sense cancelled".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
         {
             marker_succeeded = false;
             segment
                 .errors
                 .push(format!("stream marker update failed: {error}"));
+        }
+        if cancelled() {
+            return false;
         }
         let _ = outbound.send(Outbound {
             tract: "observe",
@@ -1759,6 +2022,8 @@ mod tests {
         std::fs::write(&output, "{}\n{\"timestamp\":0}\n").unwrap();
         assert!(super::unfinished_output(&raw, "describe").is_none());
     }
+    #[cfg(feature = "full-tests")]
+    use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
 
     use serde_json::json;
@@ -1801,6 +2066,7 @@ mod tests {
                 path: PathBuf::from("/bin/nonexistent"),
             }),
             BatchContext::default(),
+            None,
             None,
         );
         let mut live = observing("stream1", "120000_1");
@@ -1861,6 +2127,7 @@ mod tests {
             }),
             BatchContext::default(),
             None,
+            None,
         );
         let mut live = observing("stream1", "120000_1");
         live.extra.insert("files".into(), json!([]));
@@ -1911,6 +2178,7 @@ mod tests {
                 path: PathBuf::from("/bin/nonexistent"),
             }),
             BatchContext::default(),
+            None,
             None,
         );
         let context = SegmentContext {
@@ -2712,6 +2980,7 @@ mod tests {
             }),
             BatchContext::default(),
             None,
+            None,
         );
         let mut message = observing("one", "120000_1");
         message.extra.insert("files".into(), json!(["audio.flac"]));
@@ -2754,6 +3023,7 @@ mod tests {
                 path: PathBuf::from("/bin/nonexistent"),
             }),
             BatchContext::default(),
+            None,
             None,
         );
 
@@ -2810,6 +3080,7 @@ mod tests {
                 path: PathBuf::from("/bin/nonexistent"),
             }),
             BatchContext::default(),
+            None,
             None,
         );
 
@@ -2872,6 +3143,7 @@ mod tests {
                 path: PathBuf::from("/bin/nonexistent"),
             }),
             BatchContext::default(),
+            None,
             None,
         );
 
@@ -3109,5 +3381,210 @@ mod tests {
         assert!(job_slot.is_none());
         assert_eq!(pending_files.len(), 1);
         assert_eq!(queue.jobs.len(), 2);
+    }
+
+    #[cfg(feature = "full-tests")]
+    struct MockExecutor {
+        called: Arc<AtomicBool>,
+        result: SenseJobResult,
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn cancelled_completion_waiting_for_state_cannot_publish_a_marker_or_event() {
+        for cancel in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let job = test_job(
+                "depict",
+                &temp.path().join("frame.png"),
+                "1:20261016120000".parse().unwrap(),
+            );
+            let context = job.item.context;
+            let key = context.key.clone();
+            let mut segment = SegmentState::new(context);
+            segment.pending.insert(job.item.file_path.clone());
+            let state = Arc::new(Mutex::new(State {
+                segments: HashMap::from([(key.clone(), segment)]),
+                pending_files: HashSet::new(),
+                health: Health::default(),
+                stopping: false,
+                day_leases: HashMap::new(),
+                lease_deferred: Vec::new(),
+            }));
+            let held = state.lock().unwrap();
+            let worker_state = Arc::clone(&state);
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&cancelled);
+            let journal = temp.path().to_path_buf();
+            let file = job.item.file_path;
+            let worker_key = key.clone();
+            let (outbound, events) = mpsc::channel();
+            let (started, ready) = mpsc::channel();
+            let (ended, done) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                started.send(()).unwrap();
+                ended
+                    .send(complete_checked(
+                        &worker_state,
+                        &outbound,
+                        &journal,
+                        &worker_key,
+                        Some(&file),
+                        None,
+                        None,
+                        BatchMarkerPolicy::AdvanceStream,
+                        &|| flag.load(Ordering::Acquire),
+                    ))
+                    .unwrap();
+            });
+            ready.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(done.recv_timeout(Duration::from_millis(50)).is_err());
+            cancelled.store(cancel, Ordering::Release);
+            drop(held);
+            assert_eq!(done.recv_timeout(Duration::from_secs(5)).unwrap(), !cancel);
+            worker.join().unwrap();
+            assert_eq!(
+                temp.path()
+                    .join("chronicle")
+                    .join(&key.day)
+                    .join("health/stream.updated")
+                    .exists(),
+                !cancel
+            );
+            assert_eq!(events.try_recv().is_ok(), !cancel);
+        }
+    }
+
+    #[cfg(feature = "full-tests")]
+    impl SenseExecutor for MockExecutor {
+        fn execute(
+            &self,
+            _handler: &str,
+            path: &Path,
+            _context: &SegmentContext,
+            _attempt: Option<&solstone_core_system::work_retry::Attempt>,
+            _cancel: &AtomicBool,
+        ) -> SenseJobResult {
+            self.called.store(true, Ordering::SeqCst);
+            if self.result == SenseJobResult::Finished(0) {
+                std::fs::write(
+                    path.with_extension("jsonl"),
+                    "{}\n{\"text\":\"callable fixture output\"}\n",
+                )
+                .unwrap();
+            }
+            self.result
+        }
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn executor_hold_for_describe_defers_and_leaves_no_stream_marker() {
+        let temp = tempfile::tempdir().expect("temp journal");
+        let (outbound, _receiver) = mpsc::channel();
+        let tally = Arc::new(JobTally::new());
+        let called = Arc::new(AtomicBool::new(false));
+        let executor = Arc::new(MockExecutor {
+            called: Arc::clone(&called),
+            result: SenseJobResult::Hold,
+        });
+        let worker_context = WorkerContext {
+            journal: temp.path().to_path_buf(),
+            admission: Admission::new(Arc::new(SystemMemoryProbe)),
+            verbose: false,
+            debug: false,
+            batch: BatchContext::default(),
+            program: Err(DispatcherResolveError::Missing {
+                path: PathBuf::from("/bin/nonexistent"),
+            }),
+            tally: Arc::clone(&tally),
+            cleanups: Arc::new(Mutex::new(Vec::new())),
+            hosted_parent: None,
+            executor: Some(executor),
+        };
+        let file = temp.path().join("frame.jpg");
+        let job = test_job("describe", &file, "1:20261016120000".parse().unwrap());
+        let key = job.item.context.key.clone();
+        let queue = Arc::new(Mutex::new(HandlerQueue::new(1)));
+        let mut segment_state = SegmentState::new(job.item.context.clone());
+        segment_state.pending.insert(file.clone());
+        let mut pending_files = HashSet::new();
+        pending_files.insert(("describe".to_string(), file.clone()));
+        let state = Arc::new(Mutex::new(State {
+            segments: HashMap::from([(key.clone(), segment_state)]),
+            pending_files,
+            health: Health::default(),
+            stopping: false,
+            day_leases: HashMap::new(),
+            lease_deferred: Vec::new(),
+        }));
+
+        run_job(job, &queue, &state, &outbound, &worker_context);
+
+        assert!(called.load(Ordering::SeqCst), "executor must be called");
+        assert_eq!(tally.deferred(), 1);
+        let (failed, _ran) = tally.snapshot();
+        assert_eq!(failed, 0);
+        let marker = temp
+            .path()
+            .join(format!("chronicle/{}/health/stream.updated", key.day));
+        assert!(!marker.exists(), "temp journal must gain no stream marker");
+        let s = state.lock().unwrap();
+        assert!(
+            !s.pending_files
+                .contains(&("describe".to_string(), file.clone()))
+        );
+        assert!(!s.segments.contains_key(&key));
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn executor_finished_zero_for_depict_completes_successfully() {
+        let temp = tempfile::tempdir().expect("temp journal");
+        let (outbound, _receiver) = mpsc::channel();
+        let tally = Arc::new(JobTally::new());
+        let called = Arc::new(AtomicBool::new(false));
+        let executor = Arc::new(MockExecutor {
+            called: Arc::clone(&called),
+            result: SenseJobResult::Finished(0),
+        });
+        let worker_context = WorkerContext {
+            journal: temp.path().to_path_buf(),
+            admission: Admission::new(Arc::new(SystemMemoryProbe)),
+            verbose: false,
+            debug: false,
+            batch: BatchContext::default(),
+            program: Err(DispatcherResolveError::Missing {
+                path: PathBuf::from("/bin/nonexistent"),
+            }),
+            tally: Arc::clone(&tally),
+            cleanups: Arc::new(Mutex::new(Vec::new())),
+            hosted_parent: None,
+            executor: Some(executor),
+        };
+        let file = temp.path().join("frame.jpg");
+        let job = test_job("depict", &file, "1:20261016120000".parse().unwrap());
+        let key = job.item.context.key.clone();
+        let queue = Arc::new(Mutex::new(HandlerQueue::new(1)));
+        let mut segment_state = SegmentState::new(job.item.context.clone());
+        segment_state.pending.insert(file.clone());
+        let mut pending_files = HashSet::new();
+        pending_files.insert(("depict".to_string(), file.clone()));
+        let state = Arc::new(Mutex::new(State {
+            segments: HashMap::from([(key.clone(), segment_state)]),
+            pending_files,
+            health: Health::default(),
+            stopping: false,
+            day_leases: HashMap::new(),
+            lease_deferred: Vec::new(),
+        }));
+
+        run_job(job, &queue, &state, &outbound, &worker_context);
+
+        assert!(called.load(Ordering::SeqCst), "executor must be called");
+        let (failed, ran) = tally.snapshot();
+        assert_eq!(failed, 0);
+        assert_eq!(ran, 1);
+        assert_eq!(tally.deferred(), 0);
     }
 }

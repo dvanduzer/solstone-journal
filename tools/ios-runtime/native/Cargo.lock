@@ -1789,6 +1789,7 @@ dependencies = [
  "axum",
  "journal-mobile-audio",
  "log",
+ "ort",
  "serde_json",
  "sha2",
  "solstone-core-backup",
@@ -1805,7 +1806,6 @@ dependencies = [
  "solstone-core-maintenance",
  "solstone-core-mcp-endpoint",
  "solstone-core-spl",
- "solstone-core-transcribe",
  "tokio",
 ]
 
@@ -3557,6 +3557,7 @@ dependencies = [
  "serde_json",
  "solstone-core-brain",
  "solstone-core-callosum",
+ "solstone-core-generate",
  "solstone-core-generate-wire",
  "solstone-core-journal",
  "solstone-core-journal-cli",
@@ -3565,6 +3566,7 @@ dependencies = [
  "solstone-core-spp-ratls",
  "solstone-core-system",
  "solstone-core-talent-cli",
+ "solstone-core-talent-runtime",
  "thiserror 2.0.21",
  "tokio",
  "uuid",

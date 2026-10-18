@@ -241,11 +241,12 @@ pub(crate) fn process_one_with(
     let started = Instant::now();
     let (admitted_retry, context_attempt) = if !redo {
         if let Some(context) = retry {
-            let attempt = solstone_core_system::work_retry::raw::consume_context(
+            let attempt = solstone_core_system::work_retry::raw::consume_context_checked(
                 journal_path,
                 &audio_path.with_extension("jsonl"),
                 solstone_core_processing_record::vocab::HANDLER_TRANSCRIBE,
                 context,
+                &|| checkpoint().map_err(|error: TranscribeError| error.to_string()),
             )
             .map_err(|detail| TranscribeError::ProcessingClaim {
                 path: audio_path.to_path_buf(),

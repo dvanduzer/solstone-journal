@@ -160,11 +160,20 @@ pub fn inspect_output(journal: &Path, output: &Path) -> Result<Option<Evidence>,
 }
 
 pub fn observe(journal: &Path, evidence: &Evidence) -> Result<(), String> {
-    super::observe_held(
+    observe_checked(journal, evidence, &|| Ok(()))
+}
+
+pub fn observe_checked(
+    journal: &Path,
+    evidence: &Evidence,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    super::observe_held_checked(
         journal,
         &evidence.unit,
         &evidence.reason,
         &evidence.baseline,
+        checkpoint,
     )
 }
 
@@ -268,6 +277,17 @@ pub fn consume_context(
     handler: &str,
     context: &RetryContext,
 ) -> Result<Option<Attempt>, String> {
+    consume_context_checked(journal, output, handler, context, &|| Ok(()))
+}
+
+pub fn consume_context_checked(
+    journal: &Path,
+    output: &Path,
+    handler: &str,
+    context: &RetryContext,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Option<Attempt>, String> {
+    checkpoint()?;
     let unit = unit_for_output(journal, output, handler)?;
     if unit.id()? != context.unit_id {
         return Ok(None);
@@ -276,13 +296,14 @@ pub fn consume_context(
     if evidence.unit != unit {
         return Err("native failure handler changed".into());
     }
-    super::consume(
+    super::consume_checked(
         journal,
         &unit,
         &context.attempt,
         &evidence.reason,
         &evidence.input,
         DECLARED_FIXES,
+        checkpoint,
     )?;
     Ok(Some(context.attempt.clone()))
 }
@@ -312,6 +333,16 @@ pub fn consume_for_output(output: &Path, handler: &str) -> Result<bool, String> 
         return Ok(false);
     };
     consume_from_environment(Path::new(&journal), output, handler)
+}
+
+pub fn retry_attempt_from_environment() -> Result<Option<Attempt>, String> {
+    match std::env::var(ATTEMPT_ENV) {
+        Ok(value) => serde_json::from_str(&value)
+            .map(Some)
+            .map_err(|e| e.to_string()),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 /// Called by the owning native publication writer before saving its failed

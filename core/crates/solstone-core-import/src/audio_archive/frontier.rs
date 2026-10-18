@@ -4,9 +4,10 @@
 //! Bounded processing discovery. Saving and processing are independent durable facts.
 
 use super::claims::{
-    claim_db_path, retire_pending_tile, update_pending_tiles, update_pending_tiles_for_run,
+    claim_db_path, retire_pending_tile_checked, update_pending_tiles_checked,
+    update_pending_tiles_for_run,
 };
-use super::publish::recover_published_tile;
+use super::publish::recover_published_tile_checked;
 use super::record::ArchiveStore;
 use super::{AudioArchiveError, PartOutcome};
 use serde::{Deserialize, Serialize};
@@ -57,13 +58,15 @@ fn collect_tile(
     day: &str,
     key: &str,
     unavailable: &mut Vec<FrontierUnavailablePart>,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<Option<FrontierTile>, AudioArchiveError> {
+    checkpoint().map_err(AudioArchiveError::Other)?;
     if !store.has_tile(day, key)? {
         // A valid replacement run at a reused timestamp does not inherit old work.
-        retire_pending_tile(journal, id, day, key)?;
+        retire_pending_tile_checked(journal, id, day, key, checkpoint)?;
         return Ok(None);
     }
-    if !recover_published_tile(journal, id, store, day, key)? {
+    if !recover_published_tile_checked(journal, id, store, day, key, checkpoint)? {
         return Ok(None);
     }
     let stream = store.settings()?.stream;
@@ -100,13 +103,14 @@ fn collect_tile(
                 outcome: PartOutcome::Saved,
             });
         } else {
-            store.set_tile_outcomes(
+            store.set_tile_outcomes_checked(
                 day,
                 key,
                 &[(part.stored_name.clone(), PartOutcome::SavedButUnavailable)],
                 2,
+                checkpoint,
             )?;
-            store.finish_processing(day, key, &part.stored_name, true)?;
+            store.finish_processing_checked(day, key, &part.stored_name, true, checkpoint)?;
             unavailable.push(FrontierUnavailablePart {
                 day: day.to_owned(),
                 segment_key: key.to_owned(),
@@ -117,7 +121,7 @@ fn collect_tile(
     }
     if parts.is_empty() {
         if claim_db_path(journal).try_exists()? {
-            retire_pending_tile(journal, id, day, key)?;
+            retire_pending_tile_checked(journal, id, day, key, checkpoint)?;
         }
         return Ok(None);
     }
@@ -136,14 +140,23 @@ pub fn update_pending_archive_tiles(
     journal: &Path,
     limit: u32,
 ) -> Result<PendingArchiveBatch, AudioArchiveError> {
+    update_pending_archive_tiles_checked(journal, limit, &|| Ok(()))
+}
+
+pub fn update_pending_archive_tiles_checked(
+    journal: &Path,
+    limit: u32,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<PendingArchiveBatch, AudioArchiveError> {
+    checkpoint().map_err(AudioArchiveError::Other)?;
     let mut batch = PendingArchiveBatch::default();
     let mut stores = HashMap::new();
-    for (id, day, key) in update_pending_tiles(journal, limit)? {
+    for (id, day, key) in update_pending_tiles_checked(journal, limit, checkpoint)? {
         let result = (|| {
             let run = journal.join("imports").join(&id);
             match fs::symlink_metadata(&run) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    retire_pending_tile(journal, &id, &day, &key)?;
+                    retire_pending_tile_checked(journal, &id, &day, &key, checkpoint)?;
                     return Ok(None);
                 }
                 Err(error) => return Err(error.into()),
@@ -164,6 +177,7 @@ pub fn update_pending_archive_tiles(
                 &day,
                 &key,
                 &mut Vec::new(),
+                checkpoint,
             )
         })();
         match result {
@@ -196,9 +210,15 @@ pub fn update_archive_frontier(
     let mut pending = Vec::new();
     let mut unavailable_parts = Vec::new();
     for (day, key) in coordinates {
-        if let Some(tile) =
-            collect_tile(journal, id, &mut store, &day, &key, &mut unavailable_parts)?
-        {
+        if let Some(tile) = collect_tile(
+            journal,
+            id,
+            &mut store,
+            &day,
+            &key,
+            &mut unavailable_parts,
+            &|| Ok(()),
+        )? {
             pending.push(tile);
         }
     }
@@ -219,10 +239,23 @@ pub fn finish_archive_part(
     name: &str,
     unavailable: bool,
 ) -> Result<(), AudioArchiveError> {
+    finish_archive_part_checked(journal, id, day, key, name, unavailable, &|| Ok(()))
+}
+
+pub fn finish_archive_part_checked(
+    journal: &Path,
+    id: &str,
+    day: &str,
+    key: &str,
+    name: &str,
+    unavailable: bool,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), AudioArchiveError> {
+    checkpoint().map_err(AudioArchiveError::Other)?;
     let mut store = ArchiveStore::open(journal, id, true)?;
-    store.finish_processing(day, key, name, unavailable)?;
+    store.finish_processing_checked(day, key, name, unavailable, checkpoint)?;
     if store.tile_phase(day, key)? == 2 && store.pending_part_names(day, key)?.is_empty() {
-        retire_pending_tile(journal, id, day, key)?;
+        retire_pending_tile_checked(journal, id, day, key, checkpoint)?;
     }
     Ok(())
 }

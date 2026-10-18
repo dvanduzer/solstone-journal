@@ -1455,7 +1455,7 @@ pub(crate) fn emit_index_attempt(
     );
 }
 
-fn emit_outcome(writer: &mut impl Write, outcome: RuntimeOutcome) {
+pub fn emit_outcome(writer: &mut impl Write, outcome: RuntimeOutcome) {
     match outcome {
         RuntimeOutcome::Finished {
             output,

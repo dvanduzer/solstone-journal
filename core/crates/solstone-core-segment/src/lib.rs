@@ -82,10 +82,10 @@ pub use stream_record::{
     StreamAllocationBase, StreamAllocationCollision, StreamBindingRecord, StreamBindingState,
     StreamCollisionScheme, StreamHints, StreamRecord, UnboundStreamAdvanceError,
     advance_agent_memory_stream, advance_bound_stream, advance_unbound_stream,
-    bind_agent_memory_stream, bind_named_stream, bind_paired_stream, delete_stream_record,
-    has_unattributed_stream_record, list_stream_bindings, list_stream_records, lookup_stream,
-    lookup_stream_state, parse_agent_memory_chain, read_agent_memory_chain, resolve_stream,
-    retry_bound_stream,
+    advance_unbound_stream_checked, bind_agent_memory_stream, bind_named_stream,
+    bind_paired_stream, delete_stream_record, has_unattributed_stream_record, list_stream_bindings,
+    list_stream_records, lookup_stream, lookup_stream_state, parse_agent_memory_chain,
+    read_agent_memory_chain, resolve_stream, retry_bound_stream,
 };
 // Stream identity is allocated inside this crate; other crates reach the
 // unpaired binder only from tests.

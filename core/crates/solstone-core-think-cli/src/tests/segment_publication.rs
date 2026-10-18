@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use solstone_core_cortex_client::{CortexRequest, WaitForUsesReport};
 use solstone_core_format::content::{
     AdmittedCategory, Family, IndexDisposition, ScopeBasis, resolve_spec,
 };
@@ -12,7 +15,7 @@ use solstone_core_indexer_store::db::open_index;
 use solstone_core_indexer_store::scan::RescanFileStatus;
 
 use super::*;
-use crate::context::{IndexBoundary, ThinkContext};
+use crate::context::{CortexBoundary, IndexBoundary, ThinkContext};
 use crate::run_log::RunLogWriter;
 use crate::segment::write_sense_and_change;
 
@@ -1256,4 +1259,240 @@ fn topics_no_speech_fixtures_retain_topics_with_empty_quotes_section() {
         let quotes_section = topics_content.split("## Quotes\n").nth(1).unwrap();
         assert_eq!(quotes_section.trim(), "");
     }
+}
+
+#[test]
+fn hosted_checkpoint_skips_segment_publication_and_uncancelled_twin_publishes() {
+    struct TestCortex;
+    impl CortexBoundary for TestCortex {
+        fn dispatch(
+            &self,
+            _runtime: &tokio::runtime::Runtime,
+            _request: &CortexRequest,
+        ) -> Result<String, crate::context::DispatchFailure> {
+            Ok(String::new())
+        }
+        fn dispatch_prepared(
+            &self,
+            _runtime: &tokio::runtime::Runtime,
+            _request: &CortexRequest,
+            _reserved: Option<&str>,
+            _prepare: &mut (dyn FnMut(&str) -> std::io::Result<()> + Send),
+        ) -> Result<String, crate::context::DispatchFailure> {
+            Ok(String::new())
+        }
+        fn wait(
+            &self,
+            _runtime: &tokio::runtime::Runtime,
+            _use_ids: &[String],
+            _deadline: Option<std::time::Duration>,
+        ) -> Result<WaitForUsesReport, String> {
+            Ok(WaitForUsesReport {
+                completed: BTreeMap::new(),
+                timed_out: Vec::new(),
+            })
+        }
+    }
+
+    struct TestIndex {
+        rescanned: Arc<AtomicUsize>,
+    }
+    impl IndexBoundary for TestIndex {
+        fn rescan_file(
+            &self,
+            _journal: &Path,
+            _path: &Path,
+        ) -> Result<solstone_core_indexer_store::scan::RescanFileStatus, String> {
+            self.rescanned.fetch_add(1, Ordering::SeqCst);
+            Ok(
+                solstone_core_indexer_store::scan::RescanFileStatus::Indexed {
+                    warnings: Vec::new(),
+                },
+            )
+        }
+    }
+
+    let journal = tempfile::tempdir().unwrap();
+    let day_dir = journal.path().join("chronicle").join(DAY);
+    let segment_dir = day_dir.join("default/120000_60");
+    let talents_dir = segment_dir.join("talents");
+    fs::create_dir_all(&talents_dir).unwrap();
+    fs::write(
+        segment_dir.join("display_screen.jsonl"),
+        "{\"text\":\"test\"}\n",
+    )
+    .unwrap();
+    fs::write(talents_dir.join("sense.json"), "{\"density\":\"idle\"}").unwrap();
+
+    let rescanned = Arc::new(AtomicUsize::new(0));
+    let cancelled_context = ThinkContext::hosted(
+        journal.path(),
+        DAY.to_owned(),
+        day_dir.clone(),
+        NOW,
+        journal.path().join("talents"),
+        journal.path().join("apps"),
+        Arc::new(TestCortex),
+        Arc::new(TestIndex {
+            rescanned: Arc::clone(&rescanned),
+        }),
+        Arc::new(|| NOW),
+        None,
+        Arc::new(|| true),
+    );
+
+    let publication_path = talents_dir.join("publication.json");
+    assert!(!publication_path.exists());
+
+    assert_eq!(
+        crate::segment::publish_saved_outputs(&cancelled_context, &segment_dir).unwrap_err(),
+        "cancelled before publication"
+    );
+    assert!(!publication_path.exists());
+    assert_eq!(rescanned.load(Ordering::SeqCst), 0);
+
+    let uncancelled_context = ThinkContext::hosted(
+        journal.path(),
+        DAY.to_owned(),
+        day_dir,
+        NOW,
+        journal.path().join("talents"),
+        journal.path().join("apps"),
+        Arc::new(TestCortex),
+        Arc::new(TestIndex {
+            rescanned: Arc::clone(&rescanned),
+        }),
+        Arc::new(|| NOW),
+        None,
+        Arc::new(|| false),
+    );
+
+    crate::segment::publish_saved_outputs(&uncancelled_context, &segment_dir).unwrap();
+    assert!(publication_path.exists());
+    assert!(rescanned.load(Ordering::SeqCst) > 0);
+}
+
+#[test]
+fn hosted_checkpoint_skips_activity_provenance_and_work_removal_and_uncancelled_twin_finishes() {
+    struct TestCortex;
+    impl CortexBoundary for TestCortex {
+        fn dispatch(
+            &self,
+            _runtime: &tokio::runtime::Runtime,
+            _request: &CortexRequest,
+        ) -> Result<String, crate::context::DispatchFailure> {
+            Ok(String::new())
+        }
+        fn dispatch_prepared(
+            &self,
+            _runtime: &tokio::runtime::Runtime,
+            _request: &CortexRequest,
+            _reserved: Option<&str>,
+            _prepare: &mut (dyn FnMut(&str) -> std::io::Result<()> + Send),
+        ) -> Result<String, crate::context::DispatchFailure> {
+            Ok(String::new())
+        }
+        fn wait(
+            &self,
+            _runtime: &tokio::runtime::Runtime,
+            _use_ids: &[String],
+            _deadline: Option<std::time::Duration>,
+        ) -> Result<WaitForUsesReport, String> {
+            Ok(WaitForUsesReport {
+                completed: BTreeMap::new(),
+                timed_out: Vec::new(),
+            })
+        }
+    }
+    struct TestIndex;
+    impl IndexBoundary for TestIndex {
+        fn rescan_file(
+            &self,
+            _journal: &Path,
+            _path: &Path,
+        ) -> Result<solstone_core_indexer_store::scan::RescanFileStatus, String> {
+            Ok(
+                solstone_core_indexer_store::scan::RescanFileStatus::Indexed {
+                    warnings: Vec::new(),
+                },
+            )
+        }
+    }
+
+    let journal = tempfile::tempdir().unwrap();
+    let day_dir = journal.path().join("chronicle").join(DAY);
+    fs::create_dir_all(&day_dir).unwrap();
+    solstone_core_facets::create_facet(journal.path(), "work", "Work", "", "", "", None).unwrap();
+
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&cancelled);
+    let cancelled_context = ThinkContext::hosted(
+        journal.path(),
+        DAY.to_owned(),
+        day_dir.clone(),
+        NOW,
+        journal.path().join("talents"),
+        journal.path().join("apps"),
+        Arc::new(TestCortex),
+        Arc::new(TestIndex),
+        Arc::new(|| NOW),
+        None,
+        Arc::new(move || flag.load(Ordering::Acquire)),
+    );
+
+    let mut work = crate::activity_work::ActivityWork::begin(
+        &cancelled_context,
+        "work",
+        "meeting1",
+        "hash_abc".to_owned(),
+        std::collections::BTreeSet::new(),
+        false,
+    )
+    .unwrap();
+
+    cancelled.store(true, Ordering::Release);
+
+    let prov_path =
+        crate::segment::activity_provenance_path(&cancelled_context, DAY, "work", "meeting1");
+    assert!(!prov_path.exists());
+
+    // When cancelled, finish leaves provenance unwritten and activity work file intact
+    assert_eq!(
+        work.finish(&cancelled_context).unwrap_err(),
+        "cancelled before publication"
+    );
+    assert!(!prov_path.exists());
+    drop(work);
+
+    // Uncancelled twin finishes: writes provenance and deletes activity work file
+    let uncancelled_context = ThinkContext::hosted(
+        journal.path(),
+        DAY.to_owned(),
+        day_dir,
+        NOW,
+        journal.path().join("talents"),
+        journal.path().join("apps"),
+        Arc::new(TestCortex),
+        Arc::new(TestIndex),
+        Arc::new(|| NOW),
+        None,
+        Arc::new(|| false),
+    );
+
+    // Reopen existing work to verify file is intact on disk
+    let mut work =
+        crate::activity_work::ActivityWork::open_existing(&uncancelled_context, "work", "meeting1")
+            .unwrap()
+            .expect("activity work should still exist on disk");
+
+    work.finish(&uncancelled_context).unwrap();
+    drop(work);
+    assert!(prov_path.exists());
+    let prov_content = fs::read_to_string(&prov_path).unwrap();
+    assert!(prov_content.contains("hash_abc"));
+
+    let after_finish =
+        crate::activity_work::ActivityWork::open_existing(&uncancelled_context, "work", "meeting1")
+            .unwrap();
+    assert!(after_finish.is_none());
 }

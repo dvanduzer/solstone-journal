@@ -135,42 +135,53 @@ pub fn insert_daily_input_since(
     version: &str,
     day: &str,
 ) -> Result<String, InsertDailyInputSinceError> {
+    insert_daily_input_since_checked(journal, id, version, day, &|| Ok(()))
+}
+
+pub fn insert_daily_input_since_checked(
+    journal: &Path,
+    id: &str,
+    version: &str,
+    day: &str,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<String, InsertDailyInputSinceError> {
     if id.is_empty() || version.is_empty() {
         return Err(InsertDailyInputSinceError::Caller(DailyInputSinceError));
     }
     let date = parse_daily_input_day(day).map_err(InsertDailyInputSinceError::Caller)?;
     let canonical = date.format("%Y%m%d").to_string();
-    let transaction = mutate_journal_config(journal, LockOptions::default(), |config| {
-        let stored = solstone_core_journal_config::daily_input_since(config, id, version);
-        match stored {
-            Err(error) => JournalConfigMutation {
-                changed: false,
-                value: Err(InsertDailyInputSinceError::Stored(error)),
-            },
-            Ok(Some(date)) => JournalConfigMutation {
-                changed: false,
-                value: Ok(date.format("%Y%m%d").to_string()),
-            },
-            Ok(None) => {
-                let inputs = config
-                    .entry("daily_inputs")
-                    .or_insert_with(|| Value::Object(Map::new()))
-                    .as_object_mut()
-                    .expect("validated input map");
-                let versions = inputs
-                    .entry(id)
-                    .or_insert_with(|| Value::Object(Map::new()))
-                    .as_object_mut()
-                    .expect("validated version map");
-                versions.insert(version.to_owned(), Value::String(canonical.clone()));
-                JournalConfigMutation {
-                    changed: true,
-                    value: Ok(canonical.clone()),
+    let transaction =
+        mutate_journal_config_checked(journal, LockOptions::default(), checkpoint, |config| {
+            let stored = solstone_core_journal_config::daily_input_since(config, id, version);
+            match stored {
+                Err(error) => JournalConfigMutation {
+                    changed: false,
+                    value: Err(InsertDailyInputSinceError::Stored(error)),
+                },
+                Ok(Some(date)) => JournalConfigMutation {
+                    changed: false,
+                    value: Ok(date.format("%Y%m%d").to_string()),
+                },
+                Ok(None) => {
+                    let inputs = config
+                        .entry("daily_inputs")
+                        .or_insert_with(|| Value::Object(Map::new()))
+                        .as_object_mut()
+                        .expect("validated input map");
+                    let versions = inputs
+                        .entry(id)
+                        .or_insert_with(|| Value::Object(Map::new()))
+                        .as_object_mut()
+                        .expect("validated version map");
+                    versions.insert(version.to_owned(), Value::String(canonical.clone()));
+                    JournalConfigMutation {
+                        changed: true,
+                        value: Ok(canonical.clone()),
+                    }
                 }
             }
-        }
-    })
-    .map_err(InsertDailyInputSinceError::Mutation)?;
+        })
+        .map_err(InsertDailyInputSinceError::Mutation)?;
     transaction.value
 }
 
@@ -187,7 +198,28 @@ pub fn mutate_journal_config<T, F>(
 where
     F: FnOnce(&mut Map<String, Value>) -> JournalConfigMutation<T>,
 {
+    mutate_journal_config_checked(journal_path, lock_options, &|| Ok(()), mutator)
+}
+
+pub fn mutate_journal_config_checked<T, F>(
+    journal_path: &Path,
+    lock_options: LockOptions,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+    mutator: F,
+) -> Result<JournalConfigTransaction<T>, ConfigMutationError>
+where
+    F: FnOnce(&mut Map<String, Value>) -> JournalConfigMutation<T>,
+{
     let config_path = get_journal_config_path(journal_path);
+    let check = || {
+        checkpoint().map_err(|detail| {
+            ConfigMutationError::Write(AtomicWriteError::Io {
+                path: config_path.clone(),
+                source: std::io::Error::new(std::io::ErrorKind::Interrupted, detail),
+            })
+        })
+    };
+    check()?;
     let _lock = hold_lock(
         &config_path,
         LockOptions {
@@ -196,12 +228,14 @@ where
         },
     )
     .map_err(ConfigMutationError::Lock)?;
+    check()?;
     let mutation_base = load_mutation_base(journal_path).map_err(ConfigMutationError::Load)?;
     let materialized = mutation_base.materialized;
     let mut config = mutation_base.config;
     let mutation = mutator(&mut config);
     let written = materialized || mutation.changed;
     if written {
+        check()?;
         write_json(
             &config_path,
             &config,

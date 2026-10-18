@@ -166,6 +166,27 @@ pub fn endpoint_generate(
     )
 }
 
+pub(crate) fn endpoint_generate_with_context(
+    request: &GenerateRequest,
+    journal_path: &Path,
+    endpoint: &ByoEndpoint,
+    config: &Map<String, Value>,
+    runtime: &EndpointRuntime,
+    context: &crate::GenerateCallContext<'_>,
+) -> EndpointResult {
+    endpoint_generate_internal_with_context(
+        request,
+        journal_path,
+        endpoint,
+        config,
+        runtime,
+        &mut UreqEndpointTransport,
+        Instant::now(),
+        Instant::now(),
+        context,
+    )
+}
+
 pub fn endpoint_generate_with<T: EndpointTransport>(
     request: &GenerateRequest,
     journal_path: &Path,
@@ -198,6 +219,41 @@ pub(crate) fn endpoint_generate_internal<T: EndpointTransport>(
     now: Instant,
     started: Instant,
 ) -> EndpointResult {
+    let priority = match WorkPriority::from_environment() {
+        Ok(priority) => priority,
+        Err(_) => return failure("provider_response_invalid"),
+    };
+    endpoint_generate_internal_with_context(
+        request,
+        journal_path,
+        endpoint,
+        config,
+        runtime,
+        transport,
+        now,
+        started,
+        &crate::GenerateCallContext {
+            priority,
+            cancellation: &solstone_core_generate::Cancellation::never(),
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn endpoint_generate_internal_with_context<T: EndpointTransport>(
+    request: &GenerateRequest,
+    journal_path: &Path,
+    endpoint: &ByoEndpoint,
+    config: &Map<String, Value>,
+    runtime: &EndpointRuntime,
+    transport: &mut T,
+    now: Instant,
+    started: Instant,
+    context: &crate::GenerateCallContext<'_>,
+) -> EndpointResult {
+    if context.cancellation.is_cancelled() {
+        return failure("request_cancelled");
+    }
     let Some(max_tokens) = completion_ceiling(request, endpoint, config) else {
         return failure("provider_response_invalid");
     };
@@ -223,6 +279,7 @@ pub(crate) fn endpoint_generate_internal<T: EndpointTransport>(
                 endpoint,
                 request.exclusive_admission,
                 admission_timeout,
+                context.priority,
             ) {
                 Ok(permit) => Some(permit),
                 Err(reason_code) => return failure(reason_code),
@@ -230,6 +287,9 @@ pub(crate) fn endpoint_generate_internal<T: EndpointTransport>(
         };
         let mut refits = 0u32;
         loop {
+            if context.cancellation.is_cancelled() {
+                return failure("request_cancelled");
+            }
             let Some(remaining) = remaining_timeout(started, timeout) else {
                 return failure("local_capacity_exhausted");
             };
@@ -409,6 +469,7 @@ fn acquire_endpoint_slot(
     endpoint: &ByoEndpoint,
     exclusive_admission: bool,
     timeout: Duration,
+    priority: WorkPriority,
 ) -> Result<LocalSlotPermit, &'static str> {
     acquire_local_slot(
         &admission_dir(journal_path),
@@ -416,7 +477,7 @@ fn acquire_endpoint_slot(
         endpoint.parallel_slots.unwrap_or(1),
         Some(timeout),
         exclusive_admission,
-        WorkPriority::from_environment().map_err(|_| "provider_response_invalid")?,
+        priority,
     )
     .map_err(|error| match error {
         AdmissionError::Timeout => "local_queue_timeout",

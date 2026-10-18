@@ -38,9 +38,21 @@ pub(crate) fn run(
                 &attempt,
                 environment,
                 Duration::from_secs(1800),
+                context.sense_executor.clone(),
             )
             .map_err(|e| e.to_string());
-            let terminal = work_retry::raw::finish_output(&context.journal, &record.unit, &attempt);
+            let terminal = work_retry::raw::finish_output_checked(
+                &context.journal,
+                &record.unit,
+                &attempt,
+                &|| {
+                    if (context.cancel_checkpoint)() {
+                        Err("thinking cancelled".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
             execution?;
             terminal?;
             Ok(ModeResult::default())
