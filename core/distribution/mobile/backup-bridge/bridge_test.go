@@ -47,6 +47,13 @@ func TestActualShapeValidation(t *testing.T) {
 			t.Fatalf("missing operation input accepted: %d", op)
 		}
 	}
+	for _, op := range []int32{OpListRecoveryKeys, OpRemoveRecoveryKey} {
+		test := valid
+		test.operation = op
+		if got := validateShape(test); got != StatusOk {
+			t.Fatalf("valid operation %d refused: %d", op, got)
+		}
+	}
 }
 
 func TestSyntacticPathAndOverlapValidation(t *testing.T) {

@@ -147,13 +147,16 @@ unsafe extern "C" {
         options: *const Options,
         key_id: *const c_char,
         key_id_len: u32,
+        maintenance: u32,
         out: *mut u64,
     ) -> i32;
     fn restic_bridge_s3_remove_recovery_key_v1_start(
         request: *const RemoteRequest,
         options: *const Options,
+        state_fd: i32,
         key_id: *const c_char,
         key_id_len: u32,
+        maintenance: u32,
         out: *mut u64,
     ) -> i32;
     fn restic_bridge_free(id: u64) -> i32;
@@ -236,6 +239,7 @@ mod unlinked {
         _: *const Options,
         _: *const c_char,
         _: u32,
+        _: u32,
         _: *mut u64,
     ) -> i32 {
         INVALID_ARGUMENT
@@ -243,7 +247,9 @@ mod unlinked {
     pub(super) unsafe fn restic_bridge_s3_remove_recovery_key_v1_start(
         _: *const RemoteRequest,
         _: *const Options,
+        _: i32,
         _: *const c_char,
+        _: u32,
         _: u32,
         _: *mut u64,
     ) -> i32 {
@@ -520,6 +526,7 @@ impl Call {
         repo_path: &str,
         key_id: &str,
         options: &Options,
+        maintenance: u32,
     ) -> Result<Self, i32> {
         let began = Instant::now();
         let request = LocalRequest {
@@ -539,6 +546,7 @@ impl Call {
                 options,
                 key_id_bytes.pointer,
                 key_id_bytes.length,
+                maintenance,
                 &mut id,
             )
         };
@@ -550,6 +558,7 @@ impl Call {
         remote: &Remote<'_>,
         key_id: &str,
         options: &Options,
+        maintenance: u32,
     ) -> Result<Self, i32> {
         let began = Instant::now();
         let request = RemoteRequest {
@@ -576,8 +585,10 @@ impl Call {
             restic_bridge_s3_remove_recovery_key_v1_start(
                 &request,
                 options,
+                remote.state.descriptor.as_raw_fd(),
                 key_id_bytes.pointer,
                 key_id_bytes.length,
+                maintenance,
                 &mut id,
             )
         };

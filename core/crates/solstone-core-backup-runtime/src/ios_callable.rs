@@ -823,7 +823,7 @@ pub(crate) fn remove_key(
     let state;
     let call = match repository {
         repository::Repository::Local(repo_path) => {
-            native::Call::local_remove_key(&password, repo_path, key_id, &options)
+            native::Call::local_remove_key(&password, repo_path, key_id, &options, 1)
         }
         repository::Repository::S3 {
             destination,
@@ -860,7 +860,7 @@ pub(crate) fn remove_key(
                 reserved1: u32::from(append_only),
                 ..options
             };
-            native::Call::remote_remove_key(&password, &remote, key_id, &options)
+            native::Call::remote_remove_key(&password, &remote, key_id, &options, 1)
         }
     }
     .map_err(|status| {

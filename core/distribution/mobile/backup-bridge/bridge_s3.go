@@ -261,6 +261,9 @@ func restic_bridge_s3_start(request *C.restic_s3_request, outID *C.uint64_t) C.i
 		return C.int32_t(StatusInvalidArgument)
 	}
 	*outID = 0
+	if request == nil || request.operation == C.int32_t(OpRemoveRecoveryKey) {
+		return C.int32_t(StatusInvalidArgument)
+	}
 	req, status := validateS3Request(request)
 	if status != StatusOk {
 		return C.int32_t(status)
@@ -305,6 +308,9 @@ func restic_bridge_s3_operation_v1_start(request *C.restic_s3_request, options *
 		return C.int32_t(StatusInvalidArgument)
 	}
 	*outID = 0
+	if request == nil || request.operation == C.int32_t(OpRemoveRecoveryKey) {
+		return C.int32_t(StatusInvalidArgument)
+	}
 	entry, status := reserveOwnedCall()
 	if status != StatusOk {
 		return C.int32_t(status)
@@ -423,11 +429,14 @@ func startS3OperationWithDirectories(request *C.restic_s3_request, options *C.re
 }
 
 //export restic_bridge_s3_remove_recovery_key_v1_start
-func restic_bridge_s3_remove_recovery_key_v1_start(request *C.restic_s3_request, options *C.restic_operation_options_v1, keyID *C.char, keyIDLen C.uint32_t, outID *C.uint64_t) (returned C.int32_t) {
+func restic_bridge_s3_remove_recovery_key_v1_start(request *C.restic_s3_request, options *C.restic_operation_options_v1, stateFD C.int32_t, keyID *C.char, keyIDLen C.uint32_t, maintenance C.uint32_t, outID *C.uint64_t) (returned C.int32_t) {
 	if outID == nil {
 		return C.int32_t(StatusInvalidArgument)
 	}
 	*outID = 0
+	if maintenance != 1 {
+		return C.int32_t(StatusInvalidArgument)
+	}
 	entry, status := reserveOwnedCall()
 	if status != StatusOk {
 		return C.int32_t(status)
@@ -442,16 +451,21 @@ func restic_bridge_s3_remove_recovery_key_v1_start(request *C.restic_s3_request,
 	if !validS3ID(keyStr) {
 		return C.int32_t(StatusInvalidArgument)
 	}
+	stateIdentity, status := readBorrowedDirectoryIdentity(int(stateFD))
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
 	ownedOptions, status := parseCRemoteOperationOptions(int32(request.operation), options)
 	if status != StatusOk {
 		return C.int32_t(status)
 	}
-	req, status := validateS3RequestDirectoriesOwned(request, nil, entry, nil, nil)
+	req, status := validateS3RequestDirectoriesOwned(request, nil, entry, stateIdentity, nil)
 	if status != StatusOk {
 		return C.int32_t(status)
 	}
 	req.executionOptions = ownedOptions
 	req.removeKeyID = keyStr
+	req.maintenanceRotation = true
 	if ownedOptions.appendOnly {
 		req.remote.cfg.appendOnly = true
 	}
@@ -461,4 +475,3 @@ func restic_bridge_s3_remove_recovery_key_v1_start(request *C.restic_s3_request,
 	}
 	return C.int32_t(status)
 }
-

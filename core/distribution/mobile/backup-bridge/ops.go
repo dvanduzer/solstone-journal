@@ -353,27 +353,44 @@ func executeAddRecoveryKey(ctx context.Context, req bridgeRequest, setWrote func
 			return bridgeResult{status: StatusCancelled, diagnostic: DiagCancelled}, err
 		}
 	}
+	recordedKeyID := ""
+	if req.remote != nil && req.remote.owner != nil {
+		var recordedPw []byte
+		recordedKeyID, recordedPw = req.remote.owner.activeAddRecoveryInfo()
+		if len(recordedPw) > 0 {
+			recPw = string(recordedPw)
+			defer zeroBytes(recordedPw)
+		}
+	}
 
 	// AddKey stores params *crypto.Params with no mutex.
 	// Recovery AddKey passes username and hostname "solstone".
 	// crypto.KDF takes no context.
-	newKey, err := func() (*repository.Key, error) {
-		addKeyMu.Lock()
-		defer addKeyMu.Unlock()
-		if lockCtx.Err() != nil {
-			return nil, lockCtx.Err()
+	var newID restic.ID
+	if recordedKeyID != "" {
+		parsedID, err := restic.ParseID(recordedKeyID)
+		if err != nil {
+			return bridgeResult{status: StatusInternal, diagnostic: DiagInternal}, err
 		}
-		return repository.AddKey(lockCtx, repo, recPw, "solstone", "solstone", repo.Key())
-	}()
+		newID = parsedID
+	} else {
+		newKey, err := func() (*repository.Key, error) {
+			addKeyMu.Lock()
+			defer addKeyMu.Unlock()
+			if lockCtx.Err() != nil {
+				return nil, lockCtx.Err()
+			}
+			return repository.AddKey(lockCtx, repo, recPw, "solstone", "solstone", repo.Key())
+		}()
 
-	if err != nil {
-		if lockCtx.Err() != nil {
-			return bridgeResult{status: StatusCancelledUncertain, diagnostic: DiagCancelledUncertain}, lockCtx.Err()
+		if err != nil {
+			if lockCtx.Err() != nil {
+				return bridgeResult{status: StatusCancelledUncertain, diagnostic: DiagCancelledUncertain}, lockCtx.Err()
+			}
+			return bridgeResult{status: StatusFailed, diagnostic: scrubError(err, req)}, err
 		}
-		return bridgeResult{status: StatusFailed, diagnostic: scrubError(err, req)}, err
+		newID = newKey.ID()
 	}
-
-	newID := newKey.ID()
 
 	// Verification is a separate backend open and safe scan with only the recovery password.
 	verified := false
@@ -874,6 +891,15 @@ func classifyKeyOpen(ctx context.Context, hasKey bool, openErr error, panicVal i
 	return false, errors.New("no key opened without error")
 }
 
+func validateBackendKeyNames(ctx context.Context, be backend.Backend) error {
+	return be.List(ctx, backend.KeyFile, func(fi backend.FileInfo) error {
+		if !lowerHexID(fi.Name) {
+			return errors.New("malformed key file name")
+		}
+		return nil
+	})
+}
+
 func executeListRecoveryKeys(ctx context.Context, req bridgeRequest) (bridgeResult, error) {
 	if !req.pathsPinned {
 		if err := pinRequestPaths(&req); err != nil {
@@ -890,6 +916,13 @@ func executeListRecoveryKeys(ctx context.Context, req bridgeRequest) (bridgeResu
 		return bridgeResult{status: StatusFailed, diagnostic: DiagRepoMissing}, err
 	}
 	defer be.Close()
+
+	if err := validateBackendKeyNames(ctx, be); err != nil {
+		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+			return bridgeResult{status: StatusCancelled, diagnostic: DiagCancelled}, ctx.Err()
+		}
+		return bridgeResult{status: StatusFailed, diagnostic: DiagIoFailed}, err
+	}
 
 	repo, err := repository.New(guardedBackend{be}, repository.Options{})
 	if err != nil {
@@ -1047,6 +1080,10 @@ func executeRemoveRecoveryKey(ctx context.Context, req bridgeRequest, setWrote f
 	defer unlock()
 	_ = lockCtx
 
+	if !req.maintenanceRotation {
+		return bridgeResult{status: StatusInvalidArgument, diagnostic: DiagInvalidArgument}, errors.New("maintenance authority required")
+	}
+
 	setWrote()
 	if req.remote != nil && req.remote.owner != nil {
 		if err := req.remote.owner.noteSave(""); err != nil {
@@ -1060,7 +1097,7 @@ func executeRemoveRecoveryKey(ctx context.Context, req bridgeRequest, setWrote f
 		if err != nil {
 			removeErr = err
 		} else {
-			removeErr = base.removeExactKeyObject(ctx, keyID)
+			removeErr = base.removeExactKeyObject(ctx, keyID, req.maintenanceRotation)
 		}
 	} else {
 		removeErr = be.Remove(ctx, backend.Handle{Type: backend.KeyFile, Name: keyID})
@@ -1078,4 +1115,3 @@ func executeRemoveRecoveryKey(ctx context.Context, req bridgeRequest, setWrote f
 
 	return bridgeResult{status: StatusOk}, nil
 }
-

@@ -112,11 +112,12 @@ func (be *s3OperationBackend) Save(ctx context.Context, handle backend.Handle, r
 	if err := be.owner.noteSave(lockID); err != nil {
 		return err
 	}
-	// Retain the content-addressed attempt ID, without claiming acknowledgement.
-	be.owner.mu.Lock()
 	if handle.Type == backend.KeyFile {
-		be.owner.knownKeyID = handle.Name
+		if err := be.owner.recordKeyID(handle.Name); err != nil {
+			return err
+		}
 	}
+	be.owner.mu.Lock()
 	if handle.Type == backend.SnapshotFile {
 		be.owner.knownSnapshotID = handle.Name
 	}

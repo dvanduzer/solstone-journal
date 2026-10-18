@@ -425,9 +425,12 @@ func (be *s3Backend) Remove(ctx context.Context, handle backend.Handle) error {
 	return nil
 }
 
-func (be *s3Backend) removeExactKeyObject(ctx context.Context, keyID string) error {
+func (be *s3Backend) removeExactKeyObject(ctx context.Context, keyID string, maintenance bool) error {
 	if !validS3ID(keyID) {
 		return errS3Handle
+	}
+	if be.cfg.appendOnly && !maintenance {
+		return errS3Denied
 	}
 	owned, done, err := be.enter(ctx)
 	if err != nil {
@@ -449,4 +452,3 @@ func (be *s3Backend) removeExactKeyObject(ctx context.Context, keyID string) err
 	}
 	return nil
 }
-

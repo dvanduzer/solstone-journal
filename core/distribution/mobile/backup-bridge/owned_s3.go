@@ -43,6 +43,12 @@ func (owner *s3Owner) closeOwned() error {
 	for _, password := range owner.attemptPasses {
 		zeroBytes(password)
 	}
+	if owner.record.Active != nil && len(owner.record.Active.RecoveryPassword) > 0 {
+		zeroBytes(owner.record.Active.RecoveryPassword)
+	}
+	if owner.preservedAddIntent != nil && len(owner.preservedAddIntent.RecoveryPassword) > 0 {
+		zeroBytes(owner.preservedAddIntent.RecoveryPassword)
+	}
 	owner.attemptPasses = nil
 	owner.preservedAddIntent = nil
 	// No reverse path acquires owner.mu while holding s3OwnersMu; keep namespace

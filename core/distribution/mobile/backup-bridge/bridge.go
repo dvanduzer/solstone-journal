@@ -146,7 +146,7 @@ func validateRequestOwned(req *C.restic_request, entry *ownedCall) (bridgeReques
 	}
 
 	op := int32(req.operation)
-	if op < OpInit || op > OpRemoveRecoveryKey {
+	if !validLocalOperation(op) {
 		return bridgeRequest{}, StatusInvalidArgument
 	}
 
@@ -519,11 +519,14 @@ func restic_bridge_operation_v1_start(request *C.restic_request, options *C.rest
 }
 
 //export restic_bridge_remove_recovery_key_v1_start
-func restic_bridge_remove_recovery_key_v1_start(request *C.restic_request, options *C.restic_operation_options_v1, keyID *C.char, keyIDLen C.uint32_t, outID *C.uint64_t) (returned C.int32_t) {
+func restic_bridge_remove_recovery_key_v1_start(request *C.restic_request, options *C.restic_operation_options_v1, keyID *C.char, keyIDLen C.uint32_t, maintenance C.uint32_t, outID *C.uint64_t) (returned C.int32_t) {
 	if outID == nil {
 		return C.int32_t(StatusInvalidArgument)
 	}
 	*outID = 0
+	if maintenance != 1 {
+		return C.int32_t(StatusInvalidArgument)
+	}
 	entry, status := reserveOwnedCall()
 	if status != StatusOk {
 		return C.int32_t(status)
@@ -548,13 +551,13 @@ func restic_bridge_remove_recovery_key_v1_start(request *C.restic_request, optio
 	}
 	req.executionOptions = ownedOptions
 	req.removeKeyID = keyStr
+	req.maintenanceRotation = true
 	id, status := startBridgeCall(req)
 	if status == StatusOk {
 		*outID = C.uint64_t(id)
 	}
 	return C.int32_t(status)
 }
-
 
 //export restic_bridge_operation_directories_v1_start
 func restic_bridge_operation_directories_v1_start(request *C.restic_request, options *C.restic_operation_options_v1, sourceFD C.int32_t, workspaceFD C.int32_t, workspace *C.char, workspaceLen C.uint32_t, policy *C.char, policyLen C.uint32_t, outID *C.uint64_t) (returned C.int32_t) {

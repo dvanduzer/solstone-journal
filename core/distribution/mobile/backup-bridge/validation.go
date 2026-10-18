@@ -12,9 +12,18 @@ type requestShape struct {
 	fields    [6]requestField
 }
 
+func validLocalOperation(op int32) bool {
+	switch op {
+	case OpInit, OpOpen, OpAddRecoveryKey, OpSnapshot, OpListSnapshots, OpRestore, OpCheck, OpListRecoveryKeys, OpRemoveRecoveryKey:
+		return true
+	default:
+		return false
+	}
+}
+
 // Validate before copying any foreign memory. A nonzero length never authorizes a NULL pointer.
 func validateShape(request requestShape) int32 {
-	if request.operation < OpInit || request.operation > OpRemoveRecoveryKey {
+	if !validLocalOperation(request.operation) {
 		return StatusInvalidArgument
 	}
 	caps := [6]uint32{maxPasswordLen, maxPasswordLen, maxPathLen, maxPathLen, maxPathLen, idHexLen}
