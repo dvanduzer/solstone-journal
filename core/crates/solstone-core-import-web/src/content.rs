@@ -18,6 +18,7 @@ use crate::{
     AppState,
     http::{error, import_not_found, json as json_response},
     imports::source_icon,
+    mobile_import_contract::ImportReasonCode,
 };
 
 fn read_jsonl(path: &Path) -> Result<Vec<Value>, std::io::Error> {
@@ -216,9 +217,9 @@ fn json_from_file(root: &Path, path: &Path) -> Result<Option<Value>, std::io::Er
 
 fn metadata_read_error(detail: std::io::Error) -> Response {
     error(
-        StatusCode::INTERNAL_SERVER_ERROR,
+        ImportReasonCode::ImportMetadataFailed.status(),
         "that import metadata couldn't be read.",
-        "import_metadata_failed",
+        ImportReasonCode::ImportMetadataFailed.as_wire(),
         detail.to_string(),
     )
 }
@@ -337,9 +338,9 @@ fn content_manifest(root: &Path, timestamp: &str) -> Result<(PathBuf, Vec<Value>
             .and_then(|path| read_jsonl(&path))
             .map_err(|_| {
                 Box::new(error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ImportReasonCode::ImportMetadataFailed.status(),
                     "that import metadata couldn't be read.",
-                    "import_metadata_failed",
+                    ImportReasonCode::ImportMetadataFailed.as_wire(),
                     "Failed to read manifest".to_owned(),
                 ))
             })?;
@@ -393,9 +394,9 @@ fn content_manifest(root: &Path, timestamp: &str) -> Result<(PathBuf, Vec<Value>
             "No content available".to_owned(),
         ))),
         Err(error_detail) => Err(Box::new(error(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            ImportReasonCode::ImportMetadataFailed.status(),
             "that import metadata couldn't be read.",
-            "import_metadata_failed",
+            ImportReasonCode::ImportMetadataFailed.as_wire(),
             error_detail.to_string(),
         ))),
     }

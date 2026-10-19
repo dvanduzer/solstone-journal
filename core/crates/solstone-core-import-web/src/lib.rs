@@ -18,6 +18,7 @@ mod http;
 mod imports;
 mod journal_archive;
 mod lifecycle;
+pub mod mobile_import_contract;
 mod multipart;
 mod preview;
 mod progress;
@@ -52,7 +53,7 @@ pub fn routes(journal_root: PathBuf) -> Router {
             post(journal_archive::preview),
         )
         .route(
-            "/app/import/api/save",
+            mobile_import_contract::SAVE_PATH,
             post(lifecycle::save).layer(DefaultBodyLimit::max(
                 solstone_core_convey_http::serve::REQUEST_BODY_LIMIT,
             )),
@@ -60,7 +61,7 @@ pub fn routes(journal_root: PathBuf) -> Router {
         .route("/app/import/api/save-path", post(lifecycle::save_path))
         .route("/app/import/api/meta", post(lifecycle::meta))
         .route("/app/import/api/preview", post(preview::preview))
-        .route("/app/import/api/start", post(lifecycle::start))
+        .route(mobile_import_contract::START_PATH, post(lifecycle::start))
         .route(
             "/app/import/api/{timestamp}/content/{item_id}",
             get(content::detail),

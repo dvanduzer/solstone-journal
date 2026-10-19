@@ -6212,6 +6212,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "solstone-core-import-web",
  "solstone-core-journal",
  "solstone-core-journal-io",
  "solstone-core-sol-link",

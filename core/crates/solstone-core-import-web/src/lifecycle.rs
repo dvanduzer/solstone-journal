@@ -33,6 +33,9 @@ use crate::{
     AppState,
     callosum::{BusError, TaskWatch, request_required},
     http::{error, import_not_found, json as json_response},
+    mobile_import_contract::{
+        ImportReasonCode, SavedSource, inprocess_start_response, queued_start_response,
+    },
     multipart, save_stream,
 };
 
@@ -184,10 +187,10 @@ fn source_for(filename: &str, content_type: Option<&str>) -> &'static str {
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if solstone_core_import_sources::image::is_image_extension(&extension) {
-        "image"
+    let source = if solstone_core_import_sources::image::is_image_extension(&extension) {
+        SavedSource::Image
     } else if matches!(extension.as_str(), "pdf" | "doc" | "docx") {
-        "document"
+        SavedSource::Document
     } else if content_type
         .is_some_and(|value| value.starts_with("audio/") || value.starts_with("video/"))
         || matches!(
@@ -195,10 +198,11 @@ fn source_for(filename: &str, content_type: Option<&str>) -> &'static str {
             Some(MediaKind::Audio | MediaKind::Video)
         )
     {
-        "audio"
+        SavedSource::Audio
     } else {
-        "text"
-    }
+        SavedSource::Text
+    };
+    source.as_wire()
 }
 
 fn safe_filename(filename: &str) -> Option<String> {
@@ -209,14 +213,13 @@ fn safe_filename(filename: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn failure(status: StatusCode, reason: &str, message: &str, detail: impl Into<String>) -> Response {
-    error(status, message, reason, detail.into())
+fn failure(code: ImportReasonCode, message: &str, detail: impl Into<String>) -> Response {
+    error(code.status(), message, code.as_wire(), detail.into())
 }
 
 fn metadata_failed(detail: impl Into<String>) -> Response {
     failure(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "import_metadata_failed",
+        ImportReasonCode::ImportMetadataFailed,
         "that import metadata couldn't be updated.",
         detail,
     )
@@ -224,8 +227,7 @@ fn metadata_failed(detail: impl Into<String>) -> Response {
 
 fn missing(detail: impl Into<String>) -> Response {
     failure(
-        StatusCode::BAD_REQUEST,
-        "missing_required_field",
+        ImportReasonCode::MissingRequiredField,
         "a required field is missing.",
         detail,
     )
@@ -233,8 +235,7 @@ fn missing(detail: impl Into<String>) -> Response {
 
 fn invalid_state(detail: impl Into<String>) -> Response {
     failure(
-        StatusCode::BAD_REQUEST,
-        "invalid_operation_for_state",
+        ImportReasonCode::InvalidOperationForState,
         "that action isn't available in the current state.",
         detail,
     )
@@ -339,7 +340,7 @@ fn claim_import_directory(root: &Path, semantic: &str) -> Result<String, String>
     Ok(allocated.import_id.as_str().to_owned())
 }
 
-fn summary(metadata: &ImportMetadata) -> Value {
+pub(crate) fn summary(metadata: &ImportMetadata) -> Value {
     json!({
         "schema_version": 1,
         "status": "staged",
@@ -368,7 +369,7 @@ fn summary(metadata: &ImportMetadata) -> Value {
     })
 }
 
-fn replay_summary(metadata: &ImportMetadata) -> Value {
+pub(crate) fn replay_summary(metadata: &ImportMetadata) -> Value {
     let mut result = summary(metadata);
     result["replay"] = json!(true);
     result["recommended_action"] = json!("start");
@@ -446,8 +447,7 @@ fn ensure_save_tmp(root: &Path) -> Result<PathBuf, String> {
 
 fn payload_too_large(detail: impl Into<String>) -> Response {
     failure(
-        StatusCode::PAYLOAD_TOO_LARGE,
-        "multipart_part_too_large",
+        ImportReasonCode::MultipartPartTooLarge,
         "that file is too large to bring in.",
         detail,
     )
@@ -462,8 +462,7 @@ fn stream_error_response(error: save_stream::SaveStreamError) -> Response {
             payload_too_large("multipart file exceeds request limit")
         }
         save_stream::SaveStreamError::Read => failure(
-            StatusCode::BAD_REQUEST,
-            "ingest_no_files",
+            ImportReasonCode::IngestNoFiles,
             "there are no files to bring in.",
             "cannot read multipart part",
         ),
@@ -570,8 +569,7 @@ pub(crate) async fn save(State(state): State<AppState>, mut multipart: Multipart
             }
             Err(_) => {
                 return failure(
-                    StatusCode::BAD_REQUEST,
-                    "ingest_no_files",
+                    ImportReasonCode::IngestNoFiles,
                     "there are no files to bring in.",
                     "invalid multipart body",
                 );
@@ -579,8 +577,7 @@ pub(crate) async fn save(State(state): State<AppState>, mut multipart: Multipart
         };
         if part_count == multipart::MAX_PARTS {
             return failure(
-                StatusCode::BAD_REQUEST,
-                "ingest_no_files",
+                ImportReasonCode::IngestNoFiles,
                 "there are no files to bring in.",
                 "too many multipart parts",
             );
@@ -588,8 +585,7 @@ pub(crate) async fn save(State(state): State<AppState>, mut multipart: Multipart
         part_count += 1;
         if field.headers().len() > multipart::MAX_HEADERS {
             return failure(
-                StatusCode::BAD_REQUEST,
-                "ingest_no_files",
+                ImportReasonCode::IngestNoFiles,
                 "there are no files to bring in.",
                 "too many multipart headers",
             );
@@ -600,8 +596,7 @@ pub(crate) async fn save(State(state): State<AppState>, mut multipart: Multipart
             .is_some_and(|value| value.len() > multipart::MAX_FILENAME_BYTES)
         {
             return failure(
-                StatusCode::BAD_REQUEST,
-                "ingest_no_files",
+                ImportReasonCode::IngestNoFiles,
                 "there are no files to bring in.",
                 "multipart filename is too long",
             );
@@ -633,8 +628,7 @@ pub(crate) async fn save(State(state): State<AppState>, mut multipart: Multipart
                 }
                 Err(detail) => {
                     return failure(
-                        StatusCode::BAD_REQUEST,
-                        "ingest_no_files",
+                        ImportReasonCode::IngestNoFiles,
                         "there are no files to bring in.",
                         detail,
                     );
@@ -673,8 +667,7 @@ pub(crate) async fn save(State(state): State<AppState>, mut multipart: Multipart
         }) => {
             let Some(filename) = safe_filename(&original) else {
                 return failure(
-                    StatusCode::BAD_REQUEST,
-                    "ingest_no_files",
+                    ImportReasonCode::IngestNoFiles,
                     "there are no files to bring in.",
                     "No input",
                 );
@@ -710,8 +703,7 @@ pub(crate) async fn save(State(state): State<AppState>, mut multipart: Multipart
         }
         _ => {
             return failure(
-                StatusCode::BAD_REQUEST,
-                "ingest_no_files",
+                ImportReasonCode::IngestNoFiles,
                 "there are no files to bring in.",
                 "No input",
             );
@@ -735,8 +727,7 @@ pub(crate) async fn save(State(state): State<AppState>, mut multipart: Multipart
     let strava_card = text_value(&data, "source_hint").trim() == STRAVA_SOURCE;
     if is_strava && !strava_card {
         return failure(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "strava_download",
+            ImportReasonCode::StravaDownload,
             "this looks like a Strava download, so your journal didn't keep it. use the Strava card so only your workouts are read.",
             "this looks like a Strava download, so your journal didn't keep it. use the Strava card so only your workouts are read.",
         );
@@ -889,17 +880,16 @@ pub(crate) async fn save_path(State(state): State<AppState>, Json(data): Json<Va
     }
     let local = Path::new(&local_path);
     if !local.exists() {
-        return failure(
+        return error(
             StatusCode::NOT_FOUND,
-            "file_not_found",
             "that file isn't available.",
+            "file_not_found",
             format!("Path not found: {local_path}"),
         );
     }
     if solstone_core_import_sources::strava::looks_like_strava_download(local, None) {
         return failure(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "strava_download",
+            ImportReasonCode::StravaDownload,
             "this looks like a Strava download, so your journal didn't keep it. use the Strava card so only your workouts are read.",
             "this looks like a Strava download, so your journal didn't keep it. use the Strava card so only your workouts are read.",
         );
@@ -1058,8 +1048,7 @@ fn relocation_error(error: ImportError, old_timestamp: &str, timestamp: &str) ->
             import_not_found(&format!("Import directory not found for {old_timestamp}"))
         }
         ImportError::DestinationExists { .. } => failure(
-            StatusCode::CONFLICT,
-            "import_conflict",
+            ImportReasonCode::ImportConflict,
             "that import couldn't be started because it already exists.",
             format!("Import already exists for timestamp {timestamp}"),
         ),
@@ -1069,17 +1058,17 @@ fn relocation_error(error: ImportError, old_timestamp: &str, timestamp: &str) ->
 
 fn queue_error() -> Response {
     failure(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "import_queue_unreachable",
+        ImportReasonCode::ImportQueueUnreachable,
         "your journal's background service isn't running. start it, then try again.",
         "your journal's background service isn't running. start it, then try again.",
     )
 }
 
 fn metadata_error_with_task(task_id: &str, detail: String) -> Response {
+    let code = ImportReasonCode::ImportMetadataFailed;
     json_response(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        json!({"task_id":task_id,"error":"that import metadata couldn't be updated.","reason_code":"import_metadata_failed","detail":detail}),
+        code.status(),
+        json!({"task_id":task_id,"error":"that import metadata couldn't be updated.","reason_code":code.as_wire(),"detail":detail}),
     )
 }
 
@@ -1151,9 +1140,10 @@ pub(crate) async fn start(State(state): State<AppState>, Json(data): Json<Value>
     let data = match validated {
         Ok(data) => data,
         Err(error) => {
+            let code = ImportReasonCode::ImportPreviewRequired;
             return json_response(
-                StatusCode::CONFLICT,
-                json!({"error": error, "reason_code": "import_preview_required"}),
+                code.status(),
+                json!({"error": error, "reason_code": code.as_wire()}),
             );
         }
     };
@@ -1445,13 +1435,7 @@ where
         );
         return json_response(
             StatusCode::OK,
-            json!({
-                "status": "ok",
-                "import_id": record_id,
-                "task_id": task_id,
-                "generation": facts.generation,
-                "attempt_id": facts.attempt_id
-            }),
+            inprocess_start_response(&task_id, record_id, facts.generation, &facts.attempt_id),
         );
     }
 
@@ -1480,10 +1464,7 @@ where
             ),
         );
     }
-    json_response(
-        StatusCode::OK,
-        json!({"status":"ok","task_id":task_id,"import_id":record_id}),
-    )
+    json_response(StatusCode::OK, queued_start_response(&task_id, record_id))
 }
 
 pub(crate) fn detect_inprocess_source(
