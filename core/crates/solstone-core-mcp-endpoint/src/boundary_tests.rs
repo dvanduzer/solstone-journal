@@ -10592,11 +10592,18 @@ fn fetch_markdown_whole_record_and_chunk_verification() {
     let snippet = hit["snippet"].as_str().unwrap();
     assert!(!snippet.contains("startmdneedle"));
 
-    let fetched = probe(&journal, "fetch", json!({"reference": hit["reference"]})).unwrap();
+    let reference = hit["reference"].as_str().unwrap().to_owned();
+    let fetched = probe(&journal, "fetch", json!({"reference": reference})).unwrap();
     assert_no_leaked_keys(&fetched);
     let text = fetched["text"].as_str().unwrap();
     assert!(text.contains("startmdneedle"));
     assert!(text.contains("endmdneedle"));
+
+    fs::write(&md_path, "# Short\n\nreplacementonlyneedle\n").unwrap();
+    assert_eq!(
+        probe(&journal, "fetch", json!({"reference": reference})),
+        Err(McpProbeError::Unavailable)
+    );
 }
 
 #[test]

@@ -1561,6 +1561,45 @@ fn resolve_search_cursor(
     })
 }
 
+/// How a markdown fetch represents an indexed chunk.
+enum MarkdownFetch {
+    /// The indexed chunk is still that index in the current file, so the whole
+    /// file is the record.
+    Document(String),
+    /// One indexed chunk whose current file no longer matches. ac10 keeps the
+    /// indexed snapshot rather than the bytes now on disk.
+    IndexedChunk,
+    /// A later chunk of a multi-chunk record, and the current file does not
+    /// verify it. The indexed slice is not the whole record.
+    Reject,
+}
+
+fn markdown_fetch(journal_root: &Path, path: &str, idx: i64, indexed: &str) -> MarkdownFetch {
+    if !path.ends_with(".md") {
+        return MarkdownFetch::IndexedChunk;
+    }
+    let verified = (|| -> Option<String> {
+        let bytes = crate::activity_admit::read_contained_source(journal_root, path)?;
+        let full_text = String::from_utf8(bytes).ok()?;
+        let produced = solstone_core_format::content::produce_chunks(
+            solstone_core_format::content::Family::Markdown,
+            path,
+            &full_text,
+        );
+        let idx = usize::try_from(idx).ok()?;
+        let chunk = produced.chunks.get(idx)?;
+        (chunk.content == indexed).then_some(full_text)
+    })();
+    if let Some(full_text) = verified {
+        return MarkdownFetch::Document(full_text);
+    }
+    if idx == 0 {
+        MarkdownFetch::IndexedChunk
+    } else {
+        MarkdownFetch::Reject
+    }
+}
+
 fn fetch(
     journal_root: &Path,
     principal: DispatchPrincipal<'_>,
@@ -1602,29 +1641,14 @@ fn fetch(
                     (cleaned_text, Some(a.hidden), Some(cleaned))
                 }
                 ActivityAdmit::NotActivity(content) => {
-                    let text = (|| {
-                        if !entry.path.ends_with(".md") {
-                            return None;
+                    let text = match markdown_fetch(journal_root, &entry.path, entry.idx, &content)
+                    {
+                        MarkdownFetch::Document(text) => text,
+                        MarkdownFetch::IndexedChunk => content,
+                        MarkdownFetch::Reject => {
+                            return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
                         }
-                        let bytes = crate::activity_admit::read_contained_source(
-                            journal_root,
-                            &entry.path,
-                        )?;
-                        let full_text = String::from_utf8(bytes).ok()?;
-                        let produced = solstone_core_format::content::produce_chunks(
-                            solstone_core_format::content::Family::Markdown,
-                            &entry.path,
-                            &full_text,
-                        );
-                        let idx_usize = usize::try_from(entry.idx).ok()?;
-                        let chunk = produced.chunks.get(idx_usize)?;
-                        if chunk.content == content {
-                            Some(full_text)
-                        } else {
-                            None
-                        }
-                    })()
-                    .unwrap_or(content);
+                    };
                     (text, None, None)
                 }
                 ActivityAdmit::Withheld { .. } => {
