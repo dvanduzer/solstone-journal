@@ -290,7 +290,8 @@ fn run_in_scratch(
     if !advisory_output.status.success() {
         return Err(format!(
             "cargo-deny rejected the authenticated advisory packet: {}",
-            compact_stderr(&advisory_output.stderr)
+            rejected_findings(&advisory_output.stderr)
+                .unwrap_or_else(|| compact_stderr(&advisory_output.stderr))
         ));
     }
     let advisories = parse_advisories(&advisory_output.stdout)?;
@@ -672,6 +673,41 @@ fn strict_line(bytes: &[u8]) -> Option<&str> {
     }
 }
 
+/// Every error-severity diagnostic in cargo-deny's JSON stderr, as
+/// `<advisory id or code> <crate> <version>`, so a rejection names each finding
+/// rather than whatever fits in the first few words of the first one. `None`
+/// when no error diagnostic parses, so the caller keeps the raw text.
+fn rejected_findings(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut findings = Vec::new();
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let fields = &value["fields"];
+        if value["type"] != "diagnostic" || fields["severity"] != "error" {
+            continue;
+        }
+        let id = fields["advisory"]["id"]
+            .as_str()
+            .or_else(|| fields["code"].as_str())
+            .unwrap_or("error");
+        let krate = &fields["graphs"][0]["Krate"];
+        match (krate["name"].as_str(), krate["version"].as_str()) {
+            (Some(name), Some(version)) => findings.push(format!("{id} {name} {version}")),
+            _ => findings.push(id.to_owned()),
+        }
+    }
+    if findings.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{} error(s): {}",
+        findings.len(),
+        findings.join(", ")
+    ))
+}
+
 fn compact_stderr(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes)
         .split_whitespace()
@@ -850,7 +886,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         FreshnessReceipt, format_utc, materialize_config, parse_advisories, parse_utc,
-        validate_locator, validate_receipt, verify_bundle_heads, xxh64,
+        rejected_findings, validate_locator, validate_receipt, verify_bundle_heads, xxh64,
     };
     use std::fs;
 
@@ -959,5 +995,22 @@ mod tests {
         assert_eq!(findings[0].id, "RUSTSEC-2099-0001");
         assert_eq!(findings[0].packages.len(), 1);
         assert_eq!(findings[1].id, "RUSTSEC-2099-0002");
+    }
+
+    #[test]
+    fn rejection_names_every_error_finding_and_skips_warnings() {
+        let stderr = br#"{"fields":{"advisory":{"id":"RUSTSEC-2099-0001","description":"a long description that would otherwise fill the message"},"code":"vulnerability","graphs":[{"Krate":{"name":"alpha","version":"1.0.0"}}],"severity":"error"},"type":"diagnostic"}
+{"fields":{"advisory":{"id":"RUSTSEC-2099-0002"},"code":"unmaintained","graphs":[{"Krate":{"name":"beta","version":"0.2.0"}}],"severity":"error"},"type":"diagnostic"}
+{"fields":{"advisory":null,"code":"yanked","graphs":[{"Krate":{"name":"gamma","version":"0.1.0"}}],"severity":"warning"},"type":"diagnostic"}
+{"fields":{"advisories":{"errors":2,"warnings":1}},"type":"summary"}
+"#;
+        assert_eq!(
+            rejected_findings(stderr).as_deref(),
+            Some("2 error(s): RUSTSEC-2099-0001 alpha 1.0.0, RUSTSEC-2099-0002 beta 0.2.0")
+        );
+        assert_eq!(
+            rejected_findings(b"error: failed to open advisory database\n"),
+            None
+        );
     }
 }
