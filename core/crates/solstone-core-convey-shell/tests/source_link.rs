@@ -177,6 +177,160 @@ fn extract_run_relative(ref_url: &str) -> Option<(String, String)> {
     None
 }
 
+fn json_briefing_run(journal: &Path) {
+    write_json(
+        &journal.join("chronicle/20261017/talents/morning_briefing.json"),
+        &json!({"yesterday": ["A retained briefing memory."]}),
+    );
+    write_json(
+        &journal.join("talents/20261017.jsonl"),
+        &json!({"name":"morning_briefing","use_id":"1792376400786",
+            "output_file":"talents/morning_briefing.json","status":"completed","ts":20}),
+    );
+    write_json(
+        &journal.join("talents/morning_briefing/1792376400786.jsonl"),
+        &json!({"use_id":"1792376400786"}),
+    );
+    assert!(
+        !journal
+            .join("chronicle/20261017/talents/morning_briefing")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn extensionless_weekly_briefing_opens_its_existing_json_run_only() {
+    let root = tempdir().unwrap();
+    json_briefing_run(root.path());
+    let app = source_link_router(root.path().to_path_buf(), Arc::new(FilesystemReads));
+    for reference in [
+        "sol://chronicle/20261017/talents/morning_briefing",
+        "sol://chronicle/20261017/talents/morning_briefing.json",
+    ] {
+        let (status, _, location) = get_source(app.clone(), reference).await;
+        assert_eq!(status, StatusCode::FOUND);
+        assert_eq!(
+            location.as_deref(),
+            Some("/app/thinking/#runs/run/1792376400786")
+        );
+    }
+    // An unrelated extensionless reference does not acquire a JSON alias.
+    fs::copy(
+        root.path()
+            .join("chronicle/20261017/talents/morning_briefing.json"),
+        root.path()
+            .join("chronicle/20261017/talents/another_briefing.json"),
+    )
+    .unwrap();
+    let index = root.path().join("talents/20261017.jsonl");
+    let other = json!({"name":"another_briefing","use_id":"1792376400787",
+        "output_file":"talents/another_briefing.json","status":"completed","ts":21});
+    write_file(
+        &index,
+        &(fs::read_to_string(&index).unwrap() + &other.to_string() + "\n"),
+    );
+    write_json(
+        &root
+            .path()
+            .join("talents/another_briefing/1792376400787.jsonl"),
+        &json!({"use_id":"1792376400787"}),
+    );
+    let (status, _, location) = get_source(
+        app.clone(),
+        "sol://chronicle/20261017/talents/another_briefing.json",
+    )
+    .await;
+    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(
+        location.as_deref(),
+        Some("/app/thinking/#runs/run/1792376400787")
+    );
+    let (status, _, location) = get_source(
+        app.clone(),
+        "sol://chronicle/20261017/talents/another_briefing",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(location.is_none());
+    fs::remove_file(
+        root.path()
+            .join("chronicle/20261017/talents/morning_briefing.json"),
+    )
+    .unwrap();
+    let (status, _, location) =
+        get_source(app, "sol://chronicle/20261017/talents/morning_briefing").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(location.is_none());
+}
+
+#[tokio::test]
+async fn extensionless_weekly_briefing_keeps_run_record_errors() {
+    let root = tempdir().unwrap();
+    json_briefing_run(root.path());
+    let reference = "sol://chronicle/20261017/talents/morning_briefing";
+    let app = source_link_router(
+        root.path().to_path_buf(),
+        Arc::new(RecordReadErrorReads {
+            inner: FilesystemReads,
+        }),
+    );
+    let (status, _, location) = get_source(app, reference).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(location.is_none());
+    write_file(
+        &root
+            .path()
+            .join("talents/morning_briefing/1792376400786.jsonl"),
+        "not-json\n",
+    );
+    let app = source_link_router(root.path().to_path_buf(), Arc::new(FilesystemReads));
+    let (status, _, location) = get_source(app, reference).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(location.is_none());
+}
+
+#[tokio::test]
+async fn extensionless_weekly_briefing_preserves_literal_precedence_and_refusal() {
+    let root = tempdir().unwrap();
+    json_briefing_run(root.path());
+    let reference = "sol://chronicle/20261017/talents/morning_briefing";
+    write_file(
+        &root
+            .path()
+            .join("chronicle/20261017/talents/morning_briefing"),
+        "literal output\n",
+    );
+    let app = source_link_router(root.path().to_path_buf(), Arc::new(FilesystemReads));
+    // A literal file without its own run is CantShow, not JSON fallback.
+    let (status, _, location) = get_source(app.clone(), reference).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(location.is_none());
+    let index = root.path().join("talents/20261017.jsonl");
+    let literal = json!({"name":"literal","use_id":"1792376400700",
+        "output_file":"talents/morning_briefing","status":"completed","ts":10});
+    write_file(
+        &index,
+        &(fs::read_to_string(&index).unwrap() + &literal.to_string() + "\n"),
+    );
+    write_json(
+        &root.path().join("talents/literal/1792376400700.jsonl"),
+        &json!({"use_id":"1792376400700"}),
+    );
+    let (status, _, location) = get_source(app.clone(), reference).await;
+    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(
+        location.as_deref(),
+        Some("/app/thinking/#runs/run/1792376400700")
+    );
+    write_file(
+        &root.path().join("talents/literal/1792376400700.jsonl"),
+        "not-json\n",
+    );
+    let (status, _, location) = get_source(app, reference).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(location.is_none());
+}
+
 #[tokio::test]
 async fn source_link_corpus_walker() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

@@ -434,7 +434,18 @@ fn resolve_landing(
         ClassifiedRef::Activity { facet, day, id } => {
             resolve_activity(journal, facet, day, id, reads, now)
         }
-        ClassifiedRef::Run { day, relative } => resolve_run(journal, day, relative, reads),
+        ClassifiedRef::Run { day, relative } => {
+            let landing = resolve_run(journal, day, relative, reads)?;
+            // Weekly reflections retain this canonical briefing reference.
+            // The native daily owner stores the briefing as JSON; preserve
+            // literal run resolution and every refusal before this fallback.
+            if matches!(landing, LandingOutcome::Absence) && relative == "talents/morning_briefing"
+            {
+                resolve_run(journal, day, "talents/morning_briefing.json", reads)
+            } else {
+                Ok(landing)
+            }
+        }
         ClassifiedRef::Weekly { day } => match solstone_core_home::weekly::judge(journal, day) {
             solstone_core_home::weekly::WeekJudgment::Page(_) => {
                 let location = format!("/app/home/week/{}", encode_path_component(day));
