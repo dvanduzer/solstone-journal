@@ -14,6 +14,28 @@ use zeroize::Zeroizing;
 use super::{AdmittedIosBackupAuthority, ExecuteError, native, repository, storage};
 use crate::teardown::owned::TeardownOperation;
 
+// Private development progress only. Arguments are fixed labels and numeric
+// status/length/flag values; failed output must not affect custody or results.
+macro_rules! diagnostic {
+    ($stage:literal, $code:expr, $length:expr, $flags:expr) => {
+        #[cfg(feature = "test-hooks")]
+        {
+            use std::io::Write as _;
+            let code: i32 = $code;
+            let length: usize = $length;
+            let flags: u8 = $flags;
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "[ios-teardown-diagnostic] stage={} code={} length={} flags={}",
+                $stage,
+                code,
+                length,
+                flags
+            );
+        }
+    };
+}
+
 #[cfg(feature = "ios-linked-bridge")]
 unsafe extern "C" {
     fn restic_bridge_s3_teardown_observe_v1(
@@ -190,8 +212,11 @@ impl DestinationContext {
         pending_scope: Option<&str>,
         expected: Option<&RecordObservation>,
     ) -> Result<LockedDestination, ExecuteError> {
+        diagnostic!("lock-enter", 0, 0, 0);
         operation.remaining().map_err(|_| invalid())?;
+        diagnostic!("lock-budget-ready", 0, 0, 0);
         self.revalidate()?;
+        diagnostic!("lock-context-ready", 0, 0, 0);
         let destination = serde_json::to_vec(&self.destination).map_err(|_| invalid())?;
         let pending = pending_scope.unwrap_or("");
         if !pending.is_empty() && !hex(pending, 64) {
@@ -200,6 +225,7 @@ impl DestinationContext {
         let mut output = [0u8; 4096];
         let mut length = 0;
         let mut fd = -1;
+        diagnostic!("lock-observe-enter", 0, 0, 0);
         let status = unsafe {
             restic_bridge_s3_teardown_observe_v1(
                 self.state.as_fd().as_raw_fd(),
@@ -220,22 +246,34 @@ impl DestinationContext {
         } else {
             None
         };
+        diagnostic!(
+            "lock-observe-return",
+            status,
+            length as usize,
+            u8::from(locked.is_some())
+        );
         if status != 0 || length == 0 || length > 4096 {
             return Err(ExecuteError::Entry(status.max(1)));
         }
         let locked = locked.ok_or_else(invalid)?;
+        diagnostic!("lock-fd-ready", 0, 0, 0);
         let record: RecordObservation =
             serde_json::from_slice(&output[..length as usize]).map_err(|_| invalid())?;
+        diagnostic!("lock-observation-decoded", 0, 0, 0);
         if expected.is_some_and(|expected| expected != &record) {
             return Err(invalid());
         }
+        diagnostic!("lock-expected-matched", 0, 0, 0);
         let custody = CustodyObservation {
             destination: self.destination.clone(),
             storage: self.storage_observation()?,
             record,
         };
+        diagnostic!("lock-storage-observed", 0, 0, 0);
         operation.remaining().map_err(|_| invalid())?;
+        diagnostic!("lock-final-budget-ready", 0, 0, 0);
         self.revalidate()?;
+        diagnostic!("lock-retained-ready", 0, 0, 0);
         Ok(LockedDestination {
             context: Arc::clone(self),
             locked,
@@ -291,8 +329,24 @@ impl DestinationContext {
         let cancellation = operation.cancellation();
         let cancelled = || cancellation.is_cancelled();
         let result = call.wait(Some(timeout), Some(&cancelled), true);
+        diagnostic!(
+            "read-return",
+            result.fields.status,
+            0,
+            u8::from(result.monitor_failed)
+                | (u8::from(result.cancellation_requested) << 1)
+                | (u8::from(result.deadline_requested) << 2)
+        );
+        #[cfg(feature = "test-hooks")]
+        match &result.metadata {
+            Ok(Some(bytes)) => diagnostic!("read-metadata-present", code, bytes.len(), 0),
+            Ok(None) => diagnostic!("read-metadata-absent", code, 0, 0),
+            Err(status) => diagnostic!("read-metadata-error", *status, 0, 0),
+        }
         self.revalidate()?;
+        diagnostic!("read-context-revalidated", code, 0, 0);
         operation.remaining().map_err(|_| invalid())?;
+        diagnostic!("read-budget-ready", code, 0, 0);
         if result.fields.status != 0
             || result.monitor_failed
             || result.cancellation_requested
@@ -309,32 +363,42 @@ impl DestinationContext {
         password: &str,
         operation: &TeardownOperation,
     ) -> Result<(String, Vec<String>), ExecuteError> {
+        diagnostic!("inventory-open-enter", 0, 0, 0);
         let opened = self.read(2, repository, password, operation)?;
+        diagnostic!("inventory-open-ready", 0, 0, 0);
         let raw = opened
             .metadata
             .map_err(ExecuteError::Entry)?
             .ok_or_else(invalid)?;
+        diagnostic!("inventory-config-metadata-ready", 0, raw.len(), 0);
         let value: serde_json::Value = serde_json::from_slice(&raw).map_err(|_| invalid())?;
+        diagnostic!("inventory-config-decoded", 0, 0, 0);
         if value["schema"] != "solstone.backup-metadata.v1" || value["kind"] != "repository-config"
         {
             return Err(invalid());
         }
+        diagnostic!("inventory-config-schema-ready", 0, 0, 0);
         let id = value["repository"]["id"]
             .as_str()
             .filter(|id| hex(id, 64))
             .ok_or_else(invalid)?
             .to_owned();
+        diagnostic!("inventory-config-id-ready", 0, 0, 0);
         let listed = self.read(5, repository, password, operation)?;
+        diagnostic!("inventory-list-ready", 0, 0, 0);
         let raw = listed
             .metadata
             .map_err(ExecuteError::Entry)?
             .ok_or_else(invalid)?;
+        diagnostic!("inventory-catalog-metadata-ready", 0, raw.len(), 0);
         let catalogue: serde_json::Value = serde_json::from_slice(&raw).map_err(|_| invalid())?;
+        diagnostic!("inventory-catalog-decoded", 0, 0, 0);
         if catalogue["schema"] != "solstone.backup-metadata.v1"
             || catalogue["kind"] != "snapshot-catalog"
         {
             return Err(invalid());
         }
+        diagnostic!("inventory-catalog-schema-ready", 0, 0, 0);
         let rows = catalogue["snapshots"].as_array().ok_or_else(invalid)?;
         if rows.len() > 4096 {
             return Err(invalid());
@@ -353,6 +417,7 @@ impl DestinationContext {
         if ids.windows(2).any(|pair| pair[0] == pair[1]) {
             return Err(invalid());
         }
+        diagnostic!("inventory-cohort-ready", 0, ids.len(), 0);
         Ok((id, ids))
     }
 
