@@ -423,10 +423,13 @@ fn assert_gate_never_executes_forbidden_interpreters(gate: &str, expected: &[&st
 
     let cargo_invocations = fs::read_to_string(&cargo_log)
         .expect("nested Rust gate must traverse its Cargo-backed targets");
-    let cargo_subcommands = cargo_invocations
+    // One `metadata` per standalone lockfile; that count follows the repository's
+    // lockfiles, so a run of them is one step of the graph.
+    let mut cargo_subcommands = cargo_invocations
         .lines()
         .filter_map(|invocation| invocation.split_whitespace().next())
         .collect::<Vec<_>>();
+    cargo_subcommands.dedup_by(|next, previous| *next == "metadata" && *previous == "metadata");
     assert_eq!(
         cargo_subcommands, expected,
         "nested make {gate} traversed the wrong Cargo command graph:\n{cargo_invocations}",
