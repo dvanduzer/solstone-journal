@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-//! Finding the bundled area tier file in a checkout or an installed journal.
+//! Loading the pinned area tier from the journal's package.
 //!
-//! The file ships as a model asset beside the speech models, so every
-//! platform's package carries it at `lib/solstone_journal_models/assets/geo/`.
+//! Desktop packages carry the model asset beside the speech models at
+//! `lib/solstone_journal_models/assets/geo/`. Mobile libraries embed the same
+//! pinned bytes because their app process does not use that executable layout.
 
 use std::fmt;
 use std::fs;
-use std::io::{self, Read};
+use std::io;
+#[cfg(any(test, not(any(target_os = "android", target_os = "ios"))))]
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -95,6 +98,7 @@ fn resolve_from(
         .ok_or(AssetError::NotFound { searched })
 }
 
+#[cfg(any(test, not(any(target_os = "android", target_os = "ios"))))]
 fn read_verified(path: &Path) -> Result<Vec<u8>, AssetError> {
     let mut bytes = Vec::new();
     fs::File::open(path)
@@ -103,25 +107,47 @@ fn read_verified(path: &Path) -> Result<Vec<u8>, AssetError> {
             path: path.to_path_buf(),
             source,
         })?;
-    let actual = format!("{:x}", Sha256::digest(&bytes));
+    verify_bytes(path, &bytes)?;
+    Ok(bytes)
+}
+
+fn verify_bytes(path: &Path, bytes: &[u8]) -> Result<(), AssetError> {
+    let actual = format!("{:x}", Sha256::digest(bytes));
     if actual != AREA_TIER_SHA256 {
         return Err(AssetError::DigestMismatch {
             path: path.to_path_buf(),
             actual,
         });
     }
-    Ok(bytes)
+    Ok(())
 }
 
 static AREA_TIER: OnceLock<Result<AreaTier, String>> = OnceLock::new();
+
+#[cfg(any(test, target_os = "android", target_os = "ios"))]
+fn embedded_area_tier() -> Result<AreaTier, String> {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../models/assets/geo/area-tier.bin"
+    ));
+    verify_bytes(Path::new(AREA_TIER_ASSET), BYTES).map_err(|error| error.to_string())?;
+    AreaTier::parse(BYTES).map_err(|error| error.to_string())
+}
 
 /// The bundled area tier, read and verified once per process.
 pub fn area_tier() -> Result<&'static AreaTier, AreaTierError> {
     AREA_TIER
         .get_or_init(|| {
-            let path = resolve_area_tier_path().map_err(|error| error.to_string())?;
-            let bytes = read_verified(&path).map_err(|error| error.to_string())?;
-            AreaTier::parse(&bytes).map_err(|error| error.to_string())
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            {
+                embedded_area_tier()
+            }
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            {
+                let path = resolve_area_tier_path().map_err(|error| error.to_string())?;
+                let bytes = read_verified(&path).map_err(|error| error.to_string())?;
+                AreaTier::parse(&bytes).map_err(|error| error.to_string())
+            }
         })
         .as_ref()
         .map_err(|detail| AreaTierError::Unavailable(detail.clone()))
@@ -156,6 +182,23 @@ mod tests {
     fn the_checkout_copy_matches_its_pin() {
         let path = resolve_area_tier_path().unwrap();
         read_verified(&path).unwrap();
+    }
+
+    #[test]
+    fn mobile_embedded_tier_names_real_geography() {
+        let tier = embedded_area_tier().expect("pinned mobile area tier");
+        assert_eq!(
+            tier.name_point(39.7555, -105.2211).words(),
+            ["Golden", "Colorado", "United States"]
+        );
+    }
+
+    #[test]
+    fn embedded_verifier_refuses_changed_bytes() {
+        assert!(matches!(
+            verify_bytes(Path::new(AREA_TIER_ASSET), b"SLAT"),
+            Err(AssetError::DigestMismatch { .. })
+        ));
     }
 
     #[test]
