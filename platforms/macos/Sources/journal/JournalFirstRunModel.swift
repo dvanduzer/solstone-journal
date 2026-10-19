@@ -121,6 +121,16 @@ final class JournalFirstRunModel {
 
     private var pendingDiscoveryHandoff: JournalHandoff?
 
+    static func yieldActivationThenHide(
+        yield: @MainActor (String) -> Void = { bundleIdentifier in
+            NSApp?.yieldActivation(toApplicationWithBundleIdentifier: bundleIdentifier)
+        },
+        hide: @MainActor () -> Void = { NSApp?.hide(nil) }
+    ) {
+        yield(JournalSetupPeerResolver.bundleIdentifier)
+        hide()
+    }
+
     init(
         config: JournalAppConfig,
         setupRunner: any JournalSetupRunning = JournalSetupRunner(materializer: NativeJournalRuntimeMaterializer()),
@@ -148,9 +158,11 @@ final class JournalFirstRunModel {
             journalSupportsSetupSequence(Bundle.main.object(forInfoDictionaryKey: "SolstoneSetupCapabilities"))
         },
         peer: any JournalSetupPeerResolving = JournalSetupPeerResolver(),
-        // Once setup continues in the solstone app, this window steps aside so a
-        // system prompt closing over it hands focus back to the solstone app.
-        stepAsideAfterHandoff: @escaping @MainActor () -> Void = { NSApp?.hide(nil) },
+        // Once setup continues in the solstone app, yield activation to that app
+        // and then hide. Hiding alone leaves focus with whichever app was frontmost.
+        stepAsideAfterHandoff: @escaping @MainActor () -> Void = {
+            JournalFirstRunModel.yieldActivationThenHide()
+        },
         setupClient: any JournalSetupClienting = JournalSetupClient(),
         identity: any JournalIdentityResolving = JournalIdentityResolver(),
         mailbox: SetupMailboxStore = SetupMailboxStore(),
