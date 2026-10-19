@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// Windows publication requires setup qualification on the signed candidate.
-pub const SETUP_SEQUENCE_ENABLED: bool = false;
+pub const SETUP_SEQUENCE_ENABLED: bool = true;
 
 pub const APP_HOME_PATH: &str = "/app/home";
 pub const APP_ORIGIN: &str = "https://journal.localhost";
