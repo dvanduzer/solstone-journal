@@ -258,6 +258,7 @@
             "SUCCESS_VERIFY_NOTE_ANYWHERE": "this device can now reach your journal from anywhere. didn't do this?",
             "TERMINAL_STEP_1": "on the computer where the terminal runs, save this pairing link as pairing-link.txt",
             "TERMINAL_STEP_2": "then run this there:",
+            "THIS_COMPUTER_STEP_1": "copy the pairing link below and open it in your browser on this computer",
             "UNPAIR_BODY": "this device loses access to your journal immediately and can't reconnect until you pair it again. anything stored on the device stays on the device, and anything still waiting to be sent goes to the journal you pair it with next.",
             "UNPAIR_TITLE_FORMAT": "unpair '{label}'?",
             "WINDOW_CLOSED_BUTTON": "pairing window closed. open a new one"

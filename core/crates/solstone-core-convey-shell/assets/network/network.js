@@ -87,6 +87,7 @@
       tick: null,
       deadline: 0,
       deviceType: DEVICE_TYPES.includes(options.deviceType) ? options.deviceType : 'phone',
+      previousDeviceType: null,
       pairedDevice: null,
       unsubscribe: null,
       openerSelector: '[data-pairing-action="open"]',
@@ -484,10 +485,24 @@
       listenForCompletion(generation);
     }
 
+    function setSameMachine(active) {
+      ceremony.sameMachine = active;
+      const typeChooser = dialog.querySelector('.link-pairing-type');
+      if (typeChooser) typeChooser.hidden = active;
+      const thisComputerStep = dialog.querySelector('[data-copy="THIS_COMPUTER_STEP_1"]');
+      if (thisComputerStep) thisComputerStep.hidden = !active;
+      const computerStep = dialog.querySelector('[data-copy="COMPUTER_STEP_1"]');
+      if (computerStep) computerStep.hidden = active;
+    }
+
     function open(type) {
       options.beforeOpen?.();
-      ceremony.sameMachine = false;
-      selectType(DEVICE_TYPES.includes(type) ? type : ceremony.deviceType);
+      setSameMachine(false);
+      const targetType = DEVICE_TYPES.includes(type)
+        ? type
+        : (ceremony.previousDeviceType || ceremony.deviceType);
+      ceremony.previousDeviceType = null;
+      selectType(targetType);
       const generation = startGeneration();
       dialog.hidden = false;
       requestMaterial(generation);
@@ -514,6 +529,11 @@
       startGeneration();
       displayState('idle');
       dialog.hidden = true;
+      setSameMachine(false);
+      if (ceremony.previousDeviceType) {
+        selectType(ceremony.previousDeviceType);
+        ceremony.previousDeviceType = null;
+      }
       if (restoreFocus) restoreOpenerFocus();
     }
 
@@ -553,7 +573,11 @@
         close();
         options.onPrivateLinkRepair();
       } else if (action === 'this-computer') {
-        ceremony.sameMachine = true;
+        if (!ceremony.sameMachine) {
+          ceremony.previousDeviceType = ceremony.deviceType;
+        }
+        setSameMachine(true);
+        selectType('computer');
         regenerate();
       } else if (action === 'local-network-open') {
         if (typeof options.onLocalNetworkOpen !== 'function') return;
