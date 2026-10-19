@@ -89,8 +89,10 @@ int main(int argc, char **argv) {
     options.reserved1=0;options.retry_lock_ms=UINT64_MAX;
     if (refuse_local(&request,&options,-1,-1,NULL,NULL,0,5)) return 19;
     options=(restic_operation_options_v1){.version=1};
-    for (int operation=6;operation<=9;operation++) {
-        if (operation==7) continue;
+    request.operation=9;
+    if (run(&request,&options,-1,-1,NULL,NULL)) return 33;
+    for (int operation=6;operation<=11;operation++) {
+        if (operation==7 || operation==9) continue;
         request.operation=operation;
         if (refuse_local(&request,&options,-1,-1,NULL,NULL,0,1)) return 20;
     }

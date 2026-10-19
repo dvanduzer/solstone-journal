@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 const OK: i32 = 0;
 const INVALID_ARGUMENT: i32 = 1;
+const ADD_RECOVERY_KEY: i32 = 3;
 const SNAPSHOT: i32 = 4;
 const RESTORE: i32 = 6;
 const REMOVE_KEY: i32 = 10;
@@ -314,7 +315,7 @@ fn snapshot_directories<'a>(
             workspace.path,
             workspace.descriptor.as_raw_fd(),
         )),
-        (1 | 2 | 3 | 5 | 7, None, None) => Ok(("", -1, "", -1)),
+        (1 | 2 | 3 | 5 | 7 | 9, None, None) => Ok(("", -1, "", -1)),
         _ => Err(INVALID_ARGUMENT),
     }
 }
@@ -549,7 +550,7 @@ impl Call {
             operation: REMOVE_KEY,
             password: Bytes::new(password)?,
             recovery_password: Bytes::new(&[])?,
-            repo: Bytes::new(repo_path.as_bytes())?,
+            repository: Bytes::new(repo_path.as_bytes())?,
             source: Bytes::new(&[])?,
             restore: Bytes::new(&[])?,
             snapshot: Bytes::new(&[])?,
