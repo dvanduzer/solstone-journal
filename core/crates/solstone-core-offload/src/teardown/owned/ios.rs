@@ -153,10 +153,10 @@ fn execute(
     let mut discovered =
         Store::discover_preparation(lease.clone(), outside.ios.store.as_ref().map(Store::record))
             .map_err(|_| recovery())?;
-    if let (Some(store), Some(found)) = (&outside.ios.store, &discovered) {
-        if store.record() != &found.record {
-            return Err(recovery());
-        }
+    if let (Some(store), Some(found)) = (&outside.ios.store, &discovered)
+        && store.record() != &found.record
+    {
+        return Err(recovery());
     }
     let previous = outside
         .ios

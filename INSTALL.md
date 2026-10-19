@@ -45,7 +45,7 @@ One command does the whole thing, including signed-manifest verification and `so
 curl -fsSL https://solstone.app/install.sh | sh
 ```
 
-Pressing Enter on a terminal selects the journal; with no terminal and no component the installer shows a menu. Agents and non-interactive runs use:
+Pressing Enter on a terminal selects the journal. With no terminal and no component, the installer stops and asks you to name one with `--components`. Agents and non-interactive runs use:
 
 ```bash
 curl -fsSL https://solstone.app/install.sh | sh -s -- --components journal

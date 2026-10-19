@@ -23,9 +23,7 @@ use solstone_core_backup_runtime::teardown::owned::{
     target_os = "linux",
     target_os = "macos",
     target_os = "android",
-    target_os = "ios",
-    windows,
-    test
+    windows
 ))]
 use solstone_core_backup_runtime::teardown_admission::admit_teardown;
 #[cfg(any(unix, windows))]
@@ -207,7 +205,7 @@ enum PhaseOwner {
     BindingFailure(Box<TeardownBindingFailure>),
     #[cfg(any(unix, windows))]
     Finish(Box<TeardownFinishAdmission>),
-    #[cfg(any(unix, windows))]
+    #[cfg(all(any(unix, windows), not(target_os = "ios")))]
     CarrierMismatch {
         finish: Box<TeardownFinishAdmission>,
         operational: Arc<RootTeardownCarrier>,
@@ -342,6 +340,7 @@ impl OwnedTeardownOutcome {
     pub fn finish_admission(&self) -> Option<&TeardownFinishAdmission> {
         match self.held()?.owner.as_ref()? {
             PhaseOwner::Finish(owner) => Some(owner),
+            #[cfg(not(target_os = "ios"))]
             PhaseOwner::CarrierMismatch { finish, .. } => Some(finish),
             _ => None,
         }
@@ -349,6 +348,7 @@ impl OwnedTeardownOutcome {
     #[cfg(any(unix, windows))]
     pub fn additional_carrier(&self) -> Option<&Arc<RootTeardownCarrier>> {
         match self.held()?.owner.as_ref()? {
+            #[cfg(not(target_os = "ios"))]
             PhaseOwner::CarrierMismatch { operational, .. } => Some(operational),
             _ => None,
         }

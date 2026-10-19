@@ -4,7 +4,9 @@
 //! Forget every snapshot in an owner's own restic repository, under the original
 //! teardown budget and the same coverage checks as operated storage.
 
+#[cfg(not(target_os = "ios"))]
 use std::collections::BTreeMap;
+#[cfg(not(target_os = "ios"))]
 use std::io;
 use std::path::Path;
 use std::time::Duration;
@@ -16,9 +18,9 @@ use solstone_core_backup::archive_admission::ArchiveCancellation;
 use super::{
     RemoteTeardownDisposition, RemoteTeardownPhase, TeardownOperation, TeardownRemoteRefusal,
 };
-use crate::runner::{
-    ResticResult, ToolOutput, ToolRequest, ToolRunner, reason_for_returncode, run_restic,
-};
+use crate::runner::ResticResult;
+#[cfg(not(target_os = "ios"))]
+use crate::runner::{ToolOutput, ToolRequest, ToolRunner, reason_for_returncode, run_restic};
 use crate::teardown_admission::{CarrierTeardownAdmission, TeardownReader};
 
 const RETENTION_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -50,7 +52,9 @@ impl crate::hosted_runtime::HttpTransport for RetentionTransport<'_> {
 }
 
 /// Every restic child honours the teardown's cancellation where the platform can stop it.
+#[cfg(not(target_os = "ios"))]
 struct Cancellable<'a>(&'a TeardownOperation);
+#[cfg(not(target_os = "ios"))]
 impl ToolRunner for Cancellable<'_> {
     fn run(&self, request: &ToolRequest<'_>) -> io::Result<ToolOutput> {
         if self.0.cancellation.is_cancelled() {
@@ -118,6 +122,7 @@ pub fn snapshot_ids(listing: &ResticResult) -> Option<Vec<String>> {
 }
 
 impl TeardownOperation {
+    #[cfg(not(target_os = "ios"))]
     fn restic(
         &self,
         restic_path: &Path,
@@ -183,7 +188,7 @@ impl TeardownOperation {
         #[cfg(target_os = "ios")]
         {
             let _ = restic_path;
-            return Err(TeardownRemoteRefusal::DestinationUnavailable);
+            Err(TeardownRemoteRefusal::DestinationUnavailable)
         }
         #[cfg(not(target_os = "ios"))]
         {

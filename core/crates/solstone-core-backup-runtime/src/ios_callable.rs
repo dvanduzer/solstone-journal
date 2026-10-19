@@ -143,18 +143,33 @@ impl std::fmt::Debug for RestoreTarget {
 }
 
 impl RestoreTarget {
-    pub fn admit(root: Arc<JournalRoot>) -> Result<Self, ()> {
-        root.revalidate_canonical_binding().map_err(|_| ())?;
-        let path = root.canonical_path().to_str().ok_or(())?.to_owned();
-        let target = native::Target::admit(root.as_fd(), &path).map_err(|_| ())?;
+    pub fn admit(root: Arc<JournalRoot>) -> io::Result<Self> {
+        root.revalidate_canonical_binding()
+            .map_err(io::Error::other)?;
+        let path = root
+            .canonical_path()
+            .to_str()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "restore target path is not UTF-8",
+                )
+            })?
+            .to_owned();
+        let target = native::Target::admit(root.as_fd(), &path)
+            .map_err(|_| io::Error::other("restore target admission refused"))?;
         let admitted = Self { target, root, path };
         admitted.revalidate()?;
         Ok(admitted)
     }
 
-    pub fn revalidate(&self) -> Result<(), ()> {
-        self.target.revalidate().map_err(|_| ())?;
-        self.root.revalidate_canonical_binding().map_err(|_| ())
+    pub fn revalidate(&self) -> io::Result<()> {
+        self.target
+            .revalidate()
+            .map_err(|_| io::Error::other("restore target binding changed"))?;
+        self.root
+            .revalidate_canonical_binding()
+            .map_err(io::Error::other)
     }
 
     pub fn path(&self) -> &std::path::Path {
@@ -838,10 +853,10 @@ pub(crate) fn add_recovery_key_rotation(
         && outcome::diagnostic(&completed.fields).is_ok_and(|d| d == "REMOTE_PENDING");
 
     if is_remote_pending {
-        if let Ok(Some(bytes)) = completed.metadata {
-            if let Ok(resumed_pw) = crate::rotation::resume::decode_recovery_add_resume(&bytes) {
-                return Ok(AddOutcome::Resumed(resumed_pw));
-            }
+        if let Ok(Some(bytes)) = completed.metadata
+            && let Ok(resumed_pw) = crate::rotation::resume::decode_recovery_add_resume(&bytes)
+        {
+            return Ok(AddOutcome::Resumed(resumed_pw));
         }
         return Err(RepoError::Failed);
     }

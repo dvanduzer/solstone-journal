@@ -179,7 +179,6 @@ unsafe extern "C" {
         admission_len: u32,
         out_id: *mut u64,
     ) -> i32;
-    pub(super) fn restic_bridge_teardown_v1_wait(id: u64, out: *mut ResultFields) -> i32;
     pub(crate) fn restic_bridge_http_exchange(
         method: *const c_char,
         method_len: u32,
@@ -315,9 +314,6 @@ mod unlinked {
         _: u32,
         _: *mut u64,
     ) -> i32 {
-        INVALID_ARGUMENT
-    }
-    pub(super) unsafe fn restic_bridge_teardown_v1_wait(_: u64, _: *mut ResultFields) -> i32 {
         INVALID_ARGUMENT
     }
     pub(crate) unsafe fn restic_bridge_http_exchange(

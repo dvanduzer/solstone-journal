@@ -297,7 +297,11 @@ impl DirectExecution {
                 .as_ref()
                 .is_none_or(ArchivePredecessorCustody::unwritten)
     }
-    #[cfg(any(unix, windows))]
+    #[cfg(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        target_os = "macos",
+        windows
+    ))]
     fn helpers_quiescent(&self) -> bool {
         #[cfg(windows)]
         if self.cleanup.iter().any(|cleanup| !cleanup.quiescent()) {
