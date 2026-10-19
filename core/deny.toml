@@ -26,6 +26,20 @@ ignore = [
     # exception/migrates off derivative. Upstream: rustsec.org/advisories/RUSTSEC-2024-0388
     # and github.com/velopack/velopack/blob/develop/deny.toml.
     { id = "RUSTSEC-2024-0388", reason = "VPE-approved dependency-compatibility exception for derivative 2.2.0 via pinned Velopack =1.2.0; no patched release or drop-in replacement exists" },
+    # VPE exception, 2026-10-19: RUSTSEC-2024-0449 marks unsafe-libyaml 0.2.11
+    # unmaintained (upstream archived; informational, no vulnerability, no
+    # patched release). It is reached only through serde_yaml_ng 0.10.0 in
+    # solstone-core-user-skill, whose one call site parses the frontmatter
+    # `name` of the owner's own installed agent-skill SKILL.md to recognise the
+    # solstone skill; no network, import or journal content reaches it. A
+    # safe-Rust replacement (the advisory names saphyr) is a new dependency
+    # inside the Windows notice closure and would have to reproduce the tested
+    # duplicate-key and malformed-document refusals, so it is not a drop-in.
+    # Revisit if a vulnerability advisory names unsafe-libyaml or serde_yaml_ng,
+    # if YAML parsing gains another call site or untrusted input, or when
+    # serde_yaml_ng leaves unsafe-libyaml.
+    # Upstream: https://rustsec.org/advisories/RUSTSEC-2024-0449
+    { id = "RUSTSEC-2024-0449", reason = "VPE exception: unsafe-libyaml 0.2.11 is unmaintained, not vulnerable; reached only via serde_yaml_ng in solstone-core-user-skill to read the name field of the owner's local SKILL.md frontmatter" },
 ]
 
 [licenses]
