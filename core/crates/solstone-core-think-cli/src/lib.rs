@@ -4126,6 +4126,175 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn hosted_activity_day_keeps_admitted_owners_and_clears_parent_retry() {
+        struct RetainedSense;
+        impl solstone_core_sense::SenseExecutor for RetainedSense {
+            fn execute(
+                &self,
+                _: &str,
+                _: &Path,
+                _: &solstone_core_sense::work::SegmentContext,
+                _: Option<&solstone_core_system::work_retry::Attempt>,
+                _: &std::sync::atomic::AtomicBool,
+            ) -> solstone_core_sense::SenseJobResult {
+                panic!("context derivation must not start Sense")
+            }
+        }
+        let journal = tempdir().unwrap();
+        let roots = tempdir().unwrap();
+        let (talents, apps) = talent_roots(roots.path(), &[]);
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let check = Arc::clone(&cancelled);
+        let context = context::ThinkContext::hosted(
+            journal.path(),
+            "20260813".into(),
+            journal.path().join("chronicle/20260813"),
+            9,
+            talents,
+            apps,
+            Arc::new(Recorder::default()),
+            Arc::new(IndexRecorder::default()),
+            Arc::new(|| 11),
+            Some((
+                solstone_core_system::work_retry::Unit::Daily {
+                    day: "20260813".into(),
+                    talent: "schedule".into(),
+                    facet: None,
+                },
+                solstone_core_system::work_retry::Attempt {
+                    cause: "owner".into(),
+                    input: "parent-input".into(),
+                    reason: "parent-retry".into(),
+                },
+            )),
+            Arc::new(move || check.load(Ordering::SeqCst)),
+        )
+        .with_sense_executor(Arc::new(RetainedSense));
+        for day in ["20260813", "20260812"] {
+            let child = segment::activity_context(&context, day).unwrap();
+            assert_eq!(child.day, day);
+            assert_eq!(child.day_dir, journal.path().join("chronicle").join(day));
+            assert_eq!(child.journal, context.journal);
+            assert_eq!(child.talent_root, context.talent_root);
+            assert_eq!(child.apps_root, context.apps_root);
+            assert_eq!(child.now_ms, 9);
+            assert_eq!(child.event_now_ms(), 11);
+            assert!(Arc::ptr_eq(&child.cortex, &context.cortex));
+            assert!(Arc::ptr_eq(&child.index, &context.index));
+            assert!(Arc::ptr_eq(&child.event_clock(), &context.event_clock()));
+            assert!(Arc::ptr_eq(
+                &child.cancel_checkpoint,
+                &context.cancel_checkpoint
+            ));
+            assert!(Arc::ptr_eq(
+                child.sense_executor.as_ref().unwrap(),
+                context.sense_executor.as_ref().unwrap(),
+            ));
+            assert!(Arc::ptr_eq(
+                child
+                    .phase_runner
+                    .as_ref()
+                    .expect("hosted phase owner retained"),
+                context.phase_runner.as_ref().unwrap(),
+            ));
+            assert!(
+                child.retry.is_none(),
+                "parent permission cannot authorize activity work"
+            );
+            assert!(context.retry.is_some());
+            assert!(child.checkpoint().is_ok());
+            cancelled.store(true, Ordering::SeqCst);
+            assert_eq!(child.checkpoint().unwrap_err(), "thinking cancelled");
+            cancelled.store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn hosted_activity_replay_dispatches_persists_and_deduplicates() {
+        let journal = tempdir().unwrap();
+        let roots = tempdir().unwrap();
+        let (talents, apps) = talent_roots(
+            roots.path(),
+            &[(
+                "activity_probe",
+                "{\n\"type\":\"generate\",\"max_output_tokens\":1024,\"schedule\":\"activity\",\"priority\":1,\"output\":\"md\",\"activities\":[\"work\"]\n}",
+            )],
+        );
+        fs::create_dir_all(journal.path().join("config")).unwrap();
+        fs::write(
+            journal.path().join("config/journal.json"),
+            r#"{"providers":{"active":{"provider":"openai","model":"test-model"}}}"#,
+        )
+        .unwrap();
+        let recorder = Arc::new(Recorder::default());
+        let context = context::ThinkContext::hosted(
+            journal.path(),
+            "20260813".into(),
+            day::create_day(journal.path(), "20260813").unwrap(),
+            9,
+            talents,
+            apps,
+            recorder.clone(),
+            Arc::new(IndexRecorder::default()),
+            Arc::new(|| 9),
+            None,
+            Arc::new(|| false),
+        );
+        solstone_core_facets::create_facet(journal.path(), "work", "Work", "", "", "", None)
+            .unwrap();
+        for (segment, sense) in [
+            (
+                "090000_300",
+                serde_json::json!({"density":"active","content_type":"work","activity_summary":"work","facets":[{"facet":"work","level":"high","activity":"work"}]}),
+            ),
+            (
+                "090500_300",
+                serde_json::json!({"density":"idle","content_type":"idle","activity_summary":"","facets":[]}),
+            ),
+        ] {
+            let directory = segment_dir(journal.path(), "20260813", segment).join("talents");
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                directory.join("sense.json"),
+                serde_json::to_vec(&sense).unwrap(),
+            )
+            .unwrap();
+        }
+        let mut log = test_log(&context, "segment");
+        let segments = vec![
+            ("090000_300".to_owned(), Some("default".to_owned())),
+            ("090500_300".to_owned(), Some("default".to_owned())),
+        ];
+        for _ in 0..2 {
+            segment::replay_activity_state(&context, &mut log, &segments, false, 2, false, true)
+                .unwrap();
+        }
+        assert!(journal.path().join("chronicle/20260813/health/talent-provenance/activity-inputs/work/work_090000_300.json").is_file());
+        let records =
+            fs::read_to_string(journal.path().join("facets/work/activities/20260813.jsonl"))
+                .unwrap();
+        assert_eq!(records.lines().count(), 1);
+        assert!(
+            journal
+                .path()
+                .join("awareness/activity_state/default.json")
+                .is_file()
+        );
+        assert_eq!(
+            recorder
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.name == "activity_probe")
+                .count(),
+            1,
+        );
+    }
+
     #[test]
     fn older_prior_day_segment_preserves_live_activity() {
         assert_old_segment_preserves_live_activity("20260812", "230000_300", false);

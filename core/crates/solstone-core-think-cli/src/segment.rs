@@ -2636,20 +2636,10 @@ pub(crate) fn activity_event(
 /// The context an activity's talents run in: the day its record is filed
 /// under, with this run's boundaries and clock.
 pub(crate) fn activity_context(context: &ThinkContext, day: &str) -> Result<ThinkContext, String> {
-    let mut day_context = ThinkContext::new_with_event_clock(
-        &context.journal,
-        day.to_owned(),
-        context.journal.join("chronicle").join(day),
-        context.now_ms,
-        context.event_clock(),
-    )?;
-    day_context.talent_root = context.talent_root.clone();
-    day_context.apps_root = context.apps_root.clone();
-    day_context.cortex = context.cortex.clone();
-    day_context.index = context.index.clone();
-    day_context.status = context.status.clone();
-    day_context.cancel_checkpoint = Arc::clone(&context.cancel_checkpoint);
-    day_context.sense_executor = context.sense_executor.clone();
+    let mut day_context = context.clone();
+    day_context.day = day.to_owned();
+    day_context.day_dir = context.journal.join("chronicle").join(day);
+    day_context.retry = None;
     Ok(day_context)
 }
 

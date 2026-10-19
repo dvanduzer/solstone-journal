@@ -267,6 +267,7 @@ impl ThinkContext {
         (self.event_clock)()
     }
 
+    #[cfg(test)]
     pub(crate) fn event_clock(&self) -> Arc<dyn Fn() -> i64 + Send + Sync> {
         Arc::clone(&self.event_clock)
     }
