@@ -8,7 +8,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- on a computer that can't run local thinking, the thinking page says so, and does not offer an install that cannot succeed.
+- on a computer that can't run local thinking, home and the thinking page say so, and no longer offer to install the local model.
 
 ## [2.0.51] - 2026-10-19
 
