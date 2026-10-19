@@ -2,17 +2,29 @@
 // Copyright (c) 2026 sol pbc
 
 use super::*;
+#[cfg(feature = "full-tests")]
+use serde_json::json;
 use std::fs;
+#[cfg(any(feature = "full-tests", target_os = "android"))]
 use std::io::{Read, Write};
+#[cfg(any(feature = "full-tests", target_os = "android"))]
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicI64, Ordering};
+#[cfg(any(feature = "full-tests", target_os = "android"))]
 use std::time::{Duration, Instant};
 
-use serde_json::json;
-use solstone_core_backup::{HostedBinding, save_hosted_binding};
+#[cfg(feature = "full-tests")]
+use solstone_core_backup::HostedBinding;
+#[cfg(any(feature = "full-tests", target_os = "android"))]
+use solstone_core_backup::save_hosted_binding;
+#[cfg(any(feature = "full-tests", target_os = "android"))]
 use solstone_core_journal_io::activity::{ActivityAdmissionError, ActivityLease};
+#[cfg(any(feature = "full-tests", target_os = "android"))]
 use solstone_core_journal_io::activity_obligations::observe_obligations;
-use solstone_core_journal_io::media::{ActivityCarrierRetirementEffect, Confirmation, Durability};
+#[cfg(any(feature = "full-tests", target_os = "android"))]
+use solstone_core_journal_io::media::ActivityCarrierRetirementEffect;
+#[cfg(any(feature = "full-tests", target_os = "android"))]
+use solstone_core_journal_io::media::{Confirmation, Durability};
 
 struct TestClock(AtomicI64);
 impl Clock for TestClock {
@@ -24,6 +36,7 @@ impl Clock for TestClock {
     }
 }
 
+#[cfg(feature = "full-tests")]
 fn request(peer: &mut TcpStream) -> (String, Vec<u8>) {
     // macOS hands an accepted socket the listener's non-blocking mode; Linux doesn't.
     peer.set_nonblocking(false).unwrap();
@@ -52,6 +65,7 @@ fn request(peer: &mut TcpStream) -> (String, Vec<u8>) {
     (head, body)
 }
 
+#[cfg(feature = "full-tests")]
 fn respond(peer: &mut TcpStream, body: &[u8]) {
     write!(
         peer,
@@ -62,6 +76,7 @@ fn respond(peer: &mut TcpStream, body: &[u8]) {
     peer.write_all(body).unwrap();
 }
 
+#[cfg(feature = "full-tests")]
 fn closed(peer: &mut TcpStream) {
     peer.set_nonblocking(false).unwrap();
     let mut extra = Vec::new();
@@ -107,6 +122,7 @@ fn production_reaches_root_admission_and_closed_custody_is_send() {
 }
 
 /// An operated journal whose hosted binding points at a local listener.
+#[cfg(feature = "full-tests")]
 struct OperatedJournal {
     temp: tempfile::TempDir,
     listener: Option<TcpListener>,
@@ -208,6 +224,7 @@ impl OperatedJournal {
 }
 
 #[test]
+#[cfg(feature = "full-tests")]
 fn backup_only_media_refuses_before_any_remote_or_config_effect() {
     use solstone_core_backup_runtime::TeardownReaderRefusal;
     use solstone_core_backup_runtime::teardown_admission::{
@@ -255,6 +272,7 @@ fn backup_only_media_refuses_before_any_remote_or_config_effect() {
 }
 
 #[test]
+#[cfg(feature = "full-tests")]
 fn fully_local_catalog_passes_coverage_to_the_remote_phase() {
     let mut journal = OperatedJournal::new();
     let local = journal.archive(true);
@@ -323,6 +341,7 @@ fn operated_destination_without_a_binding_is_not_called_unsupported() {
     );
 }
 
+#[cfg(any(feature = "full-tests", target_os = "android"))]
 const BOUNDARY_CASES: [&str; 11] = [
     "complete",
     "late_catalog",
@@ -590,6 +609,28 @@ fn owned_teardown_boundaries(case: &str) {
     std::thread::spawn(move || drop(result)).join().unwrap();
     drop(ActivityLease::try_acquire(root).unwrap());
     println!("owned_teardown_{case}_ok requests={expected}");
+}
+
+#[test]
+fn desktop_run_owned_teardown_refusal_does_not_create_recovery_file() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("config")).unwrap();
+    let config = br#"{"backup":{"enabled":true,"destination":{"repository":"s3:bucket/prefix","backend":"s3"}}}"#;
+    fs::write(temp.path().join("config/journal.json"), config).unwrap();
+    let result = run_owned_teardown(
+        temp.path(),
+        Arc::new(TestClock(AtomicI64::new(1_700_000_000))),
+        ArchiveCancellation::new(),
+        "fixture",
+    );
+    assert_eq!(result.phase(), TeardownRunPhase::Admission);
+    assert!(result.refused_before_effects());
+    let recovery_file = temp.path().join("backup/teardown-recovery.json");
+    assert!(!recovery_file.exists());
+    assert_eq!(
+        fs::read(temp.path().join("config/journal.json")).unwrap(),
+        config
+    );
 }
 
 #[cfg(target_os = "android")]

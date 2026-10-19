@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#ifndef SOLSTONE_RESTIC_LEGACY_TYPES
+#define SOLSTONE_RESTIC_LEGACY_TYPES
 typedef struct {
     int32_t operation;
     const char *password;
@@ -27,6 +29,7 @@ typedef struct {
     char snapshot_ids[4096][65];
     char diagnostic[256];
 } restic_result;
+#endif
 
 int32_t restic_bridge_start(restic_request*,uint64_t*);
 int32_t restic_bridge_wait(uint64_t,restic_result*);

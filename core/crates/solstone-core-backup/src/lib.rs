@@ -26,6 +26,7 @@ mod parent_watch;
 mod rotation_binding;
 mod state;
 pub mod teardown_configuration;
+pub mod teardown_recovery;
 
 pub use archive_readback::SUPPORTED_RESTIC_VERSION;
 pub use defaults::backup_defaults;
@@ -48,6 +49,7 @@ pub use state::{
     set_destination, set_enabled, set_mode, set_offload, set_recovery_key,
     set_recovery_key_confirmed, set_retention, stage_pending_key_revocation_at_root, status_view,
 };
+pub use teardown_recovery::{TEARDOWN_RECOVERY_VERSION, teardown_recovery_path};
 
 pub(crate) const OFFLOAD_STATUSES: [&str; 4] = ["ok", "skipped", "stalled", "error"];
 pub(crate) const VERIFICATION_STATUSES: [&str; 3] = ["ok", "skipped", "error"];
@@ -119,6 +121,10 @@ pub enum BackupError {
     Entropy,
     HostedWrite,
     HostedDelete,
+    TeardownRecoveryWrite,
+    TeardownRecoveryDelete,
+    TeardownRecoveryRead,
+    TeardownRecoveryCorrupt,
     InvalidMode,
     InvalidRetentionShape,
     InvalidRetentionValue,
@@ -147,6 +153,18 @@ impl fmt::Display for BackupError {
             Self::Entropy => formatter.write_str("could not generate backup key."),
             Self::HostedWrite => formatter.write_str("could not save hosted binding."),
             Self::HostedDelete => formatter.write_str("could not delete hosted binding."),
+            Self::TeardownRecoveryWrite => {
+                formatter.write_str("could not save teardown recovery record.")
+            }
+            Self::TeardownRecoveryDelete => {
+                formatter.write_str("could not delete teardown recovery record.")
+            }
+            Self::TeardownRecoveryRead => {
+                formatter.write_str("could not read teardown recovery record.")
+            }
+            Self::TeardownRecoveryCorrupt => {
+                formatter.write_str("teardown recovery record corrupt or invalid.")
+            }
             Self::InvalidMode => formatter.write_str("backup mode must be byo or operated"),
             Self::InvalidRetentionShape => {
                 formatter.write_str("backup retention must include hourly, daily, weekly, monthly")

@@ -23,7 +23,9 @@ use solstone_core_backup_runtime::teardown::owned::{
     target_os = "linux",
     target_os = "macos",
     target_os = "android",
-    windows
+    target_os = "ios",
+    windows,
+    test
 ))]
 use solstone_core_backup_runtime::teardown_admission::admit_teardown;
 #[cfg(any(unix, windows))]
@@ -104,7 +106,7 @@ pub struct SettledTeardownReport {
     /// None for own storage, which has no hosted binding.
     #[cfg(any(unix, windows))]
     binding: Option<Arc<BindingRemovalReceipt>>,
-    retirement: ActivityCarrierRetirementReceipt,
+    retirement: Option<ActivityCarrierRetirementReceipt>,
 }
 
 impl SettledTeardownReport {
@@ -121,8 +123,8 @@ impl SettledTeardownReport {
     pub fn binding(&self) -> Option<&BindingRemovalReceipt> {
         self.binding.as_deref()
     }
-    pub fn retirement(&self) -> &ActivityCarrierRetirementReceipt {
-        &self.retirement
+    pub fn retirement(&self) -> Option<&ActivityCarrierRetirementReceipt> {
+        self.retirement.as_ref()
     }
 }
 
@@ -138,6 +140,8 @@ struct Outside {
     #[cfg(any(unix, windows))]
     binding: Option<Arc<BindingRemovalReceipt>>,
     retirement: Option<ActivityCarrierRetirement<RootTeardownCarrier>>,
+    #[cfg(target_os = "ios")]
+    ios: ios::Custody,
 }
 
 impl Outside {
@@ -154,13 +158,17 @@ impl Outside {
             #[cfg(any(unix, windows))]
             binding: None,
             retirement: None,
+            #[cfg(target_os = "ios")]
+            ios: ios::Custody::default(),
         }
     }
     #[cfg(any(
         target_os = "linux",
         target_os = "macos",
         target_os = "android",
-        windows
+        target_os = "ios",
+        windows,
+        test
     ))]
     fn remaining(&self) -> Result<(), TeardownRunRefusal> {
         self.operation
@@ -179,7 +187,9 @@ impl Outside {
         target_os = "linux",
         target_os = "macos",
         target_os = "android",
-        windows
+        target_os = "ios",
+        windows,
+        test
     )),
     allow(dead_code)
 )]
@@ -269,7 +279,7 @@ impl OwnedTeardownOutcome {
     }
     pub fn retirement(&self) -> Option<&ActivityCarrierRetirementReceipt> {
         match self {
-            Self::Finished(report) => Some(report.retirement()),
+            Self::Finished(report) => report.retirement(),
             _ => self
                 .held()?
                 .outside
@@ -415,7 +425,9 @@ fn held(
     target_os = "linux",
     target_os = "macos",
     target_os = "android",
-    windows
+    target_os = "ios",
+    windows,
+    test
 ))]
 fn unknown(
     outside: Outside,
@@ -842,13 +854,132 @@ fn execute(journal: &Path, mut outside: Outside, version: &str) -> OwnedTeardown
         attempts: std::mem::take(&mut outside.attempts),
         publication: outside.publication.take().expect("actual publication"),
         binding: outside.binding.take(),
-        retirement: retirement.receipt,
+        retirement: Some(retirement.receipt),
     };
     drop(retirement.owned);
     drop(finish);
     drop(outside);
     OwnedTeardownOutcome::Finished(Box::new(report))
 }
+
+#[cfg(feature = "test-hooks")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum OwnedTeardownInterrupt {
+    AfterClear,
+}
+
+#[cfg(feature = "test-hooks")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnedTeardownInterruptArm {
+    identity: solstone_core_journal_io::ObjectIdentity,
+    boundary: OwnedTeardownInterrupt,
+}
+
+#[cfg(feature = "test-hooks")]
+impl OwnedTeardownInterruptArm {
+    pub fn identity(&self) -> solstone_core_journal_io::ObjectIdentity {
+        self.identity
+    }
+    pub fn boundary(&self) -> OwnedTeardownInterrupt {
+        self.boundary
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnedTeardownInterruptObservation {
+    pub armed: bool,
+    pub fired: bool,
+}
+
+#[cfg(feature = "test-hooks")]
+impl OwnedTeardownInterruptObservation {
+    pub fn armed(&self) -> bool {
+        self.armed
+    }
+    pub fn fired(&self) -> bool {
+        self.fired
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+#[derive(Clone, Copy, Debug, Default)]
+struct InterruptState {
+    armed: bool,
+    fired: bool,
+}
+
+#[cfg(feature = "test-hooks")]
+static INTERRUPT_SLOTS: std::sync::Mutex<
+    Vec<(
+        (
+            solstone_core_journal_io::ObjectIdentity,
+            OwnedTeardownInterrupt,
+        ),
+        InterruptState,
+    )>,
+> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(feature = "test-hooks")]
+pub fn arm_owned_teardown_interrupt(
+    root: &JournalRoot,
+    boundary: OwnedTeardownInterrupt,
+) -> OwnedTeardownInterruptArm {
+    let identity = root.identity();
+    let mut guard = INTERRUPT_SLOTS.lock().unwrap();
+    if let Some((_, state)) = guard.iter_mut().find(|(k, _)| *k == (identity, boundary)) {
+        state.armed = true;
+        state.fired = false;
+    } else {
+        guard.push((
+            (identity, boundary),
+            InterruptState {
+                armed: true,
+                fired: false,
+            },
+        ));
+    }
+    OwnedTeardownInterruptArm { identity, boundary }
+}
+
+#[cfg(feature = "test-hooks")]
+pub fn owned_teardown_interrupt_observation(
+    root: &JournalRoot,
+    boundary: OwnedTeardownInterrupt,
+) -> OwnedTeardownInterruptObservation {
+    let identity = root.identity();
+    let guard = INTERRUPT_SLOTS.lock().unwrap();
+    if let Some((_, state)) = guard.iter().find(|(k, _)| *k == (identity, boundary)) {
+        OwnedTeardownInterruptObservation {
+            armed: state.armed,
+            fired: state.fired,
+        }
+    } else {
+        OwnedTeardownInterruptObservation {
+            armed: false,
+            fired: false,
+        }
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+fn consume_interrupt(root: &JournalRoot, boundary: OwnedTeardownInterrupt) -> bool {
+    let identity = root.identity();
+    let mut guard = INTERRUPT_SLOTS.lock().unwrap();
+    if let Some((_, state)) = guard.iter_mut().find(|(k, _)| *k == (identity, boundary)) {
+        if state.armed {
+            state.armed = false;
+            state.fired = true;
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "ios")]
+mod ios;
+#[cfg(target_os = "ios")]
+pub use ios::run as run_owned_teardown_with_root;
 
 #[cfg(all(
     test,
@@ -857,6 +988,7 @@ fn execute(journal: &Path, mut outside: Outside, version: &str) -> OwnedTeardown
         target_os = "linux",
         target_os = "macos",
         target_os = "android",
+        target_os = "ios",
         windows
     )
 ))]
@@ -868,6 +1000,7 @@ thread_local! {
 }
 
 #[cfg(any(
+    target_os = "ios",
     target_os = "linux",
     target_os = "macos",
     target_os = "android",
@@ -886,7 +1019,6 @@ fn test_cut(phase: TeardownRunPhase) {
 
 #[cfg(all(
     test,
-    feature = "full-tests",
     any(
         target_os = "linux",
         target_os = "macos",

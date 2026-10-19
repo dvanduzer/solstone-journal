@@ -100,6 +100,8 @@ type bridgeRequest struct {
 	restorePublished     bool
 	pathsPinned          bool
 	remote               *s3RemoteRequest
+	teardownIDs          []string
+	teardownAdmission    *s3TeardownAdmission
 	rootedRestore        *rootedRestore
 }
 
@@ -115,4 +117,5 @@ type bridgeResult struct {
 	// encode metadata never changes an existing operation's legacy result.
 	metadata       []byte
 	metadataStatus int32
+	recoveryResume bool
 }

@@ -596,6 +596,8 @@ pub enum NoReplacePrimitive {
     LinuxRenameAt2,
     /// macOS `renameatx_np(2)` with `RENAME_EXCL`.
     MacosRenameAtxNp,
+    /// iOS `renameatx_np(2)` with `RENAME_EXCL`.
+    IosRenameAtxNp,
     /// Another Unix platform with no supported no-replace rename primitive.
     UnsupportedUnix,
 }

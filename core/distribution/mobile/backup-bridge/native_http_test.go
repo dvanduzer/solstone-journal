@@ -73,7 +73,6 @@ func TestNativeHTTPRejectsIncompatibleRequestBeforeBodyRead(t *testing.T) {
 		{"opaque URL", func(r *http.Request) { r.URL.Opaque = "//other.example/secret" }},
 		{"fragment", func(r *http.Request) { r.URL.Fragment = "fragment" }},
 		{"userinfo", func(r *http.Request) { r.URL.User = url.UserPassword("owner", "secret") }},
-		{"method", func(r *http.Request) { r.Method = http.MethodPost }},
 		{"RequestURI", func(r *http.Request) { r.RequestURI = "/other" }},
 		{"trailers", func(r *http.Request) { r.Trailer = make(http.Header) }},
 		{"transfer", func(r *http.Request) { r.TransferEncoding = []string{"chunked"} }},
@@ -184,5 +183,43 @@ func TestNativeHTTPResponseCloseOwnsMemoryAndConcurrentReaders(t *testing.T) {
 	}
 	if _, err := body.Read(make([]byte, 1)); !errors.Is(err, io.ErrClosedPipe) {
 		t.Fatal("closed response remains readable")
+	}
+}
+
+func TestNativeHTTPPostAndMethodValidation(t *testing.T) {
+	transport := nativeHTTPTestTransport(t)
+
+	// Bounded POST with matching ContentLength passes prepareNativeHTTPRequest
+	postReq, _ := http.NewRequest(http.MethodPost, "https://storage.example/bucket/prefix/object", strings.NewReader("hello post"))
+	postReq.ContentLength = int64(len("hello post"))
+	wire, body, err := transport.prepareNativeHTTPRequest(postReq)
+	if err != nil {
+		t.Fatalf("bounded POST failed: %v", err)
+	}
+	if wire.Method != http.MethodPost || string(body) != "hello post" {
+		t.Fatalf("unexpected POST wire/body: method=%s body=%s", wire.Method, string(body))
+	}
+
+	// ContentLength == maxHTTPObjectBytes+1 on POST is errHTTPLimit
+	bigPost, _ := http.NewRequest(http.MethodPost, "https://storage.example/bucket/prefix/object", strings.NewReader(""))
+	bigPost.ContentLength = maxHTTPObjectBytes + 1
+	_, _, err = transport.prepareNativeHTTPRequest(bigPost)
+	if !errors.Is(err, errHTTPLimit) {
+		t.Fatalf("expected errHTTPLimit for oversized POST, got: %v", err)
+	}
+
+	// GET with a body stays errHTTPArgument
+	getWithBody, _ := http.NewRequest(http.MethodGet, "https://storage.example/bucket/prefix/object", strings.NewReader("get body"))
+	getWithBody.ContentLength = int64(len("get body"))
+	_, _, err = transport.prepareNativeHTTPRequest(getWithBody)
+	if !errors.Is(err, errHTTPArgument) {
+		t.Fatalf("expected errHTTPArgument for GET with body, got: %v", err)
+	}
+
+	// Unknown method (TRACE) stays errHTTPArgument
+	traceReq, _ := http.NewRequest("TRACE", "https://storage.example/bucket/prefix/object", nil)
+	_, _, err = transport.prepareNativeHTTPRequest(traceReq)
+	if !errors.Is(err, errHTTPArgument) {
+		t.Fatalf("expected errHTTPArgument for TRACE, got: %v", err)
 	}
 }

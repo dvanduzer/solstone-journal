@@ -58,6 +58,20 @@ impl Directory {
         &self.path
     }
 
+    pub fn observation(&self) -> Result<(String, String, String), Refusal> {
+        self.revalidate()?;
+        let family =
+            FlatDirectory::open(&self.root, self.relative.parent().ok_or(Refusal::Storage)?)
+                .map_err(|_| Refusal::Storage)?;
+        let observed = (
+            self.root.identity().observation_id(),
+            family.identity().observation_id(),
+            self.held.identity().observation_id(),
+        );
+        self.revalidate()?;
+        Ok(observed)
+    }
+
     pub fn revalidate(&self) -> Result<(), Refusal> {
         self.root
             .revalidate_canonical_binding()
@@ -117,6 +131,35 @@ impl Storage {
             return Err(Refusal::Storage);
         }
         self.create_directory("destinations", Some(namespace))
+    }
+
+    pub fn open_state(&self, namespace: &str) -> Result<Directory, Refusal> {
+        if namespace.len() != 64
+            || !namespace
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(Refusal::Storage);
+        }
+        self.revalidate()?;
+        let relative = Path::new("destinations").join(namespace);
+        let held = FlatDirectory::open(&self.root, &relative).map_err(|_| Refusal::Storage)?;
+        let path = self
+            .root
+            .canonical_path()
+            .join(&relative)
+            .to_str()
+            .filter(|s| s.len() <= 4096)
+            .ok_or(Refusal::Storage)?
+            .to_owned();
+        let directory = Directory {
+            root: Arc::clone(&self.root),
+            relative,
+            held,
+            path,
+        };
+        directory.revalidate()?;
+        Ok(directory)
     }
 
     fn create_directory(

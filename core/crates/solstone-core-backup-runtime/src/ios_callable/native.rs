@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 const OK: i32 = 0;
 const INVALID_ARGUMENT: i32 = 1;
+const ADD_RECOVERY_KEY: i32 = 3;
 const SNAPSHOT: i32 = 4;
 const RESTORE: i32 = 6;
 const REMOVE_KEY: i32 = 10;
@@ -25,13 +26,13 @@ static DRAIN_FAILED: AtomicBool = AtomicBool::new(false);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct Bytes {
-    pointer: *const c_char,
-    length: u32,
+pub(super) struct Bytes {
+    pub(super) pointer: *const c_char,
+    pub(super) length: u32,
 }
 
 impl Bytes {
-    fn new(value: &[u8]) -> Result<Self, i32> {
+    pub(super) fn new(value: &[u8]) -> Result<Self, i32> {
         Ok(Self {
             pointer: value.as_ptr().cast(),
             length: value.len().try_into().map_err(|_| CAP_EXCEEDED)?,
@@ -40,34 +41,34 @@ impl Bytes {
 }
 
 #[repr(C)]
-struct LocalRequest {
-    operation: i32,
-    password: Bytes,
-    recovery_password: Bytes,
-    repository: Bytes,
-    source: Bytes,
-    restore: Bytes,
-    snapshot: Bytes,
+pub(super) struct LocalRequest {
+    pub(super) operation: i32,
+    pub(super) password: Bytes,
+    pub(super) recovery_password: Bytes,
+    pub(super) repository: Bytes,
+    pub(super) source: Bytes,
+    pub(super) restore: Bytes,
+    pub(super) snapshot: Bytes,
 }
 
 #[repr(C)]
-struct RemoteRequest {
-    version: u32,
-    operation: i32,
-    endpoint: Bytes,
-    region: Bytes,
-    bucket: Bytes,
-    prefix: Bytes,
-    access: Bytes,
-    secret: Bytes,
-    token: Bytes,
-    password: Bytes,
-    recovery_password: Bytes,
-    state: Bytes,
-    source: Bytes,
-    restore: Bytes,
-    snapshot: Bytes,
-    workspace: Bytes,
+pub(super) struct RemoteRequest {
+    pub(super) version: u32,
+    pub(super) operation: i32,
+    pub(super) endpoint: Bytes,
+    pub(super) region: Bytes,
+    pub(super) bucket: Bytes,
+    pub(super) prefix: Bytes,
+    pub(super) access: Bytes,
+    pub(super) secret: Bytes,
+    pub(super) token: Bytes,
+    pub(super) password: Bytes,
+    pub(super) recovery_password: Bytes,
+    pub(super) state: Bytes,
+    pub(super) source: Bytes,
+    pub(super) restore: Bytes,
+    pub(super) snapshot: Bytes,
+    pub(super) workspace: Bytes,
 }
 
 #[derive(Clone, Copy)]
@@ -167,8 +168,37 @@ unsafe extern "C" {
         out: *mut u64,
     ) -> i32;
     fn restic_bridge_free(id: u64) -> i32;
+    pub(super) fn restic_bridge_teardown_v1_start(
+        local: *const LocalRequest,
+        remote: *const RemoteRequest,
+        options: *const Options,
+        state_fd: i32,
+        admitted_snapshot_ids: *const c_char,
+        admitted_snapshot_count: u32,
+        admission: *const c_char,
+        admission_len: u32,
+        out_id: *mut u64,
+    ) -> i32;
+    pub(super) fn restic_bridge_teardown_v1_wait(id: u64, out: *mut ResultFields) -> i32;
+    pub(crate) fn restic_bridge_http_exchange(
+        method: *const c_char,
+        method_len: u32,
+        url_str: *const c_char,
+        url_len: u32,
+        header_json: *const c_char,
+        header_json_len: u32,
+        body: *const c_char,
+        body_len: u32,
+        cancelled: *const u32,
+        out_http_status: *mut i32,
+        out_body: *mut c_char,
+        out_body_cap: u32,
+        out_body_len: *mut u32,
+    ) -> i32;
 }
 
+#[cfg(not(feature = "ios-linked-bridge"))]
+pub(crate) use unlinked::restic_bridge_http_exchange;
 #[cfg(not(feature = "ios-linked-bridge"))]
 use unlinked::*;
 
@@ -274,6 +304,39 @@ mod unlinked {
     pub(super) unsafe fn restic_bridge_free(_: u64) -> i32 {
         INVALID_ARGUMENT
     }
+    pub(super) unsafe fn restic_bridge_teardown_v1_start(
+        _: *const LocalRequest,
+        _: *const RemoteRequest,
+        _: *const Options,
+        _: i32,
+        _: *const c_char,
+        _: u32,
+        _: *const c_char,
+        _: u32,
+        _: *mut u64,
+    ) -> i32 {
+        INVALID_ARGUMENT
+    }
+    pub(super) unsafe fn restic_bridge_teardown_v1_wait(_: u64, _: *mut ResultFields) -> i32 {
+        INVALID_ARGUMENT
+    }
+    pub(crate) unsafe fn restic_bridge_http_exchange(
+        _: *const c_char,
+        _: u32,
+        _: *const c_char,
+        _: u32,
+        _: *const c_char,
+        _: u32,
+        _: *const c_char,
+        _: u32,
+        _: *const u32,
+        _: *mut i32,
+        _: *mut c_char,
+        _: u32,
+        _: *mut u32,
+    ) -> i32 {
+        INVALID_ARGUMENT
+    }
 }
 
 pub(super) struct Remote<'a> {
@@ -314,7 +377,7 @@ fn snapshot_directories<'a>(
             workspace.path,
             workspace.descriptor.as_raw_fd(),
         )),
-        (1 | 2 | 3 | 5 | 7, None, None) => Ok(("", -1, "", -1)),
+        (1 | 2 | 3 | 5 | 7 | 9, None, None) => Ok(("", -1, "", -1)),
         _ => Err(INVALID_ARGUMENT),
     }
 }
@@ -549,7 +612,7 @@ impl Call {
             operation: REMOVE_KEY,
             password: Bytes::new(password)?,
             recovery_password: Bytes::new(&[])?,
-            repo: Bytes::new(repo_path.as_bytes())?,
+            repository: Bytes::new(repo_path.as_bytes())?,
             source: Bytes::new(&[])?,
             restore: Bytes::new(&[])?,
             snapshot: Bytes::new(&[])?,
@@ -644,6 +707,38 @@ impl Call {
                 options,
                 remote.state.descriptor.as_raw_fd(),
                 custody,
+                &mut id,
+            )
+        };
+        Self::published(id, status, began)
+    }
+
+    pub(super) fn teardown(
+        local: Option<&LocalRequest>,
+        remote: Option<&RemoteRequest>,
+        options: &Options,
+        state_fd: i32,
+        admitted_ids: &[u8],
+        admitted_count: u32,
+        admission: &[u8],
+    ) -> Result<Self, i32> {
+        let began = Instant::now();
+        let mut id = 0;
+        let ids_ptr = if admitted_count == 0 {
+            std::ptr::null()
+        } else {
+            admitted_ids.as_ptr().cast()
+        };
+        let status = unsafe {
+            restic_bridge_teardown_v1_start(
+                local.map_or(std::ptr::null(), |r| r),
+                remote.map_or(std::ptr::null(), |r| r),
+                options,
+                state_fd,
+                ids_ptr,
+                admitted_count,
+                admission.as_ptr().cast(),
+                admission.len().try_into().map_err(|_| INVALID_ARGUMENT)?,
                 &mut id,
             )
         };

@@ -19,6 +19,8 @@ typedef struct {
 } restic_operation_options_v1;
 #endif
 
+#ifndef SOLSTONE_RESTIC_S3_REQUEST
+#define SOLSTONE_RESTIC_S3_REQUEST
 typedef struct {
     uint32_t version;
     int32_t operation;
@@ -37,6 +39,7 @@ typedef struct {
     const char *snapshot_id; uint32_t snapshot_id_len;
     const char *workspace_path; uint32_t workspace_path_len;
 } restic_s3_request;
+#endif
 */
 import "C"
 

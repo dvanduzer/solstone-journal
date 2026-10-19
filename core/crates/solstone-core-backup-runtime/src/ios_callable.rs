@@ -7,18 +7,19 @@
 mod build_identity;
 mod bundle;
 mod command;
-mod native;
+pub(crate) mod native;
 mod outcome;
-mod repository;
+pub mod repository;
 mod root;
 mod storage;
+pub mod teardown;
 
 pub use root::IosRootToolRunner;
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::MetadataExt;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -185,7 +186,8 @@ fn refused(reason: &'static str) -> RunnerError {
     RunnerError::Process(io::Error::new(io::ErrorKind::Unsupported, reason))
 }
 
-enum ExecuteError {
+#[derive(Debug)]
+pub enum ExecuteError {
     Admission(RunnerError),
     Entry(i32),
 }

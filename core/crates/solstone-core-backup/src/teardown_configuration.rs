@@ -39,11 +39,15 @@ pub struct TeardownConfiguration {
     #[cfg(any(unix, windows))]
     binding_observation: Option<local::BindingObservation>,
     #[cfg(any(unix, windows))]
+    retired_binding_parent: Option<Arc<solstone_core_journal_io::media::MediaDirectory>>,
+    #[cfg(any(unix, windows))]
     expected_clear_sha256: Option<String>,
 }
 
 #[cfg(any(unix, windows))]
 pub use local::binding::{BindingFinalization, BindingFinalizationRefusal, BindingRemovalReceipt};
+#[cfg(any(unix, windows))]
+pub use local::recovery::{LocalTeardownObservation, PublishedClearObservation};
 
 impl TeardownConfiguration {
     /// Retain both original-parent locks after this exact clear has been confirmed.
@@ -152,6 +156,7 @@ mod local {
     use TeardownConfigurationRefusal as Refusal;
 
     pub(super) mod binding;
+    pub(super) mod recovery;
 
     const MAX_BINDING_BYTES: usize = 1024 * 1024;
 
@@ -211,6 +216,7 @@ mod local {
             root,
             directory,
             binding_observation,
+            retired_binding_parent: None,
             expected_clear_sha256,
         };
         revalidate(&captured)?;
@@ -298,6 +304,9 @@ mod local {
     }
 
     fn revalidate_binding_and_parents(captured: &TeardownConfiguration) -> Result<(), Refusal> {
+        if let Some(parent) = &captured.retired_binding_parent {
+            recovery::require_binding_absent(parent)?;
+        }
         if let Some(binding) = &captured.binding_observation
             && read_binding(&binding.directory)? != binding.read
         {

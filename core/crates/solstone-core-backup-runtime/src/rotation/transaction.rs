@@ -27,6 +27,8 @@ use crate::engine::BackupServices;
 #[cfg(any(not(target_os = "ios"), all(test, feature = "full-tests")))]
 use crate::repo::add_recovery_key;
 use crate::repo::{capture_rotation_key_id, remove_rotation_key, strict_key_list_absence};
+#[cfg(target_os = "ios")]
+use crate::runner::ToolRunner;
 
 #[cfg(feature = "test-hooks")]
 use super::pause_after_remote_removal;
