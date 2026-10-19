@@ -26,15 +26,11 @@ mod parent_watch;
 mod rotation_binding;
 mod state;
 pub mod teardown_configuration;
-pub mod teardown_recovery;
 
 pub use archive_readback::SUPPORTED_RESTIC_VERSION;
 pub use defaults::backup_defaults;
 pub use destination::assemble_backend_env;
-pub use hosted::{
-    delete_hosted_binding, delete_hosted_binding as remove_hosted_binding, load_hosted_binding,
-    save_hosted_binding,
-};
+pub use hosted::{delete_hosted_binding, load_hosted_binding, save_hosted_binding};
 pub use keys::{
     CROCKFORD_ALPHABET, RECOVERY_KEY_LENGTH, confirm_recovery_key, format_recovery_key_display,
     generate_daily_key, generate_recovery_key, parse_recovery_key,
@@ -49,11 +45,6 @@ pub use state::{
     record_offload_result, record_prune_result, record_restore_result, record_verification_result,
     set_destination, set_enabled, set_mode, set_offload, set_recovery_key,
     set_recovery_key_confirmed, set_retention, stage_pending_key_revocation_at_root, status_view,
-};
-pub use teardown_recovery::{
-    PruneObligation, TEARDOWN_RECOVERY_VERSION, TeardownRecoveryRecord,
-    delete_teardown_recovery_at_root, load_teardown_recovery_at_root,
-    stage_teardown_recovery_at_root, teardown_recovery_path, update_teardown_recovery_at_root,
 };
 
 pub(crate) const OFFLOAD_STATUSES: [&str; 4] = ["ok", "skipped", "stalled", "error"];
@@ -126,10 +117,6 @@ pub enum BackupError {
     Entropy,
     HostedWrite,
     HostedDelete,
-    TeardownRecoveryWrite,
-    TeardownRecoveryDelete,
-    TeardownRecoveryRead,
-    TeardownRecoveryCorrupt,
     InvalidMode,
     InvalidRetentionShape,
     InvalidRetentionValue,
@@ -158,18 +145,6 @@ impl fmt::Display for BackupError {
             Self::Entropy => formatter.write_str("could not generate backup key."),
             Self::HostedWrite => formatter.write_str("could not save hosted binding."),
             Self::HostedDelete => formatter.write_str("could not delete hosted binding."),
-            Self::TeardownRecoveryWrite => {
-                formatter.write_str("could not save teardown recovery record.")
-            }
-            Self::TeardownRecoveryDelete => {
-                formatter.write_str("could not delete teardown recovery record.")
-            }
-            Self::TeardownRecoveryRead => {
-                formatter.write_str("could not read teardown recovery record.")
-            }
-            Self::TeardownRecoveryCorrupt => {
-                formatter.write_str("teardown recovery record corrupt or invalid.")
-            }
             Self::InvalidMode => formatter.write_str("backup mode must be byo or operated"),
             Self::InvalidRetentionShape => {
                 formatter.write_str("backup retention must include hourly, daily, weekly, monthly")

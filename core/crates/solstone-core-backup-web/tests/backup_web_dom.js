@@ -329,17 +329,6 @@ function fixture(document) {
   const stallReason = add(offload, 'p', { 'data-offload-stall-reason': '', hidden: '' });
   const saveOffload = add(offload, 'button', { 'data-action': 'offload-save' });
   add(offload, 'button', { 'data-action': 'offload-enable' });
-  const teardownSection = add(management, 'section', { class: 'backup-teardown' });
-  const teardownOpen = add(teardownSection, 'button', { 'data-action': 'teardown-open' });
-  const teardownGate = add(teardownSection, 'div', { class: 'backup-teardown-gate', 'data-teardown-gate': '', hidden: '' });
-  add(teardownGate, 'p', { class: 'backup-warning', 'data-teardown-stakes': '' });
-  const teardownInput = add(teardownGate, 'input', { 'data-teardown-input': '', name: 'teardown_confirm' });
-  add(teardownGate, 'p', { class: 'backup-status-message', 'data-teardown-status': '' });
-  add(teardownGate, 'button', { 'data-action': 'teardown-restore-first' });
-  const teardownConfirm = add(teardownGate, 'button', { 'data-action': 'teardown-confirm', disabled: '' });
-  teardownConfirm.disabled = true;
-  add(teardownGate, 'button', { 'data-action': 'teardown-cancel' });
-
   const destination = add(panels, 'article', { 'data-backup-panel': 'destination', hidden: '' });
   const destinationByo = add(destination, 'button', { class: 'backup-mode is-selected', 'data-mode': 'byo', role: 'radio', 'aria-checked': 'true' });
   destinationByo.textContent = 'your own';
@@ -373,7 +362,7 @@ function fixture(document) {
   add(byo, 'form', { 'data-restore-form': '' });
   const panelCancel = add(restore, 'button', { 'data-action': 'cancel-restore' });
   panelCancel.textContent = 'cancel';
-  return { root, showRestore, generateKey, backupNow, viewKey, rotateKey, retention, saveRetention, offloadProof, lastOffload, lastVerify, runHistory, runSuccessTime, verifyHistory, verifySuccessTime, stallReason, saveOffload, restore, destinationByo, destinationHosted, byoLane, operatedLane, operated, byo, heading, keyControl, key, keyReassurance, outcome, primary, attemptCancel, reopen, panelCancel, banner, cleanupBanner, cleanup, management, managementGrid, lastBackup, teardownOpen, teardownGate, teardownInput, teardownConfirm };
+  return { root, showRestore, generateKey, backupNow, viewKey, rotateKey, retention, saveRetention, offloadProof, lastOffload, lastVerify, runHistory, runSuccessTime, verifyHistory, verifySuccessTime, stallReason, saveOffload, restore, destinationByo, destinationHosted, byoLane, operatedLane, operated, byo, heading, keyControl, key, keyReassurance, outcome, primary, attemptCancel, reopen, panelCancel, banner, cleanupBanner, cleanup, management, managementGrid, lastBackup };
 }
 
 function createHarness(options = {}) {
@@ -1873,54 +1862,6 @@ asyncCase('a malformed fresh status cannot borrow successful facts from the prev
     await harness.runTimer(800);
     assert.strictEqual(summary.dataset.tone, 'neutral');
   }
-});
-
-asyncCase('teardown confirmation gate requires exact phrase and POSTs with no body', async () => {
-  const backupJsSource = fs.readFileSync(path.join(crateDir, 'assets', 'backup.js'), 'utf8');
-  const match = /"teardown_confirm_phrase":\s*"([^"]+)"/.exec(backupJsSource);
-  assert.ok(match, 'backup.js must contain teardown_confirm_phrase');
-  const phrase = match[1];
-
-  let teardownCalled = false;
-  let teardownRequestBody = 'uncalled';
-  const harness = createHarness({
-    statusQueue: [{ ...status(), enabled: true }],
-    respond(call) {
-      if (call.url === '/app/backup/teardown') {
-        teardownCalled = true;
-        teardownRequestBody = call.request.body;
-        return response({ success: true, operation: { kind: 'teardown', phase: 'starting' } });
-      }
-    },
-  });
-  await ready(harness);
-
-  click(harness.teardownOpen);
-  await settle();
-
-  assert.strictEqual(harness.teardownGate.hidden, false);
-  assert.strictEqual(harness.teardownConfirm.disabled, true);
-
-  harness.teardownInput.value = '';
-  harness.teardownInput.dispatchEvent(event('input'));
-  assert.strictEqual(harness.teardownConfirm.disabled, true);
-  click(harness.teardownConfirm);
-  assert.strictEqual(teardownCalled, false);
-
-  harness.teardownInput.value = 'wrong';
-  harness.teardownInput.dispatchEvent(event('input'));
-  assert.strictEqual(harness.teardownConfirm.disabled, true);
-  click(harness.teardownConfirm);
-  assert.strictEqual(teardownCalled, false);
-
-  harness.teardownInput.value = phrase;
-  harness.teardownInput.dispatchEvent(event('input'));
-  assert.strictEqual(harness.teardownConfirm.disabled, false);
-
-  click(harness.teardownConfirm);
-  await settle();
-  assert.strictEqual(teardownCalled, true);
-  assert.strictEqual(teardownRequestBody, undefined);
 });
 
 async function runAsyncCases() {

@@ -10,7 +10,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use serde_json::Value;
-#[cfg(any(target_os = "android", target_os = "ios"))]
+#[cfg(target_os = "android")]
 use solstone_core_backup::archive_admission::ArchiveCancellation;
 
 use super::{
@@ -23,10 +23,10 @@ use crate::teardown_admission::{CarrierTeardownAdmission, TeardownReader};
 
 const RETENTION_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[cfg(any(target_os = "android", target_os = "ios"))]
+#[cfg(target_os = "android")]
 struct RetentionTransport<'a>(&'a TeardownOperation);
 
-#[cfg(any(target_os = "android", target_os = "ios"))]
+#[cfg(target_os = "android")]
 impl crate::hosted_runtime::HttpTransport for RetentionTransport<'_> {
     fn execute(
         &self,
@@ -103,7 +103,7 @@ impl ToolRunner for Cancellable<'_> {
     }
 }
 
-pub fn snapshot_ids(listing: &ResticResult) -> Option<Vec<String>> {
+fn snapshot_ids(listing: &ResticResult) -> Option<Vec<String>> {
     let Value::Array(rows) = listing.json.as_ref()? else {
         return None;
     };
@@ -180,97 +180,37 @@ impl TeardownOperation {
         admission
             .check(reader)
             .map_err(TeardownRemoteRefusal::Admission)?;
-        #[cfg(target_os = "ios")]
-        {
-            let _ = restic_path;
+        let configuration = admission.configuration();
+        if configuration.binding().is_some() {
             return Err(TeardownRemoteRefusal::DestinationUnavailable);
         }
-        #[cfg(not(target_os = "ios"))]
-        {
-            let configuration = admission.configuration();
-            if configuration.binding().is_some() {
-                return Err(TeardownRemoteRefusal::DestinationUnavailable);
-            }
-            let (Some(destination), Some(keys)) =
-                (configuration.destination(), configuration.keys())
-            else {
-                return Err(TeardownRemoteRefusal::DestinationUnavailable);
-            };
-            let env = crate::engine::value_env(destination)
-                .ok_or(TeardownRemoteRefusal::DestinationUnavailable)?;
-            let repository = destination.repository.clone();
-            let password = keys.daily_key.clone();
-            let list = |operation: &Self| {
-                operation
-                    .restic(
-                        restic_path,
-                        &repository,
-                        &password,
-                        &env,
-                        &["snapshots".into()],
-                        true,
-                    )
-                    .and_then(|listing| {
-                        snapshot_ids(&listing).ok_or(TeardownRemoteRefusal::Protocol(
-                            super::TeardownProtocolRefusal::Malformed,
-                        ))
-                    })
-            };
-            self.report.phase = RemoteTeardownPhase::Inventory;
-            let ids = list(self)?;
-            // Read-only and never a refusal: the answer goes to the owner, not the gate.
-            let check = self
-                .remaining()
-                .map_err(TeardownRemoteRefusal::Operation)?
-                .min(RETENTION_CHECK_TIMEOUT);
-            let amz_date =
-                chrono::DateTime::<chrono::Utc>::from_timestamp(self.clock.now_unix(), 0)
-                    .ok_or(TeardownRemoteRefusal::Timestamp)?
-                    .format("%Y%m%dT%H%M%SZ")
-                    .to_string();
-            #[cfg(target_os = "android")]
-            let retention_transport = RetentionTransport(self);
-            #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            let retention_transport = crate::hosted_runtime::UreqHttpTransport;
-            self.report.storage_retention = Some(super::retention::observe(
-                destination,
-                &retention_transport,
-                &self.cancellation,
-                check,
-                &amz_date,
-            ));
-            self.remaining().map_err(TeardownRemoteRefusal::Operation)?;
-            admission
-                .check(reader)
-                .map_err(TeardownRemoteRefusal::Admission)?;
-            if !ids.is_empty() {
-                self.report.phase = RemoteTeardownPhase::Deleting;
-                self.report.delete_attempts += 1;
-                let mut args = vec!["forget".to_owned()];
-                args.extend(ids);
-                args.push("--prune".into());
-                self.restic(restic_path, &repository, &password, &env, &args, false)?;
-                self.report.delete_confirmations += 1;
-                admission
-                    .check(reader)
-                    .map_err(TeardownRemoteRefusal::Admission)?;
-            }
-            self.report.phase = RemoteTeardownPhase::Confirming;
-            if !list(self)?.is_empty() {
-                return Err(TeardownRemoteRefusal::Residual);
-            }
-            self.report.objects_empty = true;
-            self.report.uploads_empty = true;
-            self.report.phase = RemoteTeardownPhase::Wiped;
-            Ok(RemoteTeardownDisposition::Wiped)
-        }
-    }
-
-    #[cfg(target_os = "ios")]
-    pub fn observe_ios_retention(
-        &mut self,
-        destination: &solstone_core_backup::Destination,
-    ) -> Result<(), TeardownRemoteRefusal> {
+        let (Some(destination), Some(keys)) = (configuration.destination(), configuration.keys())
+        else {
+            return Err(TeardownRemoteRefusal::DestinationUnavailable);
+        };
+        let env = crate::engine::value_env(destination)
+            .ok_or(TeardownRemoteRefusal::DestinationUnavailable)?;
+        let repository = destination.repository.clone();
+        let password = keys.daily_key.clone();
+        let list = |operation: &Self| {
+            operation
+                .restic(
+                    restic_path,
+                    &repository,
+                    &password,
+                    &env,
+                    &["snapshots".into()],
+                    true,
+                )
+                .and_then(|listing| {
+                    snapshot_ids(&listing).ok_or(TeardownRemoteRefusal::Protocol(
+                        super::TeardownProtocolRefusal::Malformed,
+                    ))
+                })
+        };
+        self.report.phase = RemoteTeardownPhase::Inventory;
+        let ids = list(self)?;
+        // Read-only and never a refusal: the answer goes to the owner, not the gate.
         let check = self
             .remaining()
             .map_err(TeardownRemoteRefusal::Operation)?
@@ -279,7 +219,10 @@ impl TeardownOperation {
             .ok_or(TeardownRemoteRefusal::Timestamp)?
             .format("%Y%m%dT%H%M%SZ")
             .to_string();
+        #[cfg(target_os = "android")]
         let retention_transport = RetentionTransport(self);
+        #[cfg(not(target_os = "android"))]
+        let retention_transport = crate::hosted_runtime::UreqHttpTransport;
         self.report.storage_retention = Some(super::retention::observe(
             destination,
             &retention_transport,
@@ -287,7 +230,30 @@ impl TeardownOperation {
             check,
             &amz_date,
         ));
-        Ok(())
+        self.remaining().map_err(TeardownRemoteRefusal::Operation)?;
+        admission
+            .check(reader)
+            .map_err(TeardownRemoteRefusal::Admission)?;
+        if !ids.is_empty() {
+            self.report.phase = RemoteTeardownPhase::Deleting;
+            self.report.delete_attempts += 1;
+            let mut args = vec!["forget".to_owned()];
+            args.extend(ids);
+            args.push("--prune".into());
+            self.restic(restic_path, &repository, &password, &env, &args, false)?;
+            self.report.delete_confirmations += 1;
+            admission
+                .check(reader)
+                .map_err(TeardownRemoteRefusal::Admission)?;
+        }
+        self.report.phase = RemoteTeardownPhase::Confirming;
+        if !list(self)?.is_empty() {
+            return Err(TeardownRemoteRefusal::Residual);
+        }
+        self.report.objects_empty = true;
+        self.report.uploads_empty = true;
+        self.report.phase = RemoteTeardownPhase::Wiped;
+        Ok(RemoteTeardownDisposition::Wiped)
     }
 }
 

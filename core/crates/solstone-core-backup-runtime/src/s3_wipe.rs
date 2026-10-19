@@ -14,7 +14,6 @@ use crate::hosted_runtime::{HttpError, HttpRequest, HttpTransport};
     target_os = "linux",
     target_os = "macos",
     target_os = "android",
-    target_os = "ios",
     windows
 ))]
 pub(crate) mod owned;
@@ -22,7 +21,6 @@ pub(crate) mod owned;
     target_os = "linux",
     target_os = "macos",
     target_os = "android",
-    target_os = "ios",
     windows,
     test
 ))]

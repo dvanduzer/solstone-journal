@@ -142,23 +142,11 @@ func (be *s3OperationBackend) Remove(ctx context.Context, handle backend.Handle)
 		return err
 	}
 	defer done()
-	if handle.Type == backend.LockFile {
-		if !validS3ID(handle.Name) || !be.owner.ownsLock(handle.Name) {
-			return errS3Denied
-		}
-	} else if isTeardownScope(ctx) && (handle.Type == backend.SnapshotFile || handle.Type == backend.PackFile || handle.Type == backend.IndexFile) {
-		if !validS3ID(handle.Name) {
-			return errS3Denied
-		}
-	} else {
+	if handle.Type != backend.LockFile || !validS3ID(handle.Name) || !be.owner.ownsLock(handle.Name) {
 		return errS3Denied
 	}
 	err = be.s3Backend.Remove(ctx, handle)
-	if handle.Type == backend.LockFile {
-		be.owner.lockRemoved(handle.Name, err)
-	} else if err != nil {
-		be.owner.saveReturned(err)
-	}
+	be.owner.lockRemoved(handle.Name, err)
 	return err
 }
 

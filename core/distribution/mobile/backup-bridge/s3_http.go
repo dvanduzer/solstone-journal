@@ -396,19 +396,8 @@ func (be *s3Backend) Stat(ctx context.Context, handle backend.Handle) (backend.F
 	return backend.FileInfo{Name: handle.Name, Size: length}, nil
 }
 
-type teardownScopeKey struct{}
-
-func withTeardownScope(ctx context.Context) context.Context {
-	return context.WithValue(ctx, teardownScopeKey{}, true)
-}
-
-func isTeardownScope(ctx context.Context) bool {
-	v, ok := ctx.Value(teardownScopeKey{}).(bool)
-	return ok && v
-}
-
 // This primitive is not an owned-lock capability. The future operation layer
-// must gate it with durable current-attempt IDs; non-teardown non-lock deletion never enters, and config and key never enter.
+// must gate it with durable current-attempt IDs; non-lock deletion never enters.
 func (be *s3Backend) Remove(ctx context.Context, handle backend.Handle) error {
 	owned, done, err := be.enter(ctx)
 	if err != nil {
@@ -420,9 +409,7 @@ func (be *s3Backend) Remove(ctx context.Context, handle backend.Handle) error {
 		return err
 	}
 	if handle.Type != backend.LockFile {
-		if !isTeardownScope(ctx) || (handle.Type != backend.SnapshotFile && handle.Type != backend.PackFile && handle.Type != backend.IndexFile) {
-			return errS3Denied
-		}
+		return errS3Denied
 	}
 	reply, body, err := be.request(owned, http.MethodDelete, key, nil, nil, "")
 	defer zeroBytes(body)
