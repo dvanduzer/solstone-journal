@@ -703,6 +703,9 @@ fn scan_talent_index(
         if timestamp < cutoff || timestamp > generated_at {
             continue;
         }
+        if row.get("name").and_then(Value::as_str) == Some("facet_newsletter") {
+            continue;
+        }
         let succeeded = !row.contains_key("status")
             || matches!(
                 row.get("status").and_then(Value::as_str),
@@ -1674,21 +1677,65 @@ mod tests {
     }
 
     #[test]
-    fn a_newsletter_from_a_partial_story_is_degraded_not_unusable() {
+    fn retired_facet_newsletter_rows_are_omitted_from_synthesis_counts() {
         let temporary = temporary();
         healthy_talent_guards(temporary.path(), now());
-        talent_rows(
-            temporary.path(),
-            "20260410",
-            &[
-                json!({"ts":now().timestamp_millis(),"status":"completed","degraded":{"reason":"partial_input","activities":["a1"]},"name":"facet_newsletter","facet":"work","provider":"local","model":"m","day":"20260410"}),
-            ],
-        );
+        let day = "20260410";
+        let index_path = temporary
+            .path()
+            .join("talents")
+            .join(format!("{day}.jsonl"));
+        let rows = [
+            json!({
+                "ts": now().timestamp_millis(),
+                "status": "failed",
+                "name": "facet_newsletter",
+                "facet": "work",
+                "day": day,
+            }),
+            json!({
+                "ts": now().timestamp_millis(),
+                "status": "completed",
+                "degraded": {"reason": "partial_input", "activities": ["a1"]},
+                "name": "facet_newsletter",
+                "facet": "work",
+                "day": day,
+            }),
+            json!({
+                "ts": now().timestamp_millis(),
+                "status": "failed",
+                "name": "other_talent_fail",
+                "day": day,
+            }),
+            json!({
+                "ts": now().timestamp_millis(),
+                "status": "completed",
+                "degraded": {"output_tokens": 0, "provider": "p", "model": "m"},
+                "name": "other_talent_deg",
+                "day": day,
+            }),
+        ];
+        talent_rows(temporary.path(), day, &rows);
+        let index_bytes = fs::read(&index_path).expect("read day index");
+
         let (health, notes) =
             build_synthesis_health(temporary.path(), &ScanAggregate::default(), now()).unwrap();
-        assert_eq!(health.talent_run_failures_24h, Some(0));
+        assert_eq!(health.talent_run_failures_24h, Some(1));
         assert_eq!(health.talent_degraded_outputs_24h, Some(1));
-        assert!(notes.iter().any(|note| note.message.contains("20260410")));
+        assert!(
+            !notes
+                .iter()
+                .any(|note| note.message.contains("facet_newsletter"))
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.message.contains("other_talent_deg"))
+        );
+        assert_eq!(
+            fs::read(&index_path).expect("read day index after"),
+            index_bytes
+        );
     }
 
     #[test]

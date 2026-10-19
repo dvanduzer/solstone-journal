@@ -7440,6 +7440,7 @@ not json
         .unwrap()
     }
 
+    #[cfg(feature = "full-tests")]
     fn assert_scan_journal_refusal(error: &StoreError) {
         assert!(matches!(
             error,

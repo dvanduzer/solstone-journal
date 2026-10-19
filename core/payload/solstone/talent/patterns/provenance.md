@@ -11,12 +11,12 @@ Canonical implementation: `core/payload/solstone/talent/morning_briefing.md` emi
 A structured preamble summarizing what data sources were consulted and what gaps exist. Appears at the top of the output so the reader knows the briefing's evidence base before reading any claims.
 
 **What it includes:**
-- Source counts (segments, calendar events, entities, and activity records)
+- A coverage preamble stating plan counts for today and the next 7 days (`This briefing draws on N plan(s) for today and M plan(s) in the next 7 days.`), followed by `Missing: <gaps>.` when real gaps exist
 - Gaps — sources that returned zero results or errored
-- Structured metadata with machine-readable source counts
+- Structured metadata with machine-readable `sources` (`anticipated_activities` for the presentation day and `segments`, which is always 0)
 
 **Example:**
-> Built from 12 transcript segments, 4 calendar events, 3 entity profiles, and 5 activity records. Gaps: entity intelligence unavailable for Sarah Chen.
+> This briefing draws on 2 plans for today and 4 plans in the next 7 days. Missing: Location observations omitted: 3.
 
 ### 2. Source Attribution
 

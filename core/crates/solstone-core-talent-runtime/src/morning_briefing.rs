@@ -770,7 +770,7 @@ fn participants(value: &Value) -> String {
 const NO_PLANS_TODAY: &str = "no plans today";
 const NO_PLANS_FORWARD: &str = "no plans in the next 7 days";
 
-fn coverage_preamble(counts: &Value, gaps: &[String], forward: usize) -> String {
+pub(crate) fn coverage_preamble(counts: &Value, gaps: &[String], forward: usize) -> String {
     let count = |key: &str| counts[key].as_u64().unwrap_or(0);
     let plural = |n: u64, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
     let mut sentence = format!(
@@ -784,9 +784,29 @@ fn coverage_preamble(counts: &Value, gaps: &[String], forward: usize) -> String 
         .filter(|gap| *gap != NO_PLANS_TODAY && *gap != NO_PLANS_FORWARD)
         .collect::<Vec<_>>();
     if !missing.is_empty() {
-        sentence.push_str(&format!(" Missing: {}.", missing.join("; ")));
+        let joined = missing.join("; ");
+        if joined.ends_with('.') {
+            sentence.push_str(&format!(" Missing: {joined}"));
+        } else {
+            sentence.push_str(&format!(" Missing: {joined}."));
+        }
     }
     sentence
+}
+
+pub(crate) fn forward_count_from_preamble(preamble: &str) -> usize {
+    if let Some(idx) = preamble.find(" in the next 7 days") {
+        let prefix = &preamble[..idx];
+        if let Some(last_space) = prefix.rfind(' ') {
+            let before_unit = &prefix[..last_space];
+            if let Some(num_space) = before_unit.rfind(' ')
+                && let Ok(n) = before_unit[num_space + 1..].parse::<usize>()
+            {
+                return n;
+            }
+        }
+    }
+    0
 }
 
 /// A `YYYYMMDD` day as an owner reads it, like "October 17".
@@ -1247,7 +1267,7 @@ mod tests {
         let personal = root.path().join("facets/personal");
         fs::create_dir_all(personal.join("activities")).unwrap();
         fs::write(personal.join("facet.json"), r#"{"title":"Personal"}"#).unwrap();
-        fs::write(personal.join("activities/20261019.jsonl"), &[0xff, 0xff]).unwrap();
+        fs::write(personal.join("activities/20261019.jsonl"), [0xff, 0xff]).unwrap();
 
         let context = ExecutionContext {
             journal: root.path().to_owned(),
@@ -1408,7 +1428,7 @@ mod tests {
             .collect();
         let expected_gap = "activities from Work include a record with no activity id";
         assert!(
-            gaps.iter().any(|g| *g == expected_gap),
+            gaps.contains(&expected_gap),
             "expected gap '{expected_gap}' in {gaps:?}"
         );
         for g in &gaps {
@@ -1453,7 +1473,7 @@ mod tests {
             .collect();
         let expected_gap = "activities from Work include a record with no activity id";
         assert!(
-            gaps.iter().any(|g| *g == expected_gap),
+            gaps.contains(&expected_gap),
             "expected gap '{expected_gap}' in {gaps:?}"
         );
         for g in &gaps {

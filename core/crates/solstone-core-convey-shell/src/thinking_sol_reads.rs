@@ -212,6 +212,13 @@ pub(crate) async fn api_output_file(
         || resolved
             .strip_prefix(&canonical_root)
             .is_ok_and(is_facet_news_path)
+        || is_under_facet_newsletter(Path::new(&path))
+        || candidate
+            .strip_prefix(&journal.0)
+            .is_ok_and(is_under_facet_newsletter)
+        || resolved
+            .strip_prefix(&canonical_root)
+            .is_ok_and(is_under_facet_newsletter)
     {
         return file_not_found();
     }
@@ -553,6 +560,9 @@ fn talent_use_counts(
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
         {
+            if entry.get("name").and_then(Value::as_str) == Some("facet_newsletter") {
+                continue;
+            }
             let facet = entry
                 .get("facet")
                 .and_then(Value::as_str)
@@ -912,6 +922,17 @@ fn is_facet_news_path(path: &Path) -> bool {
             Some(std::path::Component::Normal(_file)),
             None,
         ) if c0 == "facets" && c2 == "news"
+    )
+}
+
+fn is_under_facet_newsletter(path: &Path) -> bool {
+    let mut iter = path.components().filter_map(|c| match c {
+        std::path::Component::Normal(p) => p.to_str(),
+        _ => None,
+    });
+    matches!(
+        (iter.next(), iter.next()),
+        (Some("talents"), Some("facet_newsletter"))
     )
 }
 
@@ -1333,19 +1354,60 @@ mod tests {
             Some((mb_active, true))
         );
 
+        let day_index_bytes = fs::read(&day_index).expect("day index bytes");
         let counts = talent_use_counts(root.path(), None);
-        assert_eq!(counts.get("20260101").unwrap().get("work"), Some(&1));
-        assert_eq!(counts.get("20260101").unwrap().get("personal"), Some(&1));
+        let day_counts = counts.get("20260101").unwrap();
+        assert_eq!(day_counts.get("work"), None);
+        assert_eq!(day_counts.get("personal"), Some(&1));
+        assert_eq!(
+            fs::read(&day_index).expect("day index unchanged"),
+            day_index_bytes
+        );
+    }
+
+    #[test]
+    fn newsletter_only_day_contributes_no_counts_and_bytes_unchanged() {
+        let root = tempfile::tempdir().expect("journal");
+        let talents = root.path().join("talents");
+        fs::create_dir_all(&talents).expect("talents dir");
+
+        let day_index = talents.join("20260101.jsonl");
+        let nl_row = json!({
+            "use_id": "nl-completed-1",
+            "name": "facet_newsletter",
+            "facet": "work",
+            "status": "completed",
+            "ts": 1000
+        });
+        let content = format!("{nl_row}\n");
+        let bytes = content.as_bytes().to_vec();
+        fs::write(&day_index, &content).expect("day index");
+
+        let counts = talent_use_counts(root.path(), None);
+        assert!(!counts.contains_key("20260101"));
+        assert_eq!(fs::read(&day_index).expect("day index unchanged"), bytes);
     }
 
     #[tokio::test]
-    async fn api_output_file_refuses_facet_newsletter_and_serves_chronicle() {
+    async fn api_output_file_refuses() {
         let root = tempfile::tempdir().expect("journal");
 
         let news_file = root.path().join("facets/work/news/20260101.md");
         fs::create_dir_all(news_file.parent().unwrap()).expect("news dir");
-        let sentinel = "SENTINEL_NEWSLETTER_OUTPUT_NEVER_SERVED_12345";
-        fs::write(&news_file, sentinel).expect("write news file");
+        let news_sentinel = "SENTINEL_NEWSLETTER_OUTPUT_NEVER_SERVED_12345";
+        fs::write(&news_file, news_sentinel).expect("write news file");
+
+        let nl_file = root.path().join("talents/facet_newsletter/nl-1.jsonl");
+        fs::create_dir_all(nl_file.parent().unwrap()).expect("nl dir");
+        let sentinel = "SENTINEL_NEWSLETTER_RUN_OUTPUT";
+        let nl_bytes =
+            format!("{{\"type\": \"finish\", \"output\": \"{sentinel}\"}}\n").into_bytes();
+        fs::write(&nl_file, &nl_bytes).expect("write newsletter run file");
+
+        let mb_file = root.path().join("talents/morning_briefing/mb-1.jsonl");
+        fs::create_dir_all(mb_file.parent().unwrap()).expect("mb dir");
+        let surviving = "SURVIVING_BRIEFING_OUTPUT";
+        fs::write(&mb_file, surviving).expect("write morning briefing run file");
 
         let chronicle_file = root
             .path()
@@ -1358,10 +1420,31 @@ mod tests {
             .route("/output/{day}/{*path}", axum::routing::get(api_output_file))
             .layer(Extension(Arc::new(JournalRoot(root.path().to_path_buf()))));
 
+        // Refuse facets/<facet>/news/<file>
         let response = app
             .clone()
             .oneshot(
                 Request::get("/output/20260101/facets/work/news/20260101.md")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body_bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bytes");
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        assert!(!body_str.contains(news_sentinel));
+        let error_val: Value = serde_json::from_str(&body_str).expect("json error");
+        assert_eq!(error_val["reason_code"], "file_not_found");
+        assert_eq!(error_val["error"], "that file isn't available.");
+
+        // Refuse supplied path talents/facet_newsletter/nl-1.jsonl
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/output/20260101/talents/facet_newsletter/nl-1.jsonl")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -1377,6 +1460,73 @@ mod tests {
         assert_eq!(error_val["reason_code"], "file_not_found");
         assert_eq!(error_val["error"], "that file isn't available.");
 
+        // Refuse resolved alias talents/./facet_newsletter/nl-1.jsonl
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/output/20260101/talents/./facet_newsletter/nl-1.jsonl")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body_bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bytes");
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        assert!(!body_str.contains(sentinel));
+        let error_val: Value = serde_json::from_str(&body_str).expect("json error");
+        assert_eq!(error_val["reason_code"], "file_not_found");
+        assert_eq!(error_val["error"], "that file isn't available.");
+
+        // On Unix, symlink chronicle/20260101/talents/alias.jsonl to that run file and refuse request path 20260101/talents/alias.jsonl
+        #[cfg(unix)]
+        {
+            let link_file = root.path().join("chronicle/20260101/talents/alias.jsonl");
+            fs::create_dir_all(link_file.parent().unwrap()).expect("alias parent dir");
+            std::os::unix::fs::symlink(&nl_file, &link_file).expect("symlink run file");
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get("/output/20260101/20260101/talents/alias.jsonl")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let body_bytes = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("bytes");
+            let body_str = String::from_utf8_lossy(&body_bytes);
+            assert!(!body_str.contains(sentinel));
+            let error_val: Value = serde_json::from_str(&body_str).expect("json error");
+            assert_eq!(error_val["reason_code"], "file_not_found");
+            assert_eq!(error_val["error"], "that file isn't available.");
+        }
+
+        // After all refusals, the run file bytes are unchanged
+        assert_eq!(fs::read(&nl_file).expect("read nl file"), nl_bytes);
+
+        // Positive control: talents/morning_briefing/mb-1.jsonl returns 200 and surviving text
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/output/20260101/talents/morning_briefing/mb-1.jsonl")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bytes");
+        let body_val: Value = serde_json::from_slice(&body_bytes).expect("json response");
+        assert_eq!(body_val["content"], surviving);
+
+        // Existing chronicle morning_briefing.md control stays
         let response = app
             .oneshot(
                 Request::get("/output/20260101/chronicle/20260101/talents/morning_briefing.md")

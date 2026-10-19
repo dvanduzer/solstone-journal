@@ -9,7 +9,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 use std::thread::{self, sleep};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -110,25 +110,6 @@ fn run_journal_with_journal(args: &[&str], path: Option<&Path>, journal: &Path) 
         }
     }
     panic!("solstone-core stayed busy after retries")
-}
-
-fn run_journal_with_input(args: &[&str], path: &Path, journal: &Path, input: &[u8]) -> Output {
-    let mut child = Command::new(bin())
-        .args(args)
-        .env("SOLSTONE_JOURNAL", journal)
-        .env("PATH", path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn journal binary");
-    child
-        .stdin
-        .take()
-        .expect("child stdin")
-        .write_all(input)
-        .expect("write child stdin");
-    child.wait_with_output().expect("wait for journal binary")
 }
 
 fn seed_journal(root: &Path) {
