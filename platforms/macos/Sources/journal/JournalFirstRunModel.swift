@@ -198,7 +198,16 @@ final class JournalFirstRunModel {
             .appendingPathComponent("journal", isDirectory: true)
     }
 
-    /// Launch and reopen share this chain. A second call waits and runs one follow-up body.
+    /// Legacy reopen only raises the window. Native setup still ingests peer continuations.
+    func reconcileForReopen() async {
+        let incoming: Bool
+        if case .ready = mailbox.loadStep1() { incoming = true } else { incoming = false }
+        if case .ritual = route, !incoming { return }
+        guard nativeQualified || incoming else { return }
+        await reconcileActivation()
+    }
+
+    /// A second call waits and runs one follow-up body.
     func reconcileActivation() async {
         guard !isTerminating else { return }
         if activationRunning || wholeOperationDepth > 0 {
@@ -450,7 +459,7 @@ final class JournalFirstRunModel {
         config.journalRoot = journalRoot
         errorMessage = nil
 
-        guard await startSupervisor(journalRoot) else {
+        guard await ensureSupervisor(journalRoot) else {
             await runSetupThenStartSupervisor()
             return
         }

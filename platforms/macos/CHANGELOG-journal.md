@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- clicking the journal's Dock icon keeps a running journal running and leaves unfinished setup where you left it.
+
 ## [2.0.51 (build 97)] - 2026-10-19
 
 ### Added

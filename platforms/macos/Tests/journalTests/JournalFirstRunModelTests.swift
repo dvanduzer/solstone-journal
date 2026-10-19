@@ -13,6 +13,38 @@ import Testing
 @MainActor
 @Suite("JournalFirstRunModel")
 struct JournalFirstRunModelTests {
+    @Test func resumingALiveLegacyJournalDoesNotStartItAgain() async throws {
+        let trace = FirstRunTrace()
+        let fixture = makeModel(trace: trace, startResults: [], probeResults: [.complete], supervisorIsLive: { _ in true })
+        await fixture.model.resumeConfiguredRoot(try makeTemporaryDirectory())
+        #expect(await trace.snapshot() == ["probe"])
+        #expect(fixture.model.route == .home)
+    }
+
+    @Test func legacyReopenPreservesUnfinishedSetupAndDoesNotOpenTheBrowser() async {
+        let trace = FirstRunTrace()
+        let fixture = makeModel(trace: trace, startResults: [], probeResults: [.complete])
+        for step in [JournalFirstRunStep.nameLocation, .setupProgress, .finishInBrowser] {
+            fixture.model.route = .ritual(step)
+            await fixture.model.reconcileForReopen()
+            #expect(fixture.model.route == .ritual(step))
+        }
+        #expect(await trace.snapshot().isEmpty)
+        #expect(fixture.browser.opened.isEmpty)
+    }
+
+    @Test func legacyReopenDoesNotRestartAConfiguredJournal() async throws {
+        let trace = FirstRunTrace()
+        let config = makeConfig()
+        config.journalRoot = try makeTemporaryDirectory()
+        let fixture = makeModel(trace: trace, config: config, startResults: [true], probeResults: [.complete])
+        await fixture.model.reconcileActivation()
+        let first = await trace.snapshot()
+        await fixture.model.reconcileForReopen()
+        #expect(await trace.snapshot() == first)
+        #expect(fixture.model.route == .home)
+    }
+
     @Test(.timeLimit(.minutes(1))) func terminationAwaitsCancelledSetupAndNeverStartsSupervisor() async throws {
         let setup = CancellationAwareSetupRunner()
         var starts = 0

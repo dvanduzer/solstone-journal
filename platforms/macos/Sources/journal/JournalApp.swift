@@ -63,12 +63,16 @@ final class JournalAppModel {
     }
 
     func reconcileForReopen() {
-        startActivation()
+        startActivation(reopen: true)
     }
 
-    private func startActivation() {
+    private func startActivation(reopen: Bool = false) {
         let task = Task { @MainActor [firstRunModel] in
-            await firstRunModel.reconcileActivation()
+            if reopen {
+                await firstRunModel.reconcileForReopen()
+            } else {
+                await firstRunModel.reconcileActivation()
+            }
         }
         activationTasks.append(task)
         startupTask = task
