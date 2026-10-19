@@ -703,6 +703,120 @@ async function runTests() {
   assert(cantRunEl, 'choose with capability: blocked renders cant_run');
   assert(cantRunEl.querySelector('a[href="/app/thinking/"]'), 'cant_run links to /app/thinking/');
 
+  // Blocked capability suppresses thinking error/cancelled downloads, keeps speech
+  for (const dlState of ['error', 'cancelled']) {
+    setState({
+      firstMinutesPayload: {
+        window_open: true,
+        devices_known: true,
+        devices: [],
+        thinking: { step: 'choose' },
+        checks: { phone: true, thinking: false },
+      },
+      setupPayload: {
+        thinking: { capability: 'blocked' },
+        downloads: {
+          thinking: { state: dlState },
+          speech: { state: 'error' },
+        },
+      },
+      agentsPayload: { connections: [] },
+      agentsSettled: true,
+    });
+    renderPulse(welcomePulse);
+    assert(!surface.querySelector('[data-download="thinking"]'), `blocked capability suppresses thinking download ${dlState}`);
+    assert(surface.querySelector('[data-download="speech"]'), `blocked capability still renders speech download ${dlState}`);
+  }
+
+  // Unknown capability allows thinking download error
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      thinking: { step: 'choose' },
+      checks: { phone: true, thinking: false },
+    },
+    setupPayload: {
+      thinking: { capability: 'unknown' },
+      downloads: { thinking: { state: 'error' } },
+    },
+    agentsPayload: { connections: [] },
+    agentsSettled: true,
+  });
+  renderPulse(welcomePulse);
+  assert(surface.querySelector('[data-download="thinking"]'), 'unknown capability allows thinking download error');
+
+  // Blocked capability keeps downloading state
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      thinking: { step: 'choose' },
+      checks: { phone: true, thinking: false },
+    },
+    setupPayload: {
+      thinking: { capability: 'blocked' },
+      downloads: { thinking: { state: 'downloading', bytes_done: 100, bytes_total: 1000 } },
+    },
+    agentsPayload: { connections: [] },
+    agentsSettled: true,
+  });
+  renderPulse(welcomePulse);
+  assert(surface.querySelector('[data-download="thinking"][data-download-state="downloading"]'), 'blocked capability still renders thinking downloading');
+
+  // thinking.step === 'local' + capability blocked -> cant_run, no local
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      thinking: { step: 'local' },
+      checks: { phone: true, thinking: false },
+    },
+    setupPayload: { thinking: { capability: 'blocked' } },
+    agentsPayload: { connections: [] },
+    agentsSettled: true,
+  });
+  renderPulse(welcomePulse);
+  assert(surface.querySelector('[data-thinking-step="cant_run"]'), 'local step with capability: blocked renders cant_run');
+  assert(!surface.querySelector('[data-thinking-step="local"]'), 'local step with capability: blocked has no local step');
+
+  // step choose + thinking.choice === 'local' + blocked -> cant_run, not local
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      thinking: { step: 'choose' },
+      checks: { phone: true, thinking: false },
+    },
+    setupPayload: { thinking: { choice: 'local', capability: 'blocked' } },
+    agentsPayload: { connections: [] },
+    agentsSettled: true,
+  });
+  renderPulse(welcomePulse);
+  assert(surface.querySelector('[data-thinking-step="cant_run"]'), 'choose with choice: local and capability: blocked renders cant_run');
+  assert(!surface.querySelector('[data-thinking-step="local"]'), 'choose with choice: local and capability: blocked has no local step');
+
+  // step choose + choice byo + blocked -> byo, not cant_run
+  setState({
+    firstMinutesPayload: {
+      window_open: true,
+      devices_known: true,
+      devices: [],
+      thinking: { step: 'choose' },
+      checks: { phone: true, thinking: false },
+    },
+    setupPayload: { thinking: { choice: 'byo', capability: 'blocked' } },
+    agentsPayload: { connections: [] },
+    agentsSettled: true,
+  });
+  renderPulse(welcomePulse);
+  assert(surface.querySelector('[data-thinking-step="byo"]'), 'choose with choice: byo and capability: blocked renders byo');
+  assert(!surface.querySelector('[data-thinking-step="cant_run"]'), 'choose with choice: byo and capability: blocked does not render cant_run');
+
   // Saved setup intention: nothing active yet, but setup saved a choice ->
   // continue that lane; an active lane (any step but choose) is left alone.
   for (const [choice, expected, href] of [

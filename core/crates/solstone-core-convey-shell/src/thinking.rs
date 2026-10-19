@@ -592,6 +592,22 @@ async fn state(
             } else {
                 None
             };
+            let capability =
+                solstone_core_sol_link::http::compute_local_capability(&journal.0).await;
+            let reason_code = if capability.overall == "blocked" {
+                capability.checks.first().map(|c| c.reason_code)
+            } else {
+                None
+            };
+            let detail = if capability.overall == "blocked" {
+                capability
+                    .checks
+                    .first()
+                    .map(|c| c.detail.as_str())
+                    .unwrap_or("")
+            } else {
+                ""
+            };
             let mut state_json = json!({
                 "providers": solstone_core_thinking::providers::payload(
                     &journal.0,
@@ -602,6 +618,11 @@ async fn state(
                 "keys": solstone_core_thinking::providers::keys(&config),
                 "copy": solstone_core_thinking_copy::thinking_copy_payload(),
                 "saved_lane": saved_lane,
+                "local_capability": {
+                    "overall": capability.overall,
+                    "reason_code": reason_code,
+                    "detail": detail,
+                },
             });
             if derive_active_brain_lane(&config).lane.as_deref() == Some("spp") {
                 let access_snapshot = match override_runtime {
@@ -785,6 +806,22 @@ async fn start_local_bootstrap(
             query.get("model").map(String::as_str).unwrap_or_default(),
         ));
     };
+    let capability = solstone_core_sol_link::http::compute_local_capability(&journal.0).await;
+    if let Some(refusal) = solstone_core_thinking::local::blocked_capability_refusal(
+        capability.overall,
+        capability.checks.first().map(|c| c.reason_code),
+        capability
+            .checks
+            .first()
+            .map(|c| c.detail.as_str())
+            .unwrap_or(""),
+    ) {
+        return json_response(json!({
+            "refused": true,
+            "reason_code": refusal.reason_code,
+            "detail": refusal.detail,
+        }));
+    }
     #[cfg(windows)]
     {
         let root = journal.0.clone();

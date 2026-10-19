@@ -643,7 +643,7 @@
             + bar
             + '<a href="/app/thinking/#local-setup">cancel on the thinking page →</a>'
             + '</div>';
-        } else if (state === 'error' || state === 'cancelled') {
+        } else if ((state === 'error' || state === 'cancelled') && setupPayload?.thinking?.capability !== 'blocked') {
           html += '<div class="pulse-download" data-download="thinking" data-download-state="' + esc(state) + '">'
             + '<p>the local model didn&#39;t finish downloading.</p>'
             + '<a href="/app/thinking/#local-setup">try again on the thinking page →</a>'
@@ -730,7 +730,7 @@
     } else if (step === 'choose' && savedChoice === 'local') {
       step = 'local';
     }
-    if (step === 'choose' && capability === 'blocked') {
+    if (capability === 'blocked' && (step === 'choose' || step === 'local')) {
       step = 'cant_run';
     }
     if (step === 'local' && thinkingDownloadState === 'downloading') {

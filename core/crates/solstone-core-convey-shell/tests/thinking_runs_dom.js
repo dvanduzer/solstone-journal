@@ -251,6 +251,7 @@ async function main() {
     localSetupRefusals,
     localSetupRefusal,
     localInstallAfterStart,
+    startLocalBootstrap,
     pollLocalInstallUntilTerminal,
     applyLocalInstallStatus,
     refreshInstallStatus,
@@ -415,6 +416,11 @@ async function main() {
   make('localActivate');
   make('localRefresh');
   make('localSetupLinks');
+  const localCard = make('lane-local', {lane: 'local', openView: 'local-setup'});
+  localCard.setAttribute('data-open-view', 'local-setup');
+  localCard.setAttribute('data-lane', 'local');
+  make('localCantRun');
+  make('localLanePill');
 
   // Brain Glance & Lane nodes
   make('brainGlance');
@@ -1944,6 +1950,68 @@ async function main() {
   laneStatus.dataset.tone = 'error';
   thinking.renderMainLanes();
   assert.strictEqual(laneStatus.dataset.tone, undefined, 'the local lane status resets its tone on render');
+
+  // Capability blocked on main lanes
+  thinking.state.providers = {active_lane: {lane: 'none'}, provider_status: {local: {generate_ready: false, issues: []}}};
+  thinking.state.localCapability = {overall: 'blocked', reason_code: 'gpu', detail: 'detail-blocked'};
+  thinking.state.localAvailability = {available: false, reason_code: 'binary_missing', reason: 'local runtime is not installed'};
+  thinking.renderMainLanes();
+  const laneLocalNode = nodes.get('lane-local');
+  const localCantRunNode = nodes.get('localCantRun');
+  const localLanePillNode = nodes.get('localLanePill');
+  const forkHintNode = nodes.get('forkHint');
+  assert.strictEqual(laneLocalNode.hidden, false, '#lane-local is not hidden');
+  assert.strictEqual(laneLine.textContent, 'detail-blocked', '#localLaneDescription text is detail-blocked');
+  assert.notStrictEqual(laneLine.dataset.localReason, undefined, 'dataset.localReason is defined');
+  assert.strictEqual(laneLine.classList.contains('error'), false, 'no class error');
+  assert.strictEqual(laneLine.classList.contains('error-message'), false, 'no class error-message');
+  assert.strictEqual(laneLocalNode.dataset.openView, undefined, 'card has no dataset.openView');
+  assert.strictEqual(laneLocalNode.getAttribute('data-open-view'), null, 'card has no data-open-view attribute');
+  assert.strictEqual(localLanePillNode.classList.contains('bad'), false, '#localLanePill has no class bad');
+  assert.strictEqual(localCantRunNode.hidden, true, '#localCantRun is hidden');
+  assert.notStrictEqual(forkHintNode.dataset.forkHint, 'local-ready', 'dataset.forkHint is not local-ready');
+  assert.notStrictEqual(laneStatus.textContent, thinking.localLaneBlocked.setup, '#localLaneStatus text is not setup');
+
+  // Clear capability and render same binary_missing fixture
+  for (const cap of [null, {overall: 'unknown'}]) {
+    thinking.state.localCapability = cap;
+    thinking.state.localAvailability = {available: false, reason_code: 'binary_missing', reason: 'local runtime is not installed'};
+    thinking.renderMainLanes();
+    assert.strictEqual(laneLine.textContent, blocked.setup, 'description is blocked.setup again');
+    assert.strictEqual(laneLocalNode.dataset.openView, 'local-setup', 'card action is restored on dataset');
+    assert.strictEqual(laneLocalNode.getAttribute('data-open-view'), 'local-setup', 'card action is restored on attribute');
+  }
+
+  // Local page: install_state: 'failed' plus blocked capability
+  thinking.state.install = {install_state: 'failed'};
+  thinking.state.localCapability = {overall: 'blocked', reason_code: 'gpu', detail: 'detail-blocked'};
+  thinking.renderLocal();
+  assert.strictEqual(nodes.get('localBootstrap').hidden, true, '#localBootstrap hidden');
+  assert.strictEqual(nodes.get('localCancel').hidden, true, '#localCancel hidden');
+  assert.strictEqual(nodes.get('localSetupPill').classList.contains('bad'), false, '#localSetupPill has no class bad');
+  assert.strictEqual(nodes.get('localNotice').textContent, 'detail-blocked', '#localNotice text is detail-blocked');
+  assert.notStrictEqual(nodes.get('localNotice').dataset.localReason, undefined, '#localNotice has reason marker');
+
+  // showView('main'), then openLane('local') while blocked
+  thinking.showView('main');
+  await thinking.openLane('local');
+  assert.strictEqual(nodes.get('thinkingLocalSetup').hidden, true, 'thinkingLocalSetup stays hidden when blocked');
+
+  // Bootstrap refusal
+  localResponses.push(() => Promise.resolve({refused: true, reason_code: 'memory', detail: 'detail-blocked'}));
+  const oldInstall = {install_state: 'failed'};
+  thinking.state.install = oldInstall;
+  thinking.state.localCapability = null;
+  await thinking.startLocalBootstrap();
+  assert.strictEqual(nodes.get('localBootstrap').hidden, true, '#localBootstrap hidden after refusal');
+  assert.strictEqual(nodes.get('localSetupPill').classList.contains('bad'), false, 'pill has no class bad after refusal');
+  assert.strictEqual(nodes.get('localNotice').textContent, 'detail-blocked', '#localNotice text is detail-blocked');
+  assert.strictEqual(thinking.state.install, oldInstall, 'state.install was not overwritten by refused payload');
+  assert.strictEqual(thinking.state.install.refused, undefined, 'no refused field stored as an install');
+
+  thinking.state.localCapability = null;
+  thinking.state.savedLane = null;
+  thinking.state.install = null;
   // ChatGPT tests
   const savedProvidersBeforeGpt = thinking.state.providers;
   const savedKeysBeforeGpt = thinking.state.keys;
@@ -2340,27 +2408,90 @@ async function main() {
   // thinkingIntro with savedLane
   thinking.state.providers.brain = {
     state: 'blocked',
+    headline: 'headline-fixture',
     reason_code: 'thinking_engine_not_chosen',
   };
+  const glanceNode = nodes.get('brainGlance');
+  const activeValueNode = nodes.get('thinkingActiveValue');
+
+  // null
   thinking.state.savedLane = null;
+  thinking.state.localCapability = null;
   thinking.renderGlance();
   const unchosenIntro = nodes.get('thinkingIntro').textContent;
-  assert.strictEqual(unchosenIntro, 'choose where the thinking happens. your journal keeps everything until you do.');
+  assert.notStrictEqual(unchosenIntro, '', 'unchosenIntro is non-empty');
+  assert.strictEqual(glanceNode.dataset.glanceState, 'not_chosen');
+  assert.strictEqual(glanceNode.dataset.savedLane, undefined);
+  assert.strictEqual(activeValueNode.textContent, 'headline-fixture');
+  assert.strictEqual(thinking.state.providers.brain.reason_code, 'thinking_engine_not_chosen');
 
+  // later
   thinking.state.savedLane = 'later';
   thinking.renderGlance();
   assert.strictEqual(nodes.get('thinkingIntro').textContent, unchosenIntro);
+  assert.strictEqual(glanceNode.dataset.glanceState, 'not_chosen');
+  assert.strictEqual(glanceNode.dataset.savedLane, undefined);
+  assert.strictEqual(activeValueNode.textContent, 'headline-fixture');
+  assert.strictEqual(thinking.state.providers.brain.reason_code, 'thinking_engine_not_chosen');
 
+  // byo
   thinking.state.savedLane = 'byo';
   thinking.renderGlance();
   assert.notStrictEqual(nodes.get('thinkingIntro').textContent, unchosenIntro);
+  assert.strictEqual(glanceNode.dataset.glanceState, 'saved');
+  assert.strictEqual(glanceNode.dataset.savedLane, 'byo');
+  assert.notStrictEqual(activeValueNode.textContent, 'headline-fixture');
+  assert.strictEqual(thinking.state.providers.brain.reason_code, 'thinking_engine_not_chosen');
 
+  // spp
+  thinking.state.savedLane = 'spp';
+  thinking.renderGlance();
+  assert.strictEqual(glanceNode.dataset.glanceState, 'saved');
+  assert.strictEqual(glanceNode.dataset.savedLane, 'spp');
+  assert.notStrictEqual(activeValueNode.textContent, 'headline-fixture');
+  assert.strictEqual(thinking.state.providers.brain.reason_code, 'thinking_engine_not_chosen');
+
+  // local + unknown
+  thinking.state.savedLane = 'local';
+  thinking.state.localCapability = {overall: 'unknown'};
+  thinking.renderGlance();
+  assert.strictEqual(glanceNode.dataset.glanceState, 'saved');
+  assert.strictEqual(glanceNode.dataset.savedLane, 'local');
+  assert.notStrictEqual(activeValueNode.textContent, 'headline-fixture');
+  assert.strictEqual(thinking.state.providers.brain.reason_code, 'thinking_engine_not_chosen');
+
+  // local + blocked
+  thinking.state.savedLane = 'local';
+  thinking.state.localCapability = {overall: 'blocked', reason_code: 'gpu', detail: 'detail-blocked'};
+  thinking.renderGlance();
+  assert.strictEqual(glanceNode.dataset.glanceState, 'cant_run');
+  assert.strictEqual(glanceNode.dataset.savedLane, undefined);
+  assert.notStrictEqual(activeValueNode.textContent, 'headline-fixture');
+  assert.strictEqual(thinking.state.providers.brain.reason_code, 'thinking_engine_not_chosen');
+
+  // byo + blocked
+  thinking.state.savedLane = 'byo';
+  thinking.state.localCapability = {overall: 'blocked', reason_code: 'gpu', detail: 'detail-blocked'};
+  thinking.renderGlance();
+  assert.strictEqual(glanceNode.dataset.glanceState, 'saved');
+  assert.strictEqual(glanceNode.dataset.savedLane, 'byo');
+  assert.notStrictEqual(activeValueNode.textContent, 'headline-fixture');
+  assert.strictEqual(thinking.state.providers.brain.reason_code, 'thinking_engine_not_chosen');
+
+  // other_reason
   thinking.state.providers.brain = {
     state: 'blocked',
     reason_code: 'other_reason',
   };
   thinking.renderGlance();
-  assert.strictEqual(nodes.get('thinkingIntro').textContent, 'choose or check your model in setup.');
+  const otherIntro = nodes.get('thinkingIntro').textContent;
+  assert.notStrictEqual(otherIntro, '', 'other_reason intro is non-empty');
+  assert.notStrictEqual(otherIntro, unchosenIntro, 'other_reason intro is not unchosenIntro');
+  assert.strictEqual(glanceNode.dataset.glanceState, undefined);
+  assert.strictEqual(glanceNode.dataset.savedLane, undefined);
+
+  thinking.state.localCapability = null;
+  thinking.state.savedLane = null;
 
   // 13. S4 Reopen tab: reopenChatGptTab opens authorizeUrl in new window with opener null, no API requests
   thinking.state.chatgpt.attempt = { id: 'attempt_reopen', authorizeUrl: 'https://auth.openai.com/reopen' };

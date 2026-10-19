@@ -7,6 +7,7 @@
     keys: {},
     access: null,
     savedLane: null,
+    localCapability: null,
     localModels: [],
     localAvailability: null,
     install: null,
@@ -238,6 +239,34 @@
       window.logError?.(typeof err?.cause === 'object' && err.cause ? err.cause : err, { context: 'thinking-local-setup' });
     }
     showLocalSetupError(localSetupRefusals.check);
+  }
+
+  function localCapabilityBlocked() {
+    return state.localCapability?.overall === 'blocked';
+  }
+
+  function setElementData(el, key, attr, value) {
+    if (!el) return;
+    if (el.dataset) el.dataset[key] = value;
+    if (typeof el.setAttribute === 'function') el.setAttribute(attr, value);
+  }
+
+  function removeElementData(el, key, attr) {
+    if (!el) return;
+    if (el.dataset) delete el.dataset[key];
+    if (typeof el.removeAttribute === 'function') el.removeAttribute(attr);
+  }
+
+  function setLocalReason(el, text) {
+    if (!el) return;
+    el.textContent = text;
+    setElementData(el, 'localReason', 'data-local-reason', '');
+    el.classList?.remove('error', 'error-message');
+  }
+
+  function clearLocalReason(el) {
+    if (!el) return;
+    removeElementData(el, 'localReason', 'data-local-reason');
   }
 
   function setLink(id, url, text) {
@@ -979,6 +1008,7 @@
         state.keys = payload.keys || {};
         state.access = payload.access || null;
         state.savedLane = payload.saved_lane ?? null;
+        state.localCapability = payload.local_capability || null;
         applyCopy(payload.copy || {});
         renderAll();
       } catch (_err) {}
@@ -993,6 +1023,7 @@
       state.keys = payload.keys || {};
       state.access = payload.access || null;
       state.savedLane = payload.saved_lane ?? null;
+      state.localCapability = payload.local_capability || null;
       applyCopy(payload.copy || {});
       scheduleAccessUnknownReread();
       revealThinkingApp();
@@ -2628,16 +2659,39 @@
   function renderGlance() {
     const brain = state.providers.brain || {};
     let intro;
+    let glanceState = null;
+    let savedLaneAttr = null;
+    let activeValue = brain.headline || '';
+
     if (brain.state === 'ready') {
       intro = 'your model is ready. you can change it in setup.';
     } else if (brain.reason_code === 'thinking_engine_not_chosen') {
       if (state.savedLane === 'byo') {
+        glanceState = 'saved';
+        savedLaneAttr = 'byo';
+        activeValue = 'finish setting up your own model';
         intro = 'finish setting up your own model. your journal keeps everything until you do.';
       } else if (state.savedLane === 'spp') {
+        glanceState = 'saved';
+        savedLaneAttr = 'spp';
+        activeValue = 'finish setting up confidential processing';
         intro = 'finish setting up confidential processing. your journal keeps everything until you do.';
       } else if (state.savedLane === 'local') {
-        intro = 'finish setting up local thinking. your journal keeps everything until you do.';
+        if (localCapabilityBlocked()) {
+          glanceState = 'cant_run';
+          savedLaneAttr = null;
+          activeValue = "your journal's computer can't run local thinking";
+          intro = "your journal's computer can't run local thinking. choose another way when you're ready. your journal keeps everything until then.";
+        } else {
+          glanceState = 'saved';
+          savedLaneAttr = 'local';
+          activeValue = 'finish setting up local thinking';
+          intro = 'finish setting up local thinking. your journal keeps everything until you do.';
+        }
       } else {
+        glanceState = 'not_chosen';
+        savedLaneAttr = null;
+        activeValue = brain.headline || '';
         intro = 'choose where the thinking happens. your journal keeps everything until you do.';
       }
     } else {
@@ -2648,10 +2702,23 @@
     const glanceLabel = $('thinkingActiveLane');
     const identity = brain.identity || {};
     const evidence = brain.evidence || {};
-    if (glance) glance.classList.toggle('none', brain.state === 'unknown' && !brain.reason_code);
+    if (glance) {
+      if (glanceState) {
+        setElementData(glance, 'glanceState', 'data-glance-state', glanceState);
+        if (savedLaneAttr) {
+          setElementData(glance, 'savedLane', 'data-saved-lane', savedLaneAttr);
+        } else {
+          removeElementData(glance, 'savedLane', 'data-saved-lane');
+        }
+      } else {
+        removeElementData(glance, 'glanceState', 'data-glance-state');
+        removeElementData(glance, 'savedLane', 'data-saved-lane');
+      }
+      glance.classList.toggle('none', brain.state === 'unknown' && !brain.reason_code);
+    }
     if (glanceLabel) glanceLabel.hidden = false;
     setText('thinkingActiveLane', 'right now');
-    setText('thinkingActiveValue', brain.headline || '');
+    setText('thinkingActiveValue', activeValue);
 
     renderBrainAction(brain.action || null);
 
@@ -2964,14 +3031,20 @@
     const local = localReadiness();
     const localCard = $('lane-local');
     const localActive = brain.kind === 'local';
-    const gpuBlocked = localIsGpuBlocked();
+    const capabilityBlocked = localCapabilityBlocked();
+    const gpuBlocked = !capabilityBlocked && localIsGpuBlocked();
     const endpointOverride = localEndpointConfigured();
-    setText(
-      'forkHint',
-      brain.kind !== 'none' ? 'one at a time. the one with the dot is active right now.'
-        : gpuBlocked ? 'pick one of these, or choose later.'
-        : 'pick one: use local when it is ready, or bring your own.',
-    );
+    const forkHintEl = $('forkHint');
+    if (brain.kind !== 'none') {
+      setText('forkHint', 'one at a time. the one with the dot is active right now.');
+      setElementData(forkHintEl, 'forkHint', 'data-fork-hint', 'active');
+    } else if (capabilityBlocked || gpuBlocked) {
+      setText('forkHint', 'pick one of these, or choose later.');
+      setElementData(forkHintEl, 'forkHint', 'data-fork-hint', 'no-local');
+    } else {
+      setText('forkHint', 'pick one: use local when it is ready, or bring your own.');
+      setElementData(forkHintEl, 'forkHint', 'data-fork-hint', 'local-ready');
+    }
     // A computer that can't run local thinking gets a plain card saying so,
     // in place of a local option it could never pick.
     setHidden('localCantRun', !(gpuBlocked && !localActive));
@@ -2982,39 +3055,58 @@
       localCard.classList.toggle('greyed', endpointOverride);
       localCard.setAttribute('aria-disabled', 'false');
     }
-    if (localActive) {
-      setPill('localLanePill', 'active', 'hot');
-      setText('localLaneDescription', localLane.description || '');
-      setText('localLaneStatus', 'manage →');
-    } else if (endpointOverride) {
-      setPill('localLanePill', 'endpoint');
-      const managed = state.providers.active_lane?.lane === 'confidential';
-      setText('localLaneDescription', managed
-        ? 'not in use while confidential processing is on.'
-        : 'not in use while your own endpoint is set.');
-      setText('localLaneStatus', 'set up the bundled model →');
-    } else if (gpuBlocked) {
-      setPill('localLanePill', 'unavailable', 'bad');
+    if (capabilityBlocked) {
+      setPill('localLanePill', 'unavailable');
       const desc = $('localLaneDescription');
       if (desc) {
-        desc.textContent = "your journal's computer can't run a local model yet. it needs a supported GPU. ";
-        const link = document.createElement('a');
-        link.className = 'textlink';
-        link.href = 'https://support.solstone.app/kb/solstone-memory-and-local-models';
-        link.target = '_blank';
-        link.rel = 'noopener noreferrer';
-        link.textContent = 'minimum requirements ↗';
-        desc.appendChild(link);
+        setLocalReason(desc, state.localCapability?.detail || '');
       }
-      setText('localLaneStatus', 'not available');
-    } else if (local.status === 'ready') {
-      setPill('localLanePill', 'off');
-      setText('localLaneDescription', localLane.description || '');
-      setText('localLaneStatus', 'turn on local →');
+      setText('localLaneStatus', '');
+      if (localCard) {
+        removeElementData(localCard, 'openView', 'data-open-view');
+      }
     } else {
-      setPill('localLanePill', 'off');
-      setText('localLaneDescription', localLaneUnreadyLine(local));
-      setText('localLaneStatus', localAwaitingConfirmation() ? 'details →' : 'set up →');
+      const desc = $('localLaneDescription');
+      if (desc) {
+        clearLocalReason(desc);
+      }
+      if (localCard) {
+        setElementData(localCard, 'openView', 'data-open-view', 'local-setup');
+      }
+      if (localActive) {
+        setPill('localLanePill', 'active', 'hot');
+        setText('localLaneDescription', localLane.description || '');
+        setText('localLaneStatus', 'manage →');
+      } else if (endpointOverride) {
+        setPill('localLanePill', 'endpoint');
+        const managed = state.providers.active_lane?.lane === 'confidential';
+        setText('localLaneDescription', managed
+          ? 'not in use while confidential processing is on.'
+          : 'not in use while your own endpoint is set.');
+        setText('localLaneStatus', 'set up the bundled model →');
+      } else if (gpuBlocked) {
+        setPill('localLanePill', 'unavailable', 'bad');
+        const desc = $('localLaneDescription');
+        if (desc) {
+          desc.textContent = "your journal's computer can't run a local model yet. it needs a supported GPU. ";
+          const link = document.createElement('a');
+          link.className = 'textlink';
+          link.href = 'https://support.solstone.app/kb/solstone-memory-and-local-models';
+          link.target = '_blank';
+          link.rel = 'noopener noreferrer';
+          link.textContent = 'minimum requirements ↗';
+          desc.appendChild(link);
+        }
+        setText('localLaneStatus', 'not available');
+      } else if (local.status === 'ready') {
+        setPill('localLanePill', 'off');
+        setText('localLaneDescription', localLane.description || '');
+        setText('localLaneStatus', 'turn on local →');
+      } else {
+        setPill('localLanePill', 'off');
+        setText('localLaneDescription', localLaneUnreadyLine(local));
+        setText('localLaneStatus', localAwaitingConfirmation() ? 'details →' : 'set up →');
+      }
     }
 
     renderConfidentialCard();
@@ -3501,6 +3593,19 @@
   }
 
   function localCopy() {
+    if (localCapabilityBlocked()) {
+      return {
+        pill: 'unavailable',
+        title: 'local',
+        sub: "your journal's computer can't run local thinking",
+        message: '',
+        notice: state.localCapability?.detail || '',
+        activate: false,
+        bootstrap: false,
+        cancel: false,
+        tone: '',
+      };
+    }
     if (localEndpointConfigured()) {
       return {
         pill: 'endpoint',
@@ -3712,7 +3817,13 @@
     if (state.install && typeof state.install.admission_warning === 'string' && state.install.admission_warning.length > 0) {
       notice = notice ? `${notice} ${state.install.admission_warning}` : state.install.admission_warning;
     }
-    setText('localNotice', notice);
+    const noticeEl = $('localNotice');
+    if (localCapabilityBlocked()) {
+      setLocalReason(noticeEl, notice);
+    } else {
+      clearLocalReason(noticeEl);
+      setText('localNotice', notice);
+    }
     setText(
       'localOverrideNoticeText',
       state.providers?.active_lane?.lane === 'confidential'
@@ -4431,6 +4542,14 @@
         fetchStatus: () => fetchInstallStatus(model),
         previousStatus: state.install,
       });
+      if (status?.refused === true) {
+        state.localCapability = {
+          overall: 'blocked',
+          reason_code: status.reason_code || null,
+          detail: typeof status.detail === 'string' ? status.detail : '',
+        };
+        return;
+      }
       state.install = status || null;
       renderAll();
       if (installIsInFlight(status)) {
@@ -5072,6 +5191,9 @@
   }
 
   async function openLane(lane) {
+    if (lane === 'local' && localCapabilityBlocked()) {
+      return;
+    }
     if (lane === 'confidential') {
       showView('confidential-setup');
       return;

@@ -6,6 +6,10 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- on a computer that can't run local thinking, the thinking page says so, and does not offer an install that cannot succeed.
+
 ## [2.0.51] - 2026-10-19
 
 ### Fixed

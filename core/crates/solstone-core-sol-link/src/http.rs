@@ -182,16 +182,17 @@ struct MarkResponse {
 }
 
 #[derive(Debug, PartialEq, Serialize)]
-pub(crate) struct LocalCapabilityResponse {
-    pub(crate) overall: &'static str,
-    pub(crate) checks: Vec<LocalCapabilityCheck>,
+pub struct LocalCapabilityResponse {
+    pub overall: &'static str,
+    pub checks: Vec<LocalCapabilityCheck>,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
-pub(crate) struct LocalCapabilityCheck {
-    pub(crate) name: &'static str,
-    pub(crate) severity: &'static str,
-    pub(crate) detail: String,
+pub struct LocalCapabilityCheck {
+    pub name: &'static str,
+    pub severity: &'static str,
+    pub reason_code: &'static str,
+    pub detail: String,
 }
 
 #[derive(Default, Deserialize)]
@@ -338,7 +339,7 @@ async fn init_state(
     }
 }
 
-async fn compute_local_capability(journal_root: &Path) -> LocalCapabilityResponse {
+pub async fn compute_local_capability(journal_root: &Path) -> LocalCapabilityResponse {
     let journal_root = journal_root.to_path_buf();
     #[cfg(all(test, feature = "full-tests"))]
     let checkpoint_root = journal_root.clone();
@@ -579,6 +580,7 @@ pub(crate) fn local_capability(report: &CheckReport) -> LocalCapabilityResponse 
             checks: vec![LocalCapabilityCheck {
                 name: "local",
                 severity: "blocked",
+                reason_code: row.name,
                 detail: local_unavailable_reason(row.name),
             }],
         };
@@ -1691,13 +1693,11 @@ mod local_capability_tests {
             Some(8 * GIB),
         )));
         assert_eq!(capability.overall, "blocked");
-        assert!(
-            capability
-                .checks
-                .iter()
-                .any(|check| check.severity == "blocked" && !check.detail.is_empty()),
-            "a refusal carries the reason the page shows: {capability:?}"
-        );
+        assert_eq!(capability.checks.len(), 1);
+        assert_eq!(capability.checks[0].name, "local");
+        assert_eq!(capability.checks[0].severity, "blocked");
+        assert_eq!(capability.checks[0].reason_code, "memory");
+        assert!(!capability.checks[0].detail.is_empty());
         assert_eq!(verdict(&inputs("Darwin", "arm64", Some(32 * GIB))), "ok");
     }
 
@@ -1705,27 +1705,52 @@ mod local_capability_tests {
     fn a_gpu_below_the_memory_bar_is_refused_with_a_reason() {
         let capability = local_capability(&build_check_report(&linux_with_nvidia(Some(4096))));
         assert_eq!(capability.overall, "blocked");
-        assert!(
-            capability
-                .checks
-                .iter()
-                .any(|check| check.severity == "blocked" && !check.detail.is_empty()),
-            "a refusal carries the reason the page shows: {capability:?}"
-        );
+        assert_eq!(capability.checks.len(), 1);
+        assert_eq!(capability.checks[0].name, "local");
+        assert_eq!(capability.checks[0].severity, "blocked");
+        assert_eq!(capability.checks[0].reason_code, "gpu");
+        assert!(!capability.checks[0].detail.is_empty());
         assert_eq!(verdict(&linux_with_nvidia(Some(12 * 1024))), "ok");
     }
 
     #[test]
     fn a_host_without_a_hardware_gpu_is_refused() {
-        assert_eq!(
-            verdict(&inputs("Linux", "x86_64", Some(32 * GIB))),
-            "blocked"
-        );
+        let capability = local_capability(&build_check_report(&inputs(
+            "Linux",
+            "x86_64",
+            Some(32 * GIB),
+        )));
+        assert_eq!(capability.overall, "blocked");
+        assert_eq!(capability.checks.len(), 1);
+        assert_eq!(capability.checks[0].name, "local");
+        assert_eq!(capability.checks[0].severity, "blocked");
+        assert_eq!(capability.checks[0].reason_code, "gpu");
+        assert!(!capability.checks[0].detail.is_empty());
+    }
+
+    #[test]
+    fn an_unsupported_platform_is_refused_with_a_reason() {
+        let capability = local_capability(&build_check_report(&inputs(
+            "Darwin",
+            "x86_64",
+            Some(32 * GIB),
+        )));
+        assert_eq!(capability.overall, "blocked");
+        assert_eq!(capability.checks.len(), 1);
+        assert_eq!(capability.checks[0].name, "local");
+        assert_eq!(capability.checks[0].severity, "blocked");
+        assert_eq!(capability.checks[0].reason_code, "platform");
+        assert!(!capability.checks[0].detail.is_empty());
     }
 
     #[test]
     fn unreadable_hardware_stays_unknown() {
-        assert_eq!(verdict(&linux_with_nvidia(None)), "unknown");
-        assert_eq!(verdict(&inputs("Darwin", "arm64", None)), "unknown");
+        let linux_unknown = local_capability(&build_check_report(&linux_with_nvidia(None)));
+        assert_eq!(linux_unknown.overall, "unknown");
+        assert!(linux_unknown.checks.is_empty());
+        let darwin_unknown =
+            local_capability(&build_check_report(&inputs("Darwin", "arm64", None)));
+        assert_eq!(darwin_unknown.overall, "unknown");
+        assert!(darwin_unknown.checks.is_empty());
     }
 }
