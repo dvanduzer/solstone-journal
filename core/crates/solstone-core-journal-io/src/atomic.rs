@@ -3510,6 +3510,8 @@ mod windows_tests {
         .unwrap();
         fs::write(journal.join("health/brain.json"), b"original").unwrap();
         let replaced = std::cell::Cell::new(false);
+        let excluded = std::cell::Cell::new(false);
+        const EXCLUDED: &str = "native handles excluded the staged root replacement";
         let result = atomic_replace_detailed_bound_checked(
             &parent,
             &lock,
@@ -3522,16 +3524,52 @@ mod windows_tests {
                         .unwrap()
                         .any(|entry| is_publication_candidate_name(&entry.unwrap().file_name()))
                 {
-                    fs::rename(&journal, &displaced).unwrap();
-                    fs::create_dir(&journal).unwrap();
-                    replaced.set(true);
+                    match fs::rename(&journal, &displaced) {
+                        Ok(()) => {
+                            fs::create_dir(&journal).unwrap();
+                            replaced.set(true);
+                        }
+                        Err(error) => {
+                            assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error}");
+                            eprintln!("staged root replacement excluded: {error}");
+                            excluded.set(true);
+                            return Err(EXCLUDED.to_owned());
+                        }
+                    }
                 }
                 root.revalidate_canonical_binding()
                     .map_err(|error| error.to_string())
             },
         );
-        assert!(replaced.get());
-        assert!(result.is_err());
+        assert!(replaced.get() || excluded.get());
+        let error = match result.expect_err("root replacement cannot publish") {
+            BoundAtomicPublishError::Atomic(error) => error,
+            BoundAtomicPublishError::NamespaceChanged => {
+                panic!("expected staged checkpoint refusal")
+            }
+        };
+        assert!(error.orphan_stage.is_none(), "{error}");
+        assert!(error.cleanup_error.is_none(), "{error}");
+        if excluded.get() {
+            assert_eq!(error.operation, "publish checkpoint");
+            assert_eq!(error.source.kind(), io::ErrorKind::Interrupted);
+            assert_eq!(error.source.to_string(), EXCLUDED);
+            assert!(!displaced.exists());
+            assert_eq!(
+                fs::read(journal.join("health/brain.json")).unwrap(),
+                b"original"
+            );
+            assert!(
+                !fs::read_dir(journal.join("health"))
+                    .unwrap()
+                    .any(|entry| is_publication_candidate_name(&entry.unwrap().file_name()))
+            );
+            drop(lock);
+            drop(parent);
+            drop(root);
+            fs::rename(&journal, &displaced).expect("root rename succeeds after custody ends");
+            fs::create_dir(&journal).unwrap();
+        }
         assert!(fs::read_dir(&journal).unwrap().next().is_none());
         assert_eq!(
             fs::read(displaced.join("health/brain.json")).unwrap(),
