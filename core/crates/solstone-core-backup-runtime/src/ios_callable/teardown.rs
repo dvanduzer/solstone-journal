@@ -17,7 +17,7 @@ use crate::teardown::owned::TeardownOperation;
 // Private development progress only. Arguments are fixed labels and numeric
 // status/length/flag values; failed output must not affect custody or results.
 macro_rules! diagnostic {
-    ($stage:literal, $code:expr, $length:expr, $flags:expr) => {
+    ($stage:literal, $code:expr, $length:expr, $flags:expr) => {{
         #[cfg(feature = "test-hooks")]
         {
             use std::io::Write as _;
@@ -33,7 +33,7 @@ macro_rules! diagnostic {
                 flags
             );
         }
-    };
+    }};
 }
 
 #[cfg(feature = "ios-linked-bridge")]
