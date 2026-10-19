@@ -18,15 +18,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arbitrary"
-version = "1.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
-dependencies = [
- "derive_arbitrary",
-]
-
-[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -174,12 +165,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crossbeam-utils"
-version = "0.8.23"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
-
-[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -196,17 +181,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "49fb0c6640b4507ebd99ff67677009e381ba5eee1d14df78de4a3d16eb123c39"
 
 [[package]]
-name = "derive_arbitrary"
-version = "1.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -215,17 +189,6 @@ dependencies = [
  "block-buffer",
  "crypto-common",
  "subtle",
-]
-
-[[package]]
-name = "displaydoc"
-version = "0.2.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6232dd377dcc64799954cbd3a9bb882e9cdc1308ccd87b1c098f1fb2eaf82a8"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.5",
 ]
 
 [[package]]
@@ -274,6 +237,7 @@ checksum = "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -507,6 +471,18 @@ name = "nix"
 version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
 dependencies = [
  "bitflags",
  "cfg-if",
@@ -831,7 +807,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "solstone-core-artifact-download"
-version = "2.0.50"
+version = "2.0.51"
 dependencies = [
  "sha2",
  "solstone-core-assets",
@@ -841,7 +817,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-assets"
-version = "2.0.50"
+version = "2.0.51"
 dependencies = [
  "serde",
  "serde_json",
@@ -850,7 +826,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-auth-flow"
-version = "2.0.50"
+version = "2.0.51"
 dependencies = [
  "getrandom 0.3.4",
  "sha2",
@@ -858,13 +834,13 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-brain"
-version = "2.0.50"
+version = "2.0.51"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
  "hmac",
  "log",
- "nix",
+ "nix 0.30.1",
  "ryu",
  "serde",
  "serde_json",
@@ -877,7 +853,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-chatgpt-auth"
-version = "2.0.50"
+version = "2.0.51"
 dependencies = [
  "getrandom 0.3.4",
  "serde",
@@ -891,7 +867,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-distribution"
-version = "2.0.50"
+version = "2.0.51"
 dependencies = [
  "bzip2-rs",
  "flate2",
@@ -916,24 +892,24 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-ffmpeg-build-support"
-version = "2.0.50"
+version = "2.0.51"
 dependencies = [
  "sha2",
 ]
 
 [[package]]
 name = "solstone-core-installation-identity"
-version = "2.0.50"
+version = "2.0.51"
 dependencies = [
  "getrandom 0.3.4",
- "nix",
+ "nix 0.30.1",
  "sha2",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "solstone-core-installed-payload"
-version = "2.0.50"
+version = "2.0.51"
 dependencies = [
  "minisign",
  "serde",
@@ -944,14 +920,14 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-journal"
-version = "2.0.50"
+version = "2.0.51"
 dependencies = [
  "toml_edit",
 ]
 
 [[package]]
 name = "solstone-core-journal-config"
-version = "2.0.50"
+version = "2.0.51"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -966,7 +942,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-journal-config-write"
-version = "2.0.50"
+version = "2.0.51"
 dependencies = [
  "serde_json",
  "solstone-core-journal-config",
@@ -975,13 +951,13 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-journal-io"
-version = "2.0.50"
+version = "2.0.51"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
  "libc",
  "log",
- "nix",
+ "nix 0.30.1",
  "serde",
  "serde_json",
  "sha2",
@@ -991,13 +967,13 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-local"
-version = "2.0.50"
+version = "2.0.51"
 dependencies = [
  "chrono",
  "flate2",
  "hmac",
  "log",
- "nix",
+ "nix 0.30.1",
  "serde",
  "serde_json",
  "sha2",
@@ -1018,7 +994,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-nvattest-authority"
-version = "2.0.50"
+version = "2.0.51"
 dependencies = [
  "serde",
  "serde_json",
@@ -1132,6 +1108,12 @@ dependencies = [
  "toml_datetime",
  "winnow",
 ]
+
+[[package]]
+name = "typed-path"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
 
 [[package]]
 name = "typenum"
@@ -1467,20 +1449,24 @@ checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
 
 [[package]]
 name = "zip"
-version = "2.4.2"
+version = "9.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fabe6324e908f85a1c52063ce7aa26b68dcb7eb6dbc83a2d148403c9bc3eba50"
+checksum = "c2d98561b612a84ae525331a7a094429ef8a5772514ed507ff6db5f54badc971"
 dependencies = [
- "arbitrary",
  "crc32fast",
- "crossbeam-utils",
- "displaydoc",
  "flate2",
  "indexmap",
  "memchr",
- "thiserror",
+ "nix 0.31.3",
+ "typed-path",
  "zopfli",
 ]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b142a20ec14a91d5bc708c1dc21b080c550113d8aa77afa29635673a65dd02c5"
 
 [[package]]
 name = "zmij"
