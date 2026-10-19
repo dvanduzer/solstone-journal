@@ -25,7 +25,7 @@ static SEGMENT: LazyLock<Regex> = LazyLock::new(|| {
 });
 static CHANNEL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?m)^### (?P<kind>Transcript|Screen Activity|Browser Content|ChatGPT Conversation|Claude Conversation|Gemini Conversation|Calendar Event|Note|Highlights)[ \t]*$",
+        r"(?m)^### (?P<kind>Transcript|Screen Activity|Browser Content|ChatGPT Conversation|Claude Conversation|Gemini Conversation|Calendar Event|Note|Highlights|Imported Text)[ \t]*$",
     )
     .expect("channel heading pattern")
 });
@@ -99,13 +99,7 @@ pub fn source_units(transcript: &str, activity_kind: &str) -> Vec<SourceUnit> {
         .first()
         .map_or(transcript.len(), |segment| segment.get(0).unwrap().start());
     if first > 0 {
-        regions.push(Region {
-            text: &transcript[..first],
-            timestamp: "",
-            channel: "context",
-            segment: 0,
-            channel_number: 0,
-        });
+        push_leading_channels(&mut regions, &transcript[..first]);
     }
     for (index, segment) in segments.iter().enumerate() {
         let heading = segment.get(0).unwrap();
@@ -187,6 +181,46 @@ pub fn source_units(transcript: &str, activity_kind: &str) -> Vec<SourceUnit> {
         }
     }
     units
+}
+
+/// Text before the first clock heading. A channel heading here keeps its
+/// family and has no timestamp, so an untimed import is not speech and not a
+/// clock range.
+fn push_leading_channels<'a>(regions: &mut Vec<Region<'a>>, text: &'a str) {
+    let channels = CHANNEL.captures_iter(text).collect::<Vec<_>>();
+    if channels.is_empty() {
+        regions.push(Region {
+            text,
+            timestamp: "",
+            channel: "context",
+            segment: 0,
+            channel_number: 0,
+        });
+        return;
+    }
+    let first_start = channels[0].get(0).unwrap().start();
+    if first_start > 0 {
+        regions.push(Region {
+            text: &text[..first_start],
+            timestamp: "",
+            channel: "context",
+            segment: 0,
+            channel_number: 0,
+        });
+    }
+    for (number, channel) in channels.iter().enumerate() {
+        let start = channel.get(0).unwrap().start();
+        let stop = channels
+            .get(number + 1)
+            .map_or(text.len(), |next| next.get(0).unwrap().start());
+        regions.push(Region {
+            text: &text[start..stop],
+            timestamp: "",
+            channel: channel.name("kind").unwrap().as_str(),
+            segment: 0,
+            channel_number: number + 1,
+        });
+    }
 }
 
 fn unit(region: &Region, text: String, chunk: usize) -> SourceUnit {
@@ -278,5 +312,23 @@ mod tests {
             "Activity type: coding\nSource channel: context\nOpening note\n"
         );
         assert_eq!(units[1].kind, SourceKind::Unknown);
+    }
+
+    #[test]
+    fn an_untimed_import_channel_is_not_audio_and_has_no_timestamp() {
+        let units = source_units(
+            "### Imported Text\n\nnotes from the import\n\n### ChatGPT Conversation\n\nHello\n",
+            "import",
+        );
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].kind, SourceKind::Import);
+        assert_eq!(units[1].kind, SourceKind::Import);
+        assert!(units[0].timestamp.is_none());
+        assert!(units[1].timestamp.is_none());
+        assert!(
+            units[1]
+                .text
+                .contains("Source channel: ChatGPT Conversation")
+        );
     }
 }

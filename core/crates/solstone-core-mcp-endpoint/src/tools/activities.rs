@@ -174,7 +174,9 @@ pub(crate) fn activity_title(record: &Map<String, Value>) -> String {
                             let mut chars = part.chars();
                             chars
                                 .next()
-                                .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+                                .map(|first| {
+                                    first.to_uppercase().collect::<String>() + chars.as_str()
+                                })
                                 .unwrap_or_default()
                         })
                         .collect::<Vec<_>>()
@@ -245,8 +247,7 @@ pub(crate) fn activity_times_and_duration(
                     first_start = Some((h, m, s));
                 }
                 let seg_end = h * 3600 + m * 60 + s + dur;
-                last_end_seconds =
-                    Some(last_end_seconds.map_or(seg_end, |cur| cur.max(seg_end)));
+                last_end_seconds = Some(last_end_seconds.map_or(seg_end, |cur| cur.max(seg_end)));
                 total_duration += dur as u64;
             }
         }
@@ -278,9 +279,10 @@ pub(crate) fn activity_times_and_duration(
         .map(str::to_string);
     let duration = match (&start, &end) {
         (Some(s), Some(e)) => {
-            if let (Some(sec_s), Some(sec_e)) =
-                (parse_time_string_to_seconds(s), parse_time_string_to_seconds(e))
-            {
+            if let (Some(sec_s), Some(sec_e)) = (
+                parse_time_string_to_seconds(s),
+                parse_time_string_to_seconds(e),
+            ) {
                 if sec_e >= sec_s {
                     Some((sec_e - sec_s) as u64)
                 } else {
@@ -340,7 +342,12 @@ pub(crate) fn sort_activity_key(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    (file_day.to_string(), facet_id.to_string(), created_at, id_val)
+    (
+        file_day.to_string(),
+        facet_id.to_string(),
+        created_at,
+        id_val,
+    )
 }
 
 pub(crate) fn is_path_or_segment_pointer(val: &Value) -> bool {
@@ -380,13 +387,21 @@ pub(crate) fn execute_list(
         .map(|(id, dir, decl)| {
             let title = decl.as_ref().map_or_else(
                 || dir.clone(),
-                |v| if v.title.is_empty() { dir.clone() } else { v.title.clone() },
+                |v| {
+                    if v.title.is_empty() {
+                        dir.clone()
+                    } else {
+                        v.title.clone()
+                    }
+                },
             );
             (id, dir, title)
         })
         .collect();
 
-    let facets_to_search: Vec<(String, String, String)> = if let Some(ref facet_filter) = request.facet {
+    let facets_to_search: Vec<(String, String, String)> = if let Some(ref facet_filter) =
+        request.facet
+    {
         let matching: Vec<_> = all_facets
             .into_iter()
             .filter(|(id, dir, _)| id == facet_filter || dir == facet_filter)
@@ -494,8 +509,9 @@ pub(crate) fn execute_list(
                 continue;
             }
             targets.push(format!("facets/{facet_dir}/activities/{day}.jsonl"));
-            let _ = solstone_core_facets::read_activity_records_strict(journal_root, facet_dir, &day)
-                .map_err(|_| DispatchError::Tool(ToolError::FileUnreadable))?;
+            let _ =
+                solstone_core_facets::read_activity_records_strict(journal_root, facet_dir, &day)
+                    .map_err(|_| DispatchError::Tool(ToolError::FileUnreadable))?;
 
             let rel_path = format!("facets/{facet_dir}/activities/{day}.jsonl");
             let Some(bytes) = crate::activity_admit::read_contained_source(journal_root, &rel_path)
@@ -515,7 +531,11 @@ pub(crate) fn execute_list(
                 let Ok(Value::Object(record)) = serde_json::from_str::<Value>(trimmed) else {
                     return Err(DispatchError::Tool(ToolError::FileUnreadable));
                 };
-                if record.get("hidden").and_then(Value::as_bool).unwrap_or(false) {
+                if record
+                    .get("hidden")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
                     continue;
                 }
                 let entities = activity_entities(&record);
@@ -527,9 +547,9 @@ pub(crate) fn execute_list(
                         } => entities
                             .iter()
                             .any(|e| e == entity_id || fold_literal(e) == *folded_name),
-                        EntityFilter::Literal(target) => {
-                            entities.iter().any(|e| fold_literal(e) == *target)
-                        }
+                        EntityFilter::Literal(target) => entities
+                            .iter()
+                            .any(|entity| fold_literal(entity).contains(target)),
                     };
                     if !matched {
                         continue;
@@ -585,6 +605,7 @@ pub(crate) fn execute_list(
                     record_identity: item.rec_identity.clone(),
                     file_digest: item.file_digest.clone(),
                     unit_index: None,
+                    source_binding: None,
                 }),
             )
             .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?;
@@ -701,10 +722,7 @@ pub(crate) fn execute_get_sources(
         .get("stream")
         .and_then(Value::as_str)
         .unwrap_or("default");
-    let activity_kind = record
-        .get("activity")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let activity_kind = record.get("activity").and_then(Value::as_str).unwrap_or("");
 
     let transcript_boundary = boundary(snapshot, Some(AdmittedCategory::Transcripts), None);
     let mut admitted_transcripts = Vec::new();
@@ -737,7 +755,9 @@ pub(crate) fn execute_get_sources(
         );
         if !allowed_before {
             #[cfg(feature = "test-hooks")]
-            crate::source_freeze_barrier::checkpoint(crate::source_freeze_barrier::FreezePoint::After);
+            crate::source_freeze_barrier::checkpoint(
+                crate::source_freeze_barrier::FreezePoint::After,
+            );
             any_denied_or_unreadable = true;
             continue;
         }
@@ -752,15 +772,19 @@ pub(crate) fn execute_get_sources(
             Ok(Some(s)) => s,
             _ => {
                 #[cfg(feature = "test-hooks")]
-                crate::source_freeze_barrier::checkpoint(crate::source_freeze_barrier::FreezePoint::After);
+                crate::source_freeze_barrier::checkpoint(
+                    crate::source_freeze_barrier::FreezePoint::After,
+                );
                 any_denied_or_unreadable = true;
                 continue;
             }
         };
 
-        let mut segment_entries = Vec::new();
+        let mut segment_lines = Vec::new();
         let mut cursor = None;
         let mut read_failed = false;
+        let mut segment_untimed = false;
+        let mut segment_version = None;
 
         loop {
             match solstone_core_transcripts::read_segment_transcript_page(
@@ -770,8 +794,13 @@ pub(crate) fn execute_get_sources(
                 false,
             ) {
                 Ok(page) => {
+                    segment_untimed = page.untimed;
+                    segment_version = Some(page.version.fingerprint());
                     for entry in page.entries {
-                        segment_entries.push(entry.text);
+                        segment_lines.push(SourcedLine {
+                            channel: entry.channel,
+                            text: entry.text,
+                        });
                     }
                     if page.next.is_some() {
                         cursor = page.next;
@@ -800,16 +829,27 @@ pub(crate) fn execute_get_sources(
             continue;
         }
 
-        if segment_entries.is_empty() {
+        if segment_lines.is_empty() {
             continue;
         }
 
-        let Some(heading) = format_segment_heading(&activity_ref.day, seg_key) else {
+        let heading = if segment_untimed {
+            None
+        } else {
+            match format_segment_heading(&activity_ref.day, seg_key) {
+                Some(heading) => Some(heading),
+                None => {
+                    any_denied_or_unreadable = true;
+                    continue;
+                }
+            }
+        };
+        let Some(version) = segment_version else {
             any_denied_or_unreadable = true;
             continue;
         };
 
-        let formatted = format!("{heading}\n\n### Transcript\n\n{}", segment_entries.join("\n"));
+        let formatted = compose_segment_source(heading.as_deref(), &segment_lines);
         let mut dummy_record = record.clone();
         dummy_record.insert("segments".to_string(), json!([seg_key]));
         let mut single_subject = [LinkSubject {
@@ -835,7 +875,7 @@ pub(crate) fn execute_get_sources(
         if let Some(link) = single_subject[0].segments.first().cloned() {
             segment_link_map.insert(admitted_transcripts.len(), link);
         }
-        admitted_transcripts.push((seg_key.to_string(), formatted));
+        admitted_transcripts.push(AdmittedTranscript { version, formatted });
     }
 
     if admitted_transcripts.is_empty() {
@@ -851,18 +891,16 @@ pub(crate) fn execute_get_sources(
         }
     }
 
-    let mut combined_transcript = String::new();
-    for (_seg_key, transcript_text) in &admitted_transcripts {
-        if !combined_transcript.is_empty() {
-            combined_transcript.push_str("\n\n");
+    let mut all_units = Vec::new();
+    for (index, admitted) in admitted_transcripts.iter().enumerate() {
+        for unit in solstone_core_talent_runtime::source_passages::source_units(
+            &admitted.formatted,
+            activity_kind,
+        ) {
+            all_units.push((index, unit));
         }
-        combined_transcript.push_str(transcript_text);
     }
-
-    let all_units = solstone_core_talent_runtime::source_passages::source_units(
-        &combined_transcript,
-        activity_kind,
-    );
+    let source_binding = admitted_source_binding(&admitted_transcripts);
 
     let start_unit = if let Some(ref cursor_token) = request.cursor {
         let ReferenceTarget::Activity(c) = codec()
@@ -881,10 +919,15 @@ pub(crate) fn execute_get_sources(
             || c.day != activity_ref.day
             || c.record_identity != activity_ref.record_identity
             || c.file_digest != activity_ref.file_digest
+            || c.source_binding.as_deref() != Some(source_binding.as_str())
         {
             return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
         }
         c.unit_index.unwrap_or(0)
+    } else if activity_ref.unit_index.is_some()
+        && activity_ref.source_binding.as_deref() != Some(source_binding.as_str())
+    {
+        return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
     } else {
         activity_ref.unit_index.unwrap_or(0)
     };
@@ -893,7 +936,7 @@ pub(crate) fn execute_get_sources(
     let mut page_bytes = 0usize;
     let mut next_unit_index = None;
 
-    for (idx, unit) in all_units.iter().enumerate().skip(start_unit) {
+    for (idx, (segment_index, unit)) in all_units.iter().enumerate().skip(start_unit) {
         let unit_bytes = unit.text.len();
         if !page_units.is_empty()
             && (page_units.len() >= MAX_TRANSCRIPT_PAGE_ITEMS
@@ -903,11 +946,7 @@ pub(crate) fn execute_get_sources(
             break;
         }
 
-        let source_link = if unit.segment > 0 && unit.segment <= admitted_transcripts.len() {
-            segment_link_map.get(&(unit.segment - 1)).cloned()
-        } else {
-            None
-        };
+        let source_link = segment_link_map.get(segment_index).cloned();
 
         let mut unit_json = json!({
             "text": unit.text,
@@ -936,6 +975,7 @@ pub(crate) fn execute_get_sources(
                         record_identity: activity_ref.record_identity.clone(),
                         file_digest: activity_ref.file_digest.clone(),
                         unit_index: Some(next_idx),
+                        source_binding: Some(source_binding.clone()),
                     }),
                 )
                 .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?,
@@ -959,6 +999,60 @@ pub(crate) fn execute_get_sources(
     );
     Ok(Prepared::new(response_val, count, vec![target])
         .when_empty("This activity has no transcript sources."))
+}
+
+struct SourcedLine {
+    channel: &'static str,
+    text: String,
+}
+
+struct AdmittedTranscript {
+    version: u64,
+    formatted: String,
+}
+
+fn admitted_source_binding(admitted: &[AdmittedTranscript]) -> String {
+    let mut hasher = Sha256::new();
+    for source in admitted {
+        hasher.update(source.version.to_le_bytes());
+        hasher.update(source.formatted.as_bytes());
+    }
+    crate::activity_admit::hex_encode(&hasher.finalize())
+}
+
+/// One segment's admitted lines, grouped by the channel the reader already
+/// assigned. An untimed segment omits the clock heading, so its units carry no
+/// timestamp. Each segment is composed alone: an untimed segment must not sit
+/// inside a timed segment's clock heading.
+fn compose_segment_source(heading: Option<&str>, lines: &[SourcedLine]) -> String {
+    let mut out = String::new();
+    if let Some(heading) = heading {
+        out.push_str(heading);
+        out.push_str("\n\n");
+    }
+    let mut index = 0;
+    while index < lines.len() {
+        let channel = lines[index].channel;
+        if !out.is_empty() && !out.ends_with("\n\n") {
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push('\n');
+        }
+        out.push_str("### ");
+        out.push_str(channel);
+        out.push_str("\n\n");
+        let start = index;
+        while index < lines.len() && lines[index].channel == channel {
+            if index > start {
+                out.push('\n');
+            }
+            out.push_str(&lines[index].text);
+            index += 1;
+        }
+        out.push('\n');
+    }
+    out
 }
 
 fn format_segment_heading(day: &str, seg_key: &str) -> Option<String> {

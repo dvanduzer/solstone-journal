@@ -6666,9 +6666,13 @@ fn removed_segment_marker_matrix_withheld_from_all_read_tools() {
             solstone_core_journal_io::Segment::resolve_exact(journal.path(), DAY, STREAM, SEGMENT)
                 .unwrap()
                 .unwrap();
-        let page =
-            solstone_core_transcripts::read_segment_transcript_page(journal.path(), &seg_obj, None, true)
-                .unwrap();
+        let page = solstone_core_transcripts::read_segment_transcript_page(
+            journal.path(),
+            &seg_obj,
+            None,
+            true,
+        )
+        .unwrap();
         let perm_record = PermissionStore::open(journal.path())
             .get_permission(CONNECTION)
             .unwrap()
@@ -7168,9 +7172,13 @@ fn door_seam_remove_segments_withholds_retained_references_without_leak() {
         solstone_core_journal_io::Segment::resolve_exact(journal.path(), DAY, STREAM, SEGMENT)
             .unwrap()
             .unwrap();
-    let page1 =
-        solstone_core_transcripts::read_segment_transcript_page(journal.path(), &seg1_obj, None, true)
-            .unwrap();
+    let page1 = solstone_core_transcripts::read_segment_transcript_page(
+        journal.path(),
+        &seg1_obj,
+        None,
+        true,
+    )
+    .unwrap();
     let perm_record = PermissionStore::open(journal.path())
         .get_permission(CONNECTION)
         .unwrap()
@@ -7727,8 +7735,18 @@ fn activity_hits_report_stored_hidden_and_saved_prose() {
     assert_eq!(hidden_fetch["hidden"], true);
     let hid_obj: Value = serde_json::from_str(hidden_fetch["text"].as_str().unwrap()).unwrap();
     assert_eq!(hid_obj["id"], "hid");
-    assert!(hid_obj["story"]["body"].as_str().unwrap().contains("hiddenstorytoken"));
-    assert!(!hidden_fetch["text"].as_str().unwrap().contains("visiblestorytoken"));
+    assert!(
+        hid_obj["story"]["body"]
+            .as_str()
+            .unwrap()
+            .contains("hiddenstorytoken")
+    );
+    assert!(
+        !hidden_fetch["text"]
+            .as_str()
+            .unwrap()
+            .contains("visiblestorytoken")
+    );
     assert!(hidden_fetch["text"].as_str().unwrap().chars().count() > 800);
 
     let visible_hits = activity_hits_for(&journal, "visiblestorytoken");
@@ -7743,8 +7761,18 @@ fn activity_hits_report_stored_hidden_and_saved_prose() {
     assert_eq!(visible_fetch["hidden"], false);
     let vis_obj: Value = serde_json::from_str(visible_fetch["text"].as_str().unwrap()).unwrap();
     assert_eq!(vis_obj["id"], "vis");
-    assert!(vis_obj["story"]["body"].as_str().unwrap().contains("visiblestorytoken"));
-    assert!(!visible_fetch["text"].as_str().unwrap().contains("hiddenstorytoken"));
+    assert!(
+        vis_obj["story"]["body"]
+            .as_str()
+            .unwrap()
+            .contains("visiblestorytoken")
+    );
+    assert!(
+        !visible_fetch["text"]
+            .as_str()
+            .unwrap()
+            .contains("hiddenstorytoken")
+    );
 
     let transcript_hits = activity_hits_for(&journal, "transcriptonlyneedle");
     assert_eq!(transcript_hits.len(), 1);
@@ -7795,7 +7823,12 @@ fn activity_changes_stay_out_until_the_file_is_indexed_again() {
     let fetched = probe(&journal, "fetch", json!({"reference": reference})).unwrap();
     let f_obj: Value = serde_json::from_str(fetched["text"].as_str().unwrap()).unwrap();
     assert_eq!(f_obj["id"], "one");
-    assert!(f_obj["story"]["body"].as_str().unwrap().contains("firststoryneedle"));
+    assert!(
+        f_obj["story"]["body"]
+            .as_str()
+            .unwrap()
+            .contains("firststoryneedle")
+    );
     assert!(!fetched["text"].as_str().unwrap().contains("sameprose"));
 
     let index_path = solstone_core_indexer_store::db::db_path(journal.path());
@@ -7820,7 +7853,12 @@ fn activity_changes_stay_out_until_the_file_is_indexed_again() {
         probe(&journal, "fetch", json!({"reference": repaired_reference})).unwrap();
     let rep_obj: Value = serde_json::from_str(repaired_fetch["text"].as_str().unwrap()).unwrap();
     assert_eq!(rep_obj["id"], "one");
-    assert!(rep_obj["story"]["body"].as_str().unwrap().contains("firststoryneedle"));
+    assert!(
+        rep_obj["story"]["body"]
+            .as_str()
+            .unwrap()
+            .contains("firststoryneedle")
+    );
     assert_eq!(
         probe(&journal, "fetch", json!({"reference": reference})),
         Err(McpProbeError::Unavailable)
@@ -7845,7 +7883,12 @@ fn activity_changes_stay_out_until_the_file_is_indexed_again() {
     .unwrap();
     let leg_obj: Value = serde_json::from_str(legacy_fetch["text"].as_str().unwrap()).unwrap();
     assert_eq!(leg_obj["id"], "one");
-    assert!(leg_obj["story"]["body"].as_str().unwrap().contains("firststoryneedle"));
+    assert!(
+        leg_obj["story"]["body"]
+            .as_str()
+            .unwrap()
+            .contains("firststoryneedle")
+    );
     assert_ne!(legacy_fetch["text"], "legacysavedprose");
     let legacy_reference = legacy_hits[0]["reference"].as_str().unwrap().to_owned();
 
@@ -7883,7 +7926,12 @@ fn activity_changes_stay_out_until_the_file_is_indexed_again() {
     .unwrap();
     let sec_obj: Value = serde_json::from_str(second_fetch["text"].as_str().unwrap()).unwrap();
     assert_eq!(sec_obj["id"], "two");
-    assert!(sec_obj["story"]["body"].as_str().unwrap().contains("secondstoryneedle"));
+    assert!(
+        sec_obj["story"]["body"]
+            .as_str()
+            .unwrap()
+            .contains("secondstoryneedle")
+    );
     assert_eq!(second_fetch["hidden"], true);
     assert_ne!(second_fetch["text"], "legacysavedprose");
 
@@ -7911,7 +7959,12 @@ fn activity_changes_stay_out_until_the_file_is_indexed_again() {
     .unwrap();
     let third_obj: Value = serde_json::from_str(third_fetch["text"].as_str().unwrap()).unwrap();
     assert_eq!(third_obj["id"], "three");
-    assert!(third_obj["story"]["body"].as_str().unwrap().contains("thirdstoryneedle"));
+    assert!(
+        third_obj["story"]["body"]
+            .as_str()
+            .unwrap()
+            .contains("thirdstoryneedle")
+    );
     assert_ne!(third_fetch["text"], "legacysavedprose");
 
     let twin_hits = activity_hits_for(&journal, "sameprose");
@@ -7931,8 +7984,18 @@ fn activity_changes_stay_out_until_the_file_is_indexed_again() {
     .unwrap();
     let rem_obj: Value = serde_json::from_str(remaining_fetch["text"].as_str().unwrap()).unwrap();
     assert_eq!(rem_obj["id"], "b");
-    assert!(rem_obj["story"]["body"].as_str().unwrap().contains("sameprose"));
-    assert!(!remaining_fetch["text"].as_str().unwrap().contains("\"id\":\"a\""));
+    assert!(
+        rem_obj["story"]["body"]
+            .as_str()
+            .unwrap()
+            .contains("sameprose")
+    );
+    assert!(
+        !remaining_fetch["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"id\":\"a\"")
+    );
     let mut still_reads = 0;
     let mut withheld = 0;
     for reference in &twin_refs {
@@ -7941,7 +8004,12 @@ fn activity_changes_stay_out_until_the_file_is_indexed_again() {
                 still_reads += 1;
                 let val_obj: Value = serde_json::from_str(value["text"].as_str().unwrap()).unwrap();
                 assert_eq!(val_obj["id"], "b");
-                assert!(val_obj["story"]["body"].as_str().unwrap().contains("sameprose"));
+                assert!(
+                    val_obj["story"]["body"]
+                        .as_str()
+                        .unwrap()
+                        .contains("sameprose")
+                );
                 assert!(!value["text"].as_str().unwrap().contains("\"id\":\"a\""));
             }
             Err(McpProbeError::Unavailable) => withheld += 1,
@@ -8318,8 +8386,18 @@ fn shaped_activity_follows_the_indexed_family_under_a_chosen_facet_grant() {
     assert_eq!(fetched["hidden"], true);
     let shaped_obj: Value = serde_json::from_str(fetched["text"].as_str().unwrap()).unwrap();
     assert_eq!(shaped_obj["id"], "shaped");
-    assert!(shaped_obj["story"]["body"].as_str().unwrap().contains("shapedactivityneedle"));
-    assert!(!fetched["text"].as_str().unwrap().contains("betashapedneedle"));
+    assert!(
+        shaped_obj["story"]["body"]
+            .as_str()
+            .unwrap()
+            .contains("shapedactivityneedle")
+    );
+    assert!(
+        !fetched["text"]
+            .as_str()
+            .unwrap()
+            .contains("betashapedneedle")
+    );
 
     let alias_hits = activity_hits_for(&journal, "aliascontrolneedle");
     assert_eq!(alias_hits.len(), 1, "{alias_hits:?}");
@@ -8833,7 +8911,11 @@ fn write_segment_transcript(
     facet: &str,
     transcript: &str,
 ) {
-    let seg_dir = journal.join("chronicle").join(day).join(stream).join(segment);
+    let seg_dir = journal
+        .join("chronicle")
+        .join(day)
+        .join(stream)
+        .join(segment);
     fs::create_dir_all(seg_dir.join("talents")).unwrap();
     fs::write(
         seg_dir.join("talents/facets.json"),
@@ -8851,16 +8933,91 @@ fn list_activities_range_order_and_pagination() {
     assert_eq!(oz.name(), "America/New_York");
     let expected_zone = solstone_core_journal_config::zone_label(Some(oz), 0);
 
-    write_activity_line(journal.path(), "alpha", "20260307", "act_before", "Before", 100, None, None, None, None, None, None, None);
-    write_activity_line(journal.path(), "alpha", "20260308", "act_a2", "Alpha 2", 2, None, None, None, None, None, None, None);
-    write_activity_line(journal.path(), "alpha", "20260308", "act_a1", "Alpha 1", 1, None, None, None, None, None, None, None);
-    write_activity_line(journal.path(), "beta", "20260308", "act_b1", "Beta 1", 1, None, None, None, None, None, None, None);
-    write_activity_line(journal.path(), "alpha", "20260316", "act_after", "After", 100, None, None, None, None, None, None, None);
+    write_activity_line(
+        journal.path(),
+        "alpha",
+        "20260307",
+        "act_before",
+        "Before",
+        100,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    write_activity_line(
+        journal.path(),
+        "alpha",
+        "20260308",
+        "act_a2",
+        "Alpha 2",
+        2,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    write_activity_line(
+        journal.path(),
+        "alpha",
+        "20260308",
+        "act_a1",
+        "Alpha 1",
+        1,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    write_activity_line(
+        journal.path(),
+        "beta",
+        "20260308",
+        "act_b1",
+        "Beta 1",
+        1,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    write_activity_line(
+        journal.path(),
+        "alpha",
+        "20260316",
+        "act_after",
+        "After",
+        100,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
 
-    let res = probe(&journal, "list_activities", json!({
-        "from": "20260308",
-        "to": "20260314",
-    })).unwrap();
+    let res = probe(
+        &journal,
+        "list_activities",
+        json!({
+            "from": "20260308",
+            "to": "20260314",
+        }),
+    )
+    .unwrap();
     assert_no_leaked_keys(&res);
     let acts = res["activities"].as_array().unwrap();
     assert_eq!(acts.len(), 3);
@@ -8871,35 +9028,50 @@ fn list_activities_range_order_and_pagination() {
     assert_eq!(acts[1]["title"], "Alpha 2");
     assert_eq!(acts[2]["title"], "Beta 1");
 
-    let p1 = probe(&journal, "list_activities", json!({
-        "from": "20260308",
-        "to": "20260314",
-        "limit": 1,
-    })).unwrap();
+    let p1 = probe(
+        &journal,
+        "list_activities",
+        json!({
+            "from": "20260308",
+            "to": "20260314",
+            "limit": 1,
+        }),
+    )
+    .unwrap();
     assert_no_leaked_keys(&p1);
     let p1_acts = p1["activities"].as_array().unwrap();
     assert_eq!(p1_acts.len(), 1);
     assert_eq!(p1_acts[0]["title"], "Alpha 1");
     let c1 = p1["next_cursor"].as_str().unwrap();
 
-    let p2 = probe(&journal, "list_activities", json!({
-        "from": "20260308",
-        "to": "20260314",
-        "limit": 1,
-        "cursor": c1,
-    })).unwrap();
+    let p2 = probe(
+        &journal,
+        "list_activities",
+        json!({
+            "from": "20260308",
+            "to": "20260314",
+            "limit": 1,
+            "cursor": c1,
+        }),
+    )
+    .unwrap();
     assert_no_leaked_keys(&p2);
     let p2_acts = p2["activities"].as_array().unwrap();
     assert_eq!(p2_acts.len(), 1);
     assert_eq!(p2_acts[0]["title"], "Alpha 2");
     let c2 = p2["next_cursor"].as_str().unwrap();
 
-    let p3 = probe(&journal, "list_activities", json!({
-        "from": "20260308",
-        "to": "20260314",
-        "limit": 1,
-        "cursor": c2,
-    })).unwrap();
+    let p3 = probe(
+        &journal,
+        "list_activities",
+        json!({
+            "from": "20260308",
+            "to": "20260314",
+            "limit": 1,
+            "cursor": c2,
+        }),
+    )
+    .unwrap();
     assert_no_leaked_keys(&p3);
     let p3_acts = p3["activities"].as_array().unwrap();
     assert_eq!(p3_acts.len(), 1);
@@ -8907,11 +9079,15 @@ fn list_activities_range_order_and_pagination() {
     assert!(p3.get("next_cursor").is_none());
 
     assert_eq!(
-        probe(&journal, "list_activities", json!({
-            "from": "20260301",
-            "to": "20260314",
-            "cursor": c1,
-        })),
+        probe(
+            &journal,
+            "list_activities",
+            json!({
+                "from": "20260301",
+                "to": "20260314",
+                "cursor": c1,
+            })
+        ),
         Err(McpProbeError::Unavailable)
     );
 }
@@ -8919,18 +9095,42 @@ fn list_activities_range_order_and_pagination() {
 #[test]
 fn list_activities_empty_range_and_hidden() {
     let journal = base_activity_journal();
-    let res = probe(&journal, "list_activities", json!({
-        "from": "20260322",
-        "to": "20260328",
-    })).unwrap();
+    let res = probe(
+        &journal,
+        "list_activities",
+        json!({
+            "from": "20260322",
+            "to": "20260328",
+        }),
+    )
+    .unwrap();
     assert_no_leaked_keys(&res);
     assert!(res["activities"].as_array().unwrap().is_empty());
 
-    write_activity_line(journal.path(), "alpha", "20260323", "act_hidden", "Hidden Activity Title", 100, None, None, None, None, None, Some(true), None);
-    let res2 = probe(&journal, "list_activities", json!({
-        "from": "20260322",
-        "to": "20260328",
-    })).unwrap();
+    write_activity_line(
+        journal.path(),
+        "alpha",
+        "20260323",
+        "act_hidden",
+        "Hidden Activity Title",
+        100,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(true),
+        None,
+    );
+    let res2 = probe(
+        &journal,
+        "list_activities",
+        json!({
+            "from": "20260322",
+            "to": "20260328",
+        }),
+    )
+    .unwrap();
     assert_no_leaked_keys(&res2);
     assert!(res2["activities"].as_array().unwrap().is_empty());
     assert!(!res2.to_string().contains("Hidden Activity Title"));
@@ -8939,7 +9139,21 @@ fn list_activities_empty_range_and_hidden() {
 #[test]
 fn list_activities_fields_and_fetch() {
     let journal = base_activity_journal();
-    write_activity_line(journal.path(), "alpha", "20260308", "act_nodur", "No Duration", 100, None, None, None, None, None, None, None);
+    write_activity_line(
+        journal.path(),
+        "alpha",
+        "20260308",
+        "act_nodur",
+        "No Duration",
+        100,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
     write_activity_line(
         journal.path(),
         "alpha",
@@ -8976,7 +9190,12 @@ fn list_activities_fields_and_fetch() {
 
     assert_eq!(acts[1]["facet"], "Alpha");
 
-    let fetch_res = probe(&journal, "fetch", json!({"reference": acts[1]["reference"]})).unwrap();
+    let fetch_res = probe(
+        &journal,
+        "fetch",
+        json!({"reference": acts[1]["reference"]}),
+    )
+    .unwrap();
     assert_no_leaked_keys(&fetch_res);
     let parsed: Value = serde_json::from_str(fetch_res["text"].as_str().unwrap()).unwrap();
     assert!(parsed.is_object());
@@ -8987,14 +9206,33 @@ fn list_activities_fields_and_fetch() {
 #[test]
 fn list_activities_unindexed_returns_and_fetches() {
     let journal = base_activity_journal();
-    write_activity_line(journal.path(), "alpha", "20260308", "act_unindexed", "Unindexed Title", 100, None, None, None, None, None, None, None);
+    write_activity_line(
+        journal.path(),
+        "alpha",
+        "20260308",
+        "act_unindexed",
+        "Unindexed Title",
+        100,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
     let res = probe(&journal, "list_activities", json!({"day": "20260308"})).unwrap();
     assert_no_leaked_keys(&res);
     let acts = res["activities"].as_array().unwrap();
     assert_eq!(acts.len(), 1);
     assert_eq!(acts[0]["title"], "Unindexed Title");
 
-    let fetched = probe(&journal, "fetch", json!({"reference": acts[0]["reference"]})).unwrap();
+    let fetched = probe(
+        &journal,
+        "fetch",
+        json!({"reference": acts[0]["reference"]}),
+    )
+    .unwrap();
     assert_no_leaked_keys(&fetched);
     let parsed: Value = serde_json::from_str(fetched["text"].as_str().unwrap()).unwrap();
     assert_eq!(parsed["id"], "act_unindexed");
@@ -9004,23 +9242,53 @@ fn list_activities_unindexed_returns_and_fetches() {
 #[test]
 fn list_activities_stale_index_fresh_file_behavior() {
     let journal = base_activity_journal();
-    write_activity_line(journal.path(), "alpha", "20260308", "act_stale", "Original Title needlefirst", 100, None, None, None, None, None, None, None);
+    write_activity_line(
+        journal.path(),
+        "alpha",
+        "20260308",
+        "act_stale",
+        "Original Title needlefirst",
+        100,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
     solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
 
     let search_res = probe(&journal, "search", json!({"query": "needlefirst"})).unwrap();
     assert_no_leaked_keys(&search_res);
-    let search_ref = search_res["results"][0]["reference"].as_str().unwrap().to_owned();
+    let search_ref = search_res["results"][0]["reference"]
+        .as_str()
+        .unwrap()
+        .to_owned();
 
-    let file_path = journal.path().join("facets/alpha/activities/20260308.jsonl");
+    let file_path = journal
+        .path()
+        .join("facets/alpha/activities/20260308.jsonl");
     fs::write(
         &file_path,
-        json!({"id": "act_stale", "title": "Updated Title needlenew", "created_at": 100}).to_string() + "\n",
-    ).unwrap();
+        json!({"id": "act_stale", "title": "Updated Title needlenew", "created_at": 100})
+            .to_string()
+            + "\n",
+    )
+    .unwrap();
 
     let list_res = probe(&journal, "list_activities", json!({"day": "20260308"})).unwrap();
     assert_no_leaked_keys(&list_res);
-    assert_eq!(list_res["activities"][0]["title"], "Updated Title needlenew");
-    let fetched = probe(&journal, "fetch", json!({"reference": list_res["activities"][0]["reference"]})).unwrap();
+    assert_eq!(
+        list_res["activities"][0]["title"],
+        "Updated Title needlenew"
+    );
+    let fetched = probe(
+        &journal,
+        "fetch",
+        json!({"reference": list_res["activities"][0]["reference"]}),
+    )
+    .unwrap();
     assert_no_leaked_keys(&fetched);
     let parsed: Value = serde_json::from_str(fetched["text"].as_str().unwrap()).unwrap();
     assert_eq!(parsed["title"], "Updated Title needlenew");
@@ -9034,9 +9302,15 @@ fn list_activities_stale_index_fresh_file_behavior() {
 #[test]
 fn list_activities_malformed_jsonl_fails() {
     let journal = base_activity_journal();
-    let file_path = journal.path().join("facets/alpha/activities/20260308.jsonl");
+    let file_path = journal
+        .path()
+        .join("facets/alpha/activities/20260308.jsonl");
     fs::create_dir_all(file_path.parent().unwrap()).unwrap();
-    fs::write(&file_path, "{\"id\": \"valid1\", \"title\": \"Valid\"}\nnot-json\n").unwrap();
+    fs::write(
+        &file_path,
+        "{\"id\": \"valid1\", \"title\": \"Valid\"}\nnot-json\n",
+    )
+    .unwrap();
 
     assert_eq!(
         probe(&journal, "list_activities", json!({"day": "20260308"})),
@@ -9044,7 +9318,9 @@ fn list_activities_malformed_jsonl_fails() {
     );
 
     let journal2 = base_activity_journal();
-    let file_path2 = journal2.path().join("facets/alpha/activities/20260308.jsonl");
+    let file_path2 = journal2
+        .path()
+        .join("facets/alpha/activities/20260308.jsonl");
     fs::create_dir_all(file_path2.parent().unwrap()).unwrap();
     fs::write(&file_path2, "{\"id\": \"valid1\", \"title\": \"Valid\"}\n").unwrap();
     let res = probe(&journal2, "list_activities", json!({"day": "20260308"})).unwrap();
@@ -9067,15 +9343,18 @@ fn list_activities_entity_filtering_and_tokens() {
                 "id": id,
                 "name": name,
                 "aka": aka,
-            }).to_string(),
-        ).unwrap();
+            })
+            .to_string(),
+        )
+        .unwrap();
 
         let l_dir = journal.path().join("facets/alpha/entities").join(dir);
         fs::create_dir_all(&l_dir).unwrap();
         fs::write(
             l_dir.join("entity.json"),
             json!({"entity_id": id, "detached": false}).to_string(),
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     write_activity_line(
@@ -9119,38 +9398,74 @@ fn list_activities_entity_filtering_and_tokens() {
         .unwrap();
     let ada_ref = ada_ent["reference"].as_str().unwrap();
 
-    let res_ada = probe(&journal, "list_activities", json!({
-        "day": "20260308",
-        "entity": ada_ref,
-    })).unwrap();
+    let res_ada = probe(
+        &journal,
+        "list_activities",
+        json!({
+            "day": "20260308",
+            "entity": ada_ref,
+        }),
+    )
+    .unwrap();
     assert_no_leaked_keys(&res_ada);
     let acts_ada = res_ada["activities"].as_array().unwrap();
     assert_eq!(acts_ada.len(), 1);
     assert_eq!(acts_ada[0]["title"], "Ada Activity");
 
-    let res_grace = probe(&journal, "list_activities", json!({
-        "day": "20260308",
-        "entity": "grace hopper",
-    })).unwrap();
+    let res_grace = probe(
+        &journal,
+        "list_activities",
+        json!({
+            "day": "20260308",
+            "entity": "grace hopper",
+        }),
+    )
+    .unwrap();
     assert_no_leaked_keys(&res_grace);
     let acts_grace = res_grace["activities"].as_array().unwrap();
     assert_eq!(acts_grace.len(), 1);
     assert_eq!(acts_grace[0]["title"], "Grace Activity");
 
-    let res_alias = probe(&journal, "list_activities", json!({
-        "day": "20260308",
-        "entity": "secret alias",
-    })).unwrap();
+    let res_alias = probe(
+        &journal,
+        "list_activities",
+        json!({
+            "day": "20260308",
+            "entity": "secret alias",
+        }),
+    )
+    .unwrap();
     assert_no_leaked_keys(&res_alias);
     assert!(res_alias["activities"].as_array().unwrap().is_empty());
     assert!(!res_alias.to_string().contains("secret alias"));
 
-    let res_sub = probe(&journal, "list_activities", json!({
-        "day": "20260308",
-        "entity": "ada",
-    })).unwrap();
+    let res_sub = probe(
+        &journal,
+        "list_activities",
+        json!({
+            "day": "20260308",
+            "entity": "ada",
+        }),
+    )
+    .unwrap();
     assert_no_leaked_keys(&res_sub);
-    assert!(res_sub["activities"].as_array().unwrap().is_empty());
+    let acts_sub = res_sub["activities"].as_array().unwrap();
+    assert_eq!(acts_sub.len(), 1);
+    assert_eq!(acts_sub[0]["title"], "Ada Activity");
+
+    let res_grace_part = probe(
+        &journal,
+        "list_activities",
+        json!({
+            "day": "20260308",
+            "entity": "grace",
+        }),
+    )
+    .unwrap();
+    assert_no_leaked_keys(&res_grace_part);
+    let acts_grace_part = res_grace_part["activities"].as_array().unwrap();
+    assert_eq!(acts_grace_part.len(), 1);
+    assert_eq!(acts_grace_part[0]["title"], "Grace Activity");
 
     PermissionStore::open(journal.path())
         .set_permission(
@@ -9162,18 +9477,27 @@ fn list_activities_entity_filtering_and_tokens() {
         )
         .unwrap();
 
-    let res_grace_no_ent = probe(&journal, "list_activities", json!({
-        "day": "20260308",
-        "entity": "Grace Hopper",
-    })).unwrap();
+    let res_grace_no_ent = probe(
+        &journal,
+        "list_activities",
+        json!({
+            "day": "20260308",
+            "entity": "Grace Hopper",
+        }),
+    )
+    .unwrap();
     assert_no_leaked_keys(&res_grace_no_ent);
     assert_eq!(res_grace_no_ent["activities"].as_array().unwrap().len(), 1);
 
     assert_eq!(
-        probe(&journal, "list_activities", json!({
-            "day": "20260308",
-            "entity": ada_ref,
-        })),
+        probe(
+            &journal,
+            "list_activities",
+            json!({
+                "day": "20260308",
+                "entity": ada_ref,
+            })
+        ),
         Err(McpProbeError::Unavailable)
     );
 }
@@ -9216,8 +9540,14 @@ fn list_activities_denied_facet_scoped_and_forged_references() {
         .set_permission(
             CONNECTION,
             ReadPermission {
-                categories: vec!["facets".to_owned(), "entities".to_owned(), "transcripts".to_owned()],
-                scope: ReadScope::Facets { ids: vec![FACET_A.to_owned()] },
+                categories: vec![
+                    "facets".to_owned(),
+                    "entities".to_owned(),
+                    "transcripts".to_owned(),
+                ],
+                scope: ReadScope::Facets {
+                    ids: vec![FACET_A.to_owned()],
+                },
             },
         )
         .unwrap();
@@ -9228,59 +9558,93 @@ fn list_activities_denied_facet_scoped_and_forged_references() {
     assert!(!s.contains("Beta Activity Title"));
     assert!(!s.contains("Beta Entity"));
 
-    let res_fb = probe(&journal, "list_activities", json!({"day": "20260308", "facet": "beta"})).unwrap();
+    let res_fb = probe(
+        &journal,
+        "list_activities",
+        json!({"day": "20260308", "facet": "beta"}),
+    )
+    .unwrap();
     assert_no_leaked_keys(&res_fb);
     assert!(res_fb["activities"].as_array().unwrap().is_empty());
 
-    let res_fid = probe(&journal, "list_activities", json!({"day": "20260308", "facet": FACET_B})).unwrap();
+    let res_fid = probe(
+        &journal,
+        "list_activities",
+        json!({"day": "20260308", "facet": FACET_B}),
+    )
+    .unwrap();
     assert_no_leaked_keys(&res_fid);
     assert!(res_fid["activities"].as_array().unwrap().is_empty());
 
-    assert_eq!(probe(&journal, "fetch", json!({"reference": "aaaa"})), Err(McpProbeError::Unavailable));
+    assert_eq!(
+        probe(&journal, "fetch", json!({"reference": "aaaa"})),
+        Err(McpProbeError::Unavailable)
+    );
 
     let codec = crate::dispatch::codec();
-    let perm = PermissionStore::open(journal.path()).get_permission(CONNECTION).unwrap().unwrap();
-    let bad_dir = codec.mint(
-        CONNECTION,
-        perm.generation,
-        crate::references::ReferenceTarget::Activity(crate::references::ActivityReference {
-            facet_id: FACET_A.to_string(),
-            facet_dir: "..".to_string(),
-            day: "20260308".to_string(),
-            record_identity: "rec".to_string(),
-            file_digest: "digest".to_string(),
-            unit_index: None,
-        }),
-    ).unwrap();
-    assert_eq!(probe(&journal, "fetch", json!({"reference": bad_dir})), Err(McpProbeError::Unavailable));
+    let perm = PermissionStore::open(journal.path())
+        .get_permission(CONNECTION)
+        .unwrap()
+        .unwrap();
+    let bad_dir = codec
+        .mint(
+            CONNECTION,
+            perm.generation,
+            crate::references::ReferenceTarget::Activity(crate::references::ActivityReference {
+                facet_id: FACET_A.to_string(),
+                facet_dir: "..".to_string(),
+                day: "20260308".to_string(),
+                record_identity: "rec".to_string(),
+                file_digest: "digest".to_string(),
+                unit_index: None,
+                source_binding: None,
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        probe(&journal, "fetch", json!({"reference": bad_dir})),
+        Err(McpProbeError::Unavailable)
+    );
 
-    let bad_gen = codec.mint(
-        CONNECTION,
-        perm.generation + 1,
-        crate::references::ReferenceTarget::Activity(crate::references::ActivityReference {
-            facet_id: FACET_A.to_string(),
-            facet_dir: "alpha".to_string(),
-            day: "20260308".to_string(),
-            record_identity: "rec".to_string(),
-            file_digest: "digest".to_string(),
-            unit_index: None,
-        }),
-    ).unwrap();
-    assert_eq!(probe(&journal, "fetch", json!({"reference": bad_gen})), Err(McpProbeError::Unavailable));
+    let bad_gen = codec
+        .mint(
+            CONNECTION,
+            perm.generation + 1,
+            crate::references::ReferenceTarget::Activity(crate::references::ActivityReference {
+                facet_id: FACET_A.to_string(),
+                facet_dir: "alpha".to_string(),
+                day: "20260308".to_string(),
+                record_identity: "rec".to_string(),
+                file_digest: "digest".to_string(),
+                unit_index: None,
+                source_binding: None,
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        probe(&journal, "fetch", json!({"reference": bad_gen})),
+        Err(McpProbeError::Unavailable)
+    );
 
-    let diff_conn = codec.mint(
-        "bearer:other",
-        perm.generation,
-        crate::references::ReferenceTarget::Activity(crate::references::ActivityReference {
-            facet_id: FACET_A.to_string(),
-            facet_dir: "alpha".to_string(),
-            day: "20260308".to_string(),
-            record_identity: "rec".to_string(),
-            file_digest: "digest".to_string(),
-            unit_index: None,
-        }),
-    ).unwrap();
-    assert_eq!(probe(&journal, "fetch", json!({"reference": diff_conn})), Err(McpProbeError::Unavailable));
+    let diff_conn = codec
+        .mint(
+            "bearer:other",
+            perm.generation,
+            crate::references::ReferenceTarget::Activity(crate::references::ActivityReference {
+                facet_id: FACET_A.to_string(),
+                facet_dir: "alpha".to_string(),
+                day: "20260308".to_string(),
+                record_identity: "rec".to_string(),
+                file_digest: "digest".to_string(),
+                unit_index: None,
+                source_binding: None,
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        probe(&journal, "fetch", json!({"reference": diff_conn})),
+        Err(McpProbeError::Unavailable)
+    );
 }
 
 #[test]
@@ -9299,6 +9663,270 @@ fn list_activities_without_facets_category_is_denied() {
         probe(&journal, "list_activities", json!({"day": "20260308"})),
         Err(McpProbeError::PermissionDenied)
     );
+}
+
+fn advertised_tool_names(journal: &tempfile::TempDir) -> Vec<String> {
+    let decision = evaluate_connection_read(journal.path(), CONNECTION);
+    crate::registry::advertised_tools_list(journal.path(), &decision)["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn refused_fetch_reasons(journal: &tempfile::TempDir) -> Vec<String> {
+    crate::activity::read_activity(
+        journal.path(),
+        &crate::activity::ActivityQuery {
+            limit: 20,
+            outcome: Some(crate::activity::RecordedOutcome::Refused),
+            ..crate::activity::ActivityQuery::default()
+        },
+    )
+    .unwrap()
+    .entries
+    .into_iter()
+    .filter(|entry| entry.tool_name == solstone_core_mcp_audit::ToolName::Fetch)
+    .filter_map(|entry| entry.reason)
+    .collect()
+}
+
+#[test]
+fn facets_only_listing_fetches_the_activity_and_refuses_an_entry() {
+    let journal = base_activity_journal();
+    write_activity_line(
+        journal.path(),
+        "alpha",
+        "20260308",
+        "act_facets",
+        "Facets Only Activity",
+        100,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    PermissionStore::open(journal.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["facets".to_owned()],
+                scope: ReadScope::WholeJournal,
+            },
+        )
+        .unwrap();
+
+    let names = advertised_tool_names(&journal);
+    assert!(names.iter().any(|name| name == "fetch"));
+    assert!(names.iter().any(|name| name == "list_activities"));
+    assert!(!names.iter().any(|name| name == "search"));
+    assert!(!names.iter().any(|name| name == "get_activity_sources"));
+    assert!(!names.iter().any(|name| name == "get_transcript"));
+
+    let listed = probe(&journal, "list_activities", json!({"day": "20260308"})).unwrap();
+    let reference = listed["activities"][0]["reference"].as_str().unwrap();
+    let fetched = probe(&journal, "fetch", json!({"reference": reference})).unwrap();
+    assert_no_leaked_keys(&fetched);
+    assert!(fetched["text"].as_str().unwrap().contains("act_facets"));
+    assert_eq!(
+        probe(&journal, "search", json!({"query": "Facets"})),
+        Err(McpProbeError::PermissionDenied)
+    );
+    assert_eq!(
+        probe(
+            &journal,
+            "get_activity_sources",
+            json!({"reference": reference})
+        ),
+        Err(McpProbeError::PermissionDenied)
+    );
+
+    let PermissionDecision::Snapshot(snapshot) =
+        evaluate_connection_read(journal.path(), CONNECTION)
+    else {
+        panic!("facets grant");
+    };
+    let entry = crate::dispatch::codec()
+        .mint(
+            CONNECTION,
+            snapshot.generation,
+            crate::references::ReferenceTarget::Entry(crate::references::EntryReference {
+                day: "20260308".to_owned(),
+                stream: "default".to_owned(),
+                path: "chronicle/20260308/default/090000_300/meeting_transcript.md".to_owned(),
+                idx: 0,
+                row_id: 1,
+                activity_proof: None,
+                record_identity: None,
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        probe(&journal, "fetch", json!({"reference": entry})),
+        Err(McpProbeError::PermissionDenied)
+    );
+    assert!(
+        refused_fetch_reasons(&journal)
+            .iter()
+            .any(|reason| reason == "this connection does not have the transcripts category")
+    );
+}
+
+#[test]
+fn transcripts_entities_and_paired_listing_grants_round_trip() {
+    let transcripts = fixture();
+    let transcript_names = advertised_tool_names(&transcripts);
+    assert!(transcript_names.iter().any(|name| name == "fetch"));
+    assert!(
+        transcript_names
+            .iter()
+            .any(|name| name == "list_transcripts")
+    );
+    assert!(transcript_names.iter().any(|name| name == "search"));
+    assert!(
+        !transcript_names
+            .iter()
+            .any(|name| name == "list_activities")
+    );
+    let listed = probe(&transcripts, "list_transcripts", json!({})).unwrap();
+    let transcript_ref = listed["transcripts"][0]["reference"].as_str().unwrap();
+    let page = probe(
+        &transcripts,
+        "get_transcript",
+        json!({"reference": transcript_ref}),
+    )
+    .unwrap();
+    assert!(!page["entries"].as_array().unwrap().is_empty());
+    let search = probe(&transcripts, "search", json!({"query": "indexed"})).unwrap();
+    let entry_ref = search["results"][0]["reference"].as_str().unwrap();
+    let fetched = probe(&transcripts, "fetch", json!({"reference": entry_ref})).unwrap();
+    assert!(fetched["text"].is_string());
+    assert_eq!(
+        probe(&transcripts, "list_activities", json!({"day": DAY})),
+        Err(McpProbeError::PermissionDenied)
+    );
+    let PermissionDecision::Snapshot(snapshot) =
+        evaluate_connection_read(transcripts.path(), CONNECTION)
+    else {
+        panic!("transcript grant");
+    };
+    let activity = crate::dispatch::codec()
+        .mint(
+            CONNECTION,
+            snapshot.generation,
+            crate::references::ReferenceTarget::Activity(crate::references::ActivityReference {
+                facet_id: FACET_A.to_owned(),
+                facet_dir: "alpha".to_owned(),
+                day: DAY.to_owned(),
+                record_identity: "rec".to_owned(),
+                file_digest: "digest".to_owned(),
+                unit_index: None,
+                source_binding: None,
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        probe(&transcripts, "fetch", json!({"reference": activity})),
+        Err(McpProbeError::PermissionDenied)
+    );
+    assert!(
+        refused_fetch_reasons(&transcripts)
+            .iter()
+            .any(|reason| reason == "this connection does not have the facets category")
+    );
+
+    let entities = fixture();
+    PermissionStore::open(entities.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["entities".to_owned()],
+                scope: ReadScope::Facets {
+                    ids: vec![FACET_A.to_owned()],
+                },
+            },
+        )
+        .unwrap();
+    let entity_names = advertised_tool_names(&entities);
+    assert!(entity_names.iter().any(|name| name == "list_entities"));
+    assert!(entity_names.iter().any(|name| name == "get_entity"));
+    assert!(!entity_names.iter().any(|name| name == "fetch"));
+    let listed_entities = probe(&entities, "list_entities", json!({})).unwrap();
+    let entity_ref = listed_entities["entities"][0]["reference"]
+        .as_str()
+        .unwrap();
+    let entity = probe(&entities, "get_entity", json!({"reference": entity_ref})).unwrap();
+    assert!(entity["name"].is_string());
+    assert_eq!(
+        probe(&entities, "fetch", json!({"reference": entity_ref})),
+        Err(McpProbeError::PermissionDenied)
+    );
+
+    let paired = base_activity_journal();
+    let day = "20260308";
+    let seg = "090000_300";
+    write_segment_transcript(
+        paired.path(),
+        day,
+        "default",
+        seg,
+        "alpha",
+        "pairedsourceneedle\n",
+    );
+    write_activity_line(
+        paired.path(),
+        "alpha",
+        day,
+        "act_paired",
+        "Paired Activity",
+        100,
+        None,
+        Some(&[seg]),
+        None,
+        None,
+        Some("default"),
+        None,
+        None,
+    );
+    PermissionStore::open(paired.path())
+        .set_permission(
+            CONNECTION,
+            ReadPermission {
+                categories: vec!["facets".to_owned(), "transcripts".to_owned()],
+                scope: ReadScope::WholeJournal,
+            },
+        )
+        .unwrap();
+    let paired_names = advertised_tool_names(&paired);
+    assert!(paired_names.iter().any(|name| name == "list_activities"));
+    assert!(paired_names.iter().any(|name| name == "fetch"));
+    assert!(
+        paired_names
+            .iter()
+            .any(|name| name == "get_activity_sources")
+    );
+    let listed_paired = probe(&paired, "list_activities", json!({"day": day})).unwrap();
+    let paired_ref = listed_paired["activities"][0]["reference"]
+        .as_str()
+        .unwrap();
+    let fetched_paired = probe(&paired, "fetch", json!({"reference": paired_ref})).unwrap();
+    assert!(
+        fetched_paired["text"]
+            .as_str()
+            .unwrap()
+            .contains("act_paired")
+    );
+    let sources = probe(
+        &paired,
+        "get_activity_sources",
+        json!({"reference": paired_ref}),
+    )
+    .unwrap();
+    assert!(sources.to_string().contains("pairedsourceneedle"));
 }
 
 #[test]
@@ -9330,7 +9958,12 @@ fn get_activity_sources_returns_verbatim_long_unit() {
     assert_no_leaked_keys(&list_res);
     let act_ref = list_res["activities"][0]["reference"].as_str().unwrap();
 
-    let sources_res = probe(&journal, "get_activity_sources", json!({"reference": act_ref})).unwrap();
+    let sources_res = probe(
+        &journal,
+        "get_activity_sources",
+        json!({"reference": act_ref}),
+    )
+    .unwrap();
     assert_no_leaked_keys(&sources_res);
     let units = sources_res["units"].as_array().unwrap();
     assert_eq!(units.len(), 1);
@@ -9349,7 +9982,11 @@ fn get_activity_sources_returns_verbatim_long_unit() {
         )
         .unwrap();
     assert_eq!(
-        probe(&journal, "get_activity_sources", json!({"reference": act_ref})),
+        probe(
+            &journal,
+            "get_activity_sources",
+            json!({"reference": act_ref})
+        ),
         Err(McpProbeError::PermissionDenied)
     );
 
@@ -9363,7 +10000,11 @@ fn get_activity_sources_returns_verbatim_long_unit() {
         )
         .unwrap();
     assert_eq!(
-        probe(&journal, "get_activity_sources", json!({"reference": act_ref})),
+        probe(
+            &journal,
+            "get_activity_sources",
+            json!({"reference": act_ref})
+        ),
         Err(McpProbeError::PermissionDenied)
     );
 }
@@ -9381,7 +10022,14 @@ fn get_activity_sources_pagination_over_max_bytes() {
     large_transcript.push_str("finalpageneedle paragraph final\n\n");
     assert!(large_transcript.len() > solstone_core_transcripts::MAX_TRANSCRIPT_PAGE_BYTES);
 
-    write_segment_transcript(journal.path(), day, "default", seg, "alpha", &large_transcript);
+    write_segment_transcript(
+        journal.path(),
+        day,
+        "default",
+        seg,
+        "alpha",
+        &large_transcript,
+    );
     write_activity_line(
         journal.path(),
         "alpha",
@@ -9401,7 +10049,12 @@ fn get_activity_sources_pagination_over_max_bytes() {
     let list_res = probe(&journal, "list_activities", json!({"day": day})).unwrap();
     let act_ref = list_res["activities"][0]["reference"].as_str().unwrap();
 
-    let p1 = probe(&journal, "get_activity_sources", json!({"reference": act_ref})).unwrap();
+    let p1 = probe(
+        &journal,
+        "get_activity_sources",
+        json!({"reference": act_ref}),
+    )
+    .unwrap();
     assert_no_leaked_keys(&p1);
     assert!(p1.get("next_cursor").is_some());
     let p1_str = p1.to_string();
@@ -9409,16 +10062,28 @@ fn get_activity_sources_pagination_over_max_bytes() {
     assert!(!p1_str.contains("finalpageneedle"));
     let next_c = p1["next_cursor"].as_str().unwrap();
 
-    let p2 = probe(&journal, "get_activity_sources", json!({
-        "reference": act_ref,
-        "cursor": next_c,
-    })).unwrap();
+    let p2 = probe(
+        &journal,
+        "get_activity_sources",
+        json!({
+            "reference": act_ref,
+            "cursor": next_c,
+        }),
+    )
+    .unwrap();
     assert_no_leaked_keys(&p2);
     let p2_str = p2.to_string();
     assert!(p2_str.contains("finalpageneedle"));
 
     let seg_short = "100000_100";
-    write_segment_transcript(journal.path(), day, "default", seg_short, "alpha", "short transcript line\n");
+    write_segment_transcript(
+        journal.path(),
+        day,
+        "default",
+        seg_short,
+        "alpha",
+        "short transcript line\n",
+    );
     write_activity_line(
         journal.path(),
         "alpha",
@@ -9435,10 +10100,228 @@ fn get_activity_sources_pagination_over_max_bytes() {
         None,
     );
     let list_res2 = probe(&journal, "list_activities", json!({"day": day})).unwrap();
-    let short_act = list_res2["activities"].as_array().unwrap().iter().find(|a| a["title"] == "Short Activity").unwrap();
-    let short_sources = probe(&journal, "get_activity_sources", json!({"reference": short_act["reference"]})).unwrap();
+    let short_act = list_res2["activities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["title"] == "Short Activity")
+        .unwrap();
+    let short_sources = probe(
+        &journal,
+        "get_activity_sources",
+        json!({"reference": short_act["reference"]}),
+    )
+    .unwrap();
     assert_no_leaked_keys(&short_sources);
     assert!(short_sources.get("next_cursor").is_none());
+}
+
+fn write_segment_file(
+    journal: &Path,
+    day: &str,
+    stream: &str,
+    segment: &str,
+    facet: &str,
+    name: &str,
+    body: &str,
+) {
+    let seg_dir = journal
+        .join("chronicle")
+        .join(day)
+        .join(stream)
+        .join(segment);
+    fs::create_dir_all(seg_dir.join("talents")).unwrap();
+    fs::write(
+        seg_dir.join("talents/facets.json"),
+        json!([{"facet": facet}]).to_string(),
+    )
+    .unwrap();
+    fs::write(seg_dir.join(name), body).unwrap();
+}
+
+#[test]
+fn get_activity_sources_keeps_family_and_omits_untimed_clocks() {
+    let journal = base_activity_journal();
+    let day = "20260308";
+    write_segment_file(
+        journal.path(),
+        day,
+        "import.chatgpt",
+        "090000_300",
+        "alpha",
+        "conversation_transcript.jsonl",
+        "{\"untimed\":true,\"imported\":{}}\n{\"start\":\"00:00:00\",\"speaker\":\"Ana\",\"text\":\"untimedchatneedle\"}\n",
+    );
+    write_segment_file(
+        journal.path(),
+        day,
+        "default",
+        "100000_300",
+        "alpha",
+        "audio.jsonl",
+        "{\"source\":\"recording\"}\n{\"start\":\"00:00:02\",\"text\":\"spokenaudioneedle\"}\n",
+    );
+    write_segment_file(
+        journal.path(),
+        day,
+        "import.text",
+        "110000_300",
+        "alpha",
+        "imported.md",
+        "markdownneedlenotspeech\n",
+    );
+    for (id, seg, stream) in [
+        ("act_chat", "090000_300", "import.chatgpt"),
+        ("act_audio", "100000_300", "default"),
+        ("act_md", "110000_300", "import.text"),
+    ] {
+        write_activity_line(
+            journal.path(),
+            "alpha",
+            day,
+            id,
+            id,
+            100,
+            Some("import"),
+            Some(&[seg]),
+            None,
+            None,
+            Some(stream),
+            None,
+            None,
+        );
+    }
+
+    let listed = probe(&journal, "list_activities", json!({"day": day})).unwrap();
+    let reference = |title: &str| {
+        listed["activities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|activity| activity["title"] == title)
+            .unwrap()["reference"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let chat = probe(
+        &journal,
+        "get_activity_sources",
+        json!({"reference": reference("act_chat")}),
+    )
+    .unwrap();
+    let chat_unit = &chat["units"][0];
+    assert_eq!(chat_unit["kind"], "import");
+    assert!(chat_unit.get("timestamp").is_none());
+    let chat_text = chat_unit["text"].as_str().unwrap();
+    assert!(chat_text.contains("untimedchatneedle"));
+    assert!(chat_text.contains("ChatGPT Conversation"));
+    assert!(!chat_text.contains("### Transcript"));
+
+    let audio = probe(
+        &journal,
+        "get_activity_sources",
+        json!({"reference": reference("act_audio")}),
+    )
+    .unwrap();
+    let audio_unit = &audio["units"][0];
+    assert_eq!(audio_unit["kind"], "audio");
+    assert_eq!(audio_unit["timestamp"], "2026-03-08 10:00:00 - 10:05:00");
+    let audio_text = audio_unit["text"].as_str().unwrap();
+    assert!(audio_text.contains("spokenaudioneedle"));
+    assert!(audio_text.contains("### Transcript"));
+
+    let markdown = probe(
+        &journal,
+        "get_activity_sources",
+        json!({"reference": reference("act_md")}),
+    )
+    .unwrap();
+    let markdown_unit = &markdown["units"][0];
+    assert_eq!(markdown_unit["kind"], "import");
+    assert_eq!(markdown_unit["timestamp"], "2026-03-08 11:00:00 - 11:05:00");
+    let markdown_text = markdown_unit["text"].as_str().unwrap();
+    assert!(markdown_text.contains("markdownneedlenotspeech"));
+    assert!(markdown_text.contains("### Imported Text"));
+    assert!(!markdown_text.contains("### Transcript"));
+}
+
+#[test]
+fn get_activity_sources_cursor_rejects_a_changed_transcript() {
+    let journal = base_activity_journal();
+    let day = "20260308";
+    let seg = "090000_300";
+    let mut large_transcript = String::from("firstpageblockneedle paragraph 0\n\n");
+    for i in 1..80 {
+        large_transcript.push_str(&format!("paragraph {i} text {}\n\n", "data ".repeat(200)));
+    }
+    large_transcript.push_str("finalpageneedle paragraph final\n\n");
+    write_segment_transcript(
+        journal.path(),
+        day,
+        "default",
+        seg,
+        "alpha",
+        &large_transcript,
+    );
+    write_activity_line(
+        journal.path(),
+        "alpha",
+        day,
+        "act_cursor",
+        "Cursor Activity",
+        100,
+        None,
+        Some(&[seg]),
+        None,
+        None,
+        Some("default"),
+        None,
+        None,
+    );
+    let activity_path = journal
+        .path()
+        .join("facets/alpha/activities")
+        .join(format!("{day}.jsonl"));
+    let activity_before = fs::read(&activity_path).unwrap();
+
+    let listed = probe(&journal, "list_activities", json!({"day": day})).unwrap();
+    let act_ref = listed["activities"][0]["reference"].as_str().unwrap();
+    let first = probe(
+        &journal,
+        "get_activity_sources",
+        json!({"reference": act_ref}),
+    )
+    .unwrap();
+    let cursor = first["next_cursor"].as_str().unwrap();
+
+    let transcript_path = journal
+        .path()
+        .join("chronicle")
+        .join(day)
+        .join("default")
+        .join(seg)
+        .join("meeting_transcript.md");
+    let mut changed = fs::read_to_string(&transcript_path).unwrap();
+    changed.insert_str(0, "prependedmutateneedle\n");
+    fs::write(&transcript_path, changed).unwrap();
+    assert_eq!(fs::read(&activity_path).unwrap(), activity_before);
+
+    assert_eq!(
+        probe(
+            &journal,
+            "get_activity_sources",
+            json!({"reference": act_ref, "cursor": cursor})
+        ),
+        Err(McpProbeError::Unavailable)
+    );
+    let fresh = probe(
+        &journal,
+        "get_activity_sources",
+        json!({"reference": act_ref}),
+    )
+    .unwrap();
+    assert!(fresh.to_string().contains("prependedmutateneedle"));
 }
 
 #[test]
@@ -9446,7 +10329,14 @@ fn get_activity_sources_staged_marker_is_unavailable() {
     let journal = base_activity_journal();
     let day = "20260308";
     let seg = "090000_300";
-    write_segment_transcript(journal.path(), day, "default", seg, "alpha", "transcript content\n");
+    write_segment_transcript(
+        journal.path(),
+        day,
+        "default",
+        seg,
+        "alpha",
+        "transcript content\n",
+    );
     write_activity_line(
         journal.path(),
         "alpha",
@@ -9466,14 +10356,24 @@ fn get_activity_sources_staged_marker_is_unavailable() {
     let list_res = probe(&journal, "list_activities", json!({"day": day})).unwrap();
     let act_ref = list_res["activities"][0]["reference"].as_str().unwrap();
 
-    let seg_dir = journal.path().join("chronicle").join(day).join("default").join(seg);
+    let seg_dir = journal
+        .path()
+        .join("chronicle")
+        .join(day)
+        .join("default")
+        .join(seg);
     fs::rename(
         &seg_dir,
         seg_dir.parent().unwrap().join(format!(".removing_{seg}")),
-    ).unwrap();
+    )
+    .unwrap();
 
     assert_eq!(
-        probe(&journal, "get_activity_sources", json!({"reference": act_ref})),
+        probe(
+            &journal,
+            "get_activity_sources",
+            json!({"reference": act_ref})
+        ),
         Err(McpProbeError::Unavailable)
     );
 }
@@ -9483,7 +10383,14 @@ fn get_activity_sources_cross_facet_permissions() {
     let journal = base_activity_journal();
     let day = "20260308";
     let seg_b = "090000_300";
-    write_segment_transcript(journal.path(), day, "default", seg_b, "beta", "betatranscriptneedle\n");
+    write_segment_transcript(
+        journal.path(),
+        day,
+        "default",
+        seg_b,
+        "beta",
+        "betatranscriptneedle\n",
+    );
     write_activity_line(
         journal.path(),
         "alpha",
@@ -9501,23 +10408,40 @@ fn get_activity_sources_cross_facet_permissions() {
     );
 
     let list_res = probe(&journal, "list_activities", json!({"day": day})).unwrap();
-    let act_ref = list_res["activities"][0]["reference"].as_str().unwrap().to_owned();
+    let act_ref = list_res["activities"][0]["reference"]
+        .as_str()
+        .unwrap()
+        .to_owned();
 
     PermissionStore::open(journal.path())
         .set_permission(
             CONNECTION,
             ReadPermission {
                 categories: vec!["facets".to_owned(), "transcripts".to_owned()],
-                scope: ReadScope::Facets { ids: vec![FACET_A.to_owned()] },
+                scope: ReadScope::Facets {
+                    ids: vec![FACET_A.to_owned()],
+                },
             },
         )
         .unwrap();
 
-    let err = probe(&journal, "get_activity_sources", json!({"reference": act_ref})).unwrap_err();
+    let err = probe(
+        &journal,
+        "get_activity_sources",
+        json!({"reference": act_ref}),
+    )
+    .unwrap_err();
     assert_eq!(err, McpProbeError::Unavailable);
 
     let seg_a = "090500_300";
-    write_segment_transcript(journal.path(), day, "default", seg_a, "alpha", "alphatranscriptneedle\n");
+    write_segment_transcript(
+        journal.path(),
+        day,
+        "default",
+        seg_a,
+        "alpha",
+        "alphatranscriptneedle\n",
+    );
     write_activity_line(
         journal.path(),
         "alpha",
@@ -9535,10 +10459,20 @@ fn get_activity_sources_cross_facet_permissions() {
     );
 
     let list_res_mixed = probe(&journal, "list_activities", json!({"day": day})).unwrap();
-    let mixed_act = list_res_mixed["activities"].as_array().unwrap().iter().find(|a| a["title"] == "Mixed Seg Activity").unwrap();
+    let mixed_act = list_res_mixed["activities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["title"] == "Mixed Seg Activity")
+        .unwrap();
     let mixed_ref = mixed_act["reference"].as_str().unwrap();
 
-    let mixed_sources = probe(&journal, "get_activity_sources", json!({"reference": mixed_ref})).unwrap();
+    let mixed_sources = probe(
+        &journal,
+        "get_activity_sources",
+        json!({"reference": mixed_ref}),
+    )
+    .unwrap();
     assert_no_leaked_keys(&mixed_sources);
     let s = mixed_sources.to_string();
     assert!(s.contains("alphatranscriptneedle"));
@@ -9551,16 +10485,34 @@ fn get_activity_sources_omits_desktop_activity_notes() {
     let journal = base_activity_journal();
     let day = "20260308";
     let seg = "090000_300";
-    let seg_dir = journal.path().join("chronicle").join(day).join("default").join(seg);
+    let seg_dir = journal
+        .path()
+        .join("chronicle")
+        .join(day)
+        .join("default")
+        .join(seg);
     fs::create_dir_all(seg_dir.join("talents")).unwrap();
     fs::write(
         seg_dir.join("talents/facets.json"),
         json!([{"facet": "alpha"}]).to_string(),
-    ).unwrap();
+    )
+    .unwrap();
     fs::write(seg_dir.join("meeting_transcript.md"), "transcriptneedle\n").unwrap();
-    fs::write(seg_dir.join("notes_desktop_activity.jsonl"), "{\"text\":\"desktopneedle1\"}\n").unwrap();
-    fs::write(seg_dir.join("other_desktop_activity.jsonl"), "{\"text\":\"desktopneedle2\"}\n").unwrap();
-    fs::write(seg_dir.join("shape.json"), json!({"notes_desktop_activity.jsonl": "Desktop"}).to_string()).unwrap();
+    fs::write(
+        seg_dir.join("notes_desktop_activity.jsonl"),
+        "{\"text\":\"desktopneedle1\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        seg_dir.join("other_desktop_activity.jsonl"),
+        "{\"text\":\"desktopneedle2\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        seg_dir.join("shape.json"),
+        json!({"notes_desktop_activity.jsonl": "Desktop"}).to_string(),
+    )
+    .unwrap();
 
     write_activity_line(
         journal.path(),
@@ -9581,7 +10533,12 @@ fn get_activity_sources_omits_desktop_activity_notes() {
     let list_res = probe(&journal, "list_activities", json!({"day": day})).unwrap();
     let act_ref = list_res["activities"][0]["reference"].as_str().unwrap();
 
-    let sources = probe(&journal, "get_activity_sources", json!({"reference": act_ref})).unwrap();
+    let sources = probe(
+        &journal,
+        "get_activity_sources",
+        json!({"reference": act_ref}),
+    )
+    .unwrap();
     assert_no_leaked_keys(&sources);
     let s = sources.to_string();
     assert!(s.contains("transcriptneedle"));
@@ -9600,10 +10557,18 @@ fn fetch_markdown_whole_record_and_chunk_verification() {
     fs::create_dir_all(&refl_dir).unwrap();
 
     let filler_1 = (0..60)
-        .map(|i| format!("Ordinary paragraph {i} with filler text for spacing between markdown sections.\n\n"))
+        .map(|i| {
+            format!(
+                "Ordinary paragraph {i} with filler text for spacing between markdown sections.\n\n"
+            )
+        })
         .collect::<String>();
     let filler_2 = (60..120)
-        .map(|i| format!("Ordinary paragraph {i} with filler text for spacing between markdown sections.\n\n"))
+        .map(|i| {
+            format!(
+                "Ordinary paragraph {i} with filler text for spacing between markdown sections.\n\n"
+            )
+        })
         .collect::<String>();
     assert!(filler_1.len() > 4096);
     assert!(filler_2.len() > 4096);
@@ -9671,7 +10636,12 @@ fn fetch_activity_jsonl_neighbor_isolation() {
 
     solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
 
-    let search_res = probe(&journal, "search", json!({"query": "firstdescriptionunique"})).unwrap();
+    let search_res = probe(
+        &journal,
+        "search",
+        json!({"query": "firstdescriptionunique"}),
+    )
+    .unwrap();
     assert_no_leaked_keys(&search_res);
     let hit = &search_res["results"].as_array().unwrap()[0];
 
@@ -9706,7 +10676,12 @@ fn fetch_hidden_activity_and_stale_file() {
 
     solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
 
-    let search_res = probe(&journal, "search", json!({"query": "hiddenfetchdescriptionneedle"})).unwrap();
+    let search_res = probe(
+        &journal,
+        "search",
+        json!({"query": "hiddenfetchdescriptionneedle"}),
+    )
+    .unwrap();
     assert_no_leaked_keys(&search_res);
     let hit = &search_res["results"].as_array().unwrap()[0];
     assert_eq!(hit["hidden"], true);
@@ -9717,7 +10692,9 @@ fn fetch_hidden_activity_and_stale_file() {
     let parsed: Value = serde_json::from_str(fetched["text"].as_str().unwrap()).unwrap();
     assert_eq!(parsed["id"], "act_hidden_fetch");
 
-    let file_path = journal.path().join("facets/alpha/activities/20260308.jsonl");
+    let file_path = journal
+        .path()
+        .join("facets/alpha/activities/20260308.jsonl");
     fs::write(&file_path, "modified bytes\n").unwrap();
     assert_eq!(
         probe(&journal, "fetch", json!({"reference": hit["reference"]})),
@@ -9730,7 +10707,14 @@ fn fetch_source_links_scoped_by_facet() {
     let journal = base_activity_journal();
     let day = "20260308";
     let seg_a = "090000_300";
-    write_segment_transcript(journal.path(), day, "default", seg_a, "alpha", "transcript for alpha\n");
+    write_segment_transcript(
+        journal.path(),
+        day,
+        "default",
+        seg_a,
+        "alpha",
+        "transcript for alpha\n",
+    );
     write_activity_line(
         journal.path(),
         "alpha",
@@ -9748,7 +10732,12 @@ fn fetch_source_links_scoped_by_facet() {
     );
 
     solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
-    let search_res = probe(&journal, "search", json!({"query": "Alpha Linked Activity"})).unwrap();
+    let search_res = probe(
+        &journal,
+        "search",
+        json!({"query": "Alpha Linked Activity"}),
+    )
+    .unwrap();
     let hit_ref = search_res["results"][0]["reference"].as_str().unwrap();
 
     let fetched = probe(&journal, "fetch", json!({"reference": hit_ref})).unwrap();
@@ -9758,12 +10747,22 @@ fn fetch_source_links_scoped_by_facet() {
     for s in segs {
         let obj = s.as_object().unwrap();
         for k in obj.keys() {
-            assert!(k == "time" || k == "reference" || k == "capture_zone", "Unexpected key {k} in segment link");
+            assert!(
+                k == "time" || k == "reference" || k == "capture_zone",
+                "Unexpected key {k} in segment link"
+            );
         }
     }
 
     let seg_b = "090500_300";
-    write_segment_transcript(journal.path(), day, "default", seg_b, "beta", "betatranscriptunique\n");
+    write_segment_transcript(
+        journal.path(),
+        day,
+        "default",
+        seg_b,
+        "beta",
+        "betatranscriptunique\n",
+    );
     write_activity_line(
         journal.path(),
         "alpha",
@@ -9785,14 +10784,26 @@ fn fetch_source_links_scoped_by_facet() {
             CONNECTION,
             ReadPermission {
                 categories: vec!["facets".to_owned(), "transcripts".to_owned()],
-                scope: ReadScope::Facets { ids: vec![FACET_A.to_owned()] },
+                scope: ReadScope::Facets {
+                    ids: vec![FACET_A.to_owned()],
+                },
             },
         )
         .unwrap();
 
     let list_res = probe(&journal, "list_activities", json!({"day": day})).unwrap();
-    let beta_seg_act = list_res["activities"].as_array().unwrap().iter().find(|a| a["title"] == "Beta Seg Link Activity").unwrap();
-    let fetched_b = probe(&journal, "fetch", json!({"reference": beta_seg_act["reference"]})).unwrap();
+    let beta_seg_act = list_res["activities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["title"] == "Beta Seg Link Activity")
+        .unwrap();
+    let fetched_b = probe(
+        &journal,
+        "fetch",
+        json!({"reference": beta_seg_act["reference"]}),
+    )
+    .unwrap();
     assert_no_leaked_keys(&fetched_b);
     assert!(fetched_b.get("segments").is_none());
     assert!(!fetched_b.to_string().contains("betatranscriptunique"));
@@ -9840,7 +10851,11 @@ fn search_derived_flags_across_record_types() {
 
     let refl_dir = journal.path().join("reflections/weekly");
     fs::create_dir_all(&refl_dir).unwrap();
-    fs::write(refl_dir.join("20260308.md"), "# Weekly Reflection\n\nweeklyreflectionneedle\n").unwrap();
+    fs::write(
+        refl_dir.join("20260308.md"),
+        "# Weekly Reflection\n\nweeklyreflectionneedle\n",
+    )
+    .unwrap();
 
     let AppendResult::Stored(_) = append_connection_memory(
         journal.path(),
@@ -9851,12 +10866,20 @@ fn search_derived_flags_across_record_types() {
         "agentmemoryneedle note content",
         "test-op",
         chrono::Utc.with_ymd_and_hms(2026, 3, 8, 12, 0, 0).unwrap(),
-    ).unwrap() else {
+    )
+    .unwrap() else {
         panic!("failed to store memory");
     };
 
     let seg = "090000_300";
-    write_segment_transcript(journal.path(), day, "default", seg, "alpha", "transcriptsearchneedle text\n");
+    write_segment_transcript(
+        journal.path(),
+        day,
+        "default",
+        seg,
+        "alpha",
+        "transcriptsearchneedle text\n",
+    );
 
     solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
 
@@ -9871,7 +10894,12 @@ fn search_derived_flags_across_record_types() {
     let hit2 = &s2["results"].as_array().unwrap()[0];
     assert!(hit2.get("derived").is_none());
 
-    let s3 = probe(&journal, "search", json!({"query": "weeklyreflectionneedle"})).unwrap();
+    let s3 = probe(
+        &journal,
+        "search",
+        json!({"query": "weeklyreflectionneedle"}),
+    )
+    .unwrap();
     assert_no_leaked_keys(&s3);
     let hit3 = &s3["results"].as_array().unwrap()[0];
     assert_eq!(hit3["derived"], true);
@@ -9882,7 +10910,12 @@ fn search_derived_flags_across_record_types() {
     assert_eq!(hit4["origin"]["kind"], "agent_memory");
     assert!(hit4.get("derived").is_none());
 
-    let s5 = probe(&journal, "search", json!({"query": "transcriptsearchneedle"})).unwrap();
+    let s5 = probe(
+        &journal,
+        "search",
+        json!({"query": "transcriptsearchneedle"}),
+    )
+    .unwrap();
     assert_no_leaked_keys(&s5);
     let hit5 = &s5["results"].as_array().unwrap()[0];
     assert!(hit5.get("derived").is_none());
@@ -9971,7 +11004,9 @@ fn get_week_permission_denied_on_scoped_facets() {
             CONNECTION,
             ReadPermission {
                 categories: vec!["facets".to_owned(), "transcripts".to_owned()],
-                scope: ReadScope::Facets { ids: vec![FACET_A.to_owned()] },
+                scope: ReadScope::Facets {
+                    ids: vec![FACET_A.to_owned()],
+                },
             },
         )
         .unwrap();
@@ -9983,7 +11018,12 @@ fn get_week_permission_denied_on_scoped_facets() {
 
     let decision_scoped = evaluate_connection_read(journal.path(), CONNECTION);
     let tools_scoped = crate::registry::advertised_tools_list(journal.path(), &decision_scoped);
-    let names_scoped: Vec<&str> = tools_scoped["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    let names_scoped: Vec<&str> = tools_scoped["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
     assert!(!names_scoped.contains(&"get_week"));
 
     PermissionStore::open(journal.path())
@@ -9998,14 +11038,21 @@ fn get_week_permission_denied_on_scoped_facets() {
 
     let decision_whole = evaluate_connection_read(journal.path(), CONNECTION);
     let tools_whole = crate::registry::advertised_tools_list(journal.path(), &decision_whole);
-    let names_whole: Vec<&str> = tools_whole["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    let names_whole: Vec<&str> = tools_whole["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
     assert!(names_whole.contains(&"get_week"));
 }
 
 #[test]
 fn get_week_malformed_activity_fails() {
     let journal = base_activity_journal();
-    let file_path = journal.path().join("facets/alpha/activities/20260308.jsonl");
+    let file_path = journal
+        .path()
+        .join("facets/alpha/activities/20260308.jsonl");
     fs::create_dir_all(file_path.parent().unwrap()).unwrap();
     fs::write(&file_path, "{\"id\": \"act1\"}\nmalformed-line\n").unwrap();
 
@@ -10015,9 +11062,15 @@ fn get_week_malformed_activity_fails() {
     );
 
     let journal2 = base_activity_journal();
-    let file_path2 = journal2.path().join("facets/alpha/activities/20260308.jsonl");
+    let file_path2 = journal2
+        .path()
+        .join("facets/alpha/activities/20260308.jsonl");
     fs::create_dir_all(file_path2.parent().unwrap()).unwrap();
-    fs::write(&file_path2, "{\"id\": \"act1\", \"title\": \"Twin Valid Activity\"}\n").unwrap();
+    fs::write(
+        &file_path2,
+        "{\"id\": \"act1\", \"title\": \"Twin Valid Activity\"}\n",
+    )
+    .unwrap();
     let res = probe(&journal2, "get_week", json!({"week": "20260308"})).unwrap();
     assert_no_leaked_keys(&res);
     assert_eq!(res["activities"][0]["title"], "Twin Valid Activity");
@@ -10028,7 +11081,9 @@ fn get_week_ranking_rules() {
     let journal = base_activity_journal();
     let day = "20260308";
 
-    let names = ["act80", "act70", "act60", "act50", "act40", "act30", "act20", "act10"];
+    let names = [
+        "act80", "act70", "act60", "act50", "act40", "act30", "act20", "act10",
+    ];
     let lens = ["80", "70", "60", "50", "40", "30", "20", "10"];
     for (name, len) in names.iter().zip(lens.iter()) {
         let seg = format!("090000_{len}");
@@ -10130,7 +11185,12 @@ fn get_week_ranking_rules() {
     let res3 = probe(&journal3, "get_week", json!({"week": day})).unwrap();
     assert_no_leaked_keys(&res3);
     let mems3 = res3["memories"].as_array().unwrap();
-    assert!(mems3[0]["text"].as_str().unwrap().contains("tied_many_ents"));
+    assert!(
+        mems3[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("tied_many_ents")
+    );
 
     let journal4 = base_activity_journal();
     write_activity_line(
@@ -10233,7 +11293,11 @@ fn get_week_trusted_page_and_left_out() {
             "source": {"kind":"activity","uri":"sol://facets/alpha/activities/20260309#quote1"}
         }]
     });
-    fs::write(refl_dir.join(format!("{day}.json")), trusted_json.to_string()).unwrap();
+    fs::write(
+        refl_dir.join(format!("{day}.json")),
+        trusted_json.to_string(),
+    )
+    .unwrap();
 
     let res = probe(&journal, "get_week", json!({"week": day})).unwrap();
     assert_no_leaked_keys(&res);
@@ -10241,7 +11305,10 @@ fn get_week_trusted_page_and_left_out() {
     let said = res["said"].as_array().unwrap();
     assert_eq!(said.len(), 1);
     assert_eq!(said[0]["quote"], "Quote text from meeting");
-    assert_eq!(said[0]["uri"], "sol://facets/alpha/activities/20260309#quote1");
+    assert_eq!(
+        said[0]["uri"],
+        "sol://facets/alpha/activities/20260309#quote1"
+    );
 
     let mems = res["memories"].as_array().unwrap();
     assert_eq!(mems.len(), 1);
@@ -10252,7 +11319,8 @@ fn get_week_trusted_page_and_left_out() {
     fs::write(
         health_dir.join("week-left-out.json"),
         json!({"keys": ["said-key-quote1"]}).to_string(),
-    ).unwrap();
+    )
+    .unwrap();
 
     let res_after = probe(&journal, "get_week", json!({"week": day})).unwrap();
     assert_no_leaked_keys(&res_after);
@@ -10267,7 +11335,12 @@ fn get_activity_sources_empty_segment_returns_empty_units_without_unreadable() {
     let journal = base_activity_journal();
     let day = "20260308";
     let seg = "090000_300";
-    let seg_dir = journal.path().join("chronicle").join(day).join("default").join(seg);
+    let seg_dir = journal
+        .path()
+        .join("chronicle")
+        .join(day)
+        .join("default")
+        .join(seg);
     fs::create_dir_all(seg_dir.join("talents")).unwrap();
     fs::write(
         seg_dir.join("talents/facets.json"),
@@ -10294,7 +11367,12 @@ fn get_activity_sources_empty_segment_returns_empty_units_without_unreadable() {
     let list_res = probe(&journal, "list_activities", json!({"day": day})).unwrap();
     let act_ref = list_res["activities"][0]["reference"].as_str().unwrap();
 
-    let res = probe(&journal, "get_activity_sources", json!({"reference": act_ref})).unwrap();
+    let res = probe(
+        &journal,
+        "get_activity_sources",
+        json!({"reference": act_ref}),
+    )
+    .unwrap();
     assert_no_leaked_keys(&res);
     assert_eq!(res["units"], json!([]));
     assert!(res.get("unreadable").is_none());
@@ -10306,7 +11384,12 @@ fn get_activity_sources_malformed_leaf_is_unavailable() {
     let journal = base_activity_journal();
     let day = "20260308";
     let seg = "090000_300";
-    let seg_dir = journal.path().join("chronicle").join(day).join("default").join(seg);
+    let seg_dir = journal
+        .path()
+        .join("chronicle")
+        .join(day)
+        .join("default")
+        .join(seg);
     fs::create_dir_all(seg_dir.join("talents")).unwrap();
     fs::write(
         seg_dir.join("talents/facets.json"),
@@ -10334,7 +11417,12 @@ fn get_activity_sources_malformed_leaf_is_unavailable() {
     let list_res = probe(&journal, "list_activities", json!({"day": day})).unwrap();
     let act_ref = list_res["activities"][0]["reference"].as_str().unwrap();
 
-    let err = probe(&journal, "get_activity_sources", json!({"reference": act_ref})).unwrap_err();
+    let err = probe(
+        &journal,
+        "get_activity_sources",
+        json!({"reference": act_ref}),
+    )
+    .unwrap_err();
     assert_eq!(err, McpProbeError::Unavailable);
 }
 
@@ -10372,7 +11460,12 @@ fn get_activity_sources_mixed_coverage_partial_units_and_unreadable_flag() {
     let list_res = probe(&journal, "list_activities", json!({"day": day})).unwrap();
     let act_ref = list_res["activities"][0]["reference"].as_str().unwrap();
 
-    let res = probe(&journal, "get_activity_sources", json!({"reference": act_ref})).unwrap();
+    let res = probe(
+        &journal,
+        "get_activity_sources",
+        json!({"reference": act_ref}),
+    )
+    .unwrap();
     assert_no_leaked_keys(&res);
     let s = res.to_string();
     assert!(s.contains("mixedgoodneedle"));
@@ -10384,7 +11477,12 @@ fn get_activity_sources_escaping_leaves_fail_closed_without_leaking() {
     let journal = base_activity_journal();
     let day = "20260308";
     let seg = "090000_300";
-    let seg_dir = journal.path().join("chronicle").join(day).join("default").join(seg);
+    let seg_dir = journal
+        .path()
+        .join("chronicle")
+        .join(day)
+        .join("default")
+        .join(seg);
     fs::create_dir_all(seg_dir.join("talents")).unwrap();
     fs::write(
         seg_dir.join("talents/facets.json"),
@@ -10424,7 +11522,12 @@ fn get_activity_sources_escaping_leaves_fail_closed_without_leaking() {
     let list_res = probe(&journal, "list_activities", json!({"day": day})).unwrap();
     let act_ref = list_res["activities"][0]["reference"].as_str().unwrap();
 
-    let err = probe(&journal, "get_activity_sources", json!({"reference": act_ref})).unwrap_err();
+    let err = probe(
+        &journal,
+        "get_activity_sources",
+        json!({"reference": act_ref}),
+    )
+    .unwrap_err();
     assert_eq!(err, McpProbeError::Unavailable);
     assert!(!format!("{err:?}").contains(sentinel));
 }
@@ -10434,7 +11537,12 @@ fn get_activity_sources_poisoned_sibling_fails_closed_without_leaking() {
     let journal = base_activity_journal();
     let day = "20260308";
     let seg = "090000_300";
-    let seg_dir = journal.path().join("chronicle").join(day).join("default").join(seg);
+    let seg_dir = journal
+        .path()
+        .join("chronicle")
+        .join(day)
+        .join("default")
+        .join(seg);
     fs::create_dir_all(seg_dir.join("talents")).unwrap();
     fs::write(
         seg_dir.join("talents/facets.json"),
@@ -10476,7 +11584,11 @@ fn get_activity_sources_poisoned_sibling_fails_closed_without_leaking() {
     let list_res = probe(&journal, "list_activities", json!({"day": day})).unwrap();
     let act_ref = list_res["activities"][0]["reference"].as_str().unwrap();
 
-    let res = probe(&journal, "get_activity_sources", json!({"reference": act_ref}));
+    let res = probe(
+        &journal,
+        "get_activity_sources",
+        json!({"reference": act_ref}),
+    );
     assert!(res.is_err());
     let err = res.unwrap_err();
     assert_eq!(err, McpProbeError::Unavailable);

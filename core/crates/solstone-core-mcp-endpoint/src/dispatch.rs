@@ -206,7 +206,7 @@ pub(crate) fn dispatch_authenticated_tool_call(
         }
     };
 
-    if let Some(refusal) = scope_refusal(&snapshot, entry, &validated) {
+    if let Some(refusal) = scope_refusal(principal, &snapshot, entry, &validated) {
         // Missing categories are permission denials and are still durable audit
         // events — now ones an owner can tell apart from a served call.
         let coordinates = audit_call(
@@ -322,11 +322,15 @@ fn record_outcome(
 /// the agent and deliberately visible to the owner, and ⛔ fixing one must not
 /// weaken the other.
 fn scope_refusal(
+    principal: DispatchPrincipal<'_>,
     snapshot: &ConnectionReadSnapshot,
     entry: &ToolEntry,
     request: &ValidatedTool,
 ) -> Option<String> {
     if let Some(reason) = requirement_refusal(snapshot, entry) {
+        return Some(reason);
+    }
+    if let Some(reason) = fetch_target_category_refusal(principal, snapshot, request) {
         return Some(reason);
     }
     if !arguments_within_scope(snapshot, request) {
@@ -335,6 +339,44 @@ fn scope_refusal(
         );
     }
     None
+}
+
+/// An activity reference needs the facets category. An entry reference needs
+/// transcripts. `fetch` is advertised when either category is present, and this
+/// check keeps the other target on its own category. An unresolved token is
+/// left for the tool to report as a missing reference.
+fn fetch_target_category_refusal(
+    principal: DispatchPrincipal<'_>,
+    snapshot: &ConnectionReadSnapshot,
+    request: &ValidatedTool,
+) -> Option<String> {
+    let ValidatedTool::Fetch(fetch) = request else {
+        return None;
+    };
+    let Ok(target) = codec().resolve_entry_or_activity(
+        &fetch.reference,
+        principal.connection,
+        snapshot.generation,
+    ) else {
+        return None;
+    };
+    let missing = match target {
+        ReferenceTarget::Entry(_)
+            if !snapshot.categories.contains(&AdmittedCategory::Transcripts) =>
+        {
+            AdmittedCategory::Transcripts
+        }
+        ReferenceTarget::Activity(_)
+            if !snapshot.categories.contains(&AdmittedCategory::Facets) =>
+        {
+            AdmittedCategory::Facets
+        }
+        _ => return None,
+    };
+    Some(format!(
+        "this connection does not have the {} category",
+        category_token(&missing)
+    ))
 }
 
 fn owner_denial_reason(reason: &'static str) -> &'static str {
@@ -625,13 +667,9 @@ fn get_week(
     snapshot: &ConnectionReadSnapshot,
     request: ValidatedGetWeek,
 ) -> Result<Prepared, DispatchError> {
-    let read = crate::tools::week::read_week(
-        journal_root,
-        request.week.as_deref(),
-        principal,
-        snapshot,
-    )
-    .map_err(DispatchError::Tool)?;
+    let read =
+        crate::tools::week::read_week(journal_root, request.week.as_deref(), principal, snapshot)
+            .map_err(DispatchError::Tool)?;
     Ok(Prepared::new(read.value, read.count, read.targets)
         .when_empty("no week to read. this is a complete answer, not an error."))
 }
@@ -650,7 +688,12 @@ fn execute_validated(
             crate::tools::activities::execute_list(journal_root, principal, snapshot, request)
         }
         ValidatedTool::GetActivitySources(request) => {
-            crate::tools::activities::execute_get_sources(journal_root, principal, snapshot, request)
+            crate::tools::activities::execute_get_sources(
+                journal_root,
+                principal,
+                snapshot,
+                request,
+            )
         }
         ValidatedTool::Search(request) => search(journal_root, principal, snapshot, request),
         ValidatedTool::Fetch(request) => fetch(journal_root, principal, snapshot, request),
@@ -1228,38 +1271,39 @@ fn search(
                 live_dropped = true;
                 continue;
             }
-            let (served_text, activity_proof, hidden, record, record_identity) = match admit_activity(
-                journal_root,
-                &boundary,
-                &hit.metadata.path,
-                hit.metadata.idx,
-                hit.row_id,
-                Some(&hit.text),
-                None,
-                false,
-                None,
-                MAX_INDEXED_ENTRY_BYTES,
-            ) {
-                Ok(ActivityAdmit::NotActivity(text)) => (text, None, None, None, None),
-                Ok(ActivityAdmit::Admitted(admitted)) => (
-                    admitted.text,
-                    Some(admitted.proof),
-                    Some(admitted.hidden),
-                    Some(admitted.record),
-                    Some(admitted.record_identity),
-                ),
-                Ok(ActivityAdmit::Withheld { cursor_proof }) => {
-                    if let Some(anchor) = anchor.as_mut() {
-                        match cursor_proof {
-                            Some(proof) => anchor.activity_proof = Some(proof),
-                            None => anchor.omit_cursor = true,
+            let (served_text, activity_proof, hidden, record, record_identity) =
+                match admit_activity(
+                    journal_root,
+                    &boundary,
+                    &hit.metadata.path,
+                    hit.metadata.idx,
+                    hit.row_id,
+                    Some(&hit.text),
+                    None,
+                    false,
+                    None,
+                    MAX_INDEXED_ENTRY_BYTES,
+                ) {
+                    Ok(ActivityAdmit::NotActivity(text)) => (text, None, None, None, None),
+                    Ok(ActivityAdmit::Admitted(admitted)) => (
+                        admitted.text,
+                        Some(admitted.proof),
+                        Some(admitted.hidden),
+                        Some(admitted.record),
+                        Some(admitted.record_identity),
+                    ),
+                    Ok(ActivityAdmit::Withheld { cursor_proof }) => {
+                        if let Some(anchor) = anchor.as_mut() {
+                            match cursor_proof {
+                                Some(proof) => anchor.activity_proof = Some(proof),
+                                None => anchor.omit_cursor = true,
+                            }
                         }
+                        live_dropped = true;
+                        continue;
                     }
-                    live_dropped = true;
-                    continue;
-                }
-                Err(error) => return Err(index_error(error)),
-            };
+                    Err(error) => return Err(index_error(error)),
+                };
             if let Some(anchor) = anchor.as_mut() {
                 anchor.activity_proof = activity_proof.clone();
             }
@@ -1649,8 +1693,7 @@ fn fetch(
             if !live_allows(journal_root, &boundary, &rel_path, None) {
                 return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
             }
-            let Some(bytes) =
-                crate::activity_admit::read_contained_source(journal_root, &rel_path)
+            let Some(bytes) = crate::activity_admit::read_contained_source(journal_root, &rel_path)
             else {
                 return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
             };
@@ -1661,14 +1704,16 @@ fn fetch(
             let Ok(file_text) = String::from_utf8(bytes) else {
                 return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
             };
-            let Some((record, _)) = crate::activity_admit::record_by_identity(
-                &file_text,
-                &act_ref.record_identity,
-            ) else {
+            let Some((record, _)) =
+                crate::activity_admit::record_by_identity(&file_text, &act_ref.record_identity)
+            else {
                 return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
             };
 
-            let hidden = record.get("hidden").and_then(Value::as_bool).unwrap_or(false);
+            let hidden = record
+                .get("hidden")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let cleaned = crate::tools::activities::clean_activity_record_for_wire(record);
             let text = serde_json::to_string(&cleaned)
                 .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?;

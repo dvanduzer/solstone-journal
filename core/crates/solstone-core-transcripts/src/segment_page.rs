@@ -94,6 +94,9 @@ pub struct SegmentTranscriptCursor {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SegmentTranscriptEntry {
     pub text: String,
+    /// Channel heading understood by source units. Speech stays `Transcript`.
+    /// Chat, markdown, and other imported text use a non-speech channel.
+    pub channel: &'static str,
 }
 
 /// One bounded page from a single segment.
@@ -201,7 +204,10 @@ pub fn read_segment_transcript_page(
             });
             let text = project_line(&segment_origin, name, named_line.as_deref().unwrap_or(line));
             if !text.trim().is_empty() {
-                entries.push(SegmentTranscriptEntry { text });
+                entries.push(SegmentTranscriptEntry {
+                    channel: source_channel(&segment_origin, name),
+                    text,
+                });
             }
             consumed = line_end;
             if entries.len() == MAX_TRANSCRIPT_PAGE_ITEMS {
@@ -399,6 +405,44 @@ fn append_speaker_change_warning(text: &str, line: &str) -> String {
     }
 }
 
+fn stream_name(segment_origin: &str) -> Option<&str> {
+    let mut parts = segment_origin.split('/');
+    let _day = parts.next()?;
+    let stream = parts.next()?;
+    let _segment = parts.next()?;
+    parts.next().is_none().then_some(stream)
+}
+
+fn is_speech_transcript_name(name: &str) -> bool {
+    name == "audio.jsonl"
+        || name.ends_with("_audio.jsonl")
+        || name.ends_with("_transcript.jsonl")
+        || solstone_core_format::audio_archive::is_audio_archive_transcript_name(name)
+}
+
+/// The source-unit channel for one approved transcript file. Classification is
+/// the same path `project_line` already resolves; this does not open another file.
+fn source_channel(segment_origin: &str, name: &str) -> &'static str {
+    let rel = format!("{segment_origin}/{name}");
+    let stream = stream_name(segment_origin);
+    match classify(&rel) {
+        ContentResolution::Indexed(Family::AiChat) => match stream {
+            Some("import.chatgpt") => "ChatGPT Conversation",
+            Some("import.claude") => "Claude Conversation",
+            Some("import.gemini") => "Gemini Conversation",
+            _ => "Imported Text",
+        },
+        ContentResolution::Unindexed(RawPerceptFamily::Audio) => "Transcript",
+        _ if is_speech_transcript_name(name) => "Transcript",
+        _ => match stream {
+            Some("import.obsidian") => "Note",
+            Some("import.kindle") => "Highlights",
+            Some("import.ics") => "Calendar Event",
+            _ => "Imported Text",
+        },
+    }
+}
+
 fn project_line(segment_origin: &str, name: &str, line: &str) -> String {
     let rel = format!("{segment_origin}/{name}");
     match classify(&rel) {
@@ -556,9 +600,11 @@ mod tests {
             vec![
                 super::SegmentTranscriptEntry {
                     text: "[00:00:01] what was said".to_owned(),
+                    channel: "Transcript",
                 },
                 super::SegmentTranscriptEntry {
                     text: "approved transcript line".to_owned(),
+                    channel: "Imported Text",
                 },
             ]
         );
@@ -690,11 +736,13 @@ mod tests {
         let first = read_segment_transcript_page(root.path(), &segment, None, false).unwrap();
         assert!(first.untimed);
         assert_eq!(first.entries.len(), MAX_TRANSCRIPT_PAGE_ITEMS);
+        assert_eq!(first.entries[0].channel, "Imported Text");
         assert_eq!(first.entries[0].text, "[00:00:00] **User:** turn 1");
         assert!(first.next.is_some());
 
         let second =
-            read_segment_transcript_page(root.path(), &segment, first.next.as_ref(), false).unwrap();
+            read_segment_transcript_page(root.path(), &segment, first.next.as_ref(), false)
+                .unwrap();
         assert!(second.untimed);
         assert_eq!(second.entries.len(), 10);
         assert_eq!(second.entries[0].text, "[00:00:00] **User:** turn 101");
@@ -733,6 +781,7 @@ mod tests {
             pages[0],
             vec![super::SegmentTranscriptEntry {
                 text: "## Strava workout: Morning Run\nRun\n10.2 km".to_owned(),
+                channel: "Imported Text",
             }]
         );
         assert!(pages[1].is_empty());
@@ -761,7 +810,8 @@ mod tests {
         );
 
         let second =
-            read_segment_transcript_page(root.path(), &segment, first.next.as_ref(), false).unwrap();
+            read_segment_transcript_page(root.path(), &segment, first.next.as_ref(), false)
+                .unwrap();
         assert_eq!(
             second
                 .entries

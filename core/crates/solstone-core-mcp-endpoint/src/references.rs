@@ -165,6 +165,11 @@ pub(crate) struct ActivityReference {
     pub file_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit_index: Option<usize>,
+    /// Digest of the admitted transcript versions and composed text. Present on
+    /// a source-page continuation. A later page refuses when this no longer
+    /// matches the transcripts the activity points at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_binding: Option<String>,
 }
 
 impl ActivityReference {

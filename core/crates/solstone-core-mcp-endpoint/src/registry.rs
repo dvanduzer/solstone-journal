@@ -18,6 +18,10 @@ use crate::tools::{DAY_DESCRIPTION, DAY_PATTERN, MAX_DAY_BYTES, MAX_OPAQUE_REFER
 pub(crate) struct ToolRequirement {
     pub(crate) read: &'static [AdmittedCategory],
     pub(crate) whole_journal: bool,
+    /// When set, any one category in `read` admits the tool. The default is
+    /// that every category is required. A tool that admits on any category
+    /// still checks each target against the category that target reads.
+    pub(crate) any_of: bool,
 }
 
 /// Everything schema generation may know about a connection.
@@ -48,26 +52,41 @@ pub(crate) struct ToolEntry {
 const NOTHING: ToolRequirement = ToolRequirement {
     read: &[],
     whole_journal: false,
+    any_of: false,
 };
 const TRANSCRIPTS: ToolRequirement = ToolRequirement {
     read: &[AdmittedCategory::Transcripts],
     whole_journal: false,
+    any_of: false,
 };
 const ENTITIES: ToolRequirement = ToolRequirement {
     read: &[AdmittedCategory::Entities],
     whole_journal: false,
+    any_of: false,
 };
 const FACETS: ToolRequirement = ToolRequirement {
     read: &[AdmittedCategory::Facets],
     whole_journal: false,
+    any_of: false,
 };
 const FACETS_AND_TRANSCRIPTS: ToolRequirement = ToolRequirement {
     read: &[AdmittedCategory::Facets, AdmittedCategory::Transcripts],
     whole_journal: false,
+    any_of: false,
 };
 const WEEK: ToolRequirement = ToolRequirement {
     read: &[AdmittedCategory::Transcripts, AdmittedCategory::Facets],
     whole_journal: true,
+    any_of: false,
+};
+/// `list_activities` mints activity references under a facets grant, and search
+/// mints entry references under a transcripts grant. Advertising `fetch` for
+/// either grant lets those references round-trip. The call still refuses an
+/// entry without transcripts and an activity without facets.
+const FETCH: ToolRequirement = ToolRequirement {
+    read: &[AdmittedCategory::Transcripts, AdmittedCategory::Facets],
+    whole_journal: false,
+    any_of: true,
 };
 
 /// The single registry used for advertisement, dispatch, validation, and auditing.
@@ -114,7 +133,7 @@ pub(crate) const TOOLS: &[ToolEntry] = &[
         title: "read a journal entry",
         description: "read the full text of an entry returned by search. pass its reference unchanged. when the entry lists transcript segments, read them with get_transcript. if it still shows more_segments, call list_transcripts for that day and the entry's time. an activity includes hidden, true or false, along with its text. trust that field. the text can mention hidden without the activity being hidden. if the reference does not resolve, search again.",
         input_schema: fetch_input_schema,
-        requires: TRANSCRIPTS,
+        requires: FETCH,
         audit_name: solstone_core_mcp_audit::ToolName::Fetch,
     },
     ToolEntry {
@@ -175,7 +194,7 @@ pub(crate) const TOOLS: &[ToolEntry] = &[
         tool_name: crate::jsonrpc::ToolName::GetActivitySources,
         wire_name: "get_activity_sources",
         title: "read activity sources",
-        description: "Read the verbatim transcript segments an activity spans. Pass the activity reference returned by list_activities or fetch. When more remain, pass next_cursor as cursor to continue.",
+        description: "Read the verbatim transcript segments an activity spans. Pass the activity reference returned by list_activities or get_week. When more remain, pass next_cursor as cursor to continue.",
         input_schema: get_activity_sources_input_schema,
         requires: FACETS_AND_TRANSCRIPTS,
         audit_name: solstone_core_mcp_audit::ToolName::GetActivitySources,
@@ -201,18 +220,38 @@ pub(crate) fn requirement_refusal(
     snapshot: &ConnectionReadSnapshot,
     entry: &ToolEntry,
 ) -> Option<String> {
-    let missing = entry
-        .requires
-        .read
-        .iter()
-        .filter(|category| !snapshot.categories.contains(category))
-        .map(category_token)
-        .collect::<Vec<_>>();
-    if !missing.is_empty() {
-        return Some(format!(
-            "this connection does not have the {} category",
-            missing.join(" and ")
-        ));
+    if entry.requires.any_of {
+        let admitted = entry
+            .requires
+            .read
+            .iter()
+            .any(|category| snapshot.categories.contains(category));
+        if !entry.requires.read.is_empty() && !admitted {
+            let names = entry
+                .requires
+                .read
+                .iter()
+                .map(category_token)
+                .collect::<Vec<_>>()
+                .join(" or ");
+            return Some(format!(
+                "this connection does not have the {names} category"
+            ));
+        }
+    } else {
+        let missing = entry
+            .requires
+            .read
+            .iter()
+            .filter(|category| !snapshot.categories.contains(category))
+            .map(category_token)
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Some(format!(
+                "this connection does not have the {} category",
+                missing.join(" and ")
+            ));
+        }
     }
     if entry.requires.whole_journal && !matches!(snapshot.scope, ConnectionScope::WholeJournal) {
         return Some(
