@@ -23,7 +23,7 @@ import (
 func TestS3OwnerDrainIncludesWrapperOutcomeBookkeeping(t *testing.T) {
 	cfg, root := s3TestConfig(), s3OwnerTestDirectory(t)
 	owner := s3OwnerTestOpen(t, root, cfg)
-	if owner.begin(OpInit, cfg, []byte("fixture-password")) != nil {
+	if owner.begin(OpInit, false, cfg, []byte("fixture-password")) != nil {
 		t.Fatal("setup failed")
 	}
 	base := s3TestBackend(t, cfg, s3TestTransport(func(*http.Request) (*http.Response, error) { return nil, errS3IO }))
@@ -72,7 +72,7 @@ func TestS3OwnerDrainIncludesWrapperOutcomeBookkeeping(t *testing.T) {
 func TestS3OwnerReplacedTempFIFORefusesWithoutWriter(t *testing.T) {
 	cfg, root := s3TestConfig(), s3OwnerTestDirectory(t)
 	owner := s3OwnerTestOpen(t, root, cfg)
-	if owner.begin(OpInit, cfg, []byte("fixture-password")) != nil {
+	if owner.begin(OpInit, false, cfg, []byte("fixture-password")) != nil {
 		t.Fatal("setup failed")
 	}
 	prepared := make(chan string, 1)

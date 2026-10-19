@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"sync"
 
 	"github.com/restic/restic/internal/backend"
@@ -112,11 +113,7 @@ func (be *s3OperationBackend) Save(ctx context.Context, handle backend.Handle, r
 	if err := be.owner.noteSave(lockID); err != nil {
 		return err
 	}
-	// Retain the content-addressed attempt ID, without claiming acknowledgement.
 	be.owner.mu.Lock()
-	if handle.Type == backend.KeyFile {
-		be.owner.knownKeyID = handle.Name
-	}
 	if handle.Type == backend.SnapshotFile {
 		be.owner.knownSnapshotID = handle.Name
 	}
@@ -128,12 +125,28 @@ func (be *s3OperationBackend) Save(ctx context.Context, handle backend.Handle, r
 			return
 		}
 	}()
+	if handle.Type == backend.KeyFile {
+		body, err := io.ReadAll(reader)
+		if err != nil {
+			return err
+		}
+		defer zeroBytes(body)
+		if err := reader.Rewind(); err != nil {
+			return err
+		}
+		if err := be.owner.recordKeyPayload(handle.Name, body); err != nil {
+			return err
+		}
+	}
 	err = be.s3Backend.Save(ctx, handle, reader)
-	succeeded = err == nil
+	if err != nil {
+		return err
+	}
+	succeeded = true
 	if be.afterSave != nil {
 		be.afterSave()
 	}
-	return err
+	return nil
 }
 
 func (be *s3OperationBackend) Remove(ctx context.Context, handle backend.Handle) error {

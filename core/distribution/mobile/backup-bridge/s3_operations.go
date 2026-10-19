@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"time"
@@ -145,7 +146,7 @@ func removeInheritedS3Locks(request *s3RemoteRequest) (err error) {
 	return result
 }
 
-func beginS3Owner(owner *s3Owner, operation int32, cfg s3Config, passwords ...[]byte) (err error) {
+func beginS3Owner(owner *s3Owner, req bridgeRequest) (err error) {
 	defer func() {
 		if recover() != nil {
 			owner.mu.Lock()
@@ -154,7 +155,16 @@ func beginS3Owner(owner *s3Owner, operation int32, cfg s3Config, passwords ...[]
 			err = errS3OwnerIO
 		}
 	}()
-	return owner.begin(operation, cfg, passwords...)
+	if req.operation == OpRemoveRecoveryKey {
+		owner.mu.Lock()
+		prior := owner.record.Active
+		drifted := prior != nil && prior.Operation == OpRemoveRecoveryKey && prior.MayHaveWritten && prior.KeyID != "" && prior.KeyID != req.removeKeyID
+		owner.mu.Unlock()
+		if drifted {
+			return errS3OwnerPending
+		}
+	}
+	return owner.begin(req.operation, req.rotationCustody, req.remote.cfg, req.password, req.recoveryPassword)
 }
 
 func safelyCleanupS3Locks(request *s3RemoteRequest) (err error) {
@@ -205,6 +215,10 @@ func executeS3Operation(h *callHandle, req *bridgeRequest, wrote *bool) (result 
 		}
 	case OpCheck:
 		result, _ = executeCheck(h.ctx, *req)
+	case OpListRecoveryKeys:
+		result, _ = executeListRecoveryKeys(h.ctx, *req)
+	case OpRemoveRecoveryKey:
+		result, _ = executeRemoveRecoveryKey(h.ctx, *req, markWrite)
 	default:
 		result = bridgeResult{status: StatusInvalidArgument, diagnostic: DiagInvalidArgument}
 	}
@@ -334,11 +348,44 @@ func runS3Worker(h *callHandle, req bridgeRequest) {
 		if owner.record.Active != nil && owner.record.Active.MayHaveWritten {
 			pending = true
 		}
-	} else if err := beginS3Owner(owner, req.operation, req.remote.cfg, req.password, req.recoveryPassword); err != nil {
-		result = bridgeResult{status: StatusFailed, diagnostic: DiagIoFailed}
-		pending = errors.Is(err, errS3OwnerPending)
-		if errors.Is(err, errResourceLimit) {
-			result.status, result.diagnostic = StatusCapExceeded, DiagCapExceeded
+	} else if err := beginS3Owner(owner, req); err != nil {
+		if errors.Is(err, errS3RecoveryHold) {
+			pending = true
+			keyID, holdPw := owner.recoveryHoldInfo()
+			if len(holdPw) > 0 {
+				defer zeroBytes(holdPw)
+			}
+			resume := struct {
+				Schema           string `json:"schema"`
+				Kind             string `json:"kind"`
+				RecoveryPassword string `json:"recovery_password"`
+				KeyID            string `json:"key_id,omitempty"`
+			}{
+				Schema:           metadataSchema,
+				Kind:             "recovery-add-recorded",
+				RecoveryPassword: string(holdPw),
+			}
+			if lowerHexID(keyID) {
+				resume.KeyID = keyID
+			}
+			encoded, marshalErr := json.Marshal(resume)
+			if marshalErr != nil {
+				pending = false
+				result = bridgeResult{status: StatusFailed, diagnostic: DiagInternal}
+			} else {
+				result = bridgeResult{
+					status:         StatusRemotePending,
+					diagnostic:     DiagRemotePending,
+					metadata:       encoded,
+					metadataStatus: StatusOk,
+				}
+			}
+		} else {
+			result = bridgeResult{status: StatusFailed, diagnostic: DiagIoFailed}
+			pending = errors.Is(err, errS3OwnerPending)
+			if errors.Is(err, errResourceLimit) {
+				result.status, result.diagnostic = StatusCapExceeded, DiagCapExceeded
+			}
 		}
 	} else if err := removeInheritedS3Locks(req.remote); err != nil {
 		// The adopted locks stay in custody; no repository work runs over them.

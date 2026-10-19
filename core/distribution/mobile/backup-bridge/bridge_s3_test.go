@@ -29,7 +29,7 @@ func s3ShapeFor(operation int32) [14]requestField {
 }
 
 func TestS3RequestShapeRejectsBeforeForeignCopy(t *testing.T) {
-	for operation := OpInit; operation <= OpS3Inspect; operation++ {
+	for operation := OpInit; operation <= OpRemoveRecoveryKey; operation++ {
 		valid := s3ShapeFor(operation)
 		if validateS3Shape(1, operation, valid) != StatusOk {
 			t.Fatal("supported request refused")
@@ -53,10 +53,10 @@ func TestS3RequestShapeRejectsBeforeForeignCopy(t *testing.T) {
 			}
 		}
 	}
-	if validateS3Shape(2, OpInit, s3ShapeFor(OpInit)) != StatusInvalidArgument || validateS3Shape(1, 9, s3ShapeFor(OpInit)) != StatusInvalidArgument {
+	if validateS3Shape(2, OpInit, s3ShapeFor(OpInit)) != StatusInvalidArgument || validateS3Shape(1, 11, s3ShapeFor(OpInit)) != StatusInvalidArgument {
 		t.Fatal("unknown version/operation accepted")
 	}
-	for _, operation := range []int32{OpOpen, OpListSnapshots, OpCheck, OpS3Inspect} {
+	for _, operation := range []int32{OpOpen, OpListSnapshots, OpCheck, OpS3Inspect, OpListRecoveryKeys, OpRemoveRecoveryKey} {
 		bad := s3ShapeFor(operation)
 		bad[13] = requestField{1, true}
 		if validateS3Shape(1, operation, bad) != StatusInvalidArgument {

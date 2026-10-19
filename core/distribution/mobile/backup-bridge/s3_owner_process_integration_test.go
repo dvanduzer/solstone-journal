@@ -34,7 +34,7 @@ func TestS3OwnerProcessDeathHelper(t *testing.T) {
 	if err != nil {
 		t.Fatal("child owner refused", err)
 	}
-	if err := owner.begin(OpInit, cfg, []byte("process-daily-fixture"), []byte("process-recovery-fixture")); err != nil {
+	if err := owner.begin(OpInit, false, cfg, []byte("process-daily-fixture"), []byte("process-recovery-fixture")); err != nil {
 		t.Fatal(err)
 	}
 	hold := func() {
@@ -133,14 +133,14 @@ func TestS3OwnerProcessDeathPreservesDurableCustody(t *testing.T) {
 				if owner.record.Active == nil || owner.record.Active.MayHaveWritten {
 					t.Fatal("no-egress intent changed")
 				}
-				if err := owner.begin(OpOpen, cfg, []byte("process-daily-fixture")); err != nil {
+				if err := owner.begin(OpOpen, false, cfg, []byte("process-daily-fixture")); err != nil {
 					t.Fatal("no-egress restart was not usable", err)
 				}
 			case "save":
 				if owner.record.Active == nil || !owner.record.Active.MayHaveWritten {
 					t.Fatal("admitted request lost pending state")
 				}
-				if err := owner.begin(OpInit, cfg, []byte("process-daily-fixture")); !errors.Is(err, errS3OwnerPending) {
+				if err := owner.begin(OpInit, false, cfg, []byte("process-daily-fixture")); !errors.Is(err, errS3OwnerPending) {
 					t.Fatal("process death cleared remote uncertainty", err)
 				}
 			case "completion":

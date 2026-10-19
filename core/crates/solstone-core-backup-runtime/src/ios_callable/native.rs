@@ -18,6 +18,7 @@ const OK: i32 = 0;
 const INVALID_ARGUMENT: i32 = 1;
 const SNAPSHOT: i32 = 4;
 const RESTORE: i32 = 6;
+const REMOVE_KEY: i32 = 10;
 const CAP_EXCEEDED: i32 = 5;
 const MAX_METADATA: u32 = 4 * 1024 * 1024;
 static DRAIN_FAILED: AtomicBool = AtomicBool::new(false);
@@ -141,6 +142,30 @@ unsafe extern "C" {
         capacity: u32,
         required: *mut u32,
     ) -> i32;
+    fn restic_bridge_remove_recovery_key_v1_start(
+        request: *const LocalRequest,
+        options: *const Options,
+        key_id: *const c_char,
+        key_id_len: u32,
+        maintenance: u32,
+        out: *mut u64,
+    ) -> i32;
+    fn restic_bridge_s3_remove_recovery_key_v1_start(
+        request: *const RemoteRequest,
+        options: *const Options,
+        state_fd: i32,
+        key_id: *const c_char,
+        key_id_len: u32,
+        maintenance: u32,
+        out: *mut u64,
+    ) -> i32;
+    fn restic_bridge_s3_add_recovery_key_v1_start(
+        request: *const RemoteRequest,
+        options: *const Options,
+        state_fd: i32,
+        custody: u32,
+        out: *mut u64,
+    ) -> i32;
     fn restic_bridge_free(id: u64) -> i32;
 }
 
@@ -213,6 +238,36 @@ mod unlinked {
         _: *mut c_char,
         _: u32,
         _: *mut u32,
+    ) -> i32 {
+        INVALID_ARGUMENT
+    }
+    pub(super) unsafe fn restic_bridge_remove_recovery_key_v1_start(
+        _: *const LocalRequest,
+        _: *const Options,
+        _: *const c_char,
+        _: u32,
+        _: u32,
+        _: *mut u64,
+    ) -> i32 {
+        INVALID_ARGUMENT
+    }
+    pub(super) unsafe fn restic_bridge_s3_remove_recovery_key_v1_start(
+        _: *const RemoteRequest,
+        _: *const Options,
+        _: i32,
+        _: *const c_char,
+        _: u32,
+        _: u32,
+        _: *mut u64,
+    ) -> i32 {
+        INVALID_ARGUMENT
+    }
+    pub(super) unsafe fn restic_bridge_s3_add_recovery_key_v1_start(
+        _: *const RemoteRequest,
+        _: *const Options,
+        _: i32,
+        _: u32,
+        _: *mut u64,
     ) -> i32 {
         INVALID_ARGUMENT
     }
@@ -482,6 +537,119 @@ impl Call {
         Self::published(id, status, began)
     }
 
+    pub(super) fn local_remove_key(
+        password: &[u8],
+        repo_path: &str,
+        key_id: &str,
+        options: &Options,
+        maintenance: u32,
+    ) -> Result<Self, i32> {
+        let began = Instant::now();
+        let request = LocalRequest {
+            operation: REMOVE_KEY,
+            password: Bytes::new(password)?,
+            recovery_password: Bytes::new(&[])?,
+            repo: Bytes::new(repo_path.as_bytes())?,
+            source: Bytes::new(&[])?,
+            restore: Bytes::new(&[])?,
+            snapshot: Bytes::new(&[])?,
+        };
+        let key_id_bytes = Bytes::new(key_id.as_bytes())?;
+        let mut id = 0;
+        let status = unsafe {
+            restic_bridge_remove_recovery_key_v1_start(
+                &request,
+                options,
+                key_id_bytes.pointer,
+                key_id_bytes.length,
+                maintenance,
+                &mut id,
+            )
+        };
+        Self::published(id, status, began)
+    }
+
+    pub(super) fn remote_remove_key(
+        password: &[u8],
+        remote: &Remote<'_>,
+        key_id: &str,
+        options: &Options,
+        maintenance: u32,
+    ) -> Result<Self, i32> {
+        let began = Instant::now();
+        let request = RemoteRequest {
+            version: 1,
+            operation: REMOVE_KEY,
+            endpoint: Bytes::new(remote.endpoint.as_bytes())?,
+            region: Bytes::new(remote.region.as_bytes())?,
+            bucket: Bytes::new(remote.bucket.as_bytes())?,
+            prefix: Bytes::new(remote.prefix.as_bytes())?,
+            access: Bytes::new(remote.access)?,
+            secret: Bytes::new(remote.secret)?,
+            token: Bytes::new(remote.token)?,
+            password: Bytes::new(password)?,
+            recovery_password: Bytes::new(&[])?,
+            state: Bytes::new(remote.state.path.as_bytes())?,
+            source: Bytes::new(&[])?,
+            restore: Bytes::new(&[])?,
+            snapshot: Bytes::new(&[])?,
+            workspace: Bytes::new(&[])?,
+        };
+        let key_id_bytes = Bytes::new(key_id.as_bytes())?;
+        let mut id = 0;
+        let status = unsafe {
+            restic_bridge_s3_remove_recovery_key_v1_start(
+                &request,
+                options,
+                remote.state.descriptor.as_raw_fd(),
+                key_id_bytes.pointer,
+                key_id_bytes.length,
+                maintenance,
+                &mut id,
+            )
+        };
+        Self::published(id, status, began)
+    }
+
+    pub(super) fn remote_add_recovery_key_rotation(
+        password: &[u8],
+        recovery_password: &[u8],
+        remote: &Remote<'_>,
+        options: &Options,
+        custody: u32,
+    ) -> Result<Self, i32> {
+        let began = Instant::now();
+        let request = RemoteRequest {
+            version: 1,
+            operation: ADD_RECOVERY_KEY,
+            endpoint: Bytes::new(remote.endpoint.as_bytes())?,
+            region: Bytes::new(remote.region.as_bytes())?,
+            bucket: Bytes::new(remote.bucket.as_bytes())?,
+            prefix: Bytes::new(remote.prefix.as_bytes())?,
+            access: Bytes::new(remote.access)?,
+            secret: Bytes::new(remote.secret)?,
+            token: Bytes::new(remote.token)?,
+            password: Bytes::new(password)?,
+            recovery_password: Bytes::new(recovery_password)?,
+            state: Bytes::new(remote.state.path.as_bytes())?,
+            source: Bytes::new(&[])?,
+            restore: Bytes::new(&[])?,
+            snapshot: Bytes::new(&[])?,
+            workspace: Bytes::new(&[])?,
+        };
+        let mut id = 0;
+        let status = unsafe {
+            restic_bridge_s3_add_recovery_key_v1_start(
+                &request,
+                options,
+                remote.state.descriptor.as_raw_fd(),
+                custody,
+                &mut id,
+            )
+        };
+        Self::published(id, status, began)
+    }
+
     fn published(id: u64, status: i32, began: Instant) -> Result<Self, i32> {
         match (status, id) {
             (OK, 0) => undrained(),
@@ -587,8 +755,19 @@ impl Call {
                 undrained();
             }
         });
+        let diagnostic_str = std::str::from_utf8(
+            &fields.diagnostic[..fields.diagnostic.iter().position(|b| *b == 0).unwrap_or(0)],
+        )
+        .unwrap_or("");
+        let is_remote_pending = fields.status == 11 && diagnostic_str == "REMOTE_PENDING";
+
         let metadata = if metadata && fields.status == OK {
             self.metadata().map(Some)
+        } else if is_remote_pending {
+            match self.metadata() {
+                Ok(bytes) if !bytes.is_empty() => Ok(Some(bytes)),
+                _ => Ok(None),
+            }
         } else {
             Ok(None)
         };

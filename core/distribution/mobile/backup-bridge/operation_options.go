@@ -39,11 +39,11 @@ func parseOperationOptions(operation int32, version, mode uint32, retryMillis ui
 		return nil, StatusCapExceeded
 	}
 	switch operation {
-	case OpInit, OpOpen, OpS3Inspect:
+	case OpInit, OpOpen, OpS3Inspect, OpListRecoveryKeys:
 		if retryMillis != 0 {
 			return nil, StatusInvalidArgument
 		}
-	case OpAddRecoveryKey, OpSnapshot, OpListSnapshots, OpCheck:
+	case OpAddRecoveryKey, OpSnapshot, OpListSnapshots, OpCheck, OpRemoveRecoveryKey:
 	default:
 		return nil, StatusInvalidArgument
 	}

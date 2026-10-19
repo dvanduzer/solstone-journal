@@ -733,3 +733,263 @@ pub(crate) fn add_key(
     }
     Ok(())
 }
+
+#[derive(PartialEq, Eq)]
+pub(crate) enum AddOutcome {
+    Added,
+    Resumed(String),
+}
+
+impl std::fmt::Debug for AddOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Added => write!(f, "Added"),
+            Self::Resumed(_) => write!(f, "Resumed([redacted])"),
+        }
+    }
+}
+
+pub(crate) fn add_recovery_key_rotation(
+    authority: &AdmittedIosBackupAuthority,
+    destination: &Destination,
+    daily_key: &str,
+    candidate: &str,
+    env: &BTreeMap<String, Option<String>>,
+    timeout: Option<Duration>,
+    cancellation: Option<&ArchiveCancellation>,
+) -> Result<AddOutcome, RepoError> {
+    let repository = validate_call(
+        authority,
+        &[],
+        &destination.repository,
+        daily_key,
+        Some(candidate),
+        Some(env),
+        cancellation,
+    )
+    .map_err(|_| RepoError::Failed)?;
+    let repository::Repository::S3 {
+        destination: s3_dest,
+        access,
+        secret,
+        token,
+        append_only,
+    } = repository
+    else {
+        return Err(RepoError::Failed);
+    };
+
+    authority
+        .revalidate()
+        .map_err(|reason| refused(reason.code()))
+        .map_err(|_| RepoError::Failed)?;
+    let daily_password = Zeroizing::new(daily_key.as_bytes().to_vec());
+    let candidate_password = Zeroizing::new(candidate.as_bytes().to_vec());
+    let state = authority
+        .installed
+        .storage
+        .create_state(&s3_dest.namespace())
+        .map_err(|reason| refused(reason.code()))
+        .map_err(|_| RepoError::Failed)?;
+    state
+        .revalidate()
+        .map_err(|reason| refused(reason.code()))
+        .map_err(|_| RepoError::Failed)?;
+    let remote = native::Remote {
+        endpoint: &s3_dest.endpoint,
+        region: &s3_dest.region,
+        bucket: &s3_dest.bucket,
+        prefix: &s3_dest.prefix,
+        access: access.as_bytes(),
+        secret: secret.as_bytes(),
+        token: token.as_bytes(),
+        state: native::PrivateDirectory {
+            path: state.path(),
+            descriptor: state.as_fd(),
+        },
+    };
+    let options = native::Options {
+        version: if append_only { 2 } else { 1 },
+        check_read_mode: 0,
+        retry_lock_ms: 0,
+        group: 0,
+        groups: 0,
+        reserved1: u32::from(append_only),
+        reserved2: 0,
+    };
+    let call = native::Call::remote_add_recovery_key_rotation(
+        &daily_password,
+        &candidate_password,
+        &remote,
+        &options,
+        1,
+    )
+    .map_err(|status| {
+        log::warn!("ios backup add recovery key rotation refused at entry: status {status}");
+        RepoError::Failed
+    })?;
+    let cancelled = || cancellation.is_some_and(ArchiveCancellation::is_cancelled);
+    let completed = call.wait(timeout, Some(&cancelled), true);
+    log_failure(3, &completed);
+
+    let is_remote_pending = completed.fields.status == 11
+        && outcome::diagnostic(&completed.fields).is_ok_and(|d| d == "REMOTE_PENDING");
+
+    if is_remote_pending {
+        if let Ok(Some(bytes)) = completed.metadata {
+            if let Ok(resumed_pw) = crate::rotation::resume::decode_recovery_add_resume(&bytes) {
+                return Ok(AddOutcome::Resumed(resumed_pw));
+            }
+        }
+        return Err(RepoError::Failed);
+    }
+
+    if let Some(failure) = outcome::callable_failure(&completed).map_err(|_| RepoError::Failed)? {
+        return Err(RepoError::Callable(failure));
+    }
+    Ok(AddOutcome::Added)
+}
+
+pub(crate) fn list_keys(
+    authority: &AdmittedIosBackupAuthority,
+    destination: &Destination,
+    password: &str,
+    env: &BTreeMap<String, Option<String>>,
+    timeout: Option<Duration>,
+    cancellation: Option<&ArchiveCancellation>,
+) -> Result<Vec<(String, bool)>, RepoError> {
+    let repository = validate_call(
+        authority,
+        &[],
+        &destination.repository,
+        password,
+        None,
+        Some(env),
+        cancellation,
+    )
+    .map_err(|_| RepoError::Failed)?;
+    let options = native::Options {
+        version: 1,
+        check_read_mode: 0,
+        retry_lock_ms: 0,
+        group: 0,
+        groups: 0,
+        reserved1: 0,
+        reserved2: 0,
+    };
+    let completed = execute(
+        authority,
+        9,
+        false,
+        repository,
+        password,
+        "",
+        &[],
+        &options,
+        timeout,
+        cancellation,
+        true,
+    )
+    .map_err(ExecuteError::into_repo)?;
+    if let Some(failure) =
+        outcome::callable_remove_failure(&completed).map_err(|_| RepoError::Failed)?
+    {
+        return Err(RepoError::Callable(failure));
+    }
+    outcome::decode_recovery_keys(&completed).map_err(|_| RepoError::Failed)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn remove_key(
+    authority: &AdmittedIosBackupAuthority,
+    destination: &Destination,
+    password: &str,
+    key_id: &str,
+    env: &BTreeMap<String, Option<String>>,
+    timeout: Option<Duration>,
+    cancellation: Option<&ArchiveCancellation>,
+) -> Result<(), RepoError> {
+    if !outcome::identifier(key_id) {
+        return Err(RepoError::Failed);
+    }
+    let repository = validate_call(
+        authority,
+        &[],
+        &destination.repository,
+        password,
+        None,
+        Some(env),
+        cancellation,
+    )
+    .map_err(|_| RepoError::Failed)?;
+    authority
+        .revalidate()
+        .map_err(|reason| refused(reason.code()))
+        .map_err(|_| RepoError::Failed)?;
+    let password = Zeroizing::new(password.as_bytes().to_vec());
+    let options = native::Options {
+        version: 1,
+        check_read_mode: 0,
+        retry_lock_ms: 0,
+        group: 0,
+        groups: 0,
+        reserved1: 0,
+        reserved2: 0,
+    };
+    let state;
+    let call = match repository {
+        repository::Repository::Local(repo_path) => {
+            native::Call::local_remove_key(&password, repo_path, key_id, &options, 1)
+        }
+        repository::Repository::S3 {
+            destination,
+            access,
+            secret,
+            token,
+            append_only,
+        } => {
+            state = authority
+                .installed
+                .storage
+                .create_state(&destination.namespace())
+                .map_err(|reason| refused(reason.code()))
+                .map_err(|_| RepoError::Failed)?;
+            state
+                .revalidate()
+                .map_err(|reason| refused(reason.code()))
+                .map_err(|_| RepoError::Failed)?;
+            let remote = native::Remote {
+                endpoint: &destination.endpoint,
+                region: &destination.region,
+                bucket: &destination.bucket,
+                prefix: &destination.prefix,
+                access: access.as_bytes(),
+                secret: secret.as_bytes(),
+                token: token.as_bytes(),
+                state: native::PrivateDirectory {
+                    path: state.path(),
+                    descriptor: state.as_fd(),
+                },
+            };
+            let options = native::Options {
+                version: if append_only { 2 } else { options.version },
+                reserved1: u32::from(append_only),
+                ..options
+            };
+            native::Call::remote_remove_key(&password, &remote, key_id, &options, 1)
+        }
+    }
+    .map_err(|status| {
+        log::warn!("ios backup remove key refused at entry: status {status}");
+        RepoError::Failed
+    })?;
+    let cancelled = || cancellation.is_some_and(ArchiveCancellation::is_cancelled);
+    let completed = call.wait(timeout, Some(&cancelled), false);
+    log_failure(10, &completed);
+    if let Some(failure) =
+        outcome::callable_remove_failure(&completed).map_err(|_| RepoError::Failed)?
+    {
+        return Err(RepoError::Callable(failure));
+    }
+    Ok(())
+}

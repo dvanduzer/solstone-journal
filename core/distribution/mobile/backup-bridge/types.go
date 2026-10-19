@@ -31,13 +31,15 @@ const (
 
 // Closed operation codes.
 const (
-	OpInit           int32 = 1
-	OpOpen           int32 = 2
-	OpAddRecoveryKey int32 = 3
-	OpSnapshot       int32 = 4
-	OpListSnapshots  int32 = 5
-	OpRestore        int32 = 6
-	OpCheck          int32 = 7
+	OpInit              int32 = 1
+	OpOpen              int32 = 2
+	OpAddRecoveryKey    int32 = 3
+	OpSnapshot          int32 = 4
+	OpListSnapshots     int32 = 5
+	OpRestore           int32 = 6
+	OpCheck             int32 = 7
+	OpListRecoveryKeys  int32 = 9
+	OpRemoveRecoveryKey int32 = 10
 )
 
 // Closed set of stable diagnostic tokens. Raw upstream strings containing passwords
@@ -65,17 +67,20 @@ const (
 
 // Internal Go representation of caller request parameters.
 type bridgeRequest struct {
-	owned             *ownedCall
-	operation         int32
-	password          []byte
-	recoveryPassword  []byte
-	repoPath          string
-	sourcePath        string
-	sourceName        string
-	restorePath       string
-	snapshotID        string
-	snapshotSelection *snapshotSelection
-	executionOptions  *operationOptions
+	owned               *ownedCall
+	operation           int32
+	password            []byte
+	recoveryPassword    []byte
+	repoPath            string
+	sourcePath          string
+	sourceName          string
+	restorePath         string
+	snapshotID          string
+	removeKeyID         string
+	maintenanceRotation bool
+	rotationCustody     bool
+	snapshotSelection   *snapshotSelection
+	executionOptions    *operationOptions
 	// pathFiles pin caller-authorized directories for the complete asynchronous
 	// operation.
 	pathFiles            []*os.File

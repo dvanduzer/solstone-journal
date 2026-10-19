@@ -22,7 +22,7 @@ import (
 func TestS3OperationsIndependentFailedSaveKeepsKnownAttemptID(t *testing.T) {
 	cfg := s3TestConfig()
 	owner := s3OwnerTestOpen(t, s3OwnerTestDirectory(t), cfg)
-	if err := owner.begin(OpInit, cfg, []byte("fixture-password")); err != nil {
+	if err := owner.begin(OpInit, false, cfg, []byte("fixture-password")); err != nil {
 		t.Fatal(err)
 	}
 	base := s3TestBackend(t, cfg, s3TestTransport(func(*http.Request) (*http.Response, error) { return nil, errS3IO }))

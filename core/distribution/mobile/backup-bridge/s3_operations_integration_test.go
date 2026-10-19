@@ -29,6 +29,9 @@ func s3TestStartOperation(t *testing.T, cfg s3Config, state, workspace string, t
 
 func s3TestStartOwnedOperation(t *testing.T, cfg s3Config, owner *s3Owner, workspace string, transport http.RoundTripper, req bridgeRequest) (uint64, *callHandle) {
 	t.Helper()
+	// The worker owns and clears input buffers. Preserve reusable fixture custody.
+	req.password = append([]byte(nil), req.password...)
+	req.recoveryPassword = append([]byte(nil), req.recoveryPassword...)
 	req.remote = &s3RemoteRequest{cfg: cfg, owner: owner, factory: func(ctx context.Context, cfg s3Config) (*s3Backend, error) {
 		owned, cancel := context.WithCancel(ctx)
 		return &s3Backend{cfg: cfg, transport: transport, ctx: owned, cancel: cancel}, nil
@@ -67,6 +70,9 @@ func s3TestWaitOperation(t *testing.T, id uint64, handle *callHandle) bridgeResu
 	}
 	handle.mu.Lock()
 	result := handle.result
+	if len(result.metadata) > 0 {
+		result.metadata = append([]byte(nil), result.metadata...)
+	}
 	handle.mu.Unlock()
 	if freeCall(id) != StatusOk {
 		t.Fatal("completed operation did not release handle")

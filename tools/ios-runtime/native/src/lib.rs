@@ -393,6 +393,24 @@ fn run(v: Value) -> Result<Value, String> {
                 "failed":report.failed,"warnings":report.warnings}),
             )
         }
+        #[cfg(unix)]
+        "serve-rotation-fault-arm" => {
+            if SERVING.lock().map_err(|e| e.to_string())?.is_none() {
+                return Err("serving is stopped".into());
+            }
+            let armed =
+                solstone_core_backup_runtime::rotation::arm_rotation_parent_sync_fault(root);
+            if !armed {
+                return Err("rotation publication fault was not armed".into());
+            }
+            Ok(json!({"armed":true,"checkpoint":"parent_sync"}))
+        }
+        #[cfg(unix)]
+        "serve-rotation-fault-status" => {
+            let (armed, fired) =
+                solstone_core_backup_runtime::rotation::rotation_parent_sync_fault_observation();
+            Ok(json!({"armed":armed,"fired":fired}))
+        }
         "serve-status" | "serve-owner" => {
             let serving = SERVING.lock().map_err(|e| e.to_string())?;
             let serving = serving.as_ref().ok_or("serving is stopped")?;

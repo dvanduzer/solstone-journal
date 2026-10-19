@@ -146,7 +146,7 @@ func validateRequestOwned(req *C.restic_request, entry *ownedCall) (bridgeReques
 	}
 
 	op := int32(req.operation)
-	if op < OpInit || op > OpCheck {
+	if !validLocalOperation(op) {
 		return bridgeRequest{}, StatusInvalidArgument
 	}
 
@@ -453,6 +453,10 @@ func runWorker(h *callHandle, req bridgeRequest) {
 		}
 	case OpCheck:
 		result, _ = executeCheck(h.ctx, req)
+	case OpListRecoveryKeys:
+		result, _ = executeListRecoveryKeys(h.ctx, req)
+	case OpRemoveRecoveryKey:
+		result, _ = executeRemoveRecoveryKey(h.ctx, req, markWrite)
 	default:
 		result = bridgeResult{status: StatusInvalidArgument, diagnostic: DiagInvalidArgument}
 	}
@@ -507,6 +511,47 @@ func restic_bridge_operation_v1_start(request *C.restic_request, options *C.rest
 		return C.int32_t(status)
 	}
 	req.executionOptions = ownedOptions
+	id, status := startBridgeCall(req)
+	if status == StatusOk {
+		*outID = C.uint64_t(id)
+	}
+	return C.int32_t(status)
+}
+
+//export restic_bridge_remove_recovery_key_v1_start
+func restic_bridge_remove_recovery_key_v1_start(request *C.restic_request, options *C.restic_operation_options_v1, keyID *C.char, keyIDLen C.uint32_t, maintenance C.uint32_t, outID *C.uint64_t) (returned C.int32_t) {
+	if outID == nil {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	*outID = 0
+	if maintenance != 1 {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	entry, status := reserveOwnedCall()
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	defer func() { returned = C.int32_t(entry.finishAdmission(int32(returned))) }()
+	if request == nil || request.operation != C.int32_t(OpRemoveRecoveryKey) || keyID == nil || keyIDLen != 64 {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	keyBytes := copyCBytes(keyID, keyIDLen)
+	keyStr := string(keyBytes)
+	zeroBytes(keyBytes)
+	if !validS3ID(keyStr) {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	ownedOptions, status := parseCOperationOptions(int32(request.operation), options)
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	req, status := validateRequestOwned(request, entry)
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	req.executionOptions = ownedOptions
+	req.removeKeyID = keyStr
+	req.maintenanceRotation = true
 	id, status := startBridgeCall(req)
 	if status == StatusOk {
 		*outID = C.uint64_t(id)

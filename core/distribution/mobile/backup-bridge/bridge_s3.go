@@ -53,7 +53,7 @@ func validateS3Shape(version uint32, operation int32, fields [14]requestField) i
 }
 
 func validateS3ShapeForRoot(version uint32, operation int32, fields [14]requestField, rooted bool) int32 {
-	if version != 1 || operation < OpInit || operation > OpS3Inspect {
+	if version != 1 || operation < OpInit || operation > OpRemoveRecoveryKey {
 		return StatusInvalidArgument
 	}
 	caps := [14]uint32{maxHTTPURLBytes, 64, 63, 512, 256, 1024, 16384, maxPasswordLen, maxPasswordLen, maxPathLen, maxPathLen, maxPathLen, idHexLen, maxPathLen}
@@ -261,6 +261,9 @@ func restic_bridge_s3_start(request *C.restic_s3_request, outID *C.uint64_t) C.i
 		return C.int32_t(StatusInvalidArgument)
 	}
 	*outID = 0
+	if request == nil || request.operation == C.int32_t(OpRemoveRecoveryKey) {
+		return C.int32_t(StatusInvalidArgument)
+	}
 	req, status := validateS3Request(request)
 	if status != StatusOk {
 		return C.int32_t(status)
@@ -305,6 +308,9 @@ func restic_bridge_s3_operation_v1_start(request *C.restic_s3_request, options *
 		return C.int32_t(StatusInvalidArgument)
 	}
 	*outID = 0
+	if request == nil || request.operation == C.int32_t(OpRemoveRecoveryKey) {
+		return C.int32_t(StatusInvalidArgument)
+	}
 	entry, status := reserveOwnedCall()
 	if status != StatusOk {
 		return C.int32_t(status)
@@ -412,6 +418,95 @@ func startS3OperationWithDirectories(request *C.restic_s3_request, options *C.re
 	}
 	req.executionOptions = ownedOptions
 	req.snapshotSelection = selection
+	if ownedOptions.appendOnly {
+		req.remote.cfg.appendOnly = true
+	}
+	id, status := startBridgeCall(req)
+	if status == StatusOk {
+		*outID = C.uint64_t(id)
+	}
+	return C.int32_t(status)
+}
+
+//export restic_bridge_s3_remove_recovery_key_v1_start
+func restic_bridge_s3_remove_recovery_key_v1_start(request *C.restic_s3_request, options *C.restic_operation_options_v1, stateFD C.int32_t, keyID *C.char, keyIDLen C.uint32_t, maintenance C.uint32_t, outID *C.uint64_t) (returned C.int32_t) {
+	if outID == nil {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	*outID = 0
+	if maintenance != 1 {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	entry, status := reserveOwnedCall()
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	defer func() { returned = C.int32_t(entry.finishAdmission(int32(returned))) }()
+	if request == nil || request.operation != C.int32_t(OpRemoveRecoveryKey) || keyID == nil || keyIDLen != 64 {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	keyBytes := copyCBytes(keyID, keyIDLen)
+	keyStr := string(keyBytes)
+	zeroBytes(keyBytes)
+	if !validS3ID(keyStr) {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	stateIdentity, status := readBorrowedDirectoryIdentity(int(stateFD))
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	ownedOptions, status := parseCRemoteOperationOptions(int32(request.operation), options)
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	req, status := validateS3RequestDirectoriesOwned(request, nil, entry, stateIdentity, nil)
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	req.executionOptions = ownedOptions
+	req.removeKeyID = keyStr
+	req.maintenanceRotation = true
+	if ownedOptions.appendOnly {
+		req.remote.cfg.appendOnly = true
+	}
+	id, status := startBridgeCall(req)
+	if status == StatusOk {
+		*outID = C.uint64_t(id)
+	}
+	return C.int32_t(status)
+}
+
+//export restic_bridge_s3_add_recovery_key_v1_start
+func restic_bridge_s3_add_recovery_key_v1_start(request *C.restic_s3_request, options *C.restic_operation_options_v1, stateFD C.int32_t, custody C.uint32_t, outID *C.uint64_t) (returned C.int32_t) {
+	if outID == nil {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	*outID = 0
+	if custody != 1 {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	entry, status := reserveOwnedCall()
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	defer func() { returned = C.int32_t(entry.finishAdmission(int32(returned))) }()
+	if request == nil || request.operation != C.int32_t(OpAddRecoveryKey) {
+		return C.int32_t(StatusInvalidArgument)
+	}
+	stateIdentity, status := readBorrowedDirectoryIdentity(int(stateFD))
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	ownedOptions, status := parseCRemoteOperationOptions(int32(request.operation), options)
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	req, status := validateS3RequestDirectoriesOwned(request, nil, entry, stateIdentity, nil)
+	if status != StatusOk {
+		return C.int32_t(status)
+	}
+	req.executionOptions = ownedOptions
+	req.rotationCustody = true
 	if ownedOptions.appendOnly {
 		req.remote.cfg.appendOnly = true
 	}

@@ -7,8 +7,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -352,10 +354,192 @@ func executeAddRecoveryKey(ctx context.Context, req bridgeRequest, setWrote func
 			return bridgeResult{status: StatusCancelled, diagnostic: DiagCancelled}, err
 		}
 	}
+	var recordedKeyID string
+	var recordedPw []byte
+	var recordedCiphertext []byte
+	if req.remote != nil && req.remote.owner != nil {
+		recordedKeyID, recordedPw, recordedCiphertext = req.remote.owner.activeAddRecoveryInfo()
+		if len(recordedPw) > 0 {
+			defer zeroBytes(recordedPw)
+		}
+		if len(recordedCiphertext) > 0 {
+			defer zeroBytes(recordedCiphertext)
+		}
+	}
 
-	// AddKey stores params *crypto.Params with no mutex.
-	// Recovery AddKey passes username and hostname "solstone".
-	// crypto.KDF takes no context.
+	var newID restic.ID
+	if len(recordedPw) > 0 {
+		matchesRecorded := len(req.recoveryPassword) == len(recordedPw) &&
+			subtle.ConstantTimeCompare(req.recoveryPassword, recordedPw) == 1
+		if !matchesRecorded {
+			resume := struct {
+				Schema           string `json:"schema"`
+				Kind             string `json:"kind"`
+				RecoveryPassword string `json:"recovery_password"`
+				KeyID            string `json:"key_id,omitempty"`
+			}{
+				Schema:           metadataSchema,
+				Kind:             "recovery-add-recorded",
+				RecoveryPassword: string(recordedPw),
+			}
+			if lowerHexID(recordedKeyID) {
+				resume.KeyID = recordedKeyID
+			}
+			encoded, err := json.Marshal(resume)
+			if err != nil {
+				return bridgeResult{
+					status:     StatusFailed,
+					diagnostic: DiagInternal,
+				}, errors.New("resume document marshal failed")
+			}
+			return bridgeResult{
+				status:         StatusFailed,
+				diagnostic:     DiagAuthFailed,
+				metadata:       encoded,
+				metadataStatus: StatusOk,
+			}, errors.New("recovery password differs from recorded candidate")
+		}
+		recPw = string(recordedPw)
+	}
+
+	if len(recordedCiphertext) > 0 {
+		if recordedKeyID == "" || !lowerHexID(recordedKeyID) {
+			return bridgeResult{status: StatusInternal, diagnostic: DiagInternal}, errors.New("missing recorded key ID for ciphertext")
+		}
+		parsedID, err := restic.ParseID(recordedKeyID)
+		if err != nil {
+			return bridgeResult{status: StatusInternal, diagnostic: DiagInternal}, err
+		}
+		var openKey *repository.Key
+		var openErr error
+		var panicVal interface{}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					panicVal = r
+				}
+			}()
+			k, err := repository.LoadKey(lockCtx, repo, parsedID)
+			if err != nil || k == nil || len(k.Data) < crypto.Extension {
+				openErr = errors.New("cannot load key")
+				return
+			}
+			openKey, openErr = repository.OpenKey(lockCtx, repo, parsedID, recPw)
+		}()
+		opened, classifyErr := classifyKeyOpen(lockCtx, openKey != nil, openErr, panicVal)
+		if classifyErr == nil && opened {
+			return bridgeResult{status: StatusOk, keyID: recordedKeyID}, nil
+		}
+
+		foundRecorded := false
+		listErr := be.List(lockCtx, backend.KeyFile, func(fi backend.FileInfo) error {
+			if fi.Name == recordedKeyID {
+				foundRecorded = true
+			}
+			return nil
+		})
+		if listErr != nil || lockCtx.Err() != nil || foundRecorded {
+			if lockCtx.Err() != nil {
+				return bridgeResult{status: StatusCancelled, diagnostic: DiagCancelled}, lockCtx.Err()
+			}
+			return bridgeResult{status: StatusFailed, diagnostic: DiagIoFailed}, errors.New("recorded key present or scan failed")
+		}
+
+		saveErr := be.Save(lockCtx, backend.Handle{Type: backend.KeyFile, Name: recordedKeyID}, backend.NewByteReader(recordedCiphertext, nil))
+		if saveErr != nil {
+			return bridgeResult{status: StatusFailed, diagnostic: DiagIoFailed}, saveErr
+		}
+		return bridgeResult{status: StatusOk, keyID: recordedKeyID}, nil
+	} else if recordedKeyID != "" {
+		parsedID, err := restic.ParseID(recordedKeyID)
+		if err != nil {
+			return bridgeResult{status: StatusInternal, diagnostic: DiagInternal}, err
+		}
+		var openKey *repository.Key
+		var openErr error
+		var panicVal interface{}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					panicVal = r
+				}
+			}()
+			k, err := repository.LoadKey(lockCtx, repo, parsedID)
+			if err != nil || k == nil || len(k.Data) < crypto.Extension {
+				openErr = errors.New("cannot load key")
+				return
+			}
+			openKey, openErr = repository.OpenKey(lockCtx, repo, parsedID, recPw)
+		}()
+		opened, classifyErr := classifyKeyOpen(lockCtx, openKey != nil, openErr, panicVal)
+		if classifyErr == nil && opened {
+			return bridgeResult{status: StatusOk, keyID: recordedKeyID}, nil
+		}
+		return bridgeResult{status: StatusFailed, diagnostic: DiagIoFailed}, errors.New("recorded key present or scan failed")
+	} else {
+		var candidateWinning restic.ID
+		candidateFoundCount := 0
+		candidateSeen := make(map[string]bool)
+		scanListErr := repo.List(lockCtx, restic.KeyFile, func(id restic.ID, _ int64) error {
+			idStr := id.String()
+			if !lowerHexID(idStr) || candidateSeen[idStr] {
+				return errS3OwnerInvalid
+			}
+			candidateSeen[idStr] = true
+			k, err := repository.LoadKey(lockCtx, repo, id)
+			if err != nil || k == nil || len(k.Data) < crypto.Extension {
+				return errors.New("unreadable key")
+			}
+			var openKey *repository.Key
+			var openErr error
+			var panicVal interface{}
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						panicVal = r
+					}
+				}()
+				openKey, openErr = repository.OpenKey(lockCtx, repo, id, recPw)
+			}()
+			isCurrent, err := classifyKeyOpen(lockCtx, openKey != nil, openErr, panicVal)
+			if err != nil {
+				return err
+			}
+			if isCurrent {
+				candidateFoundCount++
+				candidateWinning = id
+			}
+			return nil
+		})
+		if scanListErr != nil || lockCtx.Err() != nil {
+			if lockCtx.Err() != nil {
+				return bridgeResult{status: StatusCancelled, diagnostic: DiagCancelled}, lockCtx.Err()
+			}
+			return bridgeResult{status: StatusFailed, diagnostic: DiagIoFailed}, scanListErr
+		}
+		if candidateFoundCount == 1 {
+			var rawKey []byte
+			loadErr := be.Load(lockCtx, backend.Handle{Type: backend.KeyFile, Name: candidateWinning.String()}, 0, 0, func(rd io.Reader) error {
+				var err error
+				rawKey, err = io.ReadAll(rd)
+				return err
+			})
+			if loadErr != nil {
+				return bridgeResult{status: StatusFailed, diagnostic: DiagIoFailed}, loadErr
+			}
+			defer zeroBytes(rawKey)
+			if req.remote != nil && req.remote.owner != nil {
+				if err := req.remote.owner.recordKeyPayload(candidateWinning.String(), rawKey); err != nil {
+					return bridgeResult{status: StatusFailed, diagnostic: DiagIoFailed}, err
+				}
+			}
+			return bridgeResult{status: StatusOk, keyID: candidateWinning.String()}, nil
+		}
+		if candidateFoundCount != 0 {
+			return bridgeResult{status: StatusFailed, diagnostic: DiagInternal}, errors.New("multiple keys opened with recovery password")
+		}
+	}
+
 	newKey, err := func() (*repository.Key, error) {
 		addKeyMu.Lock()
 		defer addKeyMu.Unlock()
@@ -371,8 +555,7 @@ func executeAddRecoveryKey(ctx context.Context, req bridgeRequest, setWrote func
 		}
 		return bridgeResult{status: StatusFailed, diagnostic: scrubError(err, req)}, err
 	}
-
-	newID := newKey.ID()
+	newID = newKey.ID()
 
 	// Verification is a separate backend open and safe scan with only the recovery password.
 	verified := false
@@ -845,4 +1028,276 @@ func scrubError(err error, req bridgeRequest) string {
 		return DiagLocked
 	}
 	return DiagIoFailed
+}
+
+func classifyKeyOpen(ctx context.Context, hasKey bool, openErr error, panicVal interface{}) (bool, error) {
+	if panicVal != nil {
+		if pErr, ok := panicVal.(error); ok {
+			return false, pErr
+		}
+		return false, fmt.Errorf("panic: %v", panicVal)
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+	if errors.Is(openErr, context.Canceled) || errors.Is(openErr, context.DeadlineExceeded) {
+		return false, openErr
+	}
+	if openErr == nil && hasKey {
+		return true, nil
+	}
+	if openErr != nil {
+		s := openErr.Error()
+		if strings.Contains(s, "wrong password") || strings.Contains(s, "ciphertext verification failed") {
+			return false, nil
+		}
+		return false, openErr
+	}
+	return false, errors.New("no key opened without error")
+}
+
+func validateBackendKeyNames(ctx context.Context, be backend.Backend) error {
+	return be.List(ctx, backend.KeyFile, func(fi backend.FileInfo) error {
+		if !lowerHexID(fi.Name) {
+			return errors.New("malformed key file name")
+		}
+		return nil
+	})
+}
+
+func executeListRecoveryKeys(ctx context.Context, req bridgeRequest) (bridgeResult, error) {
+	if !req.pathsPinned {
+		if err := pinRequestPaths(&req); err != nil {
+			return mapPinError(req.operation, err), err
+		}
+		defer closeRequestPaths(&req)
+	}
+
+	pw, clearPw := passwordString(req.password)
+	defer clearPw()
+
+	be, err := operationBackend(ctx, req, false)
+	if err != nil {
+		return bridgeResult{status: StatusFailed, diagnostic: DiagRepoMissing}, err
+	}
+	defer be.Close()
+
+	if err := validateBackendKeyNames(ctx, be); err != nil {
+		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+			return bridgeResult{status: StatusCancelled, diagnostic: DiagCancelled}, ctx.Err()
+		}
+		return bridgeResult{status: StatusFailed, diagnostic: DiagIoFailed}, err
+	}
+
+	repo, err := repository.New(guardedBackend{be}, repository.Options{})
+	if err != nil {
+		return bridgeResult{status: StatusFailed, diagnostic: DiagInternal}, err
+	}
+
+	type keyItem struct {
+		id      string
+		current bool
+	}
+	var keys []keyItem
+	seen := make(map[string]bool)
+	currentCount := 0
+	var winningID restic.ID
+	keyCount := 0
+
+	err = repo.List(ctx, restic.KeyFile, func(id restic.ID, _ int64) error {
+		keyCount++
+		if keyCount > maxKeyFiles {
+			return errResourceLimit
+		}
+		idStr := id.String()
+		if !lowerHexID(idStr) || seen[idStr] {
+			return errS3OwnerInvalid
+		}
+		seen[idStr] = true
+
+		k, err := repository.LoadKey(ctx, repo, id)
+		if err != nil || k == nil || len(k.Data) < crypto.Extension {
+			return errors.New("unreadable key")
+		}
+
+		var openKey *repository.Key
+		var openErr error
+		var panicVal interface{}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					panicVal = r
+				}
+			}()
+			openKey, openErr = repository.OpenKey(ctx, repo, id, pw)
+		}()
+
+		isCurrent, err := classifyKeyOpen(ctx, openKey != nil, openErr, panicVal)
+		if err != nil {
+			return err
+		}
+		if isCurrent {
+			currentCount++
+			winningID = id
+		}
+		keys = append(keys, keyItem{id: idStr, current: isCurrent})
+		return nil
+	})
+
+	if err != nil {
+		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+			return bridgeResult{status: StatusCancelled, diagnostic: DiagCancelled}, ctx.Err()
+		}
+		if errors.Is(err, errResourceLimit) {
+			return bridgeResult{status: StatusCapExceeded, diagnostic: DiagCapExceeded}, err
+		}
+		return keyRefusal(ctx, be, err), err
+	}
+
+	if keyCount == 0 || currentCount != 1 {
+		if currentCount == 0 {
+			return keyRefusal(ctx, be, errNoKeyOpened), errNoKeyOpened
+		}
+		return bridgeResult{status: StatusFailed, diagnostic: DiagInternal}, errors.New("invalid key count")
+	}
+
+	err = repo.SearchKey(ctx, pw, 1, winningID.String())
+	if err != nil {
+		return keyRefusal(ctx, be, err), err
+	}
+
+	unlock, lockCtx, err := lockRepoForRequest(ctx, req, repo, false)
+	if err != nil {
+		return bridgeResult{status: StatusFailed, diagnostic: DiagLocked}, err
+	}
+	defer unlock()
+	_ = lockCtx
+
+	sort.Slice(keys, func(i, j int) bool { return keys[i].id < keys[j].id })
+
+	type recoveryKeyMetadataRow struct {
+		ID      string `json:"id"`
+		Current bool   `json:"current"`
+	}
+	rows := make([]recoveryKeyMetadataRow, len(keys))
+	for i, k := range keys {
+		rows[i] = recoveryKeyMetadataRow{ID: k.id, Current: k.current}
+	}
+
+	encoded, err := json.Marshal(struct {
+		Schema string                   `json:"schema"`
+		Kind   string                   `json:"kind"`
+		Keys   []recoveryKeyMetadataRow `json:"keys"`
+	}{metadataSchema, "recovery-key-list", rows})
+	if err != nil {
+		return bridgeResult{status: StatusFailed, diagnostic: DiagInternal}, err
+	}
+	if len(encoded) > maxResultMetadata {
+		return bridgeResult{status: StatusCapExceeded, diagnostic: DiagCapExceeded}, errResourceLimit
+	}
+
+	return bridgeResult{status: StatusOk, keyID: winningID.String(), metadata: encoded, metadataStatus: StatusOk}, nil
+}
+
+func executeRemoveRecoveryKey(ctx context.Context, req bridgeRequest, setWrote func()) (bridgeResult, error) {
+	if !req.pathsPinned {
+		if err := pinRequestPaths(&req); err != nil {
+			return mapPinError(req.operation, err), err
+		}
+		defer closeRequestPaths(&req)
+	}
+
+	keyID := req.removeKeyID
+	if !lowerHexID(keyID) {
+		return bridgeResult{status: StatusInvalidArgument, diagnostic: DiagInvalidArgument}, errors.New("invalid key id")
+	}
+
+	pw, clearPw := passwordString(req.password)
+	defer clearPw()
+
+	be, err := operationBackend(ctx, req, false)
+	if err != nil {
+		return bridgeResult{status: StatusFailed, diagnostic: DiagRepoMissing}, err
+	}
+	defer be.Close()
+
+	repo, err := repository.New(guardedBackend{be}, repository.Options{})
+	if err != nil {
+		return bridgeResult{status: StatusFailed, diagnostic: DiagInternal}, err
+	}
+
+	currentKeyID, err := safeScanKey(ctx, repo, pw)
+	if err != nil {
+		if ctx.Err() != nil {
+			return bridgeResult{status: StatusCancelled, diagnostic: DiagCancelled}, ctx.Err()
+		}
+		return keyRefusal(ctx, be, err), err
+	}
+
+	if currentKeyID.String() == keyID {
+		return bridgeResult{status: StatusInvalidArgument, diagnostic: DiagInvalidArgument}, errors.New("cannot remove active key")
+	}
+
+	unlock, lockCtx, err := lockRepoForRequest(ctx, req, repo, true)
+	if err != nil {
+		return bridgeResult{status: StatusFailed, diagnostic: DiagLocked}, err
+	}
+	defer unlock()
+
+	if lockCtx.Err() != nil {
+		return bridgeResult{status: StatusCancelled, diagnostic: DiagCancelled}, lockCtx.Err()
+	}
+	if testCheckPhase != nil {
+		testCheckPhase("remove-locked", lockCtx, unlock)
+	}
+	if lockCtx.Err() != nil {
+		return bridgeResult{status: StatusCancelled, diagnostic: DiagCancelled}, lockCtx.Err()
+	}
+
+	if !req.maintenanceRotation {
+		return bridgeResult{status: StatusInvalidArgument, diagnostic: DiagInvalidArgument}, errors.New("maintenance authority required")
+	}
+
+	setWrote()
+	if req.remote != nil && req.remote.owner != nil {
+		if err := req.remote.owner.noteSave(""); err != nil {
+			return bridgeResult{status: StatusFailed, diagnostic: DiagIoFailed}, err
+		}
+		if err := req.remote.owner.recordRemoveKeyID(keyID); err != nil {
+			return bridgeResult{status: StatusFailed, diagnostic: DiagIoFailed}, err
+		}
+	}
+
+	var removeErr error
+	if req.remote != nil {
+		base, err := req.remote.backend(lockCtx)
+		if err != nil {
+			removeErr = err
+		} else {
+			removeErr = base.removeExactKeyObject(lockCtx, keyID, req.maintenanceRotation)
+		}
+	} else {
+		parsedKeyID, err := restic.ParseID(keyID)
+		if err != nil {
+			removeErr = err
+		} else {
+			removeErr = repository.RemoveKey(lockCtx, repo, parsedKeyID)
+		}
+	}
+
+	if removeErr != nil {
+		if req.remote != nil && req.remote.owner != nil {
+			req.remote.owner.saveReturned(removeErr)
+		}
+		if errors.Is(removeErr, context.Canceled) || lockCtx.Err() != nil || ctx.Err() != nil {
+			return bridgeResult{status: StatusCancelledUncertain, diagnostic: DiagCancelledUncertain}, removeErr
+		}
+		return bridgeResult{status: StatusFailed, diagnostic: DiagIoFailed}, removeErr
+	}
+
+	if lockCtx.Err() != nil || ctx.Err() != nil {
+		return bridgeResult{status: StatusCancelledUncertain, diagnostic: DiagCancelledUncertain}, lockCtx.Err()
+	}
+
+	return bridgeResult{status: StatusOk}, nil
 }

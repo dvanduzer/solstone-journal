@@ -57,7 +57,9 @@ impl From<BackupError> for RepoError {
     }
 }
 
-fn backend(destination: &Destination) -> Result<BTreeMap<String, Option<String>>, BackupError> {
+pub(crate) fn backend(
+    destination: &Destination,
+) -> Result<BTreeMap<String, Option<String>>, BackupError> {
     Ok(assemble_backend_env(destination)?
         .into_iter()
         .map(|(key, value)| {
@@ -265,7 +267,6 @@ pub fn remove_key<'invocation>(
     )
 }
 
-#[cfg_attr(target_os = "ios", allow(dead_code))] // rotation is refused on iOS
 pub(crate) fn capture_rotation_key_id<'invocation>(
     runner: &dyn ToolRunner,
     destination: &Destination,
@@ -280,7 +281,7 @@ pub(crate) fn capture_rotation_key_id<'invocation>(
         .map(|(id, _)| id)
         .ok_or(RepoError::Failed)
 }
-#[cfg_attr(target_os = "ios", allow(dead_code))] // rotation is refused on iOS
+
 pub(crate) fn remove_rotation_key<'invocation>(
     runner: &dyn ToolRunner,
     destination: &Destination,
@@ -291,6 +292,18 @@ pub(crate) fn remove_rotation_key<'invocation>(
     cancellation: &ArchiveCancellation,
 ) -> Result<(), RepoError> {
     let restic_path = restic_path.into();
+    #[cfg(target_os = "ios")]
+    if let crate::runner::ResticInvocation::Callable(authority) = restic_path {
+        return crate::ios_callable::remove_key(
+            authority,
+            destination,
+            password,
+            key_id,
+            &backend(destination)?,
+            timeout,
+            Some(cancellation),
+        );
+    }
     let result = run_restic_with_stdin_cancellable(
         runner,
         &["key".into(), "remove".into(), key_id.into()],
@@ -315,7 +328,6 @@ pub(crate) fn remove_rotation_key<'invocation>(
     }
 }
 
-#[cfg_attr(target_os = "ios", allow(dead_code))] // rotation is refused on iOS
 pub(crate) fn strict_key_list_absence<'invocation>(
     runner: &dyn ToolRunner,
     destination: &Destination,
@@ -332,7 +344,6 @@ pub(crate) fn strict_key_list_absence<'invocation>(
     )
 }
 
-#[cfg_attr(target_os = "ios", allow(dead_code))] // rotation is refused on iOS
 fn strict_key_list<'invocation>(
     runner: &dyn ToolRunner,
     destination: &Destination,
@@ -341,6 +352,17 @@ fn strict_key_list<'invocation>(
     timeout: Option<Duration>,
 ) -> Result<Vec<(String, bool)>, RepoError> {
     let restic_path = restic_path.into();
+    #[cfg(target_os = "ios")]
+    if let crate::runner::ResticInvocation::Callable(authority) = restic_path {
+        return crate::ios_callable::list_keys(
+            authority,
+            destination,
+            password,
+            &backend(destination)?,
+            timeout,
+            runner.cancellation(),
+        );
+    }
     let args: Vec<String> = vec!["key".into(), "list".into()];
     let result = run_restic(
         runner,

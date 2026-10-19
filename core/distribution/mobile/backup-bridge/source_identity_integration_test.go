@@ -6,6 +6,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"golang.org/x/sys/unix"
@@ -473,6 +474,98 @@ func TestSourceIdentityPublicCActualLockRetry(t *testing.T) {
 			joined = true
 			if waited != StatusOk || freed != StatusOk || result.status != StatusOk || !validS3ID(result.snapshotID) {
 				t.Fatal("actual public retry snapshot failed", result.status, result.diagnostic, waited, freed)
+			}
+		})
+	}
+}
+
+func TestS3GenericEntriesRejectOp10BeforeOwnerAdmission(t *testing.T) {
+	type stateCase struct {
+		name  string
+		setup func(owner *s3Owner) error
+	}
+	cases := []stateCase{
+		{
+			name: "lock-id",
+			setup: func(owner *s3Owner) error {
+				return owner.noteSave(s3TestID(10))
+			},
+		},
+		{
+			name: "may-have-written-no-locks",
+			setup: func(owner *s3Owner) error {
+				return owner.noteSave("")
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := s3TestConfig()
+			root := s3OwnerTestDirectory(t)
+			owner := s3OwnerTestOpen(t, root, cfg)
+			if err := owner.begin(OpRemoveRecoveryKey, false, cfg, []byte("daily-1")); err != nil {
+				t.Fatalf("begin failed: %v", err)
+			}
+			if err := tc.setup(owner); err != nil {
+				t.Fatalf("setup failed: %v", err)
+			}
+			s3OwnerTestClose(t, owner)
+
+			stateFilePath := filepath.Join(root, s3OwnerStateName)
+			beforeBytes, err := os.ReadFile(stateFilePath)
+			if err != nil {
+				t.Fatalf("read state file failed: %v", err)
+			}
+
+			priorStage := testOwnedStage
+			tripwireCalled := false
+			testOwnedStage = func(stage string, entry *ownedCall) {
+				tripwireCalled = true
+				t.Errorf("unexpected testOwnedStage call: stage=%s", stage)
+			}
+			defer func() { testOwnedStage = priorStage }()
+
+			input := sourceCInput{
+				remote:   &cfg,
+				state:    root,
+				password: []byte("daily-1"),
+			}
+
+			id1, status1 := sourceCRawS3Start(input, OpRemoveRecoveryKey)
+			if status1 != StatusInvalidArgument {
+				t.Fatalf("sourceCRawS3Start status = %d, expected %d", status1, StatusInvalidArgument)
+			}
+			if id1 != 0 {
+				t.Fatalf("sourceCRawS3Start id = %d, expected 0", id1)
+			}
+			if tripwireCalled {
+				t.Fatal("tripwire called during sourceCRawS3Start")
+			}
+			afterBytes1, err := os.ReadFile(stateFilePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(beforeBytes, afterBytes1) {
+				t.Fatal("state file modified by sourceCRawS3Start")
+			}
+
+			id2, status2 := sourceCRawS3OperationV1Start(input, OpRemoveRecoveryKey)
+			if status2 != StatusInvalidArgument {
+				t.Fatalf("sourceCRawS3OperationV1Start status = %d, expected %d", status2, StatusInvalidArgument)
+			}
+			if id2 != 0 {
+				t.Fatalf("sourceCRawS3OperationV1Start id = %d, expected 0", id2)
+			}
+			if tripwireCalled {
+				t.Fatal("tripwire called during sourceCRawS3OperationV1Start")
+			}
+			afterBytes2, err := os.ReadFile(stateFilePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(beforeBytes, afterBytes2) {
+				t.Fatal("state file modified by sourceCRawS3OperationV1Start")
 			}
 		})
 	}

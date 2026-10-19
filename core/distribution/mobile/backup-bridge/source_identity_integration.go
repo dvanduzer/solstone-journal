@@ -93,6 +93,7 @@ typedef struct {
 int32_t restic_bridge_snapshot_source_v1_start(restic_request*,restic_operation_options_v1*,int32_t,const char*,uint32_t,const char*,uint32_t,uint64_t*);
 int32_t restic_bridge_s3_snapshot_source_v1_start(restic_s3_request*,restic_operation_options_v1*,int32_t,const char*,uint32_t,uint64_t*);
 int32_t restic_bridge_operation_v1_start(restic_request*,restic_operation_options_v1*,const char*,uint32_t,const char*,uint32_t,uint64_t*);
+int32_t restic_bridge_s3_start(restic_s3_request*,uint64_t*);
 int32_t restic_bridge_s3_operation_v1_start(restic_s3_request*,restic_operation_options_v1*,const char*,uint32_t,uint64_t*);
 int32_t restic_bridge_operation_directories_v1_start(restic_request*,restic_operation_options_v1*,int32_t,int32_t,const char*,uint32_t,const char*,uint32_t,uint64_t*);
 int32_t restic_bridge_s3_operation_directories_v1_start(restic_s3_request*,restic_operation_options_v1*,int32_t,int32_t,int32_t,const char*,uint32_t,uint64_t*);
@@ -220,4 +221,65 @@ func sourceCWaitAndFree(id uint64) (bridgeResult, int32, int32) {
 	result := bridgeResult{status: int32(output.status), snapshotCount: uint32(output.snapshot_count), snapshotID: C.GoString(&output.snapshot_id[0]), keyID: C.GoString(&output.key_id[0]), diagnostic: C.GoString(&output.diagnostic[0])}
 	freed := C.restic_bridge_free(C.uint64_t(id))
 	return result, int32(status), int32(freed)
+}
+
+func sourceCS3Request(input sourceCInput, operation int32, allocations *[]unsafe.Pointer) C.restic_s3_request {
+	bytes := func(value []byte) (*C.char, C.uint32_t) {
+		if len(value) == 0 {
+			return nil, 0
+		}
+		p := C.CBytes(value)
+		*allocations = append(*allocations, p)
+		return (*C.char)(p), C.uint32_t(len(value))
+	}
+	text := func(value string) (*C.char, C.uint32_t) { return bytes([]byte(value)) }
+
+	request := C.restic_s3_request{version: 1, operation: C.int32_t(operation)}
+	if input.remote != nil {
+		cfg := input.remote
+		request.endpoint, request.endpoint_len = text(cfg.endpoint)
+		request.region, request.region_len = text(cfg.region)
+		request.bucket, request.bucket_len = text(cfg.bucket)
+		request.prefix, request.prefix_len = text(cfg.prefix)
+		request.access_key, request.access_key_len = text(cfg.access)
+		request.secret_key, request.secret_key_len = text(cfg.secret)
+		request.session_token, request.session_token_len = text(cfg.token)
+	}
+	request.password, request.password_len = bytes(input.password)
+	if operation == OpInit || operation == OpAddRecoveryKey {
+		request.recovery_password, request.recovery_password_len = bytes(input.recovery)
+	}
+	request.state_path, request.state_path_len = text(input.state)
+	if operation == OpSnapshot {
+		request.source_path, request.source_path_len = text(input.source)
+		request.workspace_path, request.workspace_path_len = text(input.workspace)
+	}
+	return request
+}
+
+func sourceCRawS3Start(input sourceCInput, operation int32) (uint64, int32) {
+	var allocations []unsafe.Pointer
+	defer func() {
+		for _, p := range allocations {
+			C.free(p)
+		}
+	}()
+	request := sourceCS3Request(input, operation, &allocations)
+	id := C.uint64_t(0xfedcba9876543210)
+	status := C.restic_bridge_s3_start(&request, &id)
+	return uint64(id), int32(status)
+}
+
+func sourceCRawS3OperationV1Start(input sourceCInput, operation int32) (uint64, int32) {
+	var allocations []unsafe.Pointer
+	defer func() {
+		for _, p := range allocations {
+			C.free(p)
+		}
+	}()
+	request := sourceCS3Request(input, operation, &allocations)
+	options := C.restic_operation_options_v1{version: 1}
+	id := C.uint64_t(0xfedcba9876543210)
+	status := C.restic_bridge_s3_operation_v1_start(&request, &options, nil, 0, &id)
+	return uint64(id), int32(status)
 }

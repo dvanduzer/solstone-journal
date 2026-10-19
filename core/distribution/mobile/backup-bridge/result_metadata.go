@@ -158,7 +158,10 @@ func withResultMetadata(id uint64, copyResult func([]byte) int32) int32 {
 		return StatusBusy
 	}
 	if h.result.status != StatusOk {
-		return h.result.status
+		if !(h.result.status == StatusRemotePending && h.result.diagnostic == DiagRemotePending && h.result.metadataStatus == StatusOk && len(h.result.metadata) > 0 && len(h.result.metadata) <= maxResultMetadata) {
+			return h.result.status
+		}
+		return copyResult(h.result.metadata)
 	}
 	if h.result.metadataStatus != StatusOk {
 		return h.result.metadataStatus

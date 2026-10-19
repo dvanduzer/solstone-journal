@@ -9,11 +9,14 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use solstone_core_backup::archive_admission::ArchiveCancellation;
+#[cfg(any(not(target_os = "ios"), test))]
+use solstone_core_backup::load_hosted_binding;
+#[cfg(target_os = "ios")]
+use solstone_core_backup::load_hosted_binding_at_root;
 use solstone_core_backup::{
     PendingExecution, PendingKeyRevocation, backup_setup_fingerprint, candidate_binding,
     clear_pending_key_revocation_at_root, credential_binding, destination_from_config,
-    format_recovery_key_display, generate_recovery_key, load_hosted_binding,
-    stage_pending_key_revocation_at_root,
+    format_recovery_key_display, generate_recovery_key, stage_pending_key_revocation_at_root,
 };
 use solstone_core_journal_config_write::BoundConfigOutcome;
 use solstone_core_journal_config_write::DirectoryFlush;
@@ -21,13 +24,50 @@ use solstone_core_journal_io::JournalRoot;
 
 use crate::destination::validate_destination;
 use crate::engine::BackupServices;
-use crate::repo::{
-    add_recovery_key, capture_rotation_key_id, remove_rotation_key, strict_key_list_absence,
-};
+#[cfg(any(not(target_os = "ios"), all(test, feature = "full-tests")))]
+use crate::repo::add_recovery_key;
+use crate::repo::{capture_rotation_key_id, remove_rotation_key, strict_key_list_absence};
 
 #[cfg(feature = "test-hooks")]
 use super::pause_after_remote_removal;
 use super::{ROTATION_TIMEOUT_SECONDS, RotationResult, error, map_error};
+
+#[cfg(any(target_os = "ios", test))]
+pub(crate) fn admits_journal_root(root: &JournalRoot, journal: &Path) -> bool {
+    root.canonical_path() == journal && root.revalidate_canonical_binding().is_ok()
+}
+
+#[cfg(all(unix, feature = "test-hooks"))]
+struct ParentSyncFaultState {
+    target_path: std::path::PathBuf,
+    consumed: bool,
+}
+
+#[cfg(all(unix, feature = "test-hooks"))]
+static PARENT_SYNC_FAULT_HOOK: std::sync::Mutex<Option<ParentSyncFaultState>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(all(unix, feature = "test-hooks"))]
+pub fn arm_rotation_parent_sync_fault(root: &JournalRoot) -> bool {
+    let mut guard = PARENT_SYNC_FAULT_HOOK.lock().unwrap();
+    if guard.as_ref().is_some_and(|state| !state.consumed) {
+        return false;
+    }
+    *guard = Some(ParentSyncFaultState {
+        target_path: root.canonical_path().to_path_buf(),
+        consumed: false,
+    });
+    true
+}
+
+#[cfg(all(unix, feature = "test-hooks"))]
+pub fn rotation_parent_sync_fault_observation() -> (bool, bool) {
+    let guard = PARENT_SYNC_FAULT_HOOK.lock().unwrap();
+    match guard.as_ref() {
+        Some(state) => (!state.consumed, state.consumed),
+        None => (false, false),
+    }
+}
 
 /// A fetched capability expires within this attempt; later retries fetch fresh
 /// credentials while keeping the same durable key-revocation intent.
@@ -42,6 +82,11 @@ impl RotationRunner<'_> {
         request: &crate::runner::ToolRequest<'a>,
     ) -> std::io::Result<crate::runner::ToolRequest<'a>> {
         let mut bounded = request.clone();
+        bounded.timeout = self.remaining_timeout(request.timeout)?;
+        Ok(bounded)
+    }
+
+    fn remaining_timeout(&self, timeout: Option<Duration>) -> std::io::Result<Option<Duration>> {
         if let Some(deadline) = self.credential_deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -50,13 +95,11 @@ impl RotationRunner<'_> {
                     "rotation credential lifetime expired",
                 ));
             }
-            bounded.timeout = Some(
-                bounded
-                    .timeout
-                    .map_or(remaining, |timeout| timeout.min(remaining)),
-            );
+            return Ok(Some(
+                timeout.map_or(remaining, |timeout| timeout.min(remaining)),
+            ));
         }
-        Ok(bounded)
+        Ok(timeout)
     }
 }
 
@@ -79,6 +122,11 @@ impl crate::runner::ToolRunner for RotationRunner<'_> {
 
     fn cancellation(&self) -> Option<&ArchiveCancellation> {
         self.inner.cancellation()
+    }
+
+    #[cfg(target_os = "ios")]
+    fn ios_journal_root(&self) -> Option<&Arc<JournalRoot>> {
+        self.inner.ios_journal_root()
     }
 }
 
@@ -107,6 +155,10 @@ fn clear_intent(
     pending: &PendingKeyRevocation,
     binding: Option<&solstone_core_backup::HostedBinding>,
 ) -> RotationResult {
+    #[cfg(target_os = "ios")]
+    if root.revalidate_canonical_binding().is_err() {
+        return error("failed");
+    }
     let clear_outcome =
         match clear_pending_key_revocation_at_root(root, visible_sha, pending, binding) {
             Ok(outcome) => outcome,
@@ -129,10 +181,59 @@ fn clear_intent(
 
 /// Rotate the configured recovery key. No remote or local rollback is performed.
 pub(super) fn rotate_recovery_key(journal: &Path, services: &BackupServices<'_>) -> RotationResult {
+    #[cfg(all(unix, feature = "test-hooks"))]
+    {
+        let fault_waiting = {
+            let guard = PARENT_SYNC_FAULT_HOOK.lock().unwrap();
+            guard.as_ref().is_some_and(|state| {
+                !state.consumed
+                    && (state.target_path == journal
+                        || journal.canonicalize().is_ok_and(|c| c == state.target_path))
+            })
+        };
+        if fault_waiting {
+            let (result, consumed) = solstone_core_journal_io::run_with_bound_publication_fault(
+                solstone_core_journal_io::BoundPublicationPrimitive::ParentSync,
+                1,
+                5,
+                || execute_rotate_recovery_key(journal, services),
+            );
+            let mut guard = PARENT_SYNC_FAULT_HOOK.lock().unwrap();
+            if let Some(state) = guard.as_mut().filter(|state| {
+                state.target_path == journal
+                    || journal.canonicalize().is_ok_and(|c| c == state.target_path)
+            }) {
+                state.consumed = consumed;
+            }
+            return result;
+        }
+    }
+    execute_rotate_recovery_key(journal, services)
+}
+
+fn execute_rotate_recovery_key(journal: &Path, services: &BackupServices<'_>) -> RotationResult {
+    #[cfg(not(target_os = "ios"))]
     let read = match solstone_core_journal_config::read_journal_config(journal) {
         Ok(read) => read,
         Err(_) => return error("failed"),
     };
+    #[cfg(not(target_os = "ios"))]
+    let root = match JournalRoot::open(journal) {
+        Ok(root) => Arc::new(root),
+        Err(_) => return error("failed"),
+    };
+
+    #[cfg(target_os = "ios")]
+    let root = match services.runner.ios_journal_root() {
+        Some(root) if admits_journal_root(root, journal) => Arc::clone(root),
+        _ => return error("failed"),
+    };
+    #[cfg(target_os = "ios")]
+    let read = match solstone_core_journal_config::read_journal_config_bound(&root) {
+        Ok(read) => read,
+        Err(_) => return error("failed"),
+    };
+
     let (Some(config), Some(mut visible_sha)) = (read.config, read.sha256) else {
         return RotationResult {
             status: "skipped".into(),
@@ -177,16 +278,26 @@ pub(super) fn rotate_recovery_key(journal: &Path, services: &BackupServices<'_>)
         };
     };
 
-    let restic_path = match services.restic_path() {
-        Ok(path) => path,
+    let restic = match services.restic_invocation() {
+        Ok(inv) => inv,
         Err(reason) => return error(reason),
     };
+    #[cfg(target_os = "ios")]
+    if matches!(restic, crate::runner::ResticInvocation::Executable(_)) {
+        return error("restic_unavailable");
+    }
+
     let timeout = Some(Duration::from_secs(ROTATION_TIMEOUT_SECONDS));
     let mut credential_deadline = None;
 
     let (destination, hosted_binding) = match mode {
         "operated" => {
-            let Some(binding) = load_hosted_binding(journal) else {
+            #[cfg(not(target_os = "ios"))]
+            let binding_opt = load_hosted_binding(journal);
+            #[cfg(target_os = "ios")]
+            let binding_opt = load_hosted_binding_at_root(&root);
+
+            let Some(binding) = binding_opt else {
                 return RotationResult {
                     status: "skipped".into(),
                     reason_code: None,
@@ -259,11 +370,6 @@ pub(super) fn rotate_recovery_key(journal: &Path, services: &BackupServices<'_>)
         credential_deadline,
     };
 
-    let root = match JournalRoot::open(journal) {
-        Ok(root) => Arc::new(root),
-        Err(_) => return error("failed"),
-    };
-
     let (candidate, pending) = if let Some(parsed) = pending_intent {
         let candidate = recovery_key.to_owned();
 
@@ -280,8 +386,18 @@ pub(super) fn rotate_recovery_key(journal: &Path, services: &BackupServices<'_>)
             return error("failed");
         }
 
+        #[cfg(target_os = "ios")]
+        if !admits_journal_root(&root, journal) {
+            return error("failed");
+        }
+
+        let timeout = match runner.remaining_timeout(timeout) {
+            Ok(timeout) => timeout,
+            Err(_) => return error("timeout"),
+        };
+
         let verified =
-            match validate_destination(&runner, &destination, &candidate, restic_path, timeout) {
+            match validate_destination(&runner, &destination, &candidate, restic, timeout) {
                 Ok(status) => status,
                 Err(_) => return error("failed"),
             };
@@ -289,15 +405,42 @@ pub(super) fn rotate_recovery_key(journal: &Path, services: &BackupServices<'_>)
             return error(verified.reason_code);
         }
 
+        #[cfg(target_os = "ios")]
+        if !admits_journal_root(&root, journal) {
+            return error("failed");
+        }
+
+        #[cfg(target_os = "ios")]
+        {
+            let timeout = match runner.remaining_timeout(timeout) {
+                Ok(timeout) => timeout,
+                Err(_) => return error("timeout"),
+            };
+
+            let candidate_id =
+                match capture_rotation_key_id(&runner, &destination, &candidate, restic, timeout) {
+                    Ok(id) => id,
+                    Err(_) => return error("failed"),
+                };
+            if candidate_id == parsed.original_key_id {
+                return error("failed");
+            }
+        }
+
+        let timeout = match runner.remaining_timeout(timeout) {
+            Ok(timeout) => timeout,
+            Err(_) => return error("timeout"),
+        };
+
         match strict_key_list_absence(
             &runner,
             &destination,
             daily_key,
             &parsed.original_key_id,
-            restic_path,
+            restic,
             timeout,
         ) {
-            Ok(true) => {
+            Ok(true) if !cfg!(target_os = "ios") => {
                 return clear_intent(
                     &root,
                     &visible_sha,
@@ -306,8 +449,13 @@ pub(super) fn rotate_recovery_key(journal: &Path, services: &BackupServices<'_>)
                     hosted_binding.as_ref(),
                 );
             }
-            Ok(false) => {}
+            Ok(_) => {}
             Err(err) => return map_error(err),
+        }
+
+        #[cfg(target_os = "ios")]
+        if !admits_journal_root(&root, journal) {
+            return error("failed");
         }
 
         let stage_outcome = match stage_pending_key_revocation_at_root(
@@ -328,40 +476,140 @@ pub(super) fn rotate_recovery_key(journal: &Path, services: &BackupServices<'_>)
 
         (candidate, parsed)
     } else {
-        let old_id = match capture_rotation_key_id(
-            &runner,
-            &destination,
-            recovery_key,
-            restic_path,
-            timeout,
-        ) {
-            Ok(id) => id,
-            Err(err) => return map_error(err),
+        #[cfg(target_os = "ios")]
+        if !admits_journal_root(&root, journal) {
+            return error("failed");
+        }
+
+        let timeout = match runner.remaining_timeout(timeout) {
+            Ok(timeout) => timeout,
+            Err(_) => return error("timeout"),
         };
+
+        let old_id =
+            match capture_rotation_key_id(&runner, &destination, recovery_key, restic, timeout) {
+                Ok(id) => id,
+                Err(err) => return map_error(err),
+            };
 
         let candidate = match generate_recovery_key() {
             Ok(key) => key,
             Err(_) => return error("failed"),
         };
 
+        #[cfg(target_os = "ios")]
+        if !admits_journal_root(&root, journal) {
+            return error("failed");
+        }
+
+        let timeout = match runner.remaining_timeout(timeout) {
+            Ok(timeout) => timeout,
+            Err(_) => return error("timeout"),
+        };
+
+        #[cfg(not(target_os = "ios"))]
         if let Err(err) = add_recovery_key(
             &runner,
             &destination,
             daily_key,
             &candidate,
-            restic_path,
+            restic,
             timeout,
         ) {
             return map_error(err);
         }
 
+        #[cfg(target_os = "ios")]
+        let candidate = {
+            let authority = match restic {
+                crate::runner::ResticInvocation::Callable(a) => a,
+                _ => return error("failed"),
+            };
+            let env = match crate::repo::backend(&destination) {
+                Ok(e) => e,
+                Err(_) => return error("failed"),
+            };
+            let timeout = match runner.remaining_timeout(timeout) {
+                Ok(timeout) => timeout,
+                Err(_) => return error("timeout"),
+            };
+
+            let outcome = match crate::ios_callable::add_recovery_key_rotation(
+                authority,
+                &destination,
+                daily_key,
+                &candidate,
+                &env,
+                timeout,
+                runner.cancellation(),
+            ) {
+                Ok(o) => o,
+                Err(err) => return map_error(err),
+            };
+
+            match outcome {
+                crate::ios_callable::AddOutcome::Added => candidate,
+                crate::ios_callable::AddOutcome::Resumed(resumed) => {
+                    let timeout = match runner.remaining_timeout(timeout) {
+                        Ok(timeout) => timeout,
+                        Err(_) => return error("timeout"),
+                    };
+
+                    let second_outcome = match crate::ios_callable::add_recovery_key_rotation(
+                        authority,
+                        &destination,
+                        daily_key,
+                        &resumed,
+                        &env,
+                        timeout,
+                        runner.cancellation(),
+                    ) {
+                        Ok(o) => o,
+                        Err(err) => return map_error(err),
+                    };
+
+                    match second_outcome {
+                        crate::ios_callable::AddOutcome::Added => resumed,
+                        crate::ios_callable::AddOutcome::Resumed(_) => return error("failed"),
+                    }
+                }
+            }
+        };
+
+        #[cfg(target_os = "ios")]
+        if !admits_journal_root(&root, journal) {
+            return error("failed");
+        }
+
+        let timeout = match runner.remaining_timeout(timeout) {
+            Ok(timeout) => timeout,
+            Err(_) => return error("timeout"),
+        };
+
         let verified =
-            match validate_destination(&runner, &destination, &candidate, restic_path, timeout) {
+            match validate_destination(&runner, &destination, &candidate, restic, timeout) {
                 Ok(status) => status,
                 Err(_) => return error("failed"),
             };
         if !(verified.repo_exists && verified.reason_code == "repo_exists") {
             return error(verified.reason_code);
+        }
+
+        #[cfg(target_os = "ios")]
+        {
+            let timeout = match runner.remaining_timeout(timeout) {
+                Ok(timeout) => timeout,
+                Err(_) => return error("timeout"),
+            };
+
+            let candidate_id =
+                match capture_rotation_key_id(&runner, &destination, &candidate, restic, timeout) {
+                    Ok(id) => id,
+                    Err(_) => return error("failed"),
+                };
+            if candidate_id == old_id {
+                return error("failed");
+            }
         }
 
         let candidate_binding = match candidate_binding(daily_key, &candidate) {
@@ -380,6 +628,11 @@ pub(super) fn rotate_recovery_key(journal: &Path, services: &BackupServices<'_>)
             },
             setup_fingerprint: Some(setup_fingerprint),
         };
+
+        #[cfg(target_os = "ios")]
+        if !admits_journal_root(&root, journal) {
+            return error("failed");
+        }
 
         let stage_outcome = match stage_pending_key_revocation_at_root(
             &root,
@@ -403,6 +656,11 @@ pub(super) fn rotate_recovery_key(journal: &Path, services: &BackupServices<'_>)
     let default_cancel = ArchiveCancellation::new();
     let cancellation = services.runner.cancellation().unwrap_or(&default_cancel);
 
+    #[cfg(target_os = "ios")]
+    if !admits_journal_root(&root, journal) {
+        return error("failed");
+    }
+
     let binding_exclusion = match hosted_binding.as_ref() {
         Some(binding) => {
             match solstone_core_backup::hold_rotation_binding_at_root(&root, binding) {
@@ -413,12 +671,22 @@ pub(super) fn rotate_recovery_key(journal: &Path, services: &BackupServices<'_>)
         None => None,
     };
 
+    #[cfg(target_os = "ios")]
+    if !admits_journal_root(&root, journal) {
+        return error("failed");
+    }
+
+    let timeout = match runner.remaining_timeout(timeout) {
+        Ok(timeout) => timeout,
+        Err(_) => return error("timeout"),
+    };
+
     let removal = remove_rotation_key(
         &runner,
         &destination,
         daily_key,
         &pending.original_key_id,
-        restic_path,
+        restic,
         timeout,
         cancellation,
     );
@@ -437,6 +705,31 @@ pub(super) fn rotate_recovery_key(journal: &Path, services: &BackupServices<'_>)
 
     if let Err(err) = removal {
         return map_error(err);
+    }
+
+    #[cfg(target_os = "ios")]
+    if !admits_journal_root(&root, journal) {
+        return error("failed");
+    }
+
+    #[cfg(target_os = "ios")]
+    {
+        let timeout = match runner.remaining_timeout(timeout) {
+            Ok(timeout) => timeout,
+            Err(_) => return error("timeout"),
+        };
+        match strict_key_list_absence(
+            &runner,
+            &destination,
+            daily_key,
+            &pending.original_key_id,
+            restic,
+            timeout,
+        ) {
+            Ok(true) => {}
+            Ok(false) => return error("failed"),
+            Err(err) => return map_error(err),
+        }
     }
 
     clear_intent(
@@ -459,6 +752,50 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::io;
+
+    #[test]
+    fn callable_phase_timeout_uses_remaining_capability_lifetime() {
+        let inner = Script {
+            outputs: RefCell::new(VecDeque::new()),
+            commands: RefCell::new(Vec::new()),
+        };
+        let runner = RotationRunner {
+            inner: &inner,
+            credential_deadline: None,
+        };
+        assert_eq!(runner.remaining_timeout(None).unwrap(), None);
+        assert_eq!(
+            runner
+                .remaining_timeout(Some(Duration::from_secs(300)))
+                .unwrap(),
+            Some(Duration::from_secs(300))
+        );
+        let runner = RotationRunner {
+            inner: &inner,
+            credential_deadline: Some(Instant::now() + Duration::from_secs(3600)),
+        };
+        let remaining = runner.remaining_timeout(None).unwrap().unwrap();
+        assert!(!remaining.is_zero() && remaining <= Duration::from_secs(3600));
+        assert!(
+            runner
+                .remaining_timeout(Some(Duration::from_secs(1)))
+                .unwrap()
+                .unwrap()
+                <= Duration::from_secs(1)
+        );
+        let runner = RotationRunner {
+            inner: &inner,
+            credential_deadline: Some(Instant::now()),
+        };
+        assert_eq!(
+            runner
+                .remaining_timeout(Some(Duration::from_secs(300)))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        assert!(inner.commands.borrow().is_empty());
+    }
 
     struct Script {
         outputs: RefCell<VecDeque<ToolOutput>>,
@@ -1903,5 +2240,46 @@ mod tests {
                 .unwrap()
                 .contains_key("pending_key_revocation")
         );
+    }
+
+    #[test]
+    fn admitted_root_rejects_mismatched_journal_path() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let root_a = JournalRoot::open(dir_a.path()).unwrap();
+        assert!(admits_journal_root(&root_a, root_a.canonical_path()));
+        assert!(!admits_journal_root(&root_a, dir_b.path()));
+    }
+
+    #[test]
+    #[cfg(all(unix, feature = "test-hooks"))]
+    fn cross_thread_rotation_parent_sync_fault_consumed() {
+        let journal = journal();
+        let root = JournalRoot::open(journal.path()).unwrap();
+        assert!(arm_rotation_parent_sync_fault(&root));
+        assert!(!arm_rotation_parent_sync_fault(&root));
+        assert_eq!(rotation_parent_sync_fault_observation(), (true, false));
+
+        let journal_path = journal.path().to_path_buf();
+        let handle = std::thread::spawn(move || {
+            let runner = Script {
+                outputs: RefCell::new(VecDeque::from([
+                    output(0, "[{\"id\":\"old\",\"current\":true}]"),
+                    output(0, ""),
+                    output(0, ""),
+                ])),
+                commands: RefCell::new(vec![]),
+            };
+            let http = Http;
+            let clock = TestClock;
+            let maintenance = Maintenance;
+            let services = services(&runner, &http, &clock, &maintenance);
+            rotate_recovery_key(&journal_path, &services)
+        });
+
+        let result = handle.join().unwrap();
+        assert_eq!(result.status, "error");
+        assert_eq!(result.reason_code.as_deref(), Some("failed"));
+        assert_eq!(rotation_parent_sync_fault_observation(), (false, true));
     }
 }

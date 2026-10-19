@@ -12,6 +12,8 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
+import threading
 import time
 import wave
 
@@ -44,6 +46,10 @@ class Restic:
         self.env = {**os.environ, 'AWS_ACCESS_KEY_ID': credentials['access_key_id'],
                     'AWS_SECRET_ACCESS_KEY': credentials['secret_access_key'],
                     'AWS_DEFAULT_REGION': credentials['region'], 'RESTIC_CACHE_DIR': str(private / 'cache')}
+        if credentials.get('session_token'):
+            self.env['AWS_SESSION_TOKEN'] = credentials['session_token']
+        else:
+            self.env.pop('AWS_SESSION_TOKEN', None)
         self.private = private
 
     def run(self, name, password, *argv, check=True):
@@ -51,9 +57,11 @@ class Restic:
         descriptor = os.open(secret, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(descriptor, 'w') as stream:
             stream.write(password)
-        result = subprocess.run([str(self.args.restic), '-r', self.repository, '--password-file', str(secret),
-                                 *argv], env=self.env, capture_output=True, text=True, timeout=600)
-        secret.unlink()
+        try:
+            result = subprocess.run([str(self.args.restic), '-r', self.repository, '--password-file', str(secret),
+                                     *argv], env=self.env, capture_output=True, text=True, timeout=600)
+        finally:
+            secret.unlink()
         (self.args.output / f'restic-{name}.log').write_text(
             json.dumps({'argv': list(argv), 'exit': result.returncode, 'stdout': result.stdout[-65536:],
                         'stderr': result.stderr[-16384:]}, indent=2))
@@ -98,6 +106,111 @@ def operate(phone, uri, body=None, kind=None, seconds=600):
 
 def last_backup(phone):
     return owner(phone, 'GET', ROUTE + '/status').get('last_backup') or {}
+
+
+def canonical_key(display):
+    return ''.join(c for c in display.upper() if c.isalnum()).replace('I', '1').replace('L', '1').replace('O', '0')
+
+
+def key_listing(restic, name, key):
+    rows = json.loads(restic.run(name, key, 'key', 'list', '--json', '--no-lock').stdout)
+    assert rows and all(len(r['id']) == 64 and all(c in '0123456789abcdef' for c in r['id']) for r in rows), rows
+    assert len({r['id'] for r in rows}) == len(rows), rows
+    current = [r['id'] for r in rows if r.get('current') is True]
+    assert len(current) == 1, rows
+    return {r['id'] for r in rows}, current[0]
+
+
+def daily_backup_proof(phone, restic, canonical, name):
+    before = {row['id'] for row in restic.snapshots(name + '-before', canonical)}
+    previous = last_backup(phone).get('time')
+    owner(phone, 'POST', ROUTE + '/backup-now')
+    daily = wait_backup(phone, previous)
+    assert daily.get('status') == 'ok', daily
+    reported = daily.get('snapshot_id') or ''
+    assert 8 <= len(reported) <= 64 and all(c in '0123456789abcdef' for c in reported), daily
+    after = restic.snapshots(name + '-after', canonical)
+    matches = [row['id'] for row in after if row['id'].startswith(reported)]
+    assert len(matches) == 1 and matches[0] not in before, (daily, before, matches)
+    snapshot = json.loads(restic.run(name + '-read', canonical, 'cat', 'snapshot',
+                                    matches[0], '--no-lock').stdout)
+    assert snapshot.get('tree'), snapshot
+    return {'daily_backup': daily, 'independent_snapshot_id': matches[0],
+            'snapshot_ids': [row['id'] for row in after]}
+
+
+def rotate_phase(args, phone, restic, canonical, check):
+    """Exercise actual owner rotation, exact old-key revocation and daily backup."""
+    identity = owner(phone, 'GET', '/app/network/api/identity')
+    for index in range(args.rotations):
+        name = f'rotation-{index + 1}'
+        before, original = key_listing(restic, name + '-before', canonical)
+        operation = operate(phone, '/recovery-key/rotate', kind='rotate')
+        check(name, {'operation': operation, 'original_key_id': original})
+        assert operation.get('operation', {}).get('phase') == 'done', operation
+        display = owner(phone, 'POST', ROUTE + '/recovery-key/reveal')['recovery_key_display']
+        replacement = canonical_key(display)
+        assert replacement != canonical
+        (args.output / 'private' / 'recovery-key').write_text(display)
+        after, current = key_listing(restic, name + '-after', replacement)
+        revoked = restic.run(name + '-revoked', canonical, 'cat', 'config', '--no-lock', check=False)
+        assert revoked.returncode == 12, (name, revoked.returncode)
+        assert after == before - {original} | {current} and current not in before, (before, after, original, current)
+        owner(phone, 'POST', ROUTE + '/confirm', {'recovery_key': display})
+        check(name, {'operation': operation, 'original_key_id': original, 'replacement_key_id': current,
+                     'old_key_exit': revoked.returncode, 'remaining_key_ids': sorted(after)})
+        canonical = replacement
+    daily = daily_backup_proof(phone, restic, canonical, 'rotation-daily')
+    phone.launch()
+    assert owner(phone, 'GET', '/app/network/api/identity') == identity
+    assert canonical_key(owner(phone, 'POST', ROUTE + '/recovery-key/reveal')['recovery_key_display']) == canonical
+    restic.run('rotation-integrity', canonical, 'check')
+    check('rotation-restart', {**daily, 'identity': identity})
+    return canonical
+
+
+def rotation_publication_fault_phase(args, phone, restic, canonical, check):
+    """Lose directory-sync confirmation, then resume the same intent after relaunch."""
+    identity = owner(phone, 'GET', '/app/network/api/identity')
+    before, original = key_listing(restic, 'publication-before', canonical)
+    previous_key = args.output / 'private' / 'recovery-before-publication-fault'
+    descriptor = os.open(previous_key, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, 'w') as stream:
+        stream.write(canonical)
+    armed = native(phone.control('serve-rotation-fault-arm'))
+    assert armed.get('armed') is True and armed.get('checkpoint') == 'parent_sync', armed
+    uncertain = operate(phone, '/recovery-key/rotate', kind='rotate')
+    observed = native(phone.control('serve-rotation-fault-status'))
+    check('rotation-publication-uncertain', {'operation': uncertain, 'fault': observed,
+                                           'original_key_id': original})
+    assert uncertain.get('operation', {}).get('phase') == 'error', uncertain
+    assert observed == {'armed': False, 'fired': True}, observed
+    display = owner(phone, 'POST', ROUTE + '/recovery-key/reveal')['recovery_key_display']
+    candidate = canonical_key(display)
+    assert candidate != canonical, 'replacement was not visibly published'
+    after, replacement = key_listing(restic, 'publication-candidate', candidate)
+    old_access, old_current = key_listing(restic, 'publication-original', canonical)
+    assert old_current == original and old_access == after == before | {replacement}
+    assert replacement not in before
+    (args.output / 'private' / 'recovery-key').write_text(display)
+    phone.launch()
+    assert canonical_key(owner(phone, 'POST', ROUTE + '/recovery-key/reveal')['recovery_key_display']) == candidate
+    resumed = operate(phone, '/recovery-key/rotate', kind='rotate')
+    check('rotation-publication-resumed', {'operation': resumed, 'original_key_id': original,
+                                         'replacement_key_id': replacement})
+    assert resumed.get('operation', {}).get('phase') == 'done', resumed
+    assert canonical_key(owner(phone, 'POST', ROUTE + '/recovery-key/reveal')['recovery_key_display']) == candidate
+    settled, current = key_listing(restic, 'publication-settled', candidate)
+    assert current == replacement and settled == before - {original} | {replacement}
+    revoked = restic.run('publication-revoked', canonical, 'cat', 'config', '--no-lock', check=False)
+    assert revoked.returncode == 12, revoked.returncode
+    owner(phone, 'POST', ROUTE + '/confirm', {'recovery_key': display})
+    assert owner(phone, 'GET', '/app/network/api/identity') == identity
+    daily = daily_backup_proof(phone, restic, candidate, 'publication-recovered-daily')
+    check('rotation-publication-recovered', {'remaining_key_ids': sorted(settled),
+                                           'old_key_exit': revoked.returncode, 'identity': identity,
+                                           **daily})
+    return candidate
 
 
 def wait_backup(phone, previous_time, seconds=900):
@@ -149,6 +262,8 @@ def restore_phase(args, phone, restic, repository, storage, canonical, wrong, sn
 
 
 def main():
+    # Console evidence includes revealed recovery material.
+    os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--device', required=True)
     parser.add_argument('--host', required=True, help='Phone Wi-Fi IPv4 address')
@@ -162,9 +277,11 @@ def main():
     parser.add_argument('--bulk-mib', type=int, default=24)
     parser.add_argument('--bulk-files', type=int, default=4)
     parser.add_argument('--restore-suite', help='Fresh second journal for the separate restore phase')
+    parser.add_argument('--rotations', type=int, default=1, help='Successful owner rotations; use 17 to exceed retained-password capacity')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
-    args.output.mkdir(parents=True, exist_ok=False)
+    assert 1 <= args.rotations <= 32
+    args.output.mkdir(parents=True, mode=0o700, exist_ok=False)
     private = args.output / 'private'
     private.mkdir(mode=0o700)
     provenance(args)
@@ -172,6 +289,7 @@ def main():
     host = storage['endpoint'].removeprefix('https://').rstrip('/')
     repository = f"s3:https://{host}/{storage['bucket']}/{args.prefix.strip('/')}"
     restic = Restic(args, repository, storage, private)
+    prior_threads = set(threading.enumerate())
     phone, client = Phone(args), Client(args)
     results = {'suite': args.suite, 'repository': repository, 'checks': {}}
 
@@ -195,7 +313,7 @@ def main():
         owner(phone, 'POST', ROUTE + '/keys/generate')
         revealed = owner(phone, 'POST', ROUTE + '/recovery-key/reveal')
         recovery = revealed['recovery_key_display']
-        canonical = ''.join(c for c in recovery.upper() if c.isalnum()).replace('I', '1').replace('L', '1').replace('O', '0')
+        canonical = canonical_key(recovery)
         (private / 'recovery-key').write_text(recovery)
         (private / 'recovery-key').chmod(0o600)
         wrong = ('2' if canonical[0] != '2' else '3') + canonical[1:]
@@ -305,13 +423,13 @@ def main():
         final = restic.snapshots('snapshots-final', canonical)
         check('A6_restart', {'resumed': resumed, 'relaunched': relaunched, 'check_exit': integrity.returncode,
                              'snapshots': [s['id'] for s in final]})
-        # A8 last: these must refuse; if one regressed it could not damage the checks above.
-        def key_ids(name):
-            listed = json.loads(restic.run(name, canonical, 'key', 'list', '--json', '--no-lock').stdout)
-            return sorted(key['id'] for key in listed)
-        keys_before = key_ids('keys-before')
+        canonical = rotate_phase(args, phone, restic, canonical, check)
+        canonical = rotation_publication_fault_phase(args, phone, restic, canonical, check)
+        final = restic.snapshots('snapshots-after-rotation', canonical)
+        # Unsupported actions remain last so accidental admission cannot hide earlier results.
+        keys_before, _ = key_listing(restic, 'keys-before-refusals', canonical)
         refusals = {}
-        for uri, kind in (('/recovery-key/rotate', 'rotate'), ('/teardown', 'teardown')):
+        for uri, kind in (('/teardown', 'teardown'),):
             refusals[uri] = operate(phone, uri, kind=kind)
             assert refusals[uri].get('operation', {}).get('phase') != 'done', refusals[uri]
         refusals['/offload/enable'] = owner_raw(phone, 'POST', ROUTE + '/offload/enable')
@@ -319,7 +437,7 @@ def main():
         assert (refusals['/offload/enable'][1] or {}).get('reason_code') == 'unsupported_platform', refusals['/offload/enable']
         offload = owner(phone, 'GET', ROUTE + '/status').get('offload') or {}
         assert offload.get('enabled') is not True, offload
-        keys_after = key_ids('keys-after')
+        keys_after, _ = key_listing(restic, 'keys-after-refusals', canonical)
         check('A8_refusals', {'responses': refusals, 'keys_unchanged': keys_before == keys_after})
         assert keys_before == keys_after
         assert len(restic.snapshots('snapshots-a8', canonical)) == len(final)
@@ -333,14 +451,47 @@ def main():
         results['error'] = repr(error)[:4000]
         raise
     finally:
-        (args.output / 'result.json').write_text(json.dumps(results, indent=2))
+        cleanup_errors = []
         try:
-            phone.control('serve-stop')
-        except Exception as error:  # Record, never mask the original outcome.
-            results['final_stop'] = repr(error)[:2000]
-            (args.output / 'result.json').write_text(json.dumps(results, indent=2))
+            stopped = phone.control('serve-stop')
+            assert native(stopped).get('stopped') is True, stopped
+            results['final_stop'] = stopped
+        except Exception as error:
+            cleanup_errors.append({'step': 'serve-stop', 'error_type': type(error).__name__})
         for process in phone.processes:
-            process.terminate()
+            try:
+                # devicectl forwards catchable signals to the app; its console
+                # controller can be killed only after the app's joined Stop.
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=30)
+            except Exception as error:
+                cleanup_errors.append({'step': 'phone-controller', 'pid': process.pid,
+                                       'error_type': type(error).__name__})
+        try:
+            client.process.stdin.close()
+            try:
+                client.process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                client.process.kill()
+                client.process.wait(timeout=30)
+                cleanup_errors.append({'step': 'client', 'error_type': 'TimeoutExpired'})
+        except Exception as error:
+            cleanup_errors.append({'step': 'client', 'error_type': type(error).__name__})
+        captures = set(threading.enumerate()) - prior_threads
+        for thread in captures:
+            thread.join(timeout=10)
+            if thread.is_alive():
+                cleanup_errors.append({'step': 'console-capture', 'error_type': 'JoinTimeout'})
+        if not any(thread.is_alive() for thread in captures):
+            phone.log.close()
+        client.log.close()
+        results['cleanup_errors'] = cleanup_errors
+        if cleanup_errors:
+            results['passed'] = False
+        (args.output / 'result.json').write_text(json.dumps(results, indent=2))
+        if cleanup_errors and sys.exc_info()[0] is None:
+            raise AssertionError(('qualification cleanup failed', cleanup_errors))
 
 
 if __name__ == '__main__':

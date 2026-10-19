@@ -21,7 +21,7 @@ import (
 func TestS3OwnerAdapterWriteAheadAndExactLockAuthority(t *testing.T) {
 	cfg, root := s3TestConfig(), s3OwnerTestDirectory(t)
 	owner := s3OwnerTestOpen(t, root, cfg)
-	if err := owner.begin(OpOpen, cfg, []byte("fixture-password")); err != nil {
+	if err := owner.begin(OpOpen, false, cfg, []byte("fixture-password")); err != nil {
 		t.Fatal(err)
 	}
 	id := s3TestID(71)
@@ -73,7 +73,7 @@ func TestS3OwnerCredentialPasswordAndLockCapsPreserveRecord(t *testing.T) {
 		t.Run(kind, func(t *testing.T) {
 			cfg, root := s3TestConfig(), s3OwnerTestDirectory(t)
 			owner := s3OwnerTestOpen(t, root, cfg)
-			if err := owner.begin(OpOpen, cfg, []byte("fixture-password")); err != nil {
+			if err := owner.begin(OpOpen, false, cfg, []byte("fixture-password")); err != nil {
 				t.Fatal(err)
 			}
 			var refused func() error
@@ -82,22 +82,22 @@ func TestS3OwnerCredentialPasswordAndLockCapsPreserveRecord(t *testing.T) {
 				for index := 1; index < maxS3OwnerCredentials; index++ {
 					replacement := cfg
 					replacement.secret = fmt.Sprintf("retained-fixture-secret-%d", index)
-					if err := owner.begin(OpOpen, replacement, []byte("fixture-password")); err != nil {
+					if err := owner.begin(OpOpen, false, replacement, []byte("fixture-password")); err != nil {
 						t.Fatal("valid credential cap refused", err)
 					}
 				}
 				replacement := cfg
 				replacement.secret = "over-cap-secret"
-				refused = func() error { return owner.begin(OpOpen, replacement, []byte("fixture-password")) }
+				refused = func() error { return owner.begin(OpOpen, false, replacement, []byte("fixture-password")) }
 			case "passwords":
 				passwords := [][]byte{[]byte("fixture-password")}
 				for index := 1; index < maxS3OwnerPasswords; index++ {
 					passwords = append(passwords, []byte(fmt.Sprintf("fixture-password-%d", index)))
 				}
-				if err := owner.begin(OpOpen, cfg, passwords...); err != nil {
+				if err := owner.begin(OpOpen, false, cfg, passwords...); err != nil {
 					t.Fatal("valid password cap refused", err)
 				}
-				refused = func() error { return owner.begin(OpOpen, cfg, []byte("over-cap-password")) }
+				refused = func() error { return owner.begin(OpOpen, false, cfg, []byte("over-cap-password")) }
 			case "locks":
 				for index := 0; index < maxS3OwnerLocks; index++ {
 					if err := owner.noteSave(s3TestID(index + 1)); err != nil {
