@@ -1,5 +1,5 @@
 {
-  "cargo_lock_sha256": "347f81ceab28c7fec8dab9742a57a9d769aad12bb6282a73d3770faab53bb3ce",
+  "cargo_lock_sha256": "366ada704aa291e6d32c13e8f3ef66ee9cde7095b26a1635efd74d7b1ec51f2b",
   "filter_platform": "aarch64-apple-darwin",
   "notice_texts": [
     {
@@ -15566,37 +15566,37 @@
       ]
     },
     {
-      "identity": "rustls@0.23.45 (registry+https://github.com/rust-lang/crates.io-index)",
+      "identity": "rustls@0.23.46 (registry+https://github.com/rust-lang/crates.io-index)",
       "license_expression": "Apache-2.0 OR ISC OR MIT",
       "notice_references": [
         {
           "bytes": 10847,
           "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
           "source": {
-            "archive_sha256": "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634",
+            "archive_sha256": "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf",
             "kind": "cargo-registry-archive",
             "member": "LICENSE-APACHE",
-            "source_url": "https://static.crates.io/crates/rustls/rustls-0.23.45.crate"
+            "source_url": "https://static.crates.io/crates/rustls/rustls-0.23.46.crate"
           }
         },
         {
           "bytes": 775,
           "sha256": "7cfafc877eccc46c0e346ccbaa5c51bb6b894d2b818e617d970211e232785ad4",
           "source": {
-            "archive_sha256": "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634",
+            "archive_sha256": "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf",
             "kind": "cargo-registry-archive",
             "member": "LICENSE-ISC",
-            "source_url": "https://static.crates.io/crates/rustls/rustls-0.23.45.crate"
+            "source_url": "https://static.crates.io/crates/rustls/rustls-0.23.46.crate"
           }
         },
         {
           "bytes": 1082,
           "sha256": "709e3175b4212f7b13aa93971c9f62ff8c69ec45ad8c6532a7e0c41d7a7d6f8c",
           "source": {
-            "archive_sha256": "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634",
+            "archive_sha256": "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf",
             "kind": "cargo-registry-archive",
             "member": "LICENSE-MIT",
-            "source_url": "https://static.crates.io/crates/rustls/rustls-0.23.45.crate"
+            "source_url": "https://static.crates.io/crates/rustls/rustls-0.23.46.crate"
           }
         }
       ]

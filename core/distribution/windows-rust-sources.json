@@ -1,9 +1,9 @@
 {
-  "cargo_lock_sha256": "347f81ceab28c7fec8dab9742a57a9d769aad12bb6282a73d3770faab53bb3ce",
+  "cargo_lock_sha256": "366ada704aa291e6d32c13e8f3ef66ee9cde7095b26a1635efd74d7b1ec51f2b",
   "dependency_source_companion": {
-    "bytes": 106405704,
-    "filename": "windows-rust-dependencies-31360f056aeaefdc.tar.gz",
-    "sha256": "664553c2c0b8624a62867950bab71bbc851acbb4c4fd9ae5b11caebca0961011"
+    "bytes": 104184615,
+    "filename": "windows-rust-dependencies-366ada704aa291e6.tar.gz",
+    "sha256": "2d6b0f5129046f438a08caa9d278b8e525fbee816236990d6a1bbc2b99b695cd"
   },
   "notice_texts": [
     {
@@ -22204,8 +22204,8 @@
       "windows_notice_population": true
     },
     {
-      "archive_sha256": "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634",
-      "identity": "rustls@0.23.45 (registry+https://github.com/rust-lang/crates.io-index)",
+      "archive_sha256": "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf",
+      "identity": "rustls@0.23.46 (registry+https://github.com/rust-lang/crates.io-index)",
       "license_expression": "Apache-2.0 OR ISC OR MIT",
       "name": "rustls",
       "notice_references": [
@@ -22213,30 +22213,30 @@
           "bytes": 10847,
           "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
           "source": {
-            "archive_sha256": "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634",
+            "archive_sha256": "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf",
             "kind": "cargo-registry-archive",
             "member": "LICENSE-APACHE",
-            "source_url": "https://static.crates.io/crates/rustls/rustls-0.23.45.crate"
+            "source_url": "https://static.crates.io/crates/rustls/rustls-0.23.46.crate"
           }
         },
         {
           "bytes": 775,
           "sha256": "7cfafc877eccc46c0e346ccbaa5c51bb6b894d2b818e617d970211e232785ad4",
           "source": {
-            "archive_sha256": "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634",
+            "archive_sha256": "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf",
             "kind": "cargo-registry-archive",
             "member": "LICENSE-ISC",
-            "source_url": "https://static.crates.io/crates/rustls/rustls-0.23.45.crate"
+            "source_url": "https://static.crates.io/crates/rustls/rustls-0.23.46.crate"
           }
         },
         {
           "bytes": 1082,
           "sha256": "709e3175b4212f7b13aa93971c9f62ff8c69ec45ad8c6532a7e0c41d7a7d6f8c",
           "source": {
-            "archive_sha256": "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634",
+            "archive_sha256": "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf",
             "kind": "cargo-registry-archive",
             "member": "LICENSE-MIT",
-            "source_url": "https://static.crates.io/crates/rustls/rustls-0.23.45.crate"
+            "source_url": "https://static.crates.io/crates/rustls/rustls-0.23.46.crate"
           }
         }
       ],
@@ -22245,11 +22245,11 @@
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "vcs": {
         "git": {
-          "sha1": "2976d90fd1c2db6b518700dd101b714069cfcb17"
+          "sha1": "f04804fa13341a9b1dc02b5d1dd8a746f2c4b7fb"
         },
         "path_in_vcs": "rustls"
       },
-      "version": "0.23.45",
+      "version": "0.23.46",
       "windows_notice_population": true
     },
     {
@@ -30312,14 +30312,14 @@
     "metadata_feature_scope": "workspace unified; conservative inclusion, not exact PE link graph",
     "notices": "non-dev dependency closure from Windows inventory binary roots in Windows-filtered Cargo metadata",
     "query": "cargo metadata --manifest-path core/Cargo.toml --locked --offline --format-version 1 --filter-platform x86_64-pc-windows-msvc --features solstone-core/journal-mcp-endpoint; inventory roots; follow non-dev dependency edges",
-    "query_utc": "2026-10-18T19:52:31.392910+00:00",
+    "query_utc": "2026-10-19T09:25:04.542679+00:00",
     "shipped_feature_arguments": [
       "--features",
       "solstone-core/journal-mcp-endpoint"
     ],
     "source": "complete Cargo.lock external-source set",
     "source_package_count": 595,
-    "source_sha256": "3489d71092341cf36db9c5b7a0e9b62d75adefcffea33f4b69f1706c9955c231",
+    "source_sha256": "57a925a89367c7140faad3e89804f490b27feed99600e5aa5069ff15829405ab",
     "windows_notice_package_count": 512,
     "windows_notice_path_package_count": 1
   },
