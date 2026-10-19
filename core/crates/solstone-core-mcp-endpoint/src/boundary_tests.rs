@@ -10550,12 +10550,9 @@ fn get_activity_sources_omits_desktop_activity_notes() {
     assert!(search1["results"].as_array().unwrap().is_empty());
 }
 
-#[test]
-fn fetch_markdown_whole_record_and_chunk_verification() {
-    let journal = base_activity_journal();
+fn write_three_section_weekly(journal: &tempfile::TempDir) -> std::path::PathBuf {
     let refl_dir = journal.path().join("reflections/weekly");
     fs::create_dir_all(&refl_dir).unwrap();
-
     let filler_1 = (0..60)
         .map(|i| {
             format!(
@@ -10572,32 +10569,57 @@ fn fetch_markdown_whole_record_and_chunk_verification() {
         .collect::<String>();
     assert!(filler_1.len() > 4096);
     assert!(filler_2.len() > 4096);
-
     let body = format!(
         "# Section One\n\nstartmdneedle\n\n{filler_1}\n\n# Section Two\n\nmiddlemdneedle\n\n{filler_2}\n\n# Section Three\n\nendmdneedle\n"
     );
     let md_path = refl_dir.join("20260308.md");
     fs::write(&md_path, &body).unwrap();
-
     let produced = produce_chunks(Family::Markdown, "reflections/weekly/20260308.md", &body);
     assert!(produced.chunks.len() >= 3);
-
     solstone_core_indexer_store::scan::scan_journal(journal.path(), true).unwrap();
+    md_path
+}
 
-    let search_res = probe(&journal, "search", json!({"query": "middlemdneedle"})).unwrap();
+fn fetch_weekly_reference(
+    journal: &tempfile::TempDir,
+    query: &str,
+    absent_from_snippet: &str,
+) -> String {
+    let search_res = probe(journal, "search", json!({"query": query})).unwrap();
     assert_no_leaked_keys(&search_res);
     let results = search_res["results"].as_array().unwrap();
     assert!(!results.is_empty());
     let hit = &results[0];
     let snippet = hit["snippet"].as_str().unwrap();
-    assert!(!snippet.contains("startmdneedle"));
-
+    assert!(snippet.contains(query));
+    assert!(!snippet.contains(absent_from_snippet));
     let reference = hit["reference"].as_str().unwrap().to_owned();
-    let fetched = probe(&journal, "fetch", json!({"reference": reference})).unwrap();
+    let fetched = probe(journal, "fetch", json!({"reference": reference})).unwrap();
     assert_no_leaked_keys(&fetched);
     let text = fetched["text"].as_str().unwrap();
     assert!(text.contains("startmdneedle"));
     assert!(text.contains("endmdneedle"));
+    reference
+}
+
+#[test]
+fn fetch_markdown_whole_record_and_chunk_verification() {
+    let journal = base_activity_journal();
+    let md_path = write_three_section_weekly(&journal);
+    let reference = fetch_weekly_reference(&journal, "middlemdneedle", "startmdneedle");
+
+    fs::write(&md_path, "# Short\n\nreplacementonlyneedle\n").unwrap();
+    assert_eq!(
+        probe(&journal, "fetch", json!({"reference": reference})),
+        Err(McpProbeError::Unavailable)
+    );
+}
+
+#[test]
+fn fetch_markdown_first_chunk_refuses_when_expansion_cannot_be_verified() {
+    let journal = base_activity_journal();
+    let md_path = write_three_section_weekly(&journal);
+    let reference = fetch_weekly_reference(&journal, "startmdneedle", "endmdneedle");
 
     fs::write(&md_path, "# Short\n\nreplacementonlyneedle\n").unwrap();
     assert_eq!(

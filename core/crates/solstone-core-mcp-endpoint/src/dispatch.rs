@@ -14,8 +14,8 @@ use solstone_core_format::agent_memory::{Coordinate, Origin, SourceKey};
 use solstone_core_indexer_query::{
     AdmittedCategory, ConnectionBoundary, ConnectionScope, ConnectionSearchRequest,
     ConnectionStartAfter, IndexedEntry, OwnMemoryOpenError, QueryBoundary,
-    memory_row_matches_original, open_own_memory_index, read_indexed_entry,
-    read_indexed_path_entries, read_own_memory_row, search_connection,
+    indexed_path_has_later_chunk, memory_row_matches_original, open_own_memory_index,
+    read_indexed_entry, read_indexed_path_entries, read_own_memory_row, search_connection,
 };
 use solstone_core_indexer_store::classification::{FacetDeclarationSet, classify_source};
 use solstone_core_journal_io::paths::{
@@ -1566,38 +1566,58 @@ enum MarkdownFetch {
     /// The indexed chunk is still that index in the current file, so the whole
     /// file is the record.
     Document(String),
-    /// One indexed chunk whose current file no longer matches. ac10 keeps the
-    /// indexed snapshot rather than the bytes now on disk.
+    /// The index admitted no later chunk of this path, and the current file
+    /// does not verify it. ac10 keeps that indexed snapshot rather than the
+    /// bytes now on disk. A non-markdown path is the same snapshot: this fetch
+    /// does not expand it.
     IndexedChunk,
-    /// A later chunk of a multi-chunk record, and the current file does not
-    /// verify it. The indexed slice is not the whole record.
+    /// The index admitted a later chunk of this path, or this reference is not
+    /// the first chunk, and the current file does not verify it. The indexed
+    /// slice is not the whole record.
     Reject,
 }
 
-fn markdown_fetch(journal_root: &Path, path: &str, idx: i64, indexed: &str) -> MarkdownFetch {
+fn markdown_fetch(
+    journal_root: &Path,
+    boundary: &ConnectionBoundary,
+    path: &str,
+    idx: i64,
+    indexed: &str,
+) -> Result<MarkdownFetch, DispatchError> {
     if !path.ends_with(".md") {
-        return MarkdownFetch::IndexedChunk;
+        return Ok(MarkdownFetch::IndexedChunk);
     }
-    let verified = (|| -> Option<String> {
-        let bytes = crate::activity_admit::read_contained_source(journal_root, path)?;
-        let full_text = String::from_utf8(bytes).ok()?;
-        let produced = solstone_core_format::content::produce_chunks(
-            solstone_core_format::content::Family::Markdown,
-            path,
-            &full_text,
-        );
-        let idx = usize::try_from(idx).ok()?;
-        let chunk = produced.chunks.get(idx)?;
-        (chunk.content == indexed).then_some(full_text)
-    })();
-    if let Some(full_text) = verified {
-        return MarkdownFetch::Document(full_text);
+    if let Some(full_text) = verified_markdown_document(journal_root, path, idx, indexed) {
+        return Ok(MarkdownFetch::Document(full_text));
     }
-    if idx == 0 {
-        MarkdownFetch::IndexedChunk
-    } else {
-        MarkdownFetch::Reject
+    // A first chunk is the whole indexed document only when the index admitted
+    // no later chunk of this path. The connection boundary is the same one
+    // that admitted the reference; classification is per path, so a sibling
+    // chunk is visible whenever this one is.
+    if idx == 0
+        && !indexed_path_has_later_chunk(journal_root, boundary, path).map_err(index_error)?
+    {
+        return Ok(MarkdownFetch::IndexedChunk);
     }
+    Ok(MarkdownFetch::Reject)
+}
+
+fn verified_markdown_document(
+    journal_root: &Path,
+    path: &str,
+    idx: i64,
+    indexed: &str,
+) -> Option<String> {
+    let bytes = crate::activity_admit::read_contained_source(journal_root, path)?;
+    let full_text = String::from_utf8(bytes).ok()?;
+    let produced = solstone_core_format::content::produce_chunks(
+        solstone_core_format::content::Family::Markdown,
+        path,
+        &full_text,
+    );
+    let idx = usize::try_from(idx).ok()?;
+    let chunk = produced.chunks.get(idx)?;
+    (chunk.content == indexed).then_some(full_text)
 }
 
 fn fetch(
@@ -1641,8 +1661,13 @@ fn fetch(
                     (cleaned_text, Some(a.hidden), Some(cleaned))
                 }
                 ActivityAdmit::NotActivity(content) => {
-                    let text = match markdown_fetch(journal_root, &entry.path, entry.idx, &content)
-                    {
+                    let text = match markdown_fetch(
+                        journal_root,
+                        &boundary,
+                        &entry.path,
+                        entry.idx,
+                        &content,
+                    )? {
                         MarkdownFetch::Document(text) => text,
                         MarkdownFetch::IndexedChunk => content,
                         MarkdownFetch::Reject => {

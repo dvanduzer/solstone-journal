@@ -906,6 +906,42 @@ pub fn read_indexed_path_entries(
     Ok(IndexedPathEntries { entries, truncated })
 }
 
+/// Whether this connection's boundary admits a chunk of `path` after index
+/// zero. Two rows that both sit at index zero are still one indexed chunk.
+/// An absent or empty index has no later chunk.
+pub fn indexed_path_has_later_chunk(
+    journal: &Path,
+    boundary: &ConnectionBoundary,
+    path: &str,
+) -> Result<bool, IndexAccessError> {
+    let query_boundary = QueryBoundary::Connection(boundary.clone());
+    let reader = match open_index_reader(journal, &query_boundary) {
+        Ok(reader) => reader,
+        Err(IndexAccessError::Absent { .. } | IndexAccessError::Empty { .. }) => {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    let mut plan = SqlPlan {
+        where_clause: visible_rows("path=? AND idx>0"),
+        params: Vec::new(),
+        has_live_match_expression: false,
+    };
+    append_connection_prefilter(&mut plan, boundary);
+    let mut values = vec![Value::Text(path.to_string())];
+    values.extend(plan.params.into_iter().map(Value::Text));
+    let found: Option<i64> = reader
+        .connection
+        .query_row(
+            &format!("SELECT 1 FROM chunks WHERE {} LIMIT 1", plan.where_clause),
+            params_from_iter(values.iter()),
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| reader.classify(error))?;
+    Ok(found.is_some())
+}
+
 impl QueryConnection {
     pub(crate) fn new(connection: Connection, path: PathBuf) -> Self {
         Self {
