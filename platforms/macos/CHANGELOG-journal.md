@@ -7,8 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.51 (build 97)] - 2026-10-19
+
 ### Added
-- with the latest solstone app on this mac, you can now choose your folder, lock in your mark and choose where thinking happens in the journal app. setup then continues in the solstone app, and your journal opens in the browser at the end.
+- when you set up your journal with the latest solstone app on this mac, you now choose your folder, your journal's mark and where thinking happens in the journal app. setup then continues in the solstone app, and your journal opens in the browser at the end.
+
+### Changed
+- updated the bundled journal to [2.0.51](https://solstone.app/releases#v2.0.51) →
 
 ### Fixed
 - if start at login can't be changed, the journal app keeps the previous setting and shows an error.
