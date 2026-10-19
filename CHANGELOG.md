@@ -8,10 +8,6 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [2.0.51] - 2026-10-19
 
-### Changed
-
-- when you pair a mac or windows computer, you can now open the pairing link on it and choose "open in the solstone app". pasting the link into the app still works.
-
 ### Fixed
 
 - on the agents page, the steps to forward port 443 yourself warn again that a tunnel that ends HTTPS can read your agent's traffic and reuse its credential to reach your journal.
