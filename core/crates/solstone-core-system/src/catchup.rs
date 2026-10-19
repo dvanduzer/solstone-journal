@@ -212,15 +212,34 @@ fn daily_marker_proves_attempt(
     day: &str,
     admitted_generation: u64,
     fingerprint: &str,
+    talent_roots: Option<(&Path, &Path)>,
 ) -> bool {
-    crate::daily_coverage::read_daily_coverage(journal, day)
-        .is_ok_and(|coverage| coverage.state.is_current())
-        && matches!(
-            read_health_marker(journal, day, HealthMarkerKind::Daily),
-            Ok(HealthMarkerState::Versioned { marker, .. })
-                if marker.generation == admitted_generation
-                    && marker.fingerprint.as_deref() == Some(fingerprint)
-        )
+    if !daily_marker_matches_attempt(journal, day, admitted_generation, fingerprint) {
+        return false;
+    }
+    let coverage = match talent_roots {
+        Some((talent, apps)) if talent.is_dir() && apps.is_dir() => {
+            crate::daily_coverage::read_daily_coverage_with_roots(journal, day, talent, apps)
+        }
+        Some(_) => return false,
+        None => crate::daily_coverage::read_daily_coverage(journal, day),
+    };
+    coverage.is_ok_and(|coverage| coverage.state.is_current())
+        && daily_marker_matches_attempt(journal, day, admitted_generation, fingerprint)
+}
+
+fn daily_marker_matches_attempt(
+    journal: &Path,
+    day: &str,
+    admitted_generation: u64,
+    fingerprint: &str,
+) -> bool {
+    matches!(
+        read_health_marker(journal, day, HealthMarkerKind::Daily),
+        Ok(HealthMarkerState::Versioned { marker, .. })
+            if marker.generation == admitted_generation
+                && marker.fingerprint.as_deref() == Some(fingerprint)
+    )
 }
 
 fn prune(entries: &mut Map<String, Value>, journal: &Path) {
@@ -490,6 +509,28 @@ pub fn record_daily_catchup_outcome(
     )
 }
 
+/// Settle an embedded host's attempt against its admitted packaged talent roots.
+pub fn record_daily_catchup_outcome_with_roots(
+    journal: &Path,
+    day: &str,
+    reference: &str,
+    admitted_generation: u64,
+    fingerprint: &str,
+    outcome: DailyCatchupOutcome,
+    talent_roots: Option<(&Path, &Path)>,
+) -> Result<bool, CatchupError> {
+    record_daily_catchup_outcome_controlled(
+        journal,
+        day,
+        reference,
+        admitted_generation,
+        fingerprint,
+        outcome,
+        catchup_marker_capability,
+        talent_roots,
+    )
+}
+
 pub(crate) fn record_daily_catchup_outcome_with_capability<Capability>(
     journal: &Path,
     day: &str,
@@ -502,13 +543,46 @@ pub(crate) fn record_daily_catchup_outcome_with_capability<Capability>(
 where
     Capability: FnOnce() -> Result<(), CatchupError>,
 {
+    record_daily_catchup_outcome_controlled(
+        journal,
+        day,
+        reference,
+        admitted_generation,
+        fingerprint,
+        outcome,
+        capability,
+        None,
+    )
+}
+
+// Keep the admitted attempt fields explicit beside the capability and host roots.
+#[allow(clippy::too_many_arguments)]
+fn record_daily_catchup_outcome_controlled<Capability>(
+    journal: &Path,
+    day: &str,
+    reference: &str,
+    admitted_generation: u64,
+    fingerprint: &str,
+    outcome: DailyCatchupOutcome,
+    capability: Capability,
+    talent_roots: Option<(&Path, &Path)>,
+) -> Result<bool, CatchupError>
+where
+    Capability: FnOnce() -> Result<(), CatchupError>,
+{
     capability()?;
     {
         let stream_generation = marker_generation(journal, day, HealthMarkerKind::Stream);
         let current_fingerprint = read_raw_input_fingerprint(journal, day);
         let daily_completed = current_fingerprint.as_ref().is_ok_and(|current| {
             current == fingerprint
-                && daily_marker_proves_attempt(journal, day, admitted_generation, fingerprint)
+                && daily_marker_proves_attempt(
+                    journal,
+                    day,
+                    admitted_generation,
+                    fingerprint,
+                    talent_roots,
+                )
         });
         let mut recorded = false;
         update_catchup_state(journal, false, |entries| {
@@ -635,7 +709,29 @@ pub fn reconcile_stale_catchup_attempts_checked(
     now: SystemTime,
     checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<(), CatchupError> {
-    reconcile_stale_catchup_attempts_controlled(journal, now, catchup_marker_capability, checkpoint)
+    reconcile_stale_catchup_attempts_controlled(
+        journal,
+        now,
+        catchup_marker_capability,
+        checkpoint,
+        None,
+    )
+}
+
+/// Reconcile an embedded host using the same packaged roots as its execution.
+pub fn reconcile_stale_catchup_attempts_with_roots_checked(
+    journal: &Path,
+    now: SystemTime,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+    talent_roots: Option<(&Path, &Path)>,
+) -> Result<(), CatchupError> {
+    reconcile_stale_catchup_attempts_controlled(
+        journal,
+        now,
+        catchup_marker_capability,
+        checkpoint,
+        talent_roots,
+    )
 }
 
 #[cfg(test)]
@@ -647,7 +743,7 @@ pub(crate) fn reconcile_stale_catchup_attempts_with_capability<Capability>(
 where
     Capability: FnOnce() -> Result<(), CatchupError>,
 {
-    reconcile_stale_catchup_attempts_controlled(journal, now, capability, &|| Ok(()))
+    reconcile_stale_catchup_attempts_controlled(journal, now, capability, &|| Ok(()), None)
 }
 
 pub(crate) fn reconcile_stale_catchup_attempts_controlled<Capability>(
@@ -655,6 +751,7 @@ pub(crate) fn reconcile_stale_catchup_attempts_controlled<Capability>(
     now: SystemTime,
     capability: Capability,
     checkpoint: &dyn Fn() -> Result<(), String>,
+    talent_roots: Option<(&Path, &Path)>,
 ) -> Result<(), CatchupError>
 where
     Capability: FnOnce() -> Result<(), CatchupError>,
@@ -675,14 +772,28 @@ where
                 let Some(kind) = existing.get("command_kind").and_then(Value::as_str) else {
                     continue;
                 };
-                if !matches!(kind, KIND_DAILY_CATCHUP | KIND_SEGMENT_REPAIR)
-                    || !existing.get("active").is_some_and(json_truthy)
-                {
+                if !matches!(kind, KIND_DAILY_CATCHUP | KIND_SEGMENT_REPAIR) {
                     continue;
                 }
                 let Some(day) = existing.get("day").and_then(Value::as_str) else {
                     continue;
                 };
+                let active = existing.get("active").is_some_and(json_truthy);
+                if !active {
+                    let admitted = existing.get("admitted_generation").and_then(Value::as_u64);
+                    let fingerprint = existing.get("fingerprint").and_then(Value::as_str);
+                    if kind != KIND_DAILY_CATCHUP
+                        || existing.get("last_outcome").and_then(Value::as_str) != Some("error")
+                        || existing.get("exit_code").and_then(Value::as_i64) != Some(0)
+                        || !admitted
+                            .zip(fingerprint)
+                            .is_some_and(|(generation, fingerprint)| {
+                                daily_marker_matches_attempt(journal, day, generation, fingerprint)
+                            })
+                    {
+                        continue;
+                    }
+                }
                 let mut record = record_from_entry(Some(existing), day, kind);
                 let current_fingerprint = read_raw_input_fingerprint(journal, day);
                 let fingerprint_unreadable = current_fingerprint.is_err();
@@ -703,9 +814,18 @@ where
                     let daily_completed = fingerprint.is_some_and(|fingerprint| {
                         current_fingerprint.as_ref().is_ok_and(|current| {
                             current == fingerprint
-                                && daily_marker_proves_attempt(journal, day, admitted, fingerprint)
+                                && daily_marker_proves_attempt(
+                                    journal,
+                                    day,
+                                    admitted,
+                                    fingerprint,
+                                    talent_roots,
+                                )
                         })
                     });
+                    if !active && !daily_completed {
+                        continue;
+                    }
                     let stream_advanced =
                         marker_generation(journal, day, HealthMarkerKind::Stream) > admitted;
                     if daily_completed {
@@ -1366,6 +1486,236 @@ mod tests {
             } else {
                 "error".to_owned()
             },
+        }
+    }
+
+    fn accepted_embedded_daily(bed: &Bed, day: &str) -> (PathBuf, PathBuf, String) {
+        use solstone_core_journal_io::{
+            AcceptedDailyResult, DailyUnitRecord, DailyUnitStatus, save_daily_unit_record,
+        };
+        let talent = bed.root.join("embedded/talent");
+        let apps = bed.root.join("embedded/apps");
+        fs::create_dir_all(&talent).unwrap();
+        fs::create_dir_all(&apps).unwrap();
+        fs::write(talent.join("schedule.md"), "{\n\"type\":\"generate\",\"max_output_tokens\":1024,\"output\":\"json\",\"schedule\":\"daily\",\"priority\":10,\"hook\":{\"post\":\"schedule\"}\n}\nExtract scheduled items.").unwrap();
+        bed.write(
+            format!("chronicle/{day}/talents/flow.md"),
+            "Meeting at ten.",
+        );
+        let coverage =
+            crate::daily_coverage::read_daily_coverage_with_roots(&bed.root, day, &talent, &apps)
+                .unwrap();
+        assert_eq!(coverage.units.len(), 1);
+        let unit = &coverage.units[0];
+        let mut record = DailyUnitRecord::new(
+            unit.identity.clone(),
+            &unit.evidence_revision,
+            &unit.contract_digest,
+        );
+        record.status = DailyUnitStatus::CommittedNoOutput;
+        record.accepted = Some(AcceptedDailyResult {
+            evidence_revision: unit.evidence_revision.clone(),
+            contract_digest: unit.contract_digest.clone(),
+            status: DailyUnitStatus::CommittedNoOutput,
+            packet_digest: Some("a".repeat(64)),
+            generated_result: Some(
+                json!({"response":"{\"events\":[]}","output":"{\"events\":[]}"}),
+            ),
+            receipts: Vec::new(),
+            committed_at_ms: 1,
+        });
+        save_daily_unit_record(&bed.root, &record).unwrap();
+        assert!(
+            crate::daily_coverage::read_daily_coverage_with_roots(&bed.root, day, &talent, &apps)
+                .unwrap()
+                .state
+                .is_current()
+        );
+        let fingerprint = read_raw_input_fingerprint(&bed.root, day).unwrap();
+        bed.write(
+            format!("chronicle/{day}/health/stream.updated"),
+            br#"{"version":1,"generation":2,"fingerprint":null}"#,
+        );
+        bed.write(
+            format!("chronicle/{day}/health/daily.updated"),
+            daily_marker(2, &fingerprint),
+        );
+        (talent, apps, fingerprint)
+    }
+
+    #[test]
+    fn embedded_daily_outcome_uses_current_declared_payload_instead_of_desktop_roots() {
+        let day = "20261017";
+        for case in [
+            "current",
+            "missing-root",
+            "changed-contract",
+            "missing-marker",
+            "changed-marker",
+            "changed-raw",
+        ] {
+            let bed = Bed::new(&format!("embedded-outcome-{case}"));
+            let (talent, apps, fingerprint) = accepted_embedded_daily(&bed, day);
+            record_daily_catchup_attempt(&bed.root, day, "embedded", 10.0, 2, &fingerprint);
+            match case {
+                "missing-root" => fs::remove_dir_all(&apps).unwrap(),
+                "changed-contract" => {
+                    let path = talent.join("schedule.md");
+                    let prompt = fs::read_to_string(&path).unwrap();
+                    fs::write(
+                        path,
+                        prompt.replace("Extract scheduled items.", "A changed instruction."),
+                    )
+                    .unwrap();
+                }
+                "changed-marker" => bed.write(
+                    format!("chronicle/{day}/health/daily.updated"),
+                    daily_marker(3, &fingerprint),
+                ),
+                "missing-marker" => fs::remove_file(
+                    bed.root
+                        .join(format!("chronicle/{day}/health/daily.updated")),
+                )
+                .unwrap(),
+                "changed-raw" => bed.segment_file(day, "120000_1", "audio.json", b"new raw input"),
+                _ => {}
+            }
+            if case == "changed-contract" {
+                let coverage = crate::daily_coverage::read_daily_coverage_with_roots(
+                    &bed.root, day, &talent, &apps,
+                )
+                .unwrap();
+                assert_eq!(coverage.units.len(), 1);
+                assert!(!coverage.state.is_current());
+            }
+            assert!(
+                record_daily_catchup_outcome_with_roots(
+                    &bed.root,
+                    day,
+                    "embedded",
+                    2,
+                    &fingerprint,
+                    daily_outcome(20.0, 0),
+                    Some((&talent, &apps))
+                )
+                .unwrap()
+            );
+            let state = read_catchup_state(&bed.root);
+            let entry = &state["entries"][catchup_state_key(day, KIND_DAILY_CATCHUP)];
+            assert_eq!(
+                entry["last_outcome"] == "completed",
+                case == "current",
+                "{case}: {entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_startup_recovers_only_proven_inactive_zero_exit_errors() {
+        let day = "20261017";
+        for case in [
+            "current",
+            "missing-root",
+            "wrong-root",
+            "missing-marker",
+            "changed-marker",
+            "changed-raw",
+            "nonzero-exit",
+            "cancelled",
+        ] {
+            let bed = Bed::new(&format!("embedded-stale-{case}"));
+            let (mut talent, apps, fingerprint) = accepted_embedded_daily(&bed, day);
+            record_daily_catchup_attempt(&bed.root, day, "embedded", 10.0, 2, &fingerprint);
+            // The desktop reader cannot certify this distinct embedded contract.
+            assert!(
+                !crate::daily_coverage::read_daily_coverage(&bed.root, day)
+                    .unwrap()
+                    .state
+                    .is_current()
+            );
+            record_daily_catchup_outcome(
+                &bed.root,
+                day,
+                "embedded",
+                2,
+                &fingerprint,
+                daily_outcome(20.0, if case == "nonzero-exit" { 1 } else { 0 }),
+            )
+            .unwrap();
+            assert_eq!(
+                read_catchup_state(&bed.root)["entries"]
+                    [catchup_state_key(day, KIND_DAILY_CATCHUP)]["last_outcome"],
+                "error"
+            );
+            match case {
+                "missing-root" => fs::remove_dir_all(&apps).unwrap(),
+                "wrong-root" => {
+                    let other = bed.root.join("other/talent");
+                    fs::create_dir_all(&other).unwrap();
+                    let prompt = fs::read_to_string(talent.join("schedule.md")).unwrap();
+                    fs::write(
+                        other.join("schedule.md"),
+                        prompt.replace(
+                            "Extract scheduled items.",
+                            "A different declared daily contract.",
+                        ),
+                    )
+                    .unwrap();
+                    talent = other;
+                }
+                "changed-marker" => bed.write(
+                    format!("chronicle/{day}/health/daily.updated"),
+                    daily_marker(3, &fingerprint),
+                ),
+                "missing-marker" => fs::remove_file(
+                    bed.root
+                        .join(format!("chronicle/{day}/health/daily.updated")),
+                )
+                .unwrap(),
+                "changed-raw" => bed.segment_file(day, "120000_1", "audio.json", b"new raw input"),
+                _ => {}
+            }
+            if case == "wrong-root" {
+                let coverage = crate::daily_coverage::read_daily_coverage_with_roots(
+                    &bed.root, day, &talent, &apps,
+                )
+                .unwrap();
+                assert_eq!(coverage.units.len(), 1);
+                assert!(!coverage.state.is_current());
+            }
+            let before = fs::read(catchup_state_path(&bed.root)).unwrap();
+            let checkpoint = || {
+                if case == "cancelled" {
+                    Err("cancelled".to_owned())
+                } else {
+                    Ok(())
+                }
+            };
+            let result = reconcile_stale_catchup_attempts_with_roots_checked(
+                &bed.root,
+                UNIX_EPOCH + Duration::from_secs(30),
+                &checkpoint,
+                Some((&talent, &apps)),
+            );
+            if case == "cancelled" {
+                assert!(result.is_err());
+            } else {
+                result.unwrap();
+            }
+            if case == "current" {
+                let state = read_catchup_state(&bed.root);
+                let entry = &state["entries"][catchup_state_key(day, KIND_DAILY_CATCHUP)];
+                assert_eq!(entry["last_outcome"], "completed");
+                assert_eq!(entry["attempts"], 0);
+                assert_eq!(entry["next_retry_at"], 0);
+                assert!(entry["active"].is_null());
+            } else {
+                assert_eq!(
+                    fs::read(catchup_state_path(&bed.root)).unwrap(),
+                    before,
+                    "{case}"
+                );
+            }
         }
     }
 

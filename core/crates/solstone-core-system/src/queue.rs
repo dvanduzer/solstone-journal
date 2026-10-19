@@ -22,7 +22,7 @@ use crate::cap::CapResolver;
 use crate::catchup::admit_daily_catchup;
 use crate::catchup::{
     CatchupError, DailyCatchupAdmission, DailyCatchupOutcome,
-    record_daily_catchup_admission_failure, record_daily_catchup_outcome,
+    record_daily_catchup_admission_failure, record_daily_catchup_outcome_with_roots,
 };
 #[cfg(test)]
 use crate::catchup::{admit_daily_catchup_with_capability, catchup_marker_capability};
@@ -787,6 +787,7 @@ struct QueueInner {
     held_persist_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     callable_worker: Option<CallableQueueWorker>,
     callable_admission: Option<CallableAdmission>,
+    daily_talent_roots: Option<(PathBuf, PathBuf)>,
     callable_workers: Mutex<Vec<CallableTaskHandle>>,
     callable_join_failed: Arc<std::sync::atomic::AtomicBool>,
     callable_panics: Arc<Mutex<Vec<Box<dyn std::any::Any + Send>>>>,
@@ -1060,25 +1061,27 @@ fn insert_loaded_record(
 
 impl TaskQueue {
     pub fn new(options: TaskQueueOptions) -> Self {
-        Self::construct(options, None, None)
+        Self::construct(options, None, None, None)
     }
 
     pub fn with_callable_worker(options: TaskQueueOptions, worker: CallableQueueWorker) -> Self {
-        Self::construct(options, Some(worker), None)
+        Self::construct(options, Some(worker), None, None)
     }
 
     pub fn with_callable_worker_and_admission(
         options: TaskQueueOptions,
         worker: CallableQueueWorker,
         admission: CallableAdmission,
+        daily_talent_roots: Option<(PathBuf, PathBuf)>,
     ) -> Self {
-        Self::construct(options, Some(worker), Some(admission))
+        Self::construct(options, Some(worker), Some(admission), daily_talent_roots)
     }
 
     fn construct(
         options: TaskQueueOptions,
         callable_worker: Option<CallableQueueWorker>,
         callable_admission: Option<CallableAdmission>,
+        daily_talent_roots: Option<(PathBuf, PathBuf)>,
     ) -> Self {
         #[cfg(windows)]
         let spawner: QueueProcessSpawner = {
@@ -1366,6 +1369,7 @@ impl TaskQueue {
                 #[cfg(test)]
                 held_persist_hook: Mutex::new(None),
                 callable_worker,
+                daily_talent_roots,
                 callable_admission,
                 callable_workers: Mutex::new(Vec::new()),
                 callable_join_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -4281,7 +4285,7 @@ fn record_completion(
         &dispatch.daily_catchup_admission,
     ) {
         let timed_out = status == TIMEOUT_EXIT_STATUS;
-        if let Err(error) = record_daily_catchup_outcome(
+        if let Err(error) = record_daily_catchup_outcome_with_roots(
             &inner.options.journal_root,
             &provenance.day,
             &dispatch.submission.reference,
@@ -4295,6 +4299,10 @@ fn record_completion(
                 exit_code,
                 exit_status: status,
             },
+            inner
+                .daily_talent_roots
+                .as_ref()
+                .map(|(talent, apps)| (talent.as_path(), apps.as_path())),
         ) {
             eprintln!("failed to record daily catchup outcome: {error}");
         }
@@ -9266,6 +9274,7 @@ mod tests {
             },
             Arc::new(|_, _| panic!("held work must not execute")),
             Arc::new(|_| false),
+            None,
         );
         let outcome = queue.submit(command_request(
             &[

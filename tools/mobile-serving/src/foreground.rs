@@ -778,6 +778,7 @@ impl ForegroundProcessingHost {
                 },
                 Arc::clone(&worker),
                 Arc::new(move |_args| !admitted_cancelled()),
+                Some((payload.join("solstone/talent"), payload.join("solstone/apps"))),
             ));
             if queue_slot.set(Arc::downgrade(&queue)).is_err() {
                 log::warn!("foreground schedule queue was already installed");
