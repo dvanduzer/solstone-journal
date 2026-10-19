@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-//! Native read routes for the activities, news, curation, awareness, and PDF Convey surfaces.
+//! Native read routes for the activities, curation, and awareness Convey surfaces.
 
 use std::path::PathBuf;
 

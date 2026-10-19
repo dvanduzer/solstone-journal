@@ -146,8 +146,9 @@ fn attach_daily_location(
     let rendered =
         render_location_part(&context.journal, &day).map_err(|error| failure(prepared, error))?;
     let ordinary = crate::ordinary_text_parts(&prepared.config);
-    let (part, omitted) = fit_location_part(hook, &day, &rendered, &ordinary, prepared, context)
-        .map_err(|error| failure(prepared, error))?;
+    let (part, omitted) =
+        fit_location_part(hook, &day, &rendered, &ordinary, prepared, state, context)
+            .map_err(|error| failure(prepared, error))?;
     let second = daily_location_fingerprint(&context.journal, &day)
         .map_err(|error| failure(prepared, error.to_string()))?;
     if first != second {
@@ -173,61 +174,104 @@ fn attach_daily_location(
             Value::Number(omitted.into()),
         );
     }
-    if hook == "morning_briefing" && omitted > 0 {
-        let raw_meta = if let FrozenState::MorningBriefing(bs) = state {
-            bs.values
-                .get("briefing_metadata")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        } else {
-            prepared
-                .config
-                .get("briefing_metadata")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        };
-        if let Some(raw) = raw_meta
-            && let Ok(mut metadata) = serde_json::from_str::<Value>(&raw)
-            && let Some(obj) = metadata.as_object_mut()
-        {
-            let actual_notice = format!("Location observations omitted: {omitted}.");
-            let mut gaps_vec: Vec<String> = obj
-                .get("gaps")
-                .and_then(Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default();
+    if hook == "morning_briefing"
+        && let FrozenState::MorningBriefing(bs) = state
+    {
+        let old_meta_str = prepared
+            .config
+            .get("briefing_metadata")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| failure(prepared, "missing briefing_metadata in config".to_owned()))?;
+
+        let prompt_contains_old = prepared
+            .config
+            .get("prompt")
+            .and_then(Value::as_str)
+            .is_some_and(|p| p.contains(&old_meta_str));
+        if !prompt_contains_old {
+            return Err(failure(
+                prepared,
+                "prompt does not contain briefing_metadata".to_owned(),
+            ));
+        }
+
+        let mut metadata: Value = serde_json::from_str(&old_meta_str)
+            .map_err(|e| failure(prepared, format!("invalid briefing_metadata JSON: {e}")))?;
+        let obj = metadata
+            .as_object_mut()
+            .ok_or_else(|| failure(prepared, "briefing_metadata must be an object".to_owned()))?;
+
+        let mut gaps_vec: Vec<String> = obj
+            .get("gaps")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if omitted > 0 {
+            let actual_notice = format!("location entries omitted: {omitted}.");
             if !gaps_vec.contains(&actual_notice) {
                 gaps_vec.push(actual_notice);
             }
-            let forward = obj
-                .get("coverage_preamble")
-                .and_then(Value::as_str)
-                .map(crate::morning_briefing::forward_count_from_preamble)
-                .unwrap_or(0);
-            let counts = obj.get("sources").cloned().unwrap_or(json!({}));
-            let new_preamble =
-                crate::morning_briefing::coverage_preamble(&counts, &gaps_vec, forward);
-            obj.insert(
-                "gaps".to_owned(),
-                Value::Array(gaps_vec.into_iter().map(Value::String).collect()),
-            );
-            obj.insert("coverage_preamble".to_owned(), Value::String(new_preamble));
-            if let Ok(updated_raw) = serde_json::to_string_pretty(&obj) {
-                if let FrozenState::MorningBriefing(bs) = state {
-                    bs.values.insert(
-                        "briefing_metadata".into(),
-                        Value::String(updated_raw.clone()),
-                    );
-                }
-                prepared
-                    .config
-                    .insert("briefing_metadata".to_owned(), Value::String(updated_raw));
+        }
+
+        let new_preamble =
+            crate::morning_briefing::coverage_preamble(&bs.counts, &gaps_vec, bs.forward_count);
+        obj.insert(
+            "gaps".to_owned(),
+            Value::Array(gaps_vec.into_iter().map(Value::String).collect()),
+        );
+        obj.insert("coverage_preamble".to_owned(), Value::String(new_preamble));
+        let new_meta_str = serde_json::to_string_pretty(&obj).map_err(|e| {
+            failure(
+                prepared,
+                format!("failed to serialize briefing_metadata: {e}"),
+            )
+        })?;
+
+        for field in ["prompt", "user_instruction", "transcript"] {
+            if let Some(Value::String(text)) = prepared.config.get_mut(field) {
+                *text = text.replace(&old_meta_str, &new_meta_str);
             }
+        }
+
+        prepared.config.insert(
+            "briefing_metadata".to_owned(),
+            Value::String(new_meta_str.clone()),
+        );
+        bs.values
+            .insert("briefing_metadata".into(), Value::String(new_meta_str));
+
+        use solstone_core_local::generate::{compute_input_budget, estimate_tokens};
+        let max_output_tokens = prepared
+            .config
+            .get("max_output_tokens")
+            .and_then(Value::as_u64)
+            .and_then(|tokens| u32::try_from(tokens).ok())
+            .unwrap_or(0);
+        let floor_budget = compute_input_budget(
+            max_output_tokens,
+            solstone_core_local::plan::LOCAL_MIN_CONTEXT_TOKENS,
+        );
+        let schema_tokens = prepared
+            .config
+            .get("json_schema")
+            .map(|s| estimate_tokens(&s.to_string()))
+            .unwrap_or(0);
+        let total_text_tokens: u32 = crate::model_text_parts(&prepared.config)
+            .iter()
+            .map(|part| estimate_tokens(part))
+            .sum();
+        if total_text_tokens + schema_tokens > floor_budget {
+            return Err(failure(
+                prepared,
+                "prepared request does not fit the floor input budget".to_owned(),
+            ));
         }
     }
     Ok(())
@@ -257,6 +301,7 @@ fn fit_location_part(
     rendered: &str,
     ordinary: &[String],
     prepared: &PreparedTalent,
+    state: &FrozenState,
     context: &ExecutionContext,
 ) -> Result<(Option<String>, u32), String> {
     use solstone_core_local::generate::{
@@ -268,21 +313,62 @@ fn fit_location_part(
         .and_then(Value::as_u64)
         .and_then(|tokens| u32::try_from(tokens).ok())
         .unwrap_or(0);
-    let context_window = if hook == "morning_briefing" {
-        solstone_core_local::plan::LOCAL_MIN_CONTEXT_TOKENS
-    } else {
-        launched_context_window(&context.journal)
+
+    let FrozenState::MorningBriefing(bs) = state else {
+        let budget =
+            compute_input_budget(max_output_tokens, launched_context_window(&context.journal));
+        let ordinary_tokens = ordinary.iter().fold(0u32, |total, text| {
+            total.saturating_add(estimate_tokens(text))
+        });
+        let room = budget.saturating_sub(ordinary_tokens);
+        let byte_cap = usize::try_from(room)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(3)
+            .min(LOCATION_PART_BYTE_CAP);
+        let label = location_label(hook, day);
+        if room == 0 || byte_cap == 0 {
+            return Ok((None, clip_location_part(&label, rendered, 0).1));
+        }
+        let (part, omitted) = clip_location_part(&label, rendered, byte_cap);
+        debug_assert!(
+            part.as_ref()
+                .is_none_or(|text| estimate_tokens(text) <= room)
+        );
+        return Ok((part, omitted));
     };
-    let budget = compute_input_budget(max_output_tokens, context_window);
-    let schema_tokens = if hook == "morning_briefing" {
-        prepared
-            .config
-            .get("json_schema")
-            .map(|s| estimate_tokens(&s.to_string()))
-            .unwrap_or(0)
-    } else {
-        0
-    };
+
+    if hook != "morning_briefing" {
+        let budget =
+            compute_input_budget(max_output_tokens, launched_context_window(&context.journal));
+        let ordinary_tokens = ordinary.iter().fold(0u32, |total, text| {
+            total.saturating_add(estimate_tokens(text))
+        });
+        let room = budget.saturating_sub(ordinary_tokens);
+        let byte_cap = usize::try_from(room)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(3)
+            .min(LOCATION_PART_BYTE_CAP);
+        let label = location_label(hook, day);
+        if room == 0 || byte_cap == 0 {
+            return Ok((None, clip_location_part(&label, rendered, 0).1));
+        }
+        let (part, omitted) = clip_location_part(&label, rendered, byte_cap);
+        debug_assert!(
+            part.as_ref()
+                .is_none_or(|text| estimate_tokens(text) <= room)
+        );
+        return Ok((part, omitted));
+    }
+
+    let budget = compute_input_budget(
+        max_output_tokens,
+        solstone_core_local::plan::LOCAL_MIN_CONTEXT_TOKENS,
+    );
+    let schema_tokens = prepared
+        .config
+        .get("json_schema")
+        .map(|s| estimate_tokens(&s.to_string()))
+        .unwrap_or(0);
     let ordinary_tokens = ordinary.iter().fold(0u32, |total, text| {
         total.saturating_add(estimate_tokens(text))
     });
@@ -304,13 +390,63 @@ fn fit_location_part(
         return Ok((part, omitted));
     }
 
-    let total_notice = format!("Location observations omitted: {total}.");
-    let reserved_tokens = estimate_tokens(&total_notice);
-    if room < reserved_tokens {
+    let worst_notice = format!("location entries omitted: {total}.");
+    let old_meta_str = prepared
+        .config
+        .get("briefing_metadata")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing briefing_metadata in config".to_owned())?;
+    let mut meta_val: Value = serde_json::from_str(old_meta_str)
+        .map_err(|e| format!("invalid briefing_metadata JSON: {e}"))?;
+    let meta_obj = meta_val
+        .as_object_mut()
+        .ok_or_else(|| "briefing_metadata must be an object".to_owned())?;
+
+    let mut worst_gaps: Vec<String> = meta_obj
+        .get("gaps")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    if !worst_gaps.contains(&worst_notice) {
+        worst_gaps.push(worst_notice.clone());
+    }
+
+    let worst_preamble =
+        crate::morning_briefing::coverage_preamble(&bs.counts, &worst_gaps, bs.forward_count);
+    meta_obj.insert(
+        "gaps".into(),
+        Value::Array(worst_gaps.into_iter().map(Value::String).collect()),
+    );
+    meta_obj.insert("coverage_preamble".into(), Value::String(worst_preamble));
+    let worst_meta_str = serde_json::to_string_pretty(&meta_obj)
+        .map_err(|e| format!("failed to serialize briefing_metadata: {e}"))?;
+
+    let worst_ordinary_tokens = ordinary.iter().fold(0u32, |sum, part| {
+        if part.contains(old_meta_str) {
+            let replaced = part.replace(old_meta_str, &worst_meta_str);
+            sum.saturating_add(estimate_tokens(&replaced))
+        } else {
+            sum.saturating_add(estimate_tokens(part))
+        }
+    });
+    let meta_growth = if ordinary.iter().any(|p| p.contains(old_meta_str)) {
+        worst_ordinary_tokens.saturating_sub(ordinary_tokens)
+    } else {
+        estimate_tokens(&worst_meta_str).saturating_sub(estimate_tokens(old_meta_str))
+    };
+    let notice_tokens = estimate_tokens(&worst_notice);
+    let needed = notice_tokens + meta_growth;
+
+    if room < needed {
         return Err("location coverage does not fit the input budget".to_owned());
     }
 
-    let observation_room = room.saturating_sub(reserved_tokens);
+    let observation_room = room.saturating_sub(needed);
     let byte_cap = usize::try_from(observation_room)
         .unwrap_or(usize::MAX)
         .saturating_mul(3)
@@ -318,13 +454,13 @@ fn fit_location_part(
 
     let label = location_label(hook, day);
     let (part, omitted) = if byte_cap == 0 {
-        (Some(total_notice), total)
+        (Some(worst_notice), total)
     } else {
         let (clipped_part, omitted) = clip_location_part(&label, rendered, byte_cap);
         if omitted == total {
-            (Some(total_notice), total)
+            (Some(worst_notice), total)
         } else if omitted > 0 {
-            let actual_notice = format!("Location observations omitted: {omitted}.");
+            let actual_notice = format!("location entries omitted: {omitted}.");
             let text = if let Some(mut existing) = clipped_part {
                 if !existing.ends_with('\n') {
                     existing.push('\n');
@@ -340,16 +476,6 @@ fn fit_location_part(
         }
     };
 
-    if let Some(ref text) = part
-        && estimate_tokens(text) > room
-    {
-        return Err("location coverage does not fit the input budget".to_owned());
-    }
-
-    debug_assert!(
-        part.as_ref()
-            .is_none_or(|text| estimate_tokens(text) <= room)
-    );
     Ok((part, omitted))
 }
 
@@ -1092,16 +1218,29 @@ mod tests {
         );
 
         solstone_core_facets::create_facet(root.path(), "work", "Work", "", "", "", None).unwrap();
+        let story_body = "S".repeat(1500);
+        let story_tokens = solstone_core_local::generate::estimate_tokens(&story_body);
         let record = json!({
             "id": "act-1",
             "title": "Short Activity",
             "start": "09:00",
-            "story": {"body": "Short story."},
+            "story": {"body": story_body},
         });
         write(
             root.path(),
             &format!("facets/work/activities/{LOCATION_DAY}.jsonl"),
             &format!("{record}\n"),
+        );
+        let forward_record = json!({
+            "id": "act-fwd",
+            "source": "anticipated",
+            "title": "Forward Plan",
+            "start": "10:00",
+        });
+        write(
+            root.path(),
+            "facets/work/activities/20261003.jsonl",
+            &format!("{forward_record}\n"),
         );
 
         let context = ExecutionContext {
@@ -1146,6 +1285,7 @@ mod tests {
         let target_leftover = 400u32;
         let pad_tokens = floor_budget
             .saturating_sub(unpadded_tokens)
+            .saturating_add(story_tokens)
             .saturating_sub(target_leftover);
         let user_instruction = "A".repeat((pad_tokens as usize) * 3);
 
@@ -1251,7 +1391,7 @@ mod tests {
             );
         }
 
-        let notice = format!("Location observations omitted: {omitted}.");
+        let notice = format!("location entries omitted: {omitted}.");
         let model_parts = crate::model_text_parts(&thawed.config);
         assert!(
             model_parts.iter().any(|part| part.contains(&notice)),
@@ -1264,18 +1404,38 @@ mod tests {
             );
         }
 
-        let metadata: Value = serde_json::from_str(
-            thawed
-                .config
-                .get("briefing_metadata")
-                .and_then(Value::as_str)
-                .expect("briefing_metadata must be present"),
-        )
-        .expect("valid briefing_metadata JSON");
+        let raw_metadata = thawed
+            .config
+            .get("briefing_metadata")
+            .and_then(Value::as_str)
+            .expect("briefing_metadata must be present");
+        let prompt_part = thawed
+            .config
+            .get("prompt")
+            .and_then(Value::as_str)
+            .expect("prompt must be present");
+        assert!(
+            prompt_part.contains(raw_metadata),
+            "emitted prompt must contain exact briefing_metadata string"
+        );
+        assert!(
+            model_parts.iter().any(|part| part.contains(raw_metadata)),
+            "model_text_parts must contain exact briefing_metadata string"
+        );
+
+        let metadata: Value =
+            serde_json::from_str(raw_metadata).expect("valid briefing_metadata JSON");
         let gaps = metadata["gaps"].as_array().expect("gaps array");
         assert!(
             gaps.iter().any(|g| g.as_str() == Some(&notice)),
             "saved briefing_metadata must contain omission notice in gaps"
+        );
+        assert!(
+            gaps.iter().any(|g| {
+                let s = g.as_str().unwrap_or("");
+                s == "activity act-1" || s == "story for act-1"
+            }),
+            "gaps must contain activity/story omission gap: {gaps:?}"
         );
         let preamble = metadata["coverage_preamble"].as_str().unwrap();
         assert!(
@@ -1283,6 +1443,10 @@ mod tests {
             "coverage_preamble must not contain 'complete'"
         );
         assert!(preamble.contains(&notice));
+        assert!(
+            preamble.contains("1 plan in the next 7 days"),
+            "preamble must contain forward count: {preamble}"
+        );
         assert!(!preamble.contains(".."), "{preamble}");
     }
 
@@ -1295,16 +1459,28 @@ mod tests {
         let total = observations.len();
 
         solstone_core_facets::create_facet(root.path(), "work", "Work", "", "", "", None).unwrap();
+        let story_body = "S".repeat(1500);
         let record = json!({
             "id": "act-1",
             "title": "Short Activity",
             "start": "09:00",
-            "story": {"body": "Short story."},
+            "story": {"body": story_body},
         });
         write(
             root.path(),
             &format!("facets/work/activities/{LOCATION_DAY}.jsonl"),
             &format!("{record}\n"),
+        );
+        let forward_record = json!({
+            "id": "act-fwd",
+            "source": "anticipated",
+            "title": "Forward Plan",
+            "start": "10:00",
+        });
+        write(
+            root.path(),
+            "facets/work/activities/20261003.jsonl",
+            &format!("{forward_record}\n"),
         );
 
         let context = ExecutionContext {
@@ -1333,25 +1509,96 @@ mod tests {
             Some(val) => solstone_core_local::generate::estimate_tokens(&val.to_string()),
             None => 0,
         };
-        let unpadded_text_tokens: u32 = crate::model_text_parts(&thawed_unpadded.config)
+
+        let expected_notice = format!("location entries omitted: {total}.");
+        let notice_tokens = solstone_core_local::generate::estimate_tokens(&expected_notice);
+        let orig_meta_str = thawed_unpadded
+            .config
+            .get("briefing_metadata")
+            .and_then(Value::as_str)
+            .unwrap();
+        let orig_meta_val: Value = serde_json::from_str(orig_meta_str).unwrap();
+        let counts = orig_meta_val["sources"].clone();
+        let base_gaps: Vec<String> = orig_meta_val["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_owned())
+            .collect();
+
+        let mut story_dropped_gaps = base_gaps.clone();
+        story_dropped_gaps.push("story for act-1".into());
+        let story_dropped_preamble =
+            crate::morning_briefing::coverage_preamble(&counts, &story_dropped_gaps, 1);
+        let mut story_dropped_meta_val = orig_meta_val.clone();
+        {
+            let obj = story_dropped_meta_val.as_object_mut().unwrap();
+            obj.insert(
+                "gaps".into(),
+                Value::Array(
+                    story_dropped_gaps
+                        .iter()
+                        .cloned()
+                        .map(Value::String)
+                        .collect(),
+                ),
+            );
+            obj.insert(
+                "coverage_preamble".into(),
+                Value::String(story_dropped_preamble),
+            );
+        }
+        let story_dropped_meta_str = serde_json::to_string_pretty(&story_dropped_meta_val).unwrap();
+
+        let mut final_gaps = story_dropped_gaps;
+        final_gaps.push(expected_notice.clone());
+        let final_preamble = crate::morning_briefing::coverage_preamble(&counts, &final_gaps, 1);
+        let mut final_meta_val = story_dropped_meta_val.clone();
+        {
+            let obj = final_meta_val.as_object_mut().unwrap();
+            obj.insert(
+                "gaps".into(),
+                Value::Array(final_gaps.iter().cloned().map(Value::String).collect()),
+            );
+            obj.insert("coverage_preamble".into(), Value::String(final_preamble));
+        }
+        let final_meta_str = serde_json::to_string_pretty(&final_meta_val).unwrap();
+
+        let orig_prompt = thawed_unpadded
+            .config
+            .get("prompt")
+            .and_then(Value::as_str)
+            .unwrap();
+        let story_snippet = format!("\nStory:\n{story_body}");
+        let prompt_without_story = orig_prompt
+            .replace(&story_snippet, "")
+            .replace(orig_meta_str, &story_dropped_meta_str);
+        let prompt_without_story_tokens =
+            solstone_core_local::generate::estimate_tokens(&prompt_without_story);
+
+        let replaced_prompt =
+            prompt_without_story.replace(&story_dropped_meta_str, &final_meta_str);
+        let meta_growth = solstone_core_local::generate::estimate_tokens(&replaced_prompt)
+            .saturating_sub(prompt_without_story_tokens);
+        let needed = notice_tokens + meta_growth;
+
+        let other_tokens: u32 = crate::model_text_parts(&thawed_unpadded.config)
             .into_iter()
             .filter(|part| {
-                thawed_unpadded
-                    .config
-                    .get("_daily_location_text")
-                    .and_then(Value::as_str)
-                    .is_none_or(|loc| part != loc)
+                part != orig_prompt
+                    && thawed_unpadded
+                        .config
+                        .get("_daily_location_text")
+                        .and_then(Value::as_str)
+                        .is_none_or(|loc| part != loc)
             })
             .map(|part| solstone_core_local::generate::estimate_tokens(&part))
             .sum();
-        let unpadded_tokens = unpadded_text_tokens + unpadded_schema_tokens;
+        let base_tokens = prompt_without_story_tokens + other_tokens + unpadded_schema_tokens;
 
-        let expected_notice = format!("Location observations omitted: {total}.");
-        let notice_tokens = solstone_core_local::generate::estimate_tokens(&expected_notice);
-        let target_leftover = notice_tokens + 2;
         let pad_tokens = floor_budget
-            .saturating_sub(unpadded_tokens)
-            .saturating_sub(target_leftover);
+            .saturating_sub(base_tokens)
+            .saturating_sub(needed);
         let user_instruction = "A".repeat((pad_tokens as usize) * 3);
 
         let talent = prepared(
@@ -1397,7 +1644,25 @@ mod tests {
             .expect("_daily_location_omitted must be present");
         assert_eq!(omitted, total as u64);
 
+        let raw_metadata = thawed
+            .config
+            .get("briefing_metadata")
+            .and_then(Value::as_str)
+            .expect("briefing_metadata must be present");
+        let prompt_part = thawed
+            .config
+            .get("prompt")
+            .and_then(Value::as_str)
+            .expect("prompt must be present");
+        assert!(
+            prompt_part.contains(raw_metadata),
+            "emitted prompt must contain exact briefing_metadata string"
+        );
         let parts = crate::model_text_parts(&thawed.config);
+        assert!(
+            parts.iter().any(|p| p.contains(raw_metadata)),
+            "model_text_parts must contain exact briefing_metadata string"
+        );
         assert!(parts.iter().any(|p| p.contains(&expected_notice)));
 
         for obs in &observations {
@@ -1420,22 +1685,27 @@ mod tests {
             );
         }
 
-        let metadata: Value = serde_json::from_str(
-            thawed
-                .config
-                .get("briefing_metadata")
-                .and_then(Value::as_str)
-                .expect("briefing_metadata must be present"),
-        )
-        .expect("briefing_metadata valid JSON");
+        let metadata: Value =
+            serde_json::from_str(raw_metadata).expect("briefing_metadata valid JSON");
         let gaps = metadata["gaps"].as_array().expect("gaps array");
         assert!(
             gaps.iter().any(|g| g.as_str() == Some(&expected_notice)),
             "saved metadata must contain the omission notice in gaps"
         );
+        assert!(
+            gaps.iter().any(|g| {
+                let s = g.as_str().unwrap_or("");
+                s == "activity act-1" || s == "story for act-1"
+            }),
+            "gaps must contain activity/story omission gap from padding: {gaps:?}"
+        );
         let preamble = metadata["coverage_preamble"].as_str().unwrap();
         assert!(!preamble.to_lowercase().contains("complete"));
         assert!(preamble.contains(&expected_notice));
+        assert!(
+            preamble.contains("1 plan in the next 7 days"),
+            "preamble must contain forward plan count: {preamble}"
+        );
         assert!(!preamble.contains(".."), "{preamble}");
     }
 
@@ -1460,7 +1730,7 @@ mod tests {
 
         let root = tempfile::tempdir().unwrap();
         location_journal(root.path(), LOCATION_DAY);
-        write_bytes(root.path(), "health/local.ctx", b"380");
+        write_bytes(root.path(), "health/local.ctx", b"300");
         let observations = rendered_observations(root.path());
         assert!(!observations.is_empty());
         let context = ExecutionContext {
@@ -1478,11 +1748,7 @@ mod tests {
             Some("keep me")
         );
         assert!(config.get("_daily_location_fingerprint").is_some());
-        let expected_notice = format!("Location observations omitted: {}.", observations.len());
-        assert_eq!(
-            config.get("_daily_location_text").and_then(Value::as_str),
-            Some(expected_notice.as_str())
-        );
+        assert!(config.get("_daily_location_text").is_none());
         assert_eq!(
             config
                 .get("_daily_location_omitted")
@@ -1490,11 +1756,9 @@ mod tests {
             Some(u64::try_from(observations.len()).unwrap())
         );
         let parts = text_parts(&thaw(&packet).unwrap().0);
-        assert_eq!(parts, vec!["keep me".to_owned(), expected_notice.clone()]);
+        assert_eq!(parts, vec!["keep me".to_owned()]);
         for coordinate in ["39.75", "105.2", "105.0"] {
-            for part in &parts {
-                assert!(!part.contains(coordinate));
-            }
+            assert!(!parts[0].contains(coordinate));
         }
     }
     #[cfg(feature = "full-tests")]
@@ -1565,6 +1829,7 @@ mod tests {
             &rendered,
             &["ordinary".into()],
             &talent,
+            &FrozenState::None,
             &context,
         )
         .expect("fit");

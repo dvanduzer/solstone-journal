@@ -12,7 +12,6 @@ workspace = true
 [dependencies]
 axum = { workspace = true, features = ["tokio"] }
 chrono.workspace = true
-pulldown-cmark.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -24,12 +23,9 @@ solstone-core-journal-config.workspace = true
 solstone-core-journal-io.workspace = true
 solstone-core-speaker-resolve.workspace = true
 solstone-core-system.workspace = true
-# Already in this crate's graph through axum and used by the news index to move its
-# preview reads off the async worker; dev-only before, no new crate in the lock.
 tokio = { workspace = true, features = ["macros", "rt"] }
 
 [dev-dependencies]
-pdf-extract.workspace = true
 sha2.workspace = true
 solstone-core-convey-shell.workspace = true
 tempfile = "3.24.0"

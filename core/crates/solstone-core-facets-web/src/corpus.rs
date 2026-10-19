@@ -8,20 +8,14 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, header},
 };
-use chrono::DateTime;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
 use crate::{
     routes,
-    test_support::{corpus, fixed_clock, phase_root, write},
+    test_support::{corpus, fixed_clock, phase_root},
 };
-
-const CORPUS_SOURCE: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../fixtures/convey_facets_corpus.json"
-));
 
 // Mirrors sol-client json_format::{sort_json, ensure_ascii}; copied for AC3/AC19 because those helpers are private and production code must not take a client dependency. Keep sort_json(v) -> serde_json::to_string(&sorted) -> ensure_ascii(&s).
 fn sort_json(value: &Value) -> Value {
@@ -61,69 +55,6 @@ fn ensure_ascii(value: &str) -> String {
 }
 fn canonical(value: &Value) -> Vec<u8> {
     ensure_ascii(&serde_json::to_string(&sort_json(value)).expect("JSON")).into_bytes()
-}
-
-fn rewrite_sol_urls_in_value(value: &mut Value) {
-    match value {
-        Value::String(text) => *text = rewrite_sol_urls(text),
-        Value::Array(values) => {
-            for value in values {
-                rewrite_sol_urls_in_value(value);
-            }
-        }
-        Value::Object(values) => {
-            for value in values.values_mut() {
-                rewrite_sol_urls_in_value(value);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn rewrite_sol_urls(text: &str) -> String {
-    const PREFIX: &str = "/app/sol/";
-    let mut rewritten = String::new();
-    let mut cursor = 0;
-    while let Some(offset) = text[cursor..].find(PREFIX) {
-        let start = cursor + offset;
-        rewritten.push_str(&text[cursor..start]);
-        let path_start = start + PREFIX.len();
-        let path_end = text[path_start..]
-            .find(is_url_delimiter)
-            .map_or(text.len(), |offset| path_start + offset);
-        let path = &text[path_start..path_end];
-        rewritten.push_str(&rewrite_sol_path(path).unwrap_or_else(|| format!("{PREFIX}{path}")));
-        cursor = path_end;
-    }
-    rewritten.push_str(&text[cursor..]);
-    rewritten
-}
-
-fn is_url_delimiter(ch: char) -> bool {
-    ch.is_whitespace() || matches!(ch, '"' | '\'' | ')' | ']' | '<' | '>')
-}
-
-fn rewrite_sol_path(path: &str) -> Option<String> {
-    if let Some((day, fragment)) = path.split_once('#')
-        && day_key(day)
-    {
-        let parts = fragment.split('/').collect::<Vec<_>>();
-        return match parts.as_slice() {
-            [talent] if !talent.is_empty() => Some(format!("/app/thinking/#runs/{day}/{talent}")),
-            [talent, use_id] if !talent.is_empty() && !use_id.is_empty() => {
-                Some(format!("/app/thinking/#runs/{day}/{talent}/{use_id}"))
-            }
-            _ => None,
-        };
-    }
-    if day_key(path) {
-        return Some(format!("/app/thinking/#runs/{path}"));
-    }
-    (!path.is_empty() && !path.contains('/')).then(|| format!("/app/thinking/#runs/run/{path}"))
-}
-
-fn day_key(value: &str) -> bool {
-    value.len() == 8 && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn substitute(value: &str, root: &Path) -> String {

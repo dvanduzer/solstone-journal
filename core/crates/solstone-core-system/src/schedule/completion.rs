@@ -178,11 +178,16 @@ mod tests {
     }
 
     use std::fs;
+    #[cfg(feature = "full-tests")]
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    #[cfg(feature = "full-tests")]
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
+    #[cfg(feature = "full-tests")]
     use std::time::{Duration, Instant};
 
     use super::record_completion_checked;
+    #[cfg(feature = "full-tests")]
     use crate::queue::CallableTaskContext;
 
     fn state_path(root: &std::path::Path) -> std::path::PathBuf {

@@ -16,7 +16,7 @@ A structured preamble summarizing what data sources were consulted and what gaps
 - Structured metadata with machine-readable `sources` (`anticipated_activities` for the presentation day and `segments`, which is always 0)
 
 **Example:**
-> This briefing draws on 2 plans for today and 4 plans in the next 7 days. Missing: Location observations omitted: 3.
+> This briefing draws on 2 plans for today and 4 plans in the next 7 days. Missing: location entries omitted: 3.
 
 ### 2. Source Attribution
 

@@ -205,6 +205,9 @@ pub fn apply_prompt_override(
         ));
     }
 
+    if let Some(meta) = current_values.get("briefing_metadata").cloned() {
+        prepared.config.insert("briefing_metadata".into(), meta);
+    }
     apply_template_vars(&mut prepared.config, &current_values);
     Ok(())
 }
@@ -792,21 +795,6 @@ pub(crate) fn coverage_preamble(counts: &Value, gaps: &[String], forward: usize)
         }
     }
     sentence
-}
-
-pub(crate) fn forward_count_from_preamble(preamble: &str) -> usize {
-    if let Some(idx) = preamble.find(" in the next 7 days") {
-        let prefix = &preamble[..idx];
-        if let Some(last_space) = prefix.rfind(' ') {
-            let before_unit = &prefix[..last_space];
-            if let Some(num_space) = before_unit.rfind(' ')
-                && let Ok(n) = before_unit[num_space + 1..].parse::<usize>()
-            {
-                return n;
-            }
-        }
-    }
-    0
 }
 
 /// A `YYYYMMDD` day as an owner reads it, like "October 17".

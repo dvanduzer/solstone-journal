@@ -4798,7 +4798,6 @@ version = "2.0.51"
 dependencies = [
  "axum",
  "chrono",
- "pulldown-cmark",
  "regex",
  "serde",
  "serde_json",
