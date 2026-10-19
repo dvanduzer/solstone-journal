@@ -656,6 +656,12 @@ pub fn view(session: &Session) -> Value {
         _ => Value::Null,
     };
 
+    let thinking_download_bytes = session
+        .snapshot
+        .as_ref()
+        .and_then(|s| s.pointer("/thinking/download_bytes"))
+        .and_then(Value::as_u64);
+
     let downloads = session
         .snapshot
         .as_ref()
@@ -733,6 +739,7 @@ pub fn view(session: &Session) -> Value {
         },
         "local_offered": local_offered,
         "default_line": default_line,
+        "thinking_download_bytes": thinking_download_bytes,
         "downloads": downloads,
         "speech_retry": speech_retry_val,
         "thinking_retry": thinking_retry_val,
@@ -3128,6 +3135,30 @@ mod tests {
             };
             assert_eq!(view(&session)["step"], json!(step));
         }
+    }
+
+    #[test]
+    fn view_thinking_download_bytes() {
+        let session = Session::default();
+        assert_eq!(view(&session)["thinking_download_bytes"], Value::Null);
+
+        let session = Session {
+            snapshot: Some(json!({"thinking": {"download_bytes": 1500000}})),
+            ..Default::default()
+        };
+        assert_eq!(view(&session)["thinking_download_bytes"], json!(1500000));
+
+        let session = Session {
+            snapshot: Some(json!({"thinking": {}})),
+            ..Default::default()
+        };
+        assert_eq!(view(&session)["thinking_download_bytes"], Value::Null);
+
+        let session = Session {
+            snapshot: Some(json!({"thinking": {"download_bytes": "nope"}})),
+            ..Default::default()
+        };
+        assert_eq!(view(&session)["thinking_download_bytes"], Value::Null);
     }
 
     #[test]

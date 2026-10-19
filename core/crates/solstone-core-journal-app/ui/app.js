@@ -127,6 +127,26 @@ const COPY = {
     brain: 'setting up the model',
   },
   adoptLandingLine: 'nothing moved. your journal was always here.',
+  setup: {
+    band: 'your journal',
+    fitsTitle: 'what this sets up',
+    journalTerm: 'your journal',
+    journalText: 'lives on this pc and keeps everything that goes into it.',
+    appTerm: 'the solstone app',
+    appText: 'runs on this pc. your microphone, screen and computer sound each stay off until you turn them on.',
+    thinkingTerm: 'thinking',
+    thinkingText: 'helps your journal make sense of what it keeps. you choose where during setup, or later.',
+    signIn: 'start automatically after you sign in to this pc.',
+    start: 'start setup',
+    folderTitle: 'where your journal lives',
+    folderText: 'everything your journal keeps stays in this folder, on this pc.',
+    folderLabel: 'journal folder',
+    markMatch: 'when you connect a phone or another computer, you check that the mark it shows matches this one.',
+    thinkingTitle: 'where does the thinking happen?',
+    thinkingLead: 'your journal stays on this pc whatever you choose. this only decides where thinking happens.',
+    onThisPc: 'on this pc',
+    step: n => `step ${n} of 8`,
+  },
   // updates (the Mac app's update words)
   updates: {
     header: version => `journal ${version}`,
@@ -582,7 +602,9 @@ function syncDownloadWatch(watch) {
   }
 }
 
-let thinkingChoicesOpen = false;
+let signInTouched = false;
+let signInOn = true;
+let signInScreen = false;
 let flowFocus = null;
 let paneFocus = null;
 
@@ -593,185 +615,188 @@ function continueThinking(choice) {
 }
 let homeLanded = false;
 
-function stepSequence(view) {
-  const copy = view.copy || {};
-  const labels = [
-    copy.welcome?.title || copy.heading || '',
-    copy.folder?.title || '',
-    copy.mark?.title || '',
-    copy.thinking?.title || '',
-  ];
-  const items = labels.map((text, index) => {
-    const number = index + 1;
-    const item = el('li', {}, document.createTextNode(text || String(number)));
-    if (view.step === number) item.setAttribute('aria-current', 'step');
-    return item;
-  });
-  return el('ol', { class: 'setup-steps' }, ...items);
+function clearSetupFrame() {
+  const root = $('firstrun');
+  if (root) {
+    root.replaceChildren();
+    root.removeAttribute('data-phase');
+  }
 }
 
-function fitsLines(fits) {
-  const lines = [];
-  if (fits.title) lines.push(el('h2', {}, document.createTextNode(fits.title)));
-  for (const key of ['journal', 'app', 'thinking']) {
-    if (fits[`${key}_term`]) lines.push(el('p', {}, document.createTextNode(fits[`${key}_term`])));
-    if (fits[key]) lines.push(el('p', { class: 'muted' }, document.createTextNode(fits[key])));
-  }
-  return lines;
+function setupStep(view) {
+  if (view.phase === 'welcome' || view.phase === 'sign-in') return 1;
+  if (view.phase === 'folder') return 2;
+  if (view.phase === 'setup' && (view.setup_running || view.setup_failed)) return 2;
+  if (view.phase === 'mark') return 3;
+  if (view.phase === 'thinking') return 4;
+  return null;
 }
 
-function thinkingChoiceNodes(view) {
-  const thinkingCopy = view.copy?.thinking || {};
-  const choices = Array.isArray(thinkingCopy.choices) ? thinkingCopy.choices : [];
-  const savedId = view.thinking_choice;
-  const saved = Boolean(view.thinking_saved) && ['local', 'spp', 'byo', 'later'].includes(savedId);
-
-  if (saved && !thinkingChoicesOpen) {
-    const label = savedId === 'later'
-      ? (thinkingCopy.later || '')
-      : (choices.find(choice => choice.id === savedId)?.label || '');
-    return [
-      el('p', {}, document.createTextNode(label)),
-      thinkingCopy.change ? el('button', {
-        type: 'button',
-        disabled: Boolean(view.busy),
-        on: { click: () => { thinkingChoicesOpen = true; renderFlow(state.flow); } },
-      }, document.createTextNode(thinkingCopy.change)) : null,
-    ];
+function renderProgress(step) {
+  if (step == null) return null;
+  const dots1 = [];
+  for (let i = 1; i <= 4; i++) {
+    const cls = i < step ? 'setup-dot-done' : (i === step ? 'setup-dot-current' : 'setup-dot-future');
+    dots1.push(el('span', { class: `setup-dot ${cls}` }));
   }
+  const dots2 = [];
+  for (let i = 5; i <= 8; i++) {
+    dots2.push(el('span', { class: 'setup-dot setup-dot-future' }));
+  }
+  return el('div', { class: 'setup-progress', 'aria-label': COPY.setup.step(step) },
+    ...dots1,
+    el('span', { class: 'setup-progress-gap' }),
+    ...dots2,
+  );
+}
 
-  const nodes = [];
+function renderFooterDownloads(view) {
+  const flow = view;
+  const copy = flow.copy?.downloads || {};
+  const rows = [];
 
-  const isBlockedOrUnknown = view.thinking_capability === 'blocked' || view.thinking_capability === 'unknown';
-  if (!saved && isBlockedOrUnknown) {
-    if (thinkingCopy.choose_later) {
-      nodes.push(el('p', {}, document.createTextNode(thinkingCopy.choose_later)));
-    }
-    for (const choice of choices) {
-      if (choice.id === 'local') continue;
-      const line = choice.sub;
-      const desc = choice.description;
-      nodes.push(el('div', { class: 'field' },
-        el('button', {
+  // Speech row
+  const speech = flow.downloads?.speech;
+  if (speech && (speech.state === 'downloading' || speech.state === 'error' || flow.speech_retry)) {
+    const parts = [el('span', { class: 'setup-download-name' }, document.createTextNode(copy.speech || ''))];
+    if (speech.state === 'downloading') {
+      if (typeof speech.bytes_total === 'number') {
+        const done = speech.bytes_done || 0;
+        const total = speech.bytes_total;
+        parts.push(el('span', { class: 'setup-download-bytes' }, document.createTextNode(`${formatBytes(done)} of ${formatBytes(total)}`)));
+        const pct = Math.max(0, Math.min(100, Math.round((done / total) * 100)));
+        parts.push(el('div', {
+          class: 'setup-download-bar',
+          role: 'progressbar',
+          'aria-valuemin': '0',
+          'aria-valuemax': '100',
+          'aria-valuenow': String(pct)
+        }));
+      } else {
+        if (typeof speech.bytes_done === 'number' && speech.bytes_done > 0) {
+          parts.push(el('span', { class: 'setup-download-bytes' }, document.createTextNode(formatBytes(speech.bytes_done))));
+        }
+        parts.push(el('div', { class: 'setup-download-bar setup-download-bar-indeterminate' }));
+      }
+    } else if (speech.state === 'error') {
+      if (speech.error?.detail) {
+        parts.push(el('span', { class: 'setup-download-detail' }, document.createTextNode(speech.error.detail)));
+      }
+      if (flow.speech_retry) {
+        parts.push(el('button', {
           type: 'button',
-          disabled: Boolean(view.busy) || view.authoritative === false,
-          on: { click: () => {
-            if (view.authoritative === false) return;
-            call('flow', { intent: 'choose-thinking', choice: choice.id });
-          } },
-        }, document.createTextNode(choice.label || choice.id)),
-        line ? el('p', { class: 'muted' }, document.createTextNode(line)) : null,
-        desc ? el('p', { class: 'faint' }, document.createTextNode(desc)) : null
-      ));
-    }
-    if (typeof thinkingCopy.later === 'string' && thinkingCopy.later) {
-      nodes.push(el('button', {
+          'data-focus-key': 'speech:retry',
+          disabled: Boolean(flow.busy) || flow.authoritative === false,
+          on: {
+            click: () => {
+              if (flow.authoritative === false) return;
+              call('flow', { intent: 'retry-speech-download' });
+            }
+          }
+        }, document.createTextNode(copy.retry || COPY.tryAgain)));
+      }
+    } else if (flow.speech_retry) {
+      parts.push(el('button', {
         type: 'button',
-        disabled: Boolean(view.busy) || view.authoritative === false,
-        on: { click: () => {
-          if (view.authoritative === false) return;
-          continueThinking('later');
-        } },
-      }, document.createTextNode(thinkingCopy.later)));
+        'data-focus-key': 'speech:retry',
+        disabled: Boolean(flow.busy) || flow.authoritative === false,
+        on: {
+          click: () => {
+            if (flow.authoritative === false) return;
+            call('flow', { intent: 'retry-speech-download' });
+          }
+        }
+      }, document.createTextNode(copy.retry || COPY.tryAgain)));
     }
-    return nodes;
+    rows.push(el('div', { class: 'setup-download', 'data-download': 'speech' }, ...parts));
   }
 
-  if (saved || thinkingChoicesOpen) {
-    for (const choice of choices) {
-      const line = choice.sub;
-      const desc = choice.description;
-      nodes.push(el('div', { class: 'field' },
-        el('button', {
+  // Thinking row
+  const thinking = flow.downloads?.thinking;
+  if (thinking && (thinking.state === 'downloading' || thinking.state === 'error' || flow.thinking_retry)) {
+    const parts = [el('span', { class: 'setup-download-name' }, document.createTextNode(copy.thinking || ''))];
+    if (thinking.state === 'downloading') {
+      if (typeof thinking.bytes_total === 'number') {
+        const done = thinking.bytes_done || 0;
+        const total = thinking.bytes_total;
+        parts.push(el('span', { class: 'setup-download-bytes' }, document.createTextNode(`${formatBytes(done)} of ${formatBytes(total)}`)));
+        const pct = Math.max(0, Math.min(100, Math.round((done / total) * 100)));
+        parts.push(el('div', {
+          class: 'setup-download-bar',
+          role: 'progressbar',
+          'aria-valuemin': '0',
+          'aria-valuemax': '100',
+          'aria-valuenow': String(pct)
+        }));
+      } else {
+        if (typeof thinking.bytes_done === 'number' && thinking.bytes_done > 0) {
+          parts.push(el('span', { class: 'setup-download-bytes' }, document.createTextNode(formatBytes(thinking.bytes_done))));
+        }
+        parts.push(el('div', { class: 'setup-download-bar setup-download-bar-indeterminate' }));
+      }
+      const paintedAttempt = typeof thinking.attempt_id === 'string' ? thinking.attempt_id : '';
+      if (flow.thinking_cancel) {
+        parts.push(el('button', {
           type: 'button',
-          disabled: Boolean(view.busy) || view.authoritative === false,
-          on: { click: () => {
-            if (view.authoritative === false) return;
-            call('flow', { intent: 'choose-thinking', choice: choice.id });
-          } },
-        }, document.createTextNode(choice.label || choice.id)),
-        line ? el('p', { class: 'muted' }, document.createTextNode(line)) : null,
-        desc ? el('p', { class: 'faint' }, document.createTextNode(desc)) : null
-      ));
-    }
-    if (typeof thinkingCopy.later === 'string' && thinkingCopy.later) {
-      nodes.push(el('button', {
+          'data-focus-key': 'thinking:cancel',
+          disabled: Boolean(flow.busy) || flow.authoritative === false,
+          on: {
+            click: () => {
+              if (flow.authoritative === false) return;
+              call('flow', { intent: 'cancel-thinking-download', attempt_id: paintedAttempt });
+            }
+          }
+        }, document.createTextNode(copy.cancel || COPY.cancel)));
+      }
+    } else if (thinking.state === 'error') {
+      if (thinking.error?.detail) {
+        parts.push(el('span', { class: 'setup-download-detail' }, document.createTextNode(thinking.error.detail)));
+      }
+      if (flow.thinking_retry) {
+        parts.push(el('button', {
+          type: 'button',
+          'data-focus-key': 'thinking:retry',
+          disabled: Boolean(flow.busy) || flow.authoritative === false,
+          on: {
+            click: () => {
+              if (flow.authoritative === false) return;
+              call('flow', { intent: 'start-thinking-download' });
+            }
+          }
+        }, document.createTextNode(copy.retry || COPY.tryAgain)));
+      }
+    } else if (flow.thinking_retry) {
+      parts.push(el('button', {
         type: 'button',
-        disabled: Boolean(view.busy) || view.authoritative === false,
-        on: { click: () => {
-          if (view.authoritative === false) return;
-          continueThinking('later');
-        } },
-      }, document.createTextNode(thinkingCopy.later)));
+        'data-focus-key': 'thinking:retry',
+        disabled: Boolean(flow.busy) || flow.authoritative === false,
+        on: {
+          click: () => {
+            if (flow.authoritative === false) return;
+            call('flow', { intent: 'start-thinking-download' });
+          }
+        }
+      }, document.createTextNode(copy.retry || COPY.tryAgain)));
     }
-    return nodes;
+    rows.push(el('div', { class: 'setup-download', 'data-download': 'thinking' }, ...parts));
   }
 
-  const isCapable = view.thinking_capability === 'ok' || view.local_offered === true;
-  if (isCapable) {
-    if (view.default_line) {
-      nodes.push(el('p', {}, document.createTextNode(view.default_line)));
-    }
-    if (thinkingCopy.change) {
-      nodes.push(el('button', {
-        type: 'button',
-        disabled: Boolean(view.busy),
-        on: { click: () => { thinkingChoicesOpen = true; renderFlow(state.flow); } },
-      }, document.createTextNode(thinkingCopy.change)));
-    }
-    if (thinkingCopy.later) {
-      nodes.push(el('button', {
-        type: 'button',
-        disabled: Boolean(view.busy) || view.authoritative === false,
-        on: { click: () => {
-          if (view.authoritative === false) return;
-          continueThinking('later');
-        } },
-      }, document.createTextNode(thinkingCopy.later)));
-    }
-    nodes.push(el('button', {
-      type: 'button',
-      class: 'primary',
-      disabled: Boolean(view.busy) || view.authoritative === false,
-      on: { click: () => {
-        if (view.authoritative === false) return;
-        continueThinking('local');
-      } },
-    }, document.createTextNode(thinkingCopy.continue || COPY.continueButton)));
-    return nodes;
-  }
-
-  if (thinkingCopy.choose_later) {
-    nodes.push(el('p', {}, document.createTextNode(thinkingCopy.choose_later)));
-  }
-  for (const choice of choices) {
-    if (choice.id === 'local') continue;
-    const line = choice.sub;
-    const desc = choice.description;
-    nodes.push(el('div', { class: 'field' },
+  // Models row
+  if (flow.models?.showing) {
+    const parts = [
+      el('span', { class: 'setup-download-detail' }, document.createTextNode(flow.models.detail || '')),
       el('button', {
         type: 'button',
-        disabled: Boolean(view.busy) || view.authoritative === false,
-        on: { click: () => {
-          if (view.authoritative === false) return;
-          call('flow', { intent: 'choose-thinking', choice: choice.id });
-        } },
-      }, document.createTextNode(choice.label || choice.id)),
-      line ? el('p', { class: 'muted' }, document.createTextNode(line)) : null,
-      desc ? el('p', { class: 'faint' }, document.createTextNode(desc)) : null
-    ));
+        'data-focus-key': 'models:retry',
+        disabled: Boolean(flow.models.pending) || Boolean(flow.busy),
+        on: { click: () => call('flow', { intent: 'retry-models' }) }
+      }, document.createTextNode(COPY.tryAgain))
+    ];
+    rows.push(el('div', { class: 'setup-download', 'data-download': 'models' }, ...parts));
   }
-  if (typeof thinkingCopy.later === 'string' && thinkingCopy.later) {
-    nodes.push(el('button', {
-      type: 'button',
-      disabled: Boolean(view.busy) || view.authoritative === false,
-      on: { click: () => {
-        if (view.authoritative === false) return;
-        continueThinking('later');
-      } },
-    }, document.createTextNode(thinkingCopy.later)));
-  }
-  return nodes;
+
+  if (rows.length === 0) return null;
+  return el('div', { class: 'setup-downloads' }, ...rows);
 }
 
 let setupRunningArmed = false;
@@ -782,15 +807,29 @@ async function finishSetupToHome(view) {
     status = await refreshStatus(true);
   } catch (error) {
     const root = $('firstrun');
-    root.replaceChildren(
-      el('p', { class: 'error' }, document.createTextNode(error.message || String(error))),
-      el('div', { class: 'actions centered' },
-        el('button', {
-          type: 'button',
-          on: { click: () => finishSetupToHome(view) },
-        }, document.createTextNode(COPY.tryAgain))
-      )
+    root.setAttribute('data-phase', 'home');
+    root.replaceChildren();
+
+    const band = el('header', { class: 'setup-band' },
+      el('img', { class: 'setup-lockup', src: '/lockup-solstone-horizontal.svg', alt: 'solstone' }),
+      el('span', { class: 'setup-band-label' }, document.createTextNode(COPY.setup.band))
     );
+    const lead = el('div', { class: 'setup-lead' },
+      el('h1', {}, document.createTextNode(COPY.setupStopped))
+    );
+    const card = el('div', { class: 'setup-card' },
+      el('p', { class: 'error' }, document.createTextNode(error.message || String(error))),
+      el('button', {
+        type: 'button',
+        class: 'primary',
+        on: { click: () => finishSetupToHome(view) },
+      }, document.createTextNode(COPY.tryAgain))
+    );
+    const columns = el('div', { class: 'setup-columns' }, lead, card);
+    const sheet = el('div', { class: 'setup-sheet' }, columns);
+    const footer = el('footer', { class: 'setup-footer' });
+    root.append(band, sheet, footer);
+    show('firstrun');
     return;
   }
   setupRunningArmed = false;
@@ -803,14 +842,15 @@ async function finishSetupToHome(view) {
 function renderFlow(view) {
   if (!view) return;
   const previousPhase = state.flow?.phase ?? null;
-  const previousChoice = state.flow?.thinking_choice ?? null;
-  const previousSaved = state.flow?.thinking_saved ?? null;
   state.flow = view;
   syncDownloadWatch(view.watch_downloads);
-  if ((view.phase ?? null) !== previousPhase ||
-      (view.thinking_choice ?? null) !== previousChoice ||
-      (view.thinking_saved ?? null) !== previousSaved) {
-    thinkingChoicesOpen = false;
+
+  if (view.phase !== 'welcome' && view.phase !== 'sign-in') {
+    signInTouched = false;
+    signInScreen = false;
+  } else if (!signInScreen && !signInTouched) {
+    signInOn = view.sign_in !== false;
+    signInScreen = true;
   }
 
   if (view.phase === 'setup' && view.setup_running === true) {
@@ -818,6 +858,7 @@ function renderFlow(view) {
   }
 
   if (view.resting) {
+    clearSetupFrame();
     show('main');
     render();
     return;
@@ -830,6 +871,17 @@ function renderFlow(view) {
     landHome(view);
     return;
   }
+  if (view.phase === 'opening') {
+    const installed = state.status?.service?.installed === true;
+    const hasPort = state.status?.service?.port != null;
+    const disp = display();
+    if (installed && hasPort && (disp === 'stopped' || disp === 'not-running')) {
+      clearSetupFrame();
+      show('main');
+      render();
+      return;
+    }
+  }
 
   const root = $('firstrun');
   const focused = document.activeElement;
@@ -837,89 +889,111 @@ function renderFlow(view) {
     return;
   }
 
-  if (view.phase !== previousPhase) flowFocus = null;
-  if (view.phase === previousPhase && focused && root.contains(focused)) {
-    flowFocus = { tag: focused.tagName, text: focused.textContent.trim() };
+  if (view.phase !== previousPhase) {
+    flowFocus = null;
+  } else if (focused && root.contains(focused)) {
+    const key = focused.getAttribute ? focused.getAttribute('data-focus-key') : null;
+    if (key && ['sign-in', 'local', 'spp', 'byo', 'later', 'thinking:cancel', 'thinking:retry', 'speech:retry', 'models:retry'].includes(key)) {
+      flowFocus = key;
+    } else {
+      flowFocus = null;
+    }
   } else if (focused && focused !== document.body) {
     flowFocus = null;
   }
 
   root.replaceChildren();
   root.setAttribute('data-phase', view.phase);
-  const card = el('div', { class: 'firstrun-card' });
-  root.append(card);
-  const copy = view.copy || {};
-  if (['welcome', 'sign-in', 'folder', 'mark', 'thinking'].includes(view.phase)) {
-    card.append(stepSequence(view));
+
+  const band = el('header', { class: 'setup-band' },
+    el('img', { class: 'setup-lockup', src: '/lockup-solstone-horizontal.svg', alt: 'solstone' }),
+    el('span', { class: 'setup-band-label' }, document.createTextNode(COPY.setup.band))
+  );
+
+  const lead = el('div', { class: 'setup-lead' });
+  const card = el('div', { class: 'setup-card' });
+  const columns = el('div', { class: 'setup-columns' }, lead, card);
+  const sheet = el('div', { class: 'setup-sheet' }, columns);
+
+  let footerProgress = null;
+  let footerDownloads = null;
+  let footerPrimary = null;
+
+  const step = setupStep(view);
+  if (step !== null) {
+    footerProgress = renderProgress(step);
   }
 
-  if (view.phase === 'opening') {
-    const installed = state.status?.service?.installed === true;
-    const hasPort = state.status?.service?.port != null;
-    const disp = display();
-    if (installed && hasPort && (disp === 'stopped' || disp === 'not-running')) {
-      show('main');
-      render();
-      return;
-    }
-    put(card,
-      view.error ? failure(COPY.setupStopped, view.error) : null,
-      view.error ? el('div', { class: 'actions centered' },
-        el('button', {
-          type: 'button',
-          disabled: Boolean(view.busy),
-          on: { click: () => call('flow', { intent: 'retry-state' }) },
-        }, document.createTextNode(COPY.tryAgain))
-      ) : null
-    );
-  } else if (view.phase === 'welcome') {
+  const copy = view.copy || {};
+
+  if (view.phase === 'welcome' || view.phase === 'sign-in') {
     const welcome = copy.welcome || {};
-    put(card,
+    const login = copy.login || {};
+    lead.append(
       el('h1', {}, document.createTextNode(welcome.title || copy.heading || '')),
       welcome.body ? el('p', {}, document.createTextNode(welcome.body)) : null,
-      ...fitsLines(copy.fits || {}),
-      view.error ? el('p', { class: 'error' }, document.createTextNode(view.error)) : null,
-      el('div', { class: 'actions' },
-        el('button', {
-          type: 'button',
-          class: 'primary',
-          disabled: Boolean(view.busy),
-          on: { click: () => call('flow', { intent: 'acknowledge' }) },
-        }, document.createTextNode(COPY.continueButton))
-      )
-    );
-  } else if (view.phase === 'sign-in') {
-    const login = copy.login || {};
-    const checkbox = el('input', {
-      type: 'checkbox',
-      id: 'sign-in-check',
-      disabled: Boolean(view.busy),
-    });
-    checkbox.checked = view.sign_in !== false;
-    checkbox.addEventListener('change', () => {
-      call('flow', { intent: 'choose-sign-in', on: checkbox.checked });
-    });
-    put(card,
-      el('h1', {}, document.createTextNode(login.label || COPY.startAtSignIn)),
-      el('div', { class: 'field' },
-        el('div', { class: 'row' },
-          checkbox,
-          el('label', { for: 'sign-in-check' }, document.createTextNode(login.label || COPY.startAtSignIn))
-        ),
-        login.help ? el('p', { class: 'muted' }, document.createTextNode(login.help)) : null
+      el('h2', {}, document.createTextNode(COPY.setup.fitsTitle)),
+      el('p', { class: 'setup-fit' },
+        el('span', { class: 'setup-fit-term' }, document.createTextNode(COPY.setup.journalTerm)),
+        el('span', { class: 'setup-fit-text' }, document.createTextNode(COPY.setup.journalText))
       ),
-      view.error ? el('p', { class: 'error' }, document.createTextNode(view.error)) : null,
-      el('div', { class: 'actions' },
-        el('button', {
-          type: 'button',
-          class: 'primary',
-          disabled: Boolean(view.busy),
-          on: { click: () => call('flow', { intent: 'continue-sign-in' }) },
-        }, document.createTextNode(COPY.continueButton))
-      )
+      el('p', { class: 'setup-fit' },
+        el('span', { class: 'setup-fit-term' }, document.createTextNode(COPY.setup.appTerm)),
+        el('span', { class: 'setup-fit-text' }, document.createTextNode(COPY.setup.appText))
+      ),
+      el('p', { class: 'setup-fit' },
+        el('span', { class: 'setup-fit-term' }, document.createTextNode(COPY.setup.thinkingTerm)),
+        el('span', { class: 'setup-fit-text' }, document.createTextNode(COPY.setup.thinkingText))
+      ),
+      Array.isArray(welcome.how_it_fits) && typeof welcome.how_it_fits[2] === 'string'
+        ? el('p', {}, document.createTextNode(welcome.how_it_fits[2]))
+        : null
     );
+
+    card.append(
+      login.label ? el('p', {}, document.createTextNode(login.label)) : null,
+      el('button', {
+        type: 'button',
+        id: 'sign-in-check',
+        role: 'switch',
+        'aria-checked': signInOn ? 'true' : 'false',
+        'data-focus-key': 'sign-in',
+        disabled: Boolean(view.busy),
+        on: {
+          click: () => {
+            signInTouched = true;
+            signInOn = !signInOn;
+            renderFlow(state.flow);
+          }
+        }
+      }, document.createTextNode(COPY.setup.signIn)),
+      view.error ? el('p', { class: 'error' }, document.createTextNode(view.error)) : null
+    );
+
+    footerPrimary = el('button', {
+      type: 'button',
+      class: 'primary',
+      disabled: Boolean(view.busy) || view.authoritative === false,
+      on: {
+        click: async () => {
+          const on = signInOn;
+          try {
+            if (view.phase === 'welcome') await call('flow', { intent: 'acknowledge' });
+            await call('flow', { intent: 'choose-sign-in', on });
+            await call('flow', { intent: 'continue-sign-in' });
+          } catch {
+            // receive() already painted the error on this phase. Stop the sequence.
+          }
+        }
+      }
+    }, document.createTextNode(COPY.setup.start));
   } else if (view.phase === 'folder') {
     const folderCopy = copy.folder || {};
+    lead.append(
+      el('h1', {}, document.createTextNode(COPY.setup.folderTitle)),
+      el('p', {}, document.createTextNode(COPY.setup.folderText))
+    );
+
     if (!firstRun.location) {
       firstRun.location = state.init?.default_location || '';
     }
@@ -934,71 +1008,88 @@ function renderFlow(view) {
       firstRun.holdsJournal = await call('holdsJournal', { path: firstRun.location });
       renderFlow(state.flow);
     });
-    put(card,
-      el('h1', {}, document.createTextNode(folderCopy.title || COPY.locationTitle)),
-      folderCopy.help ? el('p', { class: 'muted' }, document.createTextNode(folderCopy.help)) : null,
-      el('div', { class: 'field' },
-        el('h2', {}, document.createTextNode(COPY.location)),
-        el('div', { class: 'row' },
-          locationInput,
-          el('button', {
-            type: 'button',
-            disabled: Boolean(view.busy),
-            on: { click: async () => {
-              const picked = await call('pickFolder', { start: firstRun.location });
-              if (picked) {
-                firstRun.location = picked.path;
-                firstRun.holdsJournal = picked.holds_journal;
-                renderFlow(state.flow);
-              }
-            } },
-          }, document.createTextNode(folderCopy.change || COPY.chooseLocation))
-        ),
-        firstRun.holdsJournal ? el('p', { class: 'faint' }, document.createTextNode(COPY.journalFound)) : null
-      ),
-      view.error ? el('p', { class: 'error' }, document.createTextNode(view.error)) : null,
-      el('div', { class: 'actions' },
-        el('button', {
-          type: 'button',
-          class: 'primary',
-          disabled: Boolean(view.busy),
-          on: { click: () => {
-            firstRun.adopted = firstRun.holdsJournal;
-            firstRun.steps = [];
-            call('flow', { intent: 'start-setup', path: firstRun.location });
-          } },
-        }, document.createTextNode(folderCopy.continue || COPY.continueButton))
-      )
+
+    const pickBtn = el('button', {
+      type: 'button',
+      disabled: Boolean(view.busy),
+      on: {
+        click: async () => {
+          const picked = await call('pickFolder', { start: firstRun.location });
+          if (picked) {
+            firstRun.location = picked.path;
+            firstRun.holdsJournal = picked.holds_journal;
+            renderFlow(state.flow);
+          }
+        }
+      }
+    }, document.createTextNode(folderCopy.change || COPY.chooseLocation));
+
+    card.append(
+      el('h2', {}, document.createTextNode(COPY.setup.folderLabel)),
+      el('div', { class: 'row' }, locationInput, pickBtn),
+      firstRun.holdsJournal ? el('p', { class: 'faint' }, document.createTextNode(COPY.journalFound)) : null,
+      view.error ? el('p', { class: 'error' }, document.createTextNode(view.error)) : null
     );
+
+    footerPrimary = el('button', {
+      type: 'button',
+      class: 'primary',
+      disabled: Boolean(view.busy),
+      on: {
+        click: () => {
+          firstRun.adopted = firstRun.holdsJournal;
+          firstRun.steps = [];
+          call('flow', { intent: 'start-setup', path: firstRun.location });
+        }
+      }
+    }, document.createTextNode(folderCopy.continue || COPY.continueButton));
   } else if (view.phase === 'setup') {
     if (view.setup_running || view.setup_failed) {
-      put(card,
+      lead.append(
         el('h1', {}, document.createTextNode(COPY.setupTitle)),
-        el('p', { class: 'muted' }, document.createTextNode(COPY.setupSubtitle)),
+        el('p', { class: 'muted' }, document.createTextNode(COPY.setupSubtitle))
+      );
+      put(card,
         el('div', {}, el('ul', { class: 'steps' },
           firstRun.steps.filter(item => COPY.steps[item.step]).map(item =>
             el('li', { class: item.state }, document.createTextNode(COPY.steps[item.step]))
           )
         )),
         view.error ? failure(COPY.setupStopped, view.error) : null,
-        view.error ? el('div', { class: 'actions centered' },
-          el('button', {
-            type: 'button',
-            disabled: Boolean(view.busy),
-            on: { click: () => call('flow', { intent: 'retry-setup' }) },
-          }, document.createTextNode(COPY.tryAgain))
-        ) : null
+        view.error ? el('button', {
+          type: 'button',
+          class: 'primary',
+          disabled: Boolean(view.busy),
+          on: { click: () => call('flow', { intent: 'retry-setup' }) }
+        }, document.createTextNode(COPY.tryAgain)) : null
       );
     } else {
+      lead.append(
+        el('h1', {}, document.createTextNode(COPY.setupStopped))
+      );
       put(card,
         view.error ? failure(COPY.setupStopped, view.error) : null,
-        view.error ? el('div', { class: 'actions centered' },
-          el('button', {
-            type: 'button',
-            disabled: Boolean(view.busy),
-            on: { click: () => call('flow', { intent: 'retry-state' }) },
-          }, document.createTextNode(COPY.tryAgain))
-        ) : null
+        el('button', {
+          type: 'button',
+          class: 'primary',
+          disabled: Boolean(view.busy),
+          on: { click: () => call('flow', { intent: 'retry-state' }) }
+        }, document.createTextNode(COPY.tryAgain))
+      );
+    }
+  } else if (view.phase === 'opening') {
+    lead.append(
+      el('h1', {}, document.createTextNode(view.error ? COPY.setupStopped : COPY.setupTitle))
+    );
+    if (view.error) {
+      put(card,
+        failure(COPY.setupStopped, view.error),
+        el('button', {
+          type: 'button',
+          class: 'primary',
+          disabled: Boolean(view.busy),
+          on: { click: () => call('flow', { intent: 'retry-state' }) }
+        }, document.createTextNode(COPY.tryAgain))
       );
     }
   } else if (view.phase === 'mark') {
@@ -1008,95 +1099,195 @@ function renderFlow(view) {
     const markMissing = view.mark?.render == null;
     if (!markMissing) renderMarkCard(markBox, view.mark.render);
     const canCommit = view.authoritative !== false && displayableMark(view.mark?.render);
-    const actions = [];
-    if (view.authoritative === false) {
-      actions.push(el('button', {
-        type: 'button',
-        disabled: Boolean(view.busy),
-        on: { click: () => call('flow', { intent: 'retry-state' }) },
-      }, document.createTextNode(COPY.tryAgain)));
-    }
-    if (markCopy.try_another) {
-      actions.push(el('button', {
-        type: 'button',
-        disabled: Boolean(view.busy) || view.authoritative === false,
-        on: { click: () => {
-          if (view.authoritative === false) return;
-          call('flow', { intent: 'regenerate-mark' });
-        } },
-      }, document.createTextNode(markCopy.try_another)));
-    }
-    actions.push(el('button', {
-      type: 'button',
-      class: 'primary',
-      disabled: Boolean(view.busy) || !canCommit,
-      on: { click: () => {
-        if (!canCommit) return;
-        call('flow', { intent: 'commit-mark', proposal_id: proposalId });
-      } },
-    }, document.createTextNode(markCopy.continue || COPY.continueButton)));
 
-    put(card,
-      markCopy.title ? el('h1', {}, document.createTextNode(markCopy.title)) : el('h1', {}, document.createTextNode('')),
+    lead.append(
+      el('h1', {}, document.createTextNode(markCopy.title || '')),
       markCopy.help ? el('p', { class: 'muted' }, document.createTextNode(markCopy.help)) : null,
+      el('p', {}, document.createTextNode(COPY.setup.markMatch))
+    );
+
+    card.append(
       markMissing
         ? (view.busy
           ? el('progress', { 'aria-label': markCopy.title || COPY.setupTitle })
           : (markCopy.error ? el('p', { class: 'error' }, document.createTextNode(markCopy.error)) : null))
         : markBox,
-      markCopy.permanence ? el('p', { class: 'faint' }, document.createTextNode(markCopy.permanence)) : null,
-      view.error ? el('p', { class: 'error' }, document.createTextNode(view.error)) : null,
-      el('div', { class: 'actions' }, ...actions)
+      markCopy.permanence ? el('p', { class: 'faint' }, document.createTextNode(markCopy.permanence)) : null
     );
-  } else if (view.phase === 'thinking') {
-    const thinkingCopy = view.copy?.thinking || {};
-    const finalizeButton = view.can_finalize ? el('button', {
-      type: 'button',
-      class: 'primary',
-      disabled: Boolean(view.busy) || view.authoritative === false,
-      on: { click: () => {
-        if (view.authoritative === false) return;
-        continueThinking(view.thinking_choice);
-      } },
-    }, document.createTextNode(thinkingCopy.continue || COPY.continueButton)) : null;
-    const actions = [];
+
     if (view.authoritative === false) {
-      actions.push(el('button', {
+      card.append(el('button', {
         type: 'button',
         disabled: Boolean(view.busy),
-        on: { click: () => call('flow', { intent: 'retry-state' }) },
+        on: { click: () => call('flow', { intent: 'retry-state' }) }
       }, document.createTextNode(COPY.tryAgain)));
     }
-    if (finalizeButton) actions.push(finalizeButton);
-    put(card,
-      thinkingCopy.title ? el('h1', {}, document.createTextNode(thinkingCopy.title)) : el('h1', {}, document.createTextNode('')),
-      ...thinkingChoiceNodes(view),
-      speechBlock(),
-      thinkingBlock(),
-      modelsBlock(),
-      view.error ? el('p', { class: 'error' }, document.createTextNode(view.error)) : null,
-      actions.length ? el('div', { class: 'actions' }, ...actions) : null
+    if (markCopy.try_another) {
+      card.append(el('button', {
+        type: 'button',
+        disabled: Boolean(view.busy) || view.authoritative === false,
+        on: {
+          click: () => {
+            if (view.authoritative === false) return;
+            call('flow', { intent: 'regenerate-mark' });
+          }
+        }
+      }, document.createTextNode(markCopy.try_another)));
+    }
+    if (view.error) {
+      card.append(el('p', { class: 'error' }, document.createTextNode(view.error)));
+    }
+
+    footerPrimary = el('button', {
+      type: 'button',
+      class: 'primary',
+      disabled: Boolean(view.busy) || !canCommit,
+      on: {
+        click: () => {
+          if (!canCommit) return;
+          call('flow', { intent: 'commit-mark', proposal_id: proposalId });
+        }
+      }
+    }, document.createTextNode(markCopy.continue || COPY.continueButton));
+  } else if (view.phase === 'thinking') {
+    const thinkingCopy = copy.thinking || {};
+    const choices = Array.isArray(thinkingCopy.choices) ? thinkingCopy.choices : [];
+    const saved = Boolean(view.thinking_saved) && ['local', 'spp', 'byo', 'later'].includes(view.thinking_choice);
+    const localCapable = view.thinking_capability === 'ok';
+    const showLocal = localCapable || (Boolean(view.thinking_saved) && view.thinking_choice === 'local');
+
+    let selectedChoice = null;
+    if (Boolean(view.thinking_saved) && ['local', 'spp', 'byo'].includes(view.thinking_choice)) {
+      selectedChoice = view.thinking_choice;
+    } else if (!view.thinking_saved && localCapable) {
+      selectedChoice = 'local';
+    }
+
+    lead.append(
+      el('h1', {}, document.createTextNode(COPY.setup.thinkingTitle)),
+      el('p', {}, document.createTextNode(COPY.setup.thinkingLead))
     );
+
+    if (!saved && !localCapable && typeof thinkingCopy.choose_later === 'string' && thinkingCopy.choose_later.length > 0) {
+      card.append(el('p', {}, document.createTextNode(thinkingCopy.choose_later)));
+    }
+
+    for (const choice of choices) {
+      if (choice.id === 'local' && !showLocal) continue;
+      const isSelected = selectedChoice === choice.id;
+      const label = choice.id === 'local' ? COPY.setup.onThisPc : (choice.label || choice.id);
+      let sub = null;
+      if (choice.id === 'local') {
+        if (typeof view.thinking_download_bytes === 'number' && view.thinking_download_bytes > 0) {
+          sub = formatBytes(view.thinking_download_bytes);
+        }
+      } else if (typeof choice.sub === 'string' && choice.sub.length > 0) {
+        sub = choice.sub;
+      }
+      const desc = typeof choice.description === 'string' && choice.description.length > 0 ? choice.description : null;
+
+      card.append(el('button', {
+        type: 'button',
+        class: 'setup-choice',
+        role: 'radio',
+        'data-choice-id': choice.id,
+        'data-focus-key': choice.id,
+        'aria-checked': isSelected ? 'true' : 'false',
+        'aria-label': label,
+        disabled: Boolean(view.busy) || view.authoritative === false,
+        on: {
+          click: () => {
+            if (view.authoritative === false || Boolean(view.busy)) return;
+            call('flow', { intent: 'choose-thinking', choice: choice.id });
+          }
+        }
+      },
+        el('span', { class: 'setup-choice-label' }, document.createTextNode(label)),
+        sub ? el('span', { class: 'setup-choice-sub' }, document.createTextNode(sub)) : null,
+        isSelected && desc ? el('span', { class: 'setup-choice-desc' }, document.createTextNode(desc)) : null
+      ));
+    }
+
+    if (typeof thinkingCopy.later === 'string' && thinkingCopy.later.length > 0) {
+      card.append(el('button', {
+        type: 'button',
+        'data-focus-key': 'later',
+        disabled: Boolean(view.busy) || view.authoritative === false,
+        on: {
+          click: () => {
+            if (view.authoritative === false || Boolean(view.busy)) return;
+            continueThinking('later');
+          }
+        }
+      }, document.createTextNode(thinkingCopy.later)));
+    }
+
+    if (view.authoritative === false) {
+      card.append(el('button', {
+        type: 'button',
+        disabled: Boolean(view.busy),
+        on: { click: () => call('flow', { intent: 'retry-state' }) }
+      }, document.createTextNode(COPY.tryAgain)));
+    }
+
+    if (view.error) {
+      card.append(el('p', { class: 'error' }, document.createTextNode(view.error)));
+    }
+
+    footerDownloads = renderFooterDownloads(view);
+
+    if (!view.thinking_saved && localCapable) {
+      footerPrimary = el('button', {
+        type: 'button',
+        class: 'primary',
+        disabled: Boolean(view.busy) || view.authoritative === false,
+        on: {
+          click: () => {
+            if (view.authoritative === false || Boolean(view.busy)) return;
+            continueThinking('local');
+          }
+        }
+      }, document.createTextNode(thinkingCopy.continue || COPY.continueButton));
+    } else if (Boolean(view.thinking_saved) && ['local', 'spp', 'byo', 'later'].includes(view.thinking_choice) && view.can_finalize) {
+      footerPrimary = el('button', {
+        type: 'button',
+        class: 'primary',
+        disabled: Boolean(view.busy) || view.authoritative === false,
+        on: {
+          click: () => {
+            if (view.authoritative === false || Boolean(view.busy)) return;
+            continueThinking(view.thinking_choice);
+          }
+        }
+      }, document.createTextNode(thinkingCopy.continue || COPY.continueButton));
+    }
   }
+
+  const footerChildren = [];
+  if (footerProgress) footerChildren.push(footerProgress);
+  if (footerDownloads) footerChildren.push(footerDownloads);
+  if (footerPrimary) footerChildren.push(footerPrimary);
+  const footer = el('footer', { class: 'setup-footer' }, ...footerChildren);
+
+  root.append(band, sheet, footer);
 
   show('firstrun');
   if (view.phase !== previousPhase) {
-    const heading = card.querySelector('h1');
+    const heading = lead.querySelector('h1');
     if (heading) {
       heading.tabIndex = -1;
       heading.focus();
     }
   } else if (flowFocus) {
-    const candidate = [...card.querySelectorAll(flowFocus.tag.toLowerCase())].find(
-      el => el.textContent.trim() === flowFocus.text && !el.disabled
-    );
-    if (candidate) candidate.focus();
+    const candidate = root.querySelector(`[data-focus-key="${flowFocus}"]`);
+    if (candidate && !candidate.disabled) candidate.focus();
     if (candidate || !view.busy) flowFocus = null;
   }
 }
 
 function landHome(view) {
   state.flow = view;
+  clearSetupFrame();
   if (!homeLanded) {
     homeLanded = true;
     state.pane = 'home';

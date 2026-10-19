@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -180,6 +180,15 @@ class DomElement extends DomNode {
     if (name === 'checked') this.checked = true;
   }
 
+  removeAttribute(name) {
+    delete this.attributes[name];
+    if (name === 'id') this.id = '';
+    if (name === 'class') this.className = '';
+    if (name === 'value') this._value = '';
+    if (name === 'disabled') this._disabled = false;
+    if (name === 'checked') this.checked = false;
+  }
+
   getAttribute(name) {
     return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null;
   }
@@ -223,9 +232,41 @@ function walk(node, visit) {
 
 function matches(element, selector) {
   if (!(element instanceof DomElement)) return false;
-  if (selector.startsWith('.')) return element.classList.contains(selector.slice(1));
-  if (selector.startsWith('#')) return element.id === selector.slice(1);
-  return element.localName === selector.toLowerCase();
+  let s = selector.trim();
+  if (!s) return false;
+  const tagMatch = s.match(/^([a-zA-Z0-9_-]+)/);
+  if (tagMatch) {
+    if (element.localName !== tagMatch[1].toLowerCase()) return false;
+    s = s.slice(tagMatch[1].length);
+  }
+  while (s.length > 0) {
+    if (s.startsWith('.')) {
+      const m = s.match(/^\.([a-zA-Z0-9_-]+)/);
+      if (!m) return false;
+      if (!element.classList.contains(m[1])) return false;
+      s = s.slice(m[0].length);
+    } else if (s.startsWith('#')) {
+      const m = s.match(/^#([a-zA-Z0-9_-]+)/);
+      if (!m) return false;
+      if (element.id !== m[1]) return false;
+      s = s.slice(m[0].length);
+    } else if (s.startsWith('[')) {
+      const m = s.match(/^\[([a-zA-Z0-9_-]+)(?:=([^\]]+))?\]/);
+      if (!m) return false;
+      const attrName = m[1];
+      let expectedVal = m[2];
+      if (expectedVal !== undefined) {
+        expectedVal = expectedVal.replace(/^["']|["']$/g, '');
+        if (element.getAttribute(attrName) !== expectedVal) return false;
+      } else {
+        if (!element.hasAttribute(attrName)) return false;
+      }
+      s = s.slice(m[0].length);
+    } else {
+      return false;
+    }
+  }
+  return true;
 }
 
 function query(root, selector) {
@@ -641,10 +682,22 @@ function buttons() {
   return found;
 }
 
+function accessibleName(button) {
+  const aria = button.getAttribute('aria-label');
+  if (typeof aria === 'string' && aria.trim().length > 0) return aria.trim();
+  return button.textContent.trim();
+}
+
 function click(label) {
-  const button = buttons().find(button => button.textContent.trim() === label);
-  if (!button) throw new Error(`no visible button ${label}; saw ${buttons().map(button => button.textContent.trim()).join(' | ')}`);
+  const button = buttons().find(b => accessibleName(b) === label);
+  if (!button) throw new Error(`no visible button ${label}; saw ${buttons().map(b => accessibleName(b)).join(' | ')}`);
   button.click();
+}
+
+function pressEnter() {
+  if (document.activeElement?.tagName === 'BUTTON' && !document.activeElement.disabled) {
+    document.activeElement.click();
+  }
 }
 
 function answer(value) {
@@ -705,6 +758,9 @@ if (darkResume) {
   if (calls.some(c => c.cmd === 'flow')) throw new Error('dark resume admitted new flow');
   pass('dark sign-in waits for owner shown');
   pass('dark OFF registration error and retry');
+  if (query(document.body, '.setup-band') || query(document.body, '.setup-progress')) {
+    throw new Error('dark resume left setup band or progress');
+  }
   console.log(`DOM CASES: ${passed} passed`);
   process.exit(0);
 }
@@ -733,19 +789,63 @@ if (dark) {
   if (!calls.some(c => c.cmd === 'open' && c.args?.target === 'journal')) throw new Error('dark Home lost ordinary journal open');
   if (calls.some(c => c.cmd === 'flow')) throw new Error('dark path admitted new flow');
   pass('dark browser setup recovers and retains ordinary Home open');
+  if (query(document.body, '.setup-band') || query(document.body, '.setup-progress')) {
+    throw new Error('dark setup left setup band or progress');
+  }
   console.log(`DOM CASES: ${passed} passed`);
   process.exit(0);
 }
+
+const elAttr1 = document.createElement('button');
+elAttr1.setAttribute('data-choice-id', 'local');
+const elAttr2 = document.createElement('button');
+elAttr2.setAttribute('data-choice-id', 'spp');
+if (!matches(elAttr1, '[data-choice-id="local"]') || matches(elAttr2, '[data-choice-id="local"]')) {
+  throw new Error('attribute matcher failed');
+}
+pass('compound matcher matches exact attribute');
+
+const btnPrimary = document.createElement('button');
+btnPrimary.className = 'primary';
+const divPrimary = document.createElement('div');
+divPrimary.className = 'primary';
+const plainBtn = document.createElement('button');
+if (!matches(btnPrimary, 'button.primary') || matches(divPrimary, 'button.primary') || matches(plainBtn, 'button.primary')) {
+  throw new Error('tag class matcher failed');
+}
+pass('compound matcher matches tag and class');
+
+const noticeThinking = document.createElement('div');
+noticeThinking.className = 'notice';
+noticeThinking.setAttribute('data-download', 'thinking');
+const plainNotice = document.createElement('div');
+plainNotice.className = 'notice';
+if (!matches(noticeThinking, '.notice[data-download=thinking]') || matches(plainNotice, '.notice[data-download=thinking]')) {
+  throw new Error('class attribute matcher failed');
+}
+pass('compound matcher matches class and attribute');
 
 if (root().getAttribute('data-phase') !== 'welcome') {
   throw new Error(`boot did not paint welcome (${root().getAttribute('data-phase')}) ${root().textContent}`);
 }
 
-click('continue');
+click('start setup');
+if (inbox[0]?.cmd !== 'flow' || inbox[0]?.args?.intent !== 'acknowledge') {
+  throw new Error(`expected acknowledge, got: ${JSON.stringify(inbox[0])}`);
+}
 answer(view({ phase: 'sign-in', step: 1 }));
-if (root().getAttribute('data-phase') !== 'sign-in') throw new Error('welcome continue did not paint sign-in');
-if (document.activeElement?.tagName !== 'H1') throw new Error('sign-in did not focus its heading');
-click('continue');
+await flush();
+if (inbox[0]?.cmd !== 'flow' || inbox[0]?.args?.intent !== 'choose-sign-in' || inbox[0]?.args?.on !== true) {
+  throw new Error(`expected choose-sign-in with on: true, got: ${JSON.stringify(inbox[0])}`);
+}
+answer(view({ phase: 'sign-in', step: 1 }));
+await flush();
+if (inbox[0]?.cmd !== 'flow' || inbox[0]?.args?.intent !== 'continue-sign-in') {
+  throw new Error(`expected continue-sign-in, got: ${JSON.stringify(inbox[0])}`);
+}
+if (!$('sign-in-check')) throw new Error('sign-in paint missing #sign-in-check');
+const primaryBtn = query(root(), 'button.primary');
+if (!primaryBtn || primaryBtn.textContent.trim() !== 'start setup') throw new Error('sign-in paint missing start setup button');
 answer(view({ phase: 'folder', step: 2 }));
 if (root().getAttribute('data-phase') !== 'folder') throw new Error('sign-in continue did not paint folder');
 pass('welcome and sign-in continue');
@@ -760,6 +860,75 @@ paint(view({ phase: 'folder', step: 2 }));
 if (document.activeElement !== folderInput) throw new Error('folder refresh moved focus');
 if (folderInput.value !== 'typed-path') throw new Error('folder refresh cleared the typed value');
 pass('heading focus and folder typing');
+
+// Toggle cases:
+// 1. Paint welcome, turn switch off, start setup posts acknowledge, choose-sign-in with on: false, continue-sign-in
+paint(view({ phase: 'welcome', step: 1 }));
+const switchBtn1 = $('sign-in-check');
+if (!switchBtn1 || switchBtn1.getAttribute('aria-checked') !== 'true') throw new Error('switch should be on by default');
+switchBtn1.click();
+if ($('sign-in-check').getAttribute('aria-checked') !== 'false') throw new Error('switch did not toggle off');
+click('start setup');
+if (inbox[0]?.args?.intent !== 'acknowledge') throw new Error(`expected acknowledge, got ${JSON.stringify(inbox[0])}`);
+answer(view({ phase: 'sign-in', step: 1 }));
+await flush();
+if (inbox[0]?.args?.intent !== 'choose-sign-in' || inbox[0]?.args?.on !== false) throw new Error(`expected choose-sign-in on: false, got ${JSON.stringify(inbox[0])}`);
+answer(view({ phase: 'sign-in', step: 1 }));
+await flush();
+if (inbox[0]?.args?.intent !== 'continue-sign-in') throw new Error(`expected continue-sign-in, got ${JSON.stringify(inbox[0])}`);
+answer(view({ phase: 'folder', step: 2 }));
+await flush();
+pass('sign-in toggle off posts on false');
+
+// 2. Turn switch off, fail acknowledge reply, re-render leaves aria-checked false, next press posts on: false
+paint(view({ phase: 'welcome', step: 1 }));
+$('sign-in-check').click();
+if ($('sign-in-check').getAttribute('aria-checked') !== 'false') throw new Error('switch did not toggle off');
+click('start setup');
+if (inbox[0]?.args?.intent !== 'acknowledge') throw new Error(`expected acknowledge, got ${JSON.stringify(inbox[0])}`);
+fail('ack-fail');
+await flush();
+if ($('sign-in-check').getAttribute('aria-checked') !== 'false') throw new Error('switch lost false aria-checked after failed acknowledge');
+click('start setup');
+if (inbox[0]?.args?.intent !== 'acknowledge') throw new Error(`expected acknowledge on retry, got ${JSON.stringify(inbox[0])}`);
+answer(view({ phase: 'sign-in', step: 1 }));
+await flush();
+if (inbox[0]?.args?.intent !== 'choose-sign-in' || inbox[0]?.args?.on !== false) throw new Error(`expected choose-sign-in on: false after retry, got ${JSON.stringify(inbox[0])}`);
+answer(view({ phase: 'sign-in', step: 1 }));
+await flush();
+if (inbox[0]?.args?.intent !== 'continue-sign-in') throw new Error(`expected continue-sign-in, got ${JSON.stringify(inbox[0])}`);
+answer(view({ phase: 'folder', step: 2 }));
+await flush();
+pass('sign-in failure retry retains toggle');
+
+// 3. Turn switch off, same-phase paint with no error, next press still posts on: false
+paint(view({ phase: 'welcome', step: 1 }));
+$('sign-in-check').click();
+paint(view({ phase: 'welcome', step: 1 }));
+if ($('sign-in-check').getAttribute('aria-checked') !== 'false') throw new Error('same-phase repaint lost toggle state');
+click('start setup');
+if (inbox[0]?.args?.intent !== 'acknowledge') throw new Error(`expected acknowledge on repaint, got ${JSON.stringify(inbox[0])}`);
+answer(view({ phase: 'sign-in', step: 1 }));
+await flush();
+if (inbox[0]?.args?.intent !== 'choose-sign-in' || inbox[0]?.args?.on !== false) throw new Error(`expected choose-sign-in on: false after repaint, got ${JSON.stringify(inbox[0])}`);
+answer(view({ phase: 'sign-in', step: 1 }));
+await flush();
+if (inbox[0]?.args?.intent !== 'continue-sign-in') throw new Error(`expected continue-sign-in, got ${JSON.stringify(inbox[0])}`);
+answer(view({ phase: 'folder', step: 2 }));
+await flush();
+pass('same-phase repaint retains sign-in toggle');
+
+// 4. paint({ phase: 'sign-in' }) shows welcome screen: #sign-in-check button, welcome title h1, primary text start setup
+paint(view({ phase: 'sign-in', step: 1 }));
+if (!$('sign-in-check') || $('sign-in-check').tagName !== 'BUTTON') throw new Error('sign-in-check button missing on sign-in phase');
+const welcomeH1 = query(root(), 'h1');
+if (!welcomeH1 || welcomeH1.textContent !== 'Welcome') throw new Error(`expected welcome title in h1, got ${welcomeH1?.textContent}`);
+const setupPrimary = query(root(), 'button.primary');
+if (!setupPrimary || setupPrimary.textContent.trim() !== 'start setup') throw new Error('primary button text is not start setup');
+pass('painted phase sign-in renders welcome screen');
+
+// Return to folder for the subsequent continue click
+paint(view({ phase: 'folder', step: 2 }));
 
 click('continue');
 answer(view({ phase: 'setup', busy: true, error: 'busy-err' }));
@@ -790,10 +959,7 @@ paint(view({
   thinking_choice: 'local',
   local_offered: true,
 }));
-if (!root().textContent.includes('Local lane')) throw new Error('saved choice hid its label');
-if (buttons().some(button => button.textContent.trim() === 'Later')) throw new Error('saved choice already listed Later');
-click('Change');
-if (!buttons().some(button => button.textContent.trim() === 'Later')) throw new Error('Change did not reveal Later');
+if (!buttons().some(button => accessibleName(button) === 'Later')) throw new Error('saved choice missing Later');
 click('Later');
 const later = inbox.shift();
 if (later?.args?.choice !== 'later') throw new Error(`Later posted ${JSON.stringify(later?.args)}`);
@@ -808,8 +974,8 @@ const downloading = view({
   },
 });
 paint(downloading);
-if (!root().textContent.includes('ThinkDl') || !root().textContent.includes('12') || !root().textContent.includes('40')) {
-  throw new Error(`download card hid its label or bytes (${root().textContent})`);
+if (!root().textContent.includes('ThinkDl') || !root().textContent.includes('12 bytes of 40 bytes')) {
+  throw new Error(`download card hid its label or formatted bytes (${root().textContent})`);
 }
 downloading.downloads.thinking.attempt_id = 'newer-b';
 click('Cancel');
@@ -847,15 +1013,19 @@ paint(view({
   phase: 'thinking',
   step: 4,
   thinking_capability: 'ok',
-  local_offered: true,
+  thinking_download_bytes: 1500000,
   default_line: 'measured-line',
   thinking_saved: false,
   thinking_choice: null,
 }));
-if (!root().textContent.includes('measured-line')) throw new Error('measured-line not visible');
-if (!buttons().some(b => b.textContent.trim() === 'Change')) throw new Error('Change button not visible');
-if (!buttons().some(b => b.textContent.trim() === 'Later')) throw new Error('Later button not visible');
-if (!buttons().some(b => b.textContent.trim() === 'Continue')) throw new Error('Continue button not visible');
+const localBtn = buttons().find(b => accessibleName(b) === 'on this pc');
+if (!localBtn) throw new Error('local button not found with accessible name "on this pc"');
+if (!localBtn.textContent.includes('1.5 MB')) throw new Error('local button missing 1.5 MB');
+if (root().textContent.includes('measured-line')) throw new Error('measured-line visible');
+if (root().textContent.includes('Local lane')) throw new Error('Local lane visible');
+if (!buttons().some(b => accessibleName(b) === 'Later')) throw new Error('Later not visible');
+if (buttons().some(b => accessibleName(b) === 'Change')) throw new Error('Change button visible');
+if (!buttons().some(b => accessibleName(b) === 'Continue')) throw new Error('Continue button not visible');
 if (inbox.length !== 0) throw new Error(`inbox not empty: ${JSON.stringify(inbox)}`);
 click('Continue');
 const chosen = inbox.shift();
@@ -864,30 +1034,42 @@ if (chosen?.cmd !== 'flow' || chosen?.args?.intent !== 'continue-thinking' || ch
 }
 pass('unsaved capable thinking shows the local line and continue saves local');
 
-// 2. change reveals the three lanes
-click('Change');
-const changeText = root().textContent;
-for (const choice of ['Local lane', 'on this pc', 'local description', 'Spp lane', 'spp', 'spp description', 'Byo lane', 'byo', 'byo description']) {
-  if (!changeText.includes(choice)) throw new Error(`missing in change: ${choice}`);
+// 2. unsaved capable thinking lists every choice
+paint(view({
+  phase: 'thinking',
+  step: 4,
+  thinking_capability: 'ok',
+  thinking_download_bytes: 1500000,
+  thinking_saved: false,
+  thinking_choice: null,
+}));
+const choiceBtns = root().querySelectorAll('button.setup-choice');
+const choiceIds = choiceBtns.map(b => b.getAttribute('data-choice-id'));
+if (!choiceIds.includes('local') || !choiceIds.includes('spp') || !choiceIds.includes('byo')) {
+  throw new Error(`expected local, spp, byo choices, got ${choiceIds.join(', ')}`);
 }
-pass('change reveals the three lanes');
+if (!root().textContent.includes('local description')) throw new Error('local description not visible');
+if (root().textContent.includes('spp description')) throw new Error('spp description visible');
+if (root().textContent.includes('byo description')) throw new Error('byo description visible');
+if (buttons().some(b => accessibleName(b) === 'Change')) throw new Error('Change button visible');
+pass('unsaved capable thinking lists every choice');
 
 // 3. unsaved blocked shows choose later
 paint(view({
   phase: 'thinking',
   step: 4,
   thinking_capability: 'blocked',
-  local_offered: false,
   default_line: 'measured-line',
   thinking_saved: false,
   thinking_choice: null,
 }));
 if (!root().textContent.includes('Choose later')) throw new Error('choose_later text not visible');
 if (root().textContent.includes('measured-line')) throw new Error('default_line visible');
-if (buttons().some(b => b.textContent.trim() === 'Continue')) throw new Error('Continue button visible');
-if (!buttons().some(b => b.textContent.trim() === 'Spp lane')) throw new Error('Spp lane not visible');
-if (!buttons().some(b => b.textContent.trim() === 'Byo lane')) throw new Error('Byo lane not visible');
-if (!buttons().some(b => b.textContent.trim() === 'Later')) throw new Error('Later not visible');
+if (buttons().some(b => accessibleName(b) === 'Continue')) throw new Error('Continue button visible');
+if (buttons().some(b => accessibleName(b) === 'on this pc') || root().textContent.includes('Local lane')) throw new Error('local row visible');
+if (!buttons().some(b => accessibleName(b) === 'Spp lane')) throw new Error('Spp lane not visible');
+if (!buttons().some(b => accessibleName(b) === 'Byo lane')) throw new Error('Byo lane not visible');
+if (!buttons().some(b => accessibleName(b) === 'Later')) throw new Error('Later not visible');
 click('Later');
 const laterMsg = inbox.shift();
 if (laterMsg?.cmd !== 'flow' || laterMsg?.args?.intent !== 'continue-thinking' || laterMsg?.args?.choice !== 'later') {
@@ -900,22 +1082,32 @@ paint(view({
   phase: 'thinking',
   step: 4,
   thinking_capability: 'unknown',
-  local_offered: false,
   default_line: 'measured-line',
   thinking_saved: false,
   thinking_choice: null,
 }));
 if (!root().textContent.includes('Choose later')) throw new Error('choose_later text not visible');
 if (root().textContent.includes('measured-line')) throw new Error('default_line visible');
-if (buttons().some(b => b.textContent.trim() === 'Continue')) throw new Error('Continue button visible');
-if (!buttons().some(b => b.textContent.trim() === 'Spp lane')) throw new Error('Spp lane not visible');
-if (!buttons().some(b => b.textContent.trim() === 'Byo lane')) throw new Error('Byo lane not visible');
-if (!buttons().some(b => b.textContent.trim() === 'Later')) throw new Error('Later not visible');
+if (buttons().some(b => accessibleName(b) === 'Continue')) throw new Error('Continue button visible');
+if (buttons().some(b => accessibleName(b) === 'on this pc') || root().textContent.includes('Local lane')) throw new Error('local row visible');
+if (!buttons().some(b => accessibleName(b) === 'Spp lane')) throw new Error('Spp lane not visible');
+if (!buttons().some(b => accessibleName(b) === 'Byo lane')) throw new Error('Byo lane not visible');
+if (!buttons().some(b => accessibleName(b) === 'Later')) throw new Error('Later not visible');
+paint(view({
+  phase: 'thinking',
+  step: 4,
+  default_line: 'measured-line',
+  thinking_saved: false,
+  thinking_choice: null,
+}));
+if (buttons().some(b => accessibleName(b) === 'on this pc') || root().textContent.includes('Local lane')) {
+  throw new Error('missing thinking_capability admitted local row');
+}
 pass('unsaved unknown shows choose later');
 
 // 5. saved local spp byo and later name themselves
 const savedCases = [
-  { id: 'local', label: 'Local lane' },
+  { id: 'local', label: 'on this pc' },
   { id: 'spp', label: 'Spp lane' },
   { id: 'byo', label: 'Byo lane' },
   { id: 'later', label: 'Later' },
@@ -927,14 +1119,26 @@ for (const sc of savedCases) {
     thinking_saved: true,
     thinking_choice: sc.id,
   }));
-  if (!root().textContent.includes(sc.label)) throw new Error(`${sc.id} label not visible`);
-  if (sc.id !== 'later' && buttons().some(b => b.textContent.trim() === 'Later')) {
-    throw new Error(`${sc.id} showed Later button before Change`);
+  if (sc.id === 'local') {
+    if (!buttons().some(b => accessibleName(b) === 'on this pc')) throw new Error('local visible name is not on this pc');
+    if (root().textContent.includes('Local lane')) throw new Error('Local lane is visible');
+  } else if (sc.id === 'spp' || sc.id === 'byo') {
+    if (!buttons().some(b => accessibleName(b) === sc.label)) throw new Error(`${sc.id} label not visible`);
   }
-  click('Change');
-  if (!buttons().some(b => b.textContent.trim() === 'Later')) {
-    throw new Error(`${sc.id} Change did not reveal Later`);
+  if (!buttons().some(b => accessibleName(b) === 'Later')) {
+    throw new Error(`${sc.id} missing Later button without Change click`);
   }
+}
+paint(view({
+  phase: 'thinking',
+  step: 4,
+  thinking_saved: true,
+  thinking_choice: 'local',
+  thinking_capability: 'blocked',
+}));
+const localSavedBlocked = buttons().find(b => b.getAttribute('data-choice-id') === 'local');
+if (!localSavedBlocked || localSavedBlocked.getAttribute('aria-checked') !== 'true') {
+  throw new Error('saved local with blocked capability did not retain aria-checked=true');
 }
 pass('saved local spp byo and later name themselves');
 
@@ -1120,25 +1324,42 @@ pass('failed identity does not confirm the cached mark');
 paint(view({
   phase: 'thinking',
   step: 4,
-  thinking_saved: true,
-  thinking_choice: 'local',
+  thinking_capability: 'ok',
+  thinking_download_bytes: 1000000,
+  thinking_saved: false,
+  thinking_choice: null,
 }));
-const changeBtn = buttons().find(b => b.textContent.trim() === 'Change');
-if (!changeBtn) throw new Error('Change button not found');
-changeBtn.focus();
-paint(view({
-  phase: 'thinking', step: 4, thinking_saved: true, thinking_choice: 'local', busy: true,
-  downloads: { thinking: { state: 'downloading', bytes_done: 5, bytes_total: 100 } },
-}));
+const sppBtn = buttons().find(b => b.getAttribute('data-choice-id') === 'spp');
+if (!sppBtn) throw new Error('spp button not found');
+sppBtn.focus();
+pressEnter();
+const chooseSpp = inbox.shift();
+if (chooseSpp?.args?.intent !== 'choose-thinking' || chooseSpp?.args?.choice !== 'spp') {
+  throw new Error(`expected choose-thinking spp, got ${JSON.stringify(chooseSpp)}`);
+}
 paint(view({
   phase: 'thinking',
   step: 4,
+  thinking_capability: 'ok',
+  thinking_download_bytes: 1000000,
   thinking_saved: true,
-  thinking_choice: 'local',
-  downloads: { thinking: { state: 'downloading', bytes_done: 10, bytes_total: 100 } },
+  thinking_choice: 'spp',
 }));
-if (document.activeElement?.textContent.trim() !== 'Change') {
-  throw new Error(`focus lost on thinking repaint: active is ${document.activeElement?.tagName}`);
+const sppAfter = buttons().find(b => b.getAttribute('data-choice-id') === 'spp');
+if (document.activeElement !== sppAfter || sppAfter.getAttribute('aria-checked') !== 'true') {
+  throw new Error(`expected focus on spp row with aria-checked true, active is ${document.activeElement?.getAttribute?.('data-focus-key')}`);
+}
+paint(view({
+  phase: 'thinking',
+  step: 4,
+  thinking_capability: 'ok',
+  thinking_download_bytes: 2000000,
+  thinking_saved: true,
+  thinking_choice: 'spp',
+}));
+const sppAfterDlChange = buttons().find(b => b.getAttribute('data-choice-id') === 'spp');
+if (document.activeElement !== sppAfterDlChange) {
+  throw new Error(`focus lost on spp row after thinking_download_bytes change`);
 }
 pass('thinking focus survives a progress repaint');
 
@@ -1441,5 +1662,312 @@ if (thisPcCalls.some(c => c.cmd === 'flow' && c.args?.intent === 'continue-solst
   throw new Error('this-pc click added continue-solstone call');
 }
 pass('continue in solstone app and download offer');
+
+inbox.length = 0;
+
+// 29. download progress formats bytes in megabytes
+paint(view({
+  phase: 'thinking',
+  step: 4,
+  downloads: {
+    thinking: { state: 'downloading', attempt_id: 'att-bytes', bytes_done: 1500000, bytes_total: 40000000 },
+  },
+}));
+if (!root().textContent.includes('1.5 MB of 40 MB')) {
+  throw new Error(`downloading bytes formatted incorrectly: ${root().textContent}`);
+}
+if (root().textContent.includes('1500000')) {
+  throw new Error('raw byte number 1500000 should not be visible');
+}
+pass('download progress formats bytes in megabytes');
+
+// 30. cancel focus survives progress repaints
+paint(view({
+  phase: 'thinking',
+  step: 4,
+  thinking_cancel: true,
+  downloads: {
+    thinking: { state: 'downloading', attempt_id: 'att-cancel', bytes_done: 10, bytes_total: 100 },
+  },
+}));
+const cancelBtnF = root().querySelector('button[data-focus-key="thinking:cancel"]');
+if (!cancelBtnF) throw new Error('cancel button not found');
+cancelBtnF.focus();
+paint(view({
+  phase: 'thinking',
+  step: 4,
+  thinking_cancel: true,
+  downloads: {
+    thinking: { state: 'downloading', attempt_id: 'att-cancel', bytes_done: 20, bytes_total: 100 },
+  },
+}));
+if (document.activeElement?.getAttribute?.('data-focus-key') !== 'thinking:cancel') {
+  throw new Error('focus lost on first cancel repaint');
+}
+paint(view({
+  phase: 'thinking',
+  step: 4,
+  thinking_cancel: true,
+  downloads: {
+    thinking: { state: 'downloading', attempt_id: 'att-cancel', bytes_done: 30, bytes_total: 100 },
+  },
+}));
+if (document.activeElement?.getAttribute?.('data-focus-key') !== 'thinking:cancel') {
+  throw new Error('focus lost on second cancel repaint');
+}
+pass('cancel focus survives progress repaints');
+
+// 31. retry focus distinguishes thinking from speech
+paint(view({
+  phase: 'thinking',
+  step: 4,
+  thinking_retry: true,
+  speech_retry: true,
+  downloads: {
+    speech: { state: 'error' },
+    thinking: { state: 'error' },
+  },
+}));
+const retryButtons = root().querySelectorAll('button').filter(b => b.textContent.trim() === 'Retry');
+if (retryButtons.length < 2) throw new Error(`expected at least 2 retry buttons, found ${retryButtons.length}`);
+const thinkRetry = root().querySelector('button[data-focus-key="thinking:retry"]');
+if (!thinkRetry) throw new Error('thinking:retry button not found');
+thinkRetry.focus();
+paint(view({
+  phase: 'thinking',
+  step: 4,
+  thinking_retry: true,
+  speech_retry: true,
+  downloads: {
+    speech: { state: 'error' },
+    thinking: { state: 'error' },
+  },
+}));
+if (document.activeElement?.getAttribute?.('data-focus-key') !== 'thinking:retry') {
+  throw new Error(`expected thinking:retry focused, active is ${document.activeElement?.getAttribute?.('data-focus-key')}`);
+}
+pass('retry focus distinguishes thinking from speech');
+
+// 32. indeterminate download shows progress and cancel
+paint(view({
+  phase: 'thinking',
+  step: 4,
+  thinking_cancel: true,
+  downloads: {
+    thinking: { state: 'downloading', attempt_id: 'att-indet', bytes_done: 10 },
+  },
+}));
+const dlRow = root().querySelector('.setup-download[data-download="thinking"]');
+if (!dlRow) throw new Error('thinking download row missing');
+const bar = dlRow.querySelector('.setup-download-bar');
+if (!bar) throw new Error('download bar missing');
+const rowCancel = dlRow.querySelector('button[data-focus-key="thinking:cancel"]');
+if (!rowCancel) throw new Error('cancel button missing on indeterminate download');
+pass('indeterminate download shows progress and cancel');
+
+// 33. idle thinking with retry flag offers download retry
+paint(view({
+  phase: 'thinking',
+  step: 4,
+  thinking_saved: true,
+  thinking_choice: 'local',
+  thinking_retry: true,
+  downloads: {
+    thinking: { state: 'idle' },
+  },
+}));
+const idleRetry = root().querySelector('button[data-focus-key="thinking:retry"]');
+if (!idleRetry) throw new Error('thinking retry missing on idle retryable download');
+idleRetry.click();
+const startDlMsg = inbox.shift();
+if (startDlMsg?.cmd !== 'flow' || startDlMsg?.args?.intent !== 'start-thinking-download') {
+  throw new Error(`expected start-thinking-download, got ${JSON.stringify(startDlMsg)}`);
+}
+pass('idle thinking with retry flag offers download retry');
+
+// 34. complete and unretryable idle hide thinking download row
+paint(view({
+  phase: 'thinking',
+  step: 4,
+  thinking_retry: false,
+  downloads: {
+    thinking: { state: 'complete' },
+  },
+}));
+if (root().querySelector('[data-download="thinking"]')) {
+  throw new Error('completed download should not have thinking download row');
+}
+paint(view({
+  phase: 'thinking',
+  step: 4,
+  thinking_retry: false,
+  downloads: {
+    thinking: { state: 'idle' },
+  },
+}));
+if (root().querySelector('[data-download="thinking"]')) {
+  throw new Error('idle download without retry should not have thinking download row');
+}
+pass('complete and unretryable idle hide thinking download row');
+
+// 35. unretryable speech error displays detail without retry button
+paint(view({
+  phase: 'thinking',
+  step: 4,
+  speech_retry: false,
+  downloads: {
+    speech: { state: 'error', error: { detail: 'speech-fail-detail' }, detail: 'speech-fail-detail' },
+  },
+}));
+if (!root().textContent.includes('speech-fail-detail')) {
+  throw new Error('speech error detail not visible');
+}
+if (root().querySelector('button[data-focus-key="speech:retry"]')) {
+  throw new Error('unretryable speech error showed retry button');
+}
+pass('unretryable speech error displays detail without retry button');
+
+// 36. setup progress tracks phases accurately
+const progressChecks = [
+  { view: view({ phase: 'welcome' }), expected: 'step 1 of 8' },
+  { view: view({ phase: 'sign-in' }), expected: 'step 1 of 8' },
+  { view: view({ phase: 'folder' }), expected: 'step 2 of 8' },
+  { view: view({ phase: 'setup', setup_running: true, setup_failed: false }), expected: 'step 2 of 8' },
+  { view: view({ phase: 'setup', setup_running: false, setup_failed: true }), expected: 'step 2 of 8' },
+  { view: view({ phase: 'mark' }), expected: 'step 3 of 8' },
+  { view: view({ phase: 'thinking' }), expected: 'step 4 of 8' },
+];
+for (const pc of progressChecks) {
+  paint(pc.view);
+  const prog = root().querySelector('.setup-progress');
+  if (!prog || prog.getAttribute('aria-label') !== pc.expected) {
+    throw new Error(`expected progress ${pc.expected} for ${pc.view.phase}, got ${prog?.getAttribute('aria-label')}`);
+  }
+}
+const noProgressChecks = [
+  view({ phase: 'home' }),
+  view({ phase: 'opening' }),
+  view({ phase: 'setup', setup_running: false, setup_failed: false }),
+];
+for (const np of noProgressChecks) {
+  paint(np);
+  await flush();
+  if (query(document.body, '.setup-progress')) {
+    throw new Error(`expected no progress for ${np.phase}`);
+  }
+}
+pass('setup progress tracks phases accurately');
+
+// 37. home notice renders download and clears setup frame
+click('home');
+await flush();
+paint(view({
+  phase: 'home',
+  step: 5,
+  thinking_cancel: true,
+  downloads: {
+    thinking: { state: 'downloading', attempt_id: 'home-att-1', bytes_done: 12, bytes_total: 40 },
+  },
+}));
+const homeNotice = $('pane').querySelector('.notice[data-download="thinking"]');
+if (!homeNotice) throw new Error('home notice for thinking download missing');
+if (!homeNotice.textContent.includes('ThinkDl') || !homeNotice.textContent.includes('12 40')) {
+  throw new Error(`home notice text missing ThinkDl or bytes: ${homeNotice.textContent}`);
+}
+if (!homeNotice.querySelector('button') || !homeNotice.querySelector('button').textContent.includes('Cancel')) {
+  throw new Error('home notice missing Cancel button');
+}
+if (root().querySelector('.setup-band') || root().querySelector('.setup-progress')) {
+  throw new Error('firstrun retained setup band or progress on home');
+}
+statusPlan.push(statusBody('stopped', true));
+window.journalApp.receive({ type: 'shown' });
+await flush();
+paint(view({ phase: 'opening' }));
+if (root().querySelector('.setup-band') || root().querySelector('.setup-progress')) {
+  throw new Error('firstrun retained setup band or progress on opening jump');
+}
+pass('home notice renders download and clears setup frame');
+
+// 38. pressEnter on try another triggers regenerate-mark
+paint(view({
+  phase: 'mark',
+  step: 3,
+  mark: { proposal_id: 'prop-try', render: validRender, state: 'proposed' },
+}));
+const tryAnotherBtn = buttons().find(b => b.textContent.trim() === 'Try');
+if (!tryAnotherBtn) throw new Error('try another button not found');
+tryAnotherBtn.focus();
+pressEnter();
+const tryAnotherMsg = inbox.shift();
+if (tryAnotherMsg?.cmd !== 'flow' || tryAnotherMsg?.args?.intent !== 'regenerate-mark') {
+  throw new Error(`expected regenerate-mark, got ${JSON.stringify(tryAnotherMsg)}`);
+}
+if (inbox.some(m => m.args?.intent === 'commit-mark')) {
+  throw new Error('pressEnter committed mark instead of regenerating');
+}
+pass('pressEnter on try another triggers regenerate-mark');
+
+// 39. qualification hooks align with styling and accessibility contracts
+paint(view({ phase: 'welcome', step: 1 }));
+const welcomePrimaries = root().querySelectorAll('button.primary');
+if (welcomePrimaries.length !== 1 || welcomePrimaries[0].textContent.trim() !== 'start setup') {
+  throw new Error(`welcome expected 1 primary button (start setup), found ${welcomePrimaries.length}`);
+}
+paint(view({
+  phase: 'thinking',
+  step: 4,
+  thinking_capability: 'ok',
+  thinking_saved: false,
+  thinking_choice: null,
+}));
+const thinkingPrimaries = root().querySelectorAll('button.primary');
+if (thinkingPrimaries.length !== 1 || thinkingPrimaries[0].textContent.trim() !== 'Continue') {
+  throw new Error(`thinking expected 1 primary button (Continue), found ${thinkingPrimaries.length}`);
+}
+const rowsLocal = root().querySelector('button[data-choice-id="local"]');
+const rowsSpp = root().querySelector('button[data-choice-id="spp"]');
+const rowsByo = root().querySelector('button[data-choice-id="byo"]');
+if (!rowsLocal || !rowsSpp || !rowsByo) {
+  throw new Error('missing data-choice-id for local, spp, or byo');
+}
+paint(view({ phase: 'welcome', step: 1 }));
+const signInCheckBtn = $('sign-in-check');
+if (!signInCheckBtn || signInCheckBtn.tagName !== 'BUTTON' || !signInCheckBtn.hasAttribute('aria-checked')) {
+  throw new Error('#sign-in-check is not a BUTTON with aria-checked');
+}
+paint(view({
+  phase: 'thinking',
+  step: 4,
+  thinking_capability: 'ok',
+  thinking_saved: false,
+  thinking_choice: null,
+}));
+const laterBtn = root().querySelector('button[data-focus-key="later"]');
+if (!laterBtn || laterBtn.textContent.trim() !== 'Later') {
+  throw new Error(`expected later button text 'Later', got '${laterBtn?.textContent}'`);
+}
+pass('qualification hooks align with styling and accessibility contracts');
+
+// 40. horizontal lockup asset exists and is served with svg mime type
+const appRsText = readFileSync(join(here, '../src/app.rs'), 'utf8');
+const appJsText = readFileSync(join(here, '../ui/app.js'), 'utf8');
+if (!appJsText.includes("'/lockup-solstone-horizontal.svg'") && !appJsText.includes('"/lockup-solstone-horizontal.svg"')) {
+  throw new Error('app.js does not reference /lockup-solstone-horizontal.svg');
+}
+if (!appRsText.includes('"/lockup-solstone-horizontal.svg"')) {
+  throw new Error('app.rs does not match /lockup-solstone-horizontal.svg in asset()');
+}
+if (!appRsText.includes('"image/svg+xml"')) {
+  throw new Error('app.rs does not serve image/svg+xml for lockup');
+}
+if (!appRsText.includes('include_bytes!("../ui/lockup-solstone-horizontal.svg")')) {
+  throw new Error('app.rs does not include_bytes! lockup SVG');
+}
+const svgPath = join(here, '../ui/lockup-solstone-horizontal.svg');
+if (!existsSync(svgPath)) {
+  throw new Error(`lockup SVG file does not exist at ${svgPath}`);
+}
+pass('horizontal lockup asset exists and is served with svg mime type');
 
 console.log(`DOM CASES: ${passed} passed`);

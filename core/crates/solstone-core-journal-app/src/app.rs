@@ -64,6 +64,10 @@ fn asset(path: &str) -> Option<(&'static [u8], &'static str)> {
             ),
             "font/woff2",
         ),
+        "/lockup-solstone-horizontal.svg" => (
+            include_bytes!("../ui/lockup-solstone-horizontal.svg"),
+            "image/svg+xml",
+        ),
         _ => return None,
     })
 }
