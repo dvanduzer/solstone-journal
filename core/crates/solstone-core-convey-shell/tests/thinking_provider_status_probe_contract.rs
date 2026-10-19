@@ -288,7 +288,6 @@ mod linux {
                         let bundled = temporary_journal("probe-free", "local");
                         seed_ready_brain(bundled.path());
                         for path in [
-                            "/app/thinking/api/state",
                             "/app/thinking/api/providers",
                             "/app/thinking/api/providers/local/status",
                         ] {
@@ -302,7 +301,6 @@ mod linux {
 
                         let cloud = temporary_journal("cloud-skips-local", "openai");
                         for path in [
-                            "/app/thinking/api/state",
                             "/app/thinking/api/providers",
                             "/app/thinking/api/providers/local/status",
                         ] {
@@ -320,6 +318,16 @@ mod linux {
                                 "{path} reached nvidia-smi for a non-local provider"
                             );
                         }
+
+                        let state_body =
+                            request_json(bundled.path(), "/app/thinking/api/state").await;
+                        let overall = state_body["local_capability"]["overall"]
+                            .as_str()
+                            .expect("overall string");
+                        assert!(
+                            matches!(overall, "ok" | "unknown" | "blocked"),
+                            "unexpected overall {overall}"
+                        );
                     });
                 });
             },

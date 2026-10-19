@@ -937,16 +937,44 @@ fn replay_full_recorded_case(
         case["body_sha256_basis"].as_str(),
         case.get("body_normalized"),
     ) {
-        (Some("raw-body"), None) => sha256(&response.3),
-        (Some("raw-body"), Some(_)) => sha256(
-            String::from_utf8(response.3.clone())
-                .expect("normalized body is text")
-                .replace(&journal.display().to_string(), "<JOURNAL_ROOT>")
-                .as_bytes(),
-        ),
+        (Some("raw-body"), None) => {
+            // the capability answer is this computer's and is not part of the captured corpus.
+            if case["path"] == "/app/thinking/api/state"
+                && let Ok(mut value) = serde_json::from_slice::<Value>(&response.3)
+                && let Some(map) = value.as_object_mut()
+                && map.remove("local_capability").is_some()
+            {
+                sha256(canonical_json(&value).as_bytes())
+            } else {
+                sha256(&response.3)
+            }
+        }
+        (Some("raw-body"), Some(_)) => {
+            // the capability answer is this computer's and is not part of the captured corpus.
+            if case["path"] == "/app/thinking/api/state"
+                && let Ok(mut value) = serde_json::from_slice::<Value>(&response.3)
+                && let Some(map) = value.as_object_mut()
+                && map.remove("local_capability").is_some()
+            {
+                sha256(canonical_json(&value).as_bytes())
+            } else {
+                sha256(
+                    String::from_utf8(response.3.clone())
+                        .expect("normalized body is text")
+                        .replace(&journal.display().to_string(), "<JOURNAL_ROOT>")
+                        .as_bytes(),
+                )
+            }
+        }
         (Some("normalized-json"), _) => {
             let mut value: Value =
                 serde_json::from_slice(&response.3).expect("normalized response is JSON");
+            // the capability answer is this computer's and is not part of the captured corpus.
+            if case["path"] == "/app/thinking/api/state" {
+                if let Some(map) = value.as_object_mut() {
+                    map.remove("local_capability");
+                }
+            }
             for (path, kind) in case
                 .get("normalized_fields")
                 .and_then(Value::as_object)

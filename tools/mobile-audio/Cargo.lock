@@ -77,15 +77,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arbitrary"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3bc62ac97cc33321f50863d514c3bc38a453947a8f9e781137e47c7401020aed"
-dependencies = [
- "derive_arbitrary",
-]
-
-[[package]]
 name = "asn1-rs"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -338,12 +329,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crossbeam-utils"
-version = "0.8.23"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
-
-[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -415,17 +400,6 @@ name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
-
-[[package]]
-name = "derive_arbitrary"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b034bd7d5f032402a2479444dcc6f74e36a03f31854d41680fb240ef682a1ac"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.9",
-]
 
 [[package]]
 name = "digest"
@@ -569,6 +543,7 @@ checksum = "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -1056,6 +1031,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+dependencies = [
+ "bitflags 2.13.2",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1261,6 +1248,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
+name = "plist"
+version = "1.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2896bade328c13f7042a297ea5ac5b0951f6cf989dea5f32c2fd98da398195cb"
+dependencies = [
+ "base64 0.23.1",
+ "indexmap",
+ "quick-xml 0.42.0",
+ "serde",
+ "time",
+]
+
+[[package]]
 name = "portable-atomic"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1315,6 +1315,15 @@ name = "quick-xml"
 version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.42.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
 dependencies = [
  "memchr",
 ]
@@ -1507,9 +1516,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "log",
  "once_cell",
@@ -1685,7 +1694,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-artifact-download"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "sha2",
  "solstone-core-assets",
@@ -1695,7 +1704,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-assets"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "serde",
  "serde_json",
@@ -1704,7 +1713,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-auth-flow"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "getrandom 0.3.4",
  "sha2",
@@ -1712,13 +1721,15 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-backup"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "getrandom 0.3.4",
- "nix",
+ "hmac",
+ "nix 0.30.1",
  "rustix",
  "serde",
  "serde_json",
+ "sha2",
  "solstone-core-installed-payload",
  "solstone-core-journal-config",
  "solstone-core-journal-config-write",
@@ -1727,7 +1738,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-body-source"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "ryu",
  "sha2",
@@ -1735,13 +1746,13 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-brain"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
  "hmac",
  "log",
- "nix",
+ "nix 0.30.1",
  "ryu",
  "serde",
  "serde_json",
@@ -1749,12 +1760,13 @@ dependencies = [
  "solstone-core-chatgpt-auth",
  "solstone-core-installed-payload",
  "solstone-core-journal-config",
+ "solstone-core-journal-config-write",
  "solstone-core-journal-io",
 ]
 
 [[package]]
 name = "solstone-core-callosum"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "getrandom 0.3.4",
  "hmac",
@@ -1772,7 +1784,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-chatgpt-auth"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "getrandom 0.3.4",
  "serde",
@@ -1786,10 +1798,10 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-check"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "log",
- "nix",
+ "nix 0.30.1",
  "serde",
  "serde_json",
  "solstone-core-assets",
@@ -1800,13 +1812,13 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-distribution"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "bzip2-rs",
  "flate2",
  "lzma-rs",
  "minisign",
- "quick-xml",
+ "quick-xml 0.41.0",
  "serde",
  "serde_json",
  "sha2",
@@ -1825,7 +1837,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-entity"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "caseless",
  "chrono",
@@ -1846,7 +1858,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-entity-matching"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "caseless",
  "md5",
@@ -1857,7 +1869,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-facets"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "caseless",
  "chrono",
@@ -1873,14 +1885,14 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-ffmpeg-build-support"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "sha2",
 ]
 
 [[package]]
 name = "solstone-core-format"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "chrono",
  "glob",
@@ -1894,7 +1906,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-generate"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "log",
  "serde",
@@ -1903,7 +1915,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-indexer"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -1922,7 +1934,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-indexer-store"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "log",
  "rusqlite",
@@ -1937,17 +1949,17 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-installation-identity"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "getrandom 0.3.4",
- "nix",
+ "nix 0.30.1",
  "sha2",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "solstone-core-installed-payload"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "minisign",
  "serde",
@@ -1958,14 +1970,14 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-journal"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "toml_edit",
 ]
 
 [[package]]
 name = "solstone-core-journal-config"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -1980,7 +1992,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-journal-config-write"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "serde_json",
  "solstone-core-journal-config",
@@ -1989,13 +2001,13 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-journal-io"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
  "libc",
  "log",
- "nix",
+ "nix 0.30.1",
  "serde",
  "serde_json",
  "sha2",
@@ -2005,13 +2017,13 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-local"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "chrono",
  "flate2",
  "hmac",
  "log",
- "nix",
+ "nix 0.30.1",
  "serde",
  "serde_json",
  "sha2",
@@ -2022,6 +2034,7 @@ dependencies = [
  "solstone-core-installed-payload",
  "solstone-core-journal-config",
  "solstone-core-journal-config-write",
+ "solstone-core-journal-io",
  "tar",
  "tempfile",
  "thiserror 2.0.21",
@@ -2031,7 +2044,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-memory-original"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "serde",
  "serde_json",
@@ -2042,11 +2055,11 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-npy"
-version = "2.0.43"
+version = "2.0.51"
 
 [[package]]
 name = "solstone-core-nvattest-authority"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "serde",
  "serde_json",
@@ -2054,7 +2067,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-observe-audio"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "ffmpeg-next",
  "ffmpeg-sys-next",
@@ -2063,7 +2076,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-processing-record"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "serde",
  "serde_json",
@@ -2071,7 +2084,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-retention"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
@@ -2089,12 +2102,13 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-segment"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "caseless",
  "serde",
  "serde_json",
  "sha2",
+ "solstone-core-format",
  "solstone-core-journal-io",
  "solstone-core-processing-record",
  "unicode-normalization",
@@ -2102,7 +2116,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-sound-tags"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "log",
  "serde_json",
@@ -2114,26 +2128,28 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-speaker-id"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "serde",
  "serde_json",
  "sha2",
  "solstone-core-journal-io",
  "solstone-core-npy",
+ "solstone-core-speakers",
  "zip",
 ]
 
 [[package]]
 name = "solstone-core-speakers"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "hdbscan",
+ "serde_json",
 ]
 
 [[package]]
 name = "solstone-core-speakers-analyze"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "env_logger",
  "log",
@@ -2145,7 +2161,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-speakers-onnx"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "ort",
  "solstone-core-local",
@@ -2155,12 +2171,16 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-spp-attest"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "base64 0.22.1",
+ "plist",
  "ring",
+ "serde",
  "serde_json",
+ "solstone-core-backup",
  "solstone-core-distribution",
+ "solstone-core-installed-payload",
  "subtle",
  "thiserror 2.0.21",
  "x509-parser",
@@ -2168,9 +2188,9 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-spp-ratls"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
- "nix",
+ "nix 0.30.1",
  "ring",
  "rustls",
  "serde",
@@ -2183,14 +2203,14 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-system"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "chrono",
  "chrono-tz",
  "getrandom 0.3.4",
  "libc",
  "log",
- "nix",
+ "nix 0.30.1",
  "serde",
  "serde_json",
  "sha2",
@@ -2205,6 +2225,7 @@ dependencies = [
  "solstone-core-installed-payload",
  "solstone-core-journal",
  "solstone-core-journal-config",
+ "solstone-core-journal-config-write",
  "solstone-core-journal-io",
  "solstone-core-local",
  "solstone-core-processing-record",
@@ -2216,7 +2237,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-system-health"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "chrono",
  "log",
@@ -2239,25 +2260,26 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-talent-config"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "solstone-core-transcribe"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
  "log",
- "nix",
+ "nix 0.30.1",
  "rustix",
  "serde_json",
  "sha2",
  "solstone-core-assets",
  "solstone-core-brain",
  "solstone-core-callosum",
+ "solstone-core-format",
  "solstone-core-journal-config",
  "solstone-core-journal-io",
  "solstone-core-local",
@@ -2266,6 +2288,7 @@ dependencies = [
  "solstone-core-segment",
  "solstone-core-sound-tags",
  "solstone-core-speaker-id",
+ "solstone-core-speakers",
  "solstone-core-speakers-analyze",
  "solstone-core-spp-ratls",
  "solstone-core-system",
@@ -2279,7 +2302,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-vad-analyze"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "ort",
  "serde_json",
@@ -2289,7 +2312,7 @@ dependencies = [
 
 [[package]]
 name = "solstone-core-win-dll-load"
-version = "2.0.43"
+version = "2.0.51"
 dependencies = [
  "libloading 0.8.9",
  "windows-sys 0.61.2",
@@ -2512,6 +2535,12 @@ checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
 ]
+
+[[package]]
+name = "typed-path"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
 
 [[package]]
 name = "typenum"
@@ -2959,20 +2988,24 @@ checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
 
 [[package]]
 name = "zip"
-version = "2.4.2"
+version = "9.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fabe6324e908f85a1c52063ce7aa26b68dcb7eb6dbc83a2d148403c9bc3eba50"
+checksum = "c2d98561b612a84ae525331a7a094429ef8a5772514ed507ff6db5f54badc971"
 dependencies = [
- "arbitrary",
  "crc32fast",
- "crossbeam-utils",
- "displaydoc",
  "flate2",
  "indexmap",
  "memchr",
- "thiserror 2.0.21",
+ "nix 0.31.3",
+ "typed-path",
  "zopfli",
 ]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b142a20ec14a91d5bc708c1dc21b080c550113d8aa77afa29635673a65dd02c5"
 
 [[package]]
 name = "zmij"

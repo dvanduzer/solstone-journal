@@ -3,6 +3,7 @@ import io
 import json
 import pathlib
 import plistlib
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -585,6 +586,7 @@ class JournalNativeProvenanceTest(unittest.TestCase):
             hashlib.sha256(fixture["signing"].read_bytes()).hexdigest(),
         )
         self.assertEqual(provenance["target"]["bundle_version"], "30")
+        self.assertEqual(stat.S_IMODE(fixture["output"].stat().st_mode), 0o644)
         self.assertTrue(fixture["tree_map"].is_file())
         self.assertEqual(
             provenance["runtime_tree_sha256"],
@@ -730,6 +732,9 @@ class JournalNativeProvenanceTest(unittest.TestCase):
             body["source"]["acceptance_evidence"], "journal-lane/receipt.json"
         )
         self.assertEqual(body["archive"]["sha256"], expected_sha256)
+        # Another account on the Mac runs the same installed bundle.
+        self.assertEqual(stat.S_IMODE(staged.stat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(receipt.stat().st_mode), 0o644)
 
         refused_runtime = self.root / "refused"
         refused_runtime.mkdir()

@@ -86,8 +86,7 @@ fn make_ci_never_executes_forbidden_interpreters() {
     assert_gate_never_executes_forbidden_interpreters(
         "ci",
         &[
-            "run", "metadata", "metadata", "metadata", "metadata", "fmt", "run", "clippy",
-            "clippy", "clippy", "test", "test",
+            "run", "metadata", "fmt", "run", "clippy", "clippy", "clippy", "test", "test",
         ],
     );
 }

@@ -466,6 +466,15 @@ struct JournalFirstRunModelTests {
         #expect(fixture.setupRunner.skipModelInstallFlags == [false, false])
     }
 
+    @Test func yieldActivationThenHideYieldsToTheSolstoneAppBeforeHiding() {
+        var events: [String] = []
+        JournalFirstRunModel.yieldActivationThenHide(
+            yield: { events.append("yield:\($0)") },
+            hide: { events.append("hide") }
+        )
+        #expect(events == ["yield:app.solstone.observer", "hide"])
+    }
+
 }
 
 struct FirstRunModelFixture {

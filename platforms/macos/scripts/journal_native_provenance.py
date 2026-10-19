@@ -425,6 +425,7 @@ def write_text_atomic(path: pathlib.Path, text: str) -> None:
     ) as handle:
         handle.write(text)
         temporary_path = pathlib.Path(handle.name)
+    temporary_path.chmod(0o644)
     temporary_path.replace(path)
 
 
@@ -485,6 +486,9 @@ def store_receipt(receipt: dict, receipt_path: pathlib.Path) -> None:
         json.dump(receipt, handle, indent=2, sort_keys=True)
         handle.write("\n")
         temporary_path = pathlib.Path(handle.name)
+    # Temporary files are owner-only; Journal.app's resources must be readable
+    # by every account on the Mac.
+    temporary_path.chmod(0o644)
     temporary_path.replace(receipt_path)
 
 
@@ -611,6 +615,9 @@ def stage_accepted(args: argparse.Namespace) -> None:
         tempfile.mkdtemp(prefix=f".{runtime_dir.name}.", dir=runtime_dir.parent)
     )
     try:
+        # mkdtemp is owner-only, and this directory becomes Journal.app's
+        # solstone-runtime: every account on the Mac must be able to enter it.
+        staged_dir.chmod(0o755)
         with tarfile.open(archive, mode="r:gz") as bundle:
             extract_regular_tree(bundle, staged_dir)
         entries = runtime_entries(staged_dir)

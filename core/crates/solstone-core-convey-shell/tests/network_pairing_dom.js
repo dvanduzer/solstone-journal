@@ -11,7 +11,7 @@ let cases = 0;
 const REQUIRED_COPY_KEYS = [
   'DEVICE_EMPTY_TITLE', 'DEVICE_EMPTY_BODY', 'DEVICE_PAIR_CTA', 'MODAL_TITLE', 'PAIR_TYPE_PROMPT',
   'PAIR_TYPE_PHONE', 'PAIR_TYPE_COMPUTER', 'PAIR_TYPE_TERMINAL', 'PHONE_STEP_1', 'PHONE_STEP_2',
-  'COMPUTER_STEP_1', 'COMPUTER_STEP_2', 'COMPUTER_LINUX_NOTE', 'TERMINAL_STEP_1', 'TERMINAL_STEP_2',
+  'THIS_COMPUTER_STEP_1', 'COMPUTER_STEP_1', 'COMPUTER_STEP_2', 'COMPUTER_LINUX_NOTE', 'TERMINAL_STEP_1', 'TERMINAL_STEP_2',
   'PAIR_NETWORK_LINE', 'PAIR_RELAY_LINE', 'DETAILS_DISCLOSURE', 'CA_FP_LABEL', 'CA_FP_NOTE',
   'PAIR_LINK_FIELD_LABEL', 'PAIR_LINK_COPY_LABEL', 'CHECK_PAIRING_CTA', 'PAIR_START_FAIL_BODY',
   'PAIR_START_PAIRED_DEVICE_BODY', 'PRIVATE_LINK_TIMEOUT_BODY', 'PAIR_ERROR_BODY', 'CHECK_AGAIN_LABEL',
@@ -227,13 +227,15 @@ class Element {
   }
 
   matches(selector) {
-    if (selector === '.report-error-modal') return this.classList.contains('report-error-modal');
+    if (selector.startsWith('.')) return this.classList.contains(selector.slice(1));
     if (selector === '[role="dialog"][aria-modal="true"]') {
       return this.getAttribute('role') === 'dialog' && this.getAttribute('aria-modal') === 'true';
     }
     if (selector === '[data-pairing-action]') return Object.hasOwn(this.dataset, 'pairingAction');
     const actionMatch = selector.match(/^\[data-pairing-action="([^"]+)"\]$/);
     if (actionMatch) return this.dataset.pairingAction === actionMatch[1];
+    const copyMatch = selector.match(/^\[data-copy="([^"]+)"\]$/);
+    if (copyMatch) return this.getAttribute('data-copy') === copyMatch[1];
     if (selector === '[tabindex]') return this.hasAttribute('tabindex');
     if (selector === '[contenteditable="true"]') return this.getAttribute('contenteditable') === 'true';
     if (selector === '[contenteditable=""]') return this.getAttribute('contenteditable') === '';
@@ -359,15 +361,31 @@ function createEnvironment(manifestDir, options = {}) {
     button.dataset.pairingType = type;
     return button;
   });
+  const typeChooser = make('link-pairing-type-chooser', 'div');
+  typeChooser.classList.add('link-pairing-type');
+  typeChooser.append(...typeButtons);
   const typeBlocks = ['phone', 'computer', 'terminal'].map((type) => make(`link-pairing-for-${type}`));
   typeBlocks[0].appendChild(qr);
+  const computerSteps = make('link-pairing-computer-steps', 'ol');
+  computerSteps.classList.add('link-pairing-steps');
+  const thisComputerStep1 = make('link-pairing-this-computer-step-1', 'li');
+  thisComputerStep1.setAttribute('data-copy', 'THIS_COMPUTER_STEP_1');
+  thisComputerStep1.hidden = true;
+  const computerStep1 = make('link-pairing-computer-step-1', 'li');
+  computerStep1.setAttribute('data-copy', 'COMPUTER_STEP_1');
+  const computerStep2 = make('link-pairing-computer-step-2', 'li');
+  computerStep2.setAttribute('data-copy', 'COMPUTER_STEP_2');
+  computerSteps.append(thisComputerStep1, computerStep1, computerStep2);
+  const linuxNote = make('link-pairing-computer-linux-note', 'p');
+  linuxNote.setAttribute('data-copy', 'COMPUTER_LINUX_NOTE');
+  typeBlocks[1].append(computerSteps, linuxNote);
   const copyButton = make('link-pairing-copy', 'button');
   copyButton.dataset.pairingAction = 'copy';
   const check = make('link-pairing-check', 'button');
   check.dataset.pairingAction = 'check';
   const materialClose = make('link-pairing-material-close', 'button');
   materialClose.dataset.pairingAction = 'close';
-  material.append(labelRow, ...typeButtons, ...typeBlocks, networkLine, addresses, fingerprint, linkValue, copyButton, check, materialClose);
+  material.append(labelRow, typeChooser, ...typeBlocks, networkLine, addresses, fingerprint, linkValue, copyButton, check, materialClose);
   const expiredButton = make('link-pairing-expired-action', 'button');
   expiredButton.dataset.pairingAction = 'regenerate';
   expired.appendChild(expiredButton);
@@ -554,7 +572,7 @@ async function testCase(_name, callback) {
 }
 
 async function main() {
-  const manifestDir = process.argv[2];
+  const manifestDir = path.resolve(process.argv[2]);
   if (!manifestDir) throw new Error('manifest directory required');
   const workspace = fs.readFileSync(path.join(manifestDir, 'assets/network/workspace.html'), 'utf8');
   await testCase('a retained Windows Block rule replaces the open-network claim and clears after recovery', async () => {
@@ -1385,6 +1403,29 @@ async function main() {
     assert.strictEqual(JSON.parse(last.request.body).same_machine, true);
     assert.strictEqual(env.nodes.get('link-pairing-material').hidden, false);
     assert.ok(env.nodes.get('link-pairing-network-line').textContent.startsWith('copy-PAIR_THIS_COMPUTER_LINE'));
+
+    // Assert after same-machine material is showing:
+    assert.strictEqual(env.nodes.get('link-pairing-for-computer').hidden, false);
+    assert.strictEqual(env.nodes.get('link-pairing-for-phone').hidden, true);
+    assert.strictEqual(env.nodes.get('link-pairing-type-computer').getAttribute('aria-pressed'), 'true');
+    const typeChooser = env.dialog.querySelector('.link-pairing-type');
+    assert.ok(typeChooser && typeChooser.hidden === true);
+    const visibleSteps = env.nodes.get('link-pairing-for-computer').querySelectorAll('li').filter((li) => !li.hidden);
+    assert.strictEqual(visibleSteps[0]?.getAttribute('data-copy'), 'THIS_COMPUTER_STEP_1');
+    assert.ok(env.nodes.get('link-pairing-for-computer').querySelectorAll('li').some((li) => li.getAttribute('data-copy') === 'COMPUTER_STEP_2'));
+    assert.ok(env.nodes.get('link-pairing-for-computer').querySelector('[data-copy="COMPUTER_LINUX_NOTE"]') !== null);
+
+    // While same-machine material is showing, activate data-pairing-action="regenerate"
+    env.fetchQueue.push(response(material({ link_addresses: ['127.0.0.1:7657'] })));
+    env.click(env.nodes.get('link-pairing-expired-action'));
+    await settle();
+    const regenReq = env.requests[env.requests.length - 1];
+    assert.ok(regenReq.url.endsWith('/pair-start'));
+    assert.strictEqual(JSON.parse(regenReq.request.body).same_machine, true);
+    assert.strictEqual(env.dialog.querySelector('.link-pairing-type').hidden, true);
+    const regenVisibleSteps = env.nodes.get('link-pairing-for-computer').querySelectorAll('li').filter((li) => !li.hidden);
+    assert.strictEqual(regenVisibleSteps[0]?.getAttribute('data-copy'), 'THIS_COMPUTER_STEP_1');
+
     // A fresh open asks for an ordinary link again.
     env.click(env.nodes.get('link-pairing-close'));
     await settle();
@@ -1393,6 +1434,25 @@ async function main() {
     await settle();
     const reopened = env.requests[env.requests.length - 1];
     assert.strictEqual(JSON.parse(reopened.request.body).same_machine, undefined);
+    assert.strictEqual(env.dialog.querySelector('.link-pairing-type').hidden, false);
+    assert.strictEqual(env.nodes.get('link-pairing-type-phone').getAttribute('aria-pressed'), 'true');
+
+    // Select terminal, enter same-machine, close(), open() again: chooser visible and terminal aria-pressed true
+    env.click(env.nodes.get('link-pairing-type-terminal'));
+    assert.strictEqual(env.nodes.get('link-pairing-type-terminal').getAttribute('aria-pressed'), 'true');
+    env.fetchQueue.push(response(material({ link_addresses: ['127.0.0.1:7657'] })));
+    env.click(env.nodes.get('link-pairing-this-computer'));
+    await settle();
+    assert.strictEqual(env.nodes.get('link-pairing-type-computer').getAttribute('aria-pressed'), 'true');
+    assert.strictEqual(env.dialog.querySelector('.link-pairing-type').hidden, true);
+
+    env.click(env.nodes.get('link-pairing-close'));
+    await settle();
+    env.fetchQueue.push(response(material()));
+    env.click(env.opener);
+    await settle();
+    assert.strictEqual(env.dialog.querySelector('.link-pairing-type').hidden, false);
+    assert.strictEqual(env.nodes.get('link-pairing-type-terminal').getAttribute('aria-pressed'), 'true');
   });
 
   await testCase('opening the local network from the dialog asks for a new code', async () => {

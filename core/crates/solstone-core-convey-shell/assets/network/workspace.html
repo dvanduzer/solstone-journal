@@ -235,11 +235,14 @@
         </div>
         <div id="link-pairing-for-computer" hidden>
           <ol class="link-pairing-steps">
+            <li data-copy="THIS_COMPUTER_STEP_1" hidden></li>
             <li data-copy="COMPUTER_STEP_1"></li>
             <li data-copy="COMPUTER_STEP_2"></li>
           </ol>
           <p class="modal-warning" data-copy="COMPUTER_LINUX_NOTE"></p>
-          <div class="command-box"><code>solstone-linux setup &lt; pairing-link.txt</code></div>
+          <div class="command-box"><code>systemctl --user stop solstone-linux
+solstone-linux setup &lt; pairing-link.txt
+systemctl --user start solstone-linux</code></div>
         </div>
         <div id="link-pairing-for-terminal" hidden>
           <ol class="link-pairing-steps">

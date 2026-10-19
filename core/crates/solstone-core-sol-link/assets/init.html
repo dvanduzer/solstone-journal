@@ -465,6 +465,7 @@
         input.value = choice.id;
         input.addEventListener('change', () => {
           if (input.checked) {
+            clearThinkingError();
             userPicked = true;
             pickedChoice = choice.id;
             selectionEpoch++;
@@ -520,6 +521,7 @@
       laterInput.value = 'later';
       laterInput.addEventListener('change', () => {
         if (laterInput.checked) {
+          clearThinkingError();
           userPicked = true;
           pickedChoice = 'later';
           selectionEpoch++;
@@ -538,10 +540,31 @@
       container.appendChild(laterLabel);
     }
 
+    function localChoiceAdmitted(capability) {
+      return capability.overall === 'ok'
+        || (capability.overall === 'unknown' && capability.local_admitted === true);
+    }
+
     function renderThinkingUI() {
       renderThinkingOptions();
 
+      if (localCapability !== null && !localChoiceAdmitted(localCapability)) {
+        if (userPicked && pickedChoice === 'local') {
+          userPicked = false;
+          pickedChoice = null;
+        }
+        if (setupState && setupState.thinking && setupState.thinking.choice === 'local') {
+          setupState.thinking.saved = false;
+          setupState.thinking.choice = null;
+        }
+      }
+
       const stateCapability = (setupState && setupState.thinking && setupState.thinking.capability) || 'unknown';
+      const localSelectable = (localCapability === null)
+        ? (stateCapability !== 'blocked')
+        : localChoiceAdmitted(localCapability);
+      const isBlocked = !localSelectable;
+
       const saved = setupState && setupState.thinking && setupState.thinking.saved === true && ['local', 'byo', 'spp', 'later'].includes(setupState.thinking.choice);
       const savedChoice = saved ? setupState.thinking.choice : null;
 
@@ -568,7 +591,7 @@
         }
         if (chooseLaterEl) chooseLaterEl.hidden = true;
         if (changeBtn) changeBtn.hidden = false;
-      } else if (activeChoiceId === 'local' || (!activeChoiceId && stateCapability === 'ok')) {
+      } else if (activeChoiceId === 'local' || (!activeChoiceId && localSelectable && stateCapability === 'ok')) {
         const bytes = setupState && setupState.thinking && setupState.thinking.download_bytes;
         const isFiniteBytes = typeof bytes === 'number' && Number.isFinite(bytes);
         const formatted = isFiniteBytes ? formatByteSize(bytes) : null;
@@ -595,9 +618,6 @@
         if (changeBtn) changeBtn.hidden = false;
       }
 
-      const localBlocked = Boolean(localCapability && Array.isArray(localCapability.checks) && localCapability.checks.some(c => c && c.severity === 'blocked'));
-      const isBlocked = stateCapability === 'blocked' || localBlocked;
-
       const localInput = document.querySelector('input[value="local"]');
       if (localInput) {
         localInput.disabled = isBlocked;
@@ -611,18 +631,25 @@
         }
       }
 
-      let blockedDetail = '';
-      if (localCapability && Array.isArray(localCapability.checks)) {
-        const blockedChecks = localCapability.checks.filter(c => c && c.severity === 'blocked' && typeof c.detail === 'string' && c.detail.trim());
-        if (blockedChecks.length > 0) {
-          blockedDetail = blockedChecks.map(c => c.detail.trim()).join(' ');
+      let reasonDetail = '';
+      if (localCapability !== null && localCapability.overall !== 'ok') {
+        if (Array.isArray(localCapability.checks)) {
+          const nonOkChecks = localCapability.checks.filter(
+            c => c && c.severity !== 'ok' && typeof c.detail === 'string' && c.detail.trim()
+          );
+          if (nonOkChecks.length > 0) {
+            reasonDetail = nonOkChecks.map(c => c.detail.trim()).join(' ');
+          }
+        }
+        if (!reasonDetail && setupCopy && setupCopy.thinking && typeof setupCopy.thinking.check_unknown === 'string') {
+          reasonDetail = setupCopy.thinking.check_unknown.trim();
         }
       }
 
       const reasonEl = document.getElementById('thinking-local-reason');
       if (reasonEl) {
-        if (blockedDetail) {
-          reasonEl.textContent = blockedDetail;
+        if (reasonDetail) {
+          reasonEl.textContent = reasonDetail;
           reasonEl.hidden = false;
         } else {
           reasonEl.textContent = '';
@@ -630,7 +657,7 @@
         }
       }
 
-      const defaultChoice = stateCapability === 'ok' ? 'local' : null;
+      const defaultChoice = (stateCapability === 'ok' && localSelectable) ? 'local' : null;
       const radioValueToSelect = userPicked ? pickedChoice : (savedChoice ? savedChoice : defaultChoice);
       const radios = document.querySelectorAll('input[name="thinking-choice"]');
       radios.forEach(radio => {
@@ -1017,8 +1044,12 @@
 
       const currentEpoch = selectionEpoch;
       const stateCap = (setupState && setupState.thinking && setupState.thinking.capability) || 'unknown';
+      const localAdmitted = (localCapability === null) ? (stateCap === 'ok') : localChoiceAdmitted(localCapability);
+      const defaultsToLocal = (localCapability === null) ? (stateCap === 'ok') : (localCapability.overall === 'ok');
       const saved = setupState && setupState.thinking && setupState.thinking.saved === true && ['local', 'byo', 'spp', 'later'].includes(setupState.thinking.choice);
-      const effectiveChoice = userPicked ? pickedChoice : (saved ? setupState.thinking.choice : (stateCap === 'ok' ? 'local' : 'later'));
+      let chosen = userPicked ? pickedChoice : (saved ? setupState.thinking.choice : (defaultsToLocal ? 'local' : 'later'));
+      if (chosen === 'local' && !localAdmitted) chosen = 'later';
+      const effectiveChoice = chosen;
       const needsSave = !saved || (userPicked && pickedChoice !== setupState.thinking.choice);
 
       if (needsSave) {

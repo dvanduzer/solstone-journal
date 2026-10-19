@@ -436,6 +436,8 @@ release-dmg-smoke-journal:
 	    codesign --verify --strict --deep --verbose=2 "$$MOUNT/journal.app" || { echo "error: journal dmg .app codesign verify failed"; exit 1; }; \
 	    test -x "$$MOUNT/journal.app/Contents/Resources/solstone-runtime/bin/journal" || { echo "error: journal native runtime missing bin/journal"; exit 1; }; \
 	    test -x "$$MOUNT/journal.app/Contents/Resources/solstone-runtime/bin/solstone" || { echo "error: journal native runtime missing bin/solstone"; exit 1; }; \
+	    UNREADABLE="$$(find "$$MOUNT/journal.app" \( -type d ! -perm -005 \) -o \( -type f ! -perm -004 \))"; \
+	    test -z "$$UNREADABLE" || { echo "error: journal.app has entries other accounts on the Mac cannot read:"; echo "$$UNREADABLE"; exit 1; }; \
 	    "$$MOUNT/journal.app/Contents/Resources/solstone-runtime/bin/journal" --version; \
 	    "$$MOUNT/journal.app/Contents/Resources/solstone-runtime/bin/solstone" --version; \
 	    echo "release-dmg-smoke-journal: ok"

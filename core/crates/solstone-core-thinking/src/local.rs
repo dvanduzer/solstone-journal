@@ -304,6 +304,27 @@ pub fn start_bootstrap(
     classify_bootstrap(journal, &readiness)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct BlockedCapabilityRefusal {
+    pub reason_code: String,
+    pub detail: String,
+}
+
+pub fn blocked_capability_refusal(
+    overall: &str,
+    reason_code: Option<&str>,
+    detail: &str,
+) -> Option<BlockedCapabilityRefusal> {
+    if overall == "blocked" {
+        Some(BlockedCapabilityRefusal {
+            reason_code: reason_code.unwrap_or("").to_owned(),
+            detail: detail.to_owned(),
+        })
+    } else {
+        None
+    }
+}
+
 fn classify_bootstrap(journal: &Path, readiness: &Value) -> BootstrapResponse {
     // Corrupt persisted state cannot be covered over by an artifact readiness proof.
     let status = match read_status(journal, "local") {
@@ -520,9 +541,54 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        BootstrapResponse, classify_bootstrap, default_model, runtime, runtime_status_for_phase,
-        start_bootstrap,
+        BlockedCapabilityRefusal, BootstrapResponse,
+        blocked_capability_refusal as check_blocked_capability_refusal, classify_bootstrap,
+        default_model, runtime, runtime_status_for_phase, start_bootstrap,
     };
+
+    #[test]
+    fn blocked_capability_refusal() {
+        assert_eq!(
+            check_blocked_capability_refusal("blocked", Some("gpu"), "detail-blocked"),
+            Some(BlockedCapabilityRefusal {
+                reason_code: "gpu".into(),
+                detail: "detail-blocked".into(),
+            })
+        );
+        assert_eq!(
+            check_blocked_capability_refusal("blocked", Some("memory"), "detail-mem"),
+            Some(BlockedCapabilityRefusal {
+                reason_code: "memory".into(),
+                detail: "detail-mem".into(),
+            })
+        );
+        assert_eq!(
+            check_blocked_capability_refusal("blocked", Some("platform"), "detail-plat"),
+            Some(BlockedCapabilityRefusal {
+                reason_code: "platform".into(),
+                detail: "detail-plat".into(),
+            })
+        );
+        assert_eq!(
+            check_blocked_capability_refusal("blocked", None, "detail-none"),
+            Some(BlockedCapabilityRefusal {
+                reason_code: "".into(),
+                detail: "detail-none".into(),
+            })
+        );
+        assert_eq!(
+            check_blocked_capability_refusal("unknown", Some("gpu"), "detail"),
+            None
+        );
+        assert_eq!(
+            check_blocked_capability_refusal("ok", Some("gpu"), "detail"),
+            None
+        );
+        assert_eq!(
+            check_blocked_capability_refusal("", Some("gpu"), "detail"),
+            None
+        );
+    }
 
     fn temporary_journal(name: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(

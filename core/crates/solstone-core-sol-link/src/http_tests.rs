@@ -1248,6 +1248,35 @@ async fn save_thinking_local_respects_capability() {
             assert!(host.start_calls.lock().unwrap().is_empty());
         }
     }
+
+    let temporary = TempDir::new();
+    crate::http::setup_probe_test::capability_admitted(temporary.path(), "unknown", true);
+    let host = Arc::new(FakeSetupHost::default());
+    let response = request_with_host(
+        temporary.path(),
+        host.clone(),
+        AccessBasis::Localhost,
+        Method::POST,
+        "/init/api/action",
+        Some(json!({"action":"save_thinking", "choice":"local"})),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let state = response_json(response).await;
+    assert_eq!(state["thinking"]["choice"], "local");
+    assert_eq!(state["thinking"]["saved"], true);
+    let config: Value =
+        serde_json::from_slice(&fs::read(temporary.path().join("config/journal.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        config["providers"]["active"],
+        json!({"provider":"local", "model":"local/qwen3.5-4b"})
+    );
+    assert_eq!(
+        config["setup"]["thinking_selection"],
+        config["providers"]["active"]
+    );
+    assert_eq!(host.start_calls.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

@@ -304,7 +304,7 @@ UV := $(shell command -v uv 2>/dev/null)
 UV_OPTIONAL_GOALS := \
 	preflight install \
 	check-rust-fmt check-rust-msrv check-rust-clippy check-rust-clippy-full \
-	check-mobile-lockfiles \
+	check-standalone-lockfiles \
 	check-rust-unit check-rust-doc check-rust-test check-rust-race \
 	check-rust-journal-mcp-endpoint \
 	check-rust-android check-rust-android-prepared \
@@ -480,7 +480,7 @@ ci-full-prep: ci-full-prep-cargo ci-full-prep-onnx ci-full-prep-pdf ci-full-prep
 ci-full-prep-cargo: ci-prep-ffmpeg
 	@$(REQUIRE_CARGO)
 	cargo fetch --manifest-path $(RUST_MANIFEST) --locked
-	@set -eu; for manifest in $(MOBILE_LOCK_MANIFESTS); do \
+	@set -eu; for manifest in $(STANDALONE_LOCK_MANIFESTS); do \
 		cargo fetch --manifest-path "$$manifest" --locked; \
 	done
 	cargo check --manifest-path $(RUST_MANIFEST) --workspace $(RUST_HOST_EXCLUDES) --lib --bins --locked
@@ -684,6 +684,7 @@ report-rust-code-evidence:
 	@echo "Not run for those packages: native linking or runtime execution, full same-crate tests, integrations, models, providers, inference, or platform evidence."
 	@echo "Not run by this command: tests a package keeps behind its full-tests feature (processes, sockets, host tools, wall-clock waits); ci-full runs them through each package's registry suite."
 	@echo "Not run: Cargo integration targets, doctests, native/runtime/platform, dependency-policy, package/release, and other ci-full registry evidence."
+	@sh scripts/changed_area_commands.sh 2>/dev/null || echo "Changed-area commands: not computed (scripts/changed_area_commands.sh did not run)."
 
 check-rust-doc:
 	@$(REQUIRE_CARGO)
@@ -1472,24 +1473,47 @@ ci-under-poison:
 	  node --check --input-type=module < core/crates/solstone-core-journal-app/ui/app.js && \
 	  node --check --input-type=module < core/crates/solstone-core-journal-app/ui/mark.js; \
 	fi
-	@$(MAKE) check-mobile-lockfiles
+	@$(MAKE) check-standalone-lockfiles
 	@$(MAKE) check-rust-fmt
 	@$(MAKE) check-rust-ci-topology
 	@$(MAKE) check-rust-clippy
 	@$(MAKE) check-rust-unit
 	@$(MAKE) --no-print-directory RUST_CODE_EVIDENCE_CONTEXT=ci report-rust-code-evidence
 
-# Resolve the standalone mobile graphs too: workspace-only CI cannot see their
+# Resolve every standalone Cargo graph too: workspace-only CI cannot see their
 # local dependency edges drift. Locked metadata checks without building a target.
-MOBILE_LOCK_MANIFESTS := \
-	tools/mobile-serving/Cargo.toml \
-	tools/ios-runtime/native/Cargo.toml \
+# The list must name every tracked Cargo.lock except core/Cargo.lock (the
+# workspace gates run --locked) and core/vendor/ (upstream locks cargo never
+# resolves); the check fails when they disagree.
+STANDALONE_LOCK_MANIFESTS := \
+	core/crates/solstone-core-service-legacy-evidence/Cargo.toml \
+	tools/android-runtime/native/Cargo.toml \
 	tools/ios-runtime/appraisal-helper/Cargo.toml \
+	tools/ios-runtime/native/Cargo.toml \
+	tools/local_thinking_install/helper/Cargo.toml \
+	tools/mobile-audio/Cargo.toml \
+	tools/mobile-serving/Cargo.toml \
 	tools/mobile-serving/client/Cargo.toml
-.PHONY: check-mobile-lockfiles
-check-mobile-lockfiles:
-	@set -eu; for manifest in $(MOBILE_LOCK_MANIFESTS); do \
-		printf 'Checking locked mobile graph: %s\n' "$$manifest"; \
+.PHONY: check-standalone-lockfiles
+check-standalone-lockfiles:
+	@set -eu; \
+	if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then \
+		tracked=$$(git ls-files -- ':(glob)**/Cargo.lock' ':(exclude)core/Cargo.lock' ':(exclude,glob)core/vendor/**' | sed 's|Cargo\.lock$$|Cargo.toml|'); \
+		drift=0; \
+		for manifest in $$tracked; do \
+			case " $(STANDALONE_LOCK_MANIFESTS) " in *" $$manifest "*) ;; \
+			*) printf 'Tracked lockfile not in STANDALONE_LOCK_MANIFESTS: %s\n' "$$manifest" >&2; drift=1 ;; esac; \
+		done; \
+		for manifest in $(STANDALONE_LOCK_MANIFESTS); do \
+			case " $$(echo $$tracked) " in *" $$manifest "*) ;; \
+			*) printf 'STANDALONE_LOCK_MANIFESTS entry has no tracked Cargo.lock: %s\n' "$$manifest" >&2; drift=1 ;; esac; \
+		done; \
+		test "$$drift" = 0; \
+	else \
+		echo "Not a Git work tree: lockfile inventory not compared; checking the listed graphs only"; \
+	fi; \
+	for manifest in $(STANDALONE_LOCK_MANIFESTS); do \
+		printf 'Checking locked standalone graph: %s\n' "$$manifest"; \
 		cargo metadata --manifest-path "$$manifest" --locked --offline --format-version 1 >/dev/null; \
 	done
 
