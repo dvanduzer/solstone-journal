@@ -660,18 +660,21 @@ final class JournalFirstRunModel {
     var displayedThinkingChoice: JournalThinkingChoice? {
         if let draftThinkingChoice { return draftThinkingChoice }
         if setupState?.thinking.saved == true { return setupState?.thinking.choice }
-        return setupState?.thinking.capability == .ok ? .local : nil
+        return offersLocalThinking ? .local : .later
     }
+
+    /// Local thinking is offered only when this computer is known to run it; otherwise it is not shown at all.
+    var offersLocalThinking: Bool { setupState?.thinking.capability == .ok }
 
     var canContinueThinking: Bool {
         guard handoffError == nil, setupState?.mark.state == .locked,
               let choice = displayedThinkingChoice else { return false }
-        return choice != .local || setupState?.thinking.capability == .ok
+        return choice != .local || offersLocalThinking
     }
 
     func selectThinking(_ raw: String) {
         guard !userOperationInFlight, !isTerminating, let choice = JournalThinkingChoice(rawValue: raw),
-              choice != .local || setupState?.thinking.capability == .ok else { return }
+              choice != .local || offersLocalThinking else { return }
         draftThinkingChoice = choice
         choosingThinking = false
     }

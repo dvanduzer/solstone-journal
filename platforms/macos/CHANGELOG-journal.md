@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- when your mac can't run local thinking, or can't check, the thinking step no longer shows a choice you can't pick. continue finishes setup, and you can choose thinking from the thinking page in your journal when you're ready.
+
 ## [2.0.51 (build 97)] - 2026-10-19
 
 ### Added
