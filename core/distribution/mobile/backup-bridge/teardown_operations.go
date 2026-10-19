@@ -4,7 +4,35 @@
 package main
 
 /*
-#include "abi_legacy.h"
+#include <stdint.h>
+
+#ifndef SOLSTONE_RESTIC_LEGACY_TYPES
+#define SOLSTONE_RESTIC_LEGACY_TYPES
+typedef struct {
+    int32_t operation;
+    const char *password;
+    uint32_t password_len;
+    const char *recovery_password;
+    uint32_t recovery_password_len;
+    const char *repo_path;
+    uint32_t repo_path_len;
+    const char *source_path;
+    uint32_t source_path_len;
+    const char *restore_path;
+    uint32_t restore_path_len;
+    const char *snapshot_id;
+    uint32_t snapshot_id_len;
+} restic_request;
+
+typedef struct {
+    int32_t status;
+    char key_id[65];
+    char snapshot_id[65];
+    uint32_t snapshot_count;
+    char snapshot_ids[4096][65];
+    char diagnostic[256];
+} restic_result;
+#endif
 
 #ifndef SOLSTONE_RESTIC_OPERATION_OPTIONS_V1
 #define SOLSTONE_RESTIC_OPERATION_OPTIONS_V1
