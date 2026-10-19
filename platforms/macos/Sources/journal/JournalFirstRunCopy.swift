@@ -20,6 +20,10 @@ enum JournalFirstRunCopy {
     static let setupProgressNotSaved = "setup progress couldn't be saved."
     static let loginItemChangeFailed = "start at login couldn't be changed."
     static let loginItemUnavailable = "start at login isn't available from this app location."
+    static let handoffHeldPairing = "the solstone app is already connected to a journal. open the solstone app to change that connection, or open this journal here."
+    static let handoffCompetingSetup = "the solstone app is already finishing another setup. finish it there, or open this journal here."
+    static let handoffPending = "setup hasn't continued in the solstone app. open it to continue, or try again here."
+    static let openYourJournal = "open your journal"
     static let handoffNotDelivered = "couldn't continue setup in the solstone app."
     static let thinkingFailed = "couldn't finish this step. try again."
 
@@ -42,6 +46,10 @@ enum JournalFirstRunCopy {
         loginItemChangeFailed,
         loginItemUnavailable,
         handoffNotDelivered,
+        handoffHeldPairing,
+        handoffCompetingSetup,
+        handoffPending,
+        openYourJournal,
         thinkingFailed,
     ]
 }

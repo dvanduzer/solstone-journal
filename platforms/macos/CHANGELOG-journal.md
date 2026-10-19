@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+
+- if the solstone app is already connected to a journal, setup explains how to continue instead of repeatedly switching apps.
 - clicking the journal's Dock icon keeps a running journal running and leaves unfinished setup where you left it.
 - when your mac can't run local thinking, or can't check, the thinking step no longer shows a choice you can't pick. continue finishes setup, and you can choose thinking from the thinking page in your journal when you're ready.
 

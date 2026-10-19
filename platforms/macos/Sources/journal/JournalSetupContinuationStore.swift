@@ -58,6 +58,14 @@ enum JournalSetupActiveContinuation: Equatable, Sendable {
     }
 }
 
+struct JournalSetupRefusalResolution: Codable, Equatable, Sendable {
+    var schema = "solstone.journal-setup-refusal.v1"
+    let handoffID: UUID
+    let journalRootPath: String
+    let reason: SetupHandoffRefusalReason
+    var acknowledged = false
+}
+
 struct JournalSetupAcceptanceLedger: Equatable, Sendable {
     var acceptedStep1HandoffIDs: [UUID]
 }
@@ -218,6 +226,7 @@ struct JournalSetupContinuationStore: Sendable {
                 if !record.activeStep1Aliases.contains(step1) { record.activeStep1Aliases.append(step1) }
                 joined = .local(record)
             case nil:
+                try supersedeRefusal()
                 joined = .incoming(JournalSetupContinuation(
                     step1HandoffID: step1, journalRootPath: journalRootPath, pendingStep5HandoffID: nil
                 ))
@@ -279,6 +288,7 @@ struct JournalSetupContinuationStore: Sendable {
                 }
                 return active.owner
             }
+            try supersedeRefusal()
             let record = JournalSetupLocalContinuation(
                 localHandoffID: UUID(), journalRootPath: path, pendingStep5HandoffID: nil
             )
@@ -294,6 +304,75 @@ struct JournalSetupContinuationStore: Sendable {
         }
     }
 
+    private var resolutionURL: URL { directory.appendingPathComponent("setup-refusal.json") }
+
+    func loadRefusal() throws -> JournalSetupRefusalResolution? {
+        let data: Data
+        do { data = try read(resolutionURL) }
+        catch { if Self.isMissingFile(error) { return nil }; throw error }
+        let value = try JSONDecoder().decode(JournalSetupRefusalResolution.self, from: data)
+        guard value.schema == "solstone.journal-setup-refusal.v1",
+              Self.isAbsoluteRoot(value.journalRootPath),
+              Self.standardizedPath(value.journalRootPath) == value.journalRootPath else {
+            throw JournalSetupContinuationError.failedRecord
+        }
+        return value
+    }
+
+    /// Persist the terminal outcome before retiring its exact obligation. A failed removal is retryable.
+    func resolveRefusal(_ refusal: SetupHandoffRefusal) throws {
+        try withContinuationLock { try resolveRefusalUnlocked(refusal) }
+    }
+
+    /// Cleanup can be interrupted after our local terminal decision became durable.
+    func repairActiveRefusal() throws {
+        try withContinuationLock {
+            guard let value = try loadRefusal(), let active = try activeUnlocked(),
+                  active.pending == value.handoffID else { return }
+            guard active.rootPath.map(Self.standardizedPath) == value.journalRootPath else {
+                throw JournalSetupContinuationError.conflictingRoot
+            }
+            try resolveRefusalUnlocked(SetupHandoffRefusal(handoffID: value.handoffID, reason: value.reason))
+        }
+    }
+
+    private func resolveRefusalUnlocked(_ refusal: SetupHandoffRefusal) throws {
+        guard let active = try activeUnlocked(), active.pending == refusal.handoffID,
+              let root = active.rootPath else { return }
+        let ledger = try ledgerUnlocked()
+        guard active.acceptedInputs.allSatisfy({ ledger.contains($0) }) else {
+            throw JournalSetupContinuationError.failedRecord
+        }
+        let prior = try loadRefusal()
+        if prior?.handoffID != refusal.handoffID {
+            let resolution = JournalSetupRefusalResolution(handoffID: refusal.handoffID,
+                journalRootPath: Self.standardizedPath(root), reason: refusal.reason)
+            try replace(JSONEncoder().encode(resolution), resolutionURL)
+        } else if prior?.journalRootPath != Self.standardizedPath(root) {
+            throw JournalSetupContinuationError.conflictingRoot
+        }
+        guard try activeUnlocked() == active else { return }
+        switch active {
+        case .incoming: try remove(continuationURL)
+        case .local: try remove(localURL)
+        }
+    }
+
+    func acknowledgeRefusal(_ id: UUID) throws {
+        try withContinuationLock {
+            guard var value = try loadRefusal(), value.handoffID == id else { return }
+            value.acknowledged = true
+            try replace(JSONEncoder().encode(value), resolutionURL)
+        }
+    }
+
+    private func supersedeRefusal() throws {
+        if var value = try loadRefusal(), !value.acknowledged {
+            value.acknowledged = true
+            try replace(JSONEncoder().encode(value), resolutionURL)
+        }
+    }
+
     func retire(matchingPendingStep5 pending: UUID) throws {
         try withContinuationLock {
             guard let first = try activeUnlocked(), first.pending == pending else { return }
@@ -302,6 +381,10 @@ struct JournalSetupContinuationStore: Sendable {
                 throw JournalSetupContinuationError.failedRecord
             }
             guard try activeUnlocked() == first else { return }
+            if var resolution = try loadRefusal(), resolution.handoffID == pending, !resolution.acknowledged {
+                resolution.acknowledged = true
+                try replace(JSONEncoder().encode(resolution), resolutionURL)
+            }
             let url: URL
             switch first {
             case .incoming: url = continuationURL

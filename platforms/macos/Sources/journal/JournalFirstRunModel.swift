@@ -84,6 +84,7 @@ final class JournalFirstRunModel {
     var currentStep: String?
     var adoptMessage: String?
     var errorMessage: String?
+    private(set) var handoffRefusal: JournalSetupRefusalResolution?
     var handoffError: String?
     var loginFailure: String?
     var markFailure: String?
@@ -202,7 +203,7 @@ final class JournalFirstRunModel {
     func reconcileForReopen() async {
         let incoming: Bool
         if case .ready = mailbox.loadStep1() { incoming = true } else { incoming = false }
-        if case .ritual = route, !incoming { return }
+        if case .ritual = route, !incoming, handoffError == nil, handoffRefusal == nil { return }
         guard nativeQualified || incoming else { return }
         await reconcileActivation()
     }
@@ -816,6 +817,33 @@ final class JournalFirstRunModel {
         }
     }
 
+    func openJournalAfterRefusal() async {
+        guard let resolution = handoffRefusal, beginUserAction(.outbound) else { return }
+        let captured = epoch
+        defer {
+            endUserAction(captured)
+            finishWholeOperation()
+        }
+        let root = URL(fileURLWithPath: resolution.journalRootPath, isDirectory: true)
+        guard config.journalRoot?.standardizedFileURL.path == root.path else { return }
+        guard await ensureSupervisor(root), stillCurrent(captured) else { return }
+        var opened = false
+        if let windowModel {
+            windowModel.openJournal(using: { url in
+                opened = self.openURL(url)
+                return opened
+            })
+        } else if let url = URL(string: Self.setupBaseURL + "/") {
+            opened = openURL(url)
+        }
+        guard opened else { return }
+        do {
+            try continuation.acknowledgeRefusal(resolution.handoffID)
+            handoffRefusal = nil
+            await landHome()
+        } catch { presentPersistenceFailure() }
+    }
+
     func retryHandoff() async {
         guard beginUserAction(.outbound) else { return }
 
@@ -823,7 +851,7 @@ final class JournalFirstRunModel {
         let captured = epoch
         handoffError = nil
         _ = endUserAction(captured)
-        await reconcileQualified(captured: epoch)
+        await reconcileQualified(captured: epoch, explicitRetry: true)
     }
 
     func commitDisplayedMark() async {
@@ -988,18 +1016,32 @@ final class JournalFirstRunModel {
         return true
     }
 
-    private func reconcileQualified(captured: UInt64) async {
+    private func reconcileQualified(captured: UInt64, explicitRetry: Bool = false) async {
         let receipt: SetupHandoffReceipt?
+        let refusal: SetupHandoffRefusal?
         do {
             _ = try continuation.loadActive()
             try continuation.assertMailboxAllowed()
             let loaded = try mailbox.readStep5Receipt()
             receipt = loaded?.schema == SetupHandoffReceipt.schemaV1 && loaded?.stepIndex == 5 ? loaded : nil
+            refusal = try mailbox.readStep5Refusal()
         } catch {
             presentPersistenceFailure()
             return
         }
         guard stillCurrent(captured) else { return }
+        do {
+            try continuation.repairActiveAcceptance()
+            // A new explicit intent must not join an obligation already refused by its peer.
+            // Matching acceptance retains the existing duplicate/intake ordering.
+            if let active = try continuation.loadActive(), receipt?.handoffID != active.pending {
+                if let refusal { try continuation.resolveRefusal(refusal) }
+                try continuation.repairActiveRefusal()
+            }
+        } catch {
+            presentPersistenceFailure()
+            return
+        }
         if case .ready(let handoff) = mailbox.loadStep1() {
             guard await acceptStep1(handoff, captured: captured) else { return }
         }
@@ -1007,12 +1049,23 @@ final class JournalFirstRunModel {
         do {
             try continuation.repairActiveAcceptance()
             if let receipt { try continuation.retire(matchingPendingStep5: receipt.handoffID) }
+            if let refusal { try continuation.resolveRefusal(refusal) }
+            try continuation.repairActiveRefusal()
+            handoffRefusal = nil
+            if try continuation.loadActive() == nil, let resolution = try continuation.loadRefusal(),
+               !resolution.acknowledged,
+               config.journalRoot?.standardizedFileURL.path == resolution.journalRootPath {
+                handoffRefusal = resolution
+                handoffError = nil
+                route = .ritual(.setupProgress)
+                return
+            }
         } catch {
             presentPersistenceFailure()
             return
         }
         guard stillCurrent(captured) else { return }
-        if await resumeActive(allowDelivery: true, allowMint: true, captured: captured) { return }
+        if await resumeActive(allowDelivery: explicitRetry, allowMint: true, captured: captured) { return }
         guard stillCurrent(captured) else { return }
         await routeWithoutIntent(captured: captured)
     }
@@ -1135,13 +1188,18 @@ final class JournalFirstRunModel {
         }
         guard stillCurrent(captured) else { return }
         if probe == .complete {
-            if allowDelivery && (pending != nil || allowMint) {
+            if allowDelivery || (pending == nil && allowMint) {
                 await deliverStep5(
                     root: root,
                     step1: handoffID,
                     captured: captured,
                     mintIfNeeded: pending == nil
                 )
+                return
+            }
+            if pending != nil {
+                handoffError = JournalFirstRunCopy.handoffPending
+                route = .ritual(.setupProgress)
                 return
             }
             await landHomeIfCurrent(captured)

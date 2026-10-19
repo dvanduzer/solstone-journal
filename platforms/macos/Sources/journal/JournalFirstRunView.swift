@@ -70,7 +70,16 @@ struct JournalFirstRunView: View {
 
     @ViewBuilder
     private func ritualView(_ step: JournalFirstRunStep) -> some View {
-        if let handoffError = model.handoffError, !handoffError.isEmpty {
+        if let refusal = model.handoffRefusal {
+            ritualCard {
+                Text(refusal.reason == .heldPairing ? JournalFirstRunCopy.handoffHeldPairing : JournalFirstRunCopy.handoffCompetingSetup)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button(JournalFirstRunCopy.openYourJournal) {
+                    Task { await model.openJournalAfterRefusal() }
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        } else if let handoffError = model.handoffError, !handoffError.isEmpty {
             handoffRetryCard(handoffError)
         } else {
             switch step {

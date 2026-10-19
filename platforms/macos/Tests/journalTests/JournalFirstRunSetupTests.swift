@@ -10,6 +10,105 @@ import Testing
 
 @MainActor
 extension JournalFirstRunModelTests {
+    @Test func unansweredInitialDeliveryStaysVisibleUntilExplicitRetry() async throws {
+        let world = try makeSetupWorld(configureRoot: true, done: true, supervisorLive: true, probes: [.complete])
+        defer { world.refresh.release() }
+        try seedContinuation(world.fixture.continuation, root: world.root)
+        await world.fixture.model.reconcileActivation()
+        let pending = try #require(try world.fixture.continuation.loadActive()?.pending)
+        #expect(world.peer.launched.count == 1)
+        #expect(world.fixture.stepAsides.count == 1)
+        await world.fixture.model.reconcileForReopen()
+        await world.fixture.model.reconcileForReopen()
+        #expect(world.peer.launched.count == 1)
+        #expect(world.fixture.stepAsides.count == 1)
+        #expect(world.fixture.model.handoffError != nil)
+        #expect(world.fixture.model.route == .ritual(.setupProgress))
+        await world.fixture.model.retryHandoff()
+        guard case .ready(let sent) = world.fixture.mailbox.loadStep5() else { Issue.record("retry must deliver"); return }
+        #expect(sent.handoffID == pending)
+        #expect(world.peer.launched.count == 2)
+        #expect(world.fixture.stepAsides.count == 2)
+    }
+
+    @Test(arguments: [false, true])
+    func matchingRefusalSurvivesRestartAndOwnerAcknowledgement(local: Bool) async throws {
+        let world = try makeSetupWorld(configureRoot: true, done: true, supervisorLive: true, probes: [.complete])
+        defer { world.refresh.release() }
+        let owner: UUID
+        if local { owner = try world.fixture.continuation.storeLocal(root: world.root) }
+        else { owner = try seedContinuation(world.fixture.continuation, root: world.root) }
+        await world.fixture.model.reconcileActivation()
+        let pending = try #require(try world.fixture.continuation.loadActive()?.pending)
+        try JSONEncoder().encode(SetupHandoffRefusal(handoffID: pending, reason: .heldPairing))
+            .write(to: world.fixture.mailbox.directory.appendingPathComponent("solstone-setup-handoff-refused.json"))
+        await world.fixture.model.reconcileForReopen()
+        #expect(try world.fixture.continuation.loadActive() == nil)
+        #expect(world.fixture.model.handoffRefusal?.handoffID == pending)
+        #expect(world.peer.launched.count == 1)
+        #expect(world.fixture.stepAsides.count == 1)
+        let restarted = makeModel(config: world.fixture.config, startResults: [false, true], probeResults: [.complete],
+            localSetupCapability: { true }, loadSetupCopy: { try? loadSetupFixtureCopy() }, peer: world.peer,
+            setupClient: world.client, identity: world.identity, mailbox: world.fixture.mailbox,
+            continuation: JournalSetupContinuationStore(directory: world.fixture.continuation.directory),
+            supervisorIsLive: { _ in false })
+        await restarted.model.reconcileActivation()
+        #expect(restarted.model.handoffRefusal?.handoffID == pending)
+        await restarted.model.openJournalAfterRefusal()
+        #expect(restarted.browser.opened.isEmpty)
+        #expect(restarted.model.handoffRefusal?.handoffID == pending)
+        #expect(restarted.model.pendingOperation == .none)
+        #expect(!restarted.model.userOperationInFlight)
+        await restarted.model.openJournalAfterRefusal()
+        #expect(restarted.browser.opened == [URL(string: JournalFirstRunModel.setupBaseURL + "/")!])
+        #expect(restarted.model.route == .home)
+        await restarted.model.reconcileForReopen()
+        #expect(restarted.model.handoffRefusal == nil)
+        #expect(try world.fixture.continuation.loadActive() == nil)
+        if !local {
+            try writeStep1(world.fixture.mailbox, id: owner)
+            await restarted.model.reconcileActivation()
+            #expect(try world.fixture.continuation.loadActive() == nil)
+        }
+        let fresh = try writeStep1(world.fixture.mailbox)
+        await restarted.model.reconcileActivation()
+        #expect(world.fixture.continuation.acceptance(of: fresh) == .accepted)
+        #expect(try world.fixture.continuation.loadActive()?.pending != pending)
+        #expect(world.peer.launched.count == 2)
+    }
+
+    @Test(arguments: [false, true])
+    func staleRefusalDoesNotResolveAndAcceptanceWins(matchingAcceptance: Bool) async throws {
+        let world = try makeSetupWorld(configureRoot: true, done: true, supervisorLive: true, probes: [.complete])
+        defer { world.refresh.release() }
+        let pending = UUID()
+        try seedContinuation(world.fixture.continuation, root: world.root, pending: pending)
+        try JSONEncoder().encode(SetupHandoffRefusal(handoffID: matchingAcceptance ? pending : UUID(), reason: .heldPairing))
+            .write(to: world.fixture.mailbox.directory.appendingPathComponent("solstone-setup-handoff-refused.json"))
+        if matchingAcceptance { try writeAcceptedReceipt(world.fixture.mailbox, id: pending, step: 5) }
+        await world.fixture.model.reconcileActivation()
+        #expect(world.fixture.model.handoffRefusal == nil)
+        #expect((try world.fixture.continuation.loadActive() == nil) == matchingAcceptance)
+        #expect(world.peer.launched.isEmpty)
+    }
+
+    @Test func newExplicitIntentAfterRefusalGetsItsOwnDelivery() async throws {
+        let world = try makeSetupWorld(configureRoot: true, done: true, supervisorLive: true, probes: [.complete])
+        defer { world.refresh.release() }
+        try seedContinuation(world.fixture.continuation, root: world.root)
+        await world.fixture.model.reconcileActivation()
+        let first = try #require(try world.fixture.continuation.loadActive()?.pending)
+        try JSONEncoder().encode(SetupHandoffRefusal(handoffID: first, reason: .heldPairing))
+            .write(to: world.fixture.mailbox.directory.appendingPathComponent("solstone-setup-handoff-refused.json"))
+        let fresh = try writeStep1(world.fixture.mailbox)
+        await world.fixture.model.reconcileActivation()
+        let active = try #require(try world.fixture.continuation.loadActive())
+        #expect(active.owner == fresh)
+        #expect(active.pending != first)
+        #expect(world.peer.launched.count == 2)
+        #expect(world.fixture.model.handoffRefusal == nil)
+    }
+
     @Test func warmActivationWaitsForTheWholeMarkAction() async throws {
         let world = try makeSetupWorld(configureRoot: true, supervisorLive: true, probes: [.incomplete])
         defer { world.refresh.release() }
@@ -91,6 +190,9 @@ extension JournalFirstRunModelTests {
         #expect(try world.fixture.mailbox.readStep1Receipt()?.handoffID == retired)
         #expect(try world.fixture.continuation.loadActive()?.owner == current)
         #expect(try world.fixture.continuation.loadActive()?.pending == pending)
+        #expect(world.peer.launched.isEmpty)
+        #expect(world.fixture.model.handoffError != nil)
+        await world.fixture.model.retryHandoff()
         guard case .ready(let delivered) = world.fixture.mailbox.loadStep5() else {
             Issue.record("replay must not hide current delivery")
             return
@@ -112,11 +214,11 @@ extension JournalFirstRunModelTests {
         await world.fixture.model.reconcileActivation()
         #expect(world.fixture.continuation.acceptance(of: incoming) == .accepted)
         #expect(try world.fixture.continuation.loadActive()?.pending == pending)
-        #expect(world.peer.launched.count == 1)
+        #expect(world.peer.launched.isEmpty)
         world.fixture.model.onBeforeStep1Commit = nil
         await world.fixture.model.reconcileActivation()
         #expect(try world.fixture.continuation.loadActive() == nil)
-        #expect(world.peer.launched.count == 1)
+        #expect(world.peer.launched.isEmpty)
     }
 
     @Test func localSupervisorFailureRetryDeliversTheSamePendingIdentity() async throws {
@@ -641,6 +743,9 @@ extension JournalFirstRunModelTests {
         try seedContinuation(world.fixture.continuation, root: world.root, pending: pending)
 
         await world.fixture.model.reconcileActivation()
+        #expect(world.peer.launched.isEmpty)
+        #expect(world.fixture.model.handoffError != nil)
+        await world.fixture.model.retryHandoff()
 
         guard case .ready(let handoff) = world.fixture.mailbox.loadStep5() else {
             Issue.record("expected step 5")
@@ -724,6 +829,7 @@ extension JournalFirstRunModelTests {
         try seedContinuation(uncommitted.fixture.continuation, root: uncommitted.root, pending: UUID())
         uncommitted.identity.resolution = .uncommitted(instanceID: setupInstanceID)
         await uncommitted.fixture.model.reconcileActivation()
+        await uncommitted.fixture.model.retryHandoff()
         #expect(uncommitted.fixture.mailbox.loadStep5() == .missing)
         #expect(uncommitted.peer.launched.isEmpty)
 
@@ -732,6 +838,7 @@ extension JournalFirstRunModelTests {
         try seedContinuation(absent.fixture.continuation, root: absent.root, pending: UUID())
         absent.identity.resolution = .absent
         await absent.fixture.model.reconcileActivation()
+        await absent.fixture.model.retryHandoff()
         #expect(absent.fixture.mailbox.loadStep5() == .missing)
 
         let failed = try makeSetupWorld(configureRoot: true, probes: [.complete])
@@ -739,6 +846,7 @@ extension JournalFirstRunModelTests {
         try seedContinuation(failed.fixture.continuation, root: failed.root, pending: UUID())
         failed.identity.resolution = .failed(.timeout)
         await failed.fixture.model.reconcileActivation()
+        await failed.fixture.model.retryHandoff()
         #expect(failed.fixture.mailbox.loadStep5() == .missing)
 
         let badFingerprint = try makeSetupWorld(configureRoot: true, probes: [.complete])
@@ -746,6 +854,7 @@ extension JournalFirstRunModelTests {
         try seedContinuation(badFingerprint.fixture.continuation, root: badFingerprint.root, pending: UUID())
         badFingerprint.client.setNetwork(JournalNetworkStatus(caFingerprint: "zz", instanceID: setupInstanceID))
         await badFingerprint.fixture.model.reconcileActivation()
+        await badFingerprint.fixture.model.retryHandoff()
         #expect(badFingerprint.fixture.mailbox.loadStep5() == .missing)
         #expect(badFingerprint.peer.launched.isEmpty)
     }

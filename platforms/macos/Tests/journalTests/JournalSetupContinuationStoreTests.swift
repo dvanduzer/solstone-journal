@@ -3,10 +3,44 @@
 
 import Foundation
 import Testing
+import SolstoneCore
 @testable import journal
 
 @Suite("JournalSetupContinuationStore")
 struct JournalSetupContinuationStoreTests {
+    @Test(arguments: ["setup-refusal.json", "remove"])
+    func refusalPersistenceFailureKeepsTheExactObligation(failure: String) throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = JournalSetupContinuationStore(directory: directory, replace: { data, url in
+            if url.lastPathComponent == failure { throw CocoaError(.fileWriteUnknown) }
+            try data.write(to: url, options: .atomic)
+        }, remove: { url in
+            if failure == "remove" { throw CocoaError(.fileWriteUnknown) }
+            try FileManager.default.removeItem(at: url)
+        })
+        let root = directory.appendingPathComponent("journal")
+        let input = UUID()
+        try store.storeProgress(step1: input, journalRootPath: root.path)
+        let pending = try store.mintPending(step1: input)
+        let refusal = SetupHandoffRefusal(handoffID: pending, reason: .heldPairing)
+        #expect(throws: (any Error).self) { try store.resolveRefusal(refusal) }
+        #expect(try store.loadActive()?.pending == pending)
+        let rebuilt = JournalSetupContinuationStore(directory: directory)
+        if failure == "remove" { try rebuilt.repairActiveRefusal() }
+        else { try rebuilt.resolveRefusal(refusal) }
+        #expect(try rebuilt.loadActive() == nil)
+        #expect(try rebuilt.loadRefusal()?.handoffID == pending)
+        #expect(rebuilt.acceptance(of: input) == .accepted)
+        try rebuilt.storeProgress(step1: input, journalRootPath: root.path)
+        #expect(try rebuilt.loadActive() == nil)
+        let newer = UUID()
+        try rebuilt.storeProgress(step1: newer, journalRootPath: root.path)
+        let next = try rebuilt.mintPending(step1: newer)
+        try rebuilt.resolveRefusal(refusal)
+        #expect(try rebuilt.loadActive()?.pending == next)
+    }
+
     @Test func missingIOAndMalformedLoadsStayDistinct() throws {
         let missing = try makeStore { _ in
             throw NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoSuchFileError)
