@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-use crate::admit::{ParsedMessage, dotted_to_fluent_id};
+use crate::admit::ParsedMessage;
 use crate::fault::Fault;
 use crate::model::ElementKind;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 static PSEUDO_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -44,7 +44,7 @@ pub fn generate_pseudo_ftl(
     let mut out = String::new();
     for id in ids {
         let msg = &messages[id];
-        let fluent_id = dotted_to_fluent_id(&msg.id);
+        let fluent_id = &msg.id;
         if let Some(sel_var) = &msg.selector_var {
             out.push_str(&format!("{} = {{ ${} ->\n", fluent_id, sel_var));
             for b in &msg.branches {
@@ -53,7 +53,9 @@ pub fn generate_pseudo_ftl(
                 out.push_str(&format!("   {}[{}] ", default_star, key_str));
                 for el in &b.pattern {
                     match el.kind {
-                        ElementKind::Text => out.push_str(&transform_fn(&el.value)),
+                        ElementKind::Text => {
+                            out.push_str(&transform_fn(&el.value).replace('\n', "\n        "))
+                        }
                         ElementKind::Arg | ElementKind::Slot => {
                             out.push_str(&format!("{{ ${} }}", el.value));
                         }
@@ -67,7 +69,9 @@ pub fn generate_pseudo_ftl(
             if let Some(b) = msg.branches.first() {
                 for el in &b.pattern {
                     match el.kind {
-                        ElementKind::Text => out.push_str(&transform_fn(&el.value)),
+                        ElementKind::Text => {
+                            out.push_str(&transform_fn(&el.value).replace('\n', "\n    "))
+                        }
                         ElementKind::Arg | ElementKind::Slot => {
                             out.push_str(&format!("{{ ${} }}", el.value));
                         }
@@ -129,12 +133,7 @@ pub fn write_pseudo_locales(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("locales");
-    let pid = std::process::id();
-    let count = PSEUDO_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let temp_dir_name = format!("{}.tmp.{}.{}", dir_name, pid, count);
-    let temp_dir = parent.join(temp_dir_name);
-
-    fs::create_dir_all(&temp_dir).map_err(|_| Fault::catalog("io-error"))?;
+    let temp_dir = crate::bundle::unique_stage_dir(parent, dir_name, &PSEUDO_DIR_COUNTER)?;
 
     let write_res = (|| -> Result<(), std::io::Error> {
         let mut f1 = fs::File::create(temp_dir.join("en-XA.ftl"))?;

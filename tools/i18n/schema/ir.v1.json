@@ -53,6 +53,7 @@
           "max_length",
           "description",
           "context",
+          "surfaces",
           "bundles",
           "source_revision",
           "approval",
@@ -64,7 +65,7 @@
         ],
         "properties": {
           "id": { "type": "string", "description": "Unique message identifier." },
-          "resource": { "type": "string", "description": "Lowercase hex encoded resource key." },
+          "resource": { "type": "string", "description": "Alphabetic prefix plus lowercase UTF-8 hex resource key." },
           "namespace": { "type": "string", "description": "Namespace prefix of the identifier." },
           "owner": { "type": "string", "description": "Registry owner of the namespace." },
           "risk": { "type": "string", "description": "Risk classification." },
@@ -73,13 +74,15 @@
           "max_length": { "type": "integer", "description": "Maximum character length." },
           "description": { "type": "string", "description": "Human-readable description." },
           "context": { "type": "string", "description": "Context string." },
+          "surfaces": { "type": "array", "items": { "type": "string" }, "description": "Logical UI surfaces, sorted." },
           "bundles": { "type": "array", "items": { "type": "string" }, "description": "Bundle memberships." },
           "source_revision": { "type": "string", "description": "Source revision hash." },
           "approval": {
             "type": ["object", "null"],
             "additionalProperties": false,
-            "required": ["source_revision", "translation_revision"],
+            "required": ["locale", "source_revision", "translation_revision"],
             "properties": {
+              "locale": { "type": "string", "description": "Approved locale tag." },
               "source_revision": { "type": "string", "description": "Source revision hash." },
               "translation_revision": { "type": "string", "description": "Translation revision hash." }
             },

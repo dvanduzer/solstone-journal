@@ -1,11 +1,16 @@
 {
   "description": "Synthetic test data",
   "context": "Synthetic test data",
-  "bundles": ["synth-app"],
+  "bundles": [
+    "synth-app"
+  ],
   "arguments": [],
   "format_intent": "text",
   "max_length": 200,
   "source_revision": "03543dfac209b622c1b274128c475f5e90b42f9f993ea35aaacc14480a1bf0e2",
   "risk": "payment",
-  "auto_merge": false
+  "auto_merge": false,
+  "surfaces": [
+    "synthetic-fixture"
+  ]
 }

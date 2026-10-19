@@ -24,6 +24,18 @@ pub struct CatalogConfig {
     pub source_locale: String,
 }
 
+impl CatalogConfig {
+    pub fn validate(&self) -> Result<(), Fault> {
+        if self.catalog_version != 1 {
+            return Err(Fault::catalog("unsupported-version"));
+        }
+        if !validate_locale_tag(&self.source_locale) {
+            return Err(Fault::new("locale-tag", &self.source_locale, "*"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub struct LoadedCatalog {
     pub config: CatalogConfig,
@@ -41,6 +53,31 @@ impl LoadedCatalog {
         channel: Channel,
         requested_locale: Option<&str>,
     ) -> Result<Self, Vec<Fault>> {
+        let registry = LocaleRegistry::embedded().map_err(|fault| vec![fault])?;
+        Self::load_with_registry(catalog_dir, channel, requested_locale, registry)
+    }
+
+    pub(crate) fn load_with_registry(
+        catalog_dir: &Path,
+        channel: Channel,
+        requested_locale: Option<&str>,
+        registry: LocaleRegistry,
+    ) -> Result<Self, Vec<Fault>> {
+        Self::load_internal(catalog_dir, channel, requested_locale, registry, true)
+    }
+
+    pub(crate) fn load_source(catalog_dir: &Path) -> Result<Self, Vec<Fault>> {
+        let registry = LocaleRegistry::embedded().map_err(|fault| vec![fault])?;
+        Self::load_internal(catalog_dir, Channel::Production, None, registry, false)
+    }
+
+    fn load_internal(
+        catalog_dir: &Path,
+        channel: Channel,
+        requested_locale: Option<&str>,
+        registry: LocaleRegistry,
+        include_translations: bool,
+    ) -> Result<Self, Vec<Fault>> {
         let mut faults = Vec::new();
 
         if !catalog_dir.is_dir() {
@@ -56,13 +93,7 @@ impl LoadedCatalog {
             Ok(c) => c,
             Err(_) => return Err(vec![Fault::catalog("missing-catalog")]),
         };
-        if config.catalog_version != 1 {
-            return Err(vec![Fault::catalog("unsupported-version")]);
-        }
-
-        if !validate_locale_tag(&config.source_locale) {
-            return Err(vec![Fault::new("locale-tag", &config.source_locale, "*")]);
-        }
+        config.validate().map_err(|fault| vec![fault])?;
 
         if let Some(req) = requested_locale
             && !validate_locale_tag(req)
@@ -70,12 +101,18 @@ impl LoadedCatalog {
             return Err(vec![Fault::new("locale-tag", req, "*")]);
         }
 
-        let registry = match LocaleRegistry::embedded() {
-            Ok(r) => r,
-            Err(f) => return Err(vec![f]),
-        };
-
         let namespace_owners = registry.get_namespace_owners();
+        if !registry
+            .locales
+            .iter()
+            .any(|locale| locale.tag == config.source_locale)
+        {
+            return Err(vec![Fault::new(
+                "unknown-locale",
+                &config.source_locale,
+                "*",
+            )]);
+        }
 
         // Load source/<source_locale>.ftl
         let source_ftl_path = catalog_dir
@@ -130,6 +167,12 @@ impl LoadedCatalog {
             if let Err(rule) = validate_message_id(id, ns) {
                 faults.push(Fault::new(rule, "*", id));
             }
+            if !namespace_owners
+                .get(ns)
+                .is_some_and(|owner| !owner.trim().is_empty())
+            {
+                faults.push(Fault::new("owner-conflict", "*", id));
+            }
         }
 
         // Validate admitted messages in source
@@ -157,6 +200,9 @@ impl LoadedCatalog {
         }
 
         // Check history if required
+        if include_translations && !config.history {
+            faults.push(Fault::catalog("history-required"));
+        }
         let history_path = catalog_dir.join("history.json");
         let history = if config.history {
             match HistoryRegistry::load_from_file(&history_path) {
@@ -209,20 +255,27 @@ impl LoadedCatalog {
         let all_bundle_names: Vec<String> = all_bundles.into_iter().collect();
 
         // Check channel eligibility of requested locale
-        let eligible_locales =
+        let eligible_locales = if include_translations {
             match registry.get_eligible_locales(channel, &all_bundle_names, requested_locale) {
                 Ok(locs) => locs,
                 Err(f) => {
                     faults.push(f);
                     Vec::new()
                 }
-            };
+            }
+        } else {
+            Vec::new()
+        };
 
         // Load translations
         let mut translations = HashMap::new();
         let trans_dir = catalog_dir.join("translations");
 
         for loc in &eligible_locales {
+            if *loc == config.source_locale {
+                translations.insert(loc.clone(), source_file.messages.clone());
+                continue;
+            }
             if !validate_locale_tag(loc) {
                 faults.push(Fault::new("locale-tag", loc, "*"));
                 continue;
@@ -285,6 +338,9 @@ impl LoadedCatalog {
         // Check freshness (stale) against lock
         if let Some(l) = &lock {
             for (loc, tr_msgs) in &translations {
+                if *loc == config.source_locale {
+                    continue;
+                }
                 for id in tr_msgs.keys() {
                     if let Some(src_msg) = source_file.messages.get(id)
                         && let Some(meta) = metadata_map.get(id)
@@ -313,6 +369,10 @@ impl LoadedCatalog {
                 });
                 if !declared {
                     faults.push(Fault::new("approval-locale", &app.locale, id));
+                }
+                // Packaging a channel must not load or validate excluded locale content.
+                if !eligible_locales.contains(&app.locale) {
+                    continue;
                 }
                 if let Some(src_msg) = source_file.messages.get(id) {
                     let src_hash = compute_source_hash(src_msg);

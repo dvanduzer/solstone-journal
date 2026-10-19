@@ -21,6 +21,7 @@ pub struct ApprovalRecord {
 pub struct MessageMetadata {
     pub description: String,
     pub context: String,
+    pub surfaces: Vec<String>,
     pub bundles: Vec<String>,
     pub arguments: Vec<ArgumentSpec>,
     pub format_intent: FormatIntent,
@@ -47,6 +48,7 @@ impl MessageMetadata {
         const ALLOWED_KEYS: &[&str] = &[
             "description",
             "context",
+            "surfaces",
             "bundles",
             "arguments",
             "format_intent",
@@ -79,6 +81,26 @@ impl MessageMetadata {
             .ok_or_else(|| Fault::new("empty-context", "*", message_id))?;
         if context.is_empty() {
             return Err(Fault::new("empty-context", "*", message_id));
+        }
+
+        let surfaces_val = obj
+            .get("surfaces")
+            .and_then(Value::as_array)
+            .ok_or_else(|| Fault::new("empty-surfaces", "*", message_id))?;
+        if surfaces_val.is_empty() {
+            return Err(Fault::new("empty-surfaces", "*", message_id));
+        }
+        let mut surfaces = Vec::new();
+        let mut seen_surfaces = HashSet::new();
+        for value in surfaces_val {
+            let surface = value
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| Fault::new("empty-surfaces", "*", message_id))?;
+            if !seen_surfaces.insert(surface.to_string()) {
+                return Err(Fault::new("duplicate-surface", "*", message_id));
+            }
+            surfaces.push(surface.to_string());
         }
 
         let bundles_val = obj
@@ -357,6 +379,7 @@ impl MessageMetadata {
                     .ok_or_else(|| Fault::new("selector-shape", "*", message_id))?;
 
                 let mut enum_values = Vec::new();
+                let mut seen_values = HashSet::new();
                 let mut ev_present = false;
                 if let Some(ev_val) = sel_obj.get("enum_values")
                     && !ev_val.is_null()
@@ -369,6 +392,9 @@ impl MessageMetadata {
                         let s = ev
                             .as_str()
                             .ok_or_else(|| Fault::new("selector-shape", "*", message_id))?;
+                        if !seen_values.insert(s.to_string()) {
+                            return Err(Fault::new("duplicate-enum-value", "*", message_id));
+                        }
                         enum_values.push(s.to_string());
                     }
                 }
@@ -437,9 +463,24 @@ impl MessageMetadata {
             }
         }
 
+        if let Some(sel) = &selector {
+            let expected = match format_intent {
+                FormatIntent::Cardinal => ScalarType::Cardinal,
+                FormatIntent::Enum => ScalarType::String,
+                FormatIntent::Text => return Err(Fault::new("selector-intent", "*", message_id)),
+            };
+            if !arguments
+                .iter()
+                .any(|arg| arg.name == sel.name && arg.arg_type == expected)
+            {
+                return Err(Fault::new("selector-type", "*", message_id));
+            }
+        }
+
         Ok(Self {
             description: description.to_string(),
             context: context.to_string(),
+            surfaces,
             bundles,
             arguments,
             format_intent,

@@ -7,10 +7,30 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static BUNDLE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn staging_path(parent: &Path, name: &str, count: u64) -> PathBuf {
+    parent.join(format!("{}.tmp.{}.{}", name, std::process::id(), count))
+}
+
+pub(crate) fn unique_stage_dir(
+    parent: &Path,
+    name: &str,
+    counter: &AtomicU64,
+) -> Result<PathBuf, Fault> {
+    for _ in 0..1000 {
+        let path = staging_path(parent, name, counter.fetch_add(1, Ordering::Relaxed));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err(Fault::catalog("io-error")),
+        }
+    }
+    Err(Fault::catalog("io-error"))
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -120,12 +140,7 @@ pub fn export_bundle(catalog_dir: &Path, out_dir: &Path) -> Result<(), Fault> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("bundle");
-    let pid = std::process::id();
-    let count = BUNDLE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let temp_dir_name = format!("{}.tmp.{}.{}", dir_name, pid, count);
-    let temp_dir = parent.join(temp_dir_name);
-
-    fs::create_dir_all(&temp_dir).map_err(|_| Fault::catalog("io-error"))?;
+    let temp_dir = unique_stage_dir(parent, dir_name, &BUNDLE_TEMP_COUNTER)?;
 
     let write_res = (|| -> Result<(), std::io::Error> {
         for (rel, bytes) in &member_data {
@@ -240,12 +255,7 @@ pub fn import_bundle(bundle_dir: &Path, dest_dir: &Path) -> Result<(), Fault> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("dest");
-    let pid = std::process::id();
-    let count = BUNDLE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let temp_dir_name = format!("{}.tmp.{}.{}", dir_name, pid, count);
-    let temp_dir = parent.join(temp_dir_name);
-
-    fs::create_dir_all(&temp_dir).map_err(|_| Fault::catalog("io-error"))?;
+    let temp_dir = unique_stage_dir(parent, dir_name, &BUNDLE_TEMP_COUNTER)?;
 
     let write_res = (|| -> Result<(), std::io::Error> {
         for (rel, bytes) in &files_to_write {

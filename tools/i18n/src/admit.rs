@@ -23,12 +23,8 @@ pub struct ParsedMessage {
     pub selector_var: Option<String>,
 }
 
-pub fn dotted_to_fluent_id(dotted: &str) -> String {
+fn dotted_to_fluent_id(dotted: &str) -> String {
     dotted.replace('.', "__DOT__")
-}
-
-pub fn fluent_to_dotted_id(fluent: &str) -> String {
-    fluent.replace("__DOT__", ".")
 }
 
 fn preprocess_ftl_id_dots(input: &str) -> (String, HashMap<String, String>) {

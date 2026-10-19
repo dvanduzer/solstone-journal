@@ -1,7 +1,9 @@
 {
   "description": "Synthetic test data",
   "context": "Synthetic test data",
-  "bundles": ["synth-app"],
+  "bundles": [
+    "synth-app"
+  ],
   "arguments": [],
   "format_intent": "text",
   "max_length": 200,
@@ -39,5 +41,8 @@
       "kind": "mark-word",
       "value": "STOP"
     }
+  ],
+  "surfaces": [
+    "synthetic-fixture"
   ]
 }

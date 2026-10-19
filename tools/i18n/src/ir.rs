@@ -31,6 +31,7 @@ pub struct CompiledMessage {
     pub max_length: usize,
     pub description: String,
     pub context: String,
+    pub surfaces: Vec<String>,
     pub bundles: Vec<String>,
     pub source_revision: String,
     pub approval: Option<ApprovalRecord>,
@@ -193,6 +194,8 @@ pub fn build_ir(
         }
         compiled_translations.sort_by(|a, b| a.locale.cmp(&b.locale));
 
+        let mut surfaces = meta.surfaces.clone();
+        surfaces.sort();
         let mut bundles_sorted = meta.bundles.clone();
         bundles_sorted.sort();
 
@@ -211,6 +214,7 @@ pub fn build_ir(
             max_length: meta.max_length,
             description: meta.description.clone(),
             context: meta.context.clone(),
+            surfaces,
             bundles: bundles_sorted,
             source_revision: meta.source_revision.clone(),
             approval: meta.approval.clone(),

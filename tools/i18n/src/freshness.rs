@@ -7,6 +7,7 @@ use crate::hexutil::sha256_hex;
 use crate::metadata::MessageMetadata;
 use crate::publish::atomic_write_file;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::Path;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -112,6 +113,18 @@ impl SourceLock {
             serde_json::from_str(&content).map_err(|_| Fault::catalog("lock-syntax"))?;
         if lock.lock_version != 1 {
             return Err(Fault::catalog("unsupported-version"));
+        }
+        let mut messages = HashSet::new();
+        for message in &lock.messages {
+            if !messages.insert(message.id.as_str()) {
+                return Err(Fault::catalog("lock-syntax"));
+            }
+            let mut locales = HashSet::new();
+            for ack in &message.locales {
+                if !locales.insert(ack.locale.as_str()) {
+                    return Err(Fault::catalog("lock-syntax"));
+                }
+            }
         }
         Ok(lock)
     }

@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-use crate::admit::{
-    ParsedMessage, dotted_to_fluent_id, fluent_to_dotted_id, parse_ftl_resource,
-    validate_admitted_message,
-};
+use crate::admit::{ParsedMessage, parse_ftl_resource, validate_admitted_message};
 use crate::catalog::LoadedCatalog;
 use crate::cli::update_history;
 use crate::coverage::{CoverageCell, CoverageReport};
@@ -29,11 +26,335 @@ static TEST_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {
     let pid = std::process::id();
-    let count = TEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let p = Path::new("/var/tmp").join(format!("i18n-test-{}-{}-{}", prefix, pid, count));
-    let _ = fs::remove_dir_all(&p);
-    fs::create_dir_all(&p).unwrap();
-    p
+    loop {
+        let count = TEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("i18n-test-{}-{}-{}", prefix, pid, count));
+        match fs::create_dir(&p) {
+            Ok(()) => return p,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("create test directory: {error}"),
+        }
+    }
+}
+
+#[test]
+fn stage_collision_preserves_preexisting_directory_and_symlink_target() {
+    let root = unique_temp_dir("owned-stage");
+    let counter = AtomicU64::new(0);
+    let foreign = crate::bundle::staging_path(&root, "bundle", 0);
+    fs::create_dir(&foreign).unwrap();
+    fs::write(foreign.join("sentinel"), b"foreign bytes").unwrap();
+    let own = crate::bundle::unique_stage_dir(&root, "bundle", &counter).unwrap();
+    assert_ne!(own, foreign);
+    assert_eq!(counter.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        fs::read(foreign.join("sentinel")).unwrap(),
+        b"foreign bytes"
+    );
+    #[cfg(unix)]
+    {
+        let target = root.join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("sentinel"), b"symlink target").unwrap();
+        let next = counter.load(Ordering::Relaxed);
+        std::os::unix::fs::symlink(&target, crate::bundle::staging_path(&root, "bundle", next))
+            .unwrap();
+        let _new = crate::bundle::unique_stage_dir(&root, "bundle", &counter).unwrap();
+        assert_eq!(counter.load(Ordering::Relaxed), next + 2);
+        assert_eq!(
+            fs::read(target.join("sentinel")).unwrap(),
+            b"symlink target"
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn ownership_is_checked_even_without_history() {
+    let root = unique_temp_dir("ownership");
+    copy_dir_recursive(&fixture_dir(), &root);
+    let config_path = root.join("catalog.json");
+    let mut config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    config["history"] = serde_json::Value::Bool(false);
+    fs::write(config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    for dir in ["source", "translations"] {
+        for entry in fs::read_dir(root.join(dir)).unwrap() {
+            let path = entry.unwrap().path();
+            fs::write(
+                &path,
+                fs::read_to_string(&path)
+                    .unwrap()
+                    .replace("synth.notes.", "foreign.notes."),
+            )
+            .unwrap();
+        }
+    }
+    for entry in fs::read_dir(root.join("meta")).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .replace("synth.notes.", "foreign.notes.");
+        fs::rename(&path, root.join("meta").join(name)).unwrap();
+    }
+    let lock = root.join("source-lock.json");
+    fs::write(
+        &lock,
+        fs::read_to_string(&lock)
+            .unwrap()
+            .replace("synth.notes.", "foreign.notes."),
+    )
+    .unwrap();
+    let faults = crate::compile(&root, Channel::Production, None).unwrap_err();
+    assert!(faults.iter().any(|fault| fault.rule == "owner-conflict"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn excluded_locale_approval_does_not_block_selected_channel() {
+    let root = unique_temp_dir("approval-channel");
+    copy_dir_recursive(&fixture_dir(), &root);
+    let path = root.join("meta/synth.notes.plain.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    meta["approval"]["locale"] = serde_json::Value::String("en-XA".into());
+    fs::write(&path, serde_json::to_vec(&meta).unwrap()).unwrap();
+    let mut registry = LocaleRegistry::embedded().unwrap();
+    registry
+        .bundles
+        .iter_mut()
+        .find(|bundle| bundle.id == "synth-app")
+        .unwrap()
+        .locales
+        .push("en-XA".into());
+    let catalog =
+        LoadedCatalog::load_with_registry(&root, Channel::Production, None, registry).unwrap();
+    assert!(!catalog.translations.contains_key("en-XA"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn selector_argument_types_and_enum_identity_are_consistent() {
+    let examples = [
+        (
+            include_str!("../fixtures/synth/meta/synth.notes.count.json"),
+            "string",
+        ),
+        (
+            include_str!("../fixtures/synth/meta/synth.notes.kind.json"),
+            "boolean",
+        ),
+    ];
+    for (raw, bad_type) in examples {
+        let mut value: serde_json::Value = serde_json::from_str(raw).unwrap();
+        value["arguments"][0]["type"] = serde_json::Value::String(bad_type.into());
+        for field in ["numeric_style", "min", "max"] {
+            value["arguments"][0][field] = serde_json::Value::Null;
+        }
+        let fault = MessageMetadata::parse("synth.notes.control", &value.to_string()).unwrap_err();
+        assert_eq!(fault.rule, "selector-type");
+    }
+    let mut value: serde_json::Value = serde_json::from_str(examples[1].0).unwrap();
+    let values = value["selector"]["enum_values"].as_array_mut().unwrap();
+    values.push(values[0].clone());
+    let fault = MessageMetadata::parse("synth.notes.control", &value.to_string()).unwrap_err();
+    assert_eq!(fault.rule, "duplicate-enum-value");
+}
+
+#[test]
+fn lock_refresh_preserves_unreadable_or_unsupported_provenance() {
+    let root = unique_temp_dir("invalid-lock");
+    copy_dir_recursive(&fixture_dir(), &root);
+    let path = root.join("source-lock.json");
+    let baseline: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let mut unsupported = baseline.clone();
+    unsupported["lock_version"] = serde_json::Value::from(999);
+    let mut duplicate_message = baseline.clone();
+    let messages = duplicate_message["messages"].as_array_mut().unwrap();
+    messages.push(messages[0].clone());
+    let mut duplicate_ack = baseline;
+    let locales = duplicate_ack["messages"][0]["locales"]
+        .as_array_mut()
+        .unwrap();
+    locales.push(locales[0].clone());
+    for bytes in [
+        b"{ invalid lock".to_vec(),
+        serde_json::to_vec(&unsupported).unwrap(),
+        serde_json::to_vec(&duplicate_message).unwrap(),
+        serde_json::to_vec(&duplicate_ack).unwrap(),
+    ] {
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            crate::cli::run([
+                "i18n-catalog".into(),
+                "lock".into(),
+                root.as_os_str().to_owned()
+            ]),
+            1
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn registry_refuses_ambiguous_or_missing_locale_membership() {
+    let base: serde_json::Value = serde_json::from_str(include_str!("../locales.json")).unwrap();
+    for (field, rule) in [
+        ("locales", "duplicate-locale"),
+        ("bundles", "duplicate-bundle"),
+    ] {
+        let mut value = base.clone();
+        let entries = value[field].as_array_mut().unwrap();
+        entries.push(entries[0].clone());
+        assert_eq!(
+            LocaleRegistry::load(&value.to_string()).unwrap_err().rule,
+            rule
+        );
+    }
+    let mut unknown = base.clone();
+    unknown["bundles"][0]["locales"] = serde_json::json!(["unknown-locale"]);
+    assert_eq!(
+        LocaleRegistry::load(&unknown.to_string()).unwrap_err().rule,
+        "unknown-locale"
+    );
+    let mut duplicate = base;
+    let tags = duplicate["bundles"][0]["locales"].as_array_mut().unwrap();
+    tags.push(tags[0].clone());
+    assert_eq!(
+        LocaleRegistry::load(&duplicate.to_string())
+            .unwrap_err()
+            .rule,
+        "duplicate-locale-membership"
+    );
+}
+
+#[test]
+fn surfaces_are_required_and_distinct_from_bundle_membership() {
+    let base: serde_json::Value = serde_json::from_str(include_str!(
+        "../fixtures/synth/meta/synth.notes.plain.json"
+    ))
+    .unwrap();
+    for bad in [
+        serde_json::Value::Null,
+        serde_json::json!([]),
+        serde_json::json!([" "]),
+        serde_json::json!(["one", "one"]),
+    ] {
+        let mut value = base.clone();
+        value["surfaces"] = bad;
+        assert!(MessageMetadata::parse("synth.notes.plain", &value.to_string()).is_err());
+    }
+    let meta = MessageMetadata::parse("synth.notes.plain", &base.to_string()).unwrap();
+    assert_eq!(meta.surfaces, ["synthetic-fixture"]);
+    assert_eq!(meta.bundles, ["synth-app"]);
+}
+
+#[test]
+fn canonical_source_satisfies_its_locale_without_duplicate_translation_or_ack() {
+    let root = unique_temp_dir("source-locale");
+    copy_dir_recursive(&fixture_dir(), &root);
+    assert!(!root.join("translations/en.ftl").exists());
+    let mut registry = LocaleRegistry::embedded().unwrap();
+    registry
+        .locales
+        .iter_mut()
+        .find(|locale| locale.tag == "en")
+        .unwrap()
+        .production = crate::vocab::ReleaseState::Released;
+    registry
+        .bundles
+        .iter_mut()
+        .find(|bundle| bundle.id == "synth-app")
+        .unwrap()
+        .locales
+        .push("en".into());
+    let catalog =
+        LoadedCatalog::load_with_registry(&root, Channel::Production, None, registry).unwrap();
+    for (id, source) in &catalog.source_messages {
+        assert_eq!(
+            crate::freshness::compute_source_hash(source),
+            crate::freshness::compute_source_hash(&catalog.translations["en"][id])
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pseudo_generation_precedes_translation_readiness() {
+    let root = unique_temp_dir("pseudo-bootstrap");
+    copy_dir_recursive(&fixture_dir(), &root);
+    fs::remove_dir_all(root.join("translations")).unwrap();
+    assert!(crate::compile(&root, Channel::Production, None).is_err());
+    let output = root.join("pseudos");
+    assert_eq!(
+        crate::cli::run([
+            "i18n-catalog".into(),
+            "pseudo".into(),
+            root.as_os_str().to_owned(),
+            "--out".into(),
+            output.as_os_str().to_owned()
+        ]),
+        0
+    );
+    for locale in ["en-XA", "ar-XB"] {
+        let text = fs::read_to_string(output.join(format!("{locale}.ftl"))).unwrap();
+        assert!(
+            !parse_ftl_resource(&text, locale)
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn history_bootstrap_is_explicit_and_admits_source_before_reserving_ids() {
+    let root = unique_temp_dir("history-bootstrap");
+    copy_dir_recursive(&fixture_dir(), &root);
+    let history = root.join("history.json");
+    fs::remove_file(&history).unwrap();
+    assert!(
+        update_history(&root)
+            .unwrap_err()
+            .iter()
+            .any(|fault| fault.rule == "history-missing")
+    );
+    assert!(!history.exists());
+    let config_path = root.join("catalog.json");
+    let mut config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    config["history"] = serde_json::Value::Bool(false);
+    fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    assert!(
+        crate::compile(&root, Channel::Production, None)
+            .unwrap_err()
+            .iter()
+            .any(|fault| fault.rule == "history-required")
+    );
+    let meta_path = root.join("meta/synth.notes.named.json");
+    let original = fs::read(&meta_path).unwrap();
+    let mut meta: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    meta["arguments"][0]["name"] = serde_json::Value::String("unused".into());
+    fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+    assert!(
+        update_history(&root)
+            .unwrap_err()
+            .iter()
+            .any(|fault| fault.rule == "argument-parity")
+    );
+    assert!(!history.exists());
+    fs::write(&meta_path, original).unwrap();
+    update_history(&root).unwrap();
+    config["history"] = serde_json::Value::Bool(true);
+    fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    crate::compile(&root, Channel::Production, None).unwrap();
+    fs::remove_dir_all(root).unwrap();
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) {
@@ -261,51 +582,46 @@ fn test_raw_dotted_fluent_rejected() {
 }
 
 #[test]
-fn test_pseudo_ftl_parses_cleanly_with_fluent() {
-    let fix = fixture_dir();
-    let cat = LoadedCatalog::load_and_validate(&fix, Channel::Production, None).unwrap();
-
-    let en_xa = generate_pseudo_ftl(&cat.source_messages, transform_en_xa);
-    let ar_xb = generate_pseudo_ftl(&cat.source_messages, transform_ar_xb);
-
-    let res_xa = fluent_syntax::parser::parse(en_xa.as_str());
-    assert!(
-        res_xa.is_ok(),
-        "en-XA should parse as Ok: {:?}",
-        res_xa.err()
-    );
-    let res_resource_xa = res_xa.unwrap();
-    assert!(
-        !res_resource_xa
-            .body
-            .iter()
-            .any(|entry| matches!(entry, fluent_syntax::ast::Entry::Junk { .. })),
-        "en-XA should contain no Entry::Junk"
-    );
-
-    let res_xb = fluent_syntax::parser::parse(ar_xb.as_str());
-    assert!(
-        res_xb.is_ok(),
-        "ar-XB should parse as Ok: {:?}",
-        res_xb.err()
-    );
-    let res_resource_xb = res_xb.unwrap();
-    assert!(
-        !res_resource_xb
-            .body
-            .iter()
-            .any(|entry| matches!(entry, fluent_syntax::ast::Entry::Junk { .. })),
-        "ar-XB should contain no Entry::Junk"
-    );
-
-    for id in cat.source_messages.keys() {
-        let fluent_id = dotted_to_fluent_id(id);
+fn pseudo_catalogs_round_trip_through_the_canonical_profile() {
+    let cat = LoadedCatalog::load_and_validate(&fixture_dir(), Channel::Production, None).unwrap();
+    for (locale, generated) in [
+        (
+            "en-XA",
+            generate_pseudo_ftl(&cat.source_messages, transform_en_xa),
+        ),
+        (
+            "ar-XB",
+            generate_pseudo_ftl(&cat.source_messages, transform_ar_xb),
+        ),
+    ] {
+        let mut parsed = parse_ftl_resource(&generated, locale).unwrap();
+        assert_eq!(parsed.messages.len(), cat.source_messages.len());
+        for (id, message) in &mut parsed.messages {
+            validate_admitted_message(
+                message,
+                &cat.metadata[id],
+                locale,
+                false,
+                Some(&cat.source_messages[id]),
+            )
+            .unwrap();
+        }
+    }
+    let source = parse_ftl_resource(
+        "synth.notes.multiline = First\n    second { $name }\n",
+        "en",
+    )
+    .unwrap();
+    for transform in [transform_en_xa as fn(&str) -> String, transform_ar_xb] {
+        let generated = generate_pseudo_ftl(&source.messages, transform);
+        let parsed = parse_ftl_resource(&generated, "en-XA").unwrap();
+        assert_eq!(parsed.messages.len(), 1);
         assert!(
-            fluent_id
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            parsed.messages["synth.notes.multiline"].branches[0]
+                .pattern
+                .iter()
+                .any(|element| element.value.contains('\n'))
         );
-        assert_eq!(&fluent_to_dotted_id(&fluent_id), id);
     }
 }
 
@@ -418,6 +734,7 @@ fn test_admitted_branch_rules() {
     let mut meta = MessageMetadata {
         description: "d".to_string(),
         context: "c".to_string(),
+        surfaces: vec!["synthetic".into()],
         bundles: vec!["b".to_string()],
         arguments: vec![ArgumentSpec {
             name: "count".to_string(),
@@ -499,6 +816,7 @@ fn test_admitted_branch_rules() {
     let plain_meta = MessageMetadata {
         description: "d".to_string(),
         context: "c".to_string(),
+        surfaces: vec!["synthetic".into()],
         bundles: vec!["b".to_string()],
         arguments: vec![],
         format_intent: FormatIntent::Text,
@@ -578,7 +896,7 @@ fn test_admitted_branch_rules() {
 #[test]
 fn test_protected_slot_rules() {
     // 1. slot-arg-disjoint from metadata
-    let json = r#"{"description":"d","context":"c","bundles":["b"],"arguments":[{"name":"overlap","type":"string"}],"protected_slots":[{"name":"overlap","kind":"command","value":"val"}],"format_intent":"text","max_length":10,"source_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","risk":"routine"}"#;
+    let json = r#"{"description":"d","context":"c","surfaces":["synthetic"],"bundles":["b"],"arguments":[{"name":"overlap","type":"string"}],"protected_slots":[{"name":"overlap","kind":"command","value":"val"}],"format_intent":"text","max_length":10,"source_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","risk":"routine"}"#;
     assert_eq!(
         MessageMetadata::parse("m", json).unwrap_err().rule,
         "slot-arg-disjoint"
@@ -587,6 +905,7 @@ fn test_protected_slot_rules() {
     let meta = MessageMetadata {
         description: "d".to_string(),
         context: "c".to_string(),
+        surfaces: vec!["synthetic".into()],
         bundles: vec!["b".to_string()],
         arguments: vec![ArgumentSpec {
             name: "count".to_string(),
@@ -848,7 +1167,7 @@ fn test_scalar_bounds_and_boolean() {
         "not-a-number"
     );
 
-    let json = r#"{"description":"d","context":"c","bundles":["b"],"arguments":[{"name":"n","type":"cardinal","numeric_style":"ungrouped","min":true}],"format_intent":"text","max_length":10,"source_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","risk":"routine"}"#;
+    let json = r#"{"description":"d","context":"c","surfaces":["synthetic"],"bundles":["b"],"arguments":[{"name":"n","type":"cardinal","numeric_style":"ungrouped","min":true}],"format_intent":"text","max_length":10,"source_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","risk":"routine"}"#;
     assert_eq!(
         MessageMetadata::parse("m", json).unwrap_err().rule,
         "not-a-number"
@@ -857,37 +1176,37 @@ fn test_scalar_bounds_and_boolean() {
 
 #[test]
 fn test_metadata_validations() {
-    let json = r#"{"description":"d","context":"c","bundles":["b"],"arguments":[],"format_intent":"text","max_length":10,"source_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","risk":"routine","extra":1}"#;
+    let json = r#"{"description":"d","context":"c","surfaces":["synthetic"],"bundles":["b"],"arguments":[],"format_intent":"text","max_length":10,"source_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","risk":"routine","extra":1}"#;
     assert_eq!(
         MessageMetadata::parse("m", json).unwrap_err().rule,
         "unknown-field"
     );
 
-    let json = r#"{"description":"d","context":"","bundles":["b"],"arguments":[],"format_intent":"text","max_length":10,"source_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","risk":"routine"}"#;
+    let json = r#"{"description":"d","context":"","surfaces":["synthetic"],"bundles":["b"],"arguments":[],"format_intent":"text","max_length":10,"source_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","risk":"routine"}"#;
     assert_eq!(
         MessageMetadata::parse("m", json).unwrap_err().rule,
         "empty-context"
     );
 
-    let json = r#"{"description":"d","context":"c","bundles":[],"arguments":[],"format_intent":"text","max_length":10,"source_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","risk":"routine"}"#;
+    let json = r#"{"description":"d","context":"c","surfaces":["synthetic"],"bundles":[],"arguments":[],"format_intent":"text","max_length":10,"source_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","risk":"routine"}"#;
     assert_eq!(
         MessageMetadata::parse("m", json).unwrap_err().rule,
         "empty-membership"
     );
 
-    let json = r#"{"description":"d","context":"c","bundles":["b"],"arguments":[],"format_intent":"text","max_length":10,"source_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","risk":"routine","approval":true}"#;
+    let json = r#"{"description":"d","context":"c","surfaces":["synthetic"],"bundles":["b"],"arguments":[],"format_intent":"text","max_length":10,"source_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","risk":"routine","approval":true}"#;
     assert_eq!(
         MessageMetadata::parse("m", json).unwrap_err().rule,
         "approval-shape"
     );
 
-    let json = r#"{"description":"d","context":"c","bundles":["b"],"arguments":[],"format_intent":"text","max_length":10,"source_revision":"badhash","risk":"routine"}"#;
+    let json = r#"{"description":"d","context":"c","surfaces":["synthetic"],"bundles":["b"],"arguments":[],"format_intent":"text","max_length":10,"source_revision":"badhash","risk":"routine"}"#;
     assert_eq!(
         MessageMetadata::parse("m", json).unwrap_err().rule,
         "hash-syntax"
     );
 
-    let json = r#"{"description":"d","context":"c","bundles":["b"],"arguments":[],"format_intent":"text","max_length":0,"source_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","risk":"routine"}"#;
+    let json = r#"{"description":"d","context":"c","surfaces":["synthetic"],"bundles":["b"],"arguments":[],"format_intent":"text","max_length":0,"source_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","risk":"routine"}"#;
     assert_eq!(
         MessageMetadata::parse("m", json).unwrap_err().rule,
         "max-length"
@@ -895,7 +1214,7 @@ fn test_metadata_validations() {
 
     for high_risk in &["payment", "legal", "statutory", "consent"] {
         let json = format!(
-            r#"{{"description":"d","context":"c","bundles":["b"],"arguments":[],"format_intent":"text","max_length":10,"source_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","risk":"{}","auto_merge":true}}"#,
+            r#"{{"description":"d","context":"c","surfaces":["synthetic"],"bundles":["b"],"arguments":[],"format_intent":"text","max_length":10,"source_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","risk":"{}","auto_merge":true}}"#,
             high_risk
         );
         assert_eq!(
@@ -1029,14 +1348,14 @@ fn test_distinct_history_mutation_rules() {
     // 1. signature-mutation: change arg name or type
     assert_history_fault(
         |p| {
-            let meta_p = p.join("meta").join("synth.notes.count.json");
+            let meta_p = p.join("meta").join("synth.notes.named.json");
             let s = fs::read_to_string(&meta_p).unwrap();
             let mut val: serde_json::Value = serde_json::from_str(&s).unwrap();
             val["arguments"][0]["name"] = serde_json::json!("renamed");
             fs::write(&meta_p, serde_json::to_string(&val).unwrap()).unwrap();
         },
         "signature-mutation",
-        "synth.notes.count",
+        "synth.notes.named",
     );
 
     // 2. numeric-range: change min/max only
@@ -1059,6 +1378,7 @@ fn test_distinct_history_mutation_rules() {
             let s = fs::read_to_string(&meta_p).unwrap();
             let mut val: serde_json::Value = serde_json::from_str(&s).unwrap();
             val["format_intent"] = serde_json::json!("enum");
+            val["arguments"] = serde_json::json!([{"name":"kind","type":"string"}]);
             val["selector"] = serde_json::json!({
                 "name": "kind",
                 "type": "string",
@@ -1078,6 +1398,7 @@ fn test_distinct_history_mutation_rules() {
             let s = fs::read_to_string(&meta_p).unwrap();
             let mut val: serde_json::Value = serde_json::from_str(&s).unwrap();
             val["selector"]["name"] = serde_json::json!("renamed_selector");
+            val["arguments"][0]["name"] = serde_json::json!("renamed_selector");
             fs::write(&meta_p, serde_json::to_string(&val).unwrap()).unwrap();
         },
         "selector-mutation",
@@ -1450,6 +1771,7 @@ fn test_markup_rules() {
     let meta = MessageMetadata {
         description: "d".to_string(),
         context: "c".to_string(),
+        surfaces: vec!["synthetic".into()],
         bundles: vec!["b".to_string()],
         arguments: vec![],
         format_intent: FormatIntent::Text,
@@ -1583,7 +1905,7 @@ fn test_duplicate_names_in_metadata() {
     let raw_meta_arg = r#"{
         "description": "d",
         "context": "c",
-        "bundles": ["synth-app"],
+        "surfaces":["synthetic"],"bundles": ["synth-app"],
         "arguments": [
             { "name": "val", "type": "string" },
             { "name": "val", "type": "boolean" }
@@ -1602,7 +1924,7 @@ fn test_duplicate_names_in_metadata() {
     let raw_meta_slot = r#"{
         "description": "d",
         "context": "c",
-        "bundles": ["synth-app"],
+        "surfaces":["synthetic"],"bundles": ["synth-app"],
         "arguments": [],
         "format_intent": "text",
         "max_length": 100,
@@ -1625,7 +1947,7 @@ fn test_selector_type_and_intent_checks() {
     let raw_text_sel = r#"{
         "description": "d",
         "context": "c",
-        "bundles": ["synth-app"],
+        "surfaces":["synthetic"],"bundles": ["synth-app"],
         "arguments": [],
         "format_intent": "text",
         "max_length": 100,
@@ -1642,7 +1964,7 @@ fn test_selector_type_and_intent_checks() {
     let raw_card_ev = r#"{
         "description": "d",
         "context": "c",
-        "bundles": ["synth-app"],
+        "surfaces":["synthetic"],"bundles": ["synth-app"],
         "arguments": [{ "name": "count", "type": "cardinal", "numeric_style": "ungrouped" }],
         "format_intent": "cardinal",
         "max_length": 100,
@@ -1659,7 +1981,7 @@ fn test_selector_type_and_intent_checks() {
     let raw_enum_def = r#"{
         "description": "d",
         "context": "c",
-        "bundles": ["synth-app"],
+        "surfaces":["synthetic"],"bundles": ["synth-app"],
         "arguments": [{ "name": "kind", "type": "string" }],
         "format_intent": "enum",
         "max_length": 100,
@@ -1676,7 +1998,7 @@ fn test_selector_type_and_intent_checks() {
     let raw_bad_ev = r#"{
         "description": "d",
         "context": "c",
-        "bundles": ["synth-app"],
+        "surfaces":["synthetic"],"bundles": ["synth-app"],
         "arguments": [{ "name": "count", "type": "cardinal", "numeric_style": "ungrouped" }],
         "format_intent": "cardinal",
         "max_length": 100,
@@ -1696,7 +2018,7 @@ fn test_approval_record_validations() {
     let raw_missing_loc = r#"{
         "description": "d",
         "context": "c",
-        "bundles": ["synth-app"],
+        "surfaces":["synthetic"],"bundles": ["synth-app"],
         "arguments": [],
         "format_intent": "text",
         "max_length": 100,
@@ -1716,7 +2038,7 @@ fn test_approval_record_validations() {
     let raw_array_loc = r#"{
         "description": "d",
         "context": "c",
-        "bundles": ["synth-app"],
+        "surfaces":["synthetic"],"bundles": ["synth-app"],
         "arguments": [],
         "format_intent": "text",
         "max_length": 100,
@@ -1893,24 +2215,22 @@ fn test_pseudo_cli_run() {
     let exit_code = crate::cli::run(args.clone());
     assert_eq!(exit_code, 0);
 
-    // Assert both files parse Ok with no Junk
-    let xa_str = fs::read_to_string(temp_out.join("en-XA.ftl")).unwrap();
-    let res_xa = fluent_syntax::parser::parse(xa_str.as_str()).unwrap();
-    assert!(
-        !res_xa
-            .body
-            .iter()
-            .any(|e| matches!(e, fluent_syntax::ast::Entry::Junk { .. }))
-    );
-
-    let xb_str = fs::read_to_string(temp_out.join("ar-XB.ftl")).unwrap();
-    let res_xb = fluent_syntax::parser::parse(xb_str.as_str()).unwrap();
-    assert!(
-        !res_xb
-            .body
-            .iter()
-            .any(|e| matches!(e, fluent_syntax::ast::Entry::Junk { .. }))
-    );
+    let source = LoadedCatalog::load_source(&fix).unwrap();
+    for locale in ["en-XA", "ar-XB"] {
+        let text = fs::read_to_string(temp_out.join(format!("{locale}.ftl"))).unwrap();
+        let mut parsed = parse_ftl_resource(&text, locale).unwrap();
+        assert_eq!(parsed.messages.len(), source.source_messages.len());
+        for (id, message) in &mut parsed.messages {
+            validate_admitted_message(
+                message,
+                &source.metadata[id],
+                locale,
+                false,
+                Some(&source.source_messages[id]),
+            )
+            .unwrap();
+        }
+    }
 
     // Assert denominators
     let den_str = fs::read_to_string(temp_out.join("denominators.json")).unwrap();

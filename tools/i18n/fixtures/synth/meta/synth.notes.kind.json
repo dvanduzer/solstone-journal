@@ -1,7 +1,9 @@
 {
   "description": "Synthetic test data",
   "context": "Synthetic test data",
-  "bundles": ["synth-app"],
+  "bundles": [
+    "synth-app"
+  ],
   "arguments": [
     {
       "name": "kind",
@@ -16,7 +18,13 @@
   "selector": {
     "name": "kind",
     "type": "string",
-    "enum_values": ["box", "bag"],
+    "enum_values": [
+      "box",
+      "bag"
+    ],
     "enum_default": "box"
-  }
+  },
+  "surfaces": [
+    "synthetic-fixture"
+  ]
 }

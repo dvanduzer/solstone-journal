@@ -71,7 +71,7 @@ fn print_usage() {
          emit <catalog> --channel <development|production> [--locale <tag>] --out <file>\n\
          history <catalog>\n\
          retire <catalog> --id <id> [--replacement <id>]\n\
-         lock <catalog>\n\
+         lock <catalog> [--acknowledge <locale>]\n\
          pseudo <catalog> --out <dir>\n\
          coverage <catalog> --channel <development|production>\n\
          import <bundle> --dest <dir>\n\
@@ -213,6 +213,7 @@ pub fn update_history(catalog_dir: &Path) -> Result<(), Vec<Fault>> {
         Ok(c) => c,
         Err(_) => return Err(vec![Fault::catalog("missing-catalog")]),
     };
+    config.validate().map_err(|fault| vec![fault])?;
 
     let registry = match LocaleRegistry::embedded() {
         Ok(r) => r,
@@ -227,7 +228,7 @@ pub fn update_history(catalog_dir: &Path) -> Result<(), Vec<Fault>> {
         Ok(s) => s,
         Err(_) => return Err(vec![Fault::catalog("source-missing")]),
     };
-    let source_file = parse_ftl_resource(&source_content, &config.source_locale)?;
+    let mut source_file = parse_ftl_resource(&source_content, &config.source_locale)?;
 
     let meta_dir = catalog_dir.join("meta");
     let mut meta_map = HashMap::new();
@@ -260,6 +261,9 @@ pub fn update_history(catalog_dir: &Path) -> Result<(), Vec<Fault>> {
             Err(f) => return Err(vec![f]),
         }
     } else {
+        if config.history {
+            return Err(vec![Fault::catalog("history-missing")]);
+        }
         HistoryRegistry {
             history_version: 1,
             records: Vec::new(),
@@ -285,6 +289,32 @@ pub fn update_history(catalog_dir: &Path) -> Result<(), Vec<Fault>> {
         }
     }
 
+    if !faults.is_empty() {
+        sort_faults(&mut faults);
+        return Err(faults);
+    }
+
+    for (id, message) in &mut source_file.messages {
+        let ns = id.rsplit_once('.').map(|(prefix, _)| prefix).unwrap_or("");
+        if let Err(rule) = validate_message_id(id, ns) {
+            faults.push(Fault::new(rule, "*", id));
+        }
+        if !namespace_owners
+            .get(ns)
+            .is_some_and(|owner| !owner.trim().is_empty())
+        {
+            faults.push(Fault::new("owner-conflict", "*", id));
+        }
+        if let Err(mut admission) = crate::admit::validate_admitted_message(
+            message,
+            &meta_map[id],
+            &config.source_locale,
+            true,
+            None,
+        ) {
+            faults.append(&mut admission);
+        }
+    }
     if !faults.is_empty() {
         sort_faults(&mut faults);
         return Err(faults);
@@ -489,7 +519,17 @@ fn run_lock(args: &[String]) -> i32 {
     let meta_dir = catalog_dir.join("meta");
     let lock_path = catalog_dir.join("source-lock.json");
 
-    let existing_lock = SourceLock::load_from_file(&lock_path).ok();
+    let existing_lock = if lock_path.exists() {
+        match SourceLock::load_from_file(&lock_path) {
+            Ok(lock) => Some(lock),
+            Err(fault) => {
+                eprintln!("{}", fault);
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
 
     let mut new_messages = Vec::new();
 
@@ -607,7 +647,7 @@ fn run_pseudo(args: &[String]) -> i32 {
         }
     };
 
-    let loaded = match LoadedCatalog::load_and_validate(&cat_path, Channel::Production, None) {
+    let loaded = match LoadedCatalog::load_source(&cat_path) {
         Ok(c) => c,
         Err(faults) => {
             for f in faults {

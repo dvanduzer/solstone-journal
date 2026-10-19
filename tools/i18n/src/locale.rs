@@ -75,11 +75,49 @@ impl LocaleRegistry {
         let reg: Self =
             serde_json::from_str(json_str).map_err(|_| Fault::catalog("locales-syntax"))?;
 
+        let mut locale_tags = HashSet::new();
+        for locale in &reg.locales {
+            if !validate_locale_tag(&locale.tag) {
+                return Err(Fault::catalog("locale-tag"));
+            }
+            if !locale_tags.insert(locale.tag.as_str()) {
+                return Err(Fault::catalog("duplicate-locale"));
+            }
+        }
+
         // Check for duplicate namespaces
         let mut seen_ns = HashSet::new();
         for ns in &reg.namespaces {
+            if ns.owner.trim().is_empty() {
+                return Err(Fault::catalog("owner-conflict"));
+            }
             if !seen_ns.insert(&ns.namespace) {
                 return Err(Fault::catalog("duplicate-namespace"));
+            }
+        }
+
+        let mut bundle_ids = HashSet::new();
+        for bundle in &reg.bundles {
+            if bundle.id.is_empty()
+                || bundle.id.contains("..")
+                || !bundle
+                    .id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+            {
+                return Err(Fault::catalog("bundle-id"));
+            }
+            if !bundle_ids.insert(bundle.id.as_str()) {
+                return Err(Fault::catalog("duplicate-bundle"));
+            }
+            let mut membership = HashSet::new();
+            for tag in &bundle.locales {
+                if !locale_tags.contains(tag.as_str()) {
+                    return Err(Fault::catalog("unknown-locale"));
+                }
+                if !membership.insert(tag.as_str()) {
+                    return Err(Fault::catalog("duplicate-locale-membership"));
+                }
             }
         }
 
