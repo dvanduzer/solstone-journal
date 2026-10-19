@@ -245,6 +245,11 @@
     return state.localCapability?.overall === 'blocked';
   }
 
+  function localCapabilityRefusedUnknown() {
+    return state.localCapability?.overall === 'unknown'
+      && state.localCapability?.local_admitted !== true;
+  }
+
   function setElementData(el, key, attr, value) {
     if (!el) return;
     if (el.dataset) el.dataset[key] = value;
@@ -3032,7 +3037,7 @@
     const localCard = $('lane-local');
     const localActive = brain.kind === 'local';
     const capabilityBlocked = localCapabilityBlocked();
-    const capabilityUnknown = state.localCapability?.overall === 'unknown';
+    const capabilityUnknown = localCapabilityRefusedUnknown();
     const gpuBlocked = !capabilityBlocked && localIsGpuBlocked();
     const endpointOverride = localEndpointConfigured();
     const forkHintEl = $('forkHint');
@@ -3619,7 +3624,7 @@
         tone: '',
       };
     }
-    if (state.localCapability?.overall === 'unknown') {
+    if (localCapabilityRefusedUnknown()) {
       const text = copy.local_recovery?.states?.local_probe_failed || {};
       return {
         pill: text.pill || "couldn't check",
@@ -5217,7 +5222,7 @@
   }
 
   async function openLane(lane) {
-    if (lane === 'local' && (localCapabilityBlocked() || state.localCapability?.overall === 'unknown')) {
+    if (lane === 'local' && (localCapabilityBlocked() || localCapabilityRefusedUnknown())) {
       return;
     }
     if (lane === 'confidential') {

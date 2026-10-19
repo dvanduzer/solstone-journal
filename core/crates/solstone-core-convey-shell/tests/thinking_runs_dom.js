@@ -1992,6 +1992,18 @@ async function main() {
   await thinking.openLane('local');
   assert.strictEqual(nodes.get('thinkingLocalSetup').hidden, true, 'thinkingLocalSetup stays hidden on unknown');
 
+  // Unknown capability but admitted with that same availability
+  thinking.state.localCapability = {overall: 'unknown', local_admitted: true};
+  thinking.state.localAvailability = {available: false, reason_code: 'binary_missing', reason: 'local runtime is not installed'};
+  thinking.renderMainLanes();
+  assert.strictEqual(laneLocalNode.dataset.openView, 'local-setup', 'card has dataset.openView on admitted unknown');
+  assert.strictEqual(laneLocalNode.getAttribute('data-open-view'), 'local-setup', 'card has data-open-view attribute on admitted unknown');
+  thinking.renderLocal();
+  assert.strictEqual(nodes.get('localBootstrap').hidden, false, '#localBootstrap not hidden on admitted unknown');
+  thinking.showView('main');
+  await thinking.openLane('local');
+  assert.strictEqual(nodes.get('thinkingLocalSetup').hidden, false, 'thinkingLocalSetup not hidden on admitted unknown');
+
   // Local page: install_state: 'failed' plus blocked capability
   thinking.state.install = {install_state: 'failed'};
   thinking.state.localCapability = {overall: 'blocked', reason_code: 'gpu', detail: 'detail-blocked'};

@@ -8,8 +8,9 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- pairing the solstone app on the journal's own computer now shows the steps for this computer, not a phone code.
-- when your journal can't check whether this computer can run local thinking, setup shows local as unavailable with the reason, instead of letting you pick it and then refusing.
+- on windows, when your journal can't check whether its computer can run local thinking, setup shows local as unavailable with the reason, instead of letting you pick it and then refusing.
+- on a mac or linux computer whose memory your journal can't check, setup and the thinking page let you choose local thinking and say it couldn't check, instead of refusing it.
+- pairing the solstone app on the journal's own computer now shows the steps for that computer, not the phone steps and QR code.
 - on a computer that can't run local thinking, home and the thinking page say so, and no longer offer to install the local model.
 
 ## [2.0.51] - 2026-10-19

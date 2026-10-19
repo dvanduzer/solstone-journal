@@ -1022,6 +1022,72 @@ async function runTests(manifestDir) {
     assert.strictEqual(reasonSpanE2.hidden, false);
     assert.strictEqual(envE2.doc.querySelectorAll('input[name="thinking-choice"]:checked').length, 0);
 
+    // Twin E3 (unknown capability + local_admitted: false)
+    const envE3 = createPageEnvironment(markup, scriptCode);
+    envE3.boot();
+    await settle();
+    envE3.nextPending().resolve({
+      ...defaultState(),
+      mark: { state: 'locked', proposal_id: 'L', render: makeMark() },
+      thinking: { choice: null, saved: false, capability: 'unknown', download_bytes: null }
+    });
+    await settle();
+    const capReqE3 = envE3.nextPending();
+    if (capReqE3) {
+      capReqE3.resolve({ overall: 'unknown', local_admitted: false, checks: [] });
+      await settle();
+    }
+    const localInputE3 = envE3.doc.querySelector('input[value="local"]');
+    assert.strictEqual(localInputE3.disabled, true);
+    assert.strictEqual(localInputE3.parent.classList.contains('is-unavailable'), true);
+    const reasonSpanE3 = envE3.doc.getElementById('thinking-local-reason');
+    assert.ok(reasonSpanE3 && reasonSpanE3.textContent.length > 0);
+    assert.strictEqual(reasonSpanE3.hidden, false);
+    assert.strictEqual(envE3.doc.querySelectorAll('input[name="thinking-choice"]:checked').length, 0);
+
+    envE3.doc.getElementById('thinking-continue').click();
+    await settle();
+    const saveReqE3 = envE3.nextPending();
+    assert.ok(saveReqE3 && saveReqE3.url === '/init/api/action');
+    assert.strictEqual(JSON.parse(saveReqE3.opts.body).action, 'save_thinking');
+    assert.notStrictEqual(JSON.parse(saveReqE3.opts.body).choice, 'local');
+
+    // Twin E4 (unknown capability + local_admitted: true)
+    const envE4 = createPageEnvironment(markup, scriptCode);
+    envE4.boot();
+    await settle();
+    envE4.nextPending().resolve({
+      ...defaultState(),
+      mark: { state: 'locked', proposal_id: 'L', render: makeMark() },
+      thinking: { choice: null, saved: false, capability: 'unknown', download_bytes: null }
+    });
+    await settle();
+    const capReqE4 = envE4.nextPending();
+    if (capReqE4) {
+      capReqE4.resolve({ overall: 'unknown', local_admitted: true, checks: [] });
+      await settle();
+    }
+    const localInputE4 = envE4.doc.querySelector('input[value="local"]');
+    assert.strictEqual(localInputE4.disabled, false);
+    assert.strictEqual(localInputE4.parent.classList.contains('is-unavailable'), false);
+    const reasonSpanE4 = envE4.doc.getElementById('thinking-local-reason');
+    assert.ok(reasonSpanE4 && reasonSpanE4.textContent.length > 0);
+    assert.strictEqual(reasonSpanE4.hidden, false);
+    assert.strictEqual(reasonSpanE4.classList.contains('error-message'), false);
+    assert.strictEqual(envE4.doc.querySelectorAll('input[name="thinking-choice"]:checked').length, 0);
+
+    localInputE4.click();
+    await settle();
+    assert.strictEqual(envE4.doc.querySelectorAll('input[name="thinking-choice"]:checked').length, 1);
+    assert.strictEqual(localInputE4.checked, true);
+
+    envE4.doc.getElementById('thinking-continue').click();
+    await settle();
+    const saveReqE4 = envE4.nextPending();
+    assert.ok(saveReqE4 && saveReqE4.url === '/init/api/action');
+    assert.strictEqual(JSON.parse(saveReqE4.opts.body).action, 'save_thinking');
+    assert.strictEqual(JSON.parse(saveReqE4.opts.body).choice, 'local');
+
     // Twin F (capability failure)
     const envF = createPageEnvironment(markup, scriptCode);
     envF.boot();

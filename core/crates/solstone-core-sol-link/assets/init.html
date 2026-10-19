@@ -540,10 +540,15 @@
       container.appendChild(laterLabel);
     }
 
+    function localChoiceAdmitted(capability) {
+      return capability.overall === 'ok'
+        || (capability.overall === 'unknown' && capability.local_admitted === true);
+    }
+
     function renderThinkingUI() {
       renderThinkingOptions();
 
-      if (localCapability !== null && localCapability.overall !== 'ok') {
+      if (localCapability !== null && !localChoiceAdmitted(localCapability)) {
         if (userPicked && pickedChoice === 'local') {
           userPicked = false;
           pickedChoice = null;
@@ -557,7 +562,7 @@
       const stateCapability = (setupState && setupState.thinking && setupState.thinking.capability) || 'unknown';
       const localSelectable = (localCapability === null)
         ? (stateCapability !== 'blocked')
-        : (localCapability.overall === 'ok');
+        : localChoiceAdmitted(localCapability);
       const isBlocked = !localSelectable;
 
       const saved = setupState && setupState.thinking && setupState.thinking.saved === true && ['local', 'byo', 'spp', 'later'].includes(setupState.thinking.choice);
@@ -1039,12 +1044,11 @@
 
       const currentEpoch = selectionEpoch;
       const stateCap = (setupState && setupState.thinking && setupState.thinking.capability) || 'unknown';
-      const localAllowed = (localCapability === null) ? (stateCap === 'ok') : (localCapability.overall === 'ok');
+      const localAdmitted = (localCapability === null) ? (stateCap === 'ok') : localChoiceAdmitted(localCapability);
+      const defaultsToLocal = (localCapability === null) ? (stateCap === 'ok') : (localCapability.overall === 'ok');
       const saved = setupState && setupState.thinking && setupState.thinking.saved === true && ['local', 'byo', 'spp', 'later'].includes(setupState.thinking.choice);
-      let chosen = userPicked ? pickedChoice : (saved ? setupState.thinking.choice : (localAllowed ? 'local' : 'later'));
-      if (chosen === 'local' && !localAllowed) {
-        chosen = 'later';
-      }
+      let chosen = userPicked ? pickedChoice : (saved ? setupState.thinking.choice : (defaultsToLocal ? 'local' : 'later'));
+      if (chosen === 'local' && !localAdmitted) chosen = 'later';
       const effectiveChoice = chosen;
       const needsSave = !saved || (userPicked && pickedChoice !== setupState.thinking.choice);
 

@@ -620,6 +620,7 @@ async fn state(
                 "saved_lane": saved_lane,
                 "local_capability": {
                     "overall": capability.overall,
+                    "local_admitted": capability.local_admitted,
                     "reason_code": reason_code,
                     "detail": detail,
                 },
@@ -807,19 +808,11 @@ async fn start_local_bootstrap(
         ));
     };
     let capability = solstone_core_sol_link::http::compute_local_capability(&journal.0).await;
-    if let Some(refusal) = solstone_core_thinking::local::blocked_capability_refusal(
-        capability.overall,
-        capability.checks.first().map(|c| c.reason_code),
-        capability
-            .checks
-            .first()
-            .map(|c| c.detail.as_str())
-            .unwrap_or(""),
-    ) {
+    if !capability.admits_local() {
         return json_response(json!({
             "refused": true,
-            "reason_code": refusal.reason_code,
-            "detail": refusal.detail,
+            "reason_code": capability.checks.first().map(|c| c.reason_code).unwrap_or(""),
+            "detail": capability.checks.first().map(|c| c.detail.as_str()).unwrap_or(""),
         }));
     }
     #[cfg(windows)]

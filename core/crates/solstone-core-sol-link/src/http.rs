@@ -184,7 +184,14 @@ struct MarkResponse {
 #[derive(Debug, PartialEq, Serialize)]
 pub struct LocalCapabilityResponse {
     pub overall: &'static str,
+    pub local_admitted: bool,
     pub checks: Vec<LocalCapabilityCheck>,
+}
+
+impl LocalCapabilityResponse {
+    pub fn admits_local(&self) -> bool {
+        self.overall == "ok" || (self.overall == "unknown" && self.local_admitted)
+    }
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -356,6 +363,7 @@ pub async fn compute_local_capability(journal_root: &Path) -> LocalCapabilityRes
             log::warn!("local capability check did not finish: {error}");
             LocalCapabilityResponse {
                 overall: "unknown",
+                local_admitted: false,
                 checks: Vec::new(),
             }
         }
@@ -379,14 +387,18 @@ pub(crate) mod setup_probe_test {
     }
 
     static PAUSES: OnceLock<Mutex<BTreeMap<PathBuf, Pause>>> = OnceLock::new();
-    static CAPABILITIES: OnceLock<Mutex<BTreeMap<PathBuf, &'static str>>> = OnceLock::new();
+    static CAPABILITIES: OnceLock<Mutex<BTreeMap<PathBuf, (&'static str, bool)>>> = OnceLock::new();
 
     pub(crate) fn capability(root: &Path, overall: &'static str) {
+        capability_admitted(root, overall, false);
+    }
+
+    pub(crate) fn capability_admitted(root: &Path, overall: &'static str, local_admitted: bool) {
         CAPABILITIES
             .get_or_init(Default::default)
             .lock()
             .unwrap()
-            .insert(root.to_owned(), overall);
+            .insert(root.to_owned(), (overall, local_admitted));
     }
 
     pub(crate) fn clear(root: &Path) {
@@ -421,13 +433,13 @@ pub(crate) mod setup_probe_test {
             .lock()
             .unwrap()
             .remove(root);
-        let overall = if let Some(pause) = pause {
+        let (overall, local_admitted) = if let Some(pause) = pause {
             pause.reached.send(()).unwrap();
             pause
                 .release
                 .recv_timeout(std::time::Duration::from_secs(60))
                 .unwrap();
-            "ok"
+            ("ok", true)
         } else {
             *CAPABILITIES
                 .get_or_init(Default::default)
@@ -437,6 +449,7 @@ pub(crate) mod setup_probe_test {
         };
         Some(LocalCapabilityResponse {
             overall,
+            local_admitted,
             checks: Vec::new(),
         })
     }
@@ -577,6 +590,7 @@ pub(crate) fn local_capability(report: &CheckReport) -> LocalCapabilityResponse 
     if let Some(row) = rows().find(|check| check.severity == Severity::Blocked) {
         return LocalCapabilityResponse {
             overall: "blocked",
+            local_admitted: false,
             checks: vec![LocalCapabilityCheck {
                 name: "local",
                 severity: "blocked",
@@ -597,13 +611,16 @@ pub(crate) fn local_capability(report: &CheckReport) -> LocalCapabilityResponse 
             } else {
                 Vec::new()
             };
+        let local_admitted = matches!(report.platform.os.as_str(), "Darwin" | "Linux");
         return LocalCapabilityResponse {
             overall: "unknown",
+            local_admitted,
             checks,
         };
     }
     LocalCapabilityResponse {
         overall: "ok",
+        local_admitted: true,
         checks: Vec::new(),
     }
 }
@@ -1024,7 +1041,9 @@ async fn init_action(
             }
 
             let local_available = choice != "local"
-                || compute_local_capability(&state.journal_root).await.overall == "ok";
+                || compute_local_capability(&state.journal_root)
+                    .await
+                    .admits_local();
             let mutation = mutate_journal_config(
                 &state.journal_root,
                 solstone_core_journal_config_write::LockOptions::default(),
@@ -1084,7 +1103,10 @@ async fn init_action(
                     StatusCode::BAD_REQUEST,
                 ));
             }
-            if compute_local_capability(&state.journal_root).await.overall != "ok" {
+            if !compute_local_capability(&state.journal_root)
+                .await
+                .admits_local()
+            {
                 return choice_error((
                     "local_unavailable",
                     "local thinking is not available on your journal's computer",
@@ -1393,10 +1415,12 @@ async fn init_finalize(
 
     let completed_at_existing = setup_is_complete(&config);
 
-    let cap = if !completed_at_existing && choice == "local" {
-        compute_local_capability(&state.journal_root).await.overall
+    let local_available = if !completed_at_existing && choice == "local" {
+        compute_local_capability(&state.journal_root)
+            .await
+            .admits_local()
     } else {
-        "unknown"
+        false
     };
 
     let result = mutate_journal_config(
@@ -1420,7 +1444,7 @@ async fn init_finalize(
                 };
             }
             let (mut changed, start_local) =
-                match transition_thinking_choice(config, choice, cap == "ok") {
+                match transition_thinking_choice(config, choice, local_available) {
                     Ok(transition) => transition,
                     Err(error) => {
                         return JournalConfigMutation {
@@ -1701,10 +1725,6 @@ mod local_capability_tests {
         inputs
     }
 
-    fn verdict(inputs: &CheckInputs) -> &'static str {
-        local_capability(&build_check_report(inputs)).overall
-    }
-
     #[test]
     fn a_mac_below_the_memory_bar_is_refused_with_a_reason() {
         let capability = local_capability(&build_check_report(&inputs(
@@ -1713,24 +1733,34 @@ mod local_capability_tests {
             Some(8 * GIB),
         )));
         assert_eq!(capability.overall, "blocked");
+        assert!(!capability.local_admitted);
         assert_eq!(capability.checks.len(), 1);
         assert_eq!(capability.checks[0].name, "local");
         assert_eq!(capability.checks[0].severity, "blocked");
         assert_eq!(capability.checks[0].reason_code, "memory");
         assert!(!capability.checks[0].detail.is_empty());
-        assert_eq!(verdict(&inputs("Darwin", "arm64", Some(32 * GIB))), "ok");
+        let ok_report = local_capability(&build_check_report(&inputs(
+            "Darwin",
+            "arm64",
+            Some(32 * GIB),
+        )));
+        assert_eq!(ok_report.overall, "ok");
+        assert!(ok_report.local_admitted);
     }
 
     #[test]
     fn a_gpu_below_the_memory_bar_is_refused_with_a_reason() {
         let capability = local_capability(&build_check_report(&linux_with_nvidia(Some(4096))));
         assert_eq!(capability.overall, "blocked");
+        assert!(!capability.local_admitted);
         assert_eq!(capability.checks.len(), 1);
         assert_eq!(capability.checks[0].name, "local");
         assert_eq!(capability.checks[0].severity, "blocked");
         assert_eq!(capability.checks[0].reason_code, "gpu");
         assert!(!capability.checks[0].detail.is_empty());
-        assert_eq!(verdict(&linux_with_nvidia(Some(12 * 1024))), "ok");
+        let ok_report = local_capability(&build_check_report(&linux_with_nvidia(Some(12 * 1024))));
+        assert_eq!(ok_report.overall, "ok");
+        assert!(ok_report.local_admitted);
     }
 
     #[test]
@@ -1741,6 +1771,7 @@ mod local_capability_tests {
             Some(32 * GIB),
         )));
         assert_eq!(capability.overall, "blocked");
+        assert!(!capability.local_admitted);
         assert_eq!(capability.checks.len(), 1);
         assert_eq!(capability.checks[0].name, "local");
         assert_eq!(capability.checks[0].severity, "blocked");
@@ -1756,6 +1787,7 @@ mod local_capability_tests {
             Some(32 * GIB),
         )));
         assert_eq!(capability.overall, "blocked");
+        assert!(!capability.local_admitted);
         assert_eq!(capability.checks.len(), 1);
         assert_eq!(capability.checks[0].name, "local");
         assert_eq!(capability.checks[0].severity, "blocked");
@@ -1774,12 +1806,20 @@ mod local_capability_tests {
             .unwrap_or("");
         let linux_unknown = local_capability(&linux_report);
         assert_eq!(linux_unknown.overall, "unknown");
+        assert!(linux_unknown.local_admitted);
         assert_eq!(linux_unknown.checks.len(), 1);
         assert!(!linux_unknown.checks[0].detail.is_empty());
         assert_ne!(linux_unknown.checks[0].detail, raw_detail);
         let darwin_unknown =
             local_capability(&build_check_report(&inputs("Darwin", "arm64", None)));
         assert_eq!(darwin_unknown.overall, "unknown");
+        assert!(darwin_unknown.local_admitted);
         assert!(darwin_unknown.checks.is_empty());
+
+        let mut win_inputs = inputs("Windows", "x86_64", Some(32 * GIB));
+        win_inputs.vulkan.probe_ok = false;
+        let win_unknown = local_capability(&build_check_report(&win_inputs));
+        assert_eq!(win_unknown.overall, "unknown");
+        assert!(!win_unknown.local_admitted);
     }
 }
