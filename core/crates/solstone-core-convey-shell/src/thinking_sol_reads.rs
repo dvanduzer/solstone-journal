@@ -642,11 +642,17 @@ fn read_run(path: &Path, journal: &Path, use_id: &str) -> Result<Value, RunError
     let parsed = parse_events(lines);
     let output_file = output_file(&request, journal).map_err(RunError::Operation)?;
     let start = request_start(&request, use_id);
-    let end = parsed.finish_ts.or(parsed.error_ts);
-    let runtime_seconds = end
-        .filter(|_| start != 0)
-        .map(|end| (end - start) as f64 / 1000.0);
     let end_state = parsed.end_state.as_deref().unwrap_or("unknown");
+    let end = match end_state {
+        "finish" => parsed.finish_ts,
+        "error" => parsed.error_ts,
+        _ => None,
+    };
+    let runtime_seconds = end
+        .filter(|_| start > 0)
+        .and_then(|end| end.checked_sub(start))
+        .filter(|elapsed| *elapsed >= 0)
+        .map(|elapsed| elapsed as f64 / 1000.0);
     let zone = owner_zone(journal);
     Ok(json!({
         "id": use_id,
@@ -723,12 +729,12 @@ fn parse_events<'a>(lines: impl Iterator<Item = &'a str>) -> ParsedEvents {
                 parsed.provider = event.get("provider").cloned();
             }
             Some("finish") => {
-                parsed.finish_ts = event.get("ts").and_then(Value::as_i64).or(Some(0));
+                parsed.finish_ts = event.get("ts").and_then(Value::as_i64);
                 parsed.usage = event.get("usage").cloned();
                 parsed.end_state = Some("finish".to_owned());
             }
             Some("error") => {
-                parsed.error_ts = event.get("ts").and_then(Value::as_i64).or(Some(0));
+                parsed.error_ts = event.get("ts").and_then(Value::as_i64);
                 parsed.reason_code = event.get("reason_code").cloned().unwrap_or(Value::Null);
                 if let Some(message) = event
                     .get("error")
@@ -1075,5 +1081,131 @@ mod tests {
             panic!("run detail");
         };
         assert_eq!(run["day"], "20250101");
+    }
+
+    #[test]
+    fn run_duration_uses_only_valid_timestamps_for_the_final_terminal_state() {
+        let root = tempfile::TempDir::new().expect("root");
+        let directory = root.path().join("talents/demo");
+        fs::create_dir_all(&directory).expect("talent directory");
+        let cases = [
+            (
+                json!({}),
+                "1792376400786",
+                vec![json!({"event":"finish","result":"Written"})],
+                Value::Null,
+                false,
+            ),
+            (
+                json!({}),
+                "1000",
+                vec![json!({"event":"error","error":"refused"})],
+                Value::Null,
+                true,
+            ),
+            (
+                json!({"ts":1000}),
+                "1000",
+                vec![json!({"event":"finish","ts":"2000"})],
+                Value::Null,
+                false,
+            ),
+            (
+                json!({"ts":1000}),
+                "1000",
+                vec![json!({"event":"error","ts":2000.5})],
+                Value::Null,
+                true,
+            ),
+            (
+                json!({}),
+                "1000",
+                vec![json!({"event":"finish","ts":2500})],
+                json!(1.5),
+                false,
+            ),
+            (
+                json!({"ts":1000}),
+                "9999",
+                vec![json!({"event":"error","ts":1000})],
+                json!(0.0),
+                true,
+            ),
+            (
+                json!({"ts":2000}),
+                "1000",
+                vec![json!({"event":"finish","ts":1000})],
+                Value::Null,
+                false,
+            ),
+            (
+                json!({"ts":-1}),
+                "1000",
+                vec![json!({"event":"finish","ts":1000})],
+                Value::Null,
+                false,
+            ),
+            (
+                json!({}),
+                "unknown",
+                vec![json!({"event":"finish","ts":1000})],
+                Value::Null,
+                false,
+            ),
+            (
+                json!({"ts":1}),
+                "1000",
+                vec![json!({"event":"error","ts":i64::MIN})],
+                Value::Null,
+                true,
+            ),
+            (
+                json!({"ts":1000}),
+                "1000",
+                vec![
+                    json!({"event":"error","ts":2000}),
+                    json!({"event":"finish"}),
+                ],
+                Value::Null,
+                false,
+            ),
+            (
+                json!({"ts":1000}),
+                "1000",
+                vec![
+                    json!({"event":"finish","ts":2000}),
+                    json!({"event":"error"}),
+                ],
+                Value::Null,
+                true,
+            ),
+            (
+                json!({"ts":1000}),
+                "1000",
+                vec![
+                    json!({"event":"finish","ts":2000}),
+                    json!({"event":"finish"}),
+                ],
+                Value::Null,
+                false,
+            ),
+        ];
+        for (mut request, use_id, events, duration, failed) in cases {
+            let path = directory.join(format!("{use_id}.jsonl"));
+            request["event"] = json!("request");
+            request["use_id"] = json!(use_id);
+            request["name"] = json!("demo");
+            let mut lines = vec![request.to_string()];
+            lines.extend(events.iter().map(Value::to_string));
+            fs::write(&path, lines.join("\n")).expect("run log");
+            let run = read_run(&path, root.path(), use_id)
+                .unwrap_or_else(|_| panic!("run detail: {lines:?}"));
+            assert_eq!(run["runtime_seconds"], duration, "{lines:?}");
+            assert_eq!(run["failed"], failed, "{lines:?}");
+            assert_eq!(run["events"], json!(events), "{lines:?}");
+            if request.get("ts").is_none() && use_id == "1000" {
+                assert_eq!(run["start"], 1000);
+            }
+        }
     }
 }
