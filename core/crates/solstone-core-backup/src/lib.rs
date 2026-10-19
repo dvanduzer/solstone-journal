@@ -47,6 +47,7 @@ pub use state::{
     record_offload_result, record_prune_result, record_restore_result, record_verification_result,
     set_destination, set_enabled, set_mode, set_offload, set_recovery_key,
     set_recovery_key_confirmed, set_retention, stage_pending_key_revocation_at_root, status_view,
+    with_backup_task_checkpoint,
 };
 
 pub(crate) const OFFLOAD_STATUSES: [&str; 4] = ["ok", "skipped", "stalled", "error"];

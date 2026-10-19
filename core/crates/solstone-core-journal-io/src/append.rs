@@ -28,10 +28,188 @@ fn sync_file(file: &fs::File) -> io::Result<()> {
 /// underlying single write reports a short byte count.
 #[cfg(any(unix, windows))]
 pub fn append_text(path: impl AsRef<Path>, text: &str) -> Result<(), AppendError> {
+    append_text_checked(path, text, &|| Ok(()))
+}
+
+/// Append one record, checking before the parent is created and again immediately
+/// before the record is written.
+#[cfg(any(unix, windows))]
+pub fn append_text_checked(
+    path: impl AsRef<Path>,
+    text: &str,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), AppendError> {
     let mut contents = Vec::with_capacity(text.len() + 1);
     contents.extend_from_slice(text.as_bytes());
     contents.push(b'\n');
-    append_record(path.as_ref(), &contents)
+    append_record(path.as_ref(), &contents, checkpoint)
+}
+
+#[cfg(unix)]
+use crate::FlatDirectory as CheckedAppendDirectory;
+#[cfg(windows)]
+use crate::WindowsFlatDirectory as CheckedAppendDirectory;
+
+/// Append through the retained parent, refusing links and renewing caller and
+/// named-file authority immediately before the write. An error after a write
+/// can leave appended bytes; success acknowledges the complete record/file sync.
+#[cfg(any(unix, windows))]
+pub fn append_text_bound_checked(
+    parent: &CheckedAppendDirectory,
+    name: &std::ffi::OsStr,
+    text: &str,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), AppendError> {
+    let path = parent.diagnostic_path().join(name);
+    if name
+        .to_str()
+        .is_none_or(|name| crate::check_portable_component(name).is_err())
+    {
+        return Err(io_error(
+            &path,
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid append filename"),
+        ));
+    }
+    let check = || {
+        checkpoint().map_err(|detail| {
+            io_error(&path, io::Error::new(io::ErrorKind::Interrupted, detail))
+        })?;
+        #[cfg(unix)]
+        let result = parent.revalidate();
+        #[cfg(windows)]
+        let result = parent.revalidate_bound();
+        result.map_err(|error| io_error(&path, io::Error::other(error.to_string())))
+    };
+    check()?;
+    let file = open_bound_append(parent, name).map_err(|error| io_error(&path, error))?;
+    bound_append_open_barrier();
+    check()?;
+    check_bound_append_file(parent, name, &file).map_err(|error| io_error(&path, error))?;
+    let mut contents = Vec::with_capacity(text.len() + 1);
+    contents.extend_from_slice(text.as_bytes());
+    contents.push(b'\n');
+    write_and_sync(&path, file, &contents)?;
+    #[cfg(unix)]
+    nix::unistd::fsync(parent).map_err(|error| io_error(&path, error.into()))?;
+    check()
+}
+
+#[cfg(unix)]
+fn open_bound_append(
+    parent: &CheckedAppendDirectory,
+    name: &std::ffi::OsStr,
+) -> io::Result<fs::File> {
+    use nix::fcntl::{OFlag, openat};
+    use nix::sys::stat::Mode;
+    let file = openat(
+        parent,
+        name,
+        OFlag::O_WRONLY
+            | OFlag::O_APPEND
+            | OFlag::O_CREAT
+            | OFlag::O_NOFOLLOW
+            | OFlag::O_CLOEXEC
+            | OFlag::O_NONBLOCK,
+        Mode::from_bits_truncate(0o666),
+    )
+    .map(fs::File::from)
+    .map_err(io::Error::from)?;
+    check_bound_append_file(parent, name, &file)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn check_bound_append_file(
+    parent: &CheckedAppendDirectory,
+    name: &std::ffi::OsStr,
+    file: &fs::File,
+) -> io::Result<()> {
+    use nix::fcntl::AtFlags;
+    use nix::sys::stat::{SFlag, fstat, fstatat};
+    let opened = fstat(file).map_err(io::Error::from)?;
+    let named = fstatat(parent, name, AtFlags::AT_SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
+    if opened.st_nlink != 1
+        || named.st_nlink != 1
+        || SFlag::from_bits_truncate(opened.st_mode) != SFlag::S_IFREG
+        || SFlag::from_bits_truncate(named.st_mode) != SFlag::S_IFREG
+        || opened.st_dev != named.st_dev
+        || opened.st_ino != named.st_ino
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "append destination changed",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn open_bound_append(
+    parent: &CheckedAppendDirectory,
+    name: &std::ffi::OsStr,
+) -> io::Result<fs::File> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = crate::windows_sync_dir::create_or_open_windows_append_file_bound(
+        parent,
+        name,
+        parent.diagnostic_path(),
+    )
+    .map_err(|error| io::Error::other(error.to_string()))?;
+    file.seek(SeekFrom::End(0))?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn check_bound_append_file(
+    parent: &CheckedAppendDirectory,
+    name: &std::ffi::OsStr,
+    file: &fs::File,
+) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    let opened = crate::windows_identity::file_identity(file.as_raw_handle())?;
+    let named = crate::windows_sync_dir::open_windows_regular_file_from_bound_parent(
+        parent,
+        name,
+        parent.diagnostic_path(),
+    )
+    .map_err(|error| io::Error::other(error.to_string()))?
+    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "append destination disappeared"))?;
+    if opened != crate::windows_identity::file_identity(named.as_raw_handle())? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "append destination changed",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+thread_local! {
+    static BOUND_APPEND_OPEN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn run_with_bound_append_open_barrier<T>(
+    callback: impl FnOnce() + 'static,
+    operation: impl FnOnce() -> T,
+) -> (T, bool) {
+    BOUND_APPEND_OPEN_HOOK.with(|hook| {
+        assert!(hook.borrow().is_none(), "bound append hook already active");
+        *hook.borrow_mut() = Some(Box::new(callback));
+    });
+    let result = operation();
+    let pending = BOUND_APPEND_OPEN_HOOK.with(|hook| hook.borrow_mut().take());
+    (result, pending.is_none())
+}
+
+fn bound_append_open_barrier() {
+    #[cfg(any(test, feature = "test-hooks"))]
+    BOUND_APPEND_OPEN_HOOK.with(|hook| {
+        let callback = hook.borrow_mut().take();
+        if let Some(callback) = callback {
+            callback();
+        }
+    });
 }
 
 /// Serialize and append one newline-terminated JSON record through a single raw write.
@@ -44,7 +222,7 @@ pub fn append_jsonl<T: Serialize>(path: impl AsRef<Path>, record: &T) -> Result<
     let mut contents = serde_json::to_vec(record)
         .map_err(|source| io_error(path, io::Error::new(io::ErrorKind::InvalidData, source)))?;
     contents.push(b'\n');
-    append_record(path, &contents)
+    append_record(path, &contents, &|| Ok(()))
 }
 
 #[cfg(unix)]
@@ -148,16 +326,27 @@ fn append_record_no_follow(
     Ok(())
 }
 
-fn append_record(path: &Path, contents: &[u8]) -> Result<(), AppendError> {
+fn append_record(
+    path: &Path,
+    contents: &[u8],
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), AppendError> {
+    let check = || {
+        checkpoint()
+            .map_err(|detail| io_error(path, io::Error::new(io::ErrorKind::Interrupted, detail)))
+    };
+    check()?;
     let parent = parent_dir(path);
     fs::create_dir_all(parent).map_err(|source| io_error(path, source))?;
     #[cfg(unix)]
     let is_new = !path.exists();
+    check()?;
     let file = OpenOptions::new()
         .append(true)
         .create(true)
         .open(path)
         .map_err(|source| io_error(path, source))?;
+    check()?;
     write_and_sync(path, file, contents)?;
     #[cfg(unix)]
     if is_new {
@@ -531,6 +720,24 @@ mod tests {
             vec!["first", r#"{"second":true}"#]
         );
         assert!(contents.ends_with('\n'));
+    }
+
+    #[test]
+    fn checked_append_refuses_revoked_authority_after_destination_open() {
+        let temporary = TempDir::new();
+        let path = temporary.path().join("records.jsonl");
+        let result = append_text_checked(&path, "withheld", &|| {
+            if path.exists() {
+                Err("authority revoked after open".to_owned())
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(result, Err(AppendError::Io { source, .. })
+            if source.kind() == io::ErrorKind::Interrupted));
+        assert_eq!(fs::read(&path).unwrap(), b"");
+        append_text_checked(&path, "admitted", &|| Ok(())).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"admitted\n");
     }
 
     #[test]

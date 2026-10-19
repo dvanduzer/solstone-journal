@@ -13,6 +13,7 @@ mod error;
 mod fold;
 mod migrations;
 mod model;
+mod publication;
 mod run;
 mod scan;
 mod tokens;
@@ -43,7 +44,7 @@ pub use migrations::{StatsTopicMigrationReport, migrate_stats_topic_keys};
 pub use model::{
     ActivityTotals, CacheStatus, DayScan, DayStats, HeatmapData, SCHEMA_VERSION, ScanDayOutcome,
 };
-pub use run::{CliRun, run_cli};
+pub use run::{CliRun, run_cli, run_cli_with_cache, run_cli_with_cache_checked};
 
 /// Read token usage keyed by the token-file filename day without writing
 /// its optional cache sidecar. A day is the local calendar day of the write.
@@ -89,6 +90,22 @@ where
     H: HealthLogSource,
     W: DayCacheWriter,
 {
+    scan_day_with_checkpoint(request, use_cache, None)
+}
+
+pub(crate) fn scan_day_with_checkpoint<S, H, W>(
+    request: DayScanRequest<'_, S, H, W>,
+    use_cache: bool,
+    checkpoint: Option<&dyn Fn() -> Result<(), String>>,
+) -> Result<ScanDayOutcome, JournalStatsError>
+where
+    S: SegmentSource,
+    H: HealthLogSource,
+    W: DayCacheWriter,
+{
+    if let Some(checkpoint) = checkpoint {
+        checkpoint().map_err(JournalStatsError::Validation)?;
+    }
     NaiveDate::parse_from_str(request.day, "%Y%m%d")
         .map_err(|_| JournalStatsError::InvalidDay(request.day.to_owned()))?;
     let day_dir = solstone_core_journal_io::day_path(request.journal_root, request.day, false)?;
@@ -124,7 +141,16 @@ where
                 (unreadable_inputs, &error)
             {
                 // Best effort: an unsaved failure is only scanned again next run.
-                let _ = cache::save_unreadable_day(&day_dir, &fingerprint, &error.to_string());
+                if let Some(checkpoint) = checkpoint {
+                    let _ = cache::save_unreadable_day_checked(
+                        &day_dir,
+                        &fingerprint,
+                        &error.to_string(),
+                        checkpoint,
+                    );
+                } else {
+                    let _ = cache::save_unreadable_day(&day_dir, &fingerprint, &error.to_string());
+                }
             }
             return Err(error);
         }
@@ -136,7 +162,14 @@ where
         });
     }
     let cache_path = day_dir.join("stats.json");
-    let cache_status = match cache::save_day_cache(request.cache_writer, &cache_path, &scan) {
+    let saved = if let Some(checkpoint) = checkpoint {
+        request
+            .cache_writer
+            .write_day_cache_checked(&cache_path, &scan, checkpoint)
+    } else {
+        cache::save_day_cache(request.cache_writer, &cache_path, &scan)
+    };
+    let cache_status = match saved {
         Ok(()) => CacheStatus::Saved,
         Err(error) => CacheStatus::SaveFailed {
             message: error.to_string(),

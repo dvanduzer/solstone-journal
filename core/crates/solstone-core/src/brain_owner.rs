@@ -41,7 +41,10 @@ impl OwnerProbe for DesktopProbe {
         request: &GenerateRequest,
         _journal: &Path,
         _config: &Map<String, Value>,
+        cancellation: &solstone_core_generate::Cancellation,
     ) -> Result<GenerateResponse, ClientError> {
+        let _ = cancellation;
+        let _ = solstone_core_generate::Cancellation::never();
         OneShotClient::sibling().and_then(|client| client.execute(request))
     }
 }
@@ -62,6 +65,7 @@ pub(crate) fn run(command: JournalBrainOwnerCommand) -> ExitCode {
                 },
                 &DesktopProbe,
                 &ProductionSppPrerequisite,
+                &|| false,
             );
             handle_outcome(outcome, options.json)
         }
@@ -77,6 +81,7 @@ pub(crate) fn run(command: JournalBrainOwnerCommand) -> ExitCode {
                 expected_fingerprint.as_deref(),
                 &DesktopProbe,
                 &ProductionSppPrerequisite,
+                &|| false,
             );
             handle_outcome(outcome, json)
         }
@@ -122,6 +127,7 @@ fn handle_outcome(outcome: OwnerRefreshOutcome, json_output: bool) -> ExitCode {
             render(&view, json_output);
             ExitCode::from(owner_exit_code(&view))
         }
+        OwnerRefreshOutcome::Cancelled => ExitCode::from(EXIT_UNAVAILABLE),
     }
 }
 

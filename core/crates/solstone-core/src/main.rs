@@ -1247,6 +1247,9 @@ fn feed_transcribed_files(journal: &Path, files: &[solstone_core_transcribe::Tra
                 | solstone_core_speaker_resolve::candidate_tracker::CandidateTrackerError::Lock(_) => {
                     log::warn!("speaker candidate pool left unchanged because the pool could not be read");
                 }
+                solstone_core_speaker_resolve::candidate_tracker::CandidateTrackerError::Cancelled(_) => {
+                    log::warn!("speaker candidate pool left unchanged because the write was stopped");
+                }
             }
         }
     }

@@ -9,30 +9,52 @@
 
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Duration, Utc};
 use getrandom::fill as fill_random;
 use serde_json::{Map, Value, json};
+#[cfg(unix)]
 use solstone_core_journal_io::{
-    AtomicWriteOptions, FileLease, JsonWriteOptions, LeaseOptions, LockOptions, acquire_file_lease,
-    atomic_replace, hold_lock, write_json,
+    BoundAtomicOutcome, FlatDirectory as BrainHealth, atomic_replace_bound_checked,
+    create_or_open_flat_directory_bound, open_flat_directory_bound, read_observed_file,
+};
+use solstone_core_journal_io::{
+    BoundParentLock, FileLease, JournalRoot, JsonWriteOptions, LeaseOptions, LockOptions,
+    ObjectIdentity, acquire_existing_parent_lock_bound_checked, acquire_file_lease_bound_checked,
+    hold_lock, serialize_json_bytes,
+};
+#[cfg(windows)]
+use solstone_core_journal_io::{
+    DetailedAtomicOutcome, WindowsFlatDirectory as BrainHealth,
+    atomic_replace_detailed_bound_checked, create_or_open_windows_flat_directory_bound,
+    open_windows_flat_directory_bound, read_windows_observed_file_bounded,
 };
 
+use crate::credential_hold::{
+    CredentialHoldOrigin, CredentialHoldSession, CredentialHoldTarget, CredentialMemorySnapshot,
+    CredentialPositivePublication, CredentialProviderGeneration, ObservationCarrier,
+    ProvisionalCredentialRejection, VolatileCredentialWitness,
+};
 use crate::fingerprint::{
-    LaneResolution, build_active_brain_fingerprint, derive_active_brain_lane,
+    LaneResolution, StoredCredentialBinding, build_active_brain_fingerprint,
+    classify_stored_binding, derive_active_brain_lane,
 };
 use crate::fixture::local_contract;
+use crate::inspect::{FINGERPRINT_KEY_BYTES, FingerprintKeyMaterial};
+#[cfg(test)]
 use crate::inspect::{
-    FINGERPRINT_KEY_BYTES, brain_fingerprint_key_path, brain_refresh_lease_path, brain_state_path,
+    brain_fingerprint_key_path, brain_refresh_lease_path, brain_state_path,
     load_existing_fingerprint_key,
 };
 use crate::record::{
-    BrainStateRecord, ValidationError, component_status_for_reason, parse_component,
-    parse_evidence, parse_runtime_failure_marker, reduce_evidence_with_runtime,
-    spp_reason_diagnostic, valid_spp_reason, validate_brain_state_record,
+    BrainStateRecord, CredentialObservation, CredentialRejectionHold, ValidationError,
+    component_status_for_reason, parse_component, parse_evidence, parse_runtime_failure_marker,
+    reduce_evidence_with_runtime, spp_reason_diagnostic, valid_spp_reason,
+    validate_brain_state_record,
 };
 
 const BRAIN_FILE_MODE: u32 = 0o600;
@@ -78,7 +100,363 @@ pub struct BrainRefreshPermit {
     pub fingerprint_sha256: String,
     pub checking_revision: u64,
     pub runtime_failure_marker_seen: Option<String>,
+    credential_holds_seen: BTreeMap<String, CredentialRejectionHold>,
+    credential_generation: Option<Box<CredentialProviderGeneration>>,
+    credential_authority_seen: Option<Box<RefreshCredentialAuthority>>,
+    credential_publication_deadline: Option<std::time::Instant>,
+    bundled_runtime_fingerprint_sha256: Option<String>,
+    root: Box<BrainWriteRoot>,
     _lease: FileLease,
+}
+
+/// Credential authority for the active BYO lane, captured before real work.
+/// Model/fingerprint revisions and UI probe metadata are not authentication
+/// generations. Only the existing strict config and Brain carriers are read.
+#[derive(Debug, Clone, PartialEq)]
+struct RefreshCredentialAuthority {
+    provider: String,
+    config: Option<Value>,
+    observation: Option<CredentialObservation>,
+}
+
+impl RefreshCredentialAuthority {
+    fn capture(
+        root: &BrainWriteRoot,
+        resolution: &LaneResolution,
+    ) -> Result<Option<Self>, WriterError> {
+        let provider = match resolution.lane.as_deref() {
+            Some("byo-cloud")
+                if matches!(
+                    resolution.provider.as_str(),
+                    "openai" | "anthropic" | "google"
+                ) =>
+            {
+                resolution.provider.as_str()
+            }
+            Some("byo-endpoint") => "local",
+            _ => return Ok(None),
+        };
+        Ok(Some(Self {
+            provider: provider.to_owned(),
+            config: credential_config_authority(root, provider)?,
+            observation: credential_observation_for_provider(root, provider)?,
+        }))
+    }
+
+    fn checkpoint(&self, root: &BrainWriteRoot) -> Result<(), WriterError> {
+        if credential_config_authority(root, &self.provider)? != self.config
+            || credential_observation_for_provider(root, &self.provider)? != self.observation
+        {
+            return Err(WriterError::Conflict(
+                "credential observation changed during refresh".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Retain the admitted root for the entire refresh, including its finish path.
+struct BrainWriteRoot {
+    root: Arc<JournalRoot>,
+    admitted_path: PathBuf,
+    health: OnceLock<BrainHealth>,
+}
+
+impl fmt::Debug for BrainWriteRoot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("BrainWriteRoot")
+            .field(&self.root.identity())
+            .finish()
+    }
+}
+
+impl BrainWriteRoot {
+    fn open(journal: &Path) -> Result<Self, WriterError> {
+        let root = Arc::new(
+            JournalRoot::open(journal).map_err(|error| WriterError::Io(error.to_string()))?,
+        );
+        Self::open_bound(root, journal)
+    }
+
+    fn open_bound(root: Arc<JournalRoot>, journal: &Path) -> Result<Self, WriterError> {
+        let admitted_path =
+            std::path::absolute(journal).map_err(|error| WriterError::Io(error.to_string()))?;
+        let context = Self {
+            root,
+            admitted_path,
+            health: OnceLock::new(),
+        };
+        context.check().map_err(WriterError::Io)?;
+        Ok(context)
+    }
+
+    fn checkpoint(&self, journal: &Path) -> Result<(), String> {
+        self.root
+            .revalidate_canonical_binding()
+            .map_err(|error| error.to_string())?;
+        let current = JournalRoot::open(journal).map_err(|error| error.to_string())?;
+        if current.identity() != self.root.identity() {
+            return Err("admitted journal root changed".to_owned());
+        }
+        if let Some(health) = self.health.get() {
+            let named = self
+                .open_health()
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "admitted Brain health directory disappeared".to_owned())?;
+            if health_identity(&named) != health_identity(health) {
+                return Err("admitted Brain health directory changed".to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    fn check(&self) -> Result<(), String> {
+        self.checkpoint(&self.admitted_path)
+    }
+
+    fn open_health(&self) -> Result<Option<BrainHealth>, WriterError> {
+        #[cfg(unix)]
+        let result = open_flat_directory_bound(
+            &*self.root,
+            OsStr::new("health"),
+            self.root.canonical_path(),
+        );
+        #[cfg(windows)]
+        let result = open_windows_flat_directory_bound(
+            &*self.root,
+            OsStr::new("health"),
+            self.root.canonical_path(),
+        );
+        result.map_err(|error| WriterError::Io(error.to_string()))
+    }
+
+    fn health(&self, create: bool) -> Result<Option<&BrainHealth>, WriterError> {
+        self.check().map_err(WriterError::Io)?;
+        if self.health.get().is_none() {
+            let opened = self.open_health()?;
+            let opened = match (opened, create) {
+                (Some(health), _) => Some(health),
+                (None, false) => None,
+                (None, true) => {
+                    #[cfg(unix)]
+                    let result = create_or_open_flat_directory_bound(
+                        &*self.root,
+                        OsStr::new("health"),
+                        0o777,
+                        self.root.canonical_path(),
+                    );
+                    #[cfg(windows)]
+                    let result = create_or_open_windows_flat_directory_bound(
+                        &*self.root,
+                        OsStr::new("health"),
+                        self.root.canonical_path(),
+                    );
+                    Some(result.map_err(|error| WriterError::Io(error.to_string()))?)
+                }
+            };
+            if let Some(health) = opened {
+                let _ = self.health.set(health);
+            }
+        }
+        self.check().map_err(WriterError::Io)?;
+        Ok(self.health.get())
+    }
+
+    fn read(&self, name: &OsStr) -> Result<Option<Vec<u8>>, WriterError> {
+        let Some(health) = self.health(false)? else {
+            return Ok(None);
+        };
+        #[cfg(unix)]
+        let result = read_observed_file(health, name);
+        #[cfg(windows)]
+        let result = read_windows_observed_file_bounded(health, name, usize::MAX);
+        let bytes = result
+            .map_err(|error| WriterError::Io(error.to_string()))?
+            .map(|observation| observation.bytes);
+        self.check().map_err(WriterError::Io)?;
+        Ok(bytes)
+    }
+
+    fn key_material(&self) -> FingerprintKeyMaterial {
+        match self.read(key_name()) {
+            Ok(None) => FingerprintKeyMaterial::Absent,
+            Ok(Some(bytes)) => bytes.try_into().map_or(
+                FingerprintKeyMaterial::Unavailable,
+                FingerprintKeyMaterial::Ready,
+            ),
+            Err(_) => FingerprintKeyMaterial::Unavailable,
+        }
+    }
+
+    fn existing_key(&self) -> Option<[u8; FINGERPRINT_KEY_BYTES]> {
+        match self.key_material() {
+            FingerprintKeyMaterial::Ready(key) => Some(key),
+            FingerprintKeyMaterial::Absent | FingerprintKeyMaterial::Unavailable => None,
+        }
+    }
+
+    fn lock(
+        &self,
+        name: &OsStr,
+        checkpoint: &dyn Fn() -> Result<(), String>,
+    ) -> Result<BoundParentLock, WriterError> {
+        checkpoint().map_err(WriterError::Io)?;
+        let health = self.health(true)?.expect("created Brain health parent");
+        let options = LockOptions::default();
+        let check = || {
+            self.check()?;
+            checkpoint()
+        };
+        acquire_existing_parent_lock_bound_checked(
+            health,
+            &sidecar_name(name),
+            options.timeout,
+            options.poll_interval,
+            &check,
+        )
+        .map_err(|error| WriterError::Io(error.to_string()))
+    }
+
+    fn acquire_lease(
+        &self,
+        checkpoint: &dyn Fn() -> Result<(), String>,
+    ) -> Result<Option<FileLease>, WriterError> {
+        checkpoint().map_err(WriterError::Io)?;
+        let health = self.health(true)?.expect("created Brain health parent");
+        let check = || {
+            self.check()?;
+            checkpoint()
+        };
+        acquire_file_lease_bound_checked(health, lease_name(), LeaseOptions::default(), &check)
+            .map_err(lease_error)
+    }
+
+    fn publish(
+        &self,
+        lock: &BoundParentLock,
+        name: &OsStr,
+        bytes: &[u8],
+        checkpoint: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), WriterError> {
+        let health = self
+            .health(false)?
+            .ok_or_else(|| WriterError::Io("Brain health parent is absent".to_owned()))?;
+        let check = || {
+            self.check()?;
+            checkpoint()?;
+            lock.revalidate_bound(health, &sidecar_name(name))
+                .map_err(|error| error.to_string())
+        };
+        #[cfg(unix)]
+        match atomic_replace_bound_checked(health, name, bytes, BRAIN_FILE_MODE, &check)
+            .map_err(|error| WriterError::Io(error.to_string()))?
+        {
+            BoundAtomicOutcome::Published { .. } => {}
+            BoundAtomicOutcome::PublishedDurabilityUncertain { source, .. }
+            | BoundAtomicOutcome::PublishedObservationUncertain { source, .. } => {
+                return Err(WriterError::PublicationUncertain(source.to_string()));
+            }
+        }
+        #[cfg(windows)]
+        match atomic_replace_detailed_bound_checked(
+            health,
+            lock,
+            name,
+            bytes,
+            BRAIN_FILE_MODE,
+            &check,
+        )
+        .map_err(|error| WriterError::Io(error.to_string()))?
+        {
+            DetailedAtomicOutcome::Published => {}
+            outcome => return Err(WriterError::PublicationUncertain(format!("{outcome:?}"))),
+        }
+        self.check().map_err(WriterError::PublicationUncertain)?;
+        lock.revalidate_bound(health, &sidecar_name(name))
+            .map_err(|error| WriterError::PublicationUncertain(error.to_string()))
+    }
+}
+
+#[cfg(unix)]
+fn health_identity(health: &BrainHealth) -> ObjectIdentity {
+    health.identity()
+}
+#[cfg(windows)]
+fn health_identity(health: &BrainHealth) -> ObjectIdentity {
+    health.object_identity()
+}
+
+fn record_name() -> &'static OsStr {
+    Path::new(&local_contract().brain_state.paths.record)
+        .file_name()
+        .expect("Brain record filename")
+}
+fn key_name() -> &'static OsStr {
+    Path::new(&local_contract().brain_state.paths.fingerprint_key)
+        .file_name()
+        .expect("Brain key filename")
+}
+fn lease_name() -> &'static OsStr {
+    Path::new(&local_contract().brain_state.paths.refresh_lease)
+        .file_name()
+        .expect("Brain lease filename")
+}
+fn sidecar_name(name: &OsStr) -> OsString {
+    let mut name = name.to_owned();
+    name.push(".lock");
+    name
+}
+
+impl BrainRefreshPermit {
+    pub fn admitted_root(&self) -> Arc<JournalRoot> {
+        self.root.root.clone()
+    }
+
+    /// Share the existing post-probe publication wait budget with credential
+    /// retention/settlement; this does not bound or change provider probe work.
+    pub fn share_credential_publication_budget(&mut self, witness: &CredentialValidationWitness) {
+        witness.begin_publication_budget();
+        self.credential_publication_deadline = witness.publication_deadline.get();
+    }
+
+    /// Renew the original lease, root, fingerprint and credential authority.
+    /// Owners also use this before remote work; it never adopts a later fence.
+    pub fn checkpoint(&self, journal: &Path) -> Result<(), String> {
+        self.root.checkpoint(journal)?;
+        check_publication_deadline(self.credential_publication_deadline)?;
+        let health = self
+            .root
+            .health
+            .get()
+            .ok_or_else(|| "Brain refresh health parent is absent".to_owned())?;
+        self._lease
+            .revalidate_bound(health, lease_name())
+            .map_err(|error| error.to_string())?;
+        fingerprint_checkpoint(
+            &self.root,
+            &self.fingerprint_sha256,
+            self.bundled_runtime_fingerprint_sha256.clone(),
+        )?;
+        let holds =
+            read_credential_hold_authority(&self.root).map_err(|error| error.to_string())?;
+        let holds = crate::record::parse_credential_holds(holds.as_ref())
+            .map_err(|error| error.to_string())?;
+        if holds != self.credential_holds_seen {
+            return Err("credential rejection changed during refresh".to_owned());
+        }
+        if let Some(authority) = &self.credential_authority_seen {
+            authority
+                .checkpoint(&self.root)
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(generation) = &self.credential_generation {
+            generation
+                .ensure_current()
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
 }
 
 /// A stale expected active-fingerprint assertion or another begin failure.
@@ -130,22 +508,26 @@ pub struct RuntimeFailureResult {
 #[derive(Debug)]
 pub enum WriterError {
     Io(String),
+    PublicationUncertain(String),
     Config(String),
     Validation(ValidationError),
     Conflict(String),
     Fingerprint(String),
     Random,
+    Cancelled(String),
 }
 
 impl fmt::Display for WriterError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(message)
+            | Self::PublicationUncertain(message)
             | Self::Config(message)
             | Self::Conflict(message)
             | Self::Fingerprint(message) => formatter.write_str(message),
             Self::Validation(error) => error.fmt(formatter),
             Self::Random => formatter.write_str("could not generate secure random bytes"),
+            Self::Cancelled(message) => formatter.write_str(message),
         }
     }
 }
@@ -155,10 +537,12 @@ impl Error for WriterError {
         match self {
             Self::Validation(error) => Some(error),
             Self::Io(_)
+            | Self::PublicationUncertain(_)
             | Self::Config(_)
             | Self::Conflict(_)
             | Self::Fingerprint(_)
-            | Self::Random => None,
+            | Self::Random
+            | Self::Cancelled(_) => None,
         }
     }
 }
@@ -169,32 +553,1504 @@ impl From<ValidationError> for WriterError {
     }
 }
 
+/// Read config, Brain and surviving-process rejection authority for the
+/// actual credential selected by an existing owner. This never creates a key,
+/// config, health directory, record or validation result.
+pub fn classify_credential_admission_bound(
+    admitted: Arc<JournalRoot>,
+    journal: &Path,
+    target: CredentialHoldTarget<'_>,
+    selected_validation: Option<&Value>,
+) -> Result<StoredCredentialBinding, WriterError> {
+    let root = BrainWriteRoot::open_bound(admitted, journal)?;
+    let session = CredentialHoldSession::open_bound(root.root.clone(), target)
+        .map_err(|error| WriterError::Conflict(error.to_string()))?;
+    let provider = target
+        .provider_name()
+        .map_err(|error| WriterError::Conflict(error.to_string()))?;
+    let memory = session
+        .memory_snapshot()
+        .map_err(|error| WriterError::Conflict(error.to_string()))?;
+    let snapshot = CredentialAuthoritySnapshot::read(&root, provider)?;
+    let expected = match snapshot.material {
+        FingerprintKeyMaterial::Ready(key) => Some(
+            target
+                .binding_hmac(&key)
+                .map_err(|error| WriterError::Conflict(error.to_string()))?,
+        ),
+        _ => None,
+    };
+    if snapshot.correction_proven(&memory, &session, expected.as_deref()) {
+        session
+            .reconcile(&memory)
+            .map_err(|error| WriterError::Conflict(error.to_string()))?;
+    }
+    if session
+        .is_held()
+        .map_err(|error| WriterError::Conflict(error.to_string()))?
+    {
+        return Ok(StoredCredentialBinding::Matches);
+    }
+    let provider = target
+        .provider_name()
+        .map_err(|error| WriterError::Conflict(error.to_string()))?;
+    let material = root.key_material();
+    let key = match material {
+        FingerprintKeyMaterial::Ready(key) => Some(key),
+        FingerprintKeyMaterial::Absent | FingerprintKeyMaterial::Unavailable => None,
+    };
+    if key.is_none() && credential_observation_for_provider(&root, provider)?.is_some() {
+        return Err(WriterError::Fingerprint(
+            "protected fingerprint key is absent while credential authority exists".to_owned(),
+        ));
+    }
+    let expected = key
+        .as_ref()
+        .map(|key| target.binding_hmac(key))
+        .transpose()
+        .map_err(|error| WriterError::Conflict(error.to_string()))?;
+    let holds = read_credential_hold_authority(&root)?;
+    let entry = holds
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|holds| holds.get(provider));
+    let brain_binding = classify_stored_binding(entry, key.as_ref(), expected.as_deref());
+    let config = config(&root)?;
+    let configured_entry = config
+        .get("providers")
+        .and_then(Value::as_object)
+        .and_then(|providers| providers.get("key_validation"))
+        .and_then(Value::as_object)
+        .and_then(|entries| entries.get(provider));
+    let config_binding =
+        classify_stored_binding(configured_entry, key.as_ref(), expected.as_deref());
+    let selected_binding =
+        classify_stored_binding(selected_validation, key.as_ref(), expected.as_deref());
+    let bindings = [config_binding, selected_binding, brain_binding];
+    let result = [
+        StoredCredentialBinding::Matches,
+        StoredCredentialBinding::Corrupt,
+        StoredCredentialBinding::DoesNotReject,
+    ]
+    .into_iter()
+    .find(|candidate| bindings.contains(candidate))
+    .unwrap_or(StoredCredentialBinding::Unbound);
+    if material == FingerprintKeyMaterial::Unavailable
+        && !matches!(
+            result,
+            StoredCredentialBinding::Matches | StoredCredentialBinding::Corrupt
+        )
+    {
+        return Err(WriterError::Fingerprint(
+            "protected fingerprint key is unavailable".to_owned(),
+        ));
+    }
+    root.check().map_err(WriterError::Io)?;
+    if root.key_material() != material {
+        return Err(WriterError::Conflict(
+            "protected fingerprint key changed during admission".to_owned(),
+        ));
+    }
+    // A rejection registered during the durable read also refuses this call.
+    if session
+        .is_held()
+        .map_err(|error| WriterError::Conflict(error.to_string()))?
+    {
+        return Ok(StoredCredentialBinding::Matches);
+    }
+    Ok(result)
+}
+
+/// Read the same rejection authorities for owner presentation, without
+/// admitting a target or changing its process state. A correction is usable
+/// only with the same strict provenance and stable snapshots as admission.
+pub(crate) struct BoundBrainInspection {
+    root: BrainWriteRoot,
+    pub(crate) record: Option<Vec<u8>>,
+    pub(crate) material: FingerprintKeyMaterial,
+}
+
+pub(crate) fn read_brain_inspection_inputs_bound(
+    admitted: Arc<JournalRoot>,
+    journal: &Path,
+) -> Result<BoundBrainInspection, WriterError> {
+    let root = BrainWriteRoot::open_bound(admitted, journal)?;
+    let record = root.read(record_name())?;
+    let material = root.key_material();
+    root.check().map_err(WriterError::Conflict)?;
+    Ok(BoundBrainInspection {
+        root,
+        record,
+        material,
+    })
+}
+
+pub(crate) fn inspect_credential_binding_bound(
+    inputs: &BoundBrainInspection,
+    target: CredentialHoldTarget<'_>,
+    selected_validation: Option<&Value>,
+) -> Result<StoredCredentialBinding, WriterError> {
+    let root = &inputs.root;
+    if root.read(record_name())? != inputs.record {
+        return Err(WriterError::Conflict(
+            "Brain record changed during inspection".to_owned(),
+        ));
+    }
+    let session = CredentialHoldSession::existing_bound(root.root.clone(), target)
+        .map_err(|error| WriterError::Conflict(error.to_string()))?;
+    let memory = session
+        .as_ref()
+        .map(CredentialHoldSession::memory_snapshot)
+        .transpose()
+        .map_err(|error| WriterError::Conflict(error.to_string()))?;
+    let provider = target
+        .provider_name()
+        .map_err(|error| WriterError::Conflict(error.to_string()))?;
+    let snapshot = CredentialAuthoritySnapshot::read(root, provider)?;
+    if snapshot.material != inputs.material {
+        return Err(WriterError::Conflict(
+            "protected fingerprint key changed during inspection".to_owned(),
+        ));
+    }
+    let key = match snapshot.material {
+        FingerprintKeyMaterial::Ready(key) => Some(key),
+        _ => None,
+    };
+    let expected = key
+        .as_ref()
+        .map(|key| target.binding_hmac(key))
+        .transpose()
+        .map_err(|error| WriterError::Conflict(error.to_string()))?;
+    let brain_entry = snapshot.hold.as_ref().map(|hold| {
+        json!({
+            "binding_version":1,"credential_hmac":hold.credential_hmac,
+            "reason_code":"provider_key_invalid",
+        })
+    });
+    let bindings = [
+        classify_stored_binding(snapshot.config.as_ref(), key.as_ref(), expected.as_deref()),
+        classify_stored_binding(selected_validation, key.as_ref(), expected.as_deref()),
+        classify_stored_binding(brain_entry.as_ref(), key.as_ref(), expected.as_deref()),
+    ];
+    let mut result = [
+        StoredCredentialBinding::Matches,
+        StoredCredentialBinding::Corrupt,
+        StoredCredentialBinding::DoesNotReject,
+    ]
+    .into_iter()
+    .find(|candidate| bindings.contains(candidate))
+    .unwrap_or(StoredCredentialBinding::Unbound);
+    if let (Some(session), Some(memory)) = (&session, &memory)
+        && memory.has_matching_rejection(session)
+        && !snapshot.correction_proven(memory, session, expected.as_deref())
+    {
+        result = StoredCredentialBinding::Matches;
+    }
+    if !matches!(
+        result,
+        StoredCredentialBinding::Matches | StoredCredentialBinding::Corrupt
+    ) && (snapshot.material == FingerprintKeyMaterial::Unavailable
+        || (key.is_none() && snapshot.observation.is_some()))
+    {
+        return Err(WriterError::Fingerprint(
+            "protected fingerprint key is unavailable".to_owned(),
+        ));
+    }
+    // A new P, positive reservation or partial publication cannot hide behind
+    // an unchanged accepted epoch. This reader retires no process state.
+    if snapshot != CredentialAuthoritySnapshot::read(root, provider)? {
+        return Err(WriterError::Conflict(
+            "credential authority changed during inspection".to_owned(),
+        ));
+    }
+    let after = CredentialHoldSession::existing_bound(root.root.clone(), target)
+        .map_err(|error| WriterError::Conflict(error.to_string()))?
+        .as_ref()
+        .map(CredentialHoldSession::memory_snapshot)
+        .transpose()
+        .map_err(|error| WriterError::Conflict(error.to_string()))?;
+    if memory != after {
+        return Err(WriterError::Conflict(
+            "credential process state changed during inspection".to_owned(),
+        ));
+    }
+    if root.read(record_name())? != inputs.record {
+        return Err(WriterError::Conflict(
+            "Brain record changed during inspection".to_owned(),
+        ));
+    }
+    root.check().map_err(WriterError::Conflict)?;
+    Ok(result)
+}
+
+/// Local authority captured before an existing mutating owner's real probe.
+/// It contains no credential bytes and creates no key or durable state.
+pub struct CredentialValidationWitness {
+    root: BrainWriteRoot,
+    provider: &'static str,
+    material: FingerprintKeyMaterial,
+    target_hmac: Option<String>,
+    observed_hold: Option<CredentialRejectionHold>,
+    observed_config: Option<Value>,
+    observed_observation: Option<CredentialObservation>,
+    observation_id: String,
+    prospective_config: std::cell::RefCell<Option<Value>>,
+    prospective_observation: std::cell::RefCell<Option<CredentialObservation>>,
+    retiring_hold: std::cell::Cell<bool>,
+    publication_deadline: std::cell::Cell<Option<std::time::Instant>>,
+    positive_publication: std::cell::RefCell<Option<CredentialPositivePublication>>,
+    volatile: VolatileCredentialWitness,
+}
+
+impl fmt::Debug for CredentialValidationWitness {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CredentialValidationWitness")
+            .field("root", &self.root.root.identity())
+            .field("provider", &self.provider)
+            .finish_non_exhaustive()
+    }
+}
+
+pub fn capture_credential_validation_bound(
+    admitted: Arc<JournalRoot>,
+    journal: &Path,
+    target: CredentialHoldTarget<'_>,
+) -> Result<CredentialValidationWitness, WriterError> {
+    let root = BrainWriteRoot::open_bound(admitted, journal)?;
+    let provider = target
+        .provider_name()
+        .map_err(|error| WriterError::Conflict(error.to_string()))?;
+    let session = CredentialHoldSession::open_bound(root.root.clone(), target)
+        .map_err(|error| WriterError::Conflict(error.to_string()))?;
+    let memory = session
+        .memory_snapshot()
+        .map_err(|error| WriterError::Conflict(error.to_string()))?;
+    let snapshot = CredentialAuthoritySnapshot::read(&root, provider)?;
+    let material = snapshot.material;
+    let target_hmac = match material {
+        FingerprintKeyMaterial::Ready(key) => Some(
+            target
+                .binding_hmac(&key)
+                .map_err(|error| WriterError::Conflict(error.to_string()))?,
+        ),
+        FingerprintKeyMaterial::Absent => None,
+        FingerprintKeyMaterial::Unavailable => {
+            return Err(WriterError::Fingerprint(
+                "protected fingerprint key is unavailable".to_owned(),
+            ));
+        }
+    };
+    let reconcile = snapshot.correction_proven(&memory, &session, target_hmac.as_deref());
+    let volatile = session
+        .validation_witness_after_snapshot(
+            &memory,
+            reconcile,
+            &snapshot.ids(target_hmac.as_deref()),
+        )
+        .map_err(|error| WriterError::Conflict(error.to_string()))?;
+    let CredentialAuthoritySnapshot {
+        hold: observed_hold,
+        config: observed_config,
+        observation: observed_observation,
+        ..
+    } = snapshot;
+    if target_hmac.is_none() && (observed_hold.is_some() || observed_observation.is_some()) {
+        return Err(WriterError::Fingerprint(
+            "protected fingerprint key is absent while credential authority exists".to_owned(),
+        ));
+    }
+    let witness = CredentialValidationWitness {
+        root,
+        provider,
+        material,
+        target_hmac,
+        observed_hold,
+        observed_config,
+        observed_observation,
+        observation_id: random_observation_id()?,
+        prospective_config: std::cell::RefCell::new(None),
+        prospective_observation: std::cell::RefCell::new(None),
+        retiring_hold: std::cell::Cell::new(false),
+        publication_deadline: std::cell::Cell::new(None),
+        positive_publication: std::cell::RefCell::new(None),
+        volatile,
+    };
+    witness.checkpoint()?;
+    Ok(witness)
+}
+
+fn credential_hold_for_provider(
+    root: &BrainWriteRoot,
+    provider: &str,
+) -> Result<Option<CredentialRejectionHold>, WriterError> {
+    let authority = read_credential_hold_authority(root)?;
+    Ok(crate::record::parse_credential_holds(authority.as_ref())?.remove(provider))
+}
+
+fn config_authority_projection(entry: Option<&Value>) -> Option<Value> {
+    let entry = entry?;
+    let Some(object) = entry.as_object() else {
+        return Some(entry.clone());
+    };
+    // Transient probe metadata is not a newer authentication observation.
+    // Preserve compatibility with older bound positive/negative entries; fresh
+    // successful writes acquire a unique private observation identity.
+    let bound = object.get("binding_version").and_then(Value::as_u64) == Some(1)
+        && object
+            .get("credential_hmac")
+            .and_then(Value::as_str)
+            .is_some_and(crate::record::is_sha256);
+    if bound
+        && object.get("reason_code").and_then(Value::as_str) != Some("provider_key_invalid")
+        && let Some(id) = object
+            .get("credential_observation_id")
+            .and_then(Value::as_str)
+            .filter(|id| crate::record::is_sha256(id))
+    {
+        return Some(json!({"binding_version":1,
+            "credential_hmac":object.get("credential_hmac").unwrap(),
+            "credential_observation_id":id}));
+    }
+    if bound && object.get("valid").and_then(Value::as_bool) == Some(true) {
+        // Older records without an observation ID remain readable but do not
+        // assert a fresh, uniquely settled positive generation.
+        return None;
+    }
+    if bound
+        && object.get("valid").and_then(Value::as_bool) == Some(false)
+        && object.get("reason_code").and_then(Value::as_str) != Some("provider_key_invalid")
+    {
+        return None;
+    }
+    Some(Value::Object(
+        object
+            .iter()
+            .filter(|(name, _)| {
+                !matches!(name.as_str(), "timestamp" | "probe_reason_code" | "error")
+            })
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+    ))
+}
+
+fn credential_config_authority(
+    root: &BrainWriteRoot,
+    provider: &str,
+) -> Result<Option<Value>, WriterError> {
+    let config = config(root)?;
+    let entry = config
+        .get("providers")
+        .and_then(|providers| providers.get("key_validation"))
+        .and_then(|entries| entries.get(provider));
+    if entry
+        .and_then(|entry| entry.get("credential_observation_id"))
+        .is_some_and(|id| !id.as_str().is_some_and(crate::record::is_sha256))
+    {
+        return Err(WriterError::Conflict(
+            "credential observation identity is invalid".to_owned(),
+        ));
+    }
+    Ok(config_authority_projection(entry))
+}
+
+fn credential_observation_for_provider(
+    root: &BrainWriteRoot,
+    provider: &str,
+) -> Result<Option<CredentialObservation>, WriterError> {
+    let authority = read_credential_observation_authority(root)?;
+    Ok(crate::record::parse_credential_observations(authority.as_ref())?.remove(provider))
+}
+
+/// One stable read of the existing owners, shared by reconciliation and the
+/// pre-work witness. No registry mutex is held while reading the journal.
+#[derive(PartialEq, Eq)]
+struct CredentialAuthoritySnapshot {
+    material: FingerprintKeyMaterial,
+    config: Option<Value>,
+    observation: Option<CredentialObservation>,
+    hold: Option<CredentialRejectionHold>,
+}
+
+impl CredentialAuthoritySnapshot {
+    fn read(root: &BrainWriteRoot, provider: &str) -> Result<Self, WriterError> {
+        let once = || -> Result<Self, WriterError> {
+            root.check().map_err(WriterError::Conflict)?;
+            Ok(Self {
+                material: root.key_material(),
+                config: credential_config_authority(root, provider)?,
+                observation: credential_observation_for_provider(root, provider)?,
+                hold: credential_hold_for_provider(root, provider)?,
+            })
+        };
+        let snapshot = once()?;
+        if snapshot != once()? {
+            return Err(WriterError::Conflict(
+                "credential authority changed during observation".to_owned(),
+            ));
+        }
+        root.check().map_err(WriterError::Conflict)?;
+        Ok(snapshot)
+    }
+
+    fn ids(&self, expected: Option<&str>) -> [Option<String>; 2] {
+        let config = self
+            .config
+            .as_ref()
+            .filter(|entry| {
+                entry.get("credential_hmac").and_then(Value::as_str) == expected
+                    && entry.get("reason_code").and_then(Value::as_str)
+                        != Some("provider_key_invalid")
+            })
+            .and_then(|entry| entry.get("credential_observation_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let brain = self
+            .observation
+            .as_ref()
+            .filter(|entry| Some(entry.credential_hmac.as_str()) == expected)
+            .map(|entry| entry.observation_id.clone());
+        [config, brain]
+    }
+
+    fn correction_proven(
+        &self,
+        memory: &CredentialMemorySnapshot,
+        session: &CredentialHoldSession,
+        expected: Option<&str>,
+    ) -> bool {
+        let FingerprintKeyMaterial::Ready(key) = self.material else {
+            return false;
+        };
+        if self
+            .hold
+            .as_ref()
+            .is_some_and(|hold| Some(hold.credential_hmac.as_str()) == expected)
+            || matches!(
+                classify_stored_binding(self.config.as_ref(), Some(&key), expected),
+                StoredCredentialBinding::Matches | StoredCredentialBinding::Corrupt
+            )
+        {
+            return false;
+        }
+        memory.corrected_by(
+            session,
+            &key,
+            &self.ids(expected).into_iter().flatten().collect::<Vec<_>>(),
+        )
+    }
+
+    fn origin(
+        &self,
+        session: &CredentialHoldSession,
+        expected: Option<&str>,
+    ) -> CredentialHoldOrigin {
+        let [config_id, brain_id] = self.ids(expected);
+        CredentialHoldOrigin {
+            config_id,
+            brain_id,
+            binding_material_id: match self.material {
+                FingerprintKeyMaterial::Ready(key) => Some(session.binding_material_id(&key)),
+                _ => None,
+            },
+            older_publications: Vec::new(),
+            excluded_publication: None,
+        }
+    }
+}
+
+fn check_publication_deadline(deadline: Option<std::time::Instant>) -> Result<(), String> {
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        return Err("credential publication lock budget exhausted".to_owned());
+    }
+    Ok(())
+}
+
+impl CredentialValidationWitness {
+    /// Start once, after actual remote work and before the first owner write.
+    /// Every added sidecar/fallback/settlement checkpoint shares this budget;
+    /// repeated calls cannot grant a fresh wait window.
+    pub fn begin_publication_budget(&self) {
+        if self.publication_deadline.get().is_none() {
+            self.publication_deadline.set(Some(
+                std::time::Instant::now() + LockOptions::default().timeout,
+            ));
+        }
+    }
+
+    /// Stage only this real credential-valid result's prospective config
+    /// identity. This creates no durable authority and retires no rejection.
+    pub fn prepare_successful_validation(&self, result: &mut Value) -> Result<(), WriterError> {
+        let object = result.as_object_mut().ok_or_else(|| {
+            WriterError::Conflict("validation result is not an object".to_owned())
+        })?;
+        if object.get("valid").and_then(Value::as_bool) != Some(true)
+            || object.get("binding_version").and_then(Value::as_u64) != Some(1)
+            || !object
+                .get("credential_hmac")
+                .and_then(Value::as_str)
+                .is_some_and(crate::record::is_sha256)
+            || self.target_hmac.as_deref().is_some_and(|expected| {
+                object.get("credential_hmac").and_then(Value::as_str) != Some(expected)
+            })
+        {
+            return Err(WriterError::Conflict(
+                "validation result does not match its credential".to_owned(),
+            ));
+        }
+        object.insert(
+            "credential_observation_id".to_owned(),
+            Value::String(self.observation_id.clone()),
+        );
+        *self.prospective_config.borrow_mut() = config_authority_projection(Some(result));
+        Ok(())
+    }
+
+    fn check_durable_authority(&self, own_config: Option<&Value>) -> Result<(), WriterError> {
+        self.check_durable_authority_with_provisional(own_config, None)
+    }
+
+    fn check_durable_authority_with_provisional(
+        &self,
+        own_config: Option<&Value>,
+        provisional: Option<&ProvisionalCredentialRejection>,
+    ) -> Result<(), WriterError> {
+        let current = credential_config_authority(&self.root, self.provider)?;
+        let prospective = self.prospective_config.borrow();
+        let own = own_config.and_then(|entry| config_authority_projection(Some(entry)));
+        if current != self.observed_config
+            && prospective
+                .as_ref()
+                .is_none_or(|entry| current.as_ref() != Some(entry))
+            && own
+                .as_ref()
+                .is_none_or(|entry| current.as_ref() != Some(entry))
+            && !self.known_older_publication(
+                provisional,
+                current
+                    .as_ref()
+                    .and_then(|entry| entry.get("credential_observation_id"))
+                    .and_then(Value::as_str),
+                current
+                    .as_ref()
+                    .and_then(|entry| entry.get("credential_hmac"))
+                    .and_then(Value::as_str),
+            )
+        {
+            return Err(WriterError::Conflict(
+                "credential observation changed during work".to_owned(),
+            ));
+        }
+        let observed = credential_observation_for_provider(&self.root, self.provider)?;
+        if observed != self.observed_observation
+            && self
+                .prospective_observation
+                .borrow()
+                .as_ref()
+                .is_none_or(|own| observed.as_ref() != Some(own))
+            && !self.known_older_publication(
+                provisional,
+                observed.as_ref().map(|entry| entry.observation_id.as_str()),
+                observed
+                    .as_ref()
+                    .map(|entry| entry.credential_hmac.as_str()),
+            )
+        {
+            return Err(WriterError::Conflict(
+                "settled credential observation changed during work".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn known_older_publication(
+        &self,
+        provisional: Option<&ProvisionalCredentialRejection>,
+        id: Option<&str>,
+        hmac: Option<&str>,
+    ) -> bool {
+        hmac.is_some()
+            && hmac == self.target_hmac.as_deref()
+            && provisional.is_some_and(|p| {
+                p.older_publications()
+                    .any(|publication| Some(publication.observation_id.as_str()) == id)
+            })
+    }
+
+    /// Called by the existing config owner while both config and Brain locks
+    /// are held, immediately before its native publication. The reservation
+    /// survives partial publication until this witness settles or is dropped.
+    pub fn begin_positive_config_publication(&self, key: &[u8; 32]) -> Result<(), WriterError> {
+        if self.prospective_config.borrow().is_none() {
+            return Ok(());
+        }
+        self.begin_positive_publication(key, ObservationCarrier::Config)
+    }
+
+    fn begin_positive_publication(
+        &self,
+        key: &[u8; 32],
+        carrier: ObservationCarrier,
+    ) -> Result<(), WriterError> {
+        self.checkpoint_with_binding_key(key)?;
+        if self.positive_publication.borrow().is_some() {
+            return Ok(());
+        }
+        let snapshot = CredentialAuthoritySnapshot::read(&self.root, self.provider)?;
+        // Equality is renewed before any reconciliation-origin bookkeeping.
+        self.checkpoint_with_binding_key(key)?;
+        let session = &self.volatile.session_handle();
+        let removed = self
+            .observed_hold
+            .as_ref()
+            .filter(|hold| self.target_hmac.as_deref() == Some(hold.credential_hmac.as_str()))
+            .map(|hold| hold.marker_id.clone());
+        let guard = self
+            .volatile
+            .reserve_positive(
+                &self.observation_id,
+                removed,
+                carrier,
+                &snapshot.ids(self.target_hmac.as_deref()),
+                &session.binding_material_id(key),
+            )
+            .map_err(|error| WriterError::Conflict(error.to_string()))?;
+        *self.positive_publication.borrow_mut() = Some(guard);
+        Ok(())
+    }
+    pub fn has_matching_rejection(&self) -> bool {
+        self.volatile.observed_matching_hold()
+            || self.observed_hold.as_ref().is_some_and(|hold| {
+                self.target_hmac.as_deref() == Some(hold.credential_hmac.as_str())
+            })
+    }
+
+    pub fn admitted_root(&self) -> Arc<JournalRoot> {
+        self.root.root.clone()
+    }
+
+    /// Check before the probe and before initializing a first-use binding key.
+    pub fn checkpoint(&self) -> Result<(), WriterError> {
+        self.check(None)
+    }
+
+    /// A first-use key may be initialized after the actual probe by the normal
+    /// key owner. Existing protected bytes may never change under this witness.
+    pub fn checkpoint_with_binding_key(&self, key: &[u8; 32]) -> Result<(), WriterError> {
+        self.check(Some(key))
+    }
+
+    fn check(&self, initialized: Option<&[u8; 32]>) -> Result<(), WriterError> {
+        self.root.check().map_err(WriterError::Conflict)?;
+        check_publication_deadline(self.publication_deadline.get())
+            .map_err(WriterError::Conflict)?;
+        self.volatile
+            .ensure_current()
+            .map_err(|error| WriterError::Conflict(error.to_string()))?;
+        self.check_durable_authority(None)?;
+        let hold = credential_hold_for_provider(&self.root, self.provider)?;
+        if hold != self.observed_hold && !(self.retiring_hold.get() && hold.is_none()) {
+            return Err(WriterError::Conflict(
+                "credential rejection changed during validation".to_owned(),
+            ));
+        }
+        let material = self.root.key_material();
+        let key_matches = match (self.material, initialized, material) {
+            (
+                FingerprintKeyMaterial::Ready(original),
+                Some(expected),
+                FingerprintKeyMaterial::Ready(current),
+            ) => original == *expected && current == original,
+            (
+                FingerprintKeyMaterial::Absent,
+                Some(expected),
+                FingerprintKeyMaterial::Ready(current),
+            ) => current == *expected,
+            (original, None, current) => original == current,
+            _ => false,
+        };
+        if !key_matches {
+            return Err(WriterError::Fingerprint(
+                "protected fingerprint key changed during validation".to_owned(),
+            ));
+        }
+        self.root.check().map_err(WriterError::Conflict)
+    }
+
+    /// Settle only after this mutating owner's fresh credential-valid probe and
+    /// acknowledged owner work. Settings carries its unique identity in config;
+    /// healthy Brain refresh carries it in Brain without a config write.
+    /// Read-only validation must never call it.
+    /// Failure or publication uncertainty leaves the volatile refusal held.
+    pub fn retire_after_validation(
+        self,
+        key: &[u8; 32],
+        checkpoint: &dyn Fn() -> Result<(), String>,
+    ) -> Result<bool, WriterError> {
+        self.begin_publication_budget();
+        let check = || {
+            checkpoint()?;
+            self.checkpoint_with_binding_key(key)
+                .map_err(|error| error.to_string())
+        };
+        check().map_err(WriterError::Conflict)?;
+        // Config publishers take this same interlock after their config lock.
+        // Under it, settlement only reads config and never acquires its lock.
+        let lock = self.root.lock(record_name(), &check)?;
+        check().map_err(WriterError::Conflict)?;
+        let remove = self
+            .observed_hold
+            .as_ref()
+            .is_some_and(|hold| self.target_hmac.as_deref() == Some(hold.credential_hmac.as_str()));
+        let brain_observation = self.prospective_config.borrow().is_none();
+        if brain_observation {
+            self.begin_positive_publication(key, ObservationCarrier::Brain)?;
+        } else if self.positive_publication.borrow().is_none() {
+            return Err(WriterError::Conflict(
+                "credential publication reservation is absent".to_owned(),
+            ));
+        }
+        if remove || brain_observation {
+            let mut record = match self.root.read(record_name())? {
+                Some(bytes) => serde_json::from_slice::<Value>(&bytes).map_err(|_| {
+                    WriterError::Conflict("credential authority is unreadable".to_owned())
+                })?,
+                None => Value::Object(Map::new()),
+            };
+            let object = record.as_object_mut().ok_or_else(|| {
+                WriterError::Conflict("credential authority is not an object".to_owned())
+            })?;
+            if remove {
+                object
+                    .get_mut("credential_holds")
+                    .and_then(Value::as_object_mut)
+                    .ok_or_else(|| {
+                        WriterError::Conflict("credential hold authority changed".to_owned())
+                    })?
+                    .remove(self.provider);
+                self.retiring_hold.set(true);
+            }
+            if brain_observation {
+                let credential_hmac = self.target_hmac.clone().ok_or_else(|| {
+                    WriterError::Fingerprint(
+                        "credential observation lacks original binding".to_owned(),
+                    )
+                })?;
+                let observation = CredentialObservation {
+                    credential_hmac,
+                    observation_id: self.observation_id.clone(),
+                };
+                let observations = object
+                    .entry("credential_observations")
+                    .or_insert_with(|| json!({}))
+                    .as_object_mut()
+                    .ok_or_else(|| {
+                        WriterError::Conflict(
+                            "credential observations are not an object".to_owned(),
+                        )
+                    })?;
+                observations.insert(
+                    self.provider.to_owned(),
+                    json!({
+                        "binding_version":1,"credential_hmac":observation.credential_hmac,
+                        "observation_id":observation.observation_id,
+                    }),
+                );
+                *self.prospective_observation.borrow_mut() = Some(observation);
+            }
+            crate::record::parse_credential_holds(record.get("credential_holds"))?;
+            crate::record::parse_credential_observations(record.get("credential_observations"))?;
+            let bytes = serialize_json_bytes(
+                &record,
+                JsonWriteOptions {
+                    mode: Some(BRAIN_FILE_MODE),
+                    indent: Some(2),
+                    sort_keys: true,
+                },
+            )
+            .map_err(|error| WriterError::Io(error.to_string()))?;
+            self.root.publish(&lock, record_name(), &bytes, &check)?;
+            // Keep the Brain lock until this operation has conditionally
+            // retired its volatile marker. A newer rejection wins either way.
+            checkpoint().map_err(WriterError::Conflict)?;
+            self.root.check().map_err(WriterError::Conflict)?;
+        }
+        check().map_err(WriterError::Conflict)?;
+        self.volatile
+            .retire()
+            .map(|memory| memory || remove)
+            .map_err(|error| WriterError::Conflict(error.to_string()))
+    }
+}
+
+/// Publish a provider rejection in the existing Brain record after its normal
+/// config owner could not acknowledge it. The caller supplies the binding it
+/// actually sent and renews current-target/generation/cancellation authority.
+/// A published-but-uncertain result is never a durable acknowledgment.
+pub fn record_credential_hold_bound(
+    admitted: Arc<JournalRoot>,
+    journal: &Path,
+    provider: &str,
+    hold: &CredentialRejectionHold,
+    binding_key: &[u8; FINGERPRINT_KEY_BYTES],
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), WriterError> {
+    let root = BrainWriteRoot::open_bound(admitted, journal)?;
+    record_credential_hold(&root, provider, hold, binding_key, checkpoint)
+}
+
+fn record_credential_hold(
+    root: &BrainWriteRoot,
+    provider: &str,
+    hold: &CredentialRejectionHold,
+    binding_key: &[u8; FINGERPRINT_KEY_BYTES],
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), WriterError> {
+    record_credential_hold_with_transition(
+        root,
+        provider,
+        hold,
+        binding_key,
+        checkpoint,
+        &|| Ok(()),
+    )
+}
+
+fn record_credential_hold_with_transition(
+    root: &BrainWriteRoot,
+    provider: &str,
+    hold: &CredentialRejectionHold,
+    binding_key: &[u8; FINGERPRINT_KEY_BYTES],
+    checkpoint: &dyn Fn() -> Result<(), String>,
+    transition: &dyn Fn() -> Result<(), String>,
+) -> Result<(), WriterError> {
+    let entry = json!({
+        "binding_version": 1,
+        "credential_hmac": hold.credential_hmac,
+        "marker_id": hold.marker_id,
+        "reason_code": "provider_key_invalid",
+    });
+    let mut validation = Map::new();
+    validation.insert(provider.to_owned(), entry.clone());
+    crate::record::parse_credential_holds(Some(&Value::Object(validation)))?;
+    let check = || {
+        checkpoint()?;
+        root.check()?;
+        if root.key_material() != FingerprintKeyMaterial::Ready(*binding_key) {
+            return Err(
+                "protected fingerprint key changed before rejection publication".to_owned(),
+            );
+        }
+        Ok(())
+    };
+    check().map_err(WriterError::Conflict)?;
+    let lock = root.lock(record_name(), &check)?;
+    check().map_err(WriterError::Conflict)?;
+    let health = root.health.get().expect("held Brain record parent");
+    lock.revalidate_bound(health, &sidecar_name(record_name()))
+        .map_err(|error| WriterError::Conflict(error.to_string()))?;
+    transition().map_err(WriterError::Conflict)?;
+    check().map_err(WriterError::Conflict)?;
+    let mut holds = read_credential_hold_authority(root)?
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    holds.insert(provider.to_owned(), entry);
+    let mut record = match root.read(record_name())? {
+        None => Value::Object(Map::new()),
+        Some(bytes) => serde_json::from_slice::<Value>(&bytes).map_err(|error| {
+            WriterError::Conflict(format!("credential hold authority is unreadable: {error}"))
+        })?,
+    };
+    record
+        .as_object_mut()
+        .ok_or_else(|| {
+            WriterError::Conflict("credential hold authority is not an object".to_owned())
+        })?
+        .insert("credential_holds".to_owned(), Value::Object(holds));
+    // A hold is independent authority, not evidence that a refresh ran. Keep
+    // existing derived fields exactly as values; absence/invalid derived state
+    // remains explicit until the normal refresh owner repairs it.
+    crate::record::parse_credential_holds(record.get("credential_holds"))?;
+    let bytes = serialize_json_bytes(
+        &record,
+        JsonWriteOptions {
+            mode: Some(BRAIN_FILE_MODE),
+            indent: Some(2),
+            sort_keys: true,
+        },
+    )
+    .map_err(|error| WriterError::Io(error.to_string()))?;
+    root.publish(&lock, record_name(), &bytes, &check)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialRejectionCarrier {
+    Config,
+    Brain,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum CredentialRejectionFailure {
+    Refused(String),
+    Unpublished,
+}
+
+/// An acknowledged rejection and the exact registration generation that
+/// authorized it. It grants no successful-validation or retirement authority.
+pub struct CredentialRejectionReceipt {
+    root_identity: ObjectIdentity,
+    provider: &'static str,
+    binding_key: [u8; FINGERPRINT_KEY_BYTES],
+    keyless_endpoint: bool,
+    hold: CredentialRejectionHold,
+    generation: VolatileCredentialWitness,
+    carrier: CredentialRejectionCarrier,
+    authority: RefreshCredentialAuthority,
+}
+
+impl fmt::Debug for CredentialRejectionReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CredentialRejectionReceipt")
+            .field("provider", &self.provider)
+            .field("carrier", &self.carrier)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CredentialRejectionReceipt {
+    pub fn carrier(&self) -> CredentialRejectionCarrier {
+        self.carrier
+    }
+
+    /// Renew this operation's exact negative publication without recapturing a
+    /// provider generation or granting fresh successful-validation authority.
+    pub fn checkpoint(&self, witness: &CredentialValidationWitness) -> Result<(), WriterError> {
+        if witness.root.root.identity() != self.root_identity
+            || witness.provider != self.provider
+            || !self.generation.same_target(&witness.volatile)
+        {
+            return Err(WriterError::Conflict(
+                "rejection receipt root/provider changed".to_owned(),
+            ));
+        }
+        witness.root.check().map_err(WriterError::Conflict)?;
+        self.generation
+            .ensure_current()
+            .map_err(|error| WriterError::Conflict(error.to_string()))?;
+        self.authority.checkpoint(&witness.root)?;
+        if witness.root.key_material() != FingerprintKeyMaterial::Ready(self.binding_key) {
+            return Err(WriterError::Fingerprint(
+                "protected fingerprint key changed after rejection".to_owned(),
+            ));
+        }
+        let expected = if self.carrier == CredentialRejectionCarrier::Brain {
+            Some(&self.hold)
+        } else {
+            witness.observed_hold.as_ref()
+        };
+        if credential_hold_for_provider(&witness.root, self.provider)?.as_ref() != expected {
+            return Err(WriterError::Conflict(
+                "credential rejection changed after publication".to_owned(),
+            ));
+        }
+        if self.carrier == CredentialRejectionCarrier::Config {
+            let current = config(&witness.root)?;
+            let entry = current
+                .get("providers")
+                .and_then(Value::as_object)
+                .and_then(|providers| providers.get("key_validation"))
+                .and_then(Value::as_object)
+                .and_then(|entries| entries.get(self.provider));
+            if entry
+                .and_then(|entry| entry.get("rejection_marker_id"))
+                .and_then(Value::as_str)
+                != Some(self.hold.marker_id.as_str())
+                || entry
+                    .and_then(|entry| entry.get("credential_hmac"))
+                    .and_then(Value::as_str)
+                    != Some(self.hold.credential_hmac.as_str())
+                || entry
+                    .and_then(|entry| entry.get("valid"))
+                    .and_then(Value::as_bool)
+                    != Some(false)
+                || entry
+                    .and_then(|entry| entry.get("reason_code"))
+                    .and_then(Value::as_str)
+                    != Some("provider_key_invalid")
+            {
+                return Err(WriterError::Conflict(
+                    "configuration rejection changed after publication".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Keep a definitive rejection of an actual current credential before blocking
+/// persistence, then use the normal config owner and existing Brain fallback.
+/// `None` means config no longer matches the original owner guard; the actual
+/// rejected target's process hold remains protected.
+pub fn retain_current_credential_rejection_bound(
+    journal: &Path,
+    target: CredentialHoldTarget<'_>,
+    witness: &CredentialValidationWitness,
+    caller_checkpoint: &dyn Fn() -> Result<(), String>,
+    accepts_config: &dyn Fn(&Map<String, Value>) -> bool,
+    probe_fields: Option<&Value>,
+) -> Result<Option<CredentialRejectionReceipt>, CredentialRejectionFailure> {
+    retain_credential_rejection_with_config_bound(
+        journal,
+        target,
+        witness,
+        caller_checkpoint,
+        accepts_config,
+        accepts_config,
+        &|config, entry| {
+            let mut replacement = config.clone();
+            let providers = replacement
+                .entry("providers")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()?;
+            let validations = providers
+                .entry("key_validation")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()?;
+            validations.insert(witness.provider.to_owned(), entry.clone());
+            Some(replacement)
+        },
+        probe_fields,
+    )
+}
+
+/// Retain the actual rejection while an existing config owner installs its
+/// negative result. The original state guard and publication share one read;
+/// only that state or this exact published negative can authorize continuation.
+#[allow(clippy::too_many_arguments)]
+pub fn retain_credential_rejection_with_config_bound(
+    journal: &Path,
+    target: CredentialHoldTarget<'_>,
+    witness: &CredentialValidationWitness,
+    caller_checkpoint: &dyn Fn() -> Result<(), String>,
+    prior_matches: &dyn Fn(&Map<String, Value>) -> bool,
+    target_matches: &dyn Fn(&Map<String, Value>) -> bool,
+    replacement: &impl Fn(&Map<String, Value>, &Value) -> Option<Map<String, Value>>,
+    probe_fields: Option<&Value>,
+) -> Result<Option<CredentialRejectionReceipt>, CredentialRejectionFailure> {
+    use CredentialRejectionFailure::{Refused, Unpublished};
+    let root = &witness.root;
+    root.checkpoint(journal).map_err(Refused)?;
+    witness.begin_publication_budget();
+    let provider = target
+        .provider_name()
+        .map_err(|error| Refused(error.to_string()))?;
+    if provider != witness.provider {
+        return Err(Refused("rejection witness provider changed".to_owned()));
+    }
+    // Register a provisional before any sidecar wait. A specifically known
+    // older local publication may have crossed its last native checkpoint;
+    // durable continuation is checked against that bounded provenance below.
+    witness
+        .volatile
+        .ensure_current()
+        .map_err(|error| Refused(error.to_string()))?;
+    caller_checkpoint().map_err(Refused)?;
+    let session = CredentialHoldSession::open_bound(root.root.clone(), target)
+        .map_err(|error| Refused(error.to_string()))?;
+    root.check().map_err(Refused)?;
+    let original_authority = CredentialAuthoritySnapshot {
+        material: witness.material,
+        config: witness.observed_config.clone(),
+        observation: witness.observed_observation.clone(),
+        hold: witness.observed_hold.clone(),
+    };
+    let provisional = session
+        .prepare_rejection(
+            &witness.volatile,
+            Some(original_authority.origin(&session, witness.target_hmac.as_deref())),
+        )
+        .map_err(|error| Refused(error.to_string()))?;
+    // Retain the fact before config/key readability can fail. Restoring the
+    // exact pre-probe bytes later is not a new successful validation.
+    let initial = solstone_core_journal_config::read_journal_config_bound(&root.root)
+        .map_err(|_| Unpublished)?;
+    if !prior_matches(initial.config.as_ref().unwrap_or(&Map::new())) {
+        return Ok(None);
+    }
+    caller_checkpoint().map_err(Refused)?;
+    // The actual sent target is already held in its process cell. A
+    // temporarily unreadable/replaced protected key refuses durable work,
+    // without forgetting this definitive rejection in the surviving runtime.
+    match (witness.material, root.key_material()) {
+        (FingerprintKeyMaterial::Ready(original), FingerprintKeyMaterial::Ready(current))
+            if original == current => {}
+        (FingerprintKeyMaterial::Absent, FingerprintKeyMaterial::Absent) => {}
+        _ => {
+            return Err(Refused(
+                "protected fingerprint key changed before rejection".to_owned(),
+            ));
+        }
+    }
+    let marker_id = provisional.marker().to_owned();
+    let generation = std::cell::RefCell::new(None::<VolatileCredentialWitness>);
+    let own_config = std::cell::RefCell::new(None::<Value>);
+    let own_config_seen = std::cell::Cell::new(false);
+    let own_hold = std::cell::RefCell::new(None::<CredentialRejectionHold>);
+    let current_target = || {
+        caller_checkpoint()?;
+        root.check()?;
+        check_publication_deadline(witness.publication_deadline.get())?;
+        if let FingerprintKeyMaterial::Ready(original) = witness.material
+            && root.key_material() != FingerprintKeyMaterial::Ready(original)
+        {
+            return Err(
+                "protected fingerprint key changed before rejection publication".to_owned(),
+            );
+        }
+        if let Some(generation) = generation.borrow().as_ref() {
+            generation
+                .ensure_current()
+                .map_err(|error| error.to_string())?;
+        } else {
+            provisional
+                .ensure_current()
+                .map_err(|error| error.to_string())?;
+        }
+        witness
+            .check_durable_authority_with_provisional(
+                own_config.borrow().as_ref(),
+                Some(&provisional),
+            )
+            .map_err(|error| error.to_string())?;
+        let observed_hold =
+            credential_hold_for_provider(root, provider).map_err(|error| error.to_string())?;
+        if observed_hold != witness.observed_hold
+            && own_hold
+                .borrow()
+                .as_ref()
+                .is_none_or(|own| observed_hold.as_ref() != Some(own))
+            && !(observed_hold.is_none()
+                && witness.observed_hold.as_ref().is_some_and(|old| {
+                    provisional.older_publications().any(|publication| {
+                        publication.removed_brain_hold.as_deref() == Some(old.marker_id.as_str())
+                    })
+                }))
+        {
+            return Err("credential rejection changed before publication".to_owned());
+        }
+        let current_read = solstone_core_journal_config::read_journal_config_bound(&root.root)
+            .map_err(|error| error.to_string())?;
+        let current = current_read.config.unwrap_or_default();
+        let own = own_config.borrow();
+        let exact_own = own.as_ref().is_some_and(|entry| {
+            target_matches(&current)
+                && current
+                    .get("providers")
+                    .and_then(|providers| providers.get("key_validation"))
+                    .and_then(|entries| entries.get(provider))
+                    == Some(entry)
+        });
+        if exact_own {
+            own_config_seen.set(true);
+        } else if own_config_seen.get()
+            || (initial.sha256.is_none() && current_read.sha256.is_some())
+            || !prior_matches(&current)
+        {
+            return Err("credential selection changed before rejection publication".to_owned());
+        }
+        Ok(())
+    };
+    current_target().map_err(Refused)?;
+    let key = match root.key_material() {
+        FingerprintKeyMaterial::Ready(key) => key,
+        FingerprintKeyMaterial::Unavailable => return Err(Unpublished),
+        FingerprintKeyMaterial::Absent => {
+            match generate_fingerprint_key_bound(root, &current_target) {
+                Ok(key) => key,
+                Err(_) => {
+                    current_target().map_err(Refused)?;
+                    return Err(Unpublished);
+                }
+            }
+        }
+    };
+    let hold = CredentialRejectionHold {
+        credential_hmac: target
+            .binding_hmac(&key)
+            .map_err(|error| Refused(error.to_string()))?,
+        marker_id,
+    };
+    let refused = std::cell::RefCell::new(None::<String>);
+    let checkpoint = || {
+        if let Some(error) = refused.borrow().as_ref() {
+            return Err(error.clone());
+        }
+        let result = (|| {
+            current_target()?;
+            if root.key_material() != FingerprintKeyMaterial::Ready(key) {
+                return Err(
+                    "protected fingerprint key changed before rejection publication".to_owned(),
+                );
+            }
+            Ok(())
+        })();
+        if let Err(error) = &result {
+            *refused.borrow_mut() = Some(error.clone());
+        }
+        result
+    };
+    let promote = || {
+        checkpoint()?;
+        if generation.borrow().is_none() {
+            let promoted = provisional.promote().map_err(|error| error.to_string())?;
+            *generation.borrow_mut() = Some(promoted);
+        }
+        checkpoint()
+    };
+    checkpoint().map_err(Refused)?;
+    let mut entry = json!({"valid":false,"reason_code":"provider_key_invalid","rejection_marker_id":hold.marker_id});
+    if let Some(fields) = probe_fields.and_then(Value::as_object) {
+        for name in ["probe_reason_code", "timestamp"] {
+            if let Some(value) = fields.get(name) {
+                entry
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(name.to_owned(), value.clone());
+            }
+        }
+    }
+    crate::attach_credential_binding(entry.as_object_mut().unwrap(), &hold.credential_hmac);
+    *own_config.borrow_mut() = Some(entry.clone());
+    let make_replacement = |config: &Map<String, Value>| {
+        if !prior_matches(config) {
+            return None;
+        }
+        let next = replacement(config, &entry)?;
+        if !target_matches(&next)
+            || next
+                .get("providers")
+                .and_then(|providers| providers.get("key_validation"))
+                .and_then(|entries| entries.get(provider))
+                != Some(&entry)
+        {
+            return None;
+        }
+        Some(next)
+    };
+    let publication = Some(if let Some(sha) = initial.sha256.as_deref() {
+        solstone_core_journal_config_write::conditional_update_journal_config_at_root_interlocked(
+            &root.root,
+            sha,
+            make_replacement,
+            LockOptions::default(),
+            &checkpoint,
+            &promote,
+        )
+    } else {
+        // Genuine first use keeps the normal config owner's defaults and
+        // creation semantics. Renew exact absence under its C→B interlock;
+        // a newly appearing readable leaf cannot become this probe's origin.
+        solstone_core_journal_config_write::mutate_journal_config_at_root_interlocked(
+            &root.root,
+            LockOptions::default(),
+            &checkpoint,
+            &promote,
+            |config| {
+                let still_absent =
+                    solstone_core_journal_config::read_journal_config_bound(&root.root)
+                        .is_ok_and(|read| read.sha256.is_none() && read.config.is_none());
+                let next = still_absent.then(|| make_replacement(config)).flatten();
+                let changed = next.is_some();
+                if let Some(next) = next {
+                    *config = next;
+                }
+                solstone_core_journal_config_write::JournalConfigMutation { changed, value: () }
+            },
+        )
+        .map(|transaction| transaction.outcome)
+    });
+    if matches!(
+        publication,
+        Some(Ok(
+            solstone_core_journal_config_write::BoundConfigOutcome::Published(_)
+        ))
+    ) {
+        own_config_seen.set(true);
+    }
+    checkpoint().map_err(Refused)?;
+    let carrier = if matches!(publication,
+        Some(Ok(solstone_core_journal_config_write::BoundConfigOutcome::Published(ref facts)))
+            if facts.durability_uncertainty.is_none() && facts.observation_uncertainty.is_none() && facts.confirmation_refusal.is_none())
+    {
+        CredentialRejectionCarrier::Config
+    } else {
+        *own_hold.borrow_mut() = Some(hold.clone());
+        match record_credential_hold_with_transition(
+            root,
+            provider,
+            &hold,
+            &key,
+            &checkpoint,
+            &promote,
+        ) {
+            Ok(()) => {
+                checkpoint().map_err(Refused)?;
+                CredentialRejectionCarrier::Brain
+            }
+            Err(_) => {
+                checkpoint().map_err(Refused)?;
+                return Err(Unpublished);
+            }
+        }
+    };
+    let settled_config =
+        credential_config_authority(root, provider).map_err(|error| Refused(error.to_string()))?;
+    let settled_observation = credential_observation_for_provider(root, provider)
+        .map_err(|error| Refused(error.to_string()))?;
+    checkpoint().map_err(Refused)?;
+    let receipt = CredentialRejectionReceipt {
+        root_identity: root.root.identity(),
+        provider,
+        binding_key: key,
+        keyless_endpoint: matches!(target, CredentialHoldTarget::Endpoint { credential, .. } if credential.is_empty()),
+        authority: RefreshCredentialAuthority {
+            provider: provider.to_owned(),
+            config: settled_config,
+            observation: settled_observation,
+        },
+        hold,
+        generation: generation
+            .into_inner()
+            .ok_or_else(|| Refused("credential rejection was not promoted".to_owned()))?,
+        carrier,
+    };
+    receipt
+        .checkpoint(witness)
+        .map_err(|error| Refused(error.to_string()))?;
+    Ok(Some(receipt))
+}
+
+/// Read protected binding material through the caller's retained journal root.
+/// Missing and unavailable bytes stay observations; this never creates state.
+pub fn read_fingerprint_key_material_bound(
+    admitted: Arc<JournalRoot>,
+    journal: &Path,
+) -> Result<FingerprintKeyMaterial, WriterError> {
+    let root = BrainWriteRoot::open_bound(admitted, journal)?;
+    let material = root.key_material();
+    root.check().map_err(WriterError::Io)?;
+    Ok(material)
+}
+
 /// Load or generate the protected 32-byte fingerprint key.
 pub fn generate_fingerprint_key(
     journal_path: &Path,
 ) -> Result<[u8; FINGERPRINT_KEY_BYTES], WriterError> {
-    let path = brain_fingerprint_key_path(journal_path);
-    let _lock = hold_lock(
-        &path,
-        LockOptions {
-            mode: Some(BRAIN_FILE_MODE),
-            ..LockOptions::default()
-        },
-    )
-    .map_err(lock_error)?;
-    let key = match load_existing_fingerprint_key(journal_path) {
-        Some(key) => key,
-        None => secure_key()?,
+    generate_fingerprint_key_checked(journal_path, &|| Ok(()))
+}
+
+/// Publish the fingerprint key, classifying the file under its lock.
+///
+/// `Ready` bytes are kept. `Unavailable` material and an absent file that already
+/// has a credential-binding authority are left untouched. `checkpoint` runs inside
+/// the lock and again immediately before the key file is renamed.
+pub fn generate_fingerprint_key_checked(
+    journal_path: &Path,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<[u8; FINGERPRINT_KEY_BYTES], WriterError> {
+    let root = BrainWriteRoot::open(journal_path)?;
+    generate_fingerprint_key_bound(&root, checkpoint)
+}
+
+/// Use the existing protected-key owner with the caller's original root.
+pub fn generate_fingerprint_key_at_root_checked(
+    admitted: Arc<JournalRoot>,
+    journal: &Path,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<[u8; FINGERPRINT_KEY_BYTES], WriterError> {
+    let root = BrainWriteRoot::open_bound(admitted, journal)?;
+    generate_fingerprint_key_bound(&root, checkpoint)
+}
+
+fn generate_fingerprint_key_bound(
+    root: &BrainWriteRoot,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<[u8; FINGERPRINT_KEY_BYTES], WriterError> {
+    let lock = root.lock(key_name(), checkpoint)?;
+    let material = root.key_material();
+    let key = match material {
+        FingerprintKeyMaterial::Ready(key) => key,
+        FingerprintKeyMaterial::Unavailable => {
+            return Err(WriterError::Fingerprint(
+                "protected fingerprint key is unavailable".to_owned(),
+            ));
+        }
+        FingerprintKeyMaterial::Absent => {
+            if binding_authority(root)? {
+                return Err(WriterError::Fingerprint(
+                    "protected fingerprint key is absent while a credential binding exists"
+                        .to_owned(),
+                ));
+            }
+            secure_key()?
+        }
     };
-    atomic_replace(
-        &path,
-        &key,
-        AtomicWriteOptions {
-            mode: Some(BRAIN_FILE_MODE),
-        },
-    )
-    .map_err(atomic_error)?;
+    checkpoint().map_err(WriterError::Fingerprint)?;
+    let publish_checkpoint = || {
+        checkpoint()?;
+        match (material, root.key_material()) {
+            (FingerprintKeyMaterial::Ready(expected), FingerprintKeyMaterial::Ready(current))
+                if current == expected =>
+            {
+                Ok(())
+            }
+            (FingerprintKeyMaterial::Absent, FingerprintKeyMaterial::Absent) => {
+                if binding_authority(root).map_err(|error| error.to_string())? {
+                    Err("credential binding appeared before fingerprint key publication".to_owned())
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Err("protected fingerprint key changed before publication".to_owned()),
+        }
+    };
+    root.publish(&lock, key_name(), &key, &publish_checkpoint)?;
     Ok(key)
+}
+
+fn binding_authority(root: &BrainWriteRoot) -> Result<bool, WriterError> {
+    let config = config(root).map_err(|error| {
+        WriterError::Fingerprint(format!(
+            "credential binding authority could not be read: {error}"
+        ))
+    })?;
+    let holds = read_credential_hold_authority(root)?;
+    let observations = read_credential_observation_authority(root)?;
+    Ok(observations
+        .as_ref()
+        .and_then(Value::as_object)
+        .is_some_and(|entries| !entries.is_empty())
+        || key_validation_binds(&config)
+        || holds
+            .as_ref()
+            .and_then(Value::as_object)
+            .is_some_and(|holds| !holds.is_empty()))
+}
+
+fn key_validation_binds(config: &Map<String, Value>) -> bool {
+    config
+        .get("providers")
+        .and_then(Value::as_object)
+        .and_then(|providers| providers.get("key_validation"))
+        .and_then(Value::as_object)
+        .is_some_and(|entries| {
+            entries.values().any(|entry| {
+                entry.as_object().is_some_and(|object| {
+                    object.contains_key("binding_version") || object.contains_key("credential_hmac")
+                })
+            })
+        })
 }
 
 /// Begin a fenced refresh.  Lease contention deliberately returns no permit.
@@ -206,42 +2062,77 @@ pub fn begin_refresh(
     expect_active_fingerprint_absent: bool,
     bundled_runtime_fingerprint_sha256: Option<String>,
 ) -> Result<Option<BrainRefreshPermit>, BeginRefreshError> {
-    validate_expected(
-        expected_active_fingerprint_sha256,
-        expect_active_fingerprint_absent,
-    )?;
-    let expected_contract =
-        expected_active_fingerprint_sha256.is_some() || expect_active_fingerprint_absent;
-    let config = match config(journal_path) {
-        Ok(config) => config,
-        Err(_) => return Ok(None),
-    };
-    let initial = derive_active_brain_lane(&config);
-    if initial.lane.is_none() && !expected_contract {
-        return Ok(None);
-    }
-    if initial.lane.as_deref() == Some("none") && !expected_contract {
-        begin_none_lane(journal_path, now, &initial).map_err(BeginRefreshError::Writer)?;
-        return Ok(None);
-    }
-
-    let Some(lease) = acquire_file_lease(
-        brain_refresh_lease_path(journal_path),
-        LeaseOptions::default(),
-    )
-    .map_err(|error| BeginRefreshError::Writer(lease_error(error)))?
-    else {
-        return Ok(None);
-    };
-    begin_refresh_under_lease(
+    begin_refresh_checked(
         journal_path,
         now,
         run_id,
         expected_active_fingerprint_sha256,
         expect_active_fingerprint_absent,
         bundled_runtime_fingerprint_sha256,
-        lease,
+        &|| Ok(()),
     )
+}
+
+pub fn begin_refresh_checked(
+    journal_path: &Path,
+    now: DateTime<Utc>,
+    run_id: Option<String>,
+    expected_active_fingerprint_sha256: Option<&str>,
+    expect_active_fingerprint_absent: bool,
+    bundled_runtime_fingerprint_sha256: Option<String>,
+    publication_checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Option<BrainRefreshPermit>, BeginRefreshError> {
+    publication_checkpoint()
+        .map_err(|error| BeginRefreshError::Writer(WriterError::Cancelled(error)))?;
+    let result = (|| {
+        validate_expected(
+            expected_active_fingerprint_sha256,
+            expect_active_fingerprint_absent,
+        )?;
+        let expected_contract =
+            expected_active_fingerprint_sha256.is_some() || expect_active_fingerprint_absent;
+        let root = BrainWriteRoot::open(journal_path).map_err(BeginRefreshError::Writer)?;
+        let checkpoint = || {
+            publication_checkpoint()?;
+            root.checkpoint(journal_path)
+        };
+        checkpoint().map_err(|error| BeginRefreshError::Writer(WriterError::Io(error)))?;
+        let config = match config(&root) {
+            Ok(config) => config,
+            Err(_) => return Ok(None),
+        };
+        let initial = derive_active_brain_lane(&config);
+        if initial.lane.is_none() && !expected_contract {
+            return Ok(None);
+        }
+        if initial.lane.as_deref() == Some("none") && !expected_contract {
+            begin_none_lane(&root, now, &initial, &checkpoint)
+                .map_err(BeginRefreshError::Writer)?;
+            return Ok(None);
+        }
+
+        let Some(lease) = root
+            .acquire_lease(&checkpoint)
+            .map_err(BeginRefreshError::Writer)?
+        else {
+            return Ok(None);
+        };
+        begin_refresh_under_lease(
+            now,
+            run_id,
+            expected_active_fingerprint_sha256,
+            expect_active_fingerprint_absent,
+            bundled_runtime_fingerprint_sha256,
+            lease,
+            root,
+            publication_checkpoint,
+        )
+    })();
+    if result.is_err() {
+        publication_checkpoint()
+            .map_err(|error| BeginRefreshError::Writer(WriterError::Cancelled(error)))?;
+    }
+    result
 }
 
 /// Begin the narrow SPP prerequisite-renewal lane.
@@ -252,109 +2143,245 @@ pub fn begin_prerequisite_renewal(
     expected_fingerprint_sha256: Option<&str>,
     bundled_runtime_fingerprint_sha256: Option<String>,
 ) -> BeginPrerequisiteRenewal {
-    if expected_fingerprint_sha256.is_some_and(|value| !is_sha256(value)) {
-        return BeginPrerequisiteRenewal::Unsafe {
-            reason: "fingerprint_mismatch".to_owned(),
-        };
-    }
-    let lease = match acquire_file_lease(
-        brain_refresh_lease_path(journal_path),
-        LeaseOptions::default(),
-    ) {
-        Ok(Some(lease)) => lease,
-        Ok(None) => {
-            return BeginPrerequisiteRenewal::Busy {
-                reason: "lease_held".to_owned(),
-            };
-        }
-        Err(error) => {
+    begin_prerequisite_renewal_checked(
+        journal_path,
+        now,
+        run_id,
+        expected_fingerprint_sha256,
+        bundled_runtime_fingerprint_sha256,
+        &|| Ok(()),
+    )
+    .unwrap_or_else(|error| BeginPrerequisiteRenewal::Unsafe {
+        reason: error.to_string(),
+    })
+}
+
+pub fn begin_prerequisite_renewal_checked(
+    journal_path: &Path,
+    now: DateTime<Utc>,
+    run_id: Option<String>,
+    expected_fingerprint_sha256: Option<&str>,
+    bundled_runtime_fingerprint_sha256: Option<String>,
+    publication_checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<BeginPrerequisiteRenewal, WriterError> {
+    publication_checkpoint().map_err(WriterError::Cancelled)?;
+    let result = (|| {
+        if expected_fingerprint_sha256.is_some_and(|value| !is_sha256(value)) {
             return BeginPrerequisiteRenewal::Unsafe {
-                reason: error.to_string(),
+                reason: "fingerprint_mismatch".to_owned(),
             };
         }
-    };
-    let loaded = match fingerprint_for_write(journal_path, bundled_runtime_fingerprint_sha256) {
-        Ok(Some(loaded)) => loaded,
-        Ok(None) => {
-            return BeginPrerequisiteRenewal::Unsafe {
-                reason: "fingerprint_not_available".to_owned(),
-            };
-        }
-        Err(error) => {
-            return BeginPrerequisiteRenewal::Unsafe {
-                reason: error.to_string(),
-            };
-        }
-    };
-    if loaded.resolution.lane.as_deref() != Some("spp") {
-        return BeginPrerequisiteRenewal::Unsafe {
-            reason: "non_spp_lane".to_owned(),
-        };
-    }
-    if expected_fingerprint_sha256.is_some_and(|expected| expected != loaded.sha256) {
-        return BeginPrerequisiteRenewal::Unsafe {
-            reason: "fingerprint_mismatch".to_owned(),
-        };
-    }
-    let run_id = match run_id {
-        Some(run_id) => run_id,
-        None => match random_id() {
-            Ok(run_id) => run_id,
+        let root = match BrainWriteRoot::open(journal_path) {
+            Ok(root) => root,
             Err(error) => {
                 return BeginPrerequisiteRenewal::Unsafe {
                     reason: error.to_string(),
                 };
             }
-        },
-    };
-    let expires_at = now + checking_ttl();
-    let path = brain_state_path(journal_path);
-    let result: Result<BeginPrerequisiteRenewal, WriterError> = (|| {
-        let _lock = hold_record_lock(&path)?;
-        let Some((raw, current)) = read_current(&path, now)? else {
-            return Ok(BeginPrerequisiteRenewal::Unsafe {
-                reason: "brain_record_missing".to_owned(),
-            });
         };
-        if current.fingerprint_sha256.as_deref() != Some(&loaded.sha256) {
-            return Ok(BeginPrerequisiteRenewal::Unsafe {
-                reason: "brain_record_missing".to_owned(),
-            });
+        let checkpoint = || {
+            publication_checkpoint()?;
+            root.checkpoint(journal_path)
+        };
+        let lease = match root.acquire_lease(&checkpoint) {
+            Ok(Some(lease)) => lease,
+            Ok(None) => {
+                return BeginPrerequisiteRenewal::Busy {
+                    reason: "lease_held".to_owned(),
+                };
+            }
+            Err(error) => {
+                return BeginPrerequisiteRenewal::Unsafe {
+                    reason: error.to_string(),
+                };
+            }
+        };
+        let loaded = match fingerprint_for_write(&root, bundled_runtime_fingerprint_sha256.clone())
+        {
+            Ok(Some(loaded)) => loaded,
+            Ok(None) => {
+                return BeginPrerequisiteRenewal::Unsafe {
+                    reason: "fingerprint_not_available".to_owned(),
+                };
+            }
+            Err(error) => {
+                return BeginPrerequisiteRenewal::Unsafe {
+                    reason: error.to_string(),
+                };
+            }
+        };
+        if loaded.resolution.lane.as_deref() != Some("spp") {
+            return BeginPrerequisiteRenewal::Unsafe {
+                reason: "non_spp_lane".to_owned(),
+            };
         }
-        let Some(evidence) = safe_prerequisite_evidence(&raw, &current, now) else {
-            return Ok(BeginPrerequisiteRenewal::Unsafe {
-                reason: "unsafe_evidence".to_owned(),
-            });
+        if expected_fingerprint_sha256.is_some_and(|expected| expected != loaded.sha256) {
+            return BeginPrerequisiteRenewal::Unsafe {
+                reason: "fingerprint_mismatch".to_owned(),
+            };
+        }
+        let run_id = match run_id {
+            Some(run_id) => run_id,
+            None => match random_id() {
+                Ok(run_id) => run_id,
+                Err(error) => {
+                    return BeginPrerequisiteRenewal::Unsafe {
+                        reason: error.to_string(),
+                    };
+                }
+            },
         };
-        let revision = next_revision(Some(&current));
-        let marker_seen = marker_id(Some(&raw));
-        let record = compose_checking_record(CheckingRecord {
-            revision,
-            now,
-            expires_at,
-            run_id: &run_id,
-            loaded: &loaded,
-            evidence,
-            marker: raw
-                .get("runtime_failure_marker")
-                .cloned()
-                .unwrap_or(Value::Null),
-            marker_seen: marker_seen.clone(),
-        });
-        write_record(&path, &record, now)?;
-        Ok(BeginPrerequisiteRenewal::Started(BrainRefreshPermit {
-            run_id,
-            started_at: now,
-            expires_at,
-            fingerprint_sha256: loaded.sha256.clone(),
-            checking_revision: revision,
-            runtime_failure_marker_seen: marker_seen,
-            _lease: lease,
-        }))
+        let expires_at = now + checking_ttl();
+        let result: Result<BeginPrerequisiteRenewal, WriterError> = (|| {
+            let checkpoint = || {
+                publication_checkpoint()?;
+                root.checkpoint(journal_path)?;
+                lease
+                    .revalidate_bound(root.health.get().expect("leased health"), lease_name())
+                    .map_err(|error| error.to_string())
+            };
+            let lock = root.lock(record_name(), &checkpoint)?;
+            let Some((raw, current)) = read_current(&root, now)? else {
+                return Ok(BeginPrerequisiteRenewal::Unsafe {
+                    reason: "brain_record_missing".to_owned(),
+                });
+            };
+            if current.fingerprint_sha256.as_deref() != Some(&loaded.sha256) {
+                return Ok(BeginPrerequisiteRenewal::Unsafe {
+                    reason: "brain_record_missing".to_owned(),
+                });
+            }
+            let Some(evidence) = safe_prerequisite_evidence(&raw, &current, now) else {
+                return Ok(BeginPrerequisiteRenewal::Unsafe {
+                    reason: "unsafe_evidence".to_owned(),
+                });
+            };
+            let revision = next_revision(Some(&current));
+            let marker_seen = marker_id(Some(&raw));
+            let record = compose_checking_record(CheckingRecord {
+                revision,
+                now,
+                expires_at,
+                run_id: &run_id,
+                loaded: &loaded,
+                evidence,
+                marker: raw
+                    .get("runtime_failure_marker")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                marker_seen: marker_seen.clone(),
+            });
+            let publish_checkpoint = || {
+                checkpoint()?;
+                fingerprint_checkpoint(
+                    &root,
+                    &loaded.sha256,
+                    bundled_runtime_fingerprint_sha256.clone(),
+                )
+            };
+            let written = write_record(&root, &lock, &record, now, &publish_checkpoint)?;
+            let credential_holds_seen =
+                crate::record::parse_credential_holds(written.get("credential_holds"))?;
+            Ok(BeginPrerequisiteRenewal::Started(BrainRefreshPermit {
+                run_id,
+                started_at: now,
+                expires_at,
+                fingerprint_sha256: loaded.sha256.clone(),
+                checking_revision: revision,
+                runtime_failure_marker_seen: marker_seen,
+                credential_holds_seen,
+                credential_generation: None,
+                credential_authority_seen: None,
+                credential_publication_deadline: None,
+                bundled_runtime_fingerprint_sha256,
+                root: Box::new(root),
+                _lease: lease,
+            }))
+        })();
+        result.unwrap_or_else(|error| BeginPrerequisiteRenewal::Unsafe {
+            reason: error.to_string(),
+        })
     })();
-    result.unwrap_or_else(|error| BeginPrerequisiteRenewal::Unsafe {
-        reason: error.to_string(),
-    })
+    publication_checkpoint().map_err(WriterError::Cancelled)?;
+    Ok(result)
+}
+
+/// Finish a definitive rejected probe using its exact acknowledged registration.
+/// This renews only negative evidence; the receipt cannot authorize success.
+pub fn finish_refresh_rejected(
+    journal_path: &Path,
+    permit: BrainRefreshPermit,
+    outcome: Value,
+    now: DateTime<Utc>,
+    bundled_runtime_fingerprint_sha256: Option<String>,
+    receipt: CredentialRejectionReceipt,
+) -> Result<Value, WriterError> {
+    finish_refresh_rejected_checked(
+        journal_path,
+        permit,
+        outcome,
+        now,
+        bundled_runtime_fingerprint_sha256,
+        receipt,
+        &|| Ok(()),
+    )
+}
+
+pub fn finish_refresh_rejected_checked(
+    journal_path: &Path,
+    permit: BrainRefreshPermit,
+    outcome: Value,
+    now: DateTime<Utc>,
+    bundled_runtime_fingerprint_sha256: Option<String>,
+    receipt: CredentialRejectionReceipt,
+    publication_checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Value, WriterError> {
+    publication_checkpoint().map_err(WriterError::Cancelled)?;
+    let result = (|| {
+        let mut permit = permit;
+
+        let reason = outcome
+            .get("generate")
+            .and_then(|generate| generate.get("reason_code"))
+            .and_then(Value::as_str);
+        if !(reason == Some("provider_key_invalid")
+            || (reason == Some("provider_key_missing") && receipt.keyless_endpoint))
+            || receipt.root_identity != permit.root.root.identity()
+            || derive_active_brain_lane(&config(&permit.root)?).provider != receipt.provider
+            || permit
+                .credential_generation
+                .as_ref()
+                .is_none_or(|generation| !generation.same_target(&receipt.generation))
+        {
+            return Err(WriterError::Conflict(
+                "rejected refresh receipt does not match its probe".to_owned(),
+            ));
+        }
+        receipt
+            .generation
+            .ensure_current()
+            .map_err(|error| WriterError::Conflict(error.to_string()))?;
+        receipt.authority.checkpoint(&permit.root)?;
+        permit.credential_generation = Some(Box::new(receipt.generation.provider_generation()));
+        permit.credential_authority_seen = Some(Box::new(receipt.authority));
+        if receipt.carrier == CredentialRejectionCarrier::Brain {
+            permit
+                .credential_holds_seen
+                .insert(receipt.provider.to_owned(), receipt.hold);
+        }
+        finish_refresh_checked(
+            journal_path,
+            permit,
+            outcome,
+            now,
+            bundled_runtime_fingerprint_sha256,
+            publication_checkpoint,
+        )
+    })();
+    if result.is_err() {
+        publication_checkpoint().map_err(WriterError::Cancelled)?;
+    }
+    result
 }
 
 /// Finish a refresh from the caller's probe outcome.
@@ -365,33 +2392,63 @@ pub fn finish_refresh(
     now: DateTime<Utc>,
     bundled_runtime_fingerprint_sha256: Option<String>,
 ) -> Result<Value, WriterError> {
-    parse_evidence(Some(&outcome), now)?;
-    let loaded = fingerprint_for_write(journal_path, bundled_runtime_fingerprint_sha256)?
-        .ok_or_else(|| WriterError::Conflict("brain fingerprint key is unavailable".to_owned()))?;
-    let path = brain_state_path(journal_path);
-    let _lock = hold_record_lock(&path)?;
-    let Some((_, current)) = read_current(&path, now)? else {
-        return Err(WriterError::Conflict(
-            "brain refresh checking marker is absent".to_owned(),
-        ));
-    };
-    assert_finish_allowed(&permit, &current, now)?;
-    if loaded.sha256 != permit.fingerprint_sha256 {
-        return Err(WriterError::Conflict(
-            "brain fingerprint changed".to_owned(),
-        ));
-    }
-    let record = compose_record_from_evidence(
+    finish_refresh_checked(
+        journal_path,
+        permit,
         outcome,
-        &loaded,
-        next_revision(Some(&current)),
         now,
-        Value::Null,
-        Value::Null,
-        Value::Object(Map::new()),
-    )?;
-    write_record(&path, &record, now)?;
-    Ok(record)
+        bundled_runtime_fingerprint_sha256,
+        &|| Ok(()),
+    )
+}
+
+pub fn finish_refresh_checked(
+    journal_path: &Path,
+    permit: BrainRefreshPermit,
+    outcome: Value,
+    now: DateTime<Utc>,
+    bundled_runtime_fingerprint_sha256: Option<String>,
+    publication_checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Value, WriterError> {
+    publication_checkpoint().map_err(WriterError::Cancelled)?;
+    let result = (|| {
+        let checkpoint = || {
+            publication_checkpoint()?;
+            permit.checkpoint(journal_path)
+        };
+        checkpoint().map_err(WriterError::Io)?;
+        parse_evidence(Some(&outcome), now)?;
+        let loaded = fingerprint_for_write(&permit.root, bundled_runtime_fingerprint_sha256)?
+            .ok_or_else(|| {
+                WriterError::Conflict("brain fingerprint key is unavailable".to_owned())
+            })?;
+        let lock = permit.root.lock(record_name(), &checkpoint)?;
+        let Some((_, current)) = read_current(&permit.root, now)? else {
+            return Err(WriterError::Conflict(
+                "brain refresh checking marker is absent".to_owned(),
+            ));
+        };
+        assert_finish_allowed(&permit, &current, now)?;
+        if loaded.sha256 != permit.fingerprint_sha256 {
+            return Err(WriterError::Conflict(
+                "brain fingerprint changed".to_owned(),
+            ));
+        }
+        let record = compose_record_from_evidence(
+            outcome,
+            &loaded,
+            next_revision(Some(&current)),
+            now,
+            Value::Null,
+            Value::Null,
+            Value::Object(Map::new()),
+        )?;
+        write_record(&permit.root, &lock, &record, now, &checkpoint)
+    })();
+    if result.is_err() {
+        publication_checkpoint().map_err(WriterError::Cancelled)?;
+    }
+    result
 }
 
 /// Abandon a refresh with one evidence-recordable reason.
@@ -402,41 +2459,64 @@ pub fn abandon_refresh(
     diagnostic: Map<String, Value>,
     now: DateTime<Utc>,
 ) -> Result<Value, WriterError> {
-    let component = target_component(reason_code).ok_or_else(|| {
-        WriterError::Conflict("brain abandon reason is not recordable evidence".to_owned())
-    })?;
-    let path = brain_state_path(journal_path);
-    let _lock = hold_record_lock(&path)?;
-    let Some((raw, current)) = read_current(&path, now)? else {
-        return Err(WriterError::Conflict(
-            "brain refresh checking marker is absent".to_owned(),
-        ));
-    };
-    assert_finish_allowed(&permit, &current, now)?;
-    let mut evidence = object_field(&raw, "evidence")?.clone();
-    evidence.insert(
-        component.to_owned(),
-        component_for_reason(reason_code, diagnostic.clone(), now)?,
-    );
-    let revision = next_revision(Some(&current));
-    let record = compose_direct_record(DirectRecord {
-        revision,
-        reason_code: reason_code.to_owned(),
-        active_lane: current.active_lane.clone(),
-        active_provider: current.active_provider.clone(),
-        active_model: current.active_model.clone(),
-        fingerprint_sha256: current.fingerprint_sha256.clone(),
-        evidence: Value::Object(evidence),
-        checking: Value::Null,
-        marker: raw
-            .get("runtime_failure_marker")
-            .cloned()
-            .unwrap_or(Value::Null),
-        diagnostic: Value::Object(diagnostic),
-        now,
-    });
-    write_record(&path, &record, now)?;
-    Ok(record)
+    abandon_refresh_checked(journal_path, permit, reason_code, diagnostic, now, &|| {
+        Ok(())
+    })
+}
+
+pub fn abandon_refresh_checked(
+    journal_path: &Path,
+    permit: BrainRefreshPermit,
+    reason_code: &str,
+    diagnostic: Map<String, Value>,
+    now: DateTime<Utc>,
+    publication_checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Value, WriterError> {
+    publication_checkpoint().map_err(WriterError::Cancelled)?;
+    let result = (|| {
+        let checkpoint = || {
+            publication_checkpoint()?;
+            permit.checkpoint(journal_path)
+        };
+        checkpoint().map_err(WriterError::Io)?;
+        let component = target_component(reason_code).ok_or_else(|| {
+            WriterError::Conflict("brain abandon reason is not recordable evidence".to_owned())
+        })?;
+        let lock = permit.root.lock(record_name(), &checkpoint)?;
+        let Some((raw, current)) = read_current(&permit.root, now)? else {
+            return Err(WriterError::Conflict(
+                "brain refresh checking marker is absent".to_owned(),
+            ));
+        };
+        assert_finish_allowed(&permit, &current, now)?;
+        let mut evidence = object_field(&raw, "evidence")?.clone();
+        evidence.insert(
+            component.to_owned(),
+            component_for_reason(reason_code, diagnostic.clone(), now)?,
+        );
+        let revision = next_revision(Some(&current));
+        let record = compose_direct_record(DirectRecord {
+            revision,
+            reason_code: reason_code.to_owned(),
+            active_lane: current.active_lane.clone(),
+            active_provider: current.active_provider.clone(),
+            active_model: current.active_model.clone(),
+            fingerprint_sha256: current.fingerprint_sha256.clone(),
+            evidence: Value::Object(evidence),
+            checking: Value::Null,
+            marker: raw
+                .get("runtime_failure_marker")
+                .cloned()
+                .unwrap_or(Value::Null),
+            diagnostic: Value::Object(diagnostic),
+            now,
+        });
+        write_record(&permit.root, &lock, &record, now, &checkpoint)
+    })();
+    if result.is_err() {
+        publication_checkpoint().map_err(WriterError::Cancelled)?;
+    }
+    result
 }
 
 /// Finish an SPP prerequisite renewal.
@@ -447,48 +2527,78 @@ pub fn finish_prerequisite_renewal(
     now: DateTime<Utc>,
     bundled_runtime_fingerprint_sha256: Option<String>,
 ) -> Result<Value, WriterError> {
-    let component = parse_component("lane_prerequisites", &lane_prerequisites, now)?;
-    if component.status == "not_attempted" {
-        return Err(WriterError::Validation(ValidationError {
-            path: "lane_prerequisites.status".to_owned(),
-            reason: "prerequisite renewal requires ok or declared failure".to_owned(),
-        }));
-    }
-    let loaded = fingerprint_for_write(journal_path, bundled_runtime_fingerprint_sha256)?
-        .ok_or_else(|| WriterError::Conflict("brain fingerprint key is unavailable".to_owned()))?;
-    let path = brain_state_path(journal_path);
-    let _lock = hold_record_lock(&path)?;
-    let Some((raw, current)) = read_current(&path, now)? else {
-        return Err(WriterError::Conflict(
-            "brain refresh checking marker is absent".to_owned(),
-        ));
-    };
-    assert_finish_allowed(&permit, &current, now)?;
-    if loaded.sha256 != permit.fingerprint_sha256 {
-        return Err(WriterError::Conflict(
-            "brain fingerprint changed".to_owned(),
-        ));
-    }
-    if loaded.resolution.lane.as_deref() != Some("spp") {
-        return Err(WriterError::Conflict("brain lane changed".to_owned()));
-    }
-    let Some(mut evidence) = safe_prerequisite_evidence(&raw, &current, now) else {
-        return Err(WriterError::Conflict(
-            "brain prerequisite evidence is unsafe".to_owned(),
-        ));
-    };
-    evidence.insert("lane_prerequisites".to_owned(), lane_prerequisites);
-    let record = compose_record_from_evidence(
-        Value::Object(evidence),
-        &loaded,
-        next_revision(Some(&current)),
+    finish_prerequisite_renewal_checked(
+        journal_path,
+        permit,
+        lane_prerequisites,
         now,
-        Value::Null,
-        Value::Null,
-        Value::Object(Map::new()),
-    )?;
-    write_record(&path, &record, now)?;
-    Ok(record)
+        bundled_runtime_fingerprint_sha256,
+        &|| Ok(()),
+    )
+}
+
+pub fn finish_prerequisite_renewal_checked(
+    journal_path: &Path,
+    permit: BrainRefreshPermit,
+    lane_prerequisites: Value,
+    now: DateTime<Utc>,
+    bundled_runtime_fingerprint_sha256: Option<String>,
+    publication_checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Value, WriterError> {
+    publication_checkpoint().map_err(WriterError::Cancelled)?;
+    let result = (|| {
+        let checkpoint = || {
+            publication_checkpoint()?;
+            permit.checkpoint(journal_path)
+        };
+        checkpoint().map_err(WriterError::Io)?;
+        let component = parse_component("lane_prerequisites", &lane_prerequisites, now)?;
+        if component.status == "not_attempted" {
+            return Err(WriterError::Validation(ValidationError {
+                path: "lane_prerequisites.status".to_owned(),
+                reason: "prerequisite renewal requires ok or declared failure".to_owned(),
+            }));
+        }
+        let loaded = fingerprint_for_write(&permit.root, bundled_runtime_fingerprint_sha256)?
+            .ok_or_else(|| {
+                WriterError::Conflict("brain fingerprint key is unavailable".to_owned())
+            })?;
+        let lock = permit.root.lock(record_name(), &checkpoint)?;
+        let Some((raw, current)) = read_current(&permit.root, now)? else {
+            return Err(WriterError::Conflict(
+                "brain refresh checking marker is absent".to_owned(),
+            ));
+        };
+        assert_finish_allowed(&permit, &current, now)?;
+        if loaded.sha256 != permit.fingerprint_sha256 {
+            return Err(WriterError::Conflict(
+                "brain fingerprint changed".to_owned(),
+            ));
+        }
+        if loaded.resolution.lane.as_deref() != Some("spp") {
+            return Err(WriterError::Conflict("brain lane changed".to_owned()));
+        }
+        let Some(mut evidence) = safe_prerequisite_evidence(&raw, &current, now) else {
+            return Err(WriterError::Conflict(
+                "brain prerequisite evidence is unsafe".to_owned(),
+            ));
+        };
+        evidence.insert("lane_prerequisites".to_owned(), lane_prerequisites);
+        let record = compose_record_from_evidence(
+            Value::Object(evidence),
+            &loaded,
+            next_revision(Some(&current)),
+            now,
+            Value::Null,
+            Value::Null,
+            Value::Object(Map::new()),
+        )?;
+        write_record(&permit.root, &lock, &record, now, &checkpoint)
+    })();
+    if result.is_err() {
+        publication_checkpoint().map_err(WriterError::Cancelled)?;
+    }
+    result
 }
 
 /// Abandon an SPP prerequisite renewal by delegating to its finish path.
@@ -500,13 +2610,41 @@ pub fn abandon_prerequisite_renewal(
     now: DateTime<Utc>,
     bundled_runtime_fingerprint_sha256: Option<String>,
 ) -> Result<Value, WriterError> {
-    finish_prerequisite_renewal(
+    abandon_prerequisite_renewal_checked(
         journal_path,
         permit,
-        component_for_reason(reason_code, diagnostic, now)?,
+        reason_code,
+        diagnostic,
         now,
         bundled_runtime_fingerprint_sha256,
+        &|| Ok(()),
     )
+}
+
+pub fn abandon_prerequisite_renewal_checked(
+    journal_path: &Path,
+    permit: BrainRefreshPermit,
+    reason_code: &str,
+    diagnostic: Map<String, Value>,
+    now: DateTime<Utc>,
+    bundled_runtime_fingerprint_sha256: Option<String>,
+    publication_checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Value, WriterError> {
+    publication_checkpoint().map_err(WriterError::Cancelled)?;
+    let result = (|| {
+        finish_prerequisite_renewal_checked(
+            journal_path,
+            permit,
+            component_for_reason(reason_code, diagnostic, now)?,
+            now,
+            bundled_runtime_fingerprint_sha256,
+            publication_checkpoint,
+        )
+    })();
+    if result.is_err() {
+        publication_checkpoint().map_err(WriterError::Cancelled)?;
+    }
+    result
 }
 
 /// Record an independent runtime failure without acquiring the refresh lease.
@@ -552,17 +2690,21 @@ pub fn record_runtime_failure(
     if !is_sha256(expected_fingerprint_sha256) {
         return rejected("fingerprint_mismatch", None);
     }
-    let path = brain_state_path(journal_path);
     let result = (|| {
-        let _lock = hold_record_lock(&path)?;
+        let root = BrainWriteRoot::open(journal_path)?;
+        let checkpoint = || root.checkpoint(journal_path);
+        let lock = root.lock(record_name(), &checkpoint)?;
         record_runtime_failure_locked(
-            journal_path,
-            reason_code,
-            component,
-            expected_fingerprint_sha256,
-            diagnostic,
-            now,
-            bundled_runtime_fingerprint_sha256,
+            &root,
+            &lock,
+            RuntimeFailureObservation {
+                reason_code,
+                component,
+                expected_fingerprint_sha256,
+                diagnostic,
+                now,
+                bundled_runtime_fingerprint_sha256,
+            },
         )
     })();
     match result {
@@ -579,17 +2721,31 @@ pub fn record_runtime_failure(
     }
 }
 
-fn record_runtime_failure_locked(
-    journal_path: &Path,
-    reason_code: &str,
-    component: &str,
-    expected_fingerprint_sha256: &str,
+struct RuntimeFailureObservation<'a> {
+    reason_code: &'a str,
+    component: &'a str,
+    expected_fingerprint_sha256: &'a str,
     diagnostic: Map<String, Value>,
     now: DateTime<Utc>,
     bundled_runtime_fingerprint_sha256: Option<String>,
+}
+
+fn record_runtime_failure_locked(
+    root: &BrainWriteRoot,
+    lock: &BoundParentLock,
+    observation: RuntimeFailureObservation<'_>,
 ) -> Result<Value, RuntimeFailureInternal> {
-    let path = brain_state_path(journal_path);
-    let (current_raw, current, current_readable) = match read_current(&path, now) {
+    let RuntimeFailureObservation {
+        reason_code,
+        component,
+        expected_fingerprint_sha256,
+        diagnostic,
+        now,
+        bundled_runtime_fingerprint_sha256,
+    } = observation;
+    let checkpoint = || root.check();
+    checkpoint().map_err(WriterError::Io)?;
+    let (current_raw, current, current_readable) = match read_current(root, now) {
         Ok(Some((raw, record))) => (Some(raw), Some(record), true),
         Ok(None) => (None, None, true),
         Err(WriterError::Io(error)) => {
@@ -600,7 +2756,7 @@ fn record_runtime_failure_locked(
         }
         Err(_) => (None, None, false),
     };
-    let loaded = match fingerprint_for_write(journal_path, bundled_runtime_fingerprint_sha256) {
+    let loaded = match fingerprint_for_write(root, bundled_runtime_fingerprint_sha256.clone()) {
         Ok(Some(loaded)) => loaded,
         Ok(None) => {
             return Err(RuntimeFailureInternal::Rejected(
@@ -652,8 +2808,15 @@ fn record_runtime_failure_locked(
         marker,
         Value::Object(diagnostic),
     )?;
-    write_record(&path, &record, now)?;
-    Ok(record)
+    let publish_checkpoint = || {
+        checkpoint()?;
+        fingerprint_checkpoint(
+            root,
+            expected_fingerprint_sha256,
+            bundled_runtime_fingerprint_sha256.clone(),
+        )
+    };
+    Ok(write_record(root, lock, &record, now, &publish_checkpoint)?)
 }
 
 /// Record a confidential attestation refusal into the brain record.
@@ -662,12 +2825,20 @@ pub fn record_confidential_attestation_refusal(
     held_config: &Map<String, Value>,
     raw_reason: &str,
 ) {
+    let root = match BrainWriteRoot::open(journal_path) {
+        Ok(root) => root,
+        Err(error) => {
+            log::warn!("the confidential attestation refusal was not recorded: {error}");
+            return;
+        }
+    };
+    let checkpoint = || root.checkpoint(journal_path);
     let mapped_reason = valid_spp_reason(raw_reason);
     let diagnostic = spp_reason_diagnostic(raw_reason);
     if derive_active_brain_lane(held_config).lane.as_deref() != Some("spp") {
         return;
     }
-    let Some(key) = load_existing_fingerprint_key(journal_path) else {
+    let Some(key) = root.existing_key() else {
         log::warn!(
             "the confidential attestation refusal was not recorded: fingerprint key unavailable"
         );
@@ -687,7 +2858,7 @@ pub fn record_confidential_attestation_refusal(
             return;
         }
     };
-    let loaded = match fingerprint_for_write(journal_path, None) {
+    let loaded = match fingerprint_for_write(&root, None) {
         Ok(Some(loaded)) => loaded,
         Ok(None) | Err(_) => {
             log::warn!(
@@ -703,15 +2874,14 @@ pub fn record_confidential_attestation_refusal(
         return;
     }
     let now = Utc::now();
-    let path = brain_state_path(journal_path);
-    let _lock = match hold_record_lock(&path) {
+    let lock = match root.lock(record_name(), &checkpoint) {
         Ok(lock) => lock,
         Err(error) => {
             log::warn!("the confidential attestation refusal was not recorded: {error}");
             return;
         }
     };
-    match read_current(&path, now) {
+    match read_current(&root, now) {
         Err(WriterError::Io(error)) => {
             log::warn!("the confidential attestation refusal was not recorded: {error}");
             return;
@@ -740,13 +2910,16 @@ pub fn record_confidential_attestation_refusal(
         Ok(None) | Err(_) => {}
     }
     if let Err(error) = record_runtime_failure_locked(
-        journal_path,
-        mapped_reason,
-        "lane_prerequisites",
-        &loaded.sha256,
-        diagnostic,
-        now,
-        None,
+        &root,
+        &lock,
+        RuntimeFailureObservation {
+            reason_code: mapped_reason,
+            component: "lane_prerequisites",
+            expected_fingerprint_sha256: &loaded.sha256,
+            diagnostic,
+            now,
+            bundled_runtime_fingerprint_sha256: None,
+        },
     ) {
         match error {
             RuntimeFailureInternal::Rejected(reason, detail) => {
@@ -776,16 +2949,27 @@ impl From<WriterError> for RuntimeFailureInternal {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Each independent refresh fence and publication admission is retained.
 fn begin_refresh_under_lease(
-    journal_path: &Path,
     now: DateTime<Utc>,
     run_id: Option<String>,
     expected: Option<&str>,
     expect_absent: bool,
     bundled_runtime: Option<String>,
     lease: FileLease,
+    root: BrainWriteRoot,
+    publication_checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<Option<BrainRefreshPermit>, BeginRefreshError> {
-    let config = match config(journal_path) {
+    let journal_path = root.admitted_path.as_path();
+    let checkpoint = || {
+        publication_checkpoint()?;
+        root.check()?;
+        lease
+            .revalidate_bound(root.health.get().expect("leased health"), lease_name())
+            .map_err(|error| error.to_string())
+    };
+    checkpoint().map_err(|error| BeginRefreshError::Writer(WriterError::Io(error)))?;
+    let config = match config(&root) {
         Ok(config) => config,
         Err(_) => return Ok(None),
     };
@@ -805,29 +2989,29 @@ fn begin_refresh_under_lease(
                 "active brain fingerprint is unavailable".to_owned(),
             ));
         }
-        begin_none_lane(journal_path, now, &resolution).map_err(BeginRefreshError::Writer)?;
+        begin_none_lane(&root, now, &resolution, &checkpoint).map_err(BeginRefreshError::Writer)?;
         return Ok(None);
     }
     let key = if expect_absent {
-        if load_existing_fingerprint_key(journal_path).is_some() {
+        if root.existing_key().is_some() {
             return Err(BeginRefreshError::ExpectedFingerprintStale(
                 "active brain fingerprint is present".to_owned(),
             ));
         }
-        generate_fingerprint_key(journal_path).map_err(BeginRefreshError::Writer)?
+        generate_fingerprint_key_bound(&root, &checkpoint).map_err(BeginRefreshError::Writer)?
     } else if expected.is_some() {
-        load_existing_fingerprint_key(journal_path).ok_or_else(|| {
+        root.existing_key().ok_or_else(|| {
             BeginRefreshError::ExpectedFingerprintStale(
                 "active brain fingerprint is absent".to_owned(),
             )
         })?
     } else {
-        generate_fingerprint_key(journal_path).map_err(BeginRefreshError::Writer)?
+        generate_fingerprint_key_bound(&root, &checkpoint).map_err(BeginRefreshError::Writer)?
     };
     let sha256 = match build_active_brain_fingerprint(
         &config,
         &key,
-        bundled_runtime.map(Value::String),
+        bundled_runtime.clone().map(Value::String),
         Some(journal_path),
     ) {
         Ok(Some(sha256)) => sha256,
@@ -850,13 +3034,66 @@ fn begin_refresh_under_lease(
             "active brain fingerprint changed".to_owned(),
         ));
     }
+    let credential_authority_seen = RefreshCredentialAuthority::capture(&root, &resolution)
+        .map_err(BeginRefreshError::Writer)?;
+    let credential_generation = match resolution.lane.as_deref() {
+        Some("byo-cloud")
+            if matches!(
+                resolution.provider.as_str(),
+                "openai" | "anthropic" | "google"
+            ) =>
+        {
+            Some(
+                CredentialProviderGeneration::capture(
+                    root.root.clone(),
+                    CredentialHoldTarget::Managed {
+                        provider: &resolution.provider,
+                        credential: config
+                            .get("env")
+                            .and_then(Value::as_object)
+                            .and_then(|env| {
+                                env.get(match resolution.provider.as_str() {
+                                    "openai" => "OPENAI_API_KEY",
+                                    "anthropic" => "ANTHROPIC_API_KEY",
+                                    "google" => "GOOGLE_API_KEY",
+                                    _ => unreachable!("managed provider"),
+                                })
+                            })
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .trim(),
+                    },
+                )
+                .map_err(|error| {
+                    BeginRefreshError::Writer(WriterError::Conflict(error.to_string()))
+                })?,
+            )
+        }
+        Some("byo-endpoint") => {
+            let (base_url, credential) = crate::fingerprint::endpoint_binding_parts(&config);
+            Some(
+                CredentialProviderGeneration::capture(
+                    root.root.clone(),
+                    CredentialHoldTarget::Endpoint {
+                        base_url: &base_url,
+                        credential: &credential,
+                    },
+                )
+                .map_err(|error| {
+                    BeginRefreshError::Writer(WriterError::Conflict(error.to_string()))
+                })?,
+            )
+        }
+        _ => None,
+    };
     let run_id = run_id
         .map_or_else(random_id, Ok)
         .map_err(BeginRefreshError::Writer)?;
     let expires_at = now + checking_ttl();
-    let path = brain_state_path(journal_path);
-    let _lock = hold_record_lock(&path).map_err(BeginRefreshError::Writer)?;
-    let current = match read_current(&path, now) {
+    let lock = root
+        .lock(record_name(), &checkpoint)
+        .map_err(BeginRefreshError::Writer)?;
+    let current = match read_current(&root, now) {
         Ok(current) => current,
         // This record is derived state. A fresh, fenced refresh can replace
         // invalid evidence; configuration and owner outputs are untouched.
@@ -883,7 +3120,25 @@ fn begin_refresh_under_lease(
         marker,
         marker_seen: marker_seen.clone(),
     });
-    write_record(&path, &record, now).map_err(BeginRefreshError::Writer)?;
+    let publish_checkpoint = || {
+        checkpoint()?;
+        if let Some(authority) = &credential_authority_seen {
+            authority
+                .checkpoint(&root)
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(generation) = &credential_generation {
+            generation
+                .ensure_current()
+                .map_err(|error| error.to_string())?;
+        }
+        fingerprint_checkpoint(&root, &loaded.sha256, bundled_runtime.clone())
+    };
+    let written = write_record(&root, &lock, &record, now, &publish_checkpoint)
+        .map_err(BeginRefreshError::Writer)?;
+    let credential_holds_seen =
+        crate::record::parse_credential_holds(written.get("credential_holds"))
+            .map_err(|error| BeginRefreshError::Writer(error.into()))?;
     Ok(Some(BrainRefreshPermit {
         run_id,
         started_at: now,
@@ -891,6 +3146,12 @@ fn begin_refresh_under_lease(
         fingerprint_sha256: sha256,
         checking_revision: revision,
         runtime_failure_marker_seen: marker_seen,
+        credential_holds_seen,
+        credential_generation: credential_generation.map(Box::new),
+        credential_authority_seen: credential_authority_seen.map(Box::new),
+        credential_publication_deadline: None,
+        bundled_runtime_fingerprint_sha256: bundled_runtime,
+        root: Box::new(root),
         _lease: lease,
     }))
 }
@@ -900,12 +3161,25 @@ struct LoadedFingerprint {
     sha256: String,
 }
 
+fn fingerprint_checkpoint(
+    root: &BrainWriteRoot,
+    expected: &str,
+    bundled_runtime: Option<String>,
+) -> Result<(), String> {
+    let current =
+        fingerprint_for_write(root, bundled_runtime).map_err(|error| error.to_string())?;
+    if !current.is_some_and(|current| current.sha256 == expected) {
+        return Err("brain fingerprint changed before publication".to_owned());
+    }
+    Ok(())
+}
+
 fn fingerprint_for_write(
-    journal_path: &Path,
+    root: &BrainWriteRoot,
     bundled_runtime: Option<String>,
 ) -> Result<Option<LoadedFingerprint>, WriterError> {
-    let config = config(journal_path)?;
-    let Some(key) = load_existing_fingerprint_key(journal_path) else {
+    let config = config(root)?;
+    let Some(key) = root.existing_key() else {
         return Ok(None);
     };
     let resolution = derive_active_brain_lane(&config);
@@ -913,7 +3187,7 @@ fn fingerprint_for_write(
         &config,
         &key,
         bundled_runtime.map(Value::String),
-        Some(journal_path),
+        Some(&root.admitted_path),
     )
     .map_err(|error| WriterError::Fingerprint(error.to_string()))?
     .ok_or_else(|| {
@@ -923,19 +3197,40 @@ fn fingerprint_for_write(
 }
 
 fn begin_none_lane(
-    journal_path: &Path,
+    root: &BrainWriteRoot,
     now: DateTime<Utc>,
     resolution: &LaneResolution,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<(), WriterError> {
-    let path = brain_state_path(journal_path);
-    let _lock = hold_record_lock(&path)?;
-    let current = match read_current(&path, now) {
+    let lock = root.lock(record_name(), checkpoint)?;
+    let current = match read_current(root, now) {
         Ok(current) => current,
         Err(WriterError::Validation(_)) => None,
         Err(error) => return Err(error),
     };
-    let record = compose_direct_record(DirectRecord {
-        revision: next_revision(current.as_ref().map(|(_, record)| record)),
+    let record = compose_none_record(
+        now,
+        resolution,
+        next_revision(current.as_ref().map(|(_, record)| record)),
+    )?;
+    let publish_checkpoint = || {
+        checkpoint()?;
+        let current = config(root).map_err(|error| error.to_string())?;
+        if derive_active_brain_lane(&current).lane.as_deref() != Some("none") {
+            return Err("brain lane changed before publication".to_owned());
+        }
+        Ok(())
+    };
+    write_record(root, &lock, &record, now, &publish_checkpoint).map(|_| ())
+}
+
+fn compose_none_record(
+    now: DateTime<Utc>,
+    resolution: &LaneResolution,
+    revision: u64,
+) -> Result<Value, WriterError> {
+    Ok(compose_direct_record(DirectRecord {
+        revision,
         reason_code: "thinking_engine_not_chosen".to_owned(),
         active_lane: "none".to_owned(),
         active_provider: Some(resolution.provider.clone()),
@@ -953,8 +3248,7 @@ fn begin_none_lane(
         marker: Value::Null,
         diagnostic: Value::Object(Map::new()),
         now,
-    });
-    write_record(&path, &record, now)
+    }))
 }
 
 struct CheckingRecord<'a> {
@@ -1019,6 +3313,8 @@ fn compose_record_from_evidence(
         evidence,
         checking: None,
         runtime_failure_marker: marker_typed,
+        credential_holds: BTreeMap::new(),
+        credential_observations: BTreeMap::new(),
         diagnostic: BTreeMap::new(),
     };
     let runtime_reason = provisional
@@ -1143,6 +3439,11 @@ fn assert_finish_allowed(
     current: &BrainStateRecord,
     now: DateTime<Utc>,
 ) -> Result<(), WriterError> {
+    if current.credential_holds != permit.credential_holds_seen {
+        return Err(WriterError::Conflict(
+            "credential rejection changed during refresh".to_owned(),
+        ));
+    }
     // Ownership is represented by the unforgeable, still-live FileLease field.
     if now >= permit.expires_at {
         return Err(WriterError::Conflict(
@@ -1223,28 +3524,81 @@ fn empty_evidence() -> Map<String, Value> {
         .collect()
 }
 
-fn write_record(path: &Path, record: &Value, now: DateTime<Utc>) -> Result<(), WriterError> {
-    validate_brain_state_record(record, now)?;
-    write_json(
-        path,
-        record,
+fn write_record(
+    root: &BrainWriteRoot,
+    lock: &BoundParentLock,
+    record: &Value,
+    now: DateTime<Utc>,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Value, WriterError> {
+    checkpoint().map_err(WriterError::Io)?;
+    let mut record = record.clone();
+    if record.get("credential_holds").is_none()
+        && let Some(holds) = read_credential_hold_authority(root)?
+    {
+        record
+            .as_object_mut()
+            .expect("composed Brain object")
+            .insert("credential_holds".to_owned(), holds);
+    }
+    if record.get("credential_observations").is_none()
+        && let Some(observations) = read_credential_observation_authority(root)?
+    {
+        record
+            .as_object_mut()
+            .expect("composed Brain object")
+            .insert("credential_observations".to_owned(), observations);
+    }
+    validate_brain_state_record(&record, now)?;
+    let bytes = serialize_json_bytes(
+        &record,
         JsonWriteOptions {
             mode: Some(BRAIN_FILE_MODE),
             indent: Some(2),
             sort_keys: true,
         },
     )
-    .map_err(atomic_error)
+    .map_err(|error| WriterError::Io(error.to_string()))?;
+    root.publish(lock, record_name(), &bytes, checkpoint)?;
+    Ok(record)
+}
+
+fn read_credential_hold_authority(root: &BrainWriteRoot) -> Result<Option<Value>, WriterError> {
+    let Some(bytes) = root.read(record_name())? else {
+        return Ok(None);
+    };
+    let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+        WriterError::Conflict(format!("credential hold authority is unreadable: {error}"))
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        WriterError::Conflict("credential hold authority is not an object".to_owned())
+    })?;
+    crate::record::parse_credential_holds(object.get("credential_holds"))?;
+    Ok(object.get("credential_holds").cloned())
+}
+
+fn read_credential_observation_authority(
+    root: &BrainWriteRoot,
+) -> Result<Option<Value>, WriterError> {
+    let Some(bytes) = root.read(record_name())? else {
+        return Ok(None);
+    };
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
+        WriterError::Conflict("credential observation authority is unreadable".to_owned())
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        WriterError::Conflict("credential observation authority is not an object".to_owned())
+    })?;
+    crate::record::parse_credential_observations(object.get("credential_observations"))?;
+    Ok(object.get("credential_observations").cloned())
 }
 
 fn read_current(
-    path: &Path,
+    root: &BrainWriteRoot,
     now: DateTime<Utc>,
 ) -> Result<Option<(Value, BrainStateRecord)>, WriterError> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(WriterError::Io(error.to_string())),
+    let Some(bytes) = root.read(record_name())? else {
+        return Ok(None);
     };
     let value = serde_json::from_slice(&bytes).map_err(|error| {
         WriterError::Validation(ValidationError {
@@ -1256,10 +3610,12 @@ fn read_current(
     Ok(Some((value, parsed)))
 }
 
-fn config(journal_path: &Path) -> Result<Map<String, Value>, WriterError> {
-    crate::read_journal_config(journal_path)
-        .map_err(|error| WriterError::Config(error.to_string()))
-        .map(|read| read.config.unwrap_or_default())
+fn config(root: &BrainWriteRoot) -> Result<Map<String, Value>, WriterError> {
+    root.check().map_err(WriterError::Io)?;
+    let read = solstone_core_journal_config::read_journal_config_bound(&root.root)
+        .map_err(|error| WriterError::Config(error.to_string()))?;
+    root.check().map_err(WriterError::Io)?;
+    Ok(read.config.unwrap_or_default())
 }
 
 /// Exclusive flock on the brain record sidecar. Hidden so writer component
@@ -1332,6 +3688,12 @@ fn random_id() -> Result<String, WriterError> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+fn random_observation_id() -> Result<String, WriterError> {
+    let mut bytes = [0_u8; 32];
+    fill_random(&mut bytes).map_err(|_| WriterError::Random)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 fn object_field<'a>(value: &'a Value, field: &str) -> Result<&'a Map<String, Value>, WriterError> {
     value
         .get(field)
@@ -1353,10 +3715,6 @@ fn lock_error(error: solstone_core_journal_io::LockError) -> WriterError {
 }
 
 fn lease_error(error: solstone_core_journal_io::LeaseError) -> WriterError {
-    WriterError::Io(error.to_string())
-}
-
-fn atomic_error(error: solstone_core_journal_io::AtomicWriteError) -> WriterError {
     WriterError::Io(error.to_string())
 }
 
@@ -1475,6 +3833,120 @@ mod tests {
 
     fn record_bytes(journal: &TestJournal) -> Vec<u8> {
         fs::read(brain_state_path(journal.path())).unwrap()
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn checked_finish_observes_the_held_record_lock() {
+        let journal = TestJournal::new();
+        let permit = begin_cloud(&journal);
+        let before = record_bytes(&journal);
+        let stopped = std::cell::Cell::new(false);
+        let error = finish_refresh_checked(
+            journal.path(),
+            permit,
+            ready_outcome(),
+            fixture_now(),
+            None,
+            &|| {
+                if solstone_core_journal_io::lock_is_held(brain_state_path(journal.path())).unwrap()
+                {
+                    stopped.set(true);
+                }
+                if stopped.get() {
+                    Err("stopped".into())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, WriterError::Cancelled(message) if message == "stopped"));
+        assert_eq!(record_bytes(&journal), before);
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn checked_finish_cancelled_while_blocked_does_not_publish() {
+        use std::sync::{Arc, atomic::AtomicBool};
+        use std::thread;
+
+        let journal = TestJournal::new();
+        let permit = begin_cloud(&journal);
+        let before = record_bytes(&journal);
+        let path = brain_state_path(journal.path());
+        let holder = hold_record_lock(&path).unwrap();
+        let started = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let started_flag = Arc::clone(&started);
+        let cancel_flag = Arc::clone(&cancel);
+        let journal_path = journal.path().to_path_buf();
+        let outcome = ready_outcome();
+        let now = fixture_now();
+        let worker = thread::spawn(move || {
+            started_flag.store(true, Ordering::Release);
+            finish_refresh_checked(&journal_path, permit, outcome, now, None, &|| {
+                if cancel_flag.load(Ordering::Acquire) {
+                    Err("stopped".into())
+                } else {
+                    Ok(())
+                }
+            })
+        });
+        while !started.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        assert!(!cancel.load(Ordering::Acquire));
+        cancel.store(true, Ordering::Release);
+        drop(holder);
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(matches!(error, WriterError::Cancelled(_)));
+        assert_eq!(record_bytes(&journal), before);
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn begin_refresh_cancelled_after_key_staging_does_not_publish() {
+        let journal = TestJournal::new();
+        journal.write_config("lane_byo_cloud");
+        let key_path = brain_fingerprint_key_path(journal.path());
+        let cancelled = std::cell::Cell::new(false);
+        let checkpoint = || {
+            if fs::read_dir(key_path.parent().unwrap()).is_ok_and(|mut entries| {
+                entries.any(|entry| {
+                    entry.is_ok_and(|entry| {
+                        solstone_core_journal_io::is_publication_candidate_name(&entry.file_name())
+                    })
+                })
+            }) {
+                cancelled.set(true);
+            }
+            if cancelled.get() {
+                Err("stopped at key stage".to_owned())
+            } else {
+                Ok(())
+            }
+        };
+        let error = begin_refresh_checked(
+            journal.path(),
+            fixture_now(),
+            None,
+            None,
+            false,
+            None,
+            &checkpoint,
+        )
+        .unwrap_err();
+        assert!(
+            cancelled.get(),
+            "the original key owner must reach its actual stage"
+        );
+        assert!(matches!(
+            error,
+            BeginRefreshError::Writer(WriterError::Cancelled(_))
+        ));
+        assert!(!key_path.exists());
+        assert!(!brain_state_path(journal.path()).exists());
     }
 
     #[test]
@@ -1650,6 +4122,264 @@ mod tests {
         let record: Value = serde_json::from_slice(&record_bytes(&journal)).unwrap();
         validate_brain_state_record(&record, fixture_now()).unwrap();
         assert_eq!(record["reason_code"], "brain_check_in_progress");
+    }
+
+    fn assert_replaced_root_refused(abandon: bool) {
+        let journal = TestJournal::new();
+        let permit = begin_cloud(&journal);
+        let original_record = record_bytes(&journal);
+        let original_key = fs::read(brain_fingerprint_key_path(journal.path())).unwrap();
+        let displaced = TestJournal::new();
+        fs::remove_dir(displaced.path()).unwrap();
+        fs::rename(journal.path(), displaced.path()).unwrap();
+        fs::create_dir(journal.path()).unwrap();
+        journal.write_config("lane_byo_cloud");
+        fs::create_dir(journal.path().join("health")).unwrap();
+        fs::write(brain_state_path(journal.path()), &original_record).unwrap();
+        fs::write(brain_fingerprint_key_path(journal.path()), original_key).unwrap();
+        let result = if abandon {
+            abandon_refresh(
+                journal.path(),
+                permit,
+                "generate_failed",
+                Map::new(),
+                fixture_now(),
+            )
+        } else {
+            finish_refresh(journal.path(), permit, ready_outcome(), fixture_now(), None)
+        };
+        assert!(result.is_err());
+        assert_eq!(record_bytes(&journal), original_record);
+        assert_eq!(record_bytes(&displaced), original_record);
+        assert!(!brain_refresh_lease_path(journal.path()).exists());
+    }
+
+    #[test]
+    fn finish_refresh_refuses_replacement_root_with_identical_config_and_checking_record() {
+        assert_replaced_root_refused(false);
+    }
+
+    #[test]
+    fn abandon_refresh_refuses_replacement_root_with_identical_config_and_checking_record() {
+        assert_replaced_root_refused(true);
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn refresh_refuses_replaced_health_with_identical_key_and_record() {
+        let journal = TestJournal::new();
+        let permit = begin_cloud(&journal);
+        let original_record = record_bytes(&journal);
+        let original_key = fs::read(brain_fingerprint_key_path(journal.path())).unwrap();
+        let original_health = journal.path().join("original-health");
+        fs::rename(journal.path().join("health"), &original_health).unwrap();
+        fs::create_dir(journal.path().join("health")).unwrap();
+        fs::write(brain_state_path(journal.path()), &original_record).unwrap();
+        fs::write(brain_fingerprint_key_path(journal.path()), original_key).unwrap();
+        assert!(
+            finish_refresh(journal.path(), permit, ready_outcome(), fixture_now(), None).is_err()
+        );
+        assert_eq!(record_bytes(&journal), original_record);
+        assert_eq!(
+            fs::read(original_health.join(record_name())).unwrap(),
+            original_record
+        );
+        assert!(
+            !journal
+                .path()
+                .join("health")
+                .join(sidecar_name(record_name()))
+                .exists()
+        );
+        assert!(!brain_refresh_lease_path(journal.path()).exists());
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn refresh_refuses_replaced_lease_without_unlocking_the_original() {
+        let journal = TestJournal::new();
+        let permit = begin_cloud(&journal);
+        let original_record = record_bytes(&journal);
+        let saved_lease = journal.path().join("health/original-lease");
+        fs::rename(brain_refresh_lease_path(journal.path()), &saved_lease).unwrap();
+        fs::write(brain_refresh_lease_path(journal.path()), []).unwrap();
+        assert!(permit.checkpoint(journal.path()).is_err());
+        assert!(
+            solstone_core_journal_io::acquire_file_lease(&saved_lease, LeaseOptions::default())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            finish_refresh(journal.path(), permit, ready_outcome(), fixture_now(), None).is_err()
+        );
+        assert_eq!(record_bytes(&journal), original_record);
+        assert!(
+            solstone_core_journal_io::acquire_file_lease(&saved_lease, LeaseOptions::default())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[cfg(all(unix, feature = "full-tests"))]
+    #[test]
+    fn final_rename_root_replacement_preserves_the_record_and_cleans_the_stage() {
+        use solstone_core_journal_io::{
+            BoundPublicationPrimitive, run_with_bound_publication_barrier,
+        };
+        let journal = TestJournal::new();
+        let permit = begin_cloud(&journal);
+        let before = record_bytes(&journal);
+        let mut original_entries = fs::read_dir(journal.path().join("health"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        original_entries.sort();
+        let displaced = TestJournal::new();
+        fs::remove_dir(displaced.path()).unwrap();
+        let original = journal.path().to_path_buf();
+        let destination = displaced.path().to_path_buf();
+        let (result, reached) = run_with_bound_publication_barrier(
+            BoundPublicationPrimitive::Rename,
+            1,
+            move || {
+                fs::rename(&original, &destination).unwrap();
+                fs::create_dir(&original).unwrap();
+                fs::write(original.join("replacement-sentinel"), b"untouched").unwrap();
+            },
+            || finish_refresh(journal.path(), permit, ready_outcome(), fixture_now(), None),
+        );
+        assert!(reached);
+        assert!(matches!(result, Err(WriterError::Io(_))));
+        assert_eq!(record_bytes(&displaced), before);
+        let replacement_entries = fs::read_dir(journal.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            replacement_entries,
+            [OsString::from("replacement-sentinel")]
+        );
+        let mut retained_entries = fs::read_dir(displaced.path().join("health"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        retained_entries.sort();
+        assert_eq!(retained_entries, original_entries);
+    }
+
+    #[cfg(all(unix, feature = "full-tests"))]
+    #[test]
+    fn final_rename_rechecks_the_current_model_and_protected_key() {
+        use solstone_core_journal_io::{
+            BoundPublicationPrimitive, run_with_bound_publication_barrier,
+        };
+        for replace_key in [false, true] {
+            let journal = TestJournal::new();
+            let permit = begin_cloud(&journal);
+            let before = record_bytes(&journal);
+            let root_path = journal.path().to_path_buf();
+            let (result, reached) = run_with_bound_publication_barrier(
+                BoundPublicationPrimitive::Rename,
+                1,
+                move || {
+                    if replace_key {
+                        fs::write(
+                            brain_fingerprint_key_path(&root_path),
+                            [0x77; FINGERPRINT_KEY_BYTES],
+                        )
+                        .unwrap();
+                    } else {
+                        let config_path = root_path.join("config/journal.json");
+                        let mut config: Value =
+                            serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+                        config["providers"]["active"]["model"] = json!("changed-after-staging");
+                        fs::write(config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+                    }
+                },
+                || finish_refresh(journal.path(), permit, ready_outcome(), fixture_now(), None),
+            );
+            assert!(reached);
+            assert!(result.is_err());
+            assert_eq!(record_bytes(&journal), before);
+            if replace_key {
+                assert_eq!(
+                    fs::read(brain_fingerprint_key_path(journal.path())).unwrap(),
+                    [0x77; FINGERPRINT_KEY_BYTES]
+                );
+            } else {
+                let config: Value = serde_json::from_slice(
+                    &fs::read(journal.path().join("config/journal.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    config["providers"]["active"]["model"],
+                    "changed-after-staging"
+                );
+            }
+        }
+    }
+
+    #[cfg(all(unix, feature = "full-tests"))]
+    #[test]
+    fn key_publication_final_cancellation_preserves_absence_and_can_retry_normally() {
+        use solstone_core_journal_io::{
+            BoundPublicationPrimitive, run_with_bound_publication_barrier,
+        };
+        use std::sync::{Arc, atomic::AtomicBool};
+        let journal = TestJournal::new();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel_at_rename = cancelled.clone();
+        let checkpoint = || {
+            if cancelled.load(Ordering::SeqCst) {
+                Err("cancelled".to_owned())
+            } else {
+                Ok(())
+            }
+        };
+        let (result, reached) = run_with_bound_publication_barrier(
+            BoundPublicationPrimitive::Rename,
+            1,
+            move || cancel_at_rename.store(true, Ordering::SeqCst),
+            || generate_fingerprint_key_checked(journal.path(), &checkpoint),
+        );
+        assert!(reached);
+        assert!(result.is_err());
+        assert!(!brain_fingerprint_key_path(journal.path()).exists());
+        let health_entries = fs::read_dir(journal.path().join("health"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(health_entries, [sidecar_name(key_name())]);
+        let key = generate_fingerprint_key(journal.path()).unwrap();
+        assert_eq!(
+            fs::read(brain_fingerprint_key_path(journal.path())).unwrap(),
+            key
+        );
+    }
+
+    #[cfg(all(unix, feature = "full-tests"))]
+    #[test]
+    fn post_publication_sync_failure_reports_uncertainty_with_the_actual_record() {
+        use solstone_core_journal_io::{
+            BoundPublicationPrimitive, run_with_bound_publication_fault,
+        };
+        let journal = TestJournal::new();
+        let permit = begin_cloud(&journal);
+        let checking = record_bytes(&journal);
+        let (result, reached) = run_with_bound_publication_fault(
+            BoundPublicationPrimitive::ParentSync,
+            1,
+            nix::libc::EIO,
+            || finish_refresh(journal.path(), permit, ready_outcome(), fixture_now(), None),
+        );
+        assert!(reached);
+        assert!(matches!(result, Err(WriterError::PublicationUncertain(_))));
+        let published = record_bytes(&journal);
+        assert_ne!(published, checking);
+        let record: Value = serde_json::from_slice(&published).unwrap();
+        assert_eq!(record["aggregate_state"], "ready");
+        assert!(record["reason_code"].is_null());
+        validate_brain_state_record(&record, fixture_now()).unwrap();
     }
 
     fn assert_finish_refusal_preserves_bytes(
@@ -2033,6 +4763,1311 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    fn write_openai_binding(journal: &TestJournal, bound: bool) {
+        let mut config = json!({
+            "env": {"OPENAI_API_KEY": "sk-binding"},
+            "providers": {"active": {"provider": "openai", "model": "gpt-binding"}}
+        });
+        if bound {
+            config["providers"]["key_validation"] = json!({
+                "openai": {
+                    "valid": false,
+                    "reason_code": "provider_key_invalid",
+                    "binding_version": 1,
+                    "credential_hmac": crate::managed_credential_binding_hmac(&[0x55; 32], "openai", "sk-binding")
+                }
+            });
+        }
+        let path = journal.path().join("config/journal.json");
+        fs::create_dir_all(path.parent().expect("config parent")).unwrap();
+        fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+    }
+
+    fn ordinary_refresh(
+        journal: &TestJournal,
+    ) -> Result<Option<BrainRefreshPermit>, BeginRefreshError> {
+        begin_refresh(
+            journal.path(),
+            fixture_now(),
+            Some("run".to_owned()),
+            None,
+            false,
+            None,
+        )
+    }
+
+    fn begin_binding_refresh(journal: &TestJournal) -> BrainRefreshPermit {
+        write_openai_binding(journal, false);
+        let key_path = brain_fingerprint_key_path(journal.path());
+        fs::create_dir_all(key_path.parent().unwrap()).unwrap();
+        fs::write(key_path, [0x55; 32]).unwrap();
+        ordinary_refresh(journal).unwrap().unwrap()
+    }
+
+    fn publish_binding_validation(journal: &TestJournal, entry: Value) {
+        let root = Arc::new(JournalRoot::open(journal.path()).unwrap());
+        let outcome = solstone_core_journal_config_write::mutate_journal_config_at_root_checked(
+            &root,
+            LockOptions::default(),
+            &|| Ok(()),
+            |config| {
+                config
+                    .get_mut("providers")
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("key_validation".to_owned(), json!({"openai":entry}));
+                solstone_core_journal_config_write::JournalConfigMutation {
+                    changed: true,
+                    value: (),
+                }
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome.outcome,
+            solstone_core_journal_config_write::BoundConfigOutcome::Published(_)
+        ));
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[cfg(unix)]
+    fn positive_native_gap_preserves_newer_rejection(brain: bool) {
+        use solstone_core_journal_io::{
+            BoundPublicationPrimitive, run_with_two_bound_publication_barriers,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Mutex, mpsc};
+        use std::time::Duration;
+
+        struct RetainerThreadGuard(Arc<Mutex<Option<std::thread::JoinHandle<()>>>>);
+        impl Drop for RetainerThreadGuard {
+            fn drop(&mut self) {
+                let join = self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some(join) = join {
+                    // The guard surrounds the publication call: its C/B
+                    // guards unwind first, then this owned retainer completes
+                    // within its existing budget, before fixture deletion.
+                    let result = join.join();
+                    if !std::thread::panicking() {
+                        result.expect("owned retainer thread panicked");
+                    }
+                }
+            }
+        }
+
+        let journal = TestJournal::new();
+        drop(begin_binding_refresh(&journal));
+        let root = Arc::new(JournalRoot::open(journal.path()).unwrap());
+        let target = CredentialHoldTarget::Managed {
+            provider: "openai",
+            credential: "sk-binding",
+        };
+        let positive =
+            capture_credential_validation_bound(root.clone(), journal.path(), target).unwrap();
+        let negative =
+            capture_credential_validation_bound(root.clone(), journal.path(), target).unwrap();
+        let session = CredentialHoldSession::open_bound(root.clone(), target).unwrap();
+        let positive_id = positive.observation_id.clone();
+        let path = journal.path().to_owned();
+        let observed_path = path.clone();
+        let (registered_tx, registered_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let join = Arc::new(Mutex::new(None));
+        let retainer = RetainerThreadGuard(join.clone());
+        let join_for_barrier = join.clone();
+        let published = Arc::new(AtomicBool::new(false));
+        let published_at_native = published.clone();
+        let (result, fired) = run_with_two_bound_publication_barriers(
+            BoundPublicationPrimitive::AuthorizedRename,
+            1,
+            move || {
+                let child = std::thread::spawn(move || {
+                    let sent = AtomicBool::new(false);
+                    let checkpoint = || {
+                        if session.is_held().map_err(|error| error.to_string())?
+                            && !sent.swap(true, Ordering::SeqCst)
+                        {
+                            registered_tx.send(()).map_err(|error| error.to_string())?;
+                        }
+                        Ok(())
+                    };
+                    let retained = retain_current_credential_rejection_bound(
+                        &path,
+                        target,
+                        &negative,
+                        &checkpoint,
+                        &|config| {
+                            config
+                                .get("env")
+                                .and_then(|env| env.get("OPENAI_API_KEY"))
+                                .and_then(Value::as_str)
+                                == Some("sk-binding")
+                        },
+                        None,
+                    );
+                    let result = retained.and_then(|receipt| {
+                        let receipt = receipt.ok_or_else(|| {
+                            CredentialRejectionFailure::Refused(
+                                "unexpected target change".to_owned(),
+                            )
+                        })?;
+                        receipt.checkpoint(&negative).map_err(|error| {
+                            CredentialRejectionFailure::Refused(error.to_string())
+                        })?;
+                        Ok((receipt.carrier(), receipt.hold.clone()))
+                    });
+                    done_tx.send(result).unwrap();
+                });
+                *join_for_barrier.lock().unwrap() = Some(child);
+                registered_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("actual retainer must prepare P before its config-lock wait");
+            },
+            BoundPublicationPrimitive::ParentSync,
+            1,
+            move || {
+                let file = if brain {
+                    "health/brain.json"
+                } else {
+                    "config/journal.json"
+                };
+                let value: Value =
+                    serde_json::from_slice(&fs::read(observed_path.join(file)).unwrap()).unwrap();
+                let actual = if brain {
+                    value["credential_observations"]["openai"]["observation_id"].as_str()
+                } else {
+                    value["providers"]["key_validation"]["openai"]["credential_observation_id"]
+                        .as_str()
+                };
+                assert_eq!(
+                    actual,
+                    Some(positive_id.as_str()),
+                    "the older positive really crossed the native rename"
+                );
+                published_at_native.store(true, Ordering::SeqCst);
+            },
+            || -> Result<(), String> {
+                if brain {
+                    positive
+                        .retire_after_validation(&[0x55; 32], &|| Ok(()))
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                } else {
+                    let mut entry = json!({"valid":true,"binding_version":1,
+                        "credential_hmac":crate::managed_credential_binding_hmac(&[0x55;32],"openai","sk-binding")});
+                    positive.prepare_successful_validation(&mut entry).unwrap();
+                    let transaction = solstone_core_journal_config_write::mutate_journal_config_at_root_interlocked(
+                        &root, LockOptions::default(), &|| positive.checkpoint_with_binding_key(&[0x55;32]).map_err(|error| error.to_string()),
+                        &|| positive.begin_positive_config_publication(&[0x55;32]).map_err(|error| error.to_string()),
+                        |config| {
+                            config.get_mut("providers").unwrap().as_object_mut().unwrap()
+                                .insert("key_validation".to_owned(), json!({"openai":entry}));
+                            solstone_core_journal_config_write::JournalConfigMutation { changed: true, value: () }
+                        },
+                    ).map_err(|error| error.to_string())?;
+                    // The config receipt confirms native bytes/namespace. The
+                    // credential owner's later settlement must reject newer P.
+                    assert!(matches!(
+                        transaction.outcome,
+                        solstone_core_journal_config_write::BoundConfigOutcome::Published(_)
+                    ));
+                    positive
+                        .retire_after_validation(&[0x55; 32], &|| Ok(()))
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                }
+            },
+        );
+        assert_eq!(fired, 2);
+        assert!(published.load(Ordering::SeqCst));
+        assert!(
+            result.is_err(),
+            "a known older partial publication cannot settle over newer P"
+        );
+        let retained = done_rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("actual negative owner must finish after C/B release");
+        drop(retainer);
+        let (carrier, hold) = retained.unwrap();
+        assert_eq!(
+            hold.credential_hmac,
+            crate::managed_credential_binding_hmac(&[0x55; 32], "openai", "sk-binding")
+        );
+        // R may capture the config SHA before S's native rename and then
+        // acknowledge its exact rejection through the existing Brain fallback.
+        // Require the actual returned carrier's saved authority in either case.
+        let (file, marker_field) = match carrier {
+            CredentialRejectionCarrier::Config => ("config/journal.json", "rejection_marker_id"),
+            CredentialRejectionCarrier::Brain => ("health/brain.json", "marker_id"),
+        };
+        let saved: Value =
+            serde_json::from_slice(&fs::read(journal.path().join(file)).unwrap()).unwrap();
+        let entry = match carrier {
+            CredentialRejectionCarrier::Config => {
+                let entry = &saved["providers"]["key_validation"]["openai"];
+                assert_eq!(entry["valid"], false);
+                entry
+            }
+            CredentialRejectionCarrier::Brain => &saved["credential_holds"]["openai"],
+        };
+        assert_eq!(entry["binding_version"], 1);
+        assert_eq!(entry["reason_code"], "provider_key_invalid");
+        assert_eq!(entry["credential_hmac"], hold.credential_hmac);
+        assert_eq!(entry[marker_field], hold.marker_id);
+        // The FnOnce publication callback consumed positive (including its
+        // publication guard), so admission runs after that guard has dropped.
+        assert_eq!(
+            classify_credential_admission_bound(root, journal.path(), target, None).unwrap(),
+            StoredCredentialBinding::Matches
+        );
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[cfg(unix)]
+    #[test]
+    fn config_native_authorized_rename_keeps_newer_learned_rejection() {
+        positive_native_gap_preserves_newer_rejection(false);
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[cfg(unix)]
+    #[test]
+    fn brain_native_authorized_rename_keeps_newer_rejection_and_exact_receipt() {
+        positive_native_gap_preserves_newer_rejection(true);
+    }
+
+    #[test]
+    fn refresh_terminal_refuses_a_new_config_negative_without_rewriting_brain() {
+        let journal = TestJournal::new();
+        let permit = begin_binding_refresh(&journal);
+        let before = record_bytes(&journal);
+        publish_binding_validation(
+            &journal,
+            json!({
+                "valid":false,"reason_code":"provider_key_invalid","binding_version":1,
+                "credential_hmac":crate::managed_credential_binding_hmac(&[0x55;32],"openai","sk-binding"),
+                "rejection_marker_id":"a".repeat(64),
+            }),
+        );
+        let error = finish_refresh(journal.path(), permit, ready_outcome(), fixture_now(), None)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("credential observation changed"),
+            "{error}"
+        );
+        assert_eq!(record_bytes(&journal), before);
+    }
+
+    #[test]
+    fn refresh_terminal_refuses_new_same_key_config_success_identity() {
+        let journal = TestJournal::new();
+        let permit = begin_binding_refresh(&journal);
+        let before = record_bytes(&journal);
+        publish_binding_validation(
+            &journal,
+            json!({
+                "valid":true,"binding_version":1,
+                "credential_hmac":crate::managed_credential_binding_hmac(&[0x55;32],"openai","sk-binding"),
+                "credential_observation_id":"b".repeat(64),
+            }),
+        );
+        let error = finish_refresh(journal.path(), permit, ready_outcome(), fixture_now(), None)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("credential observation changed"),
+            "{error}"
+        );
+        assert_eq!(record_bytes(&journal), before);
+    }
+
+    #[test]
+    fn refresh_terminal_refuses_a_new_brain_observation_without_config_writes() {
+        let journal = TestJournal::new();
+        let permit = begin_binding_refresh(&journal);
+        let config_before = fs::read(journal.path().join("config/journal.json")).unwrap();
+        let root = Arc::new(JournalRoot::open(journal.path()).unwrap());
+        let witness = capture_credential_validation_bound(
+            root,
+            journal.path(),
+            CredentialHoldTarget::Managed {
+                provider: "openai",
+                credential: "sk-binding",
+            },
+        )
+        .unwrap();
+        witness
+            .retire_after_validation(&[0x55; 32], &|| Ok(()))
+            .unwrap();
+        let before = record_bytes(&journal);
+        let error = finish_refresh(journal.path(), permit, ready_outcome(), fixture_now(), None)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("credential observation changed"),
+            "{error}"
+        );
+        assert_eq!(record_bytes(&journal), before);
+        assert_eq!(
+            fs::read(journal.path().join("config/journal.json")).unwrap(),
+            config_before
+        );
+    }
+
+    #[test]
+    fn first_rejection_publishes_its_binding_with_initially_absent_key() {
+        let journal = TestJournal::new();
+        fs::create_dir(journal.path().join("config")).unwrap();
+        fs::write(
+            journal.path().join("config/journal.json"),
+            br#"{"env":{"OPENAI_API_KEY":"sk-binding"}}"#,
+        )
+        .unwrap();
+        let root = Arc::new(JournalRoot::open(journal.path()).unwrap());
+        let target = CredentialHoldTarget::Managed {
+            provider: "openai",
+            credential: "sk-binding",
+        };
+        let witness = capture_credential_validation_bound(root, journal.path(), target).unwrap();
+        let result = retain_current_credential_rejection_bound(
+            journal.path(),
+            target,
+            &witness,
+            &|| Ok(()),
+            &|config| {
+                config
+                    .get("env")
+                    .and_then(|env| env.get("OPENAI_API_KEY"))
+                    .and_then(Value::as_str)
+                    == Some("sk-binding")
+            },
+            None,
+        )
+        .map(|receipt| receipt.map(|receipt| receipt.carrier()));
+        assert_eq!(result.unwrap(), Some(CredentialRejectionCarrier::Config));
+        let saved: Value =
+            serde_json::from_slice(&fs::read(journal.path().join("config/journal.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            saved["providers"]["key_validation"]["openai"]["valid"],
+            false
+        );
+        assert_eq!(
+            saved["providers"]["key_validation"]["openai"]["reason_code"],
+            "provider_key_invalid"
+        );
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[cfg(unix)]
+    fn rejection_owner_projection_journal_image(
+        journal: &Path,
+    ) -> BTreeMap<PathBuf, (u32, Option<Vec<u8>>)> {
+        fn visit(root: &Path, path: &Path, image: &mut BTreeMap<PathBuf, (u32, Option<Vec<u8>>)>) {
+            let metadata = fs::symlink_metadata(path).unwrap();
+            assert!(!metadata.is_symlink());
+            image.insert(
+                path.strip_prefix(root).unwrap().to_path_buf(),
+                (
+                    metadata.permissions().mode(),
+                    metadata.is_file().then(|| fs::read(path).unwrap()),
+                ),
+            );
+            if metadata.is_dir() {
+                for entry in fs::read_dir(path).unwrap() {
+                    visit(root, &entry.unwrap().path(), image);
+                }
+            }
+        }
+        let mut image = BTreeMap::new();
+        visit(journal, journal, &mut image);
+        image
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[cfg(unix)]
+    fn rejection_owner_projection_without_config_publication(all_writes_fail: bool) {
+        let journal = TestJournal::new();
+        let permit = begin_binding_refresh(&journal);
+        finish_refresh(journal.path(), permit, ready_outcome(), fixture_now(), None).unwrap();
+        let root = Arc::new(JournalRoot::open(journal.path()).unwrap());
+        let current =
+            config(&BrainWriteRoot::open_bound(root.clone(), journal.path()).unwrap()).unwrap();
+        assert_eq!(
+            inspect_brain_state(journal.path(), &current, fixture_now())
+                .projection
+                .aggregate_state,
+            "ready",
+            "known ready baseline"
+        );
+        let target = CredentialHoldTarget::Managed {
+            provider: "openai",
+            credential: "sk-binding",
+        };
+        let witness =
+            capture_credential_validation_bound(root.clone(), journal.path(), target).unwrap();
+        let session = CredentialHoldSession::open_bound(root, target).unwrap();
+        let config_before = fs::read(journal.path().join("config/journal.json")).unwrap();
+        let brain_before = record_bytes(&journal);
+        let config_mode = fs::metadata(journal.path().join("config"))
+            .unwrap()
+            .permissions();
+        let health_mode = fs::metadata(journal.path().join("health"))
+            .unwrap()
+            .permissions();
+        fs::set_permissions(
+            journal.path().join("config"),
+            fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        if all_writes_fail {
+            fs::set_permissions(
+                journal.path().join("health"),
+                fs::Permissions::from_mode(0o555),
+            )
+            .unwrap();
+        }
+        let result = retain_current_credential_rejection_bound(
+            journal.path(),
+            target,
+            &witness,
+            &|| Ok(()),
+            &|config| {
+                config
+                    .get("env")
+                    .and_then(|env| env.get("OPENAI_API_KEY"))
+                    .and_then(Value::as_str)
+                    == Some("sk-binding")
+            },
+            None,
+        )
+        .map(|receipt| receipt.map(|receipt| receipt.carrier()));
+        fs::set_permissions(journal.path().join("config"), config_mode).unwrap();
+        fs::set_permissions(journal.path().join("health"), health_mode).unwrap();
+        if all_writes_fail {
+            assert_eq!(result, Err(CredentialRejectionFailure::Unpublished));
+            assert_eq!(record_bytes(&journal), brain_before);
+        } else {
+            assert_eq!(result, Ok(Some(CredentialRejectionCarrier::Brain)));
+        }
+        assert_eq!(
+            fs::read(journal.path().join("config/journal.json")).unwrap(),
+            config_before
+        );
+        assert!(session.is_held().unwrap());
+        let journal_before = rejection_owner_projection_journal_image(journal.path());
+        let memory_before = session.memory_snapshot().unwrap();
+        let projection = inspect_brain_state(journal.path(), &current, fixture_now()).projection;
+        assert_eq!(
+            rejection_owner_projection_journal_image(journal.path()),
+            journal_before,
+            "inspection must preserve exact files, modes and directory population"
+        );
+        assert!(memory_before == session.memory_snapshot().unwrap());
+        assert_eq!(
+            (
+                projection.aggregate_state.as_str(),
+                projection.reason_code.as_deref()
+            ),
+            ("unhealthy", Some("provider_key_invalid")),
+            "all_writes_fail={all_writes_fail}: current owner state must reflect the retained rejection"
+        );
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[cfg(unix)]
+    #[test]
+    fn brain_only_rejection_owner_projection_does_not_reuse_old_ready_evidence() {
+        rejection_owner_projection_without_config_publication(false);
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[cfg(unix)]
+    #[test]
+    fn memory_only_rejection_owner_projection_does_not_reuse_old_ready_evidence() {
+        rejection_owner_projection_without_config_publication(true);
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[cfg(unix)]
+    fn rejection_owner_projection_does_not_adopt_a_replacement_directory_after_read(health: bool) {
+        let journal = TestJournal::new();
+        let permit = begin_binding_refresh(&journal);
+        finish_refresh(journal.path(), permit, ready_outcome(), fixture_now(), None).unwrap();
+        let root = Arc::new(JournalRoot::open(journal.path()).unwrap());
+        let current = config(&BrainWriteRoot::open_bound(root, journal.path()).unwrap()).unwrap();
+        assert_eq!(
+            inspect_brain_state(journal.path(), &current, fixture_now())
+                .projection
+                .aggregate_state,
+            "ready"
+        );
+        let directory = if health {
+            journal.path().join("health")
+        } else {
+            journal.path().to_path_buf()
+        };
+        let original = directory.with_extension("original-inspection");
+        let key = fs::read(brain_fingerprint_key_path(journal.path())).unwrap();
+        let projection = crate::inspect_brain_state_with_clock(journal.path(), &current, || {
+            fs::rename(&directory, &original).unwrap();
+            if !health {
+                fs::create_dir(journal.path()).unwrap();
+            }
+            fs::create_dir(journal.path().join("health")).unwrap();
+            fs::write(brain_fingerprint_key_path(journal.path()), &key).unwrap();
+            fixture_now()
+        })
+        .projection;
+        let replacement_key = fs::read(brain_fingerprint_key_path(journal.path())).unwrap();
+        let replacement_entries = fs::read_dir(journal.path().join("health"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        fs::remove_dir_all(&directory).unwrap();
+        fs::rename(&original, &directory).unwrap();
+        assert_eq!(replacement_key, key);
+        assert_eq!(replacement_entries, vec![key_name().to_os_string()]);
+        assert_eq!(
+            (
+                projection.aggregate_state.as_str(),
+                projection.reason_code.as_deref()
+            ),
+            ("unknown", Some("brain_record_unavailable")),
+            "a replacement directory cannot inherit the original directory's Ready record"
+        );
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[cfg(unix)]
+    #[test]
+    fn rejection_owner_projection_does_not_adopt_a_replacement_root_after_read() {
+        rejection_owner_projection_does_not_adopt_a_replacement_directory_after_read(false);
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[cfg(unix)]
+    #[test]
+    fn rejection_owner_projection_does_not_adopt_a_replacement_health_directory_after_read() {
+        rejection_owner_projection_does_not_adopt_a_replacement_directory_after_read(true);
+    }
+
+    #[cfg(all(test, feature = "full-tests"))]
+    #[cfg(unix)]
+    #[test]
+    fn durable_rejection_owner_projection_needs_no_process_cell_and_is_read_only() {
+        let source = TestJournal::new();
+        let permit = begin_binding_refresh(&source);
+        finish_refresh(source.path(), permit, ready_outcome(), fixture_now(), None).unwrap();
+        let journal = TestJournal::new();
+        for name in ["config", "health"] {
+            fs::create_dir(journal.path().join(name)).unwrap();
+        }
+        for name in [
+            "config/journal.json",
+            "health/brain.json",
+            "health/brain-fingerprint.key",
+        ] {
+            fs::copy(source.path().join(name), journal.path().join(name)).unwrap();
+        }
+        let root = Arc::new(JournalRoot::open(journal.path()).unwrap());
+        let target = CredentialHoldTarget::Managed {
+            provider: "openai",
+            credential: "sk-binding",
+        };
+        let current =
+            config(&BrainWriteRoot::open_bound(root.clone(), journal.path()).unwrap()).unwrap();
+        assert!(
+            CredentialHoldSession::existing_bound(root.clone(), target)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            inspect_brain_state(journal.path(), &current, fixture_now())
+                .projection
+                .aggregate_state,
+            "ready"
+        );
+        let key = load_existing_fingerprint_key(journal.path()).unwrap();
+        record_credential_hold_bound(
+            root.clone(),
+            journal.path(),
+            "openai",
+            &CredentialRejectionHold {
+                credential_hmac: target.binding_hmac(&key).unwrap(),
+                marker_id: "c".repeat(64),
+            },
+            &key,
+            &|| Ok(()),
+        )
+        .unwrap();
+        let before = rejection_owner_projection_journal_image(journal.path());
+        let projection = inspect_brain_state(journal.path(), &current, fixture_now()).projection;
+        assert_eq!(
+            projection.reason_code.as_deref(),
+            Some("provider_key_invalid")
+        );
+        assert_eq!(
+            rejection_owner_projection_journal_image(journal.path()),
+            before
+        );
+        assert!(
+            CredentialHoldSession::existing_bound(root, target)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn temporary_unavailable_config_after_rejection_keeps_the_process_fact() {
+        let journal = TestJournal::new();
+        drop(begin_binding_refresh(&journal));
+        let root = Arc::new(JournalRoot::open(journal.path()).unwrap());
+        let target = CredentialHoldTarget::Managed {
+            provider: "openai",
+            credential: "sk-binding",
+        };
+        let witness =
+            capture_credential_validation_bound(root.clone(), journal.path(), target).unwrap();
+        let session = CredentialHoldSession::open_bound(root.clone(), target).unwrap();
+        let config_path = journal.path().join("config/journal.json");
+        let retained = config_path.with_extension("held-original");
+        let original = fs::read(&config_path).unwrap();
+        let key_before = fs::read(brain_fingerprint_key_path(journal.path())).unwrap();
+        let brain_before = record_bytes(&journal);
+        fs::rename(&config_path, &retained).unwrap();
+        fs::create_dir(&config_path).unwrap();
+        let result = retain_current_credential_rejection_bound(
+            journal.path(),
+            target,
+            &witness,
+            &|| Ok(()),
+            &|config| {
+                config
+                    .get("env")
+                    .and_then(|env| env.get("OPENAI_API_KEY"))
+                    .and_then(Value::as_str)
+                    == Some("sk-binding")
+            },
+            None,
+        );
+        let held_while_unreadable = session.is_held().unwrap();
+        fs::remove_dir(&config_path).unwrap();
+        fs::rename(&retained, &config_path).unwrap();
+        drop(witness);
+        assert!(matches!(
+            result,
+            Err(CredentialRejectionFailure::Unpublished)
+        ));
+        assert_eq!(fs::read(&config_path).unwrap(), original);
+        assert_eq!(
+            fs::read(brain_fingerprint_key_path(journal.path())).unwrap(),
+            key_before
+        );
+        assert_eq!(record_bytes(&journal), brain_before);
+        assert_eq!(
+            (
+                held_while_unreadable,
+                session.is_held().unwrap(),
+                classify_credential_admission_bound(root, journal.path(), target, None).unwrap(),
+            ),
+            (true, true, StoredCredentialBinding::Matches),
+            "restoring original config readability must not forget the rejected actual target"
+        );
+    }
+
+    #[test]
+    fn temporary_unavailable_key_after_rejection_keeps_the_process_fact() {
+        let journal = TestJournal::new();
+        drop(begin_binding_refresh(&journal));
+        let root = Arc::new(JournalRoot::open(journal.path()).unwrap());
+        let target = CredentialHoldTarget::Managed {
+            provider: "openai",
+            credential: "sk-binding",
+        };
+        let witness =
+            capture_credential_validation_bound(root.clone(), journal.path(), target).unwrap();
+        let key = brain_fingerprint_key_path(journal.path());
+        let retained = key.with_extension("held-original");
+        let original = fs::read(&key).unwrap();
+        fs::rename(&key, &retained).unwrap();
+        fs::create_dir(&key).unwrap();
+        let result = retain_current_credential_rejection_bound(
+            journal.path(),
+            target,
+            &witness,
+            &|| Ok(()),
+            &|config| {
+                config
+                    .get("env")
+                    .and_then(|env| env.get("OPENAI_API_KEY"))
+                    .and_then(Value::as_str)
+                    == Some("sk-binding")
+            },
+            None,
+        );
+        assert!(matches!(
+            result,
+            Err(CredentialRejectionFailure::Refused(_))
+        ));
+        fs::remove_dir(&key).unwrap();
+        fs::rename(&retained, &key).unwrap();
+        assert_eq!(fs::read(&key).unwrap(), original);
+        assert!(
+            CredentialHoldSession::open_bound(root.clone(), target)
+                .unwrap()
+                .is_held()
+                .unwrap(),
+            "restoring original key readability must not erase the learned rejection"
+        );
+        assert_eq!(
+            classify_credential_admission_bound(root, journal.path(), target, None).unwrap(),
+            StoredCredentialBinding::Matches
+        );
+    }
+
+    #[test]
+    fn positive_config_authority_survives_transient_metadata_but_legacy_has_no_work_id() {
+        let positive = json!({"valid":true,"binding_version":1,"credential_hmac":"c".repeat(64),
+            "credential_observation_id":"d".repeat(64),"timestamp":"first"});
+        let mut transient = positive.clone();
+        transient["valid"] = json!(false);
+        transient["reason_code"] = json!("validation_unavailable");
+        transient["timestamp"] = json!("later");
+        assert_eq!(
+            config_authority_projection(Some(&positive)),
+            config_authority_projection(Some(&transient))
+        );
+        transient["reason_code"] = json!("provider_key_invalid");
+        assert_ne!(
+            config_authority_projection(Some(&positive)),
+            config_authority_projection(Some(&transient))
+        );
+        let mut legacy = positive;
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("credential_observation_id");
+        assert_eq!(config_authority_projection(Some(&legacy)), None);
+    }
+
+    #[test]
+    fn brain_observation_authority_never_recreates_a_missing_protected_key() {
+        for corrupt in [false, true] {
+            let journal = TestJournal::new();
+            let permit = begin_binding_refresh(&journal);
+            let root = Arc::new(JournalRoot::open(journal.path()).unwrap());
+            let target = CredentialHoldTarget::Managed {
+                provider: "openai",
+                credential: "sk-binding",
+            };
+            let witness =
+                capture_credential_validation_bound(root.clone(), journal.path(), target).unwrap();
+            witness
+                .retire_after_validation(&[0x55; 32], &|| Ok(()))
+                .unwrap();
+            drop(permit);
+            if corrupt {
+                let mut record: Value = serde_json::from_slice(&record_bytes(&journal)).unwrap();
+                record["credential_observations"]["openai"]["observation_id"] = json!("invalid");
+                journal.seed_value(&record);
+            }
+            fs::remove_file(brain_fingerprint_key_path(journal.path())).unwrap();
+            let before = record_bytes(&journal);
+            assert!(generate_fingerprint_key(journal.path()).is_err());
+            assert!(!brain_fingerprint_key_path(journal.path()).exists());
+            assert!(
+                classify_credential_admission_bound(root.clone(), journal.path(), target, None)
+                    .is_err()
+            );
+            assert!(capture_credential_validation_bound(root, journal.path(), target).is_err());
+            assert_eq!(record_bytes(&journal), before);
+        }
+    }
+
+    #[test]
+    fn credential_publication_budget_is_not_rearmed_by_later_owner_phases() {
+        let journal = TestJournal::new();
+        let permit = begin_binding_refresh(&journal);
+        let before = record_bytes(&journal);
+        let root = Arc::new(JournalRoot::open(journal.path()).unwrap());
+        let witness = capture_credential_validation_bound(
+            root,
+            journal.path(),
+            CredentialHoldTarget::Managed {
+                provider: "openai",
+                credential: "sk-binding",
+            },
+        )
+        .unwrap();
+        witness.publication_deadline.set(Some(
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+        ));
+        witness.begin_publication_budget();
+        let mut permit = permit;
+        permit.share_credential_publication_budget(&witness);
+        assert!(
+            permit
+                .checkpoint(journal.path())
+                .unwrap_err()
+                .contains("budget exhausted")
+        );
+        assert!(
+            witness
+                .retire_after_validation(&[0x55; 32], &|| Ok(()))
+                .unwrap_err()
+                .to_string()
+                .contains("budget exhausted")
+        );
+        assert_eq!(record_bytes(&journal), before);
+    }
+
+    #[test]
+    fn ordinary_refresh_keeps_unavailable_and_bound_absent_fingerprint_material() {
+        let missing = TestJournal::new();
+        write_openai_binding(&missing, true);
+        let key_path = brain_fingerprint_key_path(missing.path());
+        let error = ordinary_refresh(&missing).expect_err("bound absent key");
+        assert!(matches!(
+            error,
+            BeginRefreshError::Writer(WriterError::Fingerprint(_))
+        ));
+        assert!(!key_path.exists());
+
+        let short = TestJournal::new();
+        write_openai_binding(&short, true);
+        let short_path = brain_fingerprint_key_path(short.path());
+        fs::create_dir_all(short_path.parent().expect("health")).unwrap();
+        let original = b"not-32-bytes".to_vec();
+        fs::write(&short_path, &original).unwrap();
+        let error = ordinary_refresh(&short).expect_err("unavailable key");
+        assert!(matches!(
+            error,
+            BeginRefreshError::Writer(WriterError::Fingerprint(_))
+        ));
+        assert_eq!(fs::read(&short_path).unwrap(), original);
+
+        let fresh = TestJournal::new();
+        fresh.write_config("lane_byo_cloud");
+        let fresh_path = brain_fingerprint_key_path(fresh.path());
+        assert!(!fresh_path.exists());
+        ordinary_refresh(&fresh)
+            .expect("unbound journal")
+            .expect("first key");
+        assert_eq!(
+            fs::read(&fresh_path).unwrap().len(),
+            crate::inspect::FINGERPRINT_KEY_BYTES
+        );
+    }
+
+    #[test]
+    fn genuine_credential_rejection_survives_protected_key_loss_and_refresh() {
+        let journal = TestJournal::new();
+        write_openai_binding(&journal, true);
+        let key_path = brain_fingerprint_key_path(journal.path());
+        fs::create_dir_all(key_path.parent().unwrap()).unwrap();
+        fs::write(&key_path, [0x55; 32]).unwrap();
+        let original_config = fs::read(journal.path().join("config/journal.json")).unwrap();
+        let config: Map<String, Value> = serde_json::from_slice(&original_config).unwrap();
+        assert_eq!(
+            crate::inspect_brain_state(journal.path(), &config, fixture_now())
+                .projection
+                .reason_code
+                .as_deref(),
+            Some("provider_key_invalid")
+        );
+        fs::remove_file(&key_path).unwrap();
+        assert!(ordinary_refresh(&journal).is_err());
+        assert!(!key_path.exists());
+        assert!(!brain_state_path(journal.path()).exists());
+        assert_eq!(
+            fs::read(journal.path().join("config/journal.json")).unwrap(),
+            original_config
+        );
+        assert_eq!(
+            crate::inspect_brain_state(journal.path(), &config, fixture_now())
+                .projection
+                .reason_code
+                .as_deref(),
+            Some("provider_key_invalid")
+        );
+    }
+
+    fn seed_credential_hold(journal: &TestJournal) -> Value {
+        let key = load_existing_fingerprint_key(journal.path()).unwrap();
+        let holds = json!({ "openai": {
+            "binding_version": 1,
+            "credential_hmac": crate::managed_credential_binding_hmac(&key, "openai", "sk-binding"),
+            "marker_id": "b".repeat(64),
+            "reason_code": "provider_key_invalid",
+        }});
+        let mut record: Value = serde_json::from_slice(&record_bytes(journal)).unwrap();
+        record["credential_holds"] = holds.clone();
+        journal.seed_value(&record);
+        holds
+    }
+
+    #[test]
+    fn durable_brain_hold_prevents_rekey_when_config_has_no_rejection_binding() {
+        let journal = TestJournal::new();
+        write_openai_binding(&journal, false);
+        drop(ordinary_refresh(&journal).unwrap().unwrap());
+        seed_credential_hold(&journal);
+        let before = record_bytes(&journal);
+        let config_path = journal.path().join("config/journal.json");
+        let config_before = fs::read(&config_path).unwrap();
+        fs::remove_file(brain_fingerprint_key_path(journal.path())).unwrap();
+        assert!(ordinary_refresh(&journal).is_err());
+        assert!(!brain_fingerprint_key_path(journal.path()).exists());
+        assert_eq!(record_bytes(&journal), before);
+        assert_eq!(fs::read(config_path).unwrap(), config_before);
+    }
+
+    #[test]
+    fn brain_hold_publisher_binds_actual_key_and_new_reader_without_changing_config() {
+        let journal = TestJournal::new();
+        write_openai_binding(&journal, false);
+        let key = generate_fingerprint_key(journal.path()).unwrap();
+        let config_path = journal.path().join("config/journal.json");
+        let before = fs::read(&config_path).unwrap();
+        let hold = CredentialRejectionHold {
+            credential_hmac: crate::managed_credential_binding_hmac(&key, "openai", "sk-binding"),
+            marker_id: "c".repeat(64),
+        };
+        record_credential_hold_bound(
+            Arc::new(JournalRoot::open(journal.path()).unwrap()),
+            journal.path(),
+            "openai",
+            &hold,
+            &key,
+            &|| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&config_path).unwrap(), before);
+        let record: Value = serde_json::from_slice(&record_bytes(&journal)).unwrap();
+        assert!(validate_brain_state_record(&record, fixture_now()).is_err());
+        assert_eq!(record.as_object().unwrap().len(), 1);
+        crate::record::parse_credential_holds(record.get("credential_holds")).unwrap();
+        drop(ordinary_refresh(&journal).unwrap().unwrap());
+        let refreshed: Value = serde_json::from_slice(&record_bytes(&journal)).unwrap();
+        validate_brain_state_record(&refreshed, fixture_now()).unwrap();
+        assert_eq!(refreshed["credential_holds"], record["credential_holds"]);
+        for model in ["first-model", "changed-model"] {
+            let mut config: Value =
+                serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+            config["providers"]["active"]["model"] = json!(model);
+            fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+            for (credential, expected) in [
+                ("sk-binding", StoredCredentialBinding::Matches),
+                ("corrected-key", StoredCredentialBinding::DoesNotReject),
+            ] {
+                assert_eq!(
+                    classify_credential_admission_bound(
+                        Arc::new(JournalRoot::open(journal.path()).unwrap()),
+                        journal.path(),
+                        CredentialHoldTarget::Managed {
+                            provider: "openai",
+                            credential
+                        },
+                        None,
+                    )
+                    .unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bound_admission_consults_surviving_hold_without_creating_durable_state() {
+        let journal = TestJournal::new();
+        let root = Arc::new(JournalRoot::open(journal.path()).unwrap());
+        let target = CredentialHoldTarget::Managed {
+            provider: "openai",
+            credential: "unacknowledged-key",
+        };
+        let session = CredentialHoldSession::open_bound(root, target).unwrap();
+        session.record_rejection().unwrap();
+        drop(session);
+        assert_eq!(
+            classify_credential_admission_bound(
+                Arc::new(JournalRoot::open(journal.path()).unwrap()),
+                journal.path(),
+                target,
+                None,
+            )
+            .unwrap(),
+            StoredCredentialBinding::Matches
+        );
+        assert_eq!(
+            classify_credential_admission_bound(
+                Arc::new(JournalRoot::open(journal.path()).unwrap()),
+                journal.path(),
+                CredentialHoldTarget::Managed {
+                    provider: "openai",
+                    credential: "corrected-key"
+                },
+                None,
+            )
+            .unwrap(),
+            StoredCredentialBinding::Unbound
+        );
+        assert!(fs::read_dir(journal.path()).unwrap().next().is_none());
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn a_rejection_receipt_cannot_authorize_successful_refresh_evidence() {
+        let journal = TestJournal::new();
+        write_openai_binding(&journal, false);
+        let permit = ordinary_refresh(&journal).unwrap().unwrap();
+        let target = CredentialHoldTarget::Managed {
+            provider: "openai",
+            credential: "sk-binding",
+        };
+        let witness =
+            capture_credential_validation_bound(permit.admitted_root(), journal.path(), target)
+                .unwrap();
+        let receipt = retain_current_credential_rejection_bound(
+            journal.path(),
+            target,
+            &witness,
+            &|| Ok(()),
+            &|_| true,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let before = record_bytes(&journal);
+        assert!(
+            finish_refresh_rejected(
+                journal.path(),
+                permit,
+                ready_outcome(),
+                fixture_now(),
+                None,
+                receipt
+            )
+            .is_err()
+        );
+        assert_eq!(record_bytes(&journal), before);
+        assert_eq!(
+            classify_credential_admission_bound(
+                witness.admitted_root(),
+                journal.path(),
+                target,
+                None
+            )
+            .unwrap(),
+            StoredCredentialBinding::Matches
+        );
+    }
+
+    #[test]
+    fn brain_hold_publication_preserves_invalid_derived_evidence_for_normal_refresh() {
+        let journal = TestJournal::new();
+        write_openai_binding(&journal, false);
+        drop(ordinary_refresh(&journal).unwrap().unwrap());
+        let key = load_existing_fingerprint_key(journal.path()).unwrap();
+        let mut raw: Value = serde_json::from_slice(&record_bytes(&journal)).unwrap();
+        raw["evidence"]["retired-component"] = json!("invalid");
+        raw["credential_holds"] = json!({"anthropic": {
+            "binding_version": 1, "reason_code": "provider_key_invalid",
+            "credential_hmac": crate::managed_credential_binding_hmac(&key, "anthropic", "other-key"),
+            "marker_id": "d".repeat(64),
+        }});
+        let other = raw["credential_holds"]["anthropic"].clone();
+        journal.seed_value(&raw);
+        let hold = CredentialRejectionHold {
+            credential_hmac: crate::managed_credential_binding_hmac(&key, "openai", "sk-binding"),
+            marker_id: "e".repeat(64),
+        };
+        record_credential_hold_bound(
+            Arc::new(JournalRoot::open(journal.path()).unwrap()),
+            journal.path(),
+            "openai",
+            &hold,
+            &key,
+            &|| Ok(()),
+        )
+        .unwrap();
+        let held: Value = serde_json::from_slice(&record_bytes(&journal)).unwrap();
+        assert!(validate_brain_state_record(&held, fixture_now()).is_err());
+        assert_eq!(held["evidence"], raw["evidence"]);
+        assert_eq!(held["credential_holds"]["anthropic"], other);
+        assert_eq!(
+            held["credential_holds"]["openai"]["credential_hmac"],
+            hold.credential_hmac
+        );
+        drop(ordinary_refresh(&journal).unwrap().unwrap());
+        let repaired: Value = serde_json::from_slice(&record_bytes(&journal)).unwrap();
+        validate_brain_state_record(&repaired, fixture_now()).unwrap();
+        assert_eq!(repaired["credential_holds"], held["credential_holds"]);
+    }
+
+    #[cfg(all(unix, feature = "full-tests"))]
+    #[test]
+    fn brain_hold_final_key_change_refuses_before_creating_the_record() {
+        use solstone_core_journal_io::{
+            BoundPublicationPrimitive, run_with_bound_publication_barrier,
+        };
+        let journal = TestJournal::new();
+        write_openai_binding(&journal, false);
+        let key = generate_fingerprint_key(journal.path()).unwrap();
+        let hold = CredentialRejectionHold {
+            credential_hmac: crate::managed_credential_binding_hmac(&key, "openai", "sk-binding"),
+            marker_id: "f".repeat(64),
+        };
+        let key_path = brain_fingerprint_key_path(journal.path());
+        let (result, reached) = run_with_bound_publication_barrier(
+            BoundPublicationPrimitive::Rename,
+            1,
+            move || fs::write(key_path, [0x88; FINGERPRINT_KEY_BYTES]).unwrap(),
+            || {
+                record_credential_hold_bound(
+                    Arc::new(JournalRoot::open(journal.path()).unwrap()),
+                    journal.path(),
+                    "openai",
+                    &hold,
+                    &key,
+                    &|| Ok(()),
+                )
+            },
+        );
+        assert!(reached);
+        assert!(result.is_err());
+        assert!(!brain_state_path(journal.path()).exists());
+        assert_eq!(
+            fs::read(brain_fingerprint_key_path(journal.path())).unwrap(),
+            [0x88; FINGERPRINT_KEY_BYTES]
+        );
+    }
+
+    #[test]
+    fn invalid_derived_evidence_refresh_and_none_lane_preserve_valid_hold_authority() {
+        let journal = TestJournal::new();
+        write_openai_binding(&journal, false);
+        drop(ordinary_refresh(&journal).unwrap().unwrap());
+        let holds = seed_credential_hold(&journal);
+        let mut invalid: Value = serde_json::from_slice(&record_bytes(&journal)).unwrap();
+        invalid["evidence"]["retired_component"] = json!({"status": "invalid"});
+        journal.seed_value(&invalid);
+        drop(ordinary_refresh(&journal).unwrap().unwrap());
+        let repaired: Value = serde_json::from_slice(&record_bytes(&journal)).unwrap();
+        validate_brain_state_record(&repaired, fixture_now()).unwrap();
+        assert_eq!(repaired["credential_holds"], holds);
+        journal.write_config("lane_none");
+        assert!(ordinary_refresh(&journal).unwrap().is_none());
+        let none: Value = serde_json::from_slice(&record_bytes(&journal)).unwrap();
+        assert_eq!(none["credential_holds"], holds);
+    }
+
+    #[test]
+    fn transient_runtime_and_abandon_writes_preserve_holds_and_return_the_stored_record() {
+        let journal = TestJournal::new();
+        write_openai_binding(&journal, false);
+        drop(ordinary_refresh(&journal).unwrap().unwrap());
+        let holds = seed_credential_hold(&journal);
+        let permit = ordinary_refresh(&journal).unwrap().unwrap();
+        let abandoned = abandon_refresh(
+            journal.path(),
+            permit,
+            "provider_unavailable",
+            Map::new(),
+            fixture_now(),
+        )
+        .unwrap();
+        assert_eq!(abandoned["credential_holds"], holds);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&record_bytes(&journal)).unwrap(),
+            abandoned
+        );
+        let fingerprint = abandoned["fingerprint_sha256"].as_str().unwrap();
+        let failure = record_runtime_failure(
+            journal.path(),
+            "provider_unavailable",
+            "generate",
+            fingerprint,
+            Map::new(),
+            fixture_now(),
+            None,
+        );
+        assert!(failure.accepted, "{failure:?}");
+        let written = failure.record.unwrap();
+        assert_eq!(written["credential_holds"], holds);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&record_bytes(&journal)).unwrap(),
+            written
+        );
+    }
+
+    #[test]
+    fn newer_and_repeated_same_key_holds_defeat_an_older_refresh_success() {
+        for existing_hold in [false, true] {
+            let journal = TestJournal::new();
+            write_openai_binding(&journal, false);
+            drop(ordinary_refresh(&journal).unwrap().unwrap());
+            if existing_hold {
+                seed_credential_hold(&journal);
+            }
+            let permit = ordinary_refresh(&journal).unwrap().unwrap();
+            let key = load_existing_fingerprint_key(journal.path()).unwrap();
+            let hold = CredentialRejectionHold {
+                credential_hmac: crate::managed_credential_binding_hmac(
+                    &key,
+                    "openai",
+                    "sk-binding",
+                ),
+                marker_id: "a".repeat(64),
+            };
+            record_credential_hold_bound(
+                Arc::new(JournalRoot::open(journal.path()).unwrap()),
+                journal.path(),
+                "openai",
+                &hold,
+                &key,
+                &|| Ok(()),
+            )
+            .unwrap();
+            let before = record_bytes(&journal);
+            assert!(
+                finish_refresh(journal.path(), permit, ready_outcome(), fixture_now(), None)
+                    .is_err()
+            );
+            assert_eq!(record_bytes(&journal), before);
+            let current = ordinary_refresh(&journal).unwrap().unwrap();
+            let written = finish_refresh(
+                journal.path(),
+                current,
+                ready_outcome(),
+                fixture_now(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                written["credential_holds"]["openai"]["marker_id"],
+                hold.marker_id
+            );
+        }
+    }
+
+    #[test]
+    fn corrupt_hold_authority_is_not_discarded_by_derived_record_repair() {
+        let journal = TestJournal::new();
+        write_openai_binding(&journal, false);
+        drop(ordinary_refresh(&journal).unwrap().unwrap());
+        seed_credential_hold(&journal);
+        let mut record: Value = serde_json::from_slice(&record_bytes(&journal)).unwrap();
+        record["credential_holds"]["openai"]["credential_hmac"] = json!("broken");
+        journal.seed_value(&record);
+        let original = record_bytes(&journal);
+        assert!(ordinary_refresh(&journal).is_err());
+        assert_eq!(record_bytes(&journal), original);
     }
 
     #[test]

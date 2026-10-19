@@ -9,9 +9,7 @@ use std::path::Path;
 
 use serde_json::{Map, Value};
 use solstone_core_journal_config::{ConfigLoadError, get_journal_config_path, read_journal_config};
-use solstone_core_journal_io::{
-    AtomicWriteError, JsonWriteOptions, LockError, LockOptions, hold_lock, write_json,
-};
+use solstone_core_journal_io::{AtomicWriteError, JsonWriteOptions, LockError, LockOptions};
 
 /// A caller's expected current journal configuration state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,15 +114,54 @@ pub fn commit_journal_config(
     replacement: &Map<String, Value>,
     options: LockOptions,
 ) -> Result<(), CommitConfigError> {
+    commit_journal_config_checked(journal_path, expected, replacement, options, &|| Ok(()))
+}
+
+/// Replace journal config when its fingerprint matches, refusing the write when
+/// `checkpoint` fails after the lock is held.
+pub fn commit_journal_config_checked(
+    journal_path: &Path,
+    expected: ConfigExpectation,
+    replacement: &Map<String, Value>,
+    options: LockOptions,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), CommitConfigError> {
     let config_path = get_journal_config_path(journal_path);
-    let _lock = hold_lock(
+    #[cfg(any(unix, windows))]
+    let budget = crate::credential_interlock::PublicationBudget::new(options);
+    #[cfg(any(unix, windows))]
+    let admitted = crate::credential_interlock::existing_root(journal_path).map_err(|source| {
+        CommitConfigError::Write(AtomicWriteError::Io {
+            path: config_path.clone(),
+            source,
+        })
+    })?;
+    let entry_checkpoint = || {
+        checkpoint()?;
+        #[cfg(any(unix, windows))]
+        if let Some(root) = &admitted {
+            root.revalidate_canonical_binding()
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    };
+    let _lock = solstone_core_journal_io::hold_lock_checked(
         &config_path,
         LockOptions {
             mode: Some(0o600),
             ..options
         },
+        &entry_checkpoint,
     )
     .map_err(CommitConfigError::Lock)?;
+    #[cfg(any(unix, windows))]
+    let admitted =
+        crate::credential_interlock::created_root(journal_path, admitted).map_err(|source| {
+            CommitConfigError::Write(AtomicWriteError::Io {
+                path: config_path.clone(),
+                source,
+            })
+        })?;
     let read = read_journal_config(journal_path).map_err(CommitConfigError::Load)?;
     let actual = read
         .sha256
@@ -135,13 +172,45 @@ pub fn commit_journal_config(
             actual,
         }));
     }
-    write_json(
+    #[cfg(any(unix, windows))]
+    let credential_interlock = crate::credential_interlock::acquire(
+        &admitted,
+        &read.config.unwrap_or_default(),
+        replacement,
+        &budget,
+        &|| {
+            checkpoint()?;
+            admitted
+                .revalidate_canonical_binding()
+                .map_err(|error| error.to_string())
+        },
+    )
+    .map_err(|source| {
+        CommitConfigError::Write(AtomicWriteError::Io {
+            path: config_path.clone(),
+            source,
+        })
+    })?;
+    let checkpoint = || {
+        checkpoint()?;
+        #[cfg(any(unix, windows))]
+        admitted
+            .revalidate_canonical_binding()
+            .map_err(|error| error.to_string())?;
+        #[cfg(any(unix, windows))]
+        if let Some(interlock) = &credential_interlock {
+            interlock.checkpoint()?;
+        }
+        Ok(())
+    };
+    solstone_core_journal_io::write_json_checked(
         &config_path,
         replacement,
         JsonWriteOptions {
             mode: Some(0o600),
             ..JsonWriteOptions::default()
         },
+        &checkpoint,
     )
     .map_err(CommitConfigError::Write)
 }
@@ -163,7 +232,9 @@ mod tests {
 
     use serde_json::{Map, Value, json};
     use solstone_core_journal_config::{get_journal_config_path, read_journal_config};
-    use solstone_core_journal_io::{LockError, LockOptions, hold_lock, write_json};
+    use solstone_core_journal_io::{
+        JsonWriteOptions, LockError, LockOptions, hold_lock, write_json,
+    };
 
     use super::*;
     use crate::test_support::TempDir;
@@ -236,17 +307,19 @@ mod tests {
     #[test]
     fn commit_expect_absent_succeeds_for_missing_file() {
         let temporary = TempDir::new();
+        let journal = temporary.path().join("journal");
+        assert!(!journal.exists());
         let replacement = object(json!({"created": true}));
 
         commit_journal_config(
-            temporary.path(),
+            &journal,
             ConfigExpectation::Absent,
             &replacement,
             LockOptions::default(),
         )
         .unwrap();
 
-        let read = read_journal_config(temporary.path()).unwrap();
+        let read = read_journal_config(&journal).unwrap();
         assert!(read.present);
         assert_eq!(read.config, Some(replacement));
     }

@@ -13,7 +13,8 @@ mod store;
 mod trust_lock;
 
 pub use action_log::{
-    ActionLogScan, append_action_log, append_action_log_for_day, read_journal_action_rows,
+    ActionLogScan, append_action_log, append_action_log_checked, append_action_log_for_day,
+    append_journal_action_log_at_root_checked, read_journal_action_rows,
 };
 pub use activity_placement::{
     ActivityCourse, PlacedRecord, ResolvedSegment, place_activity_records,
@@ -71,17 +72,18 @@ pub use store::{
     read_connections_horizon, read_detected_entities, read_detected_entities_strict,
     read_detected_entity_names_strict, read_facet_declaration, read_facet_entity_link,
     read_facet_entity_observations, read_live_observations, read_log, read_log_file,
-    read_news_file, read_retired_facets, record_facet_candidates, record_import,
-    record_import_nudge, record_import_offer_declined, record_observation_ops_strict,
-    record_retired_facet, refresh_connections_horizon, remove_activity, require_declared_facet,
-    require_facet_write_identity, require_observed_facet_write_identity, resolve_facet_id,
-    resolve_observation_entity_dir, restore_retired_files, retired_facet_entry,
-    retired_facets_path, retitle_facet, review_promotion_snapshot, save_detected_entity,
-    save_facet_entity_link, scan_facet_relationships, seed_entities, serialize_observation_rows,
-    set_activity_hidden, set_activity_hidden_checked, set_facet_entity_link_detached,
-    set_facet_muted, settle_imported_facet_id, snapshot_retired_files, strip_incoming_facet_id,
-    update_activity, update_activity_record, update_activity_record_checked,
-    update_activity_record_with, update_detected_entity, update_facet, upsert_detection_segment,
+    read_news_file, read_retired_facets, record_facet_candidates, record_facet_candidates_checked,
+    record_import, record_import_nudge, record_import_offer_declined,
+    record_observation_ops_strict, record_retired_facet, refresh_connections_horizon,
+    remove_activity, require_declared_facet, require_facet_write_identity,
+    require_observed_facet_write_identity, resolve_facet_id, resolve_observation_entity_dir,
+    restore_retired_files, retired_facet_entry, retired_facets_path, retitle_facet,
+    review_promotion_snapshot, save_detected_entity, save_facet_entity_link,
+    scan_facet_relationships, seed_entities, serialize_observation_rows, set_activity_hidden,
+    set_activity_hidden_checked, set_facet_entity_link_detached, set_facet_muted,
+    settle_imported_facet_id, snapshot_retired_files, strip_incoming_facet_id, update_activity,
+    update_activity_record, update_activity_record_checked, update_activity_record_with,
+    update_detected_entity, update_facet, upsert_detection_segment,
     validate_observation_operations, write_activity_file, write_facet_entity_observations,
     write_log_file, write_news_file,
 };

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -139,6 +139,7 @@ fn accept_backfill(
     let root_identity = admitted.identity();
     let ledger_path = backfill_operations_path(&root_path);
     if let Some(parent) = ledger_path.parent() {
+        crate::backfill_operations::admit_backfill_task()?;
         fs::create_dir_all(parent).map_err(|source| BackfillOperationError::CreateDirectory {
             path: parent.to_path_buf(),
             source,
@@ -151,6 +152,7 @@ fn accept_backfill(
         .unwrap_or_else(mint_operation_id);
 
     let _ledger_lock = hold_lock(&ledger_path, LockOptions::default())?;
+    crate::backfill_operations::admit_backfill_task()?;
     truncate_torn_tail_if_present(&ledger_path)?;
     let rows = load_backfill_operations(&ledger_path)?;
     let existing_state = fold_backfill_operation(&rows, &operation_id)?;
@@ -243,6 +245,24 @@ pub fn start_backfill(
 /// complete or running in this process; an attempt running in another process
 /// holds the execution lock, and this one then leaves it alone.
 pub fn run_backfill_blocking(
+    journal_root: &Path,
+    request: &StartBackfillRequest,
+) -> Result<BackfillOperationStatus, BackfillCoordinatorError> {
+    let admit: Arc<dyn Fn() -> Result<(), String> + Send + Sync> = Arc::new(|| Ok(()));
+    run_backfill_blocking_checked(journal_root, request, &admit)
+}
+
+pub fn run_backfill_blocking_checked(
+    journal_root: &Path,
+    request: &StartBackfillRequest,
+    checkpoint: &Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+) -> Result<BackfillOperationStatus, BackfillCoordinatorError> {
+    crate::backfill_operations::with_backfill_task_checkpoint(Arc::clone(checkpoint), || {
+        run_backfill_blocking_body(journal_root, request)
+    })
+}
+
+fn run_backfill_blocking_body(
     journal_root: &Path,
     request: &StartBackfillRequest,
 ) -> Result<BackfillOperationStatus, BackfillCoordinatorError> {

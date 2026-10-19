@@ -80,6 +80,24 @@ pub fn create_oplog_at(
     format: OplogFormat,
     instant: DateTime<FixedOffset>,
 ) -> Result<OplogWriter, OplogCreateError> {
+    create_oplog_at_checked(
+        root,
+        source_original,
+        run_original,
+        format,
+        instant,
+        &|| Ok(()),
+    )
+}
+
+pub fn create_oplog_at_checked(
+    root: JournalRoot,
+    source_original: &str,
+    run_original: &str,
+    format: OplogFormat,
+    instant: DateTime<FixedOffset>,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<OplogWriter, OplogCreateError> {
     if !original_is_admissible(source_original) || !original_is_admissible(run_original) {
         return Err(bare(OplogCreateReason::InvalidField));
     }
@@ -90,6 +108,7 @@ pub fn create_oplog_at(
         format,
         instant,
         LockTiming::Default,
+        checkpoint,
     )
 }
 
@@ -111,6 +130,7 @@ pub fn create_oplog_with_test_timing(
         format,
         instant,
         LockTiming::Explicit(timeout, poll_interval),
+        &|| Ok(()),
     )
 }
 
@@ -121,6 +141,7 @@ fn create_with_timing(
     format: OplogFormat,
     instant: DateTime<FixedOffset>,
     timing: LockTiming,
+    caller_checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<OplogWriter, OplogCreateError> {
     if !original_is_admissible(source_original) || !original_is_admissible(run_original) {
         return Err(bare(OplogCreateReason::InvalidField));
@@ -147,6 +168,9 @@ fn create_with_timing(
         Err(reason) => return Err(evidence.fail(reason)),
     };
 
+    if let Err(_message) = caller_checkpoint() {
+        return Err(evidence.fail(OplogCreateReason::Stopped));
+    }
     if let Err(reason) = checkpoint(OplogCreatePrimitive::Stage) {
         return Err(evidence.fail(reason));
     }
@@ -284,6 +308,21 @@ fn create_with_timing(
             );
             return Err(fail_after_stage(
                 reason,
+                evidence,
+                &health,
+                &staged,
+                original_identity,
+                &attempted,
+                &witnesses,
+            ));
+        }
+        if let Err(_message) = caller_checkpoint() {
+            evidence.gap(
+                OplogEvidenceCheckpoint::Rename { ordinal },
+                OplogGapCause::Io,
+            );
+            return Err(fail_after_stage(
+                OplogCreateReason::Stopped,
                 evidence,
                 &health,
                 &staged,

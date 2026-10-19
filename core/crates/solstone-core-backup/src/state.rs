@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
+use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -10,8 +11,8 @@ use sha2::Sha256;
 use solstone_core_journal_config::read_journal_config;
 use solstone_core_journal_config_write::{
     BoundConfigOutcome, BoundConfigRefusal, CommitConfigError, ConfigExpectation,
-    ConfigMutationError, JournalConfigMutation, LockOptions, commit_journal_config,
-    conditional_update_journal_config_at_root, mutate_journal_config,
+    ConfigMutationError, JournalConfigMutation, LockOptions, commit_journal_config_checked,
+    conditional_update_journal_config_at_root, mutate_journal_config_checked,
 };
 use solstone_core_journal_io::JournalRoot;
 
@@ -195,11 +196,13 @@ pub fn clear_backup_config_if_unchanged(
     }
     config.insert("backup".into(), Value::Object(backup_defaults()));
     run_mutation_hook();
-    match commit_journal_config(
+    let admit = || admit_backup_task();
+    match commit_journal_config_checked(
         journal,
         ConfigExpectation::Sha256(fingerprint),
         &config,
         mutation_lock_options(),
+        &admit,
     ) {
         Ok(()) => Ok(true),
         Err(CommitConfigError::Conflict(_)) => Ok(false),
@@ -890,37 +893,73 @@ fn value_truthy(value: &Value) -> bool {
     }
 }
 
+type BackupTaskCheckpoint = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
+/// Install `checkpoint` for backup-owner writes on this thread until `body` returns.
+///
+/// The scheduled queue deadline is not the shared backup-route lifetime. Writers
+/// called from the embedded run admit this checkpoint after their own lock and
+/// immediately before the bytes change. An unset slot admits the write, so a
+/// desktop caller that never installs a checkpoint keeps the current behavior.
+pub fn with_backup_task_checkpoint<R>(
+    checkpoint: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+    body: impl FnOnce() -> R,
+) -> R {
+    struct Guard(Option<BackupTaskCheckpoint>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            BACKUP_TASK_CHECKPOINT.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let previous = BACKUP_TASK_CHECKPOINT.with(|slot| slot.borrow_mut().replace(checkpoint));
+    let _guard = Guard(previous);
+    body()
+}
+
+thread_local! {
+    static BACKUP_TASK_CHECKPOINT: RefCell<Option<BackupTaskCheckpoint>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn admit_backup_task() -> Result<(), String> {
+    BACKUP_TASK_CHECKPOINT.with(|slot| match slot.borrow().as_ref() {
+        Some(checkpoint) => checkpoint(),
+        None => Ok(()),
+    })
+}
+
 fn mutate_backup_section<T>(
     journal: &Path,
     operation: impl FnOnce(&mut Map<String, Value>) -> Result<(bool, T), BackupError>,
 ) -> Result<T, BackupError> {
-    let transaction = mutate_journal_config(journal, mutation_lock_options(), |config| {
-        run_mutation_hook();
-        let backup = config
-            .entry("backup".to_owned())
-            .or_insert_with(|| Value::Object(Map::new()));
-        let replaced_non_object = !backup.is_object();
-        if replaced_non_object {
-            *backup = Value::Object(Map::new());
-        }
-        let result = operation(backup.as_object_mut().expect("object assigned"));
-        match result {
-            Ok((changed, value)) => JournalConfigMutation {
-                changed: changed || replaced_non_object,
-                value: Ok(value),
-            },
-            Err(error) => JournalConfigMutation {
-                changed: false,
-                value: Err(error),
-            },
-        }
-    })
-    .map_err(BackupError::ConfigMutation)?;
+    let admit = || admit_backup_task();
+    let transaction =
+        mutate_journal_config_checked(journal, mutation_lock_options(), &admit, |config| {
+            run_mutation_hook();
+            let backup = config
+                .entry("backup".to_owned())
+                .or_insert_with(|| Value::Object(Map::new()));
+            let replaced_non_object = !backup.is_object();
+            if replaced_non_object {
+                *backup = Value::Object(Map::new());
+            }
+            let result = operation(backup.as_object_mut().expect("object assigned"));
+            match result {
+                Ok((changed, value)) => JournalConfigMutation {
+                    changed: changed || replaced_non_object,
+                    value: Ok(value),
+                },
+                Err(error) => JournalConfigMutation {
+                    changed: false,
+                    value: Err(error),
+                },
+            }
+        })
+        .map_err(BackupError::ConfigMutation)?;
     transaction.value
 }
 
 #[cfg(test)]
-use std::{cell::RefCell, rc::Rc};
+use std::rc::Rc;
 #[cfg(test)]
 thread_local! { static MUTATION_HOOK: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) }; }
 #[cfg(test)]

@@ -291,7 +291,8 @@ fn provider_update_error_exit(error: &ProviderUpdateError) -> u8 {
             EXIT_UNAVAILABLE
         }
         ProviderUpdateError::Mutation(MutationError::ConfigWrite(_)) => EXIT_IOERR,
-        ProviderUpdateError::Mutation(MutationError::ActionLog(_)) => EXIT_INTERNAL_FAILURE,
+        ProviderUpdateError::Mutation(MutationError::ActionLog(_))
+        | ProviderUpdateError::Mutation(MutationError::StaleProbe) => EXIT_INTERNAL_FAILURE,
     }
 }
 
@@ -316,6 +317,9 @@ fn update_error_message(error: &ProviderUpdateError) -> String {
         | ProviderUpdateError::Mutation(MutationError::ConfigWrite(detail))
         | ProviderUpdateError::Mutation(MutationError::ActionLog(detail)) => detail.clone(),
         ProviderUpdateError::Mutation(MutationError::Read(error)) => error.to_string(),
+        ProviderUpdateError::Mutation(MutationError::StaleProbe) => {
+            "the settings change was not saved".to_owned()
+        }
     }
 }
 
@@ -436,6 +440,14 @@ mod tests {
                 "x".to_owned()
             ))),
             EXIT_INTERNAL_FAILURE
+        );
+        assert_eq!(
+            provider_update_error_exit(&ProviderUpdateError::Mutation(MutationError::StaleProbe)),
+            EXIT_INTERNAL_FAILURE
+        );
+        assert_eq!(
+            update_error_message(&ProviderUpdateError::Mutation(MutationError::StaleProbe)),
+            "the settings change was not saved"
         );
     }
 

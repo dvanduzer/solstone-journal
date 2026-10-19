@@ -30,6 +30,8 @@ pub enum SpeakerCandidatePairReviewCandidateError {
     Write(#[from] AtomicWriteError),
     #[error("invalid speaker candidate-pair review record: {0}")]
     InvalidRow(&'static str),
+    #[error("{0}")]
+    Cancelled(String),
 }
 
 /// One detected pair, addressed by stable source anchors rather than pool IDs.
@@ -64,6 +66,14 @@ pub fn load_candidates(
 pub fn record_candidate_pair(
     journal_root: &Path,
     suggestion: &CandidatePairSuggestion,
+) -> Result<(Option<Value>, bool, bool), SpeakerCandidatePairReviewCandidateError> {
+    record_candidate_pair_checked(journal_root, suggestion, &|| Ok(()))
+}
+
+pub fn record_candidate_pair_checked(
+    journal_root: &Path,
+    suggestion: &CandidatePairSuggestion,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<(Option<Value>, bool, bool), SpeakerCandidatePairReviewCandidateError> {
     let source = suggestion.source_anchors.first().ok_or(
         SpeakerCandidatePairReviewCandidateError::InvalidRow("source has no anchors"),
@@ -125,6 +135,7 @@ pub fn record_candidate_pair(
     } else {
         rows.push(row.clone());
     }
+    checkpoint().map_err(SpeakerCandidatePairReviewCandidateError::Cancelled)?;
     write_jsonl(&path, rows, AtomicWriteOptions::default())?;
     Ok((Some(row), created, false))
 }

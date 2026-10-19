@@ -27,6 +27,7 @@ pub enum FacetReviewCandidateError {
     Store(FacetStoreError),
     Lock(LockError),
     Write(AtomicWriteError),
+    Cancelled(String),
 }
 
 impl fmt::Display for FacetReviewCandidateError {
@@ -36,6 +37,7 @@ impl fmt::Display for FacetReviewCandidateError {
             Self::Store(error) => error.fmt(formatter),
             Self::Lock(error) => error.fmt(formatter),
             Self::Write(error) => error.fmt(formatter),
+            Self::Cancelled(message) => formatter.write_str(message),
         }
     }
 }
@@ -47,6 +49,7 @@ impl Error for FacetReviewCandidateError {
             Self::Store(error) => Some(error),
             Self::Lock(error) => Some(error),
             Self::Write(error) => Some(error),
+            Self::Cancelled(_) => None,
         }
     }
 }
@@ -75,7 +78,7 @@ pub fn accept_candidate(
     journal_root: &Path,
     name_key: &str,
 ) -> Result<Option<Value>, FacetReviewCandidateError> {
-    modify_candidates(journal_root, |rows| {
+    modify_candidates(journal_root, &|| Ok(()), |rows| {
         let row = rows
             .iter_mut()
             .find(|row| row.get("name_key").and_then(Value::as_str) == Some(name_key))?;
@@ -93,7 +96,7 @@ pub fn dismiss_candidate(
     journal_root: &Path,
     name_key: &str,
 ) -> Result<Option<Value>, FacetReviewCandidateError> {
-    modify_candidates(journal_root, |rows| {
+    modify_candidates(journal_root, &|| Ok(()), |rows| {
         let row = rows
             .iter_mut()
             .find(|row| row.get("name_key").and_then(Value::as_str) == Some(name_key))?;
@@ -122,11 +125,20 @@ pub fn record_facet_candidates(
     day: &str,
     candidates: &[SpeculativeFacetCandidate],
 ) -> Result<usize, FacetReviewCandidateError> {
+    record_facet_candidates_checked(journal_root, day, candidates, &|| Ok(()))
+}
+
+pub fn record_facet_candidates_checked(
+    journal_root: &Path,
+    day: &str,
+    candidates: &[SpeculativeFacetCandidate],
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<usize, FacetReviewCandidateError> {
     if candidates.is_empty() {
         return Ok(0);
     }
 
-    modify_candidates(journal_root, |rows| {
+    modify_candidates(journal_root, checkpoint, |rows| {
         let mut touched = 0;
         for candidate in candidates {
             let samples = samples_value(&candidate.samples);
@@ -193,6 +205,7 @@ pub fn facet_slug(title: &str) -> String {
 
 fn modify_candidates<T>(
     journal_root: &Path,
+    checkpoint: &dyn Fn() -> Result<(), String>,
     modify: impl FnOnce(&mut Vec<Value>) -> T,
 ) -> Result<T, FacetReviewCandidateError> {
     let _trust =
@@ -208,6 +221,7 @@ fn modify_candidates<T>(
     .map_err(FacetReviewCandidateError::Lock)?;
     let mut rows = load_candidates(journal_root)?;
     let result = modify(&mut rows);
+    checkpoint().map_err(FacetReviewCandidateError::Cancelled)?;
     let contents = rows
         .iter()
         .map(|row| serde_json::to_string(row).expect("value serializes") + "\n")

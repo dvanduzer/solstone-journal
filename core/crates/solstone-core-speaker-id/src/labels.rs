@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+#[cfg(not(unix))]
+use solstone_core_journal_io::atomic_replace_checked;
 use solstone_core_journal_io::{
     AtomicWriteError, AtomicWriteOptions, FileLock, LockError, LockOptions, atomic_replace,
     hold_lock,
@@ -146,11 +148,23 @@ pub fn write_full_labels_checked(
     metadata: &Map<String, Value>,
     checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<(), LabelsError> {
+    checkpoint().map_err(LabelsError::PublicationRefused)?;
+    // hold_lock already creates this parent on first use; retain that same
+    // directory before taking the sidecar or reading merge inputs.
+    let path = labels_path(segment_dir);
+    std::fs::create_dir_all(path.parent().expect("labels have a parent"))
+        .map_err(LabelsError::Io)?;
+    let parent = capture_labels_parent(&path)?;
+    let admitted = || {
+        checkpoint()?;
+        parent
+            .revalidate_canonical_binding()
+            .map_err(|error| error.to_string())
+    };
+    let _lock = hold_lock(&path, LockOptions::default()).map_err(LabelsError::Lock)?;
+    admitted().map_err(LabelsError::PublicationRefused)?;
     let corrected =
         corrections_by_sentence(read_corrections(segment_dir).map_err(LabelsError::Corrections)?)?;
-    let path = labels_path(segment_dir);
-    let _lock = hold_lock(&path, LockOptions::default()).map_err(LabelsError::Lock)?;
-    checkpoint().map_err(LabelsError::PublicationRefused)?;
 
     let current = read_current_labels(&path);
     let mut result = current.clone().unwrap_or_default();
@@ -239,8 +253,8 @@ pub fn write_full_labels_checked(
         result.remove("candidate_evidence_gaps");
     }
 
-    checkpoint().map_err(LabelsError::PublicationRefused)?;
-    write_labels(&path, Value::Object(result))
+    admitted().map_err(LabelsError::PublicationRefused)?;
+    write_labels_bound(&path, &parent, Value::Object(result), &admitted)
 }
 
 /// Write a skipped-labels payload, replacing every label the speaker step wrote.
@@ -254,9 +268,19 @@ pub fn write_stub_labels_checked(
     reason: &str,
     checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<(), LabelsError> {
-    let path = labels_path(segment_dir);
-    let _lock = hold_lock(&path, LockOptions::default()).map_err(LabelsError::Lock)?;
     checkpoint().map_err(LabelsError::PublicationRefused)?;
+    let path = labels_path(segment_dir);
+    std::fs::create_dir_all(path.parent().expect("labels have a parent"))
+        .map_err(LabelsError::Io)?;
+    let parent = capture_labels_parent(&path)?;
+    let admitted = || {
+        checkpoint()?;
+        parent
+            .revalidate_canonical_binding()
+            .map_err(|error| error.to_string())
+    };
+    let _lock = hold_lock(&path, LockOptions::default()).map_err(LabelsError::Lock)?;
+    admitted().map_err(LabelsError::PublicationRefused)?;
 
     let user_labels = read_current_labels(&path)
         .and_then(|current| current.get("labels").and_then(Value::as_array).cloned())
@@ -268,8 +292,8 @@ pub fn write_stub_labels_checked(
     result.insert("labels".to_owned(), Value::Array(user_labels));
     result.insert("skipped".to_owned(), Value::Bool(true));
     result.insert("reason".to_owned(), Value::String(reason.to_owned()));
-    checkpoint().map_err(LabelsError::PublicationRefused)?;
-    write_labels(&path, Value::Object(result))
+    admitted().map_err(LabelsError::PublicationRefused)?;
+    write_labels_bound(&path, &parent, Value::Object(result), &admitted)
 }
 
 /// Apply sentence-ID-addressed label patches to a segment's labels.
@@ -335,7 +359,7 @@ pub fn patch_labels(
     }
 
     base.insert("labels".to_owned(), Value::Array(labels));
-    write_labels(&path, Value::Object(base))
+    write_labels(&path, Value::Object(base), &|| Ok(()))
 }
 
 /// Restore identify-authored labels only when their current values still match.
@@ -405,7 +429,7 @@ pub fn restore_label_rows(
         (sentence_id.is_none(), sentence_id.unwrap_or(0))
     });
     base.insert("labels".to_owned(), Value::Array(labels));
-    write_labels(&path, Value::Object(base))?;
+    write_labels(&path, Value::Object(base), &|| Ok(()))?;
     Ok(report)
 }
 
@@ -715,17 +739,207 @@ fn py_truthy(value: &Value) -> bool {
     }
 }
 
-fn write_labels(path: &Path, value: Value) -> Result<(), LabelsError> {
+fn write_labels(
+    path: &Path,
+    value: Value,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), LabelsError> {
+    checkpoint().map_err(LabelsError::PublicationRefused)?;
+    let parent = capture_labels_parent(path)?;
+    write_labels_bound(path, &parent, value, checkpoint)
+}
+
+fn capture_labels_parent(
+    path: &Path,
+) -> Result<solstone_core_journal_io::JournalRoot, LabelsError> {
+    solstone_core_journal_io::JournalRoot::open(path.parent().expect("labels have a parent"))
+        .map_err(|error| {
+            LabelsError::Write(AtomicWriteError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::other(error.to_string()),
+            })
+        })
+}
+
+fn write_labels_bound(
+    path: &Path,
+    parent: &solstone_core_journal_io::JournalRoot,
+    value: Value,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), LabelsError> {
+    let publication_checkpoint = || {
+        checkpoint()?;
+        parent
+            .revalidate_canonical_binding()
+            .map_err(|error| error.to_string())
+    };
+    publication_checkpoint().map_err(LabelsError::PublicationRefused)?;
     let mut bytes = write_python_compatible_json(&value, 2)
         .map_err(LabelsError::Serialize)?
         .into_bytes();
     bytes.push(b'\n');
-    atomic_replace(path, &bytes, AtomicWriteOptions { mode: Some(0o600) })
-        .map_err(LabelsError::Write)
+    #[cfg(unix)]
+    {
+        let outcome = solstone_core_journal_io::atomic_replace_bound_checked(
+            parent,
+            path.file_name().expect("labels have a name"),
+            &bytes,
+            0o600,
+            &publication_checkpoint,
+        )
+        .map_err(|error| {
+            LabelsError::Write(AtomicWriteError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::new(error.source.kind(), error.to_string()),
+            })
+        })?;
+        match outcome {
+            solstone_core_journal_io::BoundAtomicOutcome::Published { .. } => Ok(()),
+            solstone_core_journal_io::BoundAtomicOutcome::PublishedObservationUncertain {
+                source,
+                ..
+            } => Err(LabelsError::Write(AtomicWriteError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::new(
+                    source.kind(),
+                    format!("published; observation uncertain: {source}"),
+                ),
+            })),
+            solstone_core_journal_io::BoundAtomicOutcome::PublishedDurabilityUncertain {
+                source,
+                ..
+            } => Err(LabelsError::Write(AtomicWriteError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::new(
+                    source.kind(),
+                    format!("published; durability uncertain: {source}"),
+                ),
+            })),
+        }
+    }
+    #[cfg(not(unix))]
+    atomic_replace_checked(
+        path,
+        &bytes,
+        AtomicWriteOptions { mode: Some(0o600) },
+        &publication_checkpoint,
+    )
+    .map_err(LabelsError::Write)
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(unix, feature = "full-tests"))]
+    #[test]
+    fn public_label_writers_refuse_child_replacement_after_lock() {
+        for full in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let segment = temp.path().join("segment");
+            let parked = temp.path().join("parked");
+            write_stub_labels_checked(&segment, "first-use", &|| Ok(())).unwrap();
+            let path = labels_path(&segment);
+            let child = path.parent().unwrap();
+            std::fs::create_dir_all(child).unwrap();
+            let before = b"{\"labels\":[]}\n";
+            std::fs::write(&path, before).unwrap();
+            let replaced = std::cell::Cell::new(false);
+            let checkpoint = || {
+                if !replaced.get()
+                    && solstone_core_journal_io::locking::lock_is_held(&path)
+                        .map_err(|error| error.to_string())?
+                {
+                    replaced.set(true);
+                    std::fs::rename(child, &parked).unwrap();
+                    std::fs::create_dir(child).unwrap();
+                    std::fs::write(&path, before).unwrap();
+                }
+                Ok(())
+            };
+            let result = if full {
+                write_full_labels_checked(
+                    &segment,
+                    vec![serde_json::json!({"sentence_id":1,"speaker_id":"fresh"})],
+                    &Map::new(),
+                    &checkpoint,
+                )
+            } else {
+                write_stub_labels_checked(&segment, "declared-skip", &checkpoint)
+            };
+            assert!(replaced.get(), "actual public sidecar must be held");
+            assert!(result.is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(
+                std::fs::read(parked.join("speaker_labels.json")).unwrap(),
+                before
+            );
+            if full {
+                write_full_labels_checked(
+                    &segment,
+                    vec![serde_json::json!({"sentence_id":1,"speaker_id":"fresh"})],
+                    &Map::new(),
+                    &|| Ok(()),
+                )
+                .unwrap();
+                let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                assert_eq!(saved["labels"][0]["speaker_id"], "fresh");
+            } else {
+                write_stub_labels_checked(&segment, "declared-skip", &|| Ok(())).unwrap();
+                let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                assert_eq!(saved["reason"], "declared-skip");
+            }
+        }
+    }
+    #[cfg(all(unix, feature = "full-tests"))]
+    #[test]
+    fn native_stage_cancellation_and_parent_replacement_preserve_both_destinations() {
+        for replace_parent in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let parent = temp.path().join("owner");
+            let parked = temp.path().join("parked");
+            std::fs::create_dir(&parent).unwrap();
+            let path = parent.join("speaker_labels.json");
+            write_labels(&path, serde_json::json!({"labels": []}), &|| Ok(())).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let saw_stage = std::cell::Cell::new(false);
+            let checkpoint = || {
+                if !saw_stage.get()
+                    && std::fs::read_dir(&parent).unwrap().any(|entry| {
+                        solstone_core_journal_io::is_publication_candidate_name(
+                            &entry.unwrap().file_name(),
+                        )
+                    })
+                {
+                    saw_stage.set(true);
+                    if replace_parent {
+                        std::fs::rename(&parent, &parked).unwrap();
+                        std::fs::create_dir(&parent).unwrap();
+                        std::fs::write(&path, &before).unwrap();
+                    } else {
+                        return Err("declared cancellation after staging".to_owned());
+                    }
+                }
+                Ok(())
+            };
+            let result = write_labels(
+                &path,
+                serde_json::json!({"labels": [], "skipped": true, "reason": "test"}),
+                &checkpoint,
+            );
+            assert!(
+                saw_stage.get(),
+                "the actual owner must reach a native stage"
+            );
+            assert!(result.is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            if replace_parent {
+                assert_eq!(
+                    std::fs::read(parked.join("speaker_labels.json")).unwrap(),
+                    before
+                );
+            }
+        }
+    }
+
     use super::*;
 
     #[test]

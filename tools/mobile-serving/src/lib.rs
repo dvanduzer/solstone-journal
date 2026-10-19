@@ -125,6 +125,12 @@ impl MobileServing {
     pub fn stop_handle(&self) -> MobileServingStop {
         self.stop.clone()
     }
+
+    /// Share the backup operation ownership the embedded routes already hold.
+    pub fn backup_dependencies(&self) -> solstone_core_backup_web::BackupWebDeps {
+        self.handle.backup_dependencies()
+    }
+
     pub fn interface_address(&self) -> SocketAddrV4 {
         self.interface_address
     }

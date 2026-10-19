@@ -197,32 +197,49 @@ pub fn open_index_reader(journal: &Path) -> Result<Connection, StoreError> {
     Ok(conn)
 }
 
-fn open_index_connection(journal: &Path) -> Result<Connection, StoreError> {
+fn open_index_connection(
+    journal: &Path,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Connection, StoreError> {
+    admit_scan_journal(checkpoint)?;
     let index_dir = journal.join(INDEX_DIR);
     fs::create_dir_all(&index_dir)?;
+    admit_scan_journal(checkpoint)?;
     let mut conn = Connection::open(db_path(journal))?;
+    admit_scan_journal(checkpoint)?;
     conn.execute_batch(
         "PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
     )?;
-    ensure_schema(&mut conn)?;
+    admit_scan_journal(checkpoint)?;
+    ensure_schema(&mut conn, checkpoint)?;
     Ok(conn)
 }
 
 /// Fixture seeding only; not a production mutation entry point.
 #[cfg(any(test, feature = "test-fixtures"))]
 pub fn open_index(journal: &Path) -> Result<Connection, StoreError> {
-    open_index_connection(journal)
+    open_index_connection(journal, &|| Ok(()))
+}
+
+pub(crate) fn admit_scan_journal(
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), StoreError> {
+    checkpoint().map_err(|cause| StoreError::WriterAdmission {
+        operation: "scan-journal",
+        cause,
+    })
 }
 
 pub(crate) fn open_index_admitted(
     journal: &Path,
     _admission: &IndexAdmission,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<Connection, StoreError> {
-    let mut conn = open_index_connection(journal)?;
+    let mut conn = open_index_connection(journal, checkpoint)?;
     // An index built before the path lookup existed seeds it on the first
     // admitted write, so an upgraded journal keeps indexing on its own.
     if !chunk_path_lookup_ready(&conn)? {
-        seed_path_lookup(&mut conn)?;
+        seed_path_lookup(&mut conn, checkpoint)?;
     }
     Ok(conn)
 }
@@ -299,7 +316,7 @@ pub fn prune_chunks_by_stream(
     if !db_path(journal).is_file() {
         return Ok(StreamPruneCounts::default());
     }
-    let mut conn = open_index_admitted(journal, &admission)?;
+    let mut conn = open_index_admitted(journal, &admission, &|| Ok(()))?;
     let tx = conn.transaction()?;
     let paths = {
         let mut statement = tx.prepare(
@@ -360,7 +377,7 @@ pub fn prune_by_paths(
     if !db_path(journal).exists() {
         return Ok(None);
     }
-    let mut conn = open_index_admitted(journal, &admission)?;
+    let mut conn = open_index_admitted(journal, &admission, &|| Ok(()))?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut counts = StreamPruneCounts::default();
     for rel in rels {
@@ -390,12 +407,13 @@ pub const AUTHORED_CHAT_PATH_PREDICATE: &str =
 /// has no index and does not create one.
 pub fn prune_authored_chat_paths(journal: &Path) -> Result<Option<StreamPruneCounts>, StoreError> {
     let admission = IndexAdmission::acquire(journal, "prune-authored-chat")?;
-    prune_authored_chat_paths_admitted(journal, &admission)
+    prune_authored_chat_paths_admitted(journal, &admission, &|| Ok(()))
 }
 
 pub(crate) fn prune_authored_chat_paths_admitted(
     journal: &Path,
     _admission: &IndexAdmission,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<Option<StreamPruneCounts>, StoreError> {
     let path = db_path(journal);
     if !path.is_file() {
@@ -438,11 +456,21 @@ pub(crate) fn prune_authored_chat_paths_admitted(
     } else {
         0
     };
+    if let Err(cause) = checkpoint() {
+        drop(tx);
+        return Err(StoreError::WriterAdmission {
+            operation: "scan-journal",
+            cause,
+        });
+    }
     tx.commit()?;
     Ok(Some(StreamPruneCounts { chunks, files }))
 }
 
-fn ensure_schema(conn: &mut Connection) -> Result<(), StoreError> {
+fn ensure_schema(
+    conn: &mut Connection,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), StoreError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     repair_missing_classification_facets(&tx)?;
     let chunks_existed = sqlite_table_exists(&tx, "chunks")?;
@@ -458,6 +486,7 @@ fn ensure_schema(conn: &mut Connection) -> Result<(), StoreError> {
             [],
         )?;
     }
+    admit_scan_journal(checkpoint)?;
     tx.commit()?;
     Ok(())
 }
@@ -917,6 +946,67 @@ pub(crate) fn sqlite_table_exists(conn: &Connection, table: &str) -> Result<bool
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(unix, feature = "full-tests"))]
+    #[test]
+    fn schema_commit_cancellation_and_root_replacement_leave_initialization_incomplete() {
+        for replace_root in [false, true] {
+            struct TestDirectory(PathBuf);
+            impl Drop for TestDirectory {
+                fn drop(&mut self) {
+                    let _ = fs::remove_dir_all(&self.0);
+                }
+            }
+            let temp = TestDirectory(temp_root("schema-native-publication"));
+            fs::create_dir(&temp.0).unwrap();
+            let journal = temp.0.join("journal");
+            std::fs::create_dir(&journal).unwrap();
+            let database = journal.join("fixture.sqlite");
+            let mut conn = Connection::open(&database).unwrap();
+            let bound = solstone_core_journal_io::JournalRoot::open(&journal).unwrap();
+            let parked = temp.0.join("parked");
+            let observed = std::cell::Cell::new(false);
+            let checkpoint = || {
+                let observer = Connection::open(&database).unwrap();
+                observer.busy_timeout(std::time::Duration::ZERO).unwrap();
+                let error = observer.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+                assert!(
+                    matches!(error, rusqlite::Error::SqliteFailure(error, _) if error.code == rusqlite::ErrorCode::DatabaseBusy)
+                );
+                observed.set(true);
+                if replace_root {
+                    std::fs::rename(&journal, &parked).unwrap();
+                    std::fs::create_dir(&journal).unwrap();
+                    bound
+                        .revalidate_canonical_binding()
+                        .map_err(|error| error.to_string())
+                } else {
+                    Err("declared cancellation at schema commit".to_owned())
+                }
+            };
+            assert!(ensure_schema(&mut conn, &checkpoint).is_err());
+            assert!(
+                observed.get(),
+                "the actual schema transaction must hold its write lock"
+            );
+            assert!(!sqlite_table_exists(&conn, "chunks").unwrap());
+            drop(conn);
+            let retained = if replace_root {
+                parked.join("fixture.sqlite")
+            } else {
+                database
+            };
+            let inspected = Connection::open(&retained).unwrap();
+            assert!(!sqlite_table_exists(&inspected, "chunks").unwrap());
+            drop(inspected);
+            if replace_root {
+                assert!(std::fs::read_dir(&journal).unwrap().next().is_none());
+            }
+            let mut positive = Connection::open(temp.0.join("positive.sqlite")).unwrap();
+            ensure_schema(&mut positive, &|| Ok(())).unwrap();
+            assert!(sqlite_table_exists(&positive, "chunks").unwrap());
+        }
+    }
+
     use super::*;
     use crate::test_support::reserve_temp_path;
     use serde_json::json;
@@ -1986,12 +2076,12 @@ mod derived_recovery_tests {
     #[test]
     fn failed_membership_repair_rolls_back_classification_and_cursor() {
         let mut conn = Connection::open_in_memory().unwrap();
-        ensure_schema(&mut conn).unwrap();
+        ensure_schema(&mut conn, &|| Ok(())).unwrap();
         conn.execute_batch("INSERT INTO chunk_classification VALUES ('p','facets','facet_owned',1,0);
             INSERT INTO chunk_classification_backfill VALUES(1,'z',1,0,NULL,2);
             DROP TABLE chunk_classification_facets;
             CREATE TRIGGER refuse_cursor_reset BEFORE DELETE ON chunk_classification_backfill BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
-        assert!(ensure_schema(&mut conn).is_err());
+        assert!(ensure_schema(&mut conn, &|| Ok(())).is_err());
         assert_eq!(
             conn.query_row("SELECT count(*) FROM chunk_classification", [], |r| r
                 .get::<_, i64>(0))
@@ -2010,20 +2100,20 @@ mod derived_recovery_tests {
         assert!(!sqlite_table_exists(&conn, "chunk_classification_facets").unwrap());
         conn.execute_batch("DROP TRIGGER refuse_cursor_reset")
             .unwrap();
-        ensure_schema(&mut conn).unwrap();
+        ensure_schema(&mut conn, &|| Ok(())).unwrap();
         assert!(read_chunk_classification_backfill(&conn).unwrap().is_none());
     }
 
     #[test]
     fn missing_memberships_invalidates_only_classification_and_preserves_search() {
         let mut conn = Connection::open_in_memory().unwrap();
-        ensure_schema(&mut conn).unwrap();
+        ensure_schema(&mut conn, &|| Ok(())).unwrap();
         conn.execute_batch("INSERT INTO chunks(rowid,content,path) VALUES (41,'preserved','facets/work/news/20260101.md');
             INSERT INTO files VALUES ('facets/work/news/20260101.md', 12);
             INSERT INTO chunk_classification VALUES ('facets/work/news/20260101.md','facets','facet_owned',1,0);
             INSERT INTO chunk_classification_backfill VALUES(1,'z',1,0,NULL,2);
             DROP TABLE chunk_classification_facets;").unwrap();
-        ensure_schema(&mut conn).expect("derived memberships recover on ordinary open");
+        ensure_schema(&mut conn, &|| Ok(())).expect("derived memberships recover on ordinary open");
         assert_eq!(
             conn.query_row(
                 "SELECT rowid FROM chunks WHERE chunks MATCH 'preserved'",
@@ -2046,6 +2136,6 @@ mod derived_recovery_tests {
         );
         assert!(read_chunk_classification_backfill(&conn).unwrap().is_none());
         assert!(sqlite_table_exists(&conn, "chunk_classification_facets").unwrap());
-        ensure_schema(&mut conn).unwrap();
+        ensure_schema(&mut conn, &|| Ok(())).unwrap();
     }
 }

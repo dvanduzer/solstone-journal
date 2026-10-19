@@ -93,6 +93,116 @@ pub enum BoundConfigOutcome {
     Published(BoundConfigPublication),
 }
 
+/// The normal config owner's locked transformation and actual publication facts.
+#[derive(Debug)]
+pub struct BoundConfigTransaction<T> {
+    pub value: T,
+    pub changed: bool,
+    pub outcome: BoundConfigOutcome,
+}
+
+/// Normal config mutation through an admitted root, including first-use
+/// defaults. Unlike the existing-only conditional API, this operation may
+/// initialize the config leaf; it never creates or substitutes the journal root.
+pub fn mutate_journal_config_at_root_checked<T>(
+    root: &Arc<JournalRoot>,
+    options: LockOptions,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+    mutator: impl FnOnce(&mut Map<String, Value>) -> crate::JournalConfigMutation<T>,
+) -> Result<BoundConfigTransaction<T>, BoundConfigRefusal> {
+    mutate_journal_config_at_root_interlocked(root, options, checkpoint, &|| Ok(()), mutator)
+}
+
+/// Transition under both existing sidecars, immediately before native publication.
+/// The callback must not recursively acquire either sidecar or perform provider work.
+pub fn mutate_journal_config_at_root_interlocked<T>(
+    root: &Arc<JournalRoot>,
+    options: LockOptions,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+    interlocked: &dyn Fn() -> Result<(), String>,
+    mutator: impl FnOnce(&mut Map<String, Value>) -> crate::JournalConfigMutation<T>,
+) -> Result<BoundConfigTransaction<T>, BoundConfigRefusal> {
+    #[cfg(any(unix, windows))]
+    {
+        use std::ffi::OsStr;
+        caller_checkpoint(checkpoint)?;
+        root.revalidate_canonical_binding()
+            .map_err(|error| BoundConfigRefusal::Admission(Box::new(error)))?;
+        #[cfg(unix)]
+        let parent = solstone_core_journal_io::create_or_open_flat_directory_bound(
+            &**root,
+            OsStr::new("config"),
+            0o777,
+            root.canonical_path(),
+        );
+        #[cfg(windows)]
+        let parent = solstone_core_journal_io::create_or_open_windows_flat_directory_bound(
+            &**root,
+            OsStr::new("config"),
+            root.canonical_path(),
+        );
+        let parent = parent.map_err(|error| BoundConfigRefusal::Admission(Box::new(error)))?;
+        caller_checkpoint(checkpoint)?;
+        root.revalidate_canonical_binding()
+            .map_err(|error| BoundConfigRefusal::Admission(Box::new(error)))?;
+        let directory = solstone_core_journal_io::media::MediaDirectory::open(
+            root.clone(),
+            std::path::Path::new("config"),
+        )
+        .map_err(|error| BoundConfigRefusal::Admission(Box::new(error)))?;
+        #[cfg(unix)]
+        let same_parent = parent.identity() == directory.object_identity();
+        #[cfg(windows)]
+        let same_parent = parent.object_identity() == directory.object_identity();
+        if !same_parent {
+            return Err(BoundConfigRefusal::Admission(Box::new(io::Error::other(
+                "retained config parent changed",
+            ))));
+        }
+        let result = std::cell::RefCell::new(None);
+        let update = |config: &Map<String, Value>| {
+            let mut config = config.clone();
+            let mutation = mutator(&mut config);
+            let changed = mutation.changed;
+            *result.borrow_mut() = Some((mutation.value, changed));
+            changed.then_some(config)
+        };
+        #[cfg(unix)]
+        let outcome = unix::update(
+            root,
+            &directory,
+            None,
+            update,
+            options,
+            checkpoint,
+            interlocked,
+        )?;
+        #[cfg(windows)]
+        let outcome = windows::update(
+            root,
+            &directory,
+            None,
+            update,
+            options,
+            checkpoint,
+            interlocked,
+        )?;
+        let (value, changed) = result
+            .into_inner()
+            .expect("successful config transaction transforms once");
+        Ok(BoundConfigTransaction {
+            value,
+            changed,
+            outcome,
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (root, options, checkpoint, interlocked, mutator);
+        Err(BoundConfigRefusal::Unsupported)
+    }
+}
+
 /// Conditionally transform one existing config using its original exact SHA.
 ///
 /// The callback runs once on the locked strict map. `None` declines the update.
@@ -105,8 +215,47 @@ pub fn conditional_update_journal_config_at_root(
     update: impl FnOnce(&Map<String, Value>) -> Option<Map<String, Value>>,
     options: LockOptions,
 ) -> Result<BoundConfigOutcome, BoundConfigRefusal> {
+    conditional_update_journal_config_at_root_checked(
+        root,
+        expected_sha256,
+        update,
+        options,
+        &|| Ok(()),
+    )
+}
+
+/// Apply the existing retained-root update while renewing caller authority
+/// during contention and immediately before native publication.
+pub fn conditional_update_journal_config_at_root_checked(
+    root: &Arc<JournalRoot>,
+    expected_sha256: &str,
+    update: impl FnOnce(&Map<String, Value>) -> Option<Map<String, Value>>,
+    options: LockOptions,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<BoundConfigOutcome, BoundConfigRefusal> {
+    conditional_update_journal_config_at_root_interlocked(
+        root,
+        expected_sha256,
+        update,
+        options,
+        checkpoint,
+        &|| Ok(()),
+    )
+}
+
+/// Transition under both existing sidecars, immediately before native publication.
+/// The callback must not recursively acquire either sidecar or perform provider work.
+pub fn conditional_update_journal_config_at_root_interlocked(
+    root: &Arc<JournalRoot>,
+    expected_sha256: &str,
+    update: impl FnOnce(&Map<String, Value>) -> Option<Map<String, Value>>,
+    options: LockOptions,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+    interlocked: &dyn Fn() -> Result<(), String>,
+) -> Result<BoundConfigOutcome, BoundConfigRefusal> {
     #[cfg(any(unix, windows))]
     {
+        caller_checkpoint(checkpoint)?;
         root.revalidate_canonical_binding()
             .map_err(|error| BoundConfigRefusal::Admission(Box::new(error)))?;
         let directory = solstone_core_journal_io::media::MediaDirectory::open(
@@ -114,17 +263,26 @@ pub fn conditional_update_journal_config_at_root(
             std::path::Path::new("config"),
         )
         .map_err(|error| BoundConfigRefusal::Admission(Box::new(error)))?;
-        conditional_update_journal_config_in_directory(
+        conditional_update_journal_config_in_directory_interlocked(
             root,
             &directory,
             expected_sha256,
             update,
             options,
+            checkpoint,
+            interlocked,
         )
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (root, expected_sha256, update, options);
+        let _ = (
+            root,
+            expected_sha256,
+            update,
+            options,
+            checkpoint,
+            interlocked,
+        );
         Err(BoundConfigRefusal::Unsupported)
     }
 }
@@ -137,19 +295,92 @@ pub fn conditional_update_journal_config_in_directory(
     update: impl FnOnce(&Map<String, Value>) -> Option<Map<String, Value>>,
     options: LockOptions,
 ) -> Result<BoundConfigOutcome, BoundConfigRefusal> {
+    conditional_update_journal_config_in_directory_checked(
+        root,
+        directory,
+        expected_sha256,
+        update,
+        options,
+        &|| Ok(()),
+    )
+}
+
+/// Renew the caller's authority through the originally retained config parent.
+pub fn conditional_update_journal_config_in_directory_checked(
+    root: &Arc<JournalRoot>,
+    directory: &solstone_core_journal_io::media::MediaDirectory,
+    expected_sha256: &str,
+    update: impl FnOnce(&Map<String, Value>) -> Option<Map<String, Value>>,
+    options: LockOptions,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<BoundConfigOutcome, BoundConfigRefusal> {
+    conditional_update_journal_config_in_directory_interlocked(
+        root,
+        directory,
+        expected_sha256,
+        update,
+        options,
+        checkpoint,
+        &|| Ok(()),
+    )
+}
+
+/// Transition under both existing sidecars, immediately before native publication.
+/// The callback must not recursively acquire either sidecar or perform provider work.
+fn conditional_update_journal_config_in_directory_interlocked(
+    root: &Arc<JournalRoot>,
+    directory: &solstone_core_journal_io::media::MediaDirectory,
+    expected_sha256: &str,
+    update: impl FnOnce(&Map<String, Value>) -> Option<Map<String, Value>>,
+    options: LockOptions,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+    interlocked: &dyn Fn() -> Result<(), String>,
+) -> Result<BoundConfigOutcome, BoundConfigRefusal> {
     #[cfg(unix)]
     {
-        unix::update(root, directory, expected_sha256, update, options)
+        unix::update(
+            root,
+            directory,
+            Some(expected_sha256),
+            update,
+            options,
+            checkpoint,
+            interlocked,
+        )
     }
     #[cfg(windows)]
     {
-        windows::update(root, directory, expected_sha256, update, options)
+        windows::update(
+            root,
+            directory,
+            Some(expected_sha256),
+            update,
+            options,
+            checkpoint,
+            interlocked,
+        )
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (root, directory, expected_sha256, update, options);
+        let _ = (
+            root,
+            directory,
+            expected_sha256,
+            update,
+            options,
+            checkpoint,
+            interlocked,
+        );
         Err(BoundConfigRefusal::Unsupported)
     }
+}
+
+fn caller_checkpoint(
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), BoundConfigRefusal> {
+    checkpoint().map_err(|detail| {
+        BoundConfigRefusal::Admission(Box::new(io::Error::new(io::ErrorKind::Interrupted, detail)))
+    })
 }
 
 #[cfg(unix)]
@@ -162,8 +393,8 @@ mod unix {
     };
     use solstone_core_journal_io::media::{MediaDirectory, MediaIdentity};
     use solstone_core_journal_io::{
-        BoundAtomicOutcome, FileObservation, FlatDirectory, acquire_existing_parent_lock_bound,
-        atomic_replace_bound,
+        BoundAtomicOutcome, FileObservation, FlatDirectory,
+        acquire_existing_parent_lock_bound_checked, atomic_replace_bound_checked,
     };
 
     use super::*;
@@ -171,10 +402,14 @@ mod unix {
     pub(super) fn update(
         root: &Arc<JournalRoot>,
         directory: &MediaDirectory,
-        expected: &str,
+        expected: Option<&str>,
         update: impl FnOnce(&Map<String, Value>) -> Option<Map<String, Value>>,
         options: LockOptions,
+        checkpoint: &dyn Fn() -> Result<(), String>,
+        interlocked: &dyn Fn() -> Result<(), String>,
     ) -> Result<BoundConfigOutcome, BoundConfigRefusal> {
+        let budget = crate::credential_interlock::PublicationBudget::new(options);
+        caller_checkpoint(checkpoint)?;
         root.revalidate_canonical_binding().map_err(admission)?;
         directory.revalidate().map_err(admission)?;
         run_hook(Checkpoint::BeforeParentOpen);
@@ -186,11 +421,16 @@ mod unix {
         require_expected(&initial, expected)?;
         run_hook(Checkpoint::AfterInitialRead);
         validate(root, directory, &parent).map_err(BoundConfigRefusal::Admission)?;
-        let _lock = acquire_existing_parent_lock_bound(
+        let lock_checkpoint = || {
+            validate(root, directory, &parent).map_err(|error| error.to_string())?;
+            checkpoint()
+        };
+        let lock = acquire_existing_parent_lock_bound_checked(
             &parent,
             OsStr::new("journal.json.lock"),
             options.timeout,
             options.poll_interval,
+            &lock_checkpoint,
         )
         .map_err(BoundConfigRefusal::Lock)?;
         validate(root, directory, &parent).map_err(BoundConfigRefusal::Admission)?;
@@ -198,9 +438,23 @@ mod unix {
             .map_err(BoundConfigRefusal::Load)?;
         require_expected(&locked, expected)?;
         validate(root, directory, &parent).map_err(BoundConfigRefusal::Admission)?;
-        let config = locked.config.as_ref().ok_or(BoundConfigRefusal::Missing)?;
-        let Some(replacement) = update(config) else {
-            return Ok(BoundConfigOutcome::Unchanged);
+        let materialized = locked.config.is_none();
+        let config = locked
+            .config
+            .unwrap_or_else(solstone_core_journal_config::materialized_defaults);
+        caller_checkpoint(checkpoint)?;
+        #[cfg(unix)]
+        run_hook(Checkpoint::BeforeTransformation);
+        // Even an unchanged transformation can have a caller-owned process
+        // effect. Renew the root, parent, caller and original named guard
+        // together immediately before that effect.
+        caller_checkpoint(&lock_checkpoint)?;
+        lock.revalidate_bound(&parent, OsStr::new("journal.json.lock"))
+            .map_err(|error| BoundConfigRefusal::Admission(Box::new(error)))?;
+        let replacement = match update(&config) {
+            Some(replacement) => replacement,
+            None if materialized => config.clone(),
+            None => return Ok(BoundConfigOutcome::Unchanged),
         };
         let mut bytes =
             serde_json::to_vec_pretty(&replacement).map_err(BoundConfigRefusal::Serialize)?;
@@ -209,10 +463,38 @@ mod unix {
             return Err(BoundConfigRefusal::TooLarge);
         }
         let candidate_sha256 = fingerprint_journal_config_bytes(&bytes);
+        let credential_interlock = crate::credential_interlock::acquire(
+            root,
+            &config,
+            &replacement,
+            &budget,
+            &lock_checkpoint,
+        )
+        .map_err(admission)?;
         run_hook(Checkpoint::BeforePublication);
         validate(root, directory, &parent).map_err(BoundConfigRefusal::Admission)?;
-        let outcome = atomic_replace_bound(&parent, OsStr::new("journal.json"), &bytes, 0o600)
-            .map_err(BoundConfigRefusal::Write)?;
+        let publish_checkpoint = || {
+            lock_checkpoint()?;
+            if let Some(interlock) = &credential_interlock {
+                interlock.checkpoint()?;
+            }
+            lock.revalidate_bound(&parent, OsStr::new("journal.json.lock"))
+                .map_err(|error| error.to_string())
+        };
+        // The owner's transition requires the complete original C/B
+        // authority now, before its effect; native publication renews it again.
+        caller_checkpoint(&publish_checkpoint)?;
+        if credential_interlock.is_some() {
+            caller_checkpoint(interlocked)?;
+        }
+        let outcome = atomic_replace_bound_checked(
+            &parent,
+            OsStr::new("journal.json"),
+            &bytes,
+            0o600,
+            &publish_checkpoint,
+        )
+        .map_err(BoundConfigRefusal::Write)?;
         let (observation, durability_uncertainty, observation_uncertainty) = match outcome {
             BoundAtomicOutcome::Published { observation } => (observation, None, None),
             BoundAtomicOutcome::PublishedDurabilityUncertain {
@@ -248,8 +530,11 @@ mod unix {
 
     fn require_expected(
         read: &JournalConfigRead,
-        expected: &str,
+        expected: Option<&str>,
     ) -> Result<(), BoundConfigRefusal> {
+        let Some(expected) = expected else {
+            return Ok(());
+        };
         let actual = read.sha256.as_deref().ok_or(BoundConfigRefusal::Missing)?;
         if actual != expected {
             return Err(BoundConfigRefusal::Conflict);
@@ -316,11 +601,11 @@ mod windows {
         JournalConfigRead, fingerprint_journal_config_bytes, read_journal_config_in_directory,
     };
     use solstone_core_journal_io::atomic::{
-        BoundAtomicPublishError, atomic_replace_detailed_bound,
+        BoundAtomicPublishError, atomic_replace_detailed_bound_checked,
     };
     use solstone_core_journal_io::media::MediaDirectory;
     use solstone_core_journal_io::{
-        DetailedAtomicOutcome, WindowsFlatDirectory, acquire_existing_parent_lock_bound,
+        DetailedAtomicOutcome, WindowsFlatDirectory, acquire_existing_parent_lock_bound_checked,
         open_windows_flat_directory_bound, read_windows_observed_file_bounded,
     };
 
@@ -329,10 +614,14 @@ mod windows {
     pub(super) fn update(
         root: &Arc<JournalRoot>,
         directory: &MediaDirectory,
-        expected: &str,
+        expected: Option<&str>,
         update: impl FnOnce(&Map<String, Value>) -> Option<Map<String, Value>>,
         options: LockOptions,
+        checkpoint: &dyn Fn() -> Result<(), String>,
+        interlocked: &dyn Fn() -> Result<(), String>,
     ) -> Result<BoundConfigOutcome, BoundConfigRefusal> {
+        let budget = crate::credential_interlock::PublicationBudget::new(options);
+        caller_checkpoint(checkpoint)?;
         root.revalidate_canonical_binding().map_err(admission)?;
         directory.revalidate().map_err(admission)?;
         let parent = open_parent(root).map_err(BoundConfigRefusal::Admission)?;
@@ -341,11 +630,16 @@ mod windows {
             .map_err(BoundConfigRefusal::Load)?;
         require_expected(&initial, expected)?;
         validate(root, directory, &parent).map_err(BoundConfigRefusal::Admission)?;
-        let lock = acquire_existing_parent_lock_bound(
+        let lock_checkpoint = || {
+            validate(root, directory, &parent).map_err(|error| error.to_string())?;
+            checkpoint()
+        };
+        let lock = acquire_existing_parent_lock_bound_checked(
             &parent,
             OsStr::new("journal.json.lock"),
             options.timeout,
             options.poll_interval,
+            &lock_checkpoint,
         )
         .map_err(BoundConfigRefusal::Lock)?;
         validate(root, directory, &parent).map_err(BoundConfigRefusal::Admission)?;
@@ -353,9 +647,23 @@ mod windows {
             .map_err(BoundConfigRefusal::Load)?;
         require_expected(&locked, expected)?;
         validate(root, directory, &parent).map_err(BoundConfigRefusal::Admission)?;
-        let config = locked.config.as_ref().ok_or(BoundConfigRefusal::Missing)?;
-        let Some(replacement) = update(config) else {
-            return Ok(BoundConfigOutcome::Unchanged);
+        let materialized = locked.config.is_none();
+        let config = locked
+            .config
+            .unwrap_or_else(solstone_core_journal_config::materialized_defaults);
+        caller_checkpoint(checkpoint)?;
+        #[cfg(unix)]
+        run_hook(Checkpoint::BeforeTransformation);
+        // Even an unchanged transformation can have a caller-owned process
+        // effect. Renew the root, parent, caller and original named guard
+        // together immediately before that effect.
+        caller_checkpoint(&lock_checkpoint)?;
+        lock.revalidate_bound(&parent, OsStr::new("journal.json.lock"))
+            .map_err(|error| BoundConfigRefusal::Admission(Box::new(error)))?;
+        let replacement = match update(&config) {
+            Some(replacement) => replacement,
+            None if materialized => config.clone(),
+            None => return Ok(BoundConfigOutcome::Unchanged),
         };
         let mut bytes =
             serde_json::to_vec_pretty(&replacement).map_err(BoundConfigRefusal::Serialize)?;
@@ -364,13 +672,34 @@ mod windows {
             return Err(BoundConfigRefusal::TooLarge);
         }
         let candidate_sha256 = fingerprint_journal_config_bytes(&bytes);
+        let credential_interlock = crate::credential_interlock::acquire(
+            root,
+            &config,
+            &replacement,
+            &budget,
+            &lock_checkpoint,
+        )
+        .map_err(admission)?;
         validate(root, directory, &parent).map_err(BoundConfigRefusal::Admission)?;
-        let outcome = atomic_replace_detailed_bound(
+        let publish_checkpoint = || {
+            lock_checkpoint()?;
+            if let Some(interlock) = &credential_interlock {
+                interlock.checkpoint()?;
+            }
+            lock.revalidate_bound(&parent, OsStr::new("journal.json.lock"))
+                .map_err(|error| error.to_string())
+        };
+        caller_checkpoint(&publish_checkpoint)?;
+        if credential_interlock.is_some() {
+            caller_checkpoint(interlocked)?;
+        }
+        let outcome = atomic_replace_detailed_bound_checked(
             &parent,
             &lock,
             OsStr::new("journal.json"),
             &bytes,
             0o600,
+            &publish_checkpoint,
         )
         .map_err(|error| match error {
             BoundAtomicPublishError::Atomic(error) => BoundConfigRefusal::Write(error),
@@ -446,8 +775,11 @@ mod windows {
 
     fn require_expected(
         read: &JournalConfigRead,
-        expected: &str,
+        expected: Option<&str>,
     ) -> Result<(), BoundConfigRefusal> {
+        let Some(expected) = expected else {
+            return Ok(());
+        };
         let actual = read.sha256.as_deref().ok_or(BoundConfigRefusal::Missing)?;
         if actual != expected {
             return Err(BoundConfigRefusal::Conflict);
@@ -484,6 +816,7 @@ enum Checkpoint {
     BeforeParentOpen,
     AfterParentOpen,
     AfterInitialRead,
+    BeforeTransformation,
     BeforePublication,
     BeforeConfirmation,
 }
@@ -583,6 +916,207 @@ mod tests {
         let result = op();
         HOOK.with(|slot| assert!(slot.borrow().is_none(), "requested barrier must run"));
         result
+    }
+
+    #[test]
+    fn replaced_named_guard_refuses_before_read_only_transformation_effect() {
+        let (temporary, root, sha) = fixture();
+        let sidecar = temporary.path().join("config/journal.json.lock");
+        let moved = temporary.path().join("held-original.lock");
+        let before = fs::read(path(temporary.path())).unwrap();
+        let effects = std::cell::Cell::new(0);
+        let result = with_hook(
+            Checkpoint::BeforeTransformation,
+            move || {
+                fs::rename(&sidecar, &moved).unwrap();
+                fs::write(&sidecar, b"").unwrap();
+            },
+            || {
+                conditional_update_journal_config_at_root_checked(
+                    &root,
+                    &sha,
+                    |_| {
+                        effects.set(effects.get() + 1);
+                        None
+                    },
+                    LockOptions {
+                        timeout: Duration::ZERO,
+                        ..LockOptions::default()
+                    },
+                    &|| Ok(()),
+                )
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            effects.get(),
+            0,
+            "a detached guard must never authorize process-state retirement"
+        );
+        assert_eq!(fs::read(path(temporary.path())).unwrap(), before);
+    }
+
+    #[test]
+    fn replaced_root_or_parent_refuses_before_read_only_transformation_effect() {
+        for replace_root in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let journal = temporary.path().join("journal");
+            fs::create_dir_all(journal.join("config")).unwrap();
+            let before = b"{\"other\":7}\n";
+            fs::write(path(&journal), before).unwrap();
+            let root = Arc::new(JournalRoot::open(&journal).unwrap());
+            let sha = read_journal_config(&journal).unwrap().sha256.unwrap();
+            let replaced = if replace_root {
+                journal.clone()
+            } else {
+                journal.join("config")
+            };
+            let retained = temporary.path().join("retained");
+            let detached_config = if replace_root {
+                retained.join("config")
+            } else {
+                retained.clone()
+            };
+            let replacement_journal = journal.clone();
+            let effects = std::cell::Cell::new(0);
+            let result = with_hook(
+                Checkpoint::BeforeTransformation,
+                move || {
+                    fs::rename(&replaced, &retained).unwrap();
+                    fs::create_dir_all(replacement_journal.join("config")).unwrap();
+                    fs::write(path(&replacement_journal), before).unwrap();
+                },
+                || {
+                    conditional_update_journal_config_at_root_checked(
+                        &root,
+                        &sha,
+                        |_| {
+                            effects.set(effects.get() + 1);
+                            None
+                        },
+                        LockOptions {
+                            timeout: Duration::ZERO,
+                            ..LockOptions::default()
+                        },
+                        &|| Ok(()),
+                    )
+                },
+            );
+            assert!(matches!(result, Err(BoundConfigRefusal::Admission(_))));
+            assert_eq!(
+                effects.get(),
+                0,
+                "detached selectors cannot authorize retirement"
+            );
+            assert_eq!(fs::read(path(&journal)).unwrap(), before);
+            assert_eq!(
+                fs::read(detached_config.join("journal.json")).unwrap(),
+                before
+            );
+            assert!(!journal.join("config/journal.json.lock").exists());
+        }
+    }
+
+    #[test]
+    fn normal_bound_mutation_materializes_defaults_and_preserves_unchanged_existing_bytes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = Arc::new(JournalRoot::open(temporary.path()).unwrap());
+        let first = mutate_journal_config_at_root_checked(
+            &root,
+            LockOptions::default(),
+            &|| Ok(()),
+            |_| crate::JournalConfigMutation {
+                changed: false,
+                value: 42,
+            },
+        )
+        .unwrap();
+        assert_eq!(first.value, 42);
+        assert!(!first.changed);
+        assert!(matches!(first.outcome, BoundConfigOutcome::Published(_)));
+        assert_eq!(
+            read_journal_config(temporary.path())
+                .unwrap()
+                .config
+                .unwrap(),
+            solstone_core_journal_config::materialized_defaults()
+        );
+        assert_eq!(
+            fs::metadata(path(temporary.path())).unwrap().mode() & 0o777,
+            0o600
+        );
+        let before = fs::read(path(temporary.path())).unwrap();
+        let second = mutate_journal_config_at_root_checked(
+            &root,
+            LockOptions::default(),
+            &|| Ok(()),
+            |_| crate::JournalConfigMutation {
+                changed: false,
+                value: 7,
+            },
+        )
+        .unwrap();
+        assert_eq!(second.value, 7);
+        assert!(matches!(second.outcome, BoundConfigOutcome::Unchanged));
+        assert_eq!(fs::read(path(temporary.path())).unwrap(), before);
+    }
+
+    #[test]
+    fn first_use_bound_mutation_cancelled_at_rename_keeps_absence_and_can_retry() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let temporary = tempfile::tempdir().unwrap();
+        let root = Arc::new(JournalRoot::open(temporary.path()).unwrap());
+        let cancelled = Rc::new(Cell::new(false));
+        let cut = cancelled.clone();
+        let checkpoint = || {
+            if cancelled.get() {
+                Err("cancelled".to_owned())
+            } else {
+                Ok(())
+            }
+        };
+        let (result, fired) = run_with_bound_publication_barrier(
+            BoundPublicationPrimitive::Rename,
+            1,
+            move || cut.set(true),
+            || {
+                mutate_journal_config_at_root_checked(
+                    &root,
+                    LockOptions::default(),
+                    &checkpoint,
+                    |_| crate::JournalConfigMutation {
+                        changed: false,
+                        value: (),
+                    },
+                )
+            },
+        );
+        assert!(fired);
+        let Err(BoundConfigRefusal::Write(error)) = result else {
+            panic!("rename must refuse");
+        };
+        assert_eq!(error.source.kind(), io::ErrorKind::Interrupted);
+        assert!(error.orphan_stage.is_none());
+        assert!(error.cleanup_error.is_none());
+        assert!(!path(temporary.path()).exists());
+        assert!(
+            fs::read_dir(temporary.path().join("config"))
+                .unwrap()
+                .all(|entry| !is_publication_candidate_name(&entry.unwrap().file_name()))
+        );
+        cancelled.set(false);
+        let retried = mutate_journal_config_at_root_checked(
+            &root,
+            LockOptions::default(),
+            &checkpoint,
+            |_| crate::JournalConfigMutation {
+                changed: false,
+                value: (),
+            },
+        )
+        .unwrap();
+        assert!(matches!(retried.outcome, BoundConfigOutcome::Published(_)));
     }
 
     #[test]
@@ -1003,7 +1537,93 @@ mod tests {
     }
 
     #[test]
-    fn final_native_rename_keeps_original_parent_and_preserves_actual_publication_receipt() {
+    fn checked_caller_refusal_at_native_publication_preserves_bytes_and_allows_retry() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        for primitive in [
+            BoundPublicationPrimitive::TempCreate,
+            BoundPublicationPrimitive::FileSync,
+            BoundPublicationPrimitive::Rename,
+        ] {
+            let (temporary, root, sha) = fixture();
+            let before = fs::read(path(temporary.path())).unwrap();
+            let cancelled = Rc::new(Cell::new(false));
+            let cut = cancelled.clone();
+            let checkpoint = || {
+                if cancelled.get() {
+                    Err("caller cancelled".to_owned())
+                } else {
+                    Ok(())
+                }
+            };
+            let config = temporary.path().join("config");
+            let (result, fired) = run_with_bound_publication_barrier(
+                primitive,
+                1,
+                move || {
+                    if primitive == BoundPublicationPrimitive::Rename {
+                        assert!(fs::read_dir(&config).unwrap().any(|entry| {
+                            is_publication_candidate_name(&entry.unwrap().file_name())
+                        }));
+                    }
+                    cut.set(true);
+                },
+                || {
+                    conditional_update_journal_config_at_root_checked(
+                        &root,
+                        &sha,
+                        replacement,
+                        LockOptions::default(),
+                        &checkpoint,
+                    )
+                },
+            );
+            assert!(fired);
+            let Err(BoundConfigRefusal::Write(error)) = result else {
+                panic!("caller refusal must prevent native publication");
+            };
+            assert_eq!(error.source.kind(), io::ErrorKind::Interrupted);
+            assert!(error.orphan_stage.is_none());
+            assert!(error.cleanup_error.is_none());
+            assert_eq!(fs::read(path(temporary.path())).unwrap(), before);
+            assert!(
+                fs::read_dir(temporary.path().join("config"))
+                    .unwrap()
+                    .all(|entry| !is_publication_candidate_name(&entry.unwrap().file_name()))
+            );
+
+            cancelled.set(false);
+            let BoundConfigOutcome::Published(receipt) =
+                conditional_update_journal_config_at_root_checked(
+                    &root,
+                    &sha,
+                    replacement,
+                    LockOptions::default(),
+                    &checkpoint,
+                )
+                .unwrap()
+            else {
+                panic!("unchanged original fingerprint must permit a normal retry");
+            };
+            assert!(receipt.durability_uncertainty.is_none());
+            assert!(receipt.observation_uncertainty.is_none());
+            assert!(receipt.confirmation_refusal.is_none());
+            assert_eq!(
+                read_journal_config(temporary.path())
+                    .unwrap()
+                    .config
+                    .unwrap(),
+                json!({"backup":{"enabled":false},"other":7})
+                    .as_object()
+                    .unwrap()
+                    .clone()
+            );
+        }
+    }
+
+    #[test]
+    fn final_native_rename_refuses_replaced_root_without_mutating_either_journal() {
         let (temporary, root, sha) = fixture();
         let original = temporary.path().to_path_buf();
         let moved = original.with_extension("retained");
@@ -1011,6 +1631,94 @@ mod tests {
         let other = before.clone();
         let (result, fired) = run_with_bound_publication_barrier(
             BoundPublicationPrimitive::Rename,
+            1,
+            move || {
+                fs::rename(&original, &moved).unwrap();
+                fs::create_dir(&original).unwrap();
+                fs::create_dir(original.join("config")).unwrap();
+                fs::write(path(&original), other).unwrap();
+            },
+            || update(&root, &sha),
+        );
+        assert!(fired);
+        let Err(BoundConfigRefusal::Write(error)) = result else {
+            panic!("replaced root must refuse before native rename");
+        };
+        assert_eq!(error.source.kind(), io::ErrorKind::Interrupted);
+        assert!(error.orphan_stage.is_none());
+        assert!(error.cleanup_error.is_none());
+        let moved = temporary.path().with_extension("retained");
+        assert_eq!(fs::read(path(temporary.path())).unwrap(), before);
+        assert_eq!(fs::read(path(&moved)).unwrap(), before);
+        assert_eq!(
+            fs::read_dir(temporary.path().join("config"))
+                .unwrap()
+                .count(),
+            1
+        );
+        assert!(
+            fs::read_dir(moved.join("config"))
+                .unwrap()
+                .all(|entry| !is_publication_candidate_name(&entry.unwrap().file_name()))
+        );
+        fs::remove_dir_all(moved).unwrap();
+    }
+
+    #[test]
+    fn final_native_rename_refuses_replaced_sidecar_and_cleans_stage() {
+        let (temporary, root, sha) = fixture();
+        let before = fs::read(path(temporary.path())).unwrap();
+        let sidecar = temporary.path().join("config/journal.json.lock");
+        let retired_sidecar = temporary.path().join("config/retired.lock");
+        let replacement_sidecar = temporary.path().join("config/replacement.lock");
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(&replacement_sidecar, b"").unwrap();
+        fs::set_permissions(&replacement_sidecar, fs::Permissions::from_mode(0o600)).unwrap();
+        let replacement_identity = fs::metadata(&replacement_sidecar).unwrap().ino();
+        let old_sidecar = sidecar.clone();
+        let retired = retired_sidecar.clone();
+        let (result, fired) = run_with_bound_publication_barrier(
+            BoundPublicationPrimitive::Rename,
+            1,
+            move || {
+                fs::rename(&old_sidecar, retired).unwrap();
+                fs::rename(replacement_sidecar, old_sidecar).unwrap();
+            },
+            || update(&root, &sha),
+        );
+        assert!(fired);
+        let Err(BoundConfigRefusal::Write(error)) = result else {
+            panic!("lost sidecar authority must prevent native rename");
+        };
+        assert_eq!(error.source.kind(), io::ErrorKind::Interrupted);
+        assert!(error.orphan_stage.is_none());
+        assert!(error.cleanup_error.is_none());
+        assert_eq!(fs::read(path(temporary.path())).unwrap(), before);
+        assert_eq!(fs::metadata(&sidecar).unwrap().ino(), replacement_identity);
+        assert_ne!(
+            fs::metadata(&retired_sidecar).unwrap().ino(),
+            replacement_identity
+        );
+        assert!(
+            fs::read_dir(temporary.path().join("config"))
+                .unwrap()
+                .all(|entry| !is_publication_candidate_name(&entry.unwrap().file_name()))
+        );
+        assert!(matches!(
+            update(&root, &sha).unwrap(),
+            BoundConfigOutcome::Published(_)
+        ));
+    }
+
+    #[test]
+    fn post_rename_root_change_preserves_actual_publication_receipt() {
+        let (temporary, root, sha) = fixture();
+        let original = temporary.path().to_path_buf();
+        let moved = original.with_extension("retained");
+        let before = fs::read(path(&original)).unwrap();
+        let other = before.clone();
+        let (result, fired) = run_with_bound_publication_barrier(
+            BoundPublicationPrimitive::ParentSync,
             1,
             move || {
                 fs::rename(&original, &moved).unwrap();
@@ -1199,5 +1907,159 @@ mod windows_tests {
             fs::read(temp.path().join("config/journal.json")).unwrap(),
             before
         );
+    }
+}
+
+#[cfg(all(test, feature = "full-tests", any(unix, windows)))]
+mod credential_publication_tests {
+    use super::*;
+    use serde_json::json;
+    use solstone_core_journal_io::{LockError, hold_lock};
+    use std::cell::Cell;
+    use std::fs;
+    use std::time::Duration;
+
+    #[test]
+    fn credential_transition_runs_once_under_both_existing_sidecars() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+        let calls = Cell::new(0);
+        let hook = || {
+            calls.set(calls.get() + 1);
+            for relative in ["config/journal.json", "health/brain.json"] {
+                let attempt = hold_lock(
+                    temp.path().join(relative),
+                    LockOptions {
+                        timeout: Duration::ZERO,
+                        ..LockOptions::default()
+                    },
+                );
+                assert!(
+                    matches!(attempt, Err(LockError::Timeout(_))),
+                    "{relative} must already be locked"
+                );
+            }
+            Ok(())
+        };
+        let transaction = mutate_journal_config_at_root_interlocked(
+            &root,
+            LockOptions::default(),
+            &|| Ok(()),
+            &hook,
+            |config| {
+                config.insert(
+                    "env".to_owned(),
+                    json!({"OPENAI_API_KEY":"synthetic-locked-transition"}),
+                );
+                crate::JournalConfigMutation {
+                    changed: true,
+                    value: (),
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert!(matches!(
+            transaction.outcome,
+            BoundConfigOutcome::Published(_)
+        ));
+        assert!(!temp.path().join("health/brain.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn substituted_config_sidecar_refuses_before_any_credential_transition() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("config")).unwrap();
+        let path = temp.path().join("config/journal.json");
+        let before = b"{\"env\":{}}\n";
+        fs::write(&path, before).unwrap();
+        let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+        let calls = Cell::new(0);
+        let result = mutate_journal_config_at_root_interlocked(
+            &root,
+            LockOptions::default(),
+            &|| Ok(()),
+            &|| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+            |config| {
+                let sidecar = temp.path().join("config/journal.json.lock");
+                fs::rename(&sidecar, temp.path().join("config/detached-original.lock")).unwrap();
+                fs::write(sidecar, b"").unwrap();
+                config.insert(
+                    "env".to_owned(),
+                    json!({"OPENAI_API_KEY":"synthetic-sidecar-substitution"}),
+                );
+                crate::JournalConfigMutation {
+                    changed: true,
+                    value: (),
+                }
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            calls.get(),
+            0,
+            "detached config guard must not authorize the transition"
+        );
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn refused_locked_transition_keeps_original_config_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("config")).unwrap();
+        let path = temp.path().join("config/journal.json");
+        let before = b"{\"env\":{}}\n";
+        fs::write(&path, before).unwrap();
+        let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+        let calls = Cell::new(0);
+        let result = mutate_journal_config_at_root_interlocked(
+            &root,
+            LockOptions::default(),
+            &|| Ok(()),
+            &|| {
+                calls.set(calls.get() + 1);
+                Err("superseded before accepted transition".to_owned())
+            },
+            |config| {
+                config.insert(
+                    "env".to_owned(),
+                    json!({"OPENAI_API_KEY":"synthetic-refused"}),
+                );
+                crate::JournalConfigMutation {
+                    changed: true,
+                    value: (),
+                }
+            },
+        );
+        assert!(matches!(result, Err(BoundConfigRefusal::Admission(_))));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn unrelated_mutation_has_no_credential_transition_or_brain_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Arc::new(JournalRoot::open(temp.path()).unwrap());
+        mutate_journal_config_at_root_interlocked(
+            &root,
+            LockOptions::default(),
+            &|| Ok(()),
+            &|| {
+                panic!("unrelated settings must not gain credential transition dependency");
+            },
+            |config| {
+                config.insert("unrelated-synthetic-field".to_owned(), json!(true));
+                crate::JournalConfigMutation {
+                    changed: true,
+                    value: (),
+                }
+            },
+        )
+        .unwrap();
+        assert!(!temp.path().join("health").exists());
     }
 }

@@ -820,6 +820,8 @@
         "active_provider",
         "aggregate_state",
         "checking",
+        "credential_holds",
+        "credential_observations",
         "diagnostic",
         "evidence",
         "fingerprint_sha256",

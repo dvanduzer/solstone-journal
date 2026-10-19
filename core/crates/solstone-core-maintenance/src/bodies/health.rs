@@ -10,11 +10,13 @@ use chrono::NaiveDate;
 use serde_json::{Map, Value};
 use solstone_core_journal_config::read_journal_config;
 use solstone_core_retention::content::{ClosedHandlerSet, JournalMedia};
-use solstone_core_retention::door::{compact_log, remove_logs, remove_planned_oplogs};
+use solstone_core_retention::door::{
+    compact_log_checked, remove_logs_checked, remove_planned_oplogs_checked,
+};
 use solstone_core_retention::logs::{
     Compaction, EntryKind, Kept, LogPlan, LogPolicy, day_key, plan as plan_logs, plan_compactions,
 };
-use solstone_core_retention::marks::{MarkState, Proposal, RemovalClass, load, reconcile};
+use solstone_core_retention::marks::{MarkState, Proposal, RemovalClass, load, reconcile_checked};
 use solstone_core_retention::oplog_retention::{OplogRetentionPlan, plan_oplog_retention};
 use solstone_core_retention::policy::{policy_from_journal_config, policy_would_release};
 use solstone_core_retention::receipt::Outcome;
@@ -44,16 +46,30 @@ struct PruneError {
     hint: Option<String>,
 }
 
-pub(crate) fn run(id: &str, args: &[String], journal: &Path, services: &HealthServices) -> CliRun {
+pub fn run(id: &str, args: &[String], journal: &Path, services: &HealthServices) -> CliRun {
+    run_checked(id, args, journal, services, &|| Ok(()))
+}
+
+pub fn run_checked(
+    id: &str,
+    args: &[String],
+    journal: &Path,
+    services: &HealthServices,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> CliRun {
     match id {
-        "health:mark-raw" if args.is_empty() => mark_raw(journal, services),
+        "health:mark-raw" if args.is_empty() => mark_raw(journal, services, checkpoint),
         "health:mark-raw" => usage_error("health:mark-raw", args, ""),
-        "health:prune-logs" => prune_logs(args, journal, services),
+        "health:prune-logs" => prune_logs(args, journal, services, checkpoint),
         _ => usage_error(id, args, ""),
     }
 }
 
-fn mark_raw(journal: &Path, services: &HealthServices) -> CliRun {
+fn mark_raw(
+    journal: &Path,
+    services: &HealthServices,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> CliRun {
     let config = match read_config(journal) {
         Ok(config) => config,
         Err(error) => return mark_unavailable(error),
@@ -68,7 +84,14 @@ fn mark_raw(journal: &Path, services: &HealthServices) -> CliRun {
             matches!(mark.state, MarkState::Marked) && mark.class == RemovalClass::PolicyRawRelease
         });
         if has_marked_policy_raw_release
-            && reconcile(journal, RemovalClass::PolicyRawRelease, &[], services.now).is_err()
+            && reconcile_checked(
+                journal,
+                RemovalClass::PolicyRawRelease,
+                &[],
+                services.now,
+                checkpoint,
+            )
+            .is_err()
         {
             return mark_refused();
         }
@@ -124,11 +147,12 @@ fn mark_raw(journal: &Path, services: &HealthServices) -> CliRun {
                 .map(|mark| (mark.target.clone(), mark.proposal.clone())),
         );
     }
-    let after = match reconcile(
+    let after = match reconcile_checked(
         journal,
         RemovalClass::PolicyRawRelease,
         &proposals,
         services.now,
+        checkpoint,
     ) {
         Ok(register) => register,
         Err(_) => return mark_refused(),
@@ -152,7 +176,12 @@ fn mark_raw(journal: &Path, services: &HealthServices) -> CliRun {
     success(output.trim_end().to_owned())
 }
 
-fn prune_logs(args: &[String], journal: &Path, services: &HealthServices) -> CliRun {
+fn prune_logs(
+    args: &[String],
+    journal: &Path,
+    services: &HealthServices,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> CliRun {
     let (dry_run, override_days) = match parse_prune_args(args) {
         Ok(parsed) => parsed,
         Err(PruneArgError::Usage(message)) => {
@@ -192,17 +221,27 @@ fn prune_logs(args: &[String], journal: &Path, services: &HealthServices) -> Cli
     if dry_run {
         return render_prune(today, days, true, &plan, &oplogs, &compactions);
     }
-    let mut outcome = remove_logs(journal, &plan.prunable);
-    let oplog_outcome = remove_planned_oplogs(journal, &oplogs.prunable);
-    outcome.targets.extend(oplog_outcome.targets);
+    if let Err(message) = checkpoint() {
+        return CliRun {
+            stdout: String::new(),
+            stderr: format!("prune-logs: {message}\n"),
+            exit_code: 1,
+        };
+    }
+    let mut outcome = remove_logs_checked(journal, &plan.prunable, checkpoint);
     if outcome.halted.is_none() {
+        let oplog_outcome = remove_planned_oplogs_checked(journal, &oplogs.prunable, checkpoint);
+        outcome.targets.extend(oplog_outcome.targets);
         outcome.halted = oplog_outcome.halted;
     }
-    for compaction in &compactions {
-        let compacted = compact_log(journal, compaction);
-        outcome.targets.extend(compacted.targets);
-        if outcome.halted.is_none() {
-            outcome.halted = compacted.halted;
+    if outcome.halted.is_none() {
+        for compaction in &compactions {
+            let compacted = compact_log_checked(journal, compaction, checkpoint);
+            outcome.targets.extend(compacted.targets);
+            if compacted.halted.is_some() {
+                outcome.halted = compacted.halted;
+                break;
+            }
         }
     }
     if outcome.halted.is_some()

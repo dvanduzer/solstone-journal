@@ -26,11 +26,13 @@ use crate::candidate_tracker::{
 };
 use crate::owner_admission::{OwnerAdmission, admitted_owner_id};
 use crate::owner_candidate::{
-    OwnerCandidate, clear_owner_candidate_in_lock, hold_owner_candidate_lock,
-    hydrate_owner_candidate_samples, load_owner_candidate, write_owner_candidate_in_lock,
+    OwnerCandidate, clear_owner_candidate_in_lock_checked, hold_owner_candidate_lock,
+    hydrate_owner_candidate_samples, load_owner_candidate, write_owner_candidate_in_lock_checked,
 };
 use crate::owner_centroid::load_owner_centroid;
-use crate::owner_voice::{cooldown_days_remaining, update_voiceprint_state, voiceprint_state};
+use crate::owner_voice::{
+    cooldown_days_remaining, update_voiceprint_state_checked, voiceprint_state,
+};
 use crate::segment_catalog::{SegmentLookup, decode_stream_layout_value, lookup_segment};
 
 /// Fewest statements a voice needs before it can be offered as the owner's.
@@ -55,6 +57,14 @@ pub const OWNER_IDENTITY_INVALID: &str = "speaker_owner_identity_invalid";
 /// offered again, and a recent rejection waits out its cooldown unless
 /// `force` is set.
 pub fn detect_owner_candidate(root: &Path, force: bool) -> Result<Value, String> {
+    detect_owner_candidate_checked(root, force, &|| Ok(()))
+}
+
+pub fn detect_owner_candidate_checked(
+    root: &Path,
+    force: bool,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Value, String> {
     let principal = match admitted_owner_id(root) {
         OwnerAdmission::Admitted(id) => id,
         OwnerAdmission::Invalid => return Err(OWNER_IDENTITY_INVALID.to_owned()),
@@ -67,17 +77,19 @@ pub fn detect_owner_candidate(root: &Path, force: bool) -> Result<Value, String>
             .get("streams_represented")
             .cloned()
             .unwrap_or_else(|| json!(0));
-        update_voiceprint_state(
+        update_voiceprint_state_checked(
             root,
             json!({"status":"confirmed","cluster_size":centroid.cluster_size,"confirmed_at":Utc::now().to_rfc3339(),"evidence_tier":centroid.evidence_tier.clone().unwrap_or_else(|| "standard".to_owned())}),
+            checkpoint,
         )?;
         return Ok(
             json!({"status":"confirmed","recommendation":"confirmed","cluster_size":centroid.cluster_size,"streams_represented":streams_represented,"samples":[],"evidence_tier":centroid.evidence_tier.unwrap_or_else(|| "standard".to_owned())}),
         );
     }
     if force {
-        clear_owner_candidate_in_lock(root).map_err(|error| error.to_string())?;
-        update_voiceprint_state(root, json!({"rejected_at":Value::Null}))?;
+        clear_owner_candidate_in_lock_checked(root, checkpoint)
+            .map_err(|error| error.to_string())?;
+        update_voiceprint_state_checked(root, json!({"rejected_at":Value::Null}), checkpoint)?;
     }
     let state = voiceprint_state(root);
     if !force && let Some(days_remaining) = cooldown_days_remaining(&state) {
@@ -103,11 +115,12 @@ pub fn detect_owner_candidate(root: &Path, force: bool) -> Result<Value, String>
     let rejected = rejected_voices(&state);
     let candidate = match select_candidate(pool_exists, candidates, Some(&principal), &rejected) {
         Ok(candidate) => candidate,
-        Err(reason) => return no_cluster(root, reason, 0, 0, 0),
+        Err(reason) => return no_cluster(root, reason, 0, 0, 0, checkpoint),
     };
     if candidate.n_intervals < MIN_STATEMENTS {
         return candidate_low_quality(
             root,
+            checkpoint,
             CandidateLowQuality {
                 reason: "too_few_stmts",
                 observed: candidate.n_intervals as f64,
@@ -127,12 +140,14 @@ pub fn detect_owner_candidate(root: &Path, force: bool) -> Result<Value, String>
             expansion.checked,
             expansion.available,
             0,
+            checkpoint,
         );
     }
     let quality = candidate_quality(&expansion.rows);
     if let Some(reason) = quality.reason {
         return candidate_low_quality(
             root,
+            checkpoint,
             CandidateLowQuality {
                 reason,
                 observed: if reason == "median_duration_too_short" {
@@ -166,6 +181,7 @@ pub fn detect_owner_candidate(root: &Path, force: bool) -> Result<Value, String>
             expansion.checked,
             expansion.available,
             expansion.rows.len(),
+            checkpoint,
         );
     };
     let streams = expansion
@@ -188,10 +204,12 @@ pub fn detect_owner_candidate(root: &Path, force: bool) -> Result<Value, String>
         version: version.clone(),
         evidence_tier: quality.tier.to_owned(),
     };
-    write_owner_candidate_in_lock(root, &snapshot).map_err(|error| error.to_string())?;
-    update_voiceprint_state(
+    write_owner_candidate_in_lock_checked(root, &snapshot, checkpoint)
+        .map_err(|error| error.to_string())?;
+    update_voiceprint_state_checked(
         root,
         json!({"status":"candidate","cluster_size":expansion.rows.len(),"streams_represented":streams,"recommendation":recommendation,"samples":samples,"detected_at":version,"evidence_tier":quality.tier,"candidate_cluster_id":candidate.cand_id}),
+        checkpoint,
     )?;
     let hydrated_samples = hydrate_owner_candidate_samples(root, &snapshot, &samples);
     Ok(
@@ -589,10 +607,15 @@ struct CandidateLowQuality<'a> {
     tier: &'a str,
     bound: f64,
 }
-fn candidate_low_quality(root: &Path, value: CandidateLowQuality<'_>) -> Result<Value, String> {
-    update_voiceprint_state(
+fn candidate_low_quality(
+    root: &Path,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+    value: CandidateLowQuality<'_>,
+) -> Result<Value, String> {
+    update_voiceprint_state_checked(
         root,
         json!({"status":"low_quality","source":"candidate_pool","low_quality_reason":value.reason,"observed_value":value.observed,"threshold_value":value.threshold,"evidence_tier":value.tier,"intra_cosine_p25_bound":value.bound,"segments_checked":value.segments,"attempted_at":Utc::now().to_rfc3339()}),
+        checkpoint,
     )?;
     Ok(
         json!({"status":"low_quality","source":"candidate_pool","recommendation":"low_quality","segments_available":value.segments,"embeddings_available":value.embeddings,"low_quality_reason":value.reason,"observed_value":value.observed,"threshold_value":value.threshold,"evidence_tier":value.tier,"intra_cosine_p25_bound":value.bound,"next_step":"seed_manual_tags","guidance":"Use solstone call speakers tag-owner to add validated owner tags."}),
@@ -604,10 +627,12 @@ fn no_cluster(
     checked: usize,
     segments: usize,
     embeddings: usize,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<Value, String> {
-    update_voiceprint_state(
+    update_voiceprint_state_checked(
         root,
         json!({"status":"no_cluster","reason":reason,"attempted_at":Utc::now().to_rfc3339()}),
+        checkpoint,
     )?;
     Ok(
         json!({"status":"no_cluster","reason":reason,"segments_checked":checked,"segments_available":segments,"embeddings_available":embeddings,"recommendation":"no_cluster","next_step":"seed_manual_tags","guidance":"Use solstone call speakers tag-owner to add validated owner tags."}),
@@ -787,6 +812,7 @@ fn compute_intra_cosine_p25(embeddings: &[Vec<f32>]) -> Option<f64> {
 mod tests {
     use super::*;
     use crate::owner_centroid::{OwnerCentroidWriteInput, write_owner_centroid};
+    use crate::owner_voice::update_voiceprint_state;
     use std::path::PathBuf;
 
     #[test]

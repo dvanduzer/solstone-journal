@@ -29,6 +29,16 @@ const DAY_FIELDS: &[&str] = &[
 /// Publishes a complete per-day cache payload.
 pub trait DayCacheWriter {
     fn write_day_cache(&self, path: &Path, payload: &DayScan) -> Result<(), JournalStatsError>;
+
+    fn write_day_cache_checked(
+        &self,
+        path: &Path,
+        payload: &DayScan,
+        checkpoint: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), JournalStatsError> {
+        checkpoint().map_err(JournalStatsError::Validation)?;
+        self.write_day_cache(path, payload)
+    }
 }
 
 /// Production cache writer using journal-io's atomic JSON publication.
@@ -36,6 +46,15 @@ pub trait DayCacheWriter {
 pub struct FilesystemDayCacheWriter;
 
 impl DayCacheWriter for FilesystemDayCacheWriter {
+    fn write_day_cache_checked(
+        &self,
+        path: &Path,
+        payload: &DayScan,
+        checkpoint: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), JournalStatsError> {
+        crate::publication::StatsPublication::open(path, checkpoint)?.json(payload, checkpoint)
+    }
+
     fn write_day_cache(&self, path: &Path, payload: &DayScan) -> Result<(), JournalStatsError> {
         solstone_core_journal_io::write_json(
             path,
@@ -240,6 +259,23 @@ pub(crate) fn save_unreadable_day(
         solstone_core_journal_io::JsonWriteOptions::default(),
     )?;
     Ok(())
+}
+
+pub(crate) fn save_unreadable_day_checked(
+    day_dir: &Path,
+    fingerprint: &str,
+    cause: &str,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), JournalStatsError> {
+    let publication =
+        crate::publication::StatsPublication::open(&day_dir.join("stats.json"), checkpoint)?;
+    publication.json(
+        &serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "unreadable": {"inputs": fingerprint, "cause": cause},
+        }),
+        checkpoint,
+    )
 }
 
 /// Latest mtime among precisely the Python day-cache bounded input set.

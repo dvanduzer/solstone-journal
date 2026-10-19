@@ -591,6 +591,7 @@ mod tests {
         std::fs::write(
             root.path().join("config/journal.json"),
             serde_json::to_vec(&json!({
+                "env": {"OPENAI_API_KEY": "synthetic-key"},
                 "services": {"confidential": {
                     "device": "abc",
                     "endpoint_url": "http://127.0.0.1:9099",

@@ -15,7 +15,8 @@ use solstone_core_journal_config::{
     materialized_defaults, parse_daily_input_day, read_journal_config,
 };
 use solstone_core_journal_io::{
-    AtomicWriteError, JsonWriteOptions, LockError, LockOptions, LockTimeout, hold_lock, write_json,
+    AtomicWriteError, JsonWriteOptions, LockError, LockOptions, LockTimeout, hold_lock_checked,
+    write_json_checked,
 };
 
 use crate::{CommitConfigError, ConfigExpectation, commit_journal_config};
@@ -211,8 +212,51 @@ where
     F: FnOnce(&mut Map<String, Value>) -> JournalConfigMutation<T>,
 {
     let config_path = get_journal_config_path(journal_path);
+    #[cfg(any(unix, windows))]
+    let budget = crate::credential_interlock::PublicationBudget::new(lock_options);
+    #[cfg(any(unix, windows))]
+    let admitted = crate::credential_interlock::existing_root(journal_path).map_err(|source| {
+        ConfigMutationError::Write(AtomicWriteError::Io {
+            path: config_path.clone(),
+            source,
+        })
+    })?;
+    let entry_checkpoint = || {
+        checkpoint()?;
+        #[cfg(any(unix, windows))]
+        if let Some(root) = &admitted {
+            root.revalidate_canonical_binding()
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    };
+    let _lock = hold_lock_checked(
+        &config_path,
+        LockOptions {
+            mode: Some(0o600),
+            ..lock_options
+        },
+        &entry_checkpoint,
+    )
+    .map_err(ConfigMutationError::Lock)?;
+    #[cfg(any(unix, windows))]
+    let admitted =
+        crate::credential_interlock::created_root(journal_path, admitted).map_err(|source| {
+            ConfigMutationError::Write(AtomicWriteError::Io {
+                path: config_path.clone(),
+                source,
+            })
+        })?;
+    let publication_authority = || {
+        checkpoint()?;
+        #[cfg(any(unix, windows))]
+        admitted
+            .revalidate_canonical_binding()
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    };
     let check = || {
-        checkpoint().map_err(|detail| {
+        publication_authority().map_err(|detail| {
             ConfigMutationError::Write(AtomicWriteError::Io {
                 path: config_path.clone(),
                 source: std::io::Error::new(std::io::ErrorKind::Interrupted, detail),
@@ -220,29 +264,45 @@ where
         })
     };
     check()?;
-    let _lock = hold_lock(
-        &config_path,
-        LockOptions {
-            mode: Some(0o600),
-            ..lock_options
-        },
-    )
-    .map_err(ConfigMutationError::Lock)?;
-    check()?;
     let mutation_base = load_mutation_base(journal_path).map_err(ConfigMutationError::Load)?;
     let materialized = mutation_base.materialized;
     let mut config = mutation_base.config;
+    #[cfg(any(unix, windows))]
+    let original = config.clone();
     let mutation = mutator(&mut config);
     let written = materialized || mutation.changed;
     if written {
         check()?;
-        write_json(
+        #[cfg(any(unix, windows))]
+        let credential_interlock = crate::credential_interlock::acquire(
+            &admitted,
+            &original,
+            &config,
+            &budget,
+            &publication_authority,
+        )
+        .map_err(|source| {
+            ConfigMutationError::Write(AtomicWriteError::Io {
+                path: config_path.clone(),
+                source,
+            })
+        })?;
+        let publication_checkpoint = || {
+            publication_authority()?;
+            #[cfg(any(unix, windows))]
+            if let Some(interlock) = &credential_interlock {
+                interlock.checkpoint()?;
+            }
+            Ok(())
+        };
+        write_json_checked(
             &config_path,
             &config,
             JsonWriteOptions {
                 mode: Some(0o600),
                 ..JsonWriteOptions::default()
             },
+            &publication_checkpoint,
         )
         .map_err(ConfigMutationError::Write)?;
     }
@@ -384,6 +444,78 @@ mod tests {
         assert!(value.get("setup").is_none());
     }
 
+    #[test]
+    fn first_use_mutator_admits_owner_created_root_before_callback() {
+        let temporary = TempDir::new();
+        let journal = temporary.path().join("journal");
+        assert!(!journal.exists());
+        let result = mutate_journal_config(&journal, LockOptions::default(), |config| {
+            assert!(journal.join("config").is_dir());
+            config.insert("env".to_owned(), json!({"OPENAI_API_KEY":"synthetic"}));
+            JournalConfigMutation {
+                changed: true,
+                value: (),
+            }
+        })
+        .unwrap();
+        assert!(result.written);
+        assert_eq!(
+            read_journal_config(&journal).unwrap().config.unwrap()["env"]["OPENAI_API_KEY"],
+            "synthetic"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_root_open_failure_is_not_reinterpreted_as_first_use() {
+        use solstone_core_journal_io::{AcquisitionPrimitive, run_with_acquisition_fault};
+
+        let temporary = TempDir::new();
+        let missing = fs::symlink_metadata(temporary.path().join("missing")).unwrap_err();
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+        let called = std::cell::Cell::new(false);
+        let (result, fired) = run_with_acquisition_fault(
+            AcquisitionPrimitive::RequestedRootOpen,
+            1,
+            missing.raw_os_error().unwrap(),
+            || {
+                mutate_journal_config(temporary.path(), LockOptions::default(), |_config| {
+                    called.set(true);
+                    JournalConfigMutation {
+                        changed: true,
+                        value: (),
+                    }
+                })
+            },
+        );
+        assert!(fired);
+        assert!(result.is_err());
+        assert!(!called.get());
+        assert!(!temporary.path().join("config").exists());
+        assert!(!temporary.path().join("health").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_root_entry_is_not_an_absent_first_use() {
+        let temporary = TempDir::new();
+        let journal = temporary.path().join("journal");
+        let target = temporary.path().join("missing-target");
+        std::os::unix::fs::symlink(&target, &journal).unwrap();
+        let called = std::cell::Cell::new(false);
+        let result = mutate_journal_config(&journal, LockOptions::default(), |_config| {
+            called.set(true);
+            JournalConfigMutation {
+                changed: true,
+                value: (),
+            }
+        });
+        assert!(result.is_err());
+        assert!(!called.get());
+        assert!(fs::symlink_metadata(&journal).unwrap().is_symlink());
+        assert!(!target.exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn materialized_config_is_private_and_pretty_printed() {
@@ -421,6 +553,80 @@ mod tests {
         })
         .unwrap();
         assert!(!result.written);
+    }
+
+    #[test]
+    fn credential_interlock_does_not_create_health_after_legacy_mutator_root_replacement() {
+        for initially_missing in [false, true] {
+            let temporary = TempDir::new();
+            let journal = temporary.path().join("journal");
+            let displaced = temporary.path().join("displaced");
+            let original = b"{\"env\":{}}\n";
+            let replacement = b"{\"replacement\":true}\n";
+            if !initially_missing {
+                fs::create_dir_all(journal.join("config")).unwrap();
+                fs::write(journal.join("config/journal.json"), original).unwrap();
+            }
+            let called = std::cell::Cell::new(false);
+            let result = mutate_journal_config(&journal, LockOptions::default(), |config| {
+                called.set(true);
+                fs::rename(&journal, &displaced).unwrap();
+                fs::create_dir_all(journal.join("config")).unwrap();
+                fs::write(journal.join("config/journal.json"), replacement).unwrap();
+                config.insert("env".to_owned(), json!({"OPENAI_API_KEY":"synthetic"}));
+                JournalConfigMutation {
+                    changed: true,
+                    value: (),
+                }
+            });
+            assert!(called.get(), "the original owner creates a missing root");
+            assert!(result.is_err());
+            assert!(!journal.join("health").exists());
+            assert!(!displaced.join("health").exists());
+            assert_eq!(
+                fs::read(journal.join("config/journal.json")).unwrap(),
+                replacement
+            );
+            if initially_missing {
+                assert!(!displaced.join("config/journal.json").exists());
+            } else {
+                assert_eq!(
+                    fs::read(displaced.join("config/journal.json")).unwrap(),
+                    original
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_timeout_credential_mutation_preserves_the_uncontended_attempt() {
+        let temporary = TempDir::new();
+        let result = mutate_journal_config(
+            temporary.path(),
+            LockOptions {
+                timeout: std::time::Duration::ZERO,
+                ..LockOptions::default()
+            },
+            |config| {
+                config.insert(
+                    "env".to_owned(),
+                    json!({"OPENAI_API_KEY":"synthetic-zero-wait"}),
+                );
+                JournalConfigMutation {
+                    changed: true,
+                    value: (),
+                }
+            },
+        )
+        .unwrap();
+        assert!(result.written);
+        assert_eq!(
+            read_journal_config(temporary.path())
+                .unwrap()
+                .config
+                .unwrap()["env"]["OPENAI_API_KEY"],
+            "synthetic-zero-wait"
+        );
     }
 
     #[test]
@@ -576,6 +782,45 @@ mod tests {
         assert_eq!(result.value, 2);
         let value: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(value, json!({"target":"after","sibling":true}));
+    }
+
+    #[test]
+    fn checked_mutation_refuses_at_pre_rename_and_keeps_the_destination() {
+        let temporary = TempDir::new();
+        let path = get_journal_config_path(temporary.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = b"{\"known\":\"existing\"}\n";
+        fs::write(&path, original).unwrap();
+        let parent = path.parent().unwrap().to_path_buf();
+        let error = mutate_journal_config_checked(
+            temporary.path(),
+            LockOptions::default(),
+            &|| {
+                let staged = fs::read_dir(&parent).unwrap().any(|entry| {
+                    solstone_core_journal_io::is_publication_candidate_name(
+                        &entry.unwrap().file_name(),
+                    )
+                });
+                if staged {
+                    Err("stop before rename".to_owned())
+                } else {
+                    Ok(())
+                }
+            },
+            |config| {
+                config.insert("known".to_owned(), json!("changed"));
+                JournalConfigMutation {
+                    changed: true,
+                    value: (),
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, ConfigMutationError::Write(_)));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(!fs::read_dir(&parent).unwrap().any(|entry| {
+            solstone_core_journal_io::is_publication_candidate_name(&entry.unwrap().file_name())
+        }));
     }
 
     #[cfg(all(test, feature = "full-tests"))]

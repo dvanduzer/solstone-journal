@@ -60,6 +60,8 @@ pub enum BoundPublicationPrimitive {
     FileSync,
     /// Renaming the stage into the destination name.
     Rename,
+    /// After the final owner checkpoint and before the actual native rename.
+    AuthorizedRename,
     /// Syncing the bound parent directory after publication.
     ParentSync,
     /// Removing a stage name after it has been linked into its final name.
@@ -563,15 +565,15 @@ pub fn atomic_replace_detailed(
         durability_source: sync_error,
         observation_source,
         ..
-    } = publish_into_bound_directory(&directory, name, contents, mode).map_err(|error| {
-        DetailedAtomicError {
+    } = publish_into_bound_directory(&directory, name, contents, mode, &|| Ok(())).map_err(
+        |error| DetailedAtomicError {
             path: path.to_path_buf(),
             operation: error.operation,
             source: error.source,
             orphan_stage: error.orphan_stage,
             cleanup_error: error.cleanup_error,
-        }
-    })?;
+        },
+    )?;
 
     if let Some(observation) = observation_source {
         return Ok(DetailedAtomicOutcome::PublishedParentPathUnverified {
@@ -600,7 +602,7 @@ pub fn atomic_replace_detailed(
     contents: &[u8],
     mode: u32,
 ) -> Result<DetailedAtomicOutcome, DetailedAtomicError> {
-    windows_atomic::atomic_replace_detailed(path, contents, mode)
+    windows_atomic::atomic_replace_detailed(path, contents, mode, &|| Ok(()))
 }
 
 /// Failure before a capability-bound Windows publication can begin.
@@ -653,6 +655,27 @@ pub fn atomic_replace_detailed_bound(
     )
 }
 
+/// Publish through the held retained-parent lock with caller checkpoints before
+/// staging, through retries and at the native handle-relative rename.
+#[cfg(windows)]
+pub fn atomic_replace_detailed_bound_checked(
+    parent: &crate::windows_sync_dir::WindowsFlatDirectory,
+    lock: &crate::locking::BoundParentLock,
+    destination_name: &OsStr,
+    contents: &[u8],
+    mode: u32,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<DetailedAtomicOutcome, BoundAtomicPublishError> {
+    windows_atomic::atomic_replace_detailed_bound_checked(
+        parent,
+        lock.parent_identity(),
+        destination_name,
+        contents,
+        mode,
+        checkpoint,
+    )
+}
+
 #[cfg(windows)]
 #[path = "windows_atomic.rs"]
 mod windows_atomic;
@@ -692,6 +715,19 @@ pub fn atomic_replace_bound(
     contents: &[u8],
     mode: u32,
 ) -> Result<BoundAtomicOutcome, DetailedAtomicError> {
+    atomic_replace_bound_checked(directory, name, contents, mode, &|| Ok(()))
+}
+
+/// Publish beneath a retained parent, renewing caller authority before staging
+/// and immediately before the descriptor-relative rename.
+#[cfg(unix)]
+pub fn atomic_replace_bound_checked(
+    directory: &impl AsFd,
+    name: &OsStr,
+    contents: &[u8],
+    mode: u32,
+    publish_checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<BoundAtomicOutcome, DetailedAtomicError> {
     let path = Path::new(name);
     if mode > 0o777 {
         return Err(detailed_error(
@@ -710,7 +746,7 @@ pub fn atomic_replace_bound(
             ),
         )
     })?;
-    let result = publish_into_bound_directory(directory, name, contents, mode)?;
+    let result = publish_into_bound_directory(directory, name, contents, mode, publish_checkpoint)?;
     if let Some(source) = result.observation_source {
         return Ok(BoundAtomicOutcome::PublishedObservationUncertain {
             observation: result.observation,
@@ -1294,11 +1330,17 @@ fn publish_into_bound_directory(
     name: &OsStr,
     contents: &[u8],
     mode: u32,
+    publish_checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<BoundPublicationResult, DetailedAtomicError> {
     let path = Path::new(name);
+    let authorize = || {
+        publish_checkpoint().map_err(|detail| io::Error::new(io::ErrorKind::Interrupted, detail))
+    };
+    authorize().map_err(|source| detailed_error(path, "authorize stage", source))?;
     inspect_destination(directory, name, path)?;
     checkpoint(BoundPublicationPrimitive::TempCreate)
         .map_err(|source| detailed_error(path, "create stage", source))?;
+    authorize().map_err(|source| detailed_error(path, "authorize stage creation", source))?;
     let (stage_name, mut stage_file) = allocate_bound_stage(directory, name, path)?;
     pause_at("temp-create");
     let operation = (|| -> io::Result<FileObservation> {
@@ -1334,6 +1376,24 @@ fn publish_into_bound_directory(
     pause_at("close");
     checkpoint(BoundPublicationPrimitive::Rename).map_err(|source| {
         cleanup_stage_error(directory, path, stage_name.clone(), "publish stage", source)
+    })?;
+    authorize().map_err(|source| {
+        cleanup_stage_error(
+            directory,
+            path,
+            stage_name.clone(),
+            "authorize publication",
+            source,
+        )
+    })?;
+    checkpoint(BoundPublicationPrimitive::AuthorizedRename).map_err(|source| {
+        cleanup_stage_error(
+            directory,
+            path,
+            stage_name.clone(),
+            "authorized publication",
+            source,
+        )
     })?;
     renameat(directory, stage_name.as_os_str(), directory, name).map_err(|source| {
         cleanup_stage_error(
@@ -1392,8 +1452,24 @@ pub fn atomic_replace(
     contents: &[u8],
     options: AtomicWriteOptions,
 ) -> Result<(), AtomicWriteError> {
+    atomic_replace_checked(path, contents, options, &|| Ok(()))
+}
+
+/// Publish through [`atomic_replace`], checking before the parent is created and
+/// again after the temporary file is synced, immediately before rename.
+///
+/// A failed check removes the temporary file and leaves the destination bytes
+/// unchanged.
+#[cfg(unix)]
+pub fn atomic_replace_checked(
+    path: impl AsRef<Path>,
+    contents: &[u8],
+    options: AtomicWriteOptions,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), AtomicWriteError> {
     let path = path.as_ref();
     let parent = parent_dir(path);
+    checkpoint().map_err(|detail| checkpoint_error(path, detail))?;
     fs::create_dir_all(parent).map_err(|source| io_error(path, source))?;
 
     let (temporary_path, mut temporary_file) = create_temporary(parent, path)?;
@@ -1411,6 +1487,7 @@ pub fn atomic_replace(
         pause_at("chmod");
         drop(temporary_file);
         pause_at("close");
+        checkpoint().map_err(|detail| checkpoint_error(path, detail))?;
         fs::rename(&temporary_path, path).map_err(|source| io_error(path, source))?;
         pause_at("rename");
         fsync_dir(parent);
@@ -1433,11 +1510,27 @@ pub fn atomic_replace(
     contents: &[u8],
     options: AtomicWriteOptions,
 ) -> Result<(), AtomicWriteError> {
+    atomic_replace_checked(path, contents, options, &|| Ok(()))
+}
+
+/// Publish through [`atomic_replace`], checking before the parent is created and
+/// again immediately before the destination is replaced.
+#[cfg(windows)]
+pub fn atomic_replace_checked(
+    path: impl AsRef<Path>,
+    contents: &[u8],
+    options: AtomicWriteOptions,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), AtomicWriteError> {
     let path = path.as_ref();
     let parent = parent_dir(path);
+    checkpoint().map_err(|detail| checkpoint_error(path, detail))?;
     fs::create_dir_all(parent).map_err(|source| io_error(path, source))?;
     let mode = options.mode.unwrap_or(0o644);
-    map_detailed_outcome(path, atomic_replace_detailed(path, contents, mode))
+    map_detailed_outcome(
+        path,
+        windows_atomic::atomic_replace_detailed(path, contents, mode, checkpoint),
+    )
 }
 
 #[cfg(windows)]
@@ -1650,15 +1743,40 @@ pub fn write_json<T: Serialize>(
     value: &T,
     options: JsonWriteOptions,
 ) -> Result<(), AtomicWriteError> {
-    let mut value =
-        serde_json::to_value(value).map_err(|source| serialization_error(path.as_ref(), source))?;
+    write_json_checked(path, value, options, &|| Ok(()))
+}
+
+/// Serialize and publish JSON through [`atomic_replace_checked`].
+#[cfg(any(unix, windows))]
+pub fn write_json_checked<T: Serialize>(
+    path: impl AsRef<Path>,
+    value: &T,
+    options: JsonWriteOptions,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), AtomicWriteError> {
+    let contents = serialize_json_bytes(value, options)
+        .map_err(|source| serialization_error(path.as_ref(), source))?;
+    atomic_replace_checked(
+        path,
+        &contents,
+        AtomicWriteOptions { mode: options.mode },
+        checkpoint,
+    )
+}
+
+/// The JSON encoding used by both path and retained-parent atomic publishers.
+/// Includes sorted keys when requested and one trailing newline.
+pub fn serialize_json_bytes<T: Serialize>(
+    value: &T,
+    options: JsonWriteOptions,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let mut value = serde_json::to_value(value)?;
     if options.sort_keys {
         sort_json_keys(&mut value);
     }
-    let mut contents = serialize_json(&value, options.indent)
-        .map_err(|source| serialization_error(path.as_ref(), source))?;
+    let mut contents = serialize_json(&value, options.indent)?;
     contents.push(b'\n');
-    atomic_replace(path, &contents, AtomicWriteOptions { mode: options.mode })
+    Ok(contents)
 }
 
 /// Atomically replace a UTF-8 text file.
@@ -1939,6 +2057,11 @@ fn io_error(path: &Path, source: io::Error) -> AtomicWriteError {
         path: path.to_path_buf(),
         source,
     }
+}
+
+#[cfg(any(unix, windows))]
+fn checkpoint_error(path: &Path, detail: String) -> AtomicWriteError {
+    io_error(path, io::Error::new(io::ErrorKind::Interrupted, detail))
 }
 
 #[cfg(any(unix, windows))]
@@ -3165,14 +3288,299 @@ mod generic_writers {
         write_text(&path, text, AtomicWriteOptions::default()).unwrap();
         assert_eq!(fs::read(&path).unwrap(), text.as_bytes());
     }
+
+    fn candidate_present(parent: &Path) -> bool {
+        fs::read_dir(parent)
+            .unwrap()
+            .any(|entry| is_publication_candidate_name(&entry.unwrap().file_name()))
+    }
+
+    #[test]
+    fn checked_replace_removes_the_candidate_and_keeps_the_destination() {
+        let temporary = TempDir::new();
+        let path = temporary.path().join("journal.json");
+        let original = b"original-bytes";
+        fs::write(&path, original).unwrap();
+        let error = atomic_replace_checked(
+            &path,
+            b"replacement-bytes",
+            AtomicWriteOptions::default(),
+            &|| {
+                if candidate_present(temporary.path()) {
+                    Err("stop before rename".to_owned())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, AtomicWriteError::Io { source, .. }
+            if source.kind() == io::ErrorKind::Interrupted));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(!candidate_present(temporary.path()));
+    }
+
+    #[test]
+    fn checked_replace_refuses_before_creating_a_missing_parent() {
+        let temporary = TempDir::new();
+        let path = temporary.path().join("nested/journal.json");
+        let error = atomic_replace_checked(&path, b"bytes", AtomicWriteOptions::default(), &|| {
+            Err("stop before parent".to_owned())
+        })
+        .unwrap_err();
+        assert!(matches!(error, AtomicWriteError::Io { source, .. }
+            if source.kind() == io::ErrorKind::Interrupted));
+        assert!(!path.parent().unwrap().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_bound_replace_cleans_a_cancelled_stage_and_keeps_the_destination() {
+        let temporary = TempDir::new();
+        let parent = fs::File::open(temporary.path()).unwrap();
+        let path = temporary.path().join("brain.json");
+        fs::write(&path, b"original").unwrap();
+        let result = atomic_replace_bound_checked(
+            &parent,
+            OsStr::new("brain.json"),
+            b"withheld",
+            0o600,
+            &|| {
+                if candidate_present(temporary.path()) {
+                    Err("cancelled before publication".to_owned())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"original");
+        assert!(!candidate_present(temporary.path()));
+        assert!(matches!(
+            atomic_replace_bound_checked(
+                &parent,
+                OsStr::new("brain.json"),
+                b"published",
+                0o600,
+                &|| Ok(())
+            )
+            .unwrap(),
+            BoundAtomicOutcome::Published { .. }
+        ));
+        assert_eq!(fs::read(&path).unwrap(), b"published");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_bound_replace_root_replacement_receives_no_stage_or_destination() {
+        let temporary = TempDir::new();
+        let journal = temporary.path().join("journal");
+        let displaced = temporary.path().join("displaced");
+        fs::create_dir(&journal).unwrap();
+        let root = crate::JournalRoot::open(&journal).unwrap();
+        let parent = fs::File::open(&journal).unwrap();
+        fs::write(journal.join("brain.json"), b"original").unwrap();
+        let replaced = std::cell::Cell::new(false);
+        let result = atomic_replace_bound_checked(
+            &parent,
+            OsStr::new("brain.json"),
+            b"withheld",
+            0o600,
+            &|| {
+                if !replaced.get() && candidate_present(&journal) {
+                    fs::rename(&journal, &displaced).unwrap();
+                    fs::create_dir(&journal).unwrap();
+                    replaced.set(true);
+                }
+                root.revalidate_canonical_binding()
+                    .map_err(|error| error.to_string())
+            },
+        );
+        assert!(replaced.get());
+        assert!(result.is_err());
+        assert!(fs::read_dir(&journal).unwrap().next().is_none());
+        assert_eq!(fs::read(displaced.join("brain.json")).unwrap(), b"original");
+        assert!(!candidate_present(&displaced));
+    }
 }
 
 #[cfg(all(test, windows))]
 mod windows_tests {
     use std::io;
     use std::path::PathBuf;
+    #[cfg(feature = "full-tests")]
+    use std::time::Duration;
 
     use super::*;
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn checked_bound_replace_windows_cancellation_keeps_original_and_normal_publication_works() {
+        use crate::{
+            JournalRoot, acquire_existing_parent_lock_bound,
+            create_or_open_windows_flat_directory_bound, test_support::TempDir,
+        };
+        use std::fs;
+        let temporary = TempDir::new();
+        let root = JournalRoot::open(temporary.path()).unwrap();
+        let parent = create_or_open_windows_flat_directory_bound(
+            &root,
+            OsStr::new("health"),
+            temporary.path(),
+        )
+        .unwrap();
+        let lock = acquire_existing_parent_lock_bound(
+            &parent,
+            OsStr::new("brain.json.lock"),
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let directory = temporary.path().join("health");
+        let path = directory.join("brain.json");
+        fs::write(&path, b"original").unwrap();
+        let cancelled = atomic_replace_detailed_bound_checked(
+            &parent,
+            &lock,
+            OsStr::new("brain.json"),
+            b"withheld",
+            0o600,
+            &|| {
+                if fs::read_dir(&directory)
+                    .unwrap()
+                    .any(|entry| is_publication_candidate_name(&entry.unwrap().file_name()))
+                {
+                    Err("cancelled before publication".to_owned())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(cancelled.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"original");
+        assert!(
+            !fs::read_dir(&directory)
+                .unwrap()
+                .any(|entry| is_publication_candidate_name(&entry.unwrap().file_name()))
+        );
+        let outcome = atomic_replace_detailed_bound_checked(
+            &parent,
+            &lock,
+            OsStr::new("brain.json"),
+            b"published",
+            0o600,
+            &|| {
+                root.revalidate_canonical_binding()
+                    .map_err(|error| error.to_string())?;
+                lock.revalidate_bound(&parent, OsStr::new("brain.json.lock"))
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            DetailedAtomicOutcome::Published
+                | DetailedAtomicOutcome::PublishedDurabilityUncertain { .. }
+        ));
+        assert_eq!(fs::read(&path).unwrap(), b"published");
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn checked_bound_replace_windows_root_replacement_receives_no_stage_or_destination() {
+        use crate::{
+            JournalRoot, acquire_existing_parent_lock_bound,
+            create_or_open_windows_flat_directory_bound, test_support::TempDir,
+        };
+        use std::fs;
+        let temporary = TempDir::new();
+        let journal = temporary.path().join("journal");
+        let displaced = temporary.path().join("displaced");
+        fs::create_dir(&journal).unwrap();
+        let root = JournalRoot::open(&journal).unwrap();
+        let parent =
+            create_or_open_windows_flat_directory_bound(&root, OsStr::new("health"), &journal)
+                .unwrap();
+        let lock = acquire_existing_parent_lock_bound(
+            &parent,
+            OsStr::new("brain.json.lock"),
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+        fs::write(journal.join("health/brain.json"), b"original").unwrap();
+        let replaced = std::cell::Cell::new(false);
+        let excluded = std::cell::Cell::new(false);
+        const EXCLUDED: &str = "native handles excluded the staged root replacement";
+        let result = atomic_replace_detailed_bound_checked(
+            &parent,
+            &lock,
+            OsStr::new("brain.json"),
+            b"withheld",
+            0o600,
+            &|| {
+                if !replaced.get()
+                    && fs::read_dir(journal.join("health"))
+                        .unwrap()
+                        .any(|entry| is_publication_candidate_name(&entry.unwrap().file_name()))
+                {
+                    match fs::rename(&journal, &displaced) {
+                        Ok(()) => {
+                            fs::create_dir(&journal).unwrap();
+                            replaced.set(true);
+                        }
+                        Err(error) => {
+                            assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error}");
+                            eprintln!("staged root replacement excluded: {error}");
+                            excluded.set(true);
+                            return Err(EXCLUDED.to_owned());
+                        }
+                    }
+                }
+                root.revalidate_canonical_binding()
+                    .map_err(|error| error.to_string())
+            },
+        );
+        assert!(replaced.get() || excluded.get());
+        let error = match result.expect_err("root replacement cannot publish") {
+            BoundAtomicPublishError::Atomic(error) => error,
+            BoundAtomicPublishError::NamespaceChanged => {
+                panic!("expected staged checkpoint refusal")
+            }
+        };
+        assert!(error.orphan_stage.is_none(), "{error}");
+        assert!(error.cleanup_error.is_none(), "{error}");
+        if excluded.get() {
+            assert_eq!(error.operation, "publish checkpoint");
+            assert_eq!(error.source.kind(), io::ErrorKind::Interrupted);
+            assert_eq!(error.source.to_string(), EXCLUDED);
+            assert!(!displaced.exists());
+            assert_eq!(
+                fs::read(journal.join("health/brain.json")).unwrap(),
+                b"original"
+            );
+            assert!(
+                !fs::read_dir(journal.join("health"))
+                    .unwrap()
+                    .any(|entry| is_publication_candidate_name(&entry.unwrap().file_name()))
+            );
+            drop(lock);
+            drop(parent);
+            drop(root);
+            fs::rename(&journal, &displaced).expect("root rename succeeds after custody ends");
+            fs::create_dir(&journal).unwrap();
+        }
+        assert!(fs::read_dir(&journal).unwrap().next().is_none());
+        assert_eq!(
+            fs::read(displaced.join("health/brain.json")).unwrap(),
+            b"original"
+        );
+        assert!(
+            !fs::read_dir(displaced.join("health"))
+                .unwrap()
+                .any(|entry| is_publication_candidate_name(&entry.unwrap().file_name()))
+        );
+    }
 
     #[test]
     fn detailed_publication_outcomes_map_to_success() {

@@ -8,10 +8,118 @@
 //! audit trail of user- and agent-initiated actions.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use chrono::Utc;
 use serde_json::{Value, json};
-use solstone_core_journal_io::{AppendError, append_text};
+use solstone_core_journal_io::{AppendError, append_text_checked};
+
+/// Append the existing journal-level audit row beneath the caller's original
+/// journal capability. The native append never follows a diagnostic pathname.
+pub fn append_journal_action_log_at_root_checked(
+    root: &Arc<solstone_core_journal_io::JournalRoot>,
+    source: &str,
+    actor: &str,
+    action: &str,
+    params: Value,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), AppendError> {
+    use solstone_core_journal_io::append_text_bound_checked;
+    use solstone_core_journal_io::media::MediaDirectory;
+    use std::ffi::OsStr;
+    let diagnostic = root.canonical_path().join("config/actions");
+    let failure = |error: String| AppendError::Io {
+        path: diagnostic.clone(),
+        source: std::io::Error::other(error),
+    };
+    let check_root = || {
+        checkpoint().map_err(&failure)?;
+        root.revalidate_canonical_binding()
+            .map_err(|error| failure(error.to_string()))
+    };
+    check_root()?;
+    let config_media = MediaDirectory::open(root.clone(), Path::new("config"))
+        .map_err(|error| failure(error.to_string()))?;
+    #[cfg(unix)]
+    let config = solstone_core_journal_io::open_flat_directory_bound(
+        &**root,
+        OsStr::new("config"),
+        root.canonical_path(),
+    )
+    .map_err(|error| failure(error.to_string()))?
+    .ok_or_else(|| failure("config directory disappeared".to_owned()))?;
+    #[cfg(windows)]
+    let config = solstone_core_journal_io::open_windows_flat_directory_bound(
+        &**root,
+        OsStr::new("config"),
+        root.canonical_path(),
+    )
+    .map_err(|error| failure(error.to_string()))?
+    .ok_or_else(|| failure("config directory disappeared".to_owned()))?;
+    #[cfg(unix)]
+    let config_identity = config.identity();
+    #[cfg(windows)]
+    let config_identity = config.object_identity();
+    if config_media.object_identity() != config_identity {
+        return Err(failure("config directory changed".to_owned()));
+    }
+    let check_config = || {
+        check_root()?;
+        config_media
+            .revalidate()
+            .map_err(|error| failure(error.to_string()))
+    };
+    check_config()?;
+    #[cfg(unix)]
+    let actions = solstone_core_journal_io::create_or_open_flat_directory_bound(
+        &config,
+        OsStr::new("actions"),
+        0o777,
+        &root.canonical_path().join("config"),
+    )
+    .map_err(|error| failure(error.to_string()))?;
+    #[cfg(windows)]
+    let actions = solstone_core_journal_io::create_or_open_windows_flat_directory_bound(
+        &config,
+        OsStr::new("actions"),
+        &root.canonical_path().join("config"),
+    )
+    .map_err(|error| failure(error.to_string()))?;
+    let actions_media = MediaDirectory::open(root.clone(), Path::new("config/actions"))
+        .map_err(|error| failure(error.to_string()))?;
+    #[cfg(unix)]
+    let actions_identity = actions.identity();
+    #[cfg(windows)]
+    let actions_identity = actions.object_identity();
+    if actions_media.object_identity() != actions_identity {
+        return Err(failure("action-log directory changed".to_owned()));
+    }
+    let check_actions = || {
+        check_config()?;
+        actions_media
+            .revalidate()
+            .map_err(|error| failure(error.to_string()))
+    };
+    check_actions()?;
+    let config = solstone_core_journal_config::read_journal_config_bound(root)
+        .map_err(|error| failure(error.to_string()))?
+        .config
+        .unwrap_or_default();
+    let zone = config
+        .get("identity")
+        .and_then(|identity| identity.get("timezone"))
+        .and_then(Value::as_str)
+        .and_then(solstone_core_journal_config::parse_zone)
+        .unwrap_or_else(solstone_core_journal_config::host_zone);
+    let day = Utc::now().with_timezone(&zone).format("%Y%m%d").to_string();
+    let check = || check_actions().map_err(|error| error.to_string());
+    append_text_bound_checked(
+        &actions,
+        OsStr::new(&format!("{day}.jsonl")),
+        &python_json(&action_record(None, source, actor, action, params)),
+        &check,
+    )
+}
 
 /// Append an action-log record to the journal-level or facet-scoped destination.
 pub fn append_action_log(
@@ -22,11 +130,36 @@ pub fn append_action_log(
     action: &str,
     params: Value,
 ) -> Result<(), AppendError> {
+    append_action_log_checked(journal_root, facet, source, actor, action, params, &|| {
+        Ok(())
+    })
+}
+
+/// Append one action-log record, checking before its parent is created and again
+/// immediately before the record is written.
+pub fn append_action_log_checked(
+    journal_root: &Path,
+    facet: Option<&str>,
+    source: &str,
+    actor: &str,
+    action: &str,
+    params: Value,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), AppendError> {
     let day = Utc::now()
         .with_timezone(&solstone_core_journal_config::owner_zone(journal_root))
         .format("%Y%m%d")
         .to_string();
-    append_action_log_at_day(journal_root, facet, source, actor, action, params, &day)
+    append_action_log_at_day(
+        journal_root,
+        facet,
+        source,
+        actor,
+        action,
+        params,
+        &day,
+        checkpoint,
+    )
 }
 
 pub fn append_action_log_for_day(
@@ -38,9 +171,19 @@ pub fn append_action_log_for_day(
     params: Value,
     day: &str,
 ) -> Result<(), AppendError> {
-    append_action_log_at_day(journal_root, facet, source, actor, action, params, day)
+    append_action_log_at_day(
+        journal_root,
+        facet,
+        source,
+        actor,
+        action,
+        params,
+        day,
+        &|| Ok(()),
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_action_log_at_day(
     journal_root: &Path,
     facet: Option<&str>,
@@ -49,6 +192,7 @@ fn append_action_log_at_day(
     action: &str,
     params: Value,
     day: &str,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<(), AppendError> {
     let destination = match facet {
         Some(facet) => journal_root
@@ -60,6 +204,20 @@ fn append_action_log_at_day(
             .join("config/actions")
             .join(format!("{day}.jsonl")),
     };
+    append_text_checked(
+        destination,
+        &python_json(&action_record(facet, source, actor, action, params)),
+        checkpoint,
+    )
+}
+
+fn action_record(
+    facet: Option<&str>,
+    source: &str,
+    actor: &str,
+    action: &str,
+    params: Value,
+) -> Value {
     let mut record = serde_json::Map::new();
     record.insert("timestamp".to_owned(), json!(Utc::now().to_rfc3339()));
     record.insert("source".to_owned(), json!(source));
@@ -69,7 +227,7 @@ fn append_action_log_at_day(
     if let Some(facet) = facet {
         record.insert("facet".to_owned(), json!(facet));
     }
-    append_text(destination, &python_json(&Value::Object(record)))
+    Value::Object(record)
 }
 
 fn python_json(value: &Value) -> String {
@@ -94,6 +252,67 @@ fn python_json(value: &Value) -> String {
         }
     }
     output
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use serde_json::json;
+
+    use super::append_action_log_checked;
+
+    fn utc_journal() -> tempfile::TempDir {
+        let root = tempfile::TempDir::new().expect("journal");
+        std::fs::create_dir_all(root.path().join("config")).expect("config");
+        std::fs::write(
+            root.path().join("config/journal.json"),
+            b"{\"identity\":{\"timezone\":\"UTC\"}}\n",
+        )
+        .expect("timezone");
+        root
+    }
+
+    #[test]
+    fn failed_check_creates_no_action_parent() {
+        let root = utc_journal();
+        let error = append_action_log_checked(
+            root.path(),
+            None,
+            "app",
+            "thinking",
+            "env_update",
+            json!({}),
+            &|| Err("stop".to_owned()),
+        );
+        assert!(error.is_err());
+        assert!(!root.path().join("config/actions").exists());
+    }
+
+    #[test]
+    fn pre_write_check_does_not_append_the_record() {
+        let root = utc_journal();
+        let calls = AtomicUsize::new(0);
+        let error = append_action_log_checked(
+            root.path(),
+            None,
+            "app",
+            "thinking",
+            "env_update",
+            json!({}),
+            &|| {
+                if calls.fetch_add(1, Ordering::SeqCst) >= 1 {
+                    Err("stop".to_owned())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(error.is_err());
+        let actions = root.path().join("config/actions");
+        assert!(actions.is_dir());
+        assert_eq!(std::fs::read_dir(actions).unwrap().count(), 0);
+    }
 }
 
 #[cfg(all(test, feature = "full-tests"))]

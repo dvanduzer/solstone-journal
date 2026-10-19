@@ -43,14 +43,54 @@ pub fn refresh_discovery_cache(
     hosted_parent: Option<Arc<HostedServiceParentRuntime>>,
     #[cfg(windows)] generation: &solstone_core_system::process::ChildLaunchContext,
 ) -> Result<DiscoveryRefresh, DiscoveryRefreshError> {
-    refresh_with_cluster(root, |embeddings| {
-        crate::discovery_helper::discovery_cluster(
-            embeddings,
-            hosted_parent,
-            #[cfg(windows)]
-            generation,
-        )
-    })
+    refresh_with_cluster(
+        root,
+        |embeddings| {
+            crate::discovery_helper::discovery_cluster(
+                embeddings,
+                hosted_parent,
+                #[cfg(windows)]
+                generation,
+            )
+        },
+        &|| Ok(()),
+    )
+}
+
+/// Map clustering labels onto the helper's integer encoding.
+///
+/// Noise and a label that does not fit `i64` are `-1`.
+pub fn labels_as_i64(labels: &[Option<usize>]) -> Vec<i64> {
+    labels
+        .iter()
+        .map(|label| match label {
+            Some(value) => i64::try_from(*value).unwrap_or(-1),
+            None => -1,
+        })
+        .collect()
+}
+
+/// Refresh the discovery cache with a caller-supplied clustering function.
+///
+/// [`refresh_discovery_cache`] keeps the desktop helper. A hosted app passes
+/// the in-process kernel and [`labels_as_i64`].
+pub fn refresh_discovery_with_cluster(
+    root: &Path,
+    cluster: impl FnOnce(
+        Vec<Vec<f32>>,
+    ) -> Result<Vec<i64>, crate::discovery_helper::DiscoveryHelperError>,
+) -> Result<DiscoveryRefresh, DiscoveryRefreshError> {
+    refresh_discovery_with_cluster_checked(root, cluster, &|| Ok(()))
+}
+
+pub fn refresh_discovery_with_cluster_checked(
+    root: &Path,
+    cluster: impl FnOnce(
+        Vec<Vec<f32>>,
+    ) -> Result<Vec<i64>, crate::discovery_helper::DiscoveryHelperError>,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<DiscoveryRefresh, DiscoveryRefreshError> {
+    refresh_with_cluster(root, cluster, checkpoint)
 }
 
 fn refresh_with_cluster(
@@ -58,6 +98,7 @@ fn refresh_with_cluster(
     cluster: impl FnOnce(
         Vec<Vec<f32>>,
     ) -> Result<Vec<i64>, crate::discovery_helper::DiscoveryHelperError>,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<DiscoveryRefresh, DiscoveryRefreshError> {
     let (rows, dropped_invalid) =
         match discovery_candidates(root).map_err(DiscoveryRefreshError::Input)? {
@@ -75,10 +116,11 @@ fn refresh_with_cluster(
         let labels = cluster(rows.iter().map(|row| row.embedding.clone()).collect())?;
         retain_discovery_clusters(&rows, &labels)
     };
+    checkpoint().map_err(DiscoveryRefreshError::Input)?;
     if clusters.is_empty() {
-        clear_discovery_cache(root).map_err(DiscoveryRefreshError::Input)?;
+        clear_discovery_cache(root, checkpoint).map_err(DiscoveryRefreshError::Input)?;
     } else {
-        write_discovery_cache(root, &clusters).map_err(DiscoveryRefreshError::Input)?;
+        write_discovery_cache(root, &clusters, checkpoint).map_err(DiscoveryRefreshError::Input)?;
     }
     Ok(DiscoveryRefresh::Refreshed {
         clusters,
@@ -391,12 +433,16 @@ impl NumpyPcg64 {
     }
 }
 
-fn clear_discovery_cache(root: &Path) -> Result<(), String> {
+fn clear_discovery_cache(
+    root: &Path,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
     for name in [
         "discovery_clusters.json",
         "discovery_clusters.resolved.json",
     ] {
         let path = root.join("awareness").join(name);
+        checkpoint()?;
         match fs::remove_file(path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -409,8 +455,10 @@ fn clear_discovery_cache(root: &Path) -> Result<(), String> {
 fn write_discovery_cache(
     root: &Path,
     clusters: &std::collections::BTreeMap<String, Vec<Value>>,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<(), String> {
     let awareness = root.join("awareness");
+    checkpoint()?;
     fs::create_dir_all(&awareness).map_err(|error| error.to_string())?;
     let cache = awareness.join("discovery_clusters.json");
     let temp = awareness.join(format!(
@@ -423,8 +471,13 @@ fn write_discovery_cache(
         "clusters": clusters,
     });
     let bytes = serde_json::to_vec_pretty(&payload).map_err(|error| error.to_string())?;
-    let result = fs::write(&temp, bytes).and_then(|()| fs::rename(&temp, &cache));
-    if let Err(error) = result {
+    checkpoint()?;
+    fs::write(&temp, &bytes).map_err(|error| error.to_string())?;
+    if let Err(error) = checkpoint() {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&temp, &cache) {
         let _ = fs::remove_file(&temp);
         return Err(error.to_string());
     }
@@ -435,5 +488,91 @@ fn layout_name(layout: SegmentLayout) -> &'static str {
     match layout {
         SegmentLayout::Direct => "direct",
         SegmentLayout::Named => "named",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn labels_as_i64_maps_noise_and_overflow_to_minus_one() {
+        let mut labels = vec![None, Some(0), Some(7)];
+        let mut expected = vec![-1_i64, 0, 7];
+        if usize::BITS > 63 {
+            labels.push(Some(usize::MAX));
+            expected.push(-1);
+        }
+        assert_eq!(labels_as_i64(&labels), expected);
+    }
+
+    #[test]
+    fn empty_journal_returns_before_clustering() {
+        let root = tempfile::tempdir().expect("temp journal");
+        let outcome = refresh_discovery_with_cluster(root.path(), |_| {
+            panic!("cluster must not run before owner admission");
+        });
+        assert!(matches!(
+            outcome,
+            Ok(DiscoveryRefresh::IdentityInvalid | DiscoveryRefresh::NoConfirmedOwner)
+        ));
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn discovery_cache_rename_cancelled_while_blocked_does_not_publish() {
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::thread;
+
+        let root = tempfile::tempdir().expect("temp journal");
+        let awareness = root.path().join("awareness");
+        std::fs::create_dir_all(&awareness).unwrap();
+        let cache = awareness.join("discovery_clusters.json");
+        std::fs::write(&cache, b"OLD\n").unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let calls_flag = Arc::clone(&calls);
+        let entered_flag = Arc::clone(&entered);
+        let release_flag = Arc::clone(&release);
+        let journal = root.path().to_path_buf();
+        let worker = thread::spawn(move || {
+            super::write_discovery_cache(&journal, &BTreeMap::new(), &|| {
+                let seen = calls_flag.fetch_add(1, Ordering::AcqRel);
+                if seen >= 2 {
+                    entered_flag.store(true, Ordering::Release);
+                    while !release_flag.load(Ordering::Acquire) {
+                        thread::yield_now();
+                    }
+                    return Err("stopped".into());
+                }
+                Ok(())
+            })
+        });
+        for _ in 0..1_000_000 {
+            if entered.load(Ordering::Acquire) {
+                break;
+            }
+            thread::yield_now();
+        }
+        assert!(
+            entered.load(Ordering::Acquire),
+            "rename checkpoint never started; calls={}",
+            calls.load(Ordering::Acquire)
+        );
+        assert_eq!(std::fs::read(&cache).unwrap(), b"OLD\n");
+        release.store(true, Ordering::Release);
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(error.contains("stopped"), "{error}");
+        assert_eq!(std::fs::read(&cache).unwrap(), b"OLD\n");
+        let temps: Vec<_> = std::fs::read_dir(&awareness)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp"))
+            .collect();
+        assert!(temps.is_empty(), "temp left behind: {temps:?}");
     }
 }

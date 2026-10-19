@@ -14,6 +14,16 @@ pub(crate) fn scan_tokens(
     use_cache: bool,
     diagnostics: &mut Vec<String>,
 ) -> TokenUsage {
+    scan_tokens_with_checkpoint(journal_root, now, use_cache, diagnostics, None)
+}
+
+pub(crate) fn scan_tokens_with_checkpoint(
+    journal_root: &Path,
+    now: DateTime<Utc>,
+    use_cache: bool,
+    diagnostics: &mut Vec<String>,
+    checkpoint: Option<&dyn Fn() -> Result<(), String>>,
+) -> TokenUsage {
     let tokens_dir = journal_root.join("tokens");
     if !tokens_dir.is_dir() {
         return TokenUsage::default();
@@ -40,6 +50,9 @@ pub(crate) fn scan_tokens(
 
     let mut usage = TokenUsage::default();
     for token_file in token_files {
+        if checkpoint.is_some_and(|checkpoint| checkpoint().is_err()) {
+            break;
+        }
         let Some(day) = token_file.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
@@ -78,7 +91,14 @@ pub(crate) fn scan_tokens(
         }
 
         if use_cache && day != today {
-            save_token_cache(&token_file, &cache_file, &day, &usage, diagnostics);
+            save_token_cache(
+                &token_file,
+                &cache_file,
+                &day,
+                &usage,
+                diagnostics,
+                checkpoint,
+            );
         }
     }
     usage
@@ -131,11 +151,35 @@ fn save_token_cache(
     day: &str,
     usage: &TokenUsage,
     diagnostics: &mut Vec<String>,
+    checkpoint: Option<&dyn Fn() -> Result<(), String>>,
 ) {
+    // Retain the original child before cloning or serializing its payload.
+    let publication = match checkpoint
+        .map(|checkpoint| crate::publication::StatsPublication::open(cache_file, checkpoint))
+    {
+        Some(Ok(publication)) => Some(publication),
+        Some(Err(error)) => {
+            diagnostics.push(format!(
+                "Token cache save failed for {}: {error}",
+                token_file.display()
+            ));
+            return;
+        }
+        None => None,
+    };
     let payload = usage.by_day.get(day).cloned().unwrap_or_default();
     match serde_json::to_string(&payload) {
         Ok(contents) => {
-            if let Err(error) = fs::write(cache_file, contents) {
+            let written = if let Some(publication) = publication {
+                publication.bytes(
+                    contents.as_bytes(),
+                    checkpoint.expect("checked publication"),
+                )
+            } else {
+                fs::write(cache_file, contents)
+                    .map_err(|error| crate::JournalStatsError::io(cache_file, error))
+            };
+            if let Err(error) = written {
                 diagnostics.push(format!(
                     "Token cache save failed for {}: {error}",
                     token_file.display()

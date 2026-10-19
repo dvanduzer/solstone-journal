@@ -2830,6 +2830,7 @@ mod tests {
                     "credential_fingerprint_sha256": "cca56da30e3c8a13a11277193fd3263961e2e3d6d9f98038a91dac05e8fde16a"
                 }
             },
+            "env": {"OPENAI_API_KEY": "synthetic-key"},
             "providers": {
                 "active": {"provider": "openai", "model": "gpt-4o"},
                 "local": {

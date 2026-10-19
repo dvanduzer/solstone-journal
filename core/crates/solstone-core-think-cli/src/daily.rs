@@ -476,6 +476,7 @@ fn queue_daily(
     };
     let mut reservation_error = None;
     let mut conflict_exhausted = false;
+    let checkpoint = || context.checkpoint();
     let mut prepare = |reserved_use: &str| -> std::io::Result<()> {
         match reserve_daily_attempt(
             &context.journal,
@@ -488,9 +489,12 @@ fn queue_daily(
             from_scratch,
             retry,
             context.event_now_ms(),
+            &checkpoint,
         ) {
             Ok(()) => Ok(()),
-            Err(solstone_core_journal_io::DailyUnitError::OwnerConflictExhausted) => {
+            Err(ReserveAttemptError::Unit(
+                solstone_core_journal_io::DailyUnitError::OwnerConflictExhausted,
+            )) => {
                 conflict_exhausted = true;
                 Err(std::io::Error::other("owner conflict retry exhausted"))
             }
@@ -574,6 +578,32 @@ fn queue_daily(
     Ok(())
 }
 
+#[derive(Debug)]
+pub(crate) enum ReserveAttemptError {
+    Unit(solstone_core_journal_io::DailyUnitError),
+    Stopped(String),
+}
+
+impl std::fmt::Display for ReserveAttemptError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unit(error) => error.fmt(formatter),
+            Self::Stopped(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl From<solstone_core_journal_io::DailyUnitError> for ReserveAttemptError {
+    fn from(error: solstone_core_journal_io::DailyUnitError) -> Self {
+        Self::Unit(error)
+    }
+}
+
+enum ReserveStamp {
+    Reserved,
+    Stopped(String),
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn reserve_daily_attempt(
     journal: &std::path::Path,
@@ -586,9 +616,10 @@ pub(crate) fn reserve_daily_attempt(
     from_scratch: bool,
     retry: bool,
     now_ms: i64,
-) -> Result<(), solstone_core_journal_io::DailyUnitError> {
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), ReserveAttemptError> {
     let _execution = solstone_core_journal_io::claim_daily_execution(journal, identity)?;
-    solstone_core_journal_io::with_daily_unit_authority(journal, identity, |authority| {
+    match solstone_core_journal_io::with_daily_unit_authority(journal, identity, |authority| {
         let existed = authority.record().is_some();
         let mut record = authority.record_mut().take().unwrap_or_else(|| {
             solstone_core_journal_io::DailyUnitRecord::new(
@@ -729,6 +760,9 @@ pub(crate) fn reserve_daily_attempt(
                     record.action_plan = None;
                     record.frozen_packet = Some(frozen_packet.clone());
                 } else if existed {
+                    if let Err(message) = checkpoint() {
+                        return Ok(ReserveStamp::Stopped(message));
+                    }
                     let mut cleared = baseline;
                     cleared.frozen_packet = None;
                     cleared.packet_digest = None;
@@ -760,10 +794,18 @@ pub(crate) fn reserve_daily_attempt(
             record.attempt_day = Some(today.to_owned());
         }
         record.updated_at_ms = now_ms;
+        if let Err(message) = checkpoint() {
+            // A stop is not a record. Leave nothing staged for a later Ok.
+            authority.record_mut().take();
+            return Ok(ReserveStamp::Stopped(message));
+        }
         *authority.record_mut() = Some(record);
         authority.checkpoint()?;
-        Ok(())
-    })
+        Ok(ReserveStamp::Reserved)
+    })? {
+        ReserveStamp::Reserved => Ok(()),
+        ReserveStamp::Stopped(message) => Err(ReserveAttemptError::Stopped(message)),
+    }
 }
 
 #[cfg(test)]
@@ -1066,7 +1108,8 @@ mod tests {
                                 "new",
                                 false,
                                 false,
-                                1
+                                1,
+                                &|| Ok(())
                             )
                             .is_err()
                         );
@@ -1244,6 +1287,7 @@ mod tests {
             false,
             false,
             1,
+            &|| Ok(()),
         )
         .unwrap();
 
@@ -1297,6 +1341,7 @@ mod tests {
             false,
             false,
             2,
+            &|| Ok(()),
         );
         assert!(
             second.is_err(),
@@ -1329,6 +1374,7 @@ mod tests {
             false,
             false,
             1,
+            &|| Ok(()),
         )
         .unwrap();
 
@@ -1371,6 +1417,7 @@ mod tests {
             false,
             false,
             2,
+            &|| Ok(()),
         );
         assert!(
             second.is_err(),
@@ -1389,6 +1436,7 @@ mod tests {
             false,
             false,
             3,
+            &|| Ok(()),
         );
         assert!(
             third.is_err(),
@@ -1512,6 +1560,7 @@ mod tests {
             false,
             false,
             1,
+            &|| Ok(()),
         )
         .unwrap();
 
@@ -1575,6 +1624,7 @@ mod tests {
                             false,
                             false,
                             1,
+                            &|| Ok(()),
                         )
                         .is_ok()
                     })
@@ -1600,6 +1650,7 @@ mod tests {
                 false,
                 false,
                 1,
+                &|| Ok(())
             )
             .is_err()
         );
@@ -1631,6 +1682,7 @@ mod tests {
             false,
             false,
             1,
+            &|| Ok(()),
         )
         .unwrap();
 
@@ -1676,6 +1728,7 @@ mod tests {
                 false,
                 false,
                 2,
+                &|| Ok(())
             )
             .is_err()
         );
@@ -1724,6 +1777,7 @@ mod tests {
                     false,
                     false,
                     record.updated_at_ms + 3_600_000,
+                    &|| Ok(()),
                 )
                 .unwrap();
                 let admitted = load_daily_unit_record(root, &identity).unwrap().unwrap();
@@ -1767,7 +1821,8 @@ mod tests {
                         "new-use",
                         from_scratch,
                         false,
-                        2
+                        2,
+                        &|| Ok(())
                     )
                     .is_err()
                 );
@@ -1796,6 +1851,7 @@ mod tests {
             false,
             false,
             2,
+            &|| Ok(()),
         )
         .unwrap();
         let admitted = load_daily_unit_record(root, &identity).unwrap().unwrap();
@@ -1826,6 +1882,7 @@ mod tests {
             false,
             false,
             2,
+            &|| Ok(()),
         )
         .unwrap();
         let loaded = load_daily_unit_record(root, &identity).unwrap().unwrap();
@@ -1858,7 +1915,8 @@ mod tests {
                 "retry",
                 false,
                 false,
-                2
+                2,
+                &|| Ok(())
             )
             .is_err()
         );
@@ -1873,7 +1931,8 @@ mod tests {
                 "new-evidence",
                 false,
                 false,
-                3
+                3,
+                &|| Ok(())
             )
             .is_err()
         );
@@ -3147,6 +3206,7 @@ cat "${0%/*}/response-$kind.json"
             false,
             false,
             1,
+            &|| Ok(()),
         )
         .unwrap();
         let started = root.join("model-started");
@@ -3214,6 +3274,7 @@ cat "${0%/*}/response-$kind.json"
                 false,
                 false,
                 2,
+                &|| Ok(())
             )
             .is_err()
         );
@@ -3270,6 +3331,7 @@ cat "${0%/*}/response-$kind.json"
             false,
             false,
             3,
+            &|| Ok(()),
         )
         .unwrap_err();
         assert!(
@@ -3315,6 +3377,7 @@ cat "${0%/*}/response-$kind.json"
             false,
             false,
             3,
+            &|| Ok(()),
         )
         .unwrap_err();
 
@@ -3336,6 +3399,7 @@ cat "${0%/*}/response-$kind.json"
             true,
             false,
             3,
+            &|| Ok(()),
         )
         .unwrap_err();
 
@@ -3655,6 +3719,7 @@ cat "${0%/*}/response-$kind.json"
                 false,
                 false,
                 3,
+                &|| Ok(()),
             )
         });
         let journal = root.path().to_path_buf();
@@ -3670,6 +3735,7 @@ cat "${0%/*}/response-$kind.json"
                 false,
                 false,
                 4,
+                &|| Ok(()),
             )
         });
         let first_err = first.join().unwrap().unwrap_err();
@@ -3677,16 +3743,20 @@ cat "${0%/*}/response-$kind.json"
         assert!(
             matches!(
                 first_err,
-                solstone_core_journal_io::DailyUnitError::OwnerConflictExhausted
-                    | solstone_core_journal_io::DailyUnitError::Lock(_)
+                ReserveAttemptError::Unit(
+                    solstone_core_journal_io::DailyUnitError::OwnerConflictExhausted
+                        | solstone_core_journal_io::DailyUnitError::Lock(_)
+                )
             ),
             "{first_err}"
         );
         assert!(
             matches!(
                 second_err,
-                solstone_core_journal_io::DailyUnitError::OwnerConflictExhausted
-                    | solstone_core_journal_io::DailyUnitError::Lock(_)
+                ReserveAttemptError::Unit(
+                    solstone_core_journal_io::DailyUnitError::OwnerConflictExhausted
+                        | solstone_core_journal_io::DailyUnitError::Lock(_)
+                )
             ),
             "{second_err}"
         );
@@ -3728,11 +3798,14 @@ cat "${0%/*}/response-$kind.json"
             false,
             false,
             100,
+            &|| Ok(()),
         );
         assert!(
             matches!(
                 res,
-                Err(solstone_core_journal_io::DailyUnitError::OwnerConflictExhausted)
+                Err(ReserveAttemptError::Unit(
+                    solstone_core_journal_io::DailyUnitError::OwnerConflictExhausted
+                ))
             ),
             "alias_claimed with count 2 must remain exhausted on a later day: {res:?}"
         );
@@ -3774,6 +3847,7 @@ cat "${0%/*}/response-$kind.json"
             false,
             false,
             early_ms + 86400000,
+            &|| Ok(()),
         );
         assert!(res.is_ok(), "legacy stale record must renew: {res:?}");
         let read2 = solstone_core_journal_io::load_daily_unit_record(root.path(), &identity)
@@ -4181,6 +4255,7 @@ cat "${0%/*}/response-$kind.json"
                     false,
                     retry,
                     9,
+                    &|| Ok(()),
                 )
             };
             // Without the owner's request the stop holds.
@@ -4231,6 +4306,7 @@ cat "${0%/*}/response-$kind.json"
             false,
             true,
             9,
+            &|| Ok(()),
         )
         .unwrap_err();
         assert!(
@@ -4512,10 +4588,7 @@ cat "${0%/*}/response-$kind.json"
         record
     }
 
-    fn reserve_briefing(
-        root: &std::path::Path,
-        packet: &Value,
-    ) -> Result<(), solstone_core_journal_io::DailyUnitError> {
+    fn reserve_briefing(root: &std::path::Path, packet: &Value) -> Result<(), ReserveAttemptError> {
         reserve_daily_attempt(
             root,
             &DailyUnitIdentity::new("20260101", "morning_briefing", None),
@@ -4527,6 +4600,7 @@ cat "${0%/*}/response-$kind.json"
             false,
             false,
             9,
+            &|| Ok(()),
         )
     }
 
@@ -4728,6 +4802,49 @@ cat "${0%/*}/response-$kind.json"
         assert_ne!(prepared.status, DailyUnitStatus::Capped);
         assert!(prepared.packet_digest.is_some());
     }
+
+    #[test]
+    fn stale_location_stop_does_not_clear_the_record() {
+        let root = tempfile::tempdir().unwrap();
+        location_config(root.path());
+        let packet = briefing_packet(root.path());
+        let location = root
+            .path()
+            .join("chronicle/20260101/phone/120000_1/location.jsonl");
+        std::fs::create_dir_all(location.parent().unwrap()).unwrap();
+        std::fs::write(&location, b"changed\n").unwrap();
+        let seeded = accepted_briefing(root.path(), packet.clone(), 4);
+        let identity = DailyUnitIdentity::new("20260101", "morning_briefing", None);
+        let error = reserve_daily_attempt(
+            root.path(),
+            &identity,
+            "E",
+            "C",
+            &packet,
+            "20260102",
+            "worker-token",
+            false,
+            false,
+            9,
+            &|| Err("stopped".into()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ReserveAttemptError::Stopped(message) if message == "stopped"
+        ));
+        let stored = load_daily_unit_record(root.path(), &identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.frozen_packet, seeded.frozen_packet);
+        assert_eq!(stored.packet_digest, seeded.packet_digest);
+        assert_eq!(stored.generated_result, seeded.generated_result);
+        assert_eq!(stored.action_plan, seeded.action_plan);
+        assert_eq!(stored.failure_count, seeded.failure_count);
+        assert_eq!(stored.status, seeded.status);
+        assert_eq!(stored.attempts, seeded.attempts);
+    }
+
     #[test]
     fn partially_committed_reservation_keeps_the_exact_attempt_when_location_is_unreadable() {
         let root = tempfile::tempdir().unwrap();

@@ -716,6 +716,7 @@ pub fn run_batch_with_executor(
     child_environment: &solstone_core_system::process::ChildLaunchContext,
     timeout: Option<Duration>,
     executor: Arc<dyn SenseExecutor>,
+    marker_policy: crate::dispatch::BatchMarkerPolicy,
 ) -> Result<(), BatchError> {
     if request.reprocess.is_some() || request.dry_run {
         return Err(BatchError::Unrepresentable {
@@ -744,6 +745,7 @@ pub fn run_batch_with_executor(
                 describe_workers,
                 child_environment.clone(),
                 executor,
+                marker_policy,
             )
         },
         timeout.map(BatchDeadline::new),

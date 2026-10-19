@@ -236,6 +236,7 @@ impl WorkDiscovery {
             automatic,
             Arc::new(AtomicBool::new(false)),
             Arc::new(|| Ok(())),
+            None,
             reconcile_pass,
         )
     }
@@ -253,6 +254,7 @@ impl WorkDiscovery {
             automatic,
             Arc::new(AtomicBool::new(false)),
             checkpoint,
+            None,
             move |journal, queue, stopped| {
                 reconcile_pass_checked(
                     journal,
@@ -273,12 +275,14 @@ impl WorkDiscovery {
         checkpoint: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
     ) -> Self {
         let reconcile_checkpoint = Arc::clone(&checkpoint);
+        let startup_roots = Some((roots.talent.clone(), roots.apps.clone()));
         Self::with_reconciler_and_stop(
             journal,
             queue,
             automatic,
             Arc::new(AtomicBool::new(false)),
             checkpoint,
+            startup_roots,
             move |journal, queue, stopped| {
                 reconcile_pass_with_roots(
                     journal,
@@ -298,6 +302,7 @@ impl WorkDiscovery {
         automatic: bool,
         stopped: Arc<AtomicBool>,
         checkpoint: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+        startup_roots: Option<(PathBuf, PathBuf)>,
         mut reconcile_pass: impl FnMut(&Path, &TaskQueue, &AtomicBool) -> Result<Backlog, String>
         + Send
         + 'static,
@@ -318,10 +323,11 @@ impl WorkDiscovery {
                     let started = Instant::now();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         if initial {
-                            solstone_core_system::catchup::reconcile_stale_catchup_attempts_checked(
+                            solstone_core_system::catchup::reconcile_stale_catchup_attempts_with_roots_checked(
                                 &journal,
                                 SystemTime::now(),
                                 checkpoint.as_ref(),
+                                startup_roots.as_ref().map(|(talent, apps)| (talent.as_path(), apps.as_path())),
                             )
                             .map_err(|error| error.to_string())?;
                             initial = false;
@@ -3444,6 +3450,7 @@ mod tests {
             },
             Arc::new(|_, _| panic!("unready planning control cannot execute")),
             Arc::new(|args| !args.iter().any(|arg| arg == "--daily-only")),
+            None,
         );
         reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
         assert!(!queue.contains_reference("supervisor-work-19990101-daily"));

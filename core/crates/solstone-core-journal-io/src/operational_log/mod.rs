@@ -53,7 +53,7 @@ pub use create::probe_oplog_identity_lease;
 pub use create::run_with_oplog_parent_sync_fail;
 pub use create::{
     OPLOG_CREATE_ATTEMPTS, OPLOG_FILE_ID_DRAW_BUDGET, create_oplog, create_oplog_at,
-    probe_oplog_lease,
+    create_oplog_at_checked, probe_oplog_lease,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 pub use create::{

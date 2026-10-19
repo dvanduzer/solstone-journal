@@ -70,7 +70,7 @@ pub fn migrate_index_stream(
         .as_ref()
         .expect("non-dry-run migration is admitted");
     reset_index_admitted(journal, admission)?;
-    scan_journal_admitted(journal, true, admission)?;
+    scan_journal_admitted(journal, true, admission, &|| Ok(()))?;
     Ok(IndexStreamMigration::Rebuilt { missing })
 }
 

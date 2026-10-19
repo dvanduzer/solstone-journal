@@ -451,11 +451,36 @@ pub fn inspect_classifications(journal: &Path) -> Result<ClassificationStatus, S
     })
 }
 
+fn commit_classification(
+    tx: rusqlite::Transaction<'_>,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), StoreError> {
+    if let Err(cause) = checkpoint() {
+        drop(tx);
+        return Err(StoreError::WriterAdmission {
+            operation: "scan-journal",
+            cause,
+        });
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 pub(crate) fn classify_one_batch(
     conn: &mut Connection,
     journal: &Path,
     resume: ResumeCount,
     counts: Counts,
+) -> Result<ClassificationStatus, StoreError> {
+    classify_one_batch_checked(conn, journal, resume, counts, &|| Ok(()))
+}
+
+pub(crate) fn classify_one_batch_checked(
+    conn: &mut Connection,
+    journal: &Path,
+    resume: ResumeCount,
+    counts: Counts,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<ClassificationStatus, StoreError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     require_chunk_path_lookup(&tx)?;
@@ -510,7 +535,7 @@ pub(crate) fn classify_one_batch(
         let unclassified = count_unclassified(&tx)?;
         let coverage_mismatch = missing > 0;
         let committed = if schema_needed {
-            tx.commit()?;
+            commit_classification(tx, checkpoint)?;
             true
         } else {
             let _ = tx.rollback();
@@ -540,7 +565,7 @@ pub(crate) fn classify_one_batch(
             state.stalled = true;
             state.stalled_path = Some(state.cursor.clone());
             write_chunk_classification_backfill(&tx, &state)?;
-            tx.commit()?;
+            commit_classification(tx, checkpoint)?;
             let remaining = count_remaining(conn, &state.cursor)?;
             let missing = count_missing_internal(conn, true)?;
             let unclassified = count_unclassified(conn)?;
@@ -642,7 +667,7 @@ pub(crate) fn classify_one_batch(
         }
     }
 
-    tx.commit()?;
+    commit_classification(tx, checkpoint)?;
 
     Ok(ClassificationStatus {
         initialization: ClassificationInitialization::Ready,

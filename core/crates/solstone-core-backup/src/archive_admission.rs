@@ -21,10 +21,15 @@ pub trait Clock {
 }
 
 /// A shared refusal signal. Cancellation is irreversible and grants no authority.
+///
+/// `task` is observed only by this request's child. [`Self::new_child`] does not
+/// copy it, so a queue deadline that fails the child leaves the parent lifetime
+/// and every sibling child uncancelled.
 #[derive(Clone, Default)]
 pub struct ArchiveCancellation {
     cancelled: Arc<AtomicBool>,
     ancestors: Arc<[Arc<AtomicBool>]>,
+    task: Option<Arc<dyn Fn() -> Result<(), String> + Send + Sync>>,
 }
 
 impl ArchiveCancellation {
@@ -42,7 +47,14 @@ impl ArchiveCancellation {
                 .cloned()
                 .chain(std::iter::once(Arc::clone(&parent.cancelled)))
                 .collect(),
+            task: None,
         }
+    }
+
+    /// Watch one admitted task checkpoint from this child only.
+    pub fn with_task(mut self, task: Arc<dyn Fn() -> Result<(), String> + Send + Sync>) -> Self {
+        self.task = Some(task);
+        self
     }
 
     pub fn cancel(&self) {
@@ -50,12 +62,22 @@ impl ArchiveCancellation {
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        if self.cancelled.load(Ordering::Acquire)
             || self
                 .ancestors
                 .iter()
                 .any(|flag| flag.load(Ordering::Acquire))
             || archive_work_stopping()
+        {
+            return true;
+        }
+        if let Some(task) = &self.task
+            && task().is_err()
+        {
+            self.cancelled.store(true, Ordering::Release);
+            return true;
+        }
+        false
     }
 }
 

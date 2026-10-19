@@ -20,6 +20,10 @@ mod journal_route_coordination_lock;
 #[path = "journal_route/record.rs"]
 mod journal_route_record;
 
+#[cfg(all(test, feature = "full-tests"))]
+#[path = "credential_binding_composition.rs"]
+mod credential_binding_composition;
+
 #[cfg(feature = "journal-mcp-endpoint")]
 pub use solstone_core_mcp_endpoint::{
     ActivityAnchor, ActivityEntry, ActivityPage, ActivityQuery, ActivityReadError, AuditOutcome,

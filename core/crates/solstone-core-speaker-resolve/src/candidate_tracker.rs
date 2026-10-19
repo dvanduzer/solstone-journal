@@ -104,6 +104,8 @@ pub enum CandidateTrackerError {
     Write(#[from] solstone_core_journal_io::AtomicWriteError),
     #[error("candidate pool centroid width mismatch")]
     CentroidWidth,
+    #[error("{0}")]
+    Cancelled(String),
 }
 
 /// Outcome of confirming a named pool voice.
@@ -440,12 +442,20 @@ impl CandidateTracker {
     }
     /// Consolidate dense pending candidates under the existing pool lock.
     pub fn consolidate_dense_candidates(&mut self) -> Result<Value, CandidateTrackerError> {
-        self.consolidate_dense_candidates_with_lock_options(LockOptions::default())
+        self.consolidate_dense_candidates_checked(&|| Ok(()))
+    }
+
+    pub fn consolidate_dense_candidates_checked(
+        &mut self,
+        checkpoint: &dyn Fn() -> Result<(), String>,
+    ) -> Result<Value, CandidateTrackerError> {
+        self.consolidate_dense_candidates_with_lock_options(LockOptions::default(), checkpoint)
     }
 
     fn consolidate_dense_candidates_with_lock_options(
         &mut self,
         options: LockOptions,
+        checkpoint: &dyn Fn() -> Result<(), String>,
     ) -> Result<Value, CandidateTrackerError> {
         let _lock = hold_lock(&self.store_path, options)?;
         if !self.load_strict()? {
@@ -475,6 +485,7 @@ impl CandidateTracker {
                     )
                 })?;
             self.consolidation_summary = json!({"merge_count_total":total,"last_merge":last_merge});
+            checkpoint().map_err(CandidateTrackerError::Cancelled)?;
             self.write()?;
         }
         Ok(json!({"status":"ok","merged":merges.len(),"merges":merges}))
@@ -489,6 +500,7 @@ impl CandidateTracker {
             inputs,
             LockOptions::default(),
             LockOptions::default(),
+            &|| Ok(()),
         )
     }
 
@@ -497,6 +509,7 @@ impl CandidateTracker {
         inputs: &[ClusterInput],
         feed_lock: LockOptions,
         consolidate_lock: LockOptions,
+        checkpoint: &dyn Fn() -> Result<(), String>,
     ) -> Result<Option<Value>, CandidateTrackerError> {
         if inputs.is_empty() {
             return Ok(None);
@@ -595,6 +608,7 @@ impl CandidateTracker {
                 }
             }
 
+            checkpoint().map_err(CandidateTrackerError::Cancelled)?;
             self.write()?;
             density_edge_crossed = density_edge;
         }
@@ -609,7 +623,8 @@ impl CandidateTracker {
         }
 
         if density_edge_crossed {
-            match self.consolidate_dense_candidates_with_lock_options(consolidate_lock) {
+            match self.consolidate_dense_candidates_with_lock_options(consolidate_lock, checkpoint)
+            {
                 Ok(report) => Ok(Some(report)),
                 Err(_err) => {
                     log::warn!("speaker candidate consolidation failed after the pool update");
@@ -1599,7 +1614,11 @@ impl BackfillState {
     }
 }
 
-fn write_backfill_state(journal: &Path, state: &BackfillState) -> Result<(), ()> {
+fn write_backfill_state(
+    journal: &Path,
+    state: &BackfillState,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), ()> {
     #[cfg(test)]
     {
         let fault = STATE_WRITE_FAULT_HOOK.with(|cell| {
@@ -1618,6 +1637,7 @@ fn write_backfill_state(journal: &Path, state: &BackfillState) -> Result<(), ()>
         "{}\n",
         serde_json::to_string_pretty(&state.to_json()).map_err(|_| ())?
     );
+    checkpoint().map_err(|_| ())?;
     atomic_replace(
         &state_path,
         content.as_bytes(),
@@ -1729,15 +1749,23 @@ fn state_write_refusal(fed_count: usize) -> &'static str {
 }
 
 pub fn backfill_speaker_pool(journal: &Path) -> SpeakerPoolCatchUp {
+    backfill_speaker_pool_checked(journal, &|| Ok(()))
+}
+
+pub fn backfill_speaker_pool_checked(
+    journal: &Path,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> SpeakerPoolCatchUp {
     let now = Utc::now();
     let deadline = now + chrono::Duration::minutes(8);
-    backfill_speaker_pool_with_clock_and_deadline(journal, Utc::now, deadline)
+    backfill_speaker_pool_with_clock_and_deadline(journal, Utc::now, deadline, checkpoint)
 }
 
 pub(crate) fn backfill_speaker_pool_with_clock_and_deadline<F>(
     journal: &Path,
     mut clock: F,
     deadline: chrono::DateTime<Utc>,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> SpeakerPoolCatchUp
 where
     F: FnMut() -> chrono::DateTime<Utc>,
@@ -1959,7 +1987,7 @@ where
         state.retry.clear();
         state.complete = true;
         state.cursor = None;
-        if write_backfill_state(journal, &state).is_err() {
+        if write_backfill_state(journal, &state, checkpoint).is_err() {
             let msg = "voice list catch-up refused: catch-up progress file could not be written";
             log::warn!("{msg}");
             return SpeakerPoolCatchUp::Refuse(msg);
@@ -2096,7 +2124,7 @@ where
                         tried_at: run_now,
                         finished_through: None,
                     }));
-                    if write_backfill_state(journal, &state).is_err() {
+                    if write_backfill_state(journal, &state, checkpoint).is_err() {
                         let msg = state_write_refusal(fed_count);
                         log::warn!("{msg}");
                         return SpeakerPoolCatchUp::Refuse(msg);
@@ -2225,7 +2253,7 @@ where
                         {
                             cur_d.finished_through = Some(pos.clone());
                         }
-                        if write_backfill_state(journal, &state).is_err() {
+                        if write_backfill_state(journal, &state, checkpoint).is_err() {
                             let msg = if fed_count > 0 {
                                 "voice list catch-up refused: catch-up progress file could not be written; what was added is kept"
                             } else {
@@ -2255,7 +2283,7 @@ where
                             ) {
                                 cur_d.finished_through = Some(pos.clone());
                             }
-                            if write_backfill_state(journal, &state).is_err() {
+                            if write_backfill_state(journal, &state, checkpoint).is_err() {
                                 let msg = state_write_refusal(fed_count);
                                 log::warn!("{msg}");
                                 return SpeakerPoolCatchUp::Refuse(msg);
@@ -2274,7 +2302,7 @@ where
                             ) {
                                 cur_d.finished_through = Some(pos.clone());
                             }
-                            if write_backfill_state(journal, &state).is_err() {
+                            if write_backfill_state(journal, &state, checkpoint).is_err() {
                                 let msg = if fed_count > 0 {
                                     "voice list catch-up refused: catch-up progress file could not be written; what was added is kept"
                                 } else {
@@ -2310,7 +2338,7 @@ where
                         {
                             cur_d.finished_through = Some(pos.clone());
                         }
-                        if write_backfill_state(journal, &state).is_err() {
+                        if write_backfill_state(journal, &state, checkpoint).is_err() {
                             let msg = if fed_count > 0 {
                                 "voice list catch-up refused: catch-up progress file could not be written; what was added is kept"
                             } else {
@@ -2358,7 +2386,7 @@ where
                         {
                             cur_d.finished_through = Some(pos.clone());
                         }
-                        if write_backfill_state(journal, &state).is_err() {
+                        if write_backfill_state(journal, &state, checkpoint).is_err() {
                             let msg = if fed_count > 0 {
                                 "voice list catch-up refused: catch-up progress file could not be written; what was added is kept"
                             } else {
@@ -2399,6 +2427,7 @@ where
                                 &clusters,
                                 pool_lock_opts,
                                 LockOptions::default(),
+                                checkpoint,
                             ) {
                                 Ok(_) => {
                                     fed_count += 1;
@@ -2451,7 +2480,7 @@ where
                         }
                     }
 
-                    if write_backfill_state(journal, &state).is_err() {
+                    if write_backfill_state(journal, &state, checkpoint).is_err() {
                         let msg = if fed_count > 0 {
                             "voice list catch-up refused: catch-up progress file could not be written; what was added is kept"
                         } else {
@@ -2466,7 +2495,7 @@ where
                     state
                         .retry
                         .retain(|r| !matches!(r, RetryEntry::Day(cur_d) if cur_d.day == d.day));
-                    if write_backfill_state(journal, &state).is_err() {
+                    if write_backfill_state(journal, &state, checkpoint).is_err() {
                         let msg = if fed_count > 0 {
                             "voice list catch-up refused: catch-up progress file could not be written; what was added is kept"
                         } else {
@@ -2497,7 +2526,7 @@ where
                             .retain(|r| !matches!(r, RetryEntry::Day(entry) if entry.day == d.day));
                     }
                 }
-                if write_backfill_state(journal, &state).is_err() {
+                if write_backfill_state(journal, &state, checkpoint).is_err() {
                     let msg = state_write_refusal(fed_count);
                     log::warn!("{msg}");
                     return SpeakerPoolCatchUp::Refuse(msg);
@@ -2543,7 +2572,7 @@ where
                     .retry
                     .retain(|r| !matches!(r, RetryEntry::Source(s) if s.position == *pos));
                 handled_in_this_run.insert(pos.clone());
-                if write_backfill_state(journal, &state).is_err() {
+                if write_backfill_state(journal, &state, checkpoint).is_err() {
                     let msg = state_write_refusal(fed_count);
                     log::warn!("{msg}");
                     return SpeakerPoolCatchUp::Refuse(msg);
@@ -2572,7 +2601,7 @@ where
                         );
                     }
                 }
-                if write_backfill_state(journal, &state).is_err() {
+                if write_backfill_state(journal, &state, checkpoint).is_err() {
                     let msg = state_write_refusal(fed_count);
                     log::warn!("{msg}");
                     return SpeakerPoolCatchUp::Refuse(msg);
@@ -2596,7 +2625,7 @@ where
                 .retry
                 .retain(|r| !matches!(r, RetryEntry::Source(s) if s.position == *pos));
             handled_in_this_run.insert(pos.clone());
-            if write_backfill_state(journal, &state).is_err() {
+            if write_backfill_state(journal, &state, checkpoint).is_err() {
                 let msg = if fed_count > 0 {
                     "voice list catch-up refused: catch-up progress file could not be written; what was added is kept"
                 } else {
@@ -2645,7 +2674,7 @@ where
                         .retain(|r| !matches!(r, RetryEntry::Source(cur) if cur.position == *pos));
                 }
             }
-            if write_backfill_state(journal, &state).is_err() {
+            if write_backfill_state(journal, &state, checkpoint).is_err() {
                 let msg = if fed_count > 0 {
                     "voice list catch-up refused: catch-up progress file could not be written; what was added is kept"
                 } else {
@@ -2701,7 +2730,7 @@ where
                         .retain(|r| !matches!(r, RetryEntry::Source(cur) if cur.position == *pos));
                 }
             }
-            if write_backfill_state(journal, &state).is_err() {
+            if write_backfill_state(journal, &state, checkpoint).is_err() {
                 let msg = if fed_count > 0 {
                     "voice list catch-up refused: catch-up progress file could not be written; what was added is kept"
                 } else {
@@ -2740,6 +2769,7 @@ where
                     &clusters,
                     pool_lock_opts,
                     LockOptions::default(),
+                    checkpoint,
                 ) {
                     Ok(_) => {
                         fed_count += 1;
@@ -2799,7 +2829,7 @@ where
             }
         }
 
-        if write_backfill_state(journal, &state).is_err() {
+        if write_backfill_state(journal, &state, checkpoint).is_err() {
             let msg = if fed_count > 0 {
                 "voice list catch-up refused: catch-up progress file could not be written; what was added is kept"
             } else {
@@ -2857,7 +2887,7 @@ where
             sources_claimed += 1;
             state.cursor = Some(pos.clone());
             handled_in_this_run.insert(pos.clone());
-            if write_backfill_state(journal, &state).is_err() {
+            if write_backfill_state(journal, &state, checkpoint).is_err() {
                 let msg = if fed_count > 0 {
                     "voice list catch-up refused: catch-up progress file could not be written; what was added is kept"
                 } else {
@@ -2880,7 +2910,7 @@ where
             (Err(e), _) | (_, Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                 state.cursor = Some(pos.clone());
                 handled_in_this_run.insert(pos.clone());
-                if write_backfill_state(journal, &state).is_err() {
+                if write_backfill_state(journal, &state, checkpoint).is_err() {
                     let msg = state_write_refusal(fed_count);
                     log::warn!("{msg}");
                     return SpeakerPoolCatchUp::Refuse(msg);
@@ -2895,7 +2925,7 @@ where
                 }));
                 state.cursor = Some(pos.clone());
                 handled_in_this_run.insert(pos.clone());
-                if write_backfill_state(journal, &state).is_err() {
+                if write_backfill_state(journal, &state, checkpoint).is_err() {
                     let msg = if fed_count > 0 {
                         "voice list catch-up refused: catch-up progress file could not be written; what was added is kept"
                     } else {
@@ -2925,7 +2955,7 @@ where
             }));
             state.cursor = Some(pos.clone());
             handled_in_this_run.insert(pos.clone());
-            if write_backfill_state(journal, &state).is_err() {
+            if write_backfill_state(journal, &state, checkpoint).is_err() {
                 let msg = if fed_count > 0 {
                     "voice list catch-up refused: catch-up progress file could not be written; what was added is kept"
                 } else {
@@ -2967,7 +2997,7 @@ where
             }));
             state.cursor = Some(pos.clone());
             handled_in_this_run.insert(pos.clone());
-            if write_backfill_state(journal, &state).is_err() {
+            if write_backfill_state(journal, &state, checkpoint).is_err() {
                 let msg = if fed_count > 0 {
                     "voice list catch-up refused: catch-up progress file could not be written; what was added is kept"
                 } else {
@@ -3006,6 +3036,7 @@ where
                     &clusters,
                     pool_lock_opts,
                     LockOptions::default(),
+                    checkpoint,
                 ) {
                     Ok(_) => {
                         fed_count += 1;
@@ -3047,7 +3078,7 @@ where
             }
         }
 
-        if write_backfill_state(journal, &state).is_err() {
+        if write_backfill_state(journal, &state, checkpoint).is_err() {
             let msg = if fed_count > 0 {
                 "voice list catch-up refused: catch-up progress file could not be written; what was added is kept"
             } else {
@@ -3060,7 +3091,7 @@ where
 
     if !stopped_early && state.retry.is_empty() {
         state.complete = true;
-        if write_backfill_state(journal, &state).is_err() {
+        if write_backfill_state(journal, &state, checkpoint).is_err() {
             let msg = state_write_refusal(fed_count);
             log::warn!("{msg}");
             return SpeakerPoolCatchUp::Refuse(msg);
@@ -4262,6 +4293,7 @@ mod tests {
                     timeout: Duration::ZERO,
                     ..Default::default()
                 },
+                &|| Ok(()),
             )
             .unwrap();
         assert!(res.is_none());
@@ -4526,6 +4558,7 @@ mod tests {
                 }
             },
             start + chrono::Duration::minutes(8),
+            &|| Ok(()),
         );
         let SpeakerPoolCatchUp::Done(report) = res else {
             panic!("expected Done, got {res:?}");
@@ -4615,6 +4648,7 @@ mod tests {
                     }
                 },
                 start + chrono::Duration::minutes(8),
+                &|| Ok(()),
             );
             let SpeakerPoolCatchUp::Done(report) = res else {
                 panic!("expected Done");
@@ -5213,6 +5247,7 @@ mod tests {
                     }
                 },
                 start + chrono::Duration::minutes(8),
+                &|| Ok(()),
             );
             let SpeakerPoolCatchUp::Done(report) = res else {
                 panic!("expected Done");
@@ -5276,6 +5311,7 @@ mod tests {
             &journal,
             || now,
             now + chrono::Duration::minutes(8),
+            &|| Ok(()),
         ) else {
             panic!("expected Done");
         };
@@ -5353,6 +5389,7 @@ mod tests {
                 &journal,
                 || now,
                 now + chrono::Duration::minutes(8),
+                &|| Ok(()),
             );
             let SpeakerPoolCatchUp::Done(report) = res else {
                 panic!("an abandoned day must not make the catch-up refuse: {res:?}");
@@ -5406,6 +5443,7 @@ mod tests {
             &journal,
             || now,
             now + chrono::Duration::minutes(8),
+            &|| Ok(()),
         ) else {
             panic!("expected Done");
         };
@@ -5675,6 +5713,7 @@ mod tests {
             &journal,
             || t0 + chrono::Duration::minutes(1),
             t0 + chrono::Duration::minutes(9),
+            &|| Ok(()),
         );
         let SpeakerPoolCatchUp::Done(report) = res else {
             panic!("expected Done");
@@ -6232,5 +6271,64 @@ mod tests {
         assert_eq!(report["candidates_after"], 2);
 
         let _ = fs::remove_dir_all(journal);
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn pool_write_cancelled_while_blocked_does_not_publish() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread;
+
+        let journal = temporary_journal("pool-write-cancel");
+        fs::create_dir_all(journal.join("awareness")).unwrap();
+        let pool = journal.join("awareness/speaker_candidates.json");
+        let holder = hold_lock(&pool, LockOptions::default()).unwrap();
+        let before = fs::read(&pool).unwrap_or_default();
+        let started = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let allowed = Arc::new(AtomicBool::new(false));
+        let started_flag = Arc::clone(&started);
+        let cancel_flag = Arc::clone(&cancel);
+        let allowed_flag = Arc::clone(&allowed);
+        let journal_path = journal.clone();
+        let input = cluster_input("seg-cancel", vec![vec![1.0, 0.0], vec![1.0, 0.0]]);
+        let worker = thread::spawn(move || {
+            started_flag.store(true, Ordering::Release);
+            let mut tracker = CandidateTracker::new(&journal_path);
+            tracker.add_transcribed_clusters_with_lock_options(
+                &[input],
+                LockOptions::default(),
+                LockOptions::default(),
+                &|| {
+                    if cancel_flag.load(Ordering::Acquire) {
+                        Err("stopped".into())
+                    } else {
+                        allowed_flag.store(true, Ordering::Release);
+                        Ok(())
+                    }
+                },
+            )
+        });
+        while !started.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        for _ in 0..100_000 {
+            if allowed.load(Ordering::Acquire) {
+                break;
+            }
+            thread::yield_now();
+        }
+        assert!(
+            !allowed.load(Ordering::Acquire),
+            "pool checkpoint returned before cancellation"
+        );
+        assert!(!cancel.load(Ordering::Acquire));
+        cancel.store(true, Ordering::Release);
+        drop(holder);
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(matches!(error, CandidateTrackerError::Cancelled(_)));
+        assert_eq!(fs::read(&pool).unwrap_or_default(), before);
+        let _ = fs::remove_dir_all(&journal);
     }
 }

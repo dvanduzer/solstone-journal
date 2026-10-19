@@ -23,6 +23,7 @@ sha2.workspace = true
 solstone-core-chatgpt-auth.workspace = true
 solstone-core-installed-payload.workspace = true
 solstone-core-journal-config.workspace = true
+solstone-core-journal-config-write.workspace = true
 solstone-core-journal-io.workspace = true
 
 [target.'cfg(unix)'.dependencies]
@@ -33,5 +34,5 @@ chrono.workspace = true
 serde_json.workspace = true
 
 [features]
-full-tests = []
+full-tests = ["solstone-core-journal-io/test-hooks"]
 

@@ -17,6 +17,7 @@ base64 = "0.22.1"
 chrono.workspace = true
 getrandom.workspace = true
 image.workspace = true
+log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -29,6 +30,7 @@ solstone-core-generate-wire.workspace = true
 solstone-core-journal.workspace = true
 solstone-core-journal-config.workspace = true
 solstone-core-journal-config-write.workspace = true
+solstone-core-journal-io.workspace = true
 solstone-core-local.workspace = true
 solstone-core-talent-config.workspace = true
 solstone-core-sense.workspace = true
@@ -38,6 +40,6 @@ solstone-core-spp-ratls.workspace = true
 tempfile = "3.24.0"
 
 [features]
-full-tests = ["test-hooks"]
+full-tests = ["test-hooks", "solstone-core-journal-io/test-hooks"]
 test-hooks = ["solstone-core-chatgpt-auth/test-hooks"]
 

@@ -9,6 +9,16 @@ use crate::{JournalStatsError, StatsDocument};
 pub trait DocumentWriter {
     fn write_document(&self, path: &Path, payload: &StatsDocument)
     -> Result<(), JournalStatsError>;
+
+    fn write_document_checked(
+        &self,
+        path: &Path,
+        payload: &StatsDocument,
+        checkpoint: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), JournalStatsError> {
+        checkpoint().map_err(JournalStatsError::Validation)?;
+        self.write_document(path, payload)
+    }
 }
 
 /// Production document writer using journal-io's atomic JSON publication.
@@ -16,6 +26,15 @@ pub trait DocumentWriter {
 pub struct FilesystemDocumentWriter;
 
 impl DocumentWriter for FilesystemDocumentWriter {
+    fn write_document_checked(
+        &self,
+        path: &Path,
+        payload: &StatsDocument,
+        checkpoint: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), JournalStatsError> {
+        crate::publication::StatsPublication::open(path, checkpoint)?.json(payload, checkpoint)
+    }
+
     fn write_document(
         &self,
         path: &Path,

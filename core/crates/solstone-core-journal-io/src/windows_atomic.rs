@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-//! Windows detailed publication with descriptor-bound admission and path-based replacement.
+//! Windows detailed publication through retained parent and stage handles.
 
 use std::ffi::{OsStr, OsString};
 #[cfg(any(test, feature = "test-hooks"))]
@@ -31,8 +31,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_TAG_INFO, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileAttributeTagInfo,
-    FileDispositionInfo, FlushFileBuffers, GetFileInformationByHandleEx, MOVEFILE_REPLACE_EXISTING,
-    MoveFileExW, OPEN_EXISTING, SYNCHRONIZE, SetFileInformationByHandle,
+    FileDispositionInfo, FlushFileBuffers, GetFileInformationByHandleEx, OPEN_EXISTING,
+    SYNCHRONIZE, SetFileInformationByHandle,
 };
 
 use super::{
@@ -40,7 +40,7 @@ use super::{
     TEMP_SEQUENCE, detailed_error, pause_at, publication_candidate_name,
 };
 use crate::windows_identity::{WindowsFileIdentity, file_identity};
-use crate::windows_ntcreate::nt_create_relative;
+use crate::windows_ntcreate::{nt_create_relative, nt_rename_relative};
 use crate::windows_sync_dir::WindowsFlatDirectory;
 
 const MAX_PUBLICATION_ATTEMPTS: usize = 4;
@@ -88,6 +88,7 @@ pub(super) fn atomic_replace_detailed(
     path: &Path,
     contents: &[u8],
     mode: u32,
+    publish_checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<DetailedAtomicOutcome, DetailedAtomicError> {
     if mode > 0o777 {
         return Err(detailed_error(
@@ -127,6 +128,7 @@ pub(super) fn atomic_replace_detailed(
         destination_name,
         contents,
         mode,
+        publish_checkpoint,
     )
 }
 
@@ -139,10 +141,25 @@ fn publish_relative(
     destination_name: &OsStr,
     contents: &[u8],
     mode: u32,
+    publish_checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<DetailedAtomicOutcome, DetailedAtomicError> {
+    publish_checkpoint().map_err(|detail| {
+        detailed_error(
+            path,
+            "authorize stage",
+            io::Error::new(io::ErrorKind::Interrupted, detail),
+        )
+    })?;
     let initial_destination = inspect_relative_destination(parent, destination_name)
         .map_err(|source| detailed_error(path, "inspect destination", source))?;
     checkpoint("temp-create").map_err(|source| detailed_error(path, "create stage", source))?;
+    publish_checkpoint().map_err(|detail| {
+        detailed_error(
+            path,
+            "authorize stage creation",
+            io::Error::new(io::ErrorKind::Interrupted, detail),
+        )
+    })?;
     let (stage_name, mut stage_writer) = allocate_stage(parent, destination_name)
         .map_err(|source| detailed_error(path, "create stage", source))?;
     let stage_identity = match validate_regular_handle(stage_writer.as_raw_handle())
@@ -244,7 +261,23 @@ fn publish_relative(
             ));
         }
 
-        match move_stage_to_destination(parent_path, &stage_name, destination_name) {
+        if let Err(detail) = publish_checkpoint() {
+            return Err(cleanup_stage_handle_error(
+                path,
+                stage.take().expect("stage remains live before publication"),
+                stage_name,
+                "publish checkpoint",
+                io::Error::new(io::ErrorKind::Interrupted, detail),
+            ));
+        }
+        match move_stage_to_destination(
+            parent_path,
+            parent,
+            stage_handle,
+            &stage_name,
+            destination_name,
+            publish_checkpoint,
+        ) {
             Ok(()) => break,
             Err(source)
                 if is_retryable_publication_error(&source)
@@ -306,6 +339,24 @@ pub(super) fn atomic_replace_detailed_bound(
     contents: &[u8],
     mode: u32,
 ) -> Result<DetailedAtomicOutcome, BoundAtomicPublishError> {
+    atomic_replace_detailed_bound_checked(
+        parent,
+        expected_parent,
+        destination_name,
+        contents,
+        mode,
+        &|| Ok(()),
+    )
+}
+
+pub(super) fn atomic_replace_detailed_bound_checked(
+    parent: &WindowsFlatDirectory,
+    expected_parent: WindowsFileIdentity,
+    destination_name: &OsStr,
+    contents: &[u8],
+    mode: u32,
+    publish_checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<DetailedAtomicOutcome, BoundAtomicPublishError> {
     if parent.revalidate_bound().is_err() || parent.identity() != expected_parent {
         return Err(BoundAtomicPublishError::NamespaceChanged);
     }
@@ -340,6 +391,7 @@ pub(super) fn atomic_replace_detailed_bound(
         destination_name,
         contents,
         mode,
+        publish_checkpoint,
     )
     .map_err(|error| {
         if is_parent_namespace_change(&error) {
@@ -495,37 +547,34 @@ fn revalidate_before_publication(
 
 fn move_stage_to_destination(
     parent_path: &Path,
+    parent: &OwnedHandle,
+    stage: &OwnedHandle,
     stage_name: &OsStr,
     destination_name: &OsStr,
+    publish_checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> io::Result<()> {
     checkpoint("rename")?;
-    let source = parent_path.join(stage_name);
-    let destination = parent_path.join(destination_name);
-    let source = source
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let destination = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
     pause_at_terminal_move_receipt(parent_path, stage_name);
-    // SAFETY: both path buffers are NUL-terminated and remain live for the synchronous call.
-    #[allow(unsafe_code)]
-    let result = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING,
-        )
-    };
+    publish_checkpoint().map_err(|detail| io::Error::new(io::ErrorKind::Interrupted, detail))?;
+    checkpoint("authorized-rename")?;
+    let result = nt_rename_relative(
+        parent.as_raw_handle(),
+        stage.as_raw_handle(),
+        destination_name,
+        true,
+    );
     #[cfg(any(test, feature = "test-hooks"))]
-    record_windows_real_move();
-    (result != 0)
-        .then_some(())
-        .ok_or_else(io::Error::last_os_error)?;
+    if result.is_ok()
+        || result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.raw_os_error().is_some())
+    {
+        // Only the shared helper's native attempts succeed or have a raw OS
+        // error. Buffer validation failures do not count as native moves.
+        record_windows_real_move();
+    }
+    result?;
     pause_at("rename");
     Ok(())
 }

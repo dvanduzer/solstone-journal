@@ -9,13 +9,15 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Number, Value};
 use solstone_core_journal_io::AtomicWriteError;
+#[cfg(not(unix))]
 use solstone_core_journal_io::AtomicWriteOptions;
 use solstone_core_journal_io::LockError;
 use solstone_core_journal_io::LockOptions;
 use solstone_core_journal_io::PathError;
 use solstone_core_journal_io::ReadError;
 use solstone_core_journal_io::Removed;
-use solstone_core_journal_io::atomic_replace;
+#[cfg(not(unix))]
+use solstone_core_journal_io::atomic_replace_checked;
 use solstone_core_journal_io::hold_lock;
 use solstone_core_journal_io::path_lexists;
 use solstone_core_journal_io::read_bytes;
@@ -398,11 +400,20 @@ pub fn save_voiceprints_batch_checked(
     if new_items.is_empty() {
         return Ok(0);
     }
+    checkpoint().map_err(VoiceprintOperationError::PublicationRefused)?;
     let _trust =
         crate::hold_entity_trust_lock(journal_root).map_err(EntityLifecycleError::TrustLock)?;
-    let (_directory, path) = resolve_voiceprint_path(journal_root, entity_id, true)?;
-    let _lock = hold_lock(&path, LockOptions::default())?;
     checkpoint().map_err(VoiceprintOperationError::PublicationRefused)?;
+    let (_directory, path) = resolve_voiceprint_path(journal_root, entity_id, true)?;
+    let parent = capture_voiceprint_parent(&path)?;
+    let admitted = || {
+        checkpoint()?;
+        parent
+            .revalidate_canonical_binding()
+            .map_err(|error| error.to_string())
+    };
+    let _lock = hold_lock(&path, LockOptions::default())?;
+    admitted().map_err(VoiceprintOperationError::PublicationRefused)?;
     let mut archive = load_voiceprints(&path)?.unwrap_or_else(empty_archive);
     ensure_mutation_allowed(&archive, running_encoder)?;
     for item in new_items {
@@ -410,8 +421,8 @@ pub fn save_voiceprints_batch_checked(
         archive.metadata.push(serialize_metadata(&item.metadata)?);
     }
     archive.rows = archive.metadata.len();
-    checkpoint().map_err(VoiceprintOperationError::PublicationRefused)?;
-    write_and_verify_voiceprints(&path, &archive, running_encoder)?;
+    admitted().map_err(VoiceprintOperationError::PublicationRefused)?;
+    write_and_verify_voiceprints_bound(&path, &parent, &archive, running_encoder, &admitted)?;
     Ok(new_items.len())
 }
 
@@ -447,7 +458,7 @@ where
         .iter()
         .map(serialize_metadata)
         .collect::<Result<_, _>>()?;
-    write_and_verify_voiceprints(&path, &archive, running_encoder)?;
+    write_and_verify_voiceprints(&path, &archive, running_encoder, &|| Ok(()))?;
     Ok(updates)
 }
 
@@ -548,7 +559,7 @@ pub fn remove_voiceprints_by_key(
         }
     }
     kept.rows = kept.metadata.len();
-    write_and_verify_voiceprints(&path, &kept, running_encoder)?;
+    write_and_verify_voiceprints(&path, &kept, running_encoder, &|| Ok(()))?;
     Ok(report)
 }
 
@@ -592,7 +603,39 @@ fn write_and_verify_voiceprints(
     path: &Path,
     archive: &VoiceprintArchive,
     selected_encoder: &EncoderIdentity,
+    checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<(), VoiceprintOperationError> {
+    checkpoint().map_err(VoiceprintOperationError::PublicationRefused)?;
+    let parent = capture_voiceprint_parent(path)?;
+    write_and_verify_voiceprints_bound(path, &parent, archive, selected_encoder, checkpoint)
+}
+
+fn capture_voiceprint_parent(
+    path: &Path,
+) -> Result<solstone_core_journal_io::JournalRoot, VoiceprintOperationError> {
+    solstone_core_journal_io::JournalRoot::open(path.parent().expect("voiceprints have a parent"))
+        .map_err(|error| {
+            VoiceprintOperationError::Write(AtomicWriteError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::other(error.to_string()),
+            })
+        })
+}
+
+fn write_and_verify_voiceprints_bound(
+    path: &Path,
+    parent: &solstone_core_journal_io::JournalRoot,
+    archive: &VoiceprintArchive,
+    selected_encoder: &EncoderIdentity,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), VoiceprintOperationError> {
+    let publication_checkpoint = || {
+        checkpoint()?;
+        parent
+            .revalidate_canonical_binding()
+            .map_err(|error| error.to_string())
+    };
+    publication_checkpoint().map_err(VoiceprintOperationError::PublicationRefused)?;
     let expected_written_archive = VoiceprintArchive {
         embeddings: archive.embeddings.clone(),
         rows: archive.rows,
@@ -606,7 +649,56 @@ fn write_and_verify_voiceprints(
         &archive.envelope,
         selected_encoder,
     )?;
-    atomic_replace(path, &bytes, AtomicWriteOptions::default())?;
+    #[cfg(unix)]
+    {
+        let outcome = solstone_core_journal_io::atomic_replace_bound_checked(
+            parent,
+            path.file_name().expect("voiceprints have a name"),
+            &bytes,
+            0o600,
+            &publication_checkpoint,
+        )
+        .map_err(|error| {
+            VoiceprintOperationError::Write(AtomicWriteError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::new(error.source.kind(), error.to_string()),
+            })
+        })?;
+        match outcome {
+            solstone_core_journal_io::BoundAtomicOutcome::Published { .. } => {}
+            solstone_core_journal_io::BoundAtomicOutcome::PublishedObservationUncertain {
+                source,
+                ..
+            } => {
+                return Err(VoiceprintOperationError::Write(AtomicWriteError::Io {
+                    path: path.to_path_buf(),
+                    source: std::io::Error::new(
+                        source.kind(),
+                        format!("published; observation uncertain: {source}"),
+                    ),
+                }));
+            }
+            solstone_core_journal_io::BoundAtomicOutcome::PublishedDurabilityUncertain {
+                source,
+                ..
+            } => {
+                return Err(VoiceprintOperationError::Write(AtomicWriteError::Io {
+                    path: path.to_path_buf(),
+                    source: std::io::Error::new(
+                        source.kind(),
+                        format!("published; durability uncertain: {source}"),
+                    ),
+                }));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    atomic_replace_checked(
+        path,
+        &bytes,
+        AtomicWriteOptions::default(),
+        &publication_checkpoint,
+    )?;
     let verified = load_voiceprints(path)?.ok_or_else(|| {
         VoiceprintOperationError::Npz(VoiceprintNpzError::Invalid(
             "voiceprint archive disappeared after write".to_owned(),
@@ -1096,7 +1188,156 @@ fn io_error(error: std::io::Error) -> VoiceprintNpzError {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
+    #[cfg(all(unix, feature = "full-tests"))]
+    struct PublicationDirectory(std::path::PathBuf);
+
+    #[cfg(all(unix, feature = "full-tests"))]
+    impl PublicationDirectory {
+        fn new() -> Self {
+            let directory = Self(std::env::temp_dir().join(format!(
+                    "solstone-voiceprints-publication-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                )));
+            std::fs::create_dir(&directory.0).unwrap();
+            directory
+        }
+    }
+
+    #[cfg(all(unix, feature = "full-tests"))]
+    impl Drop for PublicationDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(all(unix, feature = "full-tests"))]
+    #[test]
+    fn public_voiceprint_writer_refuses_child_replacement_after_lock() {
+        let temp = PublicationDirectory::new();
+        let entity = temp.0.join("entities/voiceprint_fixture");
+        let parked = temp.0.join("parked");
+        std::fs::create_dir_all(&entity).unwrap();
+        let identity = br#"{"id":"voiceprint_fixture","name":"Fixture"}"#;
+        std::fs::write(entity.join("entity.json"), identity).unwrap();
+        let item = |sentence_id, value| VoiceprintItem {
+            embedding: vec![value; EMBEDDING_WIDTH],
+            metadata: serde_json::json!({"day":"20261017","segment_key":"fixture","source":"mic_audio","sentence_id":sentence_id}),
+        };
+        let encoder = test_encoder();
+        assert_eq!(
+            save_voiceprints_batch(&temp.0, "voiceprint_fixture", &[item(1, 0.25)], &encoder)
+                .unwrap(),
+            1
+        );
+        let root = solstone_core_journal_io::JournalRoot::open(&temp.0).unwrap();
+        let path = entity.join("voiceprints.npz");
+        let before = std::fs::read(&path).unwrap();
+        let replaced = std::cell::Cell::new(false);
+        let checkpoint = || {
+            if !replaced.get()
+                && solstone_core_journal_io::locking::lock_is_held(&path)
+                    .map_err(|error| error.to_string())?
+            {
+                replaced.set(true);
+                std::fs::rename(&entity, &parked).unwrap();
+                std::fs::create_dir(&entity).unwrap();
+                std::fs::write(entity.join("entity.json"), identity).unwrap();
+                std::fs::write(&path, &before).unwrap();
+            }
+            Ok(())
+        };
+        let result = save_voiceprints_batch_checked(
+            &temp.0,
+            "voiceprint_fixture",
+            &[item(2, 0.5)],
+            &encoder,
+            &checkpoint,
+        );
+        assert!(replaced.get(), "actual public sidecar must be held");
+        assert!(result.is_err());
+        root.revalidate_canonical_binding().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::read(parked.join("voiceprints.npz")).unwrap(),
+            before
+        );
+        assert_eq!(
+            save_voiceprints_batch_checked(
+                &temp.0,
+                "voiceprint_fixture",
+                &[item(2, 0.5)],
+                &encoder,
+                &|| Ok(())
+            )
+            .unwrap(),
+            1
+        );
+        let saved = load_voiceprints(&path).unwrap().unwrap();
+        assert_eq!(saved.rows, 2);
+        assert_eq!(
+            &saved.embeddings[EMBEDDING_WIDTH..],
+            vec![0.5; EMBEDDING_WIDTH]
+        );
+    }
+    #[cfg(all(unix, feature = "full-tests"))]
+    #[test]
+    fn native_stage_cancellation_and_parent_replacement_preserve_both_destinations() {
+        for replace_parent in [false, true] {
+            let temp = PublicationDirectory::new();
+            let parent = temp.0.join("owner");
+            let parked = temp.0.join("parked");
+            std::fs::create_dir(&parent).unwrap();
+            let path = parent.join("voiceprints.npz");
+            let mut archive = empty_archive();
+            archive.embeddings = vec![0.0; EMBEDDING_WIDTH];
+            archive.rows = 1;
+            archive.metadata = vec![r#"{"day":"20261018","source":"screen"}"#.to_owned()];
+            let encoder = test_encoder();
+            write_and_verify_voiceprints(&path, &archive, &encoder, &|| Ok(())).unwrap();
+            archive.embeddings[0] = 1.0;
+            let before = std::fs::read(&path).unwrap();
+            let saw_stage = std::cell::Cell::new(false);
+            let checkpoint = || {
+                if !saw_stage.get()
+                    && std::fs::read_dir(&parent).unwrap().any(|entry| {
+                        solstone_core_journal_io::is_publication_candidate_name(
+                            &entry.unwrap().file_name(),
+                        )
+                    })
+                {
+                    saw_stage.set(true);
+                    if replace_parent {
+                        std::fs::rename(&parent, &parked).unwrap();
+                        std::fs::create_dir(&parent).unwrap();
+                        std::fs::write(&path, &before).unwrap();
+                    } else {
+                        return Err("declared cancellation after staging".to_owned());
+                    }
+                }
+                Ok(())
+            };
+            let result = write_and_verify_voiceprints(&path, &archive, &encoder, &checkpoint);
+            assert!(
+                saw_stage.get(),
+                "the actual owner must reach a native stage"
+            );
+            assert!(result.is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            if replace_parent {
+                assert_eq!(
+                    std::fs::read(parked.join("voiceprints.npz")).unwrap(),
+                    before
+                );
+            }
+        }
+    }
+
     use super::*;
 
     fn test_encoder() -> EncoderIdentity {

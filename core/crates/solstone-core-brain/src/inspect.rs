@@ -13,7 +13,11 @@ use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
 use serde_json::{Map, Value};
 
-use crate::fingerprint::{build_active_brain_fingerprint, derive_active_brain_lane};
+use crate::fingerprint::{
+    LaneResolution, StoredCredentialBinding, build_active_brain_fingerprint,
+    classify_stored_binding, derive_active_brain_lane, endpoint_binding_parts,
+    endpoint_credential_binding_hmac, managed_credential_binding_hmac,
+};
 use crate::fixture::local_contract;
 use crate::record::{BrainStateRecord, reduce_evidence_with_runtime, validate_brain_state_record};
 use crate::runtime_health::{RuntimeRecordInspection, inspect_runtime_health};
@@ -75,6 +79,30 @@ pub fn brain_refresh_lease_path(journal_path: &Path) -> PathBuf {
 pub fn load_existing_fingerprint_key(journal_path: &Path) -> Option<[u8; FINGERPRINT_KEY_BYTES]> {
     let bytes = fs::read(brain_fingerprint_key_path(journal_path)).ok()?;
     bytes.try_into().ok()
+}
+
+/// Whether `health/brain-fingerprint.key` can bind a credential.
+///
+/// `NotFound` is [`FingerprintKeyMaterial::Absent`]. Any other length or IO
+/// error is [`FingerprintKeyMaterial::Unavailable`] and must not be replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FingerprintKeyMaterial {
+    Absent,
+    Ready([u8; FINGERPRINT_KEY_BYTES]),
+    Unavailable,
+}
+
+pub fn read_fingerprint_key_material(journal_path: &Path) -> FingerprintKeyMaterial {
+    match fs::read(brain_fingerprint_key_path(journal_path)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            FingerprintKeyMaterial::Absent
+        }
+        Ok(bytes) => match <[u8; FINGERPRINT_KEY_BYTES]>::try_from(bytes) {
+            Ok(key) => FingerprintKeyMaterial::Ready(key),
+            Err(_) => FingerprintKeyMaterial::Unavailable,
+        },
+        Err(_) => FingerprintKeyMaterial::Unavailable,
+    }
 }
 
 #[allow(dead_code)]
@@ -142,20 +170,106 @@ pub fn inspect_brain_state_with_clock(
     config: &Map<String, Value>,
     clock: impl FnOnce() -> DateTime<Utc>,
 ) -> BrainInspection {
+    let resolution = derive_active_brain_lane(config);
+    let credential;
+    let endpoint;
+    let target = match resolution.lane.as_deref() {
+        Some("byo-cloud")
+            if matches!(
+                resolution.provider.as_str(),
+                "openai" | "anthropic" | "google"
+            ) =>
+        {
+            credential = managed_config_credential(config, &resolution.provider);
+            credential
+                .as_ref()
+                .map(|credential| crate::CredentialHoldTarget::Managed {
+                    provider: &resolution.provider,
+                    credential,
+                })
+        }
+        Some("byo-endpoint") if resolution.provider == "local" => {
+            endpoint = endpoint_binding_parts(config);
+            Some(crate::CredentialHoldTarget::Endpoint {
+                base_url: &endpoint.0,
+                credential: &endpoint.1,
+            })
+        }
+        _ => None,
+    };
+    // Retain the original root and health directory before either read. An
+    // independent later open must not lend its authority to an earlier Ready
+    // record from a replaced directory.
+    let inputs = target.as_ref().map(|_| {
+        solstone_core_journal_io::JournalRoot::open(journal_path)
+            .map_err(|error| crate::WriterError::Io(error.to_string()))
+            .and_then(|root| {
+                crate::writer::read_brain_inspection_inputs_bound(
+                    std::sync::Arc::new(root),
+                    journal_path,
+                )
+            })
+    });
+    let mut inspection =
+        inspect_durable_brain_state_with_clock(journal_path, config, clock, inputs.as_ref());
+    let Some(target) = target else {
+        return inspection;
+    };
+    let binding = match inputs.as_ref().expect("applicable credential inputs") {
+        Ok(inputs) => crate::writer::inspect_credential_binding_bound(
+            inputs,
+            target,
+            validation_entry(config, &resolution.provider),
+        ),
+        Err(error) => Err(crate::WriterError::Io(error.to_string())),
+    };
+    match binding {
+        Ok(StoredCredentialBinding::Matches | StoredCredentialBinding::Corrupt) => {
+            inspection.projection.aggregate_state = aggregate_for_reason("provider_key_invalid");
+            inspection.projection.reason_code = Some("provider_key_invalid".to_owned());
+            inspection.projection.active_lane = resolution.lane;
+            inspection.projection.active_provider = Some(resolution.provider);
+            inspection.projection.active_model = resolution.model;
+            inspection.projection.runtime_transition_in_progress = false;
+        }
+        Err(_) if inspection.projection.aggregate_state == "ready" => {
+            inspection.projection.aggregate_state = "unknown".to_owned();
+            inspection.projection.reason_code = Some("brain_record_unavailable".to_owned());
+        }
+        _ => {}
+    }
+    inspection
+}
+
+fn inspect_durable_brain_state_with_clock(
+    journal_path: &Path,
+    config: &Map<String, Value>,
+    clock: impl FnOnce() -> DateTime<Utc>,
+    bound: Option<&Result<crate::writer::BoundBrainInspection, crate::WriterError>>,
+) -> BrainInspection {
     // Sample after the read: a concurrent renewal may be newer than the time
     // at which a caller started its health-check battery.
     let state_path = brain_state_path(journal_path);
-    let bytes = fs::read(&state_path);
+    let bytes = match bound {
+        Some(Ok(inputs)) => inputs.record.clone().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "Brain record is absent")
+        }),
+        Some(Err(error)) => Err(std::io::Error::other(error.to_string())),
+        None => fs::read(&state_path),
+    };
     let now = clock();
     let (record, raw, status, record_reason, error) = match bytes {
         Err(error)
             if error.kind() == std::io::ErrorKind::NotFound
-                && state_path
-                    .parent()
-                    .is_some_and(|parent| match fs::metadata(parent) {
-                        Ok(metadata) => metadata.is_dir(),
-                        Err(parent_error) => parent_error.kind() == std::io::ErrorKind::NotFound,
-                    }) =>
+                && (bound.is_some_and(Result::is_ok)
+                    || state_path
+                        .parent()
+                        .is_some_and(|parent| match fs::metadata(parent) {
+                            Ok(metadata) => metadata.is_dir(),
+                            Err(parent_error) => {
+                                parent_error.kind() == std::io::ErrorKind::NotFound
+                            }
+                        })) =>
         {
             (
                 None,
@@ -194,6 +308,14 @@ pub fn inspect_brain_state_with_clock(
             ),
         },
     };
+    let existing_key = || match bound {
+        Some(Ok(inputs)) => match inputs.material {
+            FingerprintKeyMaterial::Ready(key) => Some(key),
+            _ => None,
+        },
+        Some(Err(_)) => None,
+        None => load_existing_fingerprint_key(journal_path),
+    };
     let resolution = derive_active_brain_lane(config);
     if resolution.lane.is_none() {
         return inspection(
@@ -204,9 +326,15 @@ pub fn inspect_brain_state_with_clock(
         );
     }
     let Some(record) = record else {
+        let key = existing_key();
         return inspection(
             status,
-            record_outcome_projection(record_reason.expect("record outcome reason"), &resolution),
+            projection_without_record(
+                config,
+                &resolution,
+                key.as_ref(),
+                record_reason.expect("record outcome reason"),
+            ),
             error,
             raw,
         );
@@ -219,9 +347,17 @@ pub fn inspect_brain_state_with_clock(
             raw,
         );
     }
-    let key = match load_existing_fingerprint_key(journal_path) {
+    let key = match existing_key() {
         Some(key) => key,
         None => {
+            if credential_overlay(config, &resolution, None) == CredentialOverlay::Rejected {
+                return inspection(
+                    status,
+                    credential_rejection_projection(&record, &resolution),
+                    error,
+                    raw,
+                );
+            }
             return inspection(
                 status,
                 record_projection(&record, "unknown", Some("fingerprint_key_unavailable")),
@@ -305,7 +441,7 @@ pub fn project_brain_state_with_journal(
     }
     let lane = resolution.lane.as_deref().expect("checked lane resolution");
     let Some(record) = record else {
-        return record_outcome_projection("brain_record_missing", &resolution);
+        return projection_without_record(config, &resolution, hmac_key, "brain_record_missing");
     };
     let runtime_inputs = (lane == "bundled").then(|| bundled_runtime_inputs(runtime_health));
     let runtime_reason = runtime_inputs.as_ref().and_then(|inputs| inputs.0.clone());
@@ -320,7 +456,11 @@ pub fn project_brain_state_with_journal(
         return record_projection(record, &aggregate_state, reason_code.as_deref());
     }
     let mut config_changed = false;
+    let overlay = credential_overlay(config, &resolution, hmac_key);
     if hmac_key.is_none() {
+        if overlay == CredentialOverlay::Rejected {
+            return credential_rejection_projection(record, &resolution);
+        }
         return BrainProjection {
             aggregate_state: "unknown".to_owned(),
             reason_code: Some("fingerprint_key_unavailable".to_owned()),
@@ -330,6 +470,9 @@ pub fn project_brain_state_with_journal(
             fingerprint_sha256,
             runtime_transition_in_progress: false,
         };
+    }
+    if overlay == CredentialOverlay::Rejected {
+        return credential_rejection_projection(record, &resolution);
     }
     if record_timestamp_invalid(record, now) {
         return BrainProjection {
@@ -387,7 +530,18 @@ pub fn project_brain_state_with_journal(
             }
         }
     }
+    let missing_key = overlay == CredentialOverlay::Missing
+        && (aggregate_state == "ready"
+            || reason_code.is_none()
+            || reason_code.as_deref() == Some("brain_config_changed"));
+    if missing_key {
+        aggregate_state = aggregate_for_reason("provider_key_missing");
+        reason_code = Some("provider_key_missing".to_owned());
+        config_changed = true;
+    }
     let runtime_transition = reason_code.as_deref() != Some("brain_config_changed")
+        && reason_code.as_deref() != Some("provider_key_missing")
+        && reason_code.as_deref() != Some("provider_key_invalid")
         && runtime_transition_in_progress(lane, runtime_health);
     let (active_lane, active_provider, active_model) = if config_changed {
         (
@@ -411,6 +565,139 @@ pub fn project_brain_state_with_journal(
         fingerprint_sha256,
         runtime_transition_in_progress: runtime_transition,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialOverlay {
+    None,
+    Rejected,
+    Missing,
+}
+
+fn credential_overlay(
+    config: &Map<String, Value>,
+    resolution: &LaneResolution,
+    hmac_key: Option<&[u8; 32]>,
+) -> CredentialOverlay {
+    let lane = resolution.lane.as_deref();
+    let provider = resolution.provider.as_str();
+    if lane == Some("spp") || provider == "chatgpt" {
+        return CredentialOverlay::None;
+    }
+    let managed =
+        lane == Some("byo-cloud") && matches!(provider, "openai" | "anthropic" | "google");
+    let byo_endpoint = lane == Some("byo-endpoint") && provider == "local";
+    if !managed && !byo_endpoint {
+        return CredentialOverlay::None;
+    }
+    let (expected, credential_present) = if managed {
+        match managed_config_credential(config, provider) {
+            Some(secret) => (
+                hmac_key.map(|key| managed_credential_binding_hmac(key, provider, &secret)),
+                true,
+            ),
+            None => (None, false),
+        }
+    } else {
+        let (base_url, credential) = endpoint_binding_parts(config);
+        (
+            hmac_key.map(|key| endpoint_credential_binding_hmac(key, &base_url, &credential)),
+            !credential.is_empty(),
+        )
+    };
+    let binding = classify_stored_binding(
+        validation_entry(config, provider),
+        hmac_key,
+        expected.as_deref(),
+    );
+    if matches!(
+        binding,
+        StoredCredentialBinding::Matches | StoredCredentialBinding::Corrupt
+    ) {
+        return CredentialOverlay::Rejected;
+    }
+    if managed && !credential_present {
+        CredentialOverlay::Missing
+    } else {
+        CredentialOverlay::None
+    }
+}
+
+fn projection_without_record(
+    config: &Map<String, Value>,
+    resolution: &LaneResolution,
+    hmac_key: Option<&[u8; 32]>,
+    record_reason: &str,
+) -> BrainProjection {
+    match credential_overlay(config, resolution, hmac_key) {
+        CredentialOverlay::Rejected => BrainProjection {
+            aggregate_state: aggregate_for_reason("provider_key_invalid"),
+            reason_code: Some("provider_key_invalid".to_owned()),
+            active_lane: resolution.lane.clone(),
+            active_provider: Some(resolution.provider.clone()),
+            active_model: resolution.model.clone(),
+            fingerprint_sha256: None,
+            runtime_transition_in_progress: false,
+        },
+        CredentialOverlay::Missing => BrainProjection {
+            aggregate_state: aggregate_for_reason("provider_key_missing"),
+            reason_code: Some("provider_key_missing".to_owned()),
+            active_lane: resolution.lane.clone(),
+            active_provider: Some(resolution.provider.clone()),
+            active_model: resolution.model.clone(),
+            fingerprint_sha256: None,
+            runtime_transition_in_progress: false,
+        },
+        CredentialOverlay::None => record_outcome_projection(record_reason, resolution),
+    }
+}
+
+fn credential_rejection_projection(
+    record: &BrainStateRecord,
+    resolution: &LaneResolution,
+) -> BrainProjection {
+    BrainProjection {
+        aggregate_state: aggregate_for_reason("provider_key_invalid"),
+        reason_code: Some("provider_key_invalid".to_owned()),
+        active_lane: resolution.lane.clone(),
+        active_provider: Some(resolution.provider.clone()),
+        active_model: resolution.model.clone(),
+        fingerprint_sha256: record.fingerprint_sha256.clone(),
+        runtime_transition_in_progress: false,
+    }
+}
+
+fn aggregate_for_reason(reason: &str) -> String {
+    local_contract()
+        .brain_state
+        .reason_to_aggregate
+        .get(reason)
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn managed_config_credential(config: &Map<String, Value>, provider: &str) -> Option<String> {
+    let env_name = local_contract()
+        .brain_state
+        .provider_env_by_name
+        .get(provider)?;
+    config
+        .get("env")
+        .and_then(Value::as_object)
+        .and_then(|env| env.get(env_name))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn validation_entry<'a>(config: &'a Map<String, Value>, provider: &str) -> Option<&'a Value> {
+    config
+        .get("providers")
+        .and_then(Value::as_object)
+        .and_then(|providers| providers.get("key_validation"))
+        .and_then(Value::as_object)
+        .and_then(|entries| entries.get(provider))
 }
 
 fn record_outcome_projection(
@@ -775,5 +1062,347 @@ mod tests {
                 .as_deref(),
             Some("local_runtime_fingerprint_mismatch")
         );
+    }
+
+    fn fixture_now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(&crate::fixture::projection_fixture().now)
+            .expect("fixture now")
+            .with_timezone(&Utc)
+    }
+
+    fn fixture_key() -> [u8; 32] {
+        let hex = &crate::fixture::projection_fixture().hmac_key_hex;
+        (0..hex.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap()
+    }
+
+    fn config_named(name: &str) -> Map<String, Value> {
+        crate::fixture::projection_fixture().configs[name]
+            .as_object()
+            .expect("fixture config")
+            .clone()
+    }
+
+    fn record_named(name: &str) -> BrainStateRecord {
+        validate_brain_state_record(
+            &crate::fixture::projection_fixture().records[name],
+            fixture_now(),
+        )
+        .expect("fixture record")
+    }
+
+    fn project_at(
+        record: &str,
+        config: &Map<String, Value>,
+        key: Option<&[u8; 32]>,
+    ) -> BrainProjection {
+        project_brain_state_with_journal(
+            Some(&record_named(record)),
+            config,
+            false,
+            key,
+            None,
+            fixture_now(),
+            None,
+        )
+    }
+
+    fn plant_rejection(config: &mut Map<String, Value>, provider: &str, entry: Value) {
+        let providers = config
+            .entry("providers".to_owned())
+            .or_insert_with(|| json!({}));
+        let providers = providers.as_object_mut().expect("providers");
+        let validations = providers
+            .entry("key_validation".to_owned())
+            .or_insert_with(|| json!({}));
+        validations
+            .as_object_mut()
+            .expect("key_validation")
+            .insert(provider.to_owned(), entry);
+    }
+
+    fn matching_entry(provider: &str, credential: &str) -> Value {
+        let hmac = managed_credential_binding_hmac(&fixture_key(), provider, credential);
+        let mut entry = Map::new();
+        entry.insert("valid".to_owned(), Value::Bool(false));
+        entry.insert(
+            "reason_code".to_owned(),
+            Value::String("provider_key_invalid".to_owned()),
+        );
+        crate::attach_credential_binding(&mut entry, &hmac);
+        Value::Object(entry)
+    }
+
+    #[test]
+    fn matching_rejection_overlays_model_only_fingerprint_change() {
+        let key = fixture_key();
+        let mut changed = config_named("lane_byo_cloud");
+        changed
+            .get_mut("providers")
+            .and_then(Value::as_object_mut)
+            .and_then(|providers| providers.get_mut("active"))
+            .and_then(Value::as_object_mut)
+            .expect("active")
+            .insert("model".to_owned(), json!("claude-other"));
+        let drifted = project_at("lane_byo_cloud/ready", &changed, Some(&key));
+        assert_eq!(drifted.reason_code.as_deref(), Some("brain_config_changed"));
+        plant_rejection(
+            &mut changed,
+            "anthropic",
+            matching_entry("anthropic", "sk-test"),
+        );
+        let overlaid = project_at("lane_byo_cloud/ready", &changed, Some(&key));
+        assert_eq!(
+            overlaid.reason_code.as_deref(),
+            Some("provider_key_invalid")
+        );
+        assert_eq!(overlaid.aggregate_state, "unhealthy");
+        assert_eq!(
+            overlaid.fingerprint_sha256.as_deref(),
+            record_named("lane_byo_cloud/ready")
+                .fingerprint_sha256
+                .as_deref()
+        );
+
+        let mut corrupt = config_named("lane_byo_cloud");
+        plant_rejection(
+            &mut corrupt,
+            "anthropic",
+            json!({"valid":false,"reason_code":"provider_key_invalid","binding_version":1}),
+        );
+        let missing_key = project_at("lane_byo_cloud/ready", &corrupt, None);
+        assert_eq!(
+            missing_key.reason_code.as_deref(),
+            Some("provider_key_invalid")
+        );
+        assert_eq!(missing_key.aggregate_state, "unhealthy");
+
+        let journal = TempJournal::new();
+        let path = brain_state_path(&journal.0);
+        fs::create_dir_all(path.parent().expect("health")).expect("health directory");
+        fs::write(
+            path,
+            serde_json::to_vec(
+                &crate::fixture::projection_fixture().records["lane_byo_cloud/ready"],
+            )
+            .expect("record bytes"),
+        )
+        .expect("record writes");
+        let inspection = inspect_brain_state(&journal.0, &corrupt, fixture_now());
+        assert_eq!(
+            inspection.projection.reason_code.as_deref(),
+            Some("provider_key_invalid")
+        );
+        assert_eq!(inspection.projection.aggregate_state, "unhealthy");
+    }
+
+    #[test]
+    fn validation_unavailable_does_not_clear_matching_rejection() {
+        let key = fixture_key();
+        let mut config = config_named("lane_byo_cloud");
+        plant_rejection(
+            &mut config,
+            "anthropic",
+            matching_entry("anthropic", "sk-test"),
+        );
+        let rejected = project_at("lane_byo_cloud/ready", &config, Some(&key));
+        assert_eq!(
+            rejected.reason_code.as_deref(),
+            Some("provider_key_invalid")
+        );
+        assert_eq!(rejected.aggregate_state, "unhealthy");
+
+        let hmac = managed_credential_binding_hmac(&key, "anthropic", "sk-test");
+        let mut unavailable = Map::new();
+        unavailable.insert("valid".to_owned(), Value::Bool(false));
+        unavailable.insert(
+            "reason_code".to_owned(),
+            Value::String("validation_unavailable".to_owned()),
+        );
+        crate::attach_credential_binding(&mut unavailable, &hmac);
+        plant_rejection(&mut config, "anthropic", Value::Object(unavailable));
+        let left = project_at("lane_byo_cloud/ready", &config, Some(&key));
+        assert_ne!(left.reason_code.as_deref(), Some("provider_key_invalid"));
+        assert_eq!(left.aggregate_state, "ready");
+    }
+
+    #[test]
+    fn missing_config_key_overlays_provider_key_missing() {
+        let key = fixture_key();
+        let mut config = config_named("lane_byo_cloud");
+        config
+            .get_mut("env")
+            .and_then(Value::as_object_mut)
+            .expect("env")
+            .remove("ANTHROPIC_API_KEY");
+        let missing = project_at("lane_byo_cloud/ready", &config, Some(&key));
+        assert_eq!(missing.reason_code.as_deref(), Some("provider_key_missing"));
+        assert_eq!(missing.aggregate_state, "blocked");
+
+        config
+            .get_mut("providers")
+            .and_then(Value::as_object_mut)
+            .and_then(|providers| providers.get_mut("active"))
+            .and_then(Value::as_object_mut)
+            .expect("active")
+            .insert("model".to_owned(), json!("claude-other"));
+        let drifted = project_at("lane_byo_cloud/ready", &config, Some(&key));
+        assert_eq!(drifted.reason_code.as_deref(), Some("provider_key_missing"));
+        assert_eq!(drifted.aggregate_state, "blocked");
+
+        let unavailable = project_at("lane_byo_cloud/ready", &config, None);
+        assert_eq!(
+            unavailable.reason_code.as_deref(),
+            Some("fingerprint_key_unavailable")
+        );
+    }
+
+    #[test]
+    fn legacy_unbound_does_not_overlay() {
+        let key = fixture_key();
+        let plain = config_named("lane_byo_cloud");
+        let mut unbound = plain.clone();
+        plant_rejection(
+            &mut unbound,
+            "anthropic",
+            json!({"valid":false,"reason_code":"provider_key_invalid","error":"old","timestamp":"2026-08-06T12:00:00Z"}),
+        );
+        assert_eq!(
+            project_at("lane_byo_cloud/ready", &plain, Some(&key)),
+            project_at("lane_byo_cloud/ready", &unbound, Some(&key))
+        );
+        assert_ne!(
+            project_at("lane_byo_cloud/ready", &unbound, Some(&key))
+                .reason_code
+                .as_deref(),
+            Some("provider_key_invalid")
+        );
+    }
+
+    #[test]
+    fn spp_and_chatgpt_records_stay_unchanged() {
+        let key = fixture_key();
+        let spp = config_named("lane_spp");
+        let mut spp_rejected = spp.clone();
+        plant_rejection(
+            &mut spp_rejected,
+            "local",
+            matching_entry("local", "endpoint-credential"),
+        );
+        let spp_plain = project_at("lane_spp/ready", &spp, Some(&key));
+        let spp_planted = project_at("lane_spp/ready", &spp_rejected, Some(&key));
+        assert_eq!(spp_plain, spp_planted);
+        assert_ne!(
+            spp_plain.reason_code.as_deref(),
+            Some("provider_key_invalid")
+        );
+
+        let mut chatgpt = config_named("lane_byo_cloud");
+        chatgpt
+            .get_mut("providers")
+            .and_then(Value::as_object_mut)
+            .and_then(|providers| providers.get_mut("active"))
+            .and_then(Value::as_object_mut)
+            .expect("active")
+            .insert("provider".to_owned(), json!("chatgpt"));
+        let mut chatgpt_rejected = chatgpt.clone();
+        plant_rejection(
+            &mut chatgpt_rejected,
+            "chatgpt",
+            matching_entry("chatgpt", "sk-test"),
+        );
+        let chatgpt_plain = project_at("lane_byo_cloud/ready", &chatgpt, Some(&key));
+        let chatgpt_planted = project_at("lane_byo_cloud/ready", &chatgpt_rejected, Some(&key));
+        assert_eq!(chatgpt_plain, chatgpt_planted);
+        assert_ne!(
+            chatgpt_plain.reason_code.as_deref(),
+            Some("provider_key_invalid")
+        );
+    }
+
+    fn assert_record_free_overlay(record_bytes: Option<&[u8]>) {
+        let journal = TempJournal::new();
+        if let Some(bytes) = record_bytes {
+            let path = brain_state_path(&journal.0);
+            fs::create_dir_all(path.parent().expect("health")).expect("health");
+            fs::write(path, bytes).expect("record");
+        }
+        let key = fixture_key();
+        fs::create_dir_all(
+            brain_fingerprint_key_path(&journal.0)
+                .parent()
+                .expect("health"),
+        )
+        .expect("health");
+        fs::write(brain_fingerprint_key_path(&journal.0), key).expect("key");
+        let mut rejected = config_named("lane_byo_cloud");
+        plant_rejection(
+            &mut rejected,
+            "anthropic",
+            matching_entry("anthropic", "sk-test"),
+        );
+        let inspection = inspect_brain_state(&journal.0, &rejected, fixture_now());
+        assert_eq!(
+            inspection.projection.reason_code.as_deref(),
+            Some("provider_key_invalid")
+        );
+        assert_eq!(inspection.projection.aggregate_state, "unhealthy");
+        assert!(inspection.projection.fingerprint_sha256.is_none());
+        assert_eq!(
+            inspection.projection.active_provider.as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(
+            inspection.projection.active_lane.as_deref(),
+            Some("byo-cloud")
+        );
+
+        let mut missing = config_named("lane_byo_cloud");
+        missing
+            .get_mut("env")
+            .and_then(Value::as_object_mut)
+            .expect("env")
+            .remove("ANTHROPIC_API_KEY");
+        let inspection = inspect_brain_state(&journal.0, &missing, fixture_now());
+        assert_eq!(
+            inspection.projection.reason_code.as_deref(),
+            Some("provider_key_missing")
+        );
+        assert_eq!(inspection.projection.aggregate_state, "blocked");
+
+        let spp = inspect_brain_state(&journal.0, &config_named("lane_spp"), fixture_now());
+        let expected = if record_bytes.is_some() {
+            "brain_record_invalid"
+        } else {
+            "brain_record_missing"
+        };
+        assert_eq!(spp.projection.reason_code.as_deref(), Some(expected));
+        assert_ne!(spp.projection.aggregate_state, "ready");
+
+        let mut chatgpt = config_named("lane_byo_cloud");
+        chatgpt
+            .get_mut("providers")
+            .and_then(Value::as_object_mut)
+            .and_then(|providers| providers.get_mut("active"))
+            .and_then(Value::as_object_mut)
+            .expect("active")
+            .insert("provider".to_owned(), json!("chatgpt"));
+        let chatgpt = inspect_brain_state(&journal.0, &chatgpt, fixture_now());
+        assert_eq!(chatgpt.projection.reason_code.as_deref(), Some(expected));
+        assert_ne!(chatgpt.projection.aggregate_state, "ready");
+    }
+
+    #[test]
+    fn missing_brain_record_overlays_bound_rejection_and_missing_key() {
+        assert_record_free_overlay(None);
+    }
+
+    #[test]
+    fn corrupt_brain_record_overlays_bound_rejection_and_missing_key() {
+        assert_record_free_overlay(Some(b"{"));
     }
 }

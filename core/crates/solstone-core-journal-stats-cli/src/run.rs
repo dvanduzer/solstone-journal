@@ -8,9 +8,10 @@ use solstone_core_system_health::{FilesystemHealthLogSource, FilesystemSegmentSo
 use solstone_core_talent_config::read_talent_overrides;
 
 use crate::{
-    BacklogViewReader, CacheStatus, DayScanRequest, DocumentWriter, FilesystemDayCacheWriter,
-    JournalStatsError, backlog::degraded_backlog_view, cli, document::UnreadableDay,
-    document::assemble_document, scan_day_with_cache, tokens::scan_tokens,
+    BacklogViewReader, CacheStatus, DayCacheWriter, DayScanRequest, DocumentWriter,
+    FilesystemDayCacheWriter, JournalStatsError, backlog::degraded_backlog_view, cli,
+    document::UnreadableDay, document::assemble_document, scan_day_with_checkpoint,
+    tokens::scan_tokens_with_checkpoint,
 };
 
 /// Observable result of a journal-level CLI invocation.
@@ -31,6 +32,81 @@ pub fn run_cli(
     backlog_reader: &dyn BacklogViewReader,
     document_writer: &dyn DocumentWriter,
 ) -> CliRun {
+    run_cli_with_cache(
+        args,
+        journal_root,
+        now,
+        system_talent_root,
+        apps_root,
+        backlog_reader,
+        document_writer,
+        &FilesystemDayCacheWriter,
+    )
+}
+
+/// Run journal statistics with a caller-supplied day-cache writer.
+#[allow(clippy::too_many_arguments)]
+pub fn run_cli_with_cache<W: DayCacheWriter>(
+    args: &[OsString],
+    journal_root: &Path,
+    now: DateTime<Utc>,
+    system_talent_root: &Path,
+    apps_root: &Path,
+    backlog_reader: &dyn BacklogViewReader,
+    document_writer: &dyn DocumentWriter,
+    cache_writer: &W,
+) -> CliRun {
+    run_cli_with_admission(
+        args,
+        journal_root,
+        now,
+        system_talent_root,
+        apps_root,
+        backlog_reader,
+        document_writer,
+        cache_writer,
+        None,
+    )
+}
+
+/// Run hosted statistics with the admitted task's publication checkpoint.
+#[allow(clippy::too_many_arguments)]
+pub fn run_cli_with_cache_checked<W: DayCacheWriter>(
+    args: &[OsString],
+    journal_root: &Path,
+    now: DateTime<Utc>,
+    system_talent_root: &Path,
+    apps_root: &Path,
+    backlog_reader: &dyn BacklogViewReader,
+    document_writer: &dyn DocumentWriter,
+    cache_writer: &W,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> CliRun {
+    run_cli_with_admission(
+        args,
+        journal_root,
+        now,
+        system_talent_root,
+        apps_root,
+        backlog_reader,
+        document_writer,
+        cache_writer,
+        Some(checkpoint),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_cli_with_admission<W: DayCacheWriter>(
+    args: &[OsString],
+    journal_root: &Path,
+    now: DateTime<Utc>,
+    system_talent_root: &Path,
+    apps_root: &Path,
+    backlog_reader: &dyn BacklogViewReader,
+    document_writer: &dyn DocumentWriter,
+    cache_writer: &W,
+    checkpoint: Option<&dyn Fn() -> Result<(), String>>,
+) -> CliRun {
     let options = match cli::parse(args) {
         Ok(cli::ParseResult::Help) => return success(cli::HELP),
         Ok(cli::ParseResult::Options(options)) => options,
@@ -45,7 +121,9 @@ pub fn run_cli(
         options.use_cache,
         backlog_reader,
         document_writer,
+        cache_writer,
         options.debug,
+        checkpoint,
     ) {
         Ok((day_count, diagnostics)) => {
             let mut stderr = String::new();
@@ -78,7 +156,7 @@ pub fn run_cli(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run(
+fn run<W: DayCacheWriter>(
     journal_root: &Path,
     now: DateTime<Utc>,
     system_talent_root: &Path,
@@ -86,8 +164,12 @@ fn run(
     use_cache: bool,
     backlog_reader: &dyn BacklogViewReader,
     document_writer: &dyn DocumentWriter,
+    cache_writer: &W,
     debug: bool,
+    checkpoint: Option<&dyn Fn() -> Result<(), String>>,
 ) -> Result<(usize, Vec<String>), String> {
+    let admit = || checkpoint.map_or(Ok(()), |checkpoint| checkpoint());
+    admit()?;
     let days = solstone_core_journal_io::day_dirs(journal_root)
         .map_err(|error| format!("Error enumerating journal days: {error}"))?;
     let mut days = days.into_iter().collect::<Vec<_>>();
@@ -95,7 +177,6 @@ fn run(
 
     let segments = FilesystemSegmentSource;
     let health = FilesystemHealthLogSource::new(journal_root);
-    let cache_writer = FilesystemDayCacheWriter;
     let talent_overrides = read_talent_overrides(journal_root)
         .map_err(|message| JournalStatsError::Validation(message).to_string())?;
     // Journal-scoped prerequisites are resolved once, before any day is
@@ -123,13 +204,14 @@ fn run(
     // damaged day, so a full cold walk of a large corpus has never been
     // exercised; it converges across runs rather than in one.
     for (day, _) in days {
+        admit()?;
         // One day's damaged bytes cannot discard every other day's statistics.
         // A day that cannot be scanned contributes nothing and is named with
         // its cause.  A failure caused by the day's content is remembered
         // against a fingerprint of its inputs, so an unchanged damaged day is
         // not read again on every run, and any change to those inputs scans it
         // again, so the failure never outlives a repair.
-        match scan_day_with_cache(
+        let outcome = scan_day_with_checkpoint(
             DayScanRequest {
                 journal_root,
                 day: &day,
@@ -139,10 +221,15 @@ fn run(
                 talent_overrides: talent_overrides.as_ref(),
                 segment_source: &segments,
                 health_source: &health,
-                cache_writer: &cache_writer,
+                cache_writer,
             },
             use_cache,
-        ) {
+            checkpoint,
+        );
+        // Stop/root loss is not damaged evidence and cannot make a successful
+        // final document, even when an optional cache publication soft-fails.
+        admit()?;
+        match outcome {
             Ok(outcome) => {
                 if debug && let CacheStatus::SaveFailed { message } = &outcome.cache_status {
                     diagnostics.push(format!("Day cache save failed for {day}: {message}"));
@@ -159,14 +246,24 @@ fn run(
     let backlog = backlog_reader
         .read_backlog_view(journal_root, now)
         .unwrap_or_else(|_| degraded_backlog_view());
-    let tokens = scan_tokens(journal_root, now, use_cache, &mut diagnostics);
+    admit()?;
+    let tokens =
+        scan_tokens_with_checkpoint(journal_root, now, use_cache, &mut diagnostics, checkpoint);
+    admit()?;
     let document = assemble_document(&scans, tokens, backlog, now, evidence_unreadable_days);
     document
         .validate()
         .map_err(|error| format!("Error validating stats.json: {error}"))?;
-    document_writer
-        .write_document(&journal_root.join("stats.json"), &document)
-        .map_err(|error| format!("Error writing stats.json: {error}"))?;
+    let written = if let Some(checkpoint) = checkpoint {
+        document_writer.write_document_checked(
+            &journal_root.join("stats.json"),
+            &document,
+            checkpoint,
+        )
+    } else {
+        document_writer.write_document(&journal_root.join("stats.json"), &document)
+    };
+    written.map_err(|error| format!("Error writing stats.json: {error}"))?;
     if !debug {
         diagnostics.clear();
     }

@@ -73,6 +73,15 @@ pub(crate) struct IndexAdmission {
 
 impl IndexAdmission {
     pub(crate) fn acquire(journal: &Path, operation: &'static str) -> Result<Self, StoreError> {
+        Self::acquire_checked(journal, operation, &|| Ok(()))
+    }
+
+    pub(crate) fn acquire_checked(
+        journal: &Path,
+        operation: &'static str,
+        checkpoint: &dyn Fn() -> Result<(), String>,
+    ) -> Result<Self, StoreError> {
+        crate::db::admit_scan_journal(checkpoint)?;
         let started = Instant::now();
         let target_path = db_path(journal);
         match hold_lock(&target_path, LockOptions::default()) {
@@ -80,7 +89,8 @@ impl IndexAdmission {
                 let wait = started.elapsed();
                 // The lease is held: refuse a newer generation, and record this
                 // writer's version before any write the caller makes.
-                crate::generation::admit_writer(&target_path, operation)?;
+                crate::db::admit_scan_journal(checkpoint)?;
+                crate::generation::admit_writer(&target_path, operation, checkpoint)?;
                 let admission = Self {
                     _lock: lock,
                     operation,

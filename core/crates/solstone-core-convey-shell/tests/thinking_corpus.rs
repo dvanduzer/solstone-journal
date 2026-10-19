@@ -168,13 +168,12 @@ fn corpus() -> Value {
                     }
                 }
             }
-            if case["path"] == "/app/thinking/api/state" {
-                if let Some(object) = case.get_mut("json").and_then(Value::as_object_mut) {
-                    if object.contains_key("providers") {
-                        object.insert("saved_lane".into(), Value::Null);
-                        projected = true;
-                    }
-                }
+            if case["path"] == "/app/thinking/api/state"
+                && let Some(object) = case.get_mut("json").and_then(Value::as_object_mut)
+                && object.contains_key("providers")
+            {
+                object.insert("saved_lane".into(), Value::Null);
+                projected = true;
             }
             if let Some(setup) = case
                 .pointer_mut("/json/copy/byo_setup")
@@ -1533,10 +1532,7 @@ async fn post_validate_model_missing_key_has_exact_top_level_keys() {
     .await;
     assert_eq!(response.0, StatusCode::OK);
     let body: Value = serde_json::from_slice(&response.3).expect("response is JSON");
-    assert_top_level_keys(
-        &body,
-        vec!["message", "model", "provider", "reason_code", "valid"],
-    );
+    assert_top_level_keys(&body, vec!["model", "provider", "reason_code", "valid"]);
 
     let response = request_with_body(
         router(journal.0.clone()),

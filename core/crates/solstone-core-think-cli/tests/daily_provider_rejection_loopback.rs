@@ -68,6 +68,7 @@ fn cross_boundary_loopback_400_to_capped_daily_unit_with_detail() {
         false,
         false,
         1,
+        &|| Ok(()),
     )
     .unwrap();
 

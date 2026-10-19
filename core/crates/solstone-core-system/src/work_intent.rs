@@ -125,7 +125,17 @@ pub fn finish_from_scratch(
     id: &str,
     success: bool,
 ) -> Result<(), String> {
-    mutate(journal, |days| {
+    finish_from_scratch_checked(journal, day, id, success, &|| Ok(()))
+}
+
+pub fn finish_from_scratch_checked(
+    journal: &Path,
+    day: &str,
+    id: &str,
+    success: bool,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    mutate_checked(journal, checkpoint, |days| {
         if let Some(intent) = days.get_mut(day).filter(|intent| {
             intent.id == id && intent.from_scratch && intent.state == IntentState::Claimed
         }) {
@@ -184,6 +194,32 @@ mod tests {
         assert_eq!(
             read(root.path()).unwrap()["20260101"].state,
             IntentState::Failed
+        );
+    }
+
+    #[test]
+    fn interrupted_from_scratch_finish_stays_claimed() {
+        let root = tempfile::tempdir().unwrap();
+        let intent = register(root.path(), "20260101", true).unwrap();
+        claim_from_scratch(root.path(), "20260101", &intent.id).unwrap();
+        let error = finish_from_scratch_checked(root.path(), "20260101", &intent.id, true, &|| {
+            Err("stopped".into())
+        })
+        .unwrap_err();
+        assert_eq!(error, "stopped");
+        assert_eq!(
+            read(root.path()).unwrap()["20260101"].state,
+            IntentState::Claimed
+        );
+        let error =
+            finish_from_scratch_checked(root.path(), "20260101", &intent.id, false, &|| {
+                Err("stopped".into())
+            })
+            .unwrap_err();
+        assert_eq!(error, "stopped");
+        assert_eq!(
+            read(root.path()).unwrap()["20260101"].state,
+            IntentState::Claimed
         );
     }
 

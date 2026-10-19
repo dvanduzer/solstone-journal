@@ -157,6 +157,8 @@ pub struct ThinkContext {
     )>,
     pub(crate) cancel_checkpoint: Arc<dyn Fn() -> bool + Send + Sync>,
     pub(crate) sense_executor: Option<Arc<dyn solstone_core_sense::SenseExecutor>>,
+    pub(crate) phase_runner:
+        Option<Arc<dyn crate::phase_process::PhaseProcessRunner + Send + Sync>>,
 }
 
 impl ThinkContext {
@@ -177,6 +179,11 @@ impl ThinkContext {
         )>,
         cancel_checkpoint: Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Self {
+        let phase_runner = Arc::new(crate::phase_process::HostedPhaseRunner {
+            talent_root: talent_root.clone(),
+            apps_root: apps_root.clone(),
+            cancel_checkpoint: Arc::clone(&cancel_checkpoint),
+        });
         Self {
             journal: journal.to_path_buf(),
             day,
@@ -191,6 +198,7 @@ impl ThinkContext {
             retry,
             cancel_checkpoint,
             sense_executor: None,
+            phase_runner: Some(phase_runner),
         }
     }
 
@@ -235,6 +243,7 @@ impl ThinkContext {
             retry: None,
             cancel_checkpoint: Arc::new(|| false),
             sense_executor: None,
+            phase_runner: None,
         })
     }
 

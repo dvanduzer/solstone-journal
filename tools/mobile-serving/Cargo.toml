@@ -23,6 +23,9 @@ processing = [
     "dep:solstone-core-generate",
     "dep:chrono",
     "dep:chrono-tz",
+    "dep:solstone-core-facets",
+    "dep:solstone-core-speaker-resolve",
+    "dep:solstone-core-speakers",
 ]
 
 [dependencies]
@@ -56,11 +59,15 @@ solstone-core-cortex-client = { path = "../../core/crates/solstone-core-cortex-c
 solstone-core-generate = { path = "../../core/crates/solstone-core-generate", optional = true }
 chrono = { version = "0.4", optional = true }
 chrono-tz = { version = "0.10", optional = true }
+solstone-core-facets = { path = "../../core/crates/solstone-core-facets", optional = true }
+solstone-core-speaker-resolve = { path = "../../core/crates/solstone-core-speaker-resolve", optional = true }
+solstone-core-speakers = { path = "../../core/crates/solstone-core-speakers", optional = true }
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["api-24", "load-dynamic", "std"] }
 
 [dev-dependencies]
 tempfile = "3"
 solstone-core-system = { path = "../../core/crates/solstone-core-system" }
+solstone-core-installed-payload = { path = "../../core/crates/solstone-core-installed-payload" }
 
 [patch.crates-io]
 ffmpeg-sys-next = { path = "../../core/vendor/ffmpeg-sys-next" }

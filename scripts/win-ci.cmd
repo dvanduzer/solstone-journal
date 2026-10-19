@@ -196,6 +196,19 @@ cargo test --manifest-path core\Cargo.toml --locked -p solstone-core --bin solst
 
 echo === cargo test --locked (portable journal config substrate) ===
 cargo test --manifest-path core\Cargo.toml --locked -p solstone-core-journal-config --lib || exit /b 1
+echo === cargo test --locked (credential-bound publication and lease controls) ===
+call :run_exact_library "solstone-core-journal-io" "atomic::windows_tests::checked_bound_replace_windows_cancellation_keeps_original_and_normal_publication_works" "full-tests" || exit /b 1
+call :run_exact_library "solstone-core-journal-io" "atomic::windows_tests::checked_bound_replace_windows_root_replacement_receives_no_stage_or_destination" "full-tests" || exit /b 1
+call :run_exact_library "solstone-core-journal-io" "lease::bound_lease_tests::checked_bound_lease_contends_with_the_original_path_lease_and_releases" "full-tests" || exit /b 1
+call :run_exact_library "solstone-core-journal-io" "lease::bound_lease_tests::checked_bound_lease_revalidation_refuses_replacement_without_unlocking_the_original" "full-tests" || exit /b 1
+call :run_exact_library "solstone-core-journal-io" "lease::bound_lease_tests::checked_bound_lease_root_replacement_after_check_receives_no_lease" "full-tests" || exit /b 1
+call :run_exact_library "solstone-core-journal-config-write" "bound_commit::windows_tests::windows_publishes_unflushed_through_the_retained_parent_and_confirms_it" "full-tests" || exit /b 1
+call :run_exact_library "solstone-core-journal-config-write" "bound_commit::windows_tests::windows_refuses_a_changed_fingerprint_without_writing" "full-tests" || exit /b 1
+call :run_exact_library "solstone-core-journal-config-write" "bound_commit::credential_publication_tests::credential_transition_runs_once_under_both_existing_sidecars" "full-tests" || exit /b 1
+call :run_exact_library "solstone-core-journal-config-write" "bound_commit::credential_publication_tests::refused_locked_transition_keeps_original_config_bytes" "full-tests" || exit /b 1
+call :run_exact_library "solstone-core-journal-config-write" "bound_commit::credential_publication_tests::unrelated_mutation_has_no_credential_transition_or_brain_directory" "full-tests" || exit /b 1
+call :run_exact_library "solstone-core-brain" "writer::tests::first_rejection_publishes_its_binding_with_initially_absent_key" "full-tests" || exit /b 1
+
 echo === cargo test --locked --no-run (solstone-core Windows library harness) ===
 cargo test --manifest-path core\Cargo.toml --locked -p solstone-core --lib --features test-hooks,journal-mcp-endpoint --no-run || exit /b 1
 

@@ -300,6 +300,7 @@ pub enum StoreError {
     Integrity { reason: &'static str },
     DuplicateProposal { id: MarkId },
     Write(AtomicWriteError),
+    Stopped(String),
 }
 
 /// A reason a requested mark cannot be acted on before any target is attempted.
@@ -387,6 +388,10 @@ impl fmt::Display for StoreError {
                 formatter,
                 "the removal register could not be saved; no marks were changed"
             ),
+            Self::Stopped(_) => write!(
+                formatter,
+                "the removal register write was stopped; no marks were changed"
+            ),
         }
     }
 }
@@ -401,7 +406,8 @@ impl Error for StoreError {
             Self::UnsupportedVersion { .. }
             | Self::WriterHeld
             | Self::Integrity { .. }
-            | Self::DuplicateProposal { .. } => None,
+            | Self::DuplicateProposal { .. }
+            | Self::Stopped(_) => None,
         }
     }
 }
@@ -443,8 +449,18 @@ pub fn reconcile(
     proposals: &[(Target, Proposal)],
     at: DateTime<Utc>,
 ) -> Result<Register, StoreError> {
+    reconcile_checked(journal, class, proposals, at, &|| Ok(()))
+}
+
+pub fn reconcile_checked(
+    journal: &Path,
+    class: RemovalClass,
+    proposals: &[(Target, Proposal)],
+    at: DateTime<Utc>,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<Register, StoreError> {
     let proposals = index_proposals(class, proposals)?;
-    mutate(journal, |register| {
+    mutate_checked(journal, checkpoint, |register| {
         let stale: Vec<MarkId> = register
             .marks
             .iter()
@@ -664,12 +680,25 @@ where
     F: FnOnce(&mut Register) -> Result<bool, E>,
     E: From<StoreError>,
 {
-    mutate_with_options(journal, register_lock_options(), mutation)
+    mutate_checked(journal, &|| Ok(()), mutation)
+}
+
+fn mutate_checked<F, E>(
+    journal: &Path,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+    mutation: F,
+) -> Result<Register, E>
+where
+    F: FnOnce(&mut Register) -> Result<bool, E>,
+    E: From<StoreError>,
+{
+    mutate_with_options(journal, register_lock_options(), checkpoint, mutation)
 }
 
 fn mutate_with_options<F, E>(
     journal: &Path,
     options: LockOptions,
+    checkpoint: &dyn Fn() -> Result<(), String>,
     mutation: F,
 ) -> Result<Register, E>
 where
@@ -686,6 +715,7 @@ where
     }
     if mutation(&mut register)? {
         validate(&register).map_err(E::from)?;
+        checkpoint().map_err(StoreError::Stopped).map_err(E::from)?;
         write_json(
             &path,
             &register,

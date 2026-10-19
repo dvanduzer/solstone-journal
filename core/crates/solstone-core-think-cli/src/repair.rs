@@ -34,6 +34,7 @@ pub(crate) fn run(
             child_environment,
             Some(Duration::from_secs(1800)),
             std::sync::Arc::clone(executor),
+            solstone_core_sense::dispatch::BatchMarkerPolicy::AdvanceStream,
         )
     } else {
         solstone_core_sense::batch::run_batch_with_environment_and_timeout(

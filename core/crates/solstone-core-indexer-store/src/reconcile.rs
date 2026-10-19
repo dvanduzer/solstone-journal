@@ -56,7 +56,7 @@ pub fn reconcile_stale_classifications(
     snapshot: &mut dyn FnMut() -> Result<FacetDeclarationSet, StoreError>,
 ) -> Result<ReconcileReport, StoreError> {
     let admission = IndexAdmission::acquire(journal, "reconcile-classifications")?;
-    let mut conn = open_index_admitted(journal, &admission)?;
+    let mut conn = open_index_admitted(journal, &admission, &|| Ok(()))?;
     let mut report = ReconcileReport::default();
     'pass: loop {
         let declarations = snapshot()?;
