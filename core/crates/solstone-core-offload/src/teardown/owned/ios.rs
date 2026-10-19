@@ -30,6 +30,59 @@ pub(super) struct Custody {
     finished_configuration: Option<TeardownConfiguration>,
 }
 
+pub(super) fn confirmed_restart_custody(held: &HeldTeardown) -> Result<(), ()> {
+    if held.phase != TeardownRunPhase::Clear
+        || !held.outside.attempts.clear
+        || held.outside.attempts.binding
+        || held.outside.attempts.retirement
+        || held.outside.binding.is_some()
+        || held.outside.retirement.is_some()
+    {
+        return Err(());
+    }
+    let Some(PhaseOwner::Cleared(cleared)) = &held.owner else {
+        return Err(());
+    };
+    let outside = &held.outside;
+    let store = outside.ios.store.as_ref().ok_or(())?;
+    let preparation = outside.ios.preparation.as_ref().ok_or(())?;
+    let native = outside.ios.native.as_ref().ok_or(())?;
+    let publication = outside.publication.as_ref().ok_or(())?;
+    let carrier = outside.carrier.as_ref().ok_or(())?;
+    if !Arc::ptr_eq(publication, cleared.publication_receipt())
+        || !Arc::ptr_eq(carrier, cleared.carrier())
+        || outside
+            .lease
+            .as_ref()
+            .is_none_or(|lease| !Arc::ptr_eq(lease, cleared.teardown_lease()))
+        || outside
+            .root
+            .as_ref()
+            .is_none_or(|root| !Arc::ptr_eq(root, cleared.journal_root()))
+        || store.record().native.as_ref() != Some(native.observation())
+        || outside.operation.as_ref().and_then(|op| {
+            op.report()
+                .confirmed_facts()
+                .or_else(|| op.report().previous().cloned())
+        }) != store.record().remote_facts
+    {
+        return Err(());
+    }
+    // No fresh budget or cancellation reset: these checks observe original
+    // descriptors and durable bytes without issuing a remote/local effect.
+    native.confirm_restart_custody().map_err(|_| ())?;
+    cleared.revalidate().map_err(|_| ())?;
+    super::restart::confirm_local_custody(
+        store,
+        preparation,
+        carrier,
+        cleared.configuration(),
+        publication,
+    )?;
+    native.confirm_restart_custody().map_err(|_| ())?;
+    store.revalidate().map_err(|_| ())
+}
+
 fn recovery() -> TeardownRunRefusal {
     TeardownRunRefusal::RetirementUncertain
 }

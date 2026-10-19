@@ -499,14 +499,65 @@ pub(crate) fn response(deps: &BackupWebDeps) -> Option<Response> {
     }
 }
 
+// The complete returned owner stays outside the unwind boundary. A failing
+// observation must neither release its exclusion nor drop unvisited returns.
+fn observe_restart_custody(
+    actual: &OwnedTeardownOutcome,
+    observe: impl FnOnce(&OwnedTeardownOutcome) -> bool,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| observe(actual))).unwrap_or(false)
+}
+
+fn closed_dischargeable(
+    returned: &Returned,
+    observe: impl FnOnce(&OwnedTeardownOutcome) -> bool,
+) -> bool {
+    if returned.dischargeable() {
+        return true;
+    }
+    if returned.projected
+        && let Payload::Outcome(actual) = &returned.payload
+    {
+        return observe_restart_custody(actual, observe);
+    }
+    false
+}
+
 pub(super) fn settle_closed(state: &mut OperationState) {
-    if !state.closed {
+    settle_closed_with(state, |actual| {
+        #[cfg(target_os = "ios")]
+        {
+            actual.confirmed_restart_custody()
+        }
+        #[cfg(not(target_os = "ios"))]
+        {
+            let _ = actual;
+            false
+        }
+    });
+}
+
+fn settle_closed_with(
+    state: &mut OperationState,
+    mut observe: impl FnMut(&OwnedTeardownOutcome) -> bool,
+) {
+    if !state.closed
+        || !state.threads.is_empty()
+        || !state.join_batches.is_empty()
+        || !state.failed_joins.is_empty()
+        || state.writes_in_flight != 0
+        || state
+            .current
+            .as_ref()
+            .is_some_and(|current| current.worker_active)
+    {
         return;
     }
     let mut returned = std::mem::take(&mut state.archive.teardown.retained);
     returned.extend(state.archive.teardown.pending.take());
     for returned in returned {
-        if current_matches(state, &returned.ticket) && returned.dischargeable() {
+        if current_matches(state, &returned.ticket) && closed_dischargeable(&returned, &mut observe)
+        {
             let current = state.current.as_mut().expect("matching teardown");
             current.worker_active = false;
             operation::apply_terminal(current, returned.terminal.clone());
@@ -618,6 +669,109 @@ mod tests {
         assert!(start(&deps.operations, &ticket));
         let input = take_input(&mut deps.operations.lock().unwrap(), &ticket).unwrap();
         execute(input, || {}, crate::teardown_report::outcome)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn restart_observer_failure_and_panic_keep_effectful_returns_pending() {
+        fn effectful() -> (tempfile::TempDir, BackupWebDeps, Returned) {
+            let root = tempfile::tempdir().unwrap();
+            fs::create_dir(root.path().join("config")).unwrap();
+            fs::write(
+                root.path().join("config/journal.json"),
+                br#"{"backup":{"enabled":true,"mode":"operated"}}"#,
+            )
+            .unwrap();
+            solstone_core_backup::save_hosted_binding(
+                root.path(),
+                &solstone_core_backup::HostedBinding {
+                    broker_endpoint: "http://127.0.0.1:9".into(),
+                    ..crate::test_support::hosted_binding()
+                },
+            )
+            .unwrap();
+            let mut deps = BackupWebDeps::production(
+                root.path().to_path_buf(),
+                crate::measurement::with_geometry(crate::measurement::DeviceGeometry {
+                    free_bytes: None,
+                    total_bytes: None,
+                }),
+            );
+            deps.clock = Arc::new(FixedClock);
+            let returned = actual_return(&deps);
+            assert!(
+                !returned.dischargeable(),
+                "actual held after carrier reservation"
+            );
+            assert!(matches!(
+                &returned.payload,
+                Payload::Outcome(OwnedTeardownOutcome::Held(_))
+            ));
+            let Payload::Outcome(actual) = &returned.payload else {
+                unreachable!()
+            };
+            assert!(actual.carrier().is_some());
+            (root, deps, returned)
+        }
+        for panics in [false, true] {
+            let (root, deps, returned) = effectful();
+            let (other, _, unvisited) = effectful();
+            let Payload::Outcome(actual) = &returned.payload else {
+                unreachable!()
+            };
+            let original = Arc::as_ptr(actual.teardown_lease().unwrap());
+            receive(&deps.operations, returned);
+            receive(&deps.operations, unvisited);
+            let lifetime = deps.lifetime();
+            lifetime.request_stop();
+            {
+                let mut state = deps.operations.lock().unwrap();
+                let observed = std::cell::Cell::new(0);
+                settle_closed_with(&mut state, |_| {
+                    observed.set(observed.get() + 1);
+                    if panics {
+                        panic!("new custody observer");
+                    }
+                    false
+                });
+                assert_eq!(
+                    observed.get(),
+                    1,
+                    "matching owner reaches the actual observer"
+                );
+                assert_eq!(state.archive.teardown.retained.len(), 2);
+                let Payload::Outcome(actual) = &state.archive.teardown.retained[0].payload else {
+                    unreachable!()
+                };
+                assert_eq!(Arc::as_ptr(actual.teardown_lease().unwrap()), original);
+                assert!(state.archive.teardown.is_busy());
+            }
+            for root in [&root, &other] {
+                assert!(
+                    solstone_core_journal_io::activity::ActivityLease::try_acquire(Arc::new(
+                        solstone_core_journal_io::JournalRoot::open(root.path()).unwrap()
+                    ))
+                    .is_err()
+                );
+            }
+            assert_eq!(
+                lifetime.drain(
+                    crate::test_support::join_executor(),
+                    Instant::now() + Duration::from_millis(25)
+                ),
+                crate::BackupRouteDrain::Pending
+            );
+            assert_eq!(
+                deps.operations
+                    .lock()
+                    .unwrap()
+                    .archive
+                    .teardown
+                    .retained
+                    .len(),
+                2
+            );
+        }
     }
 
     #[test]

@@ -399,6 +399,17 @@ impl OwnedTeardownOutcome {
             && !held.outside.attempts.binding
             && !held.outside.attempts.retirement
     }
+    /// The original iOS owner can release only process-local guards at closed
+    /// route shutdown. The retained files still require ordinary readmission;
+    /// this is never a Finished or retirement receipt.
+    #[cfg(target_os = "ios")]
+    pub fn confirmed_restart_custody(&self) -> bool {
+        let Self::Held(held) = self else {
+            return false;
+        };
+        ios::confirmed_restart_custody(held).is_ok()
+    }
+
     fn held(&self) -> Option<&HeldTeardown> {
         match self {
             Self::Held(held) | Self::Unknown(held) => Some(held),
@@ -1007,6 +1018,9 @@ mod interrupt_tests {
         assert!(!owned_teardown_interrupt_observation(&unrelated, boundary).fired());
     }
 }
+
+#[cfg(any(target_os = "ios", all(unix, test, feature = "full-tests")))]
+mod restart;
 
 #[cfg(target_os = "ios")]
 mod ios;

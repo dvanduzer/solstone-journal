@@ -535,6 +535,21 @@ impl LockedDestination {
     }
     pub fn revalidate(&self, operation: &TeardownOperation) -> Result<(), ExecuteError> {
         operation.remaining().map_err(|_| invalid())?;
+        self.verify_custody()?;
+        operation.remaining().map(|_| ()).map_err(|_| invalid())
+    }
+
+    /// Read-only live-descriptor proof for handing process-local locks back to
+    /// an existing durable recovery record. This admits no executing phase.
+    pub fn confirm_restart_custody(&self) -> Result<(), ExecuteError> {
+        let record = &self.custody.record;
+        if record.active || (record.operation == 11 && !record.reconciled) {
+            return Err(invalid());
+        }
+        self.verify_custody()
+    }
+
+    fn verify_custody(&self) -> Result<(), ExecuteError> {
         self.context.revalidate()?;
         let destination = serde_json::to_vec(&self.custody.destination).map_err(|_| invalid())?;
         let record = serde_json::to_vec(&self.custody.record).map_err(|_| invalid())?;
@@ -550,8 +565,7 @@ impl LockedDestination {
         if status != 0 {
             return Err(ExecuteError::Entry(status));
         }
-        self.context.revalidate()?;
-        operation.remaining().map(|_| ()).map_err(|_| invalid())
+        self.context.revalidate()
     }
     pub fn retire(&mut self, operation: &TeardownOperation) -> Result<(), ExecuteError> {
         self.revalidate(operation)?;
