@@ -1,0 +1,25 @@
+#!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026 sol pbc
+set -eu
+script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
+scratch=$(mktemp -d "${TMPDIR:-/var/tmp}/i18n-apple-locale.XXXXXXXX")
+trap 'rm -rf -- "$scratch"' EXIT
+xcrun swiftc "$script_dir/AppleLocaleCanary.swift" "$script_dir/apple-test-main.swift" -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker "$script_dir/test-localizations.plist" -o "$scratch/canary"
+mkdir -p "$scratch/TestOnly.bundle/tr.lproj" "$scratch/TestOnly.bundle/de.lproj" "$scratch/TestOnly.bundle/ar.lproj" "$scratch/Missing.bundle"
+cp "$script_dir/test-localizations.plist" "$scratch/TestOnly.bundle/Info.plist"
+cat > "$scratch/Missing.bundle/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleDevelopmentRegion</key><string>en</string></dict></plist>
+PLIST
+I18N_TEST_LANGUAGE=tr I18N_TEST_REGION=TR I18N_TEST_BUNDLE="$scratch/TestOnly.bundle" "$scratch/canary" -AppleLanguages '(tr)' -AppleLocale tr_TR
+I18N_TEST_LANGUAGE=de I18N_TEST_REGION=DE I18N_TEST_BUNDLE="$scratch/TestOnly.bundle" "$scratch/canary" -AppleLanguages '(de)' -AppleLocale de_DE
+I18N_TEST_LANGUAGE=ar I18N_TEST_REGION=SA I18N_TEST_BUNDLE="$scratch/TestOnly.bundle" "$scratch/canary" -AppleLanguages '(ar)' -AppleLocale ar_SA
+if I18N_TEST_LANGUAGE=de I18N_TEST_REGION=DE I18N_TEST_BUNDLE="$scratch/TestOnly.bundle" "$scratch/canary" -AppleLanguages '(tr)' -AppleLocale tr_TR; then
+    echo 'wrong-process-locale control passed unexpectedly' >&2
+    exit 1
+fi
+if I18N_TEST_LANGUAGE=tr I18N_TEST_REGION=TR I18N_TEST_BUNDLE="$scratch/Missing.bundle" "$scratch/canary" -AppleLanguages '(tr)' -AppleLocale tr_TR; then
+    echo 'missing-declaration control passed unexpectedly' >&2
+    exit 1
+fi
+echo 'Apple locale harness: activation and refusal controls passed'

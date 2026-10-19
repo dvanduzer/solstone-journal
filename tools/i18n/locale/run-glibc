@@ -1,0 +1,30 @@
+#!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026 sol pbc
+set -eu
+if [ "$#" -lt 5 ] || [ "$4" != -- ]; then
+    echo 'usage: run-glibc LOCALE SOURCE_LOCALE EXPECTED_MONTH -- COMMAND [ARGS...]' >&2
+    echo 'Test-only: e.g. de_DE.UTF-8 de_DE Oktober. Builds missing locales privately. A libc canary must pass before the test starts. Rust std does not follow libc locale; inspect spawned process environments separately.' >&2
+    exit 2
+fi
+requested=$1
+locale_source=$2
+expected_month=$3
+shift 4
+if [[ ! $requested =~ ^[a-z]{2,3}_[A-Z]{2}\.UTF-8$ ]] || [[ ! $locale_source =~ ^[a-z]{2,3}_[A-Z]{2}$ ]]; then
+    echo 'unsupported locale/source spelling' >&2
+    exit 2
+fi
+if [ "${requested%.UTF-8}" != "$locale_source" ]; then
+    echo 'locale/source mismatch' >&2
+    exit 2
+fi
+script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
+scratch=$(mktemp -d "${TMPDIR:-/var/tmp}/i18n-locale.XXXXXXXX")
+trap 'rm -rf -- "$scratch"' EXIT
+cc -Wall -Wextra -Werror "$script_dir/canary.c" -o "$scratch/canary"
+# Always construct the requested locale privately: never install host-wide locale data.
+mkdir "$scratch/locales"
+localedef --no-archive -i "$locale_source" -f UTF-8 "$scratch/locales/$requested"
+env LOCPATH="$scratch/locales" LC_ALL="$requested" LANG="$requested" "$scratch/canary" "$requested" "$expected_month"
+env LOCPATH="$scratch/locales" LC_ALL="$requested" LANG="$requested" "$@"

@@ -1,0 +1,25 @@
+#!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (c) 2026 sol pbc
+set -eu
+script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
+"$script_dir/run-glibc" tr_TR.UTF-8 tr_TR Ekim -- /usr/bin/locale decimal_point
+"$script_dir/run-glibc" de_DE.UTF-8 de_DE Oktober -- /usr/bin/locale decimal_point
+"$script_dir/run-glibc" ar_SA.UTF-8 ar_SA أكتوبر -- /usr/bin/locale decimal_point
+scratch=$(mktemp -d "${TMPDIR:-/var/tmp}/i18n-locale-control.XXXXXXXX")
+trap 'rmdir -- "$scratch"' EXIT
+if "$script_dir/run-glibc" de_DE.UTF-8 de_DE WRONG -- touch "$scratch/unexpected"; then
+    echo 'wrong-canary control passed unexpectedly' >&2
+    exit 1
+fi
+if [ -e "$scratch/unexpected" ]; then
+    echo 'failed canary launched the test' >&2
+    exit 1
+fi
+result=0
+"$script_dir/run-glibc" de_DE.UTF-8 de_DE Oktober -- /bin/sh -c 'exit 7' || result=$?
+if [ "$result" != 7 ]; then
+    echo "test exit was not propagated: $result" >&2
+    exit 1
+fi
+echo 'locale harness: activation, refusal and child-exit controls passed'
