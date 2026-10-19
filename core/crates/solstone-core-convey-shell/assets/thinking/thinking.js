@@ -3032,13 +3032,14 @@
     const localCard = $('lane-local');
     const localActive = brain.kind === 'local';
     const capabilityBlocked = localCapabilityBlocked();
+    const capabilityUnknown = state.localCapability?.overall === 'unknown';
     const gpuBlocked = !capabilityBlocked && localIsGpuBlocked();
     const endpointOverride = localEndpointConfigured();
     const forkHintEl = $('forkHint');
     if (brain.kind !== 'none') {
       setText('forkHint', 'one at a time. the one with the dot is active right now.');
       setElementData(forkHintEl, 'forkHint', 'data-fork-hint', 'active');
-    } else if (capabilityBlocked || gpuBlocked) {
+    } else if (capabilityBlocked || capabilityUnknown || gpuBlocked) {
       setText('forkHint', 'pick one of these, or choose later.');
       setElementData(forkHintEl, 'forkHint', 'data-fork-hint', 'no-local');
     } else {
@@ -3060,6 +3061,18 @@
       const desc = $('localLaneDescription');
       if (desc) {
         setLocalReason(desc, state.localCapability?.detail || '');
+      }
+      setText('localLaneStatus', '');
+      if (localCard) {
+        removeElementData(localCard, 'openView', 'data-open-view');
+      }
+    } else if (capabilityUnknown) {
+      const copyUnknown = localCopy();
+      setPill('localLanePill', copyUnknown.pill);
+      const desc = $('localLaneDescription');
+      if (desc) {
+        clearLocalReason(desc);
+        setText('localLaneDescription', copyUnknown.sub || '');
       }
       setText('localLaneStatus', '');
       if (localCard) {
@@ -3603,6 +3616,19 @@
         activate: false,
         bootstrap: false,
         cancel: false,
+        tone: '',
+      };
+    }
+    if (state.localCapability?.overall === 'unknown') {
+      const text = copy.local_recovery?.states?.local_probe_failed || {};
+      return {
+        pill: text.pill || "couldn't check",
+        title: 'local',
+        sub: text.verdict || "couldn't check local setup",
+        message: '',
+        notice: text.reason || "try checking again in a moment.",
+        activate: false,
+        bootstrap: false,
         tone: '',
       };
     }
@@ -5191,7 +5217,7 @@
   }
 
   async function openLane(lane) {
-    if (lane === 'local' && localCapabilityBlocked()) {
+    if (lane === 'local' && (localCapabilityBlocked() || state.localCapability?.overall === 'unknown')) {
       return;
     }
     if (lane === 'confidential') {

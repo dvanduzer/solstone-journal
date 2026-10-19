@@ -1360,7 +1360,8 @@ pub fn setup_copy(_facts: &SetupCatalogFacts) -> serde_json::Value {
             "choose_later": "choose thinking when you're ready",
             "change": "change",
             "later": "decide later",
-            "continue": "continue"
+            "continue": "continue",
+            "check_unknown": "couldn't check local setup."
         },
         "downloads": {
             "speech": "speech recognition",

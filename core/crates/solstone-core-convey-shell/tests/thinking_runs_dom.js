@@ -1973,14 +1973,24 @@ async function main() {
   assert.notStrictEqual(laneStatus.textContent, thinking.localLaneBlocked.setup, '#localLaneStatus text is not setup');
 
   // Clear capability and render same binary_missing fixture
-  for (const cap of [null, {overall: 'unknown'}]) {
-    thinking.state.localCapability = cap;
-    thinking.state.localAvailability = {available: false, reason_code: 'binary_missing', reason: 'local runtime is not installed'};
-    thinking.renderMainLanes();
-    assert.strictEqual(laneLine.textContent, blocked.setup, 'description is blocked.setup again');
-    assert.strictEqual(laneLocalNode.dataset.openView, 'local-setup', 'card action is restored on dataset');
-    assert.strictEqual(laneLocalNode.getAttribute('data-open-view'), 'local-setup', 'card action is restored on attribute');
-  }
+  thinking.state.localCapability = null;
+  thinking.state.localAvailability = {available: false, reason_code: 'binary_missing', reason: 'local runtime is not installed'};
+  thinking.renderMainLanes();
+  assert.strictEqual(laneLine.textContent, blocked.setup, 'description is blocked.setup again');
+  assert.strictEqual(laneLocalNode.dataset.openView, 'local-setup', 'card action is restored on dataset');
+  assert.strictEqual(laneLocalNode.getAttribute('data-open-view'), 'local-setup', 'card action is restored on attribute');
+
+  // Unknown capability with that same availability
+  thinking.state.localCapability = {overall: 'unknown'};
+  thinking.state.localAvailability = {available: false, reason_code: 'binary_missing', reason: 'local runtime is not installed'};
+  thinking.renderMainLanes();
+  assert.strictEqual(laneLocalNode.dataset.openView, undefined, 'card has no dataset.openView on unknown');
+  assert.strictEqual(laneLocalNode.getAttribute('data-open-view'), null, 'card has no data-open-view attribute on unknown');
+  thinking.renderLocal();
+  assert.strictEqual(nodes.get('localBootstrap').hidden, true, '#localBootstrap hidden on unknown');
+  thinking.showView('main');
+  await thinking.openLane('local');
+  assert.strictEqual(nodes.get('thinkingLocalSetup').hidden, true, 'thinkingLocalSetup stays hidden on unknown');
 
   // Local page: install_state: 'failed' plus blocked capability
   thinking.state.install = {install_state: 'failed'};

@@ -585,15 +585,38 @@ pub(crate) fn local_capability(report: &CheckReport) -> LocalCapabilityResponse 
             }],
         };
     }
-    let overall = if rows().any(|check| check.severity == Severity::Unknown) {
-        "unknown"
-    } else {
-        "ok"
-    };
+    if rows().any(|check| check.severity == Severity::Unknown) {
+        let checks =
+            if rows().any(|check| check.name == "gpu" && check.severity == Severity::Unknown) {
+                vec![LocalCapabilityCheck {
+                    name: "local",
+                    severity: "unknown",
+                    reason_code: "gpu",
+                    detail: gpu_memory_unknown_reason(),
+                }]
+            } else {
+                Vec::new()
+            };
+        return LocalCapabilityResponse {
+            overall: "unknown",
+            checks,
+        };
+    }
     LocalCapabilityResponse {
-        overall,
+        overall: "ok",
         checks: Vec::new(),
     }
+}
+
+fn thinking_copy_pointer_string(pointer: &str) -> String {
+    serde_json::to_value(thinking_copy_payload())
+        .ok()
+        .and_then(|copy| {
+            copy.pointer(pointer)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_default()
 }
 
 /// The thinking page's own owner copy for the refusal this row predicts.
@@ -603,14 +626,11 @@ fn local_unavailable_reason(row: &str) -> String {
         "memory" => "/local_install/memory_failed",
         _ => "/local_recovery/states/unsupported/reason",
     };
-    serde_json::to_value(thinking_copy_payload())
-        .ok()
-        .and_then(|copy| {
-            copy.pointer(pointer)
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .unwrap_or_default()
+    thinking_copy_pointer_string(pointer)
+}
+
+fn gpu_memory_unknown_reason() -> String {
+    thinking_copy_pointer_string("/local_install/gpu_memory_unknown")
 }
 
 pub(crate) fn injected_init_html() -> String {
@@ -1745,9 +1765,18 @@ mod local_capability_tests {
 
     #[test]
     fn unreadable_hardware_stays_unknown() {
-        let linux_unknown = local_capability(&build_check_report(&linux_with_nvidia(None)));
+        let linux_report = build_check_report(&linux_with_nvidia(None));
+        let raw_detail = linux_report
+            .checks
+            .iter()
+            .find(|c| c.name == "gpu")
+            .map(|c| c.detail.as_str())
+            .unwrap_or("");
+        let linux_unknown = local_capability(&linux_report);
         assert_eq!(linux_unknown.overall, "unknown");
-        assert!(linux_unknown.checks.is_empty());
+        assert_eq!(linux_unknown.checks.len(), 1);
+        assert!(!linux_unknown.checks[0].detail.is_empty());
+        assert_ne!(linux_unknown.checks[0].detail, raw_detail);
         let darwin_unknown =
             local_capability(&build_check_report(&inputs("Darwin", "arm64", None)));
         assert_eq!(darwin_unknown.overall, "unknown");
