@@ -88,6 +88,9 @@ pub struct Plan {
 
 pub fn safe_relative(path: &str) -> Result<()> {
     if path.is_empty()
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
         || path.contains('\\')
         || Path::new(path)
             .components()
@@ -229,7 +232,9 @@ pub fn validate_inventory(inventory: &Inventory) -> Result<()> {
     }
     let mut roots = BTreeSet::new();
     for root in &inventory.roots {
-        safe_relative(root)?;
+        if root != "." {
+            safe_relative(root)?;
+        }
         if !roots.insert(root) {
             return Err("duplicate discovery root".into());
         }
@@ -239,7 +244,7 @@ pub fn validate_inventory(inventory: &Inventory) -> Result<()> {
         if !inventory
             .roots
             .iter()
-            .any(|root| Path::new(path).starts_with(root))
+            .any(|root| root == "." || Path::new(path).starts_with(root))
         {
             return Err(format!("file outside declared discovery roots: {path}"));
         }
@@ -502,7 +507,9 @@ mod tests {
 
     #[test]
     fn unsafe_paths_and_parser_errors_fail() {
-        for p in ["../x", "/x", "src/../x", "src\\x", ""] {
+        for p in [
+            "../x", "/x", "src/../x", "src\\x", "", "src//x", "src/./x", "src/",
+        ] {
             assert!(safe_relative(p).is_err());
         }
         assert!(discover_rust("fn broken(").is_err());

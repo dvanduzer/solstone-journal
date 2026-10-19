@@ -35,7 +35,11 @@ fn source_path(root: &Path, relative: &str) -> Result<PathBuf> {
     Ok(target)
 }
 fn walk(root: &Path, path: &str, files: &mut BTreeSet<String>) -> Result<()> {
-    let full = source_path(root, path)?;
+    let full = if path == "." {
+        root.to_path_buf()
+    } else {
+        source_path(root, path)?
+    };
     if full.is_file() {
         if matches!(
             full.extension().and_then(|v| v.to_str()),
@@ -53,7 +57,12 @@ fn walk(root: &Path, path: &str, files: &mut BTreeSet<String>) -> Result<()> {
             if matches!(name.as_str(), ".git" | "target" | ".build" | "node_modules") {
                 continue;
             }
-            walk(root, &format!("{path}/{name}"), files)?;
+            let relative = if path == "." {
+                name
+            } else {
+                format!("{path}/{name}")
+            };
+            walk(root, &relative, files)?;
         }
     } else {
         return Err(format!("not a regular source or directory: {path}"));
@@ -255,7 +264,7 @@ fn run(args: &[String]) -> Result<serde_json::Value> {
         Some("plan") if args.len()==4 => { let plan=build_plan(&read(&args[1])?,&read(&args[2])?)?;write(&args[3],&plan)?;Ok(serde_json::json!({"planned_files":plan.files.len()})) }
         Some("apply") if args.len()==4 && args[3]=="--apply" => { let root=fs::canonicalize(&args[1]).map_err(|e|e.to_string())?;Ok(serde_json::json!({"applied_files":apply(&root,&read(&args[2])?)?})) }
         Some("reconcile") if args.len()==3 => { Ok(serde_json::to_value(reconcile(&read(&args[1])?,&read(&args[2])?)?).map_err(|e|e.to_string())?) }
-        _ => Err("usage: i18n-extract discover ROOT OUTPUT SCAN_ROOT... [--swift-parser EXECUTABLE] | lint ROOT ADJUDICATION [--swift-parser EXECUTABLE] | plan ADJUDICATION REPLACEMENTS OUTPUT | apply ROOT PLAN --apply | reconcile ADJUDICATION CATALOG_IDS_JSON\nAll literals require revision-bound per-occurrence decisions; no file or prose heuristic exemptions. Dependency acquisition is separate; run Cargo with --locked --offline. Phase elapsed nanoseconds are reported on stderr. Multi-file apply preflights all files before writing; it does not promise crash-atomic transactions across multiple files. Do not edit sources concurrently with apply.".into()),
+        _ => Err("usage: i18n-extract discover ROOT OUTPUT SCAN_ROOT... [--swift-parser EXECUTABLE] | lint ROOT ADJUDICATION [--swift-parser EXECUTABLE] | plan ADJUDICATION REPLACEMENTS OUTPUT | apply ROOT PLAN --apply | reconcile ADJUDICATION CATALOG_IDS_JSON\nAll literals require revision-bound per-occurrence decisions; no file or prose heuristic exemptions. Use scan root '.' to include new top-level source directories. Dependency acquisition is separate; run Cargo with --locked --offline. Phase elapsed nanoseconds are reported on stderr. Multi-file apply preflights all files before writing; it does not promise crash-atomic transactions across multiple files. Do not edit sources concurrently with apply.".into()),
     }
 }
 fn main() -> ExitCode {
@@ -376,6 +385,38 @@ mod filesystem_tests {
         let b = discover(&scratch.0, &["tests".into(), "src".into()], None).unwrap();
         assert_eq!(a, b);
         assert_eq!(a.files["src/a.rs"].literals[0].kind, "c_string");
+    }
+
+    #[test]
+    fn whole_repository_scan_catches_new_top_level_sources() {
+        let scratch = Scratch::new();
+        fs::write(scratch.0.join("src/a.rs"), "fn a(){let _=\"ready\";}").unwrap();
+        let before = discover(&scratch.0, &[".".into()], None).unwrap();
+        assert!(before.files.contains_key("src/a.rs"));
+        fs::create_dir(scratch.0.join("new_surface")).unwrap();
+        fs::write(
+            scratch.0.join("new_surface/label.rs"),
+            "fn label(){println!(\"new label\");}",
+        )
+        .unwrap();
+        let after = discover(&scratch.0, &[".".into()], None).unwrap();
+        assert!(after.files.contains_key("new_surface/label.rs"));
+        let literal = &before.files["src/a.rs"].literals[0];
+        let a = Adjudication {
+            version: 1,
+            inventory: before.clone(),
+            decisions: vec![Decision {
+                file: "src/a.rs".into(),
+                start: literal.start,
+                end: literal.end,
+                class: Class::Presentation,
+                reason: "synthetic helper label".into(),
+                message_id: Some("fixture.state.ready".into()),
+            }],
+        };
+        assert_eq!(lint(&before, &a).unwrap(), 1);
+        assert!(lint(&after, &a).unwrap_err().contains("discovery changed"));
+        assert!(safe_relative(".").is_err()); // Editable file paths still cannot address the root.
     }
 
     #[cfg(unix)]
