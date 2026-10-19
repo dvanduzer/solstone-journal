@@ -2287,6 +2287,7 @@ dependencies = [
  "solstone-core-generate",
  "solstone-core-generate-wire",
  "solstone-core-indexer-store",
+ "solstone-core-installed-payload",
  "solstone-core-journal-config",
  "solstone-core-journal-config-write",
  "solstone-core-journal-io",

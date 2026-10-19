@@ -67,6 +67,7 @@ ort = { version = "=2.0.0-rc.12", default-features = false, features = ["api-24"
 [dev-dependencies]
 tempfile = "3"
 solstone-core-system = { path = "../../core/crates/solstone-core-system" }
+solstone-core-installed-payload = { path = "../../core/crates/solstone-core-installed-payload" }
 
 [patch.crates-io]
 ffmpeg-sys-next = { path = "../../core/vendor/ffmpeg-sys-next" }

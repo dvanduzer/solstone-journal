@@ -24,6 +24,15 @@ use tokio::{
 
 static NEXT_START: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(all(
+    test,
+    feature = "full-tests",
+    unix,
+    not(any(target_os = "android", target_os = "ios"))
+))]
+#[path = "backup_current_effect_tests.rs"]
+mod current_effect_tests;
+
 fn routine(envelope: &CallosumEnvelope) -> Option<EmbeddedBackupRoutine> {
     if envelope.tract != "supervisor" || envelope.event != "request" {
         return None;
