@@ -5316,6 +5316,7 @@ dependencies = [
  "solstone-core-segment",
  "solstone-core-sol-link",
  "solstone-core-system",
+ "solstone-core-talent-runtime",
  "solstone-core-transcripts",
  "spl-core",
  "spl-home",
