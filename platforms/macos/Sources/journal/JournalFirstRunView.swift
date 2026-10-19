@@ -414,7 +414,7 @@ struct JournalFirstRunView: View {
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
-                } else if model.displayedThinkingChoice != nil {
+                } else if let choice = model.displayedThinkingChoice, choice != .later {
                     savedThinking(copy)
                 } else {
                     Text(copy.thinking.chooseLater)
@@ -429,7 +429,10 @@ struct JournalFirstRunView: View {
                 .accessibilityIdentifier(AXID.Journal.Ritual.thinkingChange)
                 .disabled(model.userOperationInFlight || model.pendingOperation != .none)
                 if model.choosingThinking {
-                    ForEach(copy.thinking.choices, id: \.id) { choice in
+                    ForEach(
+                        copy.thinking.choices.filter { $0.id != JournalThinkingChoice.local.rawValue || model.offersLocalThinking },
+                        id: \.id
+                    ) { choice in
                         let selected = model.displayedThinkingChoice?.rawValue == choice.id
                         Button {
                             model.selectThinking(choice.id)
@@ -448,10 +451,7 @@ struct JournalFirstRunView: View {
                             }
                         }
                         .accessibilityAddTraits(selected ? .isSelected : [])
-                        .disabled(
-                            model.userOperationInFlight || model.pendingOperation != .none
-                                || (choice.id == "local" && model.setupState?.thinking.capability != .ok)
-                        )
+                        .disabled(model.userOperationInFlight || model.pendingOperation != .none)
                         .modifier(ThinkingChoiceIdentifier(choiceID: choice.id))
                     }
                     Button {
@@ -508,9 +508,7 @@ struct JournalFirstRunView: View {
     @ViewBuilder
     private func savedThinking(_ copy: JournalSetupCopy) -> some View {
         let choice = model.displayedThinkingChoice
-        if choice == .later {
-            Text(copy.thinking.later)
-        } else if let row = copy.thinking.choices.first(where: { $0.id == choice?.rawValue }) {
+        if let row = copy.thinking.choices.first(where: { $0.id == choice?.rawValue }) {
             Text(row.label)
             Text(row.sub)
                 .foregroundStyle(.secondary)

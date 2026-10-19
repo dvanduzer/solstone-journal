@@ -1026,6 +1026,49 @@ extension JournalFirstRunModelTests {
         }
     }
 
+    @Test(arguments: ["blocked", "unknown"])
+    func thinkingThisComputerCannotRunDefaultsToLaterAndContinueFinishes(capability: String) async throws {
+        let world = try makeSetupWorld(configureRoot: true, markState: "locked", saved: false,
+                                      capabilityName: capability)
+        defer { world.refresh.release() }
+        try seedContinuation(world.fixture.continuation, root: world.root)
+        await world.fixture.model.reconcileActivation()
+        #expect(world.fixture.model.route == .ritual(.thinking))
+        #expect(!world.fixture.model.offersLocalThinking)
+        #expect(world.fixture.model.displayedThinkingChoice == .later)
+        #expect(world.fixture.model.canContinueThinking)
+        world.fixture.model.selectThinking("local")
+        #expect(world.fixture.model.displayedThinkingChoice == .later)
+        #expect(world.client.actions.isEmpty)
+        let saved = setupState(root: world.root, markState: "locked", saved: true, choice: "later",
+                               capability: capability)
+        let done = setupState(root: world.root, done: true, markState: "locked", saved: true, choice: "later",
+                              capability: capability)
+        world.client.setPerforms([saved, done])
+        await world.fixture.model.continueThinking()
+        #expect(world.client.actions == [.saveThinking(choice: "later"),
+                                        .finalize(timezone: TimeZone.autoupdatingCurrent.identifier)])
+        #expect(world.peer.launched.count == 1)
+        #expect(world.fixture.stepAsides.count == 1)
+    }
+
+    @Test func thinkingThisComputerCanRunStillDefaultsToLocal() async throws {
+        let world = try makeSetupWorld(configureRoot: true, markState: "locked", saved: false, capabilityName: "ok")
+        defer { world.refresh.release() }
+        try seedContinuation(world.fixture.continuation, root: world.root)
+        await world.fixture.model.reconcileActivation()
+        #expect(world.fixture.model.offersLocalThinking)
+        #expect(world.fixture.model.displayedThinkingChoice == .local)
+        #expect(world.fixture.model.canContinueThinking)
+        let saved = setupState(root: world.root, markState: "locked", saved: true, choice: "local")
+        let done = setupState(root: world.root, done: true, markState: "locked", saved: true, choice: "local")
+        world.client.setPerforms([saved, done])
+        await world.fixture.model.continueThinking()
+        #expect(world.client.actions == [.saveThinking(choice: "local"),
+                                        .finalize(timezone: TimeZone.autoupdatingCurrent.identifier)])
+        #expect(world.peer.launched.count == 1)
+    }
+
     @Test func saveThinkingLocalIsTheLocalSave() async throws {
         let world = try makeSetupWorld(configureRoot: true, markState: "locked", saved: false, capabilityName: "ok")
         defer { world.refresh.release() }

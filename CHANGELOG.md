@@ -8,6 +8,10 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- when you first set up your journal on windows, you can choose whether it starts when you sign in. leaving that choice out keeps the current default, and setting up your journal again keeps your existing choice.
+- after setup on windows, the journal window can continue in the solstone app. if that app is missing or too old, the window offers the download page for the solstone app for windows, and you can try again after installing it.
+- on windows, setup stays in the journal window through choosing your mark and where thinking runs, then reaches home. thinking download progress and model recovery stay available there.
+
 - the day now lists a segment that only has desktop activity notes, and you can read and search those notes.
 
 ### Fixed

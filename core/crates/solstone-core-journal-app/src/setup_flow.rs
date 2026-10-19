@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// Release activation follows native qualification in a separate commit.
-pub const SETUP_SEQUENCE_ENABLED: bool = false;
+/// Windows publication requires setup qualification on the signed candidate.
+pub const SETUP_SEQUENCE_ENABLED: bool = true;
 
 pub const APP_HOME_PATH: &str = "/app/home";
 pub const APP_ORIGIN: &str = "https://journal.localhost";
@@ -715,8 +715,7 @@ pub fn view(session: &Session) -> Value {
         Phase::Folder => Some(2),
         Phase::Mark => Some(3),
         Phase::Thinking => Some(4),
-        Phase::Home => Some(5),
-        Phase::Opening | Phase::Setup => None,
+        Phase::Home | Phase::Opening | Phase::Setup => None,
     };
 
     json!({
@@ -3119,7 +3118,7 @@ mod tests {
             (Phase::Folder, Some(2)),
             (Phase::Mark, Some(3)),
             (Phase::Thinking, Some(4)),
-            (Phase::Home, Some(5)),
+            (Phase::Home, None),
             (Phase::Opening, None),
             (Phase::Setup, None),
         ] {
@@ -3967,7 +3966,7 @@ mod tests {
         assert!(!observed_false.session.continuation_pending);
         let v = view(&observed_false.session);
         assert_eq!(v["phase"], "home");
-        assert_eq!(v["step"], 5);
+        assert!(v["step"].is_null());
         assert_eq!(v["continuation_pending"], false);
 
         let cont_again = reduce(&observed_false.session, &Event::ContinueInSolstone);
