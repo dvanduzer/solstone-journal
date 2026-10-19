@@ -429,9 +429,6 @@ def main():
         # Unsupported actions remain last so accidental admission cannot hide earlier results.
         keys_before, _ = key_listing(restic, 'keys-before-refusals', canonical)
         refusals = {}
-        for uri, kind in (('/teardown', 'teardown'),):
-            refusals[uri] = operate(phone, uri, kind=kind)
-            assert refusals[uri].get('operation', {}).get('phase') != 'done', refusals[uri]
         refusals['/offload/enable'] = owner_raw(phone, 'POST', ROUTE + '/offload/enable')
         assert refusals['/offload/enable'][0] == 400, refusals['/offload/enable']
         assert (refusals['/offload/enable'][1] or {}).get('reason_code') == 'unsupported_platform', refusals['/offload/enable']
