@@ -315,7 +315,8 @@ const stubCopy = {
     complete: "stub-download-complete",
     cancelled: "stub-download-cancelled"
   },
-  footer: "stub-footer-line"
+  footer: "stub-footer-line",
+  help: { text: "stub-help-text", link: "stub-help-link", href: "https://help.invalid" }
 };
 
 function defaultState() {
@@ -943,6 +944,8 @@ async function runTests(manifestDir) {
     assert.strictEqual(envD.doc.querySelector('input[value="spp"]').disabled, false);
     assert.strictEqual(envD.doc.querySelector('input[value="later"]').disabled, false);
     assert.strictEqual(localInputD.parent.classList.contains('is-unavailable'), true);
+    // A computer that can't run local gets no greyed choice: the row is gone and its reason stays.
+    assert.strictEqual(localInputD.parent.hidden, true);
 
     const reasonSpanD = envD.doc.getElementById('thinking-local-reason');
     assert.ok(reasonSpanD && reasonSpanD.textContent.includes('detail-blocked'));
@@ -1327,6 +1330,8 @@ async function runTests(manifestDir) {
     assert.strictEqual(env.doc.getElementById('thinking-change').textContent, stubCopy.thinking.change);
     assert.strictEqual(env.doc.getElementById('thinking-continue').textContent, stubCopy.thinking.continue);
     assert.strictEqual(env.doc.getElementById('setup-footer').textContent, stubCopy.footer);
+    assert.strictEqual(env.doc.getElementById('setup-help').hidden, false);
+    assert.strictEqual(env.doc.getElementById('setup-help-link').href, stubCopy.help.href);
 
     assert.strictEqual(env.doc.getElementById('fits-journal-term').textContent, stubCopy.fits.journal_term);
     assert.strictEqual(env.doc.getElementById('fits-journal').textContent, stubCopy.fits.journal);
@@ -2018,7 +2023,11 @@ async function runTests(manifestDir) {
     await settle();
     assert.strictEqual(cancel.hidden,false);
     assert.strictEqual(cancel.disabled,false);
-    assert.ok(env.doc.getElementById('download-thinking').querySelector('.download-status').textContent.includes('8/11'));
+    assert.ok(env.doc.getElementById('download-thinking').querySelector('.download-status').textContent.includes('8 B / 11 B'));
+    const bar = env.doc.getElementById('download-thinking').querySelector('.download-bar');
+    assert.strictEqual(bar.hidden, false);
+    assert.strictEqual(bar.value, 8);
+    assert.strictEqual(bar.max, 11);
   }
 
   // A read returning idle during admission cannot obsolete its eventual action response.
@@ -2046,7 +2055,7 @@ async function runTests(manifestDir) {
     reconciliation.resolve({...initial,downloads:{thinking:{state:'downloading',attempt_id:'eventual-admission',bytes_done:3,bytes_total:11},speech:{state:'idle'}}});
     await settle();
     assert.strictEqual(env.doc.getElementById('download-thinking').hidden,false);
-    assert.ok(env.doc.getElementById('download-thinking').querySelector('.download-status').textContent.includes('3/11'));
+    assert.ok(env.doc.getElementById('download-thinking').querySelector('.download-status').textContent.includes('3 B / 11 B'));
     assert.strictEqual(env.doc.getElementById('download-thinking-cancel').hidden,false);
   }
 
@@ -2089,14 +2098,14 @@ async function runTests(manifestDir) {
     retry.resolve({...initial,downloads:{...initial.downloads,
       [task]:{state:'downloading',attempt_id:'b',bytes_done:2,bytes_total:20}}});
     await settle();
-    assert.ok(env.doc.getElementById(`download-${task}`).querySelector('.download-status').textContent.includes('8/20'));
+    assert.ok(env.doc.getElementById(`download-${task}`).querySelector('.download-status').textContent.includes('8 B / 20 B'));
     env.advanceTime(1000);
     const fresh = env.nextPending('/init/api/state');
     assert.ok(fresh);
     fresh.resolve({...current,downloads:{...current.downloads,
       [task]:{...current.downloads[task],bytes_done:12}}});
     await settle();
-    assert.ok(env.doc.getElementById(`download-${task}`).querySelector('.download-status').textContent.includes('12/20'));
+    assert.ok(env.doc.getElementById(`download-${task}`).querySelector('.download-status').textContent.includes('12 B / 20 B'));
     if (task === 'thinking') {
       env.doc.getElementById('download-thinking-cancel').click();
       await settle();
@@ -2120,7 +2129,7 @@ async function runTests(manifestDir) {
     await settle();
     assert.strictEqual(env.doc.querySelectorAll('input[name="thinking-choice"]').find(r => r.checked).value,'byo');
     assert.strictEqual(env.doc.getElementById('download-thinking').hidden,false);
-    assert.ok(env.doc.getElementById('download-thinking').querySelector('.download-status').textContent.includes('4/11'));
+    assert.ok(env.doc.getElementById('download-thinking').querySelector('.download-status').textContent.includes('4 B / 11 B'));
     assert.strictEqual(env.allRequests.filter(r => r.opts.body && JSON.parse(r.opts.body).action === 'finalize').length,0);
     env.doc.getElementById('download-thinking-cancel').click();
     await settle();
@@ -2143,7 +2152,7 @@ async function runTests(manifestDir) {
     assert.ok(fresh);
     fresh.resolve({...initial,downloads:{thinking:{state:'idle'},speech:{state:'downloading',attempt_id:'eventual-speech',bytes_done:6,bytes_total:11}}});
     await settle();
-    assert.ok(env.doc.getElementById('download-speech').querySelector('.download-status').textContent.includes('6/11'));
+    assert.ok(env.doc.getElementById('download-speech').querySelector('.download-status').textContent.includes('6 B / 11 B'));
     assert.strictEqual(env.doc.getElementById('download-speech-retry').hidden,true);
   }
   // Proposal mutation exclusion must not hold the independent download read guard.
@@ -2160,7 +2169,7 @@ async function runTests(manifestDir) {
     assert.ok(progress);
     progress.resolve({...defaultState(),downloads:{thinking:{state:'idle'},speech:{state:'downloading',attempt_id:'speech',bytes_done:7,bytes_total:11}}});
     await settle();
-    assert.ok(env.doc.getElementById('download-speech').querySelector('.download-status').textContent.includes('7/11'));
+    assert.ok(env.doc.getElementById('download-speech').querySelector('.download-status').textContent.includes('7 B / 11 B'));
     assert.strictEqual(proposal.isPending,true);
   }
   // Every glyph the journal can propose must remain usable with strict render validation.
@@ -2186,7 +2195,7 @@ async function runTests(manifestDir) {
     admitted.resolve({...initial,downloads:{thinking:{state:'idle'},speech:{state:'downloading',attempt_id:'automatic-speech',bytes_done:8,bytes_total:11}}});
     await settle();
     assert.strictEqual(env.doc.getElementById('download-speech').hidden,false);
-    assert.ok(env.doc.getElementById('download-speech').querySelector('.download-status').textContent.includes('8/11'));
+    assert.ok(env.doc.getElementById('download-speech').querySelector('.download-status').textContent.includes('8 B / 11 B'));
     assert.strictEqual(env.doc.getElementById('setup-mark').hidden,false);
   }
   // Mark mutations preserve newer job observations rather than replacing downloads wholesale.
@@ -2208,11 +2217,11 @@ async function runTests(manifestDir) {
     mutation.resolve({...initial,mark:{state:action === 'commit_mark' ? 'locked' : 'proposed',proposal_id:action === 'commit_mark' ? 'x' : 'y',render:makeMark()},
       downloads:{...initial.downloads,thinking:{state:'downloading',attempt_id:'b',bytes_done:2,bytes_total:20}}});
     await settle();
-    assert.ok(env.doc.getElementById('download-thinking').querySelector('.download-status').textContent.includes('8/20'));
+    assert.ok(env.doc.getElementById('download-thinking').querySelector('.download-status').textContent.includes('8 B / 20 B'));
     env.advanceTime(1000);
     env.nextPending('/init/api/state').resolve({...current,downloads:{...current.downloads,thinking:{...current.downloads.thinking,bytes_done:12}}});
     await settle();
-    assert.ok(env.doc.getElementById('download-thinking').querySelector('.download-status').textContent.includes('12/20'));
+    assert.ok(env.doc.getElementById('download-thinking').querySelector('.download-status').textContent.includes('12 B / 20 B'));
     env.doc.getElementById('download-thinking-cancel').click();
     await settle();
     assert.strictEqual(JSON.parse(env.nextPending('/init/api/action').opts.body).attempt_id,'c');

@@ -32,8 +32,12 @@ pub fn present_brain_inspection(
 ) -> BrainPresentation {
     let projection = &inspection.projection;
     let reason = projection.reason_code.as_deref();
+    // A local model still downloading or starting is setup under way, not a fault.
     let progressing = reason == Some("brain_check_in_progress")
-        || (reason == Some("local_runtime_not_ready") && projection.runtime_transition_in_progress);
+        || (matches!(
+            reason,
+            Some("local_runtime_not_ready" | "local_artifact_not_ready")
+        ) && projection.runtime_transition_in_progress);
     let (mut failing_component, observed_at) = evidence_view(inspection.record.as_ref());
     if failing_component.is_none() {
         failing_component = component_for_reason(reason);
@@ -73,7 +77,11 @@ fn headline(state: &str, reason: Option<&str>, progressing: bool) -> &'static st
         ("blocked", Some("attestation_not_verified")) => {
             "can't reach confidential processing right now"
         }
-        ("blocked", Some("local_runtime_not_ready")) if progressing => "setting up local thinking",
+        ("blocked", Some("local_runtime_not_ready" | "local_artifact_not_ready"))
+            if progressing =>
+        {
+            "setting up local thinking"
+        }
         // A local model that has stopped was set up once; it is not a first-run step.
         ("blocked", Some("local_runtime_not_ready")) => "local thinking isn't running",
         ("blocked", Some("nvattest_platform_unsupported")) => NOT_ON_PLATFORM,
@@ -332,6 +340,10 @@ mod tests {
         assert!(!unreachable.progressing);
         assert!(local.progressing);
         assert!(!stopped.progressing);
+        // A local model that is still downloading is setup under way, never a fault.
+        let downloading = view_of("blocked", "local_artifact_not_ready", true);
+        assert!(downloading.progressing);
+        assert_eq!(downloading.headline, local.headline);
         let headlines = [&unreachable.headline, &local.headline, &stopped.headline];
         for (index, headline) in headlines.iter().enumerate() {
             assert_ne!(**headline, setup.headline);

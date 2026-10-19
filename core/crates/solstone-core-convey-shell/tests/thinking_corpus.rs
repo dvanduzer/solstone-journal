@@ -970,10 +970,10 @@ fn replay_full_recorded_case(
             let mut value: Value =
                 serde_json::from_slice(&response.3).expect("normalized response is JSON");
             // the capability answer is this computer's and is not part of the captured corpus.
-            if case["path"] == "/app/thinking/api/state" {
-                if let Some(map) = value.as_object_mut() {
-                    map.remove("local_capability");
-                }
+            if case["path"] == "/app/thinking/api/state"
+                && let Some(map) = value.as_object_mut()
+            {
+                map.remove("local_capability");
             }
             for (path, kind) in case
                 .get("normalized_fields")

@@ -1284,7 +1284,7 @@ fn brain_refresh_argv_for_platform_kind(
     }
 }
 
-fn send_brain_refresh_request(journal_root: &Path) -> bool {
+pub(crate) fn send_brain_refresh_request(journal_root: &Path) -> bool {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
     let Some(cmd) = brain_refresh_argv() else {

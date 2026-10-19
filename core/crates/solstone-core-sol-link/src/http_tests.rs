@@ -857,9 +857,16 @@ struct FakeSetupHost {
     projected: std::sync::Mutex<Option<SetupDownloads>>,
     project_error: std::sync::Mutex<Option<SetupProgressError>>,
     thinking_bytes: std::sync::Mutex<Option<Option<u64>>>,
+    /// How many downloads had started when each thinking check was asked for.
+    brain_refreshes: std::sync::Mutex<Vec<usize>>,
 }
 
 impl SetupHost for FakeSetupHost {
+    fn refresh_brain(&self, _journal_root: &Path) {
+        let started = self.start_calls.lock().unwrap().len();
+        self.brain_refreshes.lock().unwrap().push(started);
+    }
+
     fn start_local(&self, journal_root: &Path) -> Result<(), String> {
         self.start_calls
             .lock()
@@ -1225,7 +1232,21 @@ async fn save_thinking_local_respects_capability() {
                 config["providers"]["active"]
             );
             assert_eq!(host.start_calls.lock().unwrap().len(), 1);
+            // The new choice asks for a fresh thinking check, after its download started.
+            assert_eq!(*host.brain_refreshes.lock().unwrap(), vec![1]);
+            let repeat = request_with_host(
+                temporary.path(),
+                host.clone(),
+                AccessBasis::Localhost,
+                Method::POST,
+                "/init/api/action",
+                Some(json!({"action":"save_thinking", "choice":"local"})),
+            )
+            .await;
+            assert_eq!(repeat.status(), StatusCode::OK);
+            assert_eq!(host.brain_refreshes.lock().unwrap().len(), 1);
         } else {
+            assert!(host.brain_refreshes.lock().unwrap().is_empty());
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             assert_eq!(
                 response_json(response).await["reason_code"],

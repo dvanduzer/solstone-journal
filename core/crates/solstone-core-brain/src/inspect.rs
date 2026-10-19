@@ -383,20 +383,34 @@ fn inspect_durable_brain_state_with_clock(
     } else {
         false
     };
-    inspection(
-        InspectionStatus::Ok,
-        project_brain_state_with_journal(
-            Some(&record),
-            config,
-            refresh_permit_active,
-            Some(&key),
-            runtime.as_ref(),
-            now,
-            Some(journal_path),
-        ),
-        None,
-        raw,
-    )
+    let mut projection = project_brain_state_with_journal(
+        Some(&record),
+        config,
+        refresh_permit_active,
+        Some(&key),
+        runtime.as_ref(),
+        now,
+        Some(journal_path),
+    );
+    // The runtime record only notices a model download on its next pass. The
+    // install record knows at once, so a local model the owner just chose
+    // reads as being set up from the first second, not as a fault.
+    // A check recorded before the owner chose local is out of date in the
+    // same second; until the queued check lands, the install is the answer.
+    if projection.active_lane.as_deref() == Some("bundled")
+        && matches!(
+            projection.reason_code.as_deref(),
+            Some("local_artifact_not_ready" | "local_runtime_not_ready" | "brain_config_changed")
+        )
+        && crate::runtime_health::local_install_in_flight(journal_path)
+    {
+        if projection.reason_code.as_deref() == Some("brain_config_changed") {
+            projection.aggregate_state = aggregate_for_reason("local_artifact_not_ready");
+            projection.reason_code = Some("local_artifact_not_ready".to_owned());
+        }
+        projection.runtime_transition_in_progress = true;
+    }
+    inspection(InspectionStatus::Ok, projection, None, raw)
 }
 
 pub fn project_brain_state(

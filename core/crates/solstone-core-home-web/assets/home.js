@@ -178,7 +178,18 @@
   function setSurfaceHtml(html) {
     if (!surface) return;
     surface.innerHTML = html;
+    keepGettingStartedFirst();
     renderBriefingSections(briefingSections);
+  }
+
+  // The first-minutes card leads the page, right under the status line,
+  // whichever read finished first and inserted it.
+  function keepGettingStartedFirst() {
+    if (!surface || typeof surface.querySelector !== 'function') return;
+    const card = surface.querySelector('[data-home-surface="getting-started"]');
+    const vitals = surface.querySelector('[data-home-surface="vitals"]');
+    if (!card || !vitals || vitals.nextElementSibling === card) return;
+    if (typeof vitals.after === 'function') vitals.after(card);
   }
 
   function replaceHomeSurface(name, html, previousNames) {
@@ -190,6 +201,7 @@
       } else {
         current.remove();
       }
+      keepGettingStartedFirst();
       renderBriefingSections(briefingSections);
       restoreSectionState();
       return;
@@ -205,6 +217,7 @@
     } else if (typeof surface.insertAdjacentHTML === 'function') {
       surface.insertAdjacentHTML('beforeend', html);
     }
+    keepGettingStartedFirst();
     renderBriefingSections(briefingSections);
     restoreSectionState();
   }
@@ -765,6 +778,7 @@
       } else {
         replaceHomeSurface('getting-started', html, predecessors('getting-started'));
       }
+      keepGettingStartedFirst();
     } else {
       if (currentGettingStarted) {
         if (isWelcome) {

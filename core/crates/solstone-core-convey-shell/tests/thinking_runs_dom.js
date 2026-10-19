@@ -2456,9 +2456,18 @@ async function main() {
   assert.strictEqual(activeValueNode.textContent, 'headline-fixture');
   assert.strictEqual(thinking.state.providers.brain.reason_code, 'thinking_engine_not_chosen');
 
-  // byo
+  // byo: the headline names the saved choice, so no "nothing chosen" sits under it,
+  // and no action sends the owner to the page they are already on.
+  thinking.state.providers.brain = {
+    ...thinking.state.providers.brain,
+    reason_text: 'reason-fixture',
+    identity: { lane: 'byo' },
+    action: { label: 'open thinking', href: '/app/thinking/#main' },
+  };
   thinking.state.savedLane = 'byo';
   thinking.renderGlance();
+  assert.strictEqual(nodes.get('thinkingActiveDetail').textContent, '');
+  assert.strictEqual(nodes.get('brainCheckAction').hidden, true);
   assert.notStrictEqual(nodes.get('thinkingIntro').textContent, unchosenIntro);
   assert.strictEqual(glanceNode.dataset.glanceState, 'saved');
   assert.strictEqual(glanceNode.dataset.savedLane, 'byo');

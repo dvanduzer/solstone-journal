@@ -174,6 +174,28 @@ impl RuntimeRetryTransaction {
     }
 }
 
+/// Whether the local model's install record says a download or install is
+/// under way. An unreadable or absent record is not in flight.
+pub fn local_install_in_flight(journal_path: &Path) -> bool {
+    let Ok(bytes) = fs::read(journal_path.join("health/providers/local.json")) else {
+        return false;
+    };
+    serde_json::from_slice::<Value>(&bytes)
+        .ok()
+        .and_then(|record| {
+            record
+                .get("install_state")
+                .and_then(Value::as_str)
+                .map(|state| {
+                    matches!(
+                        state,
+                        "resolving" | "downloading" | "verifying" | "installing"
+                    )
+                })
+        })
+        .unwrap_or(false)
+}
+
 pub fn inspect_runtime_health(journal_path: &Path) -> RuntimeRecordInspection {
     inspect_runtime_health_for_provider(journal_path, "local")
 }
@@ -700,7 +722,7 @@ mod tests {
 
     use super::{
         RuntimeRetryError, RuntimeRetryRecord, health_path, inspect_runtime_retry_token,
-        request_runtime_retry, retry_path, retry_record_value,
+        local_install_in_flight, request_runtime_retry, retry_path, retry_record_value,
     };
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -769,6 +791,28 @@ mod tests {
             )
             .expect("retry record writes");
         }
+    }
+
+    #[test]
+    fn a_local_model_download_is_in_flight_until_it_settles() {
+        let journal = TestJournal::new();
+        assert!(!local_install_in_flight(&journal.0));
+        fs::create_dir_all(journal.0.join("health/providers")).expect("providers dir");
+        let record = journal.0.join("health/providers/local.json");
+        for (state, in_flight) in [
+            ("resolving", true),
+            ("downloading", true),
+            ("verifying", true),
+            ("installing", true),
+            ("installed", false),
+            ("failed", false),
+            ("cancelled", false),
+        ] {
+            fs::write(&record, json!({"install_state": state}).to_string()).expect("record");
+            assert_eq!(local_install_in_flight(&journal.0), in_flight, "{state}");
+        }
+        fs::write(&record, b"not json").expect("record");
+        assert!(!local_install_in_flight(&journal.0));
     }
 
     impl Drop for TestJournal {

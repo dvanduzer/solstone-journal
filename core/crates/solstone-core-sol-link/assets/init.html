@@ -109,11 +109,14 @@
     .radio-desc {
       font-size: 0.8rem; color: var(--ink-faint-paper);
     }
-    .radio-option.is-unavailable { opacity: 0.5; cursor: not-allowed; }
+    .local-reason { margin: -0.4rem 0 0.75rem; }
     #requirements-link { color: var(--orange-text-aa); }
     .download-row {
       margin-top: 0.5rem; font-size: 0.85rem;
     }
+    .download-bar { display: block; width: 100%; height: 6px; margin: 0.35rem 0; accent-color: var(--orange-ink); }
+    #setup-help { font-size: 0.8rem; color: var(--ink-faint-paper); margin-top: 0.5rem; text-align: center; }
+    #setup-help a { color: var(--orange-text-aa); }
     #setup-footer {
       font-size: 0.8rem; color: var(--ink-faint-paper); margin-top: 1.5rem; text-align: center;
     }
@@ -178,17 +181,20 @@
         <div id="download-thinking" class="download-row" hidden>
           <span class="download-label"></span>
           <span class="download-status"></span>
+          <progress class="download-bar" hidden></progress>
           <button type="button" id="download-thinking-cancel" class="settings-preset-btn" hidden></button>
           <button type="button" id="download-thinking-retry" class="settings-preset-btn" hidden></button>
         </div>
         <div id="download-speech" class="download-row" hidden>
           <span class="download-label"></span>
           <span class="download-status"></span>
+          <progress class="download-bar" hidden></progress>
           <button type="button" id="download-speech-retry" class="settings-preset-btn" hidden></button>
         </div>
       </div>
 
       <p id="setup-footer"></p>
+      <p id="setup-help" hidden><span id="setup-help-text"></span> <a id="setup-help-link" target="_blank" rel="noopener noreferrer"></a></p>
     </div>
   </main>
 
@@ -246,6 +252,29 @@
       }
       const formatted = Number.isInteger(val) ? String(val) : (Math.round(val * 10) / 10).toFixed(1);
       return `${formatted} ${units[unitIdx]}`;
+    }
+
+    // "downloading… 239.4 MB / 980.9 MB" over a bar, never raw byte counts.
+    function renderDownloadProgress(row, status, job) {
+      const progress = (setupCopy && setupCopy.downloads && setupCopy.downloads.progress) || '';
+      const done = formatByteSize(job.bytes_done);
+      const total = formatByteSize(job.bytes_total);
+      const sizes = done && total ? `${done} / ${total}` : (done || '');
+      status.textContent = [progress, sizes].filter(Boolean).join(' ');
+      const bar = row.querySelector('.download-bar');
+      if (!bar) return;
+      bar.hidden = false;
+      if (typeof job.bytes_total === 'number' && job.bytes_total > 0 && typeof job.bytes_done === 'number') {
+        bar.max = job.bytes_total;
+        bar.value = Math.min(job.bytes_done, job.bytes_total);
+      } else if (typeof bar.removeAttribute === 'function') {
+        bar.removeAttribute('value');
+      }
+    }
+
+    function hideDownloadBar(row) {
+      const bar = row.querySelector('.download-bar');
+      if (bar) bar.hidden = true;
     }
 
     async function apiCall(endpoint, options = {}) {
@@ -448,6 +477,15 @@
       }
       const footer = document.getElementById('setup-footer');
       if (footer && setupCopy.footer) footer.textContent = setupCopy.footer;
+      const help = setupCopy.help;
+      const helpEl = document.getElementById('setup-help');
+      if (helpEl && help && help.text && help.link && help.href) {
+        document.getElementById('setup-help-text').textContent = help.text;
+        const link = document.getElementById('setup-help-link');
+        link.textContent = help.link;
+        link.href = help.href;
+        helpEl.hidden = false;
+      }
     }
 
     function renderThinkingOptions() {
@@ -501,16 +539,18 @@
           wrap.appendChild(descSpan);
         }
 
-        if (choice.id === 'local') {
-          const reasonSpan = document.createElement('span');
-          reasonSpan.className = 'radio-desc';
-          reasonSpan.id = 'thinking-local-reason';
-          reasonSpan.hidden = true;
-          wrap.appendChild(reasonSpan);
-        }
-
         label.append(input, wrap);
         container.appendChild(label);
+
+        // Why local isn't offered sits beside the choice, outside it, so a
+        // computer that can't run local reads a plain line, never a greyed choice.
+        if (choice.id === 'local') {
+          const reasonEl = document.createElement('p');
+          reasonEl.className = 'radio-desc local-reason';
+          reasonEl.id = 'thinking-local-reason';
+          reasonEl.hidden = true;
+          container.appendChild(reasonEl);
+        }
       });
 
       const laterLabel = document.createElement('label');
@@ -586,7 +626,7 @@
         if (changeBtn) changeBtn.hidden = false;
       } else if (activeChoiceId === 'later') {
         if (summaryEl) {
-          summaryEl.textContent = (setupCopy && setupCopy.thinking && setupCopy.thinking.later) || '';
+          summaryEl.textContent = (setupCopy && setupCopy.thinking && setupCopy.thinking.choose_later) || '';
           summaryEl.hidden = false;
         }
         if (chooseLaterEl) chooseLaterEl.hidden = true;
@@ -622,11 +662,14 @@
       if (localInput) {
         localInput.disabled = isBlocked;
         const localLabel = localInput.parentElement || localInput.parent;
-        if (localLabel && localLabel.classList) {
-          if (isBlocked) {
-            localLabel.classList.add('is-unavailable');
-          } else {
-            localLabel.classList.remove('is-unavailable');
+        if (localLabel) {
+          localLabel.hidden = isBlocked;
+          if (localLabel.classList) {
+            if (isBlocked) {
+              localLabel.classList.add('is-unavailable');
+            } else {
+              localLabel.classList.remove('is-unavailable');
+            }
           }
         }
       }
@@ -796,15 +839,9 @@
           const cancelBtn = document.getElementById('download-thinking-cancel');
           const retryBtn = document.getElementById('download-thinking-retry');
 
+          if (thinking.state !== 'downloading') hideDownloadBar(tRow);
           if (thinking.state === 'downloading') {
-            const progress = (setupCopy && setupCopy.downloads && setupCopy.downloads.progress) || '';
-            if (typeof thinking.bytes_total === 'number') {
-              status.textContent = progress ? `${progress} (${thinking.bytes_done}/${thinking.bytes_total})` : `(${thinking.bytes_done}/${thinking.bytes_total})`;
-            } else if (thinking.bytes_done != null) {
-              status.textContent = progress ? `${progress} ${thinking.bytes_done}` : `${thinking.bytes_done}`;
-            } else {
-              status.textContent = progress;
-            }
+            renderDownloadProgress(tRow, status, thinking);
             if (cancelBtn) {
               cancelBtn.hidden = displayedThinkingAttemptId ? cancelledAttemptIds.has(displayedThinkingAttemptId) : false;
               cancelBtn.disabled = pendingCancelIds.has(displayedThinkingAttemptId);
@@ -845,19 +882,13 @@
           const status = sRow.querySelector('.download-status');
           const retryBtn = document.getElementById('download-speech-retry');
 
+          if (speech.state !== 'downloading') hideDownloadBar(sRow);
           if (speech.state === 'downloading') {
             if (sLabel) {
               sLabel.textContent = (setupCopy && setupCopy.downloads && setupCopy.downloads.speech) || '';
               sLabel.hidden = false;
             }
-            const progress = (setupCopy && setupCopy.downloads && setupCopy.downloads.progress) || '';
-            if (typeof speech.bytes_total === 'number') {
-              status.textContent = progress ? `${progress} (${speech.bytes_done}/${speech.bytes_total})` : `(${speech.bytes_done}/${speech.bytes_total})`;
-            } else if (speech.bytes_done != null) {
-              status.textContent = progress ? `${progress} ${speech.bytes_done}` : `${speech.bytes_done}`;
-            } else {
-              status.textContent = progress;
-            }
+            renderDownloadProgress(sRow, status, speech);
             if (retryBtn) retryBtn.hidden = true;
           } else if (speech.state === 'complete') {
             if (sLabel) {

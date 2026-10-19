@@ -1357,7 +1357,7 @@ pub fn setup_copy(_facts: &SetupCatalogFacts) -> serde_json::Value {
             "choices": choices,
             "default_line": "on your journal's computer · {size}",
             "size_unknown": "download size unavailable",
-            "choose_later": "choose thinking when you're ready",
+            "choose_later": "choose thinking when you're ready. your journal keeps everything until then.",
             "change": "change",
             "later": "decide later",
             "continue": "continue",
@@ -1374,7 +1374,12 @@ pub fn setup_copy(_facts: &SetupCatalogFacts) -> serde_json::Value {
             "complete": "ready",
             "cancelled": "cancelled"
         },
-        "footer": "your journal is kept on your journal's computer. thinking uses the option you choose."
+        "footer": "your journal is kept on your journal's computer. thinking uses the option you choose.",
+        "help": {
+            "text": "stuck, or have a question?",
+            "link": "support.solstone.app",
+            "href": "https://support.solstone.app"
+        }
     })
 }
 

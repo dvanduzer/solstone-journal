@@ -53,6 +53,9 @@ pub trait SetupHost: Send + Sync {
     fn project_downloads(&self, journal_root: &Path) -> Result<SetupDownloads, SetupProgressError>;
     fn thinking_download_bytes(&self, journal: &Path) -> Option<u64>;
     fn catalog_facts(&self) -> SetupCatalogFacts;
+    /// Ask for a fresh thinking check after setup changes the active lane, so
+    /// home and Thinking read the new choice instead of the record from before it.
+    fn refresh_brain(&self, _journal_root: &Path) {}
 }
 
 pub struct NoopSetupHost;
@@ -1058,9 +1061,9 @@ async fn init_action(
                     },
                 },
             );
-            let start = match mutation {
+            let (changed, start) = match mutation {
                 Ok(transaction) => match transaction.value {
-                    Ok(start) => start,
+                    Ok(start) => (transaction.changed, start),
                     Err(error) => return choice_error(error),
                 },
                 Err(error) => return config_error(error),
@@ -1089,6 +1092,12 @@ async fn init_action(
                         .into_response();
                     }
                 }
+            }
+            // After the download has started, so the check sees it under way.
+            if changed {
+                let journal = state.journal_root.clone();
+                let host = state.host.clone();
+                let _ = tokio::task::spawn_blocking(move || host.refresh_brain(&journal)).await;
             }
         }
         "start_thinking_download" => {

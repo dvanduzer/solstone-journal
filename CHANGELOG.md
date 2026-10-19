@@ -20,6 +20,11 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - on a mac or linux computer whose memory your journal can't check, setup lets you choose local thinking and says it couldn't check, instead of refusing it.
 - pairing the solstone app on the journal's own computer now shows the steps for that computer, not the phone steps and QR code.
 - on a computer that can't run local thinking, home and the thinking page say so, and no longer offer to install the local model.
+- while the local thinking model downloads after setup, home says local thinking is being set up instead of saying something needs your attention, and the thinking page no longer says its status is unavailable.
+- on a computer that can't run local thinking, setup no longer shows local as a choice you can't pick. it says to choose thinking when you're ready, that your journal keeps everything until then, and lets you continue.
+- setup shows each download as a progress bar with its size, and links to support if you get stuck.
+- home puts the getting started card first, right under the status line, every time it loads.
+- after you save a thinking choice in setup, the thinking page no longer says "nothing chosen yet" under it.
 
 ## [2.0.51] - 2026-10-19
 

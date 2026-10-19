@@ -70,6 +70,12 @@ impl SetupHost for ConveySetupHost {
     fn catalog_facts(&self) -> SetupCatalogFacts {
         current_setup_facts()
     }
+
+    fn refresh_brain(&self, journal_root: &Path) {
+        if !crate::thinking::send_brain_refresh_request(journal_root) {
+            log::warn!("setup: thinking check after the setup choice was not queued");
+        }
+    }
 }
 
 #[allow(dead_code)]

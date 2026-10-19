@@ -2699,6 +2699,8 @@
         activeValue = brain.headline || '';
         intro = 'choose where the thinking happens. your journal keeps everything until you do.';
       }
+    } else if (brain.progressing && ['local_artifact_not_ready', 'local_runtime_not_ready'].includes(brain.reason_code)) {
+      intro = 'local thinking is getting ready. your journal keeps everything until it is.';
     } else {
       intro = 'choose or check your model in setup.';
     }
@@ -2814,6 +2816,12 @@
       }
     }
 
+    // A headline that names the saved choice already says what's next, so the
+    // brain's "nothing chosen yet" must not sit under it.
+    if (glanceState === 'saved' || glanceState === 'cant_run') {
+      setText('thinkingActiveDetail', '');
+    }
+
     const identityText = [identity.lane, identity.provider, identity.model].filter(Boolean).join(' · ');
     setText('thinkingActiveIdentity', identityText);
     setHidden('thinkingIdentityDetails', !identityText);
@@ -2822,7 +2830,8 @@
   function renderBrainAction(action) {
     const button = $('brainCheckAction');
     if (!button) return;
-    if (!action?.label) {
+    // "open thinking" is for other pages; on this page it would go nowhere.
+    if (!action?.label || (action.href && action.href.startsWith('/app/thinking'))) {
       button.hidden = true;
       button.onclick = null;
       return;
