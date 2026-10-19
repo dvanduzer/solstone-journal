@@ -1071,6 +1071,11 @@ pub(crate) fn generate_and_write(
     if cancellation.is_cancelled() {
         return RuntimeOutcome::Cancelled;
     }
+    let degraded = degraded.or_else(|| {
+        stage
+            .as_ref()
+            .and_then(|(_, state)| facet_newsletter::degraded(state))
+    });
     if let Some((stage, state)) = stage {
         if stage.unavailable_commit.is_some()
             && prepared

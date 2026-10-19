@@ -539,15 +539,18 @@ pub(crate) fn build_synthesis_health(
                     string(row.get("model")),
                 );
                 let day = string(row.get("day"));
-                let message =
-                    if degraded.get("reason").and_then(Value::as_str) == Some("story_rejected") {
+                let message = match degraded.get("reason").and_then(Value::as_str) {
+                    Some("story_rejected") => {
                         format!("an activity's story on {day} couldn't be used ({usage})")
-                    } else {
-                        format!(
-                            "'{}' finished without a usable result ({usage}) on {day}",
-                            string(row.get("name")),
-                        )
-                    };
+                    }
+                    Some("partial_input") => format!(
+                        "a newsletter on {day} used a story written from only part of its activity"
+                    ),
+                    _ => format!(
+                        "'{}' finished without a usable result ({usage}) on {day}",
+                        string(row.get("name")),
+                    ),
+                };
                 notes.push(note("warn", "synthesis", &message, generated_at, None));
             }
         }
@@ -1670,6 +1673,31 @@ mod tests {
             notes
                 .iter()
                 .any(|note| note.message.contains("story on 20260410"))
+        );
+    }
+
+    #[test]
+    fn a_newsletter_from_a_partial_story_is_degraded_not_unusable() {
+        let temporary = temporary();
+        healthy_talent_guards(temporary.path(), now());
+        talent_rows(
+            temporary.path(),
+            "20260410",
+            &[
+                json!({"ts":now().timestamp_millis(),"status":"completed","degraded":{"reason":"partial_input","activities":["a1"]},"name":"facet_newsletter","facet":"work","provider":"local","model":"m","day":"20260410"}),
+            ],
+        );
+        let (health, notes) =
+            build_synthesis_health(temporary.path(), &ScanAggregate::default(), now()).unwrap();
+        assert_eq!(health.talent_run_failures_24h, Some(0));
+        assert_eq!(health.talent_degraded_outputs_24h, Some(1));
+        let note = notes
+            .iter()
+            .find(|note| note.message.contains("20260410"))
+            .expect("a degraded note for the day");
+        assert!(
+            !note.message.contains("without a usable result"),
+            "{note:?}"
         );
     }
 

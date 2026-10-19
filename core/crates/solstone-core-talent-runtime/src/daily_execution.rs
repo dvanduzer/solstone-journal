@@ -550,6 +550,9 @@ fn publish(
         authority.checkpoint().map_err(|e| failure(name, e))?;
         generated
     };
+    // Coverage binds to the frozen packet, so a resumed response reports it too.
+    let degraded =
+        degraded.or_else(|| stage.and_then(|(_, state)| crate::facet_newsletter::degraded(state)));
     let publication: PreparedDailyPublication = if let Some(plan) =
         authority.record().and_then(|r| r.action_plan.as_ref())
     {

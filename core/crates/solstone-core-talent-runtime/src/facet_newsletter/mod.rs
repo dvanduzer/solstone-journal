@@ -119,6 +119,18 @@ pub fn apply_prompt_override(
     Ok(())
 }
 
+/// A newsletter's runtime-owned coverage: which activities in its packet show a
+/// story written from part of the activity. It comes from the packet that was
+/// gathered or frozen for the request, never from the request or the output.
+pub(crate) fn degraded(state: &PrePostState) -> Option<Box<Value>> {
+    let PrePostState::FacetNewsletter(state) = state else {
+        return None;
+    };
+    let partial = &state.packet.partial_stories;
+    (!partial.is_empty())
+        .then(|| Box::new(serde_json::json!({"reason": "partial_input", "activities": partial})))
+}
+
 pub fn parse(
     output: &str,
     _: &PreparedTalent,
@@ -186,6 +198,9 @@ pub(crate) fn apply_result_cancellable(
     solstone_core_facets::write_news_file(journal, facet, &format!("{day}.md"), content)
         .map_err(|error| error.to_string())
 }
+
+#[cfg(test)]
+mod coverage_tests;
 
 #[cfg(test)]
 mod tests {
