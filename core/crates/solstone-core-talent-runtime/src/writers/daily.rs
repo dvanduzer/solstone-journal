@@ -30,9 +30,6 @@ pub enum PreparedDailyAction {
     Anticipation {
         batch: solstone_core_facets::PreparedAnticipationBatch,
     },
-    Newsletter {
-        batch: solstone_core_facets::PreparedNewsReplacement,
-    },
     Identity {
         facet: String,
         facet_id: String,
@@ -100,7 +97,6 @@ fn action_facet(action: &PreparedDailyAction) -> Option<(&str, &str)> {
     match action {
         PreparedDailyAction::Observation { batch } => Some((&batch.facet, &batch.facet_id)),
         PreparedDailyAction::Anticipation { batch } => Some((&batch.facet, &batch.facet_id)),
-        PreparedDailyAction::Newsletter { batch } => Some((&batch.facet, &batch.facet_id)),
         PreparedDailyAction::Attachment { change } => Some((&change.facet, &change.facet_id)),
         PreparedDailyAction::Identity {
             facet, facet_id, ..
@@ -392,25 +388,6 @@ pub fn prepare_daily_publication(
                 actions.push(PreparedDailyAction::Anticipation { batch });
             }
         }
-        CommitPlan::Write(WriteIntent::FacetNewsletter { output, facet, day }) => {
-            let content = output.trim();
-            if !content.is_empty() && content != "No activity" {
-                let batch = solstone_core_facets::prepare_news_replacement(
-                    root,
-                    &facet,
-                    &format!("{day}.md"),
-                    content,
-                )
-                .map_err(error)?;
-                verify_artifact_before(
-                    prepared,
-                    &format!("facets/{}/news/{}", batch.facet, batch.relative_path),
-                    batch.before.as_ref().map(|s| s.as_bytes()),
-                )
-                .map_err(|e| error(e.to_string()))?;
-                actions.push(PreparedDailyAction::Newsletter { batch });
-            }
-        }
         CommitPlan::Write(WriteIntent::DailySchedule {
             output,
             output_path,
@@ -504,10 +481,6 @@ pub fn required_artifact_receipts(publication: &PreparedDailyPublication) -> Vec
         .filter_map(|action| {
             let (path, bytes) = match action {
                 PreparedDailyAction::Output { path, after, .. } => (path.clone(), after.as_slice()),
-                PreparedDailyAction::Newsletter { batch } => (
-                    format!("facets/{}/news/{}", batch.facet, batch.relative_path),
-                    batch.after.as_bytes(),
-                ),
                 _ => return None,
             };
             Some(json!({
@@ -712,16 +685,6 @@ pub(crate) fn publish_daily_publication_cancellable(
             }
             PreparedDailyAction::Anticipation { batch } => {
                 solstone_core_facets::publish_anticipation_batch_checked(
-                    &context.journal,
-                    batch,
-                    allow_before,
-                    || super::check_cancellation(cancellation),
-                    receipt,
-                )
-                .map_err(make_error)?
-            }
-            PreparedDailyAction::Newsletter { batch } => {
-                solstone_core_facets::publish_news_replacement_checked(
                     &context.journal,
                     batch,
                     allow_before,
@@ -1662,52 +1625,21 @@ mod tests {
     }
 
     #[test]
-    fn newsletter_and_config_reject_owner_changes_during_generation() {
+    fn config_rejects_owner_changes_during_generation() {
         let root = fixture();
         let context = ExecutionContext {
             journal: root.path().into(),
         };
-        solstone_core_facets::write_news_file(root.path(), "work", "20260910.md", "Old newsletter")
-            .unwrap();
         let mut prepared = PreparedTalent {
-            name: "facet_newsletter".into(),
+            name: "daily_schedule".into(),
             config: Default::default(),
         };
-        prepared.config.insert(
-            "_daily_artifact_before".into(),
-            json!({"facets/work/news/20260910.md":b"Old newsletter".to_vec()}),
-        );
-        solstone_core_facets::write_news_file(
-            root.path(),
-            "work",
-            "20260910.md",
-            "Owner correction",
-        )
-        .unwrap();
-        let failure = prepare_daily_publication(
-            CommitPlan::Write(WriteIntent::FacetNewsletter {
-                output: "Model replacement".into(),
-                facet: "work".into(),
-                day: "20260910".into(),
-            }),
-            &prepared,
-            &context,
-        )
-        .unwrap_err();
-        assert_eq!(failure.phase, "conflict");
-        assert_eq!(
-            solstone_core_facets::read_news_file(root.path(), "work", "20260910.md")
-                .unwrap()
-                .unwrap(),
-            "Owner correction"
-        );
         let path = root.path().join("config/schedules.json");
         solstone_core_system::schedule::set_schedule_metadata(
             &path,
             &serde_json::Map::from_iter([("daily_time".into(), json!("04:00"))]),
         )
         .unwrap();
-        prepared.name = "daily_schedule".into();
         prepared
             .config
             .insert("_daily_time_before".into(), json!("03:00"));
@@ -2171,7 +2103,6 @@ mod tests {
     fn retained_facet_actions_cannot_recreate_deleted_owner_paths() {
         for kind in [
             "calendar",
-            "news",
             "output",
             "identity",
             "attachment",
@@ -2182,7 +2113,6 @@ mod tests {
             let facet_id = solstone_core_facets::facet_write_identity(root.path(), "work").unwrap();
             let action = match kind {
                 "calendar" => PreparedDailyAction::Anticipation { batch: solstone_core_facets::prepare_anticipation_batch(root.path(), "work", "20260920", &[(json!({"id":"event", "source":"anticipated", "title":"Planning"}).as_object().unwrap().clone(), vec![])], "2026-09-14T10:00:00Z").unwrap() },
-                "news" => PreparedDailyAction::Newsletter { batch: solstone_core_facets::prepare_news_replacement(root.path(), "work", "20260910.md", "News").unwrap() },
                 "output" => bind_output_action(root.path(), &root.path().join("facets/work/entities/20260910_review_outcome.json"), b"result".to_vec(), false).unwrap(),
                 "proposals" => PreparedDailyAction::MergeProposals { facet:"work".into(), facet_id, batch:solstone_core_entity::prepare_merge_proposals(root.path(), &[json!({"facet":"work", "day":"20260910", "source":"Ada", "source_slug":"ada", "target":"Grace", "target_slug":"grace", "summary":"Variant"})]).unwrap() },
                 _ => {
@@ -2416,15 +2346,15 @@ mod tests {
         let root = fixture();
         let facet_id = solstone_core_facets::facet_write_identity(root.path(), "work").unwrap();
         let mut prepared = PreparedTalent {
-            name: "facet_newsletter".into(),
+            name: "schedule".into(),
             config: Default::default(),
         };
         prepared
             .config
             .insert("_daily_facet_ids".into(), json!({"work":facet_id}));
         prepared.config.insert(
-            "_daily_artifact_before".into(),
-            json!({"facets/work/news/20260910.md":null}),
+            "_daily_calendar_before".into(),
+            json!({"work/20260920": null}),
         );
         // A journal keeps one enabled facet; the sibling lets "work" go.
         let _ = solstone_core_facets::create_facet(
@@ -2441,10 +2371,19 @@ mod tests {
         // the store never reuses a name, so the retired record is dropped as a hand edit would.
         let _ = std::fs::remove_file(std::path::Path::new(root.path()).join("facets/retired.json"));
         solstone_core_facets::create_facet(root.path(), "work", "Work", "", "", "", None).unwrap();
+        let event = json!({
+            "activity": "meeting",
+            "target_date": "2026-09-20",
+            "start": "09:00:00",
+            "title": "Planning review",
+            "description": "Discuss",
+            "details": "",
+            "facet": "work",
+            "participation": []
+        });
         let error = prepare_daily_publication(
-            CommitPlan::Write(WriteIntent::FacetNewsletter {
-                output: "Old facet result".into(),
-                facet: "work".into(),
+            CommitPlan::Write(WriteIntent::Schedule {
+                output: json!({ "events": [event] }).to_string(),
                 day: "20260910".into(),
             }),
             &prepared,
@@ -2454,7 +2393,6 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.phase, "conflict");
-        assert!(!root.path().join("facets/work/news/20260910.md").exists());
     }
 
     fn set_relation_test_alias(root: &Path, id: &str, aliases: &[&str]) {

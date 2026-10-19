@@ -511,7 +511,12 @@ mod tests {
             Some(ID.to_string()),
         )]));
         let root = reserve_temp_path("classification-pattern");
-        let facet = classify_source(&root, "facets/Work/news/20260107.md", None, &declarations);
+        let facet = classify_source(
+            &root,
+            "facets/Work/activities/20260107.jsonl",
+            None,
+            &declarations,
+        );
         assert_eq!(facet.category, Some("facets"));
         assert_eq!(facet.basis, Some("facet_owned"));
         assert_eq!(facet.facet_ids, vec![ID]);
@@ -647,13 +652,23 @@ mod tests {
         .expect("write work declaration");
 
         let before = FacetDeclarationSet::from_journal(&root).expect("declarations");
-        let material = classify_source(&root, "facets/Work/news/20260107.md", None, &before);
+        let material = classify_source(
+            &root,
+            "facets/Work/activities/20260107.jsonl",
+            None,
+            &before,
+        );
         // AC14 / AC18: mute is irrelevant and exact-case directory naming is used.
         assert_eq!(material.facet_ids, vec![OLD]);
         assert!(
-            classify_source(&root, "facets/work/news/20260107.md", None, &before)
-                .facet_ids
-                .is_empty()
+            classify_source(
+                &root,
+                "facets/work/activities/20260107.jsonl",
+                None,
+                &before
+            )
+            .facet_ids
+            .is_empty()
         );
 
         // AC12: moving a declaration preserves its stable id for facet-owned
@@ -664,7 +679,7 @@ mod tests {
         assert_eq!(
             classify_source(
                 &root,
-                "facets/Renamed/news/20260107.md",
+                "facets/Renamed/activities/20260107.jsonl",
                 None,
                 &after_rename
             )
@@ -683,7 +698,13 @@ mod tests {
         .expect("write recreated declaration");
         let recreated = FacetDeclarationSet::from_journal(&root).expect("recreated declarations");
         assert_eq!(
-            classify_source(&root, "facets/Work/news/20260107.md", None, &recreated).facet_ids,
+            classify_source(
+                &root,
+                "facets/Work/activities/20260107.jsonl",
+                None,
+                &recreated
+            )
+            .facet_ids,
             vec![NEW]
         );
         assert_ne!(material.facet_ids, vec![NEW]);
@@ -842,7 +863,10 @@ mod tests {
             vec![S]
         );
         // Material in a live folder keeps its own facet.
-        assert_eq!(ids(&root, "facets/solstone/news/20260107.md"), vec![S]);
+        assert_eq!(
+            ids(&root, "facets/solstone/activities/20260107.jsonl"),
+            vec![S]
+        );
         // Merge scratch copies never make a live id a duplicate.
         declare(&root, ".facet-merge-1.dest", S);
         let path = assign(&root, &["sunstone"]);
@@ -910,7 +934,7 @@ mod tests {
         let path = assign(&root, &["work"]);
         assert!(ids(&root, path).is_empty());
         assert!(ids(&root, "20260107/default/123456_300/talents/work/brief.md").is_empty());
-        assert_eq!(ids(&root, "facets/work/news/20260107.md"), vec![W]);
+        assert_eq!(ids(&root, "facets/work/activities/20260107.jsonl"), vec![W]);
 
         // The facet's own leftover entry is the same facet, with or without
         // the id it has since been given.

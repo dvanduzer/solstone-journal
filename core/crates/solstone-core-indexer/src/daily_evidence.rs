@@ -22,7 +22,6 @@ pub const SEMANTIC_EVIDENCE_VERSION: &str = "daily-sources-3";
 const OUTPUTS: &[&str] = &[
     "schedule",
     "daily_schedule",
-    "facet_newsletter",
     "morning_briefing",
     "entities_review",
     "entity_suggest",
@@ -183,7 +182,6 @@ pub const DAILY_INPUTS: &[DailyInput] = &[DailyInput {
     lookback_closed_days: 7,
     recipients: &[
         "schedule",
-        "facet_newsletter",
         "entities:entity_suggest",
         "entities:entity_observer",
         "morning_briefing",
@@ -494,7 +492,6 @@ pub fn daily_hook(name: &str, metadata: &Map<String, Value>) -> Result<String, S
         effective,
         "schedule"
             | "daily_schedule"
-            | "facet_newsletter"
             | "morning_briefing"
             | "entities:entities_review"
             | "entities:entity_suggest"
@@ -886,12 +883,7 @@ fn upstream_evidence(journal: &Path, day: &str) -> Result<Value, String> {
     use solstone_core_journal_io::{
         DailyUnitIdentity, accepted_daily_artifacts_valid, load_daily_unit_record,
     };
-    let mut identities = vec![DailyUnitIdentity::new(day, "schedule", None)];
-    identities.extend(
-        facet_declarations(journal)?
-            .keys()
-            .map(|facet| DailyUnitIdentity::new(day, "facet_newsletter", Some(facet.clone()))),
-    );
+    let identities = vec![DailyUnitIdentity::new(day, "schedule", None)];
     let mut values = Vec::new();
     for identity in identities {
         let value = match load_daily_unit_record(journal, &identity).map_err(|e| e.to_string())? {
@@ -1071,7 +1063,7 @@ mod tests {
             "chronicle/20260910/talents/flow.md",
             "# Flow\nMeeting.",
         );
-        let names = ["schedule", "facet_newsletter", "entities:entity_observer"];
+        let names = ["schedule", "entities:entity_observer"];
         let before = names.map(|name| revision(&root, name, Some("work")));
         for text in [
             "# location on Thursday, September 10, 2026\n\n- readings near Golden, 14:00 to 14:09: 3 readings from your iphone.\n",
@@ -1231,12 +1223,15 @@ mod tests {
         let mut row = json!({"id":"meeting", "source":"user", "title":"Planning", "description":"Weekly planning", "decisions":["ship Monday"], "start":"09:00:00"});
         write(&root, path, &row.to_string());
         let projected = capture_day_sources(&root, "20260910").unwrap();
-        let before = revision(&root, "facet_newsletter", Some("work"));
+        let before = revision(&root, "entities:entity_suggest", Some("work"));
         row["source"] = json!("import");
         row["start"] = json!("11:00:00");
         write(&root, path, &row.to_string());
         assert_eq!(projected, capture_day_sources(&root, "20260910").unwrap());
-        assert_ne!(before, revision(&root, "facet_newsletter", Some("work")));
+        assert_ne!(
+            before,
+            revision(&root, "entities:entity_suggest", Some("work"))
+        );
 
         let audio = "chronicle/20260910/mic/090000_60/audio.jsonl";
         write(
@@ -1422,7 +1417,6 @@ mod tests {
         write(&root, "facets/work/facet.json", r#"{"title":"Work"}"#);
         let recipients = [
             "schedule",
-            "facet_newsletter",
             "entities:entity_suggest",
             "entities:entity_observer",
             "morning_briefing",
@@ -1500,7 +1494,6 @@ mod tests {
         let cutoff = chrono::NaiveDate::parse_from_str("20260910", "%Y%m%d").unwrap();
         for hook in [
             "schedule",
-            "facet_newsletter",
             "entities:entity_suggest",
             "entities:entity_observer",
             "morning_briefing",
@@ -1634,10 +1627,8 @@ mod tests {
     // --- one projection per day, shared by the units of a coverage read ---------
 
     const DAY: &str = "20260910";
-    const UNITS: [(&str, Option<&str>); 7] = [
+    const UNITS: [(&str, Option<&str>); 5] = [
         ("schedule", None),
-        ("facet_newsletter", Some("work")),
-        ("facet_newsletter", Some("home")),
         ("entities:entity_observer", Some("work")),
         ("entities:entity_suggest", Some("work")),
         ("entities:entities_review", Some("work")),
@@ -1779,7 +1770,7 @@ mod tests {
         let first = cached(
             &root,
             DAY,
-            "facet_newsletter",
+            "entities:entity_observer",
             Some("work"),
             &mut DayProjectionCache::new(&root, DAY),
         )
@@ -1792,7 +1783,7 @@ mod tests {
         let second = cached(
             &root,
             DAY,
-            "facet_newsletter",
+            "entities:entity_observer",
             Some("work"),
             &mut DayProjectionCache::new(&root, DAY),
         )
@@ -1800,7 +1791,7 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(
             second,
-            uncached(&root, DAY, "facet_newsletter", Some("work")).unwrap()
+            uncached(&root, DAY, "entities:entity_observer", Some("work")).unwrap()
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -1845,7 +1836,14 @@ mod tests {
         assert_eq!((cache.captures(), cache.requests()), (0, 0));
         // A unit that does read the projection gets the same error as its own capture.
         assert_eq!(
-            cached(&root, DAY, "facet_newsletter", Some("work"), &mut cache).unwrap_err(),
+            cached(
+                &root,
+                DAY,
+                "entities:entity_observer",
+                Some("work"),
+                &mut cache
+            )
+            .unwrap_err(),
             failure
         );
         assert_eq!(
@@ -1864,13 +1862,20 @@ mod tests {
             "chronicle/20260910/100000_60/_transcript.md",
             "# Direct\n\nDifferent.",
         );
-        let expected = uncached(&root, DAY, "facet_newsletter", Some("work")).unwrap();
+        let expected = uncached(&root, DAY, "entities:entity_observer", Some("work")).unwrap();
         for mut cache in [
             DayProjectionCache::new(&root, "20260909"),
             DayProjectionCache::new(&other, DAY),
         ] {
             assert_eq!(
-                cached(&root, DAY, "facet_newsletter", Some("work"), &mut cache).unwrap(),
+                cached(
+                    &root,
+                    DAY,
+                    "entities:entity_observer",
+                    Some("work"),
+                    &mut cache
+                )
+                .unwrap(),
                 expected
             );
             assert_eq!(cache.requests(), 0, "a mismatched cache is never asked");

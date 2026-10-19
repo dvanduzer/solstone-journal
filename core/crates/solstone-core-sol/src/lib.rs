@@ -1056,7 +1056,6 @@ mod tests {
                 "call journal facets",
                 "call journal import",
                 "call journal imports",
-                "call journal news",
                 "call journal read",
                 "call journal retention config",
                 "call journal retention list",
@@ -1101,7 +1100,6 @@ mod tests {
             ("call journal facets", &["GET /app/settings/api/facets"]),
             ("call journal import", &["GET /app/import/api/{timestamp}"]),
             ("call journal imports", &["GET /app/import/api/list"]),
-            ("call journal news", &["GET /app/news/api/facet/{facet}"]),
             ("call journal read", &["GET /app/search/api/read"]),
             (
                 "call journal retention config",
@@ -1131,6 +1129,7 @@ mod tests {
                 "call journal facet doctor",
                 "call journal facet merge",
                 "call journal merge",
+                "call journal news",
                 "call journal news --write",
                 "call journal retention purge",
                 "check",
@@ -1173,7 +1172,6 @@ mod tests {
                 "entities doctor",
                 "facet doctor",
                 "facet merge",
-                "news write",
             ])
         {
             errors.push("journal planned local command boundary drifted".to_owned());

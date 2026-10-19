@@ -15,7 +15,7 @@ use crate::briefing;
 use crate::connections::build_connections_card;
 use crate::formatting::{
     format_activity_label, format_duration, format_gap_links, format_heatmap_summary,
-    format_newsletter_summary, format_processing_summary, relative_time,
+    format_processing_summary, relative_time,
 };
 use crate::health_glance::build_health_glance;
 use crate::needs_you::{classify_needs_you, classify_owner_voice_needs, needs_dedup_key};
@@ -24,9 +24,8 @@ use crate::readers::{
     collect_anticipated_activities, collect_top_activities_yesterday, compute_briefing_phase,
     count_journal_age_days, get_capture_health, last_observe_relative_seconds, load_awareness,
     load_backlog_source, load_briefing, load_connections_network, load_flow_md,
-    load_pulse_narrative, load_stats, load_yesterday_stats, newsletter_attempts_from_think_logs,
-    overnight_window_passed, render_briefing_sections, resolve_attention, resolve_owner_voice_tier,
-    summarize_pipeline_day,
+    load_pulse_narrative, load_stats, load_yesterday_stats, overnight_window_passed,
+    render_briefing_sections, resolve_attention, resolve_owner_voice_tier, summarize_pipeline_day,
 };
 
 const FIRST_WEEK_FRAMING: &str = "most of what your journal keeps becomes useful after about a week, once your journal has enough of your days in it to show patterns. for now, here's what's already happening:";
@@ -476,16 +475,10 @@ fn summarize_yesterday_processing(context: &HomeContext, journal_age_days: i64) 
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let overnight_passed = overnight_window_passed(context.local_hour());
-    let (successful, attempted) = newsletter_attempts_from_think_logs(context, &yesterday);
-    let successful = successful as i64;
-    let attempted = attempted as i64;
     let sparse = (transcript_seconds > 0.0 || transcript_segments > 0)
         && !has_facet_activity
         && activities.is_empty();
     let mut reasons = Vec::new();
-    if attempted > successful {
-        reasons.push(Value::String("newsletter_partial".to_owned()));
-    }
     let pipeline_unavailable = pipeline.get("status").and_then(Value::as_str) == Some("unknown");
     if pipeline_unavailable {
         reasons.push(Value::String("pipeline_unavailable".to_owned()));
@@ -506,12 +499,10 @@ fn summarize_yesterday_processing(context: &HomeContext, journal_age_days: i64) 
     };
     if mode == "sparse" {
         return Some(
-            json!({"title":"Yesterday's processing","mode":"sparse","default_collapsed":false,"first_week_framing":null,"summary_line":format!("{} of audio went into your journal yesterday.", format_duration(transcript_seconds / 60.0)),"details":null,"gap_links":[],"sparse_lines":["no facet newsletters written.","there wasn't much else to process."],"status_reasons":reasons}),
+            json!({"title":"Yesterday's processing","mode":"sparse","default_collapsed":false,"first_week_framing":null,"summary_line":format!("{} of audio went into your journal yesterday.", format_duration(transcript_seconds / 60.0)),"details":null,"gap_links":[],"sparse_lines":["there wasn't much else to process."],"status_reasons":reasons}),
         );
     }
-    let mut details = vec![Value::String(format_newsletter_summary(
-        successful, attempted,
-    ))];
+    let mut details = Vec::new();
     if briefing_valid {
         details.push(Value::String(
             match briefing.get("generated_label").and_then(Value::as_str) {
@@ -539,7 +530,7 @@ fn summarize_yesterday_processing(context: &HomeContext, journal_age_days: i64) 
         "mode": mode,
         "default_collapsed": mode == "healthy" && journal_age_days >= 8,
         "first_week_framing": if journal_age_days <= 7 { Value::String(FIRST_WEEK_FRAMING.to_owned()) } else { Value::Null },
-        "summary_line": if pipeline_unavailable { "yesterday’s processing status is unavailable.".to_owned() } else { format_processing_summary(mode, successful, attempted, briefing_valid) },
+        "summary_line": if pipeline_unavailable { "yesterday’s processing status is unavailable.".to_owned() } else { format_processing_summary(mode, briefing_valid) },
         "details": details,
         "gap_links": if mode == "degraded" { Value::Array(format_gap_links(&pipeline, briefing_valid, &yesterday, overnight_passed)) } else { Value::Array(Vec::new()) },
         "failed_run_count": failed_run_count,
@@ -909,6 +900,18 @@ mod tests {
         *expected_pulse
             .pointer_mut("/health_glance/severity")
             .unwrap() = json!("neutral");
+        if let Some(sections) = expected_pulse
+            .get_mut("briefing_sections")
+            .and_then(Value::as_object_mut)
+        {
+            sections.remove("reading");
+        }
+        if let Some(details) = expected_pulse
+            .pointer_mut("/yesterday_processing/details")
+            .and_then(Value::as_array_mut)
+        {
+            details.retain(|item| item.as_str() != Some("no facet newsletters written."));
+        }
         assert_payload_fields(
             &payload,
             &expected_pulse,
@@ -919,7 +922,14 @@ mod tests {
                 "latest_weekly_reflection",
             ],
         );
-        assert_eq!(briefing_payload(&context), reference["briefing"]);
+        let mut expected_briefing = reference["briefing"].clone();
+        if let Some(sections) = expected_briefing
+            .pointer_mut("/sections")
+            .and_then(Value::as_object_mut)
+        {
+            sections.remove("reading");
+        }
+        assert_eq!(briefing_payload(&context), expected_briefing);
 
         // reference-pulse-seeded-journal.json was captured before the week page and is not the oracle for this object.
         let live_reflection = &payload["latest_weekly_reflection"];
@@ -1198,10 +1208,7 @@ mod tests {
         );
         assert_eq!(
             processing["sparse_lines"],
-            json!([
-                "no facet newsletters written.",
-                "there wasn't much else to process."
-            ])
+            json!(["there wasn't much else to process."])
         );
     }
 

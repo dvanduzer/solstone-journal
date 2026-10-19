@@ -15,7 +15,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::Value;
 use solstone_core_convey_http::cant_open_response;
 use solstone_core_facets::{
-    FacetIdResolveError, RetiredFacetState, RetiredFacets, is_well_formed_facet_id, read_news_file,
+    FacetIdResolveError, RetiredFacetState, RetiredFacets, is_well_formed_facet_id,
     read_retired_facets, resolve_facet_id, retired_facets_path,
 };
 use solstone_core_facets_web::valid_facet;
@@ -37,12 +37,6 @@ pub trait SourceReads: Send + Sync {
     fn is_facet_dir(&self, journal: &Path, facet: &str) -> Result<bool, String>;
     fn read_retired_facets(&self, journal: &Path) -> Result<RetiredFacets, String>;
     fn resolve_facet_id(&self, journal: &Path, id: &str) -> Result<String, FacetIdResolveError>;
-    fn read_news_file(
-        &self,
-        journal: &Path,
-        facet: &str,
-        file: &str,
-    ) -> Result<Option<String>, String>;
     fn read_file_text(&self, path: &Path) -> Result<String, String>;
     fn read_run_record(&self, path: &Path) -> Result<Option<String>, String>;
 }
@@ -79,15 +73,6 @@ impl SourceReads for FilesystemReads {
 
     fn resolve_facet_id(&self, journal: &Path, id: &str) -> Result<String, FacetIdResolveError> {
         resolve_facet_id(journal, id)
-    }
-
-    fn read_news_file(
-        &self,
-        journal: &Path,
-        facet: &str,
-        file: &str,
-    ) -> Result<Option<String>, String> {
-        read_news_file(journal, facet, file).map_err(|err| err.to_string())
     }
 
     fn read_file_text(&self, path: &Path) -> Result<String, String> {
@@ -186,10 +171,6 @@ enum ClassifiedRef {
         stream: Option<String>,
         segment_key: String,
     },
-    Newsletter {
-        facet: String,
-        day: String,
-    },
     Activity {
         facet: String,
         day: String,
@@ -272,15 +253,12 @@ fn parse_and_validate_reference(raw: &str) -> Result<ClassifiedRef, RefusalKind>
                         return Err(RefusalKind::WontFollow);
                     }
                     if !is_valid_calendar_date(day_str) {
-                        return Err(RefusalKind::WontFollow);
+                        return Err(RefusalKind::CantShow);
                     }
                     if fragment_part.is_some() {
                         return Err(RefusalKind::CantShow);
                     }
-                    return Ok(ClassifiedRef::Newsletter {
-                        facet: facet.to_owned(),
-                        day: day_str.to_owned(),
-                    });
+                    return Ok(ClassifiedRef::CantShowArm);
                 }
                 "activities" => {
                     if !is_day_key(target) || !is_valid_calendar_date(target) {
@@ -430,7 +408,6 @@ fn resolve_landing(
             stream,
             segment_key,
         } => resolve_segment(journal, day, stream.as_deref(), segment_key, reads, now),
-        ClassifiedRef::Newsletter { facet, day } => resolve_newsletter(journal, facet, day, reads),
         ClassifiedRef::Activity { facet, day, id } => {
             resolve_activity(journal, facet, day, id, reads, now)
         }
@@ -559,35 +536,6 @@ fn resolve_facet_directory(
                 ) => Err("failed to resolve renamed facet id".to_owned()),
             }
         }
-    }
-}
-
-fn resolve_newsletter(
-    journal: &Path,
-    facet: &str,
-    day: &str,
-    reads: &dyn SourceReads,
-) -> Result<LandingOutcome, String> {
-    let resolved_facet = match resolve_facet_directory(journal, facet, reads)? {
-        Ok(dir) => dir,
-        Err(outcome) => return Ok(outcome),
-    };
-
-    let file_name = format!("{day}.md");
-    let content = reads.read_news_file(journal, &resolved_facet, &file_name)?;
-    match content {
-        Some(_) => {
-            let location = format!(
-                "/app/news/{}/{}",
-                encode_path_component(&resolved_facet),
-                encode_path_component(day)
-            );
-            if !is_safe_location(&location) {
-                return Ok(LandingOutcome::WontFollow);
-            }
-            Ok(LandingOutcome::Redirect(location))
-        }
-        None => Ok(LandingOutcome::Absence),
     }
 }
 

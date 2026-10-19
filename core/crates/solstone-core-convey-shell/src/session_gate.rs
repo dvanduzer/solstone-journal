@@ -74,8 +74,10 @@ fn is_exempt_with_agents(path: &str, include_agents: bool) -> bool {
                         // registry entry; it must stay session-gated.
                         // `/app/devices` left the registry; leftover ingest
                         // routes and the permanent redirects must stay gated.
+                        // Leftover news paths stay gated.
                         name != "link"
                             && name != "devices"
+                            && name != "news"
                             && served_app(name, include_agents).is_none()
                     })
             }
@@ -194,5 +196,8 @@ mod tests {
         assert!(!is_exempt("/app/devices/workspace"));
         assert!(!is_exempt("/app/devices/ingest"));
         assert!(!is_exempt("/app/devices/ingest/segments/20260804"));
+        assert!(!is_exempt("/app/news"));
+        assert!(!is_exempt("/app/news/"));
+        assert!(!is_exempt("/app/news/workspace"));
     }
 }

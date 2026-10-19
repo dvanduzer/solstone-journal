@@ -37,13 +37,12 @@ use crate::content::JsonObject;
 use crate::paths::CHRONICLE_DIR;
 use crate::segment::is_date_key;
 
-const REQUIRED_ROOT_KEYS: [&str; 6] = [
+const REQUIRED_ROOT_KEYS: [&str; 5] = [
     "metadata",
     "your_day",
     "yesterday",
     "needs_attention",
     "forward_look",
-    "reading",
 ];
 
 /// Load one day's morning briefing when it has the required root shape.
@@ -99,7 +98,8 @@ mod tests {
     use crate::content::render_morning_briefing_text;
     use crate::test_support::reserve_temp_path;
 
-    const COMPLETE_BRIEFING: &str = r#"{"metadata":{},"your_day":[],"yesterday":[],"needs_attention":[],"forward_look":[],"reading":[]}"#;
+    const COMPLETE_BRIEFING: &str =
+        r#"{"metadata":{},"your_day":[],"yesterday":[],"needs_attention":[],"forward_look":[]}"#;
 
     struct TempDir {
         path: PathBuf,
@@ -212,16 +212,36 @@ mod tests {
     }
 
     #[test]
+    fn load_gate_accepts_reading_and_extra_keys() {
+        let temporary = TempDir::new("briefing-reading-optional");
+        let path = briefing_path(&temporary.path, "20260717");
+
+        // Stored object that still has reading loads
+        write(
+            &path,
+            r#"{"metadata":{},"your_day":[],"yesterday":[],"needs_attention":[],"forward_look":[],"reading":[],"extra":"accepted"}"#,
+        );
+        assert!(load_morning_briefing(&temporary.path, "20260717").is_some());
+
+        // New object without reading loads
+        write(
+            &path,
+            r#"{"metadata":{},"your_day":[],"yesterday":[],"needs_attention":[],"forward_look":[],"extra":"accepted"}"#,
+        );
+        assert!(load_morning_briefing(&temporary.path, "20260717").is_some());
+    }
+
+    #[test]
     fn load_gate_is_key_presence_only() {
         let temporary = TempDir::new("briefing-key-presence");
         write(
             &briefing_path(&temporary.path, "20260717"),
-            r#"{"metadata":null,"your_day":"nope","yesterday":[],"needs_attention":[],"forward_look":[],"reading":[]}"#,
+            r#"{"metadata":null,"your_day":"nope","yesterday":[],"needs_attention":[],"forward_look":[]}"#,
         );
         let briefing = load_morning_briefing(&temporary.path, "20260717")
             .expect("all root keys load regardless of value shape");
         let rendered = render_morning_briefing_text(&briefing);
-        assert_eq!(rendered.matches("Nothing to report.").count(), 5);
+        assert_eq!(rendered.matches("Nothing to report.").count(), 4);
     }
 
     #[test]
@@ -239,7 +259,7 @@ mod tests {
     #[test]
     fn preamble_leading_blank_lines_are_trimmed_before_quoting() {
         let briefing: JsonObject = serde_json::from_str(
-            r#"{"metadata":{"coverage_preamble":"\n\nFirst line\n\nSecond line\n\n"},"your_day":[],"yesterday":[],"needs_attention":[],"forward_look":[],"reading":[]}"#,
+            r#"{"metadata":{"coverage_preamble":"\n\nFirst line\n\nSecond line\n\n"},"your_day":[],"yesterday":[],"needs_attention":[],"forward_look":[]}"#,
         )
         .expect("briefing object parses");
         let rendered = render_morning_briefing_text(&briefing);
@@ -259,7 +279,7 @@ mod tests {
         );
         write(
             &briefing_path(&temporary.path, "20260718"),
-            r#"{"metadata":{},"your_day":[],"yesterday":[],"needs_attention":[],"forward_look":[]}"#,
+            r#"{"metadata":{},"your_day":[],"yesterday":[],"needs_attention":[]}"#,
         );
         assert_eq!(
             most_recent_morning_briefing_day(&temporary.path),

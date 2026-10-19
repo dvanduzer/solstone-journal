@@ -4061,6 +4061,31 @@ mod tests {
     }
 
     #[test]
+    fn merge_facet_content_preserves_news_markdown_bytes() {
+        let tree = PlanTree::new();
+        let target = tree.path.join("target");
+        write_target(
+            &target,
+            "facets/work/facet.json",
+            br#"{"id":"00000000-0000-4000-8000-000000000001","title":"Work"}"#,
+        );
+        let news_bytes = b"# Weekly Newsletter\n\n- Accomplished item 1\n- Item 2\n";
+        let archive = write_zip(
+            &tree.path,
+            &[
+                (
+                    "facets/work/facet.json",
+                    br#"{"id":"00000000-0000-4000-8000-000000000001","title":"Work"}"#,
+                ),
+                ("facets/work/news/20260305.md", news_bytes),
+            ],
+        );
+        merge_journal_archive(&archive, &target, &merge_options(&tree), None).unwrap();
+        let target_news = fs::read(target.join("facets/work/news/20260305.md")).unwrap();
+        assert_eq!(target_news, news_bytes);
+    }
+
+    #[test]
     fn stamping_keeps_line_endings_and_passes_other_lines_through() {
         let text = "{\"id\":\"a\",\"destination_id\":\"old\"}\r\n{torn\n\n{\"id\":\"b\"}\n{\"id\":\"c\",\"destination_id\":\"old\"}";
         assert_eq!(

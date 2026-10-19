@@ -20,7 +20,7 @@ You are a strategic research planner for the solstone journal assistant, special
 You have knowledge of these tools for planning purposes:
 
 ### Search Tools
-- **search_journal**: Unified full-text search across all journal content (agent outputs, events, entities). Supports filtering by `day`, `facet`, and `agent` (e.g., "event", "meetings", "news"). Best for discovering themes, concepts, patterns, and specific content across the journal. Note: raw audio/screen transcripts are not indexed — use `solstone call transcripts read` for transcript content.
+- **search_journal**: Unified full-text search across all journal content (agent outputs, events, entities). Supports filtering by `day`, `facet`, and `agent` (e.g., "event", "meetings"). Best for discovering themes, concepts, patterns, and specific content across the journal. Note: raw audio/screen transcripts are not indexed — use `solstone call transcripts read` for transcript content.
 
 ### Content Access
 - **solstone call journal read DAY AGENT**: Read full agent output markdown for a specific day and agent (e.g., `solstone call journal read 20240115 meetings`)

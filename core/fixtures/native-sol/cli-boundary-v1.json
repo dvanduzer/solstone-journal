@@ -35,7 +35,6 @@
         "call journal facets",
         "call journal import",
         "call journal imports",
-        "call journal news",
         "call journal read",
         "call journal retention config",
         "call journal retention list",
@@ -152,15 +151,6 @@
           ]
         },
         {
-          "path": "call journal news",
-          "bindings": [
-            {
-              "method": "GET",
-              "route": "/app/news/api/facet/{facet}"
-            }
-          ]
-        },
-        {
           "path": "call journal read",
           "bindings": [
             {
@@ -220,6 +210,7 @@
         "call journal facet doctor",
         "call journal facet merge",
         "call journal merge",
+        "call journal news",
         "call journal news --write",
         "call journal retention purge"
       ]
@@ -247,8 +238,7 @@
         "archive merge",
         "entities doctor",
         "facet doctor",
-        "facet merge",
-        "news write"
+        "facet merge"
       ],
       "service_commands": [
         "backfill-facet-ids",

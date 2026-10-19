@@ -479,7 +479,6 @@ pub fn load_briefing(context: &HomeContext, day: &str) -> Option<Value> {
         "yesterday",
         "needs_attention",
         "forward_look",
-        "reading",
     ]
     .iter()
     .all(|key| object.contains_key(*key))
@@ -506,40 +505,6 @@ pub fn render_briefing_sections(briefing: &Value) -> BTreeMap<String, String> {
         let text = strings(key);
         if !text.is_empty() {
             sections.insert(key.to_owned(), text);
-        }
-    }
-    {
-        let (key, fields) = ("reading", ("facet", "summary"));
-        let rows = briefing
-            .get(key)
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_object)
-            .filter_map(|row| {
-                let left = row
-                    .get(fields.0)
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim();
-                let right = row
-                    .get(fields.1)
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim();
-                (!left.is_empty() || !right.is_empty()).then(|| {
-                    match (left.is_empty(), right.is_empty()) {
-                        (false, false) => format!("- **{left}**: {right}"),
-                        (false, true) => format!("- **{left}**"),
-                        (true, false) => format!("- {right}"),
-                        _ => String::new(),
-                    }
-                })
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !rows.is_empty() {
-            sections.insert(key.to_owned(), rows);
         }
     }
     let your_day = briefing
@@ -686,42 +651,6 @@ pub fn briefing_lateness_state(now: DateTime<FixedOffset>, phase: &str) -> Value
         || (phase == "pending"
             && now.hour() > BRIEFING_MORNING_END_HOUR + BRIEFING_LATENESS_THRESHOLD_HOURS);
     json!({"late": late, "late_hours": if late { ((now - due).num_seconds() / 3600).max(0) } else { 0 }})
-}
-
-/// Count successful and failed facet-newsletter attempts for one day.
-pub fn newsletter_attempts_from_think_logs(context: &HomeContext, day: &str) -> (usize, usize) {
-    let successful = fs::read_dir(context.journal_root().join("facets"))
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry
-                .path()
-                .join("news")
-                .join(format!("{day}.md"))
-                .is_file()
-        })
-        .count();
-    let failed = think_oplogs(context, day)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|(run, _)| run == "daily")
-        .flat_map(|(_, rows)| rows)
-        .filter(|record| {
-            record.get("event").and_then(Value::as_str) == Some("talent.fail")
-                && record.get("facet").is_some_and(|value| match value {
-                    Value::Bool(value) => *value,
-                    Value::Null => false,
-                    Value::Number(value) => value.as_i64() != Some(0),
-                    Value::String(value) => !value.is_empty(),
-                    Value::Array(value) => !value.is_empty(),
-                    Value::Object(value) => !value.is_empty(),
-                })
-                && record.get("name").and_then(Value::as_str) == Some("facet_newsletter")
-        })
-        .count();
-    (successful, successful + failed)
 }
 
 /// Read serialized root backlog data without generating it.
@@ -1454,23 +1383,6 @@ mod tests {
     }
 
     #[test]
-    fn newsletter_reader_skips_malformed_and_missing_facet_failures() {
-        let root = TempDir::new().unwrap();
-        let context = context(root.path());
-        write_oplog(
-            root.path(),
-            "20260601",
-            "think",
-            "daily",
-            "not json\n{\"event\":\"talent.fail\",\"name\":\"facet_newsletter\"}\n",
-        );
-        assert_eq!(
-            newsletter_attempts_from_think_logs(&context, "20260601"),
-            (0, 0)
-        );
-    }
-
-    #[test]
     fn lateness_uses_supplied_phase() {
         let now = Utc
             .with_ymd_and_hms(2026, 6, 2, 13, 17, 0)
@@ -1979,6 +1891,15 @@ mod tests {
         assert_eq!(
             load_briefing(&context, "20260602").unwrap()["metadata"]["generated"],
             "invalid"
+        );
+        write(
+            root.path(),
+            "chronicle/20260601/talents/morning_briefing.json",
+            r#"{"metadata":{"generated":"without_reading"},"your_day":[],"yesterday":[],"needs_attention":[],"forward_look":[]}"#,
+        );
+        assert_eq!(
+            load_briefing(&context, "20260602").unwrap()["metadata"]["generated"],
+            "without_reading"
         );
         assert_eq!(
             briefing_freshness(&context, "20260602"),
@@ -2489,7 +2410,7 @@ mod tests {
         assert!(!rendered.contains_key("yesterday"));
         assert_eq!(rendered["forward_look"], "- next");
         assert_eq!(rendered["your_day"], "- **9:00**: meeting");
-        assert_eq!(rendered["reading"], "- **work**: read");
+        assert!(!rendered.contains_key("reading"));
         assert_eq!(rendered["needs_attention"], "- act");
     }
 
@@ -2503,26 +2424,6 @@ mod tests {
         assert_eq!(
             rendered["your_day"],
             "- **13:00–13:30**: Team sync.\n- **14:00**: Odd shape.\n- No fixed time."
-        );
-    }
-
-    #[test]
-    fn newsletter_reader_counts_present_news_and_qualified_failures_only() {
-        let root = TempDir::new().unwrap();
-        let context = context(root.path());
-        write(root.path(), "facets/work/news/20260602.md", "sent");
-        write_oplog(
-            root.path(),
-            "20260602",
-            "think",
-            "daily",
-            r#"{"event":"talent.fail","name":"facet_newsletter","facet":"work"}
-{"event":"talent.fail","name":"other","facet":"work"}
-{"event":"talent.fail","name":"facet_newsletter","facet":false}"#,
-        );
-        assert_eq!(
-            newsletter_attempts_from_think_logs(&context, "20260602"),
-            (1, 2)
         );
     }
 

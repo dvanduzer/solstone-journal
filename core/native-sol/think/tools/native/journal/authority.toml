@@ -125,16 +125,6 @@ route="/app/import/api/list"
 handler="imports"
 params=[{name="limit",kind="option",type="integer",required=false,nargs=1,multiple=false,default=20,options=["--limit","-n"],secondary=[],hidden=false,is_flag=false,count=false},{name="source",kind="option",type="text",required=false,nargs=1,multiple=false,options=["--source","-s"],secondary=[],hidden=false,is_flag=false,count=false},{name="json_output",kind="option",type="boolean",required=false,nargs=1,multiple=false,default=false,options=["--json"],secondary=[],hidden=false,is_flag=true,count=false,flag_value=true}]
 
-[[entries]]
-path=["journal","news"]
-kind="command"
-help="Read facet news."
-operation_id="journal.news"
-entry_type="http"
-method="GET"
-route="/app/news/api/facet/{facet}"
-handler="news"
-params=[{name="name",kind="argument",type="text",required=false,nargs=1,multiple=false,options=["name"],secondary=[],hidden=false,is_flag=false,count=false},{name="facet_opt",kind="option",type="text",required=false,nargs=1,multiple=false,options=["--facet","-f"],secondary=[],hidden=false,is_flag=false,count=false},{name="day",kind="option",type="text",required=false,nargs=1,multiple=false,options=["--day","-d"],secondary=[],hidden=false,is_flag=false,count=false},{name="limit",kind="option",type="integer",required=false,nargs=1,multiple=false,default=5,options=["--limit","-n"],secondary=[],hidden=false,is_flag=false,count=false},{name="cursor",kind="option",type="text",required=false,nargs=1,multiple=false,options=["--cursor"],secondary=[],hidden=false,is_flag=false,count=false}]
 
 [[entries]]
 path=["journal","read"]

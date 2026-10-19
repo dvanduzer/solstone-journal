@@ -6,12 +6,11 @@ use serde_json::Value;
 use super::{JsonObject, ProducedChunks, clean_value, recorded_chunk};
 
 const BRIEFING_ABSENT_TEXT: &str = "Nothing to report.";
-const SECTION_KEYS: [(&str, &str); 5] = [
+const SECTION_KEYS: [(&str, &str); 4] = [
     ("your_day", "Your Day"),
     ("yesterday", "Yesterday"),
     ("needs_attention", "Needs Attention"),
     ("forward_look", "Forward Look"),
-    ("reading", "Reading"),
 ];
 
 pub(super) fn render(records: &[JsonObject]) -> ProducedChunks {
@@ -73,7 +72,6 @@ fn section_body(briefing: &JsonObject, key: &str) -> String {
         "yesterday" => string_items(briefing.get("yesterday")),
         "needs_attention" => needs_attention(briefing),
         "forward_look" => string_items(briefing.get("forward_look")),
-        "reading" => reading(briefing),
         _ => String::new(),
     }
 }
@@ -153,29 +151,6 @@ fn needs_attention(briefing: &JsonObject) -> String {
     lines.join("\n")
 }
 
-fn reading(briefing: &JsonObject) -> String {
-    let mut lines = Vec::new();
-    let Some(Value::Array(items)) = briefing.get("reading") else {
-        return String::new();
-    };
-
-    for item in items {
-        let Value::Object(item) = item else {
-            continue;
-        };
-        let facet = clean_value(item.get("facet"));
-        let summary = clean_value(item.get("summary"));
-        if !facet.is_empty() && !summary.is_empty() {
-            lines.push(format!("- **{facet}** — {summary}"));
-        } else if !facet.is_empty() {
-            lines.push(format!("- **{facet}**"));
-        } else if !summary.is_empty() {
-            lines.push(format!("- {summary}"));
-        }
-    }
-    lines.join("\n")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,20 +161,14 @@ mod tests {
     }
 
     #[test]
-    fn renders_all_five_sections_and_agent_override() {
+    fn renders_all_four_sections_and_agent_override() {
         let produced = render_one(
             r#"{"metadata":{"coverage_preamble":"Built from test sources. No gaps."},"your_day":[{"start":"09:00","end":"09:00","text":"Meet Sarah."}],"yesterday":["Shipped the formatter."],"needs_attention":[{"text":"Review the report.","source_id":"sol://20260327/default/090000_300"}],"forward_look":["Prepare for Monday."],"reading":[{"facet":"work","summary":"Newsletter summary."}]}"#,
         );
         assert_eq!(produced.agent_override.as_deref(), Some("morning_briefing"));
         assert_eq!(produced.chunks.len(), 1);
         let rendered = &produced.chunks[0].content;
-        let headings = [
-            "Your Day",
-            "Yesterday",
-            "Needs Attention",
-            "Forward Look",
-            "Reading",
-        ];
+        let headings = ["Your Day", "Yesterday", "Needs Attention", "Forward Look"];
         let positions: Vec<_> = headings
             .iter()
             .map(|heading| rendered.find(&format!("## {heading}")).expect("heading"))
@@ -210,7 +179,7 @@ mod tests {
         assert!(rendered.contains("- Shipped the formatter."));
         assert!(rendered.contains("- Review the report."));
         assert!(rendered.contains("- Prepare for Monday."));
-        assert!(rendered.contains("- **work** — Newsletter summary."));
+        assert!(!rendered.contains("## Reading"));
     }
 
     #[test]
@@ -261,19 +230,18 @@ mod tests {
         assert_eq!(produced.agent_override.as_deref(), Some("morning_briefing"));
         assert_eq!(produced.chunks.len(), 1);
         let rendered = &produced.chunks[0].content;
-        assert_eq!(rendered.matches("## ").count(), 5);
-        assert_eq!(rendered.matches(BRIEFING_ABSENT_TEXT).count(), 5);
+        assert_eq!(rendered.matches("## ").count(), 4);
+        assert_eq!(rendered.matches(BRIEFING_ABSENT_TEXT).count(), 4);
     }
 
     #[test]
-    fn reading_handles_facet_only_summary_only_and_both_variants() {
-        let produced = render_one(
+    fn reading_heading_is_not_rendered_when_key_is_present_or_absent() {
+        let with_reading = render_one(
             r#"{"reading":[{"facet":"work","summary":"Newsletter summary."},{"facet":"personal"},{"summary":"Loose item."}]}"#,
         );
-        let rendered = &produced.chunks[0].content;
-        assert!(rendered.contains("- **work** — Newsletter summary."));
-        assert!(rendered.contains("- **personal**"));
-        assert!(rendered.contains("- Loose item."));
+        assert!(!with_reading.chunks[0].content.contains("Reading"));
+        let without_reading = render_one("{}");
+        assert!(!without_reading.chunks[0].content.contains("Reading"));
     }
 
     #[test]

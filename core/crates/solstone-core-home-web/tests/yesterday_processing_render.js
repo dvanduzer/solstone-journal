@@ -44,7 +44,6 @@ const degraded = renderYesterdayProcessingHtml({
       { text: '2 document runs didn\'t finish.', href: '/app/thinking/#runs/y' },
     ],
     details: [
-      'no facet newsletters written.',
       'your busiest stretches were 9-10am · 2-3pm · 5-6pm.',
     ],
     failed_run_count: 19,
@@ -53,7 +52,7 @@ const degraded = renderYesterdayProcessingHtml({
 assert(degraded.includes('what didn&#39;t finish · 19 runs') || degraded.includes('what didn\'t finish · 19 runs'), degraded);
 assert(degraded.includes('everything else'), degraded);
 const gapListStart = degraded.indexOf("conversation run");
-const detailsListStart = degraded.indexOf('facet newsletters');
+const detailsListStart = degraded.indexOf('your busiest stretches');
 assert(gapListStart > -1 && detailsListStart > -1 && gapListStart < detailsListStart, degraded);
 
 // Singular count reads "1 run", not "1 runs".
@@ -61,7 +60,7 @@ const singular = renderYesterdayProcessingHtml({
   yesterday_processing: {
     mode: 'degraded',
     gap_links: [{ text: "the conversation run didn't finish.", href: '/app/thinking/#runs/x' }],
-    details: ['no facet newsletters written.'],
+    details: ['your busiest stretches were 9-10am · 2-3pm · 5-6pm.'],
     failed_run_count: 1,
   },
 });
@@ -74,12 +73,15 @@ const healthy = renderYesterdayProcessingHtml({
   yesterday_processing: {
     mode: 'healthy',
     gap_links: [],
-    details: ['2 newsletters written and your morning briefing was prepared.'],
+    details: ['your morning briefing was prepared.'],
     failed_run_count: 0,
   },
 });
 assert.strictEqual(healthy.includes('pulse-yesterday-shelf-label'), false, healthy);
-assert(healthy.includes('2 newsletters written'), healthy);
+assert(healthy.includes('your morning briefing was prepared.'), healthy);
+assert(!degraded.includes('newsletter'), degraded);
+assert(!singular.includes('newsletter'), singular);
+assert(!healthy.includes('newsletter'), healthy);
 // The rendered card never speaks as "I".
 assert.strictEqual(/(^|[\s>"])I(\s|&#39;)/.test(degraded + singular + healthy), false, degraded + singular + healthy);
 

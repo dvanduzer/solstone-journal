@@ -203,22 +203,6 @@ pub static APP_REGISTRY: &[AppDefinition] = &[
         has_background: false,
     },
     AppDefinition {
-        name: "news",
-        icon: "📰",
-        label: "newsletters",
-        lucide_icon: "newspaper",
-        launcher_group: AppLauncherGroup::YourJournal,
-        launcher_rank: 5,
-        rail_group: None,
-        rail_rank: 0,
-        date_nav: Some(content_date_nav(
-            "newsletter",
-            "newsletters",
-            "no newsletters",
-        )),
-        has_background: false,
-    },
-    AppDefinition {
         name: "search",
         icon: "🔍",
         label: "search",
@@ -465,6 +449,12 @@ mod tests {
     fn devices_is_removed_from_the_registry() {
         assert!(!APP_REGISTRY.iter().any(|app| app.name == "devices"));
         assert!(known_app("devices").is_none());
+    }
+
+    #[test]
+    fn news_is_removed_from_the_registry() {
+        assert!(!APP_REGISTRY.iter().any(|app| app.name == "news"));
+        assert!(known_app("news").is_none());
     }
 
     #[test]

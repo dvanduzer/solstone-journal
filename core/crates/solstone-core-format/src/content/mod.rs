@@ -261,7 +261,7 @@ pub(crate) const INDEX_FAMILY_PATTERNS: &[FamilyPattern] = &[
         },
     },
     FamilyPattern {
-        pattern: "*/import.*/*/*_transcript.md",
+        pattern: "[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]/import.*/*/*_transcript.md",
         family: Family::Markdown,
         root: PatternRoot::DayRooted,
         disposition: IndexDisposition::Admitted {
@@ -270,7 +270,7 @@ pub(crate) const INDEX_FAMILY_PATTERNS: &[FamilyPattern] = &[
         },
     },
     FamilyPattern {
-        pattern: "*/import.*/*/imported.md",
+        pattern: "[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]/import.*/*/imported.md",
         family: Family::Markdown,
         root: PatternRoot::DayRooted,
         disposition: IndexDisposition::Admitted {
@@ -403,15 +403,6 @@ pub(crate) const INDEX_FAMILY_PATTERNS: &[FamilyPattern] = &[
     },
     FamilyPattern {
         pattern: "facets/*/activities/*/*/*.md",
-        family: Family::Markdown,
-        root: PatternRoot::Structural,
-        disposition: IndexDisposition::Admitted {
-            category: AdmittedCategory::Facets,
-            basis: ScopeBasis::FacetOwned,
-        },
-    },
-    FamilyPattern {
-        pattern: "facets/*/news/*.md",
         family: Family::Markdown,
         root: PatternRoot::Structural,
         disposition: IndexDisposition::Admitted {
@@ -950,6 +941,14 @@ mod tests {
                      json.dumps default separators and this crate emits compact JSON. \
                      Tokenizes identically",
         },
+        DivergenceEntry {
+            case: "morning_briefing_nominal",
+            kind: Divergence::Accepted,
+            native_chunks: &[
+                "## Your Day\n\nNothing to report.\n\n## Yesterday\n\nNothing to report.\n\n## Needs Attention\n\nNothing to report.\n\n## Forward Look\n\nNothing to report.",
+            ],
+            reason: "reading section dropped with facet newsletter retirement; four sections instead of five",
+        },
     ];
 
     fn divergence_for(case: &str) -> Option<&'static DivergenceEntry> {
@@ -989,10 +988,6 @@ mod tests {
     }
 
     fn rewrite_sol_path(path: &str) -> Option<String> {
-        let parts = path.split('/').collect::<Vec<_>>();
-        if matches!(parts.as_slice(), [day, "talents", "facet_newsletter"] if day_key(day)) {
-            return Some(format!("/app/thinking/#runs/{}/facet_newsletter", parts[0]));
-        }
         if let Some((day, fragment)) = path.split_once('#')
             && day_key(day)
         {
@@ -1514,11 +1509,9 @@ mod tests {
         // so root-first matching must preserve their shared outcome.
         let markdown_intersections = [
             "facets/x/activities/talents/x/x.md",
-            "facets/import.x/news/x_transcript.md",
-            "facets/import.x/news/imported.md",
             "imports/talents/summary.md",
-            "apps/import.x/talents/x_transcript.md",
-            "apps/import.x/talents/imported.md",
+            "20260101/import.appleXhealth/090000_300/imported.md",
+            "20260101/import.chatgpt/conv_b/x_transcript.md",
         ];
         for path in markdown_intersections {
             assert_eq!(
@@ -1527,7 +1520,19 @@ mod tests {
                 "pre-existing Markdown overlap changed for {path}"
             );
         }
-        assert_eq!(markdown_intersections.len(), 6);
+        assert_eq!(markdown_intersections.len(), 4);
+
+        for path in [
+            "facets/import.x/news/x_transcript.md",
+            "facets/import.x/news/imported.md",
+            "facets/work/news/20260101.md",
+        ] {
+            assert_eq!(
+                classify(path),
+                ContentResolution::Unrecognized,
+                "{path} must be Unrecognized"
+            );
+        }
     }
 
     #[test]

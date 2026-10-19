@@ -8,7 +8,7 @@ This document describes the layout of a **journal** directory where all original
 |----------------|---------|
 | `chronicle/` | Container for daily folders (`YYYYMMDD/`) containing segments, extracts, and agent outputs |
 | `entities/` | Journal-level entity identity records (`<id>/entity.json`) |
-| `facets/` | Facet-specific data: activities, entity relationships, historical events, news, action logs |
+| `facets/` | Facet-specific data: activities, entity relationships, historical events, action logs (`news/` holds owner markdown the product no longer writes, shows, or indexes) |
 | `talents/` | Talent run logs in per-talent subdirectories (`<name>/<id>.jsonl`), day indexes (`<day>.jsonl`), and latest-run symlinks (`<name>.log`) |
 | `solstone/apps/` | App-specific journal storage (not a codebase path) |
 | `streams/` | Per-stream state files (`<name>.json`) tracking segment chains and sequence numbers |

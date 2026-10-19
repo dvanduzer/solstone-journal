@@ -101,14 +101,6 @@ impl SourceReads for PanicReads {
     fn resolve_facet_id(&self, _journal: &Path, _id: &str) -> Result<String, FacetIdResolveError> {
         panic!("PanicReads::resolve_facet_id called");
     }
-    fn read_news_file(
-        &self,
-        _journal: &Path,
-        _facet: &str,
-        _file: &str,
-    ) -> Result<Option<String>, String> {
-        panic!("PanicReads::read_news_file called");
-    }
     fn read_file_text(&self, _path: &Path) -> Result<String, String> {
         panic!("PanicReads::read_file_text called");
     }
@@ -141,14 +133,6 @@ impl SourceReads for RecordReadErrorReads {
     }
     fn resolve_facet_id(&self, journal: &Path, id: &str) -> Result<String, FacetIdResolveError> {
         self.inner.resolve_facet_id(journal, id)
-    }
-    fn read_news_file(
-        &self,
-        journal: &Path,
-        facet: &str,
-        file: &str,
-    ) -> Result<Option<String>, String> {
-        self.inner.read_news_file(journal, facet, file)
     }
     fn read_file_text(&self, path: &Path) -> Result<String, String> {
         self.inner.read_file_text(path)
@@ -627,6 +611,8 @@ async fn source_link_corpus_walker() {
             let app = source_link_router(absent_root.to_path_buf(), Arc::new(FilesystemReads));
             let (status, body, loc) = get_source(app, ref_url).await;
             assert_response_contract(id, status, &body, loc.as_deref(), row);
+            assert!(!body.contains("/app/news"));
+            assert!(!body.contains("# Work Newsletter"));
             continue;
         }
 
@@ -641,12 +627,16 @@ async fn source_link_corpus_walker() {
                 let app = source_link_router(escape_root.to_path_buf(), Arc::new(FilesystemReads));
                 let (status, body, loc) = get_source(app, ref_url).await;
                 assert_response_contract(id, status, &body, loc.as_deref(), row);
+                assert!(!body.contains("/app/news"));
+                assert!(!body.contains("# Work Newsletter"));
             }
             continue;
         }
 
         let (status, body, loc) = get_source(news_app.clone(), ref_url).await;
         assert_response_contract(id, status, &body, loc.as_deref(), row);
+        assert!(!body.contains("/app/news"));
+        assert!(!body.contains("# Work Newsletter"));
     }
 
     // Assert activity_cases
@@ -695,7 +685,6 @@ struct InjectedFaultReads {
     inner: FilesystemReads,
     fail_segments: bool,
     fail_day_stat: bool,
-    fail_news: bool,
     fail_index: bool,
     fail_activity: bool,
     retired_override: Option<RetiredFacets>,
@@ -707,7 +696,6 @@ impl InjectedFaultReads {
             inner: FilesystemReads,
             fail_segments: false,
             fail_day_stat: false,
-            fail_news: false,
             fail_index: false,
             fail_activity: false,
             retired_override: None,
@@ -751,18 +739,6 @@ impl SourceReads for InjectedFaultReads {
         self.inner.resolve_facet_id(journal, id)
     }
 
-    fn read_news_file(
-        &self,
-        journal: &Path,
-        facet: &str,
-        file: &str,
-    ) -> Result<Option<String>, String> {
-        if self.fail_news {
-            return Err("injected news read failure".to_owned());
-        }
-        self.inner.read_news_file(journal, facet, file)
-    }
-
     fn read_file_text(&self, path: &Path) -> Result<String, String> {
         let path_str = path.to_string_lossy();
         if self.fail_index && path_str.contains("talents") {
@@ -785,7 +761,6 @@ async fn check_failure_injections() {
     let root = temp.path();
 
     create_segment(root, "20260901", "room", "100000_300");
-    write_file(&root.join("facets/work/news/20260901.md"), "news");
     write_file(&root.join("chronicle/20260901/talents/plain.md"), "plain");
     write_file(
         &root.join("talents/20260901.jsonl"),
@@ -814,16 +789,7 @@ async fn check_failure_injections() {
     assert!(body.contains("your journal couldn't check this source."));
     assert!(!body.contains("it isn't in your journal."));
 
-    // 3. News read failure
-    let mut reads = InjectedFaultReads::new();
-    reads.fail_news = true;
-    let app = source_link_router(root.to_path_buf(), Arc::new(reads));
-    let (status, body, _) = get_source(app, "sol://facets/work/news/20260901").await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert!(body.contains("your journal couldn't check this source."));
-    assert!(!body.contains("it isn't in your journal."));
-
-    // 4. Run index failure
+    // 3. Run index failure
     let mut reads = InjectedFaultReads::new();
     reads.fail_index = true;
     let app = source_link_router(root.to_path_buf(), Arc::new(reads));
@@ -832,7 +798,7 @@ async fn check_failure_injections() {
     assert!(body.contains("your journal couldn't check this source."));
     assert!(!body.contains("it isn't in your journal."));
 
-    // 5. Activity file failure
+    // 4. Activity file failure
     let mut reads = InjectedFaultReads::new();
     reads.fail_activity = true;
     let app = source_link_router(root.to_path_buf(), Arc::new(reads));
@@ -841,16 +807,7 @@ async fn check_failure_injections() {
     assert!(body.contains("your journal couldn't check this source."));
     assert!(!body.contains("it isn't in your journal."));
 
-    // 6. Retired unreadable on newsletter
-    let mut reads = InjectedFaultReads::new();
-    reads.retired_override = Some(RetiredFacets::Unreadable("damaged disk".into()));
-    let app = source_link_router(root.to_path_buf(), Arc::new(reads));
-    let (status, body, _) = get_source(app, "sol://facets/renamed/news/20260901").await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert!(body.contains("your journal couldn't check this source."));
-    assert!(!body.contains("it isn't in your journal."));
-
-    // 7. Retired unreadable on activity
+    // 5. Retired unreadable on activity
     let mut reads = InjectedFaultReads::new();
     reads.retired_override = Some(RetiredFacets::Unreadable("damaged disk".into()));
     let app = source_link_router(root.to_path_buf(), Arc::new(reads));
@@ -859,16 +816,7 @@ async fn check_failure_injections() {
     assert!(body.contains("your journal couldn't check this source."));
     assert!(!body.contains("it isn't in your journal."));
 
-    // 8. Retired malformed on newsletter
-    let mut reads = InjectedFaultReads::new();
-    reads.retired_override = Some(RetiredFacets::Malformed("bad json".into()));
-    let app = source_link_router(root.to_path_buf(), Arc::new(reads));
-    let (status, body, _) = get_source(app, "sol://facets/renamed/news/20260901").await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert!(body.contains("your journal couldn't check this source."));
-    assert!(!body.contains("it isn't in your journal."));
-
-    // 9. Retired malformed on activity
+    // 6. Retired malformed on activity
     let mut reads = InjectedFaultReads::new();
     reads.retired_override = Some(RetiredFacets::Malformed("bad json".into()));
     let app = source_link_router(root.to_path_buf(), Arc::new(reads));

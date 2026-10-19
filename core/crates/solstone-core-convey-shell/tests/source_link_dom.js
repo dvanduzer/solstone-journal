@@ -471,8 +471,6 @@ for (const [catName, cases] of Object.entries(corpus)) {
     if (item.status !== 400) {
       if (catName === 'segment_cases' || catName === 'activity_cases') {
         expectedText = 'moment';
-      } else if (catName === 'newsletter_cases') {
-        expectedText = 'newsletter';
       }
     }
     const expectedHref = '/source?ref=' + encodeURIComponent(item.ref);
@@ -506,15 +504,15 @@ caseCount++;
 const parentheticalNewsletters = window.AppServices.renderMarkdown(
   'Newsletters: (sol://facets/montague/news/20260310; sol://facets/verona/news/20260310) and sol://20260901/100000_300'
 );
-assert.ok(parentheticalNewsletters.includes('>newsletter 1<'), `newsletter 1 in ${parentheticalNewsletters}`);
-assert.ok(parentheticalNewsletters.includes('>newsletter 2<'), `newsletter 2 in ${parentheticalNewsletters}`);
+assert.ok(parentheticalNewsletters.includes('>source 1<'), `source 1 in ${parentheticalNewsletters}`);
+assert.ok(parentheticalNewsletters.includes('>source 2<'), `source 2 in ${parentheticalNewsletters}`);
 assert.ok(parentheticalNewsletters.includes('>moment<'), `trailing lone moment in ${parentheticalNewsletters}`);
 assert.ok(!parentheticalNewsletters.includes('moment 1'), `trailing lone moment not numbered in ${parentheticalNewsletters}`);
 
 caseCount++;
 const mixedLabels = window.AppServices.renderMarkdown('Check sol://20260901/100000_300 and sol://facets/work/news/20260901.');
 assert.ok(mixedLabels.includes('>moment<'), `unrepeated moment in mixed: ${mixedLabels}`);
-assert.ok(mixedLabels.includes('>newsletter<'), `unrepeated newsletter in mixed: ${mixedLabels}`);
+assert.ok(mixedLabels.includes('>source<'), `unrepeated source in mixed: ${mixedLabels}`);
 
 caseCount++;
 const autolink = window.AppServices.renderMarkdown('<sol://20260901/100000_300>');

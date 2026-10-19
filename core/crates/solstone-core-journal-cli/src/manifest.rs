@@ -47,11 +47,6 @@ pub(crate) const LOCAL_PATHS: &[LocalPath] = &[
         leaf: "merge",
         token: "facet merge",
     },
-    LocalPath {
-        group: "news",
-        leaf: "write",
-        token: "news write",
-    },
 ];
 pub const JOURNAL_COMMAND_COUNT: usize =
     ROOT_COMMANDS.len() + crate::processes::PROCESS_SPECS.len() + LOCAL_PATHS.len();

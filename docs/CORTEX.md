@@ -273,7 +273,7 @@ The JSON frontmatter for a talent can include:
 - `multi_facet`: Boolean flag for facet-aware agents (default: false)
   - When true, the agent is spawned once for each **active** facet (see Multi-Facet Agents section)
   - Each instance receives a facet-specific prompt with the facet name
-  - Useful for creating per-facet reports, newsletters, or analyses
+  - Useful for creating per-facet reports or analyses
 - `always`: Override active facet detection for multi-facet agents (default: false)
   - When true, agent runs for all non-muted facets regardless of activity
 - `env`: not applied. A talent's own `env` never reaches a process environment; only a request's `env` does (see [Request Format](#request-format))
@@ -329,7 +329,7 @@ When an agent has `"multi_facet": true`:
 1. The agent is spawned once for each **active** facet
 2. Each instance receives a prompt including the facet name
 3. The prompt arrives scoped to that facet: the runtime fills `$facets` with that facet's context, and a talent's pre hook can add facet-specific material
-4. This enables per-facet reports, newsletters, and analyses
+4. This enables per-facet reports and analyses
 
 #### Daily Multi-Facet Agents
 

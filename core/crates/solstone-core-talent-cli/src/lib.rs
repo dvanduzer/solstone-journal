@@ -530,15 +530,8 @@ mod tests {
         assert_eq!(json.exit_code, 0, "{}", json.stderr);
         let records = json.stdout.lines().collect::<Vec<_>>();
         assert_eq!(records.len(), discovered.len());
-        assert!(
-            json.stdout
-                .find("apps/entities/talent/detection.md")
-                .expect("detection")
-                < json
-                    .stdout
-                    .find("talent/facet_newsletter.md")
-                    .expect("facet_newsletter")
-        );
+        assert!(json.stdout.contains("apps/entities/talent/detection.md"));
+        assert!(!json.stdout.contains("talent/facet_newsletter.md"));
         assert_eq!(
             run_cli(
                 &args(&["list", "--schedule", "activity", "--source", "app"]),

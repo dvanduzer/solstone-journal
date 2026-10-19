@@ -572,7 +572,6 @@ mod tests {
             &root,
             "chronicle/20260101/import.ics/090000_300/event_transcript.md",
         );
-        write(&root, "facets/work/news/20240101.md");
         write(&root, "imports/20260101_120000/summary.md");
         write(&root, "config/actions/20240101.jsonl");
         write(&root, "facets/work/events/20240101.jsonl");
@@ -619,7 +618,6 @@ mod tests {
                 "facets/work/entities/alice_johnson/observations.jsonl",
                 "facets/work/events/20240101.jsonl",
                 "facets/work/logs/20240101.jsonl",
-                "facets/work/news/20240101.md",
                 "imports/20260101_120000/summary.md",
             ]
         );
@@ -713,7 +711,7 @@ mod tests {
             "chronicle/20240101/default/123456_300/talents/sense.json",
         );
         write(&root, "chronicle/20240101/default/123456_300/audio.jsonl");
-        write(&root, "facets/work/news/20240101.md");
+        write(&root, "facets/work/activities/20240101.jsonl");
         write(&root, "entities/alice/entity.json");
 
         let oracle = discover_indexable_files(&root).expect("oracle");
@@ -730,7 +728,7 @@ mod tests {
         let root = temp_root("status-without-chronicle");
         write(&root, "20240101/talents/flow.md");
         write(&root, "20240101/default/123456_300/talents/sense.json");
-        write(&root, "facets/work/news/20240101.md");
+        write(&root, "facets/work/activities/20240101.jsonl");
 
         let oracle = discover_indexable_files(&root).expect("oracle");
         let status = discover_index_status_files(&root).expect("status");
@@ -748,7 +746,7 @@ mod tests {
         });
         fs::create_dir_all(&root).expect("create meta root");
         write(&root, "chronicle/20240101/talents/flow.md");
-        write(&root, "facets/work/news/20240101.md");
+        write(&root, "facets/work/activities/20240101.jsonl");
 
         let oracle = discover_indexable_files(&root).expect("oracle");
         let status = discover_index_status_files(&root).expect("status");
@@ -793,6 +791,8 @@ mod tests {
                 format!("vid_{idx}_protected_video.jsonl")
             } else if comp.ends_with("_desktop_activity.jsonl") {
                 format!("note_{idx}_desktop_activity.jsonl")
+            } else if *comp == "[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]" {
+                format!("2026{:04}", idx % 10000)
             } else {
                 comp.to_string()
             };
@@ -874,7 +874,7 @@ mod tests {
         write(&root, "chronicle/20240102/aaa/seg/browser_x.jsonl");
         write(&root, "chronicle/20240102/bbb/seg/talents/sense.json");
         write(&root, "chronicle/20240102/bbb/seg/browser_x.jsonl");
-        write(&root, "facets/work/news/20240101.md");
+        write(&root, "facets/work/activities/20240101.jsonl");
         write(&root, "unmatched/nested/file.txt");
 
         reset_recorded_listings();
@@ -926,13 +926,13 @@ mod tests {
         assert!(first.contains_key("20240101/talents/flow.md"));
         assert!(first.contains_key("20240101/location.md"));
 
-        write(&root, "facets/work/news/20240101.md");
+        write(&root, "facets/work/activities/20240101.jsonl");
         fs::remove_file(root.join("chronicle/20240101/location.md")).expect("remove");
 
         let second = discover_index_status_files(&root).expect("second call");
         let fresh_oracle = discover_indexable_files(&root).expect("fresh oracle");
         assert_eq!(second, fresh_oracle);
-        assert!(second.contains_key("facets/work/news/20240101.md"));
+        assert!(second.contains_key("facets/work/activities/20240101.jsonl"));
         assert!(!second.contains_key("20240101/location.md"));
 
         fs::remove_dir_all(root).expect("cleanup");
@@ -972,16 +972,19 @@ mod tests {
         let external = temp_root("status-symlinks-external");
         fs::create_dir_all(&external).expect("external dir");
 
-        let real_file = external.join("real_news.md");
-        fs::write(&real_file, "# Real News\n").expect("write real file");
+        let real_file = external.join("real_activity.jsonl");
+        fs::write(&real_file, "{\"id\":\"1\"}\n").expect("write real file");
 
         let real_day = external.join("real_day");
         fs::create_dir_all(real_day.join("talents")).expect("real day talents");
         fs::write(real_day.join("talents/flow.md"), "# Flow\n").expect("write flow");
 
-        fs::create_dir_all(root.join("facets/work/news")).expect("facets news");
-        std::os::unix::fs::symlink(&real_file, root.join("facets/work/news/20240101.md"))
-            .expect("symlink file");
+        fs::create_dir_all(root.join("facets/work/activities")).expect("facets activities");
+        std::os::unix::fs::symlink(
+            &real_file,
+            root.join("facets/work/activities/20240101.jsonl"),
+        )
+        .expect("symlink file");
 
         fs::create_dir_all(root.join("chronicle")).expect("chronicle");
         std::os::unix::fs::symlink(&real_day, root.join("chronicle/20240101"))
@@ -990,7 +993,7 @@ mod tests {
         let status = discover_index_status_files(&root).expect("status");
         let oracle = discover_indexable_files(&root).expect("oracle");
         assert_eq!(status, oracle);
-        assert!(status.contains_key("facets/work/news/20240101.md"));
+        assert!(status.contains_key("facets/work/activities/20240101.jsonl"));
         assert!(status.contains_key("20240101/talents/flow.md"));
 
         fs::remove_dir_all(root).expect("cleanup root");
@@ -1146,7 +1149,7 @@ mod tests {
     fn status_walk_semantics_unreadable_unmatched_directory_does_not_error() {
         use std::os::unix::fs::PermissionsExt;
         let mut root = TempRoot::new("unreadable-unmatched");
-        write(&root, "facets/work/news/20240101.md");
+        write(&root, "facets/work/activities/20240101.jsonl");
         fs::create_dir_all(root.join("chronicle")).expect("create chronicle dir");
         let unmatched = root.join("unmatched");
         fs::create_dir_all(&unmatched).expect("create unmatched");
@@ -1160,7 +1163,7 @@ mod tests {
         let oracle =
             discover_indexable_files(&root).expect("oracle must not error on unmatched dir");
         assert_eq!(status, oracle);
-        assert!(status.contains_key("facets/work/news/20240101.md"));
+        assert!(status.contains_key("facets/work/activities/20240101.jsonl"));
     }
 
     #[cfg(unix)]

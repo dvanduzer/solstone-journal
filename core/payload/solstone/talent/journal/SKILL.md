@@ -94,7 +94,7 @@ Use `solstone journal health --help` for status flags,
 |------|---------|
 | `chronicle/` | Daily folders of original media and everything derived from it |
 | `entities/` | Journal-level entity records |
-| `facets/` | Facet data: entities, events, news, logs |
+| `facets/` | Facet data: entities, events, activities, logs (see [facets](references/facets.md)) |
 | `talents/` | Talent run logs and outputs |
 | `solstone/apps/` | App-specific journal storage |
 | `imports/` | Imported audio and artifacts |
@@ -107,7 +107,7 @@ For the full table, see [storage](references/storage.md).
 
 - [CLI reference](references/cli.md) — `solstone call journal` commands
 - [Configuration](references/config.md) — `journal.json`, providers, retention
-- [Facets](references/facets.md) — facet folders, entities, news, activities
+- [Facets](references/facets.md) — facet folders, entities, activities
 - [Original Media and Extracts](references/captures.md) — layers, imports, segment layout
 - [Logs](references/logs.md) — action logs, token usage, talent logs, health
 - [Storage](references/storage.md) — top-level layout, app storage, search index

@@ -15,7 +15,6 @@ pub enum StageId {
     Participation,
     Schedule,
     DailySchedule,
-    FacetNewsletter,
     EntityDetection,
     EntitiesReview,
     EntitySuggest,
@@ -65,7 +64,6 @@ pub enum PrePostState {
     MorningBriefing(crate::morning_briefing::MorningBriefingPreState),
     EntityDescribe(crate::entities::describe::EntityDescribePreState),
     DailySchedule(crate::daily_schedule::DailySchedulePreState),
-    FacetNewsletter(crate::facet_newsletter::FacetNewsletterState),
     EntityDetection(crate::entities::detection::DetectionState),
     EntitiesReview(crate::entities::review::ReviewState),
     EntitySuggest(crate::entities::suggest::SuggestState),
@@ -112,7 +110,7 @@ pub struct StageSpec {
     pub output_override: Option<OutputOverrideFn>,
 }
 
-pub const HOOK_TABLE: [HookBinding; 15] = [
+pub const HOOK_TABLE: [HookBinding; 14] = [
     HookBinding {
         hook: "documents",
         stage: StageId::Documents,
@@ -144,10 +142,6 @@ pub const HOOK_TABLE: [HookBinding; 15] = [
     HookBinding {
         hook: "daily_schedule",
         stage: StageId::DailySchedule,
-    },
-    HookBinding {
-        hook: "facet_newsletter",
-        stage: StageId::FacetNewsletter,
     },
     HookBinding {
         hook: "entities:detection",
@@ -278,20 +272,6 @@ pub static DAILY_SCHEDULE: StageSpec = StageSpec {
     writes_as_intent: Some(crate::writers::apply_prepared),
     output_override: None,
 };
-pub static FACET_NEWSLETTER: StageSpec = StageSpec {
-    stage: StageId::FacetNewsletter,
-    gate: Some(crate::facet_newsletter::gate),
-    build: Some(|prepared, context, _| crate::facet_newsletter::build(prepared, context)),
-    prompt_override: Some(crate::facet_newsletter::apply_prompt_override),
-    commit: Some(CommitSpec {
-        parse: crate::facet_newsletter::parse,
-        commit: crate::facet_newsletter::commit,
-    }),
-    unavailable_commit: None,
-    unavailable_before_generate: None,
-    writes_as_intent: Some(crate::writers::apply_prepared),
-    output_override: None,
-};
 pub static ENTITY_DETECTION: StageSpec = StageSpec {
     stage: StageId::EntityDetection,
     gate: Some(crate::entities::detection::gate),
@@ -390,7 +370,6 @@ pub fn resolve_hook(hook: &str) -> Option<&'static StageSpec> {
         StageId::Participation => &PARTICIPATION,
         StageId::Schedule => &SCHEDULE,
         StageId::DailySchedule => &DAILY_SCHEDULE,
-        StageId::FacetNewsletter => &FACET_NEWSLETTER,
         StageId::EntityDetection => &ENTITY_DETECTION,
         StageId::EntitiesReview => &ENTITIES_REVIEW,
         StageId::EntitySuggest => &ENTITY_SUGGEST,

@@ -2968,7 +2968,7 @@ fn repaired_memberships_deny_partial_rows_then_restore_only_authorized_results()
         .unwrap();
     }
     for i in 0..140 {
-        let path = format!("facets/A/news/{i:03}.md");
+        let path = format!("facets/A/events/{i:03}.jsonl");
         insert(
             &conn,
             if i == 139 {
@@ -2979,7 +2979,7 @@ fn repaired_memberships_deny_partial_rows_then_restore_only_authorized_results()
             &path,
             "20260107",
             "a",
-            "news",
+            "events",
             "",
             0,
         );
@@ -2988,14 +2988,20 @@ fn repaired_memberships_deny_partial_rows_then_restore_only_authorized_results()
     insert(
         &conn,
         "repairmarker foreign",
-        "facets/B/news/one.md",
+        "facets/B/events/one.jsonl",
         "20260107",
         "b",
-        "news",
+        "events",
         "",
         0,
     );
-    seed_classification(&conn, "facets/B/news/one.md", "facets", "facet_owned", &[b]);
+    seed_classification(
+        &conn,
+        "facets/B/events/one.jsonl",
+        "facets",
+        "facet_owned",
+        &[b],
+    );
     finish_classification(&conn);
     drop(conn);
     apply_path_lookup(&root).unwrap();

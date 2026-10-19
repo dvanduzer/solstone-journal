@@ -87,6 +87,9 @@ fn collect_records(
             let Some(object) = record.as_object() else {
                 continue;
             };
+            if object.get("name").and_then(Value::as_str) == Some("facet_newsletter") {
+                continue;
+            }
             if options
                 .agent
                 .as_deref()
@@ -922,5 +925,51 @@ mod tests {
             render_summary(&records),
             "  demo                 1✓ 1✗      12.5s–95.0s\n  ————————————————————————————————————————\n  total                1✓ 1✗      107.5s\n"
         );
+    }
+
+    #[test]
+    fn collect_records_skips_facet_newsletter() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let first = record(
+            "1001",
+            "facet_newsletter",
+            "20260805",
+            1000,
+            "completed",
+            5.0,
+        );
+        let second = record(
+            "1002",
+            "morning_briefing",
+            "20260805",
+            2000,
+            "completed",
+            10.0,
+        );
+        write_day(root.path(), "20260805", &[first, second]);
+
+        let talents_dir = root.path().join("talents");
+        let records =
+            collect_records(&talents_dir, &options(), 10, &mut || Ok(Vec::new())).expect("records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["name"], "morning_briefing");
+        assert_eq!(records[0]["use_id"], "1002");
+
+        let mut filtered_options = options();
+        filtered_options.agent = Some("facet_newsletter".to_string());
+        let filtered = collect_records(&talents_dir, &filtered_options, 10, &mut || Ok(Vec::new()))
+            .expect("records");
+        assert!(filtered.is_empty());
+
+        let output = run_logs(
+            root.path(),
+            &filtered_options,
+            SystemTime::now(),
+            false,
+            &mut || Ok(Vec::new()),
+        );
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout, "");
+        assert_eq!(output.stderr, "");
     }
 }

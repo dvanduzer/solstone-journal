@@ -66,11 +66,10 @@ solstone call entities history "<entity_name>"
 
 ### today — what's happening now
 
-Combine these commands to get a picture of the current day:
+Check what's anticipated for the current day:
 
 ```bash
 solstone call activities list --source anticipated
-solstone call journal news "<facet>"
 ```
 
 ### transcript — meeting transcripts
@@ -138,12 +137,11 @@ solstone call entities search --limit 5
 solstone call journal search "<name>" --day-from 20260320
 ```
 
-**"What did I miss yesterday?"** — yesterday's events, transcripts, and news:
+**"What did I miss yesterday?"** — yesterday's events and transcripts:
 
 ```bash
 solstone call journal search "" -d 20260326 -a meetings
 solstone call transcripts scan 20260326
-solstone call journal news "<facet>" --day 20260326
 ```
 
 ## Output format
@@ -159,7 +157,7 @@ cannot:
 
 - Create, delete, or modify facets
 - Attach or modify entities
-- Write news or observations
+- Write observations
 - Run pipeline operations (think, indexer, transcribe)
 - Access internal agent state or orchestration
 

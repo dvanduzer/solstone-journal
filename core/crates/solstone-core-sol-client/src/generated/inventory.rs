@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
-// authority-source-sha256: 4c5edff15b1cc2bb441a7b29be065eb102dbaf55f8f98b11c92ad29b13665fd4
+// authority-source-sha256: fce2a327d69925ec937ef8be533012c1142d9d87bb4115c810871508108f0b8b
 
 use crate::aggregate::{Handler, InventoryEntry};
 use crate::resident::ResidentHandler;
@@ -2248,21 +2248,6 @@ pub const ENTRIES: &[InventoryEntry] = &[
     },
     InventoryEntry {
         surface: "sol-call",
-        path: &["journal", "news"],
-        kind: "command",
-        help: "Read facet news.",
-        authority_path: "core/native-sol/think/tools/native/journal/authority.toml",
-        params_json: "[{\"count\":false,\"default\":null,\"flag_value\":null,\"hidden\":false,\"is_flag\":false,\"kind\":\"argument\",\"multiple\":false,\"name\":\"name\",\"nargs\":1,\"options\":[\"name\"],\"required\":false,\"secondary\":[],\"type\":\"text\"},{\"count\":false,\"default\":null,\"flag_value\":null,\"hidden\":false,\"is_flag\":false,\"kind\":\"option\",\"multiple\":false,\"name\":\"facet_opt\",\"nargs\":1,\"options\":[\"--facet\",\"-f\"],\"required\":false,\"secondary\":[],\"type\":\"text\"},{\"count\":false,\"default\":null,\"flag_value\":null,\"hidden\":false,\"is_flag\":false,\"kind\":\"option\",\"multiple\":false,\"name\":\"day\",\"nargs\":1,\"options\":[\"--day\",\"-d\"],\"required\":false,\"secondary\":[],\"type\":\"text\"},{\"count\":false,\"default\":5,\"flag_value\":null,\"hidden\":false,\"is_flag\":false,\"kind\":\"option\",\"multiple\":false,\"name\":\"limit\",\"nargs\":1,\"options\":[\"--limit\",\"-n\"],\"required\":false,\"secondary\":[],\"type\":\"integer\"},{\"count\":false,\"default\":null,\"flag_value\":null,\"hidden\":false,\"is_flag\":false,\"kind\":\"option\",\"multiple\":false,\"name\":\"cursor\",\"nargs\":1,\"options\":[\"--cursor\"],\"required\":false,\"secondary\":[],\"type\":\"text\"}]",
-        entry_type: "http",
-        operation_id: "journal.news",
-        method: Some("GET"),
-        route: Some("/app/news/api/facet/{facet}"),
-        contract_operation_id: None,
-        handler: "news",
-        resident: false,
-    },
-    InventoryEntry {
-        surface: "sol-call",
         path: &["journal", "read"],
         kind: "command",
         help: "Read full content of an agent output.",
@@ -2545,7 +2530,6 @@ pub const HANDLERS: &[Handler] = &[
     think_tools_native_journal_command_rs::facets,
     think_tools_native_journal_command_rs::import,
     think_tools_native_journal_command_rs::imports,
-    think_tools_native_journal_command_rs::news,
     think_tools_native_journal_command_rs::read,
     think_tools_native_journal_command_rs::retention_config,
     think_tools_native_journal_command_rs::retention_list,

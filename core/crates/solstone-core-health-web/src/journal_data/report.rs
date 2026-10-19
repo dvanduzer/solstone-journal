@@ -543,9 +543,6 @@ pub(crate) fn build_synthesis_health(
                     Some("story_rejected") => {
                         format!("an activity's story on {day} couldn't be used ({usage})")
                     }
-                    Some("partial_input") => format!(
-                        "a newsletter on {day} used a story written from only part of its activity"
-                    ),
                     _ => format!(
                         "'{}' finished without a usable result ({usage}) on {day}",
                         string(row.get("name")),
@@ -1691,14 +1688,7 @@ mod tests {
             build_synthesis_health(temporary.path(), &ScanAggregate::default(), now()).unwrap();
         assert_eq!(health.talent_run_failures_24h, Some(0));
         assert_eq!(health.talent_degraded_outputs_24h, Some(1));
-        let note = notes
-            .iter()
-            .find(|note| note.message.contains("20260410"))
-            .expect("a degraded note for the day");
-        assert!(
-            !note.message.contains("without a usable result"),
-            "{note:?}"
-        );
+        assert!(notes.iter().any(|note| note.message.contains("20260410")));
     }
 
     #[test]

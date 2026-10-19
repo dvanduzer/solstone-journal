@@ -412,7 +412,7 @@ fn queue_daily(
         )?;
         let mut upstream = Map::new();
         for unit in coverage.units {
-            if !matches!(unit.identity.name.as_str(), "schedule" | "facet_newsletter") {
+            if unit.identity.name.as_str() != "schedule" {
                 continue;
             }
             let key = unit.identity.facet.as_ref().map_or_else(
@@ -2723,22 +2723,18 @@ cat "${0%/*}/response-$mode.json"
             .unwrap();
         }
         std::fs::write(talent.join("schedule.md"), "{\n\"type\":\"generate\",\"max_output_tokens\":1024,\"schedule\":\"daily\",\"priority\":1,\"output\":\"json\",\"disabled\":true,\"hook\":{\"post\":\"schedule\"}\n}\nDisabled scheduling.").unwrap();
-        std::fs::write(talent.join("facet_newsletter.md"), "{\n\"type\":\"generate\",\"max_output_tokens\":1024,\"schedule\":\"daily\",\"priority\":2,\"multi_facet\":true,\"output\":\"md\",\"hook\":{\"pre\":\"facet_newsletter\",\"post\":\"facet_newsletter\"},\"load\":{\"transcripts\":false}\n}\nWrite a newsletter from $source_packet.").unwrap();
+        std::fs::write(talent.join("entities_review.md"), "{\n\"type\":\"generate\",\"max_output_tokens\":1024,\"schedule\":\"daily\",\"priority\":2,\"multi_facet\":true,\"output\":\"json\",\"hook\":{\"pre\":\"entities:entities_review\",\"post\":\"entities:entities_review\"},\"load\":{\"transcripts\":false}\n}\nReview entities.").unwrap();
         let stub = root.join("generate-stub.sh");
         std::fs::write(
-            root.join("newsletter-response.json"),
-            model_response(
-                "# Daily newsletter\nThe meeting was rescheduled.",
-                Value::Null,
-            )
-            .to_string(),
+            root.join("review-response.json"),
+            model_response("{\"promotions\":[],\"merges\":[]}", Value::Null).to_string(),
         )
         .unwrap();
         std::fs::write(
             &stub,
             r#"#!/bin/sh
 cat >/dev/null
-cat "${0%/*}/newsletter-response.json"
+cat "${0%/*}/review-response.json"
 "#,
         )
         .unwrap();
@@ -2822,14 +2818,9 @@ cat "${0%/*}/newsletter-response.json"
                 "SCHEDULE_PROOF: extract future appointments.",
             ),
             (
-                "facet_newsletter",
-                json!({"priority":2,"output":"md","multi_facet":true,"always":true,"hook":{"pre":"facet_newsletter","post":"facet_newsletter"},"load":{"transcripts":false}}),
-                "NEWSLETTER_PROOF: $source_packet",
-            ),
-            (
                 "morning_briefing",
                 json!({"priority":3,"output":"json","hook":{"pre":"morning_briefing"},"load":{"transcripts":false}}),
-                "BRIEFING_PROOF: $facet_newsletters $anticipated_today",
+                "BRIEFING_PROOF: $activity_digest $anticipated_today",
             ),
         ] {
             let mut metadata = metadata.as_object().unwrap().clone();
@@ -2858,7 +2849,6 @@ cat "${0%/*}/newsletter-response.json"
 request=$(cat)
 case "$request" in
  *SCHEDULE_PROOF*) kind=schedule;;
- *NEWSLETTER_PROOF*) kind=newsletter;;
  *BRIEFING_PROOF*) kind=briefing;;
  *) exit 91;;
 esac
@@ -2896,7 +2886,6 @@ cat "${0%/*}/response-$kind.json"
                 .unwrap()
                 .unwrap()
         };
-        let news_path = root.join(format!("facets/work/news/{day}.md"));
         let calendar_path = root.join(format!("facets/work/activities/{next}.jsonl"));
         for phase in ["OLD", "EMPTY", "NEW"] {
             if phase == "EMPTY" {
@@ -2922,10 +2911,6 @@ cat "${0%/*}/response-$kind.json"
             for (kind, response) in [
                 ("schedule", events.to_string()),
                 (
-                    "newsletter",
-                    format!("# {phase} newsletter\nA planning update."),
-                ),
-                (
                     "briefing",
                     json!({"summary":"Prepared from this pass"}).to_string(),
                 ),
@@ -2948,21 +2933,8 @@ cat "${0%/*}/response-$kind.json"
                 expected,
                 "schedule {phase}"
             );
-            assert_eq!(
-                record("facet_newsletter", Some("work".to_owned()))
-                    .accepted
-                    .unwrap()
-                    .status,
-                expected,
-                "newsletter {phase}"
-            );
             let briefing = record("morning_briefing", None);
             let packet = briefing.frozen_packet.unwrap();
-            let news = packet
-                .pointer("/state/MorningBriefing/values/facet_newsletters")
-                .unwrap()
-                .as_str()
-                .unwrap();
             let agenda = packet
                 .pointer("/state/MorningBriefing/values/anticipated_today")
                 .unwrap()
@@ -2970,32 +2942,19 @@ cat "${0%/*}/response-$kind.json"
                 .unwrap();
             if phase == "EMPTY" {
                 assert!(
-                    std::fs::read_to_string(&news_path)
-                        .unwrap()
-                        .contains("OLD newsletter"),
-                    "positive control: prior newsletter still exists"
-                );
-                assert!(
                     std::fs::read_to_string(&calendar_path)
                         .unwrap()
                         .contains("OLD appointment"),
                     "no output does not imply cancellation"
                 );
-                assert!(!news.contains("OLD newsletter"), "{news}");
                 assert!(!agenda.contains("OLD appointment"), "{agenda}");
                 assert_eq!(
                     packet.pointer("/prepared/config/_daily_upstream/schedule"),
                     Some(&json!(false))
                 );
-                assert_eq!(
-                    packet.pointer("/prepared/config/_daily_upstream/facet_newsletter:work"),
-                    Some(&json!(false))
-                );
             } else {
-                assert!(news.contains(&format!("{phase} newsletter")), "{news}");
                 assert!(agenda.contains(&format!("{phase} appointment")), "{agenda}");
                 if phase == "NEW" {
-                    assert!(!news.contains("OLD newsletter"));
                     assert!(!agenda.contains("OLD appointment"));
                 }
             }

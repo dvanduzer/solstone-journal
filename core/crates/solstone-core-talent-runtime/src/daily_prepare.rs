@@ -14,7 +14,6 @@ use serde_json::{Map, Value, json};
 enum FrozenState {
     None,
     DailySchedule(crate::daily_schedule::DailySchedulePreState),
-    FacetNewsletter(crate::facet_newsletter::FacetNewsletterState),
     MorningBriefing(crate::morning_briefing::MorningBriefingPreState),
     EntitiesReview(crate::entities::review::ReviewState),
     EntitySuggest(crate::entities::suggest::SuggestState),
@@ -43,13 +42,6 @@ pub fn freeze(
             match gate(&prepared, context).map_err(RuntimeOutcome::StageFailed)? {
                 GateDecision::Proceed => {}
                 GateDecision::Skip(reason) => {
-                    if hook == "facet_newsletter" && reason == "no substantive facet/day sources" {
-                        // A no-output decision still owes the frozen coverage
-                        // diagnostics, including sources wholly clipped by the
-                        // canonical formatter. The admission E check brackets
-                        // this read just as it brackets the normal build.
-                        state = crate::facet_newsletter::build(&mut prepared, context)?;
-                    }
                     prepared
                         .config
                         .insert("skip_reason".to_owned(), json!(reason));
@@ -88,7 +80,6 @@ pub fn freeze(
     let state = match state {
         PrePostState::None => FrozenState::None,
         PrePostState::DailySchedule(v) => FrozenState::DailySchedule(v),
-        PrePostState::FacetNewsletter(v) => FrozenState::FacetNewsletter(v),
         PrePostState::MorningBriefing(v) => FrozenState::MorningBriefing(v),
         PrePostState::EntitiesReview(v) => FrozenState::EntitiesReview(v),
         PrePostState::EntitySuggest(v) => FrozenState::EntitySuggest(v),
@@ -218,11 +209,27 @@ fn fit_location_part(
         .and_then(Value::as_u64)
         .and_then(|tokens| u32::try_from(tokens).ok())
         .unwrap_or(0);
-    let budget = compute_input_budget(max_output_tokens, launched_context_window(&context.journal));
+    let context_window = if hook == "morning_briefing" {
+        solstone_core_local::plan::LOCAL_MIN_CONTEXT_TOKENS
+    } else {
+        launched_context_window(&context.journal)
+    };
+    let budget = compute_input_budget(max_output_tokens, context_window);
+    let schema_tokens = if hook == "morning_briefing" {
+        prepared
+            .config
+            .get("json_schema")
+            .map(|s| estimate_tokens(&s.to_string()))
+            .unwrap_or(0)
+    } else {
+        0
+    };
     let ordinary_tokens = ordinary.iter().fold(0u32, |total, text| {
         total.saturating_add(estimate_tokens(text))
     });
-    let room = budget.saturating_sub(ordinary_tokens);
+    let room = budget
+        .saturating_sub(ordinary_tokens)
+        .saturating_sub(schema_tokens);
     let byte_cap = usize::try_from(room)
         .unwrap_or(usize::MAX)
         .saturating_mul(3)
@@ -321,7 +328,6 @@ pub fn thaw(packet: &Value) -> Result<ThawedStage, String> {
     let (state, expected) = match frozen {
         FrozenState::None => (PrePostState::None, "schedule"),
         FrozenState::DailySchedule(v) => (PrePostState::DailySchedule(v), "daily_schedule"),
-        FrozenState::FacetNewsletter(v) => (PrePostState::FacetNewsletter(v), "facet_newsletter"),
         FrozenState::MorningBriefing(v) => (PrePostState::MorningBriefing(v), "morning_briefing"),
         FrozenState::EntitiesReview(v) => {
             (PrePostState::EntitiesReview(v), "entities:entities_review")
@@ -402,10 +408,7 @@ fn capture_owner_expectations(
                 .map_err(|e| failure(prepared, e.to_string()))?
         } else if matches!(
             hook,
-            "facet_newsletter"
-                | "entities:entities_review"
-                | "entities:entity_suggest"
-                | "entities:entity_observer"
+            "entities:entities_review" | "entities:entity_suggest" | "entities:entity_observer"
         ) {
             prepared
                 .config
@@ -441,7 +444,6 @@ fn capture_owner_expectations(
         prepared.config.get("day").and_then(Value::as_str),
     ) {
         let relative = match hook {
-            "facet_newsletter" => Some(format!("facets/{facet}/news/{day}.md")),
             "entities:entity_suggest" => Some(format!(
                 "facets/{facet}/entities/{day}_observer_suggestions.json"
             )),
@@ -662,104 +664,6 @@ mod tests {
     }
 
     #[test]
-    fn newsletter_no_output_retains_all_clipped_source_diagnostics() {
-        let root = tempfile::tempdir().unwrap();
-        solstone_core_facets::create_facet(root.path(), "work", "Work", "", "", "", None).unwrap();
-        // Continuity alone is not a substantive source for the day, but its
-        // clipping is still coverage the no-output decision owes.
-        write(
-            root.path(),
-            "facets/work/news/20260909.md",
-            &"long prior newsletter line ".repeat(400),
-        );
-        let prepared = PreparedTalent {
-            name: "facet_newsletter".to_owned(),
-            config: json!({
-                "type":"generate","max_output_tokens":1024, "day":"20260910", "facet":"work", "prompt":"$source_packet",
-                "hook":{"pre":"facet_newsletter","post":"facet_newsletter"}
-            })
-            .as_object()
-            .unwrap()
-            .clone(),
-        };
-        let packet = freeze(
-            prepared,
-            &ExecutionContext {
-                journal: root.path().to_owned(),
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            packet
-                .pointer("/prepared/config/skip_reason")
-                .and_then(Value::as_str),
-            Some("no substantive facet/day sources")
-        );
-        let gaps = packet
-            .pointer("/state/FacetNewsletter/packet/gaps")
-            .and_then(Value::as_array)
-            .expect("no-output coverage packet retained");
-        assert!(
-            gaps.iter()
-                .filter_map(Value::as_str)
-                .any(|gap| gap.contains("clipped:") && gap.contains("prior_newsletter")),
-            "{gaps:?}"
-        );
-        assert!(thaw(&packet).is_ok());
-    }
-    #[test]
-    fn frozen_newsletter_carries_its_sources_and_thaws_without_reads() {
-        let root = tempfile::tempdir().unwrap();
-        write(
-            root.path(),
-            "facets/work/facet.json",
-            r#"{"id":"12345678-1234-4234-8234-123456789abc","title":"Work","description":"test scope"}"#,
-        );
-        let rel = "facets/work/activities/20260910.jsonl";
-        write(
-            root.path(),
-            rel,
-            &json!({"id":"coding_090000_60","activity":"coding","title":"Release work","story":{"body":"A freshly arrived source fact."}}).to_string(),
-        );
-        let context = ExecutionContext {
-            journal: root.path().to_owned(),
-        };
-        let prepared = PreparedTalent {
-            name: "facet_newsletter".to_owned(),
-            config: Map::from_iter([
-                ("max_output_tokens".to_owned(), json!(1024)),
-                ("day".to_owned(), json!("20260910")),
-                ("facet".to_owned(), json!("work")),
-                (
-                    "hook".to_owned(),
-                    json!({"pre":"facet_newsletter","post":"facet_newsletter"}),
-                ),
-                ("user_instruction".to_owned(), json!("${source_packet}")),
-            ]),
-        };
-        let packet = freeze(prepared, &context).unwrap();
-        assert!(
-            !packet["prepared"]["config"]
-                .as_object()
-                .unwrap()
-                .contains_key("skip_reason")
-        );
-        assert!(packet.to_string().contains("freshly arrived source fact"));
-        assert!(packet.to_string().contains("coding_090000_60"));
-        let original_digest = packet_digest(&packet);
-        std::fs::remove_file(root.path().join(rel)).unwrap();
-        let (restored, state) = thaw(&packet).unwrap();
-        assert!(
-            restored.config["user_instruction"]
-                .as_str()
-                .unwrap()
-                .contains("freshly arrived source fact")
-        );
-        assert!(matches!(state.unwrap().1, PrePostState::FacetNewsletter(_)));
-        assert_eq!(packet_digest(&packet), original_digest);
-        assert!(!root.path().join("indexer").exists());
-    }
-    #[test]
     fn frozen_packet_rejects_hook_state_mismatch_and_retains_legitimate_no_output() {
         let root = tempfile::tempdir().unwrap();
         let context = ExecutionContext {
@@ -912,18 +816,6 @@ mod tests {
                 ),
             ),
             (
-                "facet_newsletter",
-                prepared(
-                    "facet_newsletter",
-                    LOCATION_DAY,
-                    json!({
-                        "facet":"work",
-                        "hook":{"pre":"facet_newsletter","post":"facet_newsletter"},
-                        "prompt":"$source_packet"
-                    }),
-                ),
-            ),
-            (
                 "entities:entity_suggest",
                 prepared(
                     "entities:entity_suggest",
@@ -952,16 +844,6 @@ mod tests {
             assert!(!ordinary.is_empty(), "{hook}");
             let packet = freeze(talent, &context).unwrap();
             let config = packet["prepared"]["config"].as_object().unwrap();
-            if hook == "facet_newsletter" {
-                assert_eq!(
-                    config.get("skip_reason").and_then(Value::as_str),
-                    Some("no substantive facet/day sources")
-                );
-                assert_eq!(
-                    config.get("prompt").and_then(Value::as_str),
-                    Some("$source_packet")
-                );
-            }
             let fingerprint = config
                 .get("_daily_location_fingerprint")
                 .and_then(Value::as_str)
@@ -1066,6 +948,205 @@ mod tests {
                 .get("_daily_location_fingerprint")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn frozen_morning_briefing_with_location_fits_the_floor_budget() {
+        let root = tempfile::tempdir().unwrap();
+        location_journal(root.path(), LOCATION_DAY);
+
+        let loc_path = root.path().join(format!(
+            "chronicle/{LOCATION_DAY}/phone/140000_300/location.jsonl"
+        ));
+        let mut loc_content = std::fs::read_to_string(&loc_path).unwrap();
+        for i in 0..70 {
+            let hour = i / 60;
+            let min = i % 60;
+            loc_content.push_str(&format!(
+                "{{\"arrival\":\"2026-10-01T{hour:02}:{min:02}:00Z\",\"departure\":\"2026-10-01T{hour:02}:{min:02}:30Z\",\"h_acc\":40,\"lat\":39.7527,\"lon\":-105.0001,\"schema\":\"solstone.location.visit/1\"}}\n"
+            ));
+        }
+        std::fs::write(&loc_path, loc_content).unwrap();
+
+        let observations = rendered_observations(root.path());
+        let observation_bytes: usize = observations.iter().map(|s| s.len()).sum();
+        assert!(
+            observation_bytes > 8000,
+            "rendered observations must total more than 8000 bytes, got {observation_bytes}"
+        );
+
+        write(
+            root.path(),
+            "health/local.ctx",
+            &format!(
+                "{}\n",
+                solstone_core_local::plan::LOCAL_MIN_CONTEXT_TOKENS * 4
+            ),
+        );
+        assert!(
+            solstone_core_local::generate::launched_context_window(root.path())
+                > solstone_core_local::plan::LOCAL_MIN_CONTEXT_TOKENS
+        );
+
+        solstone_core_facets::create_facet(root.path(), "work", "Work", "", "", "", None).unwrap();
+        let record = json!({
+            "id": "act-1",
+            "title": "Short Activity",
+            "start": "09:00",
+            "story": {"body": "Short story."},
+        });
+        write(
+            root.path(),
+            &format!("facets/work/activities/{LOCATION_DAY}.jsonl"),
+            &format!("{record}\n"),
+        );
+
+        let context = ExecutionContext {
+            journal: root.path().to_owned(),
+        };
+        let max_output_tokens = 1024u32;
+        let floor_budget = solstone_core_local::generate::compute_input_budget(
+            max_output_tokens,
+            solstone_core_local::plan::LOCAL_MIN_CONTEXT_TOKENS,
+        );
+
+        let unpadded_talent = prepared(
+            "morning_briefing",
+            LOCATION_DAY,
+            json!({
+                "hook": {"pre": "morning_briefing"},
+                "prompt": "Prompt with $activity_digest and $briefing_metadata",
+                "json_schema": {"type": "object"},
+                "max_output_tokens": max_output_tokens,
+            }),
+        );
+        let unpadded_packet = freeze(unpadded_talent, &context).unwrap();
+        let (thawed_unpadded, _) = thaw(&unpadded_packet).unwrap();
+        let unpadded_schema_tokens = match thawed_unpadded.config.get("json_schema") {
+            Some(Value::String(s)) => solstone_core_local::generate::estimate_tokens(s),
+            Some(val) => solstone_core_local::generate::estimate_tokens(&val.to_string()),
+            None => 0,
+        };
+        let unpadded_text_tokens: u32 = crate::model_text_parts(&thawed_unpadded.config)
+            .into_iter()
+            .filter(|part| {
+                thawed_unpadded
+                    .config
+                    .get("_daily_location_text")
+                    .and_then(Value::as_str)
+                    .is_none_or(|loc| part != loc)
+            })
+            .map(|part| solstone_core_local::generate::estimate_tokens(&part))
+            .sum();
+        let unpadded_tokens = unpadded_text_tokens + unpadded_schema_tokens;
+
+        let target_leftover = 400u32;
+        let pad_tokens = floor_budget
+            .saturating_sub(unpadded_tokens)
+            .saturating_sub(target_leftover);
+        let user_instruction = "A".repeat((pad_tokens as usize) * 3);
+
+        let talent = prepared(
+            "morning_briefing",
+            LOCATION_DAY,
+            json!({
+                "hook": {"pre": "morning_briefing"},
+                "prompt": "Prompt with $activity_digest and $briefing_metadata",
+                "json_schema": {"type": "object"},
+                "user_instruction": user_instruction,
+                "max_output_tokens": max_output_tokens,
+            }),
+        );
+        let packet = freeze(talent, &context).unwrap();
+        let (thawed, _) = thaw(&packet).unwrap();
+
+        let schema_tokens = match thawed.config.get("json_schema") {
+            Some(Value::String(s)) => solstone_core_local::generate::estimate_tokens(s),
+            Some(val) => solstone_core_local::generate::estimate_tokens(&val.to_string()),
+            None => 0,
+        };
+        let ordinary_text_tokens: u32 = crate::model_text_parts(&thawed.config)
+            .into_iter()
+            .filter(|part| {
+                thawed
+                    .config
+                    .get("_daily_location_text")
+                    .and_then(Value::as_str)
+                    .is_none_or(|loc| part != loc)
+            })
+            .map(|part| solstone_core_local::generate::estimate_tokens(&part))
+            .sum();
+        let ordinary_total = ordinary_text_tokens + schema_tokens;
+        assert!(
+            ordinary_total <= floor_budget,
+            "ordinary request tokens {ordinary_total} must be <= floor budget {floor_budget}"
+        );
+        let leftover_floor_room = floor_budget.saturating_sub(ordinary_total);
+        assert!(
+            leftover_floor_room <= 800,
+            "ordinary request tokens {ordinary_total} must be within 800 tokens of floor budget {floor_budget}"
+        );
+
+        let rendered_doc = render_location_part(root.path(), LOCATION_DAY).unwrap();
+        let label = location_label("morning_briefing", LOCATION_DAY);
+        let (fitted_16k, _) = clip_location_part(&label, &rendered_doc, 16384);
+        let fitted_text_16k = fitted_16k.expect("16384-byte prefix must fit location observations");
+        assert!(
+            solstone_core_local::generate::estimate_tokens(&fitted_text_16k) > leftover_floor_room,
+            "estimate_tokens of 16384-byte prefix ({}) must exceed leftover floor room ({leftover_floor_room})",
+            solstone_core_local::generate::estimate_tokens(&fitted_text_16k)
+        );
+
+        let total_text_tokens: u32 = crate::model_text_parts(&thawed.config)
+            .iter()
+            .map(|part| solstone_core_local::generate::estimate_tokens(part))
+            .sum();
+        let total_tokens = total_text_tokens + schema_tokens;
+        assert!(
+            total_tokens <= floor_budget,
+            "total tokens {total_tokens} must be <= floor budget {floor_budget}"
+        );
+
+        assert!(
+            thawed.config.get("_daily_location_fingerprint").is_some(),
+            "_daily_location_fingerprint must be present"
+        );
+        let omitted = thawed
+            .config
+            .get("_daily_location_omitted")
+            .and_then(Value::as_u64)
+            .expect("_daily_location_omitted must be present");
+
+        if let Some(loc_text) = thawed
+            .config
+            .get("_daily_location_text")
+            .and_then(Value::as_str)
+        {
+            let loc_obs: Vec<&str> = loc_text
+                .lines()
+                .filter(|line| line.starts_with("- "))
+                .collect();
+            let rendered_obs_trimmed: Vec<&str> =
+                observations.iter().map(|s| s.trim_end()).collect();
+            for line in &loc_obs {
+                assert!(
+                    rendered_obs_trimmed.contains(line),
+                    "every observation line in location text must be a whole rendered observation: {line}"
+                );
+            }
+            let absent_count = observations.len().saturating_sub(loc_obs.len()) as u64;
+            assert_eq!(
+                omitted, absent_count,
+                "_daily_location_omitted must equal count of rendered observations absent from location text"
+            );
+            assert!(omitted >= 1, "at least one observation must be omitted");
+        } else {
+            assert_eq!(
+                omitted,
+                observations.len() as u64,
+                "when _daily_location_text is absent, omitted must equal the full rendered observation count"
+            );
+        }
     }
 
     #[test]

@@ -24,57 +24,16 @@ pub fn date_nav_index(counts: &BTreeMap<String, usize>) -> Value {
     json!({"coverage": coverage, "months": months})
 }
 
-pub fn day_grid_payload(
-    counts: &BTreeMap<String, usize>,
-    watermark: Option<&str>,
-    coverage_override: Option<(&str, &str)>,
-) -> Value {
-    let mut days = serde_json::Map::new();
-    let mut pending = serde_json::Map::new();
-    for (day, count) in counts {
-        let target = if watermark.is_some_and(|mark| day.as_str() <= mark) {
-            &mut days
-        } else {
-            &mut pending
-        };
-        target.insert(day.clone(), json!(count));
-    }
-    let all_days = counts.keys().collect::<Vec<_>>();
-    let coverage = coverage_override
-        .map(|(start, end)| json!({"start": start, "end": end}))
-        .or_else(|| {
-            all_days
-                .first()
-                .zip(all_days.last())
-                .map(|(start, end)| json!({"start": start, "end": end}))
-        });
-    json!({"coverage": coverage, "days": days, "pending": pending})
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
     use serde_json::json;
 
-    use super::{date_nav_index, day_grid_payload};
+    use super::date_nav_index;
 
     #[test]
-    fn ac7_established_empty_grid_has_exactly_three_keys() {
-        let payload = day_grid_payload(&BTreeMap::new(), None, None);
-        assert_eq!(
-            payload,
-            json!({"coverage": null, "days": {}, "pending": {}})
-        );
-        assert_eq!(payload.as_object().expect("object").len(), 3);
-    }
-
-    #[test]
-    fn ac8_none_watermark_leaves_all_days_pending_and_nav_drops_zeroes() {
-        let counts = BTreeMap::from([("20260510".to_owned(), 3), ("20260511".to_owned(), 1)]);
-        let payload = day_grid_payload(&counts, None, None);
-        assert_eq!(payload["days"], json!({}));
-        assert_eq!(payload["pending"], json!({"20260510": 3, "20260511": 1}));
+    fn nav_drops_zeroes() {
         let index = date_nav_index(&BTreeMap::from([
             ("20260509".to_owned(), 0),
             ("20260510".to_owned(), 3),

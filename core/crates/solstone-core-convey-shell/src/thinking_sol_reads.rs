@@ -205,6 +205,16 @@ pub(crate) async fn api_output_file(
     if !resolved.is_file() {
         return file_not_found();
     }
+    if is_facet_news_path(Path::new(&path))
+        || candidate
+            .strip_prefix(&journal.0)
+            .is_ok_and(is_facet_news_path)
+        || resolved
+            .strip_prefix(&canonical_root)
+            .is_ok_and(is_facet_news_path)
+    {
+        return file_not_found();
+    }
     let content = match fs::read_to_string(&resolved) {
         Ok(content) => content,
         Err(_) => return file_read_failed("Could not read file"),
@@ -398,7 +408,10 @@ fn uses_for_day(journal: &Path, day: &str, facet_filter: Option<&str>) -> Vec<Va
     let mut active = entries
         .flatten()
         .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
+        .filter(|path| {
+            path.is_dir()
+                && path.file_name().and_then(|name| name.to_str()) != Some("facet_newsletter")
+        })
         .collect::<Vec<_>>();
     active.sort();
     for directory in active {
@@ -415,6 +428,9 @@ fn uses_for_day(journal: &Path, day: &str, facet_filter: Option<&str>) -> Vec<Va
             let Some((logical_day, use_info)) = active_use(&file, journal) else {
                 continue;
             };
+            if use_info.get("name").and_then(Value::as_str) == Some("facet_newsletter") {
+                continue;
+            }
             if logical_day == day
                 && facet_filter.is_none_or(|facet| {
                     use_info.get("facet").and_then(Value::as_str) == Some(facet)
@@ -445,8 +461,9 @@ fn read_day_index(path: &Path, facet_filter: Option<&str>) -> Vec<Value> {
     text.lines()
         .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
         .filter(|entry| {
-            facet_filter
-                .is_none_or(|facet| entry.get("facet").and_then(Value::as_str) == Some(facet))
+            entry.get("name").and_then(Value::as_str) != Some("facet_newsletter")
+                && facet_filter
+                    .is_none_or(|facet| entry.get("facet").and_then(Value::as_str) == Some(facet))
         })
         .filter_map(|entry| {
             let id = entry
@@ -585,11 +602,10 @@ fn find_run_file(talents: &Path, use_id: &str) -> Option<(PathBuf, bool)> {
     let mut unparseable: Option<(PathBuf, bool)> = None;
     for (suffix, active) in [(".jsonl", false), ("_active.jsonl", true)] {
         let entries = fs::read_dir(talents).ok()?;
-        for directory in entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| path.is_dir())
-        {
+        for directory in entries.flatten().map(|entry| entry.path()).filter(|path| {
+            path.is_dir()
+                && path.file_name().and_then(|name| name.to_str()) != Some("facet_newsletter")
+        }) {
             let path = directory.join(format!("{use_id}{suffix}"));
             if !path.is_file() {
                 continue;
@@ -876,6 +892,26 @@ fn file_read_failed(detail: impl Into<String>) -> Response {
         "that file couldn't be read.",
         detail,
         StatusCode::INTERNAL_SERVER_ERROR,
+    )
+}
+
+fn is_facet_news_path(path: &Path) -> bool {
+    let mut components = path.components();
+    matches!(
+        (
+            components.next(),
+            components.next(),
+            components.next(),
+            components.next(),
+            components.next(),
+        ),
+        (
+            Some(std::path::Component::Normal(c0)),
+            Some(std::path::Component::Normal(_facet)),
+            Some(std::path::Component::Normal(c2)),
+            Some(std::path::Component::Normal(_file)),
+            None,
+        ) if c0 == "facets" && c2 == "news"
     )
 }
 
@@ -1207,5 +1243,154 @@ mod tests {
                 assert_eq!(run["start"], 1000);
             }
         }
+    }
+
+    #[test]
+    fn newsletter_runs_and_index_rows_are_hidden_from_uses_for_day_and_find_run_file() {
+        let root = tempfile::tempdir().expect("journal");
+        let talents = root.path().join("talents");
+        fs::create_dir_all(talents.join("facet_newsletter")).expect("newsletter dir");
+        fs::create_dir_all(talents.join("morning_briefing")).expect("briefing dir");
+
+        let day_index = talents.join("20260101.jsonl");
+        let nl_row = json!({
+            "use_id": "nl-completed-1",
+            "name": "facet_newsletter",
+            "facet": "work",
+            "status": "completed",
+            "ts": 1000
+        });
+        let mb_row = json!({
+            "use_id": "mb-completed-1",
+            "name": "morning_briefing",
+            "facet": "personal",
+            "status": "completed",
+            "ts": 2000
+        });
+        fs::write(&day_index, format!("{nl_row}\n{mb_row}\n")).expect("day index");
+
+        let nl_active = talents.join("facet_newsletter/nl-active-1_active.jsonl");
+        fs::write(
+            &nl_active,
+            r#"{"event":"request","use_id":"nl-active-1","name":"facet_newsletter","day":"20260101","ts":1100}"#,
+        )
+        .expect("newsletter active");
+
+        let mb_active = talents.join("morning_briefing/mb-active-1_active.jsonl");
+        fs::write(
+            &mb_active,
+            r#"{"event":"request","use_id":"mb-active-1","name":"morning_briefing","day":"20260101","ts":2100}"#,
+        )
+        .expect("briefing active");
+
+        let nl_run = talents.join("facet_newsletter/nl-completed-1.jsonl");
+        fs::write(
+            &nl_run,
+            r#"{"event":"request","use_id":"nl-completed-1","name":"facet_newsletter","day":"20260101","ts":1000}"#,
+        )
+        .expect("newsletter run");
+
+        let mb_run = talents.join("morning_briefing/mb-completed-1.jsonl");
+        fs::write(
+            &mb_run,
+            r#"{"event":"request","use_id":"mb-completed-1","name":"morning_briefing","day":"20260101","ts":2000}"#,
+        )
+        .expect("briefing run");
+
+        let uses = uses_for_day(root.path(), "20260101", None);
+        assert_eq!(uses.len(), 2);
+        for u in &uses {
+            assert_ne!(
+                u.get("name").and_then(Value::as_str),
+                Some("facet_newsletter")
+            );
+            assert_eq!(
+                u.get("name").and_then(Value::as_str),
+                Some("morning_briefing")
+            );
+        }
+        let ids: Vec<_> = uses
+            .iter()
+            .map(|u| u.get("id").and_then(Value::as_str).unwrap())
+            .collect();
+        assert!(ids.contains(&"mb-completed-1"));
+        assert!(ids.contains(&"mb-active-1"));
+
+        assert!(nl_active.is_file());
+        assert!(nl_run.is_file());
+        assert!(mb_active.is_file());
+        assert!(mb_run.is_file());
+        assert!(day_index.is_file());
+
+        assert_eq!(find_run_file(&talents, "nl-completed-1"), None);
+        assert_eq!(find_run_file(&talents, "nl-active-1"), None);
+        assert_eq!(
+            find_run_file(&talents, "mb-completed-1"),
+            Some((mb_run, false))
+        );
+        assert_eq!(
+            find_run_file(&talents, "mb-active-1"),
+            Some((mb_active, true))
+        );
+
+        let counts = talent_use_counts(root.path(), None);
+        assert_eq!(counts.get("20260101").unwrap().get("work"), Some(&1));
+        assert_eq!(counts.get("20260101").unwrap().get("personal"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn api_output_file_refuses_facet_newsletter_and_serves_chronicle() {
+        let root = tempfile::tempdir().expect("journal");
+
+        let news_file = root.path().join("facets/work/news/20260101.md");
+        fs::create_dir_all(news_file.parent().unwrap()).expect("news dir");
+        let sentinel = "SENTINEL_NEWSLETTER_OUTPUT_NEVER_SERVED_12345";
+        fs::write(&news_file, sentinel).expect("write news file");
+
+        let chronicle_file = root
+            .path()
+            .join("chronicle/20260101/talents/morning_briefing.md");
+        fs::create_dir_all(chronicle_file.parent().unwrap()).expect("chronicle dir");
+        let chronicle_body = "# Morning Briefing\n\nAll clear.";
+        fs::write(&chronicle_file, chronicle_body).expect("write chronicle file");
+
+        let app = axum::Router::new()
+            .route("/output/{day}/{*path}", axum::routing::get(api_output_file))
+            .layer(Extension(Arc::new(JournalRoot(root.path().to_path_buf()))));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/output/20260101/facets/work/news/20260101.md")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body_bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bytes");
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        assert!(!body_str.contains(sentinel));
+        let error_val: Value = serde_json::from_str(&body_str).expect("json error");
+        assert_eq!(error_val["reason_code"], "file_not_found");
+        assert_eq!(error_val["error"], "that file isn't available.");
+
+        let response = app
+            .oneshot(
+                Request::get("/output/20260101/chronicle/20260101/talents/morning_briefing.md")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bytes");
+        let body_val: Value = serde_json::from_slice(&body_bytes).expect("json response");
+        assert_eq!(body_val["content"], chronicle_body);
+        assert_eq!(body_val["format"], "md");
     }
 }

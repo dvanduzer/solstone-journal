@@ -105,35 +105,6 @@ pub fn render_sections(briefing: &Value) -> Value {
             sections.insert(key.to_owned(), rows.into());
         }
     }
-    {
-        let (key, left, right) = ("reading", "facet", "summary");
-        let rows = briefing
-            .get(key)
-            .and_then(Value::as_array)
-            .map(|rows| {
-                rows.iter()
-                    .filter_map(Value::as_object)
-                    .filter_map(|row| {
-                        let left = row.get(left).and_then(Value::as_str).unwrap_or("").trim();
-                        let right = row.get(right).and_then(Value::as_str).unwrap_or("").trim();
-                        (!left.is_empty() || !right.is_empty()).then(|| {
-                            if !left.is_empty() && !right.is_empty() {
-                                format!("- **{left}**: {right}")
-                            } else if !left.is_empty() {
-                                format!("- **{left}**")
-                            } else {
-                                format!("- {right}")
-                            }
-                        })
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
-        if !rows.is_empty() {
-            sections.insert(key.to_owned(), rows.into());
-        }
-    }
     let your_day = briefing
         .get("your_day")
         .and_then(Value::as_array)
@@ -276,5 +247,16 @@ mod tests {
         assert!(prefix_part.len() <= 55);
         assert!(raw_line.starts_with(prefix_part));
         assert!(!prefix_part.ends_with('—'));
+    }
+
+    #[test]
+    fn render_sections_omits_reading_even_when_present() {
+        let briefing = json!({
+            "yesterday": ["shipped"],
+            "reading": [{"facet": "work", "summary": "important items"}]
+        });
+        let sections = render_sections(&briefing);
+        assert_eq!(sections.get("yesterday").unwrap(), "- shipped");
+        assert!(sections.get("reading").is_none());
     }
 }

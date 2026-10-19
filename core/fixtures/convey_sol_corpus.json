@@ -486,17 +486,6 @@
                   "title": "entity suggest",
                   "type": "generate"
                 },
-                "facet_newsletter": {
-                  "app": null,
-                  "color": "#0d47a1",
-                  "description": "creates comprehensive daily newsletters for each facet, covering activities, progress, and insights",
-                  "multi_facet": true,
-                  "output_format": "md",
-                  "schedule": "daily",
-                  "source": "system",
-                  "title": "facet newsletter generator",
-                  "type": "generate"
-                },
                 "morning_briefing": {
                   "app": null,
                   "color": "#1565c0",
@@ -702,17 +691,6 @@
                   "schedule": "daily",
                   "source": "app",
                   "title": "entity suggest",
-                  "type": "generate"
-                },
-                "facet_newsletter": {
-                  "app": null,
-                  "color": "#0d47a1",
-                  "description": "creates comprehensive daily newsletters for each facet, covering activities, progress, and insights",
-                  "multi_facet": true,
-                  "output_format": "md",
-                  "schedule": "daily",
-                  "source": "system",
-                  "title": "facet newsletter generator",
                   "type": "generate"
                 },
                 "morning_briefing": {
@@ -1173,17 +1151,6 @@
                   "title": "entity suggest",
                   "type": "generate"
                 },
-                "facet_newsletter": {
-                  "app": null,
-                  "color": "#0d47a1",
-                  "description": "creates comprehensive daily newsletters for each facet, covering activities, progress, and insights",
-                  "multi_facet": true,
-                  "output_format": "md",
-                  "schedule": "daily",
-                  "source": "system",
-                  "title": "facet newsletter generator",
-                  "type": "generate"
-                },
                 "morning_briefing": {
                   "app": null,
                   "color": "#1565c0",
@@ -1422,17 +1389,6 @@
                   "schedule": "daily",
                   "source": "app",
                   "title": "entity suggest",
-                  "type": "generate"
-                },
-                "facet_newsletter": {
-                  "app": null,
-                  "color": "#0d47a1",
-                  "description": "creates comprehensive daily newsletters for each facet, covering activities, progress, and insights",
-                  "multi_facet": true,
-                  "output_format": "md",
-                  "schedule": "daily",
-                  "source": "system",
-                  "title": "facet newsletter generator",
                   "type": "generate"
                 },
                 "morning_briefing": {
@@ -1969,17 +1925,6 @@
                   "title": "entity suggest",
                   "type": "generate"
                 },
-                "facet_newsletter": {
-                  "app": null,
-                  "color": "#0d47a1",
-                  "description": "creates comprehensive daily newsletters for each facet, covering activities, progress, and insights",
-                  "multi_facet": true,
-                  "output_format": "md",
-                  "schedule": "daily",
-                  "source": "system",
-                  "title": "facet newsletter generator",
-                  "type": "generate"
-                },
                 "morning_briefing": {
                   "app": null,
                   "color": "#1565c0",
@@ -2218,17 +2163,6 @@
                   "schedule": "daily",
                   "source": "app",
                   "title": "entity suggest",
-                  "type": "generate"
-                },
-                "facet_newsletter": {
-                  "app": null,
-                  "color": "#0d47a1",
-                  "description": "creates comprehensive daily newsletters for each facet, covering activities, progress, and insights",
-                  "multi_facet": true,
-                  "output_format": "md",
-                  "schedule": "daily",
-                  "source": "system",
-                  "title": "facet newsletter generator",
                   "type": "generate"
                 },
                 "morning_briefing": {
@@ -2765,17 +2699,6 @@
                   "title": "entity suggest",
                   "type": "generate"
                 },
-                "facet_newsletter": {
-                  "app": null,
-                  "color": "#0d47a1",
-                  "description": "creates comprehensive daily newsletters for each facet, covering activities, progress, and insights",
-                  "multi_facet": true,
-                  "output_format": "md",
-                  "schedule": "daily",
-                  "source": "system",
-                  "title": "facet newsletter generator",
-                  "type": "generate"
-                },
                 "morning_briefing": {
                   "app": null,
                   "color": "#1565c0",
@@ -3014,17 +2937,6 @@
                   "schedule": "daily",
                   "source": "app",
                   "title": "entity suggest",
-                  "type": "generate"
-                },
-                "facet_newsletter": {
-                  "app": null,
-                  "color": "#0d47a1",
-                  "description": "creates comprehensive daily newsletters for each facet, covering activities, progress, and insights",
-                  "multi_facet": true,
-                  "output_format": "md",
-                  "schedule": "daily",
-                  "source": "system",
-                  "title": "facet newsletter generator",
                   "type": "generate"
                 },
                 "morning_briefing": {
@@ -3560,17 +3472,6 @@
                   "title": "entity suggest",
                   "type": "generate"
                 },
-                "facet_newsletter": {
-                  "app": null,
-                  "color": "#0d47a1",
-                  "description": "creates comprehensive daily newsletters for each facet, covering activities, progress, and insights",
-                  "multi_facet": true,
-                  "output_format": "md",
-                  "schedule": "daily",
-                  "source": "system",
-                  "title": "facet newsletter generator",
-                  "type": "generate"
-                },
                 "morning_briefing": {
                   "app": null,
                   "color": "#1565c0",
@@ -3809,17 +3710,6 @@
                   "schedule": "daily",
                   "source": "app",
                   "title": "entity suggest",
-                  "type": "generate"
-                },
-                "facet_newsletter": {
-                  "app": null,
-                  "color": "#0d47a1",
-                  "description": "creates comprehensive daily newsletters for each facet, covering activities, progress, and insights",
-                  "multi_facet": true,
-                  "output_format": "md",
-                  "schedule": "daily",
-                  "source": "system",
-                  "title": "facet newsletter generator",
                   "type": "generate"
                 },
                 "morning_briefing": {

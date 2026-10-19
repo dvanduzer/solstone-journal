@@ -1363,14 +1363,6 @@ mod tests {
             )
         };
         fs::write(
-            talent.join("facet_newsletter.md"),
-            frontmatter(
-                "{\"pre\":\"facet_newsletter\",\"post\":\"facet_newsletter\"}",
-                "\"multi_facet\":true,",
-            ),
-        )
-        .unwrap();
-        fs::write(
             talent.join("morning_briefing.md"),
             frontmatter("{\"pre\":\"morning_briefing\"}", ""),
         )
@@ -1393,8 +1385,8 @@ mod tests {
         let mut cache = DayProjectionCache::new(root, day);
         let mut shared =
             read_daily_coverage_with_cache(root, day, &talent, &apps, &mut cache).unwrap();
-        // schedule + morning_briefing + one facet_newsletter per active facet, through both call sites.
-        assert_eq!(shared.units.len(), 4, "{:?}", shared.units);
+        // schedule + morning_briefing through both call sites.
+        assert_eq!(shared.units.len(), 2, "{:?}", shared.units);
         assert_eq!(
             cache.captures(),
             1,

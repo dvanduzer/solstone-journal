@@ -56,11 +56,6 @@ pub enum WriteIntent {
         output: String,
         day: String,
     },
-    FacetNewsletter {
-        output: String,
-        facet: String,
-        day: String,
-    },
     EntityDetection {
         output: String,
         day: String,
@@ -407,24 +402,6 @@ fn apply_with_sources(
                 cancellation,
             )
             .map_err(|detail| StageError::new("write-intent", "schedule", "schedule", detail))?;
-            Ok(CommitDisposition::CommittedNoOutput)
-        }
-        CommitPlan::Write(WriteIntent::FacetNewsletter { output, facet, day }) => {
-            crate::facet_newsletter::apply_result_cancellable(
-                &context.journal,
-                &output,
-                &facet,
-                &day,
-                cancellation,
-            )
-            .map_err(|detail| {
-                StageError::new(
-                    "write-intent",
-                    "facet_newsletter",
-                    "facet_newsletter",
-                    detail,
-                )
-            })?;
             Ok(CommitDisposition::CommittedNoOutput)
         }
         CommitPlan::Write(WriteIntent::EntityDetection {

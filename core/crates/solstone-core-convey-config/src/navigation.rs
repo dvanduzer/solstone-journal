@@ -14,14 +14,13 @@ const DEFAULT_RAIL_APPS: [&str; 6] = [
     "search",
     "import",
 ];
-const DEFAULT_APP_ORDER: [&str; 7] = [
+const DEFAULT_APP_ORDER: [&str; 6] = [
     "home",
     "curation",
     "activities",
     "transcripts",
     "search",
     "import",
-    "news",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,7 +206,7 @@ mod tests {
 
     #[test]
     fn default_navigation_lists_do_not_include_retired_apps() {
-        for retired in ["chat", "sol", "observer", "reflections"] {
+        for retired in ["chat", "sol", "observer", "reflections", "news"] {
             assert!(!DEFAULT_RAIL_APPS.contains(&retired), "{retired}");
             assert!(!DEFAULT_APP_ORDER.contains(&retired), "{retired}");
         }

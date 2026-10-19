@@ -199,39 +199,6 @@ pub fn imports(ctx: CommandContext<'_>) -> CommandOutput {
 }
 
 #[must_use]
-pub fn news(ctx: CommandContext<'_>) -> CommandOutput {
-    let parsed = match parse_args(
-        ctx.args,
-        &["--facet", "-f", "--day", "-d", "--limit", "-n", "--cursor"],
-        &[],
-    ) {
-        Ok(value) => value,
-        Err(error) => return stderr(error),
-    };
-    let facet = parsed
-        .value("--facet")
-        .or_else(|| parsed.value("-f"))
-        .or_else(|| parsed.positionals.first().map(String::as_str));
-    let Some(facet) = facet else {
-        return stderr("Error: facet is required");
-    };
-    get(
-        ctx,
-        &format!("/app/news/api/facet/{facet}"),
-        query_values(
-            &parsed,
-            &[
-                ("--day", "day"),
-                ("-d", "day"),
-                ("--limit", "limit"),
-                ("-n", "limit"),
-                ("--cursor", "cursor"),
-            ],
-        ),
-    )
-}
-
-#[must_use]
 pub fn read(ctx: CommandContext<'_>) -> CommandOutput {
     let parsed = match parse_args(
         ctx.args,

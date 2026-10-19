@@ -11,12 +11,12 @@ Canonical implementation: `core/payload/solstone/talent/morning_briefing.md` emi
 A structured preamble summarizing what data sources were consulted and what gaps exist. Appears at the top of the output so the reader knows the briefing's evidence base before reading any claims.
 
 **What it includes:**
-- Source counts (segments, calendar events, entities consulted, newsletters)
+- Source counts (segments, calendar events, entities, and activity records)
 - Gaps — sources that returned zero results or errored
 - Structured metadata with machine-readable source counts
 
 **Example:**
-> Built from 12 transcript segments, 4 calendar events, 3 entity profiles, and 2 facet newsletters. Gaps: entity intelligence unavailable for Sarah Chen; no facet newsletters today.
+> Built from 12 transcript segments, 4 calendar events, 3 entity profiles, and 5 activity records. Gaps: entity intelligence unavailable for Sarah Chen.
 
 ### 2. Source Attribution
 
@@ -29,11 +29,10 @@ Inline parenthetical links connecting claims to their originating data using `so
 
 **When attribution is unnecessary:**
 - Calendar events (self-evident from the calendar source)
-- Reading section links (inherently attributed)
 - General summaries that synthesize multiple sources
 
 **Example:**
-- `Closed the auth migration PR ([work newsletter](sol://facets/work/news/20260326))`
+- `Closed the auth migration PR ([work activity](sol://facets/work/activities/20260326#id))`
 - `Last discussed launch timeline (from your [March standup](sol://20260313/archon/091500_300))`
 
 ### 3. Confidence-Graded Language

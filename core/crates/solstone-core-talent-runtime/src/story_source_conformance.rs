@@ -382,7 +382,7 @@ fn source_words_fit_the_reader_budget_whole_or_keep_the_ordinary_body() {
 }
 
 #[test]
-fn a_long_source_correction_survives_into_the_native_newsletter_packet() {
+fn a_long_source_correction_survives_into_activity_records() {
     let (case, quoted) = source_at_reader_boundary(2039);
     let root = tempfile::tempdir().unwrap();
     let (paths, context) = journal(root.path(), &case);
@@ -401,42 +401,13 @@ fn a_long_source_correction_survives_into_the_native_newsletter_packet() {
         &solstone_core_generate::Cancellation::never(),
     );
     assert!(matches!(outcome, RuntimeOutcome::Finished { .. }));
-    let payload = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../payload/solstone");
-    fs::copy(
-        payload.join("talent/facet_newsletter.md"),
-        paths.talent_root.join("facet_newsletter.md"),
-    )
-    .unwrap();
-    let newsletter = Scripted {
-        text: "No activity".to_owned(),
-        input_budget: None,
-        requests: Mutex::new(Vec::new()),
-    };
-    execute_request(
-        json!({"name":"facet_newsletter","day":DAY,"facet":FACET})
-            .as_object()
-            .unwrap()
-            .clone(),
-        &paths,
-        &context,
-        &newsletter,
-        &mut Vec::new(),
-        &solstone_core_generate::Cancellation::never(),
-    );
-    let requests = newsletter.requests.into_inner().unwrap();
-    assert_eq!(requests.len(), 1);
-    let packet = requests[0]
-        .contents
-        .iter()
-        .filter_map(|part| match part {
-            solstone_core_generate::ContentPart::Text { text } => Some(text.as_str()),
-            solstone_core_generate::ContentPart::Image { .. } => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(packet.contains(case["response"]["body"].as_str().unwrap()));
+    let records =
+        solstone_core_facets::load_activity_records(&context.journal, FACET, DAY, false).unwrap();
+    assert_eq!(records.len(), 1);
+    let body = records[0]["story"]["body"].as_str().unwrap();
+    assert_eq!(body, case["response"]["body"].as_str().unwrap());
     assert!(
-        !packet.contains(&quoted),
+        !body.contains(&quoted),
         "the over-budget quotation keeps the ordinary summary"
     );
 }

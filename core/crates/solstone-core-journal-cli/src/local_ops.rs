@@ -7,19 +7,16 @@ use std::ffi::{OsStr, OsString};
 #[cfg(not(target_os = "ios"))]
 use std::fmt::Write as _;
 use std::fs::{self, DirBuilder};
+use std::io;
 #[cfg(not(target_os = "ios"))]
 use std::io::Write as _;
-use std::io::{self, Read};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use chrono::{NaiveDate, SecondsFormat, Utc};
 use serde_json::{Value, json};
-use solstone_core_facets::{
-    FacetWriteError, append_action_log, hold_facet_trust_lock, require_declared_facet,
-    write_news_file,
-};
+use solstone_core_facets::{append_action_log, hold_facet_trust_lock};
 #[cfg(not(target_os = "ios"))]
 use solstone_core_import_sources::ImportSourcesError;
 #[cfg(not(target_os = "ios"))]
@@ -68,7 +65,6 @@ pub(crate) fn dispatch(token: &str, args: &[OsString]) -> Outcome {
         "facet doctor" => facet_doctor(args),
         "entities doctor" => entities_doctor(args),
         "facet merge" => facet_merge(args),
-        "news write" => news_write(args),
         _ => failure(token, "unknown local operation", EXIT_USAGE),
     }
 }
@@ -2368,56 +2364,6 @@ fn facet_merge_commit_locked(
         post_commit_failure: None,
         source_removed: true,
     })
-}
-
-fn news_write(args: &[OsString]) -> Outcome {
-    if args.len() == 1 && matches!(args[0].to_str(), Some("--help" | "-h")) {
-        return success("Usage: solstone journal news write FACET --day YYYYMMDD\n".to_owned());
-    }
-    let Some(facet) = args.first().and_then(|arg| arg.to_str()) else {
-        return usage("news write", "FACET is required");
-    };
-    if args.len() != 3 || args[1] != OsStr::new("--day") {
-        return usage("news write", "expected FACET --day YYYYMMDD");
-    }
-    let Some(day) = args[2].to_str() else {
-        return usage("news write", "DAY must be UTF-8");
-    };
-    if !safe_component(facet) {
-        return failure("news write", "FACET is invalid", EXIT_DATA);
-    }
-    if !valid_day(day) {
-        return failure("news write", "DAY must be a real YYYYMMDD date", EXIT_DATA);
-    }
-    let journal = match journal_root("news write") {
-        Ok(path) => path,
-        Err(outcome) => return outcome,
-    };
-    if let Err(error) = require_real_directory(&journal.join("facets").join(facet)) {
-        return failure("news write", &error, EXIT_DATA);
-    }
-    // Refuse before reading stdin so a caller does not lose a piped draft. The writer
-    // repeats this check under the facet trust lock.
-    if let Err(error) = require_declared_facet(&journal, facet) {
-        let code = match error {
-            FacetWriteError::DeclarationUnreadable { .. } => EXIT_IO,
-            _ => EXIT_DATA,
-        };
-        return failure("news write", &error.to_string(), code);
-    }
-    let mut bytes = Vec::new();
-    if let Err(error) = io::stdin().read_to_end(&mut bytes) {
-        return failure("news write", &error.to_string(), EXIT_IO);
-    }
-    let markdown = match String::from_utf8(bytes) {
-        Ok(markdown) if !markdown.trim().is_empty() => markdown,
-        Ok(_) => return failure("news write", "no content provided on stdin", EXIT_DATA),
-        Err(_) => return failure("news write", "stdin must be UTF-8", EXIT_DATA),
-    };
-    if let Err(error) = write_news_file(&journal, facet, &format!("{day}.md"), &markdown) {
-        return failure("news write", &error.to_string(), EXIT_IO);
-    }
-    success(format!("News for {day} saved to {facet}.\n"))
 }
 
 enum ExistingPathKind {

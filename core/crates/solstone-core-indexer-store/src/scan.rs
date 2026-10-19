@@ -6661,8 +6661,8 @@ not json
         );
         write(
             &root,
-            "facets/Work/news/20260101.md",
-            "# News\n\nfacet content",
+            "facets/Work/activities/20260101.jsonl",
+            "{\"title\":\"Planning\"}\n",
         );
         let report = scan_journal(&root, true).expect("scan mixed case");
         assert_eq!(report.indexed, 2);
@@ -6675,16 +6675,126 @@ not json
             )
             .expect("app agent row");
         assert_eq!(app_agent, "myapp:digest");
-        let news_row: (String, String) = conn
+        let activity_row: (String, String) = conn
             .query_row(
-                "SELECT facet, agent FROM chunks WHERE path='facets/Work/news/20260101.md'",
+                "SELECT facet, agent FROM chunks WHERE path='facets/Work/activities/20260101.jsonl'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .expect("news metadata row");
-        assert_eq!(news_row, ("work".to_string(), "news".to_string()));
+            .expect("activity metadata row");
+        assert_eq!(activity_row, ("work".to_string(), "activity".to_string()));
         drop(conn);
         fs::remove_dir_all(root).expect("cleanup lowercase root");
+    }
+
+    #[test]
+    fn news_markdown_is_unindexed_and_absent_from_index_after_light_scan() {
+        let root = temp_root("unindexed-news");
+        let news_path = "facets/work/news/20260101.md";
+        let activity_path = "facets/work/activities/20260101.jsonl";
+        let news_bytes = b"# Work News\n\nSome news content\n";
+        write(&root, news_path, std::str::from_utf8(news_bytes).unwrap());
+        write(
+            &root,
+            activity_path,
+            "{\"id\":\"act-1\",\"title\":\"Admitted planning\",\"source\":\"user\"}\n",
+        );
+
+        let report = scan_journal(&root, false).expect("ordinary light scan");
+        assert_eq!(report.indexed, 1);
+
+        assert_eq!(
+            fs::read(root.join(news_path)).expect("read news file"),
+            news_bytes,
+            "news bytes unchanged"
+        );
+
+        let conn = Connection::open(db_path(&root)).expect("open db");
+        let news_files: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM files WHERE path=?",
+                [news_path],
+                |row| row.get(0),
+            )
+            .expect("query news files");
+        assert_eq!(news_files, 0, "news path absent from files index");
+
+        let news_chunks: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chunks WHERE path=? OR agent='news'",
+                [news_path],
+                |row| row.get(0),
+            )
+            .expect("query news chunks");
+        assert_eq!(
+            news_chunks, 0,
+            "search by that path or agent='news' returns no row"
+        );
+
+        let activity_rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chunks WHERE path=?",
+                [activity_path],
+                |row| row.get(0),
+            )
+            .expect("query activity chunks");
+        assert!(activity_rows >= 1, "activity row still present");
+
+        conn.execute(
+            "REPLACE INTO files(path, mtime) VALUES (?, ?)",
+            params![news_path, 1],
+        )
+        .expect("insert files row");
+        conn.execute(
+            "INSERT INTO chunks(content, path, day, facet, agent, stream, idx, time_bucket) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            params!["# Work News", news_path, "20260101", "work", "news", "", 0, ""],
+        )
+        .expect("insert chunks row");
+        drop(conn);
+
+        crate::chunk_sources::apply_path_lookup(&root).expect("apply path lookup");
+
+        scan_journal(&root, false).expect("second light scan");
+
+        assert_eq!(
+            fs::read(root.join(news_path)).expect("read news file"),
+            news_bytes,
+            "news bytes unchanged"
+        );
+
+        let conn = Connection::open(db_path(&root)).expect("open db");
+        let news_files: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM files WHERE path=?",
+                [news_path],
+                |row| row.get(0),
+            )
+            .expect("query news files");
+        assert_eq!(news_files, 0, "news path absent from files index");
+
+        let news_chunks: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chunks WHERE path=? OR agent='news'",
+                [news_path],
+                |row| row.get(0),
+            )
+            .expect("query news chunks");
+        assert_eq!(
+            news_chunks, 0,
+            "search by that path or agent='news' returns no row"
+        );
+
+        let activity_rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chunks WHERE path=?",
+                [activity_path],
+                |row| row.get(0),
+            )
+            .expect("query activity chunks");
+        assert!(activity_rows >= 1, "activity row still present");
+
+        drop(conn);
+        fs::remove_dir_all(root).expect("cleanup unindexed news root");
     }
 
     #[test]

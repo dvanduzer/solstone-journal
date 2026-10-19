@@ -5,7 +5,7 @@
 
 use chrono::{Duration, NaiveDate, Utc};
 use serde_json::{Map, Value, json};
-use solstone_core_facets::{load_activity_records, read_facet_declaration, read_news_file};
+use solstone_core_facets::{load_activity_records, read_facet_declaration};
 use solstone_core_home::{
     HomeContext,
     briefing::BriefingDates,
@@ -18,8 +18,32 @@ use crate::{
 };
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DigestActivity {
+    pub facet: String,
+    pub day: String,
+    pub id: String,
+    pub start: Option<String>,
+    pub end: Option<String>,
+    pub target_date: Option<String>,
+    pub duration: Option<Value>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub details: Option<String>,
+    pub participants: Vec<String>,
+    pub entities: Vec<String>,
+    pub source_limitation: bool,
+    pub story_body: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MorningBriefingPreState {
-    values: Map<String, Value>,
+    pub values: Map<String, Value>,
+    pub activities: Vec<DigestActivity>,
+    pub initial_gaps: Vec<String>,
+    pub counts: Value,
+    pub forward_count: usize,
+    pub generated: String,
+    pub model: String,
 }
 
 pub fn gate(
@@ -47,7 +71,7 @@ pub fn build(
             talent: prepared.name.clone(),
             reason: format!("invalid day: {error}"),
         })?;
-    build_packet(
+    let state = build_briefing_state(
         &day,
         analysis_day,
         prepared
@@ -61,19 +85,19 @@ pub fn build(
             .get("_daily_upstream")
             .and_then(Value::as_object),
     )
-    .map(|values| PrePostState::MorningBriefing(MorningBriefingPreState { values }))
     .map_err(|error| RuntimeOutcome::Skipped {
         stage: "morning_briefing".into(),
         talent: prepared.name.clone(),
         reason: format!("morning briefing pre-hook failed: {error}"),
-    })
+    })?;
+    Ok(PrePostState::MorningBriefing(state))
 }
 
 pub fn apply_prompt_override(
     prepared: &mut PreparedTalent,
     state: &PrePostState,
 ) -> Result<(), StageError> {
-    let PrePostState::MorningBriefing(state) = state else {
+    let PrePostState::MorningBriefing(briefing_state) = state else {
         return Err(stage_error(
             "prompt_override",
             "morning_briefing",
@@ -81,7 +105,107 @@ pub fn apply_prompt_override(
             "missing morning briefing state",
         ));
     };
-    apply_template_vars(&mut prepared.config, &state.values);
+
+    let max_output_tokens = prepared
+        .config
+        .get("max_output_tokens")
+        .and_then(Value::as_u64)
+        .and_then(|tokens| u32::try_from(tokens).ok())
+        .unwrap_or(0);
+    let floor_budget = solstone_core_local::generate::compute_input_budget(
+        max_output_tokens,
+        solstone_core_local::plan::LOCAL_MIN_CONTEXT_TOKENS,
+    );
+    let schema_tokens = match prepared.config.get("json_schema") {
+        Some(Value::String(s)) => solstone_core_local::generate::estimate_tokens(s),
+        Some(val) => solstone_core_local::generate::estimate_tokens(&val.to_string()),
+        None => 0,
+    };
+
+    let n = briefing_state.activities.len();
+    let mut include_stories = vec![true; n];
+    let mut include_activities = vec![true; n];
+    let mut omissions: Vec<String> = Vec::new();
+
+    let measure = |inc_acts: &[bool],
+                   inc_stories: &[bool],
+                   omissions: &[String]|
+     -> (Map<String, Value>, u32) {
+        let mut current_gaps = briefing_state.initial_gaps.clone();
+        current_gaps.extend(omissions.iter().cloned());
+
+        let mut values = briefing_state.values.clone();
+        let digest_text =
+            render_digest_activities(&briefing_state.activities, inc_acts, inc_stories);
+        let metadata = json!({
+            "generated": briefing_state.generated,
+            "model": briefing_state.model,
+            "sources": briefing_state.counts,
+            "gaps": current_gaps,
+            "coverage_preamble": coverage_preamble(&briefing_state.counts, &current_gaps, briefing_state.forward_count),
+        });
+        values.insert("activity_digest".into(), Value::String(digest_text));
+        values.insert(
+            "briefing_metadata".into(),
+            Value::String(serde_json::to_string_pretty(&metadata).unwrap_or_default()),
+        );
+
+        let mut config_clone = prepared.config.clone();
+        apply_template_vars(&mut config_clone, &values);
+
+        let text_tokens: u32 = crate::model_text_parts(&config_clone)
+            .iter()
+            .map(|part| solstone_core_local::generate::estimate_tokens(part))
+            .sum();
+        let total_tokens = text_tokens + schema_tokens;
+
+        (values, total_tokens)
+    };
+
+    let (mut current_values, mut current_tokens) =
+        measure(&include_activities, &include_stories, &omissions);
+
+    if current_tokens > floor_budget {
+        for i in (0..n).rev() {
+            if briefing_state.activities[i].story_body.is_some() {
+                include_stories[i] = false;
+                omissions.push(format!("story for {}", briefing_state.activities[i].id));
+                let (vals, tokens) = measure(&include_activities, &include_stories, &omissions);
+                current_values = vals;
+                current_tokens = tokens;
+                if current_tokens <= floor_budget {
+                    break;
+                }
+            }
+        }
+    }
+
+    if current_tokens > floor_budget {
+        for i in (0..n).rev() {
+            include_activities[i] = false;
+            let id = &briefing_state.activities[i].id;
+            let story_omission = format!("story for {id}");
+            omissions.retain(|g| g != &story_omission);
+            omissions.push(format!("activity {id}"));
+            let (vals, tokens) = measure(&include_activities, &include_stories, &omissions);
+            current_values = vals;
+            current_tokens = tokens;
+            if current_tokens <= floor_budget {
+                break;
+            }
+        }
+    }
+
+    if current_tokens > floor_budget {
+        return Err(stage_error(
+            "prompt_override",
+            "morning_briefing",
+            prepared,
+            "prepared request does not fit the floor input budget",
+        ));
+    }
+
+    apply_template_vars(&mut prepared.config, &current_values);
     Ok(())
 }
 
@@ -95,6 +219,7 @@ fn configured_day(prepared: &PreparedTalent) -> String {
         .to_owned()
 }
 
+#[cfg(test)]
 fn build_packet(
     day: &str,
     analysis_day: NaiveDate,
@@ -102,11 +227,21 @@ fn build_packet(
     context: &ExecutionContext,
     upstream: Option<&Map<String, Value>>,
 ) -> Result<Map<String, Value>, String> {
+    let state = build_briefing_state(day, analysis_day, model, context, upstream)?;
+    Ok(state.values)
+}
+
+fn build_briefing_state(
+    day: &str,
+    analysis_day: NaiveDate,
+    model: &str,
+    context: &ExecutionContext,
+    upstream: Option<&Map<String, Value>>,
+) -> Result<MorningBriefingPreState, String> {
     let dates = BriefingDates::for_analysis(analysis_day).ok_or("briefing date overflow")?;
     let presentation_day = dates.presentation.format("%Y%m%d").to_string();
     let mut gaps = Vec::new();
     let home = HomeContext::new(&context.journal, Utc::now());
-    // `enabled_facet_names` supplies the reference's declared-name + muted filter.
     let facets = enabled_facet_names(&home)
         .into_iter()
         .map(|name| {
@@ -120,16 +255,9 @@ fn build_packet(
     if facets.is_empty() {
         gaps.push("active facets".to_owned());
     }
-    let newsletter_facets = facets
-        .iter()
-        .filter(|(facet, _)| {
-            upstream.is_none_or(|outcomes| {
-                outcomes.get(&format!("facet_newsletter:{facet}")) == Some(&Value::Bool(true))
-            })
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let newsletters = load_newsletters(&newsletter_facets, day, context, &mut gaps);
+
+    let digest_activities = load_digest_activities(&facets, day, context, &mut gaps);
+
     let schedule_current =
         upstream.is_none_or(|outcomes| outcomes.get("schedule") == Some(&Value::Bool(true)));
     let schedule_facets = if schedule_current {
@@ -163,16 +291,19 @@ fn build_packet(
     let counts = json!({
         "segments": 0,
         "anticipated_activities": today.len(),
-        "facet_newsletters": newsletters.len(),
     });
+    let generated = generated_stamp(&home);
     let metadata = json!({
-        "generated": generated_stamp(&home),
+        "generated": generated,
         "model": model,
         "sources": counts,
         "gaps": gaps,
         "coverage_preamble": coverage_preamble(&counts, &gaps, forward.len()),
     });
-    Ok(Map::from_iter([
+    let n = digest_activities.len();
+    let include_activities = vec![true; n];
+    let include_stories = vec![true; n];
+    let values = Map::from_iter([
         (
             "briefing_analysis_day".into(),
             Value::String(day.to_owned()),
@@ -192,8 +323,12 @@ fn build_packet(
             Value::String(render_facets(&facets)),
         ),
         (
-            "facet_newsletters".into(),
-            Value::String(render_newsletters(&newsletters, day)),
+            "activity_digest".into(),
+            Value::String(render_digest_activities(
+                &digest_activities,
+                &include_activities,
+                &include_stories,
+            )),
         ),
         (
             "anticipated_today".into(),
@@ -211,32 +346,247 @@ fn build_packet(
                 pulse
             }),
         ),
-    ]))
+    ]);
+    Ok(MorningBriefingPreState {
+        values,
+        activities: digest_activities,
+        initial_gaps: gaps,
+        counts,
+        forward_count: forward.len(),
+        generated,
+        model: model.to_owned(),
+    })
 }
 
-fn load_newsletters(
+fn load_digest_activities(
     facets: &[(String, String)],
     day: &str,
     context: &ExecutionContext,
     gaps: &mut Vec<String>,
-) -> Vec<(String, String)> {
-    let mut newsletters = Vec::new();
-    for (facet, title) in facets {
-        match read_news_file(&context.journal, facet, &format!("{day}.md")) {
-            Ok(Some(content)) if !content.trim().is_empty() => {
-                newsletters.push((facet.clone(), content.trim().to_owned()))
+) -> Vec<DigestActivity> {
+    let mut activities = Vec::new();
+    for (facet_idx, (facet, title)) in facets.iter().enumerate() {
+        match load_activity_records(&context.journal, facet, day, false) {
+            Ok(records) => {
+                let activity_path = context
+                    .journal
+                    .join("facets")
+                    .join(facet)
+                    .join("activities")
+                    .join(format!("{day}.jsonl"));
+                if activity_path.is_file()
+                    && let Ok(content) = std::fs::read_to_string(&activity_path)
+                {
+                    let has_unreadable_line = content
+                        .lines()
+                        .filter(|line| !line.trim().is_empty())
+                        .any(|line| {
+                            serde_json::from_str::<Value>(line)
+                                .ok()
+                                .and_then(|v| v.as_object().cloned())
+                                .is_none()
+                        });
+                    if has_unreadable_line {
+                        gaps.push(format!(
+                            "activities from {title} include a line that could not be read"
+                        ));
+                    }
+                }
+                let mut has_unusable_id = false;
+                for record in records {
+                    let id = match record
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.trim().is_empty())
+                    {
+                        Some(id) => id.to_owned(),
+                        None => {
+                            has_unusable_id = true;
+                            continue;
+                        }
+                    };
+                    let title = record
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    let description = record
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    let details = record
+                        .get("details")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    let start = record
+                        .get("start")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    let end = record
+                        .get("end")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    let target_date = record
+                        .get("target_date")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    let duration = record.get("duration").cloned().filter(|v| !v.is_null());
+                    let participants = record
+                        .get("participation")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|entry| entry.as_object())
+                        .map(|entry| {
+                            string_or(entry.get("name").or_else(|| entry.get("entity_id")), "")
+                        })
+                        .filter(|v| !v.is_empty())
+                        .collect::<Vec<_>>();
+                    let entities = record
+                        .get("active_entities")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>();
+                    let story_body = record
+                        .get("story")
+                        .and_then(|s| s.get("body"))
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    let source_limitation = record
+                        .get("story")
+                        .and_then(Value::as_object)
+                        .is_some_and(|story| {
+                            story
+                                .get("body")
+                                .and_then(Value::as_str)
+                                .is_some_and(|b| !b.is_empty())
+                                && story
+                                    .get("partial_input")
+                                    .and_then(Value::as_object)
+                                    .is_some()
+                        });
+
+                    activities.push((
+                        facet_idx,
+                        DigestActivity {
+                            facet: facet.clone(),
+                            day: day.to_owned(),
+                            id,
+                            start,
+                            end,
+                            target_date,
+                            duration,
+                            title,
+                            description,
+                            details,
+                            participants,
+                            entities,
+                            source_limitation,
+                            story_body,
+                        },
+                    ));
+                }
+                if has_unusable_id {
+                    gaps.push(format!(
+                        "activities from {title} include a record with no activity id"
+                    ));
+                }
             }
-            Ok(_) => gaps.push(format!("a newsletter from {title}")),
             Err(error) => {
-                log::warn!("morning briefing: newsletter for {facet} {day} unreadable: {error}");
-                gaps.push(format!(
-                    "the newsletter from {title}, which couldn't be read"
-                ));
+                log::warn!("morning briefing: activities for {facet} {day} unreadable: {error}");
+                gaps.push(format!("activities from {title}, which couldn't be read"));
             }
         }
     }
-    newsletters
+    activities.sort_by(|(idx_a, act_a), (idx_b, act_b)| {
+        idx_a
+            .cmp(idx_b)
+            .then_with(|| match (&act_a.start, &act_b.start) {
+                (Some(sa), Some(sb)) => sa.cmp(sb),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            })
+            .then_with(|| act_a.id.cmp(&act_b.id))
+    });
+    activities.into_iter().map(|(_, act)| act).collect()
 }
+
+fn render_digest_activity(act: &DigestActivity, include_story: bool) -> String {
+    let mut lines = Vec::new();
+    let title_line = if let Some(ref title) = act.title {
+        format!("### {title}")
+    } else {
+        "### Untitled activity".to_string()
+    };
+    lines.push(title_line);
+    lines.push(format!("- id: {}", act.id));
+    lines.push(format!(
+        "- source: sol://facets/{}/activities/{}#{}",
+        act.facet, act.day, act.id
+    ));
+    if let Some(ref start) = act.start {
+        lines.push(format!("- start: {start}"));
+    }
+    if let Some(ref end) = act.end {
+        lines.push(format!("- end: {end}"));
+    }
+    if let Some(ref target_date) = act.target_date {
+        lines.push(format!("- target_date: {target_date}"));
+    }
+    if let Some(ref dur) = act.duration {
+        lines.push(format!("- duration: {dur}"));
+    }
+    if let Some(ref desc) = act.description {
+        lines.push(format!("- description: {desc}"));
+    }
+    if let Some(ref det) = act.details {
+        lines.push(format!("- details: {det}"));
+    }
+    if !act.participants.is_empty() {
+        lines.push(format!("- participants: {}", act.participants.join(", ")));
+    }
+    if !act.entities.is_empty() {
+        lines.push(format!("- entities: {}", act.entities.join(", ")));
+    }
+    if act.source_limitation {
+        lines.push("source_limitation: partial_input".to_string());
+    }
+    if include_story && let Some(ref body) = act.story_body {
+        lines.push(format!("Story:\n{body}"));
+    }
+    lines.join("\n")
+}
+
+fn render_digest_activities(
+    activities: &[DigestActivity],
+    include_activities: &[bool],
+    include_stories: &[bool],
+) -> String {
+    let mut items = Vec::new();
+    for (i, act) in activities.iter().enumerate() {
+        if include_activities.get(i).copied().unwrap_or(true) {
+            let include_story = include_stories.get(i).copied().unwrap_or(true);
+            items.push(render_digest_activity(act, include_story));
+        }
+    }
+    if items.is_empty() {
+        "(none)".to_string()
+    } else {
+        items.join("\n\n")
+    }
+}
+
 fn load_activities(
     facets: &[(String, String)],
     days: &[String],
@@ -286,6 +636,7 @@ fn load_activities(
     }
     values
 }
+
 /// When the briefing was prepared, as a wall time on the journal's clock; home
 /// shows its hour and minute as written.
 fn generated_stamp(home: &HomeContext) -> String {
@@ -330,6 +681,7 @@ fn read_pulse(home: &HomeContext, day: &str, gaps: &mut Vec<String>) -> String {
     }
     value
 }
+
 fn render_facets(facets: &[(String, String)]) -> String {
     if facets.is_empty() {
         "(none)".into()
@@ -341,21 +693,7 @@ fn render_facets(facets: &[(String, String)]) -> String {
             .join("\n")
     }
 }
-fn render_newsletters(values: &[(String, String)], day: &str) -> String {
-    if values.is_empty() {
-        "(none)".into()
-    } else {
-        values
-            .iter()
-            .map(|(facet, content)| {
-                format!(
-                    "### {facet} newsletter\nSource: sol://facets/{facet}/news/{day}\n{content}",
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n")
-    }
-}
+
 fn render_activities(values: &[Value], grouped: bool) -> String {
     if values.is_empty() {
         return "(none)".into();
@@ -398,9 +736,11 @@ fn render_activities(values: &[Value], grouped: bool) -> String {
     }
     lines.join("\n")
 }
+
 fn short_time(value: Option<&Value>) -> String {
     string_or(value, "").chars().take(5).collect()
 }
+
 fn participants(value: &Value) -> String {
     let mut names = value
         .get("participation")
@@ -423,6 +763,7 @@ fn participants(value: &Value) -> String {
     }
     names.join(", ")
 }
+
 /// Gaps that say a day is empty rather than that a source is missing. The
 /// model still sees them; the owner's note leaves them out, since its counts
 /// already say 0.
@@ -433,14 +774,9 @@ fn coverage_preamble(counts: &Value, gaps: &[String], forward: usize) -> String 
     let count = |key: &str| counts[key].as_u64().unwrap_or(0);
     let plural = |n: u64, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
     let mut sentence = format!(
-        "This briefing draws on {} for today, {} in the next 7 days and {}.",
+        "This briefing draws on {} for today and {} in the next 7 days.",
         plural(count("anticipated_activities"), "plan", "plans"),
         plural(forward as u64, "plan", "plans"),
-        plural(
-            count("facet_newsletters"),
-            "facet newsletter",
-            "facet newsletters"
-        ),
     );
     let missing = gaps
         .iter()
@@ -452,11 +788,13 @@ fn coverage_preamble(counts: &Value, gaps: &[String], forward: usize) -> String 
     }
     sentence
 }
+
 /// A `YYYYMMDD` day as an owner reads it, like "October 17".
 fn spoken_day(day: &str) -> String {
     NaiveDate::parse_from_str(day, "%Y%m%d")
         .map_or_else(|_| day.to_owned(), |date| date.format("%B %-d").to_string())
 }
+
 fn string_or(value: Option<&Value>, fallback: &str) -> String {
     value.and_then(Value::as_str).unwrap_or(fallback).to_owned()
 }
@@ -468,21 +806,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn coverage_preamble_counts_plans_and_newsletters_in_words() {
-        let one = json!({"segments": 0, "anticipated_activities": 1, "facet_newsletters": 1});
-        assert_eq!(
-            coverage_preamble(&one, &[], 1),
-            "This briefing draws on 1 plan for today, 1 plan in the next 7 days and 1 facet newsletter."
+    fn coverage_preamble_counts_plans_in_words() {
+        let one = json!({"segments": 0, "anticipated_activities": 1});
+        let sentence1 = coverage_preamble(&one, &[], 1);
+        assert!(sentence1.contains("1 plan for today"));
+        assert!(sentence1.contains("1 plan in the next 7 days"));
+        assert!(!sentence1.contains("newsletter"));
+
+        let many = json!({"segments": 4, "anticipated_activities": 0});
+        let sentence2 = coverage_preamble(
+            &many,
+            &[NO_PLANS_TODAY.to_owned(), "the latest pulse".to_owned()],
+            3,
         );
-        let many = json!({"segments": 4, "anticipated_activities": 0, "facet_newsletters": 2});
-        assert_eq!(
-            coverage_preamble(
-                &many,
-                &[NO_PLANS_TODAY.to_owned(), "the latest pulse".to_owned()],
-                3
-            ),
-            "This briefing draws on 0 plans for today, 3 plans in the next 7 days and 2 facet newsletters. Missing: the latest pulse."
-        );
+        assert!(sentence2.contains("0 plans for today"));
+        assert!(sentence2.contains("3 plans in the next 7 days"));
+        assert!(sentence2.contains("Missing: the latest pulse"));
+        assert!(!sentence2.contains("newsletter"));
     }
 
     #[test]
@@ -522,10 +862,9 @@ mod tests {
         let root = tempfile::TempDir::new().unwrap();
         let facet = root.path().join("facets/work");
         fs::create_dir_all(facet.join("activities")).unwrap();
-        fs::create_dir_all(facet.join("news")).unwrap();
         fs::write(facet.join("facet.json"), r#"{"title":"Work"}"#).unwrap();
         for (day, title) in [
-            ("20261231", "analysis agenda decoy"),
+            ("20261231", "analysis agenda"),
             ("20270101", "presentation agenda"),
             ("20270102", "forward agenda"),
         ] {
@@ -535,12 +874,6 @@ mod tests {
             )
             .unwrap();
         }
-        fs::write(facet.join("news/20261231.md"), "analysis newsletter").unwrap();
-        fs::write(
-            facet.join("news/20270101.md"),
-            "presentation newsletter decoy",
-        )
-        .unwrap();
         let context = ExecutionContext {
             journal: root.path().to_owned(),
         };
@@ -556,18 +889,18 @@ mod tests {
         assert_eq!(values["briefing_presentation_day"], "20270101");
         let today = values["anticipated_today"].as_str().unwrap();
         assert!(today.contains("presentation agenda"), "{today}");
-        assert!(!today.contains("decoy") && !today.contains("forward agenda"));
+        assert!(!today.contains("forward agenda"));
         let forward = values["anticipated_forward"].as_str().unwrap();
         assert!(forward.contains("forward agenda"), "{forward}");
-        assert!(!forward.contains("presentation agenda") && !forward.contains("decoy"));
-        let news = values["facet_newsletters"].as_str().unwrap();
-        assert!(news.contains("analysis newsletter"), "{news}");
-        assert!(!news.contains("decoy"));
+        assert!(!forward.contains("presentation agenda"));
+        let digest = values["activity_digest"].as_str().unwrap();
+        assert!(digest.contains("analysis agenda"), "{digest}");
+        assert!(!digest.contains("presentation agenda"));
+        assert!(values.get("facet_newsletters").is_none());
     }
 
     #[test]
     fn gate_keeps_reference_day_reasons() {
-        // Derived from solstone/talent/morning_briefing.py:25-34.
         let prepared = PreparedTalent {
             name: "morning_briefing".into(),
             config: Map::new(),
@@ -582,13 +915,11 @@ mod tests {
     }
 
     #[test]
-    fn briefing_never_lends_retained_news_or_calendar_after_no_output_then_accepts_recovery() {
+    fn briefing_never_lends_retained_calendar_after_no_output_then_accepts_recovery() {
         let root = tempfile::tempdir().unwrap();
         let facet = root.path().join("facets/work");
-        fs::create_dir_all(facet.join("news")).unwrap();
         fs::create_dir_all(facet.join("activities")).unwrap();
         fs::write(facet.join("facet.json"), r#"{"title":"Work"}"#).unwrap();
-        fs::write(facet.join("news/20260910.md"), "Retained OLD newsletter").unwrap();
         fs::write(
             facet.join("activities/20260911.jsonl"),
             r#"{"id":"old","source":"anticipated","title":"Retained OLD agenda"}"#,
@@ -598,23 +929,688 @@ mod tests {
             journal: root.path().to_owned(),
         };
         let date = NaiveDate::from_ymd_opt(2026, 9, 10).unwrap();
-        let unavailable = Map::from_iter([
-            ("schedule".to_owned(), json!(false)),
-            ("facet_newsletter:work".to_owned(), json!(false)),
-        ]);
+        let unavailable = Map::from_iter([("schedule".to_owned(), json!(false))]);
         let values = build_packet("20260910", date, "test", &context, Some(&unavailable)).unwrap();
         let text = serde_json::to_string(&values).unwrap();
         assert!(!text.contains("Retained OLD"));
-        fs::write(facet.join("news/20260910.md"), "Recovered NEW newsletter").unwrap();
-        let available = Map::from_iter([
-            ("schedule".to_owned(), json!(true)),
-            ("facet_newsletter:work".to_owned(), json!(true)),
-        ]);
+
+        let available = Map::from_iter([("schedule".to_owned(), json!(true))]);
         let values = build_packet("20260910", date, "test", &context, Some(&available)).unwrap();
+        let text2 = serde_json::to_string(&values).unwrap();
+        assert!(text2.contains("Retained OLD agenda"));
+    }
+
+    // 1. Populated analysis day: title, description, times, participants, entities, story body,
+    // and sol://facets/.../activities/{day}#{id} appear. A second build is identical.
+    #[test]
+    fn test_populated_day_digest() {
+        let root = tempfile::tempdir().unwrap();
+        let facet = root.path().join("facets/work");
+        fs::create_dir_all(facet.join("activities")).unwrap();
+        fs::write(facet.join("facet.json"), r#"{"title":"Work"}"#).unwrap();
+        let record = json!({
+            "id": "act_1",
+            "title": "Quarterly Review",
+            "description": "Review Q3 results",
+            "details": "Detailed financial breakdown",
+            "start": "09:00",
+            "end": "10:00",
+            "target_date": "20261019",
+            "duration": 60,
+            "participation": [{"name": "Alice"}],
+            "active_entities": ["Acme Corp"],
+            "story": {"body": "Alice presented the financial metrics."},
+        });
+        fs::write(
+            facet.join("activities/20261019.jsonl"),
+            format!("{record}\n"),
+        )
+        .unwrap();
+        let context = ExecutionContext {
+            journal: root.path().to_owned(),
+        };
+        let date = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        let values1 = build_packet("20261019", date, "test", &context, None).unwrap();
+        let values2 = build_packet("20261019", date, "test", &context, None).unwrap();
+        assert_eq!(values1, values2);
+
+        let digest = values1["activity_digest"].as_str().unwrap();
+        assert!(digest.contains("Quarterly Review"));
+        assert!(digest.contains("Review Q3 results"));
+        assert!(digest.contains("Detailed financial breakdown"));
+        assert!(digest.contains("09:00"));
+        assert!(digest.contains("10:00"));
+        assert!(digest.contains("20261019"));
+        assert!(digest.contains("60"));
+        assert!(digest.contains("Alice"));
+        assert!(digest.contains("Acme Corp"));
+        assert!(digest.contains("Alice presented the financial metrics."));
+        assert!(digest.contains("sol://facets/work/activities/20261019#act_1"));
+    }
+
+    // 2. Empty facets: stable across two builds, no omission gap, failed-facet wording absent.
+    #[test]
+    fn test_empty_facets_stable_no_gap() {
+        let root = tempfile::tempdir().unwrap();
+        let facet = root.path().join("facets/work");
+        fs::create_dir_all(&facet).unwrap();
+        fs::write(facet.join("facet.json"), r#"{"title":"Work"}"#).unwrap();
+        let context = ExecutionContext {
+            journal: root.path().to_owned(),
+        };
+        let date = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        let values1 = build_packet("20261019", date, "test", &context, None).unwrap();
+        let values2 = build_packet("20261019", date, "test", &context, None).unwrap();
+        assert_eq!(values1, values2);
+
+        let metadata: Value =
+            serde_json::from_str(values1["briefing_metadata"].as_str().unwrap()).unwrap();
+        let gaps = metadata["gaps"].as_array().unwrap();
+        for gap in gaps {
+            let g = gap.as_str().unwrap();
+            assert!(!g.contains("activities"));
+            assert!(!g.contains("couldn't be read"));
+        }
+        assert_eq!(values1["activity_digest"], "(none)");
+    }
+
+    // 3. Two facets: order follows declaration order, then start, then id, including a missing start sorting last. Stable across two builds.
+    #[test]
+    fn test_two_facets_sorting_order() {
+        let root = tempfile::tempdir().unwrap();
+        let work = root.path().join("facets/work");
+        fs::create_dir_all(work.join("activities")).unwrap();
+        fs::write(work.join("facet.json"), r#"{"title":"Work"}"#).unwrap();
+
+        let personal = root.path().join("facets/personal");
+        fs::create_dir_all(personal.join("activities")).unwrap();
+        fs::write(personal.join("facet.json"), r#"{"title":"Personal"}"#).unwrap();
+
+        let work_records = [
+            json!({"id": "act_c", "start": "14:00"}),
+            json!({"id": "act_d"}),
+            json!({"id": "act_b", "start": "09:00"}),
+            json!({"id": "act_a"}),
+        ];
+        let mut work_jsonl = String::new();
+        for r in &work_records {
+            work_jsonl.push_str(&format!("{r}\n"));
+        }
+        fs::write(work.join("activities/20261019.jsonl"), work_jsonl).unwrap();
+
+        let personal_records = [
+            json!({"id": "act_p2", "start": "08:00"}),
+            json!({"id": "act_p1", "start": "08:00"}),
+        ];
+        let mut personal_jsonl = String::new();
+        for r in &personal_records {
+            personal_jsonl.push_str(&format!("{r}\n"));
+        }
+        fs::write(personal.join("activities/20261019.jsonl"), personal_jsonl).unwrap();
+
+        let context = ExecutionContext {
+            journal: root.path().to_owned(),
+        };
+        let date = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        let values1 = build_packet("20261019", date, "test", &context, None).unwrap();
+        let values2 = build_packet("20261019", date, "test", &context, None).unwrap();
+        assert_eq!(values1, values2);
+
+        let digest = values1["activity_digest"].as_str().unwrap();
+        let pos_b = digest.find("act_b").unwrap();
+        let pos_c = digest.find("act_c").unwrap();
+        let pos_a = digest.find("act_a").unwrap();
+        let pos_d = digest.find("act_d").unwrap();
+        let pos_p1 = digest.find("act_p1").unwrap();
+        let pos_p2 = digest.find("act_p2").unwrap();
+
         assert!(
-            serde_json::to_string(&values)
-                .unwrap()
-                .contains("Recovered NEW newsletter")
+            pos_p1 < pos_p2,
+            "p1 ({pos_p1}) should precede p2 ({pos_p2})"
         );
+        assert!(pos_p2 < pos_b, "p2 ({pos_p2}) should precede b ({pos_b})");
+        assert!(pos_b < pos_c, "b ({pos_b}) should precede c ({pos_c})");
+        assert!(pos_c < pos_a, "c ({pos_c}) should precede a ({pos_a})");
+        assert!(pos_a < pos_d, "a ({pos_a}) should precede d ({pos_d})");
+    }
+
+    // 4. Oversize stories: measured prompt + schema fit compute_input_budget(max_output_tokens, LOCAL_MIN_CONTEXT_TOKENS).
+    // A gap names an omitted id.
+    // Story bodies are absent once dropped; no mid-string remnant of a dropped story.
+    #[test]
+    fn test_oversize_story_clipping() {
+        let root = tempfile::tempdir().unwrap();
+        let facet = root.path().join("facets/work");
+        fs::create_dir_all(facet.join("activities")).unwrap();
+        fs::write(facet.join("facet.json"), r#"{"title":"Work"}"#).unwrap();
+
+        let huge_story = "A".repeat(50000);
+        let record1 = json!({
+            "id": "act_huge",
+            "title": "First Huge Activity",
+            "start": "09:00",
+            "story": {"body": huge_story},
+        });
+        let record2 = json!({
+            "id": "act_small",
+            "title": "Second Activity",
+            "start": "10:00",
+            "story": {"body": "short story content"},
+        });
+        fs::write(
+            facet.join("activities/20261019.jsonl"),
+            format!("{record1}\n{record2}\n"),
+        )
+        .unwrap();
+
+        let context = ExecutionContext {
+            journal: root.path().to_owned(),
+        };
+        let mut prepared = PreparedTalent {
+            name: "morning_briefing".into(),
+            config: Map::from_iter([
+                ("day".into(), json!("20261019")),
+                ("max_output_tokens".into(), json!(1024)),
+                ("json_schema".into(), json!({"type": "object"})),
+                (
+                    "prompt".into(),
+                    json!("Prompt with $activity_digest and $briefing_metadata"),
+                ),
+                ("_daily_location_text".into(), json!("Denver, Colorado")),
+            ]),
+        };
+        let state = build(&mut prepared, &context).unwrap();
+        apply_prompt_override(&mut prepared, &state).unwrap();
+
+        let prompt = prepared.config["prompt"].as_str().unwrap();
+        let schema_str = serde_json::to_string(&prepared.config["json_schema"]).unwrap();
+        let budget = solstone_core_local::generate::compute_input_budget(
+            1024,
+            solstone_core_local::plan::LOCAL_MIN_CONTEXT_TOKENS,
+        );
+        let total_tokens: u32 = crate::model_text_parts(&prepared.config)
+            .iter()
+            .map(|part| solstone_core_local::generate::estimate_tokens(part))
+            .sum::<u32>()
+            + solstone_core_local::generate::estimate_tokens(&schema_str);
+        assert!(
+            total_tokens <= budget,
+            "tokens {total_tokens} must fit budget {budget}"
+        );
+        assert!(prompt.contains("story for act_huge") || prompt.contains("activity act_huge"));
+        assert!(!prompt.contains(&huge_story));
+        assert!(!prompt.contains(&huge_story[..100]));
+    }
+
+    #[test]
+    fn test_non_digest_remainder_cannot_fit_returns_budget_error() {
+        let root = tempfile::tempdir().unwrap();
+        let context = ExecutionContext {
+            journal: root.path().to_owned(),
+        };
+        let huge_instruction = "X".repeat(100_000);
+        let mut prepared = PreparedTalent {
+            name: "morning_briefing".into(),
+            config: Map::from_iter([
+                ("day".into(), json!("20261019")),
+                ("max_output_tokens".into(), json!(1024)),
+                ("json_schema".into(), json!({"type": "object"})),
+                ("user_instruction".into(), json!(huge_instruction)),
+                ("prompt".into(), json!("Short prompt")),
+            ]),
+        };
+        let state = build(&mut prepared, &context).unwrap();
+        let result = apply_prompt_override(&mut prepared, &state);
+        assert!(
+            result.is_err(),
+            "expected budget error when request cannot fit floor budget"
+        );
+        let err = result.unwrap_err();
+        assert!(err.detail.contains("floor input budget"));
+        assert_eq!(prepared.config["prompt"], json!("Short prompt"));
+    }
+
+    #[test]
+    fn test_source_gaps_not_substring_deleted() {
+        let huge_story = "A".repeat(50000);
+        let act = DigestActivity {
+            facet: "work".into(),
+            day: "20261019".into(),
+            id: "act".into(),
+            start: Some("09:00".into()),
+            end: None,
+            target_date: None,
+            duration: None,
+            title: Some("Act Title".into()),
+            description: None,
+            details: None,
+            participants: vec![],
+            entities: vec![],
+            source_limitation: false,
+            story_body: Some(huge_story),
+        };
+        let initial_gap = "activities from Work, which couldn't be read".to_string();
+        let values = Map::from_iter([
+            ("briefing_analysis_day".into(), json!("20261019")),
+            ("briefing_presentation_day".into(), json!("20261020")),
+            ("briefing_metadata".into(), json!("{}")),
+            ("activity_digest".into(), json!("")),
+            ("anticipated_today".into(), json!("")),
+            ("anticipated_forward".into(), json!("")),
+            ("pulse_surface".into(), json!("")),
+        ]);
+        let state = PrePostState::MorningBriefing(MorningBriefingPreState {
+            values,
+            activities: vec![act],
+            initial_gaps: vec![initial_gap.clone()],
+            counts: json!({"segments": 0, "anticipated_activities": 0}),
+            forward_count: 0,
+            generated: "2026-10-20T07:00:00Z".into(),
+            model: "test-model".into(),
+        });
+        let mut prepared = PreparedTalent {
+            name: "morning_briefing".into(),
+            config: Map::from_iter([
+                ("day".into(), json!("20261019")),
+                ("max_output_tokens".into(), json!(1024)),
+                ("json_schema".into(), json!({"type": "object"})),
+                (
+                    "prompt".into(),
+                    json!("Prompt with $activity_digest and $briefing_metadata"),
+                ),
+            ]),
+        };
+        apply_prompt_override(&mut prepared, &state).unwrap();
+        let prompt = prepared.config["prompt"].as_str().unwrap();
+        assert!(
+            prompt.contains(&initial_gap),
+            "exact source gap must still be present"
+        );
+        assert!(prompt.contains("act"), "omission must name act");
+    }
+
+    // 5. One valid facet and one malformed activity file: valid activity id is in the digest;
+    // a gap names the failed facet; the gap does not say the day was empty or that there were no activities.
+    #[test]
+    fn test_one_valid_one_malformed_activity_file() {
+        let root = tempfile::tempdir().unwrap();
+        let work = root.path().join("facets/work");
+        fs::create_dir_all(work.join("activities")).unwrap();
+        fs::write(work.join("facet.json"), r#"{"title":"Work"}"#).unwrap();
+        let record = json!({"id": "valid_act", "title": "Valid Plan"});
+        fs::write(
+            work.join("activities/20261019.jsonl"),
+            format!("{record}\n"),
+        )
+        .unwrap();
+
+        let personal = root.path().join("facets/personal");
+        fs::create_dir_all(personal.join("activities")).unwrap();
+        fs::write(personal.join("facet.json"), r#"{"title":"Personal"}"#).unwrap();
+        fs::write(personal.join("activities/20261019.jsonl"), &[0xff, 0xff]).unwrap();
+
+        let context = ExecutionContext {
+            journal: root.path().to_owned(),
+        };
+        let date = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        let values = build_packet("20261019", date, "test", &context, None).unwrap();
+        let digest = values["activity_digest"].as_str().unwrap();
+        assert!(digest.contains("valid_act"));
+
+        let metadata: Value =
+            serde_json::from_str(values["briefing_metadata"].as_str().unwrap()).unwrap();
+        let gaps = metadata["gaps"].as_array().unwrap();
+        let gap_strs: Vec<&str> = gaps.iter().filter_map(Value::as_str).collect();
+        assert!(
+            gap_strs
+                .iter()
+                .any(|g| g.contains("Personal") && g.contains("couldn't be read"))
+        );
+        for g in &gap_strs {
+            if g.contains("Personal") {
+                assert!(!g.contains("empty"));
+                assert!(!g.contains("no activities"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_mixed_jsonl_keeps_valid_records_and_reports_incomplete_gap() {
+        let root = tempfile::tempdir().unwrap();
+        let facet = root.path().join("facets/work");
+        fs::create_dir_all(facet.join("activities")).unwrap();
+        fs::write(facet.join("facet.json"), r#"{"title":"Work"}"#).unwrap();
+
+        let record1 = json!({"id": "act_valid_1", "title": "First Valid"});
+        let record2 = json!({"id": "act_valid_2", "title": "Second Valid"});
+        fs::write(
+            facet.join("activities/20261019.jsonl"),
+            format!("{record1}\nnot-json\n{record2}\n"),
+        )
+        .unwrap();
+
+        let context = ExecutionContext {
+            journal: root.path().to_owned(),
+        };
+        let date = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        let values = build_packet("20261019", date, "test", &context, None).unwrap();
+        let digest = values["activity_digest"].as_str().unwrap();
+        assert!(
+            digest.contains("act_valid_1"),
+            "first valid activity must be in digest"
+        );
+        assert!(
+            digest.contains("act_valid_2"),
+            "second valid activity must be in digest"
+        );
+
+        let metadata: Value =
+            serde_json::from_str(values["briefing_metadata"].as_str().unwrap()).unwrap();
+        let gaps: Vec<&str> = metadata["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            gaps.iter()
+                .any(|g| g.contains("Work") && g.contains("include a line that could not be read")),
+            "incomplete gap must name the facet: {gaps:?}"
+        );
+    }
+
+    #[test]
+    fn test_valid_jsonl_twin_has_no_incomplete_gap() {
+        let root = tempfile::tempdir().unwrap();
+        let facet = root.path().join("facets/work");
+        fs::create_dir_all(facet.join("activities")).unwrap();
+        fs::write(facet.join("facet.json"), r#"{"title":"Work"}"#).unwrap();
+
+        let record1 = json!({"id": "act_valid_1", "title": "First Valid"});
+        let record2 = json!({"id": "act_valid_2", "title": "Second Valid"});
+        fs::write(
+            facet.join("activities/20261019.jsonl"),
+            format!("{record1}\n{record2}\n"),
+        )
+        .unwrap();
+
+        let context = ExecutionContext {
+            journal: root.path().to_owned(),
+        };
+        let date = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        let values = build_packet("20261019", date, "test", &context, None).unwrap();
+        let digest = values["activity_digest"].as_str().unwrap();
+        assert!(digest.contains("act_valid_1"));
+        assert!(digest.contains("act_valid_2"));
+
+        let metadata: Value =
+            serde_json::from_str(values["briefing_metadata"].as_str().unwrap()).unwrap();
+        let gaps: Vec<&str> = metadata["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            !gaps
+                .iter()
+                .any(|g| g.contains("could not be read") || g.contains("couldn't be read")),
+            "twin file with only valid rows must have no incomplete gap: {gaps:?}"
+        );
+        assert!(
+            !gaps.iter().any(|g| g.contains("no activity id")),
+            "twin file with only valid rows must have no missing activity id gap: {gaps:?}"
+        );
+    }
+
+    #[test]
+    fn test_mixed_jsonl_missing_activity_id_keeps_valid_records() {
+        let root = tempfile::tempdir().unwrap();
+        let facet = root.path().join("facets/work");
+        fs::create_dir_all(facet.join("activities")).unwrap();
+        fs::write(facet.join("facet.json"), r#"{"title":"Work"}"#).unwrap();
+
+        let row1 = json!({"id": "act_valid", "title": "Kept"});
+        let row2 = json!({"title": "unreferenceable activity"});
+        let row3 = json!({"id": 1, "title": "numeric"});
+        fs::write(
+            facet.join("activities/20261019.jsonl"),
+            format!("{row1}\n{row2}\n{row3}\n"),
+        )
+        .unwrap();
+
+        let context = ExecutionContext {
+            journal: root.path().to_owned(),
+        };
+        let date = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        let values = build_packet("20261019", date, "test", &context, None).unwrap();
+        let digest = values["activity_digest"].as_str().unwrap();
+        assert!(
+            digest.contains("act_valid"),
+            "valid activity must be in digest"
+        );
+        assert!(
+            !digest.contains("unreferenceable activity"),
+            "unreferenceable activity must not be in digest"
+        );
+        assert!(
+            !digest.contains("numeric"),
+            "numeric id activity must not be in digest"
+        );
+
+        let metadata: Value =
+            serde_json::from_str(values["briefing_metadata"].as_str().unwrap()).unwrap();
+        let gaps: Vec<&str> = metadata["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        let expected_gap = "activities from Work include a record with no activity id";
+        assert!(
+            gaps.iter().any(|g| *g == expected_gap),
+            "expected gap '{expected_gap}' in {gaps:?}"
+        );
+        for g in &gaps {
+            if g.contains("Work") {
+                assert!(
+                    !g.contains("empty"),
+                    "gap must not describe an empty day: {g}"
+                );
+                assert!(
+                    !g.contains("no activities"),
+                    "gap must not say no activities: {g}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_jsonl_only_missing_activity_id_reports_gap() {
+        let root = tempfile::tempdir().unwrap();
+        let facet = root.path().join("facets/work");
+        fs::create_dir_all(facet.join("activities")).unwrap();
+        fs::write(facet.join("facet.json"), r#"{"title":"Work"}"#).unwrap();
+
+        let row = json!({"title": "unreferenceable activity"});
+        fs::write(facet.join("activities/20261019.jsonl"), format!("{row}\n")).unwrap();
+
+        let context = ExecutionContext {
+            journal: root.path().to_owned(),
+        };
+        let date = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        let values = build_packet("20261019", date, "test", &context, None).unwrap();
+        let digest = values["activity_digest"].as_str().unwrap();
+        assert_eq!(digest, "(none)");
+
+        let metadata: Value =
+            serde_json::from_str(values["briefing_metadata"].as_str().unwrap()).unwrap();
+        let gaps: Vec<&str> = metadata["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        let expected_gap = "activities from Work include a record with no activity id";
+        assert!(
+            gaps.iter().any(|g| *g == expected_gap),
+            "expected gap '{expected_gap}' in {gaps:?}"
+        );
+        for g in &gaps {
+            if g.contains("Work") {
+                assert!(
+                    !g.contains("empty"),
+                    "gap must not describe an empty day: {g}"
+                );
+                assert!(
+                    !g.contains("no activities"),
+                    "gap must not say no activities: {g}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_jsonl_only_not_json_reports_gap_not_empty_day() {
+        let root = tempfile::tempdir().unwrap();
+        let facet = root.path().join("facets/work");
+        fs::create_dir_all(facet.join("activities")).unwrap();
+        fs::write(facet.join("facet.json"), r#"{"title":"Work"}"#).unwrap();
+
+        fs::write(facet.join("activities/20261019.jsonl"), "not-json\n").unwrap();
+
+        let context = ExecutionContext {
+            journal: root.path().to_owned(),
+        };
+        let date = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        let values = build_packet("20261019", date, "test", &context, None).unwrap();
+
+        let metadata: Value =
+            serde_json::from_str(values["briefing_metadata"].as_str().unwrap()).unwrap();
+        let gaps: Vec<&str> = metadata["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            gaps.iter()
+                .any(|g| g.contains("Work") && g.contains("include a line that could not be read")),
+            "gap must be present: {gaps:?}"
+        );
+        for g in &gaps {
+            if g.contains("Work") {
+                assert!(
+                    !g.contains("empty"),
+                    "gap must not describe an empty day: {g}"
+                );
+                assert!(
+                    !g.contains("no activities"),
+                    "gap must not say no activities: {g}"
+                );
+            }
+        }
+    }
+
+    // 6. partial_input object plus non-empty body: digest contains source_limitation: partial_input.
+    // The complete-input twin does not contain partial_input.
+    #[test]
+    fn test_partial_input_limitation_predicate() {
+        let root = tempfile::tempdir().unwrap();
+        let facet = root.path().join("facets/work");
+        fs::create_dir_all(facet.join("activities")).unwrap();
+        fs::write(facet.join("facet.json"), r#"{"title":"Work"}"#).unwrap();
+
+        let record1 = json!({
+            "id": "act_partial",
+            "title": "Meeting",
+            "story": {
+                "body": "Meeting content was long.",
+                "partial_input": {"reason": "cut"}
+            }
+        });
+        fs::write(
+            facet.join("activities/20261019.jsonl"),
+            format!("{record1}\n"),
+        )
+        .unwrap();
+        let context = ExecutionContext {
+            journal: root.path().to_owned(),
+        };
+        let date = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        let values1 = build_packet("20261019", date, "test", &context, None).unwrap();
+        let digest1 = values1["activity_digest"].as_str().unwrap();
+        assert!(digest1.contains("source_limitation: partial_input"));
+
+        // Complete-input twin
+        let record2 = json!({
+            "id": "act_complete",
+            "title": "Meeting",
+            "story": {
+                "body": "Meeting content was long."
+            }
+        });
+        fs::write(
+            facet.join("activities/20261019.jsonl"),
+            format!("{record2}\n"),
+        )
+        .unwrap();
+        let values2 = build_packet("20261019", date, "test", &context, None).unwrap();
+        let digest2 = values2["activity_digest"].as_str().unwrap();
+        assert!(!digest2.contains("partial_input"));
+    }
+
+    // 7. Same activities, change only the news file: packet equal, and the news body is not in the packet.
+    // Change only a title or story body: packet changes.
+    #[test]
+    fn test_news_file_independence() {
+        let root = tempfile::tempdir().unwrap();
+        let facet = root.path().join("facets/work");
+        fs::create_dir_all(facet.join("activities")).unwrap();
+        fs::create_dir_all(facet.join("news")).unwrap();
+        fs::write(facet.join("facet.json"), r#"{"title":"Work"}"#).unwrap();
+
+        let record = json!({
+            "id": "act_1",
+            "title": "Initial Title",
+            "story": {"body": "Initial Story Body"}
+        });
+        fs::write(
+            facet.join("activities/20261019.jsonl"),
+            format!("{record}\n"),
+        )
+        .unwrap();
+        fs::write(facet.join("news/20261019.md"), "Initial News File Content").unwrap();
+
+        let context = ExecutionContext {
+            journal: root.path().to_owned(),
+        };
+        let date = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        let values1 = build_packet("20261019", date, "test", &context, None).unwrap();
+
+        // Change only the news file
+        fs::write(
+            facet.join("news/20261019.md"),
+            "Completely Different News Content",
+        )
+        .unwrap();
+        let values2 = build_packet("20261019", date, "test", &context, None).unwrap();
+        assert_eq!(values1, values2);
+        let digest = values1["activity_digest"].as_str().unwrap();
+        assert!(!digest.contains("News"));
+
+        // Change title
+        let record_updated = json!({
+            "id": "act_1",
+            "title": "Changed Title",
+            "story": {"body": "Initial Story Body"}
+        });
+        fs::write(
+            facet.join("activities/20261019.jsonl"),
+            format!("{record_updated}\n"),
+        )
+        .unwrap();
+        let values3 = build_packet("20261019", date, "test", &context, None).unwrap();
+        assert_ne!(values1, values3);
     }
 }

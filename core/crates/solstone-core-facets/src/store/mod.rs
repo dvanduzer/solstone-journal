@@ -100,10 +100,7 @@ pub use lifecycle::{
 };
 pub use logs::{read_log_file, write_log_file};
 pub use map::{list_declared_facet_names, list_facet_directories, list_facet_entity_directories};
-pub use news::{
-    PreparedNewsReplacement, prepare_news_replacement, publish_news_replacement,
-    publish_news_replacement_checked, read_news_file, write_news_file,
-};
+pub use news::read_news_file;
 pub use observations::{
     HistoryEntry, IncomingObservationRow, ObservationChange, ObservationEntityResolution,
     ObservationErrorSource, ObservationLookup, ObservationLookupError, ObservationOperationCounts,

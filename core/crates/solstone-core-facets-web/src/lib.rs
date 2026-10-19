@@ -13,18 +13,16 @@ mod awareness;
 pub mod clock;
 mod curation;
 mod date_nav;
+mod facet_name;
 mod http;
-mod news;
-mod pdf;
 pub mod segments;
 
 pub use clock::Clock;
 pub use date_nav::date_nav_index;
-pub use news::store::valid_facet;
+pub use facet_name::valid_facet;
 
 pub fn routes(journal_root: PathBuf, clock: Clock) -> Router {
     activities::routes(journal_root.clone(), clock.clone())
-        .merge(news::routes(journal_root.clone(), clock.clone()))
         .merge(curation::routes(journal_root.clone()))
         .merge(awareness::routes(journal_root, clock))
 }

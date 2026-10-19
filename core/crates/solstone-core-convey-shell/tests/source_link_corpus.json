@@ -301,26 +301,26 @@
     {
       "id": "news-valid-live",
       "ref": "sol://facets/work/news/20260901",
-      "status": 302,
-      "location": "/app/news/work/20260901"
+      "status": 404,
+      "reason": "cant_show"
     },
     {
       "id": "news-valid-with-ext",
       "ref": "sol://facets/work/news/20260901.md",
-      "status": 302,
-      "location": "/app/news/work/20260901"
+      "status": 404,
+      "reason": "cant_show"
     },
     {
       "id": "news-renamed-facet",
       "ref": "sol://facets/oldwork/news/20260901",
-      "status": 302,
-      "location": "/app/news/newwork/20260901"
+      "status": 404,
+      "reason": "cant_show"
     },
     {
       "id": "news-missing-file",
       "ref": "sol://facets/work/news/20200101",
       "status": 404,
-      "reason": "absence"
+      "reason": "cant_show"
     },
     {
       "id": "news-merged-facet",
@@ -332,7 +332,7 @@
       "id": "news-deleted-facet",
       "ref": "sol://facets/deletedfacet/news/20260901",
       "status": 404,
-      "reason": "absence"
+      "reason": "cant_show"
     },
     {
       "id": "news-invalid-facet-dot",
@@ -345,15 +345,15 @@
       "ref": "sol://facets/ghost/news/20260901",
       "fixture": "retired_absent",
       "status": 404,
-      "reason": "absence"
+      "reason": "cant_show"
     },
     {
       "id": "news-retired-symlink-escape",
       "ref": "sol://facets/ghost/news/20260901",
       "fixture": "symlink_escape",
       "unix_only": true,
-      "status": 500,
-      "reason": "couldnt_check"
+      "status": 404,
+      "reason": "cant_show"
     }
   ],
   "activity_cases": [

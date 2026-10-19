@@ -106,23 +106,10 @@ fn replay_convey_home_corpus() {
         );
         asserted += 1;
     }
-    for case in groups["newsletter_summary"].as_array().unwrap() {
-        eq(
-            &formatting::format_newsletter_summary(
-                case["input"]["successful"].as_i64().unwrap(),
-                case["input"]["attempted"].as_i64().unwrap(),
-            ),
-            &case["output"],
-            "newsletter_summary",
-        );
-        asserted += 1;
-    }
     for case in groups["processing_summary"].as_array().unwrap() {
         eq(
             &formatting::format_processing_summary(
                 case["input"]["mode"].as_str().unwrap(),
-                case["input"]["successful_newsletters"].as_i64().unwrap(),
-                case["input"]["attempted_newsletters"].as_i64().unwrap(),
                 case["input"]["briefing_valid"].as_bool().unwrap(),
             ),
             &case["output"],
@@ -309,7 +296,7 @@ fn replay_convey_home_corpus() {
         );
         asserted += 1;
     }
-    assert_eq!(asserted, 1262);
+    assert_eq!(asserted, 1231);
 }
 
 fn rewrite_sol_urls_in_value(value: &mut Value) {
@@ -353,10 +340,6 @@ fn is_url_delimiter(ch: char) -> bool {
 }
 
 fn rewrite_sol_path(path: &str) -> Option<String> {
-    let parts = path.split('/').collect::<Vec<_>>();
-    if matches!(parts.as_slice(), [day, "talents", "facet_newsletter"] if day_key(day)) {
-        return Some(format!("/app/thinking/#runs/{}/facet_newsletter", parts[0]));
-    }
     if let Some((day, fragment)) = path.split_once('#')
         && day_key(day)
     {

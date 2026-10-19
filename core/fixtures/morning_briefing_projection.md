@@ -18,9 +18,3 @@ Nothing to report.
 ## Forward Look
 
 - Plan next week.
-
-## Reading
-
-- **personal**
-- Loose summary.
-- **work** — Newsletter.

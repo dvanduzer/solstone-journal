@@ -312,8 +312,6 @@
             "response.body.generators.entities:entity_suggest.path",
             "response.body.generators.event.mtime",
             "response.body.generators.event.path",
-            "response.body.generators.facet_newsletter.mtime",
-            "response.body.generators.facet_newsletter.path",
             "response.body.generators.linked_presence.mtime",
             "response.body.generators.linked_presence.path",
             "response.body.generators.linked_share.mtime",
@@ -534,25 +532,6 @@
                   "schema": "entity_suggest.schema.json",
                   "source": "app",
                   "title": "entity suggest",
-                  "type": "generate"
-                },
-                "facet_newsletter": {
-                  "accumulate": true,
-                  "color": "#0d47a1",
-                  "description": "creates comprehensive daily newsletters for each facet, covering activities, progress, and insights",
-                  "hook": {
-                    "post": "facet_newsletter",
-                    "pre": "facet_newsletter"
-                  },
-                  "max_output_tokens": 3840,
-                  "mtime": "<TALENT_MTIME>",
-                  "multi_facet": true,
-                  "output": "md",
-                  "path": "<TALENT_PATH>",
-                  "priority": 40,
-                  "schedule": "daily",
-                  "source": "system",
-                  "title": "facet newsletter generator",
                   "type": "generate"
                 },
                 "linked_presence": {
@@ -1100,8 +1079,6 @@
             "response.body.generators.entities:entity_suggest.path",
             "response.body.generators.event.mtime",
             "response.body.generators.event.path",
-            "response.body.generators.facet_newsletter.mtime",
-            "response.body.generators.facet_newsletter.path",
             "response.body.generators.linked_presence.mtime",
             "response.body.generators.linked_presence.path",
             "response.body.generators.linked_share.mtime",
@@ -1323,25 +1300,6 @@
                   "schema": "entity_suggest.schema.json",
                   "source": "app",
                   "title": "entity suggest",
-                  "type": "generate"
-                },
-                "facet_newsletter": {
-                  "accumulate": true,
-                  "color": "#0d47a1",
-                  "description": "creates comprehensive daily newsletters for each facet, covering activities, progress, and insights",
-                  "hook": {
-                    "post": "facet_newsletter",
-                    "pre": "facet_newsletter"
-                  },
-                  "max_output_tokens": 3840,
-                  "mtime": "<TALENT_MTIME>",
-                  "multi_facet": true,
-                  "output": "md",
-                  "path": "<TALENT_PATH>",
-                  "priority": 40,
-                  "schedule": "daily",
-                  "source": "system",
-                  "title": "facet newsletter generator",
                   "type": "generate"
                 },
                 "linked_presence": {
@@ -1990,8 +1948,6 @@
             "response.body.generators.entities:entity_suggest.path",
             "response.body.generators.event.mtime",
             "response.body.generators.event.path",
-            "response.body.generators.facet_newsletter.mtime",
-            "response.body.generators.facet_newsletter.path",
             "response.body.generators.linked_presence.mtime",
             "response.body.generators.linked_presence.path",
             "response.body.generators.linked_share.mtime",
@@ -2213,25 +2169,6 @@
                   "schema": "entity_suggest.schema.json",
                   "source": "app",
                   "title": "entity suggest",
-                  "type": "generate"
-                },
-                "facet_newsletter": {
-                  "accumulate": true,
-                  "color": "#0d47a1",
-                  "description": "creates comprehensive daily newsletters for each facet, covering activities, progress, and insights",
-                  "hook": {
-                    "post": "facet_newsletter",
-                    "pre": "facet_newsletter"
-                  },
-                  "max_output_tokens": 3840,
-                  "mtime": "<TALENT_MTIME>",
-                  "multi_facet": true,
-                  "output": "md",
-                  "path": "<TALENT_PATH>",
-                  "priority": 40,
-                  "schedule": "daily",
-                  "source": "system",
-                  "title": "facet newsletter generator",
                   "type": "generate"
                 },
                 "linked_presence": {
@@ -2881,8 +2818,6 @@
             "response.body.generators.entities:entity_suggest.path",
             "response.body.generators.event.mtime",
             "response.body.generators.event.path",
-            "response.body.generators.facet_newsletter.mtime",
-            "response.body.generators.facet_newsletter.path",
             "response.body.generators.linked_presence.mtime",
             "response.body.generators.linked_presence.path",
             "response.body.generators.linked_share.mtime",
@@ -3103,25 +3038,6 @@
                   "schema": "entity_suggest.schema.json",
                   "source": "app",
                   "title": "entity suggest",
-                  "type": "generate"
-                },
-                "facet_newsletter": {
-                  "accumulate": true,
-                  "color": "#0d47a1",
-                  "description": "creates comprehensive daily newsletters for each facet, covering activities, progress, and insights",
-                  "hook": {
-                    "post": "facet_newsletter",
-                    "pre": "facet_newsletter"
-                  },
-                  "max_output_tokens": 3840,
-                  "mtime": "<TALENT_MTIME>",
-                  "multi_facet": true,
-                  "output": "md",
-                  "path": "<TALENT_PATH>",
-                  "priority": 40,
-                  "schedule": "daily",
-                  "source": "system",
-                  "title": "facet newsletter generator",
                   "type": "generate"
                 },
                 "linked_presence": {

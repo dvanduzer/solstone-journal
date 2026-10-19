@@ -550,9 +550,6 @@ fn publish(
         authority.checkpoint().map_err(|e| failure(name, e))?;
         generated
     };
-    // Coverage binds to the frozen packet, so a resumed response reports it too.
-    let degraded =
-        degraded.or_else(|| stage.and_then(|(_, state)| crate::facet_newsletter::degraded(state)));
     let publication: PreparedDailyPublication = if let Some(plan) =
         authority.record().and_then(|r| r.action_plan.as_ref())
     {
@@ -814,7 +811,7 @@ mod tests {
                 "_daily_artifact_before":{"chronicle/20260101/talents/morning_briefing.md":null},
             }},
             "hook":"morning_briefing",
-            "state":{"MorningBriefing":{"values":{}}},
+            "state":{"MorningBriefing":{"values":{},"activities":[],"initial_gaps":[],"counts":{},"forward_count":0,"generated":"","model":""}},
         });
         let mut record = DailyUnitRecord::new(identity.clone(), "E", "contract");
         record.lock_token = Some("attempt-1".to_owned());

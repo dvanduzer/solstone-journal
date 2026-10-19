@@ -6,8 +6,7 @@
     "your_day",
     "yesterday",
     "needs_attention",
-    "forward_look",
-    "reading"
+    "forward_look"
   ],
   "properties": {
     "metadata": {
@@ -35,8 +34,7 @@
           "additionalProperties": false,
           "required": [
             "segments",
-            "anticipated_activities",
-            "facet_newsletters"
+            "anticipated_activities"
           ],
           "properties": {
             "segments": {
@@ -44,10 +42,6 @@
               "minimum": 0
             },
             "anticipated_activities": {
-              "type": "integer",
-              "minimum": 0
-            },
-            "facet_newsletters": {
               "type": "integer",
               "minimum": 0
             }
@@ -133,31 +127,6 @@
       "items": {
         "type": "string",
         "maxLength": 700
-      }
-    },
-    "reading": {
-      "type": "array",
-      "maxItems": 12,
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "facet",
-          "summary"
-        ],
-        "properties": {
-          "facet": {
-            "type": "string",
-            "enum": [
-              "__RUNTIME_FACETS__"
-            ],
-            "maxLength": 80
-          },
-          "summary": {
-            "type": "string",
-            "maxLength": 700
-          }
-        }
       }
     }
   }

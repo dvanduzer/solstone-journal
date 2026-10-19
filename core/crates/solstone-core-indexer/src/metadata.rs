@@ -65,9 +65,7 @@ pub fn extract_path_metadata(rel_path: &str) -> PathMetadata {
     }
 
     if is_markdown {
-        if parts.first() == Some(&"facets") && parts.len() >= 4 && parts.get(2) == Some(&"news") {
-            agent = "news".to_string();
-        } else if parts.first() == Some(&"reflections")
+        if parts.first() == Some(&"reflections")
             && parts.len() >= 3
             && parts.get(1) == Some(&"weekly")
         {
@@ -119,7 +117,6 @@ mod tests {
                 "work",
                 "brief",
             ),
-            ("facets/work/news/20240101.md", "20240101", "work", "news"),
             (
                 "facets/work/activities/20260214/coding_093000_300/session_review.md",
                 "20260214",

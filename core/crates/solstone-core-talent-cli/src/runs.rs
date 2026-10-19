@@ -12,7 +12,9 @@ pub(crate) fn find_run_file(talents_dir: &Path, use_id: &str) -> Option<PathBuf>
         let entries = fs::read_dir(talents_dir).ok()?;
         for entry in entries.flatten() {
             let subdir = entry.path();
-            if !subdir.is_dir() {
+            if !subdir.is_dir()
+                || subdir.file_name().and_then(|n| n.to_str()) == Some("facet_newsletter")
+            {
                 continue;
             }
             let candidate = subdir.join(format!("{use_id}{suffix}"));
@@ -169,5 +171,28 @@ mod tests {
                 "decoy={decoy} genuine={genuine}"
             );
         }
+    }
+
+    #[test]
+    fn find_run_file_skips_facet_newsletter_directory() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let talents = root.path().join("talents");
+        fs::create_dir_all(talents.join("facet_newsletter")).expect("newsletter dir");
+        fs::create_dir_all(talents.join("morning_briefing")).expect("briefing dir");
+        fs::write(
+            talents.join("facet_newsletter/run-nl.jsonl"),
+            r#"{"event":"request","use_id":"run-nl"}"#,
+        )
+        .expect("newsletter run");
+        fs::write(
+            talents.join("morning_briefing/run-mb.jsonl"),
+            r#"{"event":"request","use_id":"run-mb"}"#,
+        )
+        .expect("briefing run");
+        assert_eq!(find_run_file(&talents, "run-nl"), None);
+        assert_eq!(
+            find_run_file(&talents, "run-mb"),
+            Some(talents.join("morning_briefing/run-mb.jsonl"))
+        );
     }
 }

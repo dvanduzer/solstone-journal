@@ -1385,14 +1385,14 @@ mod tests {
 
     fn seed_oracle_case(journal: &Path, line: usize, now_ms: i64) {
         match line {
-            105 | 133 | 142 => {
+            103 | 128 | 137 => {
                 for facet in ["personal", "work"] {
                     let declaration = journal.join("facets").join(facet).join("facet.json");
                     fs::create_dir_all(declaration.parent().unwrap()).unwrap();
                     fs::write(declaration, "{}\n").unwrap();
                 }
             }
-            194 => {
+            189 => {
                 for (key, body) in [
                     ("093000_600", "browser_first.jsonl"),
                     ("141500_900", "browser_second.jsonl"),
@@ -1402,7 +1402,7 @@ mod tests {
                     fs::write(segment.join(body), "browser content\n").unwrap();
                 }
             }
-            222 => {
+            217 => {
                 let cadence = journal.join("health/cadence.json");
                 fs::create_dir_all(cadence.parent().unwrap()).unwrap();
                 fs::write(cadence, format!(r#"{{"pulse":{now_ms}}}"#)).unwrap();
@@ -6053,7 +6053,7 @@ mod tests {
         let blocks = oracle_blocks();
         assert_eq!(
             blocks.iter().map(|(line, _, _)| *line).collect::<Vec<_>>(),
-            vec![26, 50, 62, 74, 78, 87, 93, 99, 105, 133, 142, 194, 222]
+            vec![26, 48, 60, 72, 76, 85, 91, 97, 103, 128, 137, 189, 217]
         );
         assert_eq!(blocks.len(), 13);
         assert!(oracle_dry_run_argv(&["--dry-run"]).is_err());
@@ -6278,7 +6278,7 @@ mod tests {
         let (talent_root, apps_root) = talent_roots(
             roots.path(),
             &[(
-                "facet_newsletter",
+                "facet_report",
                 "{\n\"type\":\"generate\",\"max_output_tokens\":1024,\"schedule\":\"daily\",\"priority\":40,\"output\":\"md\",\"multi_facet\":true\n}\n",
             )],
         );
@@ -6303,7 +6303,7 @@ mod tests {
             concat!(
                 "Day 2026-01-01\n\n",
                 "Pre-phase:  solstone journal sense --day 20260101 -j 4\n",
-                "Priority 40:\n  gen  facet_newsletter/work (new)\n\n",
+                "Priority 40:\n  gen  facet_report/work (new)\n\n",
                 "Total: 1 agents\n",
                 "Post-phase: solstone journal indexer --rescan\n",
                 "Post-phase: solstone journal journal-stats\n",

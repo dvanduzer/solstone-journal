@@ -5,10 +5,7 @@ conventions) and `APPS.md` (app development guide).
 
 Convey's owner-facing web UI is a **pure client-rendered application**: JSON
 APIs + SSE/WS events + static files. The server composes no HTML for the
-serving path. The one exception is the newsletter PDF
-(`/app/news/{facet}/{day}/pdf`), which a native PDF writer in
-`core/crates/solstone-core-facets-web/src/pdf/` lays out from the newsletter
-markdown. It returns a PDF file, not a page.
+serving path.
 
 ## Architecture: static shell + per-app workspaces
 
@@ -143,4 +140,4 @@ Every workspace must be honest about what it knows:
   routes, and, where a workspace has them, DOM checks in `tests/*_dom.js`, each
   driven by a matching `tests/*_dom.rs`.
 - The serving path has no template engine: pages are static files compiled into
-  the binary, and the newsletter PDF is the only server-rendered output.
+  the binary.

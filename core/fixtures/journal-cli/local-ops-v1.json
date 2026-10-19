@@ -2,7 +2,7 @@
   "schema": "journal-local-ops-v1",
   "source": "P-CLI",
   "approval_reference": "fixture-local-no-external-approval",
-  "leaf_count": 6,
+  "leaf_count": 5,
   "exit_codes": {
     "success": 0,
     "operation_failed": 1,
@@ -292,43 +292,6 @@
           "expected_tree_unchanged": ["${JOURNAL}/facets"],
           "expected_audit_count": 0,
           "expected_index_rebuild_count": 0
-        }
-      ]
-    },
-    {
-      "path": ["news", "write"],
-      "owner": "journal-direct",
-      "grammar": "journal news write FACET --day YYYYMMDD",
-      "reads_stdin": true,
-      "retired_spellings": ["journal news --write", "journal news -w", "--facet", "-f", "-d", "SOL_FACET", "SOL_DAY", "sol call journal news --write"],
-      "day_pattern": "^[0-9]{8}$ with a real Gregorian calendar date",
-      "capabilities": [
-        "require non-whitespace UTF-8 markdown on stdin",
-        "validate FACET as one safe component and reject a missing facet before reading or writing the news path",
-        "atomically replace facets/FACET/news/YYYYMMDD.md under the facet mutation lock",
-        "preserve stdin bytes exactly and print News for YYYYMMDD saved to FACET."
-      ],
-      "cases": [
-        {
-          "name": "write_exact_bytes",
-          "argv": ["news", "write", "field-notes", "--day", "20260807"],
-          "stdin": "# Today\n\nKept byte-for-byte.\n",
-          "fixture": "existing_field_notes_facet",
-          "expected_exit": 0,
-          "expected_stdout": "News for 20260807 saved to field-notes.\n",
-          "expected_stderr": "",
-          "expected_file": "facets/field-notes/news/20260807.md",
-          "expected_file_bytes": "# Today\n\nKept byte-for-byte.\n"
-        },
-        {
-          "name": "invalid_calendar_day",
-          "argv": ["news", "write", "field-notes", "--day", "20260230"],
-          "stdin": "content\n",
-          "fixture": "existing_field_notes_facet",
-          "expected_exit": 65,
-          "expected_stdout": "",
-          "expected_stderr": "journal news write: DAY must be a real YYYYMMDD date\n",
-          "expected_absent": ["${JOURNAL}/facets/field-notes/news/20260230.md"]
         }
       ]
     }

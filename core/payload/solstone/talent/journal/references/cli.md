@@ -26,7 +26,7 @@ Search the journal index across insights, transcripts, historical event extracts
 - `-d, --day`: exact day filter (`YYYYMMDD`). Cannot be combined with `--day-from` or `--day-to`.
 - `--day-from`, `--day-to`: inclusive date-range filters (`YYYYMMDD`).
 - `-f, --facet`: facet filter (for example `work`, `personal`).
-- `-a, --agent`: agent/content filter (for example `span`, historical `event`, `news`, `entity:detected`).
+- `-a, --agent`: agent/content filter (for example `span`, historical `event`, `entity:detected`).
 - `--time-bucket`: time-of-day filter: `morning`, `afternoon`, `evening`, or `night`.
 - `--json`: return structured JSON output (the output is JSON either way).
 
@@ -265,29 +265,3 @@ solstone call journal read activity -s 091500_300
 solstone call journal read --path 20260115/talents/briefing.md
 ```
 
-## news
-
-```bash
-solstone call journal news [NAME] [-d DAY] [-n LIMIT] [--cursor CURSOR] [-w]
-```
-
-Read or write facet news entries.
-
-- `NAME`: facet name (default: `SOL_FACET` env).
-- `-d, --day`: optional specific day (`YYYYMMDD`, default: `SOL_DAY` env).
-- `-n, --limit`: max days to return (default `5`).
-- `--cursor`: optional pagination cursor (typically a `YYYYMMDD` cutoff for older entries).
-- `-w, --write`: write mode — reads markdown from stdin and saves as news for the given day.
-
-Behavior notes:
-
-- Without `--write`: reads and displays existing news entries. Uses `SOL_DAY` to filter to a specific day when set.
-- With `--write`: requires `--day` (or `SOL_DAY` env), reads markdown content from stdin, saves to facet news directory.
-
-Examples:
-
-```bash
-solstone call journal news work -n 3
-solstone call journal news -d 20260115          # uses SOL_FACET
-solstone call journal news work --cursor 20260110 -n 5
-```

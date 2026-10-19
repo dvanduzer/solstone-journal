@@ -457,7 +457,7 @@ function classifySolReference(reference) {
       if (!isValidCalendarDate(day) || fragmentPart !== undefined) {
         return null;
       }
-      return 'newsletter';
+      return 'source';
     } else if (kind === 'activities') {
       if (!isValidCalendarDate(target) || !fragmentPart) {
         return null;

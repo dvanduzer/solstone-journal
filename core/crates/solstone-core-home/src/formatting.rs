@@ -160,57 +160,14 @@ pub fn format_activity_label(activity: &Value) -> String {
     )
 }
 
-pub fn format_newsletter_summary(successful: i64, attempted: i64) -> String {
-    if attempted == 0 {
-        return "no facet newsletters written.".to_owned();
-    }
-    if attempted > successful {
-        return format!(
-            "{successful} of {attempted} newsletter{} written.",
-            if attempted == 1 { "" } else { "s" }
-        );
-    }
-    format!(
-        "{successful} newsletter{} written.",
-        if successful == 1 { "" } else { "s" }
-    )
-}
-
-pub fn format_processing_summary(
-    mode: &str,
-    successful: i64,
-    attempted: i64,
-    briefing_valid: bool,
-) -> String {
+pub fn format_processing_summary(mode: &str, briefing_valid: bool) -> String {
     if mode == "degraded" {
-        if attempted == 0 && successful == 0 {
-            return "no facet newsletters written, and some overnight processing didn't finish."
-                .to_owned();
-        }
-        if attempted > successful {
-            return format!(
-                "{successful} of {attempted} newsletters written, but some overnight processing didn't finish."
-            );
-        }
-        return format!(
-            "{successful} newsletter{} written, but some overnight processing didn't finish.",
-            if successful == 1 { "" } else { "s" }
-        );
-    }
-    let mut actions = Vec::new();
-    if successful > 0 {
-        actions.push(format!(
-            "{successful} newsletter{} written",
-            if successful == 1 { "" } else { "s" }
-        ));
+        return "some overnight processing didn't finish.".to_owned();
     }
     if briefing_valid {
-        actions.push("your morning briefing was prepared".to_owned());
+        return "your morning briefing was prepared.".to_owned();
     }
-    if actions.is_empty() {
-        return format_newsletter_summary(successful, attempted);
-    }
-    format!("{}.", join_phrases(&actions))
+    String::new()
 }
 
 pub fn top_heatmap_hours(stats: &Value) -> Vec<i64> {

@@ -31,8 +31,6 @@ Priority 10:
   gen  daily_schedule (new)
   gen  schedule (new)
 
-Priority 40:
-
 Priority 50:
   gen  morning_briefing (new)
 
@@ -109,9 +107,6 @@ Pre-phase:  journal sense --day 20260101 -j 4
 Priority 10:
   gen  daily_schedule (new)
   gen  schedule (new)
-
-Priority 40:
-  skip facet_newsletter — no activity: personal, work
 
 Priority 50:
   gen  morning_briefing (new)

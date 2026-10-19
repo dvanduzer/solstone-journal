@@ -10,7 +10,7 @@ Each facet is organized as `facets/<facet>/` where `<facet>` is a descriptive sh
 - `activities/` – configured activities and completed activity records (see [activity records](#activity-records)).
 - `entities/` – entity relationships and detected entities (see [facet entities](#facet-entities)).
 - `events/` – historical extracted events per day (see [historical event extracts](captures.md#historical-event-extracts)).
-- `news/` – daily news and updates relevant to the facet (optional).
+- `news/` – owner markdown (the product no longer writes, shows, or indexes it; do not create files there).
 - `logs/` – action audit logs for tool calls (optional, see [action logs](logs.md#action-logs)).
 
 ## Facet metadata
@@ -130,55 +130,7 @@ The same entity can be attached to multiple facets with independent descriptions
 
 ## Facet News
 
-The `news/` directory provides a chronological record of news, updates, and external developments relevant to the facet. This allows tracking of industry news, research updates, regulatory changes, or any external information that impacts the facet's focus area.
-
-### News organization
-
-News files are organized by date as `news/YYYYMMDD.md` where each file contains the day's relevant news items. Only create files for days that have news to record—sparse population is expected.
-
-### News file format
-
-Each `YYYYMMDD.md` file is a markdown document with a consistent structure:
-
-```markdown
-# 2025-01-18 News - Machine Learning Research
-
-## OpenAI Announces New Model Architecture
-**Source:** techcrunch.com | **Time:** 09:15
-Summary of the announcement and its relevance to current research projects...
-
-## Paper: "Efficient Attention Mechanisms in Transformers"
-**Source:** arxiv.org | **Time:** 14:30
-Key findings from the paper and potential applications...
-
-## Google Research Updates Dataset License Terms
-**Source:** blog.google | **Time:** 16:45
-Changes to dataset licensing that may affect ongoing experiments...
-```
-
-### News entry structure
-
-Each news entry should include:
-- **Title** – concise headline as a level 2 heading
-- **Source** – origin of the news (website, journal, etc.)
-- **Time** – optional time of publication or discovery (HH:MM format)
-- **Summary** – brief description focusing on relevance to the facet
-- **Impact** – optional notes on how this affects facet work
-
-### News metadata
-
-Optionally, a `news.json` file can be maintained at the root of the news directory to track metadata:
-
-```json
-{
-  "last_updated": "2025-01-18",
-  "sources": ["arxiv.org", "techcrunch.com", "nature.com"],
-  "auto_fetch": false,
-  "keywords": ["transformer", "attention", "llm", "research"]
-}
-```
-
-This allows for future automation of news gathering while maintaining manual curation quality.
+The `news/` directory may hold owner markdown files. The product no longer writes, shows, or indexes files here; do not create files there.
 
 ## Activity Records
 

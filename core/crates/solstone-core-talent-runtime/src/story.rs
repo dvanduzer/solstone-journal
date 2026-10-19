@@ -28,8 +28,9 @@ pub(crate) const INPUT_WHOLE_KEY: &str = "_input_whole";
 /// The built-in Story talents whose source-word body was measured.
 const SOURCE_BODY_TALENTS: &[&str] = &["work", "conversation"];
 const MAX_QUOTE_CHARS: usize = 400;
-/// A source-word body must fit the newsletter's Story budget whole: clipping
-/// its last words can hide a cancellation or correction of an earlier claim.
+/// The body is kept whole for readers of the activity record, including the
+/// morning briefing: clipping its last words can hide a cancellation or correction
+/// of an earlier claim.
 pub(crate) const MAX_STORY_BODY_CHARS: usize = 1_800;
 
 /// A Story body that quotes every word of a short activity source, framed by

@@ -2688,7 +2688,6 @@
         "sections": {
           "forward_look": "- draft the memo",
           "needs_attention": "- reply to sam",
-          "reading": "- **work**: three items\n- **life**\n- orphan summary",
           "yesterday": "- shipped the thing\n- 7",
           "your_day": "- **09:00**: standup\n- no time"
         }
@@ -52523,327 +52522,48 @@
         "output": []
       }
     ],
-    "newsletter_summary": [
-      {
-        "input": {
-          "attempted": 0,
-          "successful": 0
-        },
-        "output": "no facet newsletters written."
-      },
-      {
-        "input": {
-          "attempted": 1,
-          "successful": 0
-        },
-        "output": "0 of 1 newsletter written."
-      },
-      {
-        "input": {
-          "attempted": 2,
-          "successful": 0
-        },
-        "output": "0 of 2 newsletters written."
-      },
-      {
-        "input": {
-          "attempted": 1,
-          "successful": 1
-        },
-        "output": "1 newsletter written."
-      },
-      {
-        "input": {
-          "attempted": 2,
-          "successful": 1
-        },
-        "output": "1 of 2 newsletters written."
-      },
-      {
-        "input": {
-          "attempted": 2,
-          "successful": 2
-        },
-        "output": "2 newsletters written."
-      },
-      {
-        "input": {
-          "attempted": 2,
-          "successful": 3
-        },
-        "output": "3 newsletters written."
-      }
-    ],
     "processing_summary": [
       {
         "input": {
-          "attempted_newsletters": 0,
           "briefing_valid": false,
-          "mode": "healthy",
-          "successful_newsletters": 0
+          "mode": "degraded"
         },
-        "output": "no facet newsletters written."
+        "output": "some overnight processing didn't finish."
       },
       {
         "input": {
-          "attempted_newsletters": 0,
           "briefing_valid": true,
-          "mode": "healthy",
-          "successful_newsletters": 0
+          "mode": "degraded"
+        },
+        "output": "some overnight processing didn't finish."
+      },
+      {
+        "input": {
+          "briefing_valid": true,
+          "mode": "healthy"
         },
         "output": "your morning briefing was prepared."
       },
       {
         "input": {
-          "attempted_newsletters": 1,
           "briefing_valid": false,
-          "mode": "healthy",
-          "successful_newsletters": 0
+          "mode": "healthy"
         },
-        "output": "0 of 1 newsletter written."
+        "output": ""
       },
       {
         "input": {
-          "attempted_newsletters": 1,
           "briefing_valid": true,
-          "mode": "healthy",
-          "successful_newsletters": 0
+          "mode": "sparse"
         },
         "output": "your morning briefing was prepared."
       },
       {
         "input": {
-          "attempted_newsletters": 1,
           "briefing_valid": false,
-          "mode": "healthy",
-          "successful_newsletters": 1
+          "mode": "sparse"
         },
-        "output": "1 newsletter written."
-      },
-      {
-        "input": {
-          "attempted_newsletters": 1,
-          "briefing_valid": true,
-          "mode": "healthy",
-          "successful_newsletters": 1
-        },
-        "output": "1 newsletter written and your morning briefing was prepared."
-      },
-      {
-        "input": {
-          "attempted_newsletters": 3,
-          "briefing_valid": false,
-          "mode": "healthy",
-          "successful_newsletters": 1
-        },
-        "output": "1 newsletter written."
-      },
-      {
-        "input": {
-          "attempted_newsletters": 3,
-          "briefing_valid": true,
-          "mode": "healthy",
-          "successful_newsletters": 1
-        },
-        "output": "1 newsletter written and your morning briefing was prepared."
-      },
-      {
-        "input": {
-          "attempted_newsletters": 2,
-          "briefing_valid": false,
-          "mode": "healthy",
-          "successful_newsletters": 2
-        },
-        "output": "2 newsletters written."
-      },
-      {
-        "input": {
-          "attempted_newsletters": 2,
-          "briefing_valid": true,
-          "mode": "healthy",
-          "successful_newsletters": 2
-        },
-        "output": "2 newsletters written and your morning briefing was prepared."
-      },
-      {
-        "input": {
-          "attempted_newsletters": 0,
-          "briefing_valid": false,
-          "mode": "degraded",
-          "successful_newsletters": 0
-        },
-        "output": "no facet newsletters written, and some overnight processing didn't finish."
-      },
-      {
-        "input": {
-          "attempted_newsletters": 0,
-          "briefing_valid": true,
-          "mode": "degraded",
-          "successful_newsletters": 0
-        },
-        "output": "no facet newsletters written, and some overnight processing didn't finish."
-      },
-      {
-        "input": {
-          "attempted_newsletters": 1,
-          "briefing_valid": false,
-          "mode": "degraded",
-          "successful_newsletters": 0
-        },
-        "output": "0 of 1 newsletters written, but some overnight processing didn't finish."
-      },
-      {
-        "input": {
-          "attempted_newsletters": 1,
-          "briefing_valid": true,
-          "mode": "degraded",
-          "successful_newsletters": 0
-        },
-        "output": "0 of 1 newsletters written, but some overnight processing didn't finish."
-      },
-      {
-        "input": {
-          "attempted_newsletters": 1,
-          "briefing_valid": false,
-          "mode": "degraded",
-          "successful_newsletters": 1
-        },
-        "output": "1 newsletter written, but some overnight processing didn't finish."
-      },
-      {
-        "input": {
-          "attempted_newsletters": 1,
-          "briefing_valid": true,
-          "mode": "degraded",
-          "successful_newsletters": 1
-        },
-        "output": "1 newsletter written, but some overnight processing didn't finish."
-      },
-      {
-        "input": {
-          "attempted_newsletters": 3,
-          "briefing_valid": false,
-          "mode": "degraded",
-          "successful_newsletters": 1
-        },
-        "output": "1 of 3 newsletters written, but some overnight processing didn't finish."
-      },
-      {
-        "input": {
-          "attempted_newsletters": 3,
-          "briefing_valid": true,
-          "mode": "degraded",
-          "successful_newsletters": 1
-        },
-        "output": "1 of 3 newsletters written, but some overnight processing didn't finish."
-      },
-      {
-        "input": {
-          "attempted_newsletters": 2,
-          "briefing_valid": false,
-          "mode": "degraded",
-          "successful_newsletters": 2
-        },
-        "output": "2 newsletters written, but some overnight processing didn't finish."
-      },
-      {
-        "input": {
-          "attempted_newsletters": 2,
-          "briefing_valid": true,
-          "mode": "degraded",
-          "successful_newsletters": 2
-        },
-        "output": "2 newsletters written, but some overnight processing didn't finish."
-      },
-      {
-        "input": {
-          "attempted_newsletters": 0,
-          "briefing_valid": false,
-          "mode": "sparse",
-          "successful_newsletters": 0
-        },
-        "output": "no facet newsletters written."
-      },
-      {
-        "input": {
-          "attempted_newsletters": 0,
-          "briefing_valid": true,
-          "mode": "sparse",
-          "successful_newsletters": 0
-        },
-        "output": "your morning briefing was prepared."
-      },
-      {
-        "input": {
-          "attempted_newsletters": 1,
-          "briefing_valid": false,
-          "mode": "sparse",
-          "successful_newsletters": 0
-        },
-        "output": "0 of 1 newsletter written."
-      },
-      {
-        "input": {
-          "attempted_newsletters": 1,
-          "briefing_valid": true,
-          "mode": "sparse",
-          "successful_newsletters": 0
-        },
-        "output": "your morning briefing was prepared."
-      },
-      {
-        "input": {
-          "attempted_newsletters": 1,
-          "briefing_valid": false,
-          "mode": "sparse",
-          "successful_newsletters": 1
-        },
-        "output": "1 newsletter written."
-      },
-      {
-        "input": {
-          "attempted_newsletters": 1,
-          "briefing_valid": true,
-          "mode": "sparse",
-          "successful_newsletters": 1
-        },
-        "output": "1 newsletter written and your morning briefing was prepared."
-      },
-      {
-        "input": {
-          "attempted_newsletters": 3,
-          "briefing_valid": false,
-          "mode": "sparse",
-          "successful_newsletters": 1
-        },
-        "output": "1 newsletter written."
-      },
-      {
-        "input": {
-          "attempted_newsletters": 3,
-          "briefing_valid": true,
-          "mode": "sparse",
-          "successful_newsletters": 1
-        },
-        "output": "1 newsletter written and your morning briefing was prepared."
-      },
-      {
-        "input": {
-          "attempted_newsletters": 2,
-          "briefing_valid": false,
-          "mode": "sparse",
-          "successful_newsletters": 2
-        },
-        "output": "2 newsletters written."
-      },
-      {
-        "input": {
-          "attempted_newsletters": 2,
-          "briefing_valid": true,
-          "mode": "sparse",
-          "successful_newsletters": 2
-        },
-        "output": "2 newsletters written and your morning briefing was prepared."
+        "output": ""
       }
     ]
   },

@@ -17,7 +17,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 const LOCAL_OPS_JSON: &str = include_str!("../../../fixtures/journal-cli/local-ops-v1.json");
-const LOCAL_OPS_SHA256: &str = "8ded2fb61eb85345ea6cbd25be732d8aa593adc22fa957494401c958b8b9cf02";
+const LOCAL_OPS_SHA256: &str = "da3d1c84a102864619ad8c2e180dd758e933b73761929440f41cb78cc2c1831f";
 const CLI_BOUNDARY_JSON: &str = include_str!("../../../fixtures/native-sol/cli-boundary-v1.json");
 
 struct TempDir {
@@ -368,7 +368,6 @@ fn journal_identity_runs_every_local_leaf_natively_without_spawning() {
         "entities doctor",
         "facet doctor",
         "facet merge",
-        "news write",
     ] {
         assert!(
             local_paths.iter().any(|path| path == token),
@@ -482,42 +481,6 @@ fn journal_identity_executes_all_local_authorities_in_the_real_binary() {
         String::from_utf8_lossy(&fix.stdout)
     );
     assert!(!orphan.join("facet.json").exists());
-
-    // A directory of orphaned content is not a declaration: the write is refused before
-    // stdin is read (no stdin is supplied, so reaching the read would fail differently).
-    let refused = run_journal_with_journal(
-        &["news", "write", "field-notes", "--day", "20260808"],
-        Some(&path),
-        &journal,
-    );
-    assert_eq!(refused.status.code(), Some(65));
-    assert!(
-        String::from_utf8_lossy(&refused.stderr).contains("facet declaration is missing"),
-        "{}",
-        String::from_utf8_lossy(&refused.stderr)
-    );
-    assert!(!orphan.join("news/20260808.md").exists());
-    assert_eq!(
-        fs::read(orphan.join("news/20260807.md")).expect("orphan content untouched"),
-        b"existing\n"
-    );
-    assert!(!orphan.join("facet.json").exists());
-
-    fs::write(orphan.join("facet.json"), b"{\"title\":\"Field Notes\"}\n")
-        .expect("declare news facet");
-    let markdown = b"# Today\n\nKept byte-for-byte.\n";
-    let news = run_journal_with_input(
-        &["news", "write", "field-notes", "--day", "20260808"],
-        &path,
-        &journal,
-        markdown,
-    );
-    assert_eq!(news.status.code(), Some(0));
-    assert_eq!(news.stdout, b"News for 20260808 saved to field-notes.\n");
-    assert_eq!(
-        fs::read(orphan.join("news/20260808.md")).expect("read written news"),
-        markdown
-    );
 
     for (slug, title, id) in [
         ("source", "Source", "11111111-1111-4111-8111-111111111111"),
@@ -962,7 +925,7 @@ fn journal_local_operations_fixture_is_the_boundary_census() {
         8
     );
     let local_paths = local_op_paths(&fixture);
-    assert_eq!(local_paths.len(), 6);
+    assert_eq!(local_paths.len(), 5);
     assert_eq!(fixture["leaf_count"], local_paths.len());
     let unique = local_paths
         .iter()
@@ -1049,7 +1012,6 @@ fn journal_local_operations_fixture_is_the_boundary_census() {
         "entities doctor",
         "facet doctor",
         "facet merge",
-        "news write",
     ] {
         assert!(
             fixture["commands"]
