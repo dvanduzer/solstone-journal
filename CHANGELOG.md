@@ -6,12 +6,17 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.0.51] - 2026-10-19
+
 ### Changed
 
 - when you pair a mac or windows computer, you can now open the pairing link on it and choose "open in the solstone app". pasting the link into the app still works.
 
 ### Fixed
 
+- on the agents page, the steps to forward port 443 yourself warn again that a tunnel that ends HTTPS can read your agent's traffic and reuse its credential to reach your journal.
+- your journal can start again after an unexpected stop, even if it had been running for days. recovery keeps its progress between startup attempts instead of starting over each time.
+- on a journal with a long history, the nightly search update could run for an hour without finishing, and while it ran, new things in your journal couldn't be added to search. it finishes again, and the first run after you update adds anything it left out.
 - during setup on a computer that can't run local thinking, local shows as unavailable, with the reason beside it, instead of as an error.
 - home no longer shows "queued work status is unavailable" for the first few seconds after you open it.
 - the SSH command the installer prints for a computer without a desktop now forwards the agent port too, so an agent on that computer can finish connecting from your other computer's browser.
@@ -19,10 +24,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - if setup saved a way of thinking that isn't running yet, home, health, stats and the thinking page no longer ask you to choose. they say what's left to set up and link to it.
 - when a conversation is too long to quote in full in a daily newsletter, its story uses a summary.
 - `solstone call health` didn't count a daily newsletter that drew on a story written from only part of a long activity. it now counts it as degraded and names the day.
-- archive imports now refuse conflicting file names.
+- an archive import is now refused when two of its files' names would end up the same.
 - a name that came up on several days in a week could be left out of a facet's entities when your journal sorted it as two kinds of thing, for example a project on three days and a tool on one. the daily entity review now goes by the kind it was given on the most days, and counts only the days it was that kind. when two kinds come up equally often, the name still waits.
-- on a journal with a long history, the nightly search update could run for an hour without finishing, and while it ran, new things in your journal couldn't be added to search. it finishes again, and the first run after you update adds anything it left out.
-- your journal can start again after an unexpected stop, even if it had been running for days. recovery keeps its progress between startup attempts instead of starting over each time.
 
 ## [2.0.50] - 2026-10-18
 
