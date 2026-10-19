@@ -16,27 +16,7 @@ use crate::s3_wipe::authorization_header;
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const B2_AUTHORIZE: &str = "https://api.backblazeb2.com/b2api/v3/b2_authorize_account";
 
-/// What keeps deleted backup data in the owner's own storage.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StorageKeeps {
-    /// S3 versioning is on (or was, and is suspended).
-    Versions,
-    /// S3 object lock is on.
-    ObjectLock,
-    /// B2 file lock is on.
-    FileLock,
-    /// B2 has no lifecycle rule that deletes hidden files, so a delete only hides.
-    HiddenFiles,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StorageRetention {
-    /// Every check answered and none keeps deleted data.
-    Removes,
-    Keeps(StorageKeeps),
-    /// A check couldn't be made or answered.
-    Unknown,
-}
+pub use solstone_core_backup::teardown_recovery::{StorageKeeps, StorageRetention};
 
 struct Call<'a> {
     transport: &'a dyn HttpTransport,

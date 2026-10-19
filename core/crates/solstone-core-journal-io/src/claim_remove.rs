@@ -762,7 +762,11 @@ pub(crate) fn no_replace_primitive() -> NoReplacePrimitive {
     {
         NoReplacePrimitive::MacosRenameAtxNp
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "ios")]
+    {
+        NoReplacePrimitive::IosRenameAtxNp
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
     {
         NoReplacePrimitive::UnsupportedUnix
     }
@@ -785,7 +789,12 @@ pub(crate) fn rename_no_replace(
             "entry name contains an interior NUL",
         )
     })?;
-    let result = platform_rename_no_replace(directory.as_fd().as_raw_fd(), &from, &to)?;
+    let result = platform_rename_no_replace(
+        directory.as_fd().as_raw_fd(),
+        &from,
+        directory.as_fd().as_raw_fd(),
+        &to,
+    )?;
     if result == -1 {
         Err(io::Error::last_os_error())
     } else {
@@ -798,6 +807,7 @@ pub(crate) fn rename_no_replace(
 pub(crate) fn platform_rename_no_replace(
     directory: i32,
     from: &CString,
+    destination: i32,
     to: &CString,
 ) -> Result<i32, io::Error> {
     // `libc` exposes these Linux UAPI constants for both glibc and musl targets.
@@ -806,18 +816,19 @@ pub(crate) fn platform_rename_no_replace(
             libc::SYS_renameat2,
             directory,
             from.as_ptr(),
-            directory,
+            destination,
             to.as_ptr(),
             libc::RENAME_NOREPLACE,
         ) as i32)
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[allow(unsafe_code)]
 pub(crate) fn platform_rename_no_replace(
     directory: i32,
     from: &CString,
+    destination: i32,
     to: &CString,
 ) -> Result<i32, io::Error> {
     // libc 0.2.189 exposes the descriptor-relative Darwin variant directly.
@@ -825,17 +836,18 @@ pub(crate) fn platform_rename_no_replace(
         Ok(libc::renameatx_np(
             directory,
             from.as_ptr(),
-            directory,
+            destination,
             to.as_ptr(),
             libc::RENAME_EXCL,
         ))
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
 pub(crate) fn platform_rename_no_replace(
     _directory: i32,
     _from: &CString,
+    _destination: i32,
     _to: &CString,
 ) -> Result<i32, io::Error> {
     Err(io::Error::from_raw_os_error(libc::ENOSYS))

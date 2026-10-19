@@ -3,6 +3,7 @@
 
 //! Original teardown budget and joined remote execution. No local finish authority.
 
+use solstone_core_backup::teardown_recovery::{RemoteEffect, RemoteFacts};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -31,6 +32,8 @@ pub enum RemoteTeardownPhase {
     Aborting,
     Confirming,
     Wiped,
+    /// BYO restic snapshots were forgotten with prune; config and keys remain.
+    SnapshotsPruned,
     BindingSuperseded,
 }
 
@@ -48,6 +51,8 @@ pub struct RemoteTeardownReport {
     pub(crate) uploads_empty: bool,
     /// Own storage only: whether the owner's bucket keeps what was deleted.
     pub(crate) storage_retention: Option<StorageRetention>,
+    pub(crate) admitted_snapshot_count: Option<u32>,
+    pub(crate) previous: Option<RemoteFacts>,
 }
 
 impl RemoteTeardownReport {
@@ -77,6 +82,40 @@ impl RemoteTeardownReport {
     }
     pub fn storage_retention(&self) -> Option<StorageRetention> {
         self.storage_retention
+            .or_else(|| self.previous.as_ref().and_then(|p| p.storage_retention))
+    }
+    pub fn current_storage_retention(&self) -> Option<StorageRetention> {
+        self.storage_retention
+    }
+    pub fn admitted_snapshot_count(&self) -> Option<u32> {
+        self.admitted_snapshot_count
+    }
+    pub fn previous(&self) -> Option<&RemoteFacts> {
+        self.previous.as_ref()
+    }
+
+    /// Only observations from this invocation, never its restored prior receipt.
+    pub fn confirmed_facts(&self) -> Option<RemoteFacts> {
+        let effect = match self.phase {
+            RemoteTeardownPhase::SnapshotsPruned => RemoteEffect::SnapshotsPruned {
+                admitted_snapshot_count: self.admitted_snapshot_count?,
+                remaining_snapshots: 0,
+            },
+            RemoteTeardownPhase::Wiped => RemoteEffect::OperatedWiped {
+                delete_attempts: self.delete_attempts,
+                delete_confirmations: self.delete_confirmations,
+                abort_attempts: self.abort_attempts,
+                abort_confirmations: self.abort_confirmations,
+                objects_empty: self.objects_empty,
+                uploads_empty: self.uploads_empty,
+            },
+            _ => return None,
+        };
+        Some(RemoteFacts {
+            version: 1,
+            effect,
+            storage_retention: self.storage_retention,
+        })
     }
 }
 
@@ -154,6 +193,8 @@ impl TeardownOperation {
                 objects_empty: false,
                 uploads_empty: false,
                 storage_retention: None,
+                admitted_snapshot_count: None,
+                previous: None,
             },
         })
     }
@@ -166,6 +207,12 @@ impl TeardownOperation {
     /// This grants no local completion or cleanup authority.
     pub fn into_report(self) -> RemoteTeardownReport {
         self.report
+    }
+
+    /// Historical reporting only. This changes no phase, counters or execution authority.
+    #[cfg(any(test, target_os = "ios"))]
+    pub fn restore_prior_facts(&mut self, previous: RemoteFacts) {
+        self.report.previous = Some(previous);
     }
     pub fn cancellation(&self) -> &ArchiveCancellation {
         &self.cancellation
@@ -184,6 +231,7 @@ impl TeardownOperation {
         target_os = "linux",
         target_os = "macos",
         target_os = "android",
+        target_os = "ios",
         windows
     ))]
     pub(crate) fn date(&self) -> Result<String, TeardownRemoteRefusal> {
@@ -215,6 +263,105 @@ impl TeardownOperation {
         response.map_err(TeardownRemoteRefusal::Http)
     }
 
+    #[cfg(target_os = "ios")]
+    #[allow(unsafe_code)] // Bounded native HTTP ABI; the scoped watcher joins before return.
+    pub(crate) fn request(
+        &self,
+        mut request: crate::hosted_runtime::HttpRequest,
+    ) -> Result<crate::hosted_runtime::HttpResponse, TeardownRemoteRefusal> {
+        use std::collections::BTreeMap;
+        use std::ffi::CString;
+
+        request.timeout = request
+            .timeout
+            .min(self.remaining().map_err(TeardownRemoteRefusal::Operation)?);
+
+        let deadline = std::time::Instant::now() + request.timeout;
+
+        let mut header_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (k, v) in &request.headers {
+            header_map.entry(k.clone()).or_default().push(v.clone());
+        }
+        let header_json = serde_json::to_vec(&header_map)
+            .map_err(|_| TeardownRemoteRefusal::Http(HttpError::Other))?;
+
+        let method_c = CString::new(request.method)
+            .map_err(|_| TeardownRemoteRefusal::Http(HttpError::Other))?;
+        let url_c =
+            CString::new(request.url).map_err(|_| TeardownRemoteRefusal::Http(HttpError::Other))?;
+
+        let mut out_status: i32 = 0;
+        let mut out_body_len: u32 = 0;
+        let mut out_body: Vec<u8> = vec![0u8; 1024 * 1024];
+
+        let finished = (std::sync::Mutex::new(false), std::sync::Condvar::new());
+        let cancelled_atomic =
+            std::sync::atomic::AtomicU32::new(if self.cancellation.is_cancelled() {
+                1
+            } else {
+                0
+            });
+        let cancellation = &self.cancellation;
+
+        let status = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let (lock, wake) = &finished;
+                let mut done = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+                loop {
+                    if *done {
+                        break;
+                    }
+                    if cancellation.is_cancelled() || std::time::Instant::now() >= deadline {
+                        cancelled_atomic.store(1, std::sync::atomic::Ordering::Release);
+                        break;
+                    }
+                    done = wake
+                        .wait_timeout(done, std::time::Duration::from_millis(25))
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .0;
+                }
+            });
+            let status = unsafe {
+                crate::ios_callable::native::restic_bridge_http_exchange(
+                    method_c.as_ptr(),
+                    method_c.as_bytes().len() as u32,
+                    url_c.as_ptr(),
+                    url_c.as_bytes().len() as u32,
+                    header_json.as_ptr().cast(),
+                    header_json.len() as u32,
+                    request.body.as_ptr().cast(),
+                    request.body.len() as u32,
+                    cancelled_atomic.as_ptr(),
+                    &mut out_status,
+                    out_body.as_mut_ptr().cast(),
+                    out_body.len() as u32,
+                    &mut out_body_len,
+                )
+            };
+            let (lock, wake) = &finished;
+            let mut done = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+            *done = true;
+            wake.notify_all();
+            status
+        });
+
+        if status == 3 {
+            return Err(TeardownRemoteRefusal::Http(HttpError::Timeout));
+        }
+        if status != 0 {
+            return Err(TeardownRemoteRefusal::Http(HttpError::Other));
+        }
+
+        out_body.truncate(out_body_len as usize);
+        self.remaining().map_err(TeardownRemoteRefusal::Operation)?;
+
+        Ok(crate::hosted_runtime::HttpResponse {
+            status: out_status as u16,
+            headers: vec![],
+            body: out_body,
+        })
+    }
+
     /// Run once under the actual retained admission. The installed coordinator supplies
     /// the sole fresh Catalog/raw reader. No request transport or settlement callback
     /// can be injected here, and successful remote work grants no local finish.
@@ -228,6 +375,7 @@ impl TeardownOperation {
             target_os = "linux",
             target_os = "macos",
             target_os = "android",
+            target_os = "ios",
             windows
         ))]
         {
@@ -281,6 +429,7 @@ impl TeardownOperation {
             target_os = "linux",
             target_os = "macos",
             target_os = "android",
+            target_os = "ios",
             windows
         )))]
         {
@@ -293,6 +442,7 @@ impl TeardownOperation {
         target_os = "linux",
         target_os = "macos",
         target_os = "android",
+        target_os = "ios",
         windows
     ))]
     pub(crate) fn report_mut(&mut self) -> &mut RemoteTeardownReport {
@@ -300,8 +450,13 @@ impl TeardownOperation {
     }
 }
 
+#[cfg(target_os = "ios")]
+mod ios;
 mod own_storage;
 mod retention;
+#[cfg(target_os = "ios")]
+pub use ios::IosOperatedPreparation;
+pub use own_storage::snapshot_ids;
 pub use retention::{StorageKeeps, StorageRetention};
 
 #[cfg(test)]

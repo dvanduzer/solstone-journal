@@ -727,3 +727,103 @@ fn ended_teardowns_empty_reservation_is_retired_by_the_next_teardown() {
         b"unpublished copy"
     );
 }
+
+#[cfg(all(unix, not(target_os = "ios")))]
+#[test]
+fn teardown_carrier_restart_process_helper() {
+    let Some(journal) = std::env::var_os("SOLSTONE_TEARDOWN_CARRIER_TEST_JOURNAL") else {
+        return;
+    };
+    let witness = std::env::var_os("SOLSTONE_TEARDOWN_CARRIER_TEST_WITNESS").unwrap();
+    let root = Arc::new(JournalRoot::open(Path::new(&journal)).unwrap());
+    let lease = TeardownLease::try_acquire(root).unwrap();
+    let carrier = RootTeardownCarrier::prepare(lease).unwrap();
+    fs::write(
+        witness,
+        serde_json::to_vec(&carrier.recovery_observation().unwrap()).unwrap(),
+    )
+    .unwrap();
+    // Test process termination ends every original native handle/lease. The
+    // parent must open the exact original child under a new actual admission.
+}
+
+#[cfg(all(unix, not(target_os = "ios")))]
+#[test]
+fn teardown_carrier_restart_reacquires_original_and_refuses_replacements() {
+    for mutation in ["none", "missing", "replacement", "nonempty"] {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = temp.path().join("journal");
+        fs::create_dir(&journal).unwrap();
+        let witness = temp.path().join("observation.json");
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "media::activity_carrier::tests::teardown_carrier_restart_process_helper",
+                "--nocapture",
+            ])
+            .env("SOLSTONE_TEARDOWN_CARRIER_TEST_JOURNAL", &journal)
+            .env("SOLSTONE_TEARDOWN_CARRIER_TEST_WITNESS", &witness)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        let observed: StageObservation =
+            serde_json::from_slice(&fs::read(witness).unwrap()).unwrap();
+        let original = journal.join(&observed.directory_name);
+        let moved = temp.path().join("original-carrier");
+        match mutation {
+            "missing" | "replacement" => {
+                fs::rename(&original, &moved).unwrap();
+                if mutation == "replacement" {
+                    fs::create_dir(&original).unwrap();
+                }
+            }
+            "nonempty" => fs::write(original.join("retained"), b"do not remove").unwrap(),
+            _ => {}
+        }
+        let root = Arc::new(JournalRoot::open(&journal).unwrap());
+        let lease = TeardownLease::try_acquire(root.clone()).unwrap();
+        if mutation != "none" {
+            assert!(
+                RootTeardownCarrier::reacquire(lease.clone(), &observed).is_err(),
+                "{mutation}"
+            );
+            if mutation == "replacement" {
+                assert!(original.is_dir());
+                fs::remove_dir(&original).unwrap();
+            }
+            if mutation == "missing" || mutation == "replacement" {
+                assert!(moved.is_dir());
+                fs::rename(&moved, &original).unwrap();
+            }
+            if mutation == "nonempty" {
+                assert_eq!(
+                    fs::read(original.join("retained")).unwrap(),
+                    b"do not remove"
+                );
+                fs::remove_file(original.join("retained")).unwrap();
+            }
+        }
+        let carrier = RootTeardownCarrier::reacquire(lease, &observed).unwrap();
+        assert_eq!(carrier.recovery_observation().unwrap(), observed);
+        assert_eq!(
+            crate::activity_obligations::observe_with_carrier(&root, carrier.observation())
+                .unwrap()
+                .unresolved_entries()
+                .count(),
+            0
+        );
+        let retired = carrier.retire_after_settlement();
+        assert_eq!(
+            retired.receipt.effect(),
+            ActivityCarrierRetirementEffect::Removed
+        );
+        assert_eq!(retired.receipt.confirmation(), Confirmation::Confirmed);
+        assert_eq!(retired.receipt.root_durability(), Durability::Synced);
+        assert!(retired.receipt.failures().is_empty());
+        assert!(!original.exists());
+    }
+}

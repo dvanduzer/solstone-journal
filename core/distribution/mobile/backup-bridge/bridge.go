@@ -20,6 +20,8 @@ typedef struct {
 #endif
 
 
+#ifndef SOLSTONE_RESTIC_LEGACY_TYPES
+#define SOLSTONE_RESTIC_LEGACY_TYPES
 typedef struct {
     int32_t operation;
     const char *password;
@@ -44,6 +46,7 @@ typedef struct {
     char snapshot_ids[4096][65];
     char diagnostic[256];
 } restic_result;
+#endif
 
 typedef struct {
     uint32_t version;

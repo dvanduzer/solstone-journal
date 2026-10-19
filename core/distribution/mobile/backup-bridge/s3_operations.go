@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/restic/restic/internal/backend"
+	"github.com/restic/restic/internal/restic"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -164,6 +166,9 @@ func beginS3Owner(owner *s3Owner, req bridgeRequest) (err error) {
 			return errS3OwnerPending
 		}
 	}
+	if req.operation == OpTeardown {
+		return owner.beginTeardown(req.remote.cfg, req.teardownAdmission, req.teardownIDs, req.password)
+	}
 	return owner.begin(req.operation, req.rotationCustody, req.remote.cfg, req.password, req.recoveryPassword)
 }
 
@@ -219,6 +224,18 @@ func executeS3Operation(h *callHandle, req *bridgeRequest, wrote *bool) (result 
 		result, _ = executeListRecoveryKeys(h.ctx, *req)
 	case OpRemoveRecoveryKey:
 		result, _ = executeRemoveRecoveryKey(h.ctx, *req, markWrite)
+	case OpTeardown:
+		var admitted []restic.ID
+		for _, value := range req.teardownIDs {
+			id, err := restic.ParseID(value)
+			if err != nil {
+				return bridgeResult{status: StatusInvalidArgument, diagnostic: DiagInvalidArgument}
+			}
+			admitted = append(admitted, id)
+		}
+		var changed bool
+		result, changed = executeTeardown(withTeardownScope(h.ctx), h, req, admitted)
+		*wrote = *wrote || changed
 	default:
 		result = bridgeResult{status: StatusInvalidArgument, diagnostic: DiagInvalidArgument}
 	}
@@ -407,10 +424,19 @@ func runS3Worker(h *callHandle, req bridgeRequest) {
 	cleanupErr := closeS3RequestPaths(&req)
 	req.owned.blockIfFault(&req)
 	workspace := errors.Is(cleanupErr, errMetadataCleanup) || result.diagnostic == DiagWorkspaceCleanupRequired
+	if req.operation == OpTeardown && result.status == StatusOk && result.snapshotCount != 0 {
+		result.status, result.diagnostic = StatusFailed, DiagIoFailed
+	}
 	if started {
 		if drainErr != nil {
 			pending = true
 		} else {
+			// Persist this disposition in the same completion publication, only
+			// after real prune/zero-remaining, request cleanup and primary drain.
+			// Failed no-write attempts may complete, but never acquire it.
+			owner.mu.Lock()
+			owner.teardownReconciled = req.operation == OpTeardown && result.status == StatusOk && result.snapshotCount == 0 && cleanupErr == nil && h.ctx.Err() == nil
+			owner.mu.Unlock()
 			if result.status != StatusOk {
 				owner.noteAttemptFailed()
 			}
@@ -441,6 +467,21 @@ func runS3Worker(h *callHandle, req bridgeRequest) {
 	}
 	if req.restorePublished && cleanupErr != nil && !pending && !stateUncertain {
 		result.status, result.diagnostic = StatusCommittedUncertain, DiagCommittedUncertain
+	}
+	if req.operation == OpTeardown && result.status == StatusOk && !pending && !stateUncertain {
+		owner.mu.Lock()
+		var state unix.Stat_t
+		if owner.record.Complete == nil || !owner.record.Complete.TeardownReconciled || owner.record.Complete.Operation != OpTeardown || owner.stateFile == nil || unix.Fstat(int(owner.stateFile.Fd()), &state) != nil {
+			result.status, result.diagnostic = StatusFailed, DiagIoFailed
+		} else {
+			result.metadata, _ = json.Marshal(map[string]interface{}{
+				"schema": "solstone.backup-metadata.v1", "kind": "teardown-completed",
+				"completion_id": owner.record.Complete.ID, "state_device": uint64(state.Dev), "state_inode": uint64(state.Ino),
+				"scope": owner.record.Complete.TeardownScope, "origin": owner.record.Complete.TeardownOrigin,
+				"reconciled": owner.record.Complete.TeardownReconciled,
+			})
+		}
+		owner.mu.Unlock()
 	}
 	if err := owner.Close(); err != nil {
 		result.status, result.diagnostic = StatusFailed, DiagIoFailed

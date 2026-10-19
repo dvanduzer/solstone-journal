@@ -20,6 +20,8 @@ use sha2::{Digest, Sha256};
 use crate::JournalRoot;
 
 mod activity_carrier;
+#[cfg(unix)]
+pub mod teardown_preparation;
 #[cfg(target_os = "linux")]
 pub(crate) use activity_carrier::retire_recovered;
 pub use activity_carrier::{
@@ -89,6 +91,10 @@ pub enum MediaPrimitive {
     RemovalCompletion,
     ClaimAppliedError,
     DeleteAppliedError,
+    TeardownBeforePublish,
+    TeardownPublishApplied,
+    TeardownSourceSync,
+    TeardownDestinationSync,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]

@@ -7,11 +7,12 @@
 mod build_identity;
 mod bundle;
 mod command;
-mod native;
+pub(crate) mod native;
 mod outcome;
-mod repository;
+pub mod repository;
 mod root;
 mod storage;
+pub mod teardown;
 
 pub use root::IosRootToolRunner;
 
@@ -185,7 +186,8 @@ fn refused(reason: &'static str) -> RunnerError {
     RunnerError::Process(io::Error::new(io::ErrorKind::Unsupported, reason))
 }
 
-enum ExecuteError {
+#[derive(Debug)]
+pub enum ExecuteError {
     Admission(RunnerError),
     Entry(i32),
 }

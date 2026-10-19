@@ -89,7 +89,60 @@ pub fn admit_teardown(
     }
 }
 
+/// iOS caller supplies a freshly acquired real exclusion and Backup's actual
+/// existing-only configuration capture. No generic orphan sweep is run here.
+#[cfg(target_os = "ios")]
+pub fn admit_ios_configuration(
+    lease: Arc<TeardownLease>,
+    configuration: TeardownConfiguration,
+) -> Result<TeardownAdmission, TeardownAdmissionRefusal> {
+    let admitted = TeardownAdmission {
+        lease,
+        configuration,
+    };
+    admitted.revalidate()?;
+    Ok(admitted)
+}
+
 impl TeardownAdmission {
+    /// Reopen the exact original reservation before the reader excludes it.
+    /// Missing, changed or nonempty reservations remain held.
+    #[cfg(target_os = "ios")]
+    pub fn reacquire_carrier(
+        self,
+        expected: &solstone_core_journal_io::media::StageObservation,
+        reader: &mut TeardownReader<'_>,
+    ) -> Result<CarrierTeardownAdmission, TeardownCarrierFailure> {
+        if let Err(refusal) = self.revalidate() {
+            return Err(TeardownCarrierFailure::new(
+                self,
+                None,
+                TeardownCarrierRefusal::Admission(refusal),
+            ));
+        }
+        let carrier = match RootTeardownCarrier::reacquire(self.lease.clone(), expected) {
+            Ok(carrier) => carrier,
+            Err(_) => {
+                return Err(TeardownCarrierFailure::new(
+                    self,
+                    None,
+                    TeardownCarrierRefusal::Preparation,
+                ));
+            }
+        };
+        let prepared = CarrierTeardownAdmission {
+            admission: self,
+            carrier: Arc::new(carrier),
+        };
+        if let Err(refusal) = prepared.check(reader) {
+            return Err(TeardownCarrierFailure::new(
+                prepared.admission,
+                Some(RetainedCarrier::Prepared(prepared.carrier)),
+                TeardownCarrierRefusal::Admission(refusal),
+            ));
+        }
+        Ok(prepared)
+    }
     /// The same original exclusion, retained by outside attempt custody.
     pub fn teardown_lease(&self) -> &Arc<TeardownLease> {
         &self.lease

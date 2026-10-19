@@ -100,6 +100,8 @@ type bridgeRequest struct {
 	restorePublished     bool
 	pathsPinned          bool
 	remote               *s3RemoteRequest
+	teardownIDs          []string
+	teardownAdmission    *s3TeardownAdmission
 	rootedRestore        *rootedRestore
 }
 

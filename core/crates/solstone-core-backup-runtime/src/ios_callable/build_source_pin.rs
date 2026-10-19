@@ -4,4 +4,4 @@
 // Complete bridge-source closure computed independently of build receipts.
 // This changed candidate still requires independent review and qualification.
 const BRIDGE_SOURCE_SHA256: &str =
-    "b78a7dddd816f863762ebfec7acd13a38d3b86f1491df8a0c99a822053cfcf98";
+    "538732f2c517332d9b084daa9a06a6ff5eeacf291d48be7264a0d75f8dccb872";

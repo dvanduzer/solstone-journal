@@ -64,6 +64,8 @@ type s3OwnerIntent struct {
 	KeyID            string   `json:"key_id,omitempty"`
 	Ciphertext       []byte   `json:"ciphertext,omitempty"`
 	RotationCustody  bool     `json:"rotation_custody,omitempty"`
+	TeardownScope    string   `json:"teardown_scope,omitempty"`
+	TeardownOrigin   string   `json:"teardown_origin,omitempty"`
 }
 
 type s3RecoveryHold struct {
@@ -75,8 +77,11 @@ type s3RecoveryHold struct {
 // A completed record is prepared only after observed write/lock outcomes and
 // actual consequential work drain. Its visibility is not server quiescence.
 type s3OwnerCompletion struct {
-	ID        string `json:"id"`
-	Operation int32  `json:"operation"`
+	ID                 string `json:"id"`
+	Operation          int32  `json:"operation"`
+	TeardownScope      string `json:"teardown_scope,omitempty"`
+	TeardownOrigin     string `json:"teardown_origin,omitempty"`
+	TeardownReconciled bool   `json:"teardown_reconciled,omitempty"`
 }
 
 type s3OwnerRecord struct {
@@ -90,32 +95,33 @@ type s3OwnerRecord struct {
 }
 
 type s3Owner struct {
-	owned           *ownedCall
-	mu              sync.Mutex
-	path            string
-	destination     s3Destination
-	directory       *os.File
-	root            *os.Root
-	stateFile       *os.File
-	record          s3OwnerRecord
-	exists          bool
-	closed          bool
-	sealing         bool
-	begun           bool
-	primaryDrained  bool
-	liveID          string
-	liveCredential  s3RetainedCredential
-	baselineCreds   []s3RetainedCredential
-	baselinePasses  [][]byte
-	attemptFailed   bool
-	cleanupActive   bool
-	attemptPasses   [][]byte
-	knownKeyID      string
-	knownSnapshotID string
-	writeFailed     bool
-	stateFailed     bool
-	lockAcks        map[string]bool
-	backends        []*s3OperationBackend
+	owned              *ownedCall
+	mu                 sync.Mutex
+	path               string
+	destination        s3Destination
+	directory          *os.File
+	root               *os.Root
+	stateFile          *os.File
+	record             s3OwnerRecord
+	exists             bool
+	closed             bool
+	sealing            bool
+	begun              bool
+	primaryDrained     bool
+	liveID             string
+	liveCredential     s3RetainedCredential
+	baselineCreds      []s3RetainedCredential
+	baselinePasses     [][]byte
+	attemptFailed      bool
+	teardownReconciled bool
+	cleanupActive      bool
+	attemptPasses      [][]byte
+	knownKeyID         string
+	knownSnapshotID    string
+	writeFailed        bool
+	stateFailed        bool
+	lockAcks           map[string]bool
+	backends           []*s3OperationBackend
 	// Private deterministic fault/barrier injection; no public setter or ABI.
 	fault                 func(string) error
 	preservedAddIntent    *s3OwnerIntent
@@ -418,7 +424,7 @@ func completeS3StateJSON(raw []byte) error {
 				}
 			case "locks":
 				// nullable
-			case "recovery_password", "key_id", "ciphertext":
+			case "recovery_password", "key_id", "ciphertext", "teardown_scope", "teardown_origin":
 				if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
 					return errS3OwnerInvalid
 				}
@@ -441,7 +447,22 @@ func completeS3StateJSON(raw []byte) error {
 		}
 	}
 	if !bytes.Equal(bytes.TrimSpace(fields["complete"]), []byte("null")) {
-		if _, err := object(fields["complete"], []string{"id", "operation"}, nil); err != nil {
+		var complete map[string]json.RawMessage
+		if json.Unmarshal(fields["complete"], &complete) != nil {
+			return errS3OwnerInvalid
+		}
+		names := []string{"id", "operation"}
+		if len(complete) == 4 || len(complete) == 5 {
+			names = append(names, "teardown_scope", "teardown_origin")
+		}
+		if len(complete) == 5 {
+			names = append(names, "teardown_reconciled")
+			var reconciled bool
+			if json.Unmarshal(complete["teardown_reconciled"], &reconciled) != nil {
+				return errS3OwnerInvalid
+			}
+		}
+		if _, err := object(fields["complete"], names, nil); err != nil {
 			return err
 		}
 	}
@@ -455,7 +476,7 @@ func completeS3StateJSON(raw []byte) error {
 
 func validOwnerOperation(operation int32) bool {
 	switch operation {
-	case OpInit, OpOpen, OpAddRecoveryKey, OpSnapshot, OpListSnapshots, OpRestore, OpCheck, OpListRecoveryKeys, OpRemoveRecoveryKey:
+	case OpInit, OpOpen, OpAddRecoveryKey, OpSnapshot, OpListSnapshots, OpRestore, OpCheck, OpListRecoveryKeys, OpRemoveRecoveryKey, OpTeardown:
 		return true
 	default:
 		return false
@@ -489,6 +510,9 @@ func (record s3OwnerRecord) validate() error {
 		}
 	}
 	if active := record.Active; active != nil {
+		if (active.TeardownScope != "" || active.TeardownOrigin != "") && (active.Operation != OpTeardown || !teardownHex(active.TeardownScope, 64) || !isMetadataNonce(active.TeardownOrigin)) {
+			return errS3OwnerInvalid
+		}
 		if !isMetadataNonce(active.ID) || !validOwnerOperation(active.Operation) || len(active.Locks) > maxS3OwnerLocks || len(active.Locks) != 0 && !active.MayHaveWritten {
 			return errS3OwnerInvalid
 		}
@@ -513,6 +537,12 @@ func (record s3OwnerRecord) validate() error {
 		}
 	}
 	if complete := record.Complete; complete != nil {
+		if complete.TeardownReconciled && (complete.Operation != OpTeardown || complete.TeardownScope == "" || complete.TeardownOrigin == "") {
+			return errS3OwnerInvalid
+		}
+		if (complete.TeardownScope != "" || complete.TeardownOrigin != "") && (complete.Operation != OpTeardown || !teardownHex(complete.TeardownScope, 64) || !isMetadataNonce(complete.TeardownOrigin)) {
+			return errS3OwnerInvalid
+		}
 		if !isMetadataNonce(complete.ID) || !validOwnerOperation(complete.Operation) {
 			return errS3OwnerInvalid
 		}
@@ -671,8 +701,11 @@ func (owner *s3Owner) persist(record s3OwnerRecord) (published bool, resultErr e
 func (owner *s3Owner) begin(operation int32, rotationCustody bool, cfg s3Config, passwords ...[]byte) error {
 	owner.mu.Lock()
 	defer owner.mu.Unlock()
-	if owner.closed || owner.sealing || !validOwnerOperation(operation) {
+	if owner.closed || owner.sealing || !validOwnerOperation(operation) || operation == OpTeardown {
 		return errS3OwnerInvalid
+	}
+	if owner.record.Active != nil && owner.record.Active.Operation == OpTeardown {
+		return errS3OwnerPending
 	}
 	if operation == OpAddRecoveryKey && owner.record.RecoveryHold != nil {
 		hold := owner.record.RecoveryHold
@@ -830,6 +863,95 @@ func (owner *s3Owner) begin(operation int32, rotationCustody bool, cfg s3Config,
 		record.Active.RotationCustody = true
 		owner.knownKeyID = hold.KeyID
 	}
+	if len(record.Credentials) > maxS3OwnerCredentials || len(record.Passwords) > maxS3OwnerPasswords {
+		return errResourceLimit
+	}
+	_, err = owner.persist(record)
+	owner.begun = true
+	if err != nil {
+		owner.stateFailed = true
+	} else {
+		owner.liveID = record.Active.ID
+		owner.baselineCreds, owner.baselinePasses, owner.attemptFailed = baselineCreds, baselinePasses, false
+		owner.liveCredential = credential
+	}
+	return err
+}
+
+func (owner *s3Owner) beginTeardown(cfg s3Config, admission *s3TeardownAdmission, ids []string, passwords ...[]byte) error {
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+	if owner.closed || owner.sealing || admission == nil || owner.record.RecoveryHold != nil {
+		return errS3OwnerInvalid
+	}
+	scope, err := admission.scope(owner.destination, ids)
+	if err != nil {
+		return err
+	}
+	pendingScope := ""
+	if admission.Expected.Operation == OpTeardown {
+		pendingScope = scope
+	}
+	actual, file, err := observeTeardownState(int(owner.directory.Fd()), owner.destination, pendingScope)
+	if file != nil {
+		defer file.Close()
+	}
+	if err != nil || actual != admission.Expected || owner.recheckCustody("") != nil {
+		return errS3OwnerPending
+	}
+	inherited := []string{}
+	if prior := owner.record.Active; prior != nil {
+		if prior.Operation != OpTeardown || prior.TeardownScope != scope || prior.TeardownOrigin != admission.Origin {
+			return errS3OwnerPending
+		}
+		inherited = append(inherited, prior.Locks...)
+	}
+	destination, err := s3DestinationFor(cfg)
+	if err != nil || destination != owner.destination {
+		return errS3OwnerInvalid
+	}
+	record := owner.record
+	record.Version, record.Destination = 1, owner.destination
+	baselineCreds := append([]s3RetainedCredential(nil), record.Credentials...)
+	baselinePasses := append([][]byte(nil), record.Passwords...)
+	record.Credentials = append([]s3RetainedCredential(nil), record.Credentials...)
+	record.Passwords = append([][]byte(nil), record.Passwords...)
+	credential := s3RetainedCredential{cfg.access, cfg.secret, cfg.token}
+	found := false
+	for _, retained := range record.Credentials {
+		if retained == credential {
+			found = true
+		}
+	}
+	if !found {
+		record.Credentials = append(record.Credentials, credential)
+	}
+	for _, password := range passwords {
+		if len(password) == 0 {
+			continue
+		}
+		found = false
+		for _, retained := range record.Passwords {
+			if bytes.Equal(retained, password) {
+				found = true
+			}
+		}
+		if !found {
+			record.Passwords = append(record.Passwords, append([]byte(nil), password...))
+		}
+	}
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return errS3OwnerIO
+	}
+	record.Active = &s3OwnerIntent{ID: hex.EncodeToString(nonce[:]), Operation: OpTeardown, MayHaveWritten: owner.record.Active != nil && owner.record.Active.MayHaveWritten, Locks: inherited, TeardownScope: scope, TeardownOrigin: admission.Origin}
+	owner.attemptPasses = nil
+	for _, password := range passwords {
+		if len(password) > 0 {
+			owner.attemptPasses = append(owner.attemptPasses, append([]byte(nil), password...))
+		}
+	}
+	record.Complete = nil
 	if len(record.Credentials) > maxS3OwnerCredentials || len(record.Passwords) > maxS3OwnerPasswords {
 		return errResourceLimit
 	}
@@ -1103,6 +1225,12 @@ func (owner *s3Owner) saveReturned(err error) {
 	}
 }
 
+func (owner *s3Owner) hasWriteFailed() bool {
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+	return owner.writeFailed
+}
+
 func (owner *s3Owner) ownsLock(id string) bool {
 	owner.mu.Lock()
 	defer owner.mu.Unlock()
@@ -1187,6 +1315,9 @@ func (owner *s3Owner) complete() (published bool, err error) {
 	if owner.writeFailed || owner.stateFailed {
 		return false, errS3OwnerPending
 	}
+	if owner.attemptFailed && owner.record.Active.Operation == OpTeardown && owner.record.Active.MayHaveWritten {
+		return false, errS3OwnerPending
+	}
 	for _, id := range owner.record.Active.Locks {
 		if !owner.lockAcks[id] {
 			return false, errS3OwnerPending
@@ -1223,7 +1354,7 @@ func (owner *s3Owner) complete() (published bool, err error) {
 	} else if !owner.attemptFailed && owner.record.Active != nil && owner.record.Active.Operation == OpRemoveRecoveryKey {
 		record.RecoveryHold = nil
 	}
-	record.Complete = &s3OwnerCompletion{ID: record.Active.ID, Operation: record.Active.Operation}
+	record.Complete = &s3OwnerCompletion{ID: record.Active.ID, Operation: record.Active.Operation, TeardownScope: record.Active.TeardownScope, TeardownOrigin: record.Active.TeardownOrigin, TeardownReconciled: record.Active.Operation == OpTeardown && owner.teardownReconciled && !owner.attemptFailed && owner.primaryDrained}
 	record.Active = nil
 	// A failed attempt that wrote nothing (a mistyped recovery key, a refused
 	// credential) adds no retained material; one that may have written keeps
@@ -1364,4 +1495,10 @@ func (owner *s3Owner) Close() error {
 	}
 	s3OwnersMu.Unlock()
 	return closeErr
+}
+
+func (owner *s3Owner) isUnsealed() bool {
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+	return !owner.closed && !owner.sealing
 }

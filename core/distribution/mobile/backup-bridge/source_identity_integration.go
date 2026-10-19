@@ -90,6 +90,7 @@ typedef struct {
 } restic_s3_request;
 
 #include <stdlib.h>
+#include <unistd.h>
 int32_t restic_bridge_snapshot_source_v1_start(restic_request*,restic_operation_options_v1*,int32_t,const char*,uint32_t,const char*,uint32_t,uint64_t*);
 int32_t restic_bridge_s3_snapshot_source_v1_start(restic_s3_request*,restic_operation_options_v1*,int32_t,const char*,uint32_t,uint64_t*);
 int32_t restic_bridge_operation_v1_start(restic_request*,restic_operation_options_v1*,const char*,uint32_t,const char*,uint32_t,uint64_t*);
@@ -101,6 +102,10 @@ int32_t restic_bridge_cancel(uint64_t);
 int32_t restic_bridge_wait(uint64_t,restic_result*);
 int32_t restic_bridge_free(uint64_t);
 int32_t restic_bridge_result_metadata(uint64_t,char*,uint32_t,uint32_t*);
+int32_t restic_bridge_teardown_v1_start(restic_request*,restic_s3_request*,restic_operation_options_v1*,int,const char*,uint32_t,const char*,uint32_t,uint64_t*);
+int32_t restic_bridge_s3_teardown_observe_v1(int,const char*,uint32_t,const char*,uint32_t,int*,char*,uint32_t,uint32_t*);
+int32_t restic_bridge_s3_teardown_retire_v1(int,const char*,uint32_t,const char*,uint32_t);
+int32_t restic_bridge_s3_teardown_verify_v1(int,const char*,uint32_t,const char*,uint32_t);
 */
 import "C"
 import "unsafe"
@@ -303,4 +308,67 @@ func sourceCMetadata(id uint64) ([]byte, int32) {
 		return nil, int32(status)
 	}
 	return C.GoBytes(buffer, C.int(required)), int32(status)
+}
+
+func teardownCObserve(fd int, destination, pending []byte) (int, []byte, int32) {
+	dest := C.CBytes(destination)
+	defer C.free(dest)
+	scope := C.CBytes(pending)
+	defer C.free(scope)
+	buffer := C.malloc(4096)
+	if buffer == nil {
+		return -1, nil, StatusInternal
+	}
+	defer C.free(buffer)
+	var outFD C.int = -1
+	var length C.uint32_t
+	status := C.restic_bridge_s3_teardown_observe_v1(C.int(fd), (*C.char)(dest), C.uint32_t(len(destination)), (*C.char)(scope), C.uint32_t(len(pending)), &outFD, (*C.char)(buffer), 4096, &length)
+	if status != 0 {
+		return int(outFD), nil, int32(status)
+	}
+	if length > 4096 {
+		if outFD >= 0 {
+			C.close(outFD)
+		}
+		return -1, nil, StatusInternal
+	}
+	return int(outFD), C.GoBytes(buffer, C.int(length)), int32(status)
+}
+
+func teardownCRetire(fd int, destination, expected []byte) int32 {
+	dest := C.CBytes(destination)
+	defer C.free(dest)
+	record := C.CBytes(expected)
+	defer C.free(record)
+	return int32(C.restic_bridge_s3_teardown_retire_v1(C.int(fd), (*C.char)(dest), C.uint32_t(len(destination)), (*C.char)(record), C.uint32_t(len(expected))))
+}
+
+func teardownCVerify(fd int, destination, expected []byte) int32 {
+	dest := C.CBytes(destination)
+	defer C.free(dest)
+	record := C.CBytes(expected)
+	defer C.free(record)
+	return int32(C.restic_bridge_s3_teardown_verify_v1(C.int(fd), (*C.char)(dest), C.uint32_t(len(destination)), (*C.char)(record), C.uint32_t(len(expected))))
+}
+
+func teardownCStart(input sourceCInput, fd int, ids []string, admission []byte, reserved uint32) (uint64, int32) {
+	var allocations []unsafe.Pointer
+	defer func() {
+		for _, p := range allocations {
+			C.free(p)
+		}
+	}()
+	request := sourceCS3Request(input, 11, &allocations)
+	var joined []byte
+	for _, id := range ids {
+		joined = append(joined, []byte(id)...)
+	}
+	values := C.CBytes(joined)
+	defer C.free(values)
+	binding := C.CBytes(admission)
+	defer C.free(binding)
+	options := C.restic_operation_options_v1{version: 1, reserved1: C.uint32_t(reserved)}
+	var id C.uint64_t
+	status := C.restic_bridge_teardown_v1_start(nil, &request, &options, C.int(fd), (*C.char)(values), C.uint32_t(len(ids)), (*C.char)(binding), C.uint32_t(len(admission)), &id)
+	return uint64(id), int32(status)
 }

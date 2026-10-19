@@ -376,7 +376,7 @@ pub(super) fn claim(
     let from = CString::new(source_name.as_bytes()).map_err(|_| invalid("invalid claim name"))?;
     let to = CString::new(name.as_bytes()).map_err(|_| invalid("invalid claim name"))?;
     step(MediaPrimitive::NativeClaimCut)?;
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
     {
         use std::os::fd::AsRawFd;
 
@@ -395,7 +395,7 @@ pub(super) fn claim(
                     libc::RENAME_NOREPLACE,
                 ) as i32
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             {
                 libc::renameatx_np(
                     source.as_fd().as_raw_fd(),
@@ -412,7 +412,7 @@ pub(super) fn claim(
         step(MediaPrimitive::ClaimAppliedError)?;
         Ok(())
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
     {
         let _ = (source, destination, from, to);
         Err(io::Error::new(

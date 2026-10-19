@@ -288,3 +288,90 @@ fn config_change_between_initial_read_and_binding_capture_refuses() {
     assert!(matches!(result, Err(Refusal::ConfigurationChanged)));
     assert_eq!(fs::read(&path).unwrap(), bytes);
 }
+
+#[test]
+fn local_finish_reopens_actual_clear_and_binding_then_publishes_real_receipt() {
+    let (temp, root) = fixture("operated");
+    let lease =
+        solstone_core_journal_io::activity::TeardownLease::try_acquire(root.clone()).unwrap();
+    let captured = TeardownConfiguration::capture(&root).unwrap();
+    let original = captured.local_observation().unwrap();
+    let encoded = serde_json::to_vec(&original).unwrap();
+    for secret in [
+        "daily-secret",
+        "broker-secret",
+        "storage-secret",
+        "provider-secret",
+    ] {
+        assert!(!String::from_utf8_lossy(&encoded).contains(secret));
+    }
+    let BoundConfigOutcome::Published(first) = captured.clear_configuration().unwrap() else {
+        panic!("no publication")
+    };
+    let cleared = captured.published_clear_observation(&first).unwrap();
+    drop(captured);
+    let resumed =
+        TeardownConfiguration::capture_local_finish(&lease, &original, &cleared, false).unwrap();
+    assert!(resumed.keys().is_none());
+    assert!(resumed.destination().is_none());
+    assert!(resumed.binding().is_some());
+    let BoundConfigOutcome::Published(reconfirmed) = resumed.clear_configuration().unwrap() else {
+        panic!("no actual reconfirmation")
+    };
+    let updated = resumed.published_clear_observation(&reconfirmed).unwrap();
+    assert_eq!(updated.sha256, cleared.sha256);
+    assert_ne!(updated.file, cleared.file);
+    assert!(
+        TeardownConfiguration::capture_local_finish(&lease, &original, &cleared, false).is_err()
+    );
+    let mut binding = resumed.begin_binding_finalization(&reconfirmed).unwrap();
+    assert!(binding.remove_binding().complete());
+    binding.revalidate_removed().unwrap();
+    drop(binding);
+    drop(resumed);
+    let finished =
+        TeardownConfiguration::capture_local_finish(&lease, &original, &updated, true).unwrap();
+    assert!(finished.binding().is_none());
+    finished.revalidate().unwrap();
+    let claim = temp.path().join("backup/hosted/!solstone-claim-unknown");
+    fs::write(&claim, b"unconfirmed original").unwrap();
+    assert!(finished.revalidate().is_err());
+    assert_eq!(fs::read(claim).unwrap(), b"unconfirmed original");
+}
+
+#[test]
+fn local_finish_refuses_same_bytes_replacements_without_touching_them() {
+    for replacement in ["config", "binding", "config-parent"] {
+        let (temp, root) = fixture("operated");
+        let lease =
+            solstone_core_journal_io::activity::TeardownLease::try_acquire(root.clone()).unwrap();
+        let captured = TeardownConfiguration::capture(&root).unwrap();
+        let original = captured.local_observation().unwrap();
+        let BoundConfigOutcome::Published(publication) = captured.clear_configuration().unwrap()
+        else {
+            panic!("no publication")
+        };
+        let cleared = captured.published_clear_observation(&publication).unwrap();
+        drop(captured);
+        let file = if replacement == "binding" {
+            temp.path().join("backup/hosted/binding.json")
+        } else {
+            temp.path().join("config/journal.json")
+        };
+        let bytes = fs::read(&file).unwrap();
+        if replacement == "config-parent" {
+            fs::rename(temp.path().join("config"), temp.path().join("old-config")).unwrap();
+            fs::create_dir(temp.path().join("config")).unwrap();
+            fs::rename(temp.path().join("old-config/journal.json"), &file).unwrap();
+        } else {
+            fs::rename(&file, temp.path().join("original-object")).unwrap();
+            fs::write(&file, &bytes).unwrap();
+        }
+        assert!(
+            TeardownConfiguration::capture_local_finish(&lease, &original, &cleared, false)
+                .is_err(),
+            "{replacement}"
+        );
+        assert_eq!(fs::read(file).unwrap(), bytes);
+    }
+}

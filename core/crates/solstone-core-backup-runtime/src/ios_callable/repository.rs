@@ -8,26 +8,9 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv6Addr};
 use std::path::{Component, Path};
 
-use serde::Serialize;
-use sha2::{Digest, Sha256};
+pub use solstone_core_backup::teardown_recovery::retained::NativeDestination as Destination;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub(super) struct Destination {
-    pub endpoint: String,
-    pub region: String,
-    pub bucket: String,
-    pub prefix: String,
-}
-
-impl Destination {
-    pub fn namespace(&self) -> String {
-        let bytes = serde_json::to_vec(self).expect("destination contains only strings");
-        let digest = Sha256::digest(bytes);
-        digest.iter().map(|byte| format!("{byte:02x}")).collect()
-    }
-}
-
-pub(super) enum Repository<'a> {
+pub enum Repository<'a> {
     Local(&'a str),
     S3 {
         destination: Destination,
@@ -39,7 +22,7 @@ pub(super) enum Repository<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct RepositoryRefusal;
+pub struct RepositoryRefusal;
 
 fn printable(value: &str, cap: usize, optional: bool) -> bool {
     value.len() <= cap
@@ -175,7 +158,7 @@ fn destination(repository: &str, region: &str) -> Result<Destination, Repository
     })
 }
 
-pub(super) fn parse<'a>(
+pub fn parse<'a>(
     repository: &'a str,
     env: Option<&'a BTreeMap<String, Option<String>>>,
 ) -> Result<Repository<'a>, RepositoryRefusal> {

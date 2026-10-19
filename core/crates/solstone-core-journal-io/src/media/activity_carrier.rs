@@ -387,6 +387,93 @@ impl RootTeardownCarrier {
         }
     }
 
+    /// Persistable observations of this actual empty reservation. They grant no
+    /// recovery authority; a later invocation must acquire its own real lease.
+    pub fn recovery_observation(&self) -> io::Result<StageObservation> {
+        self.owner.revalidate_empty()?;
+        let observed = self
+            .owner
+            .stage
+            .as_ref()
+            .ok_or_else(changed)?
+            .observation()?;
+        self.owner.revalidate_empty()?;
+        Ok(observed)
+    }
+
+    /// Reacquire only the exact original empty root child under a newly acquired
+    /// teardown lease. Never creates a stage or sweeps another reservation.
+    /// The caller still owns remote settlement and namespace cooperation.
+    pub fn reacquire(
+        teardown: Arc<TeardownLease>,
+        expected: &StageObservation,
+    ) -> io::Result<Self> {
+        teardown
+            .revalidate()
+            .map_err(crate::activity::ActivityAdmissionError::into_io)?;
+        let root = teardown.journal_root();
+        let suffix = expected
+            .directory_name
+            .strip_prefix(".tmp-offload-")
+            .ok_or_else(changed)?;
+        if !expected.parent_relative.is_empty()
+            || expected.journal_observation != root.identity().observation_id()
+            || suffix.len() != 32
+            || !suffix
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(changed());
+        }
+        let parent = MediaDirectory::open(root.clone(), Path::new(""))?;
+        if parent.identity() != expected.parent_identity {
+            return Err(changed());
+        }
+        let name = OsString::from(&expected.directory_name);
+        let directory = parent.open_child(&name)?.ok_or_else(changed)?;
+        if directory.identity() != expected.directory_identity {
+            return Err(changed());
+        }
+        let stage = MediaStage {
+            parent,
+            activity: StageLease::Teardown(teardown.clone()),
+            name,
+            directory: Some(directory),
+            leaf: None,
+            removed: false,
+            #[cfg(windows)]
+            published: false,
+            #[cfg(windows)]
+            payload_delete_pending: None,
+            #[cfg(windows)]
+            directory_delete_pending: false,
+        };
+        let owner = CarrierOwner {
+            activity: StageLease::Teardown(teardown),
+            stage: Some(stage),
+        };
+        owner.revalidate_empty()?;
+        if owner.stage.as_ref().ok_or_else(changed)?.observation()? != *expected {
+            return Err(changed());
+        }
+        let mut preparation = ActivityCarrierPreparationReceipt {
+            stage_durability: Durability::Unproven,
+            root_durability: Durability::Unproven,
+            confirmation: Confirmation::Unverified,
+        };
+        if owner.flushes_directories() {
+            let stage = owner.stage.as_ref().ok_or_else(changed)?;
+            stage.directory.as_ref().ok_or_else(changed)?.inner.sync()?;
+            owner.revalidate_empty()?;
+            stage.parent.inner.sync()?;
+            preparation.stage_durability = Durability::Synced;
+            preparation.root_durability = Durability::Synced;
+        }
+        owner.revalidate_empty()?;
+        preparation.confirmation = Confirmation::Confirmed;
+        Ok(Self { owner, preparation })
+    }
+
     pub fn teardown(&self) -> &Arc<TeardownLease> {
         self.owner.teardown()
     }

@@ -1008,3 +1008,83 @@ func TestS3OwnerLegacyActiveAddRemainsReadableAndPending(t *testing.T) {
 	}
 	s3OwnerTestClose(t, owner)
 }
+
+func TestS3OwnerTeardownLifecycleAndUncertainty(t *testing.T) {
+	// adoptsUncertainty(OpTeardown) is false
+	if adoptsUncertainty(OpTeardown) {
+		t.Fatal("expected adoptsUncertainty(OpTeardown) to be false")
+	}
+
+	cfg, root := s3TestConfig(), s3OwnerTestDirectory(t)
+	owner, ad := teardownTestOwner(t, root, cfg, strings.Repeat("b", 64), nil)
+	stateFilePath := filepath.Join(root, s3OwnerStateName)
+
+	daily := []byte("fixture-password")
+	if err := owner.beginTeardown(cfg, ad, nil, daily); err != nil {
+		t.Fatalf("beginTeardown failed: %v", err)
+	}
+	if err := owner.noteSave(""); err != nil {
+		t.Fatalf("noteSave failed: %v", err)
+	}
+
+	if _, err := os.Stat(stateFilePath); err != nil {
+		t.Fatalf("state.json missing after beginTeardown: %v", err)
+	}
+
+	// begin(OpCheck) and begin(OpSnapshot) while Active.Operation == OpTeardown and MayHaveWritten
+	// return errS3OwnerPending and leave the file and Active in place
+	for _, op := range []int32{OpCheck, OpSnapshot} {
+		err := owner.begin(op, false, cfg, daily)
+		if !errors.Is(err, errS3OwnerPending) {
+			t.Fatalf("expected errS3OwnerPending for op %d, got: %v", op, err)
+		}
+		if owner.record.Active == nil || owner.record.Active.Operation != OpTeardown || !owner.record.Active.MayHaveWritten {
+			t.Fatal("Active intent was modified or discarded")
+		}
+		if _, err := os.Stat(stateFilePath); err != nil {
+			t.Fatalf("state.json was removed: %v", err)
+		}
+	}
+
+	// Close leaves state.json; Close does not call Retire
+	if err := owner.drainPrimary(); err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	if _, err := os.Stat(stateFilePath); err != nil {
+		t.Fatalf("state.json was removed by Close: %v", err)
+	}
+
+	// Pending teardown custody cannot be retired after Close.
+	fd, err := os.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fd.Close()
+	if locked, _, err := lockTeardownState(int(fd.Fd()), cfgDestination(t, cfg), ""); err == nil {
+		if locked != nil {
+			locked.Close()
+		}
+		t.Fatal("idle observation adopted pending teardown")
+	}
+	scope, err := ad.scope(cfgDestination(t, cfg), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ob, file, err := observeTeardownState(int(fd.Fd()), cfgDestination(t, cfg), scope)
+	if file != nil {
+		defer file.Close()
+	}
+	if err != nil || !ob.Active {
+		t.Fatal("matching pending observation failed", err)
+	}
+	if status := retireObservedTeardownState(int(fd.Fd()), cfgDestination(t, cfg), ob); status == StatusOk {
+		t.Fatal("pending native custody was retired")
+	}
+	if _, err := os.Stat(stateFilePath); err != nil {
+		t.Fatalf("pending state lost: %v", err)
+	}
+
+}

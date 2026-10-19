@@ -477,3 +477,144 @@ func TestS3ResponseFramingAndXMLRefusals(t *testing.T) {
 		}
 	}
 }
+
+func TestS3BackendTeardownScopeRemovals(t *testing.T) {
+	deleted := make(map[string]bool)
+	transport := s3TestTransport(func(req *http.Request) (*http.Response, error) {
+		if req.Method == http.MethodDelete {
+			deleted[req.URL.Path] = true
+			return s3TestResponse(http.StatusNoContent, "", nil), nil
+		}
+		return s3TestResponse(http.StatusOK, "", nil), nil
+	})
+	be := s3TestBackend(t, s3TestConfig(), transport)
+	ctx := context.Background()
+	teardownCtx := withTeardownScope(ctx)
+
+	// Remove of pack without scope is errS3Denied
+	if err := be.Remove(ctx, backend.Handle{Type: backend.PackFile, Name: s3TestID(1)}); !errors.Is(err, errS3Denied) {
+		t.Fatalf("expected errS3Denied without scope, got: %v", err)
+	}
+
+	// With teardown scope, snapshot, pack, and index succeed
+	for _, handleType := range []backend.FileType{backend.SnapshotFile, backend.PackFile, backend.IndexFile} {
+		handle := backend.Handle{Type: handleType, Name: s3TestID(2)}
+		if err := be.Remove(teardownCtx, handle); err != nil {
+			t.Fatalf("expected Remove of %v with teardown scope to succeed, got: %v", handleType, err)
+		}
+	}
+
+	// Config, key, and Delete stay errS3Denied with the scope on
+	for _, handleType := range []backend.FileType{backend.ConfigFile, backend.KeyFile} {
+		handle := backend.Handle{Type: handleType, Name: s3TestID(3)}
+		if handleType == backend.ConfigFile {
+			handle.Name = "" // Config handles have no object-ID name in the pinned backend.
+		}
+		if err := be.Remove(teardownCtx, handle); !errors.Is(err, errS3Denied) {
+			t.Fatalf("expected Remove of %v with scope to stay errS3Denied, got: %v", handleType, err)
+		}
+	}
+	if err := be.Delete(teardownCtx); !errors.Is(err, errS3Denied) {
+		t.Fatalf("expected Delete with scope to stay errS3Denied, got: %v", err)
+	}
+}
+
+func TestS3OperationBackendRemoveLatch(t *testing.T) {
+	teardownCtx := withTeardownScope(context.Background())
+
+	newOpBackend := func(t *testing.T, roundTrip func(*http.Request) (*http.Response, error)) (*s3OperationBackend, *s3Owner) {
+		owner := &s3Owner{
+			lockAcks: make(map[string]bool),
+		}
+		base := s3TestBackend(t, s3TestConfig(), s3TestTransport(roundTrip))
+		return &s3OperationBackend{s3Backend: base, owner: owner}, owner
+	}
+
+	// 1. Pack DELETE with RoundTrip error sets writeFailed and returns non-nil error
+	{
+		be, owner := newOpBackend(t, func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("round-trip network drop")
+		})
+		err := be.Remove(teardownCtx, backend.Handle{Type: backend.PackFile, Name: s3TestID(1)})
+		if err == nil {
+			t.Fatal("expected pack DELETE with RoundTrip error to return non-nil error")
+		}
+		if !owner.hasWriteFailed() {
+			t.Fatal("expected pack DELETE RoundTrip error to latch writeFailed")
+		}
+	}
+
+	// 2. Pack DELETE with HTTP 500 sets writeFailed and returns non-nil error
+	{
+		be, owner := newOpBackend(t, func(*http.Request) (*http.Response, error) {
+			return s3TestResponse(http.StatusInternalServerError, "internal server error", nil), nil
+		})
+		err := be.Remove(teardownCtx, backend.Handle{Type: backend.PackFile, Name: s3TestID(2)})
+		if err == nil {
+			t.Fatal("expected pack DELETE with HTTP 500 to return non-nil error")
+		}
+		if !owner.hasWriteFailed() {
+			t.Fatal("expected pack DELETE HTTP 500 to latch writeFailed")
+		}
+	}
+
+	// 3. Pack DELETE with 204 does not set writeFailed
+	{
+		be, owner := newOpBackend(t, func(*http.Request) (*http.Response, error) {
+			return s3TestResponse(http.StatusNoContent, "", nil), nil
+		})
+		err := be.Remove(teardownCtx, backend.Handle{Type: backend.PackFile, Name: s3TestID(3)})
+		if err != nil {
+			t.Fatalf("expected pack DELETE with 204 to succeed, got: %v", err)
+		}
+		if owner.hasWriteFailed() {
+			t.Fatal("expected pack DELETE 204 not to set writeFailed")
+		}
+	}
+
+	// 4. Snapshot and index errors do the same latch
+	for _, handleType := range []backend.FileType{backend.SnapshotFile, backend.IndexFile} {
+		be, owner := newOpBackend(t, func(*http.Request) (*http.Response, error) {
+			return s3TestResponse(http.StatusInternalServerError, "internal server error", nil), nil
+		})
+		err := be.Remove(teardownCtx, backend.Handle{Type: handleType, Name: s3TestID(4)})
+		if err == nil {
+			t.Fatalf("expected %v DELETE with HTTP 500 to return non-nil error", handleType)
+		}
+		if !owner.hasWriteFailed() {
+			t.Fatalf("expected %v DELETE HTTP 500 to latch writeFailed", handleType)
+		}
+	}
+
+	// 5. Lock-file Remove does not use latch
+	{
+		lockID := s3TestID(5)
+		be, owner := newOpBackend(t, func(*http.Request) (*http.Response, error) {
+			return s3TestResponse(http.StatusInternalServerError, "lock delete failed", nil), nil
+		})
+		owner.record.Active = &s3OwnerIntent{
+			Locks: []string{lockID},
+		}
+		err := be.Remove(teardownCtx, backend.Handle{Type: backend.LockFile, Name: lockID})
+		if err == nil {
+			t.Fatal("expected lock-file DELETE with HTTP 500 to return non-nil error")
+		}
+		if owner.hasWriteFailed() {
+			t.Fatal("lock-file Remove error must not latch writeFailed")
+		}
+	}
+
+	// 6. Config and key Remove stay denied
+	for _, handleType := range []backend.FileType{backend.ConfigFile, backend.KeyFile} {
+		be, owner := newOpBackend(t, func(*http.Request) (*http.Response, error) {
+			return s3TestResponse(http.StatusNoContent, "", nil), nil
+		})
+		err := be.Remove(teardownCtx, backend.Handle{Type: handleType, Name: s3TestID(6)})
+		if !errors.Is(err, errS3Denied) {
+			t.Fatalf("expected Remove of %v to stay errS3Denied, got: %v", handleType, err)
+		}
+		if owner.hasWriteFailed() {
+			t.Fatalf("denied %v Remove must not latch writeFailed", handleType)
+		}
+	}
+}
