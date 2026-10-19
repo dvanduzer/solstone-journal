@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
+use syn::spanned::Spanned;
 use syn::visit::Visit;
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -189,6 +190,20 @@ impl<'ast> Visit<'ast> for Discovery<'_> {
         self.context.pop();
     }
     fn visit_attribute(&mut self, node: &'ast syn::Attribute) {
+        // syn desugars documentation comments into attributes with synthetic string tokens.
+        // Their spans cover comments, not source literals. Explicit #[doc = "..."] stays visible.
+        if node.path().is_ident("doc")
+            && self
+                .source
+                .get(node.span().byte_range())
+                .is_some_and(|raw| {
+                    ["///", "//!", "/**", "/*!"]
+                        .iter()
+                        .any(|p| raw.starts_with(p))
+                })
+        {
+            return;
+        }
         self.context.push("attribute".into());
         if let syn::Meta::List(list) = &node.meta {
             self.tokens(list.tokens.clone());
@@ -434,6 +449,24 @@ mod tests {
             .literals
             .iter()
             .any(|l| l.raw == "\"detail\"" && l.context.contains("macro:write")));
+    }
+    #[test]
+    fn documentation_comments_are_not_synthetic_source_literals() {
+        let source = "//! 模块 \"quoted\"\n/*! module block */\n/// outer line\n/** outer block */\n#[doc = \"explicit\"]\nfn label() -> &'static str { \"ready\" }\n";
+        let file = discover_rust(source).unwrap();
+        assert_eq!(
+            file.literals
+                .iter()
+                .map(|l| l.raw.as_str())
+                .collect::<Vec<_>>(),
+            vec!["\"explicit\"", "\"ready\""]
+        );
+        for literal in &file.literals {
+            assert_eq!(
+                source.get(literal.start..literal.end),
+                Some(literal.raw.as_str())
+            );
+        }
     }
     #[test]
     fn every_new_literal_is_adjudicated_even_helper_display_and_new_file() {
