@@ -930,7 +930,7 @@ fn seed_indexed_note(journal: &std::path::Path) {
     let path = "20260831/default/123456_1/talents/brief.md";
     let source = journal.join("chronicle/20260831/default/123456_1");
     fs::create_dir_all(source.join("talents")).expect("fixture segment directory");
-    fs::write(source.join("talents/brief.md"), "disk fixture source")
+    fs::write(source.join("talents/brief.md"), "MCP fixture search needle")
         .expect("fixture source content");
     fs::write(source.join("talents/facets.json"), "[]").expect("fixture assignments");
     let connection =
@@ -2010,7 +2010,7 @@ mod tests {
         )
         .await
         .0;
-        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 10);
+        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 12);
 
         // Control: while the grant has not moved, nothing is flagged.
         let fresh = post_json_with_headers(
@@ -2188,7 +2188,7 @@ mod tests {
         )
         .await
         .0;
-        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 10);
+        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 12);
         let search = post_json_with_headers(
             &mut client,
             &token.token,

@@ -79,6 +79,8 @@ pub enum ToolName {
     GetWeek,
     SaveMemory,
     RecallMemory,
+    ListActivities,
+    GetActivitySources,
 }
 
 impl ToolName {
@@ -96,6 +98,8 @@ impl ToolName {
             Self::GetWeek => "get_week",
             Self::SaveMemory => "save_memory",
             Self::RecallMemory => "recall_memory",
+            Self::ListActivities => "list_activities",
+            Self::GetActivitySources => "get_activity_sources",
         }
     }
 
@@ -114,6 +118,8 @@ impl ToolName {
             Self::GetWeek,
             Self::SaveMemory,
             Self::RecallMemory,
+            Self::ListActivities,
+            Self::GetActivitySources,
         ]
         .into_iter()
         .find(|tool| tool.token() == value)
@@ -827,6 +833,8 @@ mod tests {
             ToolName::ListEntities,
             ToolName::GetEntity,
             ToolName::GetWeek,
+            ToolName::ListActivities,
+            ToolName::GetActivitySources,
         ] {
             assert_eq!(ToolName::from_token(tool.token()), Some(tool));
         }

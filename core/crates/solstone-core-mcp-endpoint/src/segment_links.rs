@@ -38,7 +38,7 @@ impl TranscriptPageCheck for LiveTranscriptPages {
         journal_root: &Path,
         segment: &Segment,
     ) -> Result<Option<u64>, ()> {
-        match solstone_core_transcripts::read_segment_transcript_page(journal_root, segment, None) {
+        match solstone_core_transcripts::read_segment_transcript_page(journal_root, segment, None, true) {
             Ok(page) if !page.entries.is_empty() => Ok(Some(page.version.fingerprint())),
             Ok(_) => Ok(None),
             Err(_) => Err(()),

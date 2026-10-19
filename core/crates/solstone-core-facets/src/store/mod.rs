@@ -41,8 +41,9 @@ pub use activity_records::{
     anticipation_batch_matches_prompt, append_activity_record, append_activity_record_checked,
     append_edit, get_activity_record, hold_activity_enrichment, list_activity_day_stems,
     load_activity_records, prepare_anticipation_batch, publish_anticipation_batch,
-    publish_anticipation_batch_checked, set_activity_hidden, set_activity_hidden_checked,
-    update_activity_record, update_activity_record_checked, update_activity_record_with,
+    publish_anticipation_batch_checked, read_activity_records_strict, set_activity_hidden,
+    set_activity_hidden_checked, update_activity_record, update_activity_record_checked,
+    update_activity_record_with,
 };
 pub use awareness::{
     AwarenessStoreError, append_log, load_current, load_imports, read_log, record_import,

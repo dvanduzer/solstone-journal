@@ -57,6 +57,14 @@ const ENTITIES: ToolRequirement = ToolRequirement {
     read: &[AdmittedCategory::Entities],
     whole_journal: false,
 };
+const FACETS: ToolRequirement = ToolRequirement {
+    read: &[AdmittedCategory::Facets],
+    whole_journal: false,
+};
+const FACETS_AND_TRANSCRIPTS: ToolRequirement = ToolRequirement {
+    read: &[AdmittedCategory::Facets, AdmittedCategory::Transcripts],
+    whole_journal: false,
+};
 const WEEK: ToolRequirement = ToolRequirement {
     read: &[AdmittedCategory::Transcripts, AdmittedCategory::Facets],
     whole_journal: true,
@@ -149,10 +157,28 @@ pub(crate) const TOOLS: &[ToolEntry] = &[
         tool_name: crate::jsonrpc::ToolName::GetWeek,
         wire_name: "get_week",
         title: "read a week",
-        description: "read one week. memories are generated and are not the owner's words. quotes are the owner's words. each day state describes that day's memory. leaving an entry off the week page leaves that source visible to the other tools. pass week as the sunday it starts, YYYYMMDD, or omit it for the newest week.",
+        description: "read one week. memories are derived from activities and are not the owner's words. quotes are the owner's words. each day state describes that day's memory. leaving an entry off the week page leaves that source visible to the other tools. pass week as the sunday it starts, YYYYMMDD, or omit it for the week containing today.",
         input_schema: week_input_schema,
         requires: WEEK,
         audit_name: solstone_core_mcp_audit::ToolName::GetWeek,
+    },
+    ToolEntry {
+        tool_name: crate::jsonrpc::ToolName::ListActivities,
+        wire_name: "list_activities",
+        title: "list activities",
+        description: "List journal activities for one day or an inclusive range across granted facets. When more remain, pass next_cursor as cursor to continue. Call get_activity_sources to read the verbatim transcript segments an activity spans.",
+        input_schema: list_activities_input_schema,
+        requires: FACETS,
+        audit_name: solstone_core_mcp_audit::ToolName::ListActivities,
+    },
+    ToolEntry {
+        tool_name: crate::jsonrpc::ToolName::GetActivitySources,
+        wire_name: "get_activity_sources",
+        title: "read activity sources",
+        description: "Read the verbatim transcript segments an activity spans. Pass the activity reference returned by list_activities or fetch. When more remain, pass next_cursor as cursor to continue.",
+        input_schema: get_activity_sources_input_schema,
+        requires: FACETS_AND_TRANSCRIPTS,
+        audit_name: solstone_core_mcp_audit::ToolName::GetActivitySources,
     },
 ];
 
@@ -585,8 +611,36 @@ fn week_input_schema(_context: &SchemaContext<'_>) -> Value {
             "week": {
                 "type": "string",
                 "pattern": "^[0-9]{8}$",
-                "description": "the sunday a week starts, as YYYYMMDD. omit it to read the newest week.",
+                "description": "the sunday a week starts, as YYYYMMDD. omit it to read the week containing today.",
             }
+        }
+    })
+}
+
+fn list_activities_input_schema(context: &SchemaContext<'_>) -> Value {
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "day": { "type": "string", "minLength": 1, "maxLength": MAX_DAY_BYTES, "pattern": DAY_PATTERN, "description": "A single day, YYYYMMDD or YYYY-MM-DD. Mutually exclusive with from and to." },
+            "from": { "type": "string", "minLength": 1, "maxLength": MAX_DAY_BYTES, "pattern": DAY_PATTERN, "description": "Start of date range, YYYYMMDD or YYYY-MM-DD (inclusive)." },
+            "to": { "type": "string", "minLength": 1, "maxLength": MAX_DAY_BYTES, "pattern": DAY_PATTERN, "description": "End of date range, YYYYMMDD or YYYY-MM-DD (inclusive)." },
+            "entity": { "type": "string", "description": "Filter by entity display name or opaque entity reference." },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Maximum number of activities to return (default 10, max 100)." },
+            "cursor": { "type": "string", "minLength": 1, "maxLength": MAX_OPAQUE_REFERENCE_BYTES, "description": "Opaque cursor from a previous list_activities call." },
+        }
+    });
+    with_scoped_facet(schema, context)
+}
+
+fn get_activity_sources_input_schema(_context: &SchemaContext<'_>) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["reference"],
+        "properties": {
+            "reference": { "type": "string", "minLength": 1, "maxLength": MAX_OPAQUE_REFERENCE_BYTES, "description": "Opaque activity reference." },
+            "cursor": { "type": "string", "minLength": 1, "maxLength": MAX_OPAQUE_REFERENCE_BYTES, "description": "Opaque cursor from a previous get_activity_sources call." },
         }
     })
 }

@@ -140,9 +140,14 @@ pub fn read_segment_transcript_page(
     journal_root: &Path,
     segment: &Segment,
     cursor: Option<&SegmentTranscriptCursor>,
+    resolve_speakers: bool,
 ) -> Result<SegmentTranscriptPage, SegmentTranscriptReadError> {
     let files = transcript_files(segment.path())?;
-    let labels = local_speaker_names(segment.path(), journal_root);
+    let labels = if resolve_speakers {
+        local_speaker_names(segment.path(), journal_root)
+    } else {
+        None
+    };
     let version = source_version(&files, &labels)?;
     let untimed = files
         .iter()
@@ -236,15 +241,21 @@ pub fn read_segment_transcript_page(
 }
 
 fn transcript_files(segment: &Path) -> Result<Vec<PathBuf>, SegmentTranscriptReadError> {
-    let mut files = fs::read_dir(segment)
-        .map_err(|_| SegmentTranscriptReadError::Io)?
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let path = entry.path();
-            let name = path.file_name()?.to_str()?;
-            (path.is_file() && is_transcript_name(name)).then_some(path)
-        })
-        .collect::<Vec<_>>();
+    let mut files = Vec::new();
+    for entry in fs::read_dir(segment).map_err(|_| SegmentTranscriptReadError::Io)? {
+        let entry = entry.map_err(|_| SegmentTranscriptReadError::Io)?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if is_transcript_name(name) {
+            let meta = fs::symlink_metadata(&path).map_err(|_| SegmentTranscriptReadError::Io)?;
+            if !meta.file_type().is_file() {
+                return Err(SegmentTranscriptReadError::Io);
+            }
+            files.push(path);
+        }
+    }
     files.sort();
     Ok(files)
 }
@@ -332,11 +343,12 @@ fn read_window(
     path: &Path,
     offset: u64,
 ) -> Result<(Vec<u8>, usize, bool), SegmentTranscriptReadError> {
+    let meta = fs::symlink_metadata(path).map_err(|_| SegmentTranscriptReadError::Io)?;
+    if !meta.file_type().is_file() {
+        return Err(SegmentTranscriptReadError::Io);
+    }
     let mut file = File::open(path).map_err(|_| SegmentTranscriptReadError::Io)?;
-    let length = file
-        .metadata()
-        .map_err(|_| SegmentTranscriptReadError::Io)?
-        .len();
+    let length = meta.len();
     if offset > length {
         return Err(SegmentTranscriptReadError::Changed);
     }
@@ -502,7 +514,7 @@ mod tests {
             .pop()
             .unwrap();
 
-        let first = read_segment_transcript_page(root.path(), &segment, None).unwrap();
+        let first = read_segment_transcript_page(root.path(), &segment, None, false).unwrap();
         assert!(!first.entries.is_empty());
         assert!(
             first
@@ -538,7 +550,7 @@ mod tests {
             .pop()
             .unwrap();
 
-        let page = read_segment_transcript_page(root.path(), &segment, None).unwrap();
+        let page = read_segment_transcript_page(root.path(), &segment, None, false).unwrap();
         assert_eq!(
             page.entries,
             vec![
@@ -589,25 +601,25 @@ mod tests {
 
         // Verify import.audio page
         let seg = segments.iter().find(|s| s.path() == seg_audio).unwrap();
-        let page = read_segment_transcript_page(root.path(), seg, None).unwrap();
+        let page = read_segment_transcript_page(root.path(), seg, None, false).unwrap();
         assert_eq!(page.entries.len(), 1);
         assert_eq!(page.entries[0].text, "[00:00:02] spoken words");
 
         // Verify custom _audio.jsonl page
         let seg = segments.iter().find(|s| s.path() == seg_custom).unwrap();
-        let page = read_segment_transcript_page(root.path(), seg, None).unwrap();
+        let page = read_segment_transcript_page(root.path(), seg, None, false).unwrap();
         assert_eq!(page.entries.len(), 1);
         assert_eq!(page.entries[0].text, "[00:00:02] spoken words");
 
         // Verify import.chatgpt page
         let seg = segments.iter().find(|s| s.path() == seg_chatgpt).unwrap();
-        let page = read_segment_transcript_page(root.path(), seg, None).unwrap();
+        let page = read_segment_transcript_page(root.path(), seg, None, false).unwrap();
         assert_eq!(page.entries.len(), 1);
         assert_eq!(page.entries[0].text, "[00:00:00] **Ana Lima:** Hello all.");
 
         // Verify import.text page
         let seg = segments.iter().find(|s| s.path() == seg_text).unwrap();
-        let page = read_segment_transcript_page(root.path(), seg, None).unwrap();
+        let page = read_segment_transcript_page(root.path(), seg, None, false).unwrap();
         assert_eq!(page.entries.len(), 1);
         assert_eq!(page.entries[0].text, "[00:00:00] **Ana Lima:** Hello all.");
 
@@ -644,7 +656,7 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap();
-        let page = read_segment_transcript_page(root.path(), &segment, None).unwrap();
+        let page = read_segment_transcript_page(root.path(), &segment, None, false).unwrap();
         assert_eq!(page.entries.len(), 1, "{:?}", page.entries);
         assert!(page.entries[0].text.contains("send the deck on friday"));
         assert!(
@@ -675,14 +687,14 @@ mod tests {
             .pop()
             .unwrap();
 
-        let first = read_segment_transcript_page(root.path(), &segment, None).unwrap();
+        let first = read_segment_transcript_page(root.path(), &segment, None, false).unwrap();
         assert!(first.untimed);
         assert_eq!(first.entries.len(), MAX_TRANSCRIPT_PAGE_ITEMS);
         assert_eq!(first.entries[0].text, "[00:00:00] **User:** turn 1");
         assert!(first.next.is_some());
 
         let second =
-            read_segment_transcript_page(root.path(), &segment, first.next.as_ref()).unwrap();
+            read_segment_transcript_page(root.path(), &segment, first.next.as_ref(), false).unwrap();
         assert!(second.untimed);
         assert_eq!(second.entries.len(), 10);
         assert_eq!(second.entries[0].text, "[00:00:00] **User:** turn 101");
@@ -712,7 +724,7 @@ mod tests {
         let pages = segments
             .iter()
             .map(|segment| {
-                read_segment_transcript_page(root.path(), segment, None)
+                read_segment_transcript_page(root.path(), segment, None, false)
                     .unwrap()
                     .entries
             })
@@ -740,7 +752,7 @@ mod tests {
             .pop()
             .unwrap();
 
-        let first = read_segment_transcript_page(root.path(), &segment, None).unwrap();
+        let first = read_segment_transcript_page(root.path(), &segment, None, false).unwrap();
         assert_eq!(first.entries.len(), MAX_TRANSCRIPT_PAGE_ITEMS);
         assert_eq!(first.entries[0].text, "line 1");
         assert_eq!(
@@ -749,7 +761,7 @@ mod tests {
         );
 
         let second =
-            read_segment_transcript_page(root.path(), &segment, first.next.as_ref()).unwrap();
+            read_segment_transcript_page(root.path(), &segment, first.next.as_ref(), false).unwrap();
         assert_eq!(
             second
                 .entries
@@ -821,11 +833,11 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap();
-        let first = read_segment_transcript_page(root.path(), &segment, None).unwrap();
+        let first = read_segment_transcript_page(root.path(), &segment, None, true).unwrap();
         assert_eq!(first.entries[0].text, "[00:00:01] (mic) Bea: sentence 1");
         assert_eq!(first.entries[99].text, "[00:00:01] (mic) Ada: sentence 100");
         let second =
-            read_segment_transcript_page(root.path(), &segment, first.next.as_ref()).unwrap();
+            read_segment_transcript_page(root.path(), &segment, first.next.as_ref(), true).unwrap();
         assert_eq!(
             second
                 .entries
@@ -846,7 +858,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            read_segment_transcript_page(root.path(), &segment, first.next.as_ref()),
+            read_segment_transcript_page(root.path(), &segment, first.next.as_ref(), true),
             Err(super::SegmentTranscriptReadError::Changed)
         ));
     }
@@ -872,7 +884,7 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap();
-        let read = || read_segment_transcript_page(root.path(), &segment, None).unwrap();
+        let read = || read_segment_transcript_page(root.path(), &segment, None, true).unwrap();
         let named = read();
         assert_eq!(named.entries[0].text, "[00:00:01] Ada: sentence 1");
         for id in 2..=6 {
@@ -945,7 +957,7 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap();
-        let page = read_segment_transcript_page(root.path(), &segment, None).unwrap();
+        let page = read_segment_transcript_page(root.path(), &segment, None, true).unwrap();
         assert_eq!(page.entries[0].text, "[00:00:00] **User:** hello");
     }
 
@@ -986,7 +998,7 @@ mod tests {
             .pop()
             .unwrap();
 
-        let page = read_segment_transcript_page(root.path(), &segment, None).unwrap();
+        let page = read_segment_transcript_page(root.path(), &segment, None, false).unwrap();
         assert_eq!(page.entries.len(), 2);
 
         let flagged_entry = &page.entries[0].text;

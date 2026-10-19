@@ -785,16 +785,18 @@ mod tests {
         // 🔴 The recursion guard as a property rather than a comment: no
         // registry row names this surface, and the dispatcher only ever
         // executes a row's own validated tool.
+        const DENYLIST: &[&str] = &["list_activity", "read_activity", "get_agent_interaction"];
         for entry in crate::registry::TOOLS {
             assert!(
-                !entry.wire_name.contains("activity"),
+                !DENYLIST.contains(&entry.wire_name),
                 "{} names the owner activity surface",
                 entry.wire_name
             );
         }
-        assert_eq!(crate::registry::TOOLS.len(), 10);
+        assert_eq!(crate::registry::TOOLS.len(), 12);
         assert!(crate::registry::tool_by_wire_name("get_week").is_some());
         assert!(crate::registry::tool_by_wire_name("list_activity").is_none());
+        assert!(crate::registry::tool_by_wire_name("read_activity").is_none());
         assert!(crate::registry::tool_by_wire_name("get_agent_interaction").is_none());
     }
 }

@@ -21,6 +21,7 @@ pub(crate) struct AdmittedActivity {
     pub hidden: bool,
     pub proof: String,
     pub record: Map<String, Value>,
+    pub record_identity: String,
 }
 
 pub(crate) enum ActivityAdmit {
@@ -47,6 +48,7 @@ pub(crate) fn admit_activity(
     candidate: Option<&str>,
     required_proof: Option<&str>,
     require_binding: bool,
+    record_identity: Option<&str>,
     max_bytes: u64,
 ) -> Result<ActivityAdmit, IndexAccessError> {
     pause_activity_read_seam();
@@ -96,16 +98,30 @@ pub(crate) fn admit_activity(
             cursor_proof: Some(proof),
         });
     };
-    let Some(record) = kept_record(&text, idx) else {
-        return Ok(ActivityAdmit::Withheld {
-            cursor_proof: Some(proof),
-        });
+    let (record, rec_identity) = if require_binding {
+        let Some(target_id) = record_identity else {
+            return Ok(ActivityAdmit::Withheld { cursor_proof: None });
+        };
+        let Some(pair) = record_by_identity(&text, target_id) else {
+            return Ok(ActivityAdmit::Withheld {
+                cursor_proof: Some(proof),
+            });
+        };
+        pair
+    } else {
+        let Some(pair) = kept_record_and_identity(&text, idx) else {
+            return Ok(ActivityAdmit::Withheld {
+                cursor_proof: Some(proof),
+            });
+        };
+        pair
     };
     Ok(ActivityAdmit::Admitted(AdmittedActivity {
         text: observation.content,
         hidden: observation.hidden,
         proof,
         record,
+        record_identity: rec_identity,
     }))
 }
 
@@ -151,7 +167,17 @@ fn observation_matches(observation: &ActivityObservation, candidate: &str, proof
     observation.content == candidate && hex_encode(&observation.digest) == proof
 }
 
-fn kept_record(text: &str, idx: i64) -> Option<Map<String, Value>> {
+pub(crate) fn compute_record_identity(record: &Map<String, Value>, trimmed_line: &str) -> String {
+    if let Some(id) = record.get("id").and_then(Value::as_str) {
+        let trimmed = id.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_owned();
+        }
+    }
+    hex_encode(&Sha256::digest(trimmed_line.as_bytes()))
+}
+
+fn kept_record_and_identity(text: &str, idx: i64) -> Option<(Map<String, Value>, String)> {
     let index = usize::try_from(idx).ok()?;
     let mut kept = Vec::new();
     for line in text.lines() {
@@ -160,23 +186,59 @@ fn kept_record(text: &str, idx: i64) -> Option<Map<String, Value>> {
             continue;
         }
         match serde_json::from_str::<Value>(trimmed) {
-            Ok(Value::Object(record)) => kept.push(record),
+            Ok(Value::Object(record)) => {
+                let identity = compute_record_identity(&record, trimmed);
+                kept.push((record, identity));
+            }
             _ => return None,
         }
     }
     kept.into_iter().nth(index)
 }
 
-fn read_contained_source(journal_root: &Path, rel: &str) -> Option<Vec<u8>> {
-    let root = JournalRoot::open(journal_root).ok()?;
-    let maximum = usize::try_from(ACTIVITY_SOURCE_BUDGET).ok()?;
-    match read_relative_file_bounded(&root, Path::new(rel), maximum) {
-        Ok(Some(observation)) => Some(observation.bytes),
-        Ok(None) | Err(_) => None,
+pub(crate) fn record_by_identity(
+    text: &str,
+    target_identity: &str,
+) -> Option<(Map<String, Value>, String)> {
+    let mut matched = None;
+    let mut count = 0;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Value>(trimmed) {
+            Ok(Value::Object(record)) => {
+                let identity = compute_record_identity(&record, trimmed);
+                if identity == target_identity {
+                    matched = Some((record, identity));
+                    count += 1;
+                }
+            }
+            _ => return None,
+        }
     }
+    if count == 1 { matched } else { None }
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn read_contained_source(journal_root: &Path, rel: &str) -> Option<Vec<u8>> {
+    let root = JournalRoot::open(journal_root).ok()?;
+    let maximum = usize::try_from(ACTIVITY_SOURCE_BUDGET).ok()?;
+    if let Ok(Some(observation)) = read_relative_file_bounded(&root, Path::new(rel), maximum) {
+        return Some(observation.bytes);
+    }
+    if !rel.starts_with("chronicle/") {
+        let chronicle_rel = format!("chronicle/{rel}");
+        if let Ok(Some(observation)) =
+            read_relative_file_bounded(&root, Path::new(&chronicle_rel), maximum)
+        {
+            return Some(observation.bytes);
+        }
+    }
+    None
+}
+
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len() * 2);
     for byte in bytes {

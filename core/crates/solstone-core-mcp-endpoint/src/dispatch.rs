@@ -89,7 +89,7 @@ pub(crate) struct Prepared {
 }
 
 impl Prepared {
-    fn new(value: Value, count: usize, targets: Vec<String>) -> Self {
+    pub(crate) fn new(value: Value, count: usize, targets: Vec<String>) -> Self {
         Self {
             value,
             count,
@@ -101,7 +101,7 @@ impl Prepared {
     /// Attach the plain-words reading of an empty result. Ignored when the
     /// result is not empty, so a caller cannot tell an agent "nothing" about
     /// a response that carries something.
-    fn when_empty(mut self, note: impl Into<String>) -> Self {
+    pub(crate) fn when_empty(mut self, note: impl Into<String>) -> Self {
         if self.count == 0 {
             self.empty_note = Some(note.into());
         }
@@ -187,7 +187,7 @@ pub(crate) fn dispatch_authenticated_tool_call(
     // ⚠ Validation precedes admission, unchanged: malformed protocol traffic
     // stays outside the per-agent tool trail, and only a syntactically valid
     // known tool call earns a record.
-    let validated = validate(entry, arguments)?;
+    let validated = validate(journal_root, entry, arguments)?;
     let recorded = recorded_arguments(&validated);
 
     let snapshot = match evaluate_connection_read(journal_root, principal.connection) {
@@ -462,6 +462,32 @@ fn recorded_arguments(validated: &ValidatedTool) -> Map<String, Value> {
         ValidatedTool::GetWeek(request) => {
             insert_present(&mut arguments, "week", request.week.as_deref());
         }
+        ValidatedTool::ListActivities(request) => {
+            arguments.insert("limit".to_owned(), request.limit.into());
+            insert_present(&mut arguments, "day", request.day.as_deref());
+            arguments.insert("from".to_owned(), request.from.clone().into());
+            arguments.insert("to".to_owned(), request.to.clone().into());
+            insert_present(&mut arguments, "facet", request.facet.as_deref());
+            if let Some(entity) = request.entity.as_deref() {
+                if crate::references::is_framed_entity_token(entity) {
+                    arguments.insert("entity".to_owned(), reference_fingerprint(entity).into());
+                } else {
+                    arguments.insert("entity".to_owned(), entity.into());
+                }
+            }
+            if let Some(cursor) = request.cursor.as_deref() {
+                arguments.insert("cursor".to_owned(), reference_fingerprint(cursor).into());
+            }
+        }
+        ValidatedTool::GetActivitySources(request) => {
+            arguments.insert(
+                "reference".to_owned(),
+                reference_fingerprint(&request.reference).into(),
+            );
+            if let Some(cursor) = request.cursor.as_deref() {
+                arguments.insert("cursor".to_owned(), reference_fingerprint(cursor).into());
+            }
+        }
     }
     arguments
 }
@@ -494,7 +520,11 @@ pub(crate) fn permission_generation_is_current(
     )
 }
 
-fn validate(entry: &ToolEntry, arguments: Option<&Value>) -> Result<ValidatedTool, DispatchError> {
+fn validate(
+    journal_root: &Path,
+    entry: &ToolEntry,
+    arguments: Option<&Value>,
+) -> Result<ValidatedTool, DispatchError> {
     let validated = match entry.tool_name {
         crate::jsonrpc::ToolName::ListFacets => {
             crate::tools::facets::validate(arguments).map(ValidatedTool::ListFacets)
@@ -519,6 +549,15 @@ fn validate(entry: &ToolEntry, arguments: Option<&Value>) -> Result<ValidatedToo
         }
         crate::jsonrpc::ToolName::GetWeek => {
             crate::tools::week::validate(arguments).map(ValidatedTool::GetWeek)
+        }
+        crate::jsonrpc::ToolName::ListActivities => {
+            let owner_zone = solstone_core_journal_config::owner_zone(journal_root);
+            crate::tools::activities::validate_list(arguments, &owner_zone)
+                .map(ValidatedTool::ListActivities)
+        }
+        crate::jsonrpc::ToolName::GetActivitySources => {
+            crate::tools::activities::validate_get_sources(arguments)
+                .map(ValidatedTool::GetActivitySources)
         }
         crate::jsonrpc::ToolName::SaveMemory | crate::jsonrpc::ToolName::RecallMemory => {
             return Err(DispatchError::InvalidInput);
@@ -580,9 +619,19 @@ fn audit_permission_snapshot(
     }
 }
 
-fn get_week(journal_root: &Path, request: ValidatedGetWeek) -> Result<Prepared, DispatchError> {
-    let read = crate::tools::week::read_week(journal_root, request.week.as_deref())
-        .map_err(DispatchError::Tool)?;
+fn get_week(
+    journal_root: &Path,
+    principal: DispatchPrincipal<'_>,
+    snapshot: &ConnectionReadSnapshot,
+    request: ValidatedGetWeek,
+) -> Result<Prepared, DispatchError> {
+    let read = crate::tools::week::read_week(
+        journal_root,
+        request.week.as_deref(),
+        principal,
+        snapshot,
+    )
+    .map_err(DispatchError::Tool)?;
     Ok(Prepared::new(read.value, read.count, read.targets)
         .when_empty("no week to read. this is a complete answer, not an error."))
 }
@@ -597,6 +646,12 @@ fn execute_validated(
         ValidatedTool::ListFacets(request) => {
             list_facets(journal_root, principal, snapshot, request)
         }
+        ValidatedTool::ListActivities(request) => {
+            crate::tools::activities::execute_list(journal_root, principal, snapshot, request)
+        }
+        ValidatedTool::GetActivitySources(request) => {
+            crate::tools::activities::execute_get_sources(journal_root, principal, snapshot, request)
+        }
         ValidatedTool::Search(request) => search(journal_root, principal, snapshot, request),
         ValidatedTool::Fetch(request) => fetch(journal_root, principal, snapshot, request),
         ValidatedTool::ListTranscripts(request) => {
@@ -609,7 +664,7 @@ fn execute_validated(
             list_entities(journal_root, principal, snapshot, request)
         }
         ValidatedTool::GetEntity(request) => get_entity(journal_root, principal, snapshot, request),
-        ValidatedTool::GetWeek(request) => get_week(journal_root, request),
+        ValidatedTool::GetWeek(request) => get_week(journal_root, principal, snapshot, request),
     }
 }
 
@@ -651,7 +706,7 @@ pub(crate) fn boundary(
         .expect("closed admitted categories construct a boundary")
 }
 
-fn live_allows(
+pub(crate) fn live_allows(
     journal_root: &Path,
     boundary: &ConnectionBoundary,
     path: &str,
@@ -683,7 +738,7 @@ fn is_plain_literal_query(query: &str) -> bool {
     true
 }
 
-fn fold_literal(text: &str) -> String {
+pub(crate) fn fold_literal(text: &str) -> String {
     let trimmed = text.trim();
     let mut result = String::with_capacity(trimmed.len());
     let mut in_whitespace = false;
@@ -1173,7 +1228,7 @@ fn search(
                 live_dropped = true;
                 continue;
             }
-            let (served_text, activity_proof, hidden, record) = match admit_activity(
+            let (served_text, activity_proof, hidden, record, record_identity) = match admit_activity(
                 journal_root,
                 &boundary,
                 &hit.metadata.path,
@@ -1182,14 +1237,16 @@ fn search(
                 Some(&hit.text),
                 None,
                 false,
+                None,
                 MAX_INDEXED_ENTRY_BYTES,
             ) {
-                Ok(ActivityAdmit::NotActivity(text)) => (text, None, None, None),
+                Ok(ActivityAdmit::NotActivity(text)) => (text, None, None, None, None),
                 Ok(ActivityAdmit::Admitted(admitted)) => (
                     admitted.text,
                     Some(admitted.proof),
                     Some(admitted.hidden),
                     Some(admitted.record),
+                    Some(admitted.record_identity),
                 ),
                 Ok(ActivityAdmit::Withheld { cursor_proof }) => {
                     if let Some(anchor) = anchor.as_mut() {
@@ -1269,6 +1326,7 @@ fn search(
                         idx: hit.metadata.idx,
                         row_id: hit.row_id,
                         activity_proof,
+                        record_identity,
                     }),
                 )
                 .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?;
@@ -1278,6 +1336,17 @@ fn search(
                 "snippet": snippet(&served_text),
                 "reference": reference,
             });
+            let is_story_activity = record
+                .as_ref()
+                .and_then(|r| r.get("story"))
+                .and_then(|s| s.get("body"))
+                .and_then(Value::as_str)
+                .is_some_and(|b| !b.trim().is_empty());
+            let is_weekly_reflection = hit.metadata.path.starts_with("reflections/weekly/")
+                && hit.metadata.path.ends_with(".md");
+            if is_story_activity || is_weekly_reflection {
+                value["derived"] = Value::Bool(true);
+            }
             if let Some(hidden) = hidden {
                 value["hidden"] = Value::Bool(hidden);
             }
@@ -1454,89 +1523,212 @@ fn fetch(
     snapshot: &ConnectionReadSnapshot,
     request: ValidatedFetch,
 ) -> Result<Prepared, DispatchError> {
-    let ReferenceTarget::Entry(entry) = codec()
-        .resolve(
+    let target = codec()
+        .resolve_entry_or_activity(
             &request.reference,
-            ReferenceKind::Entry,
             principal.connection,
             snapshot.generation,
         )
-        .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?
-    else {
-        return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
-    };
-    let boundary = boundary(snapshot, None, None);
-    if !live_allows(journal_root, &boundary, &entry.path, Some(&entry.stream)) {
-        return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
-    }
-    let (text, hidden, record) = match admit_activity(
-        journal_root,
-        &boundary,
-        &entry.path,
-        entry.idx,
-        entry.row_id,
-        None,
-        entry.activity_proof.as_deref(),
-        true,
-        MAX_INDEXED_ENTRY_BYTES,
-    )
-    .map_err(index_error)?
-    {
-        ActivityAdmit::Admitted(a) => (a.text, Some(a.hidden), Some(a.record)),
-        ActivityAdmit::NotActivity(text) => (text, None, None),
-        ActivityAdmit::Withheld { .. } => {
-            return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
+        .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?;
+    match target {
+        ReferenceTarget::Entry(entry) => {
+            let boundary = boundary(snapshot, None, None);
+            if !live_allows(journal_root, &boundary, &entry.path, Some(&entry.stream)) {
+                return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
+            }
+            let (text, hidden, record) = match admit_activity(
+                journal_root,
+                &boundary,
+                &entry.path,
+                entry.idx,
+                entry.row_id,
+                None,
+                entry.activity_proof.as_deref(),
+                true,
+                entry.record_identity.as_deref(),
+                MAX_INDEXED_ENTRY_BYTES,
+            )
+            .map_err(index_error)?
+            {
+                ActivityAdmit::Admitted(a) => {
+                    let cleaned =
+                        crate::tools::activities::clean_activity_record_for_wire(a.record);
+                    let cleaned_text = serde_json::to_string(&cleaned)
+                        .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?;
+                    (cleaned_text, Some(a.hidden), Some(cleaned))
+                }
+                ActivityAdmit::NotActivity(content) => {
+                    let text = (|| {
+                        if !entry.path.ends_with(".md") {
+                            return None;
+                        }
+                        let bytes = crate::activity_admit::read_contained_source(
+                            journal_root,
+                            &entry.path,
+                        )?;
+                        let full_text = String::from_utf8(bytes).ok()?;
+                        let produced = solstone_core_format::content::produce_chunks(
+                            solstone_core_format::content::Family::Markdown,
+                            &entry.path,
+                            &full_text,
+                        );
+                        let idx_usize = usize::try_from(entry.idx).ok()?;
+                        let chunk = produced.chunks.get(idx_usize)?;
+                        if chunk.content == content {
+                            Some(full_text)
+                        } else {
+                            None
+                        }
+                    })()
+                    .unwrap_or(content);
+                    (text, None, None)
+                }
+                ActivityAdmit::Withheld { .. } => {
+                    return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
+                }
+            };
+            #[cfg(feature = "test-hooks")]
+            crate::source_freeze_barrier::checkpoint(
+                crate::source_freeze_barrier::FreezePoint::Before,
+            );
+            let allowed =
+                crate::source_release::check_indexed_source_release(journal_root, &entry.path);
+            let mut subjects = [LinkSubject {
+                path: &entry.path,
+                idx: entry.idx,
+                text: &text,
+                segments: Vec::new(),
+                more_segments: false,
+                activity_record: record.as_ref(),
+            }];
+            let mut checker = LiveTranscriptPages;
+            let mut response_checks = 0;
+            if allowed {
+                issue_segment_links(
+                    journal_root,
+                    principal,
+                    snapshot,
+                    &mut subjects,
+                    48,
+                    48,
+                    &mut response_checks,
+                    &mut checker,
+                );
+            }
+            #[cfg(feature = "test-hooks")]
+            crate::source_freeze_barrier::checkpoint(
+                crate::source_freeze_barrier::FreezePoint::After,
+            );
+
+            if !allowed {
+                return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
+            }
+
+            let mut value =
+                json!({"title": entry_title(&entry.day), "date": entry.day, "text": text});
+            if let Some(hidden) = hidden {
+                value["hidden"] = Value::Bool(hidden);
+            }
+            if entry.stream.starts_with("agent-memory-") {
+                let origin = memory_hit_origin(journal_root, &entry.path, &entry.stream)
+                    .ok_or(DispatchError::Tool(ToolError::ReferenceNotFound))?;
+                value["origin"] = public_memory_origin(&origin);
+            }
+            if !subjects[0].segments.is_empty() {
+                value["segments"] = Value::Array(subjects[0].segments.clone());
+            }
+            if subjects[0].more_segments {
+                value["more_segments"] = Value::Bool(true);
+            }
+            let target = format!("{}#{}", entry.path, entry.idx);
+            Ok(Prepared::new(value, 1, vec![target]))
         }
-    };
-    #[cfg(feature = "test-hooks")]
-    crate::source_freeze_barrier::checkpoint(crate::source_freeze_barrier::FreezePoint::Before);
-    let allowed = crate::source_release::check_indexed_source_release(journal_root, &entry.path);
-    let mut subjects = [LinkSubject {
-        path: &entry.path,
-        idx: entry.idx,
-        text: &text,
-        segments: Vec::new(),
-        more_segments: false,
-        activity_record: record.as_ref(),
-    }];
-    let mut checker = LiveTranscriptPages;
-    let mut response_checks = 0;
-    if allowed {
-        issue_segment_links(
-            journal_root,
-            principal,
-            snapshot,
-            &mut subjects,
-            48,
-            48,
-            &mut response_checks,
-            &mut checker,
-        );
-    }
-    #[cfg(feature = "test-hooks")]
-    crate::source_freeze_barrier::checkpoint(crate::source_freeze_barrier::FreezePoint::After);
+        ReferenceTarget::Activity(act_ref) => {
+            let rel_path = act_ref.relative_path().map_err(DispatchError::Tool)?;
+            let boundary = boundary(snapshot, None, None);
+            if !live_allows(journal_root, &boundary, &rel_path, None) {
+                return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
+            }
+            let Some(bytes) =
+                crate::activity_admit::read_contained_source(journal_root, &rel_path)
+            else {
+                return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
+            };
+            let file_digest = crate::activity_admit::hex_encode(&Sha256::digest(&bytes));
+            if file_digest != act_ref.file_digest {
+                return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
+            }
+            let Ok(file_text) = String::from_utf8(bytes) else {
+                return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
+            };
+            let Some((record, _)) = crate::activity_admit::record_by_identity(
+                &file_text,
+                &act_ref.record_identity,
+            ) else {
+                return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
+            };
 
-    if !allowed {
-        return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
-    }
+            let hidden = record.get("hidden").and_then(Value::as_bool).unwrap_or(false);
+            let cleaned = crate::tools::activities::clean_activity_record_for_wire(record);
+            let text = serde_json::to_string(&cleaned)
+                .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?;
 
-    let mut value = json!({"title": entry_title(&entry.day), "date": entry.day, "text": text});
-    if let Some(hidden) = hidden {
-        value["hidden"] = Value::Bool(hidden);
+            #[cfg(feature = "test-hooks")]
+            crate::source_freeze_barrier::checkpoint(
+                crate::source_freeze_barrier::FreezePoint::Before,
+            );
+            let allowed =
+                crate::source_release::check_indexed_source_release(journal_root, &rel_path);
+            let mut subjects = [LinkSubject {
+                path: &rel_path,
+                idx: 0,
+                text: &text,
+                segments: Vec::new(),
+                more_segments: false,
+                activity_record: Some(&cleaned),
+            }];
+            let mut checker = LiveTranscriptPages;
+            let mut response_checks = 0;
+            if allowed {
+                issue_segment_links(
+                    journal_root,
+                    principal,
+                    snapshot,
+                    &mut subjects,
+                    48,
+                    48,
+                    &mut response_checks,
+                    &mut checker,
+                );
+            }
+            #[cfg(feature = "test-hooks")]
+            crate::source_freeze_barrier::checkpoint(
+                crate::source_freeze_barrier::FreezePoint::After,
+            );
+
+            if !allowed {
+                return Err(DispatchError::Tool(ToolError::ReferenceNotFound));
+            }
+
+            let mut value = json!({
+                "title": entry_title(&act_ref.day),
+                "date": act_ref.day,
+                "text": text,
+            });
+            if hidden {
+                value["hidden"] = Value::Bool(true);
+            }
+            if !subjects[0].segments.is_empty() {
+                value["segments"] = Value::Array(subjects[0].segments.clone());
+            }
+            if subjects[0].more_segments {
+                value["more_segments"] = Value::Bool(true);
+            }
+            let target = format!("{rel_path}#{}", act_ref.record_identity);
+            Ok(Prepared::new(value, 1, vec![target]))
+        }
+        _ => Err(DispatchError::Tool(ToolError::ReferenceNotFound)),
     }
-    if entry.stream.starts_with("agent-memory-") {
-        let origin = memory_hit_origin(journal_root, &entry.path, &entry.stream)
-            .ok_or(DispatchError::Tool(ToolError::ReferenceNotFound))?;
-        value["origin"] = public_memory_origin(&origin);
-    }
-    if !subjects[0].segments.is_empty() {
-        value["segments"] = Value::Array(subjects[0].segments.clone());
-    }
-    if subjects[0].more_segments {
-        value["more_segments"] = Value::Bool(true);
-    }
-    let target = format!("{}#{}", entry.path, entry.idx);
-    Ok(Prepared::new(value, 1, vec![target]))
 }
 
 fn memory_hit_origin(journal_root: &Path, path: &str, stream: &str) -> Option<Origin> {
@@ -1673,7 +1865,7 @@ fn list_facets(
     Ok(Prepared::new(response_val, count, targets).when_empty(LIST_FACETS_EMPTY))
 }
 
-fn read_scoped_entities(
+pub(crate) fn read_scoped_entities(
     journal_root: &Path,
     facet_dir: &str,
 ) -> Result<Vec<solstone_core_facets::ScopedFacetEntity>, DispatchError> {
@@ -2073,6 +2265,7 @@ fn list_transcripts(
                     journal_root,
                     &segment,
                     None,
+                    true,
                 ))
             } else {
                 None
@@ -2272,6 +2465,7 @@ fn get_transcript(
             journal_root,
             &segment,
             continuation.as_ref(),
+            true,
         ))
     } else {
         None
@@ -2424,7 +2618,7 @@ pub(crate) fn available_facets(
     Ok(facets)
 }
 
-fn entity_name(identity: &Value) -> String {
+pub(crate) fn entity_name(identity: &Value) -> String {
     identity
         .get("name")
         .or_else(|| identity.get("display_name"))
@@ -2433,7 +2627,7 @@ fn entity_name(identity: &Value) -> String {
         .to_owned()
 }
 
-fn scope_ids(scope: &ConnectionScope) -> Vec<String> {
+pub(crate) fn scope_ids(scope: &ConnectionScope) -> Vec<String> {
     match scope {
         ConnectionScope::WholeJournal => Vec::new(),
         ConnectionScope::ChosenFacets { ids } => ids.iter().cloned().collect(),

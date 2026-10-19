@@ -27,6 +27,8 @@ pub(crate) enum ReferenceKind {
     TranscriptList,
     FacetList,
     EntityList,
+    Activity,
+    ActivityList,
 }
 
 impl ReferenceKind {
@@ -40,6 +42,8 @@ impl ReferenceKind {
             Self::TranscriptList => 6,
             Self::FacetList => 7,
             Self::EntityList => 8,
+            Self::Activity => 9,
+            Self::ActivityList => 10,
         }
     }
 
@@ -53,6 +57,8 @@ impl ReferenceKind {
             6 => Some(Self::TranscriptList),
             7 => Some(Self::FacetList),
             8 => Some(Self::EntityList),
+            9 => Some(Self::Activity),
+            10 => Some(Self::ActivityList),
             _ => None,
         }
     }
@@ -68,6 +74,8 @@ pub(crate) struct EntryReference {
     /// File digest bound into an activity reference. Absent for every other entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity_proof: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_identity: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -149,6 +157,57 @@ pub(crate) struct EntityListCursor {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct ActivityReference {
+    pub facet_id: String,
+    pub facet_dir: String,
+    pub day: String,
+    pub record_identity: String,
+    pub file_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_index: Option<usize>,
+}
+
+impl ActivityReference {
+    pub(crate) fn relative_path(&self) -> Result<String, crate::tools::ToolError> {
+        activity_relative_path(&self.facet_dir, &self.day)
+    }
+}
+
+pub(crate) fn activity_relative_path(
+    facet_dir: &str,
+    day: &str,
+) -> Result<String, crate::tools::ToolError> {
+    if facet_dir.is_empty()
+        || facet_dir == "."
+        || facet_dir == ".."
+        || facet_dir.contains('/')
+        || facet_dir.contains('\\')
+        || !solstone_core_journal_io::is_day_key(day)
+    {
+        return Err(crate::tools::ToolError::ReferenceNotFound);
+    }
+    Ok(format!("facets/{facet_dir}/activities/{day}.jsonl"))
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct ActivityListCursor {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub day: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub facet: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity: Option<String>,
+    pub last_day: String,
+    pub last_facet: String,
+    pub last_created_at: i64,
+    pub last_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "target", rename_all = "snake_case")]
 pub(crate) enum ReferenceTarget {
     Entry(EntryReference),
@@ -159,6 +218,8 @@ pub(crate) enum ReferenceTarget {
     TranscriptList(TranscriptListCursor),
     FacetList(FacetListCursor),
     EntityList(EntityListCursor),
+    Activity(ActivityReference),
+    ActivityList(ActivityListCursor),
 }
 
 impl ReferenceTarget {
@@ -172,7 +233,19 @@ impl ReferenceTarget {
             Self::TranscriptList(_) => ReferenceKind::TranscriptList,
             Self::FacetList(_) => ReferenceKind::FacetList,
             Self::EntityList(_) => ReferenceKind::EntityList,
+            Self::Activity(_) => ReferenceKind::Activity,
+            Self::ActivityList(_) => ReferenceKind::ActivityList,
         }
+    }
+}
+
+pub(crate) fn is_framed_entity_token(value: &str) -> bool {
+    if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(value) {
+        bytes.len() >= 2 + NONCE_BYTES + 16 + HMAC_BYTES
+            && bytes[0] == TOKEN_VERSION
+            && bytes[1] == ReferenceKind::Entity.tag()
+    } else {
+        false
     }
 }
 
@@ -301,6 +374,27 @@ impl ReferenceCodec {
         }
         Ok(bound.target)
     }
+
+    pub(crate) fn resolve_entry_or_activity(
+        &self,
+        value: &str,
+        connection: &str,
+        generation: u64,
+    ) -> Result<ReferenceTarget, ReferenceError> {
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(value)
+            .map_err(|_| ReferenceError::NotFound)?;
+        if token.len() <= 2 + NONCE_BYTES + HMAC_BYTES || token[0] != TOKEN_VERSION {
+            return Err(ReferenceError::NotFound);
+        }
+        let Some(kind) = ReferenceKind::from_tag(token[1]) else {
+            return Err(ReferenceError::NotFound);
+        };
+        if kind != ReferenceKind::Entry && kind != ReferenceKind::Activity {
+            return Err(ReferenceError::NotFound);
+        }
+        self.resolve(value, kind, connection, generation)
+    }
 }
 
 #[cfg(test)]
@@ -321,6 +415,7 @@ mod tests {
                     idx: 2,
                     row_id: 9,
                     activity_proof: None,
+                    record_identity: None,
                 }),
             )
             .unwrap();
@@ -352,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn reference_kind_tags_roundtrip_1_through_8() {
+    fn reference_kind_tags_roundtrip_1_through_10() {
         for (kind, expected_tag) in [
             (ReferenceKind::Entry, 1),
             (ReferenceKind::Segment, 2),
@@ -362,11 +457,13 @@ mod tests {
             (ReferenceKind::TranscriptList, 6),
             (ReferenceKind::FacetList, 7),
             (ReferenceKind::EntityList, 8),
+            (ReferenceKind::Activity, 9),
+            (ReferenceKind::ActivityList, 10),
         ] {
             assert_eq!(kind.tag(), expected_tag);
             assert_eq!(ReferenceKind::from_tag(expected_tag), Some(kind));
         }
-        for unknown in [0, 9, 255] {
+        for unknown in [0, 11, 255] {
             assert_eq!(ReferenceKind::from_tag(unknown), None);
         }
     }

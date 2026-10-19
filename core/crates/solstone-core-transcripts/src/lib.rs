@@ -2229,7 +2229,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let page = read_segment_transcript_page(root.path(), &native, None).unwrap();
+        let page = read_segment_transcript_page(root.path(), &native, None, false).unwrap();
         let entries = page
             .entries
             .iter()

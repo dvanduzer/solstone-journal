@@ -29,12 +29,14 @@ The endpoint does not implement the stateless `2026-07-28` revision, its
 per-request metadata and header validation, or `server/discover`.
 
 tools are advertised from the connection's current grant. with transcripts,
-entities and facets enabled, the set is `list_facets`, `search`, `fetch`,
-`list_transcripts`, `get_transcript`, `list_entities`, `get_entity`,
-`save_memory` and `recall_memory`. `get_week` is advertised only for a
-whole-journal grant that also has transcripts and facets. chosen facets do not
-see it. an absent or narrower read grant exposes fewer tools. own-memory access
-is described below.
+entities and facets enabled, the set is `list_facets`, `list_activities`,
+`get_activity_sources`, `search`, `fetch`, `list_transcripts`, `get_transcript`,
+`list_entities`, `get_entity`, `save_memory` and `recall_memory`.
+`list_activities` needs facets; an entity reference on it also needs entities.
+`get_activity_sources` needs transcripts and facets. `get_week` is advertised
+only for a whole-journal grant that also has transcripts and facets. chosen
+facets do not see it. an absent or narrower read grant exposes fewer tools.
+own-memory access is described below.
 
 <a id="doors"></a>
 

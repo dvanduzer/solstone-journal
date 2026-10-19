@@ -223,6 +223,24 @@ fn read_rows(path: &Path) -> Result<Vec<ActivityRecord>, ActivityRecordStoreErro
         .collect())
 }
 
+fn read_rows_strict(path: &Path) -> Result<Vec<ActivityRecord>, ActivityRecordStoreError> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = read_text(path, String::new())?;
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let record = serde_json::from_str::<ActivityRecord>(trimmed)
+            .map_err(ActivityRecordStoreError::Json)?;
+        rows.push(record);
+    }
+    Ok(rows)
+}
+
 fn write_rows(path: &Path, rows: &[ActivityRecord]) -> Result<(), ActivityRecordStoreError> {
     let mut bytes = Vec::new();
     for row in rows {
@@ -715,6 +733,15 @@ pub fn load_activity_records(
         .map(normalize)
         .filter(|row| include_hidden || !hidden(row))
         .collect())
+}
+
+pub fn read_activity_records_strict(
+    root: &Path,
+    facet: &str,
+    day: &str,
+) -> Result<Vec<ActivityRecord>, ActivityRecordStoreError> {
+    let rows = read_rows_strict(&day_path(root, facet, day)?)?;
+    Ok(rows.into_iter().map(normalize).collect())
 }
 
 /// Admit a write to an existing declaration, adopting only a historical missing ID.
@@ -1780,5 +1807,37 @@ mod tests {
 
         let missing = list_activity_day_stems(root.path(), "missing").unwrap();
         assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn strict_reader_rejects_malformed_and_non_object_rows() {
+        let root = tempfile::TempDir::new_in("/var/tmp").unwrap();
+        let act_dir = root.path().join("facets/work/activities");
+        std::fs::create_dir_all(&act_dir).unwrap();
+
+        // Missing file returns empty Ok
+        let empty = read_activity_records_strict(root.path(), "work", "20261001").unwrap();
+        assert!(empty.is_empty());
+
+        // Valid rows return parsed and normalized
+        std::fs::write(
+            act_dir.join("20261001.jsonl"),
+            "{\"id\":\"act1\",\"title\":\"Activity One\"}\n\n{\"id\":\"act2\",\"title\":\"Activity Two\"}\n",
+        )
+        .unwrap();
+        let rows = read_activity_records_strict(root.path(), "work", "20261001").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["id"], "act1");
+        assert_eq!(rows[1]["id"], "act2");
+
+        // Malformed JSON syntax returns Json error
+        std::fs::write(act_dir.join("20261002.jsonl"), "{\"id\":\"act1\"\n").unwrap();
+        let err = read_activity_records_strict(root.path(), "work", "20261002").unwrap_err();
+        assert!(matches!(err, ActivityRecordStoreError::Json(_)));
+
+        // Non-object JSON (array) returns Json error
+        std::fs::write(act_dir.join("20261003.jsonl"), "[1, 2, 3]\n").unwrap();
+        let err2 = read_activity_records_strict(root.path(), "work", "20261003").unwrap_err();
+        assert!(matches!(err2, ActivityRecordStoreError::Json(_)));
     }
 }

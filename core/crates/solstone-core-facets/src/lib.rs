@@ -63,6 +63,7 @@ pub use store::{
     load_observations_for_query, load_recent_entity_names, migrate_custom_activity_icons_to_emoji,
     migrate_event_topic_keys, normalize_observation_content, observation_day_counts,
     observation_summary, observe_declared_facet_inventory, observe_facet_declaration,
+    read_activity_records_strict,
     observe_facet_destination, observe_facet_write_identity, parse_observation_file,
     parse_retired_facets, prepare_anticipation_batch, prepare_observation_batch,
     prepare_review_promotion, publish_anticipation_batch, publish_anticipation_batch_checked,

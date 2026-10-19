@@ -3,6 +3,7 @@
 
 //! Closed read-only MCP tool validation and execution.
 
+pub(crate) mod activities;
 pub(crate) mod entities;
 pub(crate) mod facets;
 pub(crate) mod fetch;
@@ -10,6 +11,7 @@ pub(crate) mod search;
 pub(crate) mod transcripts;
 pub(crate) mod week;
 
+pub(crate) use activities::{ValidatedGetActivitySources, ValidatedListActivities};
 pub(crate) use entities::{ValidatedGetEntity, ValidatedListEntities};
 pub(crate) use facets::ValidatedListFacets;
 pub(crate) use fetch::ValidatedFetch;
@@ -65,6 +67,8 @@ pub(crate) enum ValidatedTool {
     ListEntities(ValidatedListEntities),
     GetEntity(ValidatedGetEntity),
     GetWeek(ValidatedGetWeek),
+    ListActivities(ValidatedListActivities),
+    GetActivitySources(ValidatedGetActivitySources),
 }
 
 /// A public-safe reason to reject or fail one read-only tool call.

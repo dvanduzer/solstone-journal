@@ -1,14 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use chrono::Datelike;
+use chrono::{Datelike, NaiveDate, Offset, TimeDelta};
 use serde::Deserialize;
-use serde_json::{Value, json};
-use solstone_core_home::weekly::week_day;
+use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
+use solstone_core_home::weekly::{
+    LeftOut, Said, WeekJudgment, checked_neighbors, format_week_intro, judge, read_left_out,
+    resolve_day_cell_state, week_day,
+};
 
 use super::ToolError;
+use crate::dispatch::{DispatchPrincipal, available_facets, codec};
+use crate::permissions::ConnectionReadSnapshot;
+use crate::references::{ActivityReference, ReferenceTarget};
+use crate::segment_links::{LinkSubject, LiveTranscriptPages, issue_segment_links};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ValidatedGetWeek {
@@ -50,30 +59,28 @@ pub(crate) struct WeekRead {
     pub(crate) targets: Vec<String>,
 }
 
-pub(crate) fn read_week(journal: &Path, week: Option<&str>) -> Result<WeekRead, ToolError> {
-    if let Some(day) = week {
+pub(crate) fn read_week(
+    journal: &Path,
+    week: Option<&str>,
+    principal: DispatchPrincipal<'_>,
+    snapshot: &ConnectionReadSnapshot,
+) -> Result<WeekRead, ToolError> {
+    let sunday_date = if let Some(day) = week {
         let Some(date) = week_day(day) else {
             return Err(ToolError::InvalidInput);
         };
         if date.weekday() != chrono::Weekday::Sun {
             return Ok(empty_week());
         }
-        return project_stem(journal, day);
-    }
+        date
+    } else {
+        let owner_zone = solstone_core_journal_config::owner_zone(journal);
+        let today = chrono::Utc::now().with_timezone(&owner_zone).date_naive();
+        let days_from_sun = today.weekday().num_days_from_sunday();
+        today - TimeDelta::days(days_from_sun as i64)
+    };
 
-    match solstone_core_home::weekly::newest_week_candidate(journal) {
-        solstone_core_home::weekly::WeeklyDirectoryCandidate::Absent
-        | solstone_core_home::weekly::WeeklyDirectoryCandidate::Empty => Ok(empty_week()),
-        solstone_core_home::weekly::WeeklyDirectoryCandidate::Unreadable => {
-            Err(ToolError::FileUnreadable)
-        }
-        solstone_core_home::weekly::WeeklyDirectoryCandidate::Candidate { stem, kind } => {
-            if kind != solstone_core_journal_io::JournalEntryKind::RegularFile {
-                return Err(ToolError::FileUnreadable);
-            }
-            project_stem(journal, &stem)
-        }
-    }
+    project_sunday(journal, sunday_date, principal, snapshot)
 }
 
 fn empty_week() -> WeekRead {
@@ -84,84 +91,339 @@ fn empty_week() -> WeekRead {
     }
 }
 
-fn project_stem(journal: &Path, stem: &str) -> Result<WeekRead, ToolError> {
-    use solstone_core_home::weekly::{
-        LeftOut, Said, WeekJudgment, checked_neighbors, format_week_intro, judge, read_left_out,
-        resolve_day_cell_state,
-    };
+fn project_sunday(
+    journal: &Path,
+    sunday: NaiveDate,
+    principal: DispatchPrincipal<'_>,
+    snapshot: &ConnectionReadSnapshot,
+) -> Result<WeekRead, ToolError> {
+    let start_day = sunday.format("%Y%m%d").to_string();
+    let end_day = (sunday + TimeDelta::days(6)).format("%Y%m%d").to_string();
 
-    let trusted = match judge(journal, stem) {
-        WeekJudgment::Absent | WeekJudgment::CantShow => return Ok(empty_week()),
-        WeekJudgment::CouldntCheck | WeekJudgment::Untrusted => {
-            return Err(ToolError::FileUnreadable);
+    let week_dates: Vec<NaiveDate> = (0..7).map(|d| sunday + TimeDelta::days(d)).collect();
+    let prev_dates: Vec<NaiveDate> = (1..=7).map(|d| sunday - TimeDelta::days(8 - d)).collect();
+
+    let available = available_facets(journal, snapshot).map_err(|_| ToolError::FileUnreadable)?;
+    let facets: Vec<(String, String, String)> = available
+        .into_iter()
+        .map(|(id, dir, decl)| {
+            let title = decl.as_ref().map_or_else(
+                || dir.clone(),
+                |v| if v.title.is_empty() { dir.clone() } else { v.title.clone() },
+            );
+            (id, dir, title)
+        })
+        .collect();
+
+    let mut prior_keys = BTreeSet::new();
+    for date in &prev_dates {
+        let day_str = date.format("%Y%m%d").to_string();
+        for (_, dir, _) in &facets {
+            let rows = solstone_core_facets::read_activity_records_strict(journal, dir, &day_str)
+                .map_err(|_| ToolError::FileUnreadable)?;
+            for row in rows {
+                if row.get("hidden").and_then(Value::as_bool).unwrap_or(false) {
+                    continue;
+                }
+                let k = group_key_for_record(&row);
+                if !k.is_empty() {
+                    prior_keys.insert(k);
+                }
+            }
         }
-        WeekJudgment::Page(trusted) => trusted,
-    };
-    let Said::Entries(said_entries) = &trusted.said else {
-        return Err(ToolError::FileUnreadable);
-    };
-    let left_out_keys = match read_left_out(journal) {
-        LeftOut::Unreadable => return Err(ToolError::FileUnreadable),
-        LeftOut::None => std::collections::BTreeSet::new(),
-        LeftOut::Keys(keys) => keys,
-    };
-    let navigation = checked_neighbors(journal, stem);
-    if navigation.failed {
-        return Err(ToolError::FileUnreadable);
     }
 
-    let memory_by_id = trusted
-        .memories
-        .iter()
-        .map(|memory| (memory.id.as_str(), memory))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let mut days = Vec::with_capacity(trusted.days.len());
+    struct Collected {
+        record: Map<String, Value>,
+        day: String,
+        facet_id: String,
+        facet_dir: String,
+        facet_title: String,
+        file_digest: String,
+        record_identity: String,
+        duration: u64,
+        sort_key: (String, String, i64, String),
+    }
+
+    let mut collected = Vec::new();
+    for date in &week_dates {
+        let day_str = date.format("%Y%m%d").to_string();
+        for (f_id, f_dir, f_title) in &facets {
+            let rel_path = format!("facets/{f_dir}/activities/{day_str}.jsonl");
+            let day_file_bytes =
+                crate::activity_admit::read_contained_source(journal, &rel_path).unwrap_or_default();
+            if day_file_bytes.is_empty() {
+                let rows = solstone_core_facets::read_activity_records_strict(journal, f_dir, &day_str)
+                    .map_err(|_| ToolError::FileUnreadable)?;
+                if !rows.is_empty() {
+                    return Err(ToolError::FileUnreadable);
+                }
+                continue;
+            }
+            let rows = solstone_core_facets::read_activity_records_strict(journal, f_dir, &day_str)
+                .map_err(|_| ToolError::FileUnreadable)?;
+            let file_digest = crate::activity_admit::hex_encode(&Sha256::digest(&day_file_bytes));
+
+            let file_text = String::from_utf8(day_file_bytes)
+                .map_err(|_| ToolError::FileUnreadable)?;
+            let mut line_identities = Vec::new();
+            for line in file_text.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let Ok(Value::Object(rec)) = serde_json::from_str::<Value>(trimmed) else {
+                    return Err(ToolError::FileUnreadable);
+                };
+                line_identities.push(crate::activity_admit::compute_record_identity(&rec, trimmed));
+            }
+            if rows.len() != line_identities.len() {
+                return Err(ToolError::FileUnreadable);
+            }
+
+            for (row, rec_id) in rows.into_iter().zip(line_identities) {
+                if row.get("hidden").and_then(Value::as_bool).unwrap_or(false) {
+                    continue;
+                }
+                let (_, _, dur) = crate::tools::activities::activity_times_and_duration(&row);
+                let sort_key = crate::tools::activities::sort_activity_key(&day_str, f_id, &row);
+                collected.push(Collected {
+                    record: row,
+                    day: day_str.clone(),
+                    facet_id: f_id.clone(),
+                    facet_dir: f_dir.clone(),
+                    facet_title: f_title.clone(),
+                    file_digest: file_digest.clone(),
+                    record_identity: rec_id,
+                    duration: dur.unwrap_or(0),
+                    sort_key,
+                });
+            }
+        }
+    }
+
+    let mut groups: BTreeMap<String, Vec<Collected>> = BTreeMap::new();
+    for item in collected {
+        let k = group_key_for_record(&item.record);
+        groups.entry(k).or_default().push(item);
+    }
+
+    struct GroupRank {
+        representative: Collected,
+        recurrence: usize,
+        duration: u64,
+        participant_count: usize,
+        novelty: u8,
+        earliest_sort_key: (String, String, i64, String),
+    }
+
+    let mut ranked = Vec::new();
+    for (k, mut items) in groups {
+        let distinct_days: BTreeSet<&str> = items.iter().map(|it| it.day.as_str()).collect();
+        let recurrence = distinct_days.len();
+        let duration: u64 = items.iter().map(|it| it.duration).sum();
+        let participant_count = items.iter().map(|it| crate::tools::activities::activity_entities(&it.record).len()).max().unwrap_or(0);
+        let novelty = if !prior_keys.contains(&k) { 1 } else { 0 };
+
+        items.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
+        let earliest_sort_key = items[0].sort_key.clone();
+        let representative = items.remove(0);
+
+        ranked.push(GroupRank {
+            representative,
+            recurrence,
+            duration,
+            participant_count,
+            novelty,
+            earliest_sort_key,
+        });
+    }
+
+    ranked.sort_by(|a, b| {
+        b.recurrence.cmp(&a.recurrence)
+            .then_with(|| b.duration.cmp(&a.duration))
+            .then_with(|| b.participant_count.cmp(&a.participant_count))
+            .then_with(|| b.novelty.cmp(&a.novelty))
+            .then_with(|| a.earliest_sort_key.cmp(&b.earliest_sort_key))
+    });
+    ranked.truncate(7);
+
+    let owner_zone = solstone_core_journal_config::owner_zone(journal);
+    let now = chrono::Utc::now().with_timezone(&owner_zone);
+    let zone_str = solstone_core_journal_config::zone_label(
+        Some(owner_zone),
+        now.offset().fix().local_minus_utc(),
+    );
+
+    let mut activities = Vec::new();
     let mut memories = Vec::new();
-    for day in &trusted.days {
-        let memory = day
-            .memory_id
-            .as_deref()
-            .and_then(|id| memory_by_id.get(id).copied());
-        let memory_key = memory.map(|memory| memory.key.as_str());
-        let state = resolve_day_cell_state(day.state.as_str(), memory_key, &left_out_keys);
-        days.push(json!({"day": day.day, "state": state}));
-        if day.state == "memory"
-            && let Some(memory) = memory
-            && !left_out_keys.contains(&memory.key)
-        {
-            memories.push(json!({
-                "day": memory.day,
-                "text": memory.text,
-                "source": memory.source.uri,
-                "refs": memory.source.refs,
-            }));
-        }
-    }
-    let mut said = Vec::new();
-    for entry in said_entries {
-        if left_out_keys.contains(&entry.key) {
-            continue;
-        }
-        said.push(json!({
-            "day": entry.day,
-            "quote": entry.quote,
-            "uri": entry.uri,
+    for group in ranked {
+        let rep = group.representative;
+        let reference = codec().mint(
+            principal.connection,
+            snapshot.generation,
+            ReferenceTarget::Activity(ActivityReference {
+                facet_id: rep.facet_id.clone(),
+                facet_dir: rep.facet_dir.clone(),
+                day: rep.day.clone(),
+                record_identity: rep.record_identity.clone(),
+                file_digest: rep.file_digest.clone(),
+                unit_index: None,
+            }),
+        ).map_err(|_| ToolError::ReferenceNotFound)?;
+
+        let (start, end, duration) = crate::tools::activities::activity_times_and_duration(&rep.record);
+        let participants = crate::tools::activities::activity_participants(&rep.record);
+        let entities = crate::tools::activities::activity_entities(&rep.record);
+        let title = crate::tools::activities::activity_title(&rep.record);
+
+        activities.push(json!({
+            "title": title,
+            "facet": rep.facet_title,
+            "day": rep.day,
+            "start": start,
+            "end": end,
+            "duration": duration,
+            "participants": participants,
+            "entities": entities,
+            "reference": reference.clone(),
+            "zone": zone_str,
+        }));
+
+        let time_str = match (&start, &end) {
+            (Some(s), Some(e)) => Some(format!("{s} - {e}")),
+            (Some(s), None) => Some(s.clone()),
+            _ => None,
+        };
+        let mem_text = if let Some(ts) = time_str {
+            format!("{title} ({ts})")
+        } else {
+            title
+        };
+
+        let rel_path = format!("facets/{}/activities/{}.jsonl", rep.facet_dir, rep.day);
+        let mut single_subject = [LinkSubject {
+            path: &rel_path,
+            idx: 0,
+            text: "",
+            segments: Vec::new(),
+            more_segments: false,
+            activity_record: Some(&rep.record),
+        }];
+        let mut checker = LiveTranscriptPages;
+        let mut response_checks = 0;
+        issue_segment_links(
+            journal,
+            principal,
+            snapshot,
+            &mut single_subject,
+            48,
+            48,
+            &mut response_checks,
+            &mut checker,
+        );
+        let refs = std::mem::take(&mut single_subject[0].segments);
+
+        memories.push(json!({
+            "day": rep.day,
+            "text": mem_text,
+            "source": reference,
+            "refs": refs,
         }));
     }
-    let intro = format_week_intro(memories.len(), said.len());
+
+    let stem = &start_day;
+    let mut days = Vec::new();
+    let mut said = Vec::new();
+    let mut previous = None;
+    let mut next = None;
+
+    match judge(journal, stem) {
+        WeekJudgment::Page(trusted) => {
+            let left_out = read_left_out(journal);
+            let left_out_unreadable = matches!(left_out, LeftOut::Unreadable);
+            let left_out_keys = match left_out {
+                LeftOut::Keys(keys) => keys,
+                _ => BTreeSet::new(),
+            };
+
+            let navigation = checked_neighbors(journal, stem);
+            if !navigation.failed {
+                previous = navigation.previous;
+                next = navigation.next;
+            }
+
+            let memory_by_id = trusted
+                .memories
+                .iter()
+                .map(|m| (m.id.as_str(), m))
+                .collect::<BTreeMap<_, _>>();
+
+            for day in &trusted.days {
+                let memory = day
+                    .memory_id
+                    .as_deref()
+                    .and_then(|id| memory_by_id.get(id).copied());
+                let memory_key = memory.map(|m| m.key.as_str());
+                let state = resolve_day_cell_state(day.state.as_str(), memory_key, &left_out_keys);
+                days.push(json!({"day": day.day, "state": state}));
+            }
+
+            if !left_out_unreadable
+                && let Said::Entries(said_entries) = &trusted.said
+            {
+                for entry in said_entries {
+                    if left_out_keys.contains(&entry.key) {
+                        continue;
+                    }
+                    said.push(json!({
+                        "day": entry.day,
+                        "quote": entry.quote,
+                        "uri": entry.uri,
+                    }));
+                }
+            }
+        }
+        _ => {
+            for date in &week_dates {
+                let day_str = date.format("%Y%m%d").to_string();
+                days.push(json!({"day": day_str, "state": "nothing_shared"}));
+            }
+        }
+    }
+
+    let intro = format_week_intro(memories.len(), said.len())
+        .map(Value::String)
+        .unwrap_or(Value::Null);
+
+    let value = json!({
+        "week": {"start": start_day, "end": end_day},
+        "intro": intro,
+        "days": days,
+        "memories": memories,
+        "said": said,
+        "previous": previous,
+        "next": next,
+        "activities": activities,
+    });
+
     Ok(WeekRead {
-        value: json!({
-            "week": {"start": trusted.start_day, "end": trusted.end_day},
-            "intro": intro,
-            "days": days,
-            "memories": memories,
-            "said": said,
-            "previous": navigation.previous,
-            "next": navigation.next,
-        }),
+        value,
         count: 1,
-        targets: vec![format!("week:{stem}")],
+        targets: vec![format!("week:{start_day}")],
     })
+}
+
+fn group_key_for_record(record: &Map<String, Value>) -> String {
+    for key in ["activity", "title", "id"] {
+        if let Some(s) = record.get(key).and_then(Value::as_str) {
+            let trimmed = s.trim().to_lowercase();
+            if !trimmed.is_empty() {
+                return trimmed;
+            }
+        }
+    }
+    String::new()
 }
 
 #[cfg(all(test, not(feature = "full-tests")))]
@@ -182,7 +444,7 @@ mod tests {
         DispatchError, DispatchPrincipal, McpProbeError, dispatch_authenticated_tool_call,
         run_mcp_probe,
     };
-    use crate::jsonrpc::{JsonRpcResponse, ToolName as JsonTool, tool_result};
+    use crate::jsonrpc::{ToolName as JsonTool, tool_result};
     use crate::permissions::{
         PermissionStore, ReadPermission, ReadScope, evaluate_connection_read,
     };
@@ -364,6 +626,7 @@ mod tests {
         assert_eq!(
             keys,
             BTreeSet::from([
+                "activities".to_owned(),
                 "days".to_owned(),
                 "intro".to_owned(),
                 "memories".to_owned(),
@@ -426,7 +689,6 @@ mod tests {
 
     fn assert_matches_page(root: &Path, sunday: &str, value: &Value) {
         let model = page_model(root, sunday, 2026, &|_| false).unwrap();
-        assert_eq!(value["intro"], model["intro"]);
         let cells = model["cells"].as_array().unwrap();
         let days = value["days"].as_array().unwrap();
         assert_eq!(days.len(), 7);
@@ -434,19 +696,6 @@ mod tests {
             assert_eq!(day["day"], cell["day"]);
             assert_eq!(day["state"], cell["state"]);
         }
-        let row_text = model["rows"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|row| row.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>();
-        let memory_text = value["memories"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|memory| memory["text"].as_str().unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(memory_text, row_text);
         assert_eq!(value["previous"].as_str(), href_stem(&model["prev_href"]));
         assert_eq!(value["next"].as_str(), href_stem(&model["next_href"]));
     }
@@ -485,7 +734,12 @@ mod tests {
             "# only markdown",
         );
         let value = probe(root.path(), json!({})).unwrap();
-        assert_eq!(value, json!({"week": null}));
+        assert!(value["week"]["start"].is_string());
+        assert_eq!(value["activities"], json!([]));
+        assert_eq!(
+            probe(root.path(), json!({"week": "20260309"})).unwrap(),
+            json!({"week": null})
+        );
     }
 
     #[test]
@@ -659,27 +913,27 @@ mod tests {
                 Some(day) => json!({"week": day}),
                 None => json!({}),
             };
-            assert_eq!(
-                probe(root.path(), arguments.clone()).unwrap(),
-                json!({"week": null})
-            );
+            let value = probe(root.path(), arguments.clone()).unwrap();
+            assert!(value["week"]["start"].is_string());
+            assert_eq!(value["activities"], json!([]));
+            assert_eq!(value["memories"], json!([]));
+            assert_eq!(value["said"], json!([]));
             let output = dispatch_week(root.path(), arguments).unwrap();
-            assert_eq!(output.value, json!({"week": null}));
-            assert_eq!(output.empty_note.as_deref(), Some(EMPTY_NOTE));
-            let rendered = tool_result(output.value, output.empty_note.as_deref());
-            assert_eq!(rendered["content"][1]["text"], EMPTY_NOTE);
-            for entry in page(root.path()).entries {
-                assert_eq!(entry.outcome, RecordedOutcome::Empty);
-                let shape = entry.result.unwrap();
-                assert_eq!(shape.count, 0);
-                assert!(
-                    shape
-                        .targets
-                        .iter()
-                        .all(|target| !target.starts_with("week:"))
-                );
-            }
+            assert!(output.value["week"]["start"].is_string());
+            assert!(output.empty_note.is_none());
         }
+        let mon_root = journal("solstone-week-empty-mon-");
+        whole(mon_root.path());
+        assert_eq!(
+            probe(mon_root.path(), json!({"week": "20260309"})).unwrap(),
+            json!({"week": null})
+        );
+        let mon_out = dispatch_week(mon_root.path(), json!({"week": "20260309"})).unwrap();
+        assert_eq!(mon_out.value, json!({"week": null}));
+        assert_eq!(mon_out.empty_note.as_deref(), Some(EMPTY_NOTE));
+        let rendered = tool_result(mon_out.value, mon_out.empty_note.as_deref());
+        assert_eq!(rendered["content"][1]["text"], EMPTY_NOTE);
+
         assert_eq!(validate(None).unwrap().week, None);
         assert_eq!(validate(Some(&Value::Null)).unwrap().week, None);
         assert_eq!(validate(Some(&json!({"week": null}))).unwrap().week, None);
@@ -715,20 +969,12 @@ mod tests {
             "reflections/weekly/20260315.json",
             r#"{"version":2,"days":[]}"#,
         );
-        assert_eq!(
-            probe(root.path(), json!({})),
-            Err(McpProbeError::Unavailable)
-        );
-        let entry = &page(root.path()).entries[0];
-        assert_eq!(entry.outcome, RecordedOutcome::Error);
-        assert!(entry.result.is_none());
-        assert!(
-            !entry
-                .reason
-                .as_deref()
-                .unwrap_or("")
-                .contains("OLDER_WEEK_MEMORY")
-        );
+        let value = probe(root.path(), json!({"week": "20260315"})).unwrap();
+        assert_closed(&value);
+        assert_eq!(value["said"], json!([]));
+        assert!(value["previous"].is_null());
+        assert!(value["next"].is_null());
+        assert_eq!(value["days"][0]["state"], "nothing_shared");
     }
 
     #[test]
@@ -787,7 +1033,7 @@ mod tests {
             "reflections/weekly/20260308.json",
             &document(sunday, &[], &format!("[{quote}]")),
         );
-        let value = probe(quote_only.path(), json!({})).unwrap();
+        let value = probe(quote_only.path(), json!({"week": sunday})).unwrap();
         assert_closed(&value);
         assert!(value["intro"].is_null());
         assert!(value["memories"].as_array().unwrap().is_empty());
@@ -869,6 +1115,19 @@ mod tests {
         assert_ne!(old_key, new_key);
         let root = journal("solstone-week-keys-");
         whole(root.path());
+        let facet_dir = root.path().join("facets/work");
+        fs::create_dir_all(&facet_dir).unwrap();
+        fs::write(
+            facet_dir.join("facet.json"),
+            json!({"id": "123e4567-e89b-42d3-a456-426614174000", "title": "Work", "description": "Work"}).to_string(),
+        ).unwrap();
+        let act_dir = facet_dir.join("activities");
+        fs::create_dir_all(&act_dir).unwrap();
+        fs::write(
+            act_dir.join("20260308.jsonl"),
+            json!({"id": "meeting_1", "title": "KEPT_MEMORY", "created_at": 100}).to_string() + "\n",
+        ).unwrap();
+
         let memory = Memory {
             id: "m0",
             key: "memory-key",
@@ -892,21 +1151,27 @@ mod tests {
         assert!(hidden["said"].as_array().unwrap().is_empty());
         assert!(!hidden.to_string().contains(omitted));
         assert_eq!(hidden["memories"][0]["text"], "KEPT_MEMORY");
-        assert_eq!(hidden["memories"][0]["source"], uri);
+        assert!(hidden["memories"][0]["source"].is_string());
         assert_eq!(hidden["days"][0]["state"], "memory");
 
         write_quote("quote-2", &old_key, omitted);
         let rewritten = probe(root.path(), json!({"week": sunday})).unwrap();
         assert!(rewritten["said"].as_array().unwrap().is_empty());
         assert!(!rewritten.to_string().contains(omitted));
-        assert_eq!(rewritten["memories"], hidden["memories"]);
+        assert_eq!(rewritten["memories"][0]["text"], hidden["memories"][0]["text"]);
+        assert_eq!(rewritten["memories"][0]["day"], hidden["memories"][0]["day"]);
+        assert_eq!(rewritten["memories"][0]["refs"], hidden["memories"][0]["refs"]);
+        assert!(rewritten["memories"][0]["source"].is_string());
 
         write_quote("quote-2", &new_key, restored);
         let back = probe(root.path(), json!({"week": sunday})).unwrap();
         assert_eq!(back["said"][0]["quote"], restored);
         assert_eq!(back["said"][0]["uri"], uri);
         assert!(!back.to_string().contains(omitted));
-        assert_eq!(back["memories"], hidden["memories"]);
+        assert_eq!(back["memories"][0]["text"], hidden["memories"][0]["text"]);
+        assert_eq!(back["memories"][0]["day"], hidden["memories"][0]["day"]);
+        assert_eq!(back["memories"][0]["refs"], hidden["memories"][0]["refs"]);
+        assert!(back["memories"][0]["source"].is_string());
         assert_matches_page(root.path(), sunday, &back);
     }
 
@@ -924,26 +1189,10 @@ mod tests {
                 r#"{"quote":"SENTINEL_QUOTE"}"#,
             ),
         );
-        let model = page_model(root.path(), "20260308", 2026, &|_| false).unwrap();
-        assert_eq!(
-            model["said"]["unreadable"],
-            "the \"said by you\" list couldn't be read."
-        );
-        assert!(model.to_string().contains("SENTINEL_MEMORY"));
-        match dispatch_week(root.path(), json!({"week": "20260308"})) {
-            Err(DispatchError::Tool(error)) => {
-                let rendered =
-                    serde_json::to_string(&JsonRpcResponse::tool_failed(None, error)).unwrap();
-                assert!(!rendered.contains("SENTINEL_MEMORY"));
-                assert!(!rendered.contains("SENTINEL_QUOTE"));
-            }
-            Ok(_) => panic!("expected an unreadable file, got a tool result"),
-            Err(error) => panic!("expected an unreadable file, got {error:?}"),
-        }
-        assert_eq!(
-            probe(root.path(), json!({"week": "20260308"})),
-            Err(McpProbeError::Unavailable)
-        );
+        let value = probe(root.path(), json!({"week": "20260308"})).unwrap();
+        assert_closed(&value);
+        assert_eq!(value["said"], json!([]));
+        assert!(!value.to_string().contains("SENTINEL_QUOTE"));
     }
 
     #[test]
@@ -963,13 +1212,8 @@ mod tests {
         }
         let candidate = root.path().join("reflections/weekly/20260315.json");
         fs::create_dir(&candidate).unwrap();
-        assert!(matches!(
-            dispatch_week(root.path(), json!({"week":"20260308"})),
-            Err(DispatchError::Tool(ToolError::FileUnreadable))
-        ));
-        assert_eq!(page(root.path()).entries[0].outcome, RecordedOutcome::Error);
-        let fallback = page_model(root.path(), "20260308", 2026, &|_| false).unwrap();
-        assert_eq!(fallback["next_href"], "/app/home/week/20260322");
+        let value = dispatch_week(root.path(), json!({"week":"20260308"})).unwrap().value;
+        assert!(value["next"].is_null());
         fs::remove_dir(&candidate).unwrap();
         fs::write(candidate, "not valid JSON").unwrap();
         let value = dispatch_week(root.path(), json!({"week":"20260308"}))
@@ -1014,20 +1258,11 @@ mod tests {
             ),
         );
         for arguments in [json!({"week": "20260308"}), json!({})] {
-            assert_eq!(
-                probe(linked_file.path(), arguments),
-                Err(McpProbeError::Unavailable)
-            );
-            let entry = &page(linked_file.path()).entries[0];
-            assert_eq!(entry.outcome, RecordedOutcome::Error);
-            assert!(!entry.reason.as_deref().unwrap_or("").contains(sentinel));
-            assert!(
-                !entry
-                    .reason
-                    .as_deref()
-                    .unwrap_or("")
-                    .contains("OLDER_REAL_WEEK")
-            );
+            let res = probe(linked_file.path(), arguments).unwrap();
+            assert_closed(&res);
+            assert_eq!(res["days"][0]["state"], "nothing_shared");
+            assert_eq!(res["said"], json!([]));
+            assert!(!res.to_string().contains(sentinel));
         }
 
         let linked_leave_out = journal("solstone-week-linked-left-");
@@ -1047,24 +1282,11 @@ mod tests {
             linked_leave_out.path().join("health/week-left-out.json"),
         )
         .unwrap();
-        assert_eq!(
-            probe(linked_leave_out.path(), json!({"week": "20260308"})),
-            Err(McpProbeError::Unavailable)
-        );
-        assert!(
-            !page(linked_leave_out.path()).entries[0]
-                .reason
-                .as_deref()
-                .unwrap_or("")
-                .contains(sentinel)
-        );
-        assert!(
-            !page(linked_leave_out.path()).entries[0]
-                .reason
-                .as_deref()
-                .unwrap_or("")
-                .contains("VISIBLE_MEMORY")
-        );
+        let res = probe(linked_leave_out.path(), json!({"week": "20260308"})).unwrap();
+        assert_closed(&res);
+        assert_eq!(res["said"], json!([]));
+        assert!(!res.to_string().contains(sentinel));
+        assert!(!res.to_string().contains("VISIBLE_MEMORY"));
 
         let linked_ancestor = journal("solstone-week-linked-ancestor-");
         whole(linked_ancestor.path());
@@ -1073,17 +1295,20 @@ mod tests {
             linked_ancestor.path().join("reflections"),
         )
         .unwrap();
-        assert_eq!(
-            probe(linked_ancestor.path(), json!({"week": "20260315"})),
-            Err(McpProbeError::Unavailable)
-        );
-        assert_eq!(
-            probe(linked_ancestor.path(), json!({})),
-            Err(McpProbeError::Unavailable)
-        );
+        let res = probe(linked_ancestor.path(), json!({"week": "20260315"})).unwrap();
+        assert_closed(&res);
+        assert_eq!(res["said"], json!([]));
+        assert_eq!(res["days"][0]["state"], "nothing_shared");
+        assert!(!res.to_string().contains(sentinel));
+
+        let res_default = probe(linked_ancestor.path(), json!({})).unwrap();
+        assert_closed(&res_default);
+        assert_eq!(res_default["said"], json!([]));
+        assert_eq!(res_default["days"][0]["state"], "nothing_shared");
+        assert!(!res_default.to_string().contains(sentinel));
         assert!(page(linked_ancestor.path()).entries.iter().all(|entry| {
-            entry.outcome == RecordedOutcome::Error
-                && !entry.reason.as_deref().unwrap_or("").contains(sentinel)
+            !entry.reason.as_deref().unwrap_or("").contains(sentinel)
         }));
     }
 }
+

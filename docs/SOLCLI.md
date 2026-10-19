@@ -228,11 +228,12 @@ Command names are lowercase single words, or hyphenated multi-word
 
 ## Journal MCP Endpoint
 
-the journal MCP endpoint serves `save_memory` and `recall_memory` alongside eight
+the journal MCP endpoint serves `save_memory` and `recall_memory` alongside ten
 read-only journal tools:
-`list_facets`, `search`, `fetch`, `list_transcripts`, `get_transcript`,
-`list_entities`, `get_entity`, and `get_week`. `get_week` needs the whole journal
-as well as transcripts and facets. the endpoint exists only in builds compiled with the
+`list_facets`, `list_activities`, `get_activity_sources`, `search`, `fetch`,
+`list_transcripts`, `get_transcript`, `list_entities`, `get_entity`, and `get_week`.
+`list_activities` needs facets; `get_activity_sources` needs transcripts and facets;
+`get_week` still needs the whole journal plus transcripts and facets. the endpoint exists only in builds compiled with the
 `journal-mcp-endpoint` Cargo feature. Every released journal is built with it
 (`core/distribution/shipped-core-features.txt`); a build without it starts none
 of the doors below. The [agent memory contract](MCP_OAUTH.md#agent-memories)

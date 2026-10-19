@@ -142,6 +142,24 @@ pub(crate) fn load_segment_transcript(
     (transcript.text, counts, memory)
 }
 
+/// Render verbatim transcript text for an activity's segments without LLM generation.
+pub fn activity_span_transcript(
+    journal: &Path,
+    day: &str,
+    span: &[&str],
+    stream: Option<&str>,
+) -> Result<String, String> {
+    let sources = Sources {
+        transcripts: true,
+        percepts: false,
+        talents: TalentSource::Disabled,
+        voices: None,
+    };
+    let (transcript, _counts, _memory) =
+        cluster_span_with_memory(journal, day, span, &sources, stream)?;
+    Ok(transcript.text)
+}
+
 fn talent_source(value: Option<&Value>) -> TalentSource {
     let Some(value) = value else {
         return TalentSource::Disabled;
