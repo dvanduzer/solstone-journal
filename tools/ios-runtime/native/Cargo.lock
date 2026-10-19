@@ -6075,6 +6075,7 @@ dependencies = [
  "solstone-core-indexer-query",
  "solstone-core-indexer-store",
  "solstone-core-journal-io",
+ "solstone-core-offload",
  "solstone-core-spp-attest",
  "solstone-core-talent-runtime",
 ]

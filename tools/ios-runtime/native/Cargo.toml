@@ -25,6 +25,7 @@ solstone-core-generate-wire = { path = "../../../core/crates/solstone-core-gener
 solstone-core-talent-runtime = { path = "../../../core/crates/solstone-core-talent-runtime" }
 solstone-core-spp-attest = { path = "../../../core/crates/solstone-core-spp-attest" }
 solstone-core-backup-runtime = { path = "../../../core/crates/solstone-core-backup-runtime", features = ["ios-linked-bridge", "test-hooks"] }
+solstone-core-offload = { path = "../../../core/crates/solstone-core-offload", features = ["test-hooks"] }
 
 [patch.crates-io]
 ffmpeg-sys-next = { path = "../../../core/vendor/ffmpeg-sys-next" }

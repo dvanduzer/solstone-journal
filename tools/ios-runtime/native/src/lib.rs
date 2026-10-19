@@ -411,6 +411,32 @@ fn run(v: Value) -> Result<Value, String> {
                 solstone_core_backup_runtime::rotation::rotation_parent_sync_fault_observation();
             Ok(json!({"armed":armed,"fired":fired}))
         }
+        #[cfg(target_os = "ios")]
+        "serve-teardown-interrupt-arm" => {
+            if SERVING.lock().map_err(|e| e.to_string())?.is_none() {
+                return Err("serving is stopped".into());
+            }
+            use solstone_core_offload::teardown::{
+                OwnedTeardownInterrupt, arm_owned_teardown_interrupt,
+                owned_teardown_interrupt_observation,
+            };
+            let boundary = OwnedTeardownInterrupt::AfterClear;
+            arm_owned_teardown_interrupt(root, boundary);
+            let observed = owned_teardown_interrupt_observation(root, boundary);
+            if !observed.armed() || observed.fired() {
+                return Err("teardown interruption was not armed".into());
+            }
+            Ok(json!({"armed":true,"checkpoint":"after_confirmed_clear"}))
+        }
+        #[cfg(target_os = "ios")]
+        "serve-teardown-interrupt-status" => {
+            use solstone_core_offload::teardown::{
+                OwnedTeardownInterrupt, owned_teardown_interrupt_observation,
+            };
+            let observed =
+                owned_teardown_interrupt_observation(root, OwnedTeardownInterrupt::AfterClear);
+            Ok(json!({"armed":observed.armed(),"fired":observed.fired()}))
+        }
         "serve-status" | "serve-owner" => {
             let serving = SERVING.lock().map_err(|e| e.to_string())?;
             let serving = serving.as_ref().ok_or("serving is stopped")?;

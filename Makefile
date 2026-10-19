@@ -304,6 +304,7 @@ UV := $(shell command -v uv 2>/dev/null)
 UV_OPTIONAL_GOALS := \
 	preflight install \
 	check-rust-fmt check-rust-msrv check-rust-clippy check-rust-clippy-full \
+	check-mobile-lockfiles \
 	check-rust-unit check-rust-doc check-rust-test check-rust-race \
 	check-rust-journal-mcp-endpoint \
 	check-rust-android check-rust-android-prepared \

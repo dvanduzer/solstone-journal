@@ -962,18 +962,50 @@ pub fn owned_teardown_interrupt_observation(
     }
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(all(
+    feature = "test-hooks",
+    any(target_os = "ios", all(test, feature = "full-tests"))
+))]
 fn consume_interrupt(root: &JournalRoot, boundary: OwnedTeardownInterrupt) -> bool {
     let identity = root.identity();
     let mut guard = INTERRUPT_SLOTS.lock().unwrap();
-    if let Some((_, state)) = guard.iter_mut().find(|(k, _)| *k == (identity, boundary)) {
-        if state.armed {
-            state.armed = false;
-            state.fired = true;
-            return true;
-        }
+    if let Some((_, state)) = guard.iter_mut().find(|(k, _)| *k == (identity, boundary))
+        && state.armed
+    {
+        state.armed = false;
+        state.fired = true;
+        return true;
     }
     false
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+#[cfg(feature = "test-hooks")]
+mod interrupt_tests {
+    use super::*;
+
+    #[test]
+    fn post_clear_interrupt_is_exact_root_scoped_and_one_shot() {
+        let original = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let root = JournalRoot::open(original.path()).unwrap();
+        let unrelated = JournalRoot::open(other.path()).unwrap();
+        let boundary = OwnedTeardownInterrupt::AfterClear;
+        let arm = arm_owned_teardown_interrupt(&root, boundary);
+        assert_eq!(arm.identity(), root.identity());
+        assert_eq!(arm.boundary(), boundary);
+        assert!(!consume_interrupt(&unrelated, boundary));
+        assert!(owned_teardown_interrupt_observation(&root, boundary).armed());
+        assert!(consume_interrupt(&root, boundary));
+        assert!(!consume_interrupt(&root, boundary));
+        let observed = owned_teardown_interrupt_observation(&root, boundary);
+        assert!(!observed.armed() && observed.fired());
+        arm_owned_teardown_interrupt(&root, boundary);
+        let observed = owned_teardown_interrupt_observation(&root, boundary);
+        assert!(observed.armed() && !observed.fired());
+        assert!(consume_interrupt(&root, boundary));
+        assert!(!owned_teardown_interrupt_observation(&unrelated, boundary).fired());
+    }
 }
 
 #[cfg(target_os = "ios")]

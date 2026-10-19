@@ -359,6 +359,10 @@ fn execute(
     // exact proof before any later deletion; a publication/record gap stays held.
     update(outside, |record| record.clear = Some(clear))?;
     native_current(outside)?;
+    #[cfg(feature = "test-hooks")]
+    if super::consume_interrupt(root, super::OwnedTeardownInterrupt::AfterClear) {
+        return Err(recovery());
+    }
     super::test_cut(TeardownRunPhase::Clear);
     outside.remaining()?;
     *phase = TeardownRunPhase::Binding;
