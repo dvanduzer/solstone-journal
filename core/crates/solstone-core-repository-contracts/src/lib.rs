@@ -13,6 +13,9 @@ pub mod windows_suite;
 #[cfg(test)]
 #[path = "contracts/device_migration_contract.rs"]
 mod device_migration_contract;
+#[cfg(test)]
+#[path = "contracts/mobile_import_contract.rs"]
+mod mobile_import_contract;
 
 #[cfg(all(test, feature = "full-tests"))]
 #[path = "contracts/authorization_ledger_remove_bounded.rs"]

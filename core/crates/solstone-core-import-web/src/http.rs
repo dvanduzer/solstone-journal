@@ -8,6 +8,8 @@ use axum::{
 };
 use serde_json::{Value, json};
 
+use crate::mobile_import_contract::ImportReasonCode;
+
 pub(crate) const WERKZEUG_NOT_FOUND: &str = "<!doctype html>\n<html lang=en>\n<title>404 Not Found</title>\n<h1>Not Found</h1>\n<p>The requested URL was not found on the server. If you entered the URL manually please check your spelling and try again.</p>\n";
 
 pub(crate) fn bytes(bytes: &'static [u8], content_type: &'static str) -> Response<Body> {
@@ -42,10 +44,11 @@ pub(crate) fn error(
 }
 
 pub(crate) fn import_not_found(detail: &str) -> axum::response::Response {
+    let code = ImportReasonCode::ImportNotFound;
     error(
-        StatusCode::NOT_FOUND,
+        code.status(),
         "that import isn't in your journal.",
-        "import_not_found",
+        code.as_wire(),
         detail.to_owned(),
     )
 }
