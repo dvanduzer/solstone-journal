@@ -684,6 +684,7 @@ report-rust-code-evidence:
 	@echo "Not run for those packages: native linking or runtime execution, full same-crate tests, integrations, models, providers, inference, or platform evidence."
 	@echo "Not run by this command: tests a package keeps behind its full-tests feature (processes, sockets, host tools, wall-clock waits); ci-full runs them through each package's registry suite."
 	@echo "Not run: Cargo integration targets, doctests, native/runtime/platform, dependency-policy, package/release, and other ci-full registry evidence."
+	@sh scripts/changed_area_commands.sh 2>/dev/null || echo "Changed-area commands: not computed (scripts/changed_area_commands.sh did not run)."
 
 check-rust-doc:
 	@$(REQUIRE_CARGO)
