@@ -14,6 +14,9 @@ quick = 120
 standard = 600
 slow = 1200
 extended = 1800
+# windows-crosscheck took 1395-1750 s on contended release hosts and 354 s
+# alone; its own budget keeps headroom without raising `extended` for all.
+windows-crosscheck = 3600
 android = 7200
 mobile = 18000
 
@@ -183,7 +186,7 @@ areas = ["platform"]
 packages = ["workspace"]
 platforms = ["linux"]
 prerequisites = ["cargo-cache"]
-timeout = "extended"
+timeout = "windows-crosscheck"
 default_full = true
 
 [[legs]]
