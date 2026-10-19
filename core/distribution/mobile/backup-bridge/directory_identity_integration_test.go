@@ -390,7 +390,7 @@ func TestDirectoryIdentityPublicCInvalidAndUnsupported(t *testing.T) {
 			refuse(OpOpen, int(f.source.Fd()), int(f.state.Fd()), -1, nil)
 			refuse(OpOpen, -1, int(f.state.Fd()), int(f.workspace.Fd()), nil)
 			refuse(OpOpen, -1, int(f.state.Fd()), -1, []byte(`[]`))
-			for _, op := range []int32{-1, 0, OpRestore, OpS3Inspect, OpS3Inspect + 1} {
+			for _, op := range []int32{-1, 0, OpRestore, OpS3Inspect, OpRemoveRecoveryKey, 11} {
 				refuse(op, -1, int(f.state.Fd()), -1, nil)
 			}
 		})

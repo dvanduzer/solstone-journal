@@ -378,6 +378,7 @@ func runS3Worker(h *callHandle, req bridgeRequest) {
 					diagnostic:     DiagRemotePending,
 					metadata:       encoded,
 					metadataStatus: StatusOk,
+					recoveryResume: true,
 				}
 			}
 		} else {

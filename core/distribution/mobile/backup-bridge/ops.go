@@ -397,6 +397,7 @@ func executeAddRecoveryKey(ctx context.Context, req bridgeRequest, setWrote func
 				diagnostic:     DiagAuthFailed,
 				metadata:       encoded,
 				metadataStatus: StatusOk,
+				recoveryResume: true,
 			}, errors.New("recovery password differs from recorded candidate")
 		}
 		recPw = string(recordedPw)

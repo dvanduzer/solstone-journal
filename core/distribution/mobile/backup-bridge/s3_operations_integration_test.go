@@ -8,6 +8,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -74,6 +75,15 @@ func s3TestWaitOperation(t *testing.T, id uint64, handle *callHandle) bridgeResu
 		result.metadata = append([]byte(nil), result.metadata...)
 	}
 	handle.mu.Unlock()
+	var document struct {
+		Kind string `json:"kind"`
+	}
+	if json.Unmarshal(result.metadata, &document) == nil && document.Kind == "recovery-add-recorded" {
+		public, status := sourceCMetadata(id)
+		if status != StatusOk || !bytes.Equal(public, result.metadata) {
+			t.Fatal("recorded recovery candidate unavailable through public C accessor", status)
+		}
+	}
 	if freeCall(id) != StatusOk {
 		t.Fatal("completed operation did not release handle")
 	}

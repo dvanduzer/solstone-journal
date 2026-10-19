@@ -115,6 +115,24 @@ func TestResultMetadataRequiresActualSuccessfulRetirement(t *testing.T) {
 		t.Fatal("cancelled result published successful metadata")
 	}
 	h.mu.Lock()
+	h.result.status = StatusRemotePending
+	h.result.diagnostic = DiagRemotePending
+	h.result.metadataStatus = StatusOk
+	h.mu.Unlock()
+	if withResultMetadata(id, copyResult) != StatusRemotePending || called {
+		t.Fatal("pending restore metadata escaped as successful output")
+	}
+	h.mu.Lock()
+	h.result.recoveryResume = true
+	h.mu.Unlock()
+	if withResultMetadata(id, copyResult) != StatusOk || !called {
+		t.Fatal("typed recovery resumption payload unavailable")
+	}
+	called = false
+	h.mu.Lock()
+	h.result.recoveryResume = false
+	h.mu.Unlock()
+	h.mu.Lock()
 	h.result.status = StatusOk
 	h.result.metadataStatus = StatusCapExceeded
 	h.mu.Unlock()

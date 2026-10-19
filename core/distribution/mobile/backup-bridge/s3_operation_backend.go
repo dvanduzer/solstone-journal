@@ -139,14 +139,13 @@ func (be *s3OperationBackend) Save(ctx context.Context, handle backend.Handle, r
 		}
 	}
 	err = be.s3Backend.Save(ctx, handle, reader)
-	if err != nil {
-		return err
-	}
-	succeeded = true
+	succeeded = err == nil
+	// Outcome bookkeeping remains inside the tracked wrapper on failed writes,
+	// too. Native drain must include that work before releasing its owner.
 	if be.afterSave != nil {
 		be.afterSave()
 	}
-	return nil
+	return err
 }
 
 func (be *s3OperationBackend) Remove(ctx context.Context, handle backend.Handle) error {

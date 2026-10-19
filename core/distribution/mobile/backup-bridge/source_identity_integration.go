@@ -100,6 +100,7 @@ int32_t restic_bridge_s3_operation_directories_v1_start(restic_s3_request*,resti
 int32_t restic_bridge_cancel(uint64_t);
 int32_t restic_bridge_wait(uint64_t,restic_result*);
 int32_t restic_bridge_free(uint64_t);
+int32_t restic_bridge_result_metadata(uint64_t,char*,uint32_t,uint32_t*);
 */
 import "C"
 import "unsafe"
@@ -282,4 +283,24 @@ func sourceCRawS3OperationV1Start(input sourceCInput, operation int32) (uint64, 
 	id := C.uint64_t(0xfedcba9876543210)
 	status := C.restic_bridge_s3_operation_v1_start(&request, &options, nil, 0, &id)
 	return uint64(id), int32(status)
+}
+
+// Read the real public C accessor before Free; direct result fields do not prove
+// that Rust can retrieve a recorded recovery candidate.
+func sourceCMetadata(id uint64) ([]byte, int32) {
+	var required C.uint32_t
+	status := C.restic_bridge_result_metadata(C.uint64_t(id), nil, 0, &required)
+	if int32(status) != StatusCapExceeded || required == 0 || required > maxResultMetadata {
+		return nil, int32(status)
+	}
+	buffer := C.malloc(C.size_t(required))
+	if buffer == nil {
+		return nil, StatusInternal
+	}
+	defer C.free(buffer)
+	status = C.restic_bridge_result_metadata(C.uint64_t(id), (*C.char)(buffer), required, &required)
+	if int32(status) != StatusOk || required > maxResultMetadata {
+		return nil, int32(status)
+	}
+	return C.GoBytes(buffer, C.int(required)), int32(status)
 }

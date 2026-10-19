@@ -115,4 +115,5 @@ type bridgeResult struct {
 	// encode metadata never changes an existing operation's legacy result.
 	metadata       []byte
 	metadataStatus int32
+	recoveryResume bool
 }

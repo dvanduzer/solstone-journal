@@ -138,7 +138,8 @@ func (c *snapshotMetadataCollector) finish() ([]byte, int32) {
 }
 
 // withResultMetadata serializes result reads against actual free. It exposes
-// only a successful terminal result, after worker cleanup has completed. The
+// a successful terminal result, or the typed recorded-recovery resumption
+// payload, after worker cleanup has completed. The
 // callback is bridge-owned code, never supplied by an external caller.
 func withResultMetadata(id uint64, copyResult func([]byte) int32) int32 {
 	handlesMu.Lock()
@@ -158,7 +159,7 @@ func withResultMetadata(id uint64, copyResult func([]byte) int32) int32 {
 		return StatusBusy
 	}
 	if h.result.status != StatusOk {
-		if !(h.result.status == StatusRemotePending && h.result.diagnostic == DiagRemotePending && h.result.metadataStatus == StatusOk && len(h.result.metadata) > 0 && len(h.result.metadata) <= maxResultMetadata) {
+		if !(h.result.recoveryResume && h.result.status == StatusRemotePending && h.result.diagnostic == DiagRemotePending && h.result.metadataStatus == StatusOk && len(h.result.metadata) > 0 && len(h.result.metadata) <= maxResultMetadata) {
 			return h.result.status
 		}
 		return copyResult(h.result.metadata)

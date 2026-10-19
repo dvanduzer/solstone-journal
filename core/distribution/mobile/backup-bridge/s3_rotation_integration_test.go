@@ -571,9 +571,14 @@ func TestS3RemovalLockAndContext(t *testing.T) {
 	if !hookCalled {
 		t.Fatal("remove-locked phase hook was not called")
 	}
-	if hookRes.status != StatusCancelled || hookRes.diagnostic != DiagCancelled {
-		t.Fatalf("expected cancelled on lockCtx unlock, got status=%d diag=%s", hookRes.status, hookRes.diagnostic)
+	if hookRes.status != StatusRemotePending || hookRes.diagnostic != DiagRemotePending {
+		t.Fatalf("expected retained remove/lock custody after cancellation, got status=%d diag=%s", hookRes.status, hookRes.diagnostic)
 	}
+	pendingOwner := s3OwnerTestOpen(t, state, cfg)
+	if pendingOwner.record.Active == nil || pendingOwner.record.Active.Operation != OpRemoveRecoveryKey || !pendingOwner.record.Active.MayHaveWritten {
+		t.Fatal("cancelled removal lost its possibly-written lock intent")
+	}
+	s3OwnerTestClose(t, pendingOwner)
 
 	peer.mu.Lock()
 	if _, exists := peer.objects[cfg.prefix+"/keys/"+recoveryKeyID]; !exists {
