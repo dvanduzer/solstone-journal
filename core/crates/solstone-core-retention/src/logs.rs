@@ -778,7 +778,12 @@ pub fn plan_compactions(
     };
     let mut planned = Vec::new();
     for log in COMPACTABLE {
-        if plan.prunable.iter().any(|target| target.rel() == log.rel) {
+        // A planned rel carries the host's separators; compare paths, not text.
+        if plan
+            .prunable
+            .iter()
+            .any(|target| Path::new(target.rel()) == Path::new(log.rel))
+        {
             continue;
         }
         let path = journal.join(log.rel);
@@ -849,7 +854,10 @@ mod tests {
             today,
         );
         assert!(
-            planned.prunable.iter().any(|target| target.rel() == rel),
+            planned
+                .prunable
+                .iter()
+                .any(|target| std::path::Path::new(target.rel()) == std::path::Path::new(rel)),
             "planner did not admit the dated action log"
         );
         let entered = Arc::new(AtomicBool::new(false));
