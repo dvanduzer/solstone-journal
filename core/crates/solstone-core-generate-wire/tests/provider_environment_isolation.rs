@@ -301,8 +301,10 @@ fn embedded_config_is_not_replaced_by_inherited_probe_overrides() {
         &json!({
             "schema":solstone_core_generate::contract()["schema_identifiers"]["request"],
             "context":"settings.cloud.validate_key",
-            "contents":[{"type":"text","text":"test"}],
-            "max_output_tokens":64
+            "contents":[{"type":"text","text":"Reply with the single word OK."}],
+            "temperature":0.0,
+            "max_output_tokens":512,
+            "transport_retries":0
         })
         .to_string(),
     )
