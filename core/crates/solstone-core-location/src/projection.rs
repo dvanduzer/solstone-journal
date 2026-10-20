@@ -690,8 +690,9 @@ mod tests {
         assert_eq!(
             solstone_core_indexer_store::todo::inspect(root.path())
                 .unwrap()
-                .keys,
-            [expected.clone()]
+                .keys
+                .as_slice(),
+            std::slice::from_ref(&expected)
         );
         drop(lease);
         assert_eq!(
@@ -727,8 +728,9 @@ mod tests {
         assert_eq!(
             solstone_core_indexer_store::todo::inspect(root.path())
                 .unwrap()
-                .keys,
-            [expected.clone()]
+                .keys
+                .as_slice(),
+            std::slice::from_ref(&expected)
         );
         drop(lease);
         assert_eq!(
