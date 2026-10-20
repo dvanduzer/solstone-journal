@@ -4,8 +4,7 @@
 //! Spawned-binary reachability coverage for the native journal importer.
 
 use std::fs::{self, File};
-use std::io::{Read, Write};
-use std::os::unix::net::UnixListener;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
@@ -611,14 +610,6 @@ fn run_case(
             let target_journal = isolated_journal.as_ref().unwrap_or(journal);
             let _processing = matches!(invocation, Invocation::GenericAudio)
                 .then(|| AudioProcessingCompleter::start(target_journal.path()));
-            let _rescan = matches!(
-                invocation,
-                Invocation::Structured {
-                    source: "journal_archive",
-                    ..
-                }
-            )
-            .then(|| swallow_rescans(target_journal.path()));
             (
                 expected,
                 run_in_column(
@@ -673,23 +664,10 @@ fn every_mode_has_its_promised_observable_and_reaches_dispatch() {
     );
 }
 
-fn swallow_rescans(journal: &Path) -> thread::JoinHandle<()> {
-    let health = journal.join("health");
-    fs::create_dir_all(&health).expect("health");
-    let listener = UnixListener::bind(health.join("callosum.sock")).expect("bind callosum");
-    thread::spawn(move || {
-        while let Ok((mut stream, _)) = listener.accept() {
-            let mut line = String::new();
-            let _ = stream.read_to_string(&mut line);
-        }
-    })
-}
-
 #[test]
 fn journal_archive_remerge_reports_already_present() {
     let journal = TempDir::new().expect("journal");
     let inputs = Inputs::create(&journal);
-    let _rescans = swallow_rescans(journal.path());
     let args = Invocation::Structured {
         source: "journal_archive",
         input: Input::Archive,
@@ -711,18 +689,9 @@ fn journal_archive_remerge_reports_already_present() {
 }
 
 #[test]
-fn journal_archive_import_requests_supervisor_indexer_rescan() {
+fn journal_archive_import_queues_a_scan_without_a_supervisor() {
     let journal = TempDir::new().expect("journal");
     let inputs = Inputs::create(&journal);
-    let health = journal.path().join("health");
-    fs::create_dir_all(&health).expect("health");
-    let listener = UnixListener::bind(health.join("callosum.sock")).expect("bind callosum");
-    let receiver = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept rescan");
-        let mut line = String::new();
-        stream.read_to_string(&mut line).expect("read envelope");
-        line
-    });
     let args = Invocation::Structured {
         source: "journal_archive",
         input: Input::Archive,
@@ -742,14 +711,10 @@ fn journal_archive_import_requests_supervisor_indexer_rescan() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let line = receiver.join().expect("receiver");
-    let envelope: Value = serde_json::from_str(line.trim()).expect("rescan json");
-    assert_eq!(envelope["tract"], "supervisor");
-    assert_eq!(envelope["event"], "request");
-    assert_eq!(
-        envelope["cmd"],
-        serde_json::json!(["solstone", "journal", "indexer", "--rescan"])
-    );
+    let work = solstone_core_indexer_store::todo::inspect(journal.path()).expect("work list");
+    assert_eq!(work.pending, 1);
+    assert_eq!(work.keys, ["@scan-full"]);
+    assert!(!journal.path().join("indexer/journal.sqlite").exists());
 }
 
 #[test]
@@ -849,6 +814,7 @@ fn text_sources_save_content_the_journal_can_find() {
 }
 
 fn search_streams(journal: &TempDir, query: &str) -> Vec<String> {
+    solstone_core_indexer_store::todo::drain_now(journal.path()).expect("drain saved publications");
     let search = Command::new(env!("CARGO_BIN_EXE_solstone-core"))
         .args(["indexer", "search", query, "--json", "--journal"])
         .arg(journal.path())
