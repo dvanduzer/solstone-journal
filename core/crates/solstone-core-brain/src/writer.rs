@@ -4124,6 +4124,19 @@ mod tests {
         assert_eq!(record["reason_code"], "brain_check_in_progress");
     }
 
+    /// Whether a staged namespace replacement began. Windows refuses to rename a
+    /// directory while a handle below it is open, and a live refresh holds one:
+    /// the replacement cannot begin, which is the stronger outcome.
+    fn replacement_began(staged: std::io::Result<()>) -> bool {
+        match staged {
+            Ok(()) => true,
+            Err(error) if cfg!(windows) && error.kind() == std::io::ErrorKind::PermissionDenied => {
+                false
+            }
+            Err(error) => panic!("stage the replacement: {error}"),
+        }
+    }
+
     fn assert_replaced_root_refused(abandon: bool) {
         let journal = TestJournal::new();
         let permit = begin_cloud(&journal);
@@ -4131,7 +4144,24 @@ mod tests {
         let original_key = fs::read(brain_fingerprint_key_path(journal.path())).unwrap();
         let displaced = TestJournal::new();
         fs::remove_dir(displaced.path()).unwrap();
-        fs::rename(journal.path(), displaced.path()).unwrap();
+        if !replacement_began(fs::rename(journal.path(), displaced.path())) {
+            assert!(!displaced.path().exists());
+            assert_eq!(record_bytes(&journal), original_record);
+            let result = if abandon {
+                abandon_refresh(
+                    journal.path(),
+                    permit,
+                    "provider_unavailable",
+                    Map::new(),
+                    fixture_now(),
+                )
+            } else {
+                finish_refresh(journal.path(), permit, ready_outcome(), fixture_now(), None)
+            };
+            result.expect("the permit still names the only root");
+            assert_ne!(record_bytes(&journal), original_record);
+            return;
+        }
         fs::create_dir(journal.path()).unwrap();
         journal.write_config("lane_byo_cloud");
         fs::create_dir(journal.path().join("health")).unwrap();
@@ -4172,7 +4202,14 @@ mod tests {
         let original_record = record_bytes(&journal);
         let original_key = fs::read(brain_fingerprint_key_path(journal.path())).unwrap();
         let original_health = journal.path().join("original-health");
-        fs::rename(journal.path().join("health"), &original_health).unwrap();
+        if !replacement_began(fs::rename(journal.path().join("health"), &original_health)) {
+            assert!(!original_health.exists());
+            assert_eq!(record_bytes(&journal), original_record);
+            finish_refresh(journal.path(), permit, ready_outcome(), fixture_now(), None)
+                .expect("the permit still names the only health directory");
+            assert_ne!(record_bytes(&journal), original_record);
+            return;
+        }
         fs::create_dir(journal.path().join("health")).unwrap();
         fs::write(brain_state_path(journal.path()), &original_record).unwrap();
         fs::write(brain_fingerprint_key_path(journal.path()), original_key).unwrap();

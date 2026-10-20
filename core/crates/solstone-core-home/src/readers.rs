@@ -2599,7 +2599,7 @@ mod tests {
         let config_map = config_json.as_object().unwrap().clone();
 
         // 1. Ready journal: gateway_unreachable -> blocked / attestation_not_verified
-        let ready_temp = tempfile::tempdir_in("/var/tmp").unwrap();
+        let ready_temp = tempfile::tempdir().unwrap();
         let ready_path = ready_temp.path();
         write(ready_path, "config/journal.json", &config_json.to_string());
         solstone_core_brain::generate_fingerprint_key(ready_path).unwrap();
@@ -2669,7 +2669,7 @@ mod tests {
         );
 
         // 2. Mid-check journal: certificate_invalid -> unhealthy / attestation_rejected
-        let mid_check_temp = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mid_check_temp = tempfile::tempdir().unwrap();
         let mid_check_path = mid_check_temp.path();
         write(
             mid_check_path,

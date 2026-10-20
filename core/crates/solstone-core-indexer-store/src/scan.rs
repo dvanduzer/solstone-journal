@@ -7706,7 +7706,23 @@ not json
             thread::yield_now();
         }
         let parked = parent.join("parked");
-        fs::rename(&journal, &parked).unwrap();
+        match fs::rename(&journal, &parked) {
+            Ok(()) => {}
+            // Windows refuses to rename a root while the index is open inside it,
+            // so the replacement cannot begin and the removal commits to the only
+            // root.
+            Err(error) if cfg!(windows) && error.kind() == std::io::ErrorKind::PermissionDenied => {
+                drop(tx);
+                worker
+                    .join()
+                    .unwrap()
+                    .expect("the removal still names the only root");
+                assert!(!parked.exists());
+                assert_eq!(ghost_edge_count(&holder), 0);
+                return;
+            }
+            Err(error) => panic!("stage the replacement: {error}"),
+        }
         fs::create_dir(&journal).unwrap();
         drop(tx);
         let error = worker.join().unwrap().unwrap_err();

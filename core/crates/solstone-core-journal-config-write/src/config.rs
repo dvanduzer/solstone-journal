@@ -568,11 +568,22 @@ mod tests {
                 fs::write(journal.join("config/journal.json"), original).unwrap();
             }
             let called = std::cell::Cell::new(false);
+            let replaced = std::cell::Cell::new(false);
             let result = mutate_journal_config(&journal, LockOptions::default(), |config| {
                 called.set(true);
-                fs::rename(&journal, &displaced).unwrap();
-                fs::create_dir_all(journal.join("config")).unwrap();
-                fs::write(journal.join("config/journal.json"), replacement).unwrap();
+                match fs::rename(&journal, &displaced) {
+                    Ok(()) => {
+                        replaced.set(true);
+                        fs::create_dir_all(journal.join("config")).unwrap();
+                        fs::write(journal.join("config/journal.json"), replacement).unwrap();
+                    }
+                    // Windows refuses to rename a root while the mutation holds
+                    // a handle inside it, so the replacement cannot begin.
+                    Err(error)
+                        if cfg!(windows)
+                            && error.kind() == std::io::ErrorKind::PermissionDenied => {}
+                    Err(error) => panic!("stage the replacement: {error}"),
+                }
                 config.insert("env".to_owned(), json!({"OPENAI_API_KEY":"synthetic"}));
                 JournalConfigMutation {
                     changed: true,
@@ -580,6 +591,13 @@ mod tests {
                 }
             });
             assert!(called.get(), "the original owner creates a missing root");
+            if !replaced.get() {
+                result.expect("the mutation still names the only root");
+                assert!(!displaced.exists());
+                let written = fs::read_to_string(journal.join("config/journal.json")).unwrap();
+                assert!(written.contains("synthetic"));
+                continue;
+            }
             assert!(result.is_err());
             assert!(!journal.join("health").exists());
             assert!(!displaced.join("health").exists());

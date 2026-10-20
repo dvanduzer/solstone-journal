@@ -4065,7 +4065,7 @@ mod tests {
         assert!(!body.contains("\"success\":true"));
         assert!(!body.contains("\"success\": true"));
 
-        let root = PathBuf::from("/var/tmp").join(format!(
+        let root = std::env::temp_dir().join(format!(
             "solstone-thinking-overlap-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

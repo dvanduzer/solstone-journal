@@ -1898,7 +1898,7 @@ mod tests {
         let config_map = config_json.as_object().unwrap().clone();
 
         // 1. Ready refusal fixture: gateway_unreachable
-        let ready_temp = tempfile::tempdir_in("/var/tmp").unwrap();
+        let ready_temp = tempfile::tempdir().unwrap();
         let ready_path = ready_temp.path();
         std::fs::create_dir_all(ready_path.join("config")).unwrap();
         std::fs::write(
@@ -1959,7 +1959,7 @@ mod tests {
         ));
 
         // 2. Mid-check refusal fixture: certificate_invalid
-        let mid_check_temp = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mid_check_temp = tempfile::tempdir().unwrap();
         let mid_check_path = mid_check_temp.path();
         std::fs::create_dir_all(mid_check_path.join("config")).unwrap();
         std::fs::write(

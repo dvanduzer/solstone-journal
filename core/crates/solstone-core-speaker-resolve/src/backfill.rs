@@ -1075,7 +1075,9 @@ mod publication_fence {
 
     fn segment() -> (tempfile::TempDir, PathBuf) {
         let root = tempfile::tempdir().unwrap();
-        let segment = root.path().join("chronicle/20260808/main/120000_300");
+        let segment = ["chronicle", "20260808", "main", "120000_300"]
+            .iter()
+            .fold(root.path().to_path_buf(), |path, part| path.join(part));
         fs::create_dir_all(&segment).unwrap();
         (root, segment)
     }

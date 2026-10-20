@@ -2221,7 +2221,7 @@ mod tests {
     }
 
     fn binding_journal(name: &str, config: Value) -> std::path::PathBuf {
-        let path = std::path::PathBuf::from("/var/tmp").join(format!(
+        let path = std::env::temp_dir().join(format!(
             "solstone-thinking-binding-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -3850,7 +3850,34 @@ mod tests {
             "{}-moved",
             journal.file_name().expect("name").to_string_lossy()
         ));
-        fs::rename(&journal, &moved).expect("rename admitted root");
+        let cancellation = solstone_core_generate::Cancellation::never();
+        match fs::rename(&journal, &moved) {
+            Ok(()) => {}
+            // Windows refuses to rename a root while the validation witness holds
+            // a handle inside it, so the replacement cannot begin and the save
+            // publishes into the only root.
+            Err(error) if cfg!(windows) && error.kind() == std::io::ErrorKind::PermissionDenied => {
+                super::save_key(
+                    &journal,
+                    &admitted,
+                    &cancellation,
+                    "OPENAI_API_KEY",
+                    "openai",
+                    "beta-key",
+                    Some(json!({"valid":true})),
+                    "alpha-key",
+                    None,
+                    validation_witness,
+                )
+                .expect("the save still names the only root");
+                assert!(!moved.exists());
+                let config = read_config(&journal).expect("config reads");
+                assert_eq!(config["env"]["OPENAI_API_KEY"], "beta-key");
+                let _ = fs::remove_dir_all(&journal);
+                return;
+            }
+            Err(error) => panic!("rename admitted root: {error}"),
+        }
         fs::create_dir_all(journal.join("config")).expect("replacement config");
         fs::create_dir_all(journal.join("health")).expect("replacement health");
         let replacement_config = br#"{"env":{"OPENAI_API_KEY":"replacement-key"}}"#;
@@ -3861,7 +3888,6 @@ mod tests {
             replacement_key,
         )
         .expect("replacement key");
-        let cancellation = solstone_core_generate::Cancellation::never();
         let error = super::save_key(
             &journal,
             &admitted,
@@ -4712,7 +4738,7 @@ mod tests {
         let config_map = config_json.as_object().unwrap().clone();
 
         // 1. Ready journal: begin_refresh -> finish_refresh -> record gateway_unreachable -> unreachable
-        let ready_temp = tempfile::tempdir_in("/var/tmp").unwrap();
+        let ready_temp = tempfile::tempdir().unwrap();
         let ready_path = ready_temp.path();
         std::fs::create_dir_all(ready_path.join("config")).unwrap();
         std::fs::write(
@@ -4756,7 +4782,7 @@ mod tests {
         assert_ne!(state1, "inactive");
 
         // 2. Mid-check journal: begin_refresh only -> record certificate_invalid -> failed
-        let mid_check_temp = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mid_check_temp = tempfile::tempdir().unwrap();
         let mid_check_path = mid_check_temp.path();
         std::fs::create_dir_all(mid_check_path.join("config")).unwrap();
         std::fs::write(
@@ -4828,7 +4854,7 @@ mod tests {
         });
         let config_map = config_json.as_object().unwrap().clone();
 
-        let temp = tempfile::tempdir_in("/var/tmp").unwrap();
+        let temp = tempfile::tempdir().unwrap();
         let journal = temp.path();
         fs::create_dir_all(journal.join("config")).unwrap();
         fs::write(
@@ -5688,7 +5714,7 @@ mod refresh_dispatch {
         label: &str,
         key: Option<&[u8]>,
     ) {
-        let journal = PathBuf::from("/var/tmp").join(format!(
+        let journal = std::env::temp_dir().join(format!(
             "solstone-refresh-dispatch-{}-{}-{label}",
             std::process::id(),
             SystemTime::now()

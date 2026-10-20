@@ -306,7 +306,23 @@ mod tests {
             std::thread::yield_now();
         }
         let parked = parent.path().join("parked");
-        fs::rename(&journal, &parked).unwrap();
+        match fs::rename(&journal, &parked) {
+            Ok(()) => {}
+            // Windows refuses to rename a root while the completion holds a
+            // handle inside it, so the replacement cannot begin and the
+            // completion publishes into the only root.
+            Err(error) if cfg!(windows) && error.kind() == std::io::ErrorKind::PermissionDenied => {
+                drop(held);
+                worker
+                    .join()
+                    .unwrap()
+                    .expect("the completion still names the only root");
+                assert!(!parked.exists());
+                assert!(status_of(&path).is_some());
+                return;
+            }
+            Err(error) => panic!("stage the replacement: {error}"),
+        }
         fs::create_dir(&journal).unwrap();
         drop(held);
         let error = worker.join().unwrap().unwrap_err();

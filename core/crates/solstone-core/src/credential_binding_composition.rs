@@ -65,7 +65,7 @@ fn bound_rejection_composition_posts_retained_bytes_after_correction() {
         return;
     }
 
-    let journal = PathBuf::from("/var/tmp").join(format!(
+    let journal = std::env::temp_dir().join(format!(
         "solstone-binding-composition-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
@@ -120,6 +120,7 @@ fn bound_rejection_composition_posts_retained_bytes_after_correction() {
         .arg(CASE)
         .arg("--nocapture")
         .env_clear()
+        .envs(platform_env())
         .env("PATH", "")
         .env(MARKER, CASE)
         .env(JOURNAL_ENV, &journal)
@@ -185,6 +186,7 @@ fn bound_rejection_composition_posts_retained_bytes_after_correction() {
         .arg(CASE)
         .arg("--nocapture")
         .env_clear()
+        .envs(platform_env())
         .env("PATH", "")
         .env(MARKER, CASE)
         .env(JOURNAL_ENV, &journal)
@@ -309,7 +311,7 @@ fn owner_correction_keeps_the_unprocessed_segment() {
         return;
     }
 
-    let journal = PathBuf::from("/var/tmp").join(format!(
+    let journal = std::env::temp_dir().join(format!(
         "solstone-binding-owner-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
@@ -351,6 +353,7 @@ fn owner_correction_keeps_the_unprocessed_segment() {
             .arg(OWNER_CASE)
             .arg("--nocapture")
             .env_clear()
+            .envs(platform_env())
             .env("PATH", "")
             .env(MARKER, OWNER_CASE)
             .env(JOURNAL_ENV, &journal)
@@ -534,6 +537,7 @@ fn late_child_rejection_cannot_overwrite_newer_same_key_settings_success() {
             .arg(case)
             .arg("--nocapture")
             .env_clear()
+            .envs(platform_env())
             .env("PATH", "")
             .env(MARKER, case)
             .env(JOURNAL_ENV, &journal.0)
@@ -667,6 +671,7 @@ impl EndpointRace {
             .arg(case)
             .arg("--nocapture")
             .env_clear()
+            .envs(platform_env())
             .env("PATH", "")
             .env(MARKER, case)
             .env(JOURNAL_ENV, &self.journal.0)
@@ -959,6 +964,22 @@ impl Drop for OwnedChild {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+/// What a child with a cleared environment still needs from its host. Windows
+/// loads its socket providers through `SystemRoot`; without it every socket
+/// call in the child fails before a request can leave.
+fn platform_env() -> Vec<(&'static str, std::ffi::OsString)> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("SystemRoot")
+            .map(|root| vec![("SystemRoot", root)])
+            .unwrap_or_default()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
     }
 }
 

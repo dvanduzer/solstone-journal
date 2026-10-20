@@ -802,7 +802,7 @@ mod tests {
         let channel_attempts = AtomicUsize::new(0);
         let active = active_config();
         let audio = [0.0_f32; 160];
-        let journal_dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        let journal_dir = tempfile::tempdir().unwrap();
         let journal_path = journal_dir.path();
         std::fs::create_dir_all(journal_path.join("config")).unwrap();
         std::fs::write(
@@ -855,7 +855,7 @@ mod tests {
         let store = AttestationStateStore::new();
         let active = active_config();
         let audio = [0.0_f32; 160];
-        let journal_dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        let journal_dir = tempfile::tempdir().unwrap();
         let journal_path = journal_dir.path();
         std::fs::create_dir_all(journal_path.join("config")).unwrap();
         std::fs::write(
@@ -898,7 +898,7 @@ mod tests {
         let store = AttestationStateStore::new();
         let active = active_config();
         let audio = [0.0_f32; 160];
-        let journal_dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        let journal_dir = tempfile::tempdir().unwrap();
         let journal_path = journal_dir.path();
         std::fs::create_dir_all(journal_path.join("config")).unwrap();
         std::fs::write(
@@ -962,7 +962,7 @@ mod tests {
             }
         }));
         let audio = [0.0_f32; 160];
-        let journal_dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        let journal_dir = tempfile::tempdir().unwrap();
         let journal_path = journal_dir.path();
         std::fs::create_dir_all(journal_path.join("config")).unwrap();
         std::fs::write(
@@ -993,7 +993,7 @@ mod tests {
         let store = AttestationStateStore::new();
         let active = active_config();
         let audio = [0.0_f32; 160];
-        let journal_dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        let journal_dir = tempfile::tempdir().unwrap();
         let journal_path = journal_dir.path();
         std::fs::create_dir_all(journal_path.join("config")).unwrap();
         std::fs::write(
@@ -1024,7 +1024,7 @@ mod tests {
         let store = AttestationStateStore::new();
         let active = active_config();
         let audio = [0.0_f32; 160];
-        let journal_dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        let journal_dir = tempfile::tempdir().unwrap();
         let journal_path = journal_dir.path();
         std::fs::create_dir_all(journal_path.join("config")).unwrap();
         std::fs::write(
@@ -1074,7 +1074,7 @@ mod tests {
             }
         }));
         let audio = [0.0_f32; 160];
-        let journal_dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        let journal_dir = tempfile::tempdir().unwrap();
         let journal_path = journal_dir.path();
         std::fs::create_dir_all(journal_path.join("config")).unwrap();
         std::fs::write(
@@ -1142,7 +1142,7 @@ mod tests {
         let store = AttestationStateStore::new();
         let active = active_config();
         let audio = [0.0_f32; 160];
-        let journal_dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        let journal_dir = tempfile::tempdir().unwrap();
         let journal_path = journal_dir.path();
         std::fs::create_dir_all(journal_path.join("config")).unwrap();
         std::fs::write(
@@ -1794,7 +1794,7 @@ mod tests {
         let store = AttestationStateStore::new();
         let active = active_config();
         let audio = [0.0_f32; 160];
-        let journal_dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        let journal_dir = tempfile::tempdir().unwrap();
         let journal_path = journal_dir.path();
         std::fs::create_dir_all(journal_path.join("config")).unwrap();
         std::fs::write(
@@ -1845,7 +1845,7 @@ mod tests {
             }
         }));
         let audio = [0.0_f32; 160];
-        let journal_dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        let journal_dir = tempfile::tempdir().unwrap();
         let journal_path = journal_dir.path();
         std::fs::create_dir_all(journal_path.join("config")).unwrap();
         std::fs::write(
@@ -1880,7 +1880,7 @@ mod tests {
         let store = AttestationStateStore::new();
         let active = active_config();
         let audio = [0.0_f32; 160];
-        let journal_dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        let journal_dir = tempfile::tempdir().unwrap();
         let journal_path = journal_dir.path();
         std::fs::create_dir_all(journal_path.join("config")).unwrap();
         std::fs::write(
@@ -1918,7 +1918,7 @@ mod tests {
         let store = AttestationStateStore::new();
         let active = active_config();
         let audio = [0.0_f32; 160];
-        let journal_dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        let journal_dir = tempfile::tempdir().unwrap();
         let journal_path = journal_dir.path();
         std::fs::create_dir_all(journal_path.join("config")).unwrap();
         std::fs::write(
@@ -1982,7 +1982,7 @@ mod tests {
             }
         }));
         let audio = [0.0_f32; 160];
-        let journal_dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        let journal_dir = tempfile::tempdir().unwrap();
         let journal_path = journal_dir.path();
         std::fs::create_dir_all(journal_path.join("config")).unwrap();
         std::fs::write(
@@ -2016,7 +2016,7 @@ mod tests {
     fn early_returns_do_not_create_status_file() {
         let store = AttestationStateStore::new();
         let audio = [0.0_f32; 160];
-        let journal_dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        let journal_dir = tempfile::tempdir().unwrap();
         let journal_path = journal_dir.path();
         std::fs::create_dir_all(journal_path.join("config")).unwrap();
 
@@ -2061,7 +2061,7 @@ mod tests {
         let store = AttestationStateStore::new();
         let active = active_config();
         let audio = [0.0_f32; 160];
-        let journal_dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        let journal_dir = tempfile::tempdir().unwrap();
         let journal_path = journal_dir.path();
         std::fs::create_dir_all(journal_path.join("config")).unwrap();
         std::fs::write(
