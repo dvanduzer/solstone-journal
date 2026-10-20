@@ -47,12 +47,6 @@ struct JournalFirstRunView: View {
                 value: model.outbound.axToken
             )
         }
-        .overlay(alignment: .top) {
-            if model.userOperationInFlight || model.pendingOperation != .none {
-                ProgressView()
-                    .padding(.top, 12)
-            }
-        }
     }
 
     @ViewBuilder
@@ -525,9 +519,8 @@ struct JournalFirstRunView: View {
                             .accessibilityIdentifier(AXID.Journal.Ritual.setupProgress)
                     }
 
-                    Text(model.currentStep ?? JournalFirstRunCopy.setupTitle)
-                        .font(.system(size: 14))
-                        .foregroundStyle(SetupChromeColor.softInk(for: colorScheme))
+                    // The runtime's step names are internal ("brain", "doctor"); they stay in
+                    // the accessibility companion and never show as owner text.
                     AXStateCompanion(id: AXID.Journal.Ritual.setupStepState, value: model.currentStep ?? "")
 
                     if !model.setupRenderedLog.isEmpty {

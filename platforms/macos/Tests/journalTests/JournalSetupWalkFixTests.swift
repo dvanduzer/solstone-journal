@@ -105,4 +105,13 @@ struct JournalSetupWalkFixTests {
         // Dark sheet #221C19 (red 34); dark card #2B231C (red 43).
         #expect(red <= 38, "card fill runs into the footer: red \(red)")
     }
+
+    // D8: the setting-up card never shows the runtime's internal step name, and no second
+    // spinner sits in the band over the sun. The step name stays in its AX companion.
+    @Test func settingUpShowsNoInternalStepNameAndNoBandSpinner() throws {
+        let view = try Self.source("JournalFirstRunView.swift")
+        #expect(!view.contains("Text(model.currentStep"), "the internal step name is shown as text")
+        #expect(view.contains("AXStateCompanion(id: AXID.Journal.Ritual.setupStepState, value: model.currentStep ?? \"\")"))
+        #expect(!view.contains(".overlay(alignment: .top) {\n            if model.userOperationInFlight"), "the band spinner is back")
+    }
 }
