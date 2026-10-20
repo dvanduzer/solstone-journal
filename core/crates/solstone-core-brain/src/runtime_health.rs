@@ -174,13 +174,16 @@ impl RuntimeRetryTransaction {
     }
 }
 
-/// Whether the local model's install record says a download or install is
-/// under way. An unreadable or absent record is not in flight.
+/// Whether a local model download or install is under way: the install
+/// record says so and its installer still holds the install lease. A record
+/// left in flight by an installer that exited (killed, crashed, or stopped
+/// with its journal) is not in flight. An unreadable or absent record, or a
+/// lease that cannot be probed, is not in flight either.
 pub fn local_install_in_flight(journal_path: &Path) -> bool {
     let Ok(bytes) = fs::read(journal_path.join("health/providers/local.json")) else {
         return false;
     };
-    serde_json::from_slice::<Value>(&bytes)
+    let recorded_in_flight = serde_json::from_slice::<Value>(&bytes)
         .ok()
         .and_then(|record| {
             record
@@ -193,7 +196,18 @@ pub fn local_install_in_flight(journal_path: &Path) -> bool {
                     )
                 })
         })
-        .unwrap_or(false)
+        .unwrap_or(false);
+    recorded_in_flight && install_lease_held(&journal_path.join("health/providers/local.lease"))
+}
+
+/// Probe the installer's lease the way the installer's own observers do: open
+/// it read-only and take a momentary shared lock, so the probe never makes a
+/// starting installer or another observer read the lease as busy.
+fn install_lease_held(path: &Path) -> bool {
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    matches!(file.try_lock_shared(), Err(fs::TryLockError::WouldBlock))
 }
 
 pub fn inspect_runtime_health(journal_path: &Path) -> RuntimeRecordInspection {
@@ -799,6 +813,9 @@ mod tests {
         assert!(!local_install_in_flight(&journal.0));
         fs::create_dir_all(journal.0.join("health/providers")).expect("providers dir");
         let record = journal.0.join("health/providers/local.json");
+        let installer = fs::File::create(journal.0.join("health/providers/local.lease"))
+            .expect("install lease");
+        installer.lock().expect("installer holds the lease");
         for (state, in_flight) in [
             ("resolving", true),
             ("downloading", true),
@@ -813,6 +830,26 @@ mod tests {
         }
         fs::write(&record, b"not json").expect("record");
         assert!(!local_install_in_flight(&journal.0));
+    }
+
+    #[test]
+    fn a_download_its_installer_left_behind_is_not_in_flight() {
+        let journal = TestJournal::new();
+        fs::create_dir_all(journal.0.join("health/providers")).expect("providers dir");
+        fs::write(
+            journal.0.join("health/providers/local.json"),
+            json!({"install_state": "downloading"}).to_string(),
+        )
+        .expect("record");
+        let lease = journal.0.join("health/providers/local.lease");
+        assert!(!local_install_in_flight(&journal.0), "no lease file");
+
+        let installer = fs::File::create(&lease).expect("install lease");
+        installer.lock().expect("installer holds the lease");
+        assert!(local_install_in_flight(&journal.0), "installer running");
+
+        drop(installer);
+        assert!(!local_install_in_flight(&journal.0), "installer exited");
     }
 
     impl Drop for TestJournal {

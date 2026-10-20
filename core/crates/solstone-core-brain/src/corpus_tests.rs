@@ -20,7 +20,7 @@ use crate::runtime_health::{inspect_runtime_health, inspection_from_fixture};
 use crate::{
     InspectionStatus, brain_fingerprint_key_path, brain_refresh_lease_path, brain_state_path,
     build_active_brain_fingerprint, derive_active_brain_lane, inspect_brain_state,
-    load_existing_fingerprint_key, probe_file_lease_held,
+    load_existing_fingerprint_key, present_brain_inspection, probe_file_lease_held,
 };
 
 static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -663,6 +663,54 @@ fn lease_probe_error_returns_interrupted_projection_with_error() {
         Some("bundled")
     );
     assert!(inspection.error.is_some());
+}
+
+#[test]
+fn a_local_model_download_reads_as_setup_only_while_its_installer_runs() {
+    let journal = TestJournal::new();
+    journal.health();
+    let record = projection_fixture()
+        .records
+        .get("lane_bundled/fingerprint_other")
+        .expect("record checked against another configuration");
+    fs::write(
+        brain_state_path(&journal.path),
+        serde_json::to_vec(record).expect("record JSON"),
+    )
+    .expect("write record");
+    fs::write(
+        brain_fingerprint_key_path(&journal.path),
+        hex(&projection_fixture().hmac_key_hex),
+    )
+    .expect("write key");
+    fs::create_dir_all(journal.path.join("health/providers")).expect("providers directory");
+    let install_record = journal.path.join("health/providers/local.json");
+    fs::write(&install_record, br#"{"install_state":"downloading"}"#)
+        .expect("write install record");
+    let lease = journal.path.join("health/providers/local.lease");
+    let view = || {
+        let inspection = inspect_brain_state(&journal.path, bundled_config(), fixture_now());
+        assert_eq!(inspection.status, InspectionStatus::Ok);
+        present_brain_inspection(&inspection, fixture_now())
+    };
+
+    let left_behind = view();
+    assert!(!left_behind.progressing, "no installer: {left_behind:?}");
+
+    let installer = File::create(&lease).expect("install lease");
+    installer.lock().expect("installer holds the lease");
+    let downloading = view();
+    assert!(downloading.progressing, "installer running: {downloading:?}");
+    assert_ne!(downloading.headline, left_behind.headline);
+
+    drop(installer);
+    let exited = view();
+    assert!(!exited.progressing, "installer exited: {exited:?}");
+    assert_eq!(exited.headline, left_behind.headline);
+
+    // A download left behind reads exactly as no download at all.
+    fs::remove_file(&install_record).expect("remove install record");
+    assert_eq!(view(), left_behind);
 }
 
 #[test]
