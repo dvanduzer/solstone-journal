@@ -747,8 +747,9 @@ fn drain_activity(
                         state,
                         cause.as_deref(),
                     );
-                    // The worker's explicit non-retryable terminal is respected;
-                    // connection interruption never enters that parked set.
+                    // A context refusal can recover after a meaningful change,
+                    // but unchanged activity catchup must not repeat it hourly.
+                    // Connection interruption still never exhausts its retries.
                     if cause.as_deref() != Some("local_endpoint_unreachable")
                         && read_use_events(&context.journal, &item.use_id)
                             .ok()
@@ -762,7 +763,10 @@ fn drain_activity(
                                                 .and_then(Value::as_bool)
                                                 .unwrap_or(true)
                                     })
-                                    .is_some_and(|e| e["retryable"] == false)
+                                    .is_some_and(|e| {
+                                        e["retryable"] == false
+                                            || e["reason_code"] == "context_window_exceeded"
+                                    })
                             })
                     {
                         work.park(&item.name, cause.as_deref().unwrap_or(state), context)

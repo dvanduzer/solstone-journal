@@ -1615,6 +1615,30 @@ fn slots_from_launched_tier(context: u32) -> Option<u32> {
     }
 }
 
+fn model_content_parts(values: &[Value]) -> &[Value] {
+    let empty_typed_text = |value: &Value| {
+        value.get("role").is_none()
+            && value.get("type").and_then(Value::as_str) == Some("text")
+            && value.get("text").and_then(Value::as_str) == Some("")
+    };
+    if values.first().is_some_and(empty_typed_text)
+        && values[1..].iter().any(|value| {
+            value.as_str().is_some_and(|text| !text.is_empty())
+                || (value.get("role").is_none()
+                    && value.get("type").and_then(Value::as_str) == Some("text")
+                    && value
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.is_empty()))
+                || image_part(value).is_some()
+        })
+    {
+        &values[1..]
+    } else {
+        values
+    }
+}
+
 fn message_content(value: &Value) -> Value {
     if contains_image(value) {
         Value::Array(content_parts(value))
@@ -1622,7 +1646,7 @@ fn message_content(value: &Value) -> Value {
         value.clone()
     } else if let Value::Array(values) = value {
         Value::String(
-            values
+            model_content_parts(values)
                 .iter()
                 .map(python_text)
                 .collect::<Vec<_>>()
@@ -1640,7 +1664,10 @@ fn content_parts(value: &Value) -> Vec<Value> {
         ];
     }
     if let Value::Array(values) = value {
-        return values.iter().flat_map(content_parts).collect();
+        return model_content_parts(values)
+            .iter()
+            .flat_map(content_parts)
+            .collect();
     }
     vec![json!({"type": "text", "text": python_text(value)})]
 }
@@ -2568,6 +2595,46 @@ mod tests {
             json!(format!("{TRUNCATION_MARKER}\n\n## newest\nb\n"))
         );
         assert_eq!(budget.unwrap().dropped_entries, 1);
+    }
+
+    #[test]
+    fn fitting_reserve_rendering_preserves_existing_separators_and_all_empty_input() {
+        assert_eq!(
+            build_messages(&json!(["A", "", "B"]), None),
+            vec![json!({"role":"user","content":"A\n\nB"})]
+        );
+        let typed_middle = json!(["A", {"type":"text","text":""}, "B"]);
+        assert_eq!(
+            build_messages(&typed_middle, None),
+            vec![json!({"role":"user","content":"A\n{'type': text, 'text': }\nB"})]
+        );
+        let all_empty = json!([{"type":"text","text":""}, ""]);
+        assert_eq!(
+            build_messages(&all_empty, None),
+            vec![json!({"role":"user","content":"{'type': text, 'text': }\n"})]
+        );
+        for trailing in [Value::Null, json!(0), json!({"other":"value"})] {
+            let contents = json!([{"type":"text","text":""}, trailing]);
+            assert_eq!(
+                model_content_parts(contents.as_array().unwrap()),
+                contents.as_array().unwrap()
+            );
+        }
+        let role_bearing = json!([{"role":"user","type":"text","text":""}, "A"]);
+        assert_eq!(
+            model_content_parts(role_bearing.as_array().unwrap()),
+            role_bearing.as_array().unwrap()
+        );
+        let image = json!({"type":"image","mime_type":"image/png","data":"AA=="});
+        for content in [json!(["A", "", "B"]), typed_middle, json!(["A", image])] {
+            let expected = build_messages(&content, Some("system"));
+            let mut reserved = content.as_array().unwrap().clone();
+            reserved.insert(0, json!({"type":"text","text":""}));
+            assert_eq!(
+                build_messages(&Value::Array(reserved), Some("system")),
+                expected
+            );
+        }
     }
 
     /// A block with no `##` headers is a single entry, so keeping entries whole

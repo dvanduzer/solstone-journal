@@ -537,6 +537,353 @@ fn a_story_that_keeps_failing_validation_parks_until_its_input_changes() {
     );
 }
 
+fn fail_retryable_activity_use(
+    context: &context::ThinkContext,
+    recorder: &Recorder,
+    talent: &str,
+    use_id: &str,
+    reason: &str,
+    terminal: bool,
+) {
+    use solstone_core_generate::{ReasonCode, ReasonCodeValue, RefusalReason, RefusedResponse};
+    let policy = solstone_core_generate::contract()["reason_codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["code"] == reason)
+        .unwrap();
+    assert_eq!(policy["retryable"], true);
+    let mut bytes = format!("{{\"event\":\"start\",\"use_id\":\"{use_id}\"}}\n").into_bytes();
+    let mut error = Vec::new();
+    solstone_core_talent_runtime::emit_outcome_for_test(
+        &mut error,
+        solstone_core_talent_runtime::RuntimeOutcome::GenerateRefused {
+            error: solstone_core_talent_runtime::StageError::new(
+                "generate",
+                "runtime",
+                talent,
+                "request refused",
+            ),
+            response: Box::new(RefusedResponse {
+                id: None,
+                reason: RefusalReason::ProviderResponseInvalid,
+                reason_code: Some(ReasonCodeValue::Known(ReasonCode::new(reason).unwrap())),
+                retryable: policy["retryable"].as_bool().unwrap(),
+                blocking: policy["blocking"].as_bool().unwrap(),
+                reset_at_ms: None,
+                provider: Some("test".into()),
+                detail: "request refused".into(),
+            }),
+        },
+    );
+    let mut event: Value = serde_json::from_slice(&error).unwrap();
+    event["terminal"] = Value::Bool(terminal);
+    bytes.extend(serde_json::to_vec(&event).unwrap());
+    bytes.push(b'\n');
+    let path = context
+        .journal
+        .join("talents")
+        .join(talent)
+        .join(format!("{use_id}.jsonl"));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, bytes).unwrap();
+    recorder.end_states.lock().unwrap().insert(
+        use_id.into(),
+        solstone_core_cortex_client::UseEndState::Error,
+    );
+}
+
+#[test]
+fn context_refusal_stays_held_until_an_explicit_retry_and_can_recover() {
+    use solstone_core_system::work_retry::{self, Unit};
+    for recover in [false, true] {
+        let (_journal, _roots, context, recorder) = fixture();
+        fail_retryable_activity_use(
+            &context,
+            &recorder,
+            "participation",
+            "use-1",
+            "context_window_exceeded",
+            true,
+        );
+        assert!(replay(&context, &["090000_300", "090500_300"], true).is_err());
+        assert!(
+            due_activity_retries(&context.journal, i64::MAX)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!provenance(&context).exists());
+        let unit = Unit::Activity {
+            day: context.day.clone(),
+            facet: "work".into(),
+            activity: "work_090000_300".into(),
+            talent: "participation".into(),
+        };
+        let input = work_retry::input::current(&context.journal, &unit).unwrap();
+        seed_activity_retries(&context.journal, &context.day, context.now_ms).unwrap();
+        fs::create_dir_all(context.journal.join("config")).unwrap();
+        fs::write(
+            context.journal.join("config/journal.json"),
+            r#"{"providers":{"active":{"provider":"local","model":"fixture-model"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            work_retry::input::current(&context.journal, &unit).unwrap(),
+            input
+        );
+        assert!(
+            due_activity_retries(&context.journal, i64::MAX)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            work_retry::read(&context.journal, &unit.id().unwrap())
+                .unwrap()
+                .unwrap()
+                .permission(&input, work_retry::DECLARED_FIXES)
+                .is_none()
+        );
+        work_retry::request(&context.journal, &unit).unwrap();
+        let grant = work_retry::read(&context.journal, &unit.id().unwrap())
+            .unwrap()
+            .unwrap()
+            .permission(&input, work_retry::DECLARED_FIXES)
+            .unwrap();
+        // The fake Cortex does not run a worker; consume the worker's normal
+        // permission before it reports the next terminal outcome.
+        {
+            let _claim = work_retry::execution_claim(&context.journal, &unit).unwrap();
+            work_retry::consume(
+                &context.journal,
+                &unit,
+                &grant,
+                "context_window_exceeded",
+                &input,
+                work_retry::DECLARED_FIXES,
+            )
+            .unwrap();
+        }
+        if recover {
+            recorder.end_states.lock().unwrap().clear();
+        } else {
+            fail_retryable_activity_use(
+                &context,
+                &recorder,
+                "participation",
+                "use-2",
+                "context_window_exceeded",
+                true,
+            );
+        }
+        let mut retry = later(&context, 3_600_001);
+        retry.retry = Some((unit.clone(), grant.clone()));
+        let mut log = test_log(&retry, "explicit-retry");
+        let result =
+            activity::run(&retry, &mut log, "work_090000_300", "work", false, false, 1).unwrap();
+        assert_eq!(result.success, usize::from(recover));
+        assert_eq!(result.failed, usize::from(!recover));
+        if !recover {
+            let _claim = work_retry::execution_claim(&context.journal, &unit).unwrap();
+            work_retry::finish(
+                &context.journal,
+                &unit,
+                &grant,
+                Some("context_window_exceeded"),
+            )
+            .unwrap();
+        }
+        assert_eq!(recorder.requests.lock().unwrap().len(), 2);
+        assert_eq!(provenance(&context).exists(), recover);
+        assert!(
+            due_activity_retries(&context.journal, i64::MAX)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            work_retry::read(&context.journal, &unit.id().unwrap())
+                .unwrap()
+                .unwrap()
+                .permission(&input, work_retry::DECLARED_FIXES)
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn context_holding_requires_that_exact_terminal_reason() {
+    for (reason, terminal) in [("no_output", true), ("context_window_exceeded", false)] {
+        let (_journal, _roots, context, recorder) = fixture();
+        fail_retryable_activity_use(
+            &context,
+            &recorder,
+            "participation",
+            "use-1",
+            reason,
+            terminal,
+        );
+        assert!(replay(&context, &["090000_300", "090500_300"], true).is_err());
+        assert_eq!(
+            due_activity_retries(&context.journal, i64::MAX)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            crate::activity_work::discover_held_activities(&context.journal)
+                .0
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn context_holding_preserves_retryable_sibling_work() {
+    let (_journal, roots, context, recorder) = fixture();
+    fs::write(roots.path().join("talent/work_extra.md"), "{\n\"type\":\"generate\",\"max_output_tokens\":1024,\"schedule\":\"activity\",\"priority\":2,\"output\":\"md\",\"activities\":[\"work\"]\n}\nWrite the activity.").unwrap();
+    fail_retryable_activity_use(
+        &context,
+        &recorder,
+        "participation",
+        "use-1",
+        "context_window_exceeded",
+        true,
+    );
+    fail_retryable_activity_use(
+        &context,
+        &recorder,
+        "work_extra",
+        "use-2",
+        "local_endpoint_unreachable",
+        true,
+    );
+    assert!(replay(&context, &["090000_300", "090500_300"], true).is_err());
+    assert_eq!(recorder.requests.lock().unwrap().len(), 2);
+    let next = later(&context, 3_600_001);
+    assert_eq!(
+        due_activity_retries(&context.journal, next.now_ms)
+            .unwrap()
+            .len(),
+        1
+    );
+    recorder.end_states.lock().unwrap().clear();
+    let mut log = test_log(&next, "sibling-retry");
+    let result =
+        activity::run(&next, &mut log, "work_090000_300", "work", false, false, 1).unwrap();
+    assert_eq!((result.success, result.failed), (1, 1));
+    let requests = recorder.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[2].name, "work_extra");
+    assert!(!provenance(&context).exists());
+    assert!(
+        due_activity_retries(&context.journal, i64::MAX)
+            .unwrap()
+            .is_empty()
+    );
+    let (held, errors) = crate::activity_work::discover_held_activities(&context.journal);
+    assert!(errors.is_empty());
+    assert!(
+        matches!(held.as_slice(), [solstone_core_system::work_retry::Unit::Activity { talent, .. }] if talent == "participation")
+    );
+}
+
+#[test]
+fn changed_source_allows_one_context_retry_then_returns_to_held() {
+    use solstone_core_system::work_retry::{self, Unit};
+    let (_journal, _roots, context, recorder) = fixture();
+    fail_retryable_activity_use(
+        &context,
+        &recorder,
+        "participation",
+        "use-1",
+        "context_window_exceeded",
+        true,
+    );
+    assert!(replay(&context, &["090000_300", "090500_300"], true).is_err());
+    let unit = Unit::Activity {
+        day: context.day.clone(),
+        facet: "work".into(),
+        activity: "work_090000_300".into(),
+        talent: "participation".into(),
+    };
+    let original = crate::activity_work::activity_held_input(&context.journal, &unit)
+        .unwrap()
+        .unwrap();
+    let path = segment_dir(&context.journal, &context.day, "090000_300").join("talents/sense.json");
+    let mut source: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    source["activity_summary"] = serde_json::json!("new relevant source");
+    fs::write(path, serde_json::to_vec(&source).unwrap()).unwrap();
+    let input = crate::activity_work::activity_held_input(&context.journal, &unit)
+        .unwrap()
+        .unwrap();
+    assert_ne!(input, original);
+    let grant = work_retry::read(&context.journal, &unit.id().unwrap())
+        .unwrap()
+        .unwrap()
+        .permission(&input, work_retry::DECLARED_FIXES)
+        .unwrap();
+    {
+        let _claim = work_retry::execution_claim(&context.journal, &unit).unwrap();
+        work_retry::consume(
+            &context.journal,
+            &unit,
+            &grant,
+            "context_window_exceeded",
+            &input,
+            work_retry::DECLARED_FIXES,
+        )
+        .unwrap();
+    }
+    fail_retryable_activity_use(
+        &context,
+        &recorder,
+        "participation",
+        "use-2",
+        "context_window_exceeded",
+        true,
+    );
+    let mut retry = later(&context, 3_600_001);
+    retry.retry = Some((unit.clone(), grant.clone()));
+    let mut log = test_log(&retry, "changed-source-retry");
+    assert_eq!(
+        activity::run(&retry, &mut log, "work_090000_300", "work", false, false, 1)
+            .unwrap()
+            .failed,
+        1
+    );
+    {
+        let _claim = work_retry::execution_claim(&context.journal, &unit).unwrap();
+        work_retry::finish(
+            &context.journal,
+            &unit,
+            &grant,
+            Some("context_window_exceeded"),
+        )
+        .unwrap();
+    }
+    for _ in 0..2 {
+        assert_eq!(
+            crate::activity_work::activity_held_input(&context.journal, &unit)
+                .unwrap()
+                .as_deref(),
+            Some(input.as_str())
+        );
+        assert!(
+            work_retry::read(&context.journal, &unit.id().unwrap())
+                .unwrap()
+                .unwrap()
+                .permission(&input, work_retry::DECLARED_FIXES)
+                .is_none()
+        );
+    }
+    assert_eq!(recorder.requests.lock().unwrap().len(), 2);
+    assert!(
+        due_activity_retries(&context.journal, i64::MAX)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!provenance(&context).exists());
+}
+
 #[test]
 fn repeated_connection_interruptions_remain_due_after_many_attempts() {
     let (_journal, _roots, context, recorder) = fixture();

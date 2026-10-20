@@ -1194,15 +1194,7 @@ mod tests {
     }
 
     fn text_parts(prepared: &PreparedTalent) -> Vec<String> {
-        crate::generate_contents(prepared)
-            .into_iter()
-            .map(|part| match part {
-                solstone_core_generate::ContentPart::Text { text } => text,
-                solstone_core_generate::ContentPart::Image { .. } => {
-                    panic!("location context is text")
-                }
-            })
-            .collect()
+        crate::model_text_parts(&prepared.config)
     }
 
     fn rendered_observations(root: &std::path::Path) -> Vec<String> {
@@ -1358,7 +1350,7 @@ mod tests {
         );
         assert!(config.get("_daily_location_text").is_none());
         let parts = text_parts(&thaw(&packet).unwrap().0);
-        assert_eq!(parts, vec!["No input provided.".to_owned()]);
+        assert!(parts.is_empty());
 
         write(
             root.path(),

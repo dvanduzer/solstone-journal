@@ -10,6 +10,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - on windows, home in the journal window shows download progress in sizes like 1.2 GB of 4.8 GB, instead of two bare numbers.
 - on windows, pairing the solstone app on the journal's own computer no longer shows the linux commands.
+- long morning briefings and entity reviews keep their instructions intact. if those instructions and context won't fit your model, the run stops.
+- if your thinking provider refuses an activity because it's too long, your journal sets it aside instead of trying the same request every hour. you can try it again after changing your thinking choice.
 
 ## [2.0.52] - 2026-10-20
 
