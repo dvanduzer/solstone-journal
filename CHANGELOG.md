@@ -12,6 +12,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - on windows, pairing the solstone app on the journal's own computer no longer shows the linux commands.
 - long morning briefings and entity reviews keep their instructions intact. if those instructions and context won't fit your model, the run stops.
 - if your thinking provider refuses an activity because it's too long, your journal sets it aside instead of trying the same request every hour. you can try it again after changing your thinking choice.
+- the health page's backup spot-check now says it checked 1 of 52 parts of your backup, as the backup page does, instead of a bare 42/52.
 
 ## [2.0.52] - 2026-10-20
 

@@ -22,6 +22,10 @@
     "binding_invalid": "this computer's link to encrypted backup was refused.",
     "binding_superseded": "this computer's link to encrypted backup was replaced."
 };
+  const VERIFICATION_SUBSET = {
+    one: "checked all of your backup this week.",
+    part: "checked 1 of {total} parts of your backup, a different part each week.",
+  };
   const unavailable = "backup status is unavailable right now.";
   const incomplete = BACKUP_ERROR_REASONS.incomplete;
   const qualification = "these are recorded results. they don't confirm what's at your current destination or whether it has been verified.";
@@ -42,6 +46,27 @@
     && Number.isFinite(new Date(time * 1000).getTime())
     ? new Date(time * 1000).toLocaleString() : null;
 
+  // 'checked_subset' is restic's --read-data-subset selector, shaped 'n/m':
+  // the run read one of m equal parts of the pack data, and n only says which
+  // part this week's turn landed on. It is never a count of snapshots or of
+  // parts checked, so the sentence reports one part out of m and nothing else.
+  function verificationSubsetLine(value) {
+    if (typeof value !== 'string') return '';
+    const parts = value.split('/');
+    if (parts.length !== 2) return '';
+    const selected = Number(parts[0]);
+    const total = Number(parts[1]);
+    if (!Number.isFinite(selected) || !Number.isFinite(total) || total <= 0) return '';
+    // The only producer today is verification_subset_for_week, which always
+    // emits '/52', so the one-part branch is unreachable from this journal.
+    // It is kept rather than dropped: the selector is restic's, a future
+    // schedule that reads the whole pack in one turn would emit '1/1', and a
+    // sentence saying "1 of 1 parts" is the failure it would land as.
+    return total === 1
+      ? VERIFICATION_SUBSET.one
+      : VERIFICATION_SUBSET.part.replace('{total}', String(total));
+  }
+
   function resultText(result, verification = false) {
     if (!record(result)) return "isn't known";
     const outcomes = verification
@@ -58,8 +83,10 @@
     if (!verification && result.status === 'ok' && result.error_reason === 'incomplete') {
       text += `. ${incomplete}`;
     }
-    if (verification && result.status === 'ok' && typeof result.checked_subset === 'string'
-        && result.checked_subset) text += `, subset checked: ${result.checked_subset}`;
+    if (verification && result.status === 'ok') {
+      const subset = verificationSubsetLine(result.checked_subset);
+      if (subset) text += `. ${subset}`;
+    }
     return text;
   }
 
@@ -184,5 +211,7 @@
     }
   }
 
-  window.BackupStatus = { select, renderSummary, renderFacts, errorReasons: BACKUP_ERROR_REASONS };
+  window.BackupStatus = {
+    select, renderSummary, renderFacts, verificationSubsetLine, errorReasons: BACKUP_ERROR_REASONS,
+  };
 })();

@@ -94,8 +94,6 @@
         "backup_history_note": "this is a past result. it doesn't confirm what's stored at your current backup destination or whether it has been verified.",
         "last_prune": "last cleanup",
         "last_verification": "last verification",
-        "verification_subset_one": "checked all of your backup this week.",
-        "verification_subset": "checked 1 of {total} parts of your backup, a different part each week.",
         "not_available": "not yet available",
         "not_yet": "not yet",
         "ago": "{duration} ago",
@@ -1116,29 +1114,6 @@
     return { text: template.replace('{duration}', duration), title };
   }
 
-  // 'checked_subset' is restic's --read-data-subset selector, shaped 'n/m':
-  // the run read one of m equal parts of the pack data, and n only says which
-  // part this week's turn landed on. It is never a count of snapshots, so the
-  // sentence reports one part out of m and nothing else.
-  function verificationSubsetLine(value) {
-    if (typeof value !== 'string') return '';
-    const parts = value.split('/');
-    if (parts.length !== 2) return '';
-    const selected = Number(parts[0]);
-    const total = Number(parts[1]);
-    if (!Number.isFinite(selected) || !Number.isFinite(total) || total <= 0) return '';
-    // The only producer today is verification_subset_for_week, which always
-    // emits '/52', so the one-part branch is unreachable from this journal.
-    // It is kept rather than dropped: the selector is restic's, a future
-    // schedule that reads the whole pack in one turn would emit '1/1', and a
-    // sentence saying "1 of 1 parts" is the failure it would land as.
-    const key = total === 1
-      ? 'management.status_labels.verification_subset_one'
-      : 'management.status_labels.verification_subset';
-    const template = resolveCopyPath(copy, key) || '';
-    return template.replace('{total}', String(total));
-  }
-
   function ensureBackupStatusNodes() {
     const backup = root.querySelector('[data-last-backup]');
     let reason = document.querySelector('[data-last-backup-reason]');
@@ -1814,7 +1789,7 @@
       }
     }
     if (nodes.subset) {
-      const line = verificationSubsetLine(lastVerification.checked_subset);
+      const line = window.BackupStatus.verificationSubsetLine(lastVerification.checked_subset);
       nodes.subset.textContent = line;
       nodes.subset.hidden = !line;
     }
