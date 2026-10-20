@@ -609,10 +609,12 @@ pub(crate) fn apply_result_cancellable(
     // Preserve solstone/talent/speaker_attribution.py:200: post processing creates the segment path.
     crate::writers::check_cancellation(cancellation)?;
     let segment_dir = segment_dir(journal, day, stream, segment, layout, true)?;
+    let mut metadata = metadata_values(&resolved.metadata);
+    crate::partial_input::copy_marker(output, &mut metadata);
     solstone_core_speaker_id::labels::write_full_labels_checked(
         &segment_dir,
         label_values(&resolved),
-        &metadata_values(&resolved.metadata),
+        &metadata,
         &|| crate::writers::check_cancellation(cancellation),
     )
     .map_err(|error| error.to_string())?;

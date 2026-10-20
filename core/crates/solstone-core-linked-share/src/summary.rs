@@ -34,6 +34,8 @@ pub struct SegmentSummary {
     pub points: Vec<SharedPoint>,
     /// The points joined; `None` when the summary could not be made.
     pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partial_input: Option<Value>,
 }
 
 /// What would be shared for one activity. It carries the activity's type,
@@ -51,12 +53,16 @@ pub struct SharePackage {
     pub available: bool,
     pub activity_summary: Option<String>,
     pub segments: Vec<SegmentSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partial_input: Option<Value>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PointsReply {
     points: Vec<RawPoint>,
+    #[serde(default)]
+    partial_input: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -70,6 +76,8 @@ struct RawPoint {
 #[serde(deny_unknown_fields)]
 struct ActivityReply {
     summary: String,
+    #[serde(default)]
+    partial_input: Option<Value>,
 }
 
 /// Match the activity and, when it matches, build its package. `None` when
@@ -93,7 +101,19 @@ pub fn build_package(
     } else {
         None
     };
+    let partial_input = crate::talents::combine_partial_inputs(
+        matched
+            .partial_input
+            .iter()
+            .chain(segments.iter().filter_map(|s| s.partial_input.as_ref()))
+            .chain(
+                activity_summary
+                    .as_ref()
+                    .and_then(|(_, partial)| partial.as_ref()),
+            ),
+    );
     Some(SharePackage {
+        partial_input,
         sender: owner.name.clone(),
         shared_with: person.name.clone(),
         day: day.to_owned(),
@@ -103,7 +123,7 @@ pub fn build_package(
         basis: matched.basis,
         shape: matched.shape,
         available: available && activity_summary.is_some(),
-        activity_summary,
+        activity_summary: activity_summary.map(|(summary, _)| summary),
         segments,
     })
 }
@@ -131,15 +151,16 @@ pub(crate) fn summarize_segments(
                 None => conversation_lines(source, person, owner),
             };
             let points = if lines.is_empty() {
-                Some(Vec::new())
+                Some((Vec::new(), None))
             } else {
                 let header = segment_header(matched, person, owner, index, in_scope.len());
                 summarize_lines(&header, &lines, person, owner, talents)
             };
             SegmentSummary {
                 segment: source.segment.clone(),
-                summary: points.as_ref().map(|points| join_points(points)),
-                points: points.unwrap_or_default(),
+                summary: points.as_ref().map(|(points, _)| join_points(points)),
+                partial_input: points.as_ref().and_then(|(_, partial)| partial.clone()),
+                points: points.map(|(points, _)| points).unwrap_or_default(),
             }
         })
         .collect()
@@ -172,7 +193,7 @@ fn summarize_lines(
     person: &PersonRef,
     owner: &Owner,
     talents: &dyn TalentCaller,
-) -> Option<Vec<SharedPoint>> {
+) -> Option<(Vec<SharedPoint>, Option<Value>)> {
     let mut input = header.to_owned();
     for line in lines {
         input.push('\n');
@@ -182,7 +203,10 @@ fn summarize_lines(
         serde_json::from_value::<PointsReply>(value).map_err(|error| error.to_string())
     });
     match reply {
-        Ok(reply) => Some(attribute(reply.points, lines, person, owner)),
+        Ok(reply) => Some((
+            attribute(reply.points, lines, person, owner),
+            reply.partial_input.filter(Value::is_object),
+        )),
         Err(error) => {
             log::warn!("segment summary unavailable: {error}");
             None
@@ -286,14 +310,14 @@ fn summarize_activity(
     person: &PersonRef,
     owner: &Owner,
     talents: &dyn TalentCaller,
-) -> Option<String> {
+) -> Option<(String, Option<Value>)> {
     let points = segments
         .iter()
         .flat_map(|segment| segment.points.iter())
         .map(|point| format!("- {}", point.text))
         .collect::<Vec<_>>();
     if points.is_empty() {
-        return Some(String::new());
+        return Some((String::new(), None));
     }
     let input = format!(
         "Owner: {}\nShared with: {}\nActivity type: {activity_type}\n\nPoints:\n{}",
@@ -306,7 +330,10 @@ fn summarize_activity(
         .and_then(|value: Value| {
             serde_json::from_value::<ActivityReply>(value).map_err(|error| error.to_string())
         }) {
-        Ok(reply) => Some(reply.summary.trim().to_owned()),
+        Ok(reply) => Some((
+            reply.summary.trim().to_owned(),
+            reply.partial_input.filter(Value::is_object),
+        )),
         Err(error) => {
             log::warn!("activity summary unavailable: {error}");
             None

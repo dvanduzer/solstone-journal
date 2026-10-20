@@ -80,6 +80,24 @@ impl TalentCaller for RuntimeTalents<'_> {
     }
 }
 
+/// Aggregate the accepted calls contributing to this read-only result.
+pub(crate) fn combine_partial_inputs<'a>(
+    markers: impl Iterator<Item = &'a Value>,
+) -> Option<Value> {
+    let markers: Vec<_> = markers.filter(|v| v.is_object()).collect();
+    if markers.is_empty() {
+        return None;
+    }
+    let mut result = Map::new();
+    for key in ["dropped_entries", "dropped_chars"] {
+        let sum = markers.iter().try_fold(0u64, |sum, marker| {
+            marker.get(key)?.as_u64()?.checked_add(sum)
+        });
+        result.insert(key.into(), sum.map(Value::from).unwrap_or(Value::Null));
+    }
+    Some(Value::Object(result))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;

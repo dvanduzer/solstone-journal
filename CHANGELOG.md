@@ -13,6 +13,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- when input is too long to fit, saved results now say so. health treats those useful partial results separately from failed runs.
+
 - saving or importing something no longer waits for search to finish updating. search catches up in the background, and health shows pending updates and removals that need another try.
 - when your agent reads what was said in a recording your journal transcribed, it now sees a speaker's name only when your journal recognized the voice or you named the speaker, and lines your journal recognized as yours carry your name with "(owner)". a name your journal guessed from what was said no longer appears as who spoke.
 - when an activity's whole source is short recorded speech you didn't import, its story now quotes it word for word, crediting a line to you or to someone by name only when your journal recognized the voice or you named the speaker. stories already written stay as they are.

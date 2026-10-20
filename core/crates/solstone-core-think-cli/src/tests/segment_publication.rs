@@ -82,6 +82,38 @@ fn segment_publication_replaces_whatever_its_output_files_already_hold() {
     );
 }
 
+#[test]
+fn sense_partial_projections_replace_their_notice_with_the_result() {
+    let (_journal, context) = fixture_journal();
+    let segment = context.day_dir.join("default/120000_60");
+    let mut log = RunLogWriter::open(&context.journal, DAY, "segment");
+    for partial in [true, false, true] {
+        let mut sense = serde_json::json!({"density":"idle","content_type":"idle","activity_summary":"kept summary","entities":[{"type":"Tool","name":"Editor"}],"facets":[]});
+        if partial {
+            sense["partial_input"] = serde_json::json!({"dropped_entries":2});
+        }
+        write_sense_and_change(
+            &context,
+            &mut log,
+            "120000_60",
+            Some("default"),
+            &segment,
+            sense.as_object().unwrap(),
+        )
+        .unwrap();
+        for file in ["activity.md", "sense.md", "topics.md"] {
+            let text = fs::read_to_string(segment.join("talents").join(file)).unwrap();
+            assert_eq!(text.contains("Left out:"), partial, "{file}: {text}");
+        }
+        for file in ["sense.json", "density.json"] {
+            let saved: Value =
+                serde_json::from_slice(&fs::read(segment.join("talents").join(file)).unwrap())
+                    .unwrap();
+            assert_eq!(saved.get("partial_input").is_some(), partial, "{file}");
+        }
+    }
+}
+
 fn fixture_journal() -> (tempfile::TempDir, ThinkContext) {
     let journal = tempfile::tempdir().unwrap();
     let config_path = journal.path().join("config/journal.json");

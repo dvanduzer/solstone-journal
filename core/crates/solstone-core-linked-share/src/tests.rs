@@ -469,6 +469,7 @@ fn points_are_attributed_by_code_and_invalid_ids_dropped() {
         spoken(Voice::Unidentified, 3, "I can draft the note."),
     ];
     let found = ActivityMatch {
+        partial_input: None,
         basis: Basis::Voice,
         shape: Shape::Conversation,
         segments: vec![SEGMENTS[0].to_owned()],
@@ -521,6 +522,7 @@ fn a_failed_segment_call_makes_that_summary_unavailable() {
     let mut sources = vec![segment(SEGMENTS[0], vec![]), segment(SEGMENTS[1], vec![])];
     sources[0].utterances = vec![spoken(Voice::Owner, 1, "hello")];
     let found = ActivityMatch {
+        partial_input: None,
         basis: Basis::Voice,
         shape: Shape::Conversation,
         segments: vec![SEGMENTS[0].to_owned(), SEGMENTS[1].to_owned()],
@@ -705,6 +707,128 @@ fn the_verb_lists_matching_activities_from_journal_files() {
     assert_eq!(lines[1]["basis"], "voice");
     assert_eq!(lines[1]["segments"], json!([SEGMENTS[2]]));
     assert_eq!(fs::read_dir(root.path()).expect("dir").count(), before);
+}
+
+#[test]
+fn clipped_shipped_summary_talents_keep_the_package_available_and_read_only() {
+    use crate::talents::RuntimeTalents;
+    use solstone_core_generate::{GenerateRequest, GenerateResponse, GeneratedResponse};
+    use solstone_core_talent_runtime::prepare::RuntimePaths;
+    let root = fixture_journal();
+    let config_path = root.path().join("config/journal.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    config["providers"] = json!({"active":{"provider":"google","model":"test-model"}});
+    fs::write(config_path, config.to_string()).unwrap();
+    let config_before = fs::read(root.path().join("config/journal.json")).unwrap();
+    for clipped_talent in [SEGMENT_TALENT, ACTIVITY_TALENT] {
+        let generate = |request: &GenerateRequest| {
+            let reply = match request.context.as_str() {
+                SEGMENT_TALENT => {
+                    json!({"points":[{"ids":["m1"],"point":"raised the launch date"}]})
+                }
+                ACTIVITY_TALENT => json!({"summary":"Jane raised the launch date."}),
+                other => panic!("unexpected {other}"),
+            };
+            Ok(GenerateResponse::Generated(Box::new(GeneratedResponse {
+                id: None,
+                text: reply.to_string(),
+                model: "test-model".into(),
+                finish_reason: "stop".into(),
+                usage: json!({}),
+                thinking: None,
+                schema_validation: Some(json!({"valid":true})),
+                input_budget: Some(
+                    json!({"clipped":request.context==clipped_talent,"dropped_entries":2,"dropped_chars":50}),
+                ),
+                request_budget: None,
+                inference: None,
+                hints_applied: Vec::new(),
+            })))
+        };
+        let paths = RuntimePaths {
+            talent_root: Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../payload/solstone/talent"),
+            apps_root: root.path().join("absent-apps"),
+            templates_dir: root.path().join("absent-templates"),
+        };
+        let talents = RuntimeTalents::new(root.path(), paths, &generate);
+        let result = run(
+            root.path(),
+            &[
+                "package",
+                "--person",
+                "jane_doe",
+                "--day",
+                DAY,
+                "--facet",
+                "work",
+                "--activity",
+                "messaging_150000_300",
+            ],
+            &talents,
+        );
+        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        assert!(result.stderr.contains("Left out:"));
+        let package: Value = serde_json::from_str(&result.stdout).unwrap();
+        assert_eq!(package["available"], true, "{package}");
+        assert_eq!(package["activity_summary"], "Jane raised the launch date.");
+        assert_eq!(package["partial_input"]["dropped_entries"], 2);
+        assert_eq!(
+            package["segments"][0].get("partial_input").is_some(),
+            clipped_talent == SEGMENT_TALENT
+        );
+    }
+    assert_eq!(
+        fs::read(root.path().join("config/journal.json")).unwrap(),
+        config_before
+    );
+    assert!(!root.path().join("talents").exists());
+    assert!(
+        !root
+            .path()
+            .join(format!("chronicle/{DAY}/talents"))
+            .exists()
+    );
+}
+
+#[test]
+fn clipped_presence_marks_matches_and_warns_even_when_nothing_matches() {
+    let root = fixture_journal();
+    let audio = format!("chronicle/{DAY}/default/{}/audio.jsonl", SEGMENTS[1]);
+    write(
+        root.path(),
+        &audio,
+        &jsonl(&[
+            analyzed(),
+            json!({"start":"00:00:01","text":"Jane, can you check?","sentence_id":0}),
+        ]),
+    );
+    for role in ["with", "about"] {
+        let talents = |talent: &str, _: &str| {
+            assert_eq!(talent, PRESENCE_TALENT);
+            Ok(json!({"role":role,"partial_input":{"dropped_entries":1}}))
+        };
+        let result = run(
+            root.path(),
+            &["match", "--person", "jane_doe", "--day", DAY],
+            &talents,
+        );
+        assert_eq!(result.exit_code, 0);
+        assert!(result.stderr.contains("Left out:"));
+        let rows: Vec<Value> = result
+            .stdout
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let found = rows
+            .iter()
+            .find(|row| row["activity_id"] == "coding_150500_300");
+        if role == "with" {
+            assert_eq!(found.unwrap()["partial_input"]["dropped_entries"], 1);
+        } else {
+            assert!(found.is_none());
+        }
+    }
 }
 
 #[test]

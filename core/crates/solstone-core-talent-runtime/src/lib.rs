@@ -26,6 +26,7 @@ pub mod documents;
 pub mod entities;
 pub mod morning_briefing;
 pub mod owner_actors;
+mod partial_input;
 pub mod participation;
 pub mod prepare;
 mod prompt_context;
@@ -943,7 +944,16 @@ fn generate_response(
     let _ = prepared.config.remove(INPUT_BUDGET_KEY);
     let _ = prepared.config.remove(story::INPUT_WHOLE_KEY);
     match screen_batch::generate_if_needed(prepared, context, generate, Some(writer)) {
-        Some(Ok(response)) => Ok((response, None, None)),
+        Some(Ok(response)) => {
+            if let Some(budget) = response.input_budget {
+                prepared.config.insert(INPUT_BUDGET_KEY.to_owned(), budget);
+            } else {
+                prepared
+                    .config
+                    .insert(story::INPUT_WHOLE_KEY.to_owned(), Value::Bool(true));
+            }
+            Ok((response.text, None, None))
+        }
         Some(Err(outcome)) => Err(outcome),
         None => {
             let request = generate_request(prepared).map_err(|detail| {
@@ -1229,10 +1239,10 @@ pub(crate) fn generate_and_write(
             return RuntimeOutcome::Cancelled;
         }
         return RuntimeOutcome::Finished {
-            output,
+            output: partial_input::output(&output, prepared),
             disposition,
             usage,
-            degraded,
+            degraded: partial_input::degraded(prepared, degraded),
             output_changed,
         };
     }
@@ -1266,10 +1276,10 @@ pub(crate) fn generate_and_write(
                 return RuntimeOutcome::Cancelled;
             }
             RuntimeOutcome::Finished {
-                output: response,
+                output: partial_input::output(&response, prepared),
                 disposition: CommitDisposition::Written,
                 usage,
-                degraded,
+                degraded: partial_input::degraded(prepared, degraded),
                 output_changed: Some(changed),
             }
         }

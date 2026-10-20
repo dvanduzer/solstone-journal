@@ -123,6 +123,8 @@ pub(crate) fn write_output_if_configured_cancellable(
     cancellation: &solstone_core_generate::Cancellation,
 ) -> Result<bool, String> {
     check_cancellation(cancellation)?;
+    let output = crate::partial_input::output(output, prepared);
+    let output = output.as_str();
     let Some(path_str) = prepared.config.get("output_path").and_then(Value::as_str) else {
         return Ok(false);
     };
@@ -292,7 +294,12 @@ pub(crate) fn apply_prepared(
     prepared: &PreparedTalent,
     cancellation: &solstone_core_generate::Cancellation,
 ) -> Result<CommitDisposition, StageError> {
-    apply_with_sources(plan, context, &trusted_sources(prepared), cancellation)
+    apply_with_sources(
+        crate::partial_input::decorate(plan, prepared),
+        context,
+        &trusted_sources(prepared),
+        cancellation,
+    )
 }
 
 fn apply_with_sources(
