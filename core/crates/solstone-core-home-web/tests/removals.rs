@@ -191,6 +191,8 @@ fn action_records(root: &Path) -> Vec<Value> {
 #[test]
 fn removal_card_escapes_journal_values_before_rendering_markup() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // without_executor empties PATH for the whole process; hold its lock so node resolves.
+    let _env = EXECUTOR_ENV_LOCK.lock().expect("executor environment lock");
     let output = Command::new("node")
         .arg(manifest_dir.join("tests/removals_escape.js"))
         .arg(manifest_dir)
@@ -206,6 +208,8 @@ fn removal_card_escapes_journal_values_before_rendering_markup() {
 #[test]
 fn needs_you_items_render_informational_without_affordances() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // without_executor empties PATH for the whole process; hold its lock so node resolves.
+    let _env = EXECUTOR_ENV_LOCK.lock().expect("executor environment lock");
     let output = Command::new("node")
         .arg(manifest_dir.join("tests/needs_you_render.js"))
         .arg(manifest_dir)
@@ -222,6 +226,8 @@ fn needs_you_items_render_informational_without_affordances() {
 #[test]
 fn vitals_render_calm_neutral_without_attention_chip() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // without_executor empties PATH for the whole process; hold its lock so node resolves.
+    let _env = EXECUTOR_ENV_LOCK.lock().expect("executor environment lock");
     let output = Command::new("node")
         .arg(manifest_dir.join("tests/vitals_render.js"))
         .arg(manifest_dir)
@@ -238,6 +244,8 @@ fn vitals_render_calm_neutral_without_attention_chip() {
 #[test]
 fn narrative_and_briefing_placeholder_states_stay_honest() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // without_executor empties PATH for the whole process; hold its lock so node resolves.
+    let _env = EXECUTOR_ENV_LOCK.lock().expect("executor environment lock");
     let output = Command::new("node")
         .arg(manifest_dir.join("tests/narrative_briefing_render.js"))
         .arg(manifest_dir)
@@ -254,6 +262,8 @@ fn narrative_and_briefing_placeholder_states_stay_honest() {
 #[test]
 fn reconnect_rereads_what_a_lost_completion_event_would_have_refreshed() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // without_executor empties PATH for the whole process; hold its lock so node resolves.
+    let _env = EXECUTOR_ENV_LOCK.lock().expect("executor environment lock");
     let output = Command::new("node")
         .arg(manifest_dir.join("tests/reconnect_refresh.js"))
         .arg(manifest_dir)
@@ -270,6 +280,8 @@ fn reconnect_rereads_what_a_lost_completion_event_would_have_refreshed() {
 #[test]
 fn yesterday_processing_splits_failures_from_neutral_summary() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // without_executor empties PATH for the whole process; hold its lock so node resolves.
+    let _env = EXECUTOR_ENV_LOCK.lock().expect("executor environment lock");
     let output = Command::new("node")
         .arg(manifest_dir.join("tests/yesterday_processing_render.js"))
         .arg(manifest_dir)
@@ -286,6 +298,8 @@ fn yesterday_processing_splits_failures_from_neutral_summary() {
 #[test]
 fn today_rows_carry_the_servers_source_label_only_where_it_is_set() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // without_executor empties PATH for the whole process; hold its lock so node resolves.
+    let _env = EXECUTOR_ENV_LOCK.lock().expect("executor environment lock");
     let output = Command::new("node")
         .arg(manifest_dir.join("tests/today_activity_source_render.js"))
         .arg(manifest_dir)
@@ -520,6 +534,8 @@ fn recover_maps_receipt_shapes_without_consulting_policy() {
 #[test]
 fn getting_started_render_card_structure() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // without_executor empties PATH for the whole process; hold its lock so node resolves.
+    let _env = EXECUTOR_ENV_LOCK.lock().expect("executor environment lock");
     let output = Command::new("node")
         .arg(manifest_dir.join("tests/getting_started_render.js"))
         .arg(manifest_dir)
