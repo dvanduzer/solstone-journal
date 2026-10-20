@@ -493,6 +493,10 @@
       if (thisComputerStep) thisComputerStep.hidden = !active;
       const computerStep = dialog.querySelector('[data-copy="COMPUTER_STEP_1"]');
       if (computerStep) computerStep.hidden = active;
+      // A journal on windows pairs the solstone app on its own computer, so
+      // the linux commands don't apply there.
+      const linuxSetup = dialog.querySelector('.link-pairing-linux');
+      if (linuxSetup) linuxSetup.hidden = active && options.windowsAsks?.() === true;
     }
 
     function open(type) {

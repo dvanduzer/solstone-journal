@@ -378,7 +378,10 @@ function createEnvironment(manifestDir, options = {}) {
   computerSteps.append(thisComputerStep1, computerStep1, computerStep2);
   const linuxNote = make('link-pairing-computer-linux-note', 'p');
   linuxNote.setAttribute('data-copy', 'COMPUTER_LINUX_NOTE');
-  typeBlocks[1].append(computerSteps, linuxNote);
+  const linuxSetup = make('link-pairing-computer-linux', 'div');
+  linuxSetup.classList.add('link-pairing-linux');
+  linuxSetup.appendChild(linuxNote);
+  typeBlocks[1].append(computerSteps, linuxSetup);
   const copyButton = make('link-pairing-copy', 'button');
   copyButton.dataset.pairingAction = 'copy';
   const check = make('link-pairing-check', 'button');
@@ -1342,6 +1345,11 @@ async function main() {
     for (const id of idMatches) {
       assert.ok(workspace.includes(`id="${id}"`), `workspace.html contains id="${id}"`);
     }
+    // The block the this-computer view hides on windows holds the linux note and its commands.
+    const linuxBlock = workspace.match(/<div class="link-pairing-linux">([\s\S]*?)<div id="link-pairing-for-terminal"/);
+    assert.ok(linuxBlock, 'workspace.html wraps the linux commands in .link-pairing-linux');
+    assert.ok(linuxBlock[1].includes('data-copy="COMPUTER_LINUX_NOTE"'));
+    assert.ok(linuxBlock[1].includes('systemctl --user'));
   });
 
   await testCase('header opener opens ceremony and restores opener focus on close', async () => {
@@ -1414,6 +1422,7 @@ async function main() {
     assert.strictEqual(visibleSteps[0]?.getAttribute('data-copy'), 'THIS_COMPUTER_STEP_1');
     assert.ok(env.nodes.get('link-pairing-for-computer').querySelectorAll('li').some((li) => li.getAttribute('data-copy') === 'COMPUTER_STEP_2'));
     assert.ok(env.nodes.get('link-pairing-for-computer').querySelector('[data-copy="COMPUTER_LINUX_NOTE"]') !== null);
+    assert.strictEqual(env.nodes.get('link-pairing-computer-linux').hidden, false);
 
     // While same-machine material is showing, activate data-pairing-action="regenerate"
     env.fetchQueue.push(response(material({ link_addresses: ['127.0.0.1:7657'] })));
@@ -1453,6 +1462,30 @@ async function main() {
     await settle();
     assert.strictEqual(env.dialog.querySelector('.link-pairing-type').hidden, false);
     assert.strictEqual(env.nodes.get('link-pairing-type-terminal').getAttribute('aria-pressed'), 'true');
+  });
+
+  await testCase('on windows the this-computer view leaves out the linux commands', async () => {
+    const env = createEnvironment(manifestDir, { windowsAsks: true });
+    env.fetchQueue.push(response({ reason_code: 'local_network_closed' }, 409));
+    env.click(env.opener);
+    await settle();
+    env.fetchQueue.push(response(material({ link_addresses: ['127.0.0.1:7657'] })));
+    env.click(env.nodes.get('link-pairing-this-computer'));
+    await settle();
+    assert.strictEqual(env.nodes.get('link-pairing-for-computer').hidden, false);
+    const visibleSteps = env.nodes.get('link-pairing-for-computer').querySelectorAll('li').filter((li) => !li.hidden);
+    assert.strictEqual(visibleSteps[0]?.getAttribute('data-copy'), 'THIS_COMPUTER_STEP_1');
+    assert.strictEqual(env.nodes.get('link-pairing-computer-linux').hidden, true);
+
+    // Another computer may run linux, so its view keeps them.
+    env.click(env.nodes.get('link-pairing-close'));
+    await settle();
+    env.fetchQueue.push(response(material()));
+    env.click(env.opener);
+    await settle();
+    env.click(env.nodes.get('link-pairing-type-computer'));
+    assert.strictEqual(env.nodes.get('link-pairing-for-computer').hidden, false);
+    assert.strictEqual(env.nodes.get('link-pairing-computer-linux').hidden, false);
   });
 
   await testCase('opening the local network from the dialog asks for a new code', async () => {

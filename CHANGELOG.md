@@ -9,6 +9,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - on windows, home in the journal window shows download progress in sizes like 1.2 GB of 4.8 GB, instead of two bare numbers.
+- on windows, pairing the solstone app on the journal's own computer no longer shows the linux commands.
 
 ## [2.0.52] - 2026-10-20
 
