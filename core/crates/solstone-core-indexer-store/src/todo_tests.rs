@@ -324,6 +324,27 @@ fn non_notfound_stat_errors_keep_rows_then_drop_as_a_present_file_after_three_tr
 }
 
 #[test]
+fn failed_invalidation_keeps_the_last_attempt_unclaimed() {
+    let journal = Journal::new();
+    let source = journal.save(NOTE, "cached kestrel");
+    scan_journal(journal.path(), false).unwrap();
+    enqueue_path(journal.path(), &source).unwrap();
+    let mut entry = listed(journal.path()).pop().unwrap();
+    entry.attempts = 2;
+    rewrite(&root(journal.path()).join(entry.filename()), &entry).unwrap();
+    let conn = open_index(journal.path()).unwrap();
+    conn.execute_batch("CREATE TRIGGER refuse_invalidation BEFORE UPDATE OF mtime ON files BEGIN SELECT RAISE(ABORT, 'fixture metadata failure'); END").unwrap();
+    assert!(drain_now(journal.path()).is_err());
+    assert_eq!(listed(journal.path()), [entry]);
+    assert_eq!(inspect(journal.path()).unwrap().claimed, 0);
+    assert!(!chunks(journal.path(), NOTE).is_empty());
+    conn.execute_batch("DROP TRIGGER refuse_invalidation")
+        .unwrap();
+    assert_eq!(drain_now(journal.path()).unwrap().processed, 1);
+    assert!(listed(journal.path()).is_empty());
+}
+
+#[test]
 fn failed_deletions_survive_three_tries_and_an_empty_day_catch_all() {
     let journal = Journal::new();
     let source = journal.save(NOTE, "remove this kestrel");
@@ -648,6 +669,62 @@ fn a_killed_claim_is_recovered_and_counted_before_it_is_processed() {
         fs::read_to_string(logs)
             .unwrap()
             .contains("previous index task stopped")
+    );
+}
+
+#[test]
+fn three_killed_claims_with_resaves_leave_same_second_content_for_the_catch_all() {
+    if run_child_drain() {
+        return;
+    }
+    let journal = Journal::new();
+    let source = journal.save(NOTE, "previous kestrel");
+    scan_journal(journal.path(), false).unwrap();
+    let modified = fs::metadata(&source).unwrap().modified().unwrap();
+    fs::write(&source, "latest kestrel").unwrap();
+    fs::File::open(&source)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    enqueue_path(journal.path(), &source).unwrap();
+    let entry = listed(journal.path()).pop().unwrap();
+    let claim = root(journal.path()).join("claimed").join(entry.filename());
+    let seam = journal.path().join("seam");
+    fs::create_dir_all(&seam).unwrap();
+    for attempt in 0..3 {
+        let ready = seam.join("todo-claimed.ready");
+        if ready.exists() {
+            fs::remove_file(&ready).unwrap();
+        }
+        let mut child = child_drain(
+            "todo::tests::three_killed_claims_with_resaves_leave_same_second_content_for_the_catch_all",
+            journal.path(),
+            &seam,
+            "todo-claimed",
+        );
+        wait_for(&ready);
+        assert_eq!(
+            read_entry(&claim, false).unwrap().unwrap().attempts,
+            attempt
+        );
+        enqueue_path(journal.path(), &source).unwrap();
+        child.0.kill().unwrap();
+        assert!(!child.0.wait().unwrap().success());
+    }
+    let recovered = drain_now(journal.path()).unwrap();
+    assert_eq!((recovered.recovered, recovered.processed), (1, 0));
+    assert!(inspect(journal.path()).unwrap().keys.is_empty());
+    assert!(
+        chunks(journal.path(), NOTE)
+            .iter()
+            .any(|text| text.contains("previous"))
+    );
+    let check = scan_journal(journal.path(), false).unwrap();
+    assert_eq!((check.indexed, check.failed), (1, 0));
+    assert!(
+        chunks(journal.path(), NOTE)
+            .iter()
+            .any(|text| text.contains("latest"))
     );
 }
 

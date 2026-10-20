@@ -406,6 +406,44 @@ pub(crate) fn prune_by_paths_admitted(
     Ok(Some(counts))
 }
 
+/// Keep cached content, but make a repeatedly failing hint visible to the next
+/// scan even when its source rewrite shared the previously indexed second.
+pub(crate) fn invalidate_paths_admitted(
+    journal: &Path,
+    rels: &[&str],
+    admission: &IndexAdmission,
+) -> Result<(), StoreError> {
+    match std::fs::metadata(db_path(journal)) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    let mut conn = open_index_admitted(journal, admission, &|| Ok(()))?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for rel in rels {
+        if let Some(pred) = prune_path_predicate(rel) {
+            for table in ["files", "edge_files"] {
+                match &pred.shape2 {
+                    Some((exact, prefix)) => {
+                        tx.execute(
+                            &format!("UPDATE {table} SET mtime=-1 WHERE path=?1 OR path LIKE ?2 ESCAPE ?5 OR path=?3 OR path LIKE ?4 ESCAPE ?5"),
+                            params![&pred.shape1_exact, &pred.shape1_prefix, exact, prefix, "\\"],
+                        )?;
+                    }
+                    None => {
+                        tx.execute(
+                            &format!("UPDATE {table} SET mtime=-1 WHERE path=?1 OR path LIKE ?2 ESCAPE ?3"),
+                            params![&pred.shape1_exact, &pred.shape1_prefix, "\\"],
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// SQL predicate for journal-authored chat rows, with either indexed path shape.
 /// Readers exclude these rows; the index writer owns their removal.
 pub const AUTHORED_CHAT_PATH_PREDICATE: &str =

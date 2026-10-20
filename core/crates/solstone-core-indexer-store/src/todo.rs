@@ -211,6 +211,12 @@ pub fn drain_with_checkpoint(
             }
             let path = root(journal).join(entry.filename());
             let claim = root(journal).join("claimed").join(entry.filename());
+            if entry.kind == "path" && entry.attempts >= 2 {
+                // Do this before claiming: if invalidation cannot commit, the
+                // hint keeps its remaining attempt. A third crash can then drop
+                // the hint without letting a same-second source look current.
+                crate::db::invalidate_paths_admitted(journal, &[&entry.key], &admission)?;
+            }
             match fs::rename(&path, &claim) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,

@@ -4339,13 +4339,7 @@ mod tests {
                     journal,
                     &recording,
                     input,
-                    |_, _| {
-                        Ok(
-                            solstone_core_indexer_store::scan::RescanFileStatus::Indexed {
-                                warnings: Vec::new(),
-                            },
-                        )
-                    },
+                    |_, _| Ok(()),
                 )
                 .unwrap();
                 published = true;

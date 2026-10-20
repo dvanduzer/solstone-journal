@@ -439,10 +439,11 @@ mod tests {
         std::fs::create_dir_all(source.parent().unwrap()).unwrap();
         std::fs::write(&source, "original kestrel").unwrap();
         solstone_core_indexer_store::scan::scan_journal(journal.path(), false).unwrap();
+        let original_mtime = std::fs::metadata(&source).unwrap().modified().unwrap();
         std::fs::write(&source, [0xff]).unwrap();
         std::fs::File::open(&source)
             .unwrap()
-            .set_modified(std::time::SystemTime::now() + Duration::from_secs(2))
+            .set_modified(original_mtime)
             .unwrap();
         solstone_core_indexer_store::todo::enqueue_path(journal.path(), &source).unwrap();
         for _ in 0..3 {
@@ -477,13 +478,12 @@ mod tests {
         solstone_core_indexer_store::todo::drain(journal.path(), Default::default()).unwrap();
         assert!(evaluate_index_health(journal.path(), Utc::now()).failed > 0);
         std::fs::write(&source, "repaired kestrel").unwrap();
-        solstone_core_indexer_store::todo::enqueue_path(journal.path(), &source).unwrap();
-        assert_eq!(
-            solstone_core_indexer_store::todo::drain(journal.path(), Default::default())
-                .unwrap()
-                .failed,
-            0
-        );
+        std::fs::File::open(&source)
+            .unwrap()
+            .set_modified(original_mtime)
+            .unwrap();
+        let check = solstone_core_indexer_store::scan::scan_journal(journal.path(), false).unwrap();
+        assert_eq!((check.indexed, check.failed), (1, 0));
         assert_eq!(evaluate_index_health(journal.path(), Utc::now()).failed, 0);
     }
 

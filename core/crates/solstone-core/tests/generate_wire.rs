@@ -42,7 +42,6 @@ mod applicable_credential_targets {
     const A: &str = "sk-applicable-override-a";
     const B: &str = "sk-applicable-configured-b";
     const CANARY: &str = "retained-applicable-target-input";
-    const PREFIX: &str = "applicable_credential_targets::";
 
     struct OwnedChild(Option<Child>);
 
@@ -440,7 +439,6 @@ mod applicable_credential_targets {
         let config = solstone_core_thinking::read_config(journal).unwrap();
         assert_eq!(config["providers"]["active"]["provider"], "openai");
         assert_eq!(config["providers"]["active"]["model"], "gpt-applicable");
-        println!("applicable-target-control-complete {case}");
     }
 
     struct WireRequest {
@@ -562,6 +560,7 @@ mod applicable_credential_targets {
     fn run(case: &str) {
         if std::env::var(CHILD).ok().as_deref() == Some(case) {
             run_child(Path::new(&std::env::var("SOLSTONE_JOURNAL").unwrap()), case);
+            println!("applicable-target-control-complete {case}");
             return;
         }
         let temporary = tempfile::tempdir().unwrap();
@@ -590,7 +589,10 @@ mod applicable_credential_targets {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .arg("--exact")
-            .arg(format!("{PREFIX}{case}"))
+            .arg(format!(
+                "{}::{case}",
+                module_path!().split_once("::").unwrap().1
+            ))
             .arg("--nocapture")
             .env_clear()
             .env("PATH", "")
@@ -694,6 +696,12 @@ mod applicable_credential_targets {
                     "actual child failed:\n{}\n{}",
                     fs::read_to_string(&stdout).unwrap(),
                     fs::read_to_string(&stderr).unwrap()
+                );
+                assert!(
+                    fs::read_to_string(&stdout)
+                        .unwrap()
+                        .contains(&format!("applicable-target-control-complete {case}")),
+                    "the child must execute its selected control"
                 );
                 child
                     .finish(status)
