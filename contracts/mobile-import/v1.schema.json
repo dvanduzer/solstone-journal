@@ -242,7 +242,7 @@
       }
     },
     "start_response": {
-      "description": "200: the import is queued, or running in process when generation and attempt_id are present. replay is true when this start found the import already queued or already in. A replay is classified by the same fields as a fresh body: status, task_id, and generation and attempt_id when present.",
+      "description": "200: the import is queued, or running in process when generation and attempt_id are present. replay is true when this start found the import already queued, running or finished. A replay is classified by the same fields as a fresh body: status, task_id, and generation and attempt_id when present.",
       "type": "object",
       "required": [
         "status",

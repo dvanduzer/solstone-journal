@@ -2125,12 +2125,10 @@ async function startGuidedImport(source) {
     if (!startResponse.ok) {
       throw new Error(importErrorMessage(started, 'Failed to start import'));
     }
-    if (started.replay === true && window.showError) {
-      showError("this import is already queued or already in.");
-    }
-
     const importId = started.import_id || saved.timestamp;
-    if (!importEvents[importId] || !IMPORT_TERMINAL_EVENTS.has(importEvents[importId].event)) {
+    // A replayed start found the import already started or finished, so the progress view
+    // shows the journal's own status for it instead of a fresh start.
+    if (started.replay !== true && (!importEvents[importId] || !IMPORT_TERMINAL_EVENTS.has(importEvents[importId].event))) {
       trackPendingImport(importId);
       importEvents[importId] = {
         import_id: importId,
@@ -2398,14 +2396,12 @@ startBtn.addEventListener('click', async () => {
     if (!startResponse.ok) {
       throw new Error(importErrorMessage(started, 'Failed to start import'));
     }
-    if (started.replay === true && window.showError) {
-      showError("this import is already queued or already in.");
-    }
-
     const importId = started.import_id || window._quickSaved?.timestamp || ts;
     restoreImportButton('quick', startBtn);
     closeDetectModal();
-    if (!importEvents[importId] || !IMPORT_TERMINAL_EVENTS.has(importEvents[importId].event)) {
+    // A replayed start found the import already started or finished, so the progress view
+    // shows the journal's own status for it instead of a fresh start.
+    if (started.replay !== true && (!importEvents[importId] || !IMPORT_TERMINAL_EVENTS.has(importEvents[importId].event))) {
       trackPendingImport(importId);
       importEvents[importId] = {
         import_id: importId,

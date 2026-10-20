@@ -3995,7 +3995,7 @@ mod tests {
                 crate::preview::PreviewPlan::Program(&planner),
             )
             .await
-            .unwrap_or_else(|error| panic!("{filename}: {error}"));
+            .unwrap_or_else(|error| panic!("{filename}: {}", error.detail()));
             let planned = fs::read_to_string(tools.path().join("solstone-core.args")).unwrap();
             let planned_as = planned.lines().skip_while(|arg| *arg != "--source").nth(1);
             let expected = (content_type == "image/png").then_some("image");

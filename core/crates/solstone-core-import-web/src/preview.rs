@@ -48,14 +48,14 @@ impl PreviewError {
 
     pub const fn owner_sentence(&self) -> &'static str {
         match self {
-            Self::AlreadyRunning => "this import is already running.",
-            Self::NothingToImport => "there is nothing in this source to import.",
-            Self::SourceChanged(_) => {
-                "the source or settings changed. preview again before starting."
+            Self::AlreadyRunning => "this import has already started.",
+            Self::NothingToImport => "there is nothing new in this source to import.",
+            Self::SourceChanged(_) => "something changed, so choose the source again.",
+            Self::InvalidRequest(_) => "this import's source or date isn't valid.",
+            Self::NotFound(_) => {
+                "this import or its source wasn't found, so choose the source again."
             }
-            Self::InvalidRequest(_) => "choose a source and an import date first.",
-            Self::NotFound(_) => "that staged import is not there.",
-            Self::PlanFailed(_) => "the import could not be prepared. try again.",
+            Self::PlanFailed(_) => "the import could not be prepared.",
         }
     }
 

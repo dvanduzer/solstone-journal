@@ -140,7 +140,7 @@
     "start_nothing_to_import_409": {
       "status": 409,
       "body": {
-        "error": "there is nothing in this source to import.",
+        "error": "there is nothing new in this source to import.",
         "reason_code": "import_preview_required",
         "detail": "there are no recordings to import from this source",
         "kind": "nothing_to_import"

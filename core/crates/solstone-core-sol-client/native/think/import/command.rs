@@ -575,9 +575,9 @@ fn print_success(
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
         {
-            stdout.push_str(&format!("already processing task {task_id}\n"));
+            stdout.push_str(&format!("already started as task {task_id}\n"));
         } else {
-            stdout.push_str("already processing\n");
+            stdout.push_str("already started\n");
         }
     } else if let Some(task_id) = start_response.get("task_id").and_then(Value::as_str) {
         stdout.push_str(&format!("queued processing task {task_id}\n"));
