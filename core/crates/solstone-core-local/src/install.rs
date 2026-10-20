@@ -239,7 +239,7 @@ pub(crate) mod tests;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -2185,6 +2185,51 @@ pub(crate) fn write_parakeet_model_manifest(
     Ok(())
 }
 
+/// A dropped connection is common over a multi-gigabyte model, so a member is
+/// fetched again before the install fails. Cancel stops the installer process,
+/// so the waits stay cancellable.
+#[cfg(not(test))]
+const MODEL_FETCH_RETRY_WAITS: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(30)];
+#[cfg(test)]
+const MODEL_FETCH_RETRY_WAITS: [Duration; 2] = [Duration::ZERO, Duration::ZERO];
+
+/// Only a network failure is worth another try; a size or digest mismatch, a
+/// refused host or a full disk fails the same way again.
+fn is_transient_download(error: &DispatchError) -> bool {
+    error.envelope.error.as_ref().is_some_and(|error| {
+        error.kind == "download"
+            && matches!(
+                error.reason_code.as_str(),
+                "model_download_failed" | "download_origin_unreachable"
+            )
+    })
+}
+
+/// Run `attempt`, and after a transient download failure wait and run it
+/// again, once per entry in `waits`. `before_retry` refuses a retry for an
+/// attempt that has since been superseded.
+fn retry_transient_fetch<S>(
+    state: &mut S,
+    mut attempt: impl FnMut(&mut S) -> Result<(), DispatchError>,
+    mut before_retry: impl FnMut(&mut S) -> Result<(), DispatchError>,
+    waits: &[Duration],
+    mut sleep: impl FnMut(Duration),
+) -> Result<(), DispatchError> {
+    let mut waits = waits.iter();
+    loop {
+        match attempt(state) {
+            Err(error) if is_transient_download(&error) => {
+                let Some(wait) = waits.next() else {
+                    return Err(error);
+                };
+                sleep(*wait);
+                before_retry(state)?;
+            }
+            result => return result,
+        }
+    }
+}
+
 fn install_model(
     journal: &Path,
     model_id: &str,
@@ -2216,14 +2261,26 @@ fn install_model(
             .map_err(|error| failure("state", "attempt_superseded", error, 74))?;
         let artifact = select_artifact("local-model", None, None, None, Some(name))?;
         let dest = root.join(name);
-        fetch_install_member(
-            journal,
+        retry_transient_fetch(
             status_value,
-            artifact,
-            &dest,
-            cumulative_bytes,
-            total_bytes,
-            "model_download_failed",
+            |status_value| {
+                fetch_install_member(
+                    journal,
+                    status_value,
+                    artifact,
+                    &dest,
+                    cumulative_bytes,
+                    total_bytes,
+                    "model_download_failed",
+                )
+            },
+            |status_value| {
+                status::assert_current(journal, status_value)
+                    .map(|_| ())
+                    .map_err(|error| failure("state", "attempt_superseded", error, 74))
+            },
+            &MODEL_FETCH_RETRY_WAITS,
+            std::thread::sleep,
         )?;
         cumulative_bytes += artifact.size_bytes;
     }

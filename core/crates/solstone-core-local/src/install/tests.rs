@@ -4511,11 +4511,13 @@ mod runtime_fetch_seam_tests {
                     );
                 }
             });
-            // The fake fails the first fetch, so install_model stops there; the
-            // point is that it reached the origin instead of refusing. The
-            // positive twins above cover both files' URLs, digests and sizes.
+            // The fake fails the first fetch, so install_model stops there after
+            // its transient retries; the point is that it reached the origin
+            // instead of refusing. The positive twins above cover both files'
+            // URLs, digests and sizes.
             let calls = fake.calls.lock().unwrap();
-            assert_eq!(calls.len(), 1);
+            assert_eq!(calls.len(), 1 + super::super::MODEL_FETCH_RETRY_WAITS.len());
+            assert!(calls.iter().all(|call| call.0 == calls[0].0));
             let first = runtime_fetch_set("windows-x86_64")
                 .expect("windows fetch set")
                 .into_iter()
@@ -4574,10 +4576,17 @@ mod runtime_fetch_seam_tests {
             };
             let _ = fetch_runtime_member(&query, &dest_mmproj, |_, _| {}, "model_download_failed");
         });
+        // install_model retries the failing model member before stopping; the
+        // direct mmproj fetch is one call.
+        let retries = super::super::MODEL_FETCH_RETRY_WAITS.len();
         let calls = fake.calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert!(calls[0].0.contains("Qwen3.5-4B-Q4_K_M.gguf"));
-        assert!(calls[1].0.contains("mmproj-F16.gguf"));
+        assert_eq!(calls.len(), 2 + retries);
+        assert!(
+            calls[..=retries]
+                .iter()
+                .all(|call| call.0.contains("Qwen3.5-4B-Q4_K_M.gguf"))
+        );
+        assert!(calls[retries + 1].0.contains("mmproj-F16.gguf"));
     }
 }
 
@@ -5503,4 +5512,108 @@ fn shared_install_progress_uses_real_cumulative_fetch_bytes() {
         },
     );
     server.join().unwrap();
+}
+
+#[test]
+fn a_dropped_model_download_is_tried_again_and_a_mismatch_is_not() {
+    let waits = [Duration::from_secs(5), Duration::from_secs(30)];
+
+    // Two dropped connections, then success: the member lands after both waits.
+    let mut calls = 0;
+    let mut slept = Vec::new();
+    let result = super::retry_transient_fetch(
+        &mut calls,
+        |calls| {
+            *calls += 1;
+            if *calls < 3 {
+                Err(super::failure(
+                    "download",
+                    "model_download_failed",
+                    "Peer disconnected",
+                    74,
+                ))
+            } else {
+                Ok(())
+            }
+        },
+        |_| Ok(()),
+        &waits,
+        |wait| slept.push(wait),
+    );
+    assert!(result.is_ok());
+    assert_eq!(calls, 3);
+    assert_eq!(slept, waits.to_vec());
+
+    // Still dropping after every wait: the last failure is the one reported.
+    let mut calls = 0;
+    let result = super::retry_transient_fetch(
+        &mut calls,
+        |calls| {
+            *calls += 1;
+            Err(super::failure(
+                "download",
+                "download_origin_unreachable",
+                "offline",
+                74,
+            ))
+        },
+        |_| Ok(()),
+        &waits,
+        |_| {},
+    );
+    assert_eq!(calls, 3);
+    assert_eq!(
+        result.unwrap_err().envelope.error.unwrap().reason_code,
+        "download_origin_unreachable"
+    );
+
+    // A digest mismatch fails the same way again, so it is never retried.
+    let mut calls = 0;
+    let result = super::retry_transient_fetch(
+        &mut calls,
+        |calls| {
+            *calls += 1;
+            Err(super::failure(
+                "download",
+                "download_digest_mismatch",
+                "bad bytes",
+                74,
+            ))
+        },
+        |_| Ok(()),
+        &waits,
+        |_| panic!("a mismatch must not wait for a retry"),
+    );
+    assert_eq!(calls, 1);
+    assert!(result.is_err());
+
+    // A superseded attempt (a cancel or a newer start) stops retrying.
+    let mut calls = 0;
+    let result = super::retry_transient_fetch(
+        &mut calls,
+        |calls| {
+            *calls += 1;
+            Err(super::failure(
+                "download",
+                "model_download_failed",
+                "Peer disconnected",
+                74,
+            ))
+        },
+        |_| {
+            Err(super::failure(
+                "state",
+                "attempt_superseded",
+                "newer attempt",
+                74,
+            ))
+        },
+        &waits,
+        |_| {},
+    );
+    assert_eq!(calls, 1);
+    assert_eq!(
+        result.unwrap_err().envelope.error.unwrap().reason_code,
+        "attempt_superseded"
+    );
 }

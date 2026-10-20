@@ -1918,6 +1918,15 @@ async function main() {
       assert.strictEqual(laneLine.textContent.includes(reasonCode), false, `${reasonCode} never reaches the card as a code`);
     }
   }
+  // While the model downloads, the card says so instead of "not set up".
+  thinking.state.providers = {active_lane: {lane: 'local'}, provider_status: {local: {generate_ready: false, issues: ['model_missing']}}};
+  thinking.state.localAvailability = {available: true, reason_code: '', reason: ''};
+  thinking.state.install = {install_state: 'downloading'};
+  thinking.renderMainLanes();
+  assert.notStrictEqual(laneLine.textContent, blocked.setup, 'a downloading model is not "not set up"');
+  assert.strictEqual(nodes.get('localLaneStatus').textContent.includes('set up'), false, 'no set up link mid-download');
+  thinking.state.install = null;
+
   // With local selected and availability not refusing, the provider's first
   // issue decides the line; an issue the page doesn't know still gets one.
   for (const [issue, kind] of [

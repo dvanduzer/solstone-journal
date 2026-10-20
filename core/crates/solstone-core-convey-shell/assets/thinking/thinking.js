@@ -3129,6 +3129,12 @@
         setPill('localLanePill', 'off');
         setText('localLaneDescription', localLane.description || '');
         setText('localLaneStatus', 'turn on local →');
+      } else if (installIsInFlight(state.install)) {
+        // Mid-download is setup under way; "not set up" with "set up →" would
+        // read as if nothing had started.
+        setPill('localLanePill', 'off');
+        setText('localLaneDescription', 'downloading the local model.');
+        setText('localLaneStatus', 'details →');
       } else {
         setPill('localLanePill', 'off');
         setText('localLaneDescription', localLaneUnreadyLine(local));
