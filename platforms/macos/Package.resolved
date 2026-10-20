@@ -1,12 +1,12 @@
 {
-  "originHash" : "1cc1e0761906a357974d731b35daf063bbfdea3e2ce076d5615b4ac9fb9d4b73",
+  "originHash" : "db60d5e67d6a0b1de480d4705717fd7063ad2b4e50b465fbfedeb60417d3437a",
   "pins" : [
     {
       "identity" : "solstone-macos",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/solpbc/solstone-macos.git",
       "state" : {
-        "revision" : "a44746088214cb8c26d5268b1ec12508eb64b159"
+        "revision" : "76efa3ddead4806f386573303f89565eec9be6e7"
       }
     }
   ],
