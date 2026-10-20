@@ -571,7 +571,7 @@ fn render_digest_activity(act: &DigestActivity, include_story: bool) -> String {
     lines.join("\n")
 }
 
-fn render_digest_activities(
+pub(crate) fn render_digest_activities(
     activities: &[DigestActivity],
     include_activities: &[bool],
     include_stories: &[bool],

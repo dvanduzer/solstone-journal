@@ -145,10 +145,187 @@ fn attach_daily_location(
     });
     let rendered =
         render_location_part(&context.journal, &day).map_err(|error| failure(prepared, error))?;
-    let ordinary = crate::ordinary_text_parts(&prepared.config);
-    let (part, omitted) =
+    let mut ordinary = crate::ordinary_text_parts(&prepared.config);
+    let (part, omitted) = if hook == "morning_briefing"
+        && matches!(state, FrozenState::MorningBriefing(_))
+    {
+        let (activities, counts, forward_count) = match state {
+            FrozenState::MorningBriefing(bs) => {
+                (bs.activities.clone(), bs.counts.clone(), bs.forward_count)
+            }
+            _ => unreachable!(),
+        };
+
+        match fit_location_part(hook, &day, &rendered, &ordinary, prepared, state, context) {
+            Ok(res) => res,
+            Err(ref e) if e == "location coverage does not fit the input budget" => {
+                let mut curr_meta_str = prepared
+                    .config
+                    .get("briefing_metadata")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        failure(prepared, "missing briefing_metadata in config".to_owned())
+                    })?;
+
+                let mut metadata: Value = serde_json::from_str(&curr_meta_str).map_err(|e| {
+                    failure(prepared, format!("invalid briefing_metadata JSON: {e}"))
+                })?;
+                let obj = metadata.as_object_mut().ok_or_else(|| {
+                    failure(prepared, "briefing_metadata must be an object".to_owned())
+                })?;
+
+                let mut gaps: Vec<String> = obj
+                    .get("gaps")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let n = activities.len();
+                let mut include_activities = vec![true; n];
+                let mut include_stories = vec![true; n];
+
+                for (i, act) in activities.iter().enumerate() {
+                    let act_gap = format!("activity {}", act.id);
+                    let story_gap = format!("story for {}", act.id);
+                    if gaps.contains(&act_gap) {
+                        include_activities[i] = false;
+                        include_stories[i] = false;
+                    } else if gaps.contains(&story_gap) {
+                        include_activities[i] = true;
+                        include_stories[i] = false;
+                    } else {
+                        include_activities[i] = true;
+                        include_stories[i] = act.story_body.is_some();
+                    }
+                }
+
+                loop {
+                    let story_to_drop = (0..n).rev().find(|&i| {
+                        include_activities[i]
+                            && include_stories[i]
+                            && activities[i].story_body.is_some()
+                    });
+
+                    let (drop_idx, is_story_drop) = if let Some(idx) = story_to_drop {
+                        (idx, true)
+                    } else if let Some(idx) = (0..n).rev().find(|&i| include_activities[i]) {
+                        (idx, false)
+                    } else {
+                        return Err(failure(
+                            prepared,
+                            "prepared request does not fit the floor input budget".to_owned(),
+                        ));
+                    };
+
+                    let prev_digest = crate::morning_briefing::render_digest_activities(
+                        &activities,
+                        &include_activities,
+                        &include_stories,
+                    );
+
+                    let ordinary_has_prev = crate::ordinary_text_parts(&prepared.config)
+                        .iter()
+                        .any(|p| p.contains(&prev_digest));
+                    if !ordinary_has_prev {
+                        return Err(failure(
+                            prepared,
+                            "ordinary text does not contain activity_digest".to_owned(),
+                        ));
+                    }
+
+                    if is_story_drop {
+                        include_stories[drop_idx] = false;
+                        let id = &activities[drop_idx].id;
+                        let story_gap = format!("story for {id}");
+                        if !gaps.contains(&story_gap) {
+                            gaps.push(story_gap);
+                        }
+                    } else {
+                        include_activities[drop_idx] = false;
+                        include_stories[drop_idx] = false;
+                        let id = &activities[drop_idx].id;
+                        let story_gap = format!("story for {id}");
+                        gaps.retain(|g| g != &story_gap);
+                        let act_gap = format!("activity {id}");
+                        if !gaps.contains(&act_gap) {
+                            gaps.push(act_gap);
+                        }
+                    }
+
+                    let new_digest = crate::morning_briefing::render_digest_activities(
+                        &activities,
+                        &include_activities,
+                        &include_stories,
+                    );
+
+                    for field in ["prompt", "user_instruction", "transcript"] {
+                        if let Some(Value::String(text)) = prepared.config.get_mut(field) {
+                            *text = text.replace(&prev_digest, &new_digest);
+                        }
+                    }
+
+                    let new_preamble =
+                        crate::morning_briefing::coverage_preamble(&counts, &gaps, forward_count);
+                    let mut meta_val: Value =
+                        serde_json::from_str(&curr_meta_str).map_err(|e| {
+                            failure(prepared, format!("invalid briefing_metadata JSON: {e}"))
+                        })?;
+                    let meta_obj = meta_val.as_object_mut().ok_or_else(|| {
+                        failure(prepared, "briefing_metadata must be an object".to_owned())
+                    })?;
+                    meta_obj.insert(
+                        "gaps".into(),
+                        Value::Array(gaps.iter().cloned().map(Value::String).collect()),
+                    );
+                    meta_obj.insert("coverage_preamble".into(), Value::String(new_preamble));
+                    let new_meta_str = serde_json::to_string_pretty(&meta_obj).map_err(|e| {
+                        failure(
+                            prepared,
+                            format!("failed to serialize briefing_metadata: {e}"),
+                        )
+                    })?;
+
+                    for field in ["prompt", "user_instruction", "transcript"] {
+                        if let Some(Value::String(text)) = prepared.config.get_mut(field) {
+                            *text = text.replace(&curr_meta_str, &new_meta_str);
+                        }
+                    }
+                    prepared.config.insert(
+                        "briefing_metadata".into(),
+                        Value::String(new_meta_str.clone()),
+                    );
+                    if let FrozenState::MorningBriefing(bs) = state {
+                        bs.values.insert(
+                            "briefing_metadata".into(),
+                            Value::String(new_meta_str.clone()),
+                        );
+                    }
+                    curr_meta_str = new_meta_str;
+
+                    ordinary = crate::ordinary_text_parts(&prepared.config);
+                    match fit_location_part(
+                        hook, &day, &rendered, &ordinary, prepared, state, context,
+                    ) {
+                        Ok(res) => break res,
+                        Err(ref e) if e == "location coverage does not fit the input budget" => {
+                            continue;
+                        }
+                        Err(e) => return Err(failure(prepared, e)),
+                    }
+                }
+            }
+            Err(e) => return Err(failure(prepared, e)),
+        }
+    } else {
         fit_location_part(hook, &day, &rendered, &ordinary, prepared, state, context)
-            .map_err(|error| failure(prepared, error))?;
+            .map_err(|error| failure(prepared, error))?
+    };
     let second = daily_location_fingerprint(&context.journal, &day)
         .map_err(|error| failure(prepared, error.to_string()))?;
     if first != second {
@@ -184,15 +361,13 @@ fn attach_daily_location(
             .map(str::to_owned)
             .ok_or_else(|| failure(prepared, "missing briefing_metadata in config".to_owned()))?;
 
-        let prompt_contains_old = prepared
-            .config
-            .get("prompt")
-            .and_then(Value::as_str)
-            .is_some_and(|p| p.contains(&old_meta_str));
-        if !prompt_contains_old {
+        let ordinary_contains_old = crate::ordinary_text_parts(&prepared.config)
+            .iter()
+            .any(|p| p.contains(&old_meta_str));
+        if !ordinary_contains_old {
             return Err(failure(
                 prepared,
-                "prompt does not contain briefing_metadata".to_owned(),
+                "ordinary text does not contain briefing_metadata".to_owned(),
             ));
         }
 
@@ -1707,6 +1882,314 @@ mod tests {
             "preamble must contain forward plan count: {preamble}"
         );
         assert!(!preamble.contains(".."), "{preamble}");
+    }
+
+    #[test]
+    fn morning_briefing_drops_removable_activity_to_fit_location_coverage() {
+        let root = tempfile::tempdir().unwrap();
+        location_journal(root.path(), LOCATION_DAY);
+        solstone_core_facets::create_facet(root.path(), "work", "Work", "", "", "", None).unwrap();
+        let description = "A".repeat(44812);
+        let record = json!({
+            "id": "act-1",
+            "title": "Activity",
+            "start": "09:00",
+            "description": description,
+        });
+        write(
+            root.path(),
+            &format!("facets/work/activities/{LOCATION_DAY}.jsonl"),
+            &format!("{record}\n"),
+        );
+
+        let context = ExecutionContext {
+            journal: root.path().to_owned(),
+        };
+        let talent = prepared(
+            "morning_briefing",
+            LOCATION_DAY,
+            json!({
+                "hook": {"pre": "morning_briefing"},
+                "prompt": "Prompt with $activity_digest and $briefing_metadata",
+                "json_schema": {"type": "object"},
+                "max_output_tokens": 1024,
+            }),
+        );
+
+        let stage = contract::resolve_hook("morning_briefing").unwrap();
+        let mut probe_talent = talent.clone();
+        let state = (stage.build.unwrap())(
+            &mut probe_talent,
+            &context,
+            &solstone_core_generate::Cancellation::never(),
+        )
+        .unwrap();
+        (stage.prompt_override.unwrap())(&mut probe_talent, &state).unwrap();
+        let ordinary_tokens: u32 = crate::model_text_parts(&probe_talent.config)
+            .iter()
+            .map(|part| solstone_core_local::generate::estimate_tokens(part))
+            .sum();
+        let schema_tokens = match probe_talent.config.get("json_schema") {
+            Some(Value::String(s)) => solstone_core_local::generate::estimate_tokens(s),
+            Some(val) => solstone_core_local::generate::estimate_tokens(&val.to_string()),
+            None => 0,
+        };
+        let ordinary_request_tokens = ordinary_tokens + schema_tokens;
+        let floor_budget = solstone_core_local::generate::compute_input_budget(
+            1024,
+            solstone_core_local::plan::LOCAL_MIN_CONTEXT_TOKENS,
+        );
+        assert_eq!(
+            ordinary_request_tokens, floor_budget,
+            "ordinary request tokens ({ordinary_request_tokens}) must equal floor budget ({floor_budget})"
+        );
+
+        let packet = freeze(talent, &context).expect("freeze must succeed");
+        let (thawed, _) = thaw(&packet).unwrap();
+
+        let raw_metadata = thawed
+            .config
+            .get("briefing_metadata")
+            .and_then(Value::as_str)
+            .expect("briefing_metadata must be present");
+        let prompt_part = thawed
+            .config
+            .get("prompt")
+            .and_then(Value::as_str)
+            .expect("prompt must be present");
+        assert!(
+            prompt_part.contains(raw_metadata),
+            "emitted prompt must contain exact briefing_metadata string"
+        );
+
+        let metadata: Value =
+            serde_json::from_str(raw_metadata).expect("valid briefing_metadata JSON");
+        let gaps = metadata["gaps"].as_array().expect("gaps array");
+        assert!(
+            gaps.iter().any(|g| g.as_str() == Some("activity act-1")),
+            "gaps must include activity act-1: {gaps:?}"
+        );
+        assert!(
+            gaps.iter().any(|g| g.as_str() == Some("no plans today")),
+            "gaps must still include initial gap 'no plans today': {gaps:?}"
+        );
+        assert!(
+            gaps.iter()
+                .any(|g| g.as_str() == Some("no plans in the next 7 days")),
+            "gaps must still include initial gap 'no plans in the next 7 days': {gaps:?}"
+        );
+
+        assert!(
+            !prompt_part.contains(&description),
+            "activity description must not be in the prompt"
+        );
+
+        let loc_text = thawed
+            .config
+            .get("_daily_location_text")
+            .and_then(Value::as_str)
+            .expect("_daily_location_text must be present");
+        assert!(
+            loc_text.lines().any(|l| l.starts_with("- ")),
+            "location observation lines must be present in _daily_location_text: {loc_text}"
+        );
+
+        let model_parts = crate::model_text_parts(&thawed.config);
+        assert!(
+            model_parts
+                .iter()
+                .any(|p| p.lines().any(|l| l.starts_with("- "))),
+            "location observation lines must be present in model_text_parts"
+        );
+
+        assert!(
+            thawed.config.get("_daily_location_omitted").is_none(),
+            "_daily_location_omitted must be absent"
+        );
+
+        let total_text_tokens: u32 = model_parts
+            .iter()
+            .map(|part| solstone_core_local::generate::estimate_tokens(part))
+            .sum();
+        let final_schema_tokens = match thawed.config.get("json_schema") {
+            Some(Value::String(s)) => solstone_core_local::generate::estimate_tokens(s),
+            Some(val) => solstone_core_local::generate::estimate_tokens(&val.to_string()),
+            None => 0,
+        };
+        assert!(
+            total_text_tokens + final_schema_tokens <= floor_budget,
+            "measured request tokens {} must be <= floor budget {}",
+            total_text_tokens + final_schema_tokens,
+            floor_budget
+        );
+
+        let preamble = metadata["coverage_preamble"].as_str().unwrap();
+        assert!(!preamble.contains(".."), "{preamble}");
+        assert!(!preamble.to_lowercase().contains("complete"), "{preamble}");
+        for part in &model_parts {
+            assert!(!part.to_lowercase().contains("complete"));
+        }
+    }
+
+    #[test]
+    fn morning_briefing_freeze_succeeds_without_prompt() {
+        let root = tempfile::tempdir().unwrap();
+        location_journal(root.path(), LOCATION_DAY);
+
+        let cfg_path = root.path().join("config/journal.json");
+        let mut cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        cfg["providers"] = json!({
+            "active": {
+                "provider": "test",
+                "model": "test-model"
+            }
+        });
+        std::fs::write(&cfg_path, serde_json::to_string(&cfg).unwrap()).unwrap();
+
+        solstone_core_facets::create_facet(root.path(), "fictional", "Fictional", "", "", "", None)
+            .unwrap();
+
+        let talent_root = root.path().join("talent");
+        let apps_root = root.path().join("apps");
+        let templates_dir = root.path().join("templates");
+        for p in [&talent_root, &apps_root, &templates_dir] {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        let src_talent =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../payload/solstone/talent");
+        std::fs::copy(
+            src_talent.join("morning_briefing.md"),
+            talent_root.join("morning_briefing.md"),
+        )
+        .unwrap();
+        std::fs::copy(
+            src_talent.join("morning_briefing.schema.json"),
+            talent_root.join("morning_briefing.schema.json"),
+        )
+        .unwrap();
+
+        let paths = crate::prepare::RuntimePaths {
+            talent_root,
+            apps_root,
+            templates_dir,
+        };
+        let context = ExecutionContext {
+            journal: root.path().to_owned(),
+        };
+
+        let request = json!({
+            "name": "morning_briefing",
+            "day": LOCATION_DAY,
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let prepared_talent = crate::prepare::prepare(
+            request,
+            &paths,
+            &context,
+            crate::prepare::PrepareMode::Execute,
+        )
+        .expect("prepare must succeed");
+
+        assert!(
+            prepared_talent.config.get("prompt").is_none(),
+            "prompt must be absent before freeze"
+        );
+        let pre_ui = prepared_talent
+            .config
+            .get("user_instruction")
+            .and_then(Value::as_str)
+            .expect("user_instruction must be present");
+        assert!(
+            pre_ui.contains("$briefing_metadata"),
+            "user_instruction must contain literal $briefing_metadata before freeze"
+        );
+
+        let packet = freeze(prepared_talent, &context).expect("freeze must succeed");
+        let (thawed, _) = thaw(&packet).unwrap();
+
+        let raw_metadata = thawed
+            .config
+            .get("briefing_metadata")
+            .and_then(Value::as_str)
+            .expect("briefing_metadata must be present on config");
+        let post_ui = thawed
+            .config
+            .get("user_instruction")
+            .and_then(Value::as_str)
+            .expect("user_instruction must be present");
+        assert!(
+            post_ui.contains(raw_metadata),
+            "user_instruction must contain exact briefing_metadata string"
+        );
+
+        let model_parts = crate::model_text_parts(&thawed.config);
+        assert!(
+            model_parts.iter().any(|part| part.contains(raw_metadata)),
+            "model_text_parts must contain exact briefing_metadata string"
+        );
+
+        assert!(
+            thawed.config.get("prompt").is_none(),
+            "prompt must still be absent after freeze"
+        );
+
+        let metadata: Value =
+            serde_json::from_str(raw_metadata).expect("valid briefing_metadata JSON");
+        let gaps = metadata["gaps"].as_array().expect("gaps array");
+        assert!(
+            gaps.iter().any(|g| g.as_str() == Some("no plans today")),
+            "gaps must include initial gap 'no plans today': {gaps:?}"
+        );
+        assert!(
+            gaps.iter()
+                .any(|g| g.as_str() == Some("no plans in the next 7 days")),
+            "gaps must include initial gap 'no plans in the next 7 days': {gaps:?}"
+        );
+
+        let max_output_tokens = thawed
+            .config
+            .get("max_output_tokens")
+            .and_then(Value::as_u64)
+            .and_then(|t| u32::try_from(t).ok())
+            .expect("max_output_tokens must be set on prepared talent");
+        let floor_budget = solstone_core_local::generate::compute_input_budget(
+            max_output_tokens,
+            solstone_core_local::plan::LOCAL_MIN_CONTEXT_TOKENS,
+        );
+        let total_text_tokens: u32 = model_parts
+            .iter()
+            .map(|part| solstone_core_local::generate::estimate_tokens(part))
+            .sum();
+        let schema_tokens = match thawed.config.get("json_schema") {
+            Some(Value::String(s)) => solstone_core_local::generate::estimate_tokens(s),
+            Some(val) => solstone_core_local::generate::estimate_tokens(&val.to_string()),
+            None => 0,
+        };
+        assert!(
+            total_text_tokens + schema_tokens <= floor_budget,
+            "measured request tokens {} must be <= floor budget {}",
+            total_text_tokens + schema_tokens,
+            floor_budget
+        );
+
+        let loc_text = thawed
+            .config
+            .get("_daily_location_text")
+            .and_then(Value::as_str)
+            .expect("_daily_location_text must be present");
+        assert!(
+            loc_text.lines().any(|l| l.starts_with("- ")),
+            "location observation lines must be present in _daily_location_text: {loc_text}"
+        );
+        assert!(
+            model_parts
+                .iter()
+                .any(|p| p.lines().any(|l| l.starts_with("- "))),
+            "location observation lines must be present in model_text_parts"
+        );
     }
 
     #[test]
