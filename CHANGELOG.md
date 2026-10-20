@@ -6,6 +6,10 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- on windows, home in the journal window shows download progress in sizes like 1.2 GB of 4.8 GB, instead of two bare numbers.
+
 ## [2.0.52] - 2026-10-20
 
 ### Added

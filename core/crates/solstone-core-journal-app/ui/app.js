@@ -1458,9 +1458,11 @@ function showsBytes(download) {
 }
 
 function byteText(download) {
-  const done = typeof download.bytes_done === 'number' ? String(download.bytes_done) : '';
-  const total = typeof download.bytes_total === 'number' ? String(download.bytes_total) : '';
-  return [done, total].filter(Boolean).join(' ');
+  const done = typeof download.bytes_done === 'number' ? download.bytes_done : 0;
+  if (typeof download.bytes_total === 'number' && download.bytes_total > 0) {
+    return `${formatBytes(done)} of ${formatBytes(download.bytes_total)}`;
+  }
+  return done > 0 ? formatBytes(done) : '';
 }
 
 function speechBlock() {

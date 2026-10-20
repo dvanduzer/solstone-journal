@@ -1867,13 +1867,16 @@ paint(view({
   step: 5,
   thinking_cancel: true,
   downloads: {
-    thinking: { state: 'downloading', attempt_id: 'home-att-1', bytes_done: 12, bytes_total: 40 },
+    thinking: { state: 'downloading', attempt_id: 'home-att-1', bytes_done: 1500000, bytes_total: 40000000 },
   },
 }));
 const homeNotice = $('pane').querySelector('.notice[data-download="thinking"]');
 if (!homeNotice) throw new Error('home notice for thinking download missing');
-if (!homeNotice.textContent.includes('ThinkDl') || !homeNotice.textContent.includes('12 40')) {
-  throw new Error(`home notice text missing ThinkDl or bytes: ${homeNotice.textContent}`);
+if (!homeNotice.textContent.includes('ThinkDl') || !homeNotice.textContent.includes('1.5 MB of 40 MB')) {
+  throw new Error(`home notice text missing ThinkDl or human-unit bytes: ${homeNotice.textContent}`);
+}
+if (homeNotice.textContent.includes('1500000') || homeNotice.textContent.includes('40000000')) {
+  throw new Error(`home notice shows a raw byte count: ${homeNotice.textContent}`);
 }
 if (!homeNotice.querySelector('button') || !homeNotice.querySelector('button').textContent.includes('Cancel')) {
   throw new Error('home notice missing Cancel button');
