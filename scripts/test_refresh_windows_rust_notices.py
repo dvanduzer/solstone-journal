@@ -671,6 +671,203 @@ class InClosureNoticeTexts(unittest.TestCase):
         self.assertEqual(texts, {})
 
 
+class RegistryRemoval(unittest.TestCase):
+    """A checksummed registry removal is admitted while the closure only loses
+    named packages; a removed package inside it must be named."""
+
+    digest = f"digest@1.0.0 ({SOURCE})"
+    pdf = f"pdf@1.0.0 ({SOURCE})"
+    padding = f"padding@1.0.0 ({SOURCE})"
+
+    def removed(self, name="pdf"):
+        row = package(name, source=SOURCE)
+        row["checksum"] = "c" * 64
+        return row
+
+    def graphs(self, padding_in_closure=False):
+        edge = lambda key, kind=None: {"pkg": key, "dep_kinds": [{"kind": kind}]}
+        old = {
+            "workspace:app": {"deps": [edge(self.digest), edge(self.pdf, "dev")]},
+            self.digest: {"deps": [edge(self.padding)] if padding_in_closure else []},
+            self.pdf: {"deps": [edge(self.padding)]},
+            self.padding: {"deps": []},
+        }
+        new = {
+            "workspace:app": {"deps": [edge(self.digest)]},
+            self.digest: {"deps": []},
+        }
+        return old, new
+
+    def test_removal_only_is_split_off_and_survivors_classify_unchanged(self):
+        before = [package("digest", source=SOURCE), self.removed(), self.removed("padding")]
+        after = [before[0]]
+        surviving, removed = refresh.split_registry_removals(before, after)
+        self.assertEqual((surviving, removed), (after, [before[2], before[1]]))
+        self.assertEqual(refresh.classify_external_delta(surviving, after), ([], []))
+
+    def test_mixed_or_unchecksummed_removal_is_not_split_and_still_refuses(self):
+        git = "git+https://example.invalid/x?tag=v1#" + "a" * 40
+        added = self.removed("resolver")
+        for before, after in (
+            ([package("digest", source=SOURCE), self.removed()], [package("digest", source=SOURCE), added]),
+            ([package("digest", source=SOURCE), package("pdf", source=git)], [package("digest", source=SOURCE)]),
+            ([package("pdf", version="1.0.0", source=SOURCE)], [package("pdf", version="2.0.0", source=SOURCE)]),
+        ):
+            self.assertEqual(refresh.split_registry_removals(before, after), (before, []))
+            with self.assertRaisesRegex(refresh.RefreshError, "removed or upgraded"):
+                refresh.classify_external_delta(before, after)
+
+    def test_workspace_edge_to_a_removed_package_is_admitted(self):
+        old = {"package": [package("app", dependencies=["digest", "pdf"]),
+                           package("digest", source=SOURCE), self.removed()]}
+        new = {"package": [package("app", dependencies=["digest"]), package("digest", source=SOURCE)]}
+        ids = frozenset({("pdf", "1.0.0", SOURCE)})
+        self.assertEqual(
+            refresh.workspace_version_or_existing_dependency_edge_delta(
+                old, new, external_unchanged=False, removed=ids
+            ),
+            ["app"],
+        )
+        with self.assertRaisesRegex(refresh.RefreshError, "changed beyond"):
+            refresh.workspace_version_or_existing_dependency_edge_delta(
+                old, new, external_unchanged=False
+            )
+
+    def test_removal_outside_the_closure_is_admitted(self):
+        old, new = self.graphs()
+        self.assertEqual(
+            refresh.require_explained_notice_closure(
+                old, new, ["app"], removed=frozenset({self.pdf, self.padding})
+            ),
+            frozenset(),
+        )
+
+    def test_unnamed_removal_inside_the_closure_refuses(self):
+        old, new = self.graphs(padding_in_closure=True)
+        with self.assertRaisesRegex(refresh.RefreshError, "--admit-closure-removal"):
+            refresh.require_explained_notice_closure(
+                old, new, ["app"], removed=frozenset({self.pdf, self.padding})
+            )
+
+    def test_named_removal_inside_the_closure_is_admitted_and_stale_name_refuses(self):
+        old, new = self.graphs(padding_in_closure=True)
+        removed = frozenset({self.pdf, self.padding})
+        self.assertEqual(
+            refresh.require_explained_notice_closure(
+                old, new, ["app"], removed=removed, admitted_removals=frozenset({self.padding})
+            ),
+            frozenset(),
+        )
+        old, new = self.graphs()
+        with self.assertRaisesRegex(refresh.RefreshError, "did not leave"):
+            refresh.require_explained_notice_closure(
+                old, new, ["app"], removed=removed, admitted_removals=frozenset({self.padding})
+            )
+
+    def test_surviving_package_leaving_the_closure_still_refuses(self):
+        old, new = self.graphs()
+        new["workspace:app"]["deps"] = []
+        with self.assertRaisesRegex(refresh.RefreshError, "notice closure changed"):
+            refresh.require_explained_notice_closure(
+                old, new, ["app"], removed=frozenset({self.pdf, self.padding}),
+                admitted_removals=frozenset({self.digest}),
+            )
+
+    def test_partially_named_in_closure_removals_refuse(self):
+        old, new = self.graphs(padding_in_closure=True)
+        old[self.digest]["deps"].append({"pkg": self.pdf, "dep_kinds": [{"kind": None}]})
+        with self.assertRaisesRegex(refresh.RefreshError, "--admit-closure-removal"):
+            refresh.require_explained_notice_closure(
+                old, new, ["app"], removed=frozenset({self.pdf, self.padding}),
+                admitted_removals=frozenset({self.padding}),
+            )
+
+    def test_registry_crate_resourced_into_the_workspace_is_not_a_removal(self):
+        before = [package("digest", source=SOURCE), self.removed()]
+        after = [before[0]]
+        self.assertEqual(
+            refresh.split_registry_removals(before, after, frozenset({"app", "pdf"})),
+            (before, []),
+        )
+
+    def index(self):
+        text = lambda key: {"sha256": key * 64, "bytes": 1, "source": {}}
+        return {
+            "packages": [
+                {"identity": self.digest, "windows_notice_population": True,
+                 "notice_references": [text("a")]},
+                {"identity": self.padding, "windows_notice_population": True,
+                 "notice_references": [text("a"), text("b")]},
+                {"identity": self.pdf, "windows_notice_population": False,
+                 "notice_references": [text("c")]},
+            ],
+            "path_dependencies": [
+                {"identity": "shim@1.0.0 (path+vendor/shim)", "windows_notice_population": True,
+                 "notice_references": [text("b")]},
+            ],
+        }
+
+    def test_removal_keeping_every_notice_text_referenced_is_admitted(self):
+        rows = [self.removed("padding"), self.removed()]
+        self.assertEqual(
+            refresh.removed_index_identities(
+                self.index(), rows, frozenset({self.padding}), {"a" * 64, "b" * 64}
+            ),
+            {self.padding, self.pdf},
+        )
+
+    def test_removal_orphaning_a_notice_text_refuses(self):
+        index = self.index()
+        index["path_dependencies"] = []
+        with self.assertRaisesRegex(refresh.RefreshError, "referenced by no"):
+            refresh.removed_index_identities(
+                index, [self.removed("padding")], frozenset({self.padding}), {"a" * 64, "b" * 64}
+            )
+
+    def test_population_flag_must_match_the_recovered_closure(self):
+        with self.assertRaisesRegex(refresh.RefreshError, "population flag"):
+            refresh.removed_index_identities(
+                self.index(), [self.removed("padding")], frozenset(), {"a" * 64, "b" * 64}
+            )
+
+    def prior(self, scratch, payload):
+        import io
+        import json
+        import tarfile
+
+        archive = Path(scratch) / "prior.tar.gz"
+        data = json.dumps(payload).encode()
+        with tarfile.open(archive, "w:gz") as tar:
+            info = tarfile.TarInfo(refresh.GRAPH_MEMBER_NAME)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+        return archive
+
+    def metadata(self, scratch, features):
+        import json
+
+        path = Path(scratch) / "metadata.json"
+        path.write_text(json.dumps({
+            "packages": [{"id": "app-id", "name": "app", "version": "1.0.0", "source": None}],
+            "resolve": {"nodes": [{"id": "app-id", "deps": [], "features": features}]},
+        }))
+        return path
+
+    def test_unwrapped_embedded_graph_must_match_prior_metadata(self):
+        bare = {"workspace:app": {"features": [], "deps": []}}
+        with tempfile.TemporaryDirectory() as scratch:
+            archive = self.prior(scratch, bare)
+            with self.assertRaisesRegex(refresh.RefreshError, "--prior-metadata"):
+                refresh.load_prior_graph(archive, None)
+            self.assertEqual(
+                refresh.load_prior_graph(archive, self.metadata(scratch, [])), bare
+            )
+            with self.assertRaisesRegex(refresh.RefreshError, "does not reproduce"):
+                refresh.load_prior_graph(archive, self.metadata(scratch, ["std"]))
+            wrapped = self.prior(scratch, {"graph": bare})
+            self.assertEqual(refresh.load_prior_graph(wrapped, None), bare)
+
+
 class NoticesRendering(unittest.TestCase):
     def test_texts_are_ordered_by_digest_and_indexed_by_byte_range(self):
         texts = {refresh.sha256_bytes(data): data for data in (b"zeta\n", b"alpha")}

@@ -17,7 +17,7 @@ the external (non-workspace) dependency population is unchanged, so the
 archive can be rebuilt by copying every vendored member across untouched and
 substituting only `Cargo.lock` itself.
 
-It handles two further cases. The first is a **git-source pin move**, where
+It handles further cases. The first is a **git-source pin move**, where
 the set of external packages is unchanged by `(name, version)` and the rows
 that differ are all `git+` sources. That is the shape of advancing a first-party
 library tag. The moved rows may also change their resolved dependency edges,
@@ -64,12 +64,22 @@ script's view, and the named review has to account for them separately.
 An unchanged registry package newly reached by a shipped feature can instead
 be named with `--admit-closure-promotion NAME@VERSION`. The prior acquired
 source bytes stay unchanged; its licence texts are verified against that
-companion and added to NOTICES. Removals and unnamed gains still refuse.
+companion and added to NOTICES. Unnamed gains still refuse.
 Cargo metadata always includes the canonical shipped-core-features list.
 A reviewed promotion that declares an Apache-2.0 option but publishes no text
 can name `--admit-standard-apache-text NAME@VERSION`. This acquires the
 canonical Apache text at its reviewed digest; it cannot replace an existing
 crate notice or select a licence the package does not declare.
+
+The fifth is a **checksummed registry removal**: the new lock drops registry
+packages and adds or re-pins nothing. Every surviving vendored member is
+copied across byte for byte, the removed packages' `vendor/<name>-<version>/`
+members and index rows are dropped, and `Cargo.lock` is substituted. A removed
+package outside the Windows notice closure needs no review. One inside it
+leaves the closure only by name, with `--admit-closure-removal NAME@VERSION`,
+and only while every notice text stays referenced by a surviving package or
+path dependency, so the NOTICES file stays byte-identical. A surviving package that leaves the
+closure still refuses.
 
 The same shapes may come with a **new workspace crate**, such as a new Windows
 inventory binary root. It is admitted only when `core/Cargo.toml` declares it
@@ -78,16 +88,19 @@ names a workspace crate, an unchanged external package, or a package this lock
 adds. What it brings into Windows reach is the notice-closure check's to decide.
 
 It refuses -- loudly, with the reason -- rather than proceed, when:
-  * the external package population lost or upgraded a package by `(name,
-    version)`, or added one that is not a checksummed registry package, that
-    reaches the Windows notice closure without being named for admission, or
-    whose licence expression is not wholly permissive. That is a real
+  * the external package population upgraded a package by `(name,
+    version)`; lost one that is not a checksummed registry package, or lost
+    one alongside an addition, git pin move or promotion; or added one that
+    is not a checksummed registry package, that reaches the Windows notice
+    closure without being named for admission, or whose licence expression is
+    not wholly permissive. That is a real
     dependency change and needs licence review, not a mechanical refresh.
   * a package named for addition is not an addition in this lock, or does not
     reach the Windows notice closure. A stale review is not a review.
   * an external row changed source and either side is not a `git+` source.
   * the **Windows notice closure** changed -- the non-dev reach of the Windows
-    inventory binary roots -- other than by gaining named additions. That is
+    inventory binary roots -- other than by gaining named additions or
+    losing named removals. That is
     the set the notices are derived from, so a graph difference that moves it
     needs a fresh acquisition. A graph difference that leaves it untouched does
     not, and is admitted.
@@ -109,14 +122,15 @@ licence texts). It also
 embeds the resolved dependency graph it verified into the new archive as
 `resolved-dependency-graph.json`, so the *next* refresh can read it straight
 back out instead of depending on a `cargo metadata` capture kept somewhere
-outside this repo. `--prior-metadata` exists only to bootstrap the one
-archive produced before this script existed.
+outside this repo. `--prior-metadata` exists only to bootstrap an archive
+whose embedded graph is missing or not in the shape this script writes.
 
 Usage:
     python3 scripts/refresh_windows_rust_notices.py \\
         --prior-archive /path/to/windows-rust-dependencies-<oldhash>.tar.gz \\
         [--prior-metadata /path/to/old-cargo-metadata.json] \\
         [--admit-closure-addition NAME@VERSION ...] \\
+        [--admit-closure-removal NAME@VERSION ...] \\
         [--out /path/to/output/dir]
 """
 
@@ -265,6 +279,34 @@ def git_source_revision(source: str) -> str:
     return revision
 
 
+def split_registry_removals(
+    old_external: list[dict[str, Any]],
+    new_external: list[dict[str, Any]],
+    new_workspace_names: frozenset[str] = frozenset(),
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return `(surviving_old_rows, removed_rows)` for a removal-only lock move.
+
+    Removals are split off only when the new lock adds no `(name, version)`
+    and every removed row is a checksummed registry package whose name does not
+    reappear as a no-source package (a re-source, not a removal). Anything else
+    returns no removals, so `classify_external_delta` still sees -- and
+    refuses -- the whole delta: an upgrade reads as a removal plus an addition,
+    and a mixed shape is not one this script can prove.
+    """
+    new_ids = {(p["name"], p["version"]) for p in new_external}
+    old_ids = {(p["name"], p["version"]) for p in old_external}
+    removed = [p for p in old_external if (p["name"], p["version"]) not in new_ids]
+    if not removed or new_ids - old_ids or any(
+        not p.get("source", "").startswith("registry+")
+        or not p.get("checksum")
+        or p["name"] in new_workspace_names
+        for p in removed
+    ):
+        return old_external, []
+    surviving = [p for p in old_external if (p["name"], p["version"]) in new_ids]
+    return surviving, sorted(removed, key=lambda p: (p["name"], p["version"]))
+
+
 def classify_external_delta(
     old_external: list[dict[str, Any]], new_external: list[dict[str, Any]]
 ) -> tuple[list[tuple[dict[str, Any], dict[str, Any]]], list[dict[str, Any]]]:
@@ -275,8 +317,9 @@ def classify_external_delta(
     it unless it stays outside the Windows notice closure (so no notice text
     can change) and carries a permissive licence expression. A removal, an
     upgrade (which reads as a removal plus an add) or an added git dependency
-    still refuses. Empty results mean the population is identical and the
-    cheap member-preserving path applies unchanged.
+    still refuses; a removal-only delta is split off by the caller first
+    (`split_registry_removals`). Empty results mean the population is
+    identical and the cheap member-preserving path applies unchanged.
 
     This script still refuses a zip 2.4.2/8.6.0 → 9.0.3 upgrade and Velopack
     leaving the registry source. That regeneration is caller work. No rewrite
@@ -443,7 +486,24 @@ def load_prior_graph(
             member = None
         if member is not None:
             payload = json.loads(tar.extractfile(member).read())
-            return renormalize_graph_keys(payload["graph"])
+            if "graph" in payload:
+                return renormalize_graph_keys(payload["graph"])
+            if prior_metadata is None:
+                raise RefreshError(
+                    f"--prior-archive carries a '{GRAPH_MEMBER_NAME}' member that "
+                    "is not in the shape this script writes (no 'graph' key), and "
+                    "no --prior-metadata was supplied. Supply --prior-metadata "
+                    "pointing at the 'cargo metadata' JSON for the prior lock."
+                )
+            recovered = renormalize_graph_keys(
+                normalize_graph(json.loads(prior_metadata.read_bytes()))
+            )
+            if recovered != renormalize_graph_keys(payload):
+                raise RefreshError(
+                    "--prior-metadata does not reproduce the graph embedded in "
+                    "--prior-archive; refusing to compare against either"
+                )
+            return recovered
     if prior_metadata is None:
         raise RefreshError(
             f"--prior-archive has no embedded '{GRAPH_MEMBER_NAME}' member (it "
@@ -545,6 +605,7 @@ def _workspace_existing_deps_only(
     added: frozenset[tuple[str, str, str]] = frozenset(),
     removed_workspace: frozenset[str] = frozenset(),
     added_workspace: frozenset[str] = frozenset(),
+    removed_external: frozenset[tuple[str, str, str]] = frozenset(),
 ) -> bool:
     """Admit edges to unchanged packages, independent of unrelated pin moves.
 
@@ -582,6 +643,8 @@ def _workspace_existing_deps_only(
         if old_row is None and new_row is not None and identity in added:
             continue
         if new_row is None and old_row is not None and not identity[2] and identity[0] in removed_workspace:
+            continue
+        if new_row is None and old_row is not None and identity in removed_external:
             continue
         if old_row is None and new_row is not None and not identity[2] and identity[0] in added_workspace:
             continue
@@ -654,6 +717,7 @@ def workspace_version_or_existing_dependency_edge_delta(
     external_unchanged: bool,
     added: frozenset[tuple[str, str, str]] = frozenset(),
     declared_workspace: frozenset[str] = frozenset(),
+    removed: frozenset[tuple[str, str, str]] = frozenset(),
 ) -> list[str]:
     """Allow workspace versions or edges to existing packages only, plus new
     workspace crates `core/Cargo.toml` declares.
@@ -707,6 +771,7 @@ def workspace_version_or_existing_dependency_edge_delta(
             added,
             removed_workspace,
             frozenset(added_workspace),
+            removed,
         ):
             raise RefreshError(
                 f"workspace package '{name}' changed beyond its version or "
@@ -725,6 +790,8 @@ def require_explained_notice_closure(
     admitted: frozenset[str] = frozenset(),
     added_workspace: frozenset[str] = frozenset(),
     promoted: frozenset[str] = frozenset(),
+    removed: frozenset[str] = frozenset(),
+    admitted_removals: frozenset[str] = frozenset(),
 ) -> frozenset[str]:
     """Return what the Windows notice closure gained, once every gain is a
     registry addition or unchanged registry package named for admission.
@@ -736,6 +803,8 @@ def require_explained_notice_closure(
     roots the prior graph has, and the new one from all of them.
     `promoted` names unchanged registry packages entering the closure, whose
     acquired licence texts will be verified against the prior companion.
+    `removed` names every registry package the lock drops; the closure may
+    lose only those, and only the ones named in `admitted_removals`.
     """
     missing = [
         root
@@ -751,7 +820,8 @@ def require_explained_notice_closure(
     )
     after = selected_from_graph(new_graph, roots)
     gained = after - before
-    unexplained = sorted((before - after) | (gained - added - promoted))
+    lost = before - after
+    unexplained = sorted((lost - removed) | (gained - added - promoted))
     if unexplained:
         raise RefreshError(
             "the Windows notice closure changed beyond the packages this lock "
@@ -773,6 +843,19 @@ def require_explained_notice_closure(
         raise RefreshError(
             f"package(s) named for admission {stale} do not reach the Windows "
             "notice closure; refusing a review that does not describe this lock"
+        )
+    unnamed_removals = sorted(lost - admitted_removals)
+    if unnamed_removals:
+        raise RefreshError(
+            f"removed package(s) {unnamed_removals} were in the Windows notice "
+            "closure. Review that nothing shipped still needs them and name each "
+            "with --admit-closure-removal NAME@VERSION."
+        )
+    stale_removals = sorted(admitted_removals - lost)
+    if stale_removals:
+        raise RefreshError(
+            f"package(s) named for removal {stale_removals} did not leave the "
+            "Windows notice closure; refusing a review that does not describe this lock"
         )
     return frozenset(gained)
 
@@ -1443,6 +1526,58 @@ def promote_notice_rows(
     return promoted, texts
 
 
+def removed_index_identities(
+    index: dict[str, Any],
+    removed: list[dict[str, Any]],
+    lost: frozenset[str],
+    committed_texts: set[str],
+) -> set[str]:
+    """The committed index rows a registry removal drops, after proving them.
+
+    Each removed package must have exactly one row, flagged in the notice
+    population exactly when it left the Windows notice closure, and dropping
+    the rows must leave every committed notice text referenced by a surviving
+    population row or path dependency -- so the NOTICES file stays as it is.
+    """
+    identities = {f"{row['name']}@{row['version']} ({row['source']})" for row in removed}
+    for identity in sorted(identities):
+        rows = [p for p in index["packages"] if p["identity"] == identity]
+        if len(rows) != 1:
+            raise RefreshError(
+                f"expected exactly one committed index row for {identity}, found {len(rows)}"
+            )
+        if rows[0]["windows_notice_population"] != (normalize_identity(identity) in lost):
+            raise RefreshError(
+                f"the committed index's notice population flag for {identity} "
+                "does not match the recovered Windows notice closure"
+            )
+
+    def referenced(rows: list[dict[str, Any]]) -> set[str]:
+        return {
+            reference["sha256"]
+            for row in rows
+            if row["windows_notice_population"]
+            for reference in row["notice_references"]
+        }
+
+    surviving = [p for p in index["packages"] if p["identity"] not in identities]
+    orphaned = sorted(
+        (
+            referenced(index["packages"])
+            - referenced(surviving)
+            - referenced(index.get("path_dependencies", []))
+        )
+        & committed_texts
+    )
+    if orphaned:
+        raise RefreshError(
+            f"a removal leaves notice text(s) {orphaned} referenced by no "
+            "surviving package. The notices file is an input here, not an "
+            "output; regenerating it is out of this script's scope."
+        )
+    return identities
+
+
 NOTICES_HEADER = b"Rust dependency notices\n\n"
 
 
@@ -1479,7 +1614,7 @@ def parse_admissions(values: list[str]) -> frozenset[tuple[str, str]]:
         name, separator, version = value.partition("@")
         if not separator or not name or not version or "@" in version:
             raise RefreshError(
-                f"--admit-closure-addition takes NAME@VERSION, not {value!r}"
+                f"admission flags take NAME@VERSION, not {value!r}"
             )
         admitted.add((name, version))
     return frozenset(admitted)
@@ -1494,6 +1629,7 @@ def refresh(
     admissions: frozenset[tuple[str, str]] = frozenset(),
     promotions: frozenset[tuple[str, str]] = frozenset(),
     standard_apache: frozenset[tuple[str, str]] = frozenset(),
+    removals: frozenset[tuple[str, str]] = frozenset(),
 ) -> dict[str, Any]:
     old = load_index(repo)
 
@@ -1539,7 +1675,30 @@ def refresh(
             "Cargo.lock -- it was edited out of band"
         )
 
-    moved_git, added_external = classify_external_delta(old_external, new_external)
+    surviving_external, removed_external = split_registry_removals(
+        old_external,
+        new_external,
+        frozenset(p["name"] for p in new_lock["package"] if not p.get("source")),
+    )
+    moved_git, added_external = classify_external_delta(surviving_external, new_external)
+    if removed_external and (moved_git or promotions):
+        raise RefreshError(
+            "the lock removes registry packages and also moves a git pin or "
+            "promotes a package; this script attests a removal only on its own"
+        )
+    removed_ids = frozenset(
+        (p["name"], p["version"], p["source"]) for p in removed_external
+    )
+    not_removed = sorted(
+        f"{name}@{version}"
+        for name, version in removals
+        if not any((p["name"], p["version"]) == (name, version) for p in removed_external)
+    )
+    if not_removed:
+        raise RefreshError(
+            f"package(s) named for removal {not_removed} are not registry "
+            "removals in this lock; refusing a review that does not describe it"
+        )
     added_ids = frozenset(
         (p["name"], p["version"], p["source"]) for p in added_external
     )
@@ -1581,6 +1740,7 @@ def refresh(
         external_unchanged=old_external == existing_new_external,
         added=added_ids,
         declared_workspace=declared_workspace_crates(repo),
+        removed=removed_ids,
     )
     added_workspace = frozenset(
         change.removeprefix("added:")
@@ -1608,6 +1768,19 @@ def refresh(
         ),
         added_workspace=added_workspace,
         promoted=frozenset(added_identity(row) for row in promotion_rows),
+        removed=frozenset(added_identity(row) for row in removed_external),
+        admitted_removals=frozenset(
+            added_identity(row)
+            for row in removed_external
+            if (row["name"], row["version"]) in removals
+        ),
+    )
+    # The closure check above proved the closure lost exactly the named
+    # removals, so they are the population rows that go.
+    lost = frozenset(
+        added_identity(row)
+        for row in removed_external
+        if (row["name"], row["version"]) in removals
     )
 
     selected = {
@@ -1618,16 +1791,16 @@ def refresh(
         normalize_identity(p["identity"])
         for p in old["packages"]
         if p["windows_notice_population"]
-    } | gained
+    } - lost | gained
     if selected != wanted:
         raise RefreshError(
             "the Windows notice population computed from the current lock "
             f"does not match the committed index: missing={sorted(wanted - selected)} "
             f"added={sorted(selected - wanted)}"
         )
-    all_identities = {normalize_identity(p["identity"]) for p in old["packages"]} | {
-        added_identity(row) for row in added_external
-    }
+    all_identities = {normalize_identity(p["identity"]) for p in old["packages"]} - {
+        added_identity(row) for row in removed_external
+    } | {added_identity(row) for row in added_external}
     if not selected < all_identities:
         raise RefreshError(
             "negative control failed: the selected population is not a proper "
@@ -1643,6 +1816,10 @@ def refresh(
                 f"{row['byte_start_inclusive']} no longer matches the committed NOTICES file"
             )
         committed_texts[row["sha256"]] = raw
+
+    removed_identities = removed_index_identities(
+        old, removed_external, lost, set(committed_texts)
+    )
 
     out_dir.mkdir(parents=True, exist_ok=True)
     new_archive_path = out_dir / f"windows-rust-dependencies-{lock_hash[:16]}.tar.gz"
@@ -1714,6 +1891,15 @@ def refresh(
             ):
                 del substitutions[name]
 
+    dropped_prefixes = tuple(
+        f"vendor/{row['name']}-{row['version']}/" for row in removed_external
+    )
+
+    def dropped(name: str) -> bool:
+        # tarfile strips a directory member's trailing slash.
+        return bool(dropped_prefixes) and (
+            name.startswith(dropped_prefixes) or f"{name}/" in dropped_prefixes
+        )
     prior_members: dict[str, dict[str, Any]] = {}
     with (
         tarfile.open(prior_archive_path, "r:gz") as source,
@@ -1736,6 +1922,12 @@ def refresh(
                 "size": member.size,
                 "sha256": sha256_bytes(data) if data is not None else None,
             }
+            if dropped(member.name):
+                if member.name in substitutions:
+                    raise RefreshError(
+                        f"a substitution targets a removed package's member: {member.name}"
+                    )
+                continue
             replacement = substitutions.get(member.name)
             if replacement is not None:
                 if data is None:
@@ -1777,10 +1969,25 @@ def refresh(
                 "sha256": sha256_bytes(data) if data is not None else None,
             }
 
-    removed = set(prior_members) - set(observed)
-    if removed:
+    expected_dropped = {
+        name
+        for name in prior_members
+        if dropped(name)
+    }
+    absent = sorted(
+        prefix for prefix in dropped_prefixes
+        if prefix + ".cargo-checksum.json" not in prior_members
+    )
+    if absent:
         raise RefreshError(
-            f"the refresh dropped members that must be preserved: {sorted(removed)}"
+            f"the prior archive does not vendor the removed package(s) {absent}"
+        )
+    removed = set(prior_members) - set(observed)
+    if removed != expected_dropped:
+        raise RefreshError(
+            "the refresh dropped members that must be preserved, or kept a "
+            "removed package's members: "
+            f"{sorted(removed ^ expected_dropped)[:10]}"
         )
     added = set(observed) - set(prior_members)
     expected_added = set(substitutions) - set(prior_members)
@@ -1858,6 +2065,11 @@ def refresh(
 
     new_index = copy.deepcopy(old)
     advance_git_index_rows(new_index, moved_git)
+    if removed_external:
+        new_index["packages"] = [
+            p for p in new_index["packages"] if p["identity"] not in removed_identities
+        ]
+        new_index["population"]["source_package_count"] = len(new_external)
     if added_rows:
         new_index["packages"] = sorted(
             new_index["packages"] + added_rows,
@@ -1867,13 +2079,15 @@ def refresh(
     if promoted_rows:
         by_identity = {row["identity"]: row for row in promoted_rows}
         new_index["packages"] = [by_identity.get(row["identity"], row) for row in new_index["packages"]]
-    if gained:
-        count = old["population"]["windows_notice_package_count"] + len(gained)
+    if gained or lost:
+        count = (
+            old["population"]["windows_notice_package_count"] + len(gained) - len(lost)
+        )
         if count != len(selected):
             raise RefreshError(
                 f"the committed windows_notice_package_count plus {len(gained)} "
-                f"admitted package(s) is {count}, not the {len(selected)} the "
-                "current lock selects"
+                f"admitted and minus {len(lost)} removed package(s) is {count}, "
+                f"not the {len(selected)} the current lock selects"
             )
         new_index["population"]["windows_notice_package_count"] = count
     new_notices = None
@@ -1952,6 +2166,14 @@ def refresh(
             if row["windows_notice_population"]
         ],
         "promoted_existing_packages": [row["identity"] for row in promoted_rows],
+        "removed_packages": [
+            {
+                "identity": f"{row['name']}@{row['version']} ({row['source']})",
+                "left_windows_notice_closure": added_identity(row) in lost,
+            }
+            for row in removed_external
+        ],
+        "removed_vendor_members": len(expected_dropped),
         "added_notice_texts": sorted(set(added_texts) - set(committed_texts)),
         "windows_notice_package_count": len(selected),
         "external_package_count": len(new_external),
@@ -1994,7 +2216,8 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help=(
             "'cargo metadata' JSON captured when --prior-archive was produced; "
-            f"only needed when that archive predates the embedded '{GRAPH_MEMBER_NAME}' member"
+            f"only needed when that archive's embedded '{GRAPH_MEMBER_NAME}' member is "
+            "missing or not in the shape this script writes"
         ),
     )
     parser.add_argument(
@@ -2032,6 +2255,14 @@ def main(argv: list[str] | None = None) -> int:
         "--admit-standard-apache-text", action="append", default=[], metavar="NAME@VERSION",
         help="reviewed promotion publishing an Apache-2.0 option but no text; acquire the canonical licence",
     )
+    parser.add_argument(
+        "--admit-closure-removal", action="append", default=[], metavar="NAME@VERSION",
+        help=(
+            "a registry package this lock removes from inside the Windows notice "
+            "closure, reviewed as no longer needed by anything shipped; repeat once "
+            "per package. Any in-closure removal not named here refuses."
+        ),
+    )
     args = parser.parse_args(argv)
 
     repo = args.repo.resolve()
@@ -2052,6 +2283,7 @@ def main(argv: list[str] | None = None) -> int:
             parse_admissions(args.admit_closure_addition),
             parse_admissions(args.admit_closure_promotion),
             parse_admissions(args.admit_standard_apache_text),
+            parse_admissions(args.admit_closure_removal),
         )
     except RefreshError as error:
         print(f"refresh refused: {error}", file=sys.stderr)
