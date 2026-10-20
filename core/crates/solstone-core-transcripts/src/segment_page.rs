@@ -13,14 +13,22 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
-use solstone_core_entity::{is_admissible_person, load_all_journal_entities};
 use solstone_core_format::content::{
     ContentResolution, Family, RawPerceptFamily, classify, produce_chunks,
     produce_raw_percept_chunks,
 };
 use solstone_core_journal_io::paths::{Segment, segment_origin};
 
-use crate::{next_statement_ordinal, speaker_label_source};
+use crate::{VoiceNames, next_statement_ordinal, speaker_label_source};
+
+/// Who an agent's transcript line names: only a speaker the journal's voice
+/// gate names (the same gate an activity's Story reads), with the owner's own
+/// recognized lines named by `owner`, so an agent can tell them apart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentSpeakers {
+    pub voices: VoiceNames,
+    pub owner: String,
+}
 
 /// Largest source-byte window parsed for one transcript page.
 pub const MAX_TRANSCRIPT_PAGE_BYTES: usize = 64 * 1024;
@@ -138,19 +146,16 @@ fn peek_untimed(path: &Path) -> bool {
 ///
 /// The caller owns authorization. This function only projects transcript input;
 /// it never walks a day, reads unrelated percept/browser/talent content, or applies scope.
-/// Segment-local speaker labels supply names only; the entity profile is never projected.
+/// Segment-local speaker labels supply names only, and only as `speakers` allows;
+/// the entity profile is never projected. Without `speakers`, lines keep the
+/// stored diarization label.
 pub fn read_segment_transcript_page(
-    journal_root: &Path,
     segment: &Segment,
     cursor: Option<&SegmentTranscriptCursor>,
-    resolve_speakers: bool,
+    speakers: Option<&AgentSpeakers>,
 ) -> Result<SegmentTranscriptPage, SegmentTranscriptReadError> {
     let files = transcript_files(segment.path())?;
-    let labels = if resolve_speakers {
-        local_speaker_names(segment.path(), journal_root)
-    } else {
-        None
-    };
+    let labels = speakers.and_then(|speakers| local_speaker_names(segment.path(), speakers));
     let version = source_version(&files, &labels)?;
     let untimed = files
         .iter()
@@ -297,11 +302,11 @@ fn source_version(
     Ok(SegmentTranscriptVersion(hasher.finish()))
 }
 
-// Resolve only names used by this segment. Cross-segment voice candidates and
-// entity profiles are outside this transcript projection.
+// Resolve only names used by this segment, through the voice gate: a name the
+// journal inferred from what was said, or a declined owner match, names no one.
 fn local_speaker_names(
     segment: &Path,
-    journal_root: &Path,
+    speakers: &AgentSpeakers,
 ) -> Option<(String, BTreeMap<i64, String>)> {
     let path = segment.join("talents/speaker_labels.json");
     let file = File::open(path).ok()?;
@@ -314,32 +319,17 @@ fn local_speaker_names(
     }
     let payload: Value = serde_json::from_slice(&bytes).ok()?;
     let rows = payload.get("labels")?.as_array()?;
-    if rows.is_empty() {
-        return None;
-    }
     let (source, _) = speaker_label_source(segment);
     let source = source?;
-    let entities = match load_all_journal_entities(journal_root) {
-        Ok(entities) => entities,
-        Err(error) => {
-            log::warn!("transcript speaker names unavailable: {error}");
-            return None;
-        }
-    };
-    let names = entities
-        .iter()
-        .filter(|entity| is_admissible_person(entity))
-        .filter_map(|entity| {
-            let name = entity.value.get("name")?.as_str()?;
-            (!name.trim().is_empty()).then_some((entity.id.as_str(), name))
-        })
-        .collect::<BTreeMap<_, _>>();
     let labels = rows
         .iter()
+        .filter_map(Value::as_object)
         .filter_map(|row| {
             let id = row.get("sentence_id")?.as_i64()?;
-            let speaker = row.get("speaker")?.as_str()?;
-            Some((id, (*names.get(speaker)?).to_owned()))
+            let name = speakers.voices.name_for(row)?;
+            let owner = row.get("speaker").and_then(Value::as_str)
+                == Some(speakers.voices.principal.as_str());
+            Some((id, if owner { speakers.owner.clone() } else { name }))
         })
         .collect::<BTreeMap<_, _>>();
     (!labels.is_empty()).then_some((source, labels))
@@ -558,7 +548,7 @@ mod tests {
             .pop()
             .unwrap();
 
-        let first = read_segment_transcript_page(root.path(), &segment, None, false).unwrap();
+        let first = read_segment_transcript_page(&segment, None, None).unwrap();
         assert!(!first.entries.is_empty());
         assert!(
             first
@@ -594,7 +584,7 @@ mod tests {
             .pop()
             .unwrap();
 
-        let page = read_segment_transcript_page(root.path(), &segment, None, false).unwrap();
+        let page = read_segment_transcript_page(&segment, None, None).unwrap();
         assert_eq!(
             page.entries,
             vec![
@@ -647,25 +637,25 @@ mod tests {
 
         // Verify import.audio page
         let seg = segments.iter().find(|s| s.path() == seg_audio).unwrap();
-        let page = read_segment_transcript_page(root.path(), seg, None, false).unwrap();
+        let page = read_segment_transcript_page(seg, None, None).unwrap();
         assert_eq!(page.entries.len(), 1);
         assert_eq!(page.entries[0].text, "[00:00:02] spoken words");
 
         // Verify custom _audio.jsonl page
         let seg = segments.iter().find(|s| s.path() == seg_custom).unwrap();
-        let page = read_segment_transcript_page(root.path(), seg, None, false).unwrap();
+        let page = read_segment_transcript_page(seg, None, None).unwrap();
         assert_eq!(page.entries.len(), 1);
         assert_eq!(page.entries[0].text, "[00:00:02] spoken words");
 
         // Verify import.chatgpt page
         let seg = segments.iter().find(|s| s.path() == seg_chatgpt).unwrap();
-        let page = read_segment_transcript_page(root.path(), seg, None, false).unwrap();
+        let page = read_segment_transcript_page(seg, None, None).unwrap();
         assert_eq!(page.entries.len(), 1);
         assert_eq!(page.entries[0].text, "[00:00:00] **Ana Lima:** Hello all.");
 
         // Verify import.text page
         let seg = segments.iter().find(|s| s.path() == seg_text).unwrap();
-        let page = read_segment_transcript_page(root.path(), seg, None, false).unwrap();
+        let page = read_segment_transcript_page(seg, None, None).unwrap();
         assert_eq!(page.entries.len(), 1);
         assert_eq!(page.entries[0].text, "[00:00:00] **Ana Lima:** Hello all.");
 
@@ -702,7 +692,7 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap();
-        let page = read_segment_transcript_page(root.path(), &segment, None, false).unwrap();
+        let page = read_segment_transcript_page(&segment, None, None).unwrap();
         assert_eq!(page.entries.len(), 1, "{:?}", page.entries);
         assert!(page.entries[0].text.contains("send the deck on friday"));
         assert!(
@@ -733,16 +723,14 @@ mod tests {
             .pop()
             .unwrap();
 
-        let first = read_segment_transcript_page(root.path(), &segment, None, false).unwrap();
+        let first = read_segment_transcript_page(&segment, None, None).unwrap();
         assert!(first.untimed);
         assert_eq!(first.entries.len(), MAX_TRANSCRIPT_PAGE_ITEMS);
         assert_eq!(first.entries[0].channel, "Imported Text");
         assert_eq!(first.entries[0].text, "[00:00:00] **User:** turn 1");
         assert!(first.next.is_some());
 
-        let second =
-            read_segment_transcript_page(root.path(), &segment, first.next.as_ref(), false)
-                .unwrap();
+        let second = read_segment_transcript_page(&segment, first.next.as_ref(), None).unwrap();
         assert!(second.untimed);
         assert_eq!(second.entries.len(), 10);
         assert_eq!(second.entries[0].text, "[00:00:00] **User:** turn 101");
@@ -772,7 +760,7 @@ mod tests {
         let pages = segments
             .iter()
             .map(|segment| {
-                read_segment_transcript_page(root.path(), segment, None, false)
+                read_segment_transcript_page(segment, None, None)
                     .unwrap()
                     .entries
             })
@@ -801,7 +789,7 @@ mod tests {
             .pop()
             .unwrap();
 
-        let first = read_segment_transcript_page(root.path(), &segment, None, false).unwrap();
+        let first = read_segment_transcript_page(&segment, None, None).unwrap();
         assert_eq!(first.entries.len(), MAX_TRANSCRIPT_PAGE_ITEMS);
         assert_eq!(first.entries[0].text, "line 1");
         assert_eq!(
@@ -809,9 +797,7 @@ mod tests {
             "line 100"
         );
 
-        let second =
-            read_segment_transcript_page(root.path(), &segment, first.next.as_ref(), false)
-                .unwrap();
+        let second = read_segment_transcript_page(&segment, first.next.as_ref(), None).unwrap();
         assert_eq!(
             second
                 .entries
@@ -821,6 +807,17 @@ mod tests {
             ["line 101", "line 102", "line 103", "line 104", "line 105"]
         );
         assert!(second.next.is_none());
+    }
+
+    fn speakers() -> super::AgentSpeakers {
+        super::AgentSpeakers {
+            voices: crate::VoiceNames {
+                principal: "person-b".into(),
+                owner_voice_confirmed: true,
+                people: [("person-a".to_owned(), "Ada".to_owned())].into(),
+            },
+            owner: "Bea (owner)".into(),
+        }
     }
 
     fn named_segment(root: &std::path::Path) -> std::path::PathBuf {
@@ -871,10 +868,10 @@ mod tests {
         fs::write(
             dir.join("talents/speaker_labels.json"),
             serde_json::json!({"labels":[
-                {"sentence_id":1,"speaker":"person-b"},
-                {"sentence_id":100,"speaker":"person-a"},
-                {"sentence_id":101,"speaker":"person-b","confidence":"high","method":"acoustic"},
-                {"sentence_id":102,"speaker":"person-a"}
+                {"sentence_id":1,"speaker":"person-b","method":"owner_centroid"},
+                {"sentence_id":100,"speaker":"person-a","method":"acoustic"},
+                {"sentence_id":101,"speaker":"person-b","method":"owner_centroid","owner_margin_declined":true},
+                {"sentence_id":102,"speaker":"person-a","method":"contextual"}
             ]})
             .to_string(),
         )
@@ -883,32 +880,40 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap();
-        let first = read_segment_transcript_page(root.path(), &segment, None, true).unwrap();
-        assert_eq!(first.entries[0].text, "[00:00:01] (mic) Bea: sentence 1");
+        let first = read_segment_transcript_page(&segment, None, Some(&speakers())).unwrap();
+        assert_eq!(
+            first.entries[0].text,
+            "[00:00:01] (mic) Bea (owner): sentence 1"
+        );
         assert_eq!(first.entries[99].text, "[00:00:01] (mic) Ada: sentence 100");
         let second =
-            read_segment_transcript_page(root.path(), &segment, first.next.as_ref(), true).unwrap();
+            read_segment_transcript_page(&segment, first.next.as_ref(), Some(&speakers())).unwrap();
         assert_eq!(
             second
                 .entries
                 .iter()
                 .map(|row| row.text.as_str())
                 .collect::<Vec<_>>(),
+            // A declined owner match and a name inferred from what was said name no one.
             [
-                "[00:00:01] (mic) Bea: sentence 101",
-                "[00:00:01] (mic) Ada: sentence 102"
+                "[00:00:01] (mic) Speaker 1: sentence 101",
+                "[00:00:01] (mic) Speaker 1: sentence 102"
             ]
         );
         assert!(second.next.is_none());
 
-        // The rendered identity is part of the cursor version, including admission.
+        // The rendered identity is part of the cursor version.
         fs::write(
-            root.path().join("entities/person-a/entity.json"),
-            serde_json::json!({"name":"Ada", "type":"Person", "blocked":true}).to_string(),
+            dir.join("talents/speaker_labels.json"),
+            serde_json::json!({"labels":[
+                {"sentence_id":1,"speaker":"person-b","method":"owner_centroid"},
+                {"sentence_id":100,"speaker":"person-a","method":"contextual"}
+            ]})
+            .to_string(),
         )
         .unwrap();
         assert!(matches!(
-            read_segment_transcript_page(root.path(), &segment, first.next.as_ref(), true),
+            read_segment_transcript_page(&segment, first.next.as_ref(), Some(&speakers())),
             Err(super::SegmentTranscriptReadError::Changed)
         ));
     }
@@ -926,7 +931,7 @@ mod tests {
         let rows = ["person-a", "tool", "blocked", "missing", "nameless"]
             .iter()
             .enumerate()
-            .map(|(i, id)| serde_json::json!({"sentence_id":i+1,"speaker":id}))
+            .map(|(i, id)| serde_json::json!({"sentence_id":i+1,"speaker":id,"method":"acoustic"}))
             .collect::<Vec<_>>();
         let labels = serde_json::json!({"labels":rows}).to_string();
         fs::write(dir.join("talents/speaker_labels.json"), &labels).unwrap();
@@ -934,7 +939,7 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap();
-        let read = || read_segment_transcript_page(root.path(), &segment, None, true).unwrap();
+        let read = || read_segment_transcript_page(&segment, None, Some(&speakers())).unwrap();
         let named = read();
         assert_eq!(named.entries[0].text, "[00:00:01] Ada: sentence 1");
         for id in 2..=6 {
@@ -972,12 +977,11 @@ mod tests {
                 .iter()
                 .all(|row| row.text.contains("Speaker 1:"))
         );
-        // A failed entity enumeration leaves the original transcript readable.
+        // Without agent speakers, every line keeps its stored label.
         fs::write(dir.join("talents/speaker_labels.json"), labels).unwrap();
-        fs::remove_dir_all(root.path().join("entities")).unwrap();
-        fs::write(root.path().join("entities"), "not a directory").unwrap();
         assert!(
-            read()
+            read_segment_transcript_page(&segment, None, None)
+                .unwrap()
                 .entries
                 .iter()
                 .all(|row| row.text.contains("Speaker 1:"))
@@ -1000,14 +1004,14 @@ mod tests {
         .unwrap();
         fs::write(
             dir.join("talents/speaker_labels.json"),
-            "{\"labels\":[{\"sentence_id\":1,\"speaker\":\"person-a\"}]}",
+            "{\"labels\":[{\"sentence_id\":1,\"speaker\":\"person-a\",\"method\":\"acoustic\"}]}",
         )
         .unwrap();
         let segment = iter_segments(root.path(), PathOrDay::Day("20260914"))
             .unwrap()
             .pop()
             .unwrap();
-        let page = read_segment_transcript_page(root.path(), &segment, None, true).unwrap();
+        let page = read_segment_transcript_page(&segment, None, Some(&speakers())).unwrap();
         assert_eq!(page.entries[0].text, "[00:00:00] **User:** hello");
     }
 
@@ -1048,7 +1052,7 @@ mod tests {
             .pop()
             .unwrap();
 
-        let page = read_segment_transcript_page(root.path(), &segment, None, false).unwrap();
+        let page = read_segment_transcript_page(&segment, None, None).unwrap();
         assert_eq!(page.entries.len(), 2);
 
         let flagged_entry = &page.entries[0].text;

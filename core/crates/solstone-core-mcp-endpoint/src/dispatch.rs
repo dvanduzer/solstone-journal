@@ -1335,7 +1335,7 @@ fn search(
                 more_segments: false,
                 activity_record: record.as_ref(),
             }];
-            let mut checker = LiveTranscriptPages;
+            let mut checker = LiveTranscriptPages::default();
             if allowed {
                 issue_segment_links(
                     journal_root,
@@ -1696,7 +1696,7 @@ fn fetch(
                 more_segments: false,
                 activity_record: record.as_ref(),
             }];
-            let mut checker = LiveTranscriptPages;
+            let mut checker = LiveTranscriptPages::default();
             let mut response_checks = 0;
             if allowed {
                 issue_segment_links(
@@ -1782,7 +1782,7 @@ fn fetch(
                 more_segments: false,
                 activity_record: Some(&record),
             }];
-            let mut checker = LiveTranscriptPages;
+            let mut checker = LiveTranscriptPages::default();
             let mut response_checks = 0;
             if allowed {
                 issue_segment_links(
@@ -2332,6 +2332,7 @@ fn list_transcripts(
             },
         );
 
+        let speakers = solstone_core_talent_runtime::agent_speakers(journal_root);
         for (segment, stream, name, clock) in matching_segments {
             let start_seconds = clock.as_ref().map(|c| c.start_seconds).unwrap_or(0);
             if !is_after_cursor(day, start_seconds, &stream, &name, cursor.as_ref()) {
@@ -2357,10 +2358,9 @@ fn list_transcripts(
             );
             let page = if allowed && segments.len() < request.limit {
                 Some(solstone_core_transcripts::read_segment_transcript_page(
-                    journal_root,
                     &segment,
                     None,
-                    true,
+                    speakers.as_ref(),
                 ))
             } else {
                 None
@@ -2556,11 +2556,11 @@ fn get_transcript(
         &reference.segment,
     );
     let page_res = if allowed {
+        let speakers = solstone_core_talent_runtime::agent_speakers(journal_root);
         Some(solstone_core_transcripts::read_segment_transcript_page(
-            journal_root,
             &segment,
             continuation.as_ref(),
-            true,
+            speakers.as_ref(),
         ))
     } else {
         None
