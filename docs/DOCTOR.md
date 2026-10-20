@@ -43,6 +43,7 @@ completed health failures should compute `failed - errors`.
 | Check | Severity | Notes |
 |-------|----------|-------|
 | `disk_space` | advisory | Free-space warning. |
+| `backup_status` | advisory | Recorded backup attempt and last successful snapshot, date and age. Optional; excluded from setup readiness. |
 | `config_dir_readable` | blocker | Home and service config directory permissions. |
 | `journal_dir_writable` | blocker | Journal directory writability when the local journal exists. |
 | `supervisor_conflict` | blocker | macOS only; detects journal.app with the legacy LaunchAgent, or foreign persistent LaunchAgents that relaunch `/Applications/solstone.app`. |
@@ -51,6 +52,14 @@ completed health failures should compute `failed - errors`.
 | `journal_sync` | blocker | Concurrent-writer conflict check. |
 | `launchd_stale_plist` | advisory | macOS only; remove a positively identified legacy service with `solstone journal service uninstall`, then run the journal app. |
 | `default_stt_ready` / `parakeet_cpp_stt_ready` | advisory | Linux Parakeet artifacts, binary loader readiness, model, and running server. A missing `libgomp.so.1` is reported as “OpenMP runtime unavailable” with the distro install command, before the supervisor can collapse it to a generic process exit. |
+
+The backup row reports stored history only. A recorded failure or incomplete copy
+warns when it belongs to the selected backup setup. Unavailable observations warn;
+off, no-attempt, unbound and superseded history stay quiet unless `--verbose`,
+`--json` or `--jsonl` is requested. Past success does not establish present coverage
+or verification, and age alone never warns. The check reads local settings and,
+when needed, the existing backup binding. It does not contact the destination, run
+a backup tool or change settings. For details, open backup or health in your journal.
 
 `solstone journal doctor` is role-aware. If there is no local journal directory or no
 installed service, folder and service checks emit `skip` (`no local journal` or

@@ -39,6 +39,9 @@ pub struct RegistryEntry {
 /// on one of them says so in its own row rather than being gated here.
 const ALL: &[Platform] = &[Platform::Linux, Platform::Darwin, Platform::Windows];
 const DARWIN: &[Platform] = &[Platform::Darwin];
+fn backup_status(c: &CheckContext) -> RunnerResult {
+    checks::backup_status::run(c, CHECK_BACKUP_STATUS)
+}
 fn config(c: &CheckContext) -> RunnerResult {
     checks::config_dir_readable::run(c, CHECK_CONFIG)
 }
@@ -135,6 +138,11 @@ fn journal_durability(c: &CheckContext) -> RunnerResult {
 fn task_queue_holds(c: &CheckContext) -> RunnerResult {
     checks::task_queue_holds::run(c, CHECK_TASK_QUEUE_HOLDS)
 }
+const CHECK_BACKUP_STATUS: Check = Check {
+    name: "backup_status",
+    severity: Severity::Advisory,
+    platforms: ALL,
+};
 const CHECK_CONFIG: Check = Check {
     name: "config_dir_readable",
     severity: Severity::Blocker,
@@ -293,6 +301,11 @@ const CHECK_TASK_QUEUE_HOLDS: Check = Check {
     platforms: ALL,
 };
 pub static JOURNAL: &[RegistryEntry] = &[
+    RegistryEntry {
+        check: CHECK_BACKUP_STATUS,
+        runner: backup_status,
+        deferred: None,
+    },
     RegistryEntry {
         check: CHECK_DISK_SPACE,
         runner: disk_space,
