@@ -198,4 +198,12 @@ struct JournalSetupWalkFixTests {
         let errorBusy = try footerSpinnerPixels(route: .ritual(.setupProgress), pending: .outbound, errorMessage: "setup did not finish")
         #expect(errorBusy > errorIdle + 20, "no progress while retrying after a setup error: idle \(errorIdle), busy \(errorBusy)")
     }
+
+    // D1: the setup window names itself "set up solstone" through SwiftUI, which owns the bar
+    // while setup shows; without it macOS 27 drew "journal" on the sun.
+    @Test func theSetupWindowNamesItself() throws {
+        let view = try Self.source("JournalFirstRunView.swift")
+        #expect(view.contains("SetupWindow(appLabel: JournalFirstRunCopy.yourJournal, windowTitle: JournalFirstRunCopy.setUpSolstone"))
+        #expect(JournalFirstRunCopy.setUpSolstone == "set up solstone")
+    }
 }

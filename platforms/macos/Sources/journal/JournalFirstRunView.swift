@@ -17,7 +17,7 @@ struct JournalFirstRunView: View {
     var body: some View {
         Group {
             if model.route.showsSetupWindow {
-                SetupWindow(appLabel: JournalFirstRunCopy.yourJournal, background: background) {
+                SetupWindow(appLabel: JournalFirstRunCopy.yourJournal, windowTitle: JournalFirstRunCopy.setUpSolstone, background: background) {
                     rootContent
                 }
                 .frame(minWidth: minSize.width, minHeight: minSize.height)
