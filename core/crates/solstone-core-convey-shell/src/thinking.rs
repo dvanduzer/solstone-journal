@@ -4213,54 +4213,39 @@ mod tests {
             .expect("private directory")
             .join(format!("solstone-core{}", std::env::consts::EXE_SUFFIX));
         let previous = fs::read(&sibling).ok();
+        // The stub is bash, not an interpreter the Rust gate forbids, so this
+        // case runs the same way in the full gate as it does locally.
         let script = format!(
-            r#"#!/usr/bin/env python3
-import json, os, socket, sys
-receipt = r"{receipt_text}"
-override = os.environ.get("SOLSTONE_GENERATE_API_KEY_OVERRIDE", "")
-with open(receipt, "a", encoding="utf-8") as handle:
-    handle.write(override + "\n")
-stdin = sys.stdin.read()
-sentence = "Reply with the single word OK."
-payload = sentence.encode() if sentence in stdin else b"STDIN-LACKS-CANNED-SENTENCE"
-request = (
-    b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: %d\r\nConnection: close\r\n\r\n"
-    % len(payload)
-) + payload
-sock = socket.create_connection(("127.0.0.1", {port}), 30)
-sock.sendall(request)
-data = b""
-while True:
-    chunk = sock.recv(4096)
-    if not chunk:
-        break
-    data += chunk
-head, _, body = data.partition(b"\r\n\r\n")
-status = int(head.split()[1])
-text = body.decode()
-if status == 200:
-    out = {{
-        "schema": "solstone-generate-response-v2",
-        "outcome": "generated",
-        "text": "OK",
-        "model": "solstone-key-check",
-        "usage": {{}},
-        "finish_reason": "stop",
-    }}
-else:
-    out = {{
-        "schema": "solstone-generate-response-v2",
-        "outcome": "refused",
-        "reason": "provider-response-invalid",
-        "reason_code": "provider_key_invalid",
-        "retryable": False,
-        "blocking": True,
-        "detail": text,
-    }}
-with open(receipt + "-outcomes", "a", encoding="utf-8") as handle:
-    handle.write(json.dumps({{"credential": override, "outcome": out["outcome"],
-                            "reason_code": out.get("reason_code")}}) + "\n")
-sys.stdout.write(json.dumps(out))
+            r#"#!/bin/bash
+set -u
+receipt='{receipt_text}'
+override=${{SOLSTONE_GENERATE_API_KEY_OVERRIDE:-}}
+printf '%s\n' "$override" >> "$receipt"
+stdin=$(cat)
+sentence='Reply with the single word OK.'
+case "$stdin" in
+    *"$sentence"*) payload=$sentence ;;
+    *) payload=STDIN-LACKS-CANNED-SENTENCE ;;
+esac
+exec 3<>/dev/tcp/127.0.0.1/{port} || exit 1
+printf 'POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s' \
+    "${{#payload}}" "$payload" >&3
+response=$(cat <&3)
+status_line=${{response%%$'\r'*}}
+status=${{status_line#* }}
+status=${{status%% *}}
+body=${{response#*$'\r\n\r\n'}}
+if [ "$status" = 200 ]; then
+    outcome=generated
+    reason_code=null
+    out='{{"schema":"solstone-generate-response-v2","outcome":"generated","text":"OK","model":"solstone-key-check","usage":{{}},"finish_reason":"stop"}}'
+else
+    outcome=refused
+    reason_code='"provider_key_invalid"'
+    out=$(printf '{{"schema":"solstone-generate-response-v2","outcome":"refused","reason":"provider-response-invalid","reason_code":"provider_key_invalid","retryable":false,"blocking":true,"detail":"%s"}}' "$body")
+fi
+printf '{{"credential":"%s","outcome":"%s","reason_code":%s}}\n' "$override" "$outcome" "$reason_code" >> "$receipt-outcomes"
+printf '%s' "$out"
 "#
         );
         fs::write(&sibling, script).expect("stub");
