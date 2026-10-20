@@ -700,7 +700,10 @@ fn a_local_model_download_reads_as_setup_only_while_its_installer_runs() {
     let installer = File::create(&lease).expect("install lease");
     installer.lock().expect("installer holds the lease");
     let downloading = view();
-    assert!(downloading.progressing, "installer running: {downloading:?}");
+    assert!(
+        downloading.progressing,
+        "installer running: {downloading:?}"
+    );
     assert_ne!(downloading.headline, left_behind.headline);
 
     drop(installer);
