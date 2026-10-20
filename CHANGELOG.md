@@ -6,34 +6,34 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.0.52] - 2026-10-20
+
 ### Added
 
-- when you first set up your journal on windows, you can choose whether it starts when you sign in. leaving that choice out keeps the current default, and setting up your journal again keeps your existing choice.
+- on windows, setup stays in the journal window through choosing your mark and where thinking runs, then opens on the window's home screen. its steps share the solstone app's look, with progress dots and a step count and every thinking choice shown at once. thinking download progress stays available there, and you can try again there if a model doesn't install.
+- when you first set up your journal on windows, you can choose whether it starts when you sign in. it's on unless you turn it off, and setting up your journal again keeps the choice you made.
 - after setup on windows, the journal window can continue in the solstone app. if that app is missing or too old, the window offers the download page for the solstone app for windows, and you can try again after installing it.
-- on windows, setup stays in the journal window through choosing your mark and where thinking runs, then reaches home. thinking download progress and model recovery stay available there.
-
 - the day now lists a segment that only has desktop activity notes, and you can read and search those notes.
+- agents you've let see facets can now list your activities, and those you've also let see transcripts can read the passages each one draws on.
 
 ### Changed
 
-- facet newsletters are retired. your morning briefing now draws on activities and their stories. existing newsletter files stay in your journal.
-
-- on windows, the journal window's setup steps now share the solstone app's look, with progress dots and a step count and every thinking choice shown at once.
+- facet newsletters are retired. your morning briefing now draws on activities and their stories. existing newsletters stay in your journal's folder, but the journal no longer shows them.
 
 ### Fixed
 
-- on windows, when your journal can't check whether its computer can run local thinking, setup and the thinking page show local as unavailable with the reason, instead of letting you pick it and then refusing.
-- on a mac or linux computer whose memory your journal can't check, setup lets you choose local thinking and says it couldn't check, instead of refusing it.
+- on windows, when your journal can't check whether its computer can run local thinking, the thinking page says it couldn't check and won't set up local, and setup doesn't offer it, instead of letting you pick it and then refusing.
+- on a linux computer whose memory your journal can't check, setup lets you choose local thinking and says it couldn't check, instead of refusing it.
 - pairing the solstone app on the journal's own computer now shows the steps for that computer, not the phone steps and QR code.
 - on a computer that can't run local thinking, home and the thinking page say so, and no longer offer to install the local model.
 - while the local thinking model downloads after setup, home says local thinking is being set up instead of saying something needs your attention, and the thinking page no longer says its status is unavailable or that local thinking isn't set up.
-- on a computer that can't run local thinking, setup no longer shows local as a choice you can't pick. it says to choose thinking when you're ready, that your journal keeps everything until then, and lets you continue.
-- setup shows each download as a progress bar with its size, and links to support if you get stuck.
+- on a computer that can't run local thinking, setup no longer shows local as a choice you can't pick. it says to choose thinking when you're ready, and that your journal keeps everything until then.
+- setup in your browser shows each download as a progress bar with its size, and links to support if you get stuck.
 - home puts the getting started card first, right under the status line, every time it loads.
 - after you save a thinking choice in setup, the thinking page no longer says "nothing chosen yet" under it.
-- if your iphone loses its connection while it is sending something to your journal, it can send it again without the import running twice, failing, or being left marked "needs attention" on your iphone.
+- if your iphone loses its connection while it is starting an import in your journal, it can send it again without the import running twice, failing, or being left marked "needs attention" on your iphone.
 - an import started more than an hour after it was saved no longer shows "import never completed" while it runs.
-- when an import can't start, its message now says what happened in plain words, without the importer's internal output.
+- when an import can't start, on the import page and on your iphone, its message now says what happened in plain words, without the importer's internal output.
 - if the connection drops while the local thinking model downloads, your journal tries again twice before saying the download didn't finish.
 
 ## [2.0.51] - 2026-10-19
