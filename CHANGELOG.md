@@ -16,6 +16,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- facet newsletters are retired. your morning briefing now draws on activities and their stories. existing newsletter files stay in your journal.
+
 - on windows, the journal window's setup steps now share the solstone app's look, with progress dots and a step count and every thinking choice shown at once.
 
 ### Fixed

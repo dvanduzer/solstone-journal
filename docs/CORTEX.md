@@ -339,15 +339,6 @@ To force an agent to run for all facets regardless of activity, set `"always": t
 
 ```json
 {
-  "title": "Facet Newsletter Generator",
-  "schedule": "daily",
-  "priority": 10,
-  "multi_facet": true
-}
-```
-
-```json
-{
   "title": "Facet Auditor",
   "schedule": "daily",
   "multi_facet": true,
