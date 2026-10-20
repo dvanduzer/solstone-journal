@@ -401,7 +401,9 @@ async fn rich_fixture_matches_the_complete_report_contract() {
                 "index_activity_at":null,
                 "search_index":{
                     "state":"building","text":"search is still being built.",
-                    "stale":0,"missing":2,"orphaned":0,"failed":0
+                    "stale":0,"missing":2,"orphaned":0,"failed":0,
+                    "queued":0,"failed_deletions":0,"last_finished_check_at_ms":null,
+                    "check_indexed":0,"check_removed":0
                 }
             },
             "consumer_signal":{"profile_entities_total":2},

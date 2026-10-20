@@ -569,7 +569,7 @@ fn journal_facet_doctor_adopt_registers_lone_folders_and_leaves_variants_and_twi
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(
         String::from_utf8(output.stdout).expect("stdout"),
-        "Repaired orphan facets:\n- solo\n1 orphan facet(s) repaired. Run 'solstone journal indexer --rescan-full' to refresh the index.\n\nName-variant groups:\n- field-notes, field.notes, field_notes -> field-notes\nThese were not registered. Run with --adopt --merge to collapse them into one.\n\nFolders named like a facet you have:\n- blue_sky -> bluesky\nThese are never registered beside it. Run with --adopt --merge to fold them into it; a merge is permanent, and a file both have keeps the facet's copy.\nTo see what one would bring first: solstone journal facet merge blue_sky --into bluesky --dry-run\n\nFolders left as they are:\n- led_ger: named like ledger, whose facet.json needs repair first\n"
+        "Repaired orphan facets:\n- solo\n1 orphan facet(s) repaired. search is catching up.\n\nName-variant groups:\n- field-notes, field.notes, field_notes -> field-notes\nThese were not registered. Run with --adopt --merge to collapse them into one.\n\nFolders named like a facet you have:\n- blue_sky -> bluesky\nThese are never registered beside it. Run with --adopt --merge to fold them into it; a merge is permanent, and a file both have keeps the facet's copy.\nTo see what one would bring first: solstone journal facet merge blue_sky --into bluesky --dry-run\n\nFolders left as they are:\n- led_ger: named like ledger, whose facet.json needs repair first\n"
     );
     assert_eq!(output.stderr, b"");
     assert!(solo.join("facet.json").is_file());
@@ -704,7 +704,7 @@ fn journal_facet_doctor_merges_variants_deterministically_and_isolates_failures(
         true,
     );
 
-    let expected = b"Merged orphan facets:\n- field.notes -> field-notes\n- field_notes -> field-notes\n\nRegular-file collisions:\n- field_notes -> field-notes: news/collision.md (kept field.notes)\n\nAdopted orphan facets:\n- field-notes\n\n3 orphan facet(s) repaired. Run 'solstone journal indexer --rescan-full' to refresh the index.\n";
+    let expected = b"Merged orphan facets:\n- field.notes -> field-notes\n- field_notes -> field-notes\n\nRegular-file collisions:\n- field_notes -> field-notes: news/collision.md (kept field.notes)\n\nAdopted orphan facets:\n- field-notes\n\n3 orphan facet(s) repaired. search is catching up.\n";
     let first_output = run_journal_with_journal(
         &["facet", "doctor", "--adopt", "--merge"],
         Some(&path),
@@ -1411,7 +1411,8 @@ fn archive_merge_zip_round_trips_all_four_families_and_reindexes() {
     let payload: Value = serde_json::from_slice(&merge.stdout).expect("merge json");
     assert_eq!(payload["ok"], true);
     assert_eq!(payload["code"], "ok");
-    assert_eq!(payload["index_rebuild"], "completed");
+    assert_eq!(payload["index_rebuild"], "queued");
+    assert!(!target.join("indexer/journal.sqlite").exists());
     assert_eq!(
         fs::read(target.join("chronicle/20260807/120000_60/value")).expect("copied day"),
         b"day-bytes"
@@ -1421,6 +1422,12 @@ fn archive_merge_zip_round_trips_all_four_families_and_reindexes() {
     assert_eq!(
         fs::read(target.join("imports/imp1/file")).expect("copied import"),
         b"import-bytes"
+    );
+    let drain = run_journal_with_journal(&["indexer", "drain", "--force"], Some(&path), &target);
+    assert!(
+        drain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&drain.stderr)
     );
     let conn = rusqlite::Connection::open(target.join("indexer/journal.sqlite"))
         .expect("open written index");

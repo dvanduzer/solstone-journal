@@ -108,7 +108,24 @@ fn a_removal_leaves_the_index_stale_until_it_is_told_and_never_before() {
 
     let index = RetentionIndex::new(&journal);
     let counts = notify_index(&index, &outcome).expect("the index accepts the notification");
-    assert!(counts.files > 0, "the notification cleared file rows");
+    assert_eq!(counts, PruneCounts::default());
+    assert_eq!(
+        indexed_paths(&journal).len(),
+        2,
+        "enqueue leaves rows for the writer"
+    );
+    assert!(
+        !solstone_core_indexer_store::todo::inspect(&journal)
+            .unwrap()
+            .keys
+            .is_empty()
+    );
+    assert_eq!(
+        solstone_core_indexer_store::todo::drain_now(&journal)
+            .unwrap()
+            .failed,
+        0
+    );
 
     let remaining = indexed_paths(&journal);
     assert_eq!(
@@ -170,7 +187,14 @@ fn a_removal_clears_both_chronicle_shapes_and_nested_talent_files_acceptance_2()
 
     let index = RetentionIndex::new(&journal);
     let counts = notify_index(&index, &outcome).expect("notify index");
-    assert_eq!(counts.files, 4, "all 4 target rows cleared");
+    assert_eq!(counts, PruneCounts::default());
+    assert_eq!(indexed_paths(&journal).len(), 8, "notification only queues");
+    assert_eq!(
+        solstone_core_indexer_store::todo::drain_now(&journal)
+            .unwrap()
+            .failed,
+        0
+    );
 
     let remaining = indexed_paths(&journal);
     let mut expected_siblings = sibling_rows.to_vec();
@@ -212,14 +236,17 @@ fn a_journal_without_an_index_accepts_a_notification_and_gains_none() {
         "a notification must not bring an index database into existence"
     );
     let entries: Vec<_> = fs::read_dir(&index_dir)
-        .expect("writer lock directory")
-        .map(|entry| entry.expect("writer lock entry").file_name())
+        .expect("work list directory")
+        .map(|entry| entry.expect("work list entry").file_name())
         .collect();
-    assert_eq!(
-        entries,
-        vec![std::ffi::OsString::from("journal.sqlite.lock")]
+    assert_eq!(entries, vec![std::ffi::OsString::from("todo")]);
+    assert!(!index_dir.join("journal.sqlite.lock").exists());
+    assert!(
+        !solstone_core_indexer_store::todo::inspect(&journal)
+            .unwrap()
+            .keys
+            .is_empty()
     );
-    assert!(index_dir.join("journal.sqlite.lock").is_file());
 
     fs::remove_dir_all(&journal).expect("teardown");
 }

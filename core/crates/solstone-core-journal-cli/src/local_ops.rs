@@ -1284,7 +1284,7 @@ fn facet_doctor_orphans(
     if merge {
         #[cfg(not(target_os = "ios"))]
         {
-            let (mut outcome, committed_merges) = facet_doctor_adopt_merge(&journal, &groups);
+            let (outcome, committed_merges) = facet_doctor_adopt_merge(&journal, &groups);
             drop(_lock);
             if committed_merges > 0 {
                 let queued = solstone_core_indexer_store::todo::enqueue_token(
@@ -1295,12 +1295,6 @@ fn facet_doctor_orphans(
                 .and_then(|()| crate::facet_names::enqueue_facet_classifications(&journal));
                 if let Err(error) = queued {
                     return facet_doctor_index_failure(outcome, &error);
-                }
-                match &mut outcome {
-                    Outcome::LocalSuccess { stdout, .. } | Outcome::LocalFailure { stdout, .. } => {
-                        stdout.push_str("search is catching up.\n")
-                    }
-                    _ => {}
                 }
             }
             return outcome;
@@ -3714,7 +3708,7 @@ fn archive_merge_json(
                 _ => "ok",
             };
             let index_rebuild = match &outcome.reindex_status {
-                ReindexStatus::Accepted => "completed",
+                ReindexStatus::Accepted => "queued",
                 ReindexStatus::NotAccepted { .. } => "failed",
                 ReindexStatus::NotRequested => "not-requested",
             };

@@ -2277,8 +2277,19 @@ fn remove_segments_prunes_index_and_keeps_siblings_with_real_scan() {
     let rep = receipt(&output);
     let chunks = rep["index"]["chunks"].as_u64().expect("index.chunks u64");
     let files = rep["index"]["files"].as_u64().expect("index.files u64");
-    assert!(chunks > 0);
-    assert!(files > 0);
+    assert_eq!((chunks, files), (0, 0), "removal queues the index update");
+    assert!(
+        !solstone_core_indexer_store::todo::inspect(bed.journal())
+            .unwrap()
+            .keys
+            .is_empty()
+    );
+    assert_eq!(
+        solstone_core_indexer_store::todo::drain_now(bed.journal())
+            .unwrap()
+            .failed,
+        0
+    );
 
     let conn = rusqlite::Connection::open(bed.journal().join("indexer/journal.sqlite")).unwrap();
     let mut stmt = conn.prepare("SELECT path FROM files").unwrap();
