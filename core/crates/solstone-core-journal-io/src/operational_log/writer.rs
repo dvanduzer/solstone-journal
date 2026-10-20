@@ -520,7 +520,7 @@ thread_local! {
 }
 
 /// Run `operation` so one append writes its first byte and then fails to truncate.
-#[cfg(test)]
+#[cfg(all(test, feature = "full-tests"))]
 fn run_with_partial_append_truncate_fault<T>(operation: impl FnOnce() -> T) -> T {
     FORCE_PARTIAL_APPEND.with(|cell| cell.set(true));
     FORCE_TRUNCATE_FAULT.with(|cell| cell.set(true));
