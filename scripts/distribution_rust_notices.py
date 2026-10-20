@@ -23,7 +23,7 @@ import tomllib
 import urllib.request
 from pathlib import Path
 
-from refresh_windows_rust_notices import shipped_feature_arguments
+from refresh_windows_rust_notices import SCREEN_OCR_PACKAGE, shipped_feature_arguments
 
 ROOT = Path(__file__).resolve().parent.parent
 DIST = ROOT / "core/distribution"
@@ -186,6 +186,7 @@ def closure(target: str, triple: str) -> tuple[list[str], dict[str, dict]]:
         entry["package"]
         for entry in inventory["entry"]
         if entry["kind"] == "bin" and target in entry.get("targets", [])
+        and entry["package"] != SCREEN_OCR_PACKAGE
     }
     command = [
         "cargo", "metadata", "--manifest-path", str(ROOT / "core/Cargo.toml"),
@@ -747,7 +748,10 @@ def main() -> int:
     action.add_argument("--write", action="store_true")
     action.add_argument("--check", action="store_true")
     parser.add_argument("--target", choices=TARGETS, action="append")
-    parser.add_argument("--screen-ocr", action="store_true")
+    parser.add_argument(
+        "--screen-ocr", action="store_true",
+        help="process only the standalone OCR profile; the default processes both Cargo graphs",
+    )
     args = parser.parse_args()
     if args.screen_ocr:
         if args.target:
@@ -763,10 +767,12 @@ def main() -> int:
         known_texts = prior_texts(old_index, NOTICES.read_bytes())
         for target in targets:
             write(target, TARGETS[target], old_index, known_texts)
+        write_screen_ocr_notices()
     else:
         check_bundled_source_notices()
         for target in targets:
             check(target, TARGETS[target])
+        check_screen_ocr_notices()
     return 0
 
 
