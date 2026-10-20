@@ -563,8 +563,11 @@ fn cancelled_label_publication_after_file_lock_wait_and_positive_twins() {
             let worker = std::thread::spawn(move || {
                 started.send(()).unwrap();
                 let check = || {
+                    // Read the flag before signalling, so the entry checkpoint
+                    // can never observe a cancel stored after it signalled.
+                    let refused = flag.load(Ordering::SeqCst);
                     checkpoint.send(()).unwrap();
-                    if flag.load(Ordering::SeqCst) {
+                    if refused {
                         Err("cancelled".into())
                     } else {
                         Ok(())
@@ -582,6 +585,11 @@ fn cancelled_label_publication_after_file_lock_wait_and_positive_twins() {
                 }
             });
             ready.recv_timeout(Duration::from_secs(2)).unwrap();
+            // The writer checks for cancellation once before it starts work,
+            // then again only after it holds the real label lock.
+            reached
+                .recv_timeout(Duration::from_secs(2))
+                .expect("entry checkpoint runs before the lock wait");
             assert!(
                 reached.recv_timeout(Duration::from_millis(100)).is_err(),
                 "checkpoint must follow the real label lock"
