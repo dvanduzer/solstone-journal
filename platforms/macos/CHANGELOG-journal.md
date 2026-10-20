@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- in setup, "your journal" at the top of the window sits on its own small label, so it stays easy to read at any time of day.
+
+### Fixed
+
+- the setup window's sun runs all the way up behind the window buttons, even after you right-click the journal app's Dock icon or switch apps.
+- the "start your journal when you sign in" switch now shows whether it's on right after you click it.
+- on the thinking step, clicking anywhere on a choice picks it, not just on its circle or its words.
+- while your journal is being set up, the screen no longer shows an internal step name or a second spinner.
+
 ## [2.0.52 (build 100)] - 2026-10-20
 
 ### Changed
