@@ -732,8 +732,19 @@ struct JournalFirstRunView: View {
                 }
             },
             primary: {
-                if let primary {
-                    primary
+                // While an operation runs (a mark commit, the thinking save and hand-off, a
+                // refusal's open), a small spinner sits beside the step's button, in place of the
+                // window-wide one that sat in the band over the sun. Setting up has its own.
+                if showsFooterBusy || primary != nil {
+                    HStack(spacing: 8) {
+                        if showsFooterBusy {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                        if let primary {
+                            primary
+                        }
+                    }
                 }
             }
         )
@@ -800,6 +811,11 @@ struct JournalFirstRunView: View {
                 }
             }
         }
+    }
+
+    private var showsFooterBusy: Bool {
+        guard model.userOperationInFlight || model.pendingOperation != .none else { return false }
+        return model.route != .ritual(.setupProgress)
     }
 
     private var showsDownloadFooter: Bool {

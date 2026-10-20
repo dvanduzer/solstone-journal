@@ -114,4 +114,14 @@ struct JournalSetupWalkFixTests {
         #expect(view.contains("AXStateCompanion(id: AXID.Journal.Ritual.setupStepState, value: model.currentStep ?? \"\")"))
         #expect(!view.contains(".overlay(alignment: .top) {\n            if model.userOperationInFlight"), "the band spinner is back")
     }
+
+    // D8's re-diff: the band spinner was the only progress shown while the mark commits, the
+    // thinking choice saves and hands off, or a refusal opens the journal. That progress now sits
+    // in the footer beside the step's button, on every route but setting up (which has its own).
+    @Test func anOperationInFlightStillShowsProgressInTheFooter() throws {
+        let view = try Self.source("JournalFirstRunView.swift")
+        #expect(view.contains("if showsFooterBusy {"))
+        #expect(view.contains("guard model.userOperationInFlight || model.pendingOperation != .none else { return false }"))
+        #expect(view.contains("return model.route != .ritual(.setupProgress)"))
+    }
 }
