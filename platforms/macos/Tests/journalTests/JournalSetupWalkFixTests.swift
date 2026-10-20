@@ -122,7 +122,8 @@ struct JournalSetupWalkFixTests {
     private func footerSpinnerPixels(
         route: JournalFirstRunRoute,
         pending: JournalRitualOperationToken,
-        refusal: Bool = false
+        refusal: Bool = false,
+        errorMessage: String? = nil
     ) throws -> Int {
         JournalMarkFont.register()
         let copy = try loadSetupFixtureCopy()
@@ -145,6 +146,7 @@ struct JournalSetupWalkFixTests {
             handoffRefusal: refusal
                 ? JournalSetupRefusalResolution(handoffID: UUID(), journalRootPath: "/tmp/journal", reason: .heldPairing)
                 : nil,
+            errorMessage: errorMessage,
             pendingOperation: pending
         )
         let size = CGSize(width: 880, height: 580)
@@ -191,5 +193,9 @@ struct JournalSetupWalkFixTests {
         let setupIdle = try footerSpinnerPixels(route: .ritual(.setupProgress), pending: .none)
         let setupBusy = try footerSpinnerPixels(route: .ritual(.setupProgress), pending: .setup)
         #expect(abs(setupBusy - setupIdle) <= 4, "a second spinner on setting up: idle \(setupIdle), busy \(setupBusy)")
+        // A setting-up card showing an error hides its spinner, so the footer shows progress.
+        let errorIdle = try footerSpinnerPixels(route: .ritual(.setupProgress), pending: .none, errorMessage: "setup did not finish")
+        let errorBusy = try footerSpinnerPixels(route: .ritual(.setupProgress), pending: .outbound, errorMessage: "setup did not finish")
+        #expect(errorBusy > errorIdle + 20, "no progress while retrying after a setup error: idle \(errorIdle), busy \(errorBusy)")
     }
 }

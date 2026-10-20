@@ -820,10 +820,11 @@ struct JournalFirstRunView: View {
 
     private var showsFooterBusy: Bool {
         guard model.userOperationInFlight || model.pendingOperation != .none else { return false }
-        // Only the setting-up card has its own spinner; a refusal notice or a hand-off error
-        // shown on the setting-up route replaces that card, so its footer shows the spinner.
+        // Only the setting-up card has its own spinner, and only while it shows no error. A
+        // refusal notice or a hand-off error shown on the setting-up route replaces that card.
         let notice = model.handoffRefusal != nil || !(model.handoffError ?? "").isEmpty
-        return model.route != .ritual(.setupProgress) || notice
+        let cardSpinner = model.route == .ritual(.setupProgress) && !notice && model.errorMessage == nil
+        return !cardSpinner
     }
 
     private var showsDownloadFooter: Bool {
