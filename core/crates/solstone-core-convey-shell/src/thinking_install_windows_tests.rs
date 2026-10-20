@@ -348,6 +348,10 @@ mod native {
                 .install_state,
             "downloading"
         );
+        // The route refuses local thinking before the installer branch when
+        // this host's capability check does not admit it; admit it here so
+        // the replacement attempt reaches the failed cleanup.
+        let _admitted = crate::thinking::bootstrap_capability_test::admit(root.path());
         for state in ["downloading", "installed"] {
             let mut terminal = status::read_status(root.path(), "local").unwrap();
             terminal.install_state = state.into();

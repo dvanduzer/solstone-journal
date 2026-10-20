@@ -795,6 +795,48 @@ async fn retry_local_runtime(
     }
 }
 
+async fn bootstrap_capability(
+    journal_root: &std::path::Path,
+) -> solstone_core_sol_link::http::LocalCapabilityResponse {
+    #[cfg(all(test, windows, feature = "full-tests"))]
+    if bootstrap_capability_test::admitted(journal_root) {
+        return solstone_core_sol_link::http::LocalCapabilityResponse {
+            overall: "ok",
+            local_admitted: true,
+            checks: Vec::new(),
+        };
+    }
+    solstone_core_sol_link::http::compute_local_capability(journal_root).await
+}
+
+/// Lets a Windows installer test reach the installer branch of the bootstrap
+/// route on a host whose real capability check would refuse local thinking.
+#[cfg(all(test, windows, feature = "full-tests"))]
+pub(crate) mod bootstrap_capability_test {
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static ADMITTED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+    pub(crate) struct Admitted(PathBuf);
+
+    impl Drop for Admitted {
+        fn drop(&mut self) {
+            ADMITTED.lock().unwrap().remove(&self.0);
+        }
+    }
+
+    pub(crate) fn admit(journal_root: &Path) -> Admitted {
+        ADMITTED.lock().unwrap().insert(journal_root.to_owned());
+        Admitted(journal_root.to_owned())
+    }
+
+    pub(super) fn admitted(journal_root: &Path) -> bool {
+        ADMITTED.lock().unwrap().contains(journal_root)
+    }
+}
+
 async fn start_local_bootstrap(
     Extension(journal): Extension<Arc<JournalRoot>>,
     Query(query): Query<HashMap<String, String>>,
@@ -807,7 +849,7 @@ async fn start_local_bootstrap(
             query.get("model").map(String::as_str).unwrap_or_default(),
         ));
     };
-    let capability = solstone_core_sol_link::http::compute_local_capability(&journal.0).await;
+    let capability = bootstrap_capability(&journal.0).await;
     if !capability.admits_local() {
         return json_response(json!({
             "refused": true,
