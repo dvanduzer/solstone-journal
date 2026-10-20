@@ -250,8 +250,7 @@ button.danger { border-color: var(--danger); color: var(--danger); }
 }
 #setup-ground .sunarc-twilight,
 #setup-ground .sunarc-glow { border-radius: 50%; }
-#firstrun[data-phase] { position: relative; z-index: 1; }
-#setup-ground:not([hidden]) ~ #firstrun[data-phase] { background: transparent; }
+#setup-ground:not([hidden]) ~ #firstrun[data-phase] { position: relative; z-index: 1; background: transparent; }
 
 #firstrun[data-phase] .setup-band {
   flex: none;
