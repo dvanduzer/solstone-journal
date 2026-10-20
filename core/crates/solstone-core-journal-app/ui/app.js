@@ -145,6 +145,7 @@ const COPY = {
     thinkingTitle: 'where does the thinking happen?',
     thinkingLead: 'your journal stays on this pc whatever you choose. this only decides where thinking happens.',
     onThisPc: 'on this pc',
+    localDesc: 'model requests stay on this pc. continue starts the download.',
     step: n => `step ${n} of 8`,
   },
   // updates (the Mac app's update words)
@@ -632,6 +633,26 @@ function setupStep(view) {
   return null;
 }
 
+// Line glyphs for the welcome card's tiles (24-unit boxes, stroked in the orange text colour).
+const SETUP_GLYPHS = {
+  journal: ['M5 4h11a3 3 0 0 1 3 3v13H8a3 3 0 0 1-3-3z', 'M5 17a3 3 0 0 1 3-3h11'],
+  app: ['M12 8a4 4 0 1 0 0 8a4 4 0 1 0 0-8z', 'M12 2v3', 'M12 19v3', 'M2 12h3', 'M19 12h3', 'M4.9 4.9l2.1 2.1', 'M17 17l2.1 2.1', 'M4.9 19.1l2.1-2.1', 'M17 7l2.1-2.1'],
+  thinking: ['M9 18h6', 'M10 21h4', 'M12 3a6 6 0 0 0-3.5 10.9c.6.5 1 1.2 1 2.1h5c0-.9.4-1.6 1-2.1A6 6 0 0 0 12 3z'],
+};
+
+function setupGlyph(name) {
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('aria-hidden', 'true');
+  for (const d of SETUP_GLYPHS[name]) {
+    const path = document.createElementNS(ns, 'path');
+    path.setAttribute('d', d);
+    svg.append(path);
+  }
+  return el('span', { class: 'setup-tile' }, svg);
+}
+
 function renderProgress(step) {
   if (step == null) return null;
   const dots1 = [];
@@ -643,10 +664,11 @@ function renderProgress(step) {
   for (let i = 5; i <= 8; i++) {
     dots2.push(el('span', { class: 'setup-dot setup-dot-future' }));
   }
-  return el('div', { class: 'setup-progress', 'aria-label': COPY.setup.step(step) },
+  return el('div', { class: 'setup-progress', role: 'img', 'aria-label': COPY.setup.step(step) },
     ...dots1,
     el('span', { class: 'setup-progress-gap' }),
     ...dots2,
+    el('span', { class: 'setup-progress-label', 'aria-hidden': 'true' }, document.createTextNode(COPY.setup.step(step))),
   );
 }
 
@@ -665,13 +687,15 @@ function renderFooterDownloads(view) {
         const total = speech.bytes_total;
         parts.push(el('span', { class: 'setup-download-bytes' }, document.createTextNode(`${formatBytes(done)} of ${formatBytes(total)}`)));
         const pct = Math.max(0, Math.min(100, Math.round((done / total) * 100)));
+        const fill = el('span', { class: 'setup-download-fill' });
+        fill.style.width = `${pct}%`;
         parts.push(el('div', {
           class: 'setup-download-bar',
           role: 'progressbar',
           'aria-valuemin': '0',
           'aria-valuemax': '100',
           'aria-valuenow': String(pct)
-        }));
+        }, fill));
       } else {
         if (typeof speech.bytes_done === 'number' && speech.bytes_done > 0) {
           parts.push(el('span', { class: 'setup-download-bytes' }, document.createTextNode(formatBytes(speech.bytes_done))));
@@ -721,13 +745,15 @@ function renderFooterDownloads(view) {
         const total = thinking.bytes_total;
         parts.push(el('span', { class: 'setup-download-bytes' }, document.createTextNode(`${formatBytes(done)} of ${formatBytes(total)}`)));
         const pct = Math.max(0, Math.min(100, Math.round((done / total) * 100)));
+        const fill = el('span', { class: 'setup-download-fill' });
+        fill.style.width = `${pct}%`;
         parts.push(el('div', {
           class: 'setup-download-bar',
           role: 'progressbar',
           'aria-valuemin': '0',
           'aria-valuemax': '100',
           'aria-valuenow': String(pct)
-        }));
+        }, fill));
       } else {
         if (typeof thinking.bytes_done === 'number' && thinking.bytes_done > 0) {
           parts.push(el('span', { class: 'setup-download-bytes' }, document.createTextNode(formatBytes(thinking.bytes_done))));
@@ -827,8 +853,8 @@ async function finishSetupToHome(view) {
     );
     const columns = el('div', { class: 'setup-columns' }, lead, card);
     const sheet = el('div', { class: 'setup-sheet' }, columns);
-    const footer = el('footer', { class: 'setup-footer' });
-    root.append(band, sheet, footer);
+    sheet.append(el('footer', { class: 'setup-footer' }));
+    root.append(band, sheet);
     show('firstrun');
     return;
   }
@@ -929,34 +955,34 @@ function renderFlow(view) {
   if (view.phase === 'welcome' || view.phase === 'sign-in') {
     const welcome = copy.welcome || {};
     const login = copy.login || {};
-    lead.append(
+    put(lead,
       el('h1', {}, document.createTextNode(welcome.title || copy.heading || '')),
       welcome.body ? el('p', {}, document.createTextNode(welcome.body)) : null,
-      el('h2', {}, document.createTextNode(COPY.setup.fitsTitle)),
-      el('p', { class: 'setup-fit' },
-        el('span', { class: 'setup-fit-term' }, document.createTextNode(COPY.setup.journalTerm)),
-        el('span', { class: 'setup-fit-text' }, document.createTextNode(COPY.setup.journalText))
-      ),
-      el('p', { class: 'setup-fit' },
-        el('span', { class: 'setup-fit-term' }, document.createTextNode(COPY.setup.appTerm)),
-        el('span', { class: 'setup-fit-text' }, document.createTextNode(COPY.setup.appText))
-      ),
-      el('p', { class: 'setup-fit' },
-        el('span', { class: 'setup-fit-term' }, document.createTextNode(COPY.setup.thinkingTerm)),
-        el('span', { class: 'setup-fit-text' }, document.createTextNode(COPY.setup.thinkingText))
-      ),
       Array.isArray(welcome.how_it_fits) && typeof welcome.how_it_fits[2] === 'string'
         ? el('p', {}, document.createTextNode(welcome.how_it_fits[2]))
         : null
     );
 
-    card.append(
-      login.label ? el('p', {}, document.createTextNode(login.label)) : null,
+    const fit = (glyph, term, text) => el('div', { class: 'setup-fit' },
+      setupGlyph(glyph),
+      el('div', {},
+        el('span', { class: 'setup-fit-term' }, document.createTextNode(term)),
+        el('span', { class: 'setup-fit-text' }, document.createTextNode(text))
+      )
+    );
+    put(card,
+      el('h2', { class: 'setup-card-h' }, document.createTextNode(COPY.setup.fitsTitle)),
+      fit('journal', COPY.setup.journalTerm, COPY.setup.journalText),
+      fit('app', COPY.setup.appTerm, COPY.setup.appText),
+      fit('thinking', COPY.setup.thinkingTerm, COPY.setup.thinkingText),
+      el('hr', { class: 'setup-sep' }),
       el('button', {
         type: 'button',
         id: 'sign-in-check',
+        class: 'setup-switch-row',
         role: 'switch',
         'aria-checked': signInOn ? 'true' : 'false',
+        'aria-label': login.label || COPY.startAtSignIn,
         'data-focus-key': 'sign-in',
         disabled: Boolean(view.busy),
         on: {
@@ -966,7 +992,13 @@ function renderFlow(view) {
             renderFlow(state.flow);
           }
         }
-      }, document.createTextNode(COPY.setup.signIn)),
+      },
+        el('span', { class: 'setup-switch', 'aria-hidden': 'true' }),
+        el('span', { class: 'setup-switch-text' },
+          el('span', { class: 'setup-switch-label' }, document.createTextNode(login.label || COPY.startAtSignIn)),
+          el('span', { class: 'setup-switch-help' }, document.createTextNode(COPY.setup.signIn))
+        )
+      ),
       view.error ? el('p', { class: 'error' }, document.createTextNode(view.error)) : null
     );
 
@@ -989,7 +1021,7 @@ function renderFlow(view) {
     }, document.createTextNode(COPY.setup.start));
   } else if (view.phase === 'folder') {
     const folderCopy = copy.folder || {};
-    lead.append(
+    put(lead,
       el('h1', {}, document.createTextNode(COPY.setup.folderTitle)),
       el('p', {}, document.createTextNode(COPY.setup.folderText))
     );
@@ -1024,9 +1056,9 @@ function renderFlow(view) {
       }
     }, document.createTextNode(folderCopy.change || COPY.chooseLocation));
 
-    card.append(
-      el('h2', {}, document.createTextNode(COPY.setup.folderLabel)),
-      el('div', { class: 'row' }, locationInput, pickBtn),
+    put(card,
+      el('h2', { class: 'setup-card-h' }, document.createTextNode(COPY.setup.folderLabel)),
+      el('div', { class: 'row setup-folder-row' }, locationInput, pickBtn),
       firstRun.holdsJournal ? el('p', { class: 'faint' }, document.createTextNode(COPY.journalFound)) : null,
       view.error ? el('p', { class: 'error' }, document.createTextNode(view.error)) : null
     );
@@ -1045,7 +1077,7 @@ function renderFlow(view) {
     }, document.createTextNode(folderCopy.continue || COPY.continueButton));
   } else if (view.phase === 'setup') {
     if (view.setup_running || view.setup_failed) {
-      lead.append(
+      put(lead,
         el('h1', {}, document.createTextNode(COPY.setupTitle)),
         el('p', { class: 'muted' }, document.createTextNode(COPY.setupSubtitle))
       );
@@ -1064,7 +1096,7 @@ function renderFlow(view) {
         }, document.createTextNode(COPY.tryAgain)) : null
       );
     } else {
-      lead.append(
+      put(lead,
         el('h1', {}, document.createTextNode(COPY.setupStopped))
       );
       put(card,
@@ -1078,7 +1110,7 @@ function renderFlow(view) {
       );
     }
   } else if (view.phase === 'opening') {
-    lead.append(
+    put(lead,
       el('h1', {}, document.createTextNode(view.error ? COPY.setupStopped : COPY.setupTitle))
     );
     if (view.error) {
@@ -1100,13 +1132,14 @@ function renderFlow(view) {
     if (!markMissing) renderMarkCard(markBox, view.mark.render);
     const canCommit = view.authoritative !== false && displayableMark(view.mark?.render);
 
-    lead.append(
+    put(lead,
       el('h1', {}, document.createTextNode(markCopy.title || '')),
       markCopy.help ? el('p', { class: 'muted' }, document.createTextNode(markCopy.help)) : null,
       el('p', {}, document.createTextNode(COPY.setup.markMatch))
     );
 
-    card.append(
+    card.classList.add('setup-card-center');
+    put(card,
       markMissing
         ? (view.busy
           ? el('progress', { 'aria-label': markCopy.title || COPY.setupTitle })
@@ -1125,6 +1158,7 @@ function renderFlow(view) {
     if (markCopy.try_another) {
       card.append(el('button', {
         type: 'button',
+        class: 'setup-secondary',
         disabled: Boolean(view.busy) || view.authoritative === false,
         on: {
           click: () => {
@@ -1163,7 +1197,7 @@ function renderFlow(view) {
       selectedChoice = 'local';
     }
 
-    lead.append(
+    put(lead,
       el('h1', {}, document.createTextNode(COPY.setup.thinkingTitle)),
       el('p', {}, document.createTextNode(COPY.setup.thinkingLead))
     );
@@ -1184,7 +1218,9 @@ function renderFlow(view) {
       } else if (typeof choice.sub === 'string' && choice.sub.length > 0) {
         sub = choice.sub;
       }
-      const desc = typeof choice.description === 'string' && choice.description.length > 0 ? choice.description : null;
+      const desc = choice.id === 'local'
+        ? COPY.setup.localDesc
+        : (typeof choice.description === 'string' && choice.description.length > 0 ? choice.description : null);
 
       card.append(el('button', {
         type: 'button',
@@ -1202,15 +1238,21 @@ function renderFlow(view) {
           }
         }
       },
-        el('span', { class: 'setup-choice-label' }, document.createTextNode(label)),
-        sub ? el('span', { class: 'setup-choice-sub' }, document.createTextNode(sub)) : null,
-        isSelected && desc ? el('span', { class: 'setup-choice-desc' }, document.createTextNode(desc)) : null
+        el('span', { class: 'setup-radio', 'aria-hidden': 'true' }),
+        el('span', { class: 'setup-choice-body' },
+          el('span', { class: 'setup-choice-head' },
+            el('span', { class: 'setup-choice-label' }, document.createTextNode(label)),
+            sub ? el('span', { class: 'setup-choice-sub' }, document.createTextNode(sub)) : null
+          ),
+          isSelected && desc ? el('span', { class: 'setup-choice-desc' }, document.createTextNode(desc)) : null
+        )
       ));
     }
 
     if (typeof thinkingCopy.later === 'string' && thinkingCopy.later.length > 0) {
       card.append(el('button', {
         type: 'button',
+        class: 'setup-text',
         'data-focus-key': 'later',
         disabled: Boolean(view.busy) || view.authoritative === false,
         on: {
@@ -1268,8 +1310,9 @@ function renderFlow(view) {
   if (footerDownloads) footerChildren.push(footerDownloads);
   if (footerPrimary) footerChildren.push(footerPrimary);
   const footer = el('footer', { class: 'setup-footer' }, ...footerChildren);
+  sheet.append(footer);
 
-  root.append(band, sheet, footer);
+  root.append(band, sheet);
 
   show('firstrun');
   if (view.phase !== previousPhase) {

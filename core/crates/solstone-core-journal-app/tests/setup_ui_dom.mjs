@@ -1048,7 +1048,8 @@ const choiceIds = choiceBtns.map(b => b.getAttribute('data-choice-id'));
 if (!choiceIds.includes('local') || !choiceIds.includes('spp') || !choiceIds.includes('byo')) {
   throw new Error(`expected local, spp, byo choices, got ${choiceIds.join(', ')}`);
 }
-if (!root().textContent.includes('local description')) throw new Error('local description not visible');
+if (!root().textContent.includes('model requests stay on this pc.')) throw new Error('the local row does not carry its this-pc description');
+if (root().textContent.includes('local description')) throw new Error('the local row shows the shared description');
 if (root().textContent.includes('spp description')) throw new Error('spp description visible');
 if (root().textContent.includes('byo description')) throw new Error('byo description visible');
 if (buttons().some(b => accessibleName(b) === 'Change')) throw new Error('Change button visible');
@@ -1969,5 +1970,26 @@ if (!existsSync(svgPath)) {
   throw new Error(`lockup SVG file does not exist at ${svgPath}`);
 }
 pass('horizontal lockup asset exists and is served with svg mime type');
+
+// Craft pass: no stray "null" text, the welcome card carries the fits rows and the sign-in switch,
+// and the footer shows its step in words.
+for (const phase of ['welcome', 'folder', 'mark', 'thinking']) {
+  paint(view({ phase, step: { welcome: 1, folder: 2, mark: 3, thinking: 4 }[phase], thinking_capability: 'ok' }));
+  if (/\bnull\b/.test(root().textContent)) throw new Error(`${phase} renders the word null`);
+  const footer = root().querySelector('.setup-footer');
+  if (!footer || !footer.textContent.includes(`step ${{ welcome: 1, folder: 2, mark: 3, thinking: 4 }[phase]} of 8`)) {
+    throw new Error(`${phase} footer does not show its step in words`);
+  }
+}
+paint(view({ phase: 'welcome', step: 1 }));
+{
+  const card = root().querySelector('.setup-card');
+  if (!card || !card.textContent.includes('what this sets up')) throw new Error('the welcome card does not carry what this sets up');
+  if (!card.textContent.includes('lives on this pc and keeps everything that goes into it.')) throw new Error('the welcome card lacks the journal row');
+  const sw = root().querySelector('#sign-in-check');
+  if (!sw || sw.getAttribute('role') !== 'switch' || !card.contains(sw)) throw new Error('the sign-in switch is not in the welcome card');
+  if (!sw.textContent.includes('start automatically after you sign in to this pc.')) throw new Error('the switch lacks its help line');
+}
+pass('craft pass: no null text, welcome card rows and switch, footer step words');
 
 console.log(`DOM CASES: ${passed} passed`);
