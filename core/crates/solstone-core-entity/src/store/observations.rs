@@ -117,6 +117,7 @@ pub enum ObservationWriteError {
     TrustLock(FacetTrustLockError),
     Read(ObservationStoreError),
     Write(AtomicWriteError),
+    SearchUpdate(std::io::Error),
     Resolve(String),
     EmptyContent,
     Conflict {
@@ -135,6 +136,9 @@ impl fmt::Display for ObservationWriteError {
             Self::TrustLock(error) => error.fmt(formatter),
             Self::Read(error) => error.fmt(formatter),
             Self::Write(error) => error.fmt(formatter),
+            Self::SearchUpdate(error) => {
+                write!(formatter, "the search update could not be queued: {error}")
+            }
             Self::Resolve(message) => write!(formatter, "{message}"),
             Self::EmptyContent => write!(formatter, "Observation content cannot be blank"),
             Self::Conflict { message } => write!(formatter, "{message}"),
@@ -152,6 +156,7 @@ impl Error for ObservationWriteError {
             Self::TrustLock(error) => Some(error),
             Self::Read(error) => Some(error),
             Self::Write(error) => Some(error),
+            Self::SearchUpdate(error) => Some(error),
             _ => None,
         }
     }
@@ -197,6 +202,7 @@ impl ObservationWriteError {
                 | Self::Read(ObservationStoreError::Read(ReadError::Io { .. }))
                 | Self::Read(ObservationStoreError::Path(PathError::Io { .. }))
                 | Self::Write(AtomicWriteError::Io { .. })
+                | Self::SearchUpdate(_)
         )
     }
 }
@@ -748,7 +754,18 @@ fn write_facet_entity_observations(
 ) -> Result<(), ObservationWriteError> {
     let target = facet_entity_observations_path(journal_root, facet, entity_dir)?;
     write_text(&target, content, AtomicWriteOptions::default())
-        .map_err(ObservationWriteError::Write)
+        .map_err(ObservationWriteError::Write)?;
+    enqueue_observation(journal_root, &target)
+}
+
+fn enqueue_observation(journal: &Path, path: &Path) -> Result<(), ObservationWriteError> {
+    solstone_core_indexer_todo::enqueue_path(journal, path)
+        .map_err(ObservationWriteError::SearchUpdate)?;
+    solstone_core_indexer_todo::enqueue_token(
+        journal,
+        solstone_core_indexer_todo::Token::EntitySearch,
+    )
+    .map_err(ObservationWriteError::SearchUpdate)
 }
 
 /// Single entry point for modifying facet-scoped entity observations.
@@ -899,8 +916,9 @@ pub fn apply_observation_change(
         ObservationChange::RemoveFile => {
             if file_existed {
                 let rel = LinkDirs::for_facet(journal_root, facet_dir).observations_rel(entity_dir);
-                let _ = solstone_core_journal_io::remove_file(journal_root, &rel);
+                solstone_core_journal_io::remove_file(journal_root, &rel)?;
             }
+            enqueue_observation(journal_root, &path)?;
             Ok(ObservationWriteOutcome::Removed)
         }
     }
@@ -1684,6 +1702,44 @@ fn jitter_sleep(maximum_ms: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn removing_notes_queues_the_absent_path_and_propagates_queue_failure() {
+        for blocked in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root
+                .path()
+                .join("facets/work/entities/alice/observations.jsonl");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &path,
+                "{\"id\":1,\"content\":\"saved fact\",\"observed_at\":1000}\n",
+            )
+            .unwrap();
+            if blocked {
+                std::fs::create_dir(root.path().join("indexer")).unwrap();
+                std::fs::write(root.path().join("indexer/todo"), "blocked directory").unwrap();
+            }
+            let result = apply_observation_change(
+                root.path(),
+                "work",
+                "alice",
+                ObservationChange::RemoveFile,
+            );
+            assert!(!path.exists());
+            assert_eq!(result.is_err(), blocked);
+            if !blocked {
+                let status = solstone_core_indexer_todo::inspect(root.path()).unwrap();
+                assert!(
+                    status
+                        .keys
+                        .contains(&"facets/work/entities/alice/observations.jsonl".to_owned())
+                );
+                assert!(status.keys.contains(&"@entity-search".to_owned()));
+            }
+        }
+    }
 
     #[test]
     fn parser_handles_strict_legacy_and_derived_ids() {

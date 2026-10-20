@@ -107,6 +107,32 @@ Owners:
 Agents invoke journal data operations through `solstone call <app> <verb>`. See
 [SOLCLI.md](SOLCLI.md).
 
+### Search publication
+
+Saving or removing journal content adds a durable path hint through
+`solstone_core_indexer_store::todo::enqueue_path(journal, path)`. Producers do not
+open SQLite or acquire its writer lease. Entity changes enqueue `EntitySearch`;
+facet declaration changes enqueue `Reclassify`. Existing corpus-wide import and
+restore operations enqueue `ScanFull`.
+
+`solstone journal indexer drain` consumes due hints. It reconciles each path with
+the current filesystem, including deleted children of a queued directory. One
+persistent drain lock protects claims and crash recovery, while the SQLite writer
+lease is released between bounded batches. A failed present path is retried three
+times, then left to the daily catch-all. Failed removals remain queued and retry
+hourly after that limit. Unknown entry kinds and fields are preserved for newer
+versions.
+
+The supervisor checks due hints every 30 seconds without relying on Callosum.
+Daily thinking first runs a forced drain with its own ten-minute budget, then
+continues its talents even if the wait expires, recording pending paths. Its later
+indexer phase drains hints too. The enabled `search-catch-all` schedule runs a
+light `indexer --rescan` daily with a two-hour cap, separately from daily thinking.
+Mobile hosts supply the same drain capability in process, after thinking and from
+their scheduled loop. Health reports queued work, failed removals, and the age and
+repair counts of the last finished light check. A segment publication receipt
+means its saved outputs were queued successfully; search visibility follows later.
+
 ### Interrupted activity work
 
 `think-cli::activity_work` persists unfinished talent names and accepted Cortex use

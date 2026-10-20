@@ -1086,6 +1086,7 @@ async fn index_plate_unknown_kind_is_invalid_after_resolution() {
 async fn index_plate_missing_index_is_edge_index_unavailable() {
     let journal = Journal::new();
     save_person(journal.path(), "person-ada", "Ada Lovelace");
+    let before = solstone_core_indexer_store::todo::inspect(journal.path()).unwrap();
     assert_oracle_refusal(
         "index_plate:network:missing-index",
         call(
@@ -1097,8 +1098,12 @@ async fn index_plate_missing_index_is_edge_index_unavailable() {
         503,
     );
     assert!(
-        !journal.path().join("indexer").exists(),
-        "GET must not create indexer/"
+        !journal.path().join("indexer/journal.sqlite").exists(),
+        "GET must not create the search database"
+    );
+    assert_eq!(
+        solstone_core_indexer_store::todo::inspect(journal.path()).unwrap(),
+        before
     );
 }
 

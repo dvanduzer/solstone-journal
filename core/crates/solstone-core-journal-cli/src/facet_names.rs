@@ -9,9 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io;
 use std::path::Path;
-use std::time::Duration;
 
 use chrono::Utc;
 use serde_json::Value;
@@ -20,11 +18,6 @@ use solstone_core_facets::{
     is_well_formed_facet_id, observe_declared_facet_inventory, read_facet_declaration,
     read_retired_facets, record_retired_facet, retired_facets_path,
 };
-use solstone_core_indexer_store::classification::FacetDeclarationSet;
-use solstone_core_indexer_store::reconcile::{ReconcileReport, reconcile_stale_classifications};
-use solstone_core_journal_io::{LockOptions, hold_lock};
-
-const RECONCILE_LOCK: &str = "health/locks/facet-reconcile";
 
 /// What a merge may proceed with, read under the facet trust lock.
 pub(crate) struct MergeAdmission {
@@ -125,29 +118,13 @@ pub(crate) fn admit_facet_merge(
     })
 }
 
-/// Bring stored search classifications in step with facet names.
-///
-/// Single-flight `health/locks/facet-reconcile`, then the index writer lease
-/// inside `reconcile_stale_classifications`, then entity/facet trust only while
-/// the snapshot reads declarations. Callers must not hold facet trust or the
-/// index writer lease.
-pub(crate) fn reconcile_facet_classifications(journal: &Path) -> Result<ReconcileReport, String> {
-    let _single = hold_lock(
-        journal.join(RECONCILE_LOCK),
-        LockOptions {
-            timeout: Duration::from_secs(120),
-            mode: Some(0o600),
-            ..LockOptions::default()
-        },
+/// Queue classification repair after facet names change.
+pub(crate) fn enqueue_facet_classifications(journal: &Path) -> Result<(), String> {
+    solstone_core_indexer_store::todo::enqueue_token(
+        journal,
+        solstone_core_indexer_store::todo::Token::Reclassify,
     )
-    .map_err(|error| error.to_string())?;
-    let mut snapshot = || {
-        let _trust = hold_facet_trust_lock(journal).map_err(|error| {
-            solstone_core_indexer_store::StoreError::Io(io::Error::other(error.to_string()))
-        })?;
-        FacetDeclarationSet::from_journal(journal)
-    };
-    reconcile_stale_classifications(journal, &mut snapshot).map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())
 }
 
 // ---- journal facet doctor ------------------------------------------------
@@ -630,16 +607,12 @@ pub(crate) fn retire_name(
         );
         entry
     };
-    let reconcile = reconcile_facet_classifications(journal)?;
+    enqueue_facet_classifications(journal)?;
     Ok(match (into, entry.successor.is_some()) {
-        (Some(target), true) => format!(
-            "Recorded '{name}' as merged into '{target}'. Search updated ({} of {} stored entries changed).\n",
-            reconcile.changed, reconcile.candidates
-        ),
-        _ => format!(
-            "Recorded '{name}' as deleted. Search updated ({} of {} stored entries changed).\n",
-            reconcile.changed, reconcile.candidates
-        ),
+        (Some(target), true) => {
+            format!("Recorded '{name}' as merged into '{target}'. search is catching up.\n")
+        }
+        _ => format!("Recorded '{name}' as deleted. search is catching up.\n"),
     })
 }
 

@@ -13,6 +13,8 @@ publish = false
 full-tests = []
 
 [dependencies]
+solstone-core-format.workspace = true
+solstone-core-indexer-todo.workspace = true
 axum = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }

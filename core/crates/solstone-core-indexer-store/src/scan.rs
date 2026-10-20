@@ -159,7 +159,7 @@ pub enum RescanFileStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SavedPublicationOutcome {
-    Indexed,
+    Queued,
     Excluded,
     Declined,
     Failed,
@@ -168,7 +168,7 @@ pub enum SavedPublicationOutcome {
 impl SavedPublicationOutcome {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Indexed => "indexed",
+            Self::Queued => "queued",
             Self::Excluded => "excluded",
             Self::Declined => "declined",
             Self::Failed => "failed",
@@ -184,10 +184,23 @@ pub struct SavedPublicationAttempt {
     pub cause: Option<String>,
 }
 
+/// Publication eligibility without opening SQLite or reading the source.
+pub fn publication_path_is_indexable(journal: &Path, path: &Path) -> bool {
+    let rel = if path.is_absolute() {
+        relative_to_journal(journal, path)
+    } else {
+        path.to_str().map(str::to_owned)
+    };
+    rel.is_some_and(|rel| {
+        solstone_core_format::content::resolve_spec(&rel).is_some()
+            || edge_source_for_rel(&rel).is_ok_and(|source| source.is_some())
+    })
+}
+
 pub fn attempt_saved_publication(
     journal: &Path,
     saved: &Path,
-    rescan: impl FnOnce(&Path, &Path) -> Result<RescanFileStatus, String>,
+    enqueue: impl FnOnce(&Path, &Path) -> Result<(), String>,
 ) -> SavedPublicationAttempt {
     let (rel, path) = match resolve_rescan_target(journal, saved) {
         Ok(pair) => pair,
@@ -217,16 +230,10 @@ pub fn attempt_saved_publication(
     let is_indexed = solstone_core_format::content::resolve_spec(&rel).is_some();
 
     if edge_source.is_some() || is_indexed {
-        match rescan(journal, &path) {
-            Ok(RescanFileStatus::Indexed { warnings }) => SavedPublicationAttempt {
+        match enqueue(journal, &path) {
+            Ok(()) => SavedPublicationAttempt {
                 path: rel,
-                outcome: SavedPublicationOutcome::Indexed,
-                warnings,
-                cause: None,
-            },
-            Ok(RescanFileStatus::Declined) => SavedPublicationAttempt {
-                path: rel,
-                outcome: SavedPublicationOutcome::Declined,
+                outcome: SavedPublicationOutcome::Queued,
                 warnings: Vec::new(),
                 cause: None,
             },
@@ -911,6 +918,146 @@ pub fn rescan_file(journal: &Path, input: &Path) -> Result<RescanFileStatus, Sto
     rescan_file_admitted(journal, input, &admission)
 }
 
+/// Reconcile a hint against current disk state. Only NotFound permits pruning.
+pub(crate) fn reconcile_path_admitted(
+    journal: &Path,
+    rel: &str,
+    admission: &IndexAdmission,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<&'static str, StoreError> {
+    let path = resolve_journal_path(journal, rel)?;
+    match reconcile_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::db::prune_by_paths_admitted(journal, &[rel], admission)?;
+            Ok("removed")
+        }
+        Err(error) => Err(error.into()),
+        Ok(metadata) if metadata.is_dir() => {
+            reconcile_directory_admitted(journal, rel, &path, admission, checkpoint)?;
+            Ok("indexed")
+        }
+        Ok(metadata) if metadata.is_file() => {
+            match rescan_file_admitted(journal, Path::new(rel), admission)? {
+                RescanFileStatus::Indexed { .. } => Ok("indexed"),
+                RescanFileStatus::Declined => {
+                    crate::db::prune_by_paths_admitted(journal, &[rel], admission)?;
+                    Ok("declined")
+                }
+            }
+        }
+        Ok(_) => {
+            crate::db::prune_by_paths_admitted(journal, &[rel], admission)?;
+            Ok("declined")
+        }
+    }
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+thread_local! {
+    static RECONCILE_STAT_ERROR: std::cell::RefCell<Option<(PathBuf, std::io::ErrorKind)>> = const { std::cell::RefCell::new(None) };
+}
+
+fn reconcile_metadata(path: &Path) -> std::io::Result<fs::Metadata> {
+    #[cfg(all(test, feature = "full-tests"))]
+    if let Some(kind) = RECONCILE_STAT_ERROR.with(|fault| {
+        fault
+            .borrow()
+            .as_ref()
+            .and_then(|(target, kind)| (path == target).then_some(*kind))
+    }) {
+        return Err(std::io::Error::new(kind, "injected source stat error"));
+    }
+    fs::metadata(path)
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+pub(crate) fn with_reconcile_stat_error<T>(
+    path: &Path,
+    kind: std::io::ErrorKind,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            RECONCILE_STAT_ERROR.with(|fault| *fault.borrow_mut() = None);
+        }
+    }
+    RECONCILE_STAT_ERROR.with(|fault| *fault.borrow_mut() = Some((path.to_path_buf(), kind)));
+    let _reset = Reset;
+    run()
+}
+
+fn reconcile_directory_admitted(
+    journal: &Path,
+    rel: &str,
+    directory: &Path,
+    admission: &IndexAdmission,
+    checkpoint: &dyn Fn() -> Result<(), String>,
+) -> Result<(), StoreError> {
+    let mut directories = vec![directory.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        for child in fs::read_dir(directory)? {
+            crate::db::admit_scan_journal(checkpoint)?;
+            let child = child?;
+            if child.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let metadata = child.file_type()?;
+            if metadata.is_dir() {
+                directories.push(child.path());
+            } else if metadata.is_file() {
+                let child_rel = relative_to_journal(journal, &child.path())
+                    .ok_or_else(|| StoreError::OutsideJournal(child.path()))?;
+                reconcile_path_admitted(journal, &child_rel, admission, checkpoint)?;
+            }
+        }
+    }
+    // Rows can survive a directory move or a file removed from the destination.
+    // Enumerate stored paths, then stat each; a permission error never prunes.
+    let conn = open_index_admitted(journal, admission, checkpoint)?;
+    let prefix = format!("{rel}/");
+    let paired = if let Some(rel) = rel.strip_prefix("chronicle/") {
+        format!("{rel}/")
+    } else {
+        format!("chronicle/{rel}/")
+    };
+    let paths = {
+        let mut statement =
+            conn.prepare("SELECT path FROM files UNION SELECT path FROM edge_files")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    drop(conn);
+    for path in paths {
+        if !path.starts_with(&prefix) && !path.starts_with(&paired) {
+            continue;
+        }
+        crate::db::admit_scan_journal(checkpoint)?;
+        let absolute = resolve_journal_path(journal, &path)?;
+        match fs::metadata(absolute) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                crate::db::prune_by_paths_admitted(journal, &[&path], admission)?;
+            }
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn update_entity_search_admitted(
+    journal: &Path,
+    admission: &IndexAdmission,
+) -> Result<(), StoreError> {
+    let build = build_entity_search(journal)?;
+    let mut conn = open_index_admitted(journal, admission, &|| Ok(()))?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    index_entity_search_build(&tx, journal, &build, false)?;
+    tx.commit()?;
+    Ok(())
+}
+
 pub(crate) fn rescan_file_admitted(
     journal: &Path,
     input: &Path,
@@ -929,8 +1076,13 @@ pub(crate) fn rescan_file_admitted(
     if family.is_none() && edge_source.is_none() {
         return Ok(RescanFileStatus::Declined);
     }
-    if !path.is_file() {
-        return Err(StoreError::MissingFile(path));
+    match fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Ok(RescanFileStatus::Declined),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(StoreError::MissingFile(path));
+        }
+        Err(error) => return Err(error.into()),
     }
     let memory_original_res = if family == Some(Family::AgentMemory) {
         Some(read_memory_original(journal, &rel))
@@ -7198,13 +7350,11 @@ not json
         let mut called = false;
         let attempt = attempt_saved_publication(&root, &note_path, |_j, _p| {
             called = true;
-            Ok(RescanFileStatus::Indexed {
-                warnings: vec!["sanitized markdown".to_owned()],
-            })
+            Ok(())
         });
         assert!(called);
-        assert_eq!(attempt.outcome, SavedPublicationOutcome::Indexed);
-        assert_eq!(attempt.warnings, vec!["sanitized markdown"]);
+        assert_eq!(attempt.outcome, SavedPublicationOutcome::Queued);
+        assert!(attempt.warnings.is_empty());
         assert_eq!(attempt.path, "20260101/stream/120000_60/talents/note.md");
         assert!(!attempt.path.starts_with("chronicle/"));
 
@@ -7213,10 +7363,10 @@ not json
         let mut called = false;
         let attempt = attempt_saved_publication(&root, &sense_path, |_j, _p| {
             called = true;
-            Ok(RescanFileStatus::Indexed { warnings: vec![] })
+            Ok(())
         });
         assert!(called);
-        assert_eq!(attempt.outcome, SavedPublicationOutcome::Indexed);
+        assert_eq!(attempt.outcome, SavedPublicationOutcome::Queued);
         assert_eq!(attempt.path, "20260101/stream/120000_60/talents/sense.json");
         assert!(!attempt.path.starts_with("chronicle/"));
 
@@ -7224,7 +7374,7 @@ not json
         let mut called = false;
         let attempt = attempt_saved_publication(&root, &facets_path, |_j, _p| {
             called = true;
-            Ok(RescanFileStatus::Indexed { warnings: vec![] })
+            Ok(())
         });
         assert!(!called);
         assert_eq!(attempt.outcome, SavedPublicationOutcome::Excluded);
@@ -7233,12 +7383,6 @@ not json
             "20260101/stream/120000_60/talents/facets.json"
         );
         assert!(!attempt.path.starts_with("chronicle/"));
-
-        // 4. Closure Ok(Declined) returns declined
-        let attempt =
-            attempt_saved_publication(&root, &note_path, |_j, _p| Ok(RescanFileStatus::Declined));
-        assert_eq!(attempt.outcome, SavedPublicationOutcome::Declined);
-        assert_eq!(attempt.path, "20260101/stream/120000_60/talents/note.md");
 
         // 5. Closure Err returns failed with cause
         let attempt = attempt_saved_publication(&root, &note_path, |_j, _p| {
@@ -7263,9 +7407,10 @@ not json
             r#"{"content_type":"meeting","activity_summary":"Reviewed the quarterly kestrel launch.","entities":[]}"#,
         );
         let attempt = attempt_saved_publication(&root, &root.join(rel), |journal, path| {
-            rescan_file(journal, path).map_err(|error| error.to_string())
+            crate::todo::enqueue_path(journal, path).map_err(|error| error.to_string())
         });
-        assert_eq!(attempt.outcome, SavedPublicationOutcome::Indexed);
+        assert_eq!(attempt.outcome, SavedPublicationOutcome::Queued);
+        crate::todo::drain_now(&root).unwrap();
         let conn = Connection::open(db_path(&root)).expect("open db");
         assert!(chunk_contents_contain(&conn, "kestrel"));
         // Searchable by the owner, still not by a connection.

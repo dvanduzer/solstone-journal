@@ -70,6 +70,7 @@ pub enum IndexFailure {
     ScanFailed,
     /// The index's generation stamp cannot be read; every write refuses.
     StampUnreadable,
+    FailedDeletions,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -91,6 +92,16 @@ pub struct IndexHealth {
     pub indexed: usize,
     pub generation: Option<i64>,
     pub last_scan_at_ms: Option<i64>,
+    #[serde(default)]
+    pub queued: usize,
+    #[serde(default)]
+    pub failed_deletions: usize,
+    #[serde(default)]
+    pub last_finished_check_at_ms: Option<i64>,
+    #[serde(default)]
+    pub check_indexed: usize,
+    #[serde(default)]
+    pub check_removed: usize,
 }
 
 /// Measure the index and fold recent failed updates into one value.
@@ -104,10 +115,10 @@ pub fn evaluate_index_health_with(
     observations: &IndexingObservations,
 ) -> IndexHealth {
     match inspect_index(journal) {
-        Ok(status) => index_health_from(&status, observations),
+        Ok(status) => with_work_list(journal, index_health_from(&status, observations)),
         Err(error) => {
             log::warn!("search index status unavailable: {error}");
-            unmeasured()
+            with_work_list(journal, unmeasured())
         }
     }
 }
@@ -202,10 +213,10 @@ pub fn evaluate_index_health_recent(
         }
     };
     match reused.map_or_else(|| measure(journal), Ok) {
-        Ok(status) => index_health_from(&status, observations),
+        Ok(status) => with_work_list(journal, index_health_from(&status, observations)),
         Err(error) => {
             log::warn!("search index status unavailable: {error}");
-            unmeasured()
+            with_work_list(journal, unmeasured())
         }
     }
 }
@@ -226,6 +237,11 @@ fn unmeasured() -> IndexHealth {
         indexed: 0,
         generation: None,
         last_scan_at_ms: None,
+        queued: 0,
+        failed_deletions: 0,
+        last_finished_check_at_ms: None,
+        check_indexed: 0,
+        check_removed: 0,
     }
 }
 
@@ -326,7 +342,55 @@ pub fn index_health_from(status: &IndexStatus, observations: &IndexingObservatio
             .as_ref()
             .map(solstone_core_indexer_store::generation::IndexStamp::effective_generation),
         last_scan_at_ms: status.last_scan.as_ref().map(|scan| scan.finished_at_ms),
+        queued: 0,
+        failed_deletions: 0,
+        last_finished_check_at_ms: None,
+        check_indexed: 0,
+        check_removed: 0,
     }
+}
+
+fn with_work_list(journal: &Path, mut health: IndexHealth) -> IndexHealth {
+    match solstone_core_indexer_store::todo::inspect(journal) {
+        Ok(todo) => {
+            health.queued = todo.keys.len();
+            health.failed_deletions = todo.failed_deletions;
+            health.pending = health.pending.max(health.queued);
+            if health.failed_deletions > 0
+                && health.failure.is_none_or(|failure| {
+                    matches!(
+                        failure,
+                        IndexFailure::FailedFiles | IndexFailure::ScanFailed
+                    )
+                })
+            {
+                health.state = IndexHealthState::Failing;
+                health.failure = Some(IndexFailure::FailedDeletions);
+                health.text = "some removed entries couldn't be taken out of search.".to_owned();
+            } else if health.queued > 0 && health.state == IndexHealthState::Ok {
+                health.state = IndexHealthState::Behind;
+                health.text = "search is catching up with your journal.".to_owned();
+            }
+        }
+        Err(error) => {
+            log::warn!("search work list could not be read: {error}");
+            health.state = IndexHealthState::Failing;
+            health.failure = Some(IndexFailure::ScanFailed);
+            health.text = "search can't check its queued updates right now.".to_owned();
+        }
+    }
+    if let Ok(conn) = solstone_core_indexer_store::open_index_reader(journal) {
+        match solstone_core_indexer_store::generation::read_last_finished_check(&conn) {
+            Ok(Some(check)) => {
+                health.last_finished_check_at_ms = Some(check.finished_at_ms);
+                health.check_indexed = check.indexed;
+                health.check_removed = check.removed;
+            }
+            Ok(None) => {}
+            Err(error) => log::warn!("last finished search check could not be read: {error}"),
+        }
+    }
+    health
 }
 
 /// Building means the index holds less than half of what it should: nothing
@@ -367,6 +431,91 @@ mod tests {
 
     use super::*;
     use crate::indexing_observation::{IndexingAttemptObservation, IndexingDiagnostics};
+
+    #[test]
+    fn a_dropped_present_failure_keeps_its_reason_until_the_file_indexes() {
+        let journal = tempfile::tempdir().unwrap();
+        let source = journal.path().join("imports/fixture/summary.md");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "original kestrel").unwrap();
+        solstone_core_indexer_store::scan::scan_journal(journal.path(), false).unwrap();
+        std::fs::write(&source, [0xff]).unwrap();
+        std::fs::File::open(&source)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(2))
+            .unwrap();
+        solstone_core_indexer_store::todo::enqueue_path(journal.path(), &source).unwrap();
+        for _ in 0..3 {
+            let report = solstone_core_indexer_store::todo::drain(
+                journal.path(),
+                solstone_core_indexer_store::todo::DrainOptions {
+                    force: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(report.failed, 1);
+        }
+        assert!(
+            solstone_core_indexer_store::todo::inspect(journal.path())
+                .unwrap()
+                .keys
+                .is_empty()
+        );
+        let health = evaluate_index_health(journal.path(), Utc::now());
+        assert_eq!(health.failure, Some(IndexFailure::FailedFiles));
+        assert!(health.failed > 0);
+        let observations = read_indexing_observations(journal.path(), Utc::now());
+        assert!(
+            observations
+                .outcomes
+                .iter()
+                .any(|entry| entry.path == "imports/fixture/summary.md"
+                    && entry.outcome == "failed"
+                    && entry.cause.is_some())
+        );
+        solstone_core_indexer_store::todo::drain(journal.path(), Default::default()).unwrap();
+        assert!(evaluate_index_health(journal.path(), Utc::now()).failed > 0);
+        std::fs::write(&source, "repaired kestrel").unwrap();
+        solstone_core_indexer_store::todo::enqueue_path(journal.path(), &source).unwrap();
+        assert_eq!(
+            solstone_core_indexer_store::todo::drain(journal.path(), Default::default())
+                .unwrap()
+                .failed,
+            0
+        );
+        assert_eq!(evaluate_index_health(journal.path(), Utc::now()).failed, 0);
+    }
+
+    #[test]
+    fn failed_deletions_stay_visible_after_an_empty_day_light_check() {
+        let journal = tempfile::tempdir().unwrap();
+        let key = "20260101/device/120000_60/talents/activity.md";
+        solstone_core_indexer_store::todo::enqueue_path(journal.path(), Path::new(key)).unwrap();
+        let path = std::fs::read_dir(journal.path().join("indexer/todo"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let mut entry: solstone_core_indexer_store::todo::Entry =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        entry.attempts = 3;
+        entry.not_before_ms = u64::MAX;
+        std::fs::write(path, serde_json::to_vec(&entry).unwrap()).unwrap();
+        solstone_core_indexer_store::scan::scan_journal(journal.path(), false).unwrap();
+        let health = evaluate_index_health_with(journal.path(), &observations(&[]));
+        assert_eq!(health.failure, Some(IndexFailure::FailedDeletions));
+        assert_eq!((health.queued, health.failed_deletions), (1, 1));
+        assert!(health.last_finished_check_at_ms.is_some());
+        assert_eq!(health.check_removed, 0);
+        let mut unreadable = unmeasured();
+        unreadable.failure = Some(IndexFailure::Unreadable);
+        assert_eq!(
+            with_work_list(journal.path(), unreadable).failure,
+            Some(IndexFailure::Unreadable)
+        );
+    }
 
     fn status() -> IndexStatus {
         IndexStatus {

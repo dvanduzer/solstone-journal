@@ -94,6 +94,11 @@ pub(crate) struct SearchIndexSummary {
     pub(crate) missing: usize,
     pub(crate) orphaned: usize,
     pub(crate) failed: usize,
+    pub(crate) queued: usize,
+    pub(crate) failed_deletions: usize,
+    pub(crate) last_finished_check_at_ms: Option<i64>,
+    pub(crate) check_indexed: usize,
+    pub(crate) check_removed: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -591,6 +596,11 @@ pub(crate) fn build_synthesis_health(
                 missing: search_eval.index.missing,
                 orphaned: search_eval.index.orphaned,
                 failed: search_eval.index.failed,
+                queued: search_eval.index.queued,
+                failed_deletions: search_eval.index.failed_deletions,
+                last_finished_check_at_ms: search_eval.index.last_finished_check_at_ms,
+                check_indexed: search_eval.index.check_indexed,
+                check_removed: search_eval.index.check_removed,
             },
         },
         notes,

@@ -42,22 +42,25 @@ pub trait CortexBoundary: Send + Sync {
 }
 
 pub trait IndexBoundary: Send + Sync {
-    fn rescan_file(
+    fn enqueue_path(&self, journal: &Path, path: &Path) -> Result<(), String>;
+
+    /// Hosted runtimes supply the indexer command capability themselves.
+    fn drain_pending(
         &self,
-        journal: &Path,
-        path: &Path,
-    ) -> Result<solstone_core_indexer_store::scan::RescanFileStatus, String>;
+        _journal: &Path,
+        _force: bool,
+        _budget: Duration,
+        _checkpoint: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
+        Err("this host does not provide an in-process indexer".into())
+    }
 }
 
-struct NativeIndexBoundary;
+pub(crate) struct NativeIndexBoundary;
 
 impl IndexBoundary for NativeIndexBoundary {
-    fn rescan_file(
-        &self,
-        journal: &Path,
-        path: &Path,
-    ) -> Result<solstone_core_indexer_store::scan::RescanFileStatus, String> {
-        solstone_core_indexer_store::scan::rescan_file(journal, path).map_err(|e| e.to_string())
+    fn enqueue_path(&self, journal: &Path, path: &Path) -> Result<(), String> {
+        solstone_core_indexer_store::todo::enqueue_path(journal, path).map_err(|e| e.to_string())
     }
 }
 
@@ -180,6 +183,7 @@ impl ThinkContext {
         cancel_checkpoint: Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Self {
         let phase_runner = Arc::new(crate::phase_process::HostedPhaseRunner {
+            index: Arc::clone(&index),
             talent_root: talent_root.clone(),
             apps_root: apps_root.clone(),
             cancel_checkpoint: Arc::clone(&cancel_checkpoint),
@@ -452,12 +456,19 @@ mod tests {
     }
 
     #[test]
-    fn native_index_boundary_reports_rescan_failure_for_missing_file() {
+    fn native_index_boundary_queues_an_absent_path_without_opening_sqlite() {
         let journal = tempfile::tempdir().unwrap();
         let missing_output = journal.path().join("does-not-exist.md");
         assert!(!missing_output.exists());
 
-        let result = NativeIndexBoundary.rescan_file(journal.path(), &missing_output);
-        assert!(result.is_err());
+        let result = NativeIndexBoundary.enqueue_path(journal.path(), &missing_output);
+        result.unwrap();
+        assert_eq!(
+            solstone_core_indexer_store::todo::inspect(journal.path())
+                .unwrap()
+                .keys,
+            ["does-not-exist.md"]
+        );
+        assert!(!solstone_core_indexer_store::db::db_path(journal.path()).exists());
     }
 }

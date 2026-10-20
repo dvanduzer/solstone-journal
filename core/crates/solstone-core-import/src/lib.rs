@@ -87,9 +87,9 @@ pub use projection::{
     project_import_result,
 };
 pub use publish::{
-    CreatedSegment, DayMarkerOutcome, DayMarkerStatus, IndexPublicationOutcomes, IndexedFile,
-    IndexedFileError, NativePublicationOperations, PublicationInput, PublicationOperations,
-    PublicationRecord, PublicationStatus, PublishError, SegmentBindingOutcome,
+    CreatedSegment, DayMarkerOutcome, DayMarkerStatus, IndexPublicationOutcomes, IndexedFileError,
+    NativePublicationOperations, PublicationInput, PublicationOperations, PublicationRecord,
+    PublicationStatus, PublishError, QueueFileOutcome, QueuedFile, SegmentBindingOutcome,
     SegmentPublicationOutcome, publish, publish_with_operations, read_publication_record,
     write_publication_record,
 };

@@ -12,6 +12,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- saving or importing something no longer waits for search to finish updating. search catches up in the background, and health shows pending updates and removals that need another try.
 - on windows, setup in the journal window now has the sun behind it, moving with the time of day, as it does on mac.
 - when your journal works through an older day's recordings again, it now remakes that day's daily outputs right after them, instead of after all older history. its entity review still waits until older history is done. until the rest are remade, health's line about older history counts that day as still to do.
 

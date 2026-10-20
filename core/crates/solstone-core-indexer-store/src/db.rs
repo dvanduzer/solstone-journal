@@ -374,10 +374,18 @@ pub fn prune_by_paths(
     rels: &[&str],
 ) -> Result<Option<StreamPruneCounts>, StoreError> {
     let admission = IndexAdmission::acquire(journal, "prune-paths")?;
+    prune_by_paths_admitted(journal, rels, &admission)
+}
+
+pub(crate) fn prune_by_paths_admitted(
+    journal: &Path,
+    rels: &[&str],
+    admission: &IndexAdmission,
+) -> Result<Option<StreamPruneCounts>, StoreError> {
     if !db_path(journal).exists() {
         return Ok(None);
     }
-    let mut conn = open_index_admitted(journal, &admission, &|| Ok(()))?;
+    let mut conn = open_index_admitted(journal, admission, &|| Ok(()))?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut counts = StreamPruneCounts::default();
     for rel in rels {
@@ -391,6 +399,8 @@ pub fn prune_by_paths(
         counts.chunks += execute_prune_predicate(&tx, "chunks", &pred)?;
         execute_prune_predicate(&tx, "memory_originals", &pred)?;
         counts.files += execute_prune_predicate(&tx, "files", &pred)?;
+        execute_prune_predicate(&tx, "edges", &pred)?;
+        execute_prune_predicate(&tx, "edge_files", &pred)?;
     }
     tx.commit()?;
     Ok(Some(counts))
@@ -1933,7 +1943,7 @@ CREATE TABLE edge_files(path TEXT PRIMARY KEY, mtime INTEGER);
     }
 
     #[test]
-    fn prune_by_paths_preserves_edges_and_prunes_classifications() {
+    fn prune_by_paths_removes_edges_and_classifications() {
         let journal = temp_root("prune-edges-and-classifications");
         let conn = open_index(&journal).unwrap();
 
@@ -1984,7 +1994,7 @@ CREATE TABLE edge_files(path TEXT PRIMARY KEY, mtime INTEGER);
         assert_eq!(count_path(&conn, "files", sibling_path), 1);
         assert_eq!(count_path(&conn, "chunks", sibling_path), 1);
 
-        // Edge row MUST survive
+        // Removed content must leave no edge rows
         let edge_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM edges WHERE path=?1",
@@ -1992,7 +2002,7 @@ CREATE TABLE edge_files(path TEXT PRIMARY KEY, mtime INTEGER);
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(edge_count, 1, "edges row must not be pruned");
+        assert_eq!(edge_count, 0, "removed content must leave no edge rows");
 
         // Target classification rows are gone, sibling remain
         assert_eq!(count_path(&conn, "chunk_classification", target_path), 0);

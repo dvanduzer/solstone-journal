@@ -1,17 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde_json::Value;
-use solstone_core_indexer_store::{
-    db::StreamPruneCounts,
-    scan::{RescanFileStatus, rescan_file},
-};
 use solstone_core_segment::{
-    DEFAULT_STREAM, DirEntryKind, LockOptions, Relocation, RelocationOutcome, RelocationRefusal,
-    RepairOutcome, available_segment_key, list_dir_entries, read_text, relocate_segment,
-    touch_stream_health_marker,
+    DEFAULT_STREAM, LockOptions, Relocation, RelocationOutcome, RelocationRefusal, RepairOutcome,
+    available_segment_key, read_text, relocate_segment, touch_stream_health_marker,
 };
 
 use crate::index::{SegmentIndexStatus, read_segment_index};
@@ -49,8 +44,7 @@ impl MoveRefusal {
 pub(crate) trait SegmentOperations {
     fn relocate(&self, relocation: &Relocation<'_>)
     -> Result<RelocationOutcome, RelocationRefusal>;
-    fn prune(&self, journal: &Path, rel: &str) -> Result<Option<StreamPruneCounts>, String>;
-    fn rescan(&self, journal: &Path, file: &Path) -> Result<RescanFileStatus, String>;
+    fn enqueue_path(&self, journal: &Path, path: &Path) -> Result<(), String>;
     fn touch_health(&self, journal: &Path, day: &str) -> Result<(), String>;
 }
 
@@ -64,13 +58,9 @@ impl SegmentOperations for NativeOperations {
         relocate_segment(relocation)
     }
 
-    fn prune(&self, journal: &Path, rel: &str) -> Result<Option<StreamPruneCounts>, String> {
-        solstone_core_indexer_store::db::prune_by_paths(journal, &[rel])
+    fn enqueue_path(&self, journal: &Path, path: &Path) -> Result<(), String> {
+        solstone_core_indexer_store::todo::enqueue_path(journal, path)
             .map_err(|error| error.to_string())
-    }
-
-    fn rescan(&self, journal: &Path, file: &Path) -> Result<RescanFileStatus, String> {
-        rescan_file(journal, file).map_err(|error| error.to_string())
     }
 
     fn touch_health(&self, journal: &Path, day: &str) -> Result<(), String> {
@@ -319,40 +309,20 @@ pub(crate) fn execute_plan(
             "atomic publication failed".to_owned(),
         ),
     }
-    if !matches!(plan.index, SegmentIndexStatus::Absent) {
-        match operations.prune(journal, &plan.source.index_rel) {
-            Ok(Some(counts)) if counts.chunks > 0 || counts.files > 0 || verbose => stdout
-                .push_str(&format!(
-                    "  deleted index rows: chunks={}, files={}\n",
-                    counts.chunks, counts.files
-                )),
-            Ok(_) => {}
-            Err(error) => failures.push(
+    let mut search_queued = true;
+    for rel in [&plan.source.index_rel, &plan.destination.index_rel] {
+        if let Err(error) = operations.enqueue_path(journal, Path::new(rel)) {
+            search_queued = false;
+            failures.push(
                 &mut stderr,
                 5,
-                "index prune",
-                format!("{error}; run: solstone journal indexer --rescan"),
-            ),
+                "search update",
+                format!("the search update could not be queued: {error}"),
+            );
         }
-        let mut indexed = 0_u64;
-        for file in files_recursive(&plan.destination.path) {
-            match operations.rescan(journal, &file) {
-                Ok(RescanFileStatus::Indexed { .. }) => indexed += 1,
-                Ok(RescanFileStatus::Declined) => {}
-                Err(error) => failures.push(
-                    &mut stderr,
-                    5,
-                    "re-index",
-                    format!("{error}; run: solstone journal indexer --rescan"),
-                ),
-            }
-        }
-        stdout.push_str(&format!(
-            "  re-indexed: {indexed} files at {}\n",
-            plan.destination.index_rel
-        ));
-    } else if verbose {
-        stdout.push_str("  index not available, skipping reindex\n");
+    }
+    if search_queued {
+        stdout.push_str("  search updates queued\n");
     }
     let mutated_days = outcome.mutated_days;
     for day in &mutated_days {
@@ -390,22 +360,5 @@ impl PostMoveFailures {
         stderr.push_str(&format!(
             "step {step} {name} inconsistent after move: {detail}\n"
         ));
-    }
-}
-
-fn files_recursive(root: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    collect_files(root, &mut files);
-    files.sort();
-    files
-}
-
-fn collect_files(root: &Path, files: &mut Vec<PathBuf>) {
-    for entry in list_dir_entries(root).unwrap_or_default() {
-        match entry.kind {
-            DirEntryKind::File => files.push(entry.path),
-            DirEntryKind::Directory => collect_files(&entry.path, files),
-            DirEntryKind::Other => {}
-        }
     }
 }

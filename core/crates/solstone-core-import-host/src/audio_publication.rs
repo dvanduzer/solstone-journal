@@ -19,7 +19,7 @@ use solstone_core_import::metadata::{
 };
 use solstone_core_import::publish::{
     CreatedSegment, NativePublicationOperations, PublicationInput, PublicationOperations,
-    RescanFileStatus, publish_with_operations,
+    QueueFileOutcome, publish_with_operations,
 };
 use solstone_core_segment::{StreamAdvance, UnboundStreamAdvanceError};
 
@@ -44,8 +44,8 @@ impl PublicationOperations for AudioPublicationOperations {
         NativePublicationOperations.advance_stream(journal, segment)
     }
 
-    fn rescan_file(&self, journal: &Path, path: &Path) -> Result<RescanFileStatus, String> {
-        NativePublicationOperations.rescan_file(journal, path)
+    fn enqueue_path(&self, journal: &Path, path: &Path) -> Result<QueueFileOutcome, String> {
+        NativePublicationOperations.enqueue_path(journal, path)
     }
 
     fn touch_stream_health_marker(&self, journal: &Path, day: &str) -> Result<(), String> {

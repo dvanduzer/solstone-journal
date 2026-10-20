@@ -1193,11 +1193,11 @@ pub(crate) fn generate_and_write(
                             &context.journal,
                             &full,
                             |j, p| {
-                                solstone_core_indexer_store::scan::rescan_file(j, p)
+                                solstone_core_indexer_store::todo::enqueue_path(j, p)
                                     .map_err(|e| e.to_string())
                             },
                         );
-                        emit_index_attempt(writer, &attempt);
+                        emit_index_enqueue(writer, &attempt);
                     }
                     CommitDisposition::Written
                 }
@@ -1256,11 +1256,11 @@ pub(crate) fn generate_and_write(
                     &context.journal,
                     &full,
                     |j, p| {
-                        solstone_core_indexer_store::scan::rescan_file(j, p)
+                        solstone_core_indexer_store::todo::enqueue_path(j, p)
                             .map_err(|e| e.to_string())
                     },
                 );
-                emit_index_attempt(writer, &attempt);
+                emit_index_enqueue(writer, &attempt);
             }
             if cancellation.is_cancelled() {
                 return RuntimeOutcome::Cancelled;
@@ -1472,14 +1472,14 @@ fn emit(writer: &mut (impl Write + ?Sized), event: Value) {
     let _ = writer.write_all(b"\n");
 }
 
-pub(crate) fn emit_index_attempt(
+pub(crate) fn emit_index_enqueue(
     writer: &mut (impl Write + ?Sized),
     attempt: &solstone_core_indexer_store::SavedPublicationAttempt,
 ) {
     emit(
         writer,
         json!({
-            "event": "index.attempt",
+            "event": "index.enqueue",
             "path": attempt.path,
             "outcome": attempt.outcome.as_str(),
             "warnings": attempt.warnings,
@@ -2193,7 +2193,7 @@ mod tests {
         assert_eq!(output_events[1]["event"], "generate_call");
         assert_eq!(output_events[2]["event"], "generate_attempt");
         assert_eq!(output_events[2]["status"], "success");
-        assert_eq!(output_events[3]["event"], "index.attempt");
+        assert_eq!(output_events[3]["event"], "index.enqueue");
         assert_eq!(output_events[4]["event"], "finish");
         assert_eq!(
             fs::read_to_string(context.journal.join("chronicle/20260101/talents/plain.md"))
@@ -2254,7 +2254,7 @@ mod tests {
         assert_eq!(enabled_events[0]["event"], "start");
         assert_eq!(enabled_events[1]["event"], "generate_call");
         assert_eq!(enabled_events[2]["event"], "generate_attempt");
-        assert_eq!(enabled_events[3]["event"], "index.attempt");
+        assert_eq!(enabled_events[3]["event"], "index.enqueue");
         assert_eq!(enabled_events[4]["event"], "finish");
         assert_eq!(fs::read_to_string(output_path).unwrap(), "generated");
     }
@@ -4613,6 +4613,12 @@ mod tests {
             root.path(),
             "unique published sentence for testing search",
         ));
+        solstone_core_indexer_store::scan::scan_journal(&context.journal, false).unwrap();
+        let lease = solstone_core_journal_io::hold_lock(
+            solstone_core_indexer_store::db::db_path(&context.journal),
+            Default::default(),
+        )
+        .unwrap();
         let mut output = Vec::new();
         run_lines(
             Cursor::new("{\"name\":\"plain\",\"day\":\"20260101\",\"prompt\":\"hello\"}\n"),
@@ -4626,13 +4632,21 @@ mod tests {
         assert_eq!(finish["output_changed"], true);
         let attempts: Vec<_> = evts
             .iter()
-            .filter(|e| e["event"] == "index.attempt")
+            .filter(|e| e["event"] == "index.enqueue")
             .collect();
         assert_eq!(attempts.len(), 1);
-        assert_eq!(attempts[0]["outcome"], "indexed");
+        assert_eq!(attempts[0]["outcome"], "queued");
         assert_eq!(attempts[0]["path"], "20260101/talents/plain.md");
+        assert_eq!(
+            solstone_core_indexer_store::todo::inspect(&context.journal)
+                .unwrap()
+                .keys,
+            ["20260101/talents/plain.md"]
+        );
+        drop(lease);
 
         let ref_date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        solstone_core_indexer_store::todo::drain(&context.journal, Default::default()).unwrap();
         let search_res = solstone_core_indexer_query::search(
             &context.journal,
             solstone_core_indexer_query::OwnerBoundary,
@@ -4646,6 +4660,9 @@ mod tests {
                 .text
                 .contains("unique published sentence")
         );
+        let check =
+            solstone_core_indexer_store::scan::scan_journal(&context.journal, false).unwrap();
+        assert_eq!((check.indexed, check.removed), (0, 0));
     }
 
     #[cfg(all(test, feature = "full-tests"))]
@@ -4688,7 +4705,7 @@ mod tests {
         assert_eq!(finish2["output_changed"], false);
         let attempts2: Vec<_> = evts2
             .iter()
-            .filter(|e| e["event"] == "index.attempt")
+            .filter(|e| e["event"] == "index.enqueue")
             .collect();
         assert_eq!(attempts2.len(), 0);
     }
@@ -4768,10 +4785,10 @@ mod tests {
         assert_eq!(finish2["output_changed"], true);
         let attempts2: Vec<_> = evts2
             .iter()
-            .filter(|e| e["event"] == "index.attempt")
+            .filter(|e| e["event"] == "index.enqueue")
             .collect();
         assert_eq!(attempts2.len(), 1);
-        assert_eq!(attempts2[0]["outcome"], "indexed");
+        assert_eq!(attempts2[0]["outcome"], "queued");
     }
 
     #[cfg(all(test, feature = "full-tests"))]
@@ -4863,6 +4880,8 @@ mod tests {
                 .as_secs();
 
             if duration1 == duration2 {
+                solstone_core_indexer_store::todo::drain(&context.journal, Default::default())
+                    .unwrap();
                 let search_res = solstone_core_indexer_query::search(
                     &context.journal,
                     solstone_core_indexer_query::OwnerBoundary,
@@ -4916,7 +4935,7 @@ mod tests {
 
         let attempts: Vec<_> = evts
             .iter()
-            .filter(|e| e["event"] == "index.attempt")
+            .filter(|e| e["event"] == "index.enqueue")
             .collect();
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0]["outcome"], "failed");

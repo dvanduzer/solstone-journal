@@ -158,6 +158,9 @@ fn list_dir(
             error,
         })?;
         let filename = entry.file_name();
+        if filename.to_string_lossy().starts_with('.') {
+            continue;
+        }
         let child_path = if path == Path::new(".") {
             PathBuf::from(&filename)
         } else {
@@ -434,6 +437,9 @@ pub(crate) fn discover_from_root(
                 })?;
         let rel =
             path_to_posix(rel_path).ok_or_else(|| DiscoveryError::NonUtf8Relative(path.clone()))?;
+        if rel.split('/').any(|part| part.starts_with('.')) {
+            continue;
+        }
         files.insert(rel, path);
     }
     Ok(())
@@ -541,6 +547,39 @@ mod tests {
     }
 
     #[test]
+    fn removal_tombstones_are_excluded_from_both_discovery_walks() {
+        let root = temp_root("removal-tombstones");
+        write(&root, "facets/work/entities/alice/observations.jsonl");
+        write(
+            &root,
+            "facets/work/entities/.removing_alice/observations.jsonl",
+        );
+        write(
+            &root,
+            "facets/.removing_work/entities/alice/observations.jsonl",
+        );
+        write(
+            &root,
+            "chronicle/20260101/device/120000_60/talents/screen.md",
+        );
+        write(
+            &root,
+            "chronicle/20260101/device/.removing_120000_60/talents/screen.md",
+        );
+        for found in [
+            discover_indexable_files(&root).unwrap(),
+            discover_index_status_files(&root).unwrap(),
+        ] {
+            assert!(found.contains_key("facets/work/entities/alice/observations.jsonl"));
+            assert!(
+                found.keys().all(|path| !path.contains(".removing_")),
+                "{found:?}"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn discovers_chronicle_free_indexable_rels() {
         let root = temp_root("discover");
         write(&root, "chronicle/20240101/talents/flow.md");
@@ -603,7 +642,6 @@ mod tests {
         assert_eq!(
             rels,
             vec![
-                ".hidden/talents/secret.md",
                 "20240101/default/123456_300/talents/audio.md",
                 "20240101/default/123456_300/talents/documents.json",
                 "20240101/default/123456_300/talents/screen.json",
@@ -762,7 +800,7 @@ mod tests {
         let oracle = discover_indexable_files(&root).expect("oracle");
         let status = discover_index_status_files(&root).expect("status");
         assert_eq!(status, oracle);
-        assert!(status.contains_key(".hidden/talents/secret.md"));
+        assert!(!status.contains_key(".hidden/talents/secret.md"));
         fs::remove_dir_all(root).expect("cleanup");
     }
 

@@ -47,7 +47,6 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use solstone_core_facets::load_activity_records;
 use solstone_core_home::{HomeContext, readers::enabled_facet_names};
-use solstone_core_indexer_store::scan::{RescanFileStatus, rescan_file};
 use solstone_core_journal_io::iter_segments;
 use solstone_core_segment::owner_deleted;
 use solstone_core_transcripts::VoiceNames;
@@ -1218,22 +1217,10 @@ pub(crate) fn write_page_with_sources(
         )
     })?;
 
-    match rescan_file(journal, &md_path) {
-        Ok(RescanFileStatus::Indexed { warnings }) => {
-            for warning in warnings {
-                index_warning(&format!(
-                    "weekly_reflection index warning for {}: {warning}",
-                    md_path.display()
-                ));
-            }
-        }
-        Ok(RescanFileStatus::Declined) => {}
-        Err(err) => {
-            index_warning(&format!(
-                "weekly_reflection index error for {}: {err}",
-                md_path.display()
-            ));
-        }
+    if let Err(error) = solstone_core_indexer_store::todo::enqueue_path(journal, &md_path) {
+        index_warning(&format!(
+            "weekly reflection search update could not be queued: {error}"
+        ));
     }
 
     Ok(())
@@ -3459,6 +3446,12 @@ Weekly prompt
             let stub = sequenced_one_shot_stub(root.path(), &[resp]);
             let generate = OneShotClient::at_path(&stub);
             let mut output = Vec::new();
+            solstone_core_indexer_store::scan::scan_journal(&context.journal, false).unwrap();
+            let lease = solstone_core_journal_io::hold_lock(
+                solstone_core_indexer_store::db::db_path(&context.journal),
+                Default::default(),
+            )
+            .unwrap();
 
             let outcome = execute_request(
                 json!({
@@ -3481,6 +3474,14 @@ Weekly prompt
                 "{outcome:?}"
             );
 
+            assert_eq!(
+                solstone_core_indexer_store::todo::inspect(&context.journal)
+                    .unwrap()
+                    .keys,
+                ["reflections/weekly/20260308.md"]
+            );
+            drop(lease);
+            solstone_core_indexer_store::todo::drain(&context.journal, Default::default()).unwrap();
             let conn = solstone_core_indexer_store::db::open_index(&context.journal).unwrap();
             let mut stmt = conn
                 .prepare("SELECT DISTINCT agent, day FROM chunks WHERE path = 'reflections/weekly/20260308.md'")
@@ -3495,6 +3496,9 @@ Weekly prompt
             assert_eq!(rows[0].0, "reflection");
             assert_eq!(rows[0].1, "20260308");
             assert_eq!(crate::writers::index_warning_count(), 0);
+            let check =
+                solstone_core_indexer_store::scan::scan_journal(&context.journal, false).unwrap();
+            assert_eq!((check.indexed, check.removed), (0, 0));
         }
 
         #[test]

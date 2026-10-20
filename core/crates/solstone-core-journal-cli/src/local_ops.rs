@@ -103,7 +103,60 @@ fn indexer(_args: &[OsString]) -> Outcome {
 
 #[cfg(not(target_os = "ios"))]
 fn indexer(args: &[OsString]) -> Outcome {
-    const HELP: &str = "Usage: solstone journal indexer [--reset] [--rebuild-edges] [--rescan | --rescan-full | --rescan-file PATH] [-q [QUERY]] [--day DAY] [--day-from DAY] [--day-to DAY] [--facet FACET] [--agent AGENT] [--stream STREAM] [--limit N] [--offset N] [--top N]\n       solstone journal indexer status [--json]\n       solstone journal indexer path-lookup [--apply] [--json]\n       solstone journal indexer classifications [--json] [--apply] [--drain]\n";
+    const HELP: &str = "Usage: solstone journal indexer [--reset] [--rebuild-edges] [--rescan | --rescan-full | --rescan-file PATH] [-q [QUERY]] [--day DAY] [--day-from DAY] [--day-to DAY] [--facet FACET] [--agent AGENT] [--stream STREAM] [--limit N] [--offset N] [--top N]\n       solstone journal indexer drain [--force] [--budget-seconds N] [--json]\n       solstone journal indexer status [--json]\n       solstone journal indexer path-lookup [--apply] [--json]\n       solstone journal indexer classifications [--json] [--apply] [--drain]\n";
+
+    if let Some((verb, rest)) = args.split_first()
+        && verb == OsStr::new("drain")
+    {
+        let mut options = solstone_core_indexer_store::todo::DrainOptions::default();
+        let mut json = false;
+        let mut args = rest.iter();
+        while let Some(arg) = args.next() {
+            match arg.to_str() {
+                Some("--force") => options.force = true,
+                Some("--json") => json = true,
+                Some("--budget-seconds") => {
+                    let Some(seconds) = args.next().and_then(|a| a.to_str()).and_then(|a| a.parse::<u64>().ok()).filter(|s| *s > 0) else {
+                        return usage("indexer drain", "--budget-seconds needs a positive number");
+                    };
+                    options.budget = std::time::Duration::from_secs(seconds);
+                }
+                Some("--help" | "-h") => return success("Usage: solstone journal indexer drain [--force] [--budget-seconds N] [--json]\napply queued search updates. --force includes delayed retries.\n".into()),
+                _ => return usage("indexer drain", "unexpected argument"),
+            }
+        }
+        let journal = match journal_root("indexer") {
+            Ok(path) => path,
+            Err(outcome) => return outcome,
+        };
+        return match solstone_core_indexer_store::todo::drain(&journal, options) {
+            Ok(report) => {
+                let text = if json {
+                    format!(
+                        "{}\n",
+                        serde_json::to_string(&report).expect("serialize drain report")
+                    )
+                } else {
+                    format!(
+                        "applied {} search updates; {} failed; {} remain queued.\n",
+                        report.processed,
+                        report.failed,
+                        report.remaining.keys.len()
+                    )
+                };
+                if report.timed_out || report.failed > 0 {
+                    Outcome::LocalFailure {
+                        stdout: text,
+                        stderr: String::new(),
+                        exit: EXIT_IO,
+                    }
+                } else {
+                    success(text)
+                }
+            }
+            Err(error) => failure("indexer drain", &error.to_string(), EXIT_IO),
+        };
+    }
 
     if let Some((verb, rest)) = args.split_first()
         && verb == OsStr::new("status")
@@ -830,9 +883,12 @@ struct LocalScanReindex {
 #[cfg(not(target_os = "ios"))]
 impl FullReindexRequester for LocalScanReindex {
     fn request_full_reindex(&self) -> Result<bool, String> {
-        scan_journal(&self.journal, true)
-            .map(|_| true)
-            .map_err(|error| error.to_string())
+        solstone_core_indexer_store::todo::enqueue_token(
+            &self.journal,
+            solstone_core_indexer_store::todo::Token::ScanFull,
+        )
+        .map(|_| true)
+        .map_err(|error| error.to_string())
     }
 }
 
@@ -1092,16 +1148,9 @@ fn facet_doctor_all(journal: &Path, fix: bool, adopt: bool, merge: bool) -> Outc
     // the doctor too.
     if (fix || adopt) && solstone_core_indexer_store::db::db_path(journal).exists() {
         if retired_readable {
-            match facet_names::reconcile_facet_classifications(journal) {
-                Ok(report) if report.incomplete => failures.push(
-                    "facets kept changing while search was being updated; run again".to_owned(),
-                ),
-                Ok(report) if report.changed > 0 => stdout.push_str(&format!(
-                    "\nUpdated search for {} stored entries so it matches facet names.\n",
-                    report.changed
-                )),
-                Ok(_) => {}
-                Err(error) => failures.push(format!("search could not be updated: {error}")),
+            match facet_names::enqueue_facet_classifications(journal) {
+                Ok(()) => stdout.push_str("\nsearch is catching up with the facet changes.\n"),
+                Err(error) => failures.push(format!("search update could not be queued: {error}")),
             }
         } else {
             stdout.push_str(
@@ -1235,13 +1284,23 @@ fn facet_doctor_orphans(
     if merge {
         #[cfg(not(target_os = "ios"))]
         {
-            let (outcome, committed_merges) = facet_doctor_adopt_merge(&journal, &groups);
+            let (mut outcome, committed_merges) = facet_doctor_adopt_merge(&journal, &groups);
             drop(_lock);
             if committed_merges > 0 {
-                #[cfg(all(test, feature = "full-tests"))]
-                check_doctor_after_trust_seam();
-                if let Err(error) = scan_journal(&journal, true) {
-                    return facet_doctor_index_failure(outcome, &error.to_string());
+                let queued = solstone_core_indexer_store::todo::enqueue_token(
+                    &journal,
+                    solstone_core_indexer_store::todo::Token::ScanFull,
+                )
+                .map_err(|error| error.to_string())
+                .and_then(|()| crate::facet_names::enqueue_facet_classifications(&journal));
+                if let Err(error) = queued {
+                    return facet_doctor_index_failure(outcome, &error);
+                }
+                match &mut outcome {
+                    Outcome::LocalSuccess { stdout, .. } | Outcome::LocalFailure { stdout, .. } => {
+                        stdout.push_str("search is catching up.\n")
+                    }
+                    _ => {}
                 }
             }
             return outcome;
@@ -1273,8 +1332,13 @@ fn facet_doctor_orphans(
         stdout = String::from("No orphan facet was registered.\n");
     } else {
         stdout.push_str(&format!(
-            "{repaired} orphan facet(s) repaired. Run 'solstone journal indexer --rescan-full' to refresh the index.\n"
+            "{repaired} orphan facet(s) repaired. search is catching up.\n"
         ));
+    }
+    if repaired > 0
+        && let Err(error) = crate::facet_names::enqueue_facet_classifications(&journal)
+    {
+        return facet_doctor_index_failure(success(stdout), &error);
     }
     append_orphan_groups_left(&mut stdout, &groups, false);
     if record_failures.is_empty() {
@@ -1563,7 +1627,7 @@ fn facet_doctor_adopt_merge(journal: &Path, groups: &[OrphanGroup]) -> (Outcome,
             stdout.push_str("No orphan facet was registered or merged.\n");
         } else {
             stdout.push_str(&format!(
-                "{repaired} orphan facet(s) repaired. Run 'solstone journal indexer --rescan-full' to refresh the index.\n"
+                "{repaired} orphan facet(s) repaired. search is catching up.\n"
             ));
         }
         return (success(stdout), merged.len());
@@ -1609,7 +1673,7 @@ fn facet_doctor_index_failure(outcome: Outcome, error: &str) -> Outcome {
         _ => unreachable!("facet doctor merge returns a local result"),
     };
     stderr.push_str(&format!(
-        "solstone journal facet doctor: merge committed but index rebuild failed: {error}\n"
+        "solstone journal facet doctor: the repair finished, but its search update could not be queued: {error}\n"
     ));
     Outcome::LocalFailure {
         stdout,
@@ -2210,32 +2274,29 @@ fn facet_merge_transaction_in_journal(
     // guard is gone: the rebuild refreshes the moved files, and the reconcile
     // brings stored classifications for material that still names SOURCE onto
     // DEST. The doctor does not index here.
-    if let Err(error) = scan_journal(journal, true) {
+    if let Err(error) = solstone_core_indexer_store::todo::enqueue_token(
+        journal,
+        solstone_core_indexer_store::todo::Token::ScanFull,
+    ) {
         return Ok(FacetMergeCommit {
             report,
             source_removed,
             post_commit_failure: Some(failure(
                 "facet merge",
-                &format!("merge committed but index rebuild failed: {error}"),
+                &format!("the repair finished, but its search update could not be queued: {error}"),
                 EXIT_FAILED,
             )),
         });
     }
-    let post_commit_failure = match crate::facet_names::reconcile_facet_classifications(journal) {
-        Ok(report) if !report.incomplete => None,
-        Ok(_) => Some(failure(
-            "facet merge",
-            "the merge finished, but facets kept changing while search was being updated; run 'solstone journal facet doctor --fix'",
-            EXIT_FAILED,
-        )),
-        Err(error) => Some(failure(
-            "facet merge",
-            &format!(
-                "the merge finished, but search could not be updated for '{source}': {error}; run 'solstone journal facet doctor --fix'"
-            ),
-            EXIT_FAILED,
-        )),
-    };
+    let post_commit_failure = crate::facet_names::enqueue_facet_classifications(journal)
+        .err()
+        .map(|error| {
+            failure(
+                "facet merge",
+                &format!("the repair finished, but its search update could not be queued: {error}"),
+                EXIT_FAILED,
+            )
+        });
     Ok(FacetMergeCommit {
         report,
         post_commit_failure,
@@ -3813,24 +3874,6 @@ mod archive_merge_source_kind_tests {
 }
 
 #[cfg(all(test, feature = "full-tests"))]
-fn check_doctor_after_trust_seam() {
-    if let (Some(seam_var), Some(pause)) = (
-        std::env::var_os("SOLSTONE_TEST_INDEX_WRITER_SEAM"),
-        std::env::var_os("SOLSTONE_TEST_INDEX_WRITER_PAUSE"),
-    ) && pause.to_string_lossy() == "after-trust"
-    {
-        let seam_dir = std::path::PathBuf::from(seam_var);
-        let _ = std::fs::write(seam_dir.join("trust-released"), b"released");
-        let release_file = seam_dir.join("after-trust.release");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while !release_file.is_file() {
-            assert!(std::time::Instant::now() < deadline, "test seam timeout");
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-    }
-}
-
-#[cfg(all(test, feature = "full-tests"))]
 #[cfg(not(target_os = "ios"))]
 mod tests {
     use super::*;
@@ -3838,46 +3881,6 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    struct DoctorChild {
-        child: std::process::Child,
-        log_path: PathBuf,
-    }
-
-    impl DoctorChild {
-        fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            loop {
-                if let Some(status) = self.child.try_wait()? {
-                    let output = fs::read_to_string(&self.log_path)?;
-                    assert!(status.success(), "doctor child failed: {output}");
-                    assert_eq!(
-                        output
-                            .matches("test result: ok. 1 passed; 0 failed;")
-                            .count(),
-                        1,
-                        "doctor child must execute one test: {output}"
-                    );
-                    assert!(output.contains("test local_ops::tests::facet_doctor_adopt_merge_indexes_only_after_trust_release ... ok"), "selected doctor child test must pass: {output}");
-                    return Ok(status);
-                }
-                if std::time::Instant::now() >= deadline {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "doctor child did not finish",
-                    ));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        }
-    }
-
-    impl Drop for DoctorChild {
-        fn drop(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
 
     #[test]
     fn doctor_index_failure_preserves_repair_report_and_original_failure() {
@@ -3903,9 +3906,9 @@ mod tests {
                 panic!("index failure must be reported")
             };
             assert_eq!(stdout, report);
-            assert!(
-                stderr.ends_with("merge committed but index rebuild failed: index writer busy\n")
-            );
+            assert!(stderr.ends_with(
+                "the repair finished, but its search update could not be queued: index writer busy\n"
+            ));
             if let Some(error) = prior_error {
                 assert!(stderr.starts_with(error));
                 assert_eq!(exit, EXIT_IO);
@@ -3945,174 +3948,43 @@ mod tests {
     }
 
     #[test]
-    fn facet_doctor_adopt_merge_indexes_only_after_trust_release() {
-        let role = std::env::var("SOLSTONE_TEST_CHILD_ROLE").unwrap_or_default();
-        if role == "doctor_child" {
-            let journal = PathBuf::from(std::env::var("SOLSTONE_TEST_JOURNAL").unwrap());
-            let outcome = facet_doctor_orphans(&journal, true, true, &Default::default());
-            if !matches!(outcome, Outcome::LocalSuccess { .. }) {
-                eprintln!("doctor child failed: {outcome:?}");
-                std::process::exit(1);
-            }
-            return;
-        }
-
-        let (journal, seam) = make_test_journal();
+    fn facet_doctor_merge_queues_under_a_held_writer_and_releases_trust() {
+        let (journal, _) = make_test_journal();
         let old_path = "facets/w-ork/activities/20260717.jsonl";
         let new_path = "facets/work/activities/20260717.jsonl";
-        assert!(matches!(
-            solstone_core_indexer_store::scan::rescan_file(&journal, &journal.join(old_path))
-                .unwrap(),
-            solstone_core_indexer_store::scan::RescanFileStatus::Indexed { .. }
-        ));
-        let reference_path = "20260717/default/100000_300/talents/w-ork/brief.md";
-        let reference_file = journal.join("chronicle").join(reference_path);
-        fs::create_dir_all(reference_file.parent().unwrap()).unwrap();
-        fs::write(
-            &reference_file,
-            "# Reference\n\nmaterial naming the merged facet",
-        )
-        .unwrap();
-        assert!(matches!(
-            solstone_core_indexer_store::scan::rescan_file(&journal, &reference_file).unwrap(),
-            solstone_core_indexer_store::scan::RescanFileStatus::Indexed { .. }
-        ));
-        let reader = solstone_core_indexer_store::open_index_reader(&journal).unwrap();
-        let memberships: i64 = reader
-            .query_row(
-                "SELECT COUNT(*) FROM chunk_classification_facets WHERE path=?1",
-                [reference_path],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            memberships, 0,
-            "fixture must have an unresolved facet reference"
-        );
-        drop(reader);
-        let exe = std::env::current_exe().expect("current exe");
-
-        let log_path = seam.join("doctor.child.log");
-        let output = fs::File::create(&log_path).unwrap();
-        let mut child = DoctorChild {
-            child: std::process::Command::new(exe)
-                .arg("--exact")
-                .arg("local_ops::tests::facet_doctor_adopt_merge_indexes_only_after_trust_release")
-                .arg("--nocapture")
-                .env("SOLSTONE_TEST_CHILD_ROLE", "doctor_child")
-                .env("SOLSTONE_TEST_JOURNAL", &journal)
-                .env("SOLSTONE_TEST_INDEX_WRITER_SEAM", &seam)
-                .env("SOLSTONE_TEST_INDEX_WRITER_PAUSE", "after-trust")
-                .stdout(output.try_clone().unwrap())
-                .stderr(output)
-                .spawn()
-                .expect("spawn child doctor process"),
-            log_path,
-        };
-
-        let trust_released_file = seam.join("trust-released");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !trust_released_file.is_file() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timed out waiting for trust-released"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-
-        let scan_admitted_file = seam.join("scan-admitted");
-        assert!(
-            !scan_admitted_file.exists(),
-            "scan must not be admitted yet while child is paused at after-trust"
-        );
-
-        let acquired_lock = hold_facet_trust_lock(&journal);
-        assert!(
-            acquired_lock.is_ok(),
-            "facet trust lock should be available after doctor releases it"
-        );
-        drop(acquired_lock);
-
-        let reconcile_res = crate::facet_names::reconcile_facet_classifications(&journal);
-        let reconciled = reconcile_res.expect("competing reconciliation completed");
-        assert!(!reconciled.incomplete);
-        assert_eq!(
-            reconciled.changed, 1,
-            "reconciliation must update the stale classification"
-        );
-        let reader = solstone_core_indexer_store::open_index_reader(&journal).unwrap();
-        let facet_id: String = reader
-            .query_row(
-                "SELECT facet_id FROM chunk_classification_facets WHERE path=?1",
-                [reference_path],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(facet_id, "22222222-2222-4222-8222-222222222222");
-        drop(reader);
-
-        assert!(
-            !scan_admitted_file.exists(),
-            "scan-admitted must not be created by reconcile"
-        );
-
-        fs::write(seam.join("after-trust.release"), b"go").expect("write release file");
-
-        let status = child.wait().expect("child doctor process finishes");
-        assert!(status.success(), "child doctor process succeeded");
-
-        assert!(
-            scan_admitted_file.exists(),
-            "scan-admitted must exist after doctor finishes index scan"
-        );
-        assert!(
-            !journal.join("facets").join("w-ork").exists(),
-            "w-ork directory must be gone after merge"
-        );
-        assert!(
-            journal
-                .join("facets")
-                .join("work")
-                .join("activities")
-                .join("20260717.jsonl")
-                .exists(),
-            "moved activity must exist in the target facet"
-        );
-
+        solstone_core_indexer_store::scan::rescan_file(&journal, &journal.join(old_path)).unwrap();
         let writer = solstone_core_journal_io::locking::hold_lock(
             solstone_core_indexer_store::db::db_path(&journal),
             solstone_core_journal_io::locking::LockOptions::default(),
         )
         .unwrap();
-        let results = search(
-            &journal,
-            OwnerBoundary,
-            &SearchRequest::new("searchable", Order::Relevance),
-            NaiveDate::from_ymd_opt(2026, 7, 17).unwrap(),
-        )
-        .expect("public owner search remains available while a writer is admitted");
-        assert_eq!(results.results.len(), 1);
-        assert_eq!(results.results[0].metadata.path, new_path);
+        let outcome = facet_doctor_orphans(&journal, true, true, &Default::default());
+        assert!(
+            matches!(outcome, Outcome::LocalSuccess { .. }),
+            "{outcome:?}"
+        );
+        drop(hold_facet_trust_lock(&journal).expect("producer released facet trust"));
+        assert!(!journal.join("facets/w-ork").exists());
+        assert!(journal.join(new_path).exists());
+        let keys = solstone_core_indexer_store::todo::inspect(&journal)
+            .unwrap()
+            .keys;
+        assert!(keys.contains(&"@scan-full".into()));
+        assert!(keys.contains(&"@reclassify".into()));
         drop(writer);
-
+        let report =
+            solstone_core_indexer_store::todo::drain(&journal, Default::default()).unwrap();
+        assert_eq!(report.failed, 0);
         let reader = solstone_core_indexer_store::open_index_reader(&journal).unwrap();
-        let hits: i64 = reader
-            .query_row(
-                "SELECT COUNT(*) FROM chunks WHERE path=?1 AND chunks MATCH 'searchable'",
-                [new_path],
-                |r| r.get(0),
-            )
+        let paths = reader
+            .prepare("SELECT path FROM chunks WHERE chunks MATCH 'searchable'")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(hits, 1, "doctor must finish indexing the moved source");
-        let old_hits: i64 = reader
-            .query_row(
-                "SELECT COUNT(*) FROM chunks WHERE path=?1",
-                [old_path],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(old_hits, 0);
+        assert_eq!(paths, [new_path]);
         drop(reader);
-        let _ = fs::remove_dir_all(journal.parent().unwrap());
+        fs::remove_dir_all(journal.parent().unwrap()).unwrap();
     }
 }

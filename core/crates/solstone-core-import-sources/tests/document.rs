@@ -20,13 +20,13 @@ use solstone_core_generate::{
     ClientError, ContentPart, GenerateRequest, GenerateResponse, GeneratedResponse, RefusalReason,
     RefusedResponse,
 };
+use solstone_core_import::QueueFileOutcome;
 use solstone_core_import::{CreatedSegment, PublicationOperations, observe_source_immutability};
 use solstone_core_import_sources::document::{
     DocumentImportRequest, DocumentModelClient, DocumentPreviewRequest, PdfCommand, PdfMetadata,
     PdfPage, PdfPayload, PdfWorker, PdfWorkerRequest, SystemPdfWorker, WorkerFailure, import,
     prepare_document_import, preview, preview_size,
 };
-use solstone_core_indexer_store::scan::RescanFileStatus;
 use solstone_core_segment::{StreamAdvance, UnboundStreamAdvanceError, advance_unbound_stream};
 
 #[cfg(unix)]
@@ -1448,8 +1448,8 @@ impl PublicationOperations for FakePublication {
             seq: 1,
         })
     }
-    fn rescan_file(&self, _: &Path, _: &Path) -> Result<RescanFileStatus, String> {
-        Ok(RescanFileStatus::Declined)
+    fn enqueue_path(&self, _: &Path, _: &Path) -> Result<QueueFileOutcome, String> {
+        Ok(QueueFileOutcome::Declined)
     }
     fn touch_stream_health_marker(&self, journal: &Path, day: &str) -> Result<(), String> {
         let call = {
@@ -1502,8 +1502,8 @@ impl PublicationOperations for ChainPublication {
             segment.hints.clone(),
         )
     }
-    fn rescan_file(&self, _: &Path, _: &Path) -> Result<RescanFileStatus, String> {
-        Ok(RescanFileStatus::Declined)
+    fn enqueue_path(&self, _: &Path, _: &Path) -> Result<QueueFileOutcome, String> {
+        Ok(QueueFileOutcome::Declined)
     }
     fn touch_stream_health_marker(&self, _: &Path, _: &str) -> Result<(), String> {
         Ok(())

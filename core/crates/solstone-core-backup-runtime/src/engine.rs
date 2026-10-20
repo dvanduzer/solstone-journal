@@ -130,9 +130,11 @@ impl JournalMaintenance for NativeJournalMaintenance {
             .map_err(|_| JournalMaintenanceError)
     }
     fn full_scan(&self, journal: &Path) -> Result<(), JournalMaintenanceError> {
-        solstone_core_indexer_store::scan::scan_journal(journal, true)
-            .map(|_| ())
-            .map_err(|_| JournalMaintenanceError)
+        solstone_core_indexer_store::todo::enqueue_token(
+            journal,
+            solstone_core_indexer_store::todo::Token::ScanFull,
+        )
+        .map_err(|_| JournalMaintenanceError)
     }
 }
 
@@ -4026,6 +4028,45 @@ mod tests {
         }
     }
     struct Maintenance;
+
+    #[test]
+    fn restore_requests_one_scan_without_waiting_for_the_index_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("imports/fixture/summary.md");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(source, "restored kestrel").unwrap();
+        let lease = solstone_core_journal_io::hold_lock(
+            solstone_core_indexer_store::db::db_path(root.path()),
+            Default::default(),
+        )
+        .unwrap();
+        NativeJournalMaintenance.full_scan(root.path()).unwrap();
+        assert_eq!(
+            solstone_core_indexer_store::todo::inspect(root.path())
+                .unwrap()
+                .keys,
+            ["@scan-full"]
+        );
+        assert!(!solstone_core_indexer_store::db::db_path(root.path()).exists());
+        drop(lease);
+        assert_eq!(
+            solstone_core_indexer_store::todo::drain(root.path(), Default::default())
+                .unwrap()
+                .failed,
+            0
+        );
+        let conn = solstone_core_indexer_store::open_index_reader(root.path()).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chunks WHERE chunks MATCH 'kestrel'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(count > 0);
+        let check = solstone_core_indexer_store::scan::scan_journal(root.path(), false).unwrap();
+        assert_eq!((check.indexed, check.removed), (0, 0));
+    }
     impl JournalMaintenance for Maintenance {
         fn rebuild_body_history(&self, _: &Path) -> Result<(), JournalMaintenanceError> {
             Ok(())

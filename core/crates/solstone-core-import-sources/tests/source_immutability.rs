@@ -16,6 +16,7 @@ use image::{ImageBuffer, Rgb};
 use solstone_core_generate::{
     ClientError, GenerateRequest, GenerateResponse, RefusalReason, RefusedResponse,
 };
+use solstone_core_import::QueueFileOutcome;
 use solstone_core_import::{
     CreatedSegment, NativePublicationOperations, PublicationOperations, observe_source_immutability,
 };
@@ -23,7 +24,6 @@ use solstone_core_import_sources::image::{
     DescriptionOutcome, ImageImportError, ProgressUpdate, WireClient, import_image,
 };
 use solstone_core_import_sources::{chatgpt, claude, gemini, ics, obsidian};
-use solstone_core_indexer_store::scan::RescanFileStatus;
 use solstone_core_journal_io::{HealthMarkerKind, HealthMarkerState, read_health_marker};
 use solstone_core_segment::{StreamAdvance, UnboundStreamAdvanceError};
 use support::TempTree;
@@ -421,8 +421,8 @@ impl PublicationOperations for ImagePublication {
         })
     }
 
-    fn rescan_file(&self, _: &Path, _: &Path) -> Result<RescanFileStatus, String> {
-        Ok(RescanFileStatus::Declined)
+    fn enqueue_path(&self, _: &Path, _: &Path) -> Result<QueueFileOutcome, String> {
+        Ok(QueueFileOutcome::Declined)
     }
 
     fn touch_stream_health_marker(&self, journal: &Path, day: &str) -> Result<(), String> {

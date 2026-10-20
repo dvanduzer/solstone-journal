@@ -1075,17 +1075,9 @@ mod tests {
     struct IndexRecorder(Mutex<Vec<std::path::PathBuf>>);
 
     impl context::IndexBoundary for IndexRecorder {
-        fn rescan_file(
-            &self,
-            _: &Path,
-            path: &Path,
-        ) -> Result<solstone_core_indexer_store::scan::RescanFileStatus, String> {
+        fn enqueue_path(&self, _: &Path, path: &Path) -> Result<(), String> {
             self.0.lock().unwrap().push(path.to_path_buf());
-            Ok(
-                solstone_core_indexer_store::scan::RescanFileStatus::Indexed {
-                    warnings: Vec::new(),
-                },
-            )
+            Ok(())
         }
     }
 
@@ -1942,11 +1934,7 @@ mod tests {
         }
         struct IdleIndex;
         impl context::IndexBoundary for IdleIndex {
-            fn rescan_file(
-                &self,
-                _: &Path,
-                _: &Path,
-            ) -> Result<solstone_core_indexer_store::scan::RescanFileStatus, String> {
+            fn enqueue_path(&self, _: &Path, _: &Path) -> Result<(), String> {
                 Err("unavailable".into())
             }
         }
@@ -7053,15 +7041,11 @@ mod tests {
     fn historical_repair_retries_saved_search_publication_without_another_model_call() {
         struct RecoveringIndex(std::sync::atomic::AtomicBool);
         impl context::IndexBoundary for RecoveringIndex {
-            fn rescan_file(
-                &self,
-                root: &Path,
-                path: &Path,
-            ) -> Result<solstone_core_indexer_store::scan::RescanFileStatus, String> {
+            fn enqueue_path(&self, root: &Path, path: &Path) -> Result<(), String> {
                 if self.0.load(std::sync::atomic::Ordering::Acquire) {
                     return Err("fixture publication failure".into());
                 }
-                solstone_core_indexer_store::scan::rescan_file(root, path)
+                solstone_core_indexer_store::todo::enqueue_path(root, path)
                     .map_err(|e| e.to_string())
             }
         }
@@ -7110,6 +7094,7 @@ mod tests {
         .unwrap();
         assert_eq!(retry.failed, 0);
         assert_eq!(recorder.requests.lock().unwrap().len(), calls);
+        solstone_core_indexer_store::todo::drain(journal.path(), Default::default()).unwrap();
         let db = solstone_core_indexer_store::db::open_index_reader(journal.path()).unwrap();
         let found: i64 = db
             .query_row(

@@ -206,6 +206,7 @@ pub(crate) struct SupervisorState {
     pub daily: DailyState,
     /// Last read of when each stream's activities next need a settle check.
     pub last_activity_settle_scan: Instant,
+    pub last_index_todo_scan: Option<Instant>,
     /// Last sweep for analysis scratch a killed process left behind; `None` until
     /// the first tick, so a boot sweeps at once.
     pub last_scratch_sweep: Option<Instant>,
@@ -2098,6 +2099,7 @@ pub(crate) async fn boot_and_tick(
             last_day: Some(wall.date_naive()),
         },
         last_activity_settle_scan: Instant::now() - Duration::from_secs(60),
+        last_index_todo_scan: None,
         last_scratch_sweep: None,
         wedge: WedgeState::default(),
         timing: SupervisorTiming::for_app_fixture(fast_fixture_timing),

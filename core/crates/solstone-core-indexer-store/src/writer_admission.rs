@@ -6,6 +6,7 @@
 //! Production admission topology and lock ordering:
 //!
 //! Admit (acquires index writer lease):
+//! - `drain` (todo, once per bounded batch)
 //! - `scan_journal` (scan)
 //! - `rescan_file` (rescan-file)
 //! - `reset_index` (reset)
@@ -22,17 +23,11 @@
 //! - `remove_legacy_index_artifacts` (remove-legacy-index)
 //!
 //! Inside those callers, no second lease:
-//! - journal-cli indexer verbs and `LocalScanReindex::request_full_reindex`
-//! - owner `facet_merge_transaction_in_journal` scan+reconcile
-//! - doctor `scan_journal` after the outer trust guard drops
-//! - `solstone-core` indexer maintenance/classifications/path-lookup/prune/fold/fingerprint verbs
-//! - talent `attempt_saved_publication`, `append_day_record_with_sources`, weekly reflection rescan, daily execution while `DailyUnitAuthority` is held
-//! - think `write_sense_and_change` / `NativeIndexBoundary` while `segment_turn` is held
-//! - import `NativePublicationOperations::rescan_file` and `finish_import_attempt_with` while `imports/<id>.lock` is held
-//! - backup `NativeJournalMaintenance::full_scan`
-//! - segment move prune+rescan
-//! - retention `RetentionIndex::paths_removed` via `notify_index` (transcripts delete, strava delete while `imports/.strava` is held, `release_misplaced_strava_pieces`)
-//! - facets store saved activity and detection day files (`publish_saved`), after this thread's outermost entity trust guard drops (`after_entity_trust_released`)
+//! - explicit indexer commands and the mobile index host
+//! - the durable to-do drain, one admission per bounded batch
+//!
+//! Producers only publish hints through `solstone-core-indexer-todo` and never
+//! acquire this lease. Domain/trust locks are released before a drain reads them.
 //!
 //! Read-only, no lease:
 //! - `open_index_reader`
@@ -59,7 +54,9 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use solstone_core_journal_io::errors::LockError;
-use solstone_core_journal_io::locking::{FileLock, LockOptions, hold_lock};
+#[cfg(all(test, feature = "full-tests"))]
+use solstone_core_journal_io::locking::hold_lock;
+use solstone_core_journal_io::locking::{FileLock, LockOptions, hold_lock_checked};
 
 use crate::StoreError;
 use crate::db::db_path;
@@ -81,10 +78,31 @@ impl IndexAdmission {
         operation: &'static str,
         checkpoint: &dyn Fn() -> Result<(), String>,
     ) -> Result<Self, StoreError> {
+        Self::acquire_bounded(
+            journal,
+            operation,
+            LockOptions::default().timeout,
+            checkpoint,
+        )
+    }
+
+    pub(crate) fn acquire_bounded(
+        journal: &Path,
+        operation: &'static str,
+        timeout: Duration,
+        checkpoint: &dyn Fn() -> Result<(), String>,
+    ) -> Result<Self, StoreError> {
         crate::db::admit_scan_journal(checkpoint)?;
         let started = Instant::now();
         let target_path = db_path(journal);
-        match hold_lock(&target_path, LockOptions::default()) {
+        match hold_lock_checked(
+            &target_path,
+            LockOptions {
+                timeout,
+                ..LockOptions::default()
+            },
+            checkpoint,
+        ) {
             Ok(lock) => {
                 let wait = started.elapsed();
                 // The lease is held: refuse a newer generation, and record this

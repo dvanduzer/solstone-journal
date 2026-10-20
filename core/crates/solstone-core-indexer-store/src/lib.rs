@@ -13,6 +13,7 @@ pub mod reconcile;
 pub mod retention;
 pub mod scan;
 pub mod status;
+pub mod todo;
 pub(crate) mod writer_admission;
 
 pub use chunk_sources::{PathLookupStatus, apply_path_lookup, inspect_path_lookup};

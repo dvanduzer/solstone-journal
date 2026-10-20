@@ -1656,12 +1656,12 @@ mod tests {
             );
         }
 
-        fn rescan_file(
+        fn enqueue_path(
             &self,
             _journal: &Path,
             _path: &Path,
-        ) -> Result<solstone_core_import::publish::RescanFileStatus, String> {
-            Ok(solstone_core_import::publish::RescanFileStatus::Declined)
+        ) -> Result<solstone_core_import::publish::QueueFileOutcome, String> {
+            Ok(solstone_core_import::publish::QueueFileOutcome::Declined)
         }
 
         fn touch_stream_health_marker(&self, _journal: &Path, day: &str) -> Result<(), String> {

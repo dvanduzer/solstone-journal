@@ -4782,13 +4782,7 @@ mod tests {
             root.path(),
             &selected,
             input,
-            |_, _| {
-                Ok(
-                    solstone_core_indexer_store::scan::RescanFileStatus::Indexed {
-                        warnings: Vec::new(),
-                    },
-                )
-            },
+            |_, _| Ok(()),
         )
         .unwrap();
         let intent = work_intent::register(root.path(), day, false).unwrap();
@@ -5049,11 +5043,7 @@ mod tests {
             .join("notes/120000_60");
         let input = solstone_core_system_health::newest_segment_input_ms(&target).unwrap();
         solstone_core_system::segment_publication::publish(root.path(), &target, input, |_, _| {
-            Ok(
-                solstone_core_indexer_store::scan::RescanFileStatus::Indexed {
-                    warnings: Vec::new(),
-                },
-            )
+            Ok(())
         })
         .unwrap();
         assert!(
@@ -5089,13 +5079,7 @@ mod tests {
             root.path(),
             &same_key,
             input,
-            |_, _| {
-                Ok(
-                    solstone_core_indexer_store::scan::RescanFileStatus::Indexed {
-                        warnings: Vec::new(),
-                    },
-                )
-            },
+            |_, _| Ok(()),
         )
         .unwrap();
         assert!(

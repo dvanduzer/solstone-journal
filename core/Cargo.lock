@@ -5072,9 +5072,11 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "solstone-core-entity-matching",
+ "solstone-core-indexer-todo",
  "solstone-core-journal-config",
  "solstone-core-journal-io",
  "solstone-core-npy",
+ "tempfile",
  "unicode-normalization",
  "zip",
 ]
@@ -5473,15 +5475,30 @@ dependencies = [
 name = "solstone-core-indexer-store"
 version = "2.0.52"
 dependencies = [
+ "chrono",
  "log",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
+ "solstone-core-entity",
  "solstone-core-format",
  "solstone-core-indexer",
+ "solstone-core-indexer-todo",
  "solstone-core-journal-io",
  "solstone-core-memory-original",
  "solstone-core-retention",
+]
+
+[[package]]
+name = "solstone-core-indexer-todo"
+version = "2.0.52"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "solstone-core-format",
+ "solstone-core-journal-io",
 ]
 
 [[package]]
@@ -5496,8 +5513,10 @@ dependencies = [
  "sha2 0.10.9",
  "solstone-core-callosum",
  "solstone-core-convey-http",
+ "solstone-core-format",
  "solstone-core-indexer-query",
  "solstone-core-indexer-store",
+ "solstone-core-indexer-todo",
  "solstone-core-ingest-contract",
  "solstone-core-ingest-resolve",
  "solstone-core-journal-io",
@@ -5793,6 +5812,8 @@ dependencies = [
  "solstone-core-backup",
  "solstone-core-backup-runtime",
  "solstone-core-brain",
+ "solstone-core-indexer-store",
+ "solstone-core-indexer-todo",
  "solstone-core-installed-payload",
  "solstone-core-journal-config",
  "solstone-core-journal-io",
@@ -6077,7 +6098,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "solstone-core-format",
  "solstone-core-import-web",
+ "solstone-core-indexer-todo",
  "solstone-core-journal",
  "solstone-core-journal-io",
  "solstone-core-sol-link",

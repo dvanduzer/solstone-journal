@@ -373,14 +373,66 @@ fn notify_note(journal: &Path, coordinate: &Coordinate) {
         .join(&coordinate.stream)
         .join(&coordinate.segment)
         .join("note.txt");
+    if solstone_core_indexer_store::todo::enqueue_path(journal, &file).is_err() {
+        log::warn!("memory search update could not be queued");
+    }
     for event in [
-        json!({"tract":"supervisor", "event":"request", "cmd":["journal", "indexer", "--rescan-file", file], "ref":format!("memory-index-{}-{}", coordinate.day, coordinate.segment)}),
         json!({"tract":"observe", "event":"observed", "day":coordinate.day, "stream":coordinate.stream, "segment":coordinate.segment}),
     ] {
         if let Ok(line) = serde_json::to_string(&event) {
             let _ = sender.send_line(&format!("{line}\n"));
         }
     }
+}
+
+#[cfg(all(test, feature = "full-tests"))]
+#[test]
+fn memory_publication_queues_under_a_held_index_writer() {
+    let root = tempfile::Builder::new()
+        .prefix("memory-search-")
+        .tempdir_in(crate::test_scratch())
+        .unwrap();
+    let lease = solstone_core_journal_io::hold_lock(
+        solstone_core_indexer_store::db::db_path(root.path()),
+        Default::default(),
+    )
+    .unwrap();
+    let prepared = prepare_connection_memory(
+        root.path(),
+        AuthenticatedMemorySource {
+            verified_id: "bearer:fixture",
+            creation_label: "test connection",
+        },
+        "kestrel memory publication",
+        "operation-1",
+        Utc::now(),
+    )
+    .unwrap();
+    let AppendResult::Stored(receipt) = prepared.result else {
+        panic!("stored memory")
+    };
+    notify_note(root.path(), &receipt.coordinate);
+    assert_eq!(
+        solstone_core_indexer_store::todo::inspect(root.path())
+            .unwrap()
+            .keys,
+        [note_path(&receipt.coordinate)]
+    );
+    assert!(!solstone_core_indexer_store::db::db_path(root.path()).exists());
+    drop(lease);
+    let report = solstone_core_indexer_store::todo::drain(root.path(), Default::default()).unwrap();
+    assert_eq!((report.processed, report.failed), (1, 0));
+    let conn = solstone_core_indexer_store::open_index_reader(root.path()).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM chunks WHERE path=?1 AND chunks MATCH 'kestrel'",
+            [note_path(&receipt.coordinate)],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(count > 0);
+    let check = solstone_core_indexer_store::scan::scan_journal(root.path(), false).unwrap();
+    assert_eq!((check.indexed, check.removed), (0, 0));
 }
 
 fn recall_response(

@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
-//! Retention's index-notify boundary, implemented over this crate's prune.
+//! Retention's index-notify boundary, implemented over the durable to-do list.
 
 use std::path::Path;
 
 use solstone_core_retention::notify::{IndexNotify, NotifyError, PruneCounts};
 use solstone_core_retention::receipt::RemovedPath;
 
-use crate::db::prune_by_paths;
+use crate::todo::enqueue_path;
 
 /// The search index, as retention's removal door addresses it.
 pub struct RetentionIndex<'a> {
@@ -23,16 +23,13 @@ impl<'a> RetentionIndex<'a> {
 
 impl IndexNotify for RetentionIndex<'_> {
     fn paths_removed(&self, removed: &[RemovedPath]) -> Result<PruneCounts, NotifyError> {
-        let rels: Vec<&str> = removed.iter().map(RemovedPath::as_str).collect();
-        match prune_by_paths(self.journal, &rels) {
-            Ok(Some(counts)) => Ok(PruneCounts {
-                chunks: counts.chunks,
-                files: counts.files,
-            }),
-            Ok(None) => Ok(PruneCounts::default()),
-            Err(error) => Err(NotifyError {
-                reason: format!("the search index could not be updated: {error}"),
-            }),
+        for removed in removed {
+            enqueue_path(self.journal, Path::new(removed.as_str())).map_err(|error| {
+                NotifyError {
+                    reason: format!("the search update could not be queued: {error}"),
+                }
+            })?;
         }
+        Ok(PruneCounts::default())
     }
 }

@@ -10,8 +10,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-pub use solstone_core_indexer_store::scan::RescanFileStatus;
-use solstone_core_indexer_store::scan::rescan_file;
 use solstone_core_journal_io::{AtomicWriteError, JsonWriteOptions, write_json};
 use solstone_core_segment::{
     SegmentError, StreamAdvance, StreamHints, UnboundStreamAdvanceError, advance_unbound_stream,
@@ -116,7 +114,7 @@ pub struct SegmentPublicationOutcome {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct IndexedFile {
+pub struct QueuedFile {
     pub path: PathBuf,
     pub warnings: Vec<String>,
 }
@@ -129,7 +127,8 @@ pub struct IndexedFileError {
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct IndexPublicationOutcomes {
-    pub published: Vec<IndexedFile>,
+    #[serde(default, alias = "published")]
+    pub queued: Vec<QueuedFile>,
     pub declined: Vec<PathBuf>,
     pub errored: Vec<IndexedFileError>,
 }
@@ -166,6 +165,12 @@ fn is_path_under_segment(path: &Path, day: &str, stream: &str, segment: &str) ->
         .any(|w| w == ["chronicle", day, stream, segment])
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueueFileOutcome {
+    Queued,
+    Declined,
+}
+
 /// Injectable publication side effects. Real and fake implementations share one seam.
 pub trait PublicationOperations {
     fn advance_stream(
@@ -173,7 +178,7 @@ pub trait PublicationOperations {
         journal: &Path,
         segment: &CreatedSegment,
     ) -> Result<StreamAdvance, UnboundStreamAdvanceError>;
-    fn rescan_file(&self, journal: &Path, path: &Path) -> Result<RescanFileStatus, String>;
+    fn enqueue_path(&self, journal: &Path, path: &Path) -> Result<QueueFileOutcome, String>;
     fn touch_stream_health_marker(&self, journal: &Path, day: &str) -> Result<(), String>;
     fn emit_observed(
         &self,
@@ -212,8 +217,13 @@ impl PublicationOperations for NativePublicationOperations {
         )
     }
 
-    fn rescan_file(&self, journal: &Path, path: &Path) -> Result<RescanFileStatus, String> {
-        rescan_file(journal, path).map_err(|error| error.to_string())
+    fn enqueue_path(&self, journal: &Path, path: &Path) -> Result<QueueFileOutcome, String> {
+        if !solstone_core_indexer_store::scan::publication_path_is_indexable(journal, path) {
+            return Ok(QueueFileOutcome::Declined);
+        }
+        solstone_core_indexer_store::todo::enqueue_path(journal, path)
+            .map(|()| QueueFileOutcome::Queued)
+            .map_err(|error| error.to_string())
     }
 
     fn touch_stream_health_marker(&self, journal: &Path, day: &str) -> Result<(), String> {
@@ -321,14 +331,14 @@ pub fn publish_with_operations(
         if under_deleted {
             continue;
         }
-        match operations.rescan_file(input.journal, path) {
-            Ok(RescanFileStatus::Indexed { warnings }) => {
-                indexing.published.push(IndexedFile {
+        match operations.enqueue_path(input.journal, path) {
+            Ok(QueueFileOutcome::Queued) => {
+                indexing.queued.push(QueuedFile {
                     path: path.clone(),
-                    warnings,
+                    warnings: Vec::new(),
                 });
             }
-            Ok(RescanFileStatus::Declined) => indexing.declined.push(path.clone()),
+            Ok(QueueFileOutcome::Declined) => indexing.declined.push(path.clone()),
             Err(error) => indexing.errored.push(IndexedFileError {
                 path: path.clone(),
                 error,
@@ -478,8 +488,8 @@ mod tests {
     struct FakeOperations {
         durable_scope: Option<PathBuf>,
         advances: RefCell<Vec<Result<StreamAdvance, UnboundStreamAdvanceError>>>,
-        rescans: RefCell<Vec<Result<RescanFileStatus, String>>>,
-        rescans_seen: RefCell<Vec<PathBuf>>,
+        enqueues: RefCell<Vec<Result<QueueFileOutcome, String>>>,
+        enqueues_seen: RefCell<Vec<PathBuf>>,
         markers: RefCell<Vec<String>>,
         observed: RefCell<Vec<(String, String, String)>>,
         enrichment: RefCell<Vec<(Vec<String>, u64)>>,
@@ -504,9 +514,9 @@ mod tests {
             self.advances.borrow_mut().remove(0)
         }
 
-        fn rescan_file(&self, _: &Path, path: &Path) -> Result<RescanFileStatus, String> {
-            self.rescans_seen.borrow_mut().push(path.to_path_buf());
-            self.rescans.borrow_mut().remove(0)
+        fn enqueue_path(&self, _: &Path, path: &Path) -> Result<QueueFileOutcome, String> {
+            self.enqueues_seen.borrow_mut().push(path.to_path_buf());
+            self.enqueues.borrow_mut().remove(0)
         }
 
         fn touch_stream_health_marker(&self, _: &Path, day: &str) -> Result<(), String> {
@@ -639,18 +649,18 @@ mod tests {
         ];
         let fake = FakeOperations {
             advances: RefCell::new(vec![advance(1)]),
-            rescans: RefCell::new(vec![
-                Ok(RescanFileStatus::Indexed { warnings: vec![] }),
-                Ok(RescanFileStatus::Declined),
+            enqueues: RefCell::new(vec![
+                Ok(QueueFileOutcome::Queued),
+                Ok(QueueFileOutcome::Declined),
                 Err("index broke".to_owned()),
-                Ok(RescanFileStatus::Indexed { warnings: vec![] }),
+                Ok(QueueFileOutcome::Queued),
             ]),
             ..FakeOperations::default()
         };
         let record =
             publish_with_operations(input(temporary.path(), None, &segments, &files), &fake)
                 .unwrap();
-        assert_eq!(record.indexing.published.len(), 2);
+        assert_eq!(record.indexing.queued.len(), 2);
         assert_eq!(
             record.indexing.declined,
             vec![PathBuf::from("declined.raw")]
@@ -675,7 +685,7 @@ mod tests {
         let files = vec![PathBuf::from("stream-name-two-levels-up/file.jsonl")];
         let fake = FakeOperations {
             advances: RefCell::new(vec![advance(1), advance(2), advance(3), advance(4)]),
-            rescans: RefCell::new(vec![Ok(RescanFileStatus::Indexed { warnings: vec![] })]),
+            enqueues: RefCell::new(vec![Ok(QueueFileOutcome::Queued)]),
             ..FakeOperations::default()
         };
         publish_with_operations(input(temporary.path(), None, &segments, &files), &fake).unwrap();
@@ -712,8 +722,8 @@ mod tests {
         let fake = FakeOperations {
             durable_scope: Some(import_dir.clone()),
             advances: RefCell::new(vec![advance(1)]),
-            rescans: RefCell::new(vec![
-                Ok(RescanFileStatus::Declined),
+            enqueues: RefCell::new(vec![
+                Ok(QueueFileOutcome::Declined),
                 Err("bad index".to_owned()),
             ]),
             ..FakeOperations::default()
@@ -783,13 +793,13 @@ mod tests {
         let files = vec![PathBuf::from("one.jsonl")];
         let fake = FakeOperations {
             advances: RefCell::new(vec![advance(1)]),
-            rescans: RefCell::new(vec![Ok(RescanFileStatus::Indexed { warnings: vec![] })]),
+            enqueues: RefCell::new(vec![Ok(QueueFileOutcome::Queued)]),
             ..FakeOperations::default()
         };
         let record =
             publish_with_operations(input(temporary.path(), None, &segments, &files), &fake)
                 .unwrap();
-        assert_eq!(record.indexing.published.len(), 1);
+        assert_eq!(record.indexing.queued.len(), 1);
         assert!(record.indexing.declined.is_empty());
         assert!(record.indexing.errored.is_empty());
         assert_eq!(record.status, PublicationStatus::Success);
@@ -822,14 +832,30 @@ mod tests {
         let before = fingerprint_edge_rows(root).unwrap();
         let files = vec![source];
 
+        let lease = solstone_core_journal_io::hold_lock(
+            solstone_core_indexer_store::db::db_path(root),
+            Default::default(),
+        )
+        .unwrap();
         let first = publish(input(root, None, &[], &files)).unwrap();
-        assert_eq!(first.indexing.published.len(), 1);
+        assert_eq!(first.indexing.queued.len(), 1);
+        assert_eq!(
+            solstone_core_indexer_store::todo::inspect(root)
+                .unwrap()
+                .keys,
+            ["facets/work/entities/20260304.jsonl"]
+        );
+        drop(lease);
+        solstone_core_indexer_store::todo::drain(root, Default::default()).unwrap();
         let after_first = fingerprint_edge_rows(root).unwrap();
         assert_ne!(after_first, before);
 
         let second = publish(input(root, None, &[], &files)).unwrap();
-        assert_eq!(second.indexing.published.len(), 1);
+        assert_eq!(second.indexing.queued.len(), 1);
+        solstone_core_indexer_store::todo::drain(root, Default::default()).unwrap();
         assert_eq!(fingerprint_edge_rows(root).unwrap(), after_first);
+        let check = solstone_core_indexer_store::scan::scan_journal(root, false).unwrap();
+        assert_eq!((check.indexed, check.removed), (0, 0));
     }
 
     #[test]
@@ -875,7 +901,7 @@ mod tests {
             ));
             let fake = FakeOperations {
                 advances: RefCell::new(vec![advance(1)]),
-                rescans: RefCell::new(vec![Ok(RescanFileStatus::Indexed { warnings: vec![] })]),
+                enqueues: RefCell::new(vec![Ok(QueueFileOutcome::Queued)]),
                 ..FakeOperations::default()
             };
             let record = publish_with_operations(
@@ -904,7 +930,7 @@ mod tests {
             .join("chronicle/20260728/import.strava/120000_60/workout.json");
         let fake = FakeOperations {
             advances: RefCell::new(vec![advance(1)]),
-            rescans: RefCell::new(vec![Ok(RescanFileStatus::Indexed { warnings: vec![] })]),
+            enqueues: RefCell::new(vec![Ok(QueueFileOutcome::Queued)]),
             ..FakeOperations::default()
         };
         let record = publish_with_operations(
@@ -917,7 +943,7 @@ mod tests {
             record.segments[0].outcome,
             SegmentBindingOutcome::Bound { .. }
         ));
-        assert_eq!(*fake.rescans_seen.borrow(), vec![file]);
+        assert_eq!(*fake.enqueues_seen.borrow(), vec![file]);
         assert_eq!(fake.observed.borrow().len(), 1);
         assert_eq!(record.day_markers.len(), 1);
         assert_eq!(*fake.drains.borrow(), vec!["20260728".to_owned()]);
@@ -953,7 +979,7 @@ mod tests {
         let record = publish(input(temporary.path(), None, &[s], &files)).unwrap();
         assert_eq!(record.status, PublicationStatus::Success);
         assert_eq!(record.indexing.declined, vec![file_path]);
-        assert!(record.indexing.published.is_empty());
+        assert!(record.indexing.queued.is_empty());
         assert_eq!(record.day_markers.len(), 1);
     }
 
@@ -978,7 +1004,7 @@ mod tests {
                 )),
                 advance(2),
             ]),
-            rescans: RefCell::new(vec![Ok(RescanFileStatus::Indexed { warnings: vec![] })]),
+            enqueues: RefCell::new(vec![Ok(QueueFileOutcome::Queued)]),
             ..FakeOperations::default()
         };
         let record =
@@ -993,7 +1019,7 @@ mod tests {
             record.segments[1].outcome,
             SegmentBindingOutcome::Bound { .. }
         ));
-        assert_eq!(*fake.rescans_seen.borrow(), vec![file2]);
+        assert_eq!(*fake.enqueues_seen.borrow(), vec![file2]);
         assert_eq!(fake.observed.borrow().len(), 1);
         assert_eq!(
             *fake.enrichment.borrow(),

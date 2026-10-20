@@ -10,6 +10,10 @@ pub mod windows_crosscheck;
 pub mod windows_package;
 pub mod windows_suite;
 
+#[cfg(all(test, feature = "full-tests"))]
+#[path = "contracts/single_index_writer.rs"]
+mod single_index_writer;
+
 #[cfg(test)]
 #[path = "contracts/device_migration_contract.rs"]
 mod device_migration_contract;

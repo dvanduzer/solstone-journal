@@ -33,9 +33,12 @@ fn fix_for(failure: IndexFailure) -> Option<&'static str> {
         IndexFailure::ClassificationStalled => {
             Some("run solstone journal indexer --rescan and check its warnings")
         }
-        IndexFailure::FailedFiles => {
-            Some("run solstone journal indexer --rescan and check its warnings")
-        }
+        IndexFailure::FailedFiles => Some(
+            "search retries these updates at its daily check; run solstone journal indexer status for details",
+        ),
+        IndexFailure::FailedDeletions => Some(
+            "search keeps retrying these removals; run solstone journal indexer status for details",
+        ),
         IndexFailure::Unreadable => Some(
             "run solstone journal indexer status for details; if it persists, run solstone journal indexer --reset --rescan-full",
         ),

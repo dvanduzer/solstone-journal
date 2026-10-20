@@ -5,24 +5,10 @@ use std::path::Path;
 
 use solstone_core_indexer_store::{SavedPublicationOutcome, attempt_saved_publication};
 
-/// Bring a saved facet day file into search now, not at the next daily scan.
-///
-/// The index writer lease is taken before entity and facet trust, and trust
-/// locks are reentrant, so a caller may still hold trust here. The update then
-/// waits until this thread's outermost trust guard drops, and a file written
-/// several times under one guard is indexed once. A failed update leaves the
-/// file to the daily scan.
+/// Queue a saved facet file. No index lease or entity trust is needed.
 pub(super) fn publish_saved(journal_root: &Path, saved: &Path) {
-    let journal = journal_root.to_path_buf();
-    let path = saved.to_path_buf();
-    solstone_core_entity::after_entity_trust_released(journal_root, saved, move || {
-        publish_now(&journal, &path);
-    });
-}
-
-fn publish_now(journal_root: &Path, saved: &Path) {
     let attempt = attempt_saved_publication(journal_root, saved, |journal, path| {
-        solstone_core_indexer_store::scan::rescan_file(journal, path).map_err(|e| e.to_string())
+        solstone_core_indexer_store::todo::enqueue_path(journal, path).map_err(|e| e.to_string())
     });
     if attempt.outcome == SavedPublicationOutcome::Failed {
         log::warn!(
@@ -58,7 +44,7 @@ mod tests {
     }
 
     #[test]
-    fn a_saved_activity_record_is_searchable_at_once() {
+    fn a_saved_activity_record_is_searchable_after_a_drain() {
         let root = tempfile::tempdir().unwrap();
         create_facet(root.path(), "work", "Work", "", "", "", None).unwrap();
         let appended = append_activity_record(
@@ -69,6 +55,11 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(appended, AppendOutcome::Written(_)));
+        let report =
+            solstone_core_indexer_store::todo::drain(root.path(), Default::default()).unwrap();
+        assert_eq!(report.failed, 0);
+        let check = solstone_core_indexer_store::scan::scan_journal(root.path(), false).unwrap();
+        assert_eq!((check.indexed, check.removed), (0, 0));
         assert!(searchable(
             root.path(),
             "facets/work/activities/20260510.jsonl",
@@ -77,7 +68,7 @@ mod tests {
     }
 
     #[test]
-    fn an_anticipated_batch_is_searchable_once_its_retry_succeeds() {
+    fn an_anticipated_batch_queues_its_retry_for_search() {
         let root = tempfile::tempdir().unwrap();
         create_facet(root.path(), "work", "Work", "", "", "", None).unwrap();
         let batch = prepare_anticipation_batch(
@@ -106,6 +97,11 @@ mod tests {
         let trust = crate::hold_facet_trust_lock(root.path()).unwrap();
         publish_anticipation_batch(root.path(), &batch, true, || Ok(())).unwrap();
         drop(trust);
+        let report =
+            solstone_core_indexer_store::todo::drain(root.path(), Default::default()).unwrap();
+        assert_eq!(report.failed, 0);
+        let check = solstone_core_indexer_store::scan::scan_journal(root.path(), false).unwrap();
+        assert_eq!((check.indexed, check.removed), (0, 0));
         assert!(searchable(
             root.path(),
             "facets/work/activities/20260920.jsonl",
@@ -152,6 +148,11 @@ mod tests {
         // The scan finishes, then the caller's guard drops: the update runs.
         drop(lease);
         drop(trust);
+        let report =
+            solstone_core_indexer_store::todo::drain(root.path(), Default::default()).unwrap();
+        assert_eq!(report.failed, 0);
+        let check = solstone_core_indexer_store::scan::scan_journal(root.path(), false).unwrap();
+        assert_eq!((check.indexed, check.removed), (0, 0));
         assert!(searchable(root.path(), path, "Heron retro"));
     }
 
@@ -200,6 +201,11 @@ mod tests {
         drop(trust);
         reconcile.join().unwrap();
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let report =
+            solstone_core_indexer_store::todo::drain(root.path(), Default::default()).unwrap();
+        assert_eq!(report.failed, 0);
+        let check = solstone_core_indexer_store::scan::scan_journal(root.path(), false).unwrap();
+        assert_eq!((check.indexed, check.removed), (0, 0));
         assert!(searchable(
             root.path(),
             "facets/work/activities/20260510.jsonl",
@@ -208,7 +214,7 @@ mod tests {
     }
 
     #[test]
-    fn a_saved_entity_detection_is_searchable_at_once() {
+    fn a_saved_entity_detection_is_searchable_after_a_drain() {
         let root = tempfile::tempdir().unwrap();
         create_facet(root.path(), "work", "Work", "", "", "", None).unwrap();
         save_detected_entity(
@@ -220,6 +226,11 @@ mod tests {
             "Joined the launch call.",
         )
         .unwrap();
+        let report =
+            solstone_core_indexer_store::todo::drain(root.path(), Default::default()).unwrap();
+        assert_eq!(report.failed, 0);
+        let check = solstone_core_indexer_store::scan::scan_journal(root.path(), false).unwrap();
+        assert_eq!((check.indexed, check.removed), (0, 0));
         assert!(searchable(
             root.path(),
             "facets/work/entities/20260510.jsonl",

@@ -596,10 +596,10 @@ fn publish(
                 &context.journal,
                 &full,
                 |j, p| {
-                    solstone_core_indexer_store::scan::rescan_file(j, p).map_err(|e| e.to_string())
+                    solstone_core_indexer_store::todo::enqueue_path(j, p).map_err(|e| e.to_string())
                 },
             );
-            crate::emit_index_attempt(writer, &attempt);
+            crate::emit_index_enqueue(writer, &attempt);
         }
         Some(!changed_paths.is_empty())
     } else {
@@ -718,6 +718,13 @@ mod tests {
             }
             let stage = (mode != "later_action").then_some((&FAILING_OVERRIDE, PrePostState::None));
             let mut events = Vec::new();
+            let lease = (mode != "override_index_error").then(|| {
+                solstone_core_journal_io::hold_lock(
+                    solstone_core_indexer_store::db::db_path(&context.journal),
+                    Default::default(),
+                )
+                .unwrap()
+            });
             with_daily_unit_authority(&context.journal, &identity, |authority| {
                 let mut record = DailyUnitRecord::new(identity.clone(), "E", "C");
                 record.lock_token = Some("attempt".into());
@@ -749,6 +756,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+            drop(lease);
             assert_eq!(
                 fs::read_to_string(&path).unwrap(),
                 "saved daily searchable text"
@@ -759,7 +767,7 @@ mod tests {
                 .map(|line| serde_json::from_str(line).unwrap())
                 .collect();
             assert_eq!(attempts.len(), 1, "{mode}: {attempts:?}");
-            assert_eq!(attempts[0]["event"], "index.attempt");
+            assert_eq!(attempts[0]["event"], "index.enqueue");
             assert_eq!(attempts[0]["path"], "20260101/talents/plain.md");
             if mode == "override_index_error" {
                 assert_eq!(attempts[0]["outcome"], "failed");
@@ -769,7 +777,15 @@ mod tests {
                         .is_some_and(|cause| !cause.is_empty())
                 );
             } else {
-                assert_eq!(attempts[0]["outcome"], "indexed");
+                assert_eq!(attempts[0]["outcome"], "queued");
+                assert_eq!(
+                    solstone_core_indexer_store::todo::inspect(&context.journal)
+                        .unwrap()
+                        .keys,
+                    ["20260101/talents/plain.md"]
+                );
+                solstone_core_indexer_store::todo::drain(&context.journal, Default::default())
+                    .unwrap();
                 let results = solstone_core_indexer_query::search(
                     &context.journal,
                     solstone_core_indexer_query::OwnerBoundary,
@@ -786,6 +802,10 @@ mod tests {
                         .text
                         .contains("saved daily searchable text")
                 );
+                let check =
+                    solstone_core_indexer_store::scan::scan_journal(&context.journal, false)
+                        .unwrap();
+                assert_eq!((check.indexed, check.removed), (0, 0));
             }
         }
     }

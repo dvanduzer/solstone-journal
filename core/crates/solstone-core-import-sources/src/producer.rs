@@ -816,8 +816,8 @@ where
 mod tests {
     use super::*;
     use serde_json::Value;
+    use solstone_core_import::QueueFileOutcome;
     use solstone_core_import::publish::CreatedSegment;
-    use solstone_core_indexer_store::scan::RescanFileStatus;
     use solstone_core_segment::{StreamAdvance, UnboundStreamAdvanceError};
     use std::fs;
     use std::path::PathBuf;
@@ -866,8 +866,8 @@ mod tests {
             })
         }
 
-        fn rescan_file(&self, _journal: &Path, _path: &Path) -> Result<RescanFileStatus, String> {
-            Ok(RescanFileStatus::Indexed { warnings: vec![] })
+        fn enqueue_path(&self, _journal: &Path, _path: &Path) -> Result<QueueFileOutcome, String> {
+            Ok(QueueFileOutcome::Queued)
         }
 
         fn touch_stream_health_marker(&self, _journal: &Path, _day: &str) -> Result<(), String> {
@@ -914,8 +914,8 @@ mod tests {
             solstone_core_import::NativePublicationOperations.advance_stream(journal, segment)
         }
 
-        fn rescan_file(&self, journal: &Path, path: &Path) -> Result<RescanFileStatus, String> {
-            solstone_core_import::NativePublicationOperations.rescan_file(journal, path)
+        fn enqueue_path(&self, journal: &Path, path: &Path) -> Result<QueueFileOutcome, String> {
+            solstone_core_import::NativePublicationOperations.enqueue_path(journal, path)
         }
 
         fn touch_stream_health_marker(&self, journal: &Path, day: &str) -> Result<(), String> {

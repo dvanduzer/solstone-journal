@@ -890,6 +890,17 @@ default_full = false
 runtime = "none"
 
 [[package_suites]]
+id = "package::solstone-core-indexer-todo"
+package = "solstone-core-indexer-todo"
+set = "component"
+areas = ["indexing"]
+platforms = ["linux", "macos", "windows"]
+prerequisites = ["cargo-cache"]
+timeout = "standard"
+default_full = true
+runtime = "none"
+
+[[package_suites]]
 id = "package::solstone-core-indexer-store"
 package = "solstone-core-indexer-store"
 set = "component"

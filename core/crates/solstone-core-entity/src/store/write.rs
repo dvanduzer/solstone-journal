@@ -194,11 +194,15 @@ pub enum EntityWriteError {
         detail: String,
     },
     CacheWriteAfterCommit(AtomicWriteError),
+    SearchUpdateAfterCommit(io::Error),
 }
 
 impl fmt::Display for EntityWriteError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::SearchUpdateAfterCommit(error) => {
+                write!(formatter, "the search update could not be queued: {error}")
+            }
             Self::TrustLock(error) => error.fmt(formatter),
             Self::Read(error) => error.fmt(formatter),
             Self::InvalidIdentity {
@@ -286,6 +290,7 @@ impl fmt::Display for EntityWriteError {
 impl Error for EntityWriteError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::SearchUpdateAfterCommit(error) => Some(error),
             Self::TrustLock(error) => Some(error),
             Self::Read(error) => Some(error),
             Self::PreparedStage(error) => Some(error),
@@ -1203,7 +1208,12 @@ where
 
 pub fn rewrite_identity_map_cache(journal_root: &Path) -> Result<(), EntityWriteError> {
     let map = read_identity_map(journal_root)?;
-    write_identity_map_cache(journal_root, &map.resolved)
+    write_identity_map_cache(journal_root, &map.resolved)?;
+    solstone_core_indexer_todo::enqueue_token(
+        journal_root,
+        solstone_core_indexer_todo::Token::EntitySearch,
+    )
+    .map_err(EntityWriteError::SearchUpdateAfterCommit)
 }
 
 fn read_identity_map_cache(

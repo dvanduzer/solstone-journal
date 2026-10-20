@@ -340,7 +340,21 @@ impl LinkDirs {
 
     /// Remove a folder and everything in it; an absent folder is removed.
     pub fn remove_folder(&self, dir: &str) -> Result<(), PathError> {
-        remove_dir_all(&self.root, &self.folder_rel(dir))
+        let rel = self.folder_rel(dir);
+        remove_dir_all(&self.root, &rel)?;
+        for result in [
+            solstone_core_indexer_todo::enqueue_path(&self.root, Path::new(&rel)),
+            solstone_core_indexer_todo::enqueue_token(
+                &self.root,
+                solstone_core_indexer_todo::Token::EntitySearch,
+            ),
+        ] {
+            result.map_err(|source| PathError::Io {
+                path: self.root.join(&rel),
+                source,
+            })?;
+        }
+        Ok(())
     }
 
     pub fn folder_path(&self, dir: &str) -> Result<PathBuf, PathError> {

@@ -490,6 +490,7 @@ impl From<ObservationWriteError> for FacetEntityWriteError {
             ObservationWriteError::TrustLock(e) => Self::TrustLock(e),
             ObservationWriteError::Read(e) => Self::from(e),
             ObservationWriteError::Write(e) => Self::FacetWrite(FacetWriteError::ContentWrite(e)),
+            ObservationWriteError::SearchUpdate(e) => Self::Io(e),
             ObservationWriteError::Resolve(_)
             | ObservationWriteError::EmptyContent
             | ObservationWriteError::Conflict { .. }

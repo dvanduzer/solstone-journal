@@ -1223,6 +1223,7 @@ mod publication_cancellation_tests {
                         .unwrap()
                         .is_some()
                 );
+                solstone_core_indexer_store::todo::drain(root.path(), Default::default()).unwrap();
                 let index = solstone_core_indexer_store::db::open_index(root.path()).unwrap();
                 let searchable: bool = index
                     .query_row(

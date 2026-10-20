@@ -422,8 +422,12 @@ pub(crate) fn parse_duration(value: &Value) -> Option<Duration> {
     amount.checked_mul(multiplier).map(Duration::from_secs)
 }
 
-fn default_entries() -> [(&'static str, Value); 6] {
+fn default_entries() -> [(&'static str, Value); 7] {
     [
+        (
+            "search-catch-all",
+            json!({"cmd": crate::partition::canonical_journal_command(["indexer", "--rescan"]), "every": "daily", "enabled": true, "max_runtime": "2h"}),
+        ),
         (
             "heartbeat",
             json!({"cmd": crate::partition::canonical_journal_command(["heartbeat"]), "every": "daily", "enabled": true, "max_runtime": "10m"}),

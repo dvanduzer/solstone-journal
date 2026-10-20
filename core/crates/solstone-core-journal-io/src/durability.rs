@@ -104,6 +104,8 @@ pub enum ArtifactId {
     TaskQueueHolds,
     WorkIntent,
     WorkInventory,
+    IndexTodo,
+    IndexAttempts,
 }
 
 /// One artifact the journal reads, with its declared class and path glob.
@@ -119,6 +121,20 @@ pub struct DurableArtifact {
 
 /// The authoritative list of all journal artifacts.
 pub const JOURNAL_ARTIFACTS: &[DurableArtifact] = &[
+    DurableArtifact {
+        id: ArtifactId::IndexAttempts,
+        path: "chronicle/*/health/indexer.jsonl",
+        class: DurabilityClass::Wipeable,
+        parser: ParserKind::RecordFramedJsonl,
+        rationale: "recent search attempt diagnostics; current work and source files determine search health",
+    },
+    DurableArtifact {
+        id: ArtifactId::IndexTodo,
+        path: "indexer/todo/**/*.json",
+        class: DurabilityClass::Wipeable,
+        parser: ParserKind::WholeJson,
+        rationale: "search work hints; the daily scan repairs a lost list from source files",
+    },
     // MustBeValid
     DurableArtifact {
         id: ArtifactId::JournalConfig,

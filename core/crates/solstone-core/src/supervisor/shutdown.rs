@@ -483,6 +483,7 @@ mod tests {
             daily: DailyState { last_day: None },
             last_activity_settle_scan: Instant::now() - Duration::from_secs(60),
             last_scratch_sweep: None,
+            last_index_todo_scan: None,
             wedge: WedgeState::default(),
             timing: SupervisorTiming {
                 tick_interval: Duration::from_secs(1),

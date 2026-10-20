@@ -677,6 +677,7 @@ mod tests {
                             || path == Path::new("chronicle/20260731/health/stream.updated")
                             || path == Path::new("chronicle/20260731/health/stream.updated.lock")
                             || path == Path::new("indexer/journal.sqlite.lock")
+                            || path.starts_with("indexer/todo")
                             || path == Path::new("backup-activity.lock")
                             || path == Path::new("health/daily-location-admission.lock")
                             || path.starts_with("config/actions")
@@ -1139,6 +1140,7 @@ mod tests {
                 assert!(
                     before.contains_key(path)
                         || path.starts_with("config/actions")
+                        || path.starts_with("indexer/todo")
                         || path.starts_with(crate::pending::RECORD_DIR),
                     "unexpected new path: {}",
                     path.display()

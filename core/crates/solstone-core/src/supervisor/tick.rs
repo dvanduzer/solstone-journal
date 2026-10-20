@@ -351,6 +351,14 @@ pub(crate) async fn run(
             state.last_scratch_sweep = Some(tick);
         }
         let today = wall.format("%Y%m%d").to_string();
+        check_index_todo(
+            &state.journal,
+            &state.queue,
+            &mut state.last_index_todo_scan,
+            tick,
+            wall.timestamp_millis() as u64,
+            Duration::from_secs(30),
+        );
         check_activity_settle(
             &state.journal,
             &state.queue,
@@ -480,6 +488,36 @@ pub(crate) async fn run(
 
 fn scratch_sweep_due(last: Option<Instant>, tick: Instant) -> bool {
     last.is_none_or(|last| tick.saturating_duration_since(last) >= SCRATCH_SWEEP_INTERVAL)
+}
+
+pub(crate) fn check_index_todo(
+    journal: &Path,
+    queue: &TaskQueue,
+    last_scan: &mut Option<Instant>,
+    tick: Instant,
+    now_ms: u64,
+    interval: Duration,
+) {
+    if last_scan.is_some_and(|last| tick.saturating_duration_since(last) < interval) {
+        return;
+    }
+    *last_scan = Some(tick);
+    match solstone_core_indexer_store::todo::has_due(journal, now_ms) {
+        Ok(true) if !queue.contains_reference("index-todo") => {
+            submit_task(
+                queue,
+                canonical_journal_command(["indexer", "drain"]),
+                "index-todo".into(),
+                None,
+                None,
+            );
+        }
+        Ok(true) => {}
+        Ok(false) => {}
+        Err(error) => {
+            log::warn!(target: "solstone::indexer", "could not check queued search work: {error}")
+        }
+    }
 }
 
 /// Reap the decoded audio a killed analysis or archive merge left outside its
@@ -1493,6 +1531,7 @@ mod tests {
             daily: super::super::runtime::DailyState { last_day: None },
             last_activity_settle_scan: Instant::now() - Duration::from_secs(60),
             last_scratch_sweep: None,
+            last_index_todo_scan: None,
             wedge: solstone_core_system::provider_runtime::WedgeState::default(),
             timing: super::super::runtime::SupervisorTiming {
                 tick_interval: Duration::from_secs(1),
@@ -1502,6 +1541,61 @@ mod tests {
             sense_child_environment: solstone_core_system::process::ChildLaunchContext::default(),
             retained_sense: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn index_work_is_found_without_a_bus_and_repeated_ticks_merge_one_drain() {
+        use solstone_core_indexer_store::todo::enqueue_path;
+        let journal = TempDir::new().unwrap();
+        let state = queue_only_state(journal.path()).await;
+        enqueue_path(journal.path(), Path::new("imports/one/summary.md")).unwrap();
+        let origin = Instant::now();
+        let mut last = None;
+        check_index_todo(
+            journal.path(),
+            &state.queue,
+            &mut last,
+            origin,
+            u64::MAX,
+            Duration::from_secs(30),
+        );
+        check_index_todo(
+            journal.path(),
+            &state.queue,
+            &mut last,
+            origin + Duration::from_secs(30),
+            u64::MAX,
+            Duration::from_secs(30),
+        );
+        assert!(state.queue.contains_reference("index-todo"));
+        assert_eq!(
+            state.queue.collect_queue_counts().values().sum::<usize>(),
+            1
+        );
+
+        let delayed = TempDir::new().unwrap();
+        let delayed_state = queue_only_state(delayed.path()).await;
+        enqueue_path(delayed.path(), Path::new("imports/later/summary.md")).unwrap();
+        let path = fs::read_dir(delayed.path().join("indexer/todo"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let mut entry: solstone_core_indexer_store::todo::Entry =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        entry.not_before_ms = u64::MAX;
+        fs::write(&path, serde_json::to_vec(&entry).unwrap()).unwrap();
+        check_index_todo(
+            delayed.path(),
+            &delayed_state.queue,
+            &mut None,
+            origin,
+            1,
+            Duration::from_secs(30),
+        );
+        assert!(!delayed_state.queue.contains_reference("index-todo"));
     }
 
     #[cfg(unix)]

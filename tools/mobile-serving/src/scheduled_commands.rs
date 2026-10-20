@@ -35,6 +35,34 @@ const DISCOVERY_MIN_SAMPLES: usize = 3;
 
 pub(super) fn run(hosted: &HostedCommand, args: &[String], checkpoint: &StopCheckpoint) -> i32 {
     match args {
+        [command, verb] if command == "indexer" && verb == "drain" => {
+            match solstone_core_indexer_store::todo::drain_with_checkpoint(
+                &hosted.journal,
+                Default::default(),
+                checkpoint.as_ref(),
+            ) {
+                Ok(report) if !report.timed_out && report.failed == 0 => 0,
+                Ok(_) => 1,
+                Err(error) => {
+                    log::warn!("foreground search update: {error}");
+                    1
+                }
+            }
+        }
+        [command, verb] if command == "indexer" && verb == "--rescan" => {
+            match solstone_core_indexer_store::scan::scan_journal_with_checkpoint(
+                &hosted.journal,
+                false,
+                checkpoint.as_ref(),
+            ) {
+                Ok(report) if report.failed == 0 => 0,
+                Ok(_) => 1,
+                Err(error) => {
+                    log::warn!("foreground search check: {error}");
+                    1
+                }
+            }
+        }
         [command] if command == "heartbeat" => heartbeat(hosted, checkpoint),
         [command] if command == "facet-candidates" => facet_candidates(hosted, checkpoint),
         [command, verb] if command == "brain" && verb == "refresh" => {

@@ -676,6 +676,27 @@ fn removing_entity_ambiguity_references_retains_rows_when_last_candidate_removed
 }
 
 #[test]
+fn a_deleted_entity_reports_an_enqueue_failure_after_removing_its_directory() {
+    let root = TempDir::new();
+    save_entity_identity(
+        root.path(),
+        "alice",
+        &json!({"id":"alice","name":"Alice"}),
+        None,
+    )
+    .unwrap();
+    fs::remove_dir_all(root.path().join("indexer/todo")).unwrap();
+    fs::write(root.path().join("indexer/todo"), "blocked directory").unwrap();
+    let error = delete_entity_directory(root.path(), "alice").unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("search update could not be queued")
+    );
+    assert!(!root.path().join("entities/alice").exists());
+}
+
+#[test]
 fn delete_entity_directory_removes_the_effective_directory_and_rebuilds_cache() {
     let temporary = TempDir::new();
     save_entity_identity(

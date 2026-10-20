@@ -244,6 +244,17 @@ fn prune_logs(
             }
         }
     }
+    for removed in outcome.removed_paths() {
+        let path = removed.as_str();
+        if (path.starts_with("config/actions/")
+            || (path.starts_with("facets/") && path.contains("/logs/")))
+            && let Err(error) = solstone_core_indexer_todo::enqueue_path(journal, Path::new(path))
+        {
+            return prune_unavailable(format!(
+                "a log was removed, but its search update could not be queued: {error}"
+            ));
+        }
+    }
     if outcome.halted.is_some()
         || outcome
             .targets
@@ -752,6 +763,60 @@ mod tests {
                 .starts_with("prune-logs: pruned 1 operational-log file(s)")
         );
         assert!(!token.exists());
+    }
+
+    #[test]
+    fn pruning_indexed_logs_queues_the_removed_paths_under_a_held_writer() {
+        let journal = tempfile::tempdir().unwrap();
+        let expected = [
+            "config/actions/20200101.jsonl",
+            "facets/work/logs/20200101.jsonl",
+        ];
+        for rel in expected {
+            let path = journal.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                path,
+                "{\"timestamp\":\"2020-01-01T00:00:00Z\",\"action\":\"kestrel\"}\n",
+            )
+            .unwrap();
+        }
+        solstone_core_indexer_store::scan::scan_journal(journal.path(), false).unwrap();
+        let lease = solstone_core_journal_io::hold_lock(
+            solstone_core_indexer_store::db::db_path(journal.path()),
+            Default::default(),
+        )
+        .unwrap();
+        let services = HealthServices {
+            now: Utc.with_ymd_and_hms(2026, 3, 2, 1, 0, 0).unwrap(),
+            zone: chrono_tz::Tz::UTC,
+        };
+        let result = run("health:prune-logs", &[], journal.path(), &services);
+        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        assert_eq!(
+            solstone_core_indexer_todo::inspect(journal.path())
+                .unwrap()
+                .keys,
+            expected
+        );
+        drop(lease);
+        assert_eq!(
+            solstone_core_indexer_store::todo::drain(journal.path(), Default::default())
+                .unwrap()
+                .failed,
+            0
+        );
+        let conn = solstone_core_indexer_store::open_index_reader(journal.path()).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chunks WHERE chunks MATCH 'kestrel'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        let check = solstone_core_indexer_store::scan::scan_journal(journal.path(), false).unwrap();
+        assert_eq!((check.indexed, check.removed), (0, 0));
     }
 
     #[test]

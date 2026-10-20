@@ -12,6 +12,7 @@ use serde_json::Value;
 use solstone_core_generate::{
     ClientError, GenerateRequest, GenerateResponse, OneShotClient, SessionClient,
 };
+use solstone_core_import::QueueFileOutcome;
 use solstone_core_import::{
     CreatedSegment, PublicationOperations, SystemWireClient, TextImportOutcome, WireClient,
     process_transcript_with_wire,
@@ -20,7 +21,6 @@ use solstone_core_import_sources::document::{
     DocumentImportRequest, DocumentModelClient, PdfPage, PdfPayload, PdfWorker, PdfWorkerRequest,
     SystemDocumentModelClient, import as import_document,
 };
-use solstone_core_indexer_store::scan::RescanFileStatus;
 use solstone_core_segment::StreamAdvance;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -157,8 +157,8 @@ impl PublicationOperations for FakePublication {
             seq: 1,
         })
     }
-    fn rescan_file(&self, _: &Path, _: &Path) -> Result<RescanFileStatus, String> {
-        Ok(RescanFileStatus::Declined)
+    fn enqueue_path(&self, _: &Path, _: &Path) -> Result<QueueFileOutcome, String> {
+        Ok(QueueFileOutcome::Declined)
     }
     fn touch_stream_health_marker(&self, _: &Path, _: &str) -> Result<(), String> {
         Ok(())

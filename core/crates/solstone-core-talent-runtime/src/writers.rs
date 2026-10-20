@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 use solstone_core_format::content::ConsumedOriginal;
-use solstone_core_indexer_store::scan::{RescanFileStatus, rescan_file};
 use solstone_core_journal_io::{AtomicWriteError, AtomicWriteOptions, atomic_replace, write_jsonl};
 
 use crate::contract::{CommitDisposition, CommitPlan};
@@ -592,14 +591,10 @@ fn append_day_record_with_sources(
     check_cancellation(cancellation).map_err(|detail| stage_error(agent, detail))?;
     write_jsonl(&path, records, AtomicWriteOptions { mode: Some(0o600) })
         .map_err(|error| stage_error(agent, error.to_string()))?;
-    match rescan_file(journal, &path) {
-        Ok(RescanFileStatus::Indexed { warnings }) => {
-            for warning in warnings {
-                index_warning(&format!("talent accumulator index warning: {warning}"));
-            }
-        }
-        Ok(RescanFileStatus::Declined) => {}
-        Err(error) => index_warning(&format!("talent accumulator index failed: {error}")),
+    if let Err(error) = solstone_core_indexer_store::todo::enqueue_path(journal, &path) {
+        index_warning(&format!(
+            "talent accumulator search update could not be queued: {error}"
+        ));
     }
     Ok(())
 }
@@ -1095,7 +1090,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn criterion_19_accumulator_is_atomic_unlocked_and_declines_without_warning() {
+    fn criterion_19_accumulator_is_atomic_unlocked_and_queues_without_sqlite() {
         let root = tempfile::tempdir().unwrap();
         let path = root
             .path()
@@ -1105,15 +1100,51 @@ mod tests {
         let before_inode = fs::metadata(&path).unwrap().ino();
         let locked = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
         let _lock = Flock::lock(locked, FlockArg::LockExclusiveNonblock).unwrap();
-        // Admission creates the stable lock before checking eligibility.
-        // A declined path still leaves the database absent and emits no warning.
+        // Queuing needs no writer admission, and leaves the database absent.
         reset_index_warnings();
         let mut record = Map::from_iter([("new".to_owned(), json!(true))]);
         append_day_record(root.path(), "20260101", "nested/unrecognized", &mut record).unwrap();
         assert_ne!(fs::metadata(&path).unwrap().ino(), before_inode);
         assert_eq!(index_warnings(), 0);
         assert!(!root.path().join("indexer/journal.sqlite").exists());
-        assert!(root.path().join("indexer/journal.sqlite.lock").is_file());
+        assert!(!root.path().join("indexer/journal.sqlite.lock").exists());
+    }
+
+    #[test]
+    fn a_day_accumulator_is_searchable_after_queuing_under_a_held_index_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let lease = solstone_core_journal_io::hold_lock(
+            solstone_core_indexer_store::db::db_path(root.path()),
+            Default::default(),
+        )
+        .unwrap();
+        let mut record = Map::from_iter([("summary".into(), json!("kestrel accumulator"))]);
+        append_day_record(root.path(), "20260101", "pulse", &mut record).unwrap();
+        assert_eq!(
+            solstone_core_indexer_store::todo::inspect(root.path())
+                .unwrap()
+                .keys,
+            ["20260101/talents/pulse.jsonl"]
+        );
+        assert!(!solstone_core_indexer_store::db::db_path(root.path()).exists());
+        drop(lease);
+        assert_eq!(
+            solstone_core_indexer_store::todo::drain(root.path(), Default::default())
+                .unwrap()
+                .failed,
+            0
+        );
+        let conn = solstone_core_indexer_store::open_index_reader(root.path()).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chunks WHERE chunks MATCH 'kestrel'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(count > 0);
+        let check = solstone_core_indexer_store::scan::scan_journal(root.path(), false).unwrap();
+        assert_eq!((check.indexed, check.removed), (0, 0));
     }
 
     #[cfg(all(test, feature = "full-tests"))]

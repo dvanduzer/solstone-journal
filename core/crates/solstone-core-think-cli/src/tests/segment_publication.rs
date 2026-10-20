@@ -12,17 +12,17 @@ use solstone_core_format::content::{
     AdmittedCategory, Family, IndexDisposition, ScopeBasis, resolve_spec,
 };
 use solstone_core_indexer_store::db::open_index;
-use solstone_core_indexer_store::scan::RescanFileStatus;
 
 use super::*;
 use crate::context::{CortexBoundary, IndexBoundary, ThinkContext};
 use crate::run_log::RunLogWriter;
 use crate::segment::write_sense_and_change;
 
-fn stored_chunk_facet_ids(
+fn drain_and_stored_chunk_facet_ids(
     journal: &Path,
     path: &str,
 ) -> Result<Option<Vec<String>>, solstone_core_indexer_store::StoreError> {
+    solstone_core_indexer_store::todo::drain(journal, Default::default()).unwrap();
     let conn = open_index(journal)?;
     let exists: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM chunk_classification WHERE path=?)",
@@ -97,7 +97,8 @@ fn fixture_journal() -> (tempfile::TempDir, ThinkContext) {
     (journal, context)
 }
 
-fn chunk_text_contains(journal: &Path, rel_path: &str, substring: &str) -> bool {
+fn drain_and_chunk_text_contains(journal: &Path, rel_path: &str, substring: &str) -> bool {
+    solstone_core_indexer_store::todo::drain(journal, Default::default()).unwrap();
     let conn = open_index(journal).expect("open index db");
     let text: Option<String> = conn
         .query_row(
@@ -122,6 +123,11 @@ fn actual_results_with_entities_indexes_activity_sense_md_and_sense_json() {
         .join("default")
         .join("120000_60");
     fs::create_dir_all(&segment_dir).unwrap();
+    let lease = solstone_core_journal_io::hold_lock(
+        solstone_core_indexer_store::db::db_path(&context.journal),
+        Default::default(),
+    )
+    .unwrap();
 
     let sense_val = serde_json::json!({
         "density": "active",
@@ -149,9 +155,21 @@ fn actual_results_with_entities_indexes_activity_sense_md_and_sense_json() {
     .unwrap();
     log.finish().unwrap();
 
+    let keys = solstone_core_indexer_store::todo::inspect(&context.journal)
+        .unwrap()
+        .keys;
+    for name in ["activity.md", "sense.md", "sense.json"] {
+        assert!(
+            keys.contains(&format!("{DAY}/default/120000_60/talents/{name}")),
+            "{keys:?}"
+        );
+    }
+    assert!(!solstone_core_indexer_store::db::db_path(&context.journal).exists());
+    drop(lease);
+
     // 1. activity.md is indexed and searchable in SQLite chunks
     let rel_activity = "20260813/default/120000_60/talents/activity.md";
-    assert!(chunk_text_contains(
+    assert!(drain_and_chunk_text_contains(
         &context.journal,
         rel_activity,
         "Sprint planning"
@@ -159,7 +177,7 @@ fn actual_results_with_entities_indexes_activity_sense_md_and_sense_json() {
 
     // 2. sense.md is indexed and searchable in SQLite chunks
     let rel_sense_md = "20260813/default/120000_60/talents/sense.md";
-    assert!(chunk_text_contains(
+    assert!(drain_and_chunk_text_contains(
         &context.journal,
         rel_sense_md,
         "Alice Developer"
@@ -171,7 +189,7 @@ fn actual_results_with_entities_indexes_activity_sense_md_and_sense_json() {
     let sense_json_attempts: Vec<_> = records
         .iter()
         .filter(|r| {
-            r["event"] == "index.attempt"
+            r["event"] == "index.enqueue"
                 && r["path"]
                     .as_str()
                     .is_some_and(|p| p.ends_with("sense.json"))
@@ -179,10 +197,10 @@ fn actual_results_with_entities_indexes_activity_sense_md_and_sense_json() {
         .collect();
     assert!(!sense_json_attempts.is_empty());
     for attempt in sense_json_attempts {
-        assert_eq!(attempt["outcome"], "indexed");
+        assert_eq!(attempt["outcome"], "queued");
     }
     let rel_sense_json = "20260813/default/120000_60/talents/sense.json";
-    assert!(chunk_text_contains(
+    assert!(drain_and_chunk_text_contains(
         &context.journal,
         rel_sense_json,
         "Sprint planning"
@@ -319,7 +337,7 @@ fn later_error_on_routing_rejected_stops_before_facets_json() {
 
     let written = buffer.lock().unwrap().clone();
     let written_str = String::from_utf8_lossy(&written);
-    assert!(written_str.contains("index.attempt"));
+    assert!(written_str.contains("index.enqueue"));
 
     let facets_path = segment_dir.join("talents/facets.json");
     assert!(
@@ -428,7 +446,7 @@ fn segment_reassignment_refreshes_sibling_text_and_classification() {
 
     // Verify notes.md has Facet A
     let rel_notes = "20260813/import.document/120000_60/talents/notes.md";
-    let ids_after_a = stored_chunk_facet_ids(&context.journal, rel_notes)
+    let ids_after_a = drain_and_stored_chunk_facet_ids(&context.journal, rel_notes)
         .unwrap()
         .expect("notes indexed");
     assert_eq!(ids_after_a, vec![id_a.clone()]);
@@ -460,21 +478,21 @@ fn segment_reassignment_refreshes_sibling_text_and_classification() {
     log2.finish().unwrap();
 
     // Verify notes.md was refreshed to Facet B
-    let ids_after_b = stored_chunk_facet_ids(&context.journal, rel_notes)
+    let ids_after_b = drain_and_stored_chunk_facet_ids(&context.journal, rel_notes)
         .unwrap()
         .expect("notes reindexed");
     assert_eq!(ids_after_b, vec![id_b.clone()]);
 
     // Verify activity.md has Facet B
     let rel_activity = "20260813/import.document/120000_60/talents/activity.md";
-    let ids_activity = stored_chunk_facet_ids(&context.journal, rel_activity)
+    let ids_activity = drain_and_stored_chunk_facet_ids(&context.journal, rel_activity)
         .unwrap()
         .expect("activity indexed");
     assert_eq!(ids_activity, vec![id_b.clone()]);
 
     // Verify seg2 other.md remains on Facet A
     let rel_seg2_other = "20260813/import.document/130000_60/talents/other.md";
-    let ids_seg2 = stored_chunk_facet_ids(&context.journal, rel_seg2_other)
+    let ids_seg2 = drain_and_stored_chunk_facet_ids(&context.journal, rel_seg2_other)
         .unwrap()
         .expect("other indexed");
     assert_eq!(ids_seg2, vec![id_a.clone()]);
@@ -483,7 +501,7 @@ fn segment_reassignment_refreshes_sibling_text_and_classification() {
     let reassign_records = oplog_records(&context.journal, DAY, "reassign");
     let attempted_paths = reassign_records
         .iter()
-        .filter(|r| r["event"] == "index.attempt")
+        .filter(|r| r["event"] == "index.enqueue")
         .map(|r| r["path"].as_str().unwrap())
         .collect::<Vec<_>>();
     let unique_paths = attempted_paths
@@ -503,7 +521,7 @@ fn segment_reassignment_refreshes_sibling_text_and_classification() {
         1
     );
     assert!(!attempted_paths.iter().any(|p| p.ends_with("audio.jsonl")));
-    assert!(chunk_text_contains(
+    assert!(drain_and_chunk_text_contains(
         &context.journal,
         rel_activity,
         "Second assignment"
@@ -511,7 +529,7 @@ fn segment_reassignment_refreshes_sibling_text_and_classification() {
     for path in ["imported.md", "record_transcript.md"] {
         let rel = format!("{DAY}/import.document/120000_60/{path}");
         assert_eq!(
-            stored_chunk_facet_ids(&context.journal, &rel)
+            drain_and_stored_chunk_facet_ids(&context.journal, &rel)
                 .unwrap()
                 .unwrap(),
             vec![id_b.clone()]
@@ -522,7 +540,7 @@ fn segment_reassignment_refreshes_sibling_text_and_classification() {
     let sense_md_attempts: Vec<_> = reassign_records
         .iter()
         .filter(|r| {
-            r["event"] == "index.attempt"
+            r["event"] == "index.enqueue"
                 && r["path"].as_str().is_some_and(|p| p.ends_with("sense.md"))
         })
         .collect();
@@ -535,7 +553,7 @@ fn segment_reassignment_refreshes_sibling_text_and_classification() {
     let nested_attempts: Vec<_> = reassign_records
         .iter()
         .filter(|r| {
-            r["event"] == "index.attempt"
+            r["event"] == "index.enqueue"
                 && r["path"].as_str().is_some_and(|p| p.contains("nested.md"))
         })
         .collect();
@@ -559,7 +577,7 @@ fn segment_reassignment_refreshes_sibling_text_and_classification() {
     assert!(
         !unchanged_records
             .iter()
-            .any(|r| r["event"] == "index.attempt"
+            .any(|r| r["event"] == "index.enqueue"
                 && r["path"].as_str().is_some_and(|p| p.ends_with("notes.md")
                     || p.ends_with("imported.md")
                     || p.ends_with("record_transcript.md")))
@@ -595,7 +613,7 @@ fn a_later_projection_write_failure_still_indexes_earlier_saved_activity() {
     );
     log.finish().unwrap();
     let path = "20260813/default/120000_60/talents/activity.md";
-    assert!(chunk_text_contains(
+    assert!(drain_and_chunk_text_contains(
         &context.journal,
         path,
         "before the density write fails"
@@ -603,10 +621,10 @@ fn a_later_projection_write_failure_still_indexes_earlier_saved_activity() {
     let records = oplog_records(&context.journal, DAY, "partial-projection");
     let attempts = records
         .iter()
-        .filter(|r| r["event"] == "index.attempt" && r["path"] == path)
+        .filter(|r| r["event"] == "index.enqueue" && r["path"] == path)
         .collect::<Vec<_>>();
     assert_eq!(attempts.len(), 1);
-    assert_eq!(attempts[0]["outcome"], "indexed");
+    assert_eq!(attempts[0]["outcome"], "queued");
 }
 
 #[test]
@@ -616,11 +634,11 @@ fn multi_path_index_failure_records_oplog_and_preserves_successful_indexes() {
     }
 
     impl IndexBoundary for PartialFailingIndexBoundary {
-        fn rescan_file(&self, journal: &Path, path: &Path) -> Result<RescanFileStatus, String> {
+        fn enqueue_path(&self, journal: &Path, path: &Path) -> Result<(), String> {
             if path.to_string_lossy().ends_with(self.failing_suffix) {
                 Err("index failed notes".to_owned())
             } else {
-                solstone_core_indexer_store::scan::rescan_file(journal, path)
+                solstone_core_indexer_store::todo::enqueue_path(journal, path)
                     .map_err(|e| e.to_string())
             }
         }
@@ -672,7 +690,7 @@ fn multi_path_index_failure_records_oplog_and_preserves_successful_indexes() {
     let notes_attempt = records
         .iter()
         .find(|r| {
-            r["event"] == "index.attempt"
+            r["event"] == "index.enqueue"
                 && r["path"].as_str().is_some_and(|p| p.ends_with("notes.md"))
         })
         .expect("notes.md attempt in oplog");
@@ -682,17 +700,17 @@ fn multi_path_index_failure_records_oplog_and_preserves_successful_indexes() {
     let activity_attempt = records
         .iter()
         .find(|r| {
-            r["event"] == "index.attempt"
+            r["event"] == "index.enqueue"
                 && r["path"]
                     .as_str()
                     .is_some_and(|p| p.ends_with("activity.md"))
         })
         .expect("activity.md attempt in oplog");
-    assert_eq!(activity_attempt["outcome"], "indexed");
+    assert_eq!(activity_attempt["outcome"], "queued");
 
     // Successes are in index chunks
     let rel_activity = "20260813/default/120000_60/talents/activity.md";
-    assert!(chunk_text_contains(
+    assert!(drain_and_chunk_text_contains(
         &context.journal,
         rel_activity,
         "Summary of active work"
@@ -745,7 +763,7 @@ fn topics_happy_path_indexes_topics_md_with_admitted_transcripts_classification(
     log.finish().unwrap();
 
     let rel_topics = "20260813/default/120000_60/talents/topics.md";
-    assert!(chunk_text_contains(
+    assert!(drain_and_chunk_text_contains(
         &context.journal,
         rel_topics,
         "unique_arch_plan_alpha"
@@ -810,7 +828,7 @@ fn topics_emptied_second_call_clears_file_and_removes_indexed_chunks() {
     log1.finish().unwrap();
 
     let rel_topics1 = "20260813/default/120000_60/talents/topics.md";
-    assert!(chunk_text_contains(
+    assert!(drain_and_chunk_text_contains(
         &context.journal,
         rel_topics1,
         "distinctive_alpha_topic"
@@ -841,7 +859,7 @@ fn topics_emptied_second_call_clears_file_and_removes_indexed_chunks() {
 
     let seg1_topics_text = fs::read_to_string(seg1_dir.join("talents/topics.md")).unwrap();
     assert_eq!(seg1_topics_text, "");
-    assert!(!chunk_text_contains(
+    assert!(!drain_and_chunk_text_contains(
         &context.journal,
         rel_topics1,
         "distinctive_alpha_topic"
@@ -884,7 +902,7 @@ fn topics_emptied_second_call_clears_file_and_removes_indexed_chunks() {
     log2.finish().unwrap();
 
     let rel_topics2 = "20260813/default/121000_60/talents/topics.md";
-    assert!(chunk_text_contains(
+    assert!(drain_and_chunk_text_contains(
         &context.journal,
         rel_topics2,
         "distinctive_beta_topic"
@@ -906,7 +924,7 @@ fn topics_emptied_second_call_clears_file_and_removes_indexed_chunks() {
 
     let seg2_topics_text = fs::read_to_string(seg2_dir.join("talents/topics.md")).unwrap();
     assert_eq!(seg2_topics_text, "");
-    assert!(!chunk_text_contains(
+    assert!(!drain_and_chunk_text_contains(
         &context.journal,
         rel_topics2,
         "distinctive_beta_topic"
@@ -951,7 +969,7 @@ fn topics_no_prior_file_keyless_and_empty_does_not_create_file() {
     assert!(!seg1_dir.join("talents/topics.md").exists());
     let records1 = oplog_records(&context.journal, DAY, "segment");
     assert!(!records1.iter().any(|r| {
-        r["event"] == "index.attempt"
+        r["event"] == "index.enqueue"
             && r["path"]
                 .as_str()
                 .is_some_and(|p| p.ends_with("talents/topics.md"))
@@ -996,7 +1014,7 @@ fn topics_no_prior_file_keyless_and_empty_does_not_create_file() {
     assert!(!seg2_dir.join("talents/topics.md").exists());
     let records2 = oplog_records(&context.journal, DAY, "segment");
     assert!(!records2.iter().any(|r| {
-        r["event"] == "index.attempt"
+        r["event"] == "index.enqueue"
             && r["path"]
                 .as_str()
                 .is_some_and(|p| p.ends_with("talents/topics.md"))
@@ -1064,7 +1082,7 @@ fn topics_directory_collision_reports_unfinished_publication_and_logs_cause() {
     );
 
     assert!(!records.iter().any(|r| {
-        r["event"] == "index.attempt"
+        r["event"] == "index.enqueue"
             && r["path"]
                 .as_str()
                 .is_some_and(|p| p.ends_with("talents/topics.md"))
@@ -1298,17 +1316,9 @@ fn hosted_checkpoint_skips_segment_publication_and_uncancelled_twin_publishes() 
         rescanned: Arc<AtomicUsize>,
     }
     impl IndexBoundary for TestIndex {
-        fn rescan_file(
-            &self,
-            _journal: &Path,
-            _path: &Path,
-        ) -> Result<solstone_core_indexer_store::scan::RescanFileStatus, String> {
+        fn enqueue_path(&self, _journal: &Path, _path: &Path) -> Result<(), String> {
             self.rescanned.fetch_add(1, Ordering::SeqCst);
-            Ok(
-                solstone_core_indexer_store::scan::RescanFileStatus::Indexed {
-                    warnings: Vec::new(),
-                },
-            )
+            Ok(())
         }
     }
 
@@ -1406,16 +1416,8 @@ fn hosted_checkpoint_skips_activity_provenance_and_work_removal_and_uncancelled_
     }
     struct TestIndex;
     impl IndexBoundary for TestIndex {
-        fn rescan_file(
-            &self,
-            _journal: &Path,
-            _path: &Path,
-        ) -> Result<solstone_core_indexer_store::scan::RescanFileStatus, String> {
-            Ok(
-                solstone_core_indexer_store::scan::RescanFileStatus::Indexed {
-                    warnings: Vec::new(),
-                },
-            )
+        fn enqueue_path(&self, _journal: &Path, _path: &Path) -> Result<(), String> {
+            Ok(())
         }
     }
 

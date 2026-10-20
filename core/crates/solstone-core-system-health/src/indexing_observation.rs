@@ -78,7 +78,7 @@ enum OutcomeCategory {
 impl OutcomeCategory {
     fn from_outcome_str(s: &str) -> Self {
         match s {
-            "indexed" => Self::Indexed,
+            "indexed" | "removed" => Self::Indexed,
             "excluded" => Self::Excluded,
             "declined" => Self::Declined,
             "failed" => Self::Failed,

@@ -2998,6 +2998,7 @@ mod tests {
                 .to_string(),
         )
         .unwrap();
+        solstone_core_indexer_store::scan::scan_journal(server.journal.path(), false).unwrap();
         crate::memory_tools::faults::set_now(
             server.journal.path(),
             Utc.with_ymd_and_hms(2026, 9, 1, 0, 30, 0).unwrap(),
@@ -3012,21 +3013,20 @@ mod tests {
         let saved = post_json(&mut client, &token.token, call.clone()).await;
         let coordinate = memory_result(&saved)["coordinate"].clone();
         assert_eq!(coordinate["day"], "20260831");
-        let notifications = listener.finish(2);
+        let notifications = listener.finish(1);
+        assert_eq!(notifications[0]["tract"], "observe");
+        assert_eq!(notifications[0]["day"], coordinate["day"]);
         assert_eq!(
-            notifications[0]["cmd"][3],
-            server
-                .journal
-                .path()
-                .join("chronicle")
-                .join(coordinate["day"].as_str().unwrap())
-                .join(coordinate["stream"].as_str().unwrap())
-                .join(coordinate["segment"].as_str().unwrap())
-                .join("note.txt")
-                .to_string_lossy()
-                .as_ref()
+            solstone_core_indexer_store::todo::inspect(server.journal.path())
+                .unwrap()
+                .keys,
+            [format!(
+                "{}/{}/{}/note.txt",
+                coordinate["day"].as_str().unwrap(),
+                coordinate["stream"].as_str().unwrap(),
+                coordinate["segment"].as_str().unwrap()
+            )]
         );
-        assert_eq!(notifications[1]["day"], coordinate["day"]);
         let activity = crate::activity::read_activity(
             server.journal.path(),
             &crate::activity::ActivityQuery {
@@ -3049,9 +3049,10 @@ mod tests {
         let replay = post_json(&mut client, &token.token, call).await;
         assert_eq!(memory_result(&replay)["status"], "replayed");
         assert_eq!(memory_result(&replay)["coordinate"], coordinate);
-        let notifications = listener.finish(2);
-        assert_eq!(notifications[1]["day"], coordinate["day"]);
-        solstone_core_indexer_store::scan::scan_journal(server.journal.path(), true).unwrap();
+        let notifications = listener.finish(1);
+        assert_eq!(notifications[0]["day"], coordinate["day"]);
+        solstone_core_indexer_store::todo::drain(server.journal.path(), Default::default())
+            .unwrap();
         let recall = post_json(
             &mut client,
             &token.token,

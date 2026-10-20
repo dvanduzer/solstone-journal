@@ -305,15 +305,30 @@ pub(crate) fn record_scan(conn: &Connection, receipt: &ScanReceipt) -> Result<()
         "REPLACE INTO index_meta(key, value) VALUES (?, ?)",
         params![META_LAST_SCAN, value.to_string()],
     )?;
+    if !receipt.full && receipt.error.is_none() {
+        conn.execute(
+            "REPLACE INTO index_meta(key, value) VALUES ('last_finished_check', ?)",
+            [value.to_string()],
+        )?;
+    }
     Ok(())
 }
 
 /// Read the last scan receipt, if a stamping writer recorded one.
 pub fn read_last_scan(conn: &Connection) -> Result<Option<ScanReceipt>, StoreError> {
+    read_receipt(conn, META_LAST_SCAN)
+}
+
+/// The latest light pass that finished, preserved when a later pass stops.
+pub fn read_last_finished_check(conn: &Connection) -> Result<Option<ScanReceipt>, StoreError> {
+    read_receipt(conn, "last_finished_check")
+}
+
+fn read_receipt(conn: &Connection, key: &str) -> Result<Option<ScanReceipt>, StoreError> {
     if !sqlite_table_exists(conn, "index_meta")? {
         return Ok(None);
     }
-    let Some(raw) = read_meta(conn, META_LAST_SCAN)? else {
+    let Some(raw) = read_meta(conn, key)? else {
         return Ok(None);
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {

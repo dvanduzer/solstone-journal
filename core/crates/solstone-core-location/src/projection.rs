@@ -430,22 +430,22 @@ fn remove(path: &Path) -> Result<bool, ProjectionError> {
 }
 
 fn index_document(journal: &Path, path: &Path) -> Result<(), ProjectionError> {
-    solstone_core_indexer_store::scan::rescan_file(journal, path)
-        .map(|_| ())
-        .map_err(|error| ProjectionError::Index {
+    solstone_core_indexer_store::todo::enqueue_path(journal, path).map_err(|error| {
+        ProjectionError::Index {
             path: path.to_path_buf(),
             detail: error.to_string(),
-        })
+        }
+    })
 }
 
 fn forget_document(journal: &Path, day: &str) -> Result<(), ProjectionError> {
     let rel = format!("{day}/{DAY_DOCUMENT}");
-    solstone_core_indexer_store::db::prune_by_paths(journal, &[rel.as_str()])
-        .map(|_| ())
-        .map_err(|error| ProjectionError::Index {
+    solstone_core_indexer_store::todo::enqueue_path(journal, Path::new(&rel)).map_err(|error| {
+        ProjectionError::Index {
             path: document_path(journal, day),
             detail: error.to_string(),
-        })
+        }
+    })
 }
 
 /// Rebuild one day's document from the segments it holds now.
@@ -500,10 +500,10 @@ pub fn rebuild_day(
         bytes.push(b'\n');
         write_file(&record, &bytes)?;
     }
+    index_document(journal, &document)?;
     if unchanged {
         return Ok(Rebuilt::Unchanged);
     }
-    index_document(journal, &document)?;
     Ok(Rebuilt::Written)
 }
 
@@ -674,6 +674,79 @@ mod tests {
             chrono_tz::America::Denver,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn location_save_and_removal_queue_without_waiting_for_the_index() {
+        let root = tempfile::tempdir().unwrap();
+        seed(root.path());
+        let lease = solstone_core_journal_io::hold_lock(
+            solstone_core_indexer_store::db::db_path(root.path()),
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(rebuild(root.path()), Rebuilt::Written);
+        let expected = format!("{DAY}/{DAY_DOCUMENT}");
+        assert_eq!(
+            solstone_core_indexer_store::todo::inspect(root.path())
+                .unwrap()
+                .keys,
+            [expected.clone()]
+        );
+        drop(lease);
+        assert_eq!(
+            solstone_core_indexer_store::todo::drain(root.path(), Default::default())
+                .unwrap()
+                .failed,
+            0
+        );
+        let conn = solstone_core_indexer_store::open_index_reader(root.path()).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chunks WHERE path=?1 AND chunks MATCH 'Golden'",
+                [&expected],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(count > 0);
+        let check = solstone_core_indexer_store::scan::scan_journal(root.path(), false).unwrap();
+        assert_eq!((check.indexed, check.removed), (0, 0));
+        let lease = solstone_core_journal_io::hold_lock(
+            solstone_core_indexer_store::db::db_path(root.path()),
+            Default::default(),
+        )
+        .unwrap();
+        fs::remove_dir_all(
+            root.path()
+                .join("chronicle")
+                .join(DAY)
+                .join("phone_mobile-segment"),
+        )
+        .unwrap();
+        rebuild(root.path());
+        assert_eq!(
+            solstone_core_indexer_store::todo::inspect(root.path())
+                .unwrap()
+                .keys,
+            [expected.clone()]
+        );
+        drop(lease);
+        assert_eq!(
+            solstone_core_indexer_store::todo::drain(root.path(), Default::default())
+                .unwrap()
+                .failed,
+            0
+        );
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM files WHERE path=?1",
+                [&expected],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        let check = solstone_core_indexer_store::scan::scan_journal(root.path(), false).unwrap();
+        assert_eq!((check.indexed, check.removed), (0, 0));
     }
 
     #[test]

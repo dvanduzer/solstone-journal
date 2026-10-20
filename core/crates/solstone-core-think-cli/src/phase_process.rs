@@ -40,6 +40,7 @@ pub(crate) struct NativePhaseProcessRunner;
 ///
 /// The desktop runner stays [`NativePhaseProcessRunner`]. This one does not spawn.
 pub(crate) struct HostedPhaseRunner {
+    pub(crate) index: Arc<dyn crate::context::IndexBoundary>,
     pub(crate) talent_root: PathBuf,
     pub(crate) apps_root: PathBuf,
     pub(crate) cancel_checkpoint: Arc<dyn Fn() -> bool + Send + Sync>,
@@ -90,14 +91,15 @@ impl PhaseProcessRunner for HostedPhaseRunner {
             return PhaseProcessOutcome::Exited(1);
         }
         match phase {
-            "indexer" => {
+            "indexer" | "indexer_inputs" => {
                 let checkpoint = || admit();
-                match solstone_core_indexer_store::scan::scan_journal_with_checkpoint(
+                match self.index.drain_pending(
                     journal,
-                    false,
+                    phase == "indexer_inputs",
+                    timeout,
                     &checkpoint,
                 ) {
-                    Ok(_) => PhaseProcessOutcome::Exited(0),
+                    Ok(()) => PhaseProcessOutcome::Exited(0),
                     Err(_) => PhaseProcessOutcome::Exited(1),
                 }
             }
@@ -184,6 +186,33 @@ fn run_owned_process(
 mod hosted_tests {
     use super::*;
 
+    struct TestHostIndex;
+    impl crate::context::IndexBoundary for TestHostIndex {
+        fn enqueue_path(&self, journal: &Path, path: &Path) -> Result<(), String> {
+            solstone_core_indexer_store::todo::enqueue_path(journal, path)
+                .map_err(|error| error.to_string())
+        }
+        fn drain_pending(
+            &self,
+            journal: &Path,
+            force: bool,
+            budget: Duration,
+            checkpoint: &dyn Fn() -> Result<(), String>,
+        ) -> Result<(), String> {
+            let report = solstone_core_indexer_store::todo::drain_with_checkpoint(
+                journal,
+                solstone_core_indexer_store::todo::DrainOptions { force, budget },
+                checkpoint,
+            )
+            .map_err(|error| error.to_string())?;
+            if report.timed_out || report.failed != 0 {
+                Err("pending".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     #[cfg(all(unix, feature = "full-tests"))]
     #[test]
     fn hosted_stats_stop_after_native_staging_preserves_output() {
@@ -203,6 +232,7 @@ mod hosted_tests {
         let observed = Arc::clone(&staged);
         let watched = root.clone();
         let hosted = HostedPhaseRunner {
+            index: Arc::new(TestHostIndex),
             talent_root: root.join("talents"),
             apps_root: root.join("apps"),
             cancel_checkpoint: Arc::new(move || {
@@ -235,6 +265,7 @@ mod hosted_tests {
         assert_eq!(std::fs::read(&destination).unwrap(), before);
 
         let admitted = HostedPhaseRunner {
+            index: Arc::new(TestHostIndex),
             talent_root: root.join("talents"),
             apps_root: root.join("apps"),
             cancel_checkpoint: Arc::new(|| false),
@@ -255,6 +286,7 @@ mod hosted_tests {
     fn runner(cancel: bool) -> HostedPhaseRunner {
         let root = PathBuf::from("payload");
         HostedPhaseRunner {
+            index: Arc::new(TestHostIndex),
             talent_root: root.join("talent"),
             apps_root: root.join("apps"),
             cancel_checkpoint: Arc::new(move || cancel),
@@ -288,7 +320,7 @@ mod hosted_tests {
     }
 
     #[test]
-    fn open_hosted_indexer_accepts_an_empty_journal() {
+    fn an_empty_hosted_drain_succeeds_without_creating_sqlite() {
         let journal = tempfile::tempdir().expect("journal");
         let outcome = runner(false).run(
             "indexer",
@@ -298,7 +330,7 @@ mod hosted_tests {
             Duration::from_secs(1),
         );
         assert!(matches!(outcome, PhaseProcessOutcome::Exited(0)));
-        assert!(solstone_core_indexer_store::db::db_path(journal.path()).is_file());
+        assert!(!solstone_core_indexer_store::db::db_path(journal.path()).exists());
     }
 
     #[test]

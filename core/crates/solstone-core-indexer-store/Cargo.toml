@@ -10,8 +10,12 @@ publish = false
 workspace = true
 
 [dependencies]
+solstone-core-indexer-todo.workspace = true
+solstone-core-entity.workspace = true
+chrono.workspace = true
 log.workspace = true
 rusqlite.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 solstone-core-format.workspace = true

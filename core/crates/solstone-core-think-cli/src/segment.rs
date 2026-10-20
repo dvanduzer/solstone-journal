@@ -175,7 +175,7 @@ pub(crate) fn publish_saved_outputs(
         &context.journal,
         segment_dir,
         before,
-        |journal, path| context.index.rescan_file(journal, path),
+        |journal, path| context.index.enqueue_path(journal, path),
         &|| context.checkpoint(),
     )?;
     if before != newest_segment_input_ms(segment_dir).map_err(|error| error.to_string())? {
@@ -3080,9 +3080,9 @@ pub(crate) fn write_sense_and_change<W: std::io::Write>(
         let attempt = solstone_core_indexer_store::attempt_saved_publication(
             &context.journal,
             &path,
-            |j, p| context.index.rescan_file(j, p),
+            |j, p| context.index.enqueue_path(j, p),
         );
-        log_index_attempt(log, context, segment_name, stream, &attempt);
+        log_index_enqueue(log, context, segment_name, stream, &attempt);
     }
     result
 }
@@ -3301,7 +3301,7 @@ fn publish_segment_objects<W: std::io::Write>(
     }
 }
 
-fn log_index_attempt<W: std::io::Write>(
+fn log_index_enqueue<W: std::io::Write>(
     log: &mut RunLogWriter<W>,
     context: &ThinkContext,
     segment: &str,
@@ -3338,7 +3338,7 @@ fn log_index_attempt<W: std::io::Write>(
             ),
         ]),
     );
-    log.log("index.attempt", context.event_now_ms(), fields);
+    log.log("index.enqueue", context.event_now_ms(), fields);
 }
 
 /// Locate the requested segment. With a stream the lookup is exact; without one

@@ -701,6 +701,19 @@
     if (searchLine) {
       if (searchIndex && typeof searchIndex.text === 'string' && searchIndex.text.length > 0) {
         searchLine.textContent = searchIndex.text;
+        const index = searchIndex.index;
+        if (index) {
+          const details = [];
+          if (index.queued > 0) details.push(`${index.queued} updates queued`);
+          if (index.failed_deletions > 0) details.push(`${index.failed_deletions} removals still waiting`);
+          if (Number.isFinite(index.last_finished_check_at_ms)) {
+            const hours = Math.max(0, Math.floor((Date.now() - index.last_finished_check_at_ms) / 3600000));
+            details.push(`last search check ${hours < 1 ? 'less than an hour ago' : `${hours} hours ago`}: ${index.check_indexed} updated, ${index.check_removed} removed`);
+          } else {
+            details.push('no finished search check yet');
+          }
+          searchLine.textContent += ` ${details.join('; ')}.`;
+        }
         searchLine.hidden = false;
       } else {
         searchLine.hidden = true;

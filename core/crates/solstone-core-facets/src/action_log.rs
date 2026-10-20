@@ -118,7 +118,15 @@ pub fn append_journal_action_log_at_root_checked(
         OsStr::new(&format!("{day}.jsonl")),
         &python_json(&action_record(None, source, actor, action, params)),
         &check,
-    )
+    )?;
+    check_root()?;
+    if let Err(error) = solstone_core_indexer_store::todo::enqueue_path(
+        root.canonical_path(),
+        &diagnostic.join(format!("{day}.jsonl")),
+    ) {
+        log::warn!("action log search update could not be queued: {error}");
+    }
+    Ok(())
 }
 
 /// Append an action-log record to the journal-level or facet-scoped destination.
@@ -205,10 +213,15 @@ fn append_action_log_at_day(
             .join(format!("{day}.jsonl")),
     };
     append_text_checked(
-        destination,
+        &destination,
         &python_json(&action_record(facet, source, actor, action, params)),
         checkpoint,
-    )
+    )?;
+    if let Err(error) = solstone_core_indexer_store::todo::enqueue_path(journal_root, &destination)
+    {
+        log::warn!("action log search update could not be queued: {error}");
+    }
+    Ok(())
 }
 
 fn action_record(
@@ -322,6 +335,53 @@ mod tests {
     use serde_json::json;
 
     use super::append_action_log;
+
+    #[test]
+    fn both_action_log_destinations_queue_under_a_held_index_writer() {
+        let root = crate::store_tests::TempDir::new();
+        let lease = solstone_core_journal_io::hold_lock(
+            solstone_core_indexer_store::db::db_path(root.path()),
+            Default::default(),
+        )
+        .unwrap();
+        for facet in [None, Some("work")] {
+            super::append_action_log_for_day(
+                root.path(),
+                facet,
+                "app",
+                "settings",
+                "kestrel",
+                json!({}),
+                "20260101",
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            solstone_core_indexer_store::todo::inspect(root.path())
+                .unwrap()
+                .keys,
+            [
+                "config/actions/20260101.jsonl",
+                "facets/work/logs/20260101.jsonl"
+            ]
+        );
+        assert!(!solstone_core_indexer_store::db::db_path(root.path()).exists());
+        drop(lease);
+        let report =
+            solstone_core_indexer_store::todo::drain(root.path(), Default::default()).unwrap();
+        assert_eq!((report.processed, report.failed), (2, 0));
+        let conn = solstone_core_indexer_store::open_index_reader(root.path()).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chunks WHERE chunks MATCH 'kestrel'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        let check = solstone_core_indexer_store::scan::scan_journal(root.path(), false).unwrap();
+        assert_eq!((check.indexed, check.removed), (0, 0));
+    }
 
     #[test]
     fn action_logs_preserve_python_insertion_order_and_unicode() {

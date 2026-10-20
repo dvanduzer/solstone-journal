@@ -918,6 +918,7 @@ mod tests {
         );
         assert_eq!(json["deleted"], "070000_17");
 
+        solstone_core_indexer_store::todo::drain(root.path(), Default::default()).unwrap();
         let after = solstone_core_indexer_query::search(
             root.path(),
             solstone_core_indexer_query::OwnerBoundary,
@@ -943,8 +944,8 @@ mod tests {
             .iter()
             .find(|r| r["params"]["phase"] == "committed")
             .expect("committed action row");
-        assert!(committed["params"]["index_chunks"].as_u64().unwrap() > 0);
-        assert!(committed["params"]["index_files"].as_u64().unwrap() > 0);
+        assert_eq!(committed["params"]["index_chunks"].as_u64().unwrap_or(0), 0);
+        assert_eq!(committed["params"]["index_files"].as_u64().unwrap_or(0), 0);
         assert!(committed["params"].get("search_not_updated").is_none());
     }
 
@@ -1107,10 +1108,12 @@ mod tests {
         assert!(segment_dir.join(super::TOMBSTONE_NAME).is_file());
 
         assert!(!root.path().join("indexer/journal.sqlite").exists());
-        assert!(root.path().join("indexer/journal.sqlite.lock").is_file());
-        assert_eq!(
-            fs::read_dir(root.path().join("indexer")).unwrap().count(),
-            1
+        assert!(!root.path().join("indexer/journal.sqlite.lock").exists());
+        assert!(
+            !solstone_core_indexer_store::todo::inspect(root.path())
+                .unwrap()
+                .keys
+                .is_empty()
         );
 
         let action_rows = read_all_actions(root.path());
@@ -1122,16 +1125,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corrupt_index_records_search_not_updated_and_still_deletes() {
+    async fn unwritable_work_list_records_search_not_updated_and_still_deletes() {
         let root = TempDir::new().expect("journal");
         setup_acceptance_journal(root.path());
 
         scan_journal(root.path(), true).expect("scan journal");
 
-        let index_file = root.path().join("indexer/journal.sqlite");
-        let _ = fs::remove_file(root.path().join("indexer/journal.sqlite-wal"));
-        let _ = fs::remove_file(root.path().join("indexer/journal.sqlite-shm"));
-        fs::write(&index_file, b"not a valid sqlite database").expect("corrupt db write");
+        if root.path().join("indexer/todo").is_dir() {
+            fs::remove_dir_all(root.path().join("indexer/todo")).expect("remove queued hints");
+        }
+        fs::write(root.path().join("indexer/todo"), b"blocked directory").expect("block queue");
 
         let app = router_with_delete_window(
             root.path().to_path_buf(),
@@ -1614,6 +1617,7 @@ mod tests {
             .unwrap();
         assert_eq!(settled.state, DeleteState::Deleted);
 
+        solstone_core_indexer_store::todo::drain(root.path(), Default::default()).unwrap();
         let after_direct = solstone_core_indexer_query::search(
             root.path(),
             solstone_core_indexer_query::OwnerBoundary,
@@ -1862,6 +1866,7 @@ mod tests {
         );
 
         let ref_date = NaiveDate::from_ymd_opt(2026, 8, 5).unwrap();
+        solstone_core_indexer_store::todo::drain(root.path(), Default::default()).unwrap();
         let search_direct = solstone_core_indexer_query::search(
             root.path(),
             solstone_core_indexer_query::OwnerBoundary,

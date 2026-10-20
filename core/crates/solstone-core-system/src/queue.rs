@@ -3034,6 +3034,7 @@ fn take_ready(state: &mut QueueState, selection: Selection) -> Vec<Dispatch> {
         return dispatches;
     }
     loop {
+        let running_slots = &state.running;
         let background_waits = spending.lane == ThinkingLane::Confidential
             && (!background_slot_open
                 || state.running.values().any(|slot| slot.background)
@@ -3050,6 +3051,9 @@ fn take_ready(state: &mut QueueState, selection: Selection) -> Vec<Dispatch> {
                         queue.iter().enumerate().filter_map(move |(index, entry)| {
                             let priority = entry.priority.resolve(&entry.command, today);
                             (is_analysis_command(&entry.command)
+                                && !running_slots.values().any(|slot| {
+                                    index_daily_pair_conflicts(&entry.command, &slot.command)
+                                })
                                 && spending.permits(priority.band)
                                 && !(background_waits && priority.band.is_background()))
                             .then(|| (partition.clone(), index, priority))
@@ -3065,9 +3069,10 @@ fn take_ready(state: &mut QueueState, selection: Selection) -> Vec<Dispatch> {
                 state.queues.iter().find_map(|(partition, queue)| {
                     (!state.running.contains_key(partition)
                         && !state.held.contains_key(partition)
-                        && queue
-                            .front()
-                            .is_some_and(|entry| !is_analysis_command(&entry.command)))
+                        && queue.front().is_some_and(|entry| {
+                            !is_analysis_command(&entry.command)
+                                && !index_daily_conflict(state, &entry.command)
+                        }))
                     .then(|| (partition.clone(), 0))
                 })
             });
@@ -3131,6 +3136,24 @@ fn is_analysis_command(command: &[String]) -> bool {
     }
     matches!(program, "journal" | "solstone" | "solstone-core-journal")
         && alias.get(1).is_some_and(|v| v == "think")
+}
+
+/// The daily catch-all and daily talents share the corpus. Keep their scheduled
+/// executions separate; ordinary path drains may still run while talents do.
+fn index_daily_conflict(state: &QueueState, command: &[String]) -> bool {
+    state
+        .running
+        .values()
+        .any(|running| index_daily_pair_conflicts(command, &running.command))
+}
+
+fn index_daily_pair_conflicts(left: &[String], right: &[String]) -> bool {
+    let catch_all = |command: &[String]| {
+        let command = crate::partition::journal_alias_form(command);
+        matches!(command.as_ref(), [journal, indexer, rescan] if journal == "journal" && indexer == "indexer" && rescan == "--rescan")
+    };
+    let daily = |command: &[String]| crate::partition::partition_for(command).as_str() == "daily";
+    (catch_all(left) && daily(right)) || (catch_all(right) && daily(left))
 }
 
 fn record_callable_panic(inner: &QueueInner, payload: Box<dyn std::any::Any + Send>) {
@@ -4975,6 +4998,58 @@ mod tests {
 
     fn queue(ready: bool, cap: u64, plans: VecDeque<SpawnPlan>) -> TaskQueue {
         queue_with_sink(ready, cap, plans, None)
+    }
+
+    #[cfg(feature = "full-tests")]
+    #[test]
+    fn a_light_catch_all_and_daily_thinking_never_dispatch_together() {
+        let daily = ["journal", "think", "--day", "20260101"];
+        let catch_all = ["solstone", "journal", "indexer", "--rescan"];
+        for (first, second) in [(&daily[..], &catch_all[..]), (&catch_all[..], &daily[..])] {
+            let queue = queue(false, 10, VecDeque::new());
+            queue.submit(command_request(first, "first", None));
+            let mut state = queue.inner.state.lock().unwrap();
+            for submission in std::mem::take(&mut state.pending) {
+                enqueue_locked(&mut state, submission);
+            }
+            state.ready = true;
+            assert_eq!(
+                take_ready(
+                    &mut state,
+                    selection(selection_day(Path::new("")), local_spending())
+                )
+                .len(),
+                1
+            );
+            state.ready = false;
+            drop(state);
+            queue.submit(command_request(second, "second", None));
+            let mut state = queue.inner.state.lock().unwrap();
+            for submission in std::mem::take(&mut state.pending) {
+                enqueue_locked(&mut state, submission);
+            }
+            state.ready = true;
+            assert!(
+                take_ready(
+                    &mut state,
+                    selection(selection_day(Path::new("")), local_spending())
+                )
+                .is_empty()
+            );
+            state.running.clear();
+            assert_eq!(
+                take_ready(
+                    &mut state,
+                    selection(selection_day(Path::new("")), local_spending())
+                )
+                .len(),
+                1
+            );
+        }
+        assert!(!index_daily_pair_conflicts(
+            &daily.map(str::to_owned),
+            &["journal".into(), "indexer".into(), "drain".into()]
+        ));
     }
 
     struct UnreachableProcessStateProbe;

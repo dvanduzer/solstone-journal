@@ -19,7 +19,6 @@ use solstone_core_cortex_client::{
 };
 use solstone_core_depict::WireClient;
 use solstone_core_generate::{ClientError, GenerateExecutor, GenerateRequest, GenerateResponse};
-use solstone_core_indexer_store::scan::RescanFileStatus;
 use solstone_core_journal_config::work_priority::{WorkBand, WorkPriority};
 use solstone_core_journal_io::JournalRoot;
 use solstone_core_sense::{SenseExecutor, SenseJobResult};
@@ -29,7 +28,7 @@ use solstone_core_system::queue::{
     CallableQueueWorker, CallableTaskContext, ProcessState, ProcessStateProbe, TaskQueue,
     TaskQueueEvent, TaskQueueEventSink, TaskQueueOptions,
 };
-use solstone_core_system::request::{ExecutionRequest, ScheduledRequest};
+use solstone_core_system::request::{BusTaskRequest, ExecutionRequest, ScheduledRequest, TaskArgv};
 use solstone_core_system::schedule::{
     CheckReport, ScheduleEngine, ScheduleError, ScheduleNow, ScheduleSubmissionSink,
 };
@@ -149,11 +148,30 @@ struct HostIndexBoundary {
     cancelled: Checkpoint,
 }
 impl IndexBoundary for HostIndexBoundary {
-    fn rescan_file(&self, journal: &Path, path: &Path) -> Result<RescanFileStatus, String> {
+    fn drain_pending(
+        &self,
+        journal: &Path,
+        force: bool,
+        budget: Duration,
+        checkpoint: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let report = solstone_core_indexer_store::todo::drain_with_checkpoint(
+            journal,
+            solstone_core_indexer_store::todo::DrainOptions { force, budget },
+            checkpoint,
+        )
+        .map_err(|error| error.to_string())?;
+        if report.timed_out || report.failed != 0 {
+            Err("search updates are still pending".into())
+        } else {
+            Ok(())
+        }
+    }
+    fn enqueue_path(&self, journal: &Path, path: &Path) -> Result<(), String> {
         if (self.cancelled)() {
             return Err("thinking cancelled".into());
         }
-        solstone_core_indexer_store::scan::rescan_file(journal, path).map_err(|e| e.to_string())
+        solstone_core_indexer_store::todo::enqueue_path(journal, path).map_err(|e| e.to_string())
     }
 }
 
@@ -409,7 +427,12 @@ fn exact_command(args: &[String]) -> bool {
     match args {
         [command] if command == "heartbeat" || command == "facet-candidates" => true,
         [command, verb] if command == "brain" && verb == "refresh" => true,
-        [command, flag] if command == "indexer" && flag == "--rebuild-edges" => true,
+        [command, flag]
+            if command == "indexer"
+                && ["--rebuild-edges", "--rescan", "drain"].contains(&flag.as_str()) =>
+        {
+            true
+        }
         [command, verb, id]
             if command == "maintenance"
                 && verb == "run"
@@ -778,7 +801,10 @@ impl ForegroundProcessingHost {
                 },
                 Arc::clone(&worker),
                 Arc::new(move |_args| !admitted_cancelled()),
-                Some((payload.join("solstone/talent"), payload.join("solstone/apps"))),
+                Some((
+                    payload.join("solstone/talent"),
+                    payload.join("solstone/apps"),
+                )),
             ));
             if queue_slot.set(Arc::downgrade(&queue)).is_err() {
                 log::warn!("foreground schedule queue was already installed");
@@ -911,8 +937,24 @@ impl ForegroundProcessingHost {
             cancelled,
         )
         .with_sense_executor(executor);
-        solstone_core_think_cli::run_hosted_command(&context, &args, &ChildLaunchContext::default())
-            .exit_code
+        let result = solstone_core_think_cli::run_hosted_command(
+            &context,
+            &args,
+            &ChildLaunchContext::default(),
+        )
+        .exit_code;
+        let options = solstone_core_indexer_store::todo::DrainOptions {
+            force: false,
+            budget: Duration::from_secs(600),
+        };
+        if let Err(error) = solstone_core_indexer_store::todo::drain_with_checkpoint(
+            &hosted.journal,
+            options,
+            checkpoint.as_ref(),
+        ) {
+            log::warn!("foreground search update: {error}");
+        }
+        result
     }
     #[cfg(test)]
     pub fn execute_worker_command(&self, args: &[String]) -> i32 {
@@ -1017,6 +1059,7 @@ impl ForegroundProcessingHost {
             .name("journal-schedule".into())
             .spawn(move || {
                 let mut last_settle_scan = Instant::now();
+                let mut last_index_check = Instant::now() - Duration::from_secs(30);
                 while !cancelled() {
                     let tick = Instant::now();
                     queue.resume_processing();
@@ -1039,6 +1082,30 @@ impl ForegroundProcessingHost {
                             now_ms(),
                             &today,
                         );
+                    }
+                    if last_index_check.elapsed() >= Duration::from_secs(30) {
+                        last_index_check = tick;
+                        match solstone_core_indexer_store::todo::has_due(&journal, now_ms() as u64)
+                        {
+                            Ok(true) if !queue.contains_reference("index-todo") => {
+                                let _ = queue.submit(ExecutionRequest::Bus(BusTaskRequest {
+                                    cmd: TaskArgv::from_wire(vec![
+                                        "journal".into(),
+                                        "indexer".into(),
+                                        "drain".into(),
+                                    ])
+                                    .expect("fixed command"),
+                                    reference: "index-todo".into(),
+                                    day: None,
+                                    scheduler_name: None,
+                                    queue_if_active_cmd_differs: false,
+                                    priority: None,
+                                    daily_catchup_provenance: None,
+                                }));
+                            }
+                            Ok(_) => {}
+                            Err(error) => log::warn!("foreground search work list: {error}"),
+                        }
                     }
                     if let Ok(mut engine) = engine.lock() {
                         if cancelled() {

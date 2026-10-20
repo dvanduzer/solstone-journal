@@ -297,6 +297,32 @@ fn run_with_phase_process(
                     segment_outcome.borrow().result.clone()
                 }
                 "daily" => {
+                    let command = journal_command(&[
+                        "indexer",
+                        "drain",
+                        "--force",
+                        "--budget-seconds",
+                        "600",
+                    ]);
+                    let _ = run_process_phase(
+                        phase_process,
+                        "indexer_inputs",
+                        command,
+                        context,
+                        Duration::from_secs(610),
+                    );
+                    match solstone_core_indexer_store::todo::inspect(&context.journal) {
+                        Ok(status) if !status.keys.is_empty() => {
+                            phase_log.log("index.inputs_pending", context.event_now_ms(), serde_json::Map::from_iter([
+                                ("paths".to_owned(), serde_json::json!(status.keys)),
+                                ("detail".to_owned(), serde_json::json!("search updates are still queued; daily thinking continues")),
+                            ]));
+                        }
+                        Err(error) => log::warn!(
+                            "could not inspect search work before daily thinking: {error}"
+                        ),
+                        _ => {}
+                    }
                     daily_result = match daily::run(
                         context,
                         phase_log,
@@ -323,7 +349,7 @@ fn run_with_phase_process(
                         halted.set(true);
                         return failed_phase("indexer", "thinking cancelled");
                     }
-                    let command = journal_command(&["indexer", "--rescan"]);
+                    let command = journal_command(&["indexer", "drain"]);
                     let result = run_process_phase(
                         phase_process,
                         "indexer",
@@ -1049,6 +1075,9 @@ mod tests {
             _day: &str,
             _timeout: Duration,
         ) -> PhaseProcessOutcome {
+            if phase == "indexer_inputs" {
+                return PhaseProcessOutcome::Exited(0);
+            }
             self.calls.lock().unwrap().push((phase, command));
             self.outcomes
                 .lock()
@@ -1060,6 +1089,7 @@ mod tests {
 
     struct TerminalCortex {
         end_state: UseEndState,
+        dispatched: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl crate::context::CortexBoundary for TerminalCortex {
@@ -1068,6 +1098,8 @@ mod tests {
             _runtime: &tokio::runtime::Runtime,
             request: &CortexRequest,
         ) -> Result<String, crate::context::DispatchFailure> {
+            self.dispatched
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(format!("use-{}", request.name))
         }
 
@@ -1158,7 +1190,10 @@ mod tests {
             "{\n\"type\": \"generate\", \"max_output_tokens\": 1024, \"schedule\": \"daily\", \"hook\": {\"post\":\"schedule\"}, \"priority\": 1, \"output\": \"md\"\n}\n",
         )
         .unwrap();
-        context.with_boundary(Arc::new(TerminalCortex { end_state }))
+        context.with_boundary(Arc::new(TerminalCortex {
+            end_state,
+            dispatched: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }))
     }
 
     fn blocker(key: &str) -> SegmentIdentity {
@@ -2229,6 +2264,228 @@ mod tests {
         }
     }
 
+    #[test]
+    fn daily_talents_wait_for_claims_and_admission_then_read_indexed_inputs() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct ReadyRunner {
+            started: std::sync::mpsc::Sender<()>,
+            dispatched: Arc<AtomicUsize>,
+            key: String,
+        }
+        impl PhaseProcessRunner for ReadyRunner {
+            fn run(
+                &self,
+                phase: &'static str,
+                _command: Vec<String>,
+                journal: &std::path::Path,
+                _day: &str,
+                _timeout: Duration,
+            ) -> PhaseProcessOutcome {
+                if phase != "indexer_inputs" {
+                    return PhaseProcessOutcome::Exited(0);
+                }
+                assert_eq!(self.dispatched.load(Ordering::SeqCst), 0);
+                self.started.send(()).unwrap();
+                let report = solstone_core_indexer_store::todo::drain(
+                    journal,
+                    solstone_core_indexer_store::todo::DrainOptions {
+                        force: true,
+                        budget: Duration::from_secs(10),
+                    },
+                )
+                .unwrap();
+                assert!(!report.timed_out);
+                assert_eq!(report.failed, 0);
+                assert!(report.remaining.keys.is_empty());
+                assert_eq!(self.dispatched.load(Ordering::SeqCst), 0);
+                let reader = solstone_core_indexer_store::open_index_reader(journal).unwrap();
+                let count: i64 = reader
+                    .query_row(
+                        "SELECT count(*) FROM chunks WHERE path=?1 AND chunks MATCH 'kestrel'",
+                        [&self.key],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 1);
+                PhaseProcessOutcome::Exited(0)
+            }
+        }
+        for active_claim in [false, true] {
+            let journal = tempdir().unwrap();
+            let dispatched = Arc::new(AtomicUsize::new(0));
+            let context = terminal_context(journal.path(), UseEndState::Error).with_boundary(
+                Arc::new(TerminalCortex {
+                    end_state: UseEndState::Error,
+                    dispatched: dispatched.clone(),
+                }),
+            );
+            let key = format!("{DAY}/talents/input.md");
+            let source = journal.path().join("chronicle").join(&key);
+            fs::create_dir_all(source.parent().unwrap()).unwrap();
+            fs::write(&source, "kestrel planning input").unwrap();
+            solstone_core_indexer_store::todo::enqueue_path(journal.path(), &source).unwrap();
+            let claim = if active_claim {
+                let entry = fs::read_dir(journal.path().join("indexer/todo"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                let claim = entry
+                    .parent()
+                    .unwrap()
+                    .join("claimed")
+                    .join(entry.file_name().unwrap());
+                fs::create_dir_all(claim.parent().unwrap()).unwrap();
+                fs::rename(entry, &claim).unwrap();
+                Some(claim)
+            } else {
+                None
+            };
+            let held = solstone_core_journal_io::hold_lock(
+                if active_claim {
+                    journal.path().join("indexer/drain")
+                } else {
+                    solstone_core_indexer_store::db::db_path(journal.path())
+                },
+                Default::default(),
+            )
+            .unwrap();
+            let (sent, received) = std::sync::mpsc::channel();
+            let watched = dispatched.clone();
+            let root = journal.path().to_owned();
+            let holder = std::thread::spawn(move || {
+                received.recv_timeout(Duration::from_secs(5)).unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+                assert_eq!(
+                    watched.load(Ordering::SeqCst),
+                    0,
+                    "daily talents started while inputs were held"
+                );
+                if let Some(claim) = claim {
+                    solstone_core_indexer_store::scan::rescan_file(&root, &source).unwrap();
+                    fs::remove_file(claim).unwrap();
+                }
+                drop(held);
+            });
+            let runner = ReadyRunner {
+                started: sent,
+                dispatched: dispatched.clone(),
+                key,
+            };
+            let mut log = log(journal.path());
+            run_with_phase_process(
+                &context,
+                &mut log,
+                &ThinkArgs::default(),
+                1,
+                None,
+                &runner,
+                &Default::default(),
+            )
+            .unwrap();
+            holder.join().unwrap();
+            assert!(
+                dispatched.load(Ordering::SeqCst) > 0,
+                "daily talent must actually run"
+            );
+        }
+    }
+
+    #[test]
+    fn daily_continues_after_waiting_for_active_claims_or_writer_admission() {
+        struct WaitingRunner;
+        impl PhaseProcessRunner for WaitingRunner {
+            fn run(
+                &self,
+                phase: &'static str,
+                command: Vec<String>,
+                journal: &std::path::Path,
+                _day: &str,
+                timeout: Duration,
+            ) -> PhaseProcessOutcome {
+                assert_eq!(phase, "indexer_inputs");
+                assert_eq!(timeout, Duration::from_secs(610));
+                assert!(command.ends_with(&[
+                    "drain".into(),
+                    "--force".into(),
+                    "--budget-seconds".into(),
+                    "600".into()
+                ]));
+                let report = solstone_core_indexer_store::todo::drain(
+                    journal,
+                    solstone_core_indexer_store::todo::DrainOptions {
+                        force: true,
+                        budget: Duration::from_millis(100),
+                    },
+                )
+                .unwrap();
+                assert!(report.timed_out);
+                assert_eq!(report.remaining.keys.len(), 1);
+                PhaseProcessOutcome::TimedOut {
+                    cleanup_error: None,
+                }
+            }
+        }
+        for active_claim in [false, true] {
+            let journal = tempdir().unwrap();
+            let context = context(journal.path());
+            let key = "20260813/device/120000_60/talents/activity.md";
+            solstone_core_indexer_store::todo::enqueue_path(
+                journal.path(),
+                std::path::Path::new(key),
+            )
+            .unwrap();
+            let lock_path = if active_claim {
+                let path = fs::read_dir(journal.path().join("indexer/todo"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                fs::create_dir(journal.path().join("indexer/todo/claimed")).unwrap();
+                fs::rename(
+                    &path,
+                    path.parent()
+                        .unwrap()
+                        .join("claimed")
+                        .join(path.file_name().unwrap()),
+                )
+                .unwrap();
+                journal.path().join("indexer/drain")
+            } else {
+                solstone_core_indexer_store::db::db_path(journal.path())
+            };
+            let held = solstone_core_journal_io::locking::hold_lock(lock_path, Default::default())
+                .unwrap();
+            let mut log = log(journal.path());
+            let result = run_with_phase_process(
+                &context,
+                &mut log,
+                &ThinkArgs::default(),
+                1,
+                None,
+                &WaitingRunner,
+                &Default::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                result.failed, 0,
+                "the bounded input wait does not prevent daily work"
+            );
+            assert_eq!(marker_generation(journal.path()), Some(0));
+            drop(log);
+            let logs = lifecycle_rows(journal.path(), "index.inputs_pending")
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(logs.contains("index.inputs_pending"));
+            assert!(logs.contains(key));
+            drop(held);
+        }
+    }
+
     /// Catch-up re-ran days whose runs found nothing to do, and each re-run
     /// re-indexed and re-scanned the whole journal.  A run that changed
     /// nothing now skips both, and its day still completes.
@@ -2354,7 +2611,7 @@ mod tests {
                 .rev()
                 .cloned()
                 .collect::<Vec<_>>(),
-            ["indexer", "--rescan"]
+            ["indexer", "drain"]
         );
         assert_eq!(calls[1].0, "journal_stats");
         assert_eq!(calls[1].1.last().map(String::as_str), Some("journal-stats"));
@@ -2396,7 +2653,7 @@ mod tests {
         assert!(result.timed_out);
         let calls = runner.calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].1.last().map(String::as_str), Some("--rescan"));
+        assert_eq!(calls[0].1.last().map(String::as_str), Some("drain"));
         assert_eq!(calls[1].0, "journal_stats");
         assert_eq!(calls[1].1.last().map(String::as_str), Some("journal-stats"));
         // ... and the day still completes.  A whole-corpus statistics scan can

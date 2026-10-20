@@ -502,10 +502,7 @@ mod tests {
 
     use rusqlite::Connection;
     use serde_json::{Value, json};
-    use solstone_core_indexer_store::{
-        db::{StreamPruneCounts, db_path, open_index},
-        scan::RescanFileStatus,
-    };
+    use solstone_core_indexer_store::db::{db_path, open_index};
     use solstone_core_segment::{
         Relocation, RelocationError, RelocationOutcome, RelocationRefusal, RepairOutcome,
     };
@@ -687,14 +684,9 @@ mod tests {
             Ok(outcome)
         }
 
-        fn prune(&self, journal: &Path, rel: &str) -> Result<Option<StreamPruneCounts>, String> {
-            self.record("prune")?;
-            NativeOperations.prune(journal, rel)
-        }
-
-        fn rescan(&self, journal: &Path, file: &Path) -> Result<RescanFileStatus, String> {
-            self.record("rescan")?;
-            NativeOperations.rescan(journal, file)
+        fn enqueue_path(&self, journal: &Path, path: &Path) -> Result<(), String> {
+            self.record("enqueue")?;
+            NativeOperations.enqueue_path(journal, path)
         }
 
         fn touch_health(&self, journal: &Path, day: &str) -> Result<(), String> {
@@ -721,11 +713,7 @@ mod tests {
             NativeOperations.relocate(relocation)
         }
 
-        fn prune(&self, _: &Path, _: &str) -> Result<Option<StreamPruneCounts>, String> {
-            unreachable!("late collision returns before post-move work")
-        }
-
-        fn rescan(&self, _: &Path, _: &Path) -> Result<RescanFileStatus, String> {
+        fn enqueue_path(&self, _: &Path, _: &Path) -> Result<(), String> {
             unreachable!("late collision returns before post-move work")
         }
 
@@ -1299,6 +1287,7 @@ mod tests {
             root.path(),
         );
         assert_eq!(run.exit_code, 0, "{}", run.stderr);
+        solstone_core_indexer_store::todo::drain(root.path(), Default::default()).unwrap();
         assert_eq!(index_rows(root.path(), old), 0);
         assert_eq!(
             index_rows(root.path(), "20260305/090000_60"),
@@ -1321,13 +1310,25 @@ mod tests {
         let old = "20260304/work/090000_60";
         let new = "20260305/work/090000_60";
         seed_index(root.path(), old);
+        let lease =
+            solstone_core_segment::hold_lock(db_path(root.path()), Default::default()).unwrap();
         let run = bypass(
             &["move", "20260304/work/090000_60", "--to-day", "20260305"],
             root.path(),
         );
         assert_eq!(run.exit_code, 0, "{}", run.stderr);
+        assert_eq!(
+            solstone_core_indexer_store::todo::inspect(root.path())
+                .unwrap()
+                .keys,
+            [old, new]
+        );
+        drop(lease);
+        solstone_core_indexer_store::todo::drain(root.path(), Default::default()).unwrap();
         assert_eq!(index_rows(root.path(), old), 0);
         assert!(index_rows(root.path(), new) > 0);
+        let check = solstone_core_indexer_store::scan::scan_journal(root.path(), false).unwrap();
+        assert_eq!((check.indexed, check.removed), (0, 0));
     }
 
     #[test]
@@ -1525,7 +1526,7 @@ mod tests {
             ("rewrite", 2),
             ("patch", 3),
             ("tail", 4),
-            ("rescan", 5),
+            ("enqueue", 5),
             ("health", 6),
         ] {
             let root = TempDir::new().unwrap();
@@ -1546,7 +1547,7 @@ mod tests {
                 ),
             );
             stream_state(root.path(), "work", "20260304", "090000_60", 1);
-            if failure == "rescan" {
+            if failure == "enqueue" {
                 seed_index(root.path(), "20260304/work/090000_60");
             }
             let operations = RecordingOperations {
@@ -1560,11 +1561,8 @@ mod tests {
             );
             assert_eq!(run.exit_code, 3, "{failure}: {}", run.stderr);
             assert!(run.stderr.contains(&format!("step {step}")));
-            if failure == "rescan" {
-                assert!(
-                    run.stderr
-                        .contains("run: solstone journal indexer --rescan")
-                );
+            if failure == "enqueue" {
+                assert!(run.stderr.contains("the search update could not be queued"));
             }
             assert!(run.stdout.contains("checks passed"));
             assert!(operations.calls.borrow().contains(&"health"));

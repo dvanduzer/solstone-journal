@@ -91,10 +91,7 @@ pub fn publish(
     journal: &Path,
     segment: &Path,
     source_mtime_ms: Option<i64>,
-    rescan: impl FnMut(
-        &Path,
-        &Path,
-    ) -> Result<solstone_core_indexer_store::scan::RescanFileStatus, String>,
+    rescan: impl FnMut(&Path, &Path) -> Result<(), String>,
 ) -> Result<(), String> {
     publish_checked(journal, segment, source_mtime_ms, rescan, &|| Ok(()))
 }
@@ -103,10 +100,7 @@ pub fn publish_checked(
     journal: &Path,
     segment: &Path,
     source_mtime_ms: Option<i64>,
-    mut rescan: impl FnMut(
-        &Path,
-        &Path,
-    ) -> Result<solstone_core_indexer_store::scan::RescanFileStatus, String>,
+    mut rescan: impl FnMut(&Path, &Path) -> Result<(), String>,
     checkpoint: &dyn Fn() -> Result<(), String>,
 ) -> Result<(), String> {
     checkpoint()?;
@@ -119,7 +113,7 @@ pub fn publish_checked(
             });
         if !matches!(
             attempt.outcome,
-            SavedPublicationOutcome::Indexed | SavedPublicationOutcome::Excluded
+            SavedPublicationOutcome::Queued | SavedPublicationOutcome::Excluded
         ) {
             return Err(format!(
                 "saved publication {}: {}",
@@ -143,7 +137,25 @@ pub fn publish_checked(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solstone_core_indexer_store::scan::RescanFileStatus;
+
+    #[test]
+    fn an_unwritable_work_list_leaves_the_saved_publication_owed() {
+        let journal = tempfile::tempdir().unwrap();
+        let segment = journal.path().join("chronicle/20260101/desktop/120000_300");
+        std::fs::create_dir_all(segment.join("talents")).unwrap();
+        std::fs::write(segment.join("talents/activity.md"), "saved summary").unwrap();
+        std::fs::create_dir(journal.path().join("indexer")).unwrap();
+        std::fs::write(journal.path().join("indexer/todo"), "blocked directory").unwrap();
+        assert!(
+            publish(journal.path(), &segment, Some(1), |journal, path| {
+                solstone_core_indexer_store::todo::enqueue_path(journal, path)
+                    .map_err(|error| error.to_string())
+            })
+            .is_err()
+        );
+        assert!(!receipt_path(&segment).exists());
+        assert!(!is_current(journal.path(), &segment, Some(1)).unwrap());
+    }
 
     #[test]
     fn failed_publication_retries_saved_text_and_receipt_is_bound_to_input_and_output() {
@@ -163,9 +175,7 @@ mod tests {
         publish(journal.path(), &segment, Some(1), |_, path| {
             calls += 1;
             assert_eq!(std::fs::read_to_string(path).unwrap(), "a saved summary");
-            Ok(RescanFileStatus::Indexed {
-                warnings: Vec::new(),
-            })
+            Ok(())
         })
         .unwrap();
         assert_eq!(calls, 1);
@@ -173,12 +183,7 @@ mod tests {
         assert!(!is_current(journal.path(), &segment, Some(2)).unwrap());
         std::fs::write(&output, "the owner's edit").unwrap();
         assert!(!is_current(journal.path(), &segment, Some(1)).unwrap());
-        publish(journal.path(), &segment, Some(1), |_, _| {
-            Ok(RescanFileStatus::Indexed {
-                warnings: Vec::new(),
-            })
-        })
-        .unwrap();
+        publish(journal.path(), &segment, Some(1), |_, _| Ok(())).unwrap();
         assert_eq!(std::fs::read_to_string(output).unwrap(), "the owner's edit");
     }
 
@@ -198,9 +203,7 @@ mod tests {
                 Some(1),
                 |_, _| {
                     cancelled.set(cancel);
-                    Ok(RescanFileStatus::Indexed {
-                        warnings: Vec::new(),
-                    })
+                    Ok(())
                 },
                 &|| {
                     if cancelled.get() {
