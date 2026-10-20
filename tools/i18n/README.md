@@ -36,6 +36,47 @@ After changing source prose, run `lock <catalog>`. Copy each changed message's c
 
 `export <catalog> --out <absent-directory>` creates a shared catalog bundle with a deterministic `import-lock.json`. `import <bundle> --dest <absent-directory>` verifies the exact manifest and member digests before publishing a staged tree and retaining the lock. Commit the imported bytes and lock with the consuming repository's source pin. Import verifies transport integrity; run normal catalog compilation afterward to validate semantics and current coverage. Local build and CI routes need no network or localization service. The tools use Rust and Swift, so a consuming repository need not introduce Python.
 
+## target resources
+
+Use `targets` to lower a validated catalog. Repeat `--target` to request more than one format:
+
+```sh
+tools/i18n/target/debug/i18n-catalog targets tools/i18n/fixtures/runtime-contract \
+  --channel production --target rust --target esm --target apple --target android --target gettext \
+  --out /var/tmp/i18n-target-resources
+```
+
+The target names are `rust`, `esm`, `apple`, `android`, `webextension` and `gettext`. Each output cell follows the registry's bundle and locale membership. Missing or stale translations fail before publication. An unsupported target contract produces an error; it does not fall back to a different locale, numeric style or argument type. All requested targets are staged together. A target refusal preserves the previous output tree; successful regeneration replaces it, removing locales excluded by the new channel selection. Use an absent destination or a directory previously produced by this command.
+
+Canonical FTL remains compiler input. Use the emitted resource keys and adapters at runtime. Enum variants share the parent semantic identity and use its declared default for an unmatched string value. A missing argument or a value of the wrong scalar type remains an error.
+
+Rust output includes `MessageId`, typed scalar values, and `render`/`render_dotted` entry points. The ESM API exports `render`, `integer` and `cardinal`; pass named argument pairs, preserving the declared scalar types. Strings and booleans keep their ordinary JavaScript types. Displayed runtime arguments retain interpolation isolation. Protected payloads remain literal data.
+
+WebExtension resources are for explicitly eligible static manifest messages. Dynamic UI messages use the Fluent runtime. The ESM output includes its pinned local runtime and license; serve those files with the generated module, without a CDN or bundler.
+
+Native resource compilation and runtime rendering are separate checks. Compile xcstrings with Xcode, link Android resources with AAPT2 and the platform jar, and check PO files with GNU gettext. Then run the emitted call contract in the adopting target and compare arguments, selected branches, protected tokens and meaningful whitespace. A parser written alongside the generator does not replace its platform reader.
+
+The output's `cases.json` supplies synthetic inputs and a structured `call_contract` with the selected resource key and ordered native argument types. `own_reader_call` is an internal parser description, not executable platform code. `logical_expected` records scalar text; `expected` is null when native number formatting or ESM rendering still needs an independent golden. Its platform-reader status remains pending until that reader runs. Preserve the native call's argument order and display types, including the original numeric plural quantity and any separate display string. Literal percent signs are escaped for one native formatting pass, including messages with no runtime arguments.
+
+Rust and gettext refuse locale-formatted numbers. ESM uses native Intl; Apple uses Foundation; Android supplies an ICU number-format helper. The pinned Rust plural reader supports the initial English profile; Arabic quantities require declared bounds within -100..100 because its larger-value rules differ from current native readers. Unsupported plural-rule families refuse.
+
+Android writes the selected locale that sorts first by tag into `values/` as its default table, plus each selected locale's qualified table. Coverage still requires every declared cell; the default table cannot satisfy a missing translation. Private-use tags require an explicit native projection. WebExtension output likewise requires explicit native locale folders.
+
+InfoPlist/AppShortcuts catalogs, desktop/AppStream, winget and store-listing publication are outside these generators. Test locale declarations and generated fixtures must stay out of application packaging.
+
+The committed [runtime contract fixture](fixtures/runtime-contract) includes independent exact Rust and ESM goldens for signed quantities, integer bounds, reordered arguments, enum defaults, protected tokens and whitespace. After the example generation above, run its ESM cases under Node:
+
+```sh
+node tools/i18n/verify-esm.mjs /var/tmp/i18n-target-resources \
+  tools/i18n/fixtures/runtime-contract/expected-esm.json
+```
+
+Run process-based generated API checks explicitly; routine `make ci` keeps compiler tests in process:
+
+```sh
+cargo test --manifest-path tools/i18n/Cargo.toml --locked --offline --features full-tests
+```
+
 ## source review
 
 The [extractor](extract/README.md) uses Rust `syn` and an installed SwiftSyntax parser. Prepare dependencies explicitly, then run its locked, offline checks:
