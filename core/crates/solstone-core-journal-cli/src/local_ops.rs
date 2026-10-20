@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 
 use chrono::{NaiveDate, SecondsFormat, Utc};
 use serde_json::{Value, json};
-use solstone_core_facets::{append_action_log, hold_facet_trust_lock};
+#[cfg(not(target_os = "ios"))]
+use solstone_core_facets::append_action_log;
+use solstone_core_facets::hold_facet_trust_lock;
 #[cfg(not(target_os = "ios"))]
 use solstone_core_import_sources::ImportSourcesError;
 #[cfg(not(target_os = "ios"))]
@@ -1330,9 +1332,9 @@ fn facet_doctor_orphans(
         ));
     }
     if repaired > 0
-        && let Err(error) = solstone_core_indexer_store::todo::enqueue_token(
+        && let Err(error) = solstone_core_indexer_todo::enqueue_token(
             &journal,
-            solstone_core_indexer_store::todo::Token::Reclassify,
+            solstone_core_indexer_todo::Token::Reclassify,
         )
     {
         return facet_doctor_index_failure(success(stdout), &error.to_string());
