@@ -733,18 +733,23 @@ struct JournalFirstRunView: View {
             },
             primary: {
                 // While an operation runs (a mark commit, the thinking save and hand-off, a
-                // refusal's open), a small spinner sits beside the step's button, in place of the
-                // window-wide one that sat in the band over the sun. Setting up has its own.
-                if showsFooterBusy || primary != nil {
-                    HStack(spacing: 8) {
-                        if showsFooterBusy {
-                            ProgressView()
-                                .controlSize(.small)
+                // refusal's open), a small spinner shows beside the step's button, in place of the
+                // window-wide one that sat in the band over the sun. It rides in the gap before
+                // the button and takes no width, so the button keeps its line.
+                if let primary {
+                    primary
+                        .overlay(alignment: .leading) {
+                            if showsFooterBusy {
+                                ProgressView()
+                                    .controlSize(.mini)
+                                    .frame(width: 12, height: 12)
+                                    .offset(x: -14)
+                                    .allowsHitTesting(false)
+                            }
                         }
-                        if let primary {
-                            primary
-                        }
-                    }
+                } else if showsFooterBusy {
+                    ProgressView()
+                        .controlSize(.small)
                 }
             }
         )
@@ -815,7 +820,10 @@ struct JournalFirstRunView: View {
 
     private var showsFooterBusy: Bool {
         guard model.userOperationInFlight || model.pendingOperation != .none else { return false }
-        return model.route != .ritual(.setupProgress)
+        // Only the setting-up card has its own spinner; a refusal notice or a hand-off error
+        // shown on the setting-up route replaces that card, so its footer shows the spinner.
+        let notice = model.handoffRefusal != nil || !(model.handoffError ?? "").isEmpty
+        return model.route != .ritual(.setupProgress) || notice
     }
 
     private var showsDownloadFooter: Bool {

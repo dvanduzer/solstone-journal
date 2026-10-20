@@ -151,9 +151,11 @@ final class JournalFirstRunModel {
         errorMessage: String? = nil,
         thinkingFailure: String? = nil,
         speechFailure: String? = nil,
-        operationError: JournalRitualOperationToken = .none
+        operationError: JournalRitualOperationToken = .none,
+        pendingOperation: JournalRitualOperationToken = .none
     ) {
         self.route = route
+        self.pendingOperation = pendingOperation
         self.setupState = setupState
         self.setupCopy = setupCopy
         self.handoffRefusal = handoffRefusal

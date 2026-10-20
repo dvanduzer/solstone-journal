@@ -171,6 +171,21 @@ struct JournalSetupChromeSnapshotTests {
             StateFixture(name: "thinking-later") { model in
                 model.applySnapshotState(route: .ritual(.thinking), setupState: thinkingCapable, setupCopy: copy, draftThinkingChoice: .later)
             },
+            StateFixture(name: "thinking-downloading-busy") { model in
+                model.applySnapshotState(route: .ritual(.thinking), setupState: thinkingDownloading, setupCopy: copy, draftThinkingChoice: .local, pendingOperation: .thinkingSave)
+            },
+            StateFixture(name: "refusal-busy") { model in
+                model.applySnapshotState(
+                    route: .ritual(.setupProgress),
+                    setupCopy: copy,
+                    handoffRefusal: JournalSetupRefusalResolution(
+                        handoffID: UUID(),
+                        journalRootPath: "/tmp/journal",
+                        reason: .heldPairing
+                    ),
+                    pendingOperation: .outbound
+                )
+            },
             StateFixture(name: "thinking-cant-run") { model in
                 model.applySnapshotState(route: .ritual(.thinking), setupState: thinkingCantRun, setupCopy: copy)
             },

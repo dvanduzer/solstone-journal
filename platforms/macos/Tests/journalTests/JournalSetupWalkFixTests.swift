@@ -117,11 +117,79 @@ struct JournalSetupWalkFixTests {
 
     // D8's re-diff: the band spinner was the only progress shown while the mark commits, the
     // thinking choice saves and hands off, or a refusal opens the journal. That progress now sits
-    // in the footer beside the step's button, on every route but setting up (which has its own).
-    @Test func anOperationInFlightStillShowsProgressInTheFooter() throws {
-        let view = try Self.source("JournalFirstRunView.swift")
-        #expect(view.contains("if showsFooterBusy {"))
-        #expect(view.contains("guard model.userOperationInFlight || model.pendingOperation != .none else { return false }"))
-        #expect(view.contains("return model.route != .ritual(.setupProgress)"))
+    // in the footer beside the step's button, on every screen but the setting-up card, which has
+    // its own. Rendered: a footer pixel left of the primary is the spinner's, not the footer fill.
+    private func footerSpinnerPixels(
+        route: JournalFirstRunRoute,
+        pending: JournalRitualOperationToken,
+        refusal: Bool = false
+    ) throws -> Int {
+        JournalMarkFont.register()
+        let copy = try loadSetupFixtureCopy()
+        let state = JournalSetupState(
+            schema: "solstone.setup-state.v1",
+            journalPath: "/tmp/journal",
+            done: false,
+            mark: .init(render: .uiTestSample, state: .proposed, proposalID: "prop-1"),
+            thinking: .init(choice: nil, saved: false, capability: .ok, downloadBytes: 1_500_000_000),
+            downloads: .init(
+                speech: .init(state: .idle, attemptID: nil, bytesDone: 0, bytesTotal: nil),
+                thinking: .init(state: .idle, attemptID: nil, bytesDone: 0, bytesTotal: nil)
+            )
+        )
+        let fixture = makeModel(startResults: [], probeResults: [])
+        fixture.model.applySnapshotState(
+            route: route,
+            setupState: state,
+            setupCopy: copy,
+            handoffRefusal: refusal
+                ? JournalSetupRefusalResolution(handoffID: UUID(), journalRootPath: "/tmp/journal", reason: .heldPairing)
+                : nil,
+            pendingOperation: pending
+        )
+        let size = CGSize(width: 880, height: 580)
+        let view = JournalFirstRunView(
+            model: fixture.model,
+            minSize: size,
+            background: SunArcBackgroundView(fixedDate: Date(timeIntervalSince1970: 1_790_190_000), timeZone: TimeZone(identifier: "America/Denver")!)
+        )
+        .frame(width: size.width, height: size.height)
+        .environment(\.colorScheme, .light)
+        let host = NSHostingView(rootView: view)
+        host.appearance = NSAppearance(named: .aqua)
+        host.frame = NSRect(origin: .zero, size: size)
+        host.layoutSubtreeIfNeeded()
+        let rep = try #require(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+        host.cacheDisplay(in: host.bounds, to: rep)
+        // Count dark pixels in the footer's right third, outside the orange primary: the
+        // spinner's spokes are grey on the light footer fill.
+        let scale = CGFloat(rep.pixelsHigh) / size.height
+        let top = rep.pixelsHigh - Int((18 + 66) * scale)
+        let bottom = rep.pixelsHigh - Int(18 * scale)
+        var count = 0
+        for y in stride(from: top, to: bottom, by: 1) {
+            for x in stride(from: Int(size.width * 0.55 * scale), to: Int((size.width - 18) * scale), by: 1) {
+                guard let c = rep.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { continue }
+                let r = c.redComponent, g = c.greenComponent, b = c.blueComponent
+                let grey = abs(r - g) < 0.06 && abs(g - b) < 0.06 && r < 0.75
+                if grey { count += 1 }
+            }
+        }
+        return count
+    }
+
+    @Test func anOperationInFlightShowsProgressInTheFooter() throws {
+        // The mark commit: no spinner before, one while it runs.
+        let idle = try footerSpinnerPixels(route: .ritual(.mark), pending: .none)
+        let busy = try footerSpinnerPixels(route: .ritual(.mark), pending: .mark)
+        #expect(busy > idle + 20, "no footer progress while the mark commits: idle \(idle), busy \(busy)")
+        // A refusal shown over the setting-up route, opening the journal.
+        let refusalIdle = try footerSpinnerPixels(route: .ritual(.setupProgress), pending: .none, refusal: true)
+        let refusalBusy = try footerSpinnerPixels(route: .ritual(.setupProgress), pending: .outbound, refusal: true)
+        #expect(refusalBusy > refusalIdle + 20, "no footer progress while a refusal opens the journal: idle \(refusalIdle), busy \(refusalBusy)")
+        // Setting up keeps only its card's spinner.
+        let setupIdle = try footerSpinnerPixels(route: .ritual(.setupProgress), pending: .none)
+        let setupBusy = try footerSpinnerPixels(route: .ritual(.setupProgress), pending: .setup)
+        #expect(abs(setupBusy - setupIdle) <= 4, "a second spinner on setting up: idle \(setupIdle), busy \(setupBusy)")
     }
 }
