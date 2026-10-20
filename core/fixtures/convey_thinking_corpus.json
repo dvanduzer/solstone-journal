@@ -1496,8 +1496,8 @@
         "why": "local runtime recovery view"
       },
       {
-        "body_bytes": 2500,
-        "body_sha256": "c43d7d13a470bba6d6505b0def5ecbedbb5586108a2f33bcc098bf4ad59c97e4",
+        "body_bytes": 2478,
+        "body_sha256": "40e1cc74c5cc2bb5b8ec544a95fe9a87e3b38a88eb9d8dea016d969ebc0d8d8a",
         "body_sha256_basis": "raw-body",
         "content_type": "application/json",
         "json": {
@@ -1512,15 +1512,7 @@
             },
             {
               "app": null,
-              "description": "creates comprehensive daily newsletters for each facet, covering activities, progress, and insights",
-              "disabled": false,
-              "key": "facet_newsletter",
-              "source": "system",
-              "title": "facet newsletter generator"
-            },
-            {
-              "app": null,
-              "description": "synthesizes all daily agent outputs into a structured five-section morning briefing",
+              "description": "synthesizes all daily agent outputs into a structured four-section morning briefing",
               "disabled": false,
               "key": "morning_briefing",
               "source": "system",
@@ -1544,19 +1536,19 @@
             },
             {
               "app": "entities",
-              "description": "proposes candidate durable factoids about attached entities from journal content",
-              "disabled": false,
-              "key": "entities:entity_suggest",
-              "source": "app",
-              "title": "entity suggest"
-            },
-            {
-              "app": "entities",
               "description": "reconciles proposed entity observations against existing observations",
               "disabled": false,
               "key": "entities:entity_observer",
               "source": "app",
               "title": "entity observer"
+            },
+            {
+              "app": "entities",
+              "description": "proposes candidate durable factoids about attached entities from journal content",
+              "disabled": false,
+              "key": "entities:entity_suggest",
+              "source": "app",
+              "title": "entity suggest"
             }
           ],
           "segment": [
@@ -3739,8 +3731,8 @@
         "why": "local runtime recovery view"
       },
       {
-        "body_bytes": 2500,
-        "body_sha256": "c43d7d13a470bba6d6505b0def5ecbedbb5586108a2f33bcc098bf4ad59c97e4",
+        "body_bytes": 2478,
+        "body_sha256": "40e1cc74c5cc2bb5b8ec544a95fe9a87e3b38a88eb9d8dea016d969ebc0d8d8a",
         "body_sha256_basis": "raw-body",
         "content_type": "application/json",
         "json": {
@@ -3755,15 +3747,7 @@
             },
             {
               "app": null,
-              "description": "creates comprehensive daily newsletters for each facet, covering activities, progress, and insights",
-              "disabled": false,
-              "key": "facet_newsletter",
-              "source": "system",
-              "title": "facet newsletter generator"
-            },
-            {
-              "app": null,
-              "description": "synthesizes all daily agent outputs into a structured five-section morning briefing",
+              "description": "synthesizes all daily agent outputs into a structured four-section morning briefing",
               "disabled": false,
               "key": "morning_briefing",
               "source": "system",
@@ -3787,19 +3771,19 @@
             },
             {
               "app": "entities",
-              "description": "proposes candidate durable factoids about attached entities from journal content",
-              "disabled": false,
-              "key": "entities:entity_suggest",
-              "source": "app",
-              "title": "entity suggest"
-            },
-            {
-              "app": "entities",
               "description": "reconciles proposed entity observations against existing observations",
               "disabled": false,
               "key": "entities:entity_observer",
               "source": "app",
               "title": "entity observer"
+            },
+            {
+              "app": "entities",
+              "description": "proposes candidate durable factoids about attached entities from journal content",
+              "disabled": false,
+              "key": "entities:entity_suggest",
+              "source": "app",
+              "title": "entity suggest"
             }
           ],
           "segment": [
@@ -5962,8 +5946,8 @@
         "why": "local runtime recovery view"
       },
       {
-        "body_bytes": 2500,
-        "body_sha256": "c43d7d13a470bba6d6505b0def5ecbedbb5586108a2f33bcc098bf4ad59c97e4",
+        "body_bytes": 2478,
+        "body_sha256": "40e1cc74c5cc2bb5b8ec544a95fe9a87e3b38a88eb9d8dea016d969ebc0d8d8a",
         "body_sha256_basis": "raw-body",
         "content_type": "application/json",
         "json": {
@@ -5978,15 +5962,7 @@
             },
             {
               "app": null,
-              "description": "creates comprehensive daily newsletters for each facet, covering activities, progress, and insights",
-              "disabled": false,
-              "key": "facet_newsletter",
-              "source": "system",
-              "title": "facet newsletter generator"
-            },
-            {
-              "app": null,
-              "description": "synthesizes all daily agent outputs into a structured five-section morning briefing",
+              "description": "synthesizes all daily agent outputs into a structured four-section morning briefing",
               "disabled": false,
               "key": "morning_briefing",
               "source": "system",
@@ -6010,19 +5986,19 @@
             },
             {
               "app": "entities",
-              "description": "proposes candidate durable factoids about attached entities from journal content",
-              "disabled": false,
-              "key": "entities:entity_suggest",
-              "source": "app",
-              "title": "entity suggest"
-            },
-            {
-              "app": "entities",
               "description": "reconciles proposed entity observations against existing observations",
               "disabled": false,
               "key": "entities:entity_observer",
               "source": "app",
               "title": "entity observer"
+            },
+            {
+              "app": "entities",
+              "description": "proposes candidate durable factoids about attached entities from journal content",
+              "disabled": false,
+              "key": "entities:entity_suggest",
+              "source": "app",
+              "title": "entity suggest"
             }
           ],
           "segment": [
@@ -8179,8 +8155,8 @@
         "why": "local runtime recovery view"
       },
       {
-        "body_bytes": 2500,
-        "body_sha256": "c43d7d13a470bba6d6505b0def5ecbedbb5586108a2f33bcc098bf4ad59c97e4",
+        "body_bytes": 2478,
+        "body_sha256": "40e1cc74c5cc2bb5b8ec544a95fe9a87e3b38a88eb9d8dea016d969ebc0d8d8a",
         "body_sha256_basis": "raw-body",
         "content_type": "application/json",
         "json": {
@@ -8195,15 +8171,7 @@
             },
             {
               "app": null,
-              "description": "creates comprehensive daily newsletters for each facet, covering activities, progress, and insights",
-              "disabled": false,
-              "key": "facet_newsletter",
-              "source": "system",
-              "title": "facet newsletter generator"
-            },
-            {
-              "app": null,
-              "description": "synthesizes all daily agent outputs into a structured five-section morning briefing",
+              "description": "synthesizes all daily agent outputs into a structured four-section morning briefing",
               "disabled": false,
               "key": "morning_briefing",
               "source": "system",
@@ -8227,19 +8195,19 @@
             },
             {
               "app": "entities",
-              "description": "proposes candidate durable factoids about attached entities from journal content",
-              "disabled": false,
-              "key": "entities:entity_suggest",
-              "source": "app",
-              "title": "entity suggest"
-            },
-            {
-              "app": "entities",
               "description": "reconciles proposed entity observations against existing observations",
               "disabled": false,
               "key": "entities:entity_observer",
               "source": "app",
               "title": "entity observer"
+            },
+            {
+              "app": "entities",
+              "description": "proposes candidate durable factoids about attached entities from journal content",
+              "disabled": false,
+              "key": "entities:entity_suggest",
+              "source": "app",
+              "title": "entity suggest"
             }
           ],
           "segment": [
@@ -10585,8 +10553,8 @@
         "why": "local runtime recovery view"
       },
       {
-        "body_bytes": 2500,
-        "body_sha256": "c43d7d13a470bba6d6505b0def5ecbedbb5586108a2f33bcc098bf4ad59c97e4",
+        "body_bytes": 2478,
+        "body_sha256": "40e1cc74c5cc2bb5b8ec544a95fe9a87e3b38a88eb9d8dea016d969ebc0d8d8a",
         "body_sha256_basis": "raw-body",
         "content_type": "application/json",
         "json": {
@@ -10601,15 +10569,7 @@
             },
             {
               "app": null,
-              "description": "creates comprehensive daily newsletters for each facet, covering activities, progress, and insights",
-              "disabled": false,
-              "key": "facet_newsletter",
-              "source": "system",
-              "title": "facet newsletter generator"
-            },
-            {
-              "app": null,
-              "description": "synthesizes all daily agent outputs into a structured five-section morning briefing",
+              "description": "synthesizes all daily agent outputs into a structured four-section morning briefing",
               "disabled": false,
               "key": "morning_briefing",
               "source": "system",
@@ -10633,19 +10593,19 @@
             },
             {
               "app": "entities",
-              "description": "proposes candidate durable factoids about attached entities from journal content",
-              "disabled": false,
-              "key": "entities:entity_suggest",
-              "source": "app",
-              "title": "entity suggest"
-            },
-            {
-              "app": "entities",
               "description": "reconciles proposed entity observations against existing observations",
               "disabled": false,
               "key": "entities:entity_observer",
               "source": "app",
               "title": "entity observer"
+            },
+            {
+              "app": "entities",
+              "description": "proposes candidate durable factoids about attached entities from journal content",
+              "disabled": false,
+              "key": "entities:entity_suggest",
+              "source": "app",
+              "title": "entity suggest"
             }
           ],
           "segment": [
@@ -14118,8 +14078,8 @@
         "why": "local runtime recovery view"
       },
       {
-        "body_bytes": 2500,
-        "body_sha256": "c43d7d13a470bba6d6505b0def5ecbedbb5586108a2f33bcc098bf4ad59c97e4",
+        "body_bytes": 2478,
+        "body_sha256": "40e1cc74c5cc2bb5b8ec544a95fe9a87e3b38a88eb9d8dea016d969ebc0d8d8a",
         "body_sha256_basis": "raw-body",
         "content_type": "application/json",
         "json": {
@@ -14134,15 +14094,7 @@
             },
             {
               "app": null,
-              "description": "creates comprehensive daily newsletters for each facet, covering activities, progress, and insights",
-              "disabled": false,
-              "key": "facet_newsletter",
-              "source": "system",
-              "title": "facet newsletter generator"
-            },
-            {
-              "app": null,
-              "description": "synthesizes all daily agent outputs into a structured five-section morning briefing",
+              "description": "synthesizes all daily agent outputs into a structured four-section morning briefing",
               "disabled": false,
               "key": "morning_briefing",
               "source": "system",
@@ -14166,19 +14118,19 @@
             },
             {
               "app": "entities",
-              "description": "proposes candidate durable factoids about attached entities from journal content",
-              "disabled": false,
-              "key": "entities:entity_suggest",
-              "source": "app",
-              "title": "entity suggest"
-            },
-            {
-              "app": "entities",
               "description": "reconciles proposed entity observations against existing observations",
               "disabled": false,
               "key": "entities:entity_observer",
               "source": "app",
               "title": "entity observer"
+            },
+            {
+              "app": "entities",
+              "description": "proposes candidate durable factoids about attached entities from journal content",
+              "disabled": false,
+              "key": "entities:entity_suggest",
+              "source": "app",
+              "title": "entity suggest"
             }
           ],
           "segment": [
