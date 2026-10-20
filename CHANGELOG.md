@@ -6,12 +6,17 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- `solstone journal doctor` now shows recorded backup problems and the last successful copy, with dates and qualifications for incomplete or older setups.
+
 ### Changed
 
 - on windows, setup in the journal window now has the sun behind it, moving with the time of day, as it does on mac.
 
 ### Fixed
 
+- health shows processing progress sooner when you open it.
 - on windows, home in the journal window shows download progress in sizes like 1.2 GB of 4.8 GB, instead of two bare numbers.
 - on windows, pairing the solstone app on the journal's own computer no longer shows the linux commands.
 - long morning briefings and entity reviews keep their instructions intact. if those instructions and context won't fit your model, the run stops.

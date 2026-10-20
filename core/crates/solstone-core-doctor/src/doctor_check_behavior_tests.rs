@@ -90,6 +90,7 @@ const W3C_CHECK_NAMES: &[&str] = &[
 
 #[cfg(all(test, feature = "full-tests"))]
 const BASELINE_CHECK_NAMES: &[&str] = &[
+    "backup_status",
     "task_queue_holds",
     "config_dir_readable",
     "journal_dir_writable",
