@@ -417,16 +417,18 @@ fn journal_config_commit_lock_timeout_exits_tempfail() {
 
 #[test]
 fn journal_config_commit_lock_io_exits_ioerr() {
+    // The journal exists, but its config directory is a file, so the config
+    // lock cannot be opened.
     let root = temp_path("commit-lock-io");
-    fs::write(&root, b"not a directory").expect("write journal path as file");
-    let child_journal = root.join("child");
+    fs::create_dir(&root).expect("create root");
+    fs::write(root.join("config"), b"not a directory").expect("write config dir as file");
 
     let output = Command::new(bin())
         .args([
             "journal-config",
             "commit",
             "--journal",
-            child_journal.to_str().expect("test path should be utf-8"),
+            root.to_str().expect("test path should be utf-8"),
             "--expect",
             "absent",
         ])
@@ -446,7 +448,7 @@ fn journal_config_commit_lock_io_exits_ioerr() {
 
     assert_eq!(output.status.code(), Some(74));
     assert_eq!(output.stdout, b"");
-    fs::remove_file(root).expect("cleanup root");
+    fs::remove_dir_all(root).expect("cleanup root");
 }
 
 fn noop_materialize(
