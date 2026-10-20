@@ -3929,17 +3929,17 @@ mod tests {
             r#"{"id":"22222222-2222-4222-8222-222222222222","title":"Work"}"#,
         )
         .expect("write work facet");
-        fs::create_dir_all(journal.join("facets").join("w-ork").join("news"))
-            .expect("create orphan logs");
+        fs::create_dir_all(journal.join("facets").join("w-ork").join("activities"))
+            .expect("create orphan activities");
         fs::write(
             journal
                 .join("facets")
                 .join("w-ork")
-                .join("news")
-                .join("20260717.md"),
-            "# A saved note\n\nsearchable doctor fixture",
+                .join("activities")
+                .join("20260717.jsonl"),
+            "{\"id\":\"note-1\",\"title\":\"A saved note\",\"description\":\"searchable doctor fixture\"}\n",
         )
-        .expect("write orphan note");
+        .expect("write orphan activity");
         fs::create_dir_all(&seam).expect("create seam dir");
         (journal, seam)
     }
@@ -3958,8 +3958,8 @@ mod tests {
         }
 
         let (journal, seam) = make_test_journal();
-        let old_path = "facets/w-ork/news/20260717.md";
-        let new_path = "facets/work/news/20260717.md";
+        let old_path = "facets/w-ork/activities/20260717.jsonl";
+        let new_path = "facets/work/activities/20260717.jsonl";
         assert!(matches!(
             solstone_core_indexer_store::scan::rescan_file(&journal, &journal.join(old_path))
                 .unwrap(),
@@ -4073,10 +4073,10 @@ mod tests {
             journal
                 .join("facets")
                 .join("work")
-                .join("news")
-                .join("20260717.md")
+                .join("activities")
+                .join("20260717.jsonl")
                 .exists(),
-            "moved note must exist in target facet logs"
+            "moved activity must exist in the target facet"
         );
 
         let writer = solstone_core_journal_io::locking::hold_lock(
