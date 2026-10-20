@@ -74,6 +74,10 @@ pub struct SourceUnit {
     pub kind: SourceKind,
     /// The segment heading's time range, when the unit sits in a segment.
     pub timestamp: Option<String>,
+    /// The transcript page marked this segment untimed. A clock inside the text
+    /// is then the native projection's synthetic start, not a captured time.
+    /// `source_units` leaves this false; the caller that read the page sets it.
+    pub untimed: bool,
     /// 1-based segment ordinal in the transcript; 0 before the first segment.
     pub segment: usize,
     /// 1-based channel ordinal in its segment; 0 when it has none.
@@ -228,6 +232,7 @@ fn unit(region: &Region, text: String, chunk: usize) -> SourceUnit {
         text,
         kind: SourceKind::of_channel(region.channel),
         timestamp: (!region.timestamp.is_empty()).then(|| region.timestamp.to_owned()),
+        untimed: false,
         segment: region.segment,
         channel: region.channel_number,
         chunk,
@@ -325,6 +330,8 @@ mod tests {
         assert_eq!(units[1].kind, SourceKind::Import);
         assert!(units[0].timestamp.is_none());
         assert!(units[1].timestamp.is_none());
+        assert!(!units[0].untimed);
+        assert!(!units[1].untimed);
         assert!(
             units[1]
                 .text

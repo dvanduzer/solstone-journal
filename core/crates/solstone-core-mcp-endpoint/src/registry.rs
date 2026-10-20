@@ -194,7 +194,7 @@ pub(crate) const TOOLS: &[ToolEntry] = &[
         tool_name: crate::jsonrpc::ToolName::GetActivitySources,
         wire_name: "get_activity_sources",
         title: "read activity sources",
-        description: "Read the verbatim transcript segments an activity spans. Pass the activity reference returned by list_activities or get_week. When more remain, pass next_cursor as cursor to continue.",
+        description: "Read the verbatim transcript segments an activity spans. Pass the activity reference returned by list_activities or get_week. When more remain, pass next_cursor as cursor to continue. When a unit says untimed, the times inside it are not real.",
         input_schema: get_activity_sources_input_schema,
         requires: FACETS_AND_TRANSCRIPTS,
         audit_name: solstone_core_mcp_audit::ToolName::GetActivitySources,

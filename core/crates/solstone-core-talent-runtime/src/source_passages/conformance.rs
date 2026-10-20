@@ -546,6 +546,7 @@ fn long_unit(text: &str) -> SourceUnit {
         ),
         kind: SourceKind::Audio,
         timestamp: Some("2026-01-01 09:00:00 - 09:15:00".to_owned()),
+        untimed: false,
         segment: 1,
         channel: 1,
         chunk: 1,

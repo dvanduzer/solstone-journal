@@ -10212,9 +10212,10 @@ fn get_activity_sources_keeps_family_and_omits_untimed_clocks() {
     .unwrap();
     let chat_unit = &chat["units"][0];
     assert_eq!(chat_unit["kind"], "import");
+    assert_eq!(chat_unit["untimed"], true);
     assert!(chat_unit.get("timestamp").is_none());
     let chat_text = chat_unit["text"].as_str().unwrap();
-    assert!(chat_text.contains("untimedchatneedle"));
+    assert!(chat_text.contains("[00:00:00] **Ana:** untimedchatneedle"));
     assert!(chat_text.contains("ChatGPT Conversation"));
     assert!(!chat_text.contains("### Transcript"));
 
@@ -10226,6 +10227,7 @@ fn get_activity_sources_keeps_family_and_omits_untimed_clocks() {
     .unwrap();
     let audio_unit = &audio["units"][0];
     assert_eq!(audio_unit["kind"], "audio");
+    assert!(audio_unit.get("untimed").is_none());
     assert_eq!(audio_unit["timestamp"], "2026-03-08 10:00:00 - 10:05:00");
     let audio_text = audio_unit["text"].as_str().unwrap();
     assert!(audio_text.contains("spokenaudioneedle"));
@@ -10239,11 +10241,147 @@ fn get_activity_sources_keeps_family_and_omits_untimed_clocks() {
     .unwrap();
     let markdown_unit = &markdown["units"][0];
     assert_eq!(markdown_unit["kind"], "import");
+    assert!(markdown_unit.get("untimed").is_none());
     assert_eq!(markdown_unit["timestamp"], "2026-03-08 11:00:00 - 11:05:00");
     let markdown_text = markdown_unit["text"].as_str().unwrap();
     assert!(markdown_text.contains("markdownneedlenotspeech"));
     assert!(markdown_text.contains("### Imported Text"));
     assert!(!markdown_text.contains("### Transcript"));
+}
+
+#[test]
+fn get_activity_sources_untimed_qualifier_survives_continuation() {
+    let journal = base_activity_journal();
+    let day = "20260308";
+    let mut chat = String::from("{\"untimed\":true,\"imported\":{}}\n");
+    chat.push_str("{\"start\":\"00:00:00\",\"speaker\":\"Ana\",\"text\":\"pagestartuntimed\"}\n");
+    for index in 0..400 {
+        chat.push_str(&format!(
+            "{{\"start\":\"00:00:00\",\"speaker\":\"Ana\",\"text\":\"untimed filler {index} {}\"}}\n",
+            "word ".repeat(40)
+        ));
+    }
+    chat.push_str("{\"start\":\"00:00:00\",\"speaker\":\"Ana\",\"text\":\"pageenduntimed\"}\n");
+    write_segment_file(
+        journal.path(),
+        day,
+        "import.chatgpt",
+        "090000_300",
+        "alpha",
+        "conversation_transcript.jsonl",
+        &chat,
+    );
+
+    let mut audio = String::from("{\"source\":\"recording\"}\n");
+    audio.push_str("{\"start\":\"00:00:02\",\"text\":\"pagestartaudio\"}\n");
+    for index in 0..400 {
+        audio.push_str(&format!(
+            "{{\"start\":\"00:00:02\",\"text\":\"timed filler {index} {}\"}}\n",
+            "word ".repeat(40)
+        ));
+    }
+    audio.push_str("{\"start\":\"00:00:02\",\"text\":\"pageendaudio\"}\n");
+    write_segment_file(
+        journal.path(),
+        day,
+        "default",
+        "100000_300",
+        "alpha",
+        "audio.jsonl",
+        &audio,
+    );
+    for (id, segment, stream) in [
+        ("act_untimed_pages", "090000_300", "import.chatgpt"),
+        ("act_timed_pages", "100000_300", "default"),
+    ] {
+        write_activity_line(
+            journal.path(),
+            "alpha",
+            day,
+            id,
+            id,
+            100,
+            Some("import"),
+            Some(&[segment]),
+            None,
+            None,
+            Some(stream),
+            None,
+            None,
+        );
+    }
+    let listed = probe(&journal, "list_activities", json!({"day": day})).unwrap();
+    let reference = |title: &str| {
+        listed["activities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|activity| activity["title"] == title)
+            .unwrap()["reference"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+
+    let chat_page = probe(
+        &journal,
+        "get_activity_sources",
+        json!({"reference": reference("act_untimed_pages")}),
+    )
+    .unwrap();
+    assert_untimed_source_page(&chat_page, "pagestartuntimed");
+    let chat_cursor = chat_page["next_cursor"].as_str().unwrap();
+    let chat_next = probe(
+        &journal,
+        "get_activity_sources",
+        json!({"reference": reference("act_untimed_pages"), "cursor": chat_cursor}),
+    )
+    .unwrap();
+    assert_untimed_source_page(&chat_next, "pageenduntimed");
+
+    let audio_page = probe(
+        &journal,
+        "get_activity_sources",
+        json!({"reference": reference("act_timed_pages")}),
+    )
+    .unwrap();
+    assert_timed_speech_page(&audio_page, "pagestartaudio");
+    let audio_cursor = audio_page["next_cursor"].as_str().unwrap();
+    let audio_next = probe(
+        &journal,
+        "get_activity_sources",
+        json!({"reference": reference("act_timed_pages"), "cursor": audio_cursor}),
+    )
+    .unwrap();
+    assert_timed_speech_page(&audio_next, "pageendaudio");
+}
+
+fn assert_untimed_source_page(page: &serde_json::Value, needle: &str) {
+    let units = page["units"].as_array().unwrap();
+    assert!(!units.is_empty());
+    let mut saw_needle = false;
+    for unit in units {
+        assert_eq!(unit["untimed"], true);
+        assert!(unit.get("timestamp").is_none());
+        assert_eq!(unit["kind"], "import");
+        let text = unit["text"].as_str().unwrap();
+        assert!(text.contains("[00:00:00]"));
+        saw_needle |= text.contains(needle);
+    }
+    assert!(saw_needle);
+}
+
+fn assert_timed_speech_page(page: &serde_json::Value, needle: &str) {
+    let units = page["units"].as_array().unwrap();
+    assert!(!units.is_empty());
+    let mut saw_needle = false;
+    for unit in units {
+        assert!(unit.get("untimed").is_none());
+        assert_eq!(unit["kind"], "audio");
+        assert_eq!(unit["timestamp"], "2026-03-08 10:00:00 - 10:05:00");
+        saw_needle |= unit["text"].as_str().unwrap().contains(needle);
+    }
+    assert!(saw_needle);
 }
 
 #[test]

@@ -875,7 +875,11 @@ pub(crate) fn execute_get_sources(
         if let Some(link) = single_subject[0].segments.first().cloned() {
             segment_link_map.insert(admitted_transcripts.len(), link);
         }
-        admitted_transcripts.push(AdmittedTranscript { version, formatted });
+        admitted_transcripts.push(AdmittedTranscript {
+            version,
+            formatted,
+            untimed: segment_untimed,
+        });
     }
 
     if admitted_transcripts.is_empty() {
@@ -893,10 +897,14 @@ pub(crate) fn execute_get_sources(
 
     let mut all_units = Vec::new();
     for (index, admitted) in admitted_transcripts.iter().enumerate() {
-        for unit in solstone_core_talent_runtime::source_passages::source_units(
+        for mut unit in solstone_core_talent_runtime::source_passages::source_units(
             &admitted.formatted,
             activity_kind,
         ) {
+            // The rendered text keeps the native projection, including a
+            // synthetic [00:00:00] on an untimed chat line. The page flag is
+            // the qualifier that clock is not a captured time.
+            unit.untimed = admitted.untimed;
             all_units.push((index, unit));
         }
     }
@@ -955,6 +963,9 @@ pub(crate) fn execute_get_sources(
         if let Some(ref ts) = unit.timestamp {
             unit_json["timestamp"] = json!(ts);
         }
+        if unit.untimed {
+            unit_json["untimed"] = json!(true);
+        }
         if let Some(link) = source_link {
             unit_json["source_link"] = link;
         }
@@ -1009,6 +1020,7 @@ struct SourcedLine {
 struct AdmittedTranscript {
     version: u64,
     formatted: String,
+    untimed: bool,
 }
 
 fn admitted_source_binding(admitted: &[AdmittedTranscript]) -> String {
@@ -1022,8 +1034,8 @@ fn admitted_source_binding(admitted: &[AdmittedTranscript]) -> String {
 
 /// One segment's admitted lines, grouped by the channel the reader already
 /// assigned. An untimed segment omits the clock heading, so its units carry no
-/// timestamp. Each segment is composed alone: an untimed segment must not sit
-/// inside a timed segment's clock heading.
+/// timestamp, and each of those units says `untimed`. Each segment is composed
+/// alone: an untimed segment must not sit inside a timed segment's clock heading.
 fn compose_segment_source(heading: Option<&str>, lines: &[SourcedLine]) -> String {
     let mut out = String::new();
     if let Some(heading) = heading {
