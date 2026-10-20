@@ -11,6 +11,7 @@ use serde_json::{Map, Value, json};
 
 use crate::lifecycle;
 use crate::multipart;
+use crate::preview;
 
 pub const SAVE_PATH: &str = "/app/import/api/save";
 pub const START_PATH: &str = "/app/import/api/start";
@@ -103,6 +104,47 @@ impl SavedSource {
     }
 }
 
+/// What a save or start is refused for when the refusal has a typed kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImportErrorKind {
+    AlreadyImported,
+    AlreadyRunning,
+    ClientItemConflict,
+    NothingToImport,
+    SourceChanged,
+    InvalidRequest,
+    NotFound,
+    PlanFailed,
+}
+
+impl ImportErrorKind {
+    pub const fn all() -> &'static [Self] {
+        &[
+            Self::AlreadyImported,
+            Self::AlreadyRunning,
+            Self::ClientItemConflict,
+            Self::NothingToImport,
+            Self::SourceChanged,
+            Self::InvalidRequest,
+            Self::NotFound,
+            Self::PlanFailed,
+        ]
+    }
+
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            Self::AlreadyImported => "already_imported",
+            Self::AlreadyRunning => "already_running",
+            Self::ClientItemConflict => "client_item_conflict",
+            Self::NothingToImport => "nothing_to_import",
+            Self::SourceChanged => "source_changed",
+            Self::InvalidRequest => "invalid_request",
+            Self::NotFound => "not_found",
+            Self::PlanFailed => "plan_failed",
+        }
+    }
+}
+
 /// The body of a start that sent its import to the task queue.
 pub(crate) fn queued_start_response(task_id: &str, import_id: &str) -> Value {
     json!({"status": "ok", "task_id": task_id, "import_id": import_id})
@@ -124,6 +166,11 @@ pub(crate) fn inprocess_start_response(
     })
 }
 
+fn with_replay(mut val: Value) -> Value {
+    val["replay"] = json!(true);
+    val
+}
+
 fn wire<T: Copy>(values: &[T], as_wire: fn(T) -> &'static str) -> Vec<&'static str> {
     values.iter().map(|value| as_wire(*value)).collect()
 }
@@ -131,6 +178,7 @@ fn wire<T: Copy>(values: &[T], as_wire: fn(T) -> &'static str) -> Vec<&'static s
 pub fn schema_json() -> Value {
     let reason_codes = wire(ImportReasonCode::all(), ImportReasonCode::as_wire);
     let sources = wire(SavedSource::all(), SavedSource::as_wire);
+    let error_kinds = wire(ImportErrorKind::all(), ImportErrorKind::as_wire);
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "Solstone mobile import v1",
@@ -147,15 +195,16 @@ pub fn schema_json() -> Value {
                 "properties": ImportReasonCode::all().iter().map(|code| (code.as_wire().to_owned(), json!({"const": code.status().as_u16()}))).collect::<Map<_, _>>()
             },
             "source": {"type": "string", "enum": sources},
+            "error_kind": {"type": "string", "enum": error_kinds},
             "error_response": {
-                "description": "Every refusal. error is a sentence the owner may be shown as is; reason_code and detail are for machines. A start refused for metadata may also carry the task_id it allocated.",
+                "description": "Every refusal. error is a sentence the owner may be shown as is; reason_code and detail are for machines.",
                 "type": "object",
                 "required": ["error", "reason_code"],
                 "properties": {
                     "error": {"type": "string"},
                     "reason_code": {"$ref": "#/$defs/reason_code"},
                     "detail": {"type": "string"},
-                    "task_id": {"type": "string"}
+                    "kind": {"$ref": "#/$defs/error_kind"}
                 }
             },
             "save_request": {
@@ -212,7 +261,7 @@ pub fn schema_json() -> Value {
                 }
             },
             "start_response": {
-                "description": "200: the import is queued, or running in process when generation and attempt_id are present.",
+                "description": "200: the import is queued, or running in process when generation and attempt_id are present. replay is true when this start found the import already queued or already in. A replay is classified by the same fields as a fresh body: status, task_id, and generation and attempt_id when present.",
                 "type": "object",
                 "required": ["status", "task_id", "import_id"],
                 "properties": {
@@ -220,7 +269,8 @@ pub fn schema_json() -> Value {
                     "task_id": {"type": "string"},
                     "import_id": {"type": "string"},
                     "generation": {"type": "integer", "minimum": 0},
-                    "attempt_id": {"type": "string"}
+                    "attempt_id": {"type": "string"},
+                    "replay": {"type": "boolean"}
                 }
             }
         }
@@ -277,6 +327,30 @@ pub fn vectors_json() -> Value {
             "start_request": start_request,
             "start_queued_200": {"status": 200, "body": queued_start_response("1792404900000", "20261019_101500")},
             "start_inprocess_200": {"status": 200, "body": inprocess_start_response("1792404900000", "20261019_101500", 1, "attempt-1")},
+            "start_queued_replay_200": {"status": 200, "body": with_replay(queued_start_response("1792404900000", "20261019_101500"))},
+            "start_inprocess_replay_200": {"status": 200, "body": with_replay(inprocess_start_response("1792404900000", "20261019_101500", 1, "attempt-1"))},
+            "save_already_imported_400": {
+                "status": 400,
+                "body": lifecycle::invalid_state_body("content already imported", Some(ImportErrorKind::AlreadyImported)),
+            },
+            "save_client_item_conflict_400": {
+                "status": 400,
+                "body": lifecycle::invalid_state_body(
+                    "client_item_id already staged for different content; use a new client_item_id or re-fetch the existing item",
+                    Some(ImportErrorKind::ClientItemConflict),
+                ),
+            },
+            "start_already_imported_400": {
+                "status": 400,
+                "body": lifecycle::invalid_state_body("content already imported; will not start", Some(ImportErrorKind::AlreadyImported)),
+            },
+            "start_nothing_to_import_409": {
+                "status": 409,
+                "body": preview::preview_error_body(
+                    ImportReasonCode::ImportPreviewRequired.as_wire(),
+                    &preview::PreviewError::NothingToImport,
+                ),
+            },
             "refusals": ImportReasonCode::all().iter().map(|code| json!({"status": code.status().as_u16(), "reason_code": code.as_wire()})).collect::<Vec<_>>()
         }
     })

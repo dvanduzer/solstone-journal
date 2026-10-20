@@ -23,6 +23,7 @@ mod multipart;
 mod preview;
 mod progress;
 mod save_stream;
+pub(crate) mod start_lock;
 
 #[cfg(test)]
 mod corpus;

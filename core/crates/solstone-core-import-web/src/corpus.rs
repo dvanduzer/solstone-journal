@@ -851,7 +851,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn ac17a_upload_timestamp_is_the_shared_sort_and_timeout_time() {
+    fn ac17a_non_numeric_task_id_times_out_from_upload_timestamp_and_sorts_by_it() {
         let root = phase_root("empty");
         for (timestamp, upload_sec) in [
             ("20260108_000000", 100_000.0),

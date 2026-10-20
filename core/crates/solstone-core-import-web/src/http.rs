@@ -8,7 +8,7 @@ use axum::{
 };
 use serde_json::{Value, json};
 
-use crate::mobile_import_contract::ImportReasonCode;
+use crate::mobile_import_contract::{ImportErrorKind, ImportReasonCode};
 
 pub(crate) const WERKZEUG_NOT_FOUND: &str = "<!doctype html>\n<html lang=en>\n<title>404 Not Found</title>\n<h1>Not Found</h1>\n<p>The requested URL was not found on the server. If you entered the URL manually please check your spelling and try again.</p>\n";
 
@@ -31,16 +31,27 @@ pub(crate) fn json(status: StatusCode, value: Value) -> axum::response::Response
     (status, axum::Json(value)).into_response()
 }
 
+pub(crate) fn error_body(
+    error: &str,
+    reason_code: &str,
+    detail: String,
+    kind: Option<ImportErrorKind>,
+) -> Value {
+    let mut value = json!({"error": error, "reason_code": reason_code, "detail": detail});
+    if let Some(kind) = kind {
+        value["kind"] = json!(kind.as_wire());
+    }
+    value
+}
+
 pub(crate) fn error(
     status: StatusCode,
     error: &str,
     reason_code: &str,
     detail: String,
+    kind: Option<ImportErrorKind>,
 ) -> axum::response::Response {
-    json(
-        status,
-        json!({"error": error, "reason_code": reason_code, "detail": detail}),
-    )
+    json(status, error_body(error, reason_code, detail, kind))
 }
 
 pub(crate) fn import_not_found(detail: &str) -> axum::response::Response {
@@ -50,5 +61,6 @@ pub(crate) fn import_not_found(detail: &str) -> axum::response::Response {
         "that import isn't in your journal.",
         code.as_wire(),
         detail.to_owned(),
+        None,
     )
 }

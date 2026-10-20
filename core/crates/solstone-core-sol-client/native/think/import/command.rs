@@ -548,11 +548,15 @@ fn print_success(
         .cloned()
         .unwrap_or(Value::Null);
     let path = save_response.get("path").cloned().unwrap_or(Value::Null);
+    let is_replay = start_response
+        .get("replay")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     if json_out {
         return CommandOutput::success(format!(
             "{}\n",
             sorted_json_compact_ascii(&json!({
-                "status": "queued",
+                "status": if is_replay { "replay" } else { "queued" },
                 "path": path,
                 "timestamp": timestamp,
                 "save": Value::Object(save_response.clone()),
@@ -565,7 +569,17 @@ fn print_success(
     if let Some(timestamp) = timestamp.as_str().filter(|value| !value.is_empty()) {
         stdout.push_str(&format!("timestamp {timestamp}\n"));
     }
-    if let Some(task_id) = start_response.get("task_id").and_then(Value::as_str) {
+    if is_replay {
+        if let Some(task_id) = start_response
+            .get("task_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            stdout.push_str(&format!("already processing task {task_id}\n"));
+        } else {
+            stdout.push_str("already processing\n");
+        }
+    } else if let Some(task_id) = start_response.get("task_id").and_then(Value::as_str) {
         stdout.push_str(&format!("queued processing task {task_id}\n"));
     } else {
         stdout.push_str("queued processing\n");
@@ -872,6 +886,134 @@ mod tests {
             }
         );
         transport.assert_done();
+    }
+
+    #[test]
+    fn replay_start_reports_replay_status_and_suppresses_queued_line() {
+        let mut fixtures = HashMap::new();
+        fixtures.insert(PathBuf::from("/tmp/sample.txt"), b"hello".to_vec());
+        let files = FixtureFileProvider::new(fixtures);
+        let client_item_ids = FakeClientItemIdProvider::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let transport = ScriptedHttpTransport::new(vec![
+            ExpectedHttpCall::Upload {
+                expected: UploadRequest {
+                    path: "/app/import/api/save".to_string(),
+                    files: vec![MultipartFile {
+                        field_name: "file".to_string(),
+                        filename: "sample.txt".to_string(),
+                        content_type: Some("application/octet-stream".to_string()),
+                        body: b"hello".to_vec(),
+                    }],
+                    data: vec![
+                        FormField {
+                            name: "client_item_id".to_string(),
+                            value: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                        },
+                        FormField {
+                            name: "setting".to_string(),
+                            value: "office".to_string(),
+                        },
+                        FormField {
+                            name: "source_hint".to_string(),
+                            value: "ics".to_string(),
+                        },
+                    ],
+                    headers: vec![],
+                    boundary: None,
+                    policy: TimeoutPolicy::Upload,
+                },
+                result: Ok(json_response(
+                    json!({
+                        "path": "/staged/imports/20260101_120000/sample.txt",
+                        "timestamp": "20260101_120000"
+                    }),
+                    TimeoutPolicy::Upload,
+                )),
+            },
+            ExpectedHttpCall::Request {
+                expected: ApiRequest {
+                    method: HttpMethod::Post,
+                    path: "/app/import/api/preview".to_string(),
+                    params: vec![],
+                    json: Some(json!({
+                        "path": "/staged/imports/20260101_120000/sample.txt",
+                        "timestamp": "20260101_120000",
+                        "import_id": "20260101_120000",
+                        "force": true, "timestamp_override": false, "resolved_timestamp": null,
+                    })),
+                    headers: vec![],
+                    policy: TimeoutPolicy::Upload,
+                },
+                result: Ok(json_response(
+                    json!({"preview_token":"preview-1","size":{"recordings":2,"days":1,"skipped":0}}),
+                    TimeoutPolicy::Upload,
+                )),
+            },
+            ExpectedHttpCall::Request {
+                expected: ApiRequest {
+                    method: HttpMethod::Post,
+                    path: "/app/import/api/start".to_string(),
+                    params: vec![],
+                    json: Some(json!({
+                        "path": "/staged/imports/20260101_120000/sample.txt",
+                        "timestamp": "20260101_120000",
+                        "import_id": "20260101_120000",
+                        "preview_token": "preview-1",
+                        "force": true, "timestamp_override": false, "resolved_timestamp": null,
+                    })),
+                    headers: vec![],
+                    policy: TimeoutPolicy::Upload,
+                },
+                result: Ok(json_response(
+                    json!({"status": "ok", "task_id": "task-file", "replay": true}),
+                    TimeoutPolicy::Upload,
+                )),
+            },
+        ]);
+
+        let output = run_import_case(
+            &[
+                "/tmp/sample.txt",
+                "--setting",
+                " office ",
+                "--source",
+                " ics ",
+                "--force",
+            ],
+            &transport,
+            &files,
+            &client_item_ids,
+        );
+
+        assert_eq!(output.exit, 0);
+        assert!(!output.stdout.contains("queued processing task"));
+        assert!(
+            output
+                .stdout
+                .contains("staged /staged/imports/20260101_120000/sample.txt")
+        );
+        assert!(output.stdout.contains("timestamp 20260101_120000"));
+        assert!(output.stdout.contains("task-file"));
+        transport.assert_done();
+    }
+
+    #[test]
+    fn replay_start_json_status_is_replay() {
+        let save_resp = serde_json::from_value(json!({
+            "path": "/staged/imports/20260101_120000/sample.txt",
+            "timestamp": "20260101_120000"
+        }))
+        .unwrap();
+        let start_resp = serde_json::from_value(json!({
+            "status": "ok",
+            "task_id": "task-123",
+            "replay": true
+        }))
+        .unwrap();
+        let output = print_success(&save_resp, &start_resp, true);
+        assert_eq!(output.exit, 0);
+        let parsed: Value = serde_json::from_str(&output.stdout).unwrap();
+        assert_eq!(parsed["status"], "replay");
     }
 
     #[test]

@@ -44,6 +44,7 @@ pub(crate) async fn export(State(state): State<AppState>) -> Response {
             "this journal couldn't be exported.",
             "journal_archive_export_failed",
             detail,
+            None,
         ),
     }
 }
@@ -64,6 +65,7 @@ pub(crate) async fn preview(State(state): State<AppState>, Json(data): Json<Valu
             "that archive couldn't be previewed.",
             "journal_archive_preview_failed",
             archive_error.to_string(),
+            None,
         ),
     }
 }
@@ -137,6 +139,7 @@ fn invalid_preview_request(detail: &str) -> Response {
         "one of those values couldn't be used.",
         "invalid_request_value",
         detail.to_owned(),
+        None,
     )
 }
 

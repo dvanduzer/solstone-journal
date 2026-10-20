@@ -34,7 +34,8 @@ use crate::{
     callosum::{BusError, TaskWatch, request_required},
     http::{error, import_not_found, json as json_response},
     mobile_import_contract::{
-        ImportReasonCode, SavedSource, inprocess_start_response, queued_start_response,
+        ImportErrorKind, ImportReasonCode, SavedSource, inprocess_start_response,
+        queued_start_response,
     },
     multipart, save_stream,
 };
@@ -213,8 +214,13 @@ fn safe_filename(filename: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn failure(code: ImportReasonCode, message: &str, detail: impl Into<String>) -> Response {
-    error(code.status(), message, code.as_wire(), detail.into())
+fn failure(
+    code: ImportReasonCode,
+    message: &str,
+    detail: impl Into<String>,
+    kind: Option<ImportErrorKind>,
+) -> Response {
+    error(code.status(), message, code.as_wire(), detail.into(), kind)
 }
 
 fn metadata_failed(detail: impl Into<String>) -> Response {
@@ -222,6 +228,7 @@ fn metadata_failed(detail: impl Into<String>) -> Response {
         ImportReasonCode::ImportMetadataFailed,
         "that import metadata couldn't be updated.",
         detail,
+        None,
     )
 }
 
@@ -230,15 +237,109 @@ fn missing(detail: impl Into<String>) -> Response {
         ImportReasonCode::MissingRequiredField,
         "a required field is missing.",
         detail,
+        None,
     )
 }
 
-fn invalid_state(detail: impl Into<String>) -> Response {
+pub(crate) fn invalid_state_body(
+    detail: impl Into<String>,
+    kind: Option<ImportErrorKind>,
+) -> Value {
+    crate::http::error_body(
+        "that action isn't available in the current state.",
+        ImportReasonCode::InvalidOperationForState.as_wire(),
+        detail.into(),
+        kind,
+    )
+}
+
+fn invalid_state(detail: impl Into<String>, kind: Option<ImportErrorKind>) -> Response {
     failure(
         ImportReasonCode::InvalidOperationForState,
         "that action isn't available in the current state.",
         detail,
+        kind,
     )
+}
+
+pub(crate) fn resolve_import_id(root: &Path, data: &Value) -> Option<String> {
+    let path = text_value(data, "path");
+    let timestamp = text_value(data, "timestamp");
+    if path.is_empty() || timestamp.is_empty() {
+        return None;
+    }
+    if let Some(id) = data
+        .get("import_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(id.to_owned());
+    }
+    let imports = root.join("imports");
+    let file_path = Path::new(&path);
+    let is_local_path = !file_path.starts_with(&imports);
+    if is_local_path {
+        Some(timestamp)
+    } else {
+        file_path
+            .parent()
+            .and_then(|value| value.file_name())
+            .and_then(|value| value.to_str())
+            .map(ToOwned::to_owned)
+            .or(Some(timestamp))
+    }
+}
+
+pub(crate) type TaskIdHook = dyn Fn(&TaskIdOp) -> Result<(), ImportError> + Send + Sync;
+
+#[derive(Debug, Clone)]
+pub(crate) enum TaskIdOp {
+    Record {
+        new_id: String,
+    },
+    Restore {
+        recorded_id: String,
+        previous: Option<String>,
+    },
+}
+
+fn exchange_task_id(
+    root: &Path,
+    import_id: &str,
+    op: &TaskIdOp,
+    hook: Option<&TaskIdHook>,
+) -> Result<(), ImportError> {
+    if let Some(hook) = hook {
+        hook(op)?;
+    }
+    match op {
+        TaskIdOp::Record { new_id } => {
+            solstone_core_import::record_queued_task(root, import_id, new_id).map(|_| ())
+        }
+        TaskIdOp::Restore {
+            recorded_id,
+            previous,
+        } => {
+            let _guard = solstone_core_import::hold_import_lock(root, import_id)?;
+            let current = solstone_core_import::read_import_metadata(root, import_id).ok();
+            let current_task_id = current
+                .as_ref()
+                .and_then(|m| m.get("task_id"))
+                .and_then(Value::as_str);
+            if current_task_id == Some(recorded_id.as_str()) {
+                let mut results = serde_json::Map::new();
+                results.insert(
+                    "task_id".to_owned(),
+                    match previous {
+                        Some(prev) => Value::String(prev.clone()),
+                        None => Value::Null,
+                    },
+                );
+                solstone_core_import::record_import_results_unlocked(root, import_id, results)?;
+            }
+            Ok(())
+        }
+    }
 }
 
 fn manifest_exists(root: &Path, hash: &SourceHash) -> bool {
@@ -450,6 +551,7 @@ fn payload_too_large(detail: impl Into<String>) -> Response {
         ImportReasonCode::MultipartPartTooLarge,
         "that file is too large to bring in.",
         detail,
+        None,
     )
 }
 
@@ -465,6 +567,7 @@ fn stream_error_response(error: save_stream::SaveStreamError) -> Response {
             ImportReasonCode::IngestNoFiles,
             "there are no files to bring in.",
             "cannot read multipart part",
+            None,
         ),
         save_stream::SaveStreamError::Io(error) => {
             metadata_failed(format!("Failed to stage temporary file: {error}"))
@@ -572,6 +675,7 @@ pub(crate) async fn save(State(state): State<AppState>, mut multipart: Multipart
                     ImportReasonCode::IngestNoFiles,
                     "there are no files to bring in.",
                     "invalid multipart body",
+                    None,
                 );
             }
         };
@@ -580,6 +684,7 @@ pub(crate) async fn save(State(state): State<AppState>, mut multipart: Multipart
                 ImportReasonCode::IngestNoFiles,
                 "there are no files to bring in.",
                 "too many multipart parts",
+                None,
             );
         }
         part_count += 1;
@@ -588,6 +693,7 @@ pub(crate) async fn save(State(state): State<AppState>, mut multipart: Multipart
                 ImportReasonCode::IngestNoFiles,
                 "there are no files to bring in.",
                 "too many multipart headers",
+                None,
             );
         }
         let filename = field.file_name().map(ToOwned::to_owned);
@@ -599,6 +705,7 @@ pub(crate) async fn save(State(state): State<AppState>, mut multipart: Multipart
                 ImportReasonCode::IngestNoFiles,
                 "there are no files to bring in.",
                 "multipart filename is too long",
+                None,
             );
         }
         let name = field.name().unwrap_or_default().to_owned();
@@ -631,6 +738,7 @@ pub(crate) async fn save(State(state): State<AppState>, mut multipart: Multipart
                         ImportReasonCode::IngestNoFiles,
                         "there are no files to bring in.",
                         detail,
+                        None,
                     );
                 }
             }
@@ -670,6 +778,7 @@ pub(crate) async fn save(State(state): State<AppState>, mut multipart: Multipart
                     ImportReasonCode::IngestNoFiles,
                     "there are no files to bring in.",
                     "No input",
+                    None,
                 );
             };
             Incoming::File {
@@ -706,6 +815,7 @@ pub(crate) async fn save(State(state): State<AppState>, mut multipart: Multipart
                 ImportReasonCode::IngestNoFiles,
                 "there are no files to bring in.",
                 "No input",
+                None,
             );
         }
     };
@@ -730,6 +840,7 @@ pub(crate) async fn save(State(state): State<AppState>, mut multipart: Multipart
             ImportReasonCode::StravaDownload,
             "this looks like a Strava download, so your journal didn't keep it. use the Strava card so only your workouts are read.",
             "this looks like a Strava download, so your journal didn't keep it. use the Strava card so only your workouts are read.",
+            None,
         );
     }
     let source_path = match &incoming {
@@ -759,12 +870,16 @@ pub(crate) async fn save(State(state): State<AppState>, mut multipart: Multipart
         }
         return invalid_state(
             "client_item_id already staged for different content; use a new client_item_id or re-fetch the existing item",
+            Some(ImportErrorKind::ClientItemConflict),
         );
     }
     // Importing the same Strava download again is how a deleted import is brought
     // back, and it re-places only what is missing, so it is never refused as a repeat.
     if !strava_card && manifest_exists(&state.root, &source_hash) {
-        return invalid_state("content already imported");
+        return invalid_state(
+            "content already imported",
+            Some(ImportErrorKind::AlreadyImported),
+        );
     }
     if let Some(existing) = staged_by_source_hash(&state.root, &source_hash) {
         return json_response(
@@ -885,6 +1000,7 @@ pub(crate) async fn save_path(State(state): State<AppState>, Json(data): Json<Va
             "that file isn't available.",
             "file_not_found",
             format!("Path not found: {local_path}"),
+            None,
         );
     }
     if solstone_core_import_sources::strava::looks_like_strava_download(local, None) {
@@ -892,6 +1008,7 @@ pub(crate) async fn save_path(State(state): State<AppState>, Json(data): Json<Va
             ImportReasonCode::StravaDownload,
             "this looks like a Strava download, so your journal didn't keep it. use the Strava card so only your workouts are read.",
             "this looks like a Strava download, so your journal didn't keep it. use the Strava card so only your workouts are read.",
+            None,
         );
     }
     let source_hash = match hash_source(local) {
@@ -912,10 +1029,14 @@ pub(crate) async fn save_path(State(state): State<AppState>, Json(data): Json<Va
         }
         return invalid_state(
             "client_item_id already staged for different content; use a new client_item_id or re-fetch the existing item",
+            Some(ImportErrorKind::ClientItemConflict),
         );
     }
     if manifest_exists(&state.root, &source_hash) {
-        return invalid_state("content already imported");
+        return invalid_state(
+            "content already imported",
+            Some(ImportErrorKind::AlreadyImported),
+        );
     }
     if let Some(existing) = staged_by_source_hash(&state.root, &source_hash) {
         return json_response(
@@ -996,7 +1117,7 @@ pub(crate) async fn meta(State(state): State<AppState>, Json(data): Json<Value>)
         return import_not_found("Import metadata not found");
     }
     if import_is_running_or_successful(&state.root, timestamp, &metadata) {
-        return invalid_state("import already started or processed");
+        return invalid_state("import already started or processed", None);
     }
     if source_hint(&metadata).as_deref() != Some(STRAVA_SOURCE)
         && metadata
@@ -1004,7 +1125,7 @@ pub(crate) async fn meta(State(state): State<AppState>, Json(data): Json<Value>)
             .and_then(Value::as_str)
             .is_some_and(|hash| manifest_exists(&state.root, &SourceHash::new(hash.to_owned())))
     {
-        return invalid_state("content already imported");
+        return invalid_state("content already imported", None);
     }
     let mut changed = Map::new();
     for key in [
@@ -1051,6 +1172,7 @@ fn relocation_error(error: ImportError, old_timestamp: &str, timestamp: &str) ->
             ImportReasonCode::ImportConflict,
             "that import couldn't be started because it already exists.",
             format!("Import already exists for timestamp {timestamp}"),
+            None,
         ),
         error => metadata_failed(format!("Failed to rename import directory: {error}")),
     }
@@ -1061,14 +1183,7 @@ fn queue_error() -> Response {
         ImportReasonCode::ImportQueueUnreachable,
         "your journal's background service isn't running. start it, then try again.",
         "your journal's background service isn't running. start it, then try again.",
-    )
-}
-
-fn metadata_error_with_task(task_id: &str, detail: String) -> Response {
-    let code = ImportReasonCode::ImportMetadataFailed;
-    json_response(
-        code.status(),
-        json!({"task_id":task_id,"error":"that import metadata couldn't be updated.","reason_code":code.as_wire(),"detail":detail}),
+        None,
     )
 }
 
@@ -1132,44 +1247,184 @@ pub(crate) fn command(
     cmd
 }
 
-pub(crate) async fn start(State(state): State<AppState>, Json(data): Json<Value>) -> Response {
-    let validated = match crate::preview::planner() {
-        Ok(program) => crate::preview::validate_start(&state.root, data, &program).await,
-        Err(error) => Err(error),
+pub(crate) type SendSeam = std::sync::Arc<
+    std::sync::Mutex<Box<dyn FnMut(&Path, &str, &[String]) -> Result<(), BusError> + Send>>,
+>;
+pub(crate) type WriteSeam = std::sync::Arc<
+    std::sync::Mutex<
+        Box<dyn FnMut(&Path, &str, &ImportMetadata) -> Result<PathBuf, ImportError> + Send>,
+    >,
+>;
+pub(crate) type ProduceSeam = std::sync::Arc<
+    std::sync::Mutex<
+        Box<
+            dyn FnMut(PathBuf, PathBuf, String, solstone_core_import::RegistrySource, bool, u64)
+                + Send,
+        >,
+    >,
+>;
+pub(crate) type FollowSeam = std::sync::Arc<std::sync::Mutex<Box<dyn FnMut(&str, &str) + Send>>>;
+
+#[derive(Clone, Default)]
+pub(crate) struct StartSeams {
+    pub send: Option<SendSeam>,
+    pub write: Option<WriteSeam>,
+    pub produce: Option<ProduceSeam>,
+    pub follow: Option<FollowSeam>,
+    pub task_id_hook: Option<std::sync::Arc<TaskIdHook>>,
+}
+
+impl StartSeams {
+    pub const fn production() -> Self {
+        Self {
+            send: None,
+            write: None,
+            produce: None,
+            follow: None,
+            task_id_hook: None,
+        }
+    }
+}
+
+pub(crate) async fn run_start(
+    root: &Path,
+    data: Value,
+    plan: crate::preview::PreviewPlan<'_>,
+    seams: StartSeams,
+) -> Response {
+    let resolved_id = resolve_import_id(root, &data);
+    let guard = if let Some(id) = resolved_id.as_deref() {
+        Some(crate::start_lock::acquire(root, id).await)
+    } else {
+        None
     };
-    let data = match validated {
+
+    let force = data.get("force").and_then(Value::as_bool).unwrap_or(false);
+    if !force && let Some(id) = resolved_id.as_deref() {
+        let projection = solstone_core_import::project_import_result(root, id);
+        let should_replay = match projection.status {
+            solstone_core_import::ProjectionStatus::Running
+            | solstone_core_import::ProjectionStatus::Success => true,
+            solstone_core_import::ProjectionStatus::Unconfirmed => projection
+                .raw_publication
+                .as_ref()
+                .and_then(|pub_val| {
+                    serde_json::from_value::<solstone_core_import::PublicationRecord>(
+                        pub_val.clone(),
+                    )
+                    .ok()
+                })
+                .is_some_and(|rec| rec.status == solstone_core_import::PublicationStatus::Success),
+            _ => false,
+        };
+        if should_replay {
+            let effective_task_id = projection
+                .task_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .unwrap_or(id);
+            let mut body = if let Some(attempt) = &projection.attempt {
+                inprocess_start_response(
+                    effective_task_id,
+                    id,
+                    attempt.generation,
+                    &attempt.attempt_id,
+                )
+            } else {
+                queued_start_response(effective_task_id, id)
+            };
+            body["replay"] = json!(true);
+            return json_response(StatusCode::OK, body);
+        }
+    }
+
+    let validated = match crate::preview::validate_start(root, data, plan).await {
         Ok(data) => data,
-        Err(error) => {
-            let code = ImportReasonCode::ImportPreviewRequired;
-            return json_response(
-                code.status(),
-                json!({"error": error, "reason_code": code.as_wire()}),
+        Err(err) => {
+            return crate::preview::preview_error_response(
+                ImportReasonCode::ImportPreviewRequired.status(),
+                ImportReasonCode::ImportPreviewRequired.as_wire(),
+                &err,
             );
         }
     };
-    // The request goes out on the connection that hears the task end, so an importer that
-    // refuses its arguments and exits within milliseconds is still seen.
-    let watch = TaskWatch::subscribe(&state.root).await;
+
+    let watch = if seams.send.is_none() {
+        TaskWatch::subscribe(root).await
+    } else {
+        None
+    };
+
+    let root_path = root.to_path_buf();
     tokio::task::spawn_blocking(move || {
+        let _guard = guard;
         let watch = RefCell::new(watch);
+        let root = &root_path;
+        let data = &validated;
+        let hook = seams.task_id_hook.clone();
         start_with(
-            &state.root,
-            &data,
-            |root, task_id, cmd| match watch.borrow().as_ref() {
-                Some(watch) => watch.request(task_id, cmd),
-                None => request_required(root, task_id, cmd),
-            },
-            write_import_metadata,
-            spawn_inprocess_import,
-            |task_id, timestamp| {
-                if let Some(watch) = watch.borrow_mut().take() {
-                    settle_on_exit(watch, state.root.clone(), task_id, timestamp);
+            root,
+            data,
+            |r, task_id, cmd| {
+                if let Some(send_fn) = seams.send.as_ref() {
+                    let mut lock = send_fn.lock().unwrap();
+                    (*lock)(r, task_id, cmd)
+                } else {
+                    match watch.borrow().as_ref() {
+                        Some(w) => w.request(task_id, cmd),
+                        None => request_required(r, task_id, cmd),
+                    }
                 }
             },
+            |r, timestamp, meta| {
+                if let Some(write_fn) = seams.write.as_ref() {
+                    let mut lock = write_fn.lock().unwrap();
+                    (*lock)(r, timestamp, meta)
+                } else {
+                    write_import_metadata(r, timestamp, meta)
+                }
+            },
+            |r, source, timestamp, source_type, force, generation| {
+                if let Some(produce_fn) = seams.produce.as_ref() {
+                    let mut lock = produce_fn.lock().unwrap();
+                    (*lock)(r, source, timestamp, source_type, force, generation)
+                } else {
+                    spawn_inprocess_import(r, source, timestamp, source_type, force, generation)
+                }
+            },
+            |task_id, timestamp| {
+                if let Some(follow_fn) = seams.follow.as_ref() {
+                    let mut lock = follow_fn.lock().unwrap();
+                    (*lock)(task_id, timestamp)
+                } else if let Some(w) = watch.borrow_mut().take() {
+                    settle_on_exit(w, root.to_path_buf(), task_id, timestamp);
+                }
+            },
+            hook,
         )
     })
     .await
     .unwrap_or_else(|error| metadata_failed(format!("could not start the import: {error}")))
+}
+
+pub(crate) async fn start(State(state): State<AppState>, Json(data): Json<Value>) -> Response {
+    let program = match crate::preview::planner() {
+        Ok(program) => program,
+        Err(err) => {
+            return crate::preview::preview_error_response(
+                ImportReasonCode::ImportPreviewRequired.status(),
+                ImportReasonCode::ImportPreviewRequired.as_wire(),
+                &err,
+            );
+        }
+    };
+    run_start(
+        &state.root,
+        data,
+        crate::preview::PreviewPlan::Program(&program),
+        StartSeams::production(),
+    )
+    .await
 }
 
 /// When the queued importer exits, settle a record it left running, then tell the page how it
@@ -1282,6 +1537,7 @@ fn start_with<S, W, P, F>(
     mut write: W,
     mut produce: P,
     mut follow: F,
+    task_id_hook: Option<std::sync::Arc<TaskIdHook>>,
 ) -> Response
 where
     S: FnMut(&Path, &str, &[String]) -> Result<(), BusError>,
@@ -1307,23 +1563,16 @@ where
     let imports = root.join("imports");
     let file_path = Path::new(path);
     let is_local_path = !file_path.starts_with(&imports);
-    let original_timestamp = if let Some(id) = data.get("import_id").and_then(Value::as_str) {
-        id
-    } else if is_local_path {
-        timestamp
-    } else {
-        file_path
-            .parent()
-            .and_then(|value| value.file_name())
-            .and_then(|value| value.to_str())
-            .unwrap_or(timestamp)
+    let original_timestamp = match resolve_import_id(root, data) {
+        Some(id) => id,
+        None => return missing("missing params"),
     };
-    if contained_import_file(root, original_timestamp, "import.json").is_err() {
+    if contained_import_file(root, &original_timestamp, "import.json").is_err() {
         return import_not_found(&format!(
             "Import metadata not found for {original_timestamp}"
         ));
     }
-    let mut metadata = match read_import_metadata(root, original_timestamp) {
+    let mut metadata = match read_import_metadata(root, &original_timestamp) {
         Ok(metadata) => metadata,
         Err(_) => {
             return import_not_found(&format!(
@@ -1337,22 +1586,25 @@ where
             .and_then(Value::as_str)
             .is_some_and(|hash| manifest_exists(root, &SourceHash::new(hash.to_owned())))
     {
-        return invalid_state("content already imported; will not start");
+        return invalid_state(
+            "content already imported; will not start",
+            Some(ImportErrorKind::AlreadyImported),
+        );
     }
     // A save of the same bytes replays the staged row, so a source that records no manifest
     // (generic text) would otherwise import a second time. Only `force` re-imports on purpose.
-    match solstone_core_import::project_import_result(root, original_timestamp).status {
+    match solstone_core_import::project_import_result(root, &original_timestamp).status {
         solstone_core_import::ProjectionStatus::Running => {
-            return invalid_state("import already started or processed");
+            return invalid_state("import already started or processed", None);
         }
         solstone_core_import::ProjectionStatus::Success if !force => {
-            return invalid_state("content already imported; will not start");
+            return invalid_state("content already imported; will not start", None);
         }
         _ => {}
     }
     let mut command_path = path.to_owned();
     let owner_choice = owner_timestamp_choice(data, &metadata);
-    let mut record_id = original_timestamp;
+    let mut record_id = original_timestamp.as_str();
     if owner_choice.is_some()
         && original_timestamp != timestamp
         && !imports.join(timestamp).try_exists().unwrap_or(true)
@@ -1360,9 +1612,9 @@ where
         if let Err(error) = contained_import_file(root, timestamp, "import.json") {
             return metadata_failed(error.to_string());
         }
-        let new_directory = match relocate_import(root, original_timestamp, timestamp) {
+        let new_directory = match relocate_import(root, &original_timestamp, timestamp) {
             Ok(path) => path,
-            Err(error) => return relocation_error(error, original_timestamp, timestamp),
+            Err(error) => return relocation_error(error, &original_timestamp, timestamp),
         };
         let filename = file_path
             .file_name()
@@ -1404,7 +1656,7 @@ where
             source_hint(&metadata).as_deref(),
         )
     {
-        return invalid_state(&error);
+        return invalid_state(&error, None);
     }
     let inprocess_source = detect_inprocess_source(&metadata, &command_path);
     let task_id = now_ms().to_string();
@@ -1440,30 +1692,44 @@ where
     }
 
     let cmd = command(&command_path, timestamp, &metadata, force);
+    let previous_task_id = metadata
+        .get("task_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned);
+
+    let hook_ref = task_id_hook.as_deref();
+    if let Err(error) = exchange_task_id(
+        root,
+        record_id,
+        &TaskIdOp::Record {
+            new_id: task_id.clone(),
+        },
+        hook_ref,
+    ) {
+        return metadata_failed(format!("Failed to record queued task: {error}"));
+    }
+
     if send(root, &task_id, &cmd).is_err() {
+        let _ = exchange_task_id(
+            root,
+            record_id,
+            &TaskIdOp::Restore {
+                recorded_id: task_id,
+                previous: previous_task_id,
+            },
+            hook_ref,
+        );
         return queue_error();
     }
+
     metadata.insert("task_id".to_owned(), json!(task_id));
     metadata.insert(
         "source_hint".to_owned(),
         source_hint(&metadata).map_or(Value::Null, Value::String),
     );
-    // A whole-record write keeps the task id already on disk, so a retry records its own
-    // separately: until its importer admits an attempt, the row reads running, not the
-    // outcome being retried.
-    let written = write(root, record_id, &metadata)
-        .and_then(|_| solstone_core_import::record_queued_task(root, record_id, &task_id));
-    // Called either way: the watch carries the request it sent, and a record without its
-    // task id reads pending rather than running, so there is nothing for it to settle.
+    let _ = write(root, record_id, &metadata);
     follow(&task_id, record_id);
-    if let Err(error) = written {
-        return metadata_error_with_task(
-            &task_id,
-            format!(
-                "Supervisor accepted task {task_id}, but metadata could not be updated: {error}"
-            ),
-        );
-    }
     json_response(StatusCode::OK, queued_start_response(&task_id, record_id))
 }
 
@@ -1751,12 +2017,12 @@ fn run_inprocess_import(
 
 #[cfg(test)]
 mod tests {
-    use super::inprocess_producer_request;
+    use super::{SendSeam, TaskIdHook, inprocess_producer_request};
     use chrono_tz::Tz;
     use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::{cell::RefCell, fs, rc::Rc, time::Duration};
 
     use axum::{
@@ -1776,8 +2042,8 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        BusError, ExitEvent, SAVE_TMP_DIR, command, exit_event, manifest_exists, source_for,
-        start_with,
+        BusError, ExitEvent, SAVE_TMP_DIR, StartSeams, TaskIdOp, command, exit_event,
+        manifest_exists, run_start, source_for, start_with,
     };
     use crate::multipart;
 
@@ -1814,6 +2080,7 @@ mod tests {
                 write_import_metadata,
                 |_, _, _, _, _, _| panic!("text queues through supervisor"),
                 |_, _| {},
+                None,
             );
             assert_eq!(response.status(), StatusCode::OK);
             let id = if occupied { old } else { chosen };
@@ -2154,6 +2421,7 @@ mod tests {
             write_import_metadata,
             |_, _, _, _, _, _| {},
             |_, _| {},
+            None,
         );
         assert_eq!(started.status(), StatusCode::OK);
         assert_eq!(captured.borrow()[4], "--auto");
@@ -2527,6 +2795,7 @@ mod tests {
             write_import_metadata,
             |_, _, _, _, _, _| {},
             |_, _| {},
+            None,
         );
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(fs::read(&owner).unwrap(), b"only owner copy");
@@ -2590,6 +2859,7 @@ mod tests {
             write_import_metadata,
             |_, _, _, _, _, _| {},
             |_, _| {},
+            None,
         );
         assert_eq!(response.status(), StatusCode::OK);
         // The queued start records its task id durably: without it the row has no clock
@@ -2659,6 +2929,7 @@ mod tests {
             move |task_id, timestamp| {
                 *follow.borrow_mut() = Some((task_id.to_owned(), timestamp.to_owned()));
             },
+            None,
         );
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
@@ -2852,6 +3123,7 @@ mod tests {
                 write_import_metadata,
                 |_, _, _, _, _, _| {},
                 |_, _| {},
+                None,
             )
             .status();
             (status, *sent.borrow())
@@ -2933,6 +3205,7 @@ mod tests {
             write_import_metadata,
             |_, _, _, _, _, _| {},
             |_, _| {},
+            None,
         );
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(projected(root.path(), "ts"), Running);
@@ -2970,6 +3243,7 @@ mod tests {
             write_import_metadata,
             |_, _, _, _, _, _| panic!("a text file is not produced in process"),
             |_, _| {},
+            None,
         );
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(projected(root.path(), "ts"), Running);
@@ -3021,6 +3295,7 @@ mod tests {
             },
             |_, _, _, _, _, _| {},
             |_, _| {},
+            None,
         );
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(*writes.borrow(), 0);
@@ -3033,7 +3308,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn criterion_26_metadata_failure_after_send_keeps_task_id_top_level() {
+    async fn criterion_26_metadata_failure_after_send_returns_ok_with_task_id() {
         let root = TempDir::new().unwrap();
         let path = root.path().join("imports/ts/item.txt");
         staged(
@@ -3053,11 +3328,20 @@ mod tests {
             },
             |_, _, _, _, _, _| {},
             |_, _| {},
+            None,
         );
         let (status, body) = response_json(response).await;
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(body["task_id"].as_str().is_some());
-        assert!(body.get("extra").is_none());
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ok");
+        let task_id = body["task_id"].as_str().expect("task_id present");
+        assert!(!task_id.is_empty());
+        assert_eq!(
+            read_import_metadata(root.path(), "ts")
+                .unwrap()
+                .get("task_id")
+                .and_then(Value::as_str),
+            Some(task_id)
+        );
     }
 
     #[tokio::test]
@@ -3103,6 +3387,7 @@ mod tests {
             write_import_metadata,
             |_, _, _, _, _, _| {},
             |_, _| {},
+            None,
         );
         let (_, start) = response_json(start).await;
         assert_eq!(start["reason_code"], "invalid_operation_for_state");
@@ -3707,7 +3992,7 @@ mod tests {
             let data = crate::preview::validate_start(
                 root.path(),
                 json!({"path": path, "timestamp": timestamp}),
-                &planner,
+                crate::preview::PreviewPlan::Program(&planner),
             )
             .await
             .unwrap_or_else(|error| panic!("{filename}: {error}"));
@@ -3728,6 +4013,7 @@ mod tests {
                 write_import_metadata,
                 move |_, source, _, kind, _, _| *producer.borrow_mut() = Some((source, kind)),
                 |_, _| {},
+                None,
             );
             assert_eq!(response.status(), StatusCode::OK, "{filename}");
 
@@ -3760,5 +4046,1223 @@ mod tests {
             }
         }
         assert!(!root.path().join("chronicle").exists());
+    }
+
+    fn composition_fixture_with_id(id: &str) -> (TempDir, Value) {
+        let root = TempDir::new().unwrap();
+        let dir = root.path().join("imports").join(id);
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("notes.txt");
+        fs::write(&source, "note content").unwrap();
+        let hash = solstone_core_import::hash_source(&source)
+            .unwrap()
+            .as_str()
+            .to_owned();
+        write_import_metadata(
+            root.path(),
+            id,
+            json!({
+                "file_path": source,
+                "source_hash": hash,
+                "import_id": id,
+                "user_timestamp": id,
+                "source_timestamp": id,
+            })
+            .as_object()
+            .unwrap(),
+        )
+        .unwrap();
+        (
+            root,
+            json!({"path": source, "timestamp": id, "import_id": id}),
+        )
+    }
+
+    fn composition_fixture() -> (TempDir, Value) {
+        composition_fixture_with_id("20261019_120000")
+    }
+
+    fn composition_image_fixture_with_id(id: &str) -> (TempDir, Value) {
+        let root = TempDir::new().unwrap();
+        let dir = root.path().join("imports").join(id);
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("photo.jpg");
+        fs::write(
+            &source,
+            b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xdb",
+        )
+        .unwrap();
+        let hash = solstone_core_import::hash_source(&source)
+            .unwrap()
+            .as_str()
+            .to_owned();
+        write_import_metadata(
+            root.path(),
+            id,
+            json!({
+                "file_path": source,
+                "source_hash": hash,
+                "import_id": id,
+                "user_timestamp": id,
+                "source_timestamp": id,
+                "source_hint": "image",
+            })
+            .as_object()
+            .unwrap(),
+        )
+        .unwrap();
+        (
+            root,
+            json!({"path": source, "timestamp": id, "import_id": id}),
+        )
+    }
+
+    fn immediate_plan(recordings: usize) -> crate::preview::PreviewPlan<'static> {
+        crate::preview::PreviewPlan::Stub(std::sync::Arc::new(move |_path, _options, _meta| {
+            Box::pin(async move {
+                Ok(json!({
+                    "schema": "solstone.import.size.v1",
+                    "recordings": recordings,
+                }))
+            })
+        }))
+    }
+
+    fn mock_send<F>(f: F) -> SendSeam
+    where
+        F: FnMut(&Path, &str, &[String]) -> Result<(), BusError> + Send + 'static,
+    {
+        std::sync::Arc::new(std::sync::Mutex::new(Box::new(f)))
+    }
+
+    fn noop_send_seams() -> StartSeams {
+        StartSeams {
+            send: Some(mock_send(|_r, _t, _c| Ok(()))),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn composition_second_queued_start_replays() {
+        let (root, data) = composition_fixture();
+        let planner_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let send_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let pc = planner_count.clone();
+        let plan = crate::preview::PreviewPlan::Stub(std::sync::Arc::new(
+            move |_path, _options, _meta| {
+                let pc = pc.clone();
+                Box::pin(async move {
+                    pc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(json!({"schema": "solstone.import.size.v1", "recordings": 1}))
+                })
+            },
+        ));
+
+        let sc = send_count.clone();
+        let seams = StartSeams {
+            send: Some(mock_send(move |_root, _task_id, _cmd| {
+                sc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })),
+            ..Default::default()
+        };
+
+        let res1 = run_start(root.path(), data.clone(), plan.clone(), seams.clone()).await;
+        let (status1, body1) = response_json(res1).await;
+        assert_eq!(status1, StatusCode::OK);
+        let task_id1 = body1["task_id"]
+            .as_str()
+            .expect("task_id present")
+            .to_owned();
+        assert!(!task_id1.is_empty());
+
+        let res2 = run_start(root.path(), data.clone(), plan, seams).await;
+        let (status2, body2) = response_json(res2).await;
+        assert_eq!(status2, StatusCode::OK);
+        assert_eq!(body2["replay"], true);
+        assert_eq!(body2["task_id"], task_id1);
+        assert_eq!(body2["import_id"], data["import_id"]);
+        assert_eq!(send_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(planner_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn composition_admitted_attempt_replay() {
+        let (root, data) = composition_fixture();
+        let id = data["import_id"].as_str().unwrap();
+        let now = super::now_ms() as u64;
+        let attempt =
+            solstone_core_import::admit_running_attempt(root.path(), id, now, None).unwrap();
+
+        let plan = immediate_plan(1);
+        let seams = noop_send_seams();
+
+        let res = run_start(root.path(), data.clone(), plan, seams).await;
+        let (status, body) = response_json(res).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["replay"], true);
+        assert_eq!(body["task_id"], id);
+        assert_eq!(body["generation"], attempt.generation);
+        assert_eq!(body["attempt_id"], attempt.attempt_id);
+    }
+
+    #[tokio::test]
+    async fn composition_success_without_task_id_replays_queued_shape() {
+        let (root, data) = composition_fixture();
+        let id = data["import_id"].as_str().unwrap();
+        let dir = root.path().join("imports").join(id);
+        fs::write(
+            dir.join("imported.json"),
+            json!({
+                "schema": "solstone.import.publication.v1",
+                "imported_at": 1700000000000_u64,
+                "source_type": "notes",
+                "status": "success",
+                "segments": [],
+                "indexing": {"published": [], "declined": [], "errored": []},
+                "day_markers": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let plan = immediate_plan(1);
+        let seams = noop_send_seams();
+
+        let res = run_start(root.path(), data.clone(), plan, seams).await;
+        let (status, body) = response_json(res).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["replay"], true);
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["task_id"], id);
+        assert_eq!(body["import_id"], id);
+        assert!(body.get("generation").is_none());
+        assert!(body.get("attempt_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn composition_image_produces_once_and_replays() {
+        let (root, data) = composition_image_fixture_with_id("20261019_120000");
+        let produce_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let plan = immediate_plan(1);
+
+        let pc = produce_count.clone();
+        let seams = StartSeams {
+            send: Some(mock_send(|_r, _t, _c| Ok(()))),
+            produce: Some(std::sync::Arc::new(std::sync::Mutex::new(Box::new(
+                move |_root, _source, _id, _reg_source, _force, _gen| {
+                    pc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                },
+            )))),
+            ..Default::default()
+        };
+
+        let res1 = run_start(root.path(), data.clone(), plan.clone(), seams.clone()).await;
+        let (status1, body1) = response_json(res1).await;
+        assert_eq!(status1, StatusCode::OK);
+        let gen1 = body1["generation"].as_u64().expect("generation present");
+        let attempt1 = body1["attempt_id"]
+            .as_str()
+            .expect("attempt_id present")
+            .to_owned();
+        assert_eq!(produce_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let res2 = run_start(root.path(), data.clone(), plan, seams).await;
+        let (status2, body2) = response_json(res2).await;
+        assert_eq!(status2, StatusCode::OK);
+        assert_eq!(body2["replay"], true);
+        assert_eq!(body2["generation"], gen1);
+        assert_eq!(body2["attempt_id"], attempt1);
+        assert_eq!(produce_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn composition_upload_timestamp_older_than_bound_projects_running() {
+        let (root, data) = composition_fixture();
+        let id = data["import_id"].as_str().unwrap();
+        let old_time = (super::now_ms() as u64)
+            .saturating_sub(solstone_core_import::RUNNING_ATTEMPT_BOUND_MS + 60_000);
+        let mut meta = read_import_metadata(root.path(), id).unwrap();
+        meta.insert("upload_timestamp".to_owned(), json!(old_time));
+        write_import_metadata(root.path(), id, &meta).unwrap();
+
+        let plan = immediate_plan(1);
+
+        let send_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sc = send_count.clone();
+        let seams = StartSeams {
+            send: Some(mock_send(move |_root, _task_id, _cmd| {
+                sc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })),
+            ..Default::default()
+        };
+
+        let res1 = run_start(root.path(), data.clone(), plan.clone(), seams.clone()).await;
+        let (status1, _) = response_json(res1).await;
+        assert_eq!(status1, StatusCode::OK);
+
+        let projection = solstone_core_import::project_import_result(root.path(), id);
+        assert_eq!(
+            projection.status,
+            solstone_core_import::ProjectionStatus::Running
+        );
+
+        let res2 = run_start(root.path(), data.clone(), plan, seams).await;
+        let (status2, body2) = response_json(res2).await;
+        assert_eq!(status2, StatusCode::OK);
+        assert_eq!(body2["replay"], true);
+        assert_eq!(send_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn composition_two_tokenless_starts_of_one_import() {
+        let (root, data) = composition_fixture();
+        let id = data["import_id"].as_str().unwrap().to_owned();
+
+        let send_cmd = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let send_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let notify_a_started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let notify_release_a = std::sync::Arc::new(tokio::sync::Notify::new());
+        let na = notify_a_started.clone();
+        let nr = notify_release_a.clone();
+
+        let plan1 = crate::preview::PreviewPlan::Stub(std::sync::Arc::new(
+            move |_path, _options, _meta| {
+                let na = na.clone();
+                let nr = nr.clone();
+                Box::pin(async move {
+                    na.notify_one();
+                    nr.notified().await;
+                    Ok(json!({"schema": "solstone.import.size.v1", "recordings": 1}))
+                })
+            },
+        ));
+        let plan2 = immediate_plan(1);
+
+        let sc = send_count.clone();
+        let scmd = send_cmd.clone();
+        let seams = StartSeams {
+            send: Some(mock_send(move |_root, _task_id, cmd| {
+                sc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                *scmd.lock().unwrap() = cmd.to_vec();
+                Ok(())
+            })),
+            ..Default::default()
+        };
+
+        let r1 = root.path().to_path_buf();
+        let d1 = data.clone();
+        let s1 = seams.clone();
+        let h1 = tokio::spawn(async move { run_start(&r1, d1, plan1, s1).await });
+
+        notify_a_started.notified().await;
+
+        let r2 = root.path().to_path_buf();
+        let d2 = data.clone();
+        let s2 = seams;
+        let h2 = tokio::spawn(async move { run_start(&r2, d2, plan2, s2).await });
+
+        crate::start_lock::wait_for_start_lock_waiters(root.path(), &id, 1).await;
+        assert!(crate::start_lock::start_lock_waiters(root.path(), &id) > 0);
+
+        notify_release_a.notify_one();
+
+        let res1 = h1.await.unwrap();
+        let res2 = h2.await.unwrap();
+        let (status1, body1) = response_json(res1).await;
+        let (status2, body2) = response_json(res2).await;
+
+        assert!(
+            !status1.is_client_error(),
+            "res1 was client error: {status1}"
+        );
+        assert!(
+            !status2.is_client_error(),
+            "res2 was client error: {status2}"
+        );
+        assert_eq!(status1, StatusCode::OK);
+        assert_eq!(status2, StatusCode::OK);
+
+        let replay1 = body1
+            .get("replay")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let replay2 = body2
+            .get("replay")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        assert!(replay1 ^ replay2, "exactly one should be replay: true");
+
+        assert_eq!(send_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let cmd = send_cmd.lock().unwrap().clone();
+        let token_arg = cmd
+            .windows(2)
+            .find(|pair| pair[0] == "--preview-token")
+            .map(|pair| pair[1].clone())
+            .expect("--preview-token found in cmd");
+
+        let meta = read_import_metadata(root.path(), &id).unwrap();
+        let stored_token = meta["preview"]["token"]
+            .as_str()
+            .expect("preview token stored");
+        assert_eq!(stored_token, token_arg);
+    }
+
+    #[tokio::test]
+    async fn composition_second_import_completes_while_first_blocked_in_planner() {
+        let (root1, data1) = composition_fixture_with_id("20261019_100001");
+        let id2 = "20261019_100002";
+        let dir2 = root1.path().join("imports").join(id2);
+        fs::create_dir_all(&dir2).unwrap();
+        let source2 = dir2.join("notes.txt");
+        fs::write(&source2, "note 2").unwrap();
+        let hash2 = solstone_core_import::hash_source(&source2)
+            .unwrap()
+            .as_str()
+            .to_owned();
+        write_import_metadata(
+            root1.path(),
+            id2,
+            json!({
+                "file_path": source2,
+                "source_hash": hash2,
+                "import_id": id2,
+                "user_timestamp": id2,
+                "source_timestamp": id2,
+            })
+            .as_object()
+            .unwrap(),
+        )
+        .unwrap();
+        let data2 = json!({"path": source2, "timestamp": id2, "import_id": id2});
+
+        let notify_b_done = std::sync::Arc::new(tokio::sync::Notify::new());
+        let notify_a_started = std::sync::Arc::new(tokio::sync::Notify::new());
+
+        let nb = notify_b_done.clone();
+        let na = notify_a_started.clone();
+        let plan1 = crate::preview::PreviewPlan::Stub(std::sync::Arc::new(
+            move |_path, _options, _meta| {
+                let na = na.clone();
+                let nb = nb.clone();
+                Box::pin(async move {
+                    na.notify_one();
+                    nb.notified().await;
+                    Ok(json!({"schema": "solstone.import.size.v1", "recordings": 1}))
+                })
+            },
+        ));
+
+        let plan2 = immediate_plan(1);
+        let seams = noop_send_seams();
+
+        let r1 = root1.path().to_path_buf();
+        let s1 = seams.clone();
+        let h1 = tokio::spawn(async move { run_start(&r1, data1, plan1, s1).await });
+
+        notify_a_started.notified().await;
+
+        let res2 = run_start(root1.path(), data2, plan2, seams).await;
+        let (status2, body2) = response_json(res2).await;
+        assert_eq!(status2, StatusCode::OK);
+        assert_eq!(body2["status"], "ok");
+
+        notify_b_done.notify_one();
+
+        let res1 = h1.await.unwrap();
+        let (status1, body1) = response_json(res1).await;
+        assert_eq!(status1, StatusCode::OK);
+        assert_eq!(body1["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn composition_failed_and_unconfirmed_and_timeout_start_again() {
+        let plan = immediate_plan(1);
+
+        // Case 1: Failed starts again (new send, no replay)
+        let (root1, data1) = composition_fixture_with_id("20261019_100001");
+        let id1 = data1["import_id"].as_str().unwrap();
+        let now = super::now_ms() as u64;
+        let first =
+            solstone_core_import::admit_running_attempt(root1.path(), id1, now - 5000, None)
+                .unwrap();
+        solstone_core_import::record_unconfirmed_attempt(
+            root1.path(),
+            id1,
+            first.generation,
+            now - 4000,
+            Some(solstone_core_import::IMPORT_FAILED_REASON.to_owned()),
+        )
+        .unwrap();
+        let send_count1 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sc1 = send_count1.clone();
+        let seams1 = StartSeams {
+            send: Some(mock_send(move |_r, _t, _c| {
+                sc1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })),
+            ..Default::default()
+        };
+        let res1 = run_start(root1.path(), data1, plan.clone(), seams1).await;
+        let (status1, body1) = response_json(res1).await;
+        assert_eq!(status1, StatusCode::OK);
+        assert_ne!(body1.get("replay"), Some(&Value::Bool(true)));
+        assert_eq!(send_count1.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Case 2: Unconfirmed with attempt released and no successful publication starts again
+        let (root2, data2) = composition_fixture_with_id("20261019_100002");
+        let id2 = data2["import_id"].as_str().unwrap();
+        solstone_core_import::admit_running_attempt(root2.path(), id2, now - 5000, None).unwrap();
+        solstone_core_import::release_attempt(root2.path(), id2);
+        let send_count2 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sc2 = send_count2.clone();
+        let seams2 = StartSeams {
+            send: Some(mock_send(move |_r, _t, _c| {
+                sc2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })),
+            ..Default::default()
+        };
+        let res2 = run_start(root2.path(), data2, plan.clone(), seams2).await;
+        let (status2, body2) = response_json(res2).await;
+        assert_eq!(status2, StatusCode::OK);
+        assert_ne!(body2.get("replay"), Some(&Value::Bool(true)));
+        assert_eq!(send_count2.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Case 3: A retry whose queued task id is older than bound starts again
+        let (root3, data3) = composition_fixture_with_id("20261019_100003");
+        let id3 = data3["import_id"].as_str().unwrap();
+        let old_task_id =
+            (now - solstone_core_import::RUNNING_ATTEMPT_BOUND_MS - 10_000).to_string();
+        let mut meta3 = read_import_metadata(root3.path(), id3).unwrap();
+        meta3.insert("task_id".to_owned(), json!(old_task_id));
+        write_import_metadata(root3.path(), id3, &meta3).unwrap();
+        let send_count3 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sc3 = send_count3.clone();
+        let seams3 = StartSeams {
+            send: Some(mock_send(move |_r, _t, _c| {
+                sc3.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })),
+            ..Default::default()
+        };
+        let res3 = run_start(root3.path(), data3, plan.clone(), seams3).await;
+        let (status3, body3) = response_json(res3).await;
+        assert_eq!(status3, StatusCode::OK);
+        assert_ne!(body3.get("replay"), Some(&Value::Bool(true)));
+        assert_eq!(send_count3.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Case 4: force: true on Running is 409 import_preview_required, kind already_running
+        let (root4, mut data4) = composition_fixture_with_id("20261019_100004");
+        let id4 = data4["import_id"].as_str().unwrap();
+        solstone_core_import::admit_running_attempt(root4.path(), id4, now, None).unwrap();
+        data4["force"] = json!(true);
+        let res4 = run_start(root4.path(), data4, plan, noop_send_seams()).await;
+        let (status4, body4) = response_json(res4).await;
+        assert_eq!(status4, StatusCode::CONFLICT);
+        assert_eq!(body4["reason_code"], "import_preview_required");
+        assert_eq!(body4["kind"], "already_running");
+    }
+
+    #[tokio::test]
+    async fn composition_drop_future_while_hook_blocks_second_replays() {
+        let (root, data) = composition_fixture();
+        let id = data["import_id"].as_str().unwrap().to_owned();
+
+        let (entry_tx, mut entry_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Arc::new(std::sync::Mutex::new(release_rx));
+
+        let send_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sc = send_count.clone();
+
+        let hook: std::sync::Arc<TaskIdHook> = std::sync::Arc::new(move |op| {
+            if let TaskIdOp::Record { .. } = op {
+                let _ = entry_tx.send(());
+                let _ = release_rx.lock().unwrap().recv();
+            }
+            Ok(())
+        });
+
+        let seams1 = StartSeams {
+            send: Some(mock_send(move |_r, _t, _c| {
+                sc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })),
+            task_id_hook: Some(hook),
+            ..Default::default()
+        };
+
+        let r1 = root.path().to_path_buf();
+        let d1 = data.clone();
+        let p1 = immediate_plan(1);
+        let task1 = tokio::spawn(async move { run_start(&r1, d1, p1, seams1).await });
+
+        entry_rx.recv().await.unwrap();
+
+        let r2 = root.path().to_path_buf();
+        let d2 = data.clone();
+        let sc2 = send_count.clone();
+        let p2 = immediate_plan(1);
+        let seams2 = StartSeams {
+            send: Some(mock_send(move |_r, _t, _c| {
+                sc2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })),
+            ..Default::default()
+        };
+        let task2 = tokio::spawn(async move { run_start(&r2, d2, p2, seams2).await });
+
+        crate::start_lock::wait_for_start_lock_waiters(root.path(), &id, 1).await;
+        assert!(crate::start_lock::start_lock_waiters(root.path(), &id) > 0);
+        assert!(!task2.is_finished());
+
+        task1.abort();
+
+        let _ = release_tx.send(());
+
+        let res2 = task2.await.unwrap();
+        let (status2, body2) = response_json(res2).await;
+        assert_eq!(status2, StatusCode::OK);
+        assert_eq!(body2["replay"], true);
+        assert_eq!(send_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn composition_preview_route_waits_while_tokenless_start_in_planner() {
+        let (root, data) = composition_fixture();
+        let id = data["import_id"].as_str().unwrap().to_owned();
+
+        let notify_start_in_planner = std::sync::Arc::new(tokio::sync::Notify::new());
+        let notify_release_planner = std::sync::Arc::new(tokio::sync::Notify::new());
+        let n_in = notify_start_in_planner.clone();
+        let n_rel = notify_release_planner.clone();
+
+        let plan = crate::preview::PreviewPlan::Stub(std::sync::Arc::new(
+            move |_path, _options, _meta| {
+                let n_in = n_in.clone();
+                let n_rel = n_rel.clone();
+                Box::pin(async move {
+                    n_in.notify_one();
+                    n_rel.notified().await;
+                    Ok(json!({"schema": "solstone.import.size.v1", "recordings": 1}))
+                })
+            },
+        ));
+
+        let sent_token = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let st = sent_token.clone();
+
+        let seams = StartSeams {
+            send: Some(mock_send(move |_r, _t, cmd| {
+                let token = cmd
+                    .windows(2)
+                    .find(|p| p[0] == "--preview-token")
+                    .map(|p| p[1].clone())
+                    .unwrap_or_default();
+                *st.lock().unwrap() = token;
+                Ok(())
+            })),
+            ..Default::default()
+        };
+
+        let r1 = root.path().to_path_buf();
+        let d1 = data.clone();
+        let start_task = tokio::spawn(async move { run_start(&r1, d1, plan, seams).await });
+
+        notify_start_in_planner.notified().await;
+
+        let preview_app = crate::routes(root.path().to_path_buf());
+        let d2 = data.clone();
+        let preview_task = tokio::spawn(async move {
+            preview_app
+                .oneshot(
+                    Request::post("/app/import/api/preview")
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&d2).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+
+        crate::start_lock::wait_for_start_lock_waiters(root.path(), &id, 1).await;
+        assert!(crate::start_lock::start_lock_waiters(root.path(), &id) > 0);
+
+        notify_release_planner.notify_one();
+
+        let start_res = start_task.await.unwrap();
+        let (start_status, _) = response_json(start_res).await;
+        assert!(
+            !start_status.is_client_error(),
+            "Start failed with {start_status}"
+        );
+        assert_eq!(start_status, StatusCode::OK);
+
+        let preview_res = preview_task.await.unwrap();
+        let (preview_status, preview_body) = response_json(preview_res).await;
+        assert_eq!(preview_status, StatusCode::BAD_REQUEST);
+        assert_eq!(preview_body["reason_code"], "import_preview_failed");
+        assert_eq!(preview_body["kind"], "already_running");
+        assert!(
+            preview_body["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("this import is already running")
+        );
+
+        let meta = read_import_metadata(root.path(), &id).unwrap();
+        assert_eq!(meta["preview"]["token"], *sent_token.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn composition_retry_of_failed_import_blocked_in_send_projects_running() {
+        let (root, data) = composition_fixture();
+        let id = data["import_id"].as_str().unwrap();
+        let now = super::now_ms() as u64;
+
+        let first =
+            solstone_core_import::admit_running_attempt(root.path(), id, now - 50_000, None)
+                .unwrap();
+        solstone_core_import::record_unconfirmed_attempt(
+            root.path(),
+            id,
+            first.generation,
+            now - 40_000,
+            Some(solstone_core_import::IMPORT_FAILED_REASON.to_owned()),
+        )
+        .unwrap();
+
+        let old_task_id = (now - 60_000).to_string();
+        let mut meta = read_import_metadata(root.path(), id).unwrap();
+        meta.insert("task_id".to_owned(), json!(old_task_id));
+        write_import_metadata(root.path(), id, &meta).unwrap();
+
+        let plan = immediate_plan(1);
+
+        let (entry_tx, mut entry_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Arc::new(std::sync::Mutex::new(release_rx));
+        let sent_task_id = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let stid = sent_task_id.clone();
+
+        let seams = StartSeams {
+            send: Some(mock_send(move |_r, task_id, _cmd| {
+                *stid.lock().unwrap() = task_id.to_owned();
+                let _ = entry_tx.send(task_id.to_owned());
+                let _ = release_rx.lock().unwrap().recv();
+                Ok(())
+            })),
+            ..Default::default()
+        };
+
+        let r = root.path().to_path_buf();
+        let d = data.clone();
+        let h = tokio::spawn(async move { run_start(&r, d, plan, seams).await });
+
+        let received_task_id = entry_rx.recv().await.unwrap();
+
+        let cur_meta = read_import_metadata(root.path(), id).unwrap();
+        let on_disk_id = cur_meta.get("task_id").and_then(Value::as_str).unwrap();
+        assert_eq!(on_disk_id, received_task_id);
+        assert_eq!(on_disk_id, *sent_task_id.lock().unwrap());
+
+        let projection = solstone_core_import::project_import_result(root.path(), id);
+        assert_eq!(
+            projection.status,
+            solstone_core_import::ProjectionStatus::Running
+        );
+
+        let _ = release_tx.send(());
+        let res = h.await.unwrap();
+        let (status, _) = response_json(res).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn composition_unconfirmed_with_publication_success_replays_unless_force() {
+        let (root, mut data) = composition_fixture();
+        let id = data["import_id"].as_str().unwrap();
+        let dir = root.path().join("imports").join(id);
+        fs::write(
+            dir.join("imported.json"),
+            json!({
+                "schema": "solstone.import.publication.v1",
+                "imported_at": 1700000000000_u64,
+                "source_type": "notes",
+                "status": "success",
+                "segments": [],
+                "indexing": {"published": [], "declined": [], "errored": []},
+                "day_markers": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let now = super::now_ms() as u64;
+        solstone_core_import::admit_running_attempt(root.path(), id, now - 5000, None).unwrap();
+        solstone_core_import::release_attempt(root.path(), id);
+
+        let plan = immediate_plan(1);
+
+        let send_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sc = send_count.clone();
+        let seams = StartSeams {
+            send: Some(mock_send(move |_r, _t, _c| {
+                sc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })),
+            ..Default::default()
+        };
+
+        let res1 = run_start(root.path(), data.clone(), plan.clone(), seams.clone()).await;
+        let (status1, body1) = response_json(res1).await;
+        assert_eq!(status1, StatusCode::OK);
+        assert_eq!(body1["replay"], true);
+        assert_eq!(send_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        data["force"] = json!(true);
+        let res2 = run_start(root.path(), data, plan, seams).await;
+        let (status2, body2) = response_json(res2).await;
+        assert_eq!(status2, StatusCode::OK);
+        assert_ne!(body2.get("replay"), Some(&Value::Bool(true)));
+        assert_eq!(send_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn composition_pre_send_record_hook_error_returns_500() {
+        let (root, data) = composition_fixture();
+        let plan = immediate_plan(1);
+
+        let send_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sc = send_count.clone();
+
+        let hook: std::sync::Arc<TaskIdHook> = std::sync::Arc::new(move |op| {
+            if let TaskIdOp::Record { .. } = op {
+                return Err(ImportError::MetadataWriteFailed {
+                    path: PathBuf::from("import.json"),
+                    message: "simulated disk failure".to_owned(),
+                });
+            }
+            Ok(())
+        });
+
+        let seams = StartSeams {
+            send: Some(mock_send(move |_r, _t, _c| {
+                sc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })),
+            task_id_hook: Some(hook),
+            ..Default::default()
+        };
+
+        let res = run_start(root.path(), data, plan, seams).await;
+        let (status, body) = response_json(res).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["reason_code"], "import_metadata_failed");
+        assert!(body.get("task_id").is_none());
+        assert_eq!(send_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn composition_send_fails_503_restores_prior_state() {
+        let plan = immediate_plan(1);
+
+        let failing_send_seams = || StartSeams {
+            send: Some(mock_send(|_r, _t, _c| Err(BusError::Unavailable))),
+            ..Default::default()
+        };
+
+        // 1. Pending first start:
+        let (root1, data1) = composition_fixture_with_id("20261019_100001");
+        let id1 = data1["import_id"].as_str().unwrap().to_owned();
+        let res1 = run_start(
+            root1.path(),
+            data1.clone(),
+            plan.clone(),
+            failing_send_seams(),
+        )
+        .await;
+        let (status1, body1) = response_json(res1).await;
+        assert_eq!(status1, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body1["reason_code"], "import_queue_unreachable");
+        let meta1 = read_import_metadata(root1.path(), &id1).unwrap();
+        assert!(meta1.get("task_id").is_none());
+
+        let ok_send_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let osc = ok_send_count.clone();
+        let ok_seams = StartSeams {
+            send: Some(mock_send(move |_r, _t, _c| {
+                osc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })),
+            ..Default::default()
+        };
+        let retry_res = run_start(root1.path(), data1, plan.clone(), ok_seams).await;
+        let (retry_status, _) = response_json(retry_res).await;
+        assert_eq!(retry_status, StatusCode::OK);
+        assert_eq!(ok_send_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 2. Attempt-based Failed retry:
+        let (root2, data2) = composition_fixture_with_id("20261019_100002");
+        let id2 = data2["import_id"].as_str().unwrap().to_owned();
+        let now = super::now_ms() as u64;
+        let attempt =
+            solstone_core_import::admit_running_attempt(root2.path(), &id2, now - 50_000, None)
+                .unwrap();
+        solstone_core_import::record_unconfirmed_attempt(
+            root2.path(),
+            &id2,
+            attempt.generation,
+            now - 40_000,
+            Some(solstone_core_import::IMPORT_FAILED_REASON.to_owned()),
+        )
+        .unwrap();
+        solstone_core_import::record_queued_task(root2.path(), &id2, "prior_task_id").unwrap();
+
+        let res2 = run_start(root2.path(), data2, plan.clone(), failing_send_seams()).await;
+        let (status2, _) = response_json(res2).await;
+        assert_eq!(status2, StatusCode::SERVICE_UNAVAILABLE);
+        let meta2_after = read_import_metadata(root2.path(), &id2).unwrap();
+        assert_eq!(
+            meta2_after.get("task_id").and_then(Value::as_str),
+            Some("prior_task_id")
+        );
+
+        // 3. Legacy timeout-Failed row (old numeric task id, no attempt):
+        let (root3, data3) = composition_fixture_with_id("20261019_100003");
+        let id3 = data3["import_id"].as_str().unwrap().to_owned();
+        let old_numeric_id =
+            (now - solstone_core_import::RUNNING_ATTEMPT_BOUND_MS - 20_000).to_string();
+        let mut meta3 = read_import_metadata(root3.path(), &id3).unwrap();
+        meta3.insert("task_id".to_owned(), json!(old_numeric_id));
+        write_import_metadata(root3.path(), &id3, &meta3).unwrap();
+
+        let res3 = run_start(root3.path(), data3, plan.clone(), failing_send_seams()).await;
+        let (status3, _) = response_json(res3).await;
+        assert_eq!(status3, StatusCode::SERVICE_UNAVAILABLE);
+        let meta3_after = read_import_metadata(root3.path(), &id3).unwrap();
+        assert_eq!(
+            meta3_after.get("task_id").and_then(Value::as_str),
+            Some(old_numeric_id.as_str())
+        );
+
+        // 4. If on-disk id was changed before restore, that id is left as changed:
+        let (root4, data4) = composition_fixture_with_id("20261019_100004");
+        let id4 = data4["import_id"].as_str().unwrap().to_owned();
+        let r4_path = root4.path().to_path_buf();
+        let id4_str = id4.clone();
+
+        let hook: std::sync::Arc<TaskIdHook> = std::sync::Arc::new(move |op| {
+            if let TaskIdOp::Restore { .. } = op {
+                solstone_core_import::record_queued_task(&r4_path, &id4_str, "externally_changed")
+                    .unwrap();
+            }
+            Ok(())
+        });
+
+        let mut seams4 = failing_send_seams();
+        seams4.task_id_hook = Some(hook);
+
+        let res4 = run_start(root4.path(), data4, plan, seams4).await;
+        let (status4, _) = response_json(res4).await;
+        assert_eq!(status4, StatusCode::SERVICE_UNAVAILABLE);
+        let meta4_after = read_import_metadata(root4.path(), &id4).unwrap();
+        assert_eq!(
+            meta4_after.get("task_id").and_then(Value::as_str),
+            Some("externally_changed")
+        );
+    }
+
+    #[tokio::test]
+    async fn composition_write_closure_failure_returns_200_and_replays() {
+        let (root, data) = composition_fixture();
+        let plan = immediate_plan(1);
+
+        let send_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sc = send_count.clone();
+
+        let seams = StartSeams {
+            send: Some(mock_send(move |_r, _t, _c| {
+                sc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })),
+            write: Some(std::sync::Arc::new(std::sync::Mutex::new(Box::new(
+                |_r, _t, _m| {
+                    Err(ImportError::MetadataWriteFailed {
+                        path: PathBuf::from("import.json"),
+                        message: "disk full".to_owned(),
+                    })
+                },
+            )))),
+            ..Default::default()
+        };
+
+        let res1 = run_start(root.path(), data.clone(), plan.clone(), seams.clone()).await;
+        let (status1, body1) = response_json(res1).await;
+        assert_eq!(status1, StatusCode::OK);
+        let task_id1 = body1["task_id"].as_str().expect("task_id present");
+        assert!(!task_id1.is_empty());
+        assert_eq!(send_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let res2 = run_start(root.path(), data, plan, seams).await;
+        let (status2, body2) = response_json(res2).await;
+        assert_eq!(status2, StatusCode::OK);
+        assert_eq!(body2["replay"], true);
+        assert_eq!(send_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn composition_send_fails_and_restore_hook_fails_returns_503() {
+        let (root, data) = composition_fixture();
+        let plan = immediate_plan(1);
+
+        let send_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sc = send_count.clone();
+
+        let hook: std::sync::Arc<TaskIdHook> = std::sync::Arc::new(|op| {
+            if let TaskIdOp::Restore { .. } = op {
+                return Err(ImportError::MetadataWriteFailed {
+                    path: PathBuf::from("import.json"),
+                    message: "restore failed".to_owned(),
+                });
+            }
+            Ok(())
+        });
+
+        let seams = StartSeams {
+            send: Some(mock_send(move |_r, _t, _c| {
+                sc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(BusError::Unavailable)
+            })),
+            task_id_hook: Some(hook),
+            ..Default::default()
+        };
+
+        let res = run_start(root.path(), data, plan, seams).await;
+        let (status, body) = response_json(res).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["reason_code"], "import_queue_unreachable");
+        assert_eq!(send_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn composition_refusal_kinds_and_error_codes() {
+        let (root, data) = composition_fixture();
+
+        // 1. Missing path: 409 import_preview_required, kind invalid_request
+        let mut missing_path_data = data.clone();
+        missing_path_data.as_object_mut().unwrap().remove("path");
+        let plan_ok = immediate_plan(1);
+        let res1 = run_start(
+            root.path(),
+            missing_path_data,
+            plan_ok.clone(),
+            noop_send_seams(),
+        )
+        .await;
+        let (status1, body1) = response_json(res1).await;
+        assert_eq!(status1, StatusCode::CONFLICT);
+        assert_eq!(body1["reason_code"], "import_preview_required");
+        assert_eq!(body1["kind"], "invalid_request");
+
+        // 2. Nothing to import: kind nothing_to_import
+        let plan_zero = immediate_plan(0);
+        let res2 = run_start(root.path(), data.clone(), plan_zero, noop_send_seams()).await;
+        let (status2, body2) = response_json(res2).await;
+        assert_eq!(status2, StatusCode::CONFLICT);
+        assert_eq!(body2["reason_code"], "import_preview_required");
+        assert_eq!(body2["kind"], "nothing_to_import");
+
+        // 3. Missing staged import: kind not_found
+        let missing_staged_data = json!({
+            "path": "/imports/nonexistent/notes.txt",
+            "timestamp": "20261019_130000",
+            "import_id": "20261019_130000",
+        });
+        let res3 = run_start(root.path(), missing_staged_data, plan_ok, noop_send_seams()).await;
+        let (status3, body3) = response_json(res3).await;
+        assert_eq!(status3, StatusCode::CONFLICT);
+        assert_eq!(body3["reason_code"], "import_preview_required");
+        assert_eq!(body3["kind"], "not_found");
+
+        // 4. Planner stub returning PlanFailed("marker-solstone-preview"): marker in detail not error
+        let plan_fail =
+            crate::preview::PreviewPlan::Stub(std::sync::Arc::new(|_path, _options, _meta| {
+                Box::pin(async {
+                    Err(crate::preview::PreviewError::PlanFailed(
+                        "marker-solstone-preview".to_owned(),
+                    ))
+                })
+            }));
+        let res4 = run_start(root.path(), data, plan_fail, noop_send_seams()).await;
+        let (status4, body4) = response_json(res4).await;
+        assert_eq!(status4, StatusCode::CONFLICT);
+        assert_eq!(body4["reason_code"], "import_preview_required");
+        assert_eq!(body4["kind"], "plan_failed");
+        let detail = body4["detail"].as_str().unwrap_or_default();
+        let error = body4["error"].as_str().unwrap_or_default();
+        assert!(detail.contains("marker-solstone-preview"));
+        assert!(!error.contains("marker-solstone-preview"));
+    }
+
+    #[tokio::test]
+    async fn composition_save_and_save_path_refusal_details_and_kinds() {
+        // 1. save (/app/import/api/save):
+        let root = TempDir::new().unwrap();
+        let b = "boundary18";
+        let body1 = format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\"client_item_id\"\r\n\r\nitem1\r\n--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"doc1.txt\"\r\nContent-Type: text/plain\r\n\r\ncontent A\r\n--{b}--\r\n"
+        );
+        let resp1 = crate::routes(root.path().to_path_buf())
+            .oneshot(multipart_save(body1, b))
+            .await
+            .unwrap();
+        let (s1, _) = response_json(resp1).await;
+        assert_eq!(s1, StatusCode::OK);
+
+        let body2 = format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\"client_item_id\"\r\n\r\nitem1\r\n--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"doc1.txt\"\r\nContent-Type: text/plain\r\n\r\ncontent B different\r\n--{b}--\r\n"
+        );
+        let resp2 = crate::routes(root.path().to_path_buf())
+            .oneshot(multipart_save(body2, b))
+            .await
+            .unwrap();
+        let (s2, b2) = response_json(resp2).await;
+        assert_eq!(s2, StatusCode::BAD_REQUEST);
+        assert_eq!(b2["reason_code"], "invalid_operation_for_state");
+        assert_eq!(b2["kind"], "client_item_conflict");
+        assert_eq!(
+            b2["detail"],
+            "client_item_id already staged for different content; use a new client_item_id or re-fetch the existing item"
+        );
+
+        let root_ai = TempDir::new().unwrap();
+        let body_ai_1 = format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\"client_item_id\"\r\n\r\nitem_first\r\n--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"doc.txt\"\r\nContent-Type: text/plain\r\n\r\nalready imported content\r\n--{b}--\r\n"
+        );
+        let resp_ai_1 = crate::routes(root_ai.path().to_path_buf())
+            .oneshot(multipart_save(body_ai_1, b))
+            .await
+            .unwrap();
+        let (_, b_ai_1) = response_json(resp_ai_1).await;
+        let stamp = b_ai_1["timestamp"].as_str().unwrap();
+        let hash_ai = read_import_metadata(root_ai.path(), stamp).unwrap()["source_hash"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        write_manifest(&ManifestWriteRequest {
+            journal_root: root_ai.path(),
+            import_id: "complete",
+            source_type: "text",
+            source_hash: &SourceHash::new(hash_ai),
+            entry_count: 1,
+            days_affected: &[],
+            files_created: &[],
+            imported_via: "test",
+            link_id: None,
+            observer_handle: None,
+            raw_retention: None,
+        })
+        .unwrap();
+
+        let body_ai = format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\"client_item_id\"\r\n\r\nitem_ai\r\n--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"doc.txt\"\r\nContent-Type: text/plain\r\n\r\nalready imported content\r\n--{b}--\r\n"
+        );
+        let resp_ai = crate::routes(root_ai.path().to_path_buf())
+            .oneshot(multipart_save(body_ai, b))
+            .await
+            .unwrap();
+        let (s_ai, b_ai) = response_json(resp_ai).await;
+        assert_eq!(s_ai, StatusCode::BAD_REQUEST);
+        assert_eq!(b_ai["reason_code"], "invalid_operation_for_state");
+        assert_eq!(b_ai["kind"], "already_imported");
+        assert_eq!(b_ai["detail"], "content already imported");
+
+        // 2. save_path (/app/import/api/save-path):
+        let root_sp = TempDir::new().unwrap();
+        let file_a = root_sp.path().join("a.txt");
+        let file_b = root_sp.path().join("b.txt");
+        fs::write(&file_a, "content A").unwrap();
+        fs::write(&file_b, "content B different").unwrap();
+
+        let resp_spa = crate::routes(root_sp.path().to_path_buf())
+            .oneshot(
+                Request::post("/app/import/api/save-path")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"client_item_id":"p1","path":file_a})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (s_spa, _) = response_json(resp_spa).await;
+        assert_eq!(s_spa, StatusCode::OK);
+
+        let resp_spb = crate::routes(root_sp.path().to_path_buf())
+            .oneshot(
+                Request::post("/app/import/api/save-path")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"client_item_id":"p1","path":file_b})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (s_spb, b_spb) = response_json(resp_spb).await;
+        assert_eq!(s_spb, StatusCode::BAD_REQUEST);
+        assert_eq!(b_spb["reason_code"], "invalid_operation_for_state");
+        assert_eq!(b_spb["kind"], "client_item_conflict");
+        assert_eq!(
+            b_spb["detail"],
+            "client_item_id already staged for different content; use a new client_item_id or re-fetch the existing item"
+        );
+
+        let root_spai = TempDir::new().unwrap();
+        let file_ai = root_spai.path().join("ai.txt");
+        fs::write(&file_ai, "manifest content").unwrap();
+        let hash_spai = solstone_core_import::hash_source(&file_ai)
+            .unwrap()
+            .as_str()
+            .to_owned();
+        write_manifest(&ManifestWriteRequest {
+            journal_root: root_spai.path(),
+            import_id: "complete_sp",
+            source_type: "text",
+            source_hash: &SourceHash::new(hash_spai),
+            entry_count: 1,
+            days_affected: &[],
+            files_created: &[],
+            imported_via: "test",
+            link_id: None,
+            observer_handle: None,
+            raw_retention: None,
+        })
+        .unwrap();
+
+        let resp_spai = crate::routes(root_spai.path().to_path_buf())
+            .oneshot(
+                Request::post("/app/import/api/save-path")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"client_item_id":"p_ai","path":file_ai}))
+                            .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (s_spai, b_spai) = response_json(resp_spai).await;
+        assert_eq!(s_spai, StatusCode::BAD_REQUEST);
+        assert_eq!(b_spai["reason_code"], "invalid_operation_for_state");
+        assert_eq!(b_spai["kind"], "already_imported");
+        assert_eq!(b_spai["detail"], "content already imported");
     }
 }

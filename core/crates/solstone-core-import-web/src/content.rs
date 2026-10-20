@@ -221,6 +221,7 @@ fn metadata_read_error(detail: std::io::Error) -> Response {
         "that import metadata couldn't be read.",
         ImportReasonCode::ImportMetadataFailed.as_wire(),
         detail.to_string(),
+        None,
     )
 }
 
@@ -342,6 +343,7 @@ fn content_manifest(root: &Path, timestamp: &str) -> Result<(PathBuf, Vec<Value>
                     "that import metadata couldn't be read.",
                     ImportReasonCode::ImportMetadataFailed.as_wire(),
                     "Failed to read manifest".to_owned(),
+                    None,
                 ))
             })?;
         for item in &mut items {
@@ -392,12 +394,14 @@ fn content_manifest(root: &Path, timestamp: &str) -> Result<(PathBuf, Vec<Value>
             "there's nothing to browse for this import.",
             "import_content_unavailable",
             "No content available".to_owned(),
+            None,
         ))),
         Err(error_detail) => Err(Box::new(error(
             ImportReasonCode::ImportMetadataFailed.status(),
             "that import metadata couldn't be read.",
             ImportReasonCode::ImportMetadataFailed.as_wire(),
             error_detail.to_string(),
+            None,
         ))),
     }
 }
@@ -519,6 +523,7 @@ pub(crate) async fn detail(
                 "that imported content couldn't be read.",
                 "import_content_failed",
                 detail.to_string(),
+                None,
             );
         }
     };

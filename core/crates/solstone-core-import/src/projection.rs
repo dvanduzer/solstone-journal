@@ -1261,26 +1261,40 @@ fn derive_status_and_errors(
                 .get("task_id")
                 .is_some_and(|v| !v.is_null() && !v.as_str().is_some_and(|s| s.is_empty()))
             {
-                let imported_at = meta
-                    .get("upload_timestamp")
-                    .and_then(|v| {
-                        v.as_f64()
-                            .or_else(|| v.as_u64().map(|n| n as f64))
-                            .or_else(|| v.as_i64().map(|n| n as f64))
-                    })
-                    .map(|ms| ms / 1000.0)
-                    .unwrap_or(created_at);
-                // 1h wall-clock bound: legacy unfinalized task rows time out after 3600 seconds
-                #[allow(clippy::cast_precision_loss)]
-                let bound_secs = crate::metadata::RUNNING_ATTEMPT_BOUND_MS as f64 / 1000.0;
-                if now_sec - imported_at > bound_secs {
-                    (
-                        ProjectionStatus::Failed,
-                        Some("Import never completed".to_owned()),
-                        Some("timeout".to_owned()),
-                    )
+                if let Some(queued_ms) = crate::metadata::queued_task_ms(meta) {
+                    if now_ms.saturating_sub(queued_ms) > crate::metadata::RUNNING_ATTEMPT_BOUND_MS
+                    {
+                        (
+                            ProjectionStatus::Failed,
+                            Some("Import never completed".to_owned()),
+                            Some("timeout".to_owned()),
+                        )
+                    } else {
+                        (ProjectionStatus::Running, None, None)
+                    }
                 } else {
-                    (ProjectionStatus::Running, None, None)
+                    // A non-numeric task id still times out from upload_timestamp, and
+                    // imported_at still sorts by it.
+                    let imported_at = meta
+                        .get("upload_timestamp")
+                        .and_then(|v| {
+                            v.as_f64()
+                                .or_else(|| v.as_u64().map(|n| n as f64))
+                                .or_else(|| v.as_i64().map(|n| n as f64))
+                        })
+                        .map(|ms| ms / 1000.0)
+                        .unwrap_or(created_at);
+                    #[allow(clippy::cast_precision_loss)]
+                    let bound_secs = crate::metadata::RUNNING_ATTEMPT_BOUND_MS as f64 / 1000.0;
+                    if now_sec - imported_at > bound_secs {
+                        (
+                            ProjectionStatus::Failed,
+                            Some("Import never completed".to_owned()),
+                            Some("timeout".to_owned()),
+                        )
+                    } else {
+                        (ProjectionStatus::Running, None, None)
+                    }
                 }
             } else {
                 (ProjectionStatus::Pending, None, None)

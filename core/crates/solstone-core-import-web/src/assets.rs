@@ -51,6 +51,7 @@ pub(crate) async fn guide(Path(source): Path<String>) -> Response {
             "one of those values couldn't be used.",
             "invalid_request_value",
             "Invalid source name".to_owned(),
+            None,
         );
     }
     let Some(guide) = (match source.as_str() {
@@ -68,6 +69,7 @@ pub(crate) async fn guide(Path(source): Path<String>) -> Response {
             "that file isn't available.",
             "file_not_found",
             format!("No guide available for '{source}'"),
+            None,
         );
     };
     bytes(guide, "text/markdown; charset=utf-8").into_response()

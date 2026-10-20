@@ -2125,6 +2125,9 @@ async function startGuidedImport(source) {
     if (!startResponse.ok) {
       throw new Error(importErrorMessage(started, 'Failed to start import'));
     }
+    if (started.replay === true && window.showError) {
+      showError("this import is already queued or already in.");
+    }
 
     const importId = started.import_id || saved.timestamp;
     if (!importEvents[importId] || !IMPORT_TERMINAL_EVENTS.has(importEvents[importId].event)) {
@@ -2394,6 +2397,9 @@ startBtn.addEventListener('click', async () => {
     const started = await startResponse.json().catch(() => ({}));
     if (!startResponse.ok) {
       throw new Error(importErrorMessage(started, 'Failed to start import'));
+    }
+    if (started.replay === true && window.showError) {
+      showError("this import is already queued or already in.");
     }
 
     const importId = started.import_id || window._quickSaved?.timestamp || ts;

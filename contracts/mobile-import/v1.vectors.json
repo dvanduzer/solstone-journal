@@ -90,6 +90,62 @@
         "attempt_id": "attempt-1"
       }
     },
+    "start_queued_replay_200": {
+      "status": 200,
+      "body": {
+        "status": "ok",
+        "task_id": "1792404900000",
+        "import_id": "20261019_101500",
+        "replay": true
+      }
+    },
+    "start_inprocess_replay_200": {
+      "status": 200,
+      "body": {
+        "status": "ok",
+        "import_id": "20261019_101500",
+        "task_id": "1792404900000",
+        "generation": 1,
+        "attempt_id": "attempt-1",
+        "replay": true
+      }
+    },
+    "save_already_imported_400": {
+      "status": 400,
+      "body": {
+        "error": "that action isn't available in the current state.",
+        "reason_code": "invalid_operation_for_state",
+        "detail": "content already imported",
+        "kind": "already_imported"
+      }
+    },
+    "save_client_item_conflict_400": {
+      "status": 400,
+      "body": {
+        "error": "that action isn't available in the current state.",
+        "reason_code": "invalid_operation_for_state",
+        "detail": "client_item_id already staged for different content; use a new client_item_id or re-fetch the existing item",
+        "kind": "client_item_conflict"
+      }
+    },
+    "start_already_imported_400": {
+      "status": 400,
+      "body": {
+        "error": "that action isn't available in the current state.",
+        "reason_code": "invalid_operation_for_state",
+        "detail": "content already imported; will not start",
+        "kind": "already_imported"
+      }
+    },
+    "start_nothing_to_import_409": {
+      "status": 409,
+      "body": {
+        "error": "there is nothing in this source to import.",
+        "reason_code": "import_preview_required",
+        "detail": "there are no recordings to import from this source",
+        "kind": "nothing_to_import"
+      }
+    },
     "refusals": [
       {
         "status": 400,

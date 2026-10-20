@@ -29,7 +29,7 @@ solstone-core-segment.workspace = true
 solstone-core-system.workspace = true
 solstone-core-system-health.workspace = true
 tempfile = "3.24.0"
-tokio = { workspace = true, features = ["fs", "io-util", "process", "rt", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "process", "rt", "sync", "time"] }
 tokio-util = { version = "0.7.16", features = ["io"] }
 
 [dev-dependencies]
