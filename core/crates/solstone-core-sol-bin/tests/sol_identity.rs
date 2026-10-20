@@ -136,7 +136,7 @@ fn cli_boundary_declares_the_complete_sol_partition() {
 
     assert_eq!(api.len(), 3);
     assert_eq!(device.len(), 3);
-    assert_eq!(journal_leaves.len(), 17);
+    assert_eq!(journal_leaves.len(), 16);
     assert_unique(&api, "api_commands");
     assert_unique(&device, "invoking_device_commands");
     assert_unique(&journal_leaves, "http_paths");
@@ -178,7 +178,7 @@ fn cli_boundary_declares_the_complete_sol_partition() {
 fn fixture_retired_sol_invocations_are_unsupported_without_spawning() {
     let fixture = fixture();
     let retired = strings(&fixture["identities"]["solstone"], "retired_invocations");
-    assert_eq!(retired.len(), 11);
+    assert_eq!(retired.len(), 12);
     assert_unique(&retired, "retired_invocations");
 
     let temp = TempDir::new("sol-retired");
