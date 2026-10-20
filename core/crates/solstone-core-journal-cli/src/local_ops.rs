@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 
 use chrono::{NaiveDate, SecondsFormat, Utc};
 use serde_json::{Value, json};
-use solstone_core_facets::{append_action_log, hold_facet_trust_lock};
+#[cfg(not(target_os = "ios"))]
+use solstone_core_facets::append_action_log;
+use solstone_core_facets::hold_facet_trust_lock;
 #[cfg(not(target_os = "ios"))]
 use solstone_core_import_sources::ImportSourcesError;
 #[cfg(not(target_os = "ios"))]
@@ -1330,9 +1332,12 @@ fn facet_doctor_orphans(
         ));
     }
     if repaired > 0
-        && let Err(error) = crate::facet_names::enqueue_facet_classifications(&journal)
+        && let Err(error) = solstone_core_indexer_todo::enqueue_token(
+            &journal,
+            solstone_core_indexer_todo::Token::Reclassify,
+        )
     {
-        return facet_doctor_index_failure(success(stdout), &error);
+        return facet_doctor_index_failure(success(stdout), &error.to_string());
     }
     append_orphan_groups_left(&mut stdout, &groups, false);
     if record_failures.is_empty() {
@@ -1655,7 +1660,6 @@ fn facet_doctor_adopt_merge(journal: &Path, groups: &[OrphanGroup]) -> (Outcome,
     )
 }
 
-#[cfg(not(target_os = "ios"))]
 fn facet_doctor_index_failure(outcome: Outcome, error: &str) -> Outcome {
     let (stdout, mut stderr, exit) = match outcome {
         Outcome::LocalSuccess { stdout, stderr } => (stdout, stderr, EXIT_FAILED),

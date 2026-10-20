@@ -40,6 +40,32 @@ class NoticePathDependencyTests(unittest.TestCase):
                 result.stdout = json.dumps(metadata).encode()
                 self.assertEqual(notices.closure("linux-x86_64", "x86_64-unknown-linux-gnu"), ([], {}))
 
+    def test_standalone_inventory_root_is_separate_but_unknown_roots_still_fail(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dist = root / "core/distribution"
+            dist.mkdir(parents=True)
+            (root / "core/Cargo.toml").write_text('[workspace]\nmembers=["crates/owned"]\n')
+            inventory = (
+                '[[entry]]\nkind="bin"\npackage="owned"\ntargets=["linux-x86_64"]\n'
+                '[[entry]]\nkind="bin"\npackage="solstone-screen-ocr-helper"\ntargets=["linux-x86_64"]\n'
+            )
+            (dist / "inventory.toml").write_text(inventory)
+            metadata = {
+                "packages": [{"id": "owned", "name": "owned", "version": "1.0.0",
+                              "source": None, "manifest_path": str(root / "core/crates/owned/Cargo.toml")}],
+                "resolve": {"nodes": [{"id": "owned", "deps": []}]},
+            }
+            result = subprocess.CompletedProcess([], 0, stdout=json.dumps(metadata).encode(), stderr=b"")
+            with patch.object(notices, "ROOT", root), patch.object(notices, "DIST", dist), \
+                 patch.object(notices.subprocess, "run", return_value=result), \
+                 patch.object(notices, "shipped_feature_arguments", return_value=[]):
+                self.assertEqual(notices.closure("linux-x86_64", "x86_64-unknown-linux-gnu"), ([], {}))
+                (dist / "inventory.toml").write_text(inventory +
+                    '[[entry]]\nkind="bin"\npackage="unaccounted"\ntargets=["linux-x86_64"]\n')
+                with self.assertRaisesRegex(RuntimeError, "missing inventory binary roots"):
+                    notices.closure("linux-x86_64", "x86_64-unknown-linux-gnu")
+
     def test_old_index_refuses_vendor_and_origin_changed_together(self):
         original_root = notices.ROOT
         with tempfile.TemporaryDirectory() as temporary:
@@ -69,6 +95,32 @@ class NoticePathDependencyTests(unittest.TestCase):
                 notices.prove_velopack_provenance()
                 with self.assertRaisesRegex(RuntimeError, "Rust notices are missing or stale"):
                     notices.check("linux-x86_64", "x86_64-unknown-linux-gnu")
+
+
+class NoticeProfileRoutingTests(unittest.TestCase):
+    def test_default_check_cannot_pass_a_broken_standalone_profile(self):
+        with patch("sys.argv", ["notices", "--check", "--target", "linux-x86_64"]), \
+             patch.object(notices, "check_bundled_source_notices"), \
+             patch.object(notices, "check") as check, \
+             patch.object(notices, "check_screen_ocr_notices", side_effect=RuntimeError("helper ledger stale")):
+            with self.assertRaisesRegex(RuntimeError, "helper ledger stale"):
+                notices.main()
+            check.assert_called_once_with("linux-x86_64", "x86_64-unknown-linux-gnu")
+
+    def test_default_write_updates_the_standalone_profile_too(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            index = Path(temporary) / "index.json"
+            texts = Path(temporary) / "notices.txt"
+            index.write_text('{"packages": []}')
+            texts.write_bytes(b"")
+            with patch("sys.argv", ["notices", "--write", "--target", "linux-x86_64"]), \
+                 patch.object(notices, "INDEX", index), patch.object(notices, "NOTICES", texts), \
+                 patch.object(notices, "prior_texts", return_value={}), \
+                 patch.object(notices, "write") as write, \
+                 patch.object(notices, "write_screen_ocr_notices") as helper:
+                self.assertEqual(notices.main(), 0)
+                write.assert_called_once()
+                helper.assert_called_once_with()
 
 
 class ScreenOcrNoticeTests(unittest.TestCase):

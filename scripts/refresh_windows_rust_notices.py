@@ -161,6 +161,8 @@ INDEX_RELATIVE_PATH = "core/distribution/windows-rust-sources.json"
 NOTICES_RELATIVE_PATH = "core/distribution/windows-rust-NOTICES.txt"
 LOCK_RELATIVE_PATH = "core/Cargo.lock"
 INVENTORY_RELATIVE_PATH = "core/distribution/inventory.toml"
+# This binary has its own Cargo lock and per-bundle notice profile.
+SCREEN_OCR_PACKAGE = "solstone-screen-ocr-helper"
 
 # Operator-internal fragments that must never end up in a file this repo
 # carries: no internal office/session paths on public surface. Structural
@@ -525,6 +527,7 @@ def windows_roots(repo: Path) -> list[str]:
             e["package"]
             for e in inventory["entry"]
             if e["kind"] == "bin" and "windows-x86_64" in e.get("targets", [])
+            and e["package"] != SCREEN_OCR_PACKAGE
         }
     )
 

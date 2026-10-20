@@ -35,6 +35,25 @@ def graph(extra_edge=False, digest_reachable=True):
     }
 
 
+class StandaloneInventoryRoots(unittest.TestCase):
+    def test_windows_roots_separate_ocr_without_hiding_unaccounted_binaries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            inventory = root / refresh.INVENTORY_RELATIVE_PATH
+            inventory.parent.mkdir(parents=True)
+            inventory.write_text(
+                '[[entry]]\nkind="bin"\npackage="app"\ntargets=["windows-x86_64"]\n'
+                '[[entry]]\nkind="bin"\npackage="solstone-screen-ocr-helper"\ntargets=["windows-x86_64"]\n'
+                '[[entry]]\nkind="bin"\npackage="unaccounted"\ntargets=["windows-x86_64"]\n'
+            )
+            roots = refresh.windows_roots(root)
+            self.assertEqual(roots, ["app", "unaccounted"])
+            metadata = {"packages": [{"id": "app", "name": "app", "source": None}],
+                        "resolve": {"nodes": [{"id": "app", "deps": []}]}}
+            with self.assertRaisesRegex(refresh.RefreshError, "expected one workspace package"):
+                refresh.selected_external_identities(metadata, roots)
+
+
 class ExistingDependencyEdges(unittest.TestCase):
     def setUp(self):
         self.old = {"package": [
