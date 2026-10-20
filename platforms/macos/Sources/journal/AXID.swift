@@ -49,6 +49,7 @@ enum AXID {
             static let markProposalState = "journal.ritual.mark.proposal.state"
             static let markErrorState = "journal.ritual.mark.error.state"
             static let thinkingContinue = "journal.ritual.thinking.continue"
+            static let thinkingChange = "journal.ritual.thinking.change"
             static let thinkingLater = "journal.ritual.thinking.later"
             static let thinkingChoiceState = "journal.ritual.thinking.choice.state"
             static let thinkingErrorState = "journal.ritual.thinking.error.state"
@@ -71,10 +72,6 @@ enum AXID {
             static let outboundState = "journal.ritual.outbound.state"
             static let handoffErrorState = "journal.ritual.handoff.error.state"
             static let handoffRetry = "journal.ritual.handoff.retry"
-            static let back = "journal.ritual.back"
-            static let progress = "journal.ritual.progress"
-            static let card = "journal.ritual.card"
-            static let footer = "journal.ritual.footer"
         }
 
         enum Adopt {

@@ -6,9 +6,9 @@ import PackageDescription
 
 // The Journal app for macOS: a Swift lifecycle and window adapter around the native journal
 // runtime this repository builds. The shared Mac libraries (core types, the journal mark,
-// setup chrome, updates and the watchdog) come from solstone-macos at one exact commit; bump the revision
+// updates and the watchdog) come from solstone-macos at one exact commit; bump the revision
 // and Package.resolved together, never to a branch or tag.
-let supportRevision = "6deb4a1aa0e0467be213abe6ab73ed74975020cf"
+let supportRevision = "4e317a4b1779bd4ea39f6c7d192e0b09775e7f87"
 
 let package = Package(
     name: "SolstoneJournalMac",
@@ -54,7 +54,6 @@ let package = Package(
                 .product(name: "SolstoneCore", package: "solstone-macos"),
                 .target(name: "JournalRuntime"),
                 .product(name: "JournalMarkKit", package: "solstone-macos"),
-                .product(name: "SetupChrome", package: "solstone-macos"),
                 .product(name: "UpdateKit", package: "solstone-macos"),
                 .product(name: "Sparkle", package: "solstone-macos")
             ],
@@ -132,7 +131,6 @@ let package = Package(
                 .target(name: "JournalRuntime"),
                 .target(name: "JournalRuntimeTestSupport"),
                 .product(name: "MacTestSupport", package: "solstone-macos"),
-                .product(name: "SetupChrome", package: "solstone-macos"),
                 .product(name: "SolstoneCore", package: "solstone-macos"),
                 .product(name: "UpdateKit", package: "solstone-macos")
             ],

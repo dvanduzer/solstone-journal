@@ -27,32 +27,6 @@ enum JournalFirstRunCopy {
     static let handoffNotDelivered = "couldn't continue setup in the solstone app."
     static let thinkingFailed = "couldn't finish this step. try again."
 
-    static let setUpSolstone = "set up solstone"
-    static let yourJournal = "your journal"
-    static let whatThisSetsUp = "what this sets up"
-    static let whatThisSetsUpJournal = "lives on this mac and keeps everything that goes into it."
-    static let theSolstoneApp = "the solstone app"
-    static let theSolstoneAppDescription = "runs on this mac. your microphone, screen and computer sound each stay off until you turn them on."
-    static let thinking = "thinking"
-    static let thinkingDescription = "helps your journal make sense of what it keeps. you choose where during setup, or later."
-    static let startAutomaticallyHelp = "start automatically after you sign in to this mac."
-    static let startSetup = "start setup"
-    static let whereYourJournalLives = "where your journal lives"
-    static let whereYourJournalLivesDescription = "everything your journal keeps stays in this folder, on this mac."
-    static let journalFolder = "journal folder"
-    static let markPhoneCheck = "when you connect a phone or another computer, you check that the mark it shows matches this one."
-    static let whereDoesThinkingHappen = "where does the thinking happen?"
-    static let whereDoesThinkingHappenDescription = "your journal stays on this mac whatever you choose. this only decides where thinking happens."
-    static let onThisMac = "on this mac"
-    static let onThisMacDescription = "model requests stay on this mac. continue starts the download."
-    static let continueInTheSolstoneApp = "continue in the solstone app"
-    static let back = "back"
-    static let stepProgressTemplate = "step {n} of 7"
-
-    static func stepProgress(_ n: Int) -> String {
-        "step \(n) of 7"
-    }
-
     static let all = [
         nameLocationTitle,
         adoptLandingLine,
@@ -77,26 +51,5 @@ enum JournalFirstRunCopy {
         handoffPending,
         openYourJournal,
         thinkingFailed,
-        setUpSolstone,
-        yourJournal,
-        whatThisSetsUp,
-        whatThisSetsUpJournal,
-        theSolstoneApp,
-        theSolstoneAppDescription,
-        thinking,
-        thinkingDescription,
-        startAutomaticallyHelp,
-        startSetup,
-        whereYourJournalLives,
-        whereYourJournalLivesDescription,
-        journalFolder,
-        markPhoneCheck,
-        whereDoesThinkingHappen,
-        whereDoesThinkingHappenDescription,
-        onThisMac,
-        onThisMacDescription,
-        continueInTheSolstoneApp,
-        back,
-        stepProgressTemplate,
     ]
 }
