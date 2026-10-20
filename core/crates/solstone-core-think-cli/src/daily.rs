@@ -2723,7 +2723,8 @@ cat "${0%/*}/response-$mode.json"
             .unwrap();
         }
         std::fs::write(talent.join("schedule.md"), "{\n\"type\":\"generate\",\"max_output_tokens\":1024,\"schedule\":\"daily\",\"priority\":1,\"output\":\"json\",\"disabled\":true,\"hook\":{\"post\":\"schedule\"}\n}\nDisabled scheduling.").unwrap();
-        std::fs::write(talent.join("entities_review.md"), "{\n\"type\":\"generate\",\"max_output_tokens\":1024,\"schedule\":\"daily\",\"priority\":2,\"multi_facet\":true,\"output\":\"json\",\"hook\":{\"pre\":\"entities:entities_review\",\"post\":\"entities:entities_review\"},\"load\":{\"transcripts\":false}\n}\nReview entities.").unwrap();
+        std::fs::create_dir_all(apps.join("entities/talent")).unwrap();
+        std::fs::write(apps.join("entities/talent/entities_review.md"), "{\n\"type\":\"generate\",\"max_output_tokens\":1024,\"schedule\":\"daily\",\"priority\":2,\"multi_facet\":true,\"output\":\"json\",\"hook\":{\"pre\":\"entities:entities_review\",\"post\":\"entities:entities_review\"},\"load\":{\"transcripts\":false}\n}\nReview entities.").unwrap();
         let stub = root.join("generate-stub.sh");
         std::fs::write(
             root.join("review-response.json"),
