@@ -273,8 +273,7 @@ fn request_body(
     thinking: Thinking,
     candidate: &AnthropicThinking,
 ) -> Value {
-    let content = request
-        .contents
+    let content = crate::request::model_content_parts(request)
         .iter()
         .map(|part| match part {
             ContentPart::Text { text } => json!({"type": "text", "text": text}),
@@ -467,6 +466,46 @@ mod tests {
             attempt_index: 0,
             exclusive_admission: false,
             transport_retries: None,
+        }
+    }
+
+    #[test]
+    fn fitting_reserve_does_not_change_anthropic_provider_body() {
+        let mut input = request();
+        input.contents = vec![
+            ContentPart::Text {
+                text: "EARLY_RULE".into(),
+            },
+            ContentPart::Text {
+                text: String::new(),
+            },
+            ContentPart::Text {
+                text: "context".into(),
+            },
+        ];
+        for image in [false, true] {
+            if image {
+                input.contents.push(ContentPart::Image {
+                    mime_type: "image/png".into(),
+                    data: "AA==".into(),
+                });
+            }
+            let candidate = &anthropic_candidates(Thinking::Off)[0];
+            let original = request_body(&input, "model", Thinking::Off, candidate);
+            let mut protected = input.clone();
+            protected.contents.insert(
+                0,
+                ContentPart::Text {
+                    text: String::new(),
+                },
+            );
+            assert_eq!(
+                request_body(&protected, "model", Thinking::Off, candidate).to_string(),
+                original.to_string()
+            );
+            assert_eq!(original["messages"][0]["content"][0]["text"], "EARLY_RULE");
+            assert_eq!(original["messages"][0]["content"][1]["text"], "");
+            assert_eq!(original["messages"][0]["content"][2]["text"], "context");
         }
     }
 

@@ -2,8 +2,45 @@
 // Copyright (c) 2026 sol pbc
 
 use base64::Engine;
-use serde_json::Value;
-use solstone_core_generate::{GenerateRequest, contract, decode_one_shot_request};
+use serde_json::{Value, json};
+use solstone_core_generate::{ContentPart, GenerateRequest, contract, decode_one_shot_request};
+
+/// An empty first text part reserves the fitter's expendable position. Keep
+/// all-empty requests and every subsequent part in their original shape.
+pub(crate) fn model_content_parts(request: &GenerateRequest) -> &[ContentPart] {
+    let parts = &request.contents;
+    if matches!(parts.first(), Some(ContentPart::Text { text }) if text.is_empty())
+        && parts[1..]
+            .iter()
+            .any(|part| !matches!(part, ContentPart::Text { text } if text.is_empty()))
+    {
+        &parts[1..]
+    } else {
+        parts
+    }
+}
+
+/// Preserve the fitting reserve as a typed empty part until rendering; normal
+/// text stays in the local lane's existing raw-string representation.
+pub(crate) fn local_contents(request: &GenerateRequest) -> Value {
+    let reserved = model_content_parts(request).len() != request.contents.len();
+    Value::Array(
+        request
+            .contents
+            .iter()
+            .enumerate()
+            .map(|(index, part)| match part {
+                ContentPart::Text { text } if index == 0 && reserved => {
+                    json!({"type": "text", "text": text})
+                }
+                ContentPart::Text { text } => Value::String(text.clone()),
+                ContentPart::Image { mime_type, data } => {
+                    json!({"type": "image", "mime_type": mime_type, "data": data})
+                }
+            })
+            .collect(),
+    )
+}
 
 pub fn parse_one_shot_request(input: &str) -> Result<GenerateRequest, String> {
     let raw: Value = serde_json::from_str(input).map_err(|error| error.to_string())?;
@@ -111,6 +148,30 @@ mod tests {
             parse_one_shot_request(&value.to_string()).unwrap().context,
             "test.generate"
         );
+    }
+
+    #[test]
+    fn fitting_reserve_keeps_middle_empty_parts_and_all_empty_requests() {
+        let mut input = decode_one_shot_request(&request(json!([{"type":"text","text":"A"},{"type":"text","text":""},{"type":"text","text":"B"}])).to_string()).unwrap();
+        let original = input.contents.clone();
+        input.contents.insert(
+            0,
+            ContentPart::Text {
+                text: String::new(),
+            },
+        );
+        assert_eq!(model_content_parts(&input), original);
+        assert_eq!(
+            local_contents(&input),
+            json!([{"type":"text","text":""},"A","","B"])
+        );
+        let all_empty = parse_one_shot_request(
+            &request(json!([{"type":"text","text":""},{"type":"text","text":""}])).to_string(),
+        )
+        .unwrap();
+        assert_eq!(model_content_parts(&all_empty), all_empty.contents);
+        assert_eq!(local_contents(&all_empty), json!(["", ""]));
+        assert!(parse_one_shot_request(&request(json!([])).to_string()).is_err());
     }
 
     #[test]

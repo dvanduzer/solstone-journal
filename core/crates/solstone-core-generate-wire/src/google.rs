@@ -306,8 +306,7 @@ fn request_body(
     thinking: Thinking,
     control: GoogleThinkingControl,
 ) -> Value {
-    let parts = request
-        .contents
+    let parts = crate::request::model_content_parts(request)
         .iter()
         .map(|part| match part {
             ContentPart::Text { text } => json!({"text": text}),
@@ -908,6 +907,56 @@ mod tests {
         assert_eq!(schema["items"]["minimum"], 0);
         assert!(schema["properties"]["nested"].get("minLength").is_none());
         assert_eq!(schema["properties"]["nested"]["maximum"], 3);
+    }
+
+    #[test]
+    fn fitting_reserve_does_not_change_google_provider_body() {
+        let mut input = request();
+        input.contents = vec![
+            ContentPart::Text {
+                text: "EARLY_RULE".into(),
+            },
+            ContentPart::Text {
+                text: String::new(),
+            },
+            ContentPart::Text {
+                text: "context".into(),
+            },
+        ];
+        for image in [false, true] {
+            if image {
+                input.contents.push(ContentPart::Image {
+                    mime_type: "image/png".into(),
+                    data: "AA==".into(),
+                });
+            }
+            let original = request_body(
+                &input,
+                "model",
+                Thinking::Off,
+                GoogleThinkingControl::Level("MINIMAL"),
+            );
+            let mut protected = input.clone();
+            protected.contents.insert(
+                0,
+                ContentPart::Text {
+                    text: String::new(),
+                },
+            );
+            assert_eq!(
+                request_body(
+                    &protected,
+                    "model",
+                    Thinking::Off,
+                    GoogleThinkingControl::Level("MINIMAL")
+                )
+                .to_string(),
+                original.to_string()
+            );
+            assert_eq!(original["contents"][0]["parts"][0]["text"], "EARLY_RULE");
+            assert_eq!(original["contents"][0]["parts"][1]["text"], "");
+            assert_eq!(original["contents"][0]["parts"][2]["text"], "context");
+        }
     }
 
     #[test]
