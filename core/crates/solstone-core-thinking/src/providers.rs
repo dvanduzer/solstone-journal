@@ -5280,8 +5280,11 @@ mod tests {
 /// Desktop key probe. `OneShotKeyValidator::at_path` is the process arm:
 /// `OneShotClient::at_path`, the three override environment variables, and
 /// `execute` of the canned validation request. This is not `respond`.
-// The stub is a shebang script, which only a unix host executes.
-#[cfg(all(test, unix, feature = "full-tests"))]
+// The stub is a shebang script, which only a unix host executes. The unix
+// gate is its own attribute so the CI topology check still sees the exact
+// full-tests cfg.
+#[cfg(all(test, feature = "full-tests"))]
+#[cfg(unix)]
 mod desktop_probe {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
