@@ -676,7 +676,12 @@ final class JournalFirstRunModel {
 
     var isRefreshLoopRunning: Bool { refreshTask != nil }
 
-    var launchAtLoginEnabled: Bool { config.launchAtLoginEnabled }
+    /// Reads through to the saved setting, which Observation cannot see on its own: the read is
+    /// registered here and the write in `setWelcomeLaunchAtLogin`, so a control bound to it redraws.
+    var launchAtLoginEnabled: Bool {
+        access(keyPath: \.launchAtLoginEnabled)
+        return config.launchAtLoginEnabled
+    }
 
     var validatedMark: JournalMark? {
         guard let render = setupState?.mark.render else { return nil }
@@ -801,7 +806,9 @@ final class JournalFirstRunModel {
     }
 
     func setWelcomeLaunchAtLogin(_ enabled: Bool) {
-        _ = config.setLaunchAtLoginEnabled(enabled)
+        withMutation(keyPath: \.launchAtLoginEnabled) {
+            _ = config.setLaunchAtLoginEnabled(enabled)
+        }
         loginFailure = config.launchAtLoginFailureSentence
     }
 
