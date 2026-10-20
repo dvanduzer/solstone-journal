@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (c) 2026 sol pbc
 
+import AppKit
 import Foundation
 import JournalMarkKit
 import JournalRuntime
 import SolstoneCore
+import SwiftUI
 import Testing
 @testable import journal
 
@@ -1984,7 +1986,7 @@ private func setupState(
     )
 }
 
-private func loadSetupFixtureCopy() throws -> JournalSetupCopy {
+func loadSetupFixtureCopy() throws -> JournalSetupCopy {
     let url = URL(filePath: #filePath)
         .deletingLastPathComponent()
         .deletingLastPathComponent()
@@ -2342,4 +2344,116 @@ private actor HeldCompletionProbe: JournalInitClienting {
         if calls == 2 { await gate.enterAndWait() }
         return .complete
     }
+}
+
+@MainActor
+extension JournalSetupChromeTests {
+    @Test(arguments: [JournalFirstRunStep.setupProgress, JournalFirstRunStep.folder])
+    func refusalRendersOpenYourJournalAndOmitsStepControls(step: JournalFirstRunStep) async throws {
+        let world = try makeSetupWorld(configureRoot: true, done: true, supervisorLive: true, probes: [.complete])
+        defer { world.refresh.release() }
+        _ = try world.fixture.continuation.storeLocal(root: world.root)
+        await world.fixture.model.reconcileActivation()
+        let pending = try #require(try world.fixture.continuation.loadActive()?.pending)
+        try JSONEncoder().encode(SetupHandoffRefusal(handoffID: pending, reason: .heldPairing))
+            .write(to: world.fixture.mailbox.directory.appendingPathComponent("solstone-setup-handoff-refused.json"))
+        await world.fixture.model.reconcileForReopen()
+        #expect(world.fixture.model.handoffRefusal?.handoffID == pending)
+
+        world.fixture.model.route = .ritual(step)
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 880, height: 580),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        let hostingView = NSHostingView(rootView: JournalFirstRunView(model: world.fixture.model))
+        window.contentView = hostingView
+        hostingView.layoutSubtreeIfNeeded()
+
+        let elements = collectAccessibilityElements(root: hostingView)
+        let tree = String(reflecting: hostingView.rootView.body)
+
+        let hasOpenYourJournal = tree.contains(JournalFirstRunCopy.openYourJournal) || elements.contains { elem in
+            getAXTitleOrLabel(elem) == JournalFirstRunCopy.openYourJournal
+        }
+        #expect(hasOpenYourJournal)
+
+        let stepPrimaryID: String = (step == .setupProgress)
+            ? AXID.Journal.Ritual.setupRetry
+            : AXID.Journal.Ritual.folderContinue
+
+        let hasBack = elements.contains { elem in
+            getAXIdentifier(elem) == AXID.Journal.Ritual.back
+        }
+        #expect(!hasBack)
+
+        let hasStepPrimary = elements.contains { elem in
+            getAXIdentifier(elem) == stepPrimaryID
+        }
+        #expect(!hasStepPrimary)
+    }
+}
+
+@MainActor
+private func getAXChildren(_ obj: AnyObject) -> [AnyObject] {
+    if let v = obj as? NSView {
+        return (v.accessibilityChildren() ?? []) as [AnyObject]
+    }
+    if let el = obj as? NSAccessibilityElement {
+        return (el.accessibilityChildren() ?? []) as [AnyObject]
+    }
+    return []
+}
+
+@MainActor
+private func getAXIdentifier(_ obj: AnyObject) -> String? {
+    if let v = obj as? NSView {
+        let id = v.accessibilityIdentifier()
+        return id.isEmpty ? nil : id
+    }
+    if let el = obj as? NSAccessibilityElement {
+        return el.accessibilityIdentifier()
+    }
+    return nil
+}
+
+@MainActor
+private func getAXTitleOrLabel(_ obj: AnyObject) -> String? {
+    if let v = obj as? NSView {
+        if let t = v.accessibilityTitle(), !t.isEmpty { return t }
+        if let l = v.accessibilityLabel(), !l.isEmpty { return l }
+        if let b = v as? NSButton, !b.title.isEmpty { return b.title }
+    }
+    if let el = obj as? NSAccessibilityElement {
+        if let t = el.accessibilityTitle(), !t.isEmpty { return t }
+        if let l = el.accessibilityLabel(), !l.isEmpty { return l }
+    }
+    return nil
+}
+
+@MainActor
+private func collectAccessibilityElements(root: NSView) -> [AnyObject] {
+    var visited: [ObjectIdentifier] = []
+    var results: [AnyObject] = []
+
+    func walk(_ node: AnyObject) {
+        let id = ObjectIdentifier(node)
+        if visited.contains(id) { return }
+        visited.append(id)
+        results.append(node)
+
+        for child in getAXChildren(node) {
+            walk(child)
+        }
+        if let view = node as? NSView {
+            for sub in view.subviews {
+                walk(sub)
+            }
+        }
+    }
+
+    walk(root)
+    return results
 }

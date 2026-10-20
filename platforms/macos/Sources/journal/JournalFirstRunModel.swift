@@ -8,6 +8,7 @@ import JournalRuntime
 import Observation
 import os
 import SolstoneCore
+import SwiftUI
 
 enum JournalFirstRunRoute: Equatable {
     case deciding
@@ -76,6 +77,8 @@ final class JournalFirstRunModel {
     @ObservationIgnored private let refreshSleep: @Sendable () async -> Void
 
     var route: JournalFirstRunRoute = .deciding
+    /// Set by back from the folder step so returning to it keeps the owner's chosen folder.
+    private var keepsChosenRootOnReturn = false
     var journalRoot: URL {
         didSet { noteSelectedRootChange(from: oldValue) }
     }
@@ -91,7 +94,12 @@ final class JournalFirstRunModel {
     var thinkingFailure: String?
     var speechFailure: String?
     var nativeFolderSetup = false
-    var choosingThinking = false
+    var welcomeLaunchAtLogin: Binding<Bool> {
+        Binding(
+            get: { [weak self] in self?.launchAtLoginEnabled ?? false },
+            set: { [weak self] in self?.setWelcomeLaunchAtLogin($0) }
+        )
+    }
     private(set) var draftThinkingChoice: JournalThinkingChoice?
     private(set) var reopenCount = 0
     private(set) var setupCopy: JournalSetupCopy?
@@ -131,6 +139,32 @@ final class JournalFirstRunModel {
         yield(JournalSetupPeerResolver.bundleIdentifier)
         hide()
     }
+
+    #if DEBUG
+    func applySnapshotState(
+        route: JournalFirstRunRoute,
+        setupState: JournalSetupState? = nil,
+        setupCopy: JournalSetupCopy? = nil,
+        handoffRefusal: JournalSetupRefusalResolution? = nil,
+        draftThinkingChoice: JournalThinkingChoice? = nil,
+        loginFailure: String? = nil,
+        errorMessage: String? = nil,
+        thinkingFailure: String? = nil,
+        speechFailure: String? = nil,
+        operationError: JournalRitualOperationToken = .none
+    ) {
+        self.route = route
+        self.setupState = setupState
+        self.setupCopy = setupCopy
+        self.handoffRefusal = handoffRefusal
+        self.draftThinkingChoice = draftThinkingChoice
+        self.loginFailure = loginFailure
+        self.errorMessage = errorMessage
+        self.thinkingFailure = thinkingFailure
+        self.speechFailure = speechFailure
+        self.operationError = operationError
+    }
+    #endif
 
     init(
         config: JournalAppConfig,
@@ -686,7 +720,6 @@ final class JournalFirstRunModel {
         guard !userOperationInFlight, !isTerminating, let choice = JournalThinkingChoice(rawValue: raw),
               choice != .local || offersLocalThinking else { return }
         draftThinkingChoice = choice
-        choosingThinking = false
     }
 
     func continueThinking() async {
@@ -774,10 +807,26 @@ final class JournalFirstRunModel {
 
     func continueFromWelcome() {
         handoffError = nil
-        if config.journalRoot == nil {
+        // Back from the folder step keeps the folder the owner had chosen.
+        if config.journalRoot == nil && !keepsChosenRootOnReturn {
             assignRoot(defaultJournalRoot)
         }
+        keepsChosenRootOnReturn = false
         route = .ritual(.folder)
+    }
+
+    func backFromFolder() {
+        guard JournalSetupChrome.canGoBackFromFolder(
+            route: route,
+            userOperationInFlight: userOperationInFlight,
+            pendingOperation: pendingOperation,
+            outbound: outbound,
+            hasRefusal: handoffRefusal != nil,
+            handoffError: handoffError
+        ) else { return }
+        keepsChosenRootOnReturn = true
+        errorMessage = nil
+        route = .ritual(.welcome)
     }
 
     func continueFromFolder() async {
@@ -892,7 +941,6 @@ final class JournalFirstRunModel {
                 return false
             }
             guard endUserAction(captured) else { return false }
-            choosingThinking = false
             presentInteractiveState(state)
             return true
         } catch {

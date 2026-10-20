@@ -9,6 +9,7 @@ import JournalRuntimeTestSupport
 import os
 import SwiftUI
 import Testing
+import SetupChrome
 @testable import UpdateKit
 @testable import journal
 
@@ -24,7 +25,7 @@ private func runGit(_ args: String...) throws -> String {
         .trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
-private func makeSnapshotOutputDir() throws -> URL {
+func makeSnapshotOutputDir() throws -> URL {
     // Renders land under this package (platforms/macos/snapshots, ignored), not the
     // repository root: the package root and the Git root are different directories.
     let repoRoot = journalPackageRoot().path
@@ -171,10 +172,7 @@ struct JournalSnapshotTests {
                 let firstRun = makeModel(startResults: [], probeResults: [])
                 firstRun.model.route = .ritual(.nameLocation)
                 try await render(
-                    ZStack {
-                        background
-                        JournalFirstRunView(model: firstRun.model)
-                    }
+                    JournalFirstRunView(model: firstRun.model, background: background)
                     .frame(width: size.width, height: size.height),
                     size: size,
                     appearance: appearance,
@@ -449,11 +447,8 @@ struct JournalSnapshotTests {
 
     private func renderFirstRun(_ model: JournalFirstRunModel, to filename: String) async throws {
         try await render(
-            ZStack {
-                SunArcBackgroundView()
-                JournalFirstRunView(model: model)
-            }
-            .frame(width: size.width, height: size.height),
+            JournalFirstRunView(model: model)
+                .frame(width: size.width, height: size.height),
             size: size,
             to: filename
         )
@@ -470,9 +465,10 @@ struct JournalSnapshotTests {
 
     /// `validateContent: false` is for a frame that is legitimately uniform (the bare sun arc in
     /// true dark is one ground colour and nothing else).
-    private func render<V: View>(
+    static func render<V: View>(
         _ view: V,
         size: CGSize,
+        outputDir: URL,
         appearance: NSAppearance.Name? = nil,
         validateContent: Bool = true,
         to filename: String
@@ -491,7 +487,7 @@ struct JournalSnapshotTests {
             throw RenderError.noPNG
         }
 
-        let url = try outputDir.appendingPathComponent(filename)
+        let url = outputDir.appendingPathComponent(filename)
         let bytesPerPixel = bitmapRep.bitsPerPixel / 8
         let bytesPerRow = bitmapRep.bytesPerRow
         let width = bitmapRep.pixelsWide
@@ -519,7 +515,24 @@ struct JournalSnapshotTests {
         )
     }
 
-    private enum RenderError: Error, Sendable, CustomStringConvertible {
+    func render<V: View>(
+        _ view: V,
+        size: CGSize,
+        appearance: NSAppearance.Name? = nil,
+        validateContent: Bool = true,
+        to filename: String
+    ) async throws {
+        try await Self.render(
+            view,
+            size: size,
+            outputDir: try outputDir,
+            appearance: appearance,
+            validateContent: validateContent,
+            to: filename
+        )
+    }
+
+    enum RenderError: Error, Sendable, CustomStringConvertible {
         case noBitmap
         case noPNG
         case emptyContent(filename: String, contentPixelCount: Int, minimum: Int)
