@@ -1,5 +1,5 @@
 {
-  "cargo_lock_sha256": "366ada704aa291e6d32c13e8f3ef66ee9cde7095b26a1635efd74d7b1ec51f2b",
+  "cargo_lock_sha256": "ea8d7a04b76efbe7827167e452e05e383bb6f94f525be66174de321f41cf9942",
   "filter_platform": "aarch64-apple-darwin",
   "notice_texts": [
     {
@@ -3092,32 +3092,6 @@
             "kind": "cargo-registry-archive",
             "member": "LICENSE-MIT",
             "source_url": "https://static.crates.io/crates/block-buffer/block-buffer-0.12.1.crate"
-          }
-        }
-      ]
-    },
-    {
-      "identity": "block-padding@0.3.3 (registry+https://github.com/rust-lang/crates.io-index)",
-      "license_expression": "MIT OR Apache-2.0",
-      "notice_references": [
-        {
-          "bytes": 10849,
-          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
-          "source": {
-            "archive_sha256": "a8894febbff9f758034a5b8e12d87918f56dfc64a8e1fe757d65e29041538d93",
-            "kind": "cargo-registry-archive",
-            "member": "LICENSE-APACHE",
-            "source_url": "https://static.crates.io/crates/block-padding/block-padding-0.3.3.crate"
-          }
-        },
-        {
-          "bytes": 1082,
-          "sha256": "d5c22aa3118d240e877ad41c5d9fa232f9c77d757d4aac0c2f943afc0a95e0ef",
-          "source": {
-            "archive_sha256": "a8894febbff9f758034a5b8e12d87918f56dfc64a8e1fe757d65e29041538d93",
-            "kind": "cargo-registry-archive",
-            "member": "LICENSE-MIT",
-            "source_url": "https://static.crates.io/crates/block-padding/block-padding-0.3.3.crate"
           }
         }
       ]
