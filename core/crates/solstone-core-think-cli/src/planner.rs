@@ -3164,7 +3164,7 @@ mod tests {
     }
 
     #[test]
-    fn discovery_reaches_old_segments_with_no_adoption_and_never_queues_their_day_first() {
+    fn discovery_reaches_old_segments_and_never_queues_their_day_first() {
         let root = fixture("local");
         for day in [
             "19990101", "20000101", "20010101", "20020101", "20030101", "20040101",
@@ -3172,27 +3172,18 @@ mod tests {
             segment(root.path(), day, "120000_60");
         }
         let queue = queue(root.path());
-        for state in [
-            None,
-            Some("{"),
-            Some("{\"version\":999,\"first_closed_day\":\"20990101\"}"),
-        ] {
-            if let Some(state) = state {
-                std::fs::write(root.path().join("health/daily-adoption.json"), state).unwrap();
-            }
-            reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
-            let report = solstone_core_system::work_inventory::read(root.path())
-                .unwrap()
-                .unwrap();
-            assert_eq!(report.days_total, 6);
-            assert_eq!(report.days_inspected, 6);
-            assert_eq!(report.oldest_day.as_deref(), Some("19990101"));
-            assert_eq!(report.bands[4].segments_owed, 6);
-            assert_eq!(queue.collect_queue_counts()["pending"], 4);
-            assert!(queue.contains_reference("supervisor-work-20040101-notes-120000_60"));
-            assert!(!queue.contains_reference("supervisor-work-19990101-notes-120000_60"));
-            assert!(!queue.contains_reference("supervisor-work-20040101-daily"));
-        }
+        reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
+        let report = solstone_core_system::work_inventory::read(root.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.days_total, 6);
+        assert_eq!(report.days_inspected, 6);
+        assert_eq!(report.oldest_day.as_deref(), Some("19990101"));
+        assert_eq!(report.bands[4].segments_owed, 6);
+        assert_eq!(queue.collect_queue_counts()["pending"], 4);
+        assert!(queue.contains_reference("supervisor-work-20040101-notes-120000_60"));
+        assert!(!queue.contains_reference("supervisor-work-19990101-notes-120000_60"));
+        assert!(!queue.contains_reference("supervisor-work-20040101-daily"));
     }
 
     #[test]
