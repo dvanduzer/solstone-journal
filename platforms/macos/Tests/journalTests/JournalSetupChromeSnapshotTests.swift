@@ -135,6 +135,20 @@ struct JournalSetupChromeSnapshotTests {
             )
         )
 
+        // The walk's footer case: speech recognition downloading on the mark step, its bytes in
+        // the format that wrapped the name ("243 bytes of 483.3 MB").
+        let markDownloading = JournalSetupState(
+            schema: "solstone.setup-state.v1",
+            journalPath: "/tmp/journal",
+            done: false,
+            mark: .init(render: .uiTestSample, state: .proposed, proposalID: "prop-1"),
+            thinking: .init(choice: nil, saved: false, capability: .ok, downloadBytes: nil),
+            downloads: .init(
+                speech: .init(state: .downloading, attemptID: "sp-1", bytesDone: 243, bytesTotal: 483_300_000),
+                thinking: .init(state: .idle, attemptID: nil, bytesDone: 0, bytesTotal: nil)
+            )
+        )
+
         let states: [StateFixture] = [
             StateFixture(name: "welcome") { model in
                 model.applySnapshotState(route: .ritual(.welcome), setupCopy: copy, loginFailure: "Could not set start at login")
@@ -150,6 +164,12 @@ struct JournalSetupChromeSnapshotTests {
             },
             StateFixture(name: "thinking-capable") { model in
                 model.applySnapshotState(route: .ritual(.thinking), setupState: thinkingCapable, setupCopy: copy)
+            },
+            StateFixture(name: "mark-downloading") { model in
+                model.applySnapshotState(route: .ritual(.mark), setupState: markDownloading, setupCopy: copy)
+            },
+            StateFixture(name: "thinking-later") { model in
+                model.applySnapshotState(route: .ritual(.thinking), setupState: thinkingCapable, setupCopy: copy, draftThinkingChoice: .later)
             },
             StateFixture(name: "thinking-cant-run") { model in
                 model.applySnapshotState(route: .ritual(.thinking), setupState: thinkingCantRun, setupCopy: copy)

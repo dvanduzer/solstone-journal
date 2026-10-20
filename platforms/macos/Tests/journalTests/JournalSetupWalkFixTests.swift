@@ -62,4 +62,47 @@ struct JournalSetupWalkFixTests {
             #expect(defaults.bool(forKey: "launchAtLoginEnabled") == expected)
         }
     }
+
+    // D4: after "decide later" the thinking card keeps its bottom padding and corners above the
+    // footer at the 880 x 580 minimum. Four points above the footer is sheet, not card.
+    @Test func theThinkingCardFitsAboveTheFooterAfterDecideLater() async throws {
+        JournalMarkFont.register()
+        let copy = try loadSetupFixtureCopy()
+        let state = JournalSetupState(
+            schema: "solstone.setup-state.v1",
+            journalPath: "/tmp/journal",
+            done: false,
+            mark: .init(render: .uiTestSample, state: .locked, proposalID: "prop-1"),
+            thinking: .init(choice: nil, saved: false, capability: .ok, downloadBytes: 1_500_000_000),
+            downloads: .init(
+                speech: .init(state: .idle, attemptID: nil, bytesDone: 0, bytesTotal: nil),
+                thinking: .init(state: .idle, attemptID: nil, bytesDone: 0, bytesTotal: nil)
+            )
+        )
+        let fixture = makeModel(startResults: [], probeResults: [])
+        fixture.model.applySnapshotState(route: .ritual(.thinking), setupState: state, setupCopy: copy, draftThinkingChoice: .later)
+
+        let size = CGSize(width: 880, height: 580)
+        let view = JournalFirstRunView(
+            model: fixture.model,
+            minSize: size,
+            background: SunArcBackgroundView(fixedDate: Date(timeIntervalSince1970: 1_790_190_000), timeZone: TimeZone(identifier: "America/Denver")!)
+        )
+        .frame(width: size.width, height: size.height)
+        .environment(\.colorScheme, .dark)
+        let host = NSHostingView(rootView: view)
+        host.appearance = NSAppearance(named: .darkAqua)
+        host.frame = NSRect(origin: .zero, size: size)
+        host.layoutSubtreeIfNeeded()
+        let rep = try #require(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+        host.cacheDisplay(in: host.bounds, to: rep)
+        let scale = CGFloat(rep.pixelsHigh) / size.height
+        // The card's column, 4 pt above the footer's top hairline (18 pt inset + 66 pt bar + 1 pt).
+        let y = rep.pixelsHigh - Int((18 + 66 + 1 + 4) * scale)
+        let x = Int(size.width * 0.75 * scale)
+        let color = try #require(rep.colorAt(x: x, y: y)?.usingColorSpace(.sRGB))
+        let red = Int((color.redComponent * 255).rounded())
+        // Dark sheet #221C19 (red 34); dark card #2B231C (red 43).
+        #expect(red <= 38, "card fill runs into the footer: red \(red)")
+    }
 }

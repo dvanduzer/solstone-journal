@@ -472,18 +472,23 @@ struct JournalFirstRunView: View {
                         .accessibilityAddTraits(model.displayedThinkingChoice == .later ? .isSelected : [])
                         .disabled(locked)
 
-                        AXStateCompanion(
-                            id: AXID.Journal.Ritual.thinkingChoiceState,
-                            value: model.displayedThinkingChoice?.rawValue ?? ""
-                        )
-                        AXStateCompanion(
-                            id: AXID.Journal.Ritual.thinkingErrorState,
-                            value: model.thinkingFailure ?? ""
-                        )
-
                         if let failure = model.thinkingFailure, !failure.isEmpty {
                             SetupErrorText(failure)
                                 .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    // The companions ride behind the stack: as stack items each took a row of
+                    // spacing, which pushed the card's bottom under the footer at 880 x 580.
+                    .background(alignment: .topLeading) {
+                        ZStack(alignment: .topLeading) {
+                            AXStateCompanion(
+                                id: AXID.Journal.Ritual.thinkingChoiceState,
+                                value: model.displayedThinkingChoice?.rawValue ?? ""
+                            )
+                            AXStateCompanion(
+                                id: AXID.Journal.Ritual.thinkingErrorState,
+                                value: model.thinkingFailure ?? ""
+                            )
                         }
                     }
                 }
