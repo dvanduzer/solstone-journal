@@ -264,4 +264,3 @@ solstone call journal read briefing
 solstone call journal read activity -s 091500_300
 solstone call journal read --path 20260115/talents/briefing.md
 ```
-

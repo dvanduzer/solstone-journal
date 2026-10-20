@@ -208,6 +208,23 @@ pub fn apply_prompt_override(
     if let Some(meta) = current_values.get("briefing_metadata").cloned() {
         prepared.config.insert("briefing_metadata".into(), meta);
     }
+    let inclusion = briefing_state
+        .activities
+        .iter()
+        .enumerate()
+        .map(|(i, act)| {
+            json!({
+                "facet": act.facet,
+                "day": act.day,
+                "id": act.id,
+                "activity": include_activities[i],
+                "story": include_stories[i],
+            })
+        })
+        .collect::<Vec<_>>();
+    prepared
+        .config
+        .insert("_briefing_inclusion".into(), Value::Array(inclusion));
     apply_template_vars(&mut prepared.config, &current_values);
     Ok(())
 }

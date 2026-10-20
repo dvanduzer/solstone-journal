@@ -98,6 +98,7 @@ pub fn freeze(
         }
     };
     attach_daily_location(&mut prepared, &mut state, context, &hook)?;
+    prepared.config.remove("_briefing_inclusion");
     Ok(
         json!({"version":1,"prepared":{"name":prepared.name,"config":prepared.config},"hook":hook,"state":state}),
     )
@@ -186,23 +187,58 @@ fn attach_daily_location(
                     })
                     .unwrap_or_default();
 
-                let n = activities.len();
-                let mut include_activities = vec![true; n];
-                let mut include_stories = vec![true; n];
+                let inclusion_arr = prepared
+                    .config
+                    .get("_briefing_inclusion")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        failure(
+                            prepared,
+                            "briefing inclusion does not match activities".to_owned(),
+                        )
+                    })?;
 
-                for (i, act) in activities.iter().enumerate() {
-                    let act_gap = format!("activity {}", act.id);
-                    let story_gap = format!("story for {}", act.id);
-                    if gaps.contains(&act_gap) {
-                        include_activities[i] = false;
-                        include_stories[i] = false;
-                    } else if gaps.contains(&story_gap) {
-                        include_activities[i] = true;
-                        include_stories[i] = false;
-                    } else {
-                        include_activities[i] = true;
-                        include_stories[i] = act.story_body.is_some();
+                if inclusion_arr.len() != activities.len() {
+                    return Err(failure(
+                        prepared,
+                        "briefing inclusion does not match activities".to_owned(),
+                    ));
+                }
+
+                let n = activities.len();
+                let mut include_activities = Vec::with_capacity(n);
+                let mut include_stories = Vec::with_capacity(n);
+
+                for (i, item) in inclusion_arr.iter().enumerate() {
+                    let Some(obj) = item.as_object() else {
+                        return Err(failure(
+                            prepared,
+                            "briefing inclusion does not match activities".to_owned(),
+                        ));
+                    };
+                    let facet = obj.get("facet").and_then(Value::as_str);
+                    let day = obj.get("day").and_then(Value::as_str);
+                    let id = obj.get("id").and_then(Value::as_str);
+                    let act_inc = obj.get("activity").and_then(Value::as_bool);
+                    let story_inc = obj.get("story").and_then(Value::as_bool);
+
+                    if facet != Some(&activities[i].facet)
+                        || day != Some(&activities[i].day)
+                        || id != Some(&activities[i].id)
+                    {
+                        return Err(failure(
+                            prepared,
+                            "briefing inclusion does not match activities".to_owned(),
+                        ));
                     }
+                    let (Some(act_inc), Some(story_inc)) = (act_inc, story_inc) else {
+                        return Err(failure(
+                            prepared,
+                            "briefing inclusion does not match activities".to_owned(),
+                        ));
+                    };
+                    include_activities.push(act_inc);
+                    include_stories.push(story_inc);
                 }
 
                 loop {
@@ -2029,6 +2065,280 @@ mod tests {
         for part in &model_parts {
             assert!(!part.to_lowercase().contains("complete"));
         }
+    }
+
+    #[test]
+    fn morning_briefing_keeps_each_facet_briefing_inclusion_when_schedule_ids_collide() {
+        let root = tempfile::tempdir().unwrap();
+        location_journal(root.path(), LOCATION_DAY);
+
+        solstone_core_facets::create_facet(root.path(), "a", "A", "", "", "", None).unwrap();
+        solstone_core_facets::create_facet(root.path(), "b", "B", "", "", "", None).unwrap();
+
+        let desc_a = "A".repeat(43027);
+        let story_s = "S".repeat(1500);
+        let story_t = "T".repeat(1500);
+
+        let record_a = json!({
+            "id": "anticipated_meeting_090000_1001",
+            "title": "A",
+            "start": "09:00:00",
+            "description": desc_a,
+            "story": {
+                "body": story_s,
+            },
+        });
+        write(
+            root.path(),
+            &format!("facets/a/activities/{LOCATION_DAY}.jsonl"),
+            &format!("{record_a}\n"),
+        );
+
+        let record_b = json!({
+            "id": "anticipated_meeting_090000_1001",
+            "title": "B",
+            "start": "09:00:00",
+            "story": {
+                "body": story_t,
+            },
+        });
+        write(
+            root.path(),
+            &format!("facets/b/activities/{LOCATION_DAY}.jsonl"),
+            &format!("{record_b}\n"),
+        );
+
+        let context = ExecutionContext {
+            journal: root.path().to_owned(),
+        };
+        let talent = prepared(
+            "morning_briefing",
+            LOCATION_DAY,
+            json!({
+                "hook": {"pre": "morning_briefing"},
+                "prompt": "Prompt with $activity_digest and $briefing_metadata",
+                "json_schema": {"type": "object"},
+                "max_output_tokens": 1024,
+            }),
+        );
+
+        let stage = contract::resolve_hook("morning_briefing").unwrap();
+        let mut probe_talent = talent.clone();
+        let state = (stage.build.unwrap())(
+            &mut probe_talent,
+            &context,
+            &solstone_core_generate::Cancellation::never(),
+        )
+        .unwrap();
+
+        let PrePostState::MorningBriefing(ref briefing_state) = state else {
+            panic!("expected MorningBriefing pre-state");
+        };
+
+        let mut unclipped_config = probe_talent.config.clone();
+        crate::apply_template_vars(&mut unclipped_config, &briefing_state.values);
+
+        let unclipped_text_tokens: u32 = crate::model_text_parts(&unclipped_config)
+            .iter()
+            .map(|part| solstone_core_local::generate::estimate_tokens(part))
+            .sum();
+        let unclipped_schema_tokens = match unclipped_config.get("json_schema") {
+            Some(Value::String(s)) => solstone_core_local::generate::estimate_tokens(s),
+            Some(val) => solstone_core_local::generate::estimate_tokens(&val.to_string()),
+            None => 0,
+        };
+        let unclipped_total = unclipped_text_tokens + unclipped_schema_tokens;
+        assert_eq!(
+            unclipped_total, 15576,
+            "unclipped model_text_parts + schema tokens ({unclipped_total}) must be 15576"
+        );
+
+        (stage.prompt_override.unwrap())(&mut probe_talent, &state).unwrap();
+
+        let ordinary_tokens: u32 = crate::ordinary_text_parts(&probe_talent.config)
+            .iter()
+            .map(|part| solstone_core_local::generate::estimate_tokens(part))
+            .sum();
+        let probe_schema_tokens = match probe_talent.config.get("json_schema") {
+            Some(Value::String(s)) => solstone_core_local::generate::estimate_tokens(s),
+            Some(val) => solstone_core_local::generate::estimate_tokens(&val.to_string()),
+            None => 0,
+        };
+        let ordinary_total = ordinary_tokens + probe_schema_tokens;
+        let floor_budget = solstone_core_local::generate::compute_input_budget(
+            1024,
+            solstone_core_local::plan::LOCAL_MIN_CONTEXT_TOKENS,
+        );
+        assert_eq!(
+            floor_budget, 15104,
+            "floor budget for 1024 ({floor_budget}) must be 15104"
+        );
+        assert_eq!(
+            ordinary_total, 15104,
+            "ordinary tokens plus schema ({ordinary_total}) must equal 15104"
+        );
+        assert_eq!(
+            ordinary_total, floor_budget,
+            "ordinary tokens plus schema ({ordinary_total}) must equal computed floor ({floor_budget})"
+        );
+
+        let ordinary_parts = crate::ordinary_text_parts(&probe_talent.config);
+        let ordinary_text = ordinary_parts.join("\n");
+        assert!(
+            ordinary_text.contains(&desc_a),
+            "emitted ordinary text must contain description A*43027"
+        );
+        assert!(
+            ordinary_text.contains(&story_s),
+            "emitted ordinary text must contain story S*1500"
+        );
+        assert!(
+            ordinary_text.contains("### B"),
+            "emitted ordinary text must contain title B"
+        );
+        assert!(
+            !ordinary_text.contains(&story_t),
+            "emitted ordinary text must not contain story T*1500"
+        );
+
+        let pos_a = ordinary_text.find("### A").expect("### A must be present");
+        let pos_b = ordinary_text.find("### B").expect("### B must be present");
+        assert!(
+            pos_a < pos_b,
+            "### A must appear before ### B in emitted ordinary text"
+        );
+
+        let inclusion = probe_talent
+            .config
+            .get("_briefing_inclusion")
+            .and_then(Value::as_array)
+            .expect("_briefing_inclusion must be present on probe talent");
+        assert_eq!(inclusion.len(), 2, "_briefing_inclusion must have 2 slots");
+        assert_eq!(
+            inclusion[0],
+            json!({
+                "facet": "a",
+                "day": LOCATION_DAY,
+                "id": "anticipated_meeting_090000_1001",
+                "activity": true,
+                "story": true,
+            })
+        );
+        assert_eq!(
+            inclusion[1],
+            json!({
+                "facet": "b",
+                "day": LOCATION_DAY,
+                "id": "anticipated_meeting_090000_1001",
+                "activity": true,
+                "story": false,
+            })
+        );
+
+        let packet = freeze(talent, &context).expect("freeze must succeed");
+        let (thawed, _) = thaw(&packet).unwrap();
+
+        let thawed_ordinary = crate::ordinary_text_parts(&thawed.config).join("\n");
+        assert!(
+            thawed_ordinary.contains(&desc_a),
+            "description A*43027 must remain after thaw"
+        );
+        assert!(
+            thawed_ordinary.contains("### A"),
+            "title A must remain after thaw"
+        );
+        assert!(
+            thawed_ordinary.contains("### B"),
+            "title B must remain after thaw"
+        );
+
+        let thaw_pos_a = thawed_ordinary.find("### A").unwrap();
+        let thaw_pos_b = thawed_ordinary.find("### B").unwrap();
+        assert!(
+            thaw_pos_a < thaw_pos_b,
+            "### A must appear before ### B after thaw"
+        );
+
+        assert!(
+            !thawed_ordinary.contains(&story_s),
+            "story S*1500 must be absent after thaw"
+        );
+        assert!(
+            !thawed_ordinary.contains(&story_t),
+            "story T*1500 must be absent after thaw"
+        );
+
+        let raw_metadata = thawed
+            .config
+            .get("briefing_metadata")
+            .and_then(Value::as_str)
+            .expect("briefing_metadata must be present");
+        let metadata: Value =
+            serde_json::from_str(raw_metadata).expect("valid briefing_metadata JSON");
+        let gaps = metadata["gaps"].as_array().expect("gaps array");
+
+        assert!(
+            gaps.iter()
+                .any(|g| g.as_str() == Some("story for anticipated_meeting_090000_1001")),
+            "gaps must include 'story for anticipated_meeting_090000_1001': {gaps:?}"
+        );
+        assert!(
+            gaps.iter().any(|g| g.as_str() == Some("no plans today")),
+            "gaps must include 'no plans today': {gaps:?}"
+        );
+        assert!(
+            gaps.iter()
+                .any(|g| g.as_str() == Some("no plans in the next 7 days")),
+            "gaps must include 'no plans in the next 7 days': {gaps:?}"
+        );
+        assert!(
+            !gaps
+                .iter()
+                .any(|g| g.as_str() == Some("activity anticipated_meeting_090000_1001")),
+            "gaps must not include 'activity anticipated_meeting_090000_1001': {gaps:?}"
+        );
+
+        let loc_text = thawed
+            .config
+            .get("_daily_location_text")
+            .and_then(Value::as_str)
+            .expect("_daily_location_text must be present");
+        assert!(
+            loc_text.lines().any(|l| l.starts_with("- ")),
+            "location observation lines must be present in _daily_location_text: {loc_text}"
+        );
+
+        let model_parts = crate::model_text_parts(&thawed.config);
+        assert!(
+            model_parts
+                .iter()
+                .any(|p| p.lines().any(|l| l.starts_with("- "))),
+            "location observation lines must be present in model_text_parts"
+        );
+
+        assert!(
+            thawed.config.get("_daily_location_omitted").is_none(),
+            "_daily_location_omitted must be absent"
+        );
+        assert!(
+            thawed.config.get("_briefing_inclusion").is_none(),
+            "_briefing_inclusion must be absent"
+        );
+
+        let final_text_tokens: u32 = model_parts
+            .iter()
+            .map(|part| solstone_core_local::generate::estimate_tokens(part))
+            .sum();
+        let final_schema_tokens = match thawed.config.get("json_schema") {
+            Some(Value::String(s)) => solstone_core_local::generate::estimate_tokens(s),
+            Some(val) => solstone_core_local::generate::estimate_tokens(&val.to_string()),
+            None => 0,
+        };
+        assert!(
+            final_text_tokens + final_schema_tokens <= floor_budget,
+            "measured request tokens ({}) must be <= floor budget ({floor_budget})",
+            final_text_tokens + final_schema_tokens
+        );
     }
 
     #[test]
