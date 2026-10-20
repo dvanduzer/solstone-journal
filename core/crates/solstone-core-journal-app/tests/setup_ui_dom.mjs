@@ -1050,8 +1050,8 @@ if (!choiceIds.includes('local') || !choiceIds.includes('spp') || !choiceIds.inc
 }
 if (!root().textContent.includes('model requests stay on this pc.')) throw new Error('the local row does not carry its this-pc description');
 if (root().textContent.includes('local description')) throw new Error('the local row shows the shared description');
-if (root().textContent.includes('spp description')) throw new Error('spp description visible');
-if (root().textContent.includes('byo description')) throw new Error('byo description visible');
+if (!root().textContent.includes('spp description')) throw new Error('spp description hidden before it is chosen');
+if (!root().textContent.includes('byo description')) throw new Error('byo description hidden before it is chosen');
 if (buttons().some(b => accessibleName(b) === 'Change')) throw new Error('Change button visible');
 pass('unsaved capable thinking lists every choice');
 
@@ -1991,5 +1991,44 @@ paint(view({ phase: 'welcome', step: 1 }));
   if (!sw.textContent.includes('start automatically after you sign in to this pc.')) throw new Error('the switch lacks its help line');
 }
 pass('craft pass: no null text, welcome card rows and switch, footer step words');
+
+// Behaviour holds under the shared layout.
+// A fresh install's flow is not yet authoritative; start setup must still be pressable.
+paint(view({ phase: 'welcome', step: 1, authoritative: false }));
+{
+  const primary = root().querySelector('button.primary');
+  if (!primary || primary.disabled) throw new Error('start setup is disabled while the flow is not yet authoritative');
+}
+pass('welcome start setup works before the flow is authoritative');
+
+// Between setup finishing and the state loading, nothing reads as stopped.
+paint(view({ phase: 'setup', step: null, setup_running: false, setup_failed: false, error: null, busy: true }));
+if (root().textContent.includes("setup stopped before it finished.")) throw new Error('a finished setup reads as stopped');
+pass('the post-setup interstitial does not say setup stopped');
+
+// Every choice's description is readable before it is chosen.
+paint(view({ phase: 'thinking', step: 4, thinking_capability: 'blocked', thinking_saved: false, thinking_choice: null }));
+if (!root().textContent.includes('spp description') || !root().textContent.includes('byo description')) {
+  throw new Error('unselected choices hide their descriptions');
+}
+pass('every thinking choice shows its description');
+
+// A choice keeps focus through its busy round-trip.
+paint(view({ phase: 'thinking', step: 4, thinking_capability: 'blocked', thinking_saved: false, thinking_choice: null }));
+{
+  const spp = root().querySelector('[data-choice-id="spp"]');
+  spp.focus();
+  paint(view({ phase: 'thinking', step: 4, thinking_capability: 'blocked', thinking_saved: false, thinking_choice: null, busy: true }));
+  paint(view({ phase: 'thinking', step: 4, thinking_capability: 'blocked', thinking_saved: true, thinking_choice: 'spp', can_finalize: true }));
+  const after = root().querySelector('[data-choice-id="spp"]');
+  if (document.activeElement !== after) throw new Error('focus left the chosen row after its busy round-trip');
+}
+pass('a chosen row keeps focus through a busy repaint');
+
+// Cancel needs the attempt it would cancel.
+paint(view({ phase: 'thinking', step: 4, thinking_capability: 'ok', thinking_saved: true, thinking_choice: 'local', can_finalize: true,
+  thinking_cancel: true, downloads: { thinking: { state: 'downloading', bytes_done: 1, bytes_total: 2, attempt_id: '  ' } } }));
+if (root().querySelector('[data-focus-key="thinking:cancel"]')) throw new Error('cancel shows without an attempt id');
+pass('cancel needs a painted attempt id');
 
 console.log(`DOM CASES: ${passed} passed`);

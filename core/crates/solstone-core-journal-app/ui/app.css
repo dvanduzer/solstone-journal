@@ -640,3 +640,6 @@ details.detail p { margin-top: var(--space-2); user-select: text; overflow-wrap:
 #firstrun[data-phase] .setup-downloads + button.primary { margin-left: 18px; }
 #firstrun[data-phase] .setup-card > button { align-self: flex-start; }
 #firstrun[data-phase] .setup-card-center > button { align-self: center; }
+#firstrun[data-phase] .setup-card:empty { display: none; }
+#firstrun[data-phase] button.setup-text-chosen { font-weight: 600; }
+#firstrun[data-phase] button.setup-text-chosen::before { content: "● "; }

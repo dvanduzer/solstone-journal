@@ -682,7 +682,7 @@ function renderFooterDownloads(view) {
   if (speech && (speech.state === 'downloading' || speech.state === 'error' || flow.speech_retry)) {
     const parts = [el('span', { class: 'setup-download-name' }, document.createTextNode(copy.speech || ''))];
     if (speech.state === 'downloading') {
-      if (typeof speech.bytes_total === 'number') {
+      if (typeof speech.bytes_total === 'number' && speech.bytes_total > 0) {
         const done = speech.bytes_done || 0;
         const total = speech.bytes_total;
         parts.push(el('span', { class: 'setup-download-bytes' }, document.createTextNode(`${formatBytes(done)} of ${formatBytes(total)}`)));
@@ -740,7 +740,7 @@ function renderFooterDownloads(view) {
   if (thinking && (thinking.state === 'downloading' || thinking.state === 'error' || flow.thinking_retry)) {
     const parts = [el('span', { class: 'setup-download-name' }, document.createTextNode(copy.thinking || ''))];
     if (thinking.state === 'downloading') {
-      if (typeof thinking.bytes_total === 'number') {
+      if (typeof thinking.bytes_total === 'number' && thinking.bytes_total > 0) {
         const done = thinking.bytes_done || 0;
         const total = thinking.bytes_total;
         parts.push(el('span', { class: 'setup-download-bytes' }, document.createTextNode(`${formatBytes(done)} of ${formatBytes(total)}`)));
@@ -761,7 +761,7 @@ function renderFooterDownloads(view) {
         parts.push(el('div', { class: 'setup-download-bar setup-download-bar-indeterminate' }));
       }
       const paintedAttempt = typeof thinking.attempt_id === 'string' ? thinking.attempt_id : '';
-      if (flow.thinking_cancel) {
+      if (flow.thinking_cancel && paintedAttempt.trim()) {
         parts.push(el('button', {
           type: 'button',
           'data-focus-key': 'thinking:cancel',
@@ -840,9 +840,7 @@ async function finishSetupToHome(view) {
       el('img', { class: 'setup-lockup', src: '/lockup-solstone-horizontal.svg', alt: 'solstone' }),
       el('span', { class: 'setup-band-label' }, document.createTextNode(COPY.setup.band))
     );
-    const lead = el('div', { class: 'setup-lead' },
-      el('h1', {}, document.createTextNode(COPY.setupStopped))
-    );
+    const lead = el('div', { class: 'setup-lead' });
     const card = el('div', { class: 'setup-card' },
       el('p', { class: 'error' }, document.createTextNode(error.message || String(error))),
       el('button', {
@@ -919,11 +917,7 @@ function renderFlow(view) {
     flowFocus = null;
   } else if (focused && root.contains(focused)) {
     const key = focused.getAttribute ? focused.getAttribute('data-focus-key') : null;
-    if (key && ['sign-in', 'local', 'spp', 'byo', 'later', 'thinking:cancel', 'thinking:retry', 'speech:retry', 'models:retry'].includes(key)) {
-      flowFocus = key;
-    } else {
-      flowFocus = null;
-    }
+    flowFocus = key || null;
   } else if (focused && focused !== document.body) {
     flowFocus = null;
   }
@@ -1005,7 +999,8 @@ function renderFlow(view) {
     footerPrimary = el('button', {
       type: 'button',
       class: 'primary',
-      disabled: Boolean(view.busy) || view.authoritative === false,
+      'data-focus-key': 'primary',
+      disabled: Boolean(view.busy),
       on: {
         click: async () => {
           const on = signInOn;
@@ -1043,6 +1038,7 @@ function renderFlow(view) {
 
     const pickBtn = el('button', {
       type: 'button',
+      'data-focus-key': 'folder:change',
       disabled: Boolean(view.busy),
       on: {
         click: async () => {
@@ -1066,6 +1062,7 @@ function renderFlow(view) {
     footerPrimary = el('button', {
       type: 'button',
       class: 'primary',
+      'data-focus-key': 'primary',
       disabled: Boolean(view.busy),
       on: {
         click: () => {
@@ -1092,27 +1089,29 @@ function renderFlow(view) {
           type: 'button',
           class: 'primary',
           disabled: Boolean(view.busy),
+          'data-focus-key': 'retry-setup',
           on: { click: () => call('flow', { intent: 'retry-setup' }) }
         }, document.createTextNode(COPY.tryAgain)) : null
       );
     } else {
+      // Between steps (setup just finished, state loading) nothing has stopped.
       put(lead,
-        el('h1', {}, document.createTextNode(COPY.setupStopped))
+        el('h1', {}, document.createTextNode(COPY.setupTitle))
       );
-      put(card,
-        view.error ? failure(COPY.setupStopped, view.error) : null,
+      if (view.error) put(card,
+        failure(COPY.setupStopped, view.error),
         el('button', {
           type: 'button',
           class: 'primary',
           disabled: Boolean(view.busy),
-          on: { click: () => call('flow', { intent: 'retry-state' }) }
+          'data-focus-key': 'retry-state',
+        on: { click: () => call('flow', { intent: 'retry-state' }) }
         }, document.createTextNode(COPY.tryAgain))
       );
     }
   } else if (view.phase === 'opening') {
-    put(lead,
-      el('h1', {}, document.createTextNode(view.error ? COPY.setupStopped : COPY.setupTitle))
-    );
+    // Opening is a moment, not a step: no heading unless something went wrong.
+    if (view.error) put(lead, el('h1', {}, document.createTextNode(COPY.setupStopped)));
     if (view.error) {
       put(card,
         failure(COPY.setupStopped, view.error),
@@ -1120,7 +1119,8 @@ function renderFlow(view) {
           type: 'button',
           class: 'primary',
           disabled: Boolean(view.busy),
-          on: { click: () => call('flow', { intent: 'retry-state' }) }
+          'data-focus-key': 'retry-state',
+        on: { click: () => call('flow', { intent: 'retry-state' }) }
         }, document.createTextNode(COPY.tryAgain))
       );
     }
@@ -1152,6 +1152,7 @@ function renderFlow(view) {
       card.append(el('button', {
         type: 'button',
         disabled: Boolean(view.busy),
+        'data-focus-key': 'retry-state',
         on: { click: () => call('flow', { intent: 'retry-state' }) }
       }, document.createTextNode(COPY.tryAgain)));
     }
@@ -1159,6 +1160,7 @@ function renderFlow(view) {
       card.append(el('button', {
         type: 'button',
         class: 'setup-secondary',
+        'data-focus-key': 'mark:try',
         disabled: Boolean(view.busy) || view.authoritative === false,
         on: {
           click: () => {
@@ -1175,6 +1177,7 @@ function renderFlow(view) {
     footerPrimary = el('button', {
       type: 'button',
       class: 'primary',
+      'data-focus-key': 'primary',
       disabled: Boolean(view.busy) || !canCommit,
       on: {
         click: () => {
@@ -1244,15 +1247,17 @@ function renderFlow(view) {
             el('span', { class: 'setup-choice-label' }, document.createTextNode(label)),
             sub ? el('span', { class: 'setup-choice-sub' }, document.createTextNode(sub)) : null
           ),
-          isSelected && desc ? el('span', { class: 'setup-choice-desc' }, document.createTextNode(desc)) : null
+          desc ? el('span', { class: 'setup-choice-desc' }, document.createTextNode(desc)) : null
         )
       ));
     }
 
     if (typeof thinkingCopy.later === 'string' && thinkingCopy.later.length > 0) {
+      const laterSaved = Boolean(view.thinking_saved) && view.thinking_choice === 'later';
       card.append(el('button', {
         type: 'button',
-        class: 'setup-text',
+        class: laterSaved ? 'setup-text setup-text-chosen' : 'setup-text',
+        'aria-pressed': laterSaved ? 'true' : 'false',
         'data-focus-key': 'later',
         disabled: Boolean(view.busy) || view.authoritative === false,
         on: {
@@ -1268,6 +1273,7 @@ function renderFlow(view) {
       card.append(el('button', {
         type: 'button',
         disabled: Boolean(view.busy),
+        'data-focus-key': 'retry-state',
         on: { click: () => call('flow', { intent: 'retry-state' }) }
       }, document.createTextNode(COPY.tryAgain)));
     }
@@ -1282,6 +1288,7 @@ function renderFlow(view) {
       footerPrimary = el('button', {
         type: 'button',
         class: 'primary',
+        'data-focus-key': 'primary',
         disabled: Boolean(view.busy) || view.authoritative === false,
         on: {
           click: () => {
@@ -1294,6 +1301,7 @@ function renderFlow(view) {
       footerPrimary = el('button', {
         type: 'button',
         class: 'primary',
+        'data-focus-key': 'primary',
         disabled: Boolean(view.busy) || view.authoritative === false,
         on: {
           click: () => {
@@ -1322,9 +1330,14 @@ function renderFlow(view) {
       heading.focus();
     }
   } else if (flowFocus) {
+    // A control disabled by a busy round-trip keeps its claim until it is enabled again.
     const candidate = root.querySelector(`[data-focus-key="${flowFocus}"]`);
-    if (candidate && !candidate.disabled) candidate.focus();
-    if (candidate || !view.busy) flowFocus = null;
+    if (candidate && !candidate.disabled) {
+      candidate.focus();
+      flowFocus = null;
+    } else if (!view.busy) {
+      flowFocus = null;
+    }
   }
 }
 
@@ -1565,6 +1578,7 @@ const panes = {
       el('button', {
         type: 'button',
         disabled: Boolean(state.flow?.busy),
+        'data-focus-key': 'retry-state',
         on: { click: () => call('flow', { intent: 'retry-state' }) },
       }, COPY.tryAgain)
     ) : null;
