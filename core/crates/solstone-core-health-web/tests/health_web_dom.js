@@ -1182,7 +1182,8 @@ test('backup producer facts survive failed refresh and recover without a mislead
   const rows = env.facts.querySelectorAll('dd');
   assert.ok(rows[2].textContent.includes(new Date(failed.time * 1000).toLocaleString()));
   assert.ok(rows[3].textContent.includes(new Date(successfulBackup.time * 1000).toLocaleString()));
-  assert.ok(rows[4].textContent.includes('1 of 52'));
+  assert.ok(rows[4].textContent.includes('1 of 52 parts'));
+  assert.ok(!rows[4].textContent.includes('1/52'), 'the raw part selector never reaches the owner');
   assert.strictEqual(env.facts.querySelector('details').hasAttribute('open'), false);
   env.facts.querySelector('details').open = true;
   env.facts.querySelector('summary').focus();

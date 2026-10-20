@@ -798,6 +798,10 @@ where
             }
             GenerateResponse::Cancelled => None,
         };
+        let input_budget = match &response {
+            GenerateResponse::Generated(generated) => generated.input_budget.as_ref(),
+            _ => None,
+        };
         let is_eligible = is_bounded_retry_eligible(&response, schema_checked);
         if is_eligible && ordinal < VALIDATION_RETRY_ATTEMPTS {
             if request.context == "screen" && cause == Some("incomplete_json_length") {
@@ -811,6 +815,7 @@ where
                 "status": "retry_eligible",
                 "cause": cause,
                 "retry": true,
+                "input_budget": input_budget,
             }));
             continue;
         }
@@ -827,6 +832,7 @@ where
             "status": status,
             "cause": cause,
             "retry": false,
+            "input_budget": input_budget,
         }));
         last_response = Some(response);
         break;
@@ -1330,11 +1336,26 @@ pub(crate) fn model_text_parts(config: &Map<String, Value>) -> Vec<String> {
 }
 
 pub(crate) fn generate_contents(prepared: &PreparedTalent) -> Vec<ContentPart> {
-    let parts = model_text_parts(&prepared.config);
+    let mut parts = model_text_parts(&prepared.config);
     if parts.is_empty() {
         return vec![ContentPart::Text {
             text: "No input provided.".to_owned(),
         }];
+    }
+    // Fitting may trim only the first part. Without a transcript, reserve that
+    // position so instructions (including any embedded context) stay intact.
+    if prepared
+        .config
+        .get("messages")
+        .and_then(Value::as_array)
+        .is_none()
+        && prepared
+            .config
+            .get("transcript")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+    {
+        parts.insert(0, String::new());
     }
     parts
         .into_iter()
@@ -3791,6 +3812,157 @@ mod tests {
         assert!(attempt_events[1]["cause"].is_null());
         assert_eq!(attempt_events[1]["retry"], false);
         assert_eq!(attempt_events[1]["terminal"], false);
+    }
+
+    #[test]
+    fn no_transcript_requests_preserve_instructions_through_local_fitting() {
+        use solstone_core_local::{build_messages, fit_contents};
+        for field in ["user_instruction", "prompt"] {
+            for transcript in [None, Some("")] {
+                for instructions in ["EARLY_RULE".to_owned(), "x".repeat(175), "x".repeat(1_024)] {
+                    let mut config = source_config(json!({"max_output_tokens":64}));
+                    config.insert(field.into(), json!(instructions));
+                    if let Some(transcript) = transcript {
+                        config.insert("transcript".into(), json!(transcript));
+                    }
+                    let request = generate_request(&PreparedTalent {
+                        name: "plain".into(),
+                        config,
+                    })
+                    .unwrap();
+                    let input =
+                        solstone_core_generate_wire::bundled_input(&request, Path::new("unused"))
+                            .unwrap();
+                    let fitted = fit_contents(
+                        &input.contents,
+                        input.system_instruction.as_deref(),
+                        64,
+                        512,
+                        &mut |text| u32::try_from(text.len()).unwrap(),
+                    );
+                    if instructions.len() > 512 {
+                        assert!(
+                            matches!(fitted, Err(error) if error.reason_code == "context_preserved_overflow")
+                        );
+                    } else {
+                        let (contents, budget) = fitted.unwrap();
+                        assert!(budget.is_none(), "no source was dropped");
+                        assert_eq!(
+                            build_messages(&contents, None),
+                            vec![json!({"role":"user", "content":instructions})]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transcript_fitting_and_explicit_message_separators_keep_their_contract() {
+        use solstone_core_local::{build_messages, fit_contents};
+        for transcript in ["source".to_owned(), format!("{}NEWEST", "x".repeat(8_000))] {
+            let request = generate_request(&PreparedTalent {
+                name: "plain".into(),
+                config: source_config(json!({"max_output_tokens":64,"transcript":transcript,"user_instruction":"EARLY_RULE","prompt":"context"})),
+            }).unwrap();
+            assert_eq!(
+                request.contents,
+                vec![
+                    ContentPart::Text {
+                        text: transcript.clone()
+                    },
+                    ContentPart::Text {
+                        text: "EARLY_RULE".into()
+                    },
+                    ContentPart::Text {
+                        text: "context".into()
+                    }
+                ]
+            );
+            let input =
+                solstone_core_generate_wire::bundled_input(&request, Path::new("unused")).unwrap();
+            let (contents, budget) = fit_contents(&input.contents, None, 64, 1_024, &mut |text| {
+                u32::try_from(text.len()).unwrap()
+            })
+            .unwrap();
+            assert_eq!(contents[1], "EARLY_RULE");
+            assert_eq!(contents[2], "context");
+            if transcript.len() > 1_024 {
+                assert!(budget.unwrap().clipped);
+                assert!(contents[0].as_str().unwrap().ends_with("NEWEST"));
+            } else {
+                assert!(budget.is_none());
+                assert_eq!(
+                    build_messages(&contents, None),
+                    vec![json!({"role":"user","content":"source\nEARLY_RULE\ncontext"})]
+                );
+            }
+        }
+        let request = generate_request(&PreparedTalent {
+            name: "plain".into(),
+            config: source_config(json!({"max_output_tokens":64,"messages":[{"content":"A"},{"content":""},{"content":"B"}]})),
+        }).unwrap();
+        let input =
+            solstone_core_generate_wire::bundled_input(&request, Path::new("unused")).unwrap();
+        assert_eq!(
+            build_messages(&input.contents, None),
+            vec![json!({"role":"user","content":"A\n\nB"})]
+        );
+    }
+
+    #[test]
+    fn generated_attempt_events_persist_each_returned_input_budget() {
+        let clipped =
+            json!({"clipped":true,"dropped_chars":321,"dropped_entries":2,"budget_tokens":700});
+        let whole =
+            json!({"clipped":false,"dropped_chars":0,"dropped_entries":0,"budget_tokens":700});
+        for budgets in [
+            vec![clipped.clone()],
+            vec![whole.clone()],
+            vec![Value::Null],
+            vec![clipped.clone(), whole.clone()],
+        ] {
+            let request = retry_test_request("plain");
+            let mut output = Vec::new();
+            execute_bounded_attempts(
+                &request,
+                Some(2),
+                |ordinal, _| {
+                    let mut response = test_support::generated_response_value(
+                        "RESULT_ONLY",
+                        json!({"valid":ordinal + 1 == budgets.len()}),
+                    );
+                    response["input_budget"] = budgets[ordinal].clone();
+                    Ok(
+                        solstone_core_generate::decode_one_shot_response(&response.to_string())
+                            .unwrap(),
+                    )
+                },
+                |event| emit(&mut output, event),
+            )
+            .unwrap();
+            let recorded = events(&output);
+            let attempts = recorded
+                .iter()
+                .filter(|event| event["event"] == "generate_attempt")
+                .collect::<Vec<_>>();
+            assert_eq!(attempts.len(), budgets.len());
+            assert_eq!(
+                recorded
+                    .iter()
+                    .filter(|event| event["event"] == "generate_call")
+                    .count(),
+                budgets.len()
+            );
+            for (ordinal, event) in attempts.iter().enumerate() {
+                assert_eq!(event["input_budget"], budgets[ordinal]);
+                assert_eq!(event["ordinal"], ordinal);
+                assert_eq!(event["batch"], 2);
+            }
+            let output = String::from_utf8(output).unwrap();
+            assert!(!output.contains("RESULT_ONLY"));
+            assert!(!output.contains("document activity"));
+        }
     }
 
     fn retry_test_request(name: &str) -> GenerateRequest {

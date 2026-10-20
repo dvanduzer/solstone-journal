@@ -3,8 +3,7 @@
 
 use std::path::Path;
 
-use serde_json::{Value, json};
-use solstone_core_generate::{ContentPart, GenerateRequest};
+use solstone_core_generate::GenerateRequest;
 use solstone_core_local::{
     GenerateInput, GenerateResult, LocalInferenceAuthority, LoopbackAddr, Platform,
     local_generate_input_schema,
@@ -47,7 +46,7 @@ pub fn bundled_input(
         bind_address: LoopbackAddr::IPV4_LOOPBACK,
         default_model_id: LOCAL_MODEL_ID.to_owned(),
         platform,
-        contents: Value::Array(request.contents.iter().map(content_value).collect()),
+        contents: crate::request::local_contents(request),
         system_instruction: request.system_instruction.clone(),
         temperature: request.temperature,
         max_output_tokens: u32::try_from(request.max_output_tokens)
@@ -70,20 +69,11 @@ fn detect_platform() -> Result<Platform, BundledError> {
     }
 }
 
-fn content_value(content: &ContentPart) -> Value {
-    match content {
-        ContentPart::Text { text } => Value::String(text.clone()),
-        ContentPart::Image { mime_type, data } => {
-            json!({"type": "image", "mime_type": mime_type, "data": data})
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use serde_json::{Value, json};
     use std::time::Duration;
 
-    use serde_json::json;
     use solstone_core_generate::ContentPart;
     use solstone_core_local::connect::ConnectedServer;
     use solstone_core_local::{ConnectOutcome, GenerateTransport, HttpResponse, generate_with};

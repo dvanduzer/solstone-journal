@@ -9,8 +9,8 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use regex::Regex;
-use serde_json::{Map, Value, json};
-use solstone_core_generate::{ContentPart, GenerateRequest};
+use serde_json::{Map, Value};
+use solstone_core_generate::GenerateRequest;
 use solstone_core_journal_config::work_priority::WorkPriority;
 use solstone_core_local::admission::{
     AdmissionError, LocalSlotPermit, acquire_local_slot, admission_dir,
@@ -479,7 +479,7 @@ fn prepare_endpoint_request(
     max_tokens: u32,
     window: u32,
 ) -> Result<PreparedEndpointRequest, &'static str> {
-    let contents = request_contents(request);
+    let contents = crate::request::local_contents(request);
     let mut count = estimate_tokens;
     let (contents, input_budget) = fit_contents(
         &contents,
@@ -773,21 +773,6 @@ fn discover_served_window<T: EndpointTransport>(
     served_window_from_models_response(&body, &endpoint.served_model_id)
 }
 
-fn request_contents(request: &GenerateRequest) -> Value {
-    Value::Array(
-        request
-            .contents
-            .iter()
-            .map(|content| match content {
-                ContentPart::Text { text } => Value::String(text.clone()),
-                ContentPart::Image { mime_type, data } => {
-                    json!({"type": "image", "mime_type": mime_type, "data": data})
-                }
-            })
-            .collect(),
-    )
-}
-
 /// The reason for a non-success reply from the endpoint. An owner-supplied
 /// endpoint that answers 401 is refusing the credential, which the owner can fix,
 /// so it is named as a key problem, the same as the OpenAI and Anthropic presets:
@@ -862,7 +847,7 @@ mod tests {
     use std::thread;
 
     use serde_json::json;
-    use solstone_core_generate::ReasonCodeValue;
+    use solstone_core_generate::{ContentPart, ReasonCodeValue};
 
     use super::*;
 
@@ -1044,6 +1029,40 @@ mod tests {
         "min_p",
         "presence_penalty",
     ];
+
+    #[test]
+    fn endpoint_fitting_preserves_no_transcript_instructions_without_changing_short_bodies() {
+        let endpoint = endpoint("http://endpoint.invalid");
+        let mut input = request(None);
+        input.system_instruction = None;
+        input.max_output_tokens = 256;
+        for text in ["EARLY_RULE".to_owned(), "x".repeat(4_605)] {
+            input.contents = vec![ContentPart::Text { text: text.clone() }];
+            let original = prepare_endpoint_request(&input, &endpoint, 256, 2_048).unwrap();
+            input.contents.insert(
+                0,
+                ContentPart::Text {
+                    text: String::new(),
+                },
+            );
+            let protected = prepare_endpoint_request(&input, &endpoint, 256, 2_048).unwrap();
+            assert_eq!(protected.body.to_string(), original.body.to_string());
+            assert_eq!(protected.body["messages"][0]["content"], text);
+            assert!(protected.input_budget.is_none());
+        }
+        input.contents = vec![
+            ContentPart::Text {
+                text: String::new(),
+            },
+            ContentPart::Text {
+                text: "x".repeat(10_000),
+            },
+        ];
+        assert!(matches!(
+            prepare_endpoint_request(&input, &endpoint, 256, 2_048),
+            Err("context_budget_exceeded")
+        ));
+    }
 
     #[test]
     fn qwen_sampling_controls_follow_the_endpoint_lane_flags() {

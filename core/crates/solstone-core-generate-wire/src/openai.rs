@@ -274,8 +274,7 @@ pub(crate) fn request_body(
     effort: Option<&str>,
     mode: RequestBodyMode,
 ) -> Value {
-    let content = request
-        .contents
+    let content = crate::request::model_content_parts(request)
         .iter()
         .map(|part| match part {
             ContentPart::Text { text } => json!({"type": "input_text", "text": text}),
@@ -803,6 +802,58 @@ mod tests {
         );
         assert_eq!(body["text"]["format"]["strict"], true);
         assert!(body.get("response_format").is_none());
+    }
+
+    #[test]
+    fn fitting_reserve_does_not_change_openai_provider_body() {
+        let mut input = request();
+        input.contents = vec![
+            ContentPart::Text {
+                text: "EARLY_RULE".into(),
+            },
+            ContentPart::Text {
+                text: String::new(),
+            },
+            ContentPart::Text {
+                text: "context".into(),
+            },
+        ];
+        for image in [false, true] {
+            if image {
+                input.contents.push(ContentPart::Image {
+                    mime_type: "image/png".into(),
+                    data: "AA==".into(),
+                });
+            }
+            let original = request_body(
+                &input,
+                "model",
+                Thinking::Off,
+                None,
+                RequestBodyMode::OpenAi,
+            );
+            let mut protected = input.clone();
+            protected.contents.insert(
+                0,
+                ContentPart::Text {
+                    text: String::new(),
+                },
+            );
+            assert_eq!(
+                request_body(
+                    &protected,
+                    "model",
+                    Thinking::Off,
+                    None,
+                    RequestBodyMode::OpenAi
+                )
+                .to_string(),
+                original.to_string()
+            );
+            assert_eq!(original["input"][1]["content"][0]["text"], "EARLY_RULE");
+            assert_eq!(original["input"][1]["content"][1]["text"], "");
+            assert_eq!(original["input"][1]["content"][2]["text"], "context");
+        }
     }
 
     #[test]

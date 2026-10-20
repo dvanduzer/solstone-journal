@@ -830,6 +830,17 @@ mod tests {
 
     use super::*;
 
+    /// Two builds can straddle a second, and `generated` is the wall clock: the
+    /// packets must agree on everything else.
+    fn without_generated(mut values: Map<String, Value>) -> Map<String, Value> {
+        if let Some(Value::String(text)) = values.get("briefing_metadata") {
+            let mut metadata: Value = serde_json::from_str(text).unwrap();
+            metadata.as_object_mut().unwrap().remove("generated");
+            values.insert("briefing_metadata".into(), metadata);
+        }
+        values
+    }
+
     #[test]
     fn coverage_preamble_counts_plans_in_words() {
         let one = json!({"segments": 0, "anticipated_activities": 1});
@@ -997,7 +1008,10 @@ mod tests {
         let date = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
         let values1 = build_packet("20261019", date, "test", &context, None).unwrap();
         let values2 = build_packet("20261019", date, "test", &context, None).unwrap();
-        assert_eq!(values1, values2);
+        assert_eq!(
+            without_generated(values1.clone()),
+            without_generated(values2.clone())
+        );
 
         let digest = values1["activity_digest"].as_str().unwrap();
         assert!(digest.contains("Quarterly Review"));
@@ -1026,7 +1040,10 @@ mod tests {
         let date = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
         let values1 = build_packet("20261019", date, "test", &context, None).unwrap();
         let values2 = build_packet("20261019", date, "test", &context, None).unwrap();
-        assert_eq!(values1, values2);
+        assert_eq!(
+            without_generated(values1.clone()),
+            without_generated(values2.clone())
+        );
 
         let metadata: Value =
             serde_json::from_str(values1["briefing_metadata"].as_str().unwrap()).unwrap();
@@ -1079,7 +1096,10 @@ mod tests {
         let date = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
         let values1 = build_packet("20261019", date, "test", &context, None).unwrap();
         let values2 = build_packet("20261019", date, "test", &context, None).unwrap();
-        assert_eq!(values1, values2);
+        assert_eq!(
+            without_generated(values1.clone()),
+            without_generated(values2.clone())
+        );
 
         let digest = values1["activity_digest"].as_str().unwrap();
         let pos_b = digest.find("act_b").unwrap();
@@ -1620,7 +1640,10 @@ mod tests {
         )
         .unwrap();
         let values2 = build_packet("20261019", date, "test", &context, None).unwrap();
-        assert_eq!(values1, values2);
+        assert_eq!(
+            without_generated(values1.clone()),
+            without_generated(values2.clone())
+        );
         let digest = values1["activity_digest"].as_str().unwrap();
         assert!(!digest.contains("News"));
 
