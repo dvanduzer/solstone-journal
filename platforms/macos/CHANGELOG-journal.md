@@ -7,16 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.52 (build 98)] - 2026-10-20
+
 ### Changed
 
 - setup now looks like the solstone app's setup, with a step count, and a back button on the folder step. the thinking step lists every choice you can pick, with no change button to open first.
+- updated the bundled journal to [2.0.52](https://solstone.app/releases#v2.0.52) →
 
 ### Fixed
 
 - if the solstone app is already connected to a journal, setup explains how to continue instead of repeatedly switching apps.
-- clicking the journal's Dock icon keeps a running journal running and leaves unfinished setup where you left it.
+- clicking the journal app's Dock icon keeps a running journal running and leaves unfinished setup where you left it.
 - when your mac can't run local thinking, or can't check, the thinking step no longer shows a choice you can't pick. continue finishes setup, and you can choose thinking from the thinking page in your journal when you're ready.
-- after you enter an administrator's name and password to update the journal app, the update installs and the journal app restarts, instead of asking you to press install again.
+- once this version is installed, after you enter an administrator's name and password to update the journal app, the update installs and the journal app restarts, instead of asking you to press install again.
+- on a mac with more than one account, each account's journal can now start.
 
 ## [2.0.51 (build 97)] - 2026-10-19
 
