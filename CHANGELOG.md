@@ -13,6 +13,8 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [2.0.52] - 2026-10-20
 
+2.0.52 isn't available on windows. on windows, your journal stays on 2.0.51 and gets these changes, including the windows ones below, in a later version.
+
 ### Added
 
 - on windows, setup stays in the journal window through choosing your mark and where thinking runs, then opens on the window's home screen. its steps share the solstone app's look, with progress dots and a step count and every thinking choice shown at once. thinking download progress stays available there, and you can try again there if a model doesn't install.
