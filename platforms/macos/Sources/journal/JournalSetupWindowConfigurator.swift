@@ -8,14 +8,10 @@ import SwiftUI
 @MainActor
 private final class JournalSetupWindowMemory {
     let styleMask: NSWindow.StyleMask
-    let titlebarAppearsTransparent: Bool
-    let titleVisibility: NSWindow.TitleVisibility
     var appliedInitialSetupSize: Bool = false
 
     init(window: NSWindow) {
         self.styleMask = window.styleMask
-        self.titlebarAppearsTransparent = window.titlebarAppearsTransparent
-        self.titleVisibility = window.titleVisibility
     }
 }
 
@@ -54,8 +50,11 @@ enum JournalSetupWindowConfigurator {
                 if !memory.styleMask.contains(.fullSizeContentView) {
                     window.styleMask.remove(.fullSizeContentView)
                 }
-                window.titlebarAppearsTransparent = memory.titlebarAppearsTransparent
-                window.titleVisibility = memory.titleVisibility
+                // Home's own title bar: opaque, title shown. Not read back from the window when
+                // setup first shows, because SwiftUI may already have hidden the title for the
+                // setup window by then, and home would keep it hidden.
+                window.titlebarAppearsTransparent = false
+                window.titleVisibility = .visible
                 memory.appliedInitialSetupSize = false
             }
             window.contentMinSize = NSSize(width: 720, height: 500)

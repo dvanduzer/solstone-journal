@@ -206,4 +206,22 @@ struct JournalSetupWalkFixTests {
         #expect(view.contains("SetupWindow(appLabel: JournalFirstRunCopy.yourJournal, windowTitle: JournalFirstRunCopy.setUpSolstone"))
         #expect(JournalFirstRunCopy.setUpSolstone == "set up solstone")
     }
+
+    // The 2026-10-20 re-walk: with SwiftUI owning the setup title bar, the title can already be
+    // hidden when the configurator first sees the window; home must still show its title.
+    @Test func homeShowsItsTitleEvenIfSetupHidItFirst() {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 700, height: 450),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        JournalSetupWindowConfigurator.apply(setupShowing: true, to: window)
+        JournalSetupWindowConfigurator.apply(setupShowing: false, to: window)
+        #expect(window.title == "journal")
+        #expect(window.titleVisibility == .visible)
+        #expect(window.titlebarAppearsTransparent == false)
+    }
 }

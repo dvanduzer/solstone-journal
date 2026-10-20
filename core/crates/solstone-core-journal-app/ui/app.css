@@ -230,6 +230,28 @@ button.danger { border-color: var(--danger); color: var(--danger); }
   }
 }
 
+/* The sun arc ground behind the setup frame (sunarc.js). It sits outside #firstrun, which is
+   rebuilt on every refresh, and shows only while the frame does; the footer colour stays as
+   the ground whenever it is hidden. */
+#setup-ground {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  overflow: hidden;
+  contain: strict;
+}
+#setup-ground .sunarc-twilight,
+#setup-ground .sunarc-glow,
+#setup-ground .sunarc-sun {
+  position: absolute;
+  pointer-events: none;
+  user-select: none;
+}
+#setup-ground .sunarc-twilight,
+#setup-ground .sunarc-glow { border-radius: 50%; }
+#setup-ground:not([hidden]) ~ #firstrun[data-phase] { position: relative; z-index: 1; background: transparent; }
+
 #firstrun[data-phase] .setup-band {
   flex: none;
   display: flex;
@@ -243,12 +265,17 @@ button.danger { border-color: var(--danger); color: var(--danger); }
   margin-left: 40px;
 }
 
+/* The label is text, so it gets its own container: the sun can pass behind the band.
+   Only the lockup sits on the ground. */
 #firstrun[data-phase] .setup-band-label {
   font-size: 12px;
+  line-height: 16px;
   color: var(--ink-faint);
-  border-left: 1px solid var(--hairline);
+  background: var(--setup-sheet);
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+  padding: 3px 10px;
   margin-left: 12px;
-  padding-left: 12px;
 }
 
 #firstrun[data-phase] .setup-sheet {
