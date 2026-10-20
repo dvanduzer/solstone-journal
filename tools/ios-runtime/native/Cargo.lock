@@ -4708,6 +4708,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "solstone-core-backup",
  "solstone-core-brain",
  "solstone-core-callosum",
  "solstone-core-distribution",
