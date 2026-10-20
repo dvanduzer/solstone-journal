@@ -256,12 +256,24 @@ case "$phase" in
         assert_payload
 
         log "running a basic native journal write operation"
-        mkdir -p "$HOME/journal/facets/reference/news"
+        # Facet newsletters (and `journal news write`) were retired in 2.0.52;
+        # backfilling a facet id is a host-local v2 write that needs no
+        # finished onboarding.
+        mkdir -p "$HOME/journal/facets/reference"
         printf '{"title":"Reference","description":"","color":"#667eea","emoji":"R"}\n' \
             > "$HOME/journal/facets/reference/facet.json"
-        printf '# Crossover\n\nnative v2 write\n' \
-            | solstone journal news write reference --day 20260828
-        grep -Fq 'native v2 write' "$HOME/journal/facets/reference/news/20260828.md"
+        solstone journal backfill-facet-ids --commit
+        python3 - "$HOME/journal/facets/reference/facet.json" > "$state_dir/v2-facet-id" <<'PY'
+import json
+import re
+import sys
+facet = json.load(open(sys.argv[1], encoding="utf-8"))
+uuid4 = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
+assert facet.get("title") == "Reference", facet
+ids = [value for value in facet.values() if isinstance(value, str) and uuid4.fullmatch(value)]
+assert len(ids) == 1, facet
+print(ids[0])
+PY
         solstone journal doctor --json > "$state_dir/v2-doctor.json" || true
         python3 - "$state_dir/v2-doctor.json" <<'PY'
 import json
@@ -277,7 +289,8 @@ PY
         wait_active
         assert_payload
         assert_candidate_version journal
-        grep -Fq 'native v2 write' "$HOME/journal/facets/reference/news/20260828.md"
+        grep -Fq "$(cat "$state_dir/v2-facet-id")" "$HOME/journal/facets/reference/facet.json" \
+            || fail "the v2 facet id write did not persist"
         main=$(systemctl --user show solstone.service --property=MainPID --value)
         [ "$main" -gt 1 ] || fail "v2 PID missing after lifecycle transition"
         [ "$(readlink -f "/proc/$main/exe")" = "/usr/bin/solstone-core" ] \
@@ -305,7 +318,8 @@ PY
         wait_active
         journal --version | grep -F '1.0.22'
         assert_payload
-        grep -Fq 'native v2 write' "$HOME/journal/facets/reference/news/20260828.md"
+        grep -Fq "$(cat "$state_dir/v2-facet-id")" "$HOME/journal/facets/reference/facet.json" \
+            || fail "the v2 facet id write did not persist"
         downgrade_main=$(systemctl --user show solstone.service --property=MainPID --value)
         [ "$downgrade_main" -gt 1 ] || fail "downgraded v1 service has no main PID"
         [ -n "$(listener_inode)" ] || fail "downgraded v1 service has no listener"
