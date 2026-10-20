@@ -948,6 +948,13 @@ fn transcript_local_names_page_under_a_transcripts_only_facet_grant() {
         )
         .unwrap();
     }
+    let owner = journal.path().join("entities/local-owner");
+    fs::create_dir_all(&owner).unwrap();
+    fs::write(
+        owner.join("entity.json"),
+        json!({"id":"local-owner","name":"Olu","type":"Person","is_principal":true}).to_string(),
+    )
+    .unwrap();
     fs::write(
         segment.join("talents/speaker_labels.json"),
         json!({"labels":[
@@ -977,7 +984,8 @@ fn transcript_local_names_page_under_a_transcripts_only_facet_grant() {
     let listed = probe(&journal, "list_transcripts", json!({})).unwrap();
     let reference = listed["transcripts"][0]["reference"].as_str().unwrap();
     let first = probe(&journal, "get_transcript", json!({"reference":reference})).unwrap();
-    assert_eq!(first["entries"][98], "[00:00:01] Ada: sentence 99");
+    // Only a voice-identified label names a speaker; a label without one names no one.
+    assert_eq!(first["entries"][98], "[00:00:01] Speaker 1: sentence 99");
     let second = probe(
         &journal,
         "get_transcript",
@@ -988,7 +996,7 @@ fn transcript_local_names_page_under_a_transcripts_only_facet_grant() {
         second["entries"],
         json!([
             "[00:00:01] Bea: sentence 101",
-            "[00:00:01] Ada: sentence 102",
+            "[00:00:01] Speaker 1: sentence 102",
             "[00:00:01] Speaker 1: sentence 103"
         ])
     );
@@ -6667,10 +6675,9 @@ fn removed_segment_marker_matrix_withheld_from_all_read_tools() {
                 .unwrap()
                 .unwrap();
         let page = solstone_core_transcripts::read_segment_transcript_page(
-            journal.path(),
             &seg_obj,
             None,
-            true,
+            solstone_core_talent_runtime::agent_speakers(journal.path()).as_ref(),
         )
         .unwrap();
         let perm_record = PermissionStore::open(journal.path())
@@ -7173,10 +7180,9 @@ fn door_seam_remove_segments_withholds_retained_references_without_leak() {
             .unwrap()
             .unwrap();
     let page1 = solstone_core_transcripts::read_segment_transcript_page(
-        journal.path(),
         &seg1_obj,
         None,
-        true,
+        solstone_core_talent_runtime::agent_speakers(journal.path()).as_ref(),
     )
     .unwrap();
     let perm_record = PermissionStore::open(journal.path())
@@ -9927,6 +9933,91 @@ fn transcripts_entities_and_paired_listing_grants_round_trip() {
     )
     .unwrap();
     assert!(sources.to_string().contains("pairedsourceneedle"));
+}
+
+#[test]
+fn get_activity_sources_names_speakers_only_through_the_voice_gate() {
+    let journal = base_activity_journal();
+    let day = "20260309";
+    let seg = "090000_300";
+    let dir = journal
+        .path()
+        .join("chronicle")
+        .join(day)
+        .join("default")
+        .join(seg);
+    fs::create_dir_all(dir.join("talents")).unwrap();
+    fs::write(
+        dir.join("talents/facets.json"),
+        json!([{"facet": "alpha"}]).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("audio.jsonl"),
+        [
+            r#"{"raw":"audio.flac"}"#,
+            r#"{"start":"00:00:01","speaker":1,"sentence_id":1,"text":"ownerline"}"#,
+            r#"{"start":"00:00:02","speaker":2,"sentence_id":2,"text":"acousticline"}"#,
+            r#"{"start":"00:00:03","speaker":3,"sentence_id":3,"text":"guessedline"}"#,
+        ]
+        .join("\n")
+            + "\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("talents/speaker_labels.json"),
+        json!({"labels": [
+            {"sentence_id": 1, "speaker": "owner-e", "method": "user_identified"},
+            {"sentence_id": 2, "speaker": "mina-e", "method": "acoustic"},
+            {"sentence_id": 3, "speaker": "ravi-e", "method": "contextual"}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    for (id, name, principal) in [
+        ("owner-e", "Olu", true),
+        ("mina-e", "Mina", false),
+        ("ravi-e", "Ravi", false),
+    ] {
+        let entity = journal.path().join("entities").join(id);
+        fs::create_dir_all(&entity).unwrap();
+        fs::write(
+            entity.join("entity.json"),
+            json!({"id": id, "name": name, "type": "Person", "is_principal": principal})
+                .to_string(),
+        )
+        .unwrap();
+    }
+    write_activity_line(
+        journal.path(),
+        "alpha",
+        day,
+        "act_voice",
+        "Voice Activity",
+        100,
+        None,
+        Some(&[seg]),
+        None,
+        None,
+        Some("default"),
+        None,
+        None,
+    );
+
+    let listed = probe(&journal, "list_activities", json!({"day": day})).unwrap();
+    let reference = listed["activities"][0]["reference"].as_str().unwrap();
+    let sources = probe(
+        &journal,
+        "get_activity_sources",
+        json!({"reference": reference}),
+    )
+    .unwrap();
+    let text = sources["units"][0]["text"].as_str().unwrap();
+    // The owner's own line says so; a person is named by voice; a guess is not a name.
+    assert!(text.contains("Olu (owner): ownerline"), "{text}");
+    assert!(text.contains("Mina: acousticline"), "{text}");
+    assert!(text.contains("Speaker 3: guessedline"), "{text}");
+    assert!(!text.contains("Ravi"), "{text}");
 }
 
 #[test]

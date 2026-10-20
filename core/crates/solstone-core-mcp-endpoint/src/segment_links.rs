@@ -30,7 +30,24 @@ pub(crate) trait TranscriptPageCheck {
     ) -> Result<Option<u64>, ()>;
 }
 
-pub(crate) struct LiveTranscriptPages;
+/// Live first-page checks for one response. Who spoke is resolved once, the
+/// first time a segment carries speaker labels, so every link in the response
+/// binds the same rendering.
+#[derive(Default)]
+pub(crate) struct LiveTranscriptPages {
+    speakers: Option<Option<solstone_core_transcripts::AgentSpeakers>>,
+}
+
+impl LiveTranscriptPages {
+    /// Checks that render who spoke exactly as the caller's own read did.
+    pub(crate) fn with_speakers(
+        speakers: Option<solstone_core_transcripts::AgentSpeakers>,
+    ) -> Self {
+        Self {
+            speakers: Some(speakers),
+        }
+    }
+}
 
 impl TranscriptPageCheck for LiveTranscriptPages {
     fn check_first_page(
@@ -38,12 +55,14 @@ impl TranscriptPageCheck for LiveTranscriptPages {
         journal_root: &Path,
         segment: &Segment,
     ) -> Result<Option<u64>, ()> {
-        match solstone_core_transcripts::read_segment_transcript_page(
-            journal_root,
-            segment,
-            None,
-            true,
-        ) {
+        let speakers = if segment.path().join("talents/speaker_labels.json").exists() {
+            self.speakers
+                .get_or_insert_with(|| solstone_core_talent_runtime::agent_speakers(journal_root))
+                .as_ref()
+        } else {
+            None
+        };
+        match solstone_core_transcripts::read_segment_transcript_page(segment, None, speakers) {
             Ok(page) if !page.entries.is_empty() => Ok(Some(page.version.fingerprint())),
             Ok(_) => Ok(None),
             Err(_) => Err(()),

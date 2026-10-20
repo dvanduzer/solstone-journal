@@ -2,7 +2,7 @@
 // Copyright (c) 2026 sol pbc
 
 use serde_json::{Map, Value, json};
-use solstone_core_transcripts::{EntrySource, VoiceNames};
+use solstone_core_transcripts::{EntrySource, OWNER_VOICE, VoiceNames};
 
 use crate::contract::{CommitPlan, ParsedOutput, PrePostState};
 use crate::{AGENT_ACTOR, NamedActor, PreparedTalent, StageError, UNKNOWN_ACTOR, stage_error};
@@ -34,9 +34,10 @@ const MAX_QUOTE_CHARS: usize = 400;
 pub(crate) const MAX_STORY_BODY_CHARS: usize = 1_800;
 
 /// A Story body that quotes every word of a short activity source, framed by
-/// who the producer says wrote or said it: one imported conversation, or one
-/// utterance by an unidentified speaker. `None` for any other talent, source
-/// or request, which keeps the model's own body.
+/// who the producer says wrote or said it: one imported conversation, or
+/// recorded speech whose speakers are framed by the journal's voice gate.
+/// `None` for any other talent, source or request, which keeps the model's
+/// own body.
 pub(crate) fn source_body(
     name: &str,
     config: &Map<String, Value>,
@@ -57,19 +58,34 @@ pub(crate) fn source_body(
     if crate::model_text_parts(config) != [transcript, instruction] {
         return None;
     }
-    let [Some(source)] = sources else {
-        return None;
-    };
-    // Every line of the file is one the model reads.
-    if source.unparsed_lines != 0
-        || !source
-            .chunks
-            .iter()
-            .all(|(rendered, _)| transcript.contains(rendered.as_str()))
+    let sources = sources
+        .iter()
+        .map(Option::as_ref)
+        .collect::<Option<Vec<_>>>()?;
+    // Every line of every file is one the model reads.
+    if sources.is_empty()
+        || sources.iter().any(|source| {
+            source.unparsed_lines != 0
+                || !source
+                    .chunks
+                    .iter()
+                    .all(|(rendered, _)| transcript.contains(rendered.as_str()))
+        })
     {
         return None;
     }
-    let quotes = quoted_lines(source)?;
+    let quotes = match sources.as_slice() {
+        [source] => quoted_lines(source)?,
+        // Several files quote together only as recorded speech, one file per
+        // segment: two files of one segment would lose their turn order. Each
+        // file numbers its speakers on its own, so numbers are not carried.
+        [first, rest @ ..] if rest.iter().all(|source| source.file == first.file) => sources
+            .iter()
+            .map(|source| spoken_lines(source, false, false))
+            .collect::<Option<Vec<_>>>()?
+            .concat(),
+        _ => return None,
+    };
     let mut body = Vec::with_capacity(quotes.len());
     for (framing, text) in quotes {
         let text = text.trim();
@@ -140,22 +156,86 @@ fn quoted_lines(source: &EntrySource) -> Option<Vec<(String, &str)>> {
                 Some((format!("{framing} in a message dated {sent}"), text))
             })
             .collect()
-    } else if source.file.ends_with("audio.jsonl") {
-        let [record] = source.records.as_slice() else {
-            return None;
-        };
-        // A speaker the journal recognizes is named, not numbered.
-        let Some(Value::Number(speaker)) = record.get("speaker") else {
-            return None;
-        };
-        let start = record.get("start")?.as_str()?;
-        let text = shown_text(record)?;
-        (source.chunks.len() == 1
-            && rendered(0, record)? == format!("[{start}] Speaker {speaker}: {text}"))
-        .then(|| vec![("An unidentified speaker said".to_owned(), text)])
     } else {
-        None
+        spoken_lines(source, true, true)
     }
+}
+
+/// Recorded speech, framed only as the voice gate named it: "You" for a line
+/// in the owner's recognized voice, a person named by their voice, and
+/// otherwise a speaker the journal has not identified. A name the file itself
+/// carries is not voice evidence, and imported recordings keep the model body.
+fn spoken_lines(source: &EntrySource, alone: bool, numbered: bool) -> Option<Vec<(String, &str)>> {
+    let stream = source.stream.as_deref().unwrap_or_default();
+    // A header record (the recording's file name) renders nothing; every other
+    // record is a statement the model read.
+    let statements = source
+        .records
+        .iter()
+        .filter(|record| record.contains_key("start") || record.contains_key("text"))
+        .collect::<Vec<_>>();
+    if !source.file.ends_with("audio.jsonl")
+        || stream.starts_with("import.")
+        || statements.is_empty()
+        || statements.len() != source.chunks.len()
+    {
+        return None;
+    }
+    let single = alone && statements.len() == 1;
+    let mut ordinal = 0_i64;
+    statements
+        .into_iter()
+        .enumerate()
+        .map(|(index, record)| {
+            let (text_from, from) = source.chunks.get(index)?;
+            if from != record
+                // One sentence may hold two speakers' words.
+                || record.get("turn_boundary_suspect") == Some(&Value::Bool(true))
+            {
+                return None;
+            }
+            let start = record.get("start")?.as_str()?;
+            ordinal += 1;
+            let text = shown_text(record)?;
+            let voiced = match record.get("sentence_id").and_then(Value::as_i64) {
+                Some(id) if source.voice_named.contains(&id) => {
+                    // Agent reads apply labels by statement position; frame a
+                    // voice only where both readings name the same line.
+                    if id != ordinal {
+                        return None;
+                    }
+                    true
+                }
+                _ => false,
+            };
+            let (label, framing) = match record.get("speaker") {
+                Some(Value::String(name)) if voiced && name == OWNER_VOICE => {
+                    (format!("{name}:"), "You said".to_owned())
+                }
+                Some(Value::String(name)) if voiced => (format!("{name}:"), format!("{name} said")),
+                Some(Value::Number(speaker)) if single => (
+                    format!("Speaker {speaker}:"),
+                    "An unidentified speaker said".to_owned(),
+                ),
+                Some(Value::Number(speaker)) if numbered => (
+                    format!("Speaker {speaker}:"),
+                    format!("Speaker {speaker}, whom the journal has not identified, said"),
+                ),
+                Some(Value::Number(speaker)) => (
+                    format!("Speaker {speaker}:"),
+                    "An unidentified speaker said".to_owned(),
+                ),
+                None if !single => (String::new(), "An unidentified speaker said".to_owned()),
+                _ => return None,
+            };
+            let shown = if label.is_empty() {
+                format!("[{start}] {text}")
+            } else {
+                format!("[{start}] {label} {text}")
+            };
+            (*text_from == shown).then_some((framing, text))
+        })
+        .collect()
 }
 
 /// The words a transcript line shows: its correction, else its text.
@@ -1130,5 +1210,168 @@ mod tests {
         .unwrap();
         assert_eq!(record["story"]["talent"], "work");
         assert!(record["story"].get("partial_input").is_none());
+    }
+
+    fn spoken(stream: &str, rows: &[(Value, &str)], voice_named: &[i64]) -> EntrySource {
+        let records = rows
+            .iter()
+            .enumerate()
+            .map(|(index, (speaker, text))| {
+                let mut record = json!({"start": format!("00:00:0{index}"), "sentence_id": index as i64 + 1, "text": text});
+                if !speaker.is_null() {
+                    record["speaker"] = speaker.clone();
+                }
+                record.as_object().unwrap().clone()
+            })
+            .collect::<Vec<_>>();
+        let chunks = records
+            .iter()
+            .map(|record| {
+                let label = match record.get("speaker") {
+                    Some(Value::Number(n)) => format!(" Speaker {n}:"),
+                    Some(Value::String(name)) => format!(" {name}:"),
+                    _ => String::new(),
+                };
+                (
+                    format!(
+                        "[{}]{label} {}",
+                        record["start"].as_str().unwrap(),
+                        record["text"].as_str().unwrap()
+                    ),
+                    record.clone(),
+                )
+            })
+            .collect();
+        EntrySource {
+            stream: Some(stream.to_owned()),
+            file: "audio.jsonl".to_owned(),
+            records,
+            unparsed_lines: 0,
+            chunks,
+            voice_named: voice_named.iter().copied().collect(),
+        }
+    }
+
+    #[test]
+    fn spoken_lines_frame_only_what_the_voice_gate_named() {
+        let source = spoken(
+            "phone",
+            &[
+                (json!("You"), "I'll send the contract."),
+                (json!("Mina Okafor"), "I filed the permit."),
+                (json!(3), "Push it to May."),
+                (Value::Null, "Agreed."),
+            ],
+            &[1, 2],
+        );
+        let lines = spoken_lines(&source, false, true).unwrap();
+        let framing = lines
+            .iter()
+            .map(|(framing, _)| framing.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            framing,
+            [
+                "You said",
+                "Mina Okafor said",
+                "Speaker 3, whom the journal has not identified, said",
+                "An unidentified speaker said",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_name_the_file_carries_is_not_voice_evidence() {
+        // The same rows, but no sentence was named by the voice gate.
+        let stored = spoken(
+            "phone",
+            &[(json!("You"), "I paid it."), (json!(2), "Thanks.")],
+            &[],
+        );
+        assert!(spoken_lines(&stored, false, true).is_none());
+        let named = spoken("phone", &[(json!("Priya"), "It shipped.")], &[]);
+        assert!(spoken_lines(&named, true, true).is_none());
+    }
+
+    #[test]
+    fn imported_recordings_and_unrendered_lines_keep_the_model_body() {
+        let imported = spoken("import.plaud", &[(json!("You"), "I paid it.")], &[1]);
+        assert!(spoken_lines(&imported, true, true).is_none());
+        let mut changed = spoken(
+            "phone",
+            &[(json!(1), "It shipped."), (json!(2), "Not yet.")],
+            &[],
+        );
+        changed.chunks[1].0.push_str(" *(happy)*");
+        assert!(spoken_lines(&changed, false, true).is_none());
+    }
+
+    #[test]
+    fn a_possible_speaker_change_or_shifted_sentence_id_keeps_the_model_body() {
+        let mut flagged = spoken(
+            "phone",
+            &[(json!("You"), "Can you send it"), (json!(2), "Yes.")],
+            &[1],
+        );
+        flagged.records[0].insert("turn_boundary_suspect".into(), Value::Bool(true));
+        flagged.chunks[0].1 = flagged.records[0].clone();
+        assert!(spoken_lines(&flagged, false, true).is_none());
+        let mut shifted = spoken(
+            "phone",
+            &[(json!(2), "Hello."), (json!("You"), "I paid it.")],
+            &[2],
+        );
+        shifted.records[1].insert("sentence_id".into(), json!(7));
+        shifted.chunks[1].1 = shifted.records[1].clone();
+        shifted.voice_named = [7].into();
+        assert!(spoken_lines(&shifted, false, true).is_none());
+    }
+
+    #[test]
+    fn several_files_quote_speakers_without_their_numbers() {
+        let source = spoken(
+            "phone",
+            &[(json!("You"), "I booked it."), (json!(1), "Thanks.")],
+            &[1],
+        );
+        let framing = spoken_lines(&source, false, false)
+            .unwrap()
+            .into_iter()
+            .map(|(framing, _)| framing)
+            .collect::<Vec<_>>();
+        assert_eq!(framing, ["You said", "An unidentified speaker said"]);
+    }
+
+    #[test]
+    fn a_recording_header_record_is_not_a_statement() {
+        let mut source = spoken(
+            "phone",
+            &[(json!("You"), "I paid it."), (json!(2), "Thanks.")],
+            &[1],
+        );
+        source
+            .records
+            .insert(0, json!({"raw": "audio.flac"}).as_object().unwrap().clone());
+        let framing = spoken_lines(&source, false, true)
+            .unwrap()
+            .into_iter()
+            .map(|(framing, _)| framing)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            framing,
+            [
+                "You said",
+                "Speaker 2, whom the journal has not identified, said"
+            ]
+        );
+    }
+
+    #[test]
+    fn one_numbered_utterance_keeps_its_measured_framing() {
+        let one = spoken("phone", &[(json!(1), "It shipped.")], &[]);
+        assert_eq!(
+            spoken_lines(&one, true, true).unwrap(),
+            [("An unidentified speaker said".to_owned(), "It shipped.")]
+        );
     }
 }

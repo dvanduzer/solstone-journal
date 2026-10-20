@@ -48,7 +48,7 @@ pub mod writers;
 mod test_support;
 
 use contract::{CommitDisposition, GateDecision, PrePostState, resolve_hook};
-pub use transcript::{activity_span_transcript, voice_names};
+pub use transcript::{activity_span_transcript, agent_speakers, voice_names};
 
 /// Config key honored only by the speaker_attribution pre-step.
 /// Not a general per-stage dry-run flag.
