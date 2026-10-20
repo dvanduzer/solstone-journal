@@ -265,8 +265,8 @@ button.danger { border-color: var(--danger); color: var(--danger); }
   margin-left: 40px;
 }
 
-/* The label is text, so it gets its own container: the sun can pass behind the band
-   (sun-arc spec § 8; founder, 2026-10-20). Only the lockup sits on the ground. */
+/* The label is text, so it gets its own container: the sun can pass behind the band.
+   Only the lockup sits on the ground. */
 #firstrun[data-phase] .setup-band-label {
   font-size: 12px;
   line-height: 16px;
