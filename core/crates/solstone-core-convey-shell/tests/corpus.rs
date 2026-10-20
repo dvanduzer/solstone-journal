@@ -172,6 +172,26 @@ fn apply_permanent_chat_removal_divergence(expected: &mut Value) {
         .remove("chat_bar");
 }
 
+/// Permanent documented divergence, introduced 2026-10-19, with no expiry
+/// condition: the frozen corpus permanently records the `news` app, which was
+/// removed when facet newsletters stopped being produced and shown. The corpus
+/// CANNOT be regenerated -- its generator needs a runnable reference tree that
+/// no longer exists -- so the one removed entry is taken out of the frozen
+/// record before the comparison. Narrowness is the safeguard: it is keyed to
+/// that one name and removes exactly that element. Never generalize this into
+/// a rule over app names, and never retire it.
+fn apply_permanent_news_removal_divergence(expected: &mut Value) {
+    let apps = expected["apps"]
+        .as_array_mut()
+        .expect("shell apps are an array");
+    assert_eq!(
+        apps.iter().filter(|app| app["name"] == "news").count(),
+        1,
+        "frozen shell contains exactly one news app"
+    );
+    apps.retain(|app| app["name"] != "news");
+}
+
 /// Permanent narrow divergence introduced by the 2026-09-10 support-client
 /// excision. Support remains an app, but its single frozen background route
 /// is gone. Require exactly that one row and route before clearing it.
@@ -713,6 +733,7 @@ async fn corpus_gate_and_converted_surface_match_all_non_deferred_cases() {
                     apply_permanent_tokens_removal_divergence(&mut expected);
                     apply_permanent_sol_removal_divergence(&mut expected);
                     apply_permanent_chat_removal_divergence(&mut expected);
+                    apply_permanent_news_removal_divergence(&mut expected);
                     apply_permanent_support_background_removal_divergence(&mut expected);
                     apply_permanent_starred_removal_divergence(&mut expected);
                     strip_permanent_launcher_metadata_from_actual(&mut actual);
@@ -848,7 +869,7 @@ async fn registry_contract_is_stable() {
     let shell: Value = serde_json::from_slice(&shell_body).expect("shell parses");
     let apps = shell["apps"].as_array().expect("apps array");
     assert!(shell.get("chat_bar").is_none());
-    assert_eq!(apps.len(), 18);
+    assert_eq!(apps.len(), 17);
     for app in apps {
         // `starred` and the global facet capability were removed; launcher and rail metadata add four fields.
         assert_eq!(app.as_object().unwrap().len(), 12);
