@@ -328,7 +328,7 @@ fn project_sunday(
             more_segments: false,
             activity_record: Some(&rep.record),
         }];
-        let mut checker = LiveTranscriptPages;
+        let mut checker = LiveTranscriptPages::default();
         let mut response_checks = 0;
         issue_segment_links(
             journal,

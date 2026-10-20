@@ -1,5 +1,5 @@
 {
-  "about": "Invented Story source-word cases. A short activity source of a measured shape (one imported conversation, or one unidentified utterance) gets a body quoting every source word with its producer-recorded framing; every other case, including a terminal pane whose session, window and description the body would drop, keeps the model's body and returned response byte for byte. Topics, confidence and relations are always the model's. Files are written into one segment; a string row is written as a raw line.",
+  "about": "Invented Story source-word cases. A short activity source of a measured shape (one imported conversation, or recorded speech framed by the voice gate) gets a body quoting every source word with its producer-recorded framing; every other case, including a terminal pane whose session, window and description the body would drop, keeps the model's body and returned response byte for byte. Topics, confidence and relations are always the model's. Files are written into one segment; a string row is written as a raw line.",
   "cases": [
     {
       "name": "imported_messages_keep_their_authors_and_message_dates",
@@ -790,7 +790,7 @@
       }
     },
     {
-      "name": "two_utterances_keep_the_model_body",
+      "name": "two_unidentified_speakers_are_quoted_apart",
       "talent": "conversation",
       "activity_kind": "meeting",
       "stream": "phone",
@@ -819,7 +819,7 @@
         "relations": []
       },
       "expect": {
-        "ordinary": true
+        "body": "Speaker 1, whom the journal has not identified, said: \"The Birch build shipped.\" Speaker 2, whom the journal has not identified, said: \"It has not been announced.\""
       }
     },
     {

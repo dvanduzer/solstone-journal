@@ -58,6 +58,23 @@ pub fn voice_names(journal: &Path) -> Option<VoiceNames> {
     })
 }
 
+/// Who an agent's transcript read names: [`voice_names`], with the owner's own
+/// recognized lines named "<owner name> (owner)" so an agent can tell them from
+/// everyone else's. `None` without a single admitted principal.
+pub fn agent_speakers(journal: &Path) -> Option<solstone_core_transcripts::AgentSpeakers> {
+    let voices = voice_names(journal)?;
+    let name = solstone_core_entity::load_all_journal_entities(journal)
+        .ok()?
+        .into_iter()
+        .find(|entity| entity.id == voices.principal)
+        .and_then(|entity| Some(entity.value.get("name")?.as_str()?.trim().to_owned()))
+        .filter(|name| !name.is_empty());
+    Some(solstone_core_transcripts::AgentSpeakers {
+        owner: name.map_or_else(|| "The owner".to_owned(), |name| format!("{name} (owner)")),
+        voices,
+    })
+}
+
 pub(crate) fn sources_are_enabled(config: &Map<String, Value>) -> bool {
     config.values().any(source_is_enabled)
 }
@@ -193,6 +210,43 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    fn person(journal: &Path, id: &str, value: serde_json::Value) {
+        let dir = journal.join("entities").join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("entity.json"), value.to_string()).unwrap();
+    }
+
+    #[test]
+    fn agent_speakers_mark_the_owner_by_name_and_need_one_principal() {
+        let journal = TempDir::new().unwrap();
+        assert!(agent_speakers(journal.path()).is_none());
+        person(
+            journal.path(),
+            "mina",
+            json!({"id": "mina", "name": "Mina", "type": "Person"}),
+        );
+        assert!(agent_speakers(journal.path()).is_none());
+        person(
+            journal.path(),
+            "olu",
+            json!({"id": "olu", "name": "Olu", "type": "Person", "is_principal": true}),
+        );
+        let speakers = agent_speakers(journal.path()).unwrap();
+        assert_eq!(speakers.owner, "Olu (owner)");
+        assert_eq!(speakers.voices.principal, "olu");
+        assert_eq!(
+            speakers.voices.people.get("mina").map(String::as_str),
+            Some("Mina")
+        );
+        // Two principals is a damaged identity: no one is named.
+        person(
+            journal.path(),
+            "ada",
+            json!({"id": "ada", "name": "Ada", "type": "Person", "is_principal": true}),
+        );
+        assert!(agent_speakers(journal.path()).is_none());
+    }
 
     #[test]
     fn an_activity_reads_its_own_streams_segment_when_another_stream_shares_the_key() {

@@ -23,10 +23,10 @@ mod speaker_coordinates;
 pub use speaker_coordinates::{next_statement_ordinal, speaker_label_source};
 
 pub use segment_page::{
-    MAX_TRANSCRIPT_PAGE_BYTES, MAX_TRANSCRIPT_PAGE_ITEMS, POSSIBLE_SPEAKER_CHANGE_WITHIN_SENTENCE,
-    SegmentClock, SegmentTranscriptCursor, SegmentTranscriptEntry, SegmentTranscriptPage,
-    SegmentTranscriptReadError, SegmentTranscriptVersion, read_segment_transcript_page,
-    segment_clock,
+    AgentSpeakers, MAX_TRANSCRIPT_PAGE_BYTES, MAX_TRANSCRIPT_PAGE_ITEMS,
+    POSSIBLE_SPEAKER_CHANGE_WITHIN_SENTENCE, SegmentClock, SegmentTranscriptCursor,
+    SegmentTranscriptEntry, SegmentTranscriptPage, SegmentTranscriptReadError,
+    SegmentTranscriptVersion, read_segment_transcript_page, segment_clock,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -144,6 +144,8 @@ pub struct EntrySource {
     pub unparsed_lines: usize,
     /// Each rendered chunk beside the record it was rendered from.
     pub chunks: Vec<(String, Map<String, Value>)>,
+    /// Sentence ids whose speaker the voice gate named in these records.
+    pub voice_named: BTreeSet<i64>,
 }
 
 impl std::ops::Deref for ScreenTranscript {
@@ -1042,6 +1044,9 @@ fn raw_content_with_speakers(
                         .collect(),
                     records,
                     unparsed_lines,
+                    voice_named: speakers
+                        .map(|speakers| speakers.keys().copied().collect())
+                        .unwrap_or_default(),
                 });
             }
             (produced.header, produced.chunks, produced.error, Vec::new())
@@ -2229,7 +2234,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let page = read_segment_transcript_page(root.path(), &native, None, false).unwrap();
+        let page = read_segment_transcript_page(&native, None, None).unwrap();
         let entries = page
             .entries
             .iter()
