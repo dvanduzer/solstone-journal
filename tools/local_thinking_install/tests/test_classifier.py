@@ -16,6 +16,7 @@ from tools.local_thinking_install.harness import (
     RUNTIME_DOWNLOAD_BYTES,
     classify_bootstrap_response,
     classify_hardware_refusal,
+    classify_unknown_setup,
     find_or_build_helper,
     is_leftover_mlx,
     run_post_admit_checks,
@@ -270,9 +271,9 @@ if __name__ == "__main__":
 
 class TestHardwareRefusalClassifier(unittest.TestCase):
     BODY = {
-        "error": "those settings couldn't be saved.",
-        "reason_code": "settings_operation_failed",
-        "detail": "installer exited before admission (1)",
+        "refused": True,
+        "reason_code": "gpu",
+        "detail": "local thinking needs a compatible GPU with at least 6 GB of GPU memory.",
     }
     REFUSED = {
         "install_state": "failed",
@@ -281,23 +282,26 @@ class TestHardwareRefusalClassifier(unittest.TestCase):
         "target_fingerprint_sha256": None,
     }
 
-    def response(self, status: int = 500, body: dict | None = None) -> HttpResponse:
+    def response(self, status: int = 200, body: dict | None = None) -> HttpResponse:
         body = self.BODY if body is None else body
         import json
         return HttpResponse(status, {}, json.dumps(body), body, body.get("detail"))
 
-    def test_refusal_persisted_before_download_passes(self) -> None:
-        for code in ("gpu_unavailable", "gpu_memory_insufficient"):
-            classification, _ = classify_hardware_refusal(
-                self.response(), {**self.REFUSED, "error_code": code}
-            )
+    def test_early_refusal_requires_no_installer_status(self) -> None:
+        for status in (None, self.REFUSED):
+            classification, _ = classify_hardware_refusal(self.response(), status)
             self.assertEqual(classification, "hardware_refused")
 
-    def test_admission_or_other_failures_do_not_pass(self) -> None:
+    def test_admission_other_errors_or_install_evidence_do_not_pass(self) -> None:
         cases = [
-            (self.response(202, {"install_state": "downloading"}), self.REFUSED),
-            (self.response(500, {**self.BODY, "detail": "lease busy"}), self.REFUSED),
-            (self.response(), None),
+            (self.response(202, {"install_state": "downloading"}), None),
+            (self.response(500), None),
+            (self.response(body={**self.BODY, "refused": False}), None),
+            (self.response(body={**self.BODY, "refused": "true"}), None),
+            (self.response(body={**self.BODY, "reason_code": "memory"}), None),
+            (self.response(body={**self.BODY, "detail": ""}), None),
+            (self.response(), {}),
+            (self.response(), []),
             (self.response(), {**self.REFUSED, "error_code": "install_failed"}),
             (self.response(), {**self.REFUSED, "install_state": "downloading"}),
             (self.response(), {**self.REFUSED, "progress_bytes_received": 4096}),
@@ -306,3 +310,27 @@ class TestHardwareRefusalClassifier(unittest.TestCase):
         for resp, status in cases:
             classification, _ = classify_hardware_refusal(resp, status)
             self.assertEqual(classification, "unexpected", (resp.status, status))
+
+
+class TestUnknownSetupClassifier(unittest.TestCase):
+    CAPABILITY = {"overall": "unknown", "local_admitted": True,
+                  "checks": [{"severity": "unknown", "reason_code": "gpu"}]}
+    BEFORE = {"done": False}
+    AFTER = {"done": True, "thinking": {"choice": "local", "saved": True}}
+
+    def test_unknown_capability_and_fresh_local_commit_are_admitted(self):
+        result, _ = classify_unknown_setup(self.CAPABILITY, self.BEFORE, self.AFTER)
+        self.assertEqual(result, "unknown_setup_admitted")
+
+    def test_replay_blocked_unsupported_or_unsaved_choices_do_not_pass(self):
+        for cap, before, after in [
+            ({**self.CAPABILITY, "overall": "blocked"}, self.BEFORE, self.AFTER),
+            ({**self.CAPABILITY, "local_admitted": False}, self.BEFORE, self.AFTER),
+            ({**self.CAPABILITY, "checks": []}, self.BEFORE, self.AFTER),
+            (self.CAPABILITY, {"done": True}, self.AFTER),
+            (self.CAPABILITY, self.BEFORE, {"done": False}),
+            (self.CAPABILITY, self.BEFORE, {"done": True, "thinking": {"choice": "later", "saved": True}}),
+            (self.CAPABILITY, self.BEFORE, {"done": True, "thinking": {"choice": "local", "saved": False}}),
+        ]:
+            result, _ = classify_unknown_setup(cap, before, after)
+            self.assertEqual(result, "unexpected")

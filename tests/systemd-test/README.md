@@ -32,15 +32,22 @@ purpose. `--skip-models` / `--skip-skills` are passed by default because Parakee
 / Claude-skill installation is orthogonal to the systemd question; use `make
 full` to drop those flags.
 
-`local-thinking-install` installs the same candidate package, starts the real
-`systemd --user` service, and uses `tools/local_thinking_install` to ask that
-resident portal to install the bundled local model. The generic container has
-no usable GPU, and the product refuses a local install on such hardware before
-downloading, so this cell runs with `--expect-hardware-refusal`: it requires the
-portal's installer refusal and a persisted `failed` status with a hardware
-cause (`gpu_unavailable` or `gpu_memory_insufficient`), no download progress
-and no target. It copies the harness receipt to the new host directory named
-by `LOCAL_THINKING_RECEIPT_DIR`. On a Linux host whose GPU has a Mesa Vulkan
+`local-thinking-install` installs the candidate package and starts the real
+`systemd --user` service in two independent GPU capability cells. The default
+cell removes render nodes from the container's own `/dev`, proves the native
+check is Blocked, requires setup to refuse the local lane with HTTP 400, and
+requires bootstrap's early HTTP 200 `refused: true` GPU response. A missing
+provider status is valid because no installer ran; existing malformed status,
+download progress or an installed target fails the proof. The second cell
+creates an unreadable container-local render-node fixture, proves the check
+is Unknown, and requires the portal to admit Unknown capability and setup to commit a
+fresh local choice. It stops at capability/setup admission; later installer
+admission and successful installation are not qualified by this GPU-less cell. The receipt named by
+`LOCAL_THINKING_RECEIPT_DIR` holds the refusal proof and its `unknown/` child
+holds admission proof; a failure in either cell fails the target. No host device
+node is removed or changed.
+
+On a Linux host whose GPU has a Mesa Vulkan
 driver (the image carries no NVIDIA driver) and enough VRAM for a local install,
 set `LOCAL_THINKING_EXPECT=installed` and pass the GPU through with
 `GPU_DEVICES=/dev/dri`: the cell then drops the flag, waits for terminal
@@ -124,7 +131,7 @@ up. This is useful when an install step fails and you want to inspect it.
 | `KEEP`       | `0`                           | `1` leaves the container up on success for inspection.                  |
 | `SOLSTONE_DIST_DIR` | unset                  | Host directory of produced `linux-x86_64` artifacts, mounted at `/artifacts`. Required for package-backed tests. Must contain the candidate `.deb` or `.rpm` selected by the target. |
 | `LOCAL_THINKING_RECEIPT_DIR` | unset          | New host directory that receives the preserved receipt from `local-thinking-install`. Required for that mode. |
-| `LOCAL_THINKING_EXPECT` | `refusal`          | `local-thinking-install` outcome: `refusal` (hardware refusal before download) or `installed` (full download to terminal `installed`; needs a passed-through GPU). |
+| `LOCAL_THINKING_EXPECT` | `refusal`          | `local-thinking-install` outcome: `refusal` (Blocked refusal plus the Unknown admission child), `unknown` (admission only), or `installed` (full download to terminal `installed`; needs a passed-through GPU). |
 | `GPU_DEVICES` | unset                        | Space-separated host device paths passed with `--device` (e.g. `/dev/dri`). Under rootless podman also maps the test user to the invoking host user. |
 | `CONTAINER_ENGINE` | `docker`                | Container CLI for `run-test.sh`, `make build` and `make clean`; `podman` is accepted. |
 

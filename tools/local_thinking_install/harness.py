@@ -320,47 +320,43 @@ def collect_provenance(candidate_dir: Path) -> dict[str, Any]:
     }
 
 
-INSTALLER_EXITED_SNIPPET = "installer exited before admission"
-HARDWARE_REFUSAL_CODES = ("gpu_unavailable", "gpu_memory_insufficient")
-
-
 def classify_hardware_refusal(
     resp: HttpResponse,
     status: dict[str, Any] | None,
 ) -> tuple[str, str]:
-    """Hardware with no usable GPU must refuse a local install before any download.
+    """A capability refusal precedes installer startup and may create no status."""
+    body = resp.json_data
+    if (resp.status != 200 or not isinstance(body, dict)
+            or body.get("refused") is not True or body.get("reason_code") != "gpu"
+            or not isinstance(body.get("detail"), str) or not body["detail"]):
+        return (
+            "unexpected",
+            f"expected an early GPU refusal, got HTTP {resp.status}: {resp.body[:200]}",
+        )
+    if status is not None:
+        if (not isinstance(status, dict)
+                or status.get("install_state") != "failed"
+                or status.get("error_code") not in ("gpu_unavailable", "gpu_memory_insufficient")):
+            return ("unexpected", "provider status contradicts the early hardware refusal")
+        if (status.get("progress_bytes_received") not in (None, 0)
+                or status.get("target_fingerprint_sha256") is not None):
+            return ("unexpected", "the refusal recorded download progress or a target")
+    return ("hardware_refused", "GPU capability refused before installer startup")
 
-    The portal reports the installer's refusal as a 500, and the owner-visible
-    cause is the persisted provider status, so both must agree.
-    """
-    detail = ""
-    reason = None
-    if isinstance(resp.json_data, dict):
-        detail = str(resp.json_data.get("detail") or "")
-        reason = resp.json_data.get("reason_code")
-    if (resp.status != 500 or reason != "settings_operation_failed"
-            or INSTALLER_EXITED_SNIPPET not in detail):
-        return (
-            "unexpected",
-            f"expected a hardware refusal, got HTTP {resp.status}: {resp.body[:200]}",
-        )
-    if not isinstance(status, dict):
-        return ("unexpected", "provider status unreadable after the refusal")
-    if (status.get("install_state") != "failed"
-            or status.get("error_code") not in HARDWARE_REFUSAL_CODES):
-        return (
-            "unexpected",
-            "persisted status is "
-            f"{status.get('install_state')}/{status.get('error_code')}, "
-            "expected a failed hardware refusal",
-        )
-    if (status.get("progress_bytes_received") not in (None, 0)
-            or status.get("target_fingerprint_sha256") is not None):
-        return ("unexpected", "the refusal recorded download progress or a target")
-    return (
-        "hardware_refused",
-        f"Refused before download: {status.get('error_code')} persisted",
-    )
+
+def classify_unknown_setup(capability: dict, before: dict, after: dict) -> tuple[str, str]:
+    """Prove capability/setup admission, independently of later installer results."""
+    checks = capability.get("checks", [])
+    if (capability.get("overall") != "unknown"
+            or capability.get("local_admitted") is not True
+            or not any(c.get("severity") == "unknown" and c.get("reason_code") == "gpu"
+                       for c in checks)):
+        return ("unexpected", "the portal did not admit Unknown GPU capability")
+    thinking = after.get("thinking", {})
+    if (before.get("done") is not False or after.get("done") is not True
+            or thinking.get("choice") != "local" or thinking.get("saved") is not True):
+        return ("unexpected", "setup did not commit the fresh local choice")
+    return ("unknown_setup_admitted", "Unknown capability/setup admitted; installation not qualified")
 
 
 def classify_bootstrap_response(
@@ -1085,7 +1081,9 @@ def run_service_harness(
         status_path = journal_dir / "health" / "providers" / "local.json"
         try:
             status = json.loads(status_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            if not isinstance(status, dict):
+                raise ValueError("existing provider status must be a JSON object")
+        except FileNotFoundError:
             status = None
         (case_dir / "provider-status.json").write_text(
             json.dumps(status, indent=2), encoding="utf-8"
