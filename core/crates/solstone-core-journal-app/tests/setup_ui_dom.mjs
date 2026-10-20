@@ -1018,8 +1018,8 @@ paint(view({
   thinking_saved: false,
   thinking_choice: null,
 }));
-const localBtn = buttons().find(b => accessibleName(b) === 'on this pc');
-if (!localBtn) throw new Error('local button not found with accessible name "on this pc"');
+const localBtn = buttons().find(b => accessibleName(b) === 'on this PC');
+if (!localBtn) throw new Error('local button not found with accessible name "on this PC"');
 if (!localBtn.textContent.includes('1.5 MB')) throw new Error('local button missing 1.5 MB');
 if (root().textContent.includes('measured-line')) throw new Error('measured-line visible');
 if (root().textContent.includes('Local lane')) throw new Error('Local lane visible');
@@ -1048,7 +1048,7 @@ const choiceIds = choiceBtns.map(b => b.getAttribute('data-choice-id'));
 if (!choiceIds.includes('local') || !choiceIds.includes('spp') || !choiceIds.includes('byo')) {
   throw new Error(`expected local, spp, byo choices, got ${choiceIds.join(', ')}`);
 }
-if (!root().textContent.includes('model requests stay on this pc.')) throw new Error('the local row does not carry its this-pc description');
+if (!root().textContent.includes('model requests stay on this PC.')) throw new Error('the local row does not carry its this-PC description');
 if (root().textContent.includes('local description')) throw new Error('the local row shows the shared description');
 if (!root().textContent.includes('spp description')) throw new Error('spp description hidden before it is chosen');
 if (!root().textContent.includes('byo description')) throw new Error('byo description hidden before it is chosen');
@@ -1067,7 +1067,7 @@ paint(view({
 if (!root().textContent.includes('Choose later')) throw new Error('choose_later text not visible');
 if (root().textContent.includes('measured-line')) throw new Error('default_line visible');
 if (buttons().some(b => accessibleName(b) === 'Continue')) throw new Error('Continue button visible');
-if (buttons().some(b => accessibleName(b) === 'on this pc') || root().textContent.includes('Local lane')) throw new Error('local row visible');
+if (buttons().some(b => accessibleName(b) === 'on this PC') || root().textContent.includes('Local lane')) throw new Error('local row visible');
 if (!buttons().some(b => accessibleName(b) === 'Spp lane')) throw new Error('Spp lane not visible');
 if (!buttons().some(b => accessibleName(b) === 'Byo lane')) throw new Error('Byo lane not visible');
 if (!buttons().some(b => accessibleName(b) === 'Later')) throw new Error('Later not visible');
@@ -1090,7 +1090,7 @@ paint(view({
 if (!root().textContent.includes('Choose later')) throw new Error('choose_later text not visible');
 if (root().textContent.includes('measured-line')) throw new Error('default_line visible');
 if (buttons().some(b => accessibleName(b) === 'Continue')) throw new Error('Continue button visible');
-if (buttons().some(b => accessibleName(b) === 'on this pc') || root().textContent.includes('Local lane')) throw new Error('local row visible');
+if (buttons().some(b => accessibleName(b) === 'on this PC') || root().textContent.includes('Local lane')) throw new Error('local row visible');
 if (!buttons().some(b => accessibleName(b) === 'Spp lane')) throw new Error('Spp lane not visible');
 if (!buttons().some(b => accessibleName(b) === 'Byo lane')) throw new Error('Byo lane not visible');
 if (!buttons().some(b => accessibleName(b) === 'Later')) throw new Error('Later not visible');
@@ -1101,14 +1101,14 @@ paint(view({
   thinking_saved: false,
   thinking_choice: null,
 }));
-if (buttons().some(b => accessibleName(b) === 'on this pc') || root().textContent.includes('Local lane')) {
+if (buttons().some(b => accessibleName(b) === 'on this PC') || root().textContent.includes('Local lane')) {
   throw new Error('missing thinking_capability admitted local row');
 }
 pass('unsaved unknown shows choose later');
 
 // 5. saved local spp byo and later name themselves
 const savedCases = [
-  { id: 'local', label: 'on this pc' },
+  { id: 'local', label: 'on this PC' },
   { id: 'spp', label: 'Spp lane' },
   { id: 'byo', label: 'Byo lane' },
   { id: 'later', label: 'Later' },
@@ -1121,7 +1121,7 @@ for (const sc of savedCases) {
     thinking_choice: sc.id,
   }));
   if (sc.id === 'local') {
-    if (!buttons().some(b => accessibleName(b) === 'on this pc')) throw new Error('local visible name is not on this pc');
+    if (!buttons().some(b => accessibleName(b) === 'on this PC')) throw new Error('local visible name is not on this PC');
     if (root().textContent.includes('Local lane')) throw new Error('Local lane is visible');
   } else if (sc.id === 'spp' || sc.id === 'byo') {
     if (!buttons().some(b => accessibleName(b) === sc.label)) throw new Error(`${sc.id} label not visible`);
@@ -1985,10 +1985,10 @@ paint(view({ phase: 'welcome', step: 1 }));
 {
   const card = root().querySelector('.setup-card');
   if (!card || !card.textContent.includes('what this sets up')) throw new Error('the welcome card does not carry what this sets up');
-  if (!card.textContent.includes('lives on this pc and keeps everything that goes into it.')) throw new Error('the welcome card lacks the journal row');
+  if (!card.textContent.includes('lives on this PC and keeps everything that goes into it.')) throw new Error('the welcome card lacks the journal row');
   const sw = root().querySelector('#sign-in-check');
   if (!sw || sw.getAttribute('role') !== 'switch' || !card.contains(sw)) throw new Error('the sign-in switch is not in the welcome card');
-  if (!sw.textContent.includes('start automatically after you sign in to this pc.')) throw new Error('the switch lacks its help line');
+  if (!sw.textContent.includes('start automatically after you sign in to this PC.')) throw new Error('the switch lacks its help line');
 }
 pass('craft pass: no null text, welcome card rows and switch, footer step words');
 

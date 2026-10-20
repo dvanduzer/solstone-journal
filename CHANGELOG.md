@@ -16,7 +16,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- the windows journal window's setup steps now share the solstone app's look, with clearer progress and every thinking choice shown at once.
+- on windows, the journal window's setup steps now share the solstone app's look, with progress dots and a step count and every thinking choice shown at once.
 
 ### Fixed
 
