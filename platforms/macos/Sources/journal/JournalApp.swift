@@ -5,6 +5,7 @@ import AppKit
 import JournalMarkKit
 import JournalRuntime
 import os
+import SetupChrome
 import SwiftUI
 import UpdateKit
 
@@ -168,14 +169,16 @@ final class JournalAppDelegate: NSObject, NSApplicationDelegate {
         modelLauncher(receiptContext)
     }
 
+    static func isJournalWindow(_ window: NSWindow) -> Bool {
+        window.identifier?.rawValue.contains("journal") == true || window.title == "journal"
+    }
+
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         guard let model = JournalAppModel.shared else {
             Logger.journalApp.error("JournalAppModel.shared nil in applicationShouldHandleReopen")
             return true
         }
-        if let journalWindow = NSApp.windows.first(where: {
-            $0.identifier?.rawValue.contains("journal") == true || $0.title == "journal"
-        }) {
+        if let journalWindow = NSApp.windows.first(where: Self.isJournalWindow) {
             model.prepareWindowOpen()
             journalWindow.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
@@ -261,15 +264,16 @@ private struct JournalWindowSceneRoot: View {
                             .padding(.top, 12)
                     }
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(SunArcBackgroundView())
             } else {
                 JournalFirstRunView(model: firstRunModel)
             }
         }
-        // Fill the window before drawing the sun arc: the first-run view keeps a 720-pt
-        // minimum and never grows, so a background sized to it left the window's own
-        // ground showing as bands either side.
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(SunArcBackgroundView())
+        .overlay {
+            JournalSetupWindowInstaller(setupShowing: firstRunModel.route != .home)
+        }
         .onReceive(NotificationCenter.default.publisher(for: .openJournalWindow)) { _ in
             model.prepareForWindowOpen()
             openWindow(id: "journal")

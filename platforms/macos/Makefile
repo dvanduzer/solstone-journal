@@ -240,6 +240,8 @@ journal-app-dev: journal-native-runtime
 		cp Sources/journal/app.solstone.journal.watchdog.plist journal.app/Contents/Library/LaunchAgents/; \
 		test -d "$$BUILD_DIR/solstone_JournalMarkKit.bundle" || { echo "error: solstone_JournalMarkKit.bundle missing from $$BUILD_DIR"; exit 1; }; \
 		cp -R "$$BUILD_DIR/solstone_JournalMarkKit.bundle" journal.app/Contents/Resources/; \
+		test -d "$$BUILD_DIR/solstone_SetupChrome.bundle" || { echo "error: solstone_SetupChrome.bundle missing from $$BUILD_DIR"; exit 1; }; \
+		cp -R "$$BUILD_DIR/solstone_SetupChrome.bundle" journal.app/Contents/Resources/; \
 		if [ -d "$$BUILD_DIR/SolstoneJournalMac_journal.bundle" ]; then \
 			cp -R "$$BUILD_DIR/SolstoneJournalMac_journal.bundle" journal.app/Contents/Resources/; \
 		fi; \
@@ -273,8 +275,10 @@ assemble-journal-app: release-universal-journal
 	@cp Sources/journal/Resources/AppIcon.icns journal.app/Contents/Resources/
 	@cp Sources/journal/app.solstone.journal.watchdog.plist journal.app/Contents/Library/LaunchAgents/
 	@test -d .build/apple/Products/Release/solstone_JournalMarkKit.bundle || { echo "error: solstone_JournalMarkKit.bundle missing from .build/apple/Products/Release"; exit 1; }
+	@test -d .build/apple/Products/Release/solstone_SetupChrome.bundle || { echo "error: solstone_SetupChrome.bundle missing from .build/apple/Products/Release"; exit 1; }
 	@test -d .build/apple/Products/Release/SolstoneJournalMac_journal.bundle || { echo "error: SolstoneJournalMac_journal.bundle missing from .build/apple/Products/Release"; exit 1; }
 	@cp -r .build/apple/Products/Release/solstone_JournalMarkKit.bundle journal.app/Contents/Resources/
+	@cp -r .build/apple/Products/Release/solstone_SetupChrome.bundle journal.app/Contents/Resources/
 	@cp -r .build/apple/Products/Release/SolstoneJournalMac_journal.bundle journal.app/Contents/Resources/
 
 journal-app-unsigned: assemble-journal-app
@@ -325,6 +329,9 @@ bundle-dist-journal: unlock-signing signing-check journal-native-runtime-accepte
 	@codesign --force --options runtime --timestamp \
 		--sign "$(DEVELOPER_ID_APP)" --keychain "$(SIGNING_KEYCHAIN)" \
 		journal.app/Contents/Resources/solstone_JournalMarkKit.bundle
+	@codesign --force --options runtime --timestamp \
+		--sign "$(DEVELOPER_ID_APP)" --keychain "$(SIGNING_KEYCHAIN)" \
+		journal.app/Contents/Resources/solstone_SetupChrome.bundle
 	@codesign --force --options runtime --timestamp \
 		--sign "$(DEVELOPER_ID_APP)" --keychain "$(SIGNING_KEYCHAIN)" \
 		journal.app/Contents/Resources/SolstoneJournalMac_journal.bundle

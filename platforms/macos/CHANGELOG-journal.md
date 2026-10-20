@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- setup uses the same window as the solstone app, with the step count and a way back from the folder. every thinking choice stays on the screen.
+
 ### Fixed
 
 - if the solstone app is already connected to a journal, setup explains how to continue instead of repeatedly switching apps.
