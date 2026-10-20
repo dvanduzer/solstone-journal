@@ -22,7 +22,9 @@ use solstone_core_installed_payload::{
     render_installed_payload,
 };
 
+use crate::acquire::PDF_LINK_ROOT;
 use crate::inventory::{Entry, load_inventory};
+use crate::pdfium;
 use crate::produce::{ProduceError, stage_pinned_entry};
 
 const INVENTORY: &str = "core/distribution/inventory.toml";
@@ -115,6 +117,11 @@ pub(crate) fn build(
             } if targets.iter().any(|t| t == target_id) => {
                 copy_runtime_dir(&args.runtime_root.join(dest_dir), &out.join(dest_dir))?;
             }
+            Entry::Pdfium {
+                dest_dir, targets, ..
+            } if targets.iter().any(|t| t == target_id) => {
+                copy_pdfium(repo, target_id, dest_dir, out)?;
+            }
             Entry::PinnedNative { .. } | Entry::PinnedMembers { .. } => {
                 stage_pinned_entry(entry, repo, &catalog_cache, target_id, out)?;
             }
@@ -155,6 +162,37 @@ fn copy_runtime_dir(from: &Path, to: &Path) -> Result<(), ProduceError> {
             fs::copy(entry.path(), to.join(entry.file_name()))?;
         }
     }
+    Ok(())
+}
+
+/// The PDFium library `acquire pdfium` staged for the target, written where and
+/// with the mode the release writes it; the PDF worker loads it from
+/// `<prefix>/lib/solstone-core-pdf` beside its `bin`.
+fn copy_pdfium(
+    repo: &Path,
+    target_id: &str,
+    dest_dir: &str,
+    out: &Path,
+) -> Result<(), ProduceError> {
+    let spec = pdfium::spec_for(target_id).ok_or_else(|| {
+        ProduceError::new(format!("missing required:\n  pdfium runtime {target_id}"))
+    })?;
+    let from = repo
+        .join(PDF_LINK_ROOT)
+        .join(spec.key)
+        .join(spec.library_name);
+    let bytes = fs::read(&from).map_err(|error| {
+        ProduceError::new(format!(
+            "dev-package needs the staged PDFium {} ({error}); run make check-rust-pdf-stage",
+            from.display()
+        ))
+    })?;
+    crate::stage::write_staged_file_mode(
+        out,
+        &format!("{dest_dir}/{}", spec.library_name),
+        &bytes,
+        pdfium::LIB_MODE,
+    )?;
     Ok(())
 }
 
@@ -264,5 +302,60 @@ mod tests {
             package.member("bin/solstone-core").unwrap(),
             out.join("bin/solstone-core")
         );
+    }
+
+    #[test]
+    fn the_package_carries_the_staged_pdf_library_for_its_target_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().join("debug");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::write(bin_dir.join("solstone-core-pdf"), b"pdf").unwrap();
+        let staged = tmp.path().join("target/pdfium-runtime-link/linux-x86_64");
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(staged.join("libpdfium.so"), b"pdf library").unwrap();
+        let pdf_library = |dest_dir: &str, target: &str| Entry::Pdfium {
+            class: None,
+            dest_dir: dest_dir.into(),
+            mode: 0o755,
+            identities: vec![],
+            targets: vec![target.into()],
+        };
+        let entries = [
+            Entry::Bin {
+                class: None,
+                package: "solstone-core-pdf".into(),
+                bin: "solstone-core-pdf".into(),
+                dest: "bin/solstone-core-pdf".into(),
+                mode: 0o755,
+                lane: "native".into(),
+                targets: vec![TARGET_LINUX_X86_64.into()],
+            },
+            pdf_library("lib/solstone-core-pdf", TARGET_LINUX_X86_64),
+            pdf_library("lib/other-target-pdf", "macos-arm64"),
+        ];
+        let out = tmp.path().join("pkg");
+        build(
+            tmp.path(),
+            &entries,
+            TARGET_LINUX_X86_64,
+            &DevPackageArgs {
+                out: out.clone(),
+                bin_dir,
+                runtime_root: tmp.path().join("target"),
+                source_commit: "0123abc".into(),
+            },
+        )
+        .unwrap();
+        let carried = out.join("lib/solstone-core-pdf/libpdfium.so");
+        assert_eq!(fs::read(&carried).unwrap(), b"pdf library");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&carried).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
+        assert!(!out.join("lib/other-target-pdf").exists());
     }
 }

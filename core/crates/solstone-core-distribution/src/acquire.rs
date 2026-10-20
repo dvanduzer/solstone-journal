@@ -25,7 +25,7 @@ const BUILDER_INPUTS: &str = "core/distribution/builder-inputs.toml";
 const ONNX_CACHE: &str = "target/speakers-analyze-runtime-cache";
 const ONNX_LINK_ROOT: &str = "target/speakers-analyze-runtime-link";
 const PDF_CACHE: &str = "target/pdfium-runtime-cache";
-const PDF_LINK_ROOT: &str = "target/pdfium-runtime-link";
+pub(crate) const PDF_LINK_ROOT: &str = "target/pdfium-runtime-link";
 
 #[derive(Debug)]
 pub struct AcquireError {

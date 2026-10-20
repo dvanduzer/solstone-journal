@@ -531,9 +531,11 @@ build-sandbox-processing:
 # run the binaries from dev-package/bin instead (a sandbox does). Fetches the
 # host target's pinned inputs into the catalog cache first, and carries the
 # ONNX Runtime build-sandbox-processing staged, which the helpers' rpath finds
-# beside their bin.
-dev-package: build-shipped-features build-sandbox-processing
+# beside their bin, and the pinned PDFium the PDF worker loads from
+# lib/solstone-core-pdf.
+dev-package: build-shipped-features build-sandbox-processing $(PDF_RUNTIME_HOST_LINK_DIR)
 	@$(REQUIRE_SUPPORTED_ONNX_HOST)
+	@set -eu; $(REQUIRE_PDF_HOST_RUNTIME)
 	$(SOLSTONE_DISTRIBUTION_ACQUIRE) acquire catalog-inputs --target $(ONNX_RUNTIME_HOST_TARGET)
 	$(SOLSTONE_DISTRIBUTION) dev-package "$(RUST_TARGET_DIR)/dev-package" --bin-dir "$(RUST_TARGET_DIR)/debug" --runtime-root "$(RUST_TARGET_DIR)" --source-commit "$$(git rev-parse HEAD)"
 
