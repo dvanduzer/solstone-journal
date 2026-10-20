@@ -57,7 +57,7 @@ def _parse_args(args: list[str]) -> argparse.Namespace:
         action="store_true",
         help=(
             "Service-context mode on hardware with no usable GPU: require the "
-            "local install to be refused before any download, with the cause persisted."
+            "local install to be refused before any download, with no download progress or installed target."
         ),
     )
     parser.add_argument(

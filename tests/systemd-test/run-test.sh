@@ -37,7 +37,7 @@
 #                       local-thinking-install.
 #   LOCAL_THINKING_EXPECT — "refusal" (default: GPU-less hardware refuses before
 #                       download) or "installed" (full download to terminal
-#                       installed; needs GPU_DEVICES).
+#                       installed; needs GPU_DEVICES), or "unknown" (admission only).
 #   GPU_DEVICES — space-separated host device paths to pass through (/dev/dri).
 #   CONTAINER_ENGINE — "docker" (default) or "podman".
 #
@@ -76,8 +76,8 @@ case "$mode" in
 esac
 
 case "$LOCAL_THINKING_EXPECT" in
-    refusal|installed) ;;
-    *) die "LOCAL_THINKING_EXPECT must be refusal or installed, got: $LOCAL_THINKING_EXPECT" ;;
+    refusal|installed|unknown) ;;
+    *) die "LOCAL_THINKING_EXPECT must be refusal, installed or unknown, got: $LOCAL_THINKING_EXPECT" ;;
 esac
 
 # Every container command below goes through the selected engine; podman
@@ -294,6 +294,15 @@ UNIT
         ;;
 
     local-thinking-install)
+        # --privileged populates the container's own /dev with host devices.
+        # Inaccessible real render nodes mean Unknown rather than Blocked.
+        # Control that input explicitly; no host /dev directory is mounted.
+        if [ -z "$GPU_DEVICES" ]; then
+            docker exec "$CONTAINER" sh -c 'mkdir -p /dev/dri; rm -f /dev/dri/card* /dev/dri/renderD*'
+            if [ "$LOCAL_THINKING_EXPECT" = "unknown" ]; then
+                docker exec "$CONTAINER" sh -c 'touch /dev/dri/renderD128; chmod 000 /dev/dri/renderD128'
+            fi
+        fi
         log "local-thinking-install: apt install solstone-journal .deb"
         docker exec -u "$TEST_USER" "$CONTAINER" bash -lc "$install_solstone_cmd"
 
@@ -320,11 +329,29 @@ UNIT
         # loopback API so the test reaches the authenticated product surface by
         # the same state transition as an owner, instead of manufacturing
         # setup.completed_at in the journal fixture.
+        if [ "$LOCAL_THINKING_EXPECT" != "installed" ]; then
+            log "local-thinking-install: assert native GPU classification"
+            docker exec -e LOCAL_THINKING_EXPECT="$LOCAL_THINKING_EXPECT" -u "$TEST_USER" "$CONTAINER" bash -lc '
+                set -euo pipefail
+                solstone journal check --json >/var/tmp/journal-check.json || check_rc=$?
+                python3 -c "
+import json, os
+checks = json.load(open(\"/var/tmp/journal-check.json\"))[\"checks\"]
+gpu = [c[\"severity\"] for c in checks if c[\"name\"] == \"gpu\"]
+expected = \"unknown\" if os.environ[\"LOCAL_THINKING_EXPECT\"] == \"unknown\" else \"blocked\"
+assert gpu == [expected], (expected, gpu)
+"
+            '
+        fi
         log "local-thinking-install: complete loopback onboarding ceremony"
         docker exec -e LOCAL_THINKING_EXPECT="$LOCAL_THINKING_EXPECT" -u "$TEST_USER" "$CONTAINER" bash -lc '
             set -euo pipefail
             port=$(cat "$HOME/journal/health/convey.port")
             origin="http://127.0.0.1:${port}"
+            curl --fail-with-body --silent --show-error \
+                "$origin/init/api/state" >/var/tmp/init-state-before.json
+            curl --fail-with-body --silent --show-error \
+                "$origin/init/api/local-capability" >/var/tmp/local-capability.json
             curl --fail-with-body --silent --show-error \
                 -X POST -H "Content-Type: application/json" -d "{}" \
                 "$origin/init/mark/regenerate" >/tmp/init-mark-regenerate.json
@@ -345,10 +372,47 @@ UNIT
                 test "$code" = 400
                 grep -q local_unavailable /tmp/init-finalize-local.json
             fi
+            lane=later
+            if [ "$LOCAL_THINKING_EXPECT" = "unknown" ]; then lane=local; fi
             curl --fail-with-body --silent --show-error \
-                -X POST -H "Content-Type: application/json" -d "{\"lane\":\"later\"}" \
+                -X POST -H "Content-Type: application/json" -d "{\"lane\":\"${lane}\"}" \
                 "$origin/init/finalize" >/tmp/init-finalize.json
+            curl --fail-with-body --silent --show-error \
+                "$origin/init/api/state" >/var/tmp/init-state-after.json
         '
+
+        if [ "$LOCAL_THINKING_EXPECT" = "unknown" ]; then
+            log "local-thinking-install: prove Unknown capability/setup admission"
+            if docker exec -u "$TEST_USER" "$CONTAINER" bash -lc '
+                set -euo pipefail
+                cd /harness
+                python3 -c "
+import hashlib, json
+from pathlib import Path
+from tools.local_thinking_install.harness import classify_unknown_setup
+read = lambda name: json.loads(Path(\"/var/tmp/\" + name + \".json\").read_text())
+capability = read(\"local-capability\")
+before, after = read(\"init-state-before\"), read(\"init-state-after\")
+classification, note = classify_unknown_setup(capability, before, after)
+receipt = dict(classification=classification, note=note, capability=capability,
+               before=before, after=after, native_check=read(\"journal-check\"))
+receipt[\"provenance\"] = {name: hashlib.file_digest(open(\"/usr/bin/\" + name, \"rb\"), \"sha256\").hexdigest()
+                           for name in (\"solstone-core\", \"solstone-core-journal\")}
+out = Path(\"/var/tmp/lti-systemd\")
+out.mkdir()
+(out / \"receipt.json\").write_text(json.dumps(receipt, indent=2))
+assert classification == \"unknown_setup_admitted\", note
+"
+            '; then
+                unknown_rc=0
+            else
+                unknown_rc=$?
+            fi
+            docker cp "$CONTAINER:/var/tmp/lti-systemd/." "$LOCAL_THINKING_RECEIPT_DIR/"
+            if [ "$unknown_rc" -ne 0 ]; then exit "$unknown_rc"; fi
+            log "local-thinking-install: PASS Unknown capability/setup; installation not qualified"
+            exit 0
+        fi
 
         # The generic container has no usable GPU, and the product refuses a
         # local install there before downloading, so by default prove that
@@ -384,6 +448,14 @@ UNIT
             exit "$harness_rc"
         fi
         log "local-thinking-install: PASS; receipt copied to $LOCAL_THINKING_RECEIPT_DIR"
+        if [ "$LOCAL_THINKING_EXPECT" = "refusal" ] && [ -z "$GPU_DEVICES" ]; then
+            # Preserve the refusal receipt and require the opposite outcome in
+            # an independent service/journal cell using the same installed deb.
+            LOCAL_THINKING_EXPECT=unknown \
+                CONTAINER="${CONTAINER}-unknown" \
+                LOCAL_THINKING_RECEIPT_DIR="$LOCAL_THINKING_RECEIPT_DIR/unknown" \
+                "$0" local-thinking-install
+        fi
         ;;
 
     legacy-upgrade)
