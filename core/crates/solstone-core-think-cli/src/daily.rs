@@ -2820,7 +2820,7 @@ cat "${0%/*}/review-response.json"
             (
                 "morning_briefing",
                 json!({"priority":3,"output":"json","hook":{"pre":"morning_briefing"},"load":{"transcripts":false}}),
-                "BRIEFING_PROOF: $activity_digest $anticipated_today",
+                "BRIEFING_PROOF: $briefing_metadata $activity_digest $anticipated_today",
             ),
         ] {
             let mut metadata = metadata.as_object().unwrap().clone();
