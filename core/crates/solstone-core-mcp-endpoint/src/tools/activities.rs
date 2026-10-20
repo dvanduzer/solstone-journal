@@ -22,7 +22,9 @@ use crate::permissions::ConnectionReadSnapshot;
 use crate::references::{
     ActivityListCursor, ActivityReference, ReferenceKind, ReferenceTarget, is_framed_entity_token,
 };
-use crate::segment_links::{LinkSubject, LiveTranscriptPages, issue_segment_links};
+use crate::segment_links::{
+    LinkSubject, LiveTranscriptPages, activity_segment_candidates, issue_segment_links,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ValidatedListActivities {
@@ -509,7 +511,7 @@ pub(crate) fn execute_list(
                 continue;
             }
             targets.push(format!("facets/{facet_dir}/activities/{day}.jsonl"));
-            let _ =
+            let normalized =
                 solstone_core_facets::read_activity_records_strict(journal_root, facet_dir, &day)
                     .map_err(|_| DispatchError::Tool(ToolError::FileUnreadable))?;
 
@@ -522,7 +524,7 @@ pub(crate) fn execute_list(
             let Ok(text) = String::from_utf8(bytes) else {
                 return Err(DispatchError::Tool(ToolError::FileUnreadable));
             };
-
+            let mut raw_rows = Vec::new();
             for line in text.lines() {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
@@ -531,11 +533,20 @@ pub(crate) fn execute_list(
                 let Ok(Value::Object(record)) = serde_json::from_str::<Value>(trimmed) else {
                     return Err(DispatchError::Tool(ToolError::FileUnreadable));
                 };
-                if record
+                raw_rows.push((record, trimmed.to_owned()));
+            }
+            if raw_rows.len() != normalized.len() {
+                return Err(DispatchError::Tool(ToolError::FileUnreadable));
+            }
+
+            for ((record, trimmed), normalized_row) in raw_rows.into_iter().zip(normalized) {
+                // Same predicate as load_activity_records(..., include_hidden: false).
+                // Identity stays the raw line, not the normalized object.
+                let hidden = normalized_row
                     .get("hidden")
                     .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                {
+                    .unwrap_or(false);
+                if hidden {
                     continue;
                 }
                 let entities = activity_entities(&record);
@@ -555,7 +566,8 @@ pub(crate) fn execute_list(
                         continue;
                     }
                 }
-                let rec_identity = crate::activity_admit::compute_record_identity(&record, trimmed);
+                let rec_identity =
+                    crate::activity_admit::compute_record_identity(&record, &trimmed);
                 let sort_key = sort_activity_key(&day, facet_id, &record);
                 collected.push(CollectedItem {
                     sort_key,
@@ -718,22 +730,38 @@ pub(crate) fn execute_get_sources(
             .when_empty("This activity has no transcript sources."));
     }
 
-    let stream = record
-        .get("stream")
-        .and_then(Value::as_str)
-        .unwrap_or("default");
     let activity_kind = record.get("activity").and_then(Value::as_str).unwrap_or("");
 
     let transcript_boundary = boundary(snapshot, Some(AdmittedCategory::Transcripts), None);
     let mut admitted_transcripts = Vec::new();
     let mut any_denied_or_unreadable = false;
     let mut segment_link_map = std::collections::BTreeMap::new();
-
+    let candidates = activity_segment_candidates(journal_root, &rel_path, &record);
+    let mut ordered = Vec::new();
     for seg_val in segment_vals {
-        let Some(seg_key) = seg_val.as_str() else {
+        let Some(key) = seg_val.as_str() else {
             any_denied_or_unreadable = true;
             continue;
         };
+        let matched: Vec<_> = candidates
+            .iter()
+            .filter(|segment| segment.name().to_str() == Some(key) || segment.key() == key)
+            .cloned()
+            .collect();
+        if matched.is_empty() {
+            any_denied_or_unreadable = true;
+            continue;
+        }
+        ordered.extend(matched);
+    }
+
+    for segment in ordered {
+        let Ok(identity) = segment.record_identity() else {
+            any_denied_or_unreadable = true;
+            continue;
+        };
+        let stream = identity.stream;
+        let seg_key = identity.name;
         let probe_path = segment_assignment_probe_path(&activity_ref.day, stream, seg_key);
         if !live_allows(
             journal_root,
@@ -761,24 +789,6 @@ pub(crate) fn execute_get_sources(
             any_denied_or_unreadable = true;
             continue;
         }
-
-        let seg_res = solstone_core_journal_io::Segment::resolve_exact(
-            journal_root,
-            &activity_ref.day,
-            stream,
-            seg_key,
-        );
-        let segment = match seg_res {
-            Ok(Some(s)) => s,
-            _ => {
-                #[cfg(feature = "test-hooks")]
-                crate::source_freeze_barrier::checkpoint(
-                    crate::source_freeze_barrier::FreezePoint::After,
-                );
-                any_denied_or_unreadable = true;
-                continue;
-            }
-        };
 
         let mut segment_lines = Vec::new();
         let mut cursor = None;
@@ -852,6 +862,9 @@ pub(crate) fn execute_get_sources(
         let formatted = compose_segment_source(heading.as_deref(), &segment_lines);
         let mut dummy_record = record.clone();
         dummy_record.insert("segments".to_string(), json!([seg_key]));
+        // This candidate's identity, so a streamless record's other matches
+        // do not take the link.
+        dummy_record.insert("stream".to_string(), json!(stream));
         let mut single_subject = [LinkSubject {
             path: &rel_path,
             idx: 0,

@@ -1655,10 +1655,12 @@ fn fetch(
             {
                 ActivityAdmit::Admitted(a) => {
                     let cleaned =
-                        crate::tools::activities::clean_activity_record_for_wire(a.record);
+                        crate::tools::activities::clean_activity_record_for_wire(a.record.clone());
                     let cleaned_text = serde_json::to_string(&cleaned)
                         .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?;
-                    (cleaned_text, Some(a.hidden), Some(cleaned))
+                    // Links resolve from the admitted record. Cleaning drops
+                    // `stream`, and the resolver would then cross streams.
+                    (cleaned_text, Some(a.hidden), Some(a.record))
                 }
                 ActivityAdmit::NotActivity(content) => {
                     let text = match markdown_fetch(
@@ -1761,9 +1763,8 @@ fn fetch(
 
             let hidden = record
                 .get("hidden")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let cleaned = crate::tools::activities::clean_activity_record_for_wire(record);
+                .is_some_and(solstone_core_facets::activity_value_truthy);
+            let cleaned = crate::tools::activities::clean_activity_record_for_wire(record.clone());
             let text = serde_json::to_string(&cleaned)
                 .map_err(|_| DispatchError::Tool(ToolError::ReferenceNotFound))?;
 
@@ -1779,7 +1780,7 @@ fn fetch(
                 text: &text,
                 segments: Vec::new(),
                 more_segments: false,
-                activity_record: Some(&cleaned),
+                activity_record: Some(&record),
             }];
             let mut checker = LiveTranscriptPages;
             let mut response_checks = 0;

@@ -163,6 +163,29 @@ pub(crate) fn issue_segment_links(
     }
 }
 
+/// Segments named by an activity record, under the same stream rules as
+/// [`resolve_candidates`]. A missing stream stays missing: it is not rewritten
+/// to the named stream `default`, and direct segments keep the `_default` identity.
+pub(crate) fn activity_segment_candidates(
+    journal_root: &Path,
+    activity_path: &str,
+    record: &Map<String, Value>,
+) -> Vec<Segment> {
+    let mut day_cache = BTreeMap::new();
+    let subject = LinkSubject {
+        path: activity_path,
+        idx: 0,
+        text: "",
+        segments: Vec::new(),
+        more_segments: false,
+        activity_record: Some(record),
+    };
+    resolve_candidates(journal_root, &subject, &mut day_cache)
+        .into_iter()
+        .map(|(_, segment)| segment)
+        .collect()
+}
+
 fn resolve_candidates(
     journal_root: &Path,
     subject: &LinkSubject<'_>,
