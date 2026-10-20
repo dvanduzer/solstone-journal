@@ -299,6 +299,27 @@ function display() {
 
 function show(section) {
   for (const id of ['loading', 'firstrun', 'main']) $(id).hidden = id !== section;
+  syncSetupGround();
+}
+
+// The sun arc behind the setup frame. It lives outside #firstrun, which is rebuilt on every
+// refresh, and is torn down (its clock and listeners stopped) whenever the frame is not showing.
+let setupSun = null;
+
+function syncSetupGround() {
+  const ground = $('setup-ground');
+  const root = $('firstrun');
+  if (!ground || !root) return;
+  const framed = !root.hidden && root.getAttribute('data-phase') != null;
+  if (framed && !setupSun && window.SunArc) {
+    ground.hidden = false;
+    setupSun = window.SunArc.mount(ground);
+    if (!setupSun) ground.hidden = true;
+  } else if (!framed && setupSun) {
+    setupSun.teardown();
+    setupSun = null;
+    ground.hidden = true;
+  }
 }
 
 // --- status --------------------------------------------------------------
@@ -622,6 +643,7 @@ function clearSetupFrame() {
     root.replaceChildren();
     root.removeAttribute('data-phase');
   }
+  syncSetupGround();
 }
 
 function setupStep(view) {

@@ -397,6 +397,18 @@ globalThis.DOMParser = class {
 globalThis.document = document;
 globalThis.window = globalThis;
 
+// The sun arc engine (sunarc.js) as the window loads it: a global the page mounts on its ground.
+const sunArc = { mounts: 0, teardowns: 0, live: 0, overlap: false, root: null };
+globalThis.SunArc = {
+  mount(element) {
+    if (sunArc.live > 0) sunArc.overlap = true;
+    sunArc.mounts += 1;
+    sunArc.live += 1;
+    sunArc.root = element;
+    return { teardown() { sunArc.teardowns += 1; sunArc.live -= 1; } };
+  },
+};
+
 const intervals = new Map();
 const realSetInterval = globalThis.setInterval.bind(globalThis);
 globalThis.setInterval = (fn, ms, ...args) => {
@@ -406,7 +418,7 @@ globalThis.setInterval = (fn, ms, ...args) => {
   return timer;
 };
 
-const ids = ['loading', 'firstrun', 'main', 'panes', 'pane', 'admin-terminal', 'quit', 'overlay', 'overlay-text'];
+const ids = ['loading', 'setup-ground', 'firstrun', 'main', 'panes', 'pane', 'admin-terminal', 'quit', 'overlay', 'overlay-text'];
 for (const id of ids) {
   if (!html.includes(`id="${id}"`)) throw new Error(`index.html is missing #${id}`);
   const tag = id === 'pane' ? 'main' : id === 'panes' ? 'ul' : id === 'firstrun' ? 'section' : 'div';
@@ -2033,5 +2045,39 @@ paint(view({ phase: 'thinking', step: 4, thinking_capability: 'ok', thinking_sav
   thinking_cancel: true, downloads: { thinking: { state: 'downloading', bytes_done: 1, bytes_total: 2, attempt_id: '  ' } } }));
 if (root().querySelector('[data-focus-key="thinking:cancel"]')) throw new Error('cancel shows without an attempt id');
 pass('cancel needs a painted attempt id');
+
+// The sun arc ground: mounted once while the setup frame shows, outside the node every refresh
+// rebuilds, and torn down when the frame goes.
+{
+  const ground = $('setup-ground');
+  if (!ground || root().contains(ground)) throw new Error('the sun arc ground is missing or inside the rebuilt setup frame');
+  if (ground.hidden || sunArc.live !== 1 || sunArc.root !== ground) throw new Error(`setup does not show one live sun arc on its ground (live ${sunArc.live})`);
+  const mounts = sunArc.mounts;
+  for (let done = 1; done <= 3; done += 1) {
+    paint(view({ phase: 'thinking', step: 4, thinking_capability: 'ok', local_offered: true, can_finalize: true, watch_downloads: true,
+      downloads: { speech: { state: 'downloading', bytes_done: done * 1000000, bytes_total: 4000000, attempt_id: 'a1' } } }));
+  }
+  if (sunArc.mounts !== mounts || $('setup-ground') !== ground || ground.hidden) throw new Error('a download repaint remounted or hid the sun arc');
+  paint(view({ phase: 'thinking', step: 4, resting: true }));
+  if (!visible($('main')) || !ground.hidden || sunArc.live !== 0) throw new Error(`leaving setup did not tear the sun arc down (live ${sunArc.live})`);
+  paint(view({ phase: 'welcome', step: 1 }));
+  if (ground.hidden || sunArc.live !== 1 || sunArc.mounts !== mounts + 1) throw new Error('returning to setup did not mount the sun arc again');
+  if (sunArc.overlap) throw new Error('two sun arcs were live at once');
+}
+pass('the sun arc lives outside the setup frame, survives repaints and is torn down on leaving');
+
+// The window serves the engine and the mark at the path the engine asks for, and loads the engine first.
+{
+  const engine = readFileSync(join(here, '../../solstone-core-convey-shell/assets/static/sunarc.js'), 'utf8');
+  if (!engine.includes("'/static/sol-status/mark.svg'")) throw new Error('sunarc.js no longer asks for /static/sol-status/mark.svg; move the asset() row with it');
+  if (!appRsText.includes('"/static/sol-status/mark.svg"') || !appRsText.includes('assets/static/sol-status/mark.svg")')) {
+    throw new Error('app.rs does not serve the sun mark at /static/sol-status/mark.svg');
+  }
+  if (!appRsText.includes('"/sunarc.js"') || !appRsText.includes('assets/static/sunarc.js")')) throw new Error('app.rs does not serve /sunarc.js');
+  const engineTag = html.indexOf('<script src="sunarc.js"></script>');
+  if (engineTag < 0 || engineTag > html.indexOf('src="app.js"')) throw new Error('index.html does not load sunarc.js before app.js');
+  if (html.indexOf('id="setup-ground"') > html.indexOf('id="firstrun"')) throw new Error('#setup-ground must precede #firstrun for the ground rule');
+}
+pass('the sun arc engine and mark are served and loaded before the app');
 
 console.log(`DOM CASES: ${passed} passed`);

@@ -50,6 +50,16 @@ fn asset(path: &str) -> Option<(&'static [u8], &'static str)> {
             include_bytes!("../../solstone-core-convey-shell/assets/static/pairing-qr.js"),
             "text/javascript",
         ),
+        // The sun arc behind setup: the journal's own engine and the mark it draws, at the
+        // path the engine asks for.
+        "/sunarc.js" => (
+            include_bytes!("../../solstone-core-convey-shell/assets/static/sunarc.js"),
+            "text/javascript",
+        ),
+        "/static/sol-status/mark.svg" => (
+            include_bytes!("../../solstone-core-convey-shell/assets/static/sol-status/mark.svg"),
+            "image/svg+xml",
+        ),
         "/tokens.css" => (
             include_bytes!("../../solstone-core-convey-shell/assets/static/tokens.css"),
             "text/css",
