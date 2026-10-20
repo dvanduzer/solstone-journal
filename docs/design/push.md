@@ -103,7 +103,7 @@ Headerless re-register, key replacement, token/endpoint change, steal, deregiste
 removal withdraw the grant. A stale, malformed, unreadable, or missing capability file does
 not grant presentation and does not block English delivery.
 
-A capability read or write failure never turns register into 503; the register still succeeds and delivery stays English-only; a failed capability update stores a later `registered_at` that does not reuse the clock value, a current registry row timestamp, or a known grant timestamp, which `parse_registered_at` accepts, so the stale grant does not match. Registry lock and registry write failures stay 503.
+A capability read or write failure never turns register into 503; the register still succeeds and delivery stays English-only. `registered_at` stays the clock value unless it must advance so a stale grant cannot match: the capability file is unreadable and the clear write fails, or a clear of withdrawn identities fails while an existing grant matches the clock value. That later value does not reuse the clock value, a current registry row timestamp, or a known grant timestamp, which `parse_registered_at` accepts. Registry lock and registry write failures stay 503.
 
 ### Migration and Rollback
 
