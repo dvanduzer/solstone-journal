@@ -1030,7 +1030,7 @@ mod tests {
     fn same_path_stream_lookup_uses_lowest_rowid_for_classification() {
         let root = temp_root("same-path-stream");
         let conn = open_index(&root).expect("open index");
-        let path = "facets/Work/news/20260107.md";
+        let path = "facets/Work/activities/20260107.jsonl";
         let declarations = FacetDeclarationSet::default();
 
         // Lowest rowid stream SQL NULL, later rowid stream mcp.agent

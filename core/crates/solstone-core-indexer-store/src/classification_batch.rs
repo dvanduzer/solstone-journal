@@ -904,7 +904,7 @@ mod tests {
     fn classification_batch_missing_facet_memberships_restarts_without_losing_search() {
         for complete in [false, true] {
             let root = temp_root("missing-facet-memberships");
-            fs::create_dir_all(root.join("facets/Public/news")).unwrap();
+            fs::create_dir_all(root.join("facets/Public/activities")).unwrap();
             fs::write(
                 root.join("facets/Public/facet.json"),
                 r#"{"id":"a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"}"#,
@@ -912,8 +912,8 @@ mod tests {
             .unwrap();
             let conn = crate::db::open_index(&root).unwrap();
             for i in 0..STEP + 8 {
-                let path = format!("facets/Public/news/20260101-{i:03}.md");
-                fs::write(root.join(&path), "# News\nsearchable fixture").unwrap();
+                let path = format!("facets/Public/activities/20260101-{i:03}.jsonl");
+                fs::write(root.join(&path), "{\"title\":\"searchable fixture\"}\n").unwrap();
                 conn.execute(
                     "INSERT INTO chunks(content, path) VALUES ('fixture', ?1)",
                     [&path],
@@ -1215,12 +1215,12 @@ mod tests {
         let root = temp_root("unreadable-facet-json");
         let conn = crate::db::open_index(&root).expect("open");
         conn.execute(
-            "INSERT INTO chunks(content, path) VALUES ('text', 'facets/Secret/news/20260101.md')",
+            "INSERT INTO chunks(content, path) VALUES ('text', 'facets/Secret/activities/20260101.jsonl')",
             [],
         )
         .expect("seed secret");
         conn.execute(
-            "INSERT INTO chunks(content, path) VALUES ('text', 'facets/Public/news/20260101.md')",
+            "INSERT INTO chunks(content, path) VALUES ('text', 'facets/Public/activities/20260101.jsonl')",
             [],
         )
         .expect("seed public");
@@ -1251,8 +1251,8 @@ mod tests {
         let conn = Connection::open_with_flags(db_path(&root), OpenFlags::SQLITE_OPEN_READ_ONLY)
             .expect("read classifications");
         for (path, expected) in [
-            ("facets/Secret/news/20260101.md", 1_i64),
-            ("facets/Public/news/20260101.md", 0_i64),
+            ("facets/Secret/activities/20260101.jsonl", 1_i64),
+            ("facets/Public/activities/20260101.jsonl", 0_i64),
         ] {
             let actual: i64 = conn
                 .query_row(
