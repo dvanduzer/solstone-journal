@@ -5280,7 +5280,8 @@ mod tests {
 /// Desktop key probe. `OneShotKeyValidator::at_path` is the process arm:
 /// `OneShotClient::at_path`, the three override environment variables, and
 /// `execute` of the canned validation request. This is not `respond`.
-#[cfg(all(test, feature = "full-tests"))]
+// The stub is a shebang script, which only a unix host executes.
+#[cfg(all(test, unix, feature = "full-tests"))]
 mod desktop_probe {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -5483,65 +5484,44 @@ mod desktop_probe {
         String::from_utf8_lossy(bytes).into_owned()
     }
 
+    // The stub is bash, not an interpreter the Rust gate forbids, so this case
+    // runs the same way in the full gate as it does locally.
     fn stub_script(port: u16, receipt_path: &Path) -> String {
         format!(
-            r#"#!/usr/bin/env python3
-import json, os, socket, sys
-stdin = sys.stdin.read()
-receipt = {{
-    "provider": os.environ.get({provider_env:?}, ""),
-    "model": os.environ.get({model_env:?}, ""),
-    "secret": os.environ.get({secret_env:?}, ""),
-}}
-with open({receipt_path:?}, "w", encoding="utf-8") as handle:
-    json.dump(receipt, handle)
-sentence = "Reply with the single word OK."
-payload = sentence.encode() if sentence in stdin else b"STDIN-LACKS-CANNED-SENTENCE"
-request = (
-    b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: %d\r\nConnection: close\r\n\r\n"
-    % len(payload)
-) + payload
-sock = socket.create_connection(("127.0.0.1", {port}), 30)
-sock.sendall(request)
-data = b""
-while True:
-    chunk = sock.recv(4096)
-    if not chunk:
-        break
-    data += chunk
-head, _, _body = data.partition(b"\r\n\r\n")
-status = int(head.split()[1])
-if status != 200:
-    sys.stderr.write(data.decode("utf-8", "replace"))
-    sys.exit(1)
-sys.stdout.write(json.dumps({{
-    "schema": "solstone-generate-response-v2",
-    "outcome": "generated",
-    "text": "OK",
-    "model": "solstone-key-check",
-    "usage": {{}},
-    "finish_reason": "stop",
-}}))
+            r#"#!/bin/bash
+set -u
+stdin=$(cat)
+printf '{{"provider":"%s","model":"%s","secret":"%s"}}' \
+    "${{{provider_env}:-}}" "${{{model_env}:-}}" "${{{secret_env}:-}}" > '{receipt_path}'
+sentence='Reply with the single word OK.'
+case "$stdin" in
+    *"$sentence"*) payload=$sentence ;;
+    *) payload=STDIN-LACKS-CANNED-SENTENCE ;;
+esac
+exec 3<>/dev/tcp/127.0.0.1/{port} || exit 1
+printf 'POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s' \
+    "${{#payload}}" "$payload" >&3
+response=$(cat <&3)
+status_line=${{response%%$'\r'*}}
+status=${{status_line#* }}
+status=${{status%% *}}
+if [ "$status" != 200 ]; then
+    printf '%s' "$response" >&2
+    exit 1
+fi
+printf '%s' '{{"schema":"solstone-generate-response-v2","outcome":"generated","text":"OK","model":"solstone-key-check","usage":{{}},"finish_reason":"stop"}}'
 "#,
             provider_env = PROVIDER_OVERRIDE_ENV,
             model_env = MODEL_OVERRIDE_ENV,
             secret_env = API_KEY_OVERRIDE_ENV,
-            receipt_path = receipt_path,
+            receipt_path = receipt_path.display(),
             port = port,
         )
     }
 
     fn make_executable(path: &Path) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-                .expect("stub mode");
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = path;
-        }
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("stub mode");
     }
 
     fn spawn_content_child(journal: &Path, port: u16) -> std::process::Child {
