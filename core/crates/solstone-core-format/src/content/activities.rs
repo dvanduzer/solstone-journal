@@ -88,37 +88,19 @@ pub(super) fn render(rel: Option<&str>, records: &[JsonObject]) -> ProducedChunk
 /// owner's search view reads at 16 KiB and an agent's fetch at 64 KiB.
 const READ_LIMITS: [usize; 2] = [16 * 1024, 64 * 1024];
 const OMITTED: &str = "\n\nNot everything saved with this activity fit in this entry. The full activity record has all of it.";
-const PARTIAL: &str = "\n\nThis story, and anything saved with it, was written from part of the activity, not all of it.";
 const STORED_ARRAYS: [(&str, &str); 1] = [("relations", "Saved relation")];
 
-/// Append a record's saved relations, and whether its story saw only part of
-/// its input, after the rendered text.
-///
-/// The rendered text is never shortened: search over it must keep matching
-/// what it matched before. Only additions are bounded, by the smallest read
-/// limit the rendered text already fits, so an entry every reader could fetch
-/// stays fetchable by each of them. Each entry goes in whole or not at all, a
-/// later smaller one can still fit, and a skipped one leaves a notice. When the
-/// rendered text has no room for that notice (and the partial-input note, when
-/// the story has one), it is returned exactly as it was.
+/// Append whole saved relations within the existing read limit.
+/// The shared chunk renderer separately reserves space for input limitations.
 fn with_stored_details(mut text: String, record: &JsonObject) -> String {
     let Some(limit) = READ_LIMITS.into_iter().find(|limit| text.len() <= *limit) else {
         return text;
     };
     let limit = limit - OMITTED.len();
-    let partial = record
-        .get("story")
-        .and_then(|story| story.get("partial_input"))
-        .filter(|value| value.is_object());
-    let reserve = if partial.is_some() { PARTIAL.len() } else { 0 };
-    if text.len() + reserve > limit {
+    if text.len() > limit {
         return text;
     }
     let mut additions = Vec::new();
-    if let Some(partial) = partial {
-        text.push_str(PARTIAL);
-        additions.push(format!("\nLeft out: {partial}"));
-    }
     for (key, label) in STORED_ARRAYS {
         if let Some(Value::Array(items)) = record.get(key) {
             additions.extend(items.iter().map(|item| format!("\n\n{label}: {item}")));
@@ -283,7 +265,8 @@ fn parse_segment(segment: &str) -> Option<(u32, u32, u32, u32)> {
 mod tests {
     use serde_json::{Value, json};
 
-    use super::{JsonObject, OMITTED, PARTIAL, normalize_record, render};
+    use super::{JsonObject, OMITTED, normalize_record, render};
+    const PARTIAL: &str = "\n\nThis story, and anything saved with it, was written from part of the activity, not all of it.";
 
     fn object(value: Value) -> JsonObject {
         value.as_object().expect("object").clone()
@@ -403,17 +386,16 @@ mod tests {
         let text = rendered(&record);
         assert_eq!(
             &text[legacy(&record).len()..],
-            format!("{PARTIAL}\nLeft out: {partial}")
+            format!("{PARTIAL}\nLeft out: dropped_entries: 3, dropped_chars: 1200")
         );
 
         let huge = json!({"dropped_entries": 3, "note": "n".repeat(70_000)});
         let record =
             object(json!({"title": "Chat", "story": {"body": "Talked.", "partial_input": huge}}));
         let text = rendered(&record);
-        assert_eq!(
-            &text[legacy(&record).len()..],
-            format!("{PARTIAL}{OMITTED}")
-        );
+        assert!(text.contains(PARTIAL));
+        assert!(text.contains("dropped_entries: 3"));
+        assert!(!text.contains(&"n".repeat(1000)));
 
         for partial in [Value::Null, json!(true), json!("partial")] {
             let record = object(
@@ -424,7 +406,7 @@ mod tests {
     }
 
     #[test]
-    fn a_partial_story_without_room_for_its_note_keeps_the_exact_rendering() {
+    fn a_partial_story_reserves_space_for_its_note() {
         let record = object(json!({"title": "Chat", "relations": ["a"]}));
         let record = sized(record, 16 * 1024 - OMITTED.len() - PARTIAL.len() + 1);
         let mut partial = record.clone();
@@ -432,7 +414,9 @@ mod tests {
             "story".into(),
             json!({"body": record["story"]["body"], "partial_input": {"dropped_entries": 1}}),
         );
-        assert_eq!(rendered(&partial), legacy(&partial));
+        assert!(rendered(&partial).contains(PARTIAL));
+        assert!(rendered(&partial).len() <= 16 * 1024);
+        assert_ne!(rendered(&partial), legacy(&partial));
         assert_ne!(rendered(&record), legacy(&record));
     }
 }

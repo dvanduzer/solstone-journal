@@ -216,6 +216,7 @@ pub fn prepare_daily_output(
             no_output: true,
         });
     };
+    let output = crate::partial_input::output(output, prepared);
     let action = prepare_frozen_output_action(
         &context.journal,
         Path::new(path),
@@ -299,6 +300,7 @@ pub fn prepare_daily_publication(
     prepared: &PreparedTalent,
     context: &ExecutionContext,
 ) -> Result<PreparedDailyPublication, StageError> {
+    let plan = crate::partial_input::decorate(plan, prepared);
     let root = &context.journal;
     let mut actions = Vec::new();
     if let CommitPlan::Write(intent) = &plan {

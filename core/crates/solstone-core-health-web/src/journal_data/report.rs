@@ -536,6 +536,9 @@ pub(crate) fn build_synthesis_health(
                 );
                 let day = string(row.get("day"));
                 let message = match degraded.get("reason").and_then(Value::as_str) {
+                    Some("partial_input") => {
+                        format!("a result on {day} was written from part of its input")
+                    }
                     Some("story_rejected") => {
                         format!("an activity's story on {day} couldn't be used ({usage})")
                     }
@@ -1689,6 +1692,33 @@ mod tests {
             notes
                 .iter()
                 .any(|note| note.message.contains("story on 20260410"))
+        );
+    }
+
+    #[test]
+    fn useful_clipped_outputs_are_degraded_without_failure_or_unusable_copy() {
+        let temporary = temporary();
+        healthy_talent_guards(temporary.path(), now());
+        talent_rows(
+            temporary.path(),
+            "20260410",
+            &[
+                json!({"ts":now().timestamp_millis(),"status":"completed","degraded":{"reason":"partial_input","partial_input":{"dropped_entries":2}},"name":"sense","day":"20260410"}),
+            ],
+        );
+        let (health, notes) =
+            build_synthesis_health(temporary.path(), &ScanAggregate::default(), now()).unwrap();
+        assert_eq!(health.talent_degraded_outputs_24h, Some(1));
+        assert_eq!(health.talent_run_failures_24h, Some(0));
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.message.contains("written from part of its input"))
+        );
+        assert!(
+            !notes
+                .iter()
+                .any(|note| note.message.contains("without a usable result"))
         );
     }
 

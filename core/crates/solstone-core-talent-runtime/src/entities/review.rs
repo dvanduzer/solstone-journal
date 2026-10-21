@@ -667,7 +667,8 @@ pub fn prepare_publication(
             batch: solstone_core_entity::prepare_merge_proposals(journal, &proposals)?,
         });
     }
-    let outcome = serde_json::json!({"promoted":promoted,"aliased":aliased,"merges":proposals.len(),"skipped":skipped,"errored":0,"error":null,"ts":chrono::Utc::now().timestamp_millis()});
+    let mut outcome = serde_json::json!({"promoted":promoted,"aliased":aliased,"merges":proposals.len(),"skipped":skipped,"errored":0,"error":null,"ts":chrono::Utc::now().timestamp_millis()});
+    crate::partial_input::copy_marker(output, outcome.as_object_mut().expect("outcome object"));
     let path = journal
         .join("facets")
         .join(facet)
@@ -887,8 +888,7 @@ pub(crate) fn apply_result_cancellable(
         error = Some(detail);
     }
     crate::writers::check_cancellation(cancellation)?;
-    write_outcome(journal, facet, day, &counts, error.as_deref());
-    Ok(())
+    write_outcome(journal, facet, day, &counts, error.as_deref(), output)
 }
 
 fn write_outcome(
@@ -897,7 +897,8 @@ fn write_outcome(
     day: &str,
     counts: &BTreeMap<&str, usize>,
     error: Option<&str>,
-) {
+    output: &str,
+) -> Result<(), String> {
     let path = journal
         .join("facets")
         .join(facet)
@@ -916,9 +917,10 @@ fn write_outcome(
         Value::from(chrono::Utc::now().timestamp_millis()),
     );
     if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let _ = fs::write(path, format!("{}\n", Value::Object(payload)));
+    crate::partial_input::copy_marker(output, &mut payload);
+    fs::write(path, format!("{}\n", Value::Object(payload))).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
