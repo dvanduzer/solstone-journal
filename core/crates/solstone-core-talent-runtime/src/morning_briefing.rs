@@ -618,15 +618,48 @@ fn render_facets(facets: &[(String, String)]) -> String {
 
 /// The owner's note on what this briefing could not draw on.
 pub(crate) fn coverage_preamble(gaps: &[String]) -> String {
-    if gaps.is_empty() {
+    // `gaps` keeps record ids for the model and the stored metadata; the owner
+    // reads counts instead.
+    let mut parts = Vec::new();
+    let (mut activities, mut stories) = (0, 0);
+    for gap in gaps {
+        if gap.starts_with("story for ") {
+            stories += 1;
+        } else if gap.starts_with("activity ") {
+            activities += 1;
+        } else if let Some(count) = gap
+            .strip_prefix("location entries omitted: ")
+            .and_then(|rest| rest.strip_suffix('.'))
+        {
+            parts.push(if count == "1" {
+                "one location entry".to_owned()
+            } else {
+                format!("{count} location entries")
+            });
+        } else if gap == "the latest pulse" {
+            parts.push("the latest running summary".to_owned());
+        } else {
+            parts.push(gap.trim_end_matches('.').to_owned());
+        }
+    }
+    if activities > 0 {
+        parts.push(if activities == 1 {
+            "one activity".to_owned()
+        } else {
+            format!("{activities} activities")
+        });
+    }
+    if stories > 0 {
+        parts.push(if stories == 1 {
+            "the story of one activity".to_owned()
+        } else {
+            format!("the stories of {stories} activities")
+        });
+    }
+    if parts.is_empty() {
         return String::new();
     }
-    let joined = gaps.join("; ");
-    if joined.ends_with('.') {
-        format!("Not in this briefing: {joined}")
-    } else {
-        format!("Not in this briefing: {joined}.")
-    }
+    format!("Not in this briefing: {}.", parts.join("; "))
 }
 
 fn string_or(value: Option<&Value>, fallback: &str) -> String {
@@ -655,7 +688,24 @@ mod tests {
         assert_eq!(coverage_preamble(&[]), "");
         assert_eq!(
             coverage_preamble(&["the latest pulse".to_owned()]),
-            "Not in this briefing: the latest pulse."
+            "Not in this briefing: the latest running summary."
+        );
+    }
+
+    #[test]
+    fn coverage_preamble_counts_omitted_records_without_their_ids() {
+        let gaps = [
+            "the latest pulse",
+            "story for 20261019_meeting_1",
+            "activity 20261019_x",
+            "story for 20261019_y",
+            "location entries omitted: 3.",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            coverage_preamble(&gaps),
+            "Not in this briefing: the latest running summary; 3 location entries; \
+             one activity; the stories of 2 activities."
         );
     }
 

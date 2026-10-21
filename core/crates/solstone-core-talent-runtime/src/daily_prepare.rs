@@ -1539,7 +1539,8 @@ mod tests {
             !preamble.to_lowercase().contains("complete"),
             "coverage_preamble must not contain 'complete'"
         );
-        assert!(preamble.contains(&notice));
+        assert!(preamble.contains(" location entr"), "{preamble}");
+        assert!(!preamble.contains("act-1"), "{preamble}");
         assert!(!preamble.contains(".."), "{preamble}");
     }
 
@@ -1782,7 +1783,8 @@ mod tests {
         );
         let preamble = metadata["coverage_preamble"].as_str().unwrap();
         assert!(!preamble.to_lowercase().contains("complete"));
-        assert!(preamble.contains(&expected_notice));
+        assert!(preamble.contains(" location entr"), "{preamble}");
+        assert!(!preamble.contains("act-1"), "{preamble}");
         assert!(!preamble.contains(".."), "{preamble}");
     }
 
@@ -1791,7 +1793,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         location_journal(root.path(), LOCATION_DAY);
         solstone_core_facets::create_facet(root.path(), "work", "Work", "", "", "", None).unwrap();
-        let description = "A".repeat(44962);
+        let description = "A".repeat(44950);
         let record = json!({
             "id": "act-1",
             "title": "Activity",
@@ -1936,7 +1938,7 @@ mod tests {
         solstone_core_facets::create_facet(root.path(), "a", "A", "", "", "", None).unwrap();
         solstone_core_facets::create_facet(root.path(), "b", "B", "", "", "", None).unwrap();
 
-        let desc_a = "A".repeat(43177);
+        let desc_a = "A".repeat(43182);
         let story_s = "S".repeat(1500);
         let story_t = "T".repeat(1500);
 
@@ -2010,8 +2012,8 @@ mod tests {
         };
         let unclipped_total = unclipped_text_tokens + unclipped_schema_tokens;
         assert_eq!(
-            unclipped_total, 15576,
-            "unclipped model_text_parts + schema tokens ({unclipped_total}) must be 15576"
+            unclipped_total, 15581,
+            "unclipped model_text_parts + schema tokens ({unclipped_total}) must be 15581"
         );
 
         (stage.prompt_override.unwrap())(&mut probe_talent, &state).unwrap();
