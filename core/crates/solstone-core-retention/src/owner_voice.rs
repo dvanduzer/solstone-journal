@@ -385,7 +385,7 @@ pub fn finish_owed_owner_voice_deletions(
                 }
                 match owner_voice_deletion_state(segment.path(), &jsonl) {
                     OwedState::Owed => owed.push(jsonl),
-                    OwedState::Unknown => counts.unknown += 1,
+                    OwedState::Unknown => counts.unknown = counts.unknown.saturating_add(1),
                     OwedState::NotOwed => {}
                 }
             }
@@ -404,7 +404,7 @@ pub fn finish_owed_owner_voice_deletions(
             match finish_one(journal, &jsonl, now()) {
                 Some(OwnerVoiceDeletion::Owed(_)) if !last => still_owed.push(jsonl),
                 Some(outcome) => tally(&mut counts, &outcome),
-                None => counts.skipped += 1,
+                None => counts.skipped = counts.skipped.saturating_add(1),
             }
         }
         owed = still_owed;
@@ -436,7 +436,7 @@ fn tally(counts: &mut OwedRunCounts, outcome: &OwnerVoiceDeletion) {
         OwnerVoiceDeletion::NotProvable(_) => &mut counts.not_provable,
         OwnerVoiceDeletion::Owed(_) => &mut counts.owed,
     };
-    *slot += 1;
+    *slot = slot.saturating_add(1);
 }
 
 /// `(day, stream, dir)` of a segment directory inside the journal's chronicle, for either
@@ -463,16 +463,24 @@ fn segment_coordinates(journal: &Path, segment: &Path) -> Option<(String, String
 
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
+    bytes.iter().fold(
+        String::with_capacity(bytes.len().saturating_mul(2)),
+        |mut out, byte| {
             let _ = write!(out, "{byte:02x}");
             out
-        })
+        },
+    )
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::disallowed_methods,
+    reason = "test code: fixtures remove files to set up states; the crate-level denials exist to constrain the verbs"
+)]
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};

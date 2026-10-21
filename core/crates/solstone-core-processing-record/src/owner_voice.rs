@@ -184,7 +184,8 @@ mod tests {
 
     #[test]
     fn each_invalid_field_is_an_error() {
-        let cases: Vec<Box<dyn Fn(&mut Value)>> = vec![
+        type Mutation = Box<dyn Fn(&mut Value)>;
+        let cases: Vec<Mutation> = vec![
             Box::new(|r| r["owner_voice"]["original"]["name"] = json!("")),
             Box::new(|r| r["owner_voice"]["original"]["name"] = json!(".")),
             Box::new(|r| r["owner_voice"]["original"]["name"] = json!("..")),

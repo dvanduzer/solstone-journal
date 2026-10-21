@@ -78,7 +78,7 @@ fn transcripts_with_original(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let pairs = names
+        names
             .iter()
             .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
             .filter(|jsonl| {
@@ -95,8 +95,7 @@ fn transcripts_with_original(
                 })
             })
             .map(|jsonl| (segment.clone(), jsonl.clone()))
-            .collect::<Vec<_>>();
-        pairs
+            .collect::<Vec<_>>()
     })
 }
 
