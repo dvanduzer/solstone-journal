@@ -802,13 +802,18 @@ fn skipped_and_shortened_counts_reach_the_import_summary() {
         let summary = crate::save::ics_summary(4, 1, &counts);
         assert!(summary.starts_with(&clean), "{summary}");
         let numbers = summary[clean.len()..]
+            .replace(',', "")
             .split(|character: char| !character.is_ascii_digit())
             .filter(|part| !part.is_empty())
             .map(|part| part.parse::<u64>().unwrap())
             .filter(|number| *number != MAX_SERIES_OCCURRENCES as u64)
             .collect::<Vec<_>>();
         let mut expected = vec![counts.skipped()];
-        expected.extend([counts.no_change_time, counts.unknown_zone, counts.invalid]);
+        expected.extend(
+            [counts.no_change_time, counts.unknown_zone, counts.invalid]
+                .into_iter()
+                .filter(|count| *count > 0),
+        );
         if counts.skipped() == 0 {
             expected.clear();
         }
@@ -818,6 +823,10 @@ fn skipped_and_shortened_counts_reach_the_import_summary() {
             }
         }
         assert_eq!(numbers, expected, "{summary}");
+        assert!(
+            !summary.contains(" 0 "),
+            "a zero reason is never shown: {summary}"
+        );
     }
 }
 

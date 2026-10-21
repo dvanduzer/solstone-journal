@@ -8,7 +8,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- calendar files you import from now on can also be found by the day each event happens, not only the day it was added or last changed. repeating events are listed up to a year after you import them. calendars you imported before aren't added.
+- events in calendar files you import from now on can also be found by the day each one happens, not only the day it was added or last changed. repeating events are listed up to a year after you import them. calendars you imported before aren't listed this way.
 
 ## [2.0.53] - 2026-10-21
 

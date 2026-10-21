@@ -32,16 +32,25 @@ pub(crate) fn ics_summary(
     let mut summary = format!("imported {entry_count} calendar events across {days} days");
     let skipped = counts.skipped();
     if skipped > 0 {
+        let reasons: Vec<String> = [
+            (counts.no_change_time, "with no change time"),
+            (counts.unknown_zone, "in an unknown time zone"),
+            (counts.invalid, "unreadable"),
+        ]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, reason)| format!("{count} {reason}"))
+        .collect();
         summary.push_str(&format!(
-            "; {skipped} not listed by the day they happen ({} with no change time, {} in an unknown time zone, {} unreadable)",
-            counts.no_change_time, counts.unknown_zone, counts.invalid
+            "; {skipped} not listed by the day they happen ({})",
+            reasons.join(", ")
         ));
     }
     if counts.truncated_series > 0 {
         summary.push_str(&format!(
             "; {} repeating series listed only for their latest {} dates",
             counts.truncated_series,
-            crate::ics_notes::MAX_SERIES_OCCURRENCES
+            grouped(crate::ics_notes::MAX_SERIES_OCCURRENCES as u64)
         ));
     }
     if counts.unexpandable_series > 0 {
@@ -52,12 +61,25 @@ pub(crate) fn ics_summary(
     }
     if counts.over_limit > 0 {
         summary.push_str(&format!(
-            "; {} more not listed by the day they happen, past the {} dates one import lists",
+            "; {} not listed by the day they happen, past the {} dates one import lists",
             counts.over_limit,
-            crate::ics_notes::MAX_IMPORT_LINES
+            grouped(crate::ics_notes::MAX_IMPORT_LINES as u64)
         ));
     }
     summary
+}
+
+/// A count with thousands separators, as an owner reads it: `200,000`.
+fn grouped(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
 }
 
 pub(crate) fn obsidian_summary(entry_count: u64, days: usize) -> String {
@@ -474,6 +496,15 @@ fn hints(source: RegistrySource) -> StreamHints {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn counts_are_grouped_by_thousands() {
+        assert_eq!(super::grouped(0), "0");
+        assert_eq!(super::grouped(999), "999");
+        assert_eq!(super::grouped(5_000), "5,000");
+        assert_eq!(super::grouped(200_000), "200,000");
+        assert_eq!(super::grouped(1_234_567), "1,234,567");
+    }
+
     #[test]
     fn direct_rendered_file_publication_preserves_owner_deleted_segments() {
         let root = tempfile::tempdir().unwrap();
