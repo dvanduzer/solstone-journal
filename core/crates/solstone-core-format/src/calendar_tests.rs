@@ -585,3 +585,151 @@ fn a_file_over_5000_notes_or_8_mib_is_refused_whole() {
     assert!(bytes.len() < MAX_FILE_BYTES);
     assert!(validate_calendar_file(&name, &bytes, "20261020", "163000_300").is_ok());
 }
+
+/// A golden line as an import writes it: its own import and upload time.
+fn imported(line: &str, import: &str, imported_at: &str) -> String {
+    with(
+        &with(line, "import", json!(import)),
+        "imported_at",
+        json!(imported_at),
+    )
+}
+
+fn validate_import(
+    lines: &[&str],
+    day: &str,
+    segment: &str,
+) -> Result<Vec<CalendarNote>, CalendarFileError> {
+    let (name, bytes) = file(lines);
+    validate_import_calendar_file(&name, &bytes, day, segment)
+}
+
+#[test]
+fn an_import_file_is_checked_against_its_own_segment_span() {
+    let line = imported(
+        &with(golden(0), "changed_at", json!("2026-10-19T09:42:00-06:00")),
+        "20261019_154200",
+        "2026-10-20T11:05:00-06:00",
+    );
+    // A window starts at its first event, not on the 300-second grid, and
+    // runs for its own length.
+    for segment in ["094130_301", "093000_900", "094200_1"] {
+        assert!(
+            validate_import(&[&line], "20261019", segment).is_ok(),
+            "{segment}"
+        );
+    }
+    for segment in ["094300_600", "093000_720", "094130_0", "0941_301"] {
+        assert!(
+            validate_import(&[&line], "20261019", segment).is_err(),
+            "{segment}"
+        );
+    }
+    // The same instant written in UTC reads as 15:42 and falls outside it.
+    let utc = with(&line, "changed_at", json!("2026-10-19T15:42:00Z"));
+    let error = validate_import(&[&utc], "20261019", "094130_301").unwrap_err();
+    assert_eq!(error.line, Some(1));
+    assert!(validate_import(&[&utc], "20261019", "154000_300").is_ok());
+}
+
+#[test]
+fn an_import_line_must_name_its_import_and_when_it_happened() {
+    let base = with(golden(2), "changed_at", json!("2026-10-20T16:31:00-06:00"));
+    let line = imported(&base, "20261020_223100", "2026-10-21T08:00:00-06:00");
+    let notes = validate_import(&[&line], "20261020", "163000_300").unwrap();
+    assert_eq!(
+        import_stamp(&notes[0].record).unwrap(),
+        (
+            "20261020_223100".to_owned(),
+            DateTime::parse_from_rfc3339("2026-10-21T08:00:00-06:00").unwrap()
+        )
+    );
+    let other = imported(&base, "20250101_000000", "2026-12-01T09:00:00-07:00");
+    let notes = validate_import(&[&other], "20261020", "163000_300").unwrap();
+    assert_eq!(notes[0].record["import"], json!("20250101_000000"));
+    for broken in [
+        without(&line, "import"),
+        without(&line, "imported_at"),
+        with(&line, "import", json!("")),
+        with(&line, "import", json!(7)),
+        with(&line, "imported_at", json!("2026-10-21T08:00:00")),
+        with(&line, "expanded", json!(false)),
+        with(&line, "expanded", json!("yes")),
+    ] {
+        let error = validate_import(&[&broken], "20261020", "163000_300").unwrap_err();
+        assert_eq!(error.line, Some(1), "{broken}");
+    }
+    assert!(
+        validate_import(
+            &[&with(&line, "expanded", json!(true))],
+            "20261020",
+            "163000_300"
+        )
+        .is_ok()
+    );
+    // A phone's file never needs them.
+    assert!(validate(&[&base], "20261020", "163000_300").is_ok());
+}
+
+#[test]
+fn written_files_hold_the_golden_bytes_and_read_back() {
+    let records = [3, 1, 2]
+        .into_iter()
+        .map(|index| serde_json::from_str::<Map<String, Value>>(golden(index)).unwrap())
+        .collect::<Vec<_>>();
+    let files = write_calendar_files(records);
+    assert_eq!(files.len(), 1);
+    let (name, bytes) = &files[0];
+    // Sorted by event: 48fa…, 701B…, CCBF….
+    let expected = format!("{}\n{}\n{}\n", golden(2), golden(3), golden(1));
+    assert_eq!(String::from_utf8(bytes.clone()).unwrap(), expected);
+    assert_eq!(name, &file_name(bytes));
+    assert_eq!(calendar_file_name(bytes), *name);
+    assert!(validate_calendar_file(name, bytes, "20261020", "163000_300").is_ok());
+    // Keys in any order are written sorted.
+    let mut reversed = Map::new();
+    let golden_record: Map<String, Value> = serde_json::from_str(golden(0)).unwrap();
+    for (key, value) in golden_record.iter().rev() {
+        reversed.insert(key.clone(), value.clone());
+    }
+    let files = write_calendar_files(vec![reversed]);
+    assert_eq!(files[0].1, format!("{}\n", golden(0)).into_bytes());
+}
+
+#[test]
+fn more_than_5000_notes_split_into_consecutive_valid_files() {
+    let records = (0..7_000)
+        .rev()
+        .map(|index| {
+            let line = imported(
+                &with(
+                    &with(
+                        golden(1),
+                        "occurrence",
+                        json!(format!("2027-01-01T00:00:{:02}Z", index % 60)),
+                    ),
+                    "event",
+                    json!(format!("series-{:05}", index / 60)),
+                ),
+                "20261020_223100",
+                "2026-10-21T08:00:00-06:00",
+            );
+            serde_json::from_str::<Map<String, Value>>(&line).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let files = write_calendar_files(records);
+    assert_eq!(files.len(), 2);
+    let mut all = Vec::new();
+    for (index, (name, bytes)) in files.iter().enumerate() {
+        let notes = validate_import_calendar_file(name, bytes, "20261020", "163000_300").unwrap();
+        assert_eq!(notes.len(), [5_000, 2_000][index]);
+        all.extend(notes.into_iter().map(|note| (note.event, note.occurrence)));
+    }
+    // The second file carries on where the first stopped.
+    let mut sorted = all.clone();
+    sorted.sort();
+    assert_eq!(all, sorted);
+    assert_eq!(all.len(), 7_000);
+    assert_eq!(all[0].0, "series-00000");
+    assert_eq!(all[6_999].0, "series-00116");
+}

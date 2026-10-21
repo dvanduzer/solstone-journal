@@ -222,14 +222,71 @@ pub fn validate_calendar_file(
     day: &str,
     segment: &str,
 ) -> Result<Vec<CalendarNote>, CalendarFileError> {
-    if !is_calendar_file_name(name) {
-        return Err(whole_file(
-            "file name must be calendar_ followed by 64 lowercase hex digits and .jsonl",
-        ));
-    }
-    let (window_start, window_end) = segment_window(day, segment).ok_or_else(|| {
+    check_file_name(name)?;
+    let window = segment_window(day, segment).ok_or_else(|| {
         whole_file("segment must name one 300-second window on the journal's grid")
     })?;
+    validate_lines(bytes, window, |_| Ok(()))
+}
+
+/// Check a calendar file the importer wrote beside an import window's
+/// transcript before the index reads it.
+///
+/// Import segments are not on the 300-second grid, so every note's
+/// `changed_at`, read in its own offset, must fall inside that segment's own
+/// span: its start and its length. Each line also names the import that wrote
+/// it and when that import happened, and a line written by expanding a
+/// series' rule says so with `"expanded": true`.
+pub fn validate_import_calendar_file(
+    name: &str,
+    bytes: &[u8],
+    day: &str,
+    segment: &str,
+) -> Result<Vec<CalendarNote>, CalendarFileError> {
+    check_file_name(name)?;
+    let window = segment_span(day, segment)
+        .ok_or_else(|| whole_file("segment must name a span on its day"))?;
+    validate_lines(bytes, window, |note| {
+        import_stamp(&note.record)?;
+        match note.record.get("expanded") {
+            None | Some(Value::Bool(true)) => Ok(()),
+            Some(_) => Err("expanded must be true when present".to_owned()),
+        }
+    })
+}
+
+/// The import a line written by the importer came from, and when that import
+/// happened.
+pub fn import_stamp(
+    record: &Map<String, Value>,
+) -> Result<(String, DateTime<FixedOffset>), String> {
+    let import = match record.get("import") {
+        Some(Value::String(import)) if !import.is_empty() => import.clone(),
+        _ => return Err("import must be a non-empty string".to_owned()),
+    };
+    let imported_at = record
+        .get("imported_at")
+        .and_then(Value::as_str)
+        .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
+        .ok_or_else(|| "imported_at must be a time with an offset".to_owned())?;
+    Ok((import, imported_at))
+}
+
+fn check_file_name(name: &str) -> Result<(), CalendarFileError> {
+    if is_calendar_file_name(name) {
+        Ok(())
+    } else {
+        Err(whole_file(
+            "file name must be calendar_ followed by 64 lowercase hex digits and .jsonl",
+        ))
+    }
+}
+
+fn validate_lines(
+    bytes: &[u8],
+    (window_start, window_end): (NaiveDateTime, NaiveDateTime),
+    extra: impl Fn(&CalendarNote) -> Result<(), String>,
+) -> Result<Vec<CalendarNote>, CalendarFileError> {
     if bytes.len() > MAX_FILE_BYTES {
         return Err(whole_file("file holds more than 8 MiB"));
     }
@@ -248,6 +305,7 @@ pub fn validate_calendar_file(
             return Err(at("line is empty".to_owned()));
         }
         let note = parse_calendar_note(line).map_err(at)?;
+        extra(&note).map_err(at)?;
         if !identities.insert((note.event.clone(), note.occurrence.clone())) {
             return Err(at("event and occurrence repeat an earlier line".to_owned()));
         }
@@ -318,6 +376,92 @@ fn segment_window(day: &str, segment: &str) -> Option<(NaiveDateTime, NaiveDateT
     }
     let start = date.and_hms_opt(hour, minute, second)?;
     Some((start, start + Duration::seconds(i64::from(WINDOW_SECONDS))))
+}
+
+/// The span any segment key names on its day: its start, and its start plus
+/// its length.
+pub fn segment_span(day: &str, segment: &str) -> Option<(NaiveDateTime, NaiveDateTime)> {
+    if !is_date_key(day) {
+        return None;
+    }
+    let date = NaiveDate::parse_from_str(day, "%Y%m%d").ok()?;
+    let times = segment_parse(segment)?;
+    let (clock, length) = segment.split_once('_')?;
+    if clock.len() != 6 {
+        return None;
+    }
+    let length: i64 = length.parse().ok().filter(|length| *length > 0)?;
+    let start = date.and_hms_opt(
+        u32::from(times.hour),
+        u32::from(times.minute),
+        u32::from(times.second),
+    )?;
+    Some((start, start + Duration::seconds(length)))
+}
+
+/// Write calendar notes as calendar note files: compact JSON with sorted keys,
+/// lines sorted by `event` and then `occurrence` with no occurrence first, each
+/// file ending in a newline and named by the SHA-256 of its bytes. A set over
+/// 5,000 notes or 8 MiB splits, in order, into consecutive files.
+pub fn write_calendar_files(records: Vec<Map<String, Value>>) -> Vec<(String, Vec<u8>)> {
+    let mut lines = records
+        .into_iter()
+        .map(|record| {
+            let event = record
+                .get("event")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let occurrence = record
+                .get("occurrence")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let mut line = sorted_keys(&Value::Object(record)).to_string();
+            line.push('\n');
+            ((event, occurrence), line)
+        })
+        .collect::<Vec<_>>();
+    lines.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut files = Vec::new();
+    let mut current: Vec<u8> = Vec::new();
+    let mut count = 0;
+    for (_, line) in lines {
+        if count == MAX_FILE_LINES || (count > 0 && current.len() + line.len() > MAX_FILE_BYTES) {
+            files.push(std::mem::take(&mut current));
+            count = 0;
+        }
+        current.extend_from_slice(line.as_bytes());
+        count += 1;
+    }
+    if count > 0 {
+        files.push(current);
+    }
+    files
+        .into_iter()
+        .map(|bytes| (calendar_file_name(&bytes), bytes))
+        .collect()
+}
+
+/// The name of a calendar note file holding these bytes.
+pub fn calendar_file_name(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{CALENDAR_FILE_PREFIX}{:x}.jsonl", Sha256::digest(bytes))
+}
+
+fn sorted_keys(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut keys = map.keys().collect::<Vec<_>>();
+            keys.sort();
+            Value::Object(
+                keys.into_iter()
+                    .map(|key| (key.clone(), sorted_keys(&map[key])))
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sorted_keys).collect()),
+        other => other.clone(),
+    }
 }
 
 /// Parse and check one note line against the contract.
