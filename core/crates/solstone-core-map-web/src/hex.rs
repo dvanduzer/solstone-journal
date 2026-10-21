@@ -36,9 +36,32 @@ const RESOLUTIONS: [Resolution; 3] = [Resolution::Eight, Resolution::Nine, Resol
 
 #[derive(Default)]
 struct Cell {
-    seconds: f64,
+    /// Each stay's time as (start, end) in Unix seconds. Two phones often
+    /// report the same stay, so a cell's time is the union of these, not the sum.
+    spans: Vec<(i64, i64)>,
     stays: u32,
     days: BTreeSet<String>,
+}
+
+impl Cell {
+    /// Seconds covered by at least one stay, overlaps counted once.
+    fn covered_seconds(&self) -> i64 {
+        let mut spans = self.spans.clone();
+        spans.sort_unstable();
+        let mut total = 0;
+        let mut current: Option<(i64, i64)> = None;
+        for (start, end) in spans {
+            current = match current {
+                Some((open, close)) if start <= close => Some((open, close.max(end))),
+                Some((open, close)) => {
+                    total += close - open;
+                    Some((start, end))
+                }
+                None => Some((start, end)),
+            };
+        }
+        total + current.map_or(0, |(open, close)| close - open)
+    }
 }
 
 #[derive(Default)]
@@ -62,10 +85,13 @@ fn invalid_resolution() -> Response {
     .into_response()
 }
 
-fn seconds(start: Option<&LocalTime>, end: Option<&LocalTime>) -> f64 {
+/// A stay's time, or `None` when the phone never said when it ended.
+fn span(start: Option<&LocalTime>, end: Option<&LocalTime>) -> Option<(i64, i64)> {
     match (start, end) {
-        (Some(start), Some(end)) => (end.utc - start.utc).num_seconds().max(0) as f64,
-        _ => 0.0,
+        (Some(start), Some(end)) if end.utc > start.utc => {
+            Some((start.utc.timestamp(), end.utc.timestamp()))
+        }
+        _ => None,
     }
 }
 
@@ -77,7 +103,7 @@ fn gather(
     res: Resolution,
     day: &str,
     point: &Point,
-    span: f64,
+    time: Option<(i64, i64)>,
 ) {
     if store.hides(point.latitude, point.longitude) {
         left_out.hidden += 1;
@@ -102,7 +128,7 @@ fn gather(
         return;
     };
     let cell = cells.entry(at.to_cell(res)).or_default();
-    cell.seconds += span;
+    cell.spans.extend(time);
     cell.stays += 1;
     cell.days.insert(day.to_owned());
 }
@@ -110,7 +136,7 @@ fn gather(
 fn cell_json(index: &CellIndex, cell: &Cell) -> Value {
     json!({
         "cell": index.to_string(),
-        "hours": (cell.seconds / 36.0).round() / 100.0,
+        "hours": (cell.covered_seconds() as f64 / 36.0).round() / 100.0,
         "stays": cell.stays,
         "days": cell.days.len(),
         "outline": index
@@ -192,19 +218,19 @@ pub(crate) async fn month(
                 }
             };
             for entry in &view.entries {
-                let (point, span) = match entry {
+                let (point, time) = match entry {
                     Entry::Stay {
                         point, first, last, ..
-                    } => (point, seconds(Some(first), Some(last))),
+                    } => (point, span(Some(first), Some(last))),
                     Entry::Visit {
                         point,
                         arrival,
                         departure,
                         ..
-                    } => (point, seconds(arrival.as_ref(), departure.as_ref())),
+                    } => (point, span(arrival.as_ref(), departure.as_ref())),
                     Entry::Readings { .. } | Entry::Unreadable { .. } => continue,
                 };
-                gather(&mut cells, &mut left_out, &store, res, day, point, span);
+                gather(&mut cells, &mut left_out, &store, res, day, point, time);
             }
         }
         Json(json!({

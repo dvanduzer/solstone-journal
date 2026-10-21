@@ -544,6 +544,34 @@ async fn a_month_of_visits_gathers_into_one_hexagon() {
 }
 
 #[tokio::test]
+async fn two_phones_at_one_stay_count_its_time_once() {
+    let root = tempfile::tempdir().unwrap();
+    // The same evening seen by two phones: 21:02-22:40 and 21:30-23:00.
+    for (stream, arrival, departure) in [
+        ("phone_location", "21:02", "22:40"),
+        ("second_location", "21:30", "23:00"),
+    ] {
+        write(
+            root.path(),
+            "20261001",
+            stream,
+            "150000_300",
+            &format!(
+                "{IPHONE_HEADER}\n{{\"arrival\":\"2026-10-01T{arrival}:00Z\",\"departure\":\"2026-10-01T{departure}:00Z\",\"h_acc\":20,\"lat\":39.7527,\"lon\":-105.0001,\"schema\":\"solstone.location.visit/1\"}}\n"
+            ),
+        );
+    }
+    let mut reconciler = Reconciler::default();
+    solstone_core_location::reconcile_journal(root.path(), &mut reconciler).unwrap();
+    let (_, _, hex) = get(root.path(), "/app/map/api/hex/202610/10").await;
+    let cells = hex["cells"].as_array().unwrap();
+    assert_eq!(cells.len(), 1);
+    assert_eq!(cells[0]["stays"], 2);
+    // 21:02 to 23:00 is 1 h 58 min; adding the two would give 3 h 8 min.
+    assert_eq!(cells[0]["hours"], 1.97);
+}
+
+#[tokio::test]
 async fn a_hidden_place_stays_off_the_hexagon_map() {
     let journal = journal_with_a_place();
     let (_, _, list) = get(journal.path(), "/app/map/api/places").await;
