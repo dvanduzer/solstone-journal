@@ -525,6 +525,54 @@ async fn a_place_is_listed_described_renamed_and_hidden() {
 }
 
 #[tokio::test]
+async fn a_month_of_visits_gathers_into_one_hexagon() {
+    let journal = journal_with_a_place();
+    let (status, _, hex) = get(journal.path(), "/app/map/api/hex/202610/10").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(hex["res"], 10);
+    let cells = hex["cells"].as_array().unwrap();
+    assert_eq!(cells.len(), 1, "two visits at one spot share a cell");
+    assert_eq!(cells[0]["stays"], 2);
+    assert_eq!(cells[0]["days"], 2);
+    // Two visits of 1 h 38 min.
+    assert_eq!(cells[0]["hours"], 3.27);
+    assert_eq!(cells[0]["outline"].as_array().unwrap().len(), 6);
+    assert_eq!(hex["left_out"]["hidden"], 0);
+    assert_eq!(hex["left_out"]["coarse"], 0);
+    let (_, _, other) = get(journal.path(), "/app/map/api/hex/202609/10").await;
+    assert!(other["cells"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_hidden_place_stays_off_the_hexagon_map() {
+    let journal = journal_with_a_place();
+    let (_, _, list) = get(journal.path(), "/app/map/api/places").await;
+    let id = list["places"][0]["id"].as_str().unwrap().to_owned();
+    post(
+        journal.path(),
+        &format!("/app/map/api/place/{id}"),
+        r#"{"hidden":true}"#,
+    )
+    .await;
+    let (_, _, hex) = get(journal.path(), "/app/map/api/hex/202610/8").await;
+    assert!(hex["cells"].as_array().unwrap().is_empty());
+    assert_eq!(hex["left_out"]["hidden"], 2);
+}
+
+#[tokio::test]
+async fn bad_hexagon_months_and_sizes_are_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let (status, _, body) = get(root.path(), "/app/map/api/hex/202613/9").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["reason_code"], "invalid_month");
+    for res in ["7", "11", "nine"] {
+        let (status, _, body) = get(root.path(), &format!("/app/map/api/hex/202610/{res}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{res}");
+        assert_eq!(body["reason_code"], "invalid_resolution");
+    }
+}
+
+#[tokio::test]
 async fn a_week_runs_monday_to_sunday_with_its_visits() {
     let journal = journal_with_a_place();
     let (status, _, week) = get(journal.path(), "/app/map/api/week/20261002").await;

@@ -27,12 +27,13 @@ use solstone_core_location::{
 };
 
 mod accuracy;
+mod hex;
 mod places;
 
 const WORKSPACE: &[u8] = include_bytes!("../assets/workspace.html");
 /// How often the background pass checks every day's marker.
 const MAINTENANCE_PERIOD: Duration = Duration::from_secs(20);
-const MAP_TOWNS: usize = 40;
+pub(crate) const MAP_TOWNS: usize = 40;
 
 struct AppState {
     journal_root: PathBuf,
@@ -51,12 +52,14 @@ pub fn router(journal_root: PathBuf, shared_shell: fn() -> Response) -> Router {
         .route("/app/map/places", get(day_shell_static))
         .route("/app/map/place/{id}", get(place_shell))
         .route("/app/map/week/{day}", get(week_shell))
+        .route("/app/map/hex/{month}", get(hex_shell))
         .route("/app/map/api/places", get(places::list))
         .route(
             "/app/map/api/place/{id}",
             get(places::show).post(places::edit),
         )
         .route("/app/map/api/week/{day}", get(places::week))
+        .route("/app/map/api/hex/{month}/{res}", get(hex::month))
         .route("/app/map/api/accuracy", get(accuracy::get))
         .route("/app/map/api/accuracy/download", post(accuracy::download))
         .route("/app/map/api/accuracy/remove", post(accuracy::remove))
@@ -168,6 +171,16 @@ async fn week_shell(
     shell(&state)
 }
 
+async fn hex_shell(
+    State(state): State<Arc<AppState>>,
+    RoutePath(month): RoutePath<String>,
+) -> Response {
+    if !valid_month(&month) {
+        return invalid_month();
+    }
+    shell(&state)
+}
+
 async fn day_shell(
     State(state): State<Arc<AppState>>,
     RoutePath(day): RoutePath<String>,
@@ -178,7 +191,23 @@ async fn day_shell(
     shell(&state)
 }
 
-fn day_counts(journal: &Path) -> BTreeMap<String, u64> {
+pub(crate) fn valid_month(month: &str) -> bool {
+    month.len() == 6
+        && month.bytes().all(|byte| byte.is_ascii_digit())
+        && chrono::NaiveDate::parse_from_str(&format!("{month}01"), "%Y%m%d").is_ok()
+}
+
+pub(crate) fn invalid_month() -> Response {
+    error_envelope(
+        "invalid_month",
+        "that month couldn't be used.",
+        "Month must be YYYYMM",
+        StatusCode::BAD_REQUEST,
+    )
+    .into_response()
+}
+
+pub(crate) fn day_counts(journal: &Path) -> BTreeMap<String, u64> {
     solstone_core_location::list_location_days(journal)
         .into_iter()
         .collect()
@@ -206,17 +235,8 @@ async fn month_stats(
     State(state): State<Arc<AppState>>,
     RoutePath(month): RoutePath<String>,
 ) -> Response {
-    if month.len() != 6
-        || !month.bytes().all(|byte| byte.is_ascii_digit())
-        || chrono::NaiveDate::parse_from_str(&format!("{month}01"), "%Y%m%d").is_err()
-    {
-        return error_envelope(
-            "invalid_month",
-            "that month couldn't be used.",
-            "Month must be YYYYMM",
-            StatusCode::BAD_REQUEST,
-        )
-        .into_response();
+    if !valid_month(&month) {
+        return invalid_month();
     }
     let journal_root = state.journal_root.clone();
     spawn_blocking_response(OwnerReadRole::MapMonthStats, move || {
@@ -507,7 +527,7 @@ fn record_bounds(view: &DayLocation, store: &PlaceStore) -> Option<Bounds> {
 
 /// The area drawn around the records: wide enough to show the towns around
 /// them, never narrower than about ten kilometres.
-fn context_bounds(records: Bounds) -> Bounds {
+pub(crate) fn context_bounds(records: Bounds) -> Bounds {
     let latitude_span = (records.north - records.south).max(0.1);
     let longitude_span = (records.east - records.west).max(0.1);
     Bounds {
@@ -518,7 +538,7 @@ fn context_bounds(records: Bounds) -> Bounds {
     }
 }
 
-fn bounds_json(bounds: &Bounds) -> Value {
+pub(crate) fn bounds_json(bounds: &Bounds) -> Value {
     json!([
         round(bounds.west),
         round(bounds.south),
@@ -538,7 +558,7 @@ fn boundary_json(boundary: &Boundary) -> Value {
     })
 }
 
-fn town_json(town: &TownPoint) -> Value {
+pub(crate) fn town_json(town: &TownPoint) -> Value {
     json!({"name": town.name, "lat": round(town.latitude), "lon": round(town.longitude), "population": town.population})
 }
 

@@ -504,6 +504,7 @@
     if (parts[3] === "places") return { page: "places" };
     if (parts[3] === "place" && parts[4]) return { page: "place", id: decodeURIComponent(parts[4]) };
     if (parts[3] === "week" && DAY_RE.test(parts[4] || "")) return { page: "week", day: parts[4] };
+    if (parts[3] === "hex" && /^\d{6}$/.test(parts[4] || "")) return { page: "hex", month: parts[4] };
     return {};
   }
 
@@ -875,7 +876,7 @@
         </section>`
       : "";
     const accuracy = accuracyCard(data.accuracy) || "<div data-accuracy-card hidden></div>";
-    reveal(`<nav class="map-page-nav" aria-label="more of your location"><a class="map-link" href="/app/map/week/${escapeHtml(data.day)}">this week</a><a class="map-link" href="/app/map/places">places</a></nav>
+    reveal(`<nav class="map-page-nav" aria-label="more of your location"><a class="map-link" href="/app/map/week/${escapeHtml(data.day)}">this week</a><a class="map-link" href="/app/map/hex/${escapeHtml(String(data.day).slice(0, 6))}">this month in hexagons</a><a class="map-link" href="/app/map/places">places</a></nav>
       ${devices.map((device) => renderDevice(device, data.day)).join("")}
       <div class="map-columns">
         <section class="map-card" aria-label="the day, in order">
@@ -1136,7 +1137,91 @@
       <section class="map-card"><p class="map-muted">filled bars are visits your phone reported; outlined bars are stays your journal worked out. every reading is on each day's page.</p></section>`);
   }
 
+  const HEX_SIZES = [["8", "about 900 m"], ["9", "about 350 m"], ["10", "about 130 m"]];
+
+  function monthLabel(month) {
+    return `${MONTHS[Number(month.slice(4, 6)) - 1]} ${month.slice(0, 4)}`;
+  }
+
+  function monthStep(month, delta) {
+    const date = new Date(Number(month.slice(0, 4)), Number(month.slice(4, 6)) - 1 + delta, 1);
+    return `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, "0")}`;
+  }
+
+  function hours(value) {
+    return value < 1 ? `${Math.round(value * 60)} min` : `${value.toFixed(1)} h`;
+  }
+
+  function renderHex(data) {
+    const cells = asArray(data.cells);
+    const sizes = HEX_SIZES.map(([res, label]) =>
+      `<button type="button" data-hex-res="${res}" aria-pressed="${String(data.res) === res}">${label}</button>`).join("");
+    const left = [];
+    if (data.left_out?.hidden) left.push(`${plural(data.left_out.hidden, "stay", "stays")} near places you hid`);
+    if (data.left_out?.coarse) left.push(`${plural(data.left_out.coarse, "stay", "stays")} whose position isn't known well enough for this cell size`);
+    const body = data.map
+      ? `<section class="map-card map-figure-card" aria-label="map">
+          <div class="map-canvas" id="map-canvas" role="region" aria-label="hexagons shaded by time spent at stays and visits this month, with towns"></div>
+          <p class="map-muted">${escapeHtml(plural(cells.length, "hexagon", "hexagons"))}; darker means more time.${left.length ? ` left out: ${escapeHtml(left.join("; "))}.` : ""}</p>
+        </section>`
+      : `<section class="map-card"><p>no stays or visits to draw this month at this cell size.</p>${left.length ? `<p class="map-muted">left out: ${escapeHtml(left.join("; "))}.</p>` : ""}</section>`;
+    pageShell(`${monthLabel(data.month)} in hexagons`, `<nav class="map-page-nav" aria-label="other months">
+        <a class="map-link" href="/app/map/hex/${escapeHtml(monthStep(data.month, -1))}">the month before</a>
+        <a class="map-link" href="/app/map/hex/${escapeHtml(monthStep(data.month, 1))}">the month after</a></nav>
+      <div class="map-accuracy-actions" role="group" aria-label="hexagon size">${sizes}</div>
+      ${body}
+      <section class="map-card"><details class="map-details"><summary>how this is drawn</summary>
+        <p>each stay and visit this month is put in the H3 hexagon its middle falls in, and each hexagon is shaded by the time spent there. your journal works this out when you open the page; nothing about it is kept.</p>
+        <p>a stay counts only at a cell size no finer than how well its position is known, so smaller hexagons can show fewer stays. nothing within 50 m of a place you hid is counted.</p>
+        <p>there's no street map, for the same reason as on each day's page.</p>
+      </details></section>`);
+    root.querySelectorAll("[data-hex-res]").forEach((button) => {
+      button.addEventListener("click", () => loadHex(data.month, button.getAttribute("data-hex-res")));
+    });
+    drawHex(data);
+  }
+
+  function drawHex(data) {
+    const L = window.L;
+    const element = document.getElementById("map-canvas");
+    if (!L || !element || !data.map) return;
+    const ink = cssColor("--ink-soft", "#5B5246");
+    const orange = cssColor("--orange", "#e8913a");
+    const map = L.map(element, { attributionControl: false, zoomSnap: 0.5, worldCopyJump: false });
+    const [west, south, east, north] = data.map.bounds;
+    map.fitBounds([[south, west], [north, east]], { padding: [28, 28], maxZoom: 15 });
+    L.control.scale({ imperial: false }).addTo(map);
+    asArray(data.map.towns).slice(0, 15).forEach((town) => {
+      const dot = L.circleMarker([town.lat, town.lon], { radius: 2.5, color: ink, weight: 1, fillColor: ink, fillOpacity: 0.9, interactive: false }).addTo(map);
+      dot.bindTooltip(tooltipNode(town.name), { permanent: true, direction: "right", className: "map-town-label", offset: [4, 0] });
+    });
+    const cells = asArray(data.cells);
+    const most = Math.max(...cells.map((cell) => cell.hours), 0.01);
+    cells.forEach((cell) => {
+      // Log scale, so home doesn't wash out everywhere else.
+      const share = Math.log1p(cell.hours) / Math.log1p(most);
+      const hex = L.polygon(cell.outline, { color: orange, weight: 1, fillColor: orange, fillOpacity: 0.12 + 0.68 * share });
+      hex.bindTooltip(tooltipNode(`${hours(cell.hours)} · ${plural(cell.stays, "stay", "stays")} on ${plural(cell.days, "day", "days")}`));
+      hex.addTo(map);
+    });
+    mapState = { map, layers: [] };
+  }
+
+  async function loadHex(month, res = "9") {
+    setGate(window.SurfaceState.loading({ text: "loading…" }));
+    try {
+      mapState?.map?.remove?.();
+      renderHex(await window.apiJson(`/app/map/api/hex/${encodeURIComponent(month)}/${encodeURIComponent(res)}`));
+    } catch (err) {
+      showError(err, () => loadHex(month, res));
+    }
+  }
+
   async function loadPage(view) {
+    if (view.page === "hex") {
+      await loadHex(view.month);
+      return;
+    }
     setGate(window.SurfaceState.loading({ text: "loading…" }));
     try {
       if (view.page === "places") renderPlaces(await window.apiJson("/app/map/api/places"));
