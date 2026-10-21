@@ -1257,9 +1257,18 @@ fn overlap_ranges(
         .ok_or_else(invalid)?
         .iter()
         .map(|pair| {
-            let pair = pair.as_array().filter(|pair| pair.len() == 2).ok_or_else(invalid)?;
-            let start = pair[0].as_f64().filter(|v| v.is_finite()).ok_or_else(invalid)?;
-            let end = pair[1].as_f64().filter(|v| v.is_finite()).ok_or_else(invalid)?;
+            let pair = pair
+                .as_array()
+                .filter(|pair| pair.len() == 2)
+                .ok_or_else(invalid)?;
+            let start = pair[0]
+                .as_f64()
+                .filter(|v| v.is_finite())
+                .ok_or_else(invalid)?;
+            let end = pair[1]
+                .as_f64()
+                .filter(|v| v.is_finite())
+                .ok_or_else(invalid)?;
             if start < 0.0 || start > end || end > audio_duration_s + tolerance {
                 return Err(invalid());
             }

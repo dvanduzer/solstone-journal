@@ -537,17 +537,27 @@ mod tests {
         count
     }
 
-    async fn send(root: &std::path::Path, method: &str, body: serde_json::Value) -> (u16, serde_json::Value) {
+    async fn send(
+        root: &std::path::Path,
+        method: &str,
+        body: serde_json::Value,
+    ) -> (u16, serde_json::Value) {
         let request = Request::builder()
             .method(method)
             .uri("/app/settings/api/config")
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .unwrap();
-        let response = crate::test_support::shell_router(root).oneshot(request).await.unwrap();
+        let response = crate::test_support::shell_router(root)
+            .oneshot(request)
+            .await
+            .unwrap();
         let status = response.status().as_u16();
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
     }
 
     #[tokio::test]
@@ -601,12 +611,20 @@ mod tests {
         assert_eq!(files_containing(root.path(), "owner_confirmed"), 1);
 
         // Already on: re-saving needs no confirmation and records none.
-        let (status, _) =
-            send(root.path(), "PUT", json!({"section": "transcribe", "data": {"owner_voice_only": true}})).await;
+        let (status, _) = send(
+            root.path(),
+            "PUT",
+            json!({"section": "transcribe", "data": {"owner_voice_only": true}}),
+        )
+        .await;
         assert_eq!(status, 200);
         // Turning it off needs none either.
-        let (status, response) =
-            send(root.path(), "PUT", json!({"section": "transcribe", "data": {"owner_voice_only": false}})).await;
+        let (status, response) = send(
+            root.path(),
+            "PUT",
+            json!({"section": "transcribe", "data": {"owner_voice_only": false}}),
+        )
+        .await;
         assert_eq!(status, 200);
         assert_eq!(response["config"]["transcribe"]["owner_voice_only"], false);
         let (status, _) = send(
@@ -631,7 +649,11 @@ mod tests {
             let projected = super::project_transcribe(json!({"owner_voice_only": value}), false);
             assert_eq!(projected["owner_voice_only"], json!(on), "{value}");
         }
-        assert!(super::project_transcribe(json!({}), false).get("owner_voice_only").is_none());
+        assert!(
+            super::project_transcribe(json!({}), false)
+                .get("owner_voice_only")
+                .is_none()
+        );
     }
 
     #[tokio::test]

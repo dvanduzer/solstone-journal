@@ -1016,7 +1016,10 @@ mod tests {
     fn assert_ranges(actual: &[(f64, f64)], expected: &[(f64, f64)]) {
         assert_eq!(actual.len(), expected.len(), "{actual:?} vs {expected:?}");
         for (a, e) in actual.iter().zip(expected) {
-            assert!((a.0 - e.0).abs() < 1e-9 && (a.1 - e.1).abs() < 1e-9, "{actual:?} vs {expected:?}");
+            assert!(
+                (a.0 - e.0).abs() < 1e-9 && (a.1 - e.1).abs() < 1e-9,
+                "{actual:?} vs {expected:?}"
+            );
         }
     }
 
@@ -1042,7 +1045,10 @@ mod tests {
 
         // The averaged frame is single-speaker, but window 0's own frame is overlap.
         assert_eq!(result.overlap_fraction, 0.0);
-        assert_ranges(&result.overlap_ranges, &[(236.0 * frame_s(), 237.0 * frame_s())]);
+        assert_ranges(
+            &result.overlap_ranges,
+            &[(236.0 * frame_s(), 237.0 * frame_s())],
+        );
     }
 
     #[test]
@@ -1116,7 +1122,10 @@ mod tests {
         )
         .expect("segmentation pass");
 
-        assert_ranges(&result.overlap_ranges, &[(100.0 * frame_s(), 102.0 * frame_s())]);
+        assert_ranges(
+            &result.overlap_ranges,
+            &[(100.0 * frame_s(), 102.0 * frame_s())],
+        );
     }
 
     #[test]

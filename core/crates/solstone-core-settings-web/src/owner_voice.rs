@@ -23,7 +23,8 @@ pub(crate) fn status_at(journal: &Path, now: DateTime<Utc>) -> Value {
     let today = now
         .with_timezone(&solstone_core_journal_config::owner_zone(journal))
         .date_naive();
-    let available = solstone_core_speaker_resolve::owner_centroid::owner_voice_print(journal).is_some();
+    let available =
+        solstone_core_speaker_resolve::owner_centroid::owner_voice_print(journal).is_some();
     let (left_out_s, recordings) = today_counts(journal, today);
     let pending = owner_voice_owed_days(today)
         .map(|day| {
@@ -83,9 +84,14 @@ fn transcripts_with_original(
             .filter(|jsonl| {
                 names.iter().any(|other| {
                     other.file_stem() == jsonl.file_stem()
-                        && other.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| {
-                            solstone_core_processing_record::is_media_extension(&ext.to_ascii_lowercase())
-                        })
+                        && other
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .is_some_and(|ext| {
+                                solstone_core_processing_record::is_media_extension(
+                                    &ext.to_ascii_lowercase(),
+                                )
+                            })
                 })
             })
             .map(|jsonl| (segment.clone(), jsonl.clone()))
@@ -102,7 +108,14 @@ mod tests {
 
     use super::*;
 
-    fn write_transcript(journal: &Path, day: &str, key: &str, left_out_s: f64, windows_scored: u64, with_original: bool) {
+    fn write_transcript(
+        journal: &Path,
+        day: &str,
+        key: &str,
+        left_out_s: f64,
+        windows_scored: u64,
+        with_original: bool,
+    ) {
         let segment = journal.join(format!("chronicle/{day}/watch/{key}"));
         fs::create_dir_all(&segment).unwrap();
         let name = format!("{key}.m4a");
@@ -139,7 +152,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal = dir.path();
         fs::create_dir_all(journal.join("config")).unwrap();
-        fs::write(journal.join("config/journal.json"), r#"{"identity": {"timezone": "America/Denver"}}"#).unwrap();
+        fs::write(
+            journal.join("config/journal.json"),
+            r#"{"identity": {"timezone": "America/Denver"}}"#,
+        )
+        .unwrap();
         // 23:30 in Denver on 10-20 is already 10-21 in UTC.
         let now = Utc.with_ymd_and_hms(2026, 10, 21, 5, 30, 0).unwrap();
         write_transcript(journal, "20261020", "120000_300", 4.0, 3, true);

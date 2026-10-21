@@ -20,6 +20,7 @@ mod http;
 mod icons;
 mod keys;
 mod logs;
+mod owner_voice;
 mod processing;
 mod request_body;
 mod retention;
@@ -27,7 +28,6 @@ mod retention_executor;
 mod state;
 mod storage;
 mod sync;
-mod owner_voice;
 mod transcribe;
 mod vision;
 

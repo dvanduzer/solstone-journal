@@ -59,8 +59,14 @@ pub(crate) fn eligibility(audio_path: &Path, output: &Path, setting_on: bool) ->
                 Eligibility::Final
             }
         }
-        Some(record) if record.get("state").and_then(Value::as_str) == Some(vocab::STATE_FAILED) => {
-            if setting_on { Eligibility::Filtered } else { Eligibility::Today }
+        Some(record)
+            if record.get("state").and_then(Value::as_str) == Some(vocab::STATE_FAILED) =>
+        {
+            if setting_on {
+                Eligibility::Filtered
+            } else {
+                Eligibility::Today
+            }
         }
         Some(_) => Eligibility::Today,
         None if output.exists() => Eligibility::Today,
@@ -119,7 +125,10 @@ pub(crate) fn scored_windows(
 ) -> Vec<Window> {
     (0..len)
         .step_by(WINDOW_SAMPLES)
-        .map(|start| Window { start, end: (start + WINDOW_SAMPLES).min(len) })
+        .map(|start| Window {
+            start,
+            end: (start + WINDOW_SAMPLES).min(len),
+        })
         .filter(|window| {
             speech
                 .iter()
@@ -195,7 +204,11 @@ pub(crate) fn first_pass(
         .map(|index| by_id.remove(&(SYNTHETIC_ID_BASE + index as i64)))
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| unusable("owner-voice-missing-embedding"))?;
-    Ok(FirstPass { embeddings, turn_ranges, overlap_ranges })
+    Ok(FirstPass {
+        embeddings,
+        turn_ranges,
+        overlap_ranges,
+    })
 }
 
 /// Best cosine of an embedding against the kept prints (already L2-normalized).
@@ -225,8 +238,14 @@ pub(crate) fn score(embedding: &[f32], prints: &[&[f32]]) -> f64 {
 pub(crate) fn keeps(window: Window, score: f64, pass: &FirstPass) -> bool {
     let (start, end) = (window.start_s(), window.end_s());
     score >= OWNER_VOICE_KEEP_SCORE
-        || pass.overlap_ranges.iter().any(|(s, e)| *s < end && *e > start)
-        || pass.turn_ranges.iter().any(|(s, e)| start <= *s && *e <= end)
+        || pass
+            .overlap_ranges
+            .iter()
+            .any(|(s, e)| *s < end && *e > start)
+        || pass
+            .turn_ranges
+            .iter()
+            .any(|(s, e)| start <= *s && *e <= end)
 }
 
 /// Kept windows padded (0.5 s before, 1 s after), clamped and merged.
@@ -286,7 +305,11 @@ pub(crate) fn decide(windows: &[Window], pass: &FirstPass, print: &[f32], len: u
 
 /// The nothing-kept decision (no speech, or no window scored).
 pub(crate) fn keep_nothing() -> Decision {
-    Decision { union: Vec::new(), windows_scored: 0, windows_kept: 0 }
+    Decision {
+        union: Vec::new(),
+        windows_scored: 0,
+        windows_kept: 0,
+    }
 }
 
 /// SHA-256 of the print's values exactly as loaded, little-endian.
@@ -300,10 +323,12 @@ pub(crate) fn print_sha256(values: &[f32]) -> String {
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
-    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
-        let _ = write!(out, "{byte:02x}");
-        out
-    })
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
 }
 
 /// The `owner_voice` member for this attempt.
@@ -316,7 +341,11 @@ pub(crate) fn filter_record(
     print: &[f32],
 ) -> OwnerVoiceFilter {
     let speech_samples = speech.iter().map(|(start, end)| end - start).sum::<usize>();
-    let kept_samples = decision.union.iter().map(|(start, end)| end - start).sum::<usize>();
+    let kept_samples = decision
+        .union
+        .iter()
+        .map(|(start, end)| end - start)
+        .sum::<usize>();
     let kept_speech = speech
         .iter()
         .map(|range| {
@@ -339,7 +368,9 @@ pub(crate) fn filter_record(
             size: original_size,
             sha256: hex(original_sha256),
         },
-        print: OwnerVoicePrint { sha256: print_sha256(print) },
+        print: OwnerVoicePrint {
+            sha256: print_sha256(print),
+        },
     }
 }
 
@@ -407,7 +438,11 @@ where
         decide(&windows, &pass, print, len)
     };
     mask(&mut audio, &decision.union);
-    Ok(FilterStep { audio, speech, decision })
+    Ok(FilterStep {
+        audio,
+        speech,
+        decision,
+    })
 }
 
 #[cfg(test)]
@@ -415,7 +450,11 @@ mod tests {
     use super::*;
 
     fn pass(turns: Vec<(f64, f64)>, overlaps: Vec<(f64, f64)>) -> FirstPass {
-        FirstPass { embeddings: Vec::new(), turn_ranges: turns, overlap_ranges: overlaps }
+        FirstPass {
+            embeddings: Vec::new(),
+            turn_ranges: turns,
+            overlap_ranges: overlaps,
+        }
     }
 
     fn unit_print() -> Vec<f32> {
@@ -443,7 +482,10 @@ mod tests {
 
     #[test]
     fn the_cutoff_keeps_at_and_above_only() {
-        let window = Window { start: 0, end: WINDOW_SAMPLES };
+        let window = Window {
+            start: 0,
+            end: WINDOW_SAMPLES,
+        };
         let none = pass(vec![], vec![]);
         assert!(keeps(window, OWNER_VOICE_KEEP_SCORE, &none));
         let below = f64::from_bits(OWNER_VOICE_KEEP_SCORE.to_bits() - 1);
@@ -453,7 +495,10 @@ mod tests {
 
     #[test]
     fn uncertainty_keeps_follow_the_evaluated_rule() {
-        let window = Window { start: 2 * WINDOW_SAMPLES, end: 3 * WINDOW_SAMPLES }; // 4 s .. 6 s
+        let window = Window {
+            start: 2 * WINDOW_SAMPLES,
+            end: 3 * WINDOW_SAMPLES,
+        }; // 4 s .. 6 s
         let low = 0.0;
         assert!(keeps(window, low, &pass(vec![], vec![(5.0, 5.1)])));
         // Touching only is not an intersection.
@@ -468,14 +513,35 @@ mod tests {
     #[test]
     fn padding_clamps_and_touching_spans_merge() {
         let len = 10 * SAMPLE_RATE;
-        let first = Window { start: 0, end: WINDOW_SAMPLES };
-        let last = Window { start: 4 * WINDOW_SAMPLES, end: len };
-        assert_eq!(kept_union(&[first], len), vec![(0, WINDOW_SAMPLES + PAD_AFTER_SAMPLES)]);
-        assert_eq!(kept_union(&[last], len), vec![(4 * WINDOW_SAMPLES - PAD_BEFORE_SAMPLES, len)]);
+        let first = Window {
+            start: 0,
+            end: WINDOW_SAMPLES,
+        };
+        let last = Window {
+            start: 4 * WINDOW_SAMPLES,
+            end: len,
+        };
+        assert_eq!(
+            kept_union(&[first], len),
+            vec![(0, WINDOW_SAMPLES + PAD_AFTER_SAMPLES)]
+        );
+        assert_eq!(
+            kept_union(&[last], len),
+            vec![(4 * WINDOW_SAMPLES - PAD_BEFORE_SAMPLES, len)]
+        );
         // A window ending at 2 s pads to 3 s; one starting at 3.5 s pads back to 3 s: they touch.
-        let a = Window { start: 0, end: WINDOW_SAMPLES };
-        let b = Window { start: 56_000, end: 56_000 + WINDOW_SAMPLES };
-        assert_eq!(kept_union(&[b, a], len), vec![(0, 56_000 + WINDOW_SAMPLES + PAD_AFTER_SAMPLES)]);
+        let a = Window {
+            start: 0,
+            end: WINDOW_SAMPLES,
+        };
+        let b = Window {
+            start: 56_000,
+            end: 56_000 + WINDOW_SAMPLES,
+        };
+        assert_eq!(
+            kept_union(&[b, a], len),
+            vec![(0, 56_000 + WINDOW_SAMPLES + PAD_AFTER_SAMPLES)]
+        );
     }
 
     #[test]
@@ -483,7 +549,13 @@ mod tests {
         let len = 3 * WINDOW_SAMPLES;
         let speech = vec![(0, 4_799), (WINDOW_SAMPLES, WINDOW_SAMPLES + 4_800)];
         let windows = scored_windows(len, &speech, |_| true);
-        assert_eq!(windows, vec![Window { start: WINDOW_SAMPLES, end: 2 * WINDOW_SAMPLES }]);
+        assert_eq!(
+            windows,
+            vec![Window {
+                start: WINDOW_SAMPLES,
+                end: 2 * WINDOW_SAMPLES
+            }]
+        );
         assert!(scored_windows(len, &speech, |_| false).is_empty());
     }
 
@@ -500,7 +572,11 @@ mod tests {
     #[test]
     fn counts_follow_the_definitions() {
         let speech = vec![(0, 32_000), (64_000, 80_000)];
-        let decision = Decision { union: vec![(0, 40_000)], windows_scored: 2, windows_kept: 1 };
+        let decision = Decision {
+            union: vec![(0, 40_000)],
+            windows_scored: 2,
+            windows_kept: 1,
+        };
         let filter = filter_record(&speech, &decision, "a.m4a", 7, &[0u8; 32], &unit_print());
         assert_eq!(filter.speech_s, 3.0);
         assert_eq!(filter.kept_s, 2.5);
@@ -522,7 +598,11 @@ mod tests {
         }
     }
 
-    fn result_for(embeddings: &[(i64, Vec<f32>)], turns: Option<Vec<(f64, f64)>>, overlaps: Option<Vec<(f64, f64)>>) -> SpeakerAnalyzeResult {
+    fn result_for(
+        embeddings: &[(i64, Vec<f32>)],
+        turns: Option<Vec<(f64, f64)>>,
+        overlaps: Option<Vec<(f64, f64)>>,
+    ) -> SpeakerAnalyzeResult {
         let payload = embeddings
             .iter()
             .flat_map(|(_, values)| values.iter().flat_map(|v| v.to_le_bytes()))
@@ -558,29 +638,41 @@ mod tests {
         let audio = vec![0.5_f32; len];
         let print = unit_print();
         let calls = std::cell::Cell::new(0);
-        let step = filter_audio(Path::new("a.m4a"), audio, &vad(vec![(0.0, 10.0)]), &print, |seen, statements| {
-            calls.set(calls.get() + 1);
-            assert!(seen.iter().all(|v| *v == 0.5), "the first pass sees the unmasked audio");
-            assert_eq!(statements.len(), 5);
-            let ids = (0..5).map(|i| SYNTHETIC_ID_BASE + i).collect::<Vec<_>>();
-            Ok(result_for(
-                &[
-                    (ids[0], along(1, 2.0)),
-                    (ids[1], along(0, 3.0)),
-                    (ids[2], along(1, 1.0)),
-                    (ids[3], along(1, 1.0)),
-                    (ids[4], along(1, 1.0)),
-                ],
-                Some(vec![(6.5, 6.6)]),
-                Some(vec![]),
-            ))
-        })
+        let step = filter_audio(
+            Path::new("a.m4a"),
+            audio,
+            &vad(vec![(0.0, 10.0)]),
+            &print,
+            |seen, statements| {
+                calls.set(calls.get() + 1);
+                assert!(
+                    seen.iter().all(|v| *v == 0.5),
+                    "the first pass sees the unmasked audio"
+                );
+                assert_eq!(statements.len(), 5);
+                let ids = (0..5).map(|i| SYNTHETIC_ID_BASE + i).collect::<Vec<_>>();
+                Ok(result_for(
+                    &[
+                        (ids[0], along(1, 2.0)),
+                        (ids[1], along(0, 3.0)),
+                        (ids[2], along(1, 1.0)),
+                        (ids[3], along(1, 1.0)),
+                        (ids[4], along(1, 1.0)),
+                    ],
+                    Some(vec![(6.5, 6.6)]),
+                    Some(vec![]),
+                ))
+            },
+        )
         .expect("filtered");
         assert_eq!(calls.get(), 1);
         assert_eq!(step.decision.windows_scored, 5);
         assert_eq!(step.decision.windows_kept, 2);
         // Window 1 (2-4 s) pads to 1.5-5 s; window 3 (6-8 s) pads to 5.5-9 s.
-        assert_eq!(step.decision.union, vec![(24_000, 80_000), (88_000, 144_000)]);
+        assert_eq!(
+            step.decision.union,
+            vec![(24_000, 80_000), (88_000, 144_000)]
+        );
         for (index, sample) in step.audio.iter().enumerate() {
             let kept = (24_000..80_000).contains(&index) || (88_000..144_000).contains(&index);
             assert_eq!(*sample, if kept { 0.5 } else { 0.0 }, "sample {index}");
@@ -591,9 +683,13 @@ mod tests {
     fn filter_audio_skips_the_first_pass_without_scored_speech() {
         let len = 4 * SAMPLE_RATE;
         for vad in [vad(vec![]), vad(vec![(0.0, 0.29)])] {
-            let step = filter_audio(Path::new("a.m4a"), vec![0.5; len], &vad, &unit_print(), |_, _| {
-                panic!("no first pass without scored speech")
-            })
+            let step = filter_audio(
+                Path::new("a.m4a"),
+                vec![0.5; len],
+                &vad,
+                &unit_print(),
+                |_, _| panic!("no first pass without scored speech"),
+            )
             .expect("filtered");
             assert_eq!(step.decision.windows_scored, 0);
             assert!(step.audio.iter().all(|v| *v == 0.0));
@@ -605,14 +701,28 @@ mod tests {
         let len = 2 * SAMPLE_RATE;
         let speech = vad(vec![(0.0, 2.0)]);
         for (turns, overlaps) in [(None, Some(vec![])), (Some(vec![]), None)] {
-            let outcome = filter_audio(Path::new("a.m4a"), vec![0.5; len], &speech, &unit_print(), |_, _| {
-                Ok(result_for(&[(SYNTHETIC_ID_BASE, along(0, 1.0))], turns.clone(), overlaps.clone()))
-            });
+            let outcome = filter_audio(
+                Path::new("a.m4a"),
+                vec![0.5; len],
+                &speech,
+                &unit_print(),
+                |_, _| {
+                    Ok(result_for(
+                        &[(SYNTHETIC_ID_BASE, along(0, 1.0))],
+                        turns.clone(),
+                        overlaps.clone(),
+                    ))
+                },
+            );
             assert!(matches!(outcome, Err(FirstPassProblem::HelperOutdated)));
         }
-        let outcome = filter_audio(Path::new("a.m4a"), vec![0.5; len], &speech, &unit_print(), |_, _| {
-            Ok(result_for(&[], Some(vec![]), Some(vec![])))
-        });
+        let outcome = filter_audio(
+            Path::new("a.m4a"),
+            vec![0.5; len],
+            &speech,
+            &unit_print(),
+            |_, _| Ok(result_for(&[], Some(vec![]), Some(vec![]))),
+        );
         assert!(matches!(outcome, Err(FirstPassProblem::Unusable(_))));
     }
 
@@ -624,7 +734,11 @@ mod tests {
         let audio = stream.join("120000_300.m4a");
         let output = stream.join("120000_300.jsonl");
         let write = |record: Value| {
-            std::fs::write(&output, format!("{}\n", json!({"_solstone_processing": record}))).unwrap();
+            std::fs::write(
+                &output,
+                format!("{}\n", json!({"_solstone_processing": record})),
+            )
+            .unwrap();
         };
         assert_eq!(eligibility(&audio, &output, true), Eligibility::Filtered);
         assert_eq!(eligibility(&audio, &output, false), Eligibility::Today);
@@ -642,7 +756,9 @@ mod tests {
         std::fs::write(&output, "{\"start\":\"12:00:00\"}\n").unwrap();
         assert_eq!(eligibility(&audio, &output, true), Eligibility::Today);
 
-        let import = dir.path().join("chronicle/20261020/import.audio/120000_300");
+        let import = dir
+            .path()
+            .join("chronicle/20261020/import.audio/120000_300");
         std::fs::create_dir_all(&import).unwrap();
         assert_eq!(
             eligibility(&import.join("a.m4a"), &import.join("a.jsonl"), true),

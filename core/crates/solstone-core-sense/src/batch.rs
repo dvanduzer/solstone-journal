@@ -1190,7 +1190,10 @@ mod tests {
         let path = segment(temp.path());
         let day = temp.path().join("chronicle").join("20260812");
         let header = |record: serde_json::Value| {
-            format!("{}\n", serde_json::json!({"raw": "mic_audio.flac", "_solstone_processing": record}))
+            format!(
+                "{}\n",
+                serde_json::json!({"raw": "mic_audio.flac", "_solstone_processing": record})
+            )
         };
         for record in [
             serde_json::json!({"state": "analyzed", "owner_voice_filter": true}),
@@ -1204,17 +1207,22 @@ mod tests {
                 (ReprocessKind::All, false),
                 (ReprocessKind::Audio, false),
             ] {
-                let outcome =
-                    delete_outputs_counted(temp.path(), &day, kind, None, None, dry_run).expect("reprocess");
+                let outcome = delete_outputs_counted(temp.path(), &day, kind, None, None, dry_run)
+                    .expect("reprocess");
                 assert!(outcome.deleted.is_empty());
                 assert_eq!(outcome.kept_voice_only, 1);
                 assert!(path.join("mic_audio.jsonl").exists());
             }
         }
         // An ordinary output in the same segment is still deleted.
-        fs::write(path.join("mic_audio.jsonl"), header(serde_json::json!({"state": "analyzed"}))).expect("sidecar");
+        fs::write(
+            path.join("mic_audio.jsonl"),
+            header(serde_json::json!({"state": "analyzed"})),
+        )
+        .expect("sidecar");
         let outcome =
-            delete_outputs_counted(temp.path(), &day, ReprocessKind::Audio, None, None, false).expect("reprocess");
+            delete_outputs_counted(temp.path(), &day, ReprocessKind::Audio, None, None, false)
+                .expect("reprocess");
         assert_eq!(outcome.deleted, vec![path.join("mic_audio.jsonl")]);
         assert_eq!(outcome.kept_voice_only, 0);
     }

@@ -207,7 +207,9 @@ fn missing_video_reason(cause: Option<RawReleaseClass>) -> &'static str {
         }
         Some(RawReleaseClass::Owner) => "you deleted the original video",
         // Voice-only filtering never deletes video.
-        Some(RawReleaseClass::OwnerVoice) | None => "the original video is no longer in your journal",
+        Some(RawReleaseClass::OwnerVoice) | None => {
+            "the original video is no longer in your journal"
+        }
     }
 }
 

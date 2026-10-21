@@ -81,34 +81,51 @@ fn validate(record: &Value, member: &Value) -> Result<OwnerVoiceFilter, OwnerVoi
     let filter: OwnerVoiceFilter = serde_json::from_value(member.clone())
         .map_err(|_| OwnerVoiceRecordError("owner voice member has an invalid shape"))?;
     if filter.version != OWNER_VOICE_VERSION {
-        return Err(OwnerVoiceRecordError("owner voice member has an unknown version"));
+        return Err(OwnerVoiceRecordError(
+            "owner voice member has an unknown version",
+        ));
     }
     for duration in [filter.speech_s, filter.kept_s, filter.left_out_s] {
         if !duration.is_finite() || duration < 0.0 {
-            return Err(OwnerVoiceRecordError("owner voice durations must be finite and non-negative"));
+            return Err(OwnerVoiceRecordError(
+                "owner voice durations must be finite and non-negative",
+            ));
         }
     }
     if filter.left_out_s > filter.speech_s {
-        return Err(OwnerVoiceRecordError("owner voice left-out speech exceeds detected speech"));
+        return Err(OwnerVoiceRecordError(
+            "owner voice left-out speech exceeds detected speech",
+        ));
     }
     if filter.windows_kept > filter.windows_scored {
-        return Err(OwnerVoiceRecordError("owner voice kept windows exceed scored windows"));
+        return Err(OwnerVoiceRecordError(
+            "owner voice kept windows exceed scored windows",
+        ));
     }
     let name = filter.original.name.as_str();
     if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') {
-        return Err(OwnerVoiceRecordError("owner voice original name must be a bare file name"));
+        return Err(OwnerVoiceRecordError(
+            "owner voice original name must be a bare file name",
+        ));
     }
     if !is_sha256_hex(&filter.original.sha256) || !is_sha256_hex(&filter.print.sha256) {
-        return Err(OwnerVoiceRecordError("owner voice digests must be 64 lowercase hex characters"));
+        return Err(OwnerVoiceRecordError(
+            "owner voice digests must be 64 lowercase hex characters",
+        ));
     }
     if record.get("input_size").and_then(Value::as_u64) != Some(filter.original.size) {
-        return Err(OwnerVoiceRecordError("owner voice original size differs from the record's input size"));
+        return Err(OwnerVoiceRecordError(
+            "owner voice original size differs from the record's input size",
+        ));
     }
     Ok(filter)
 }
 
 fn is_sha256_hex(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Whether a record was written by a voice-only attempt.
@@ -203,8 +220,12 @@ mod tests {
         assert!(owner_voice_filtered(&record()));
         assert!(owner_voice_filtered(&json!({"owner_voice_filter": true})));
         assert!(owner_voice_filtered(&json!({"owner_voice_filter": "yes"})));
-        assert!(owner_voice_filtered(&json!({"owner_voice": {"broken": true}})));
-        assert!(owner_voice_filtered(&json!({"owner_voice_filter": false, "owner_voice": 1})));
+        assert!(owner_voice_filtered(
+            &json!({"owner_voice": {"broken": true}})
+        ));
+        assert!(owner_voice_filtered(
+            &json!({"owner_voice_filter": false, "owner_voice": 1})
+        ));
         assert!(!owner_voice_filtered(&json!({"owner_voice_filter": false})));
         assert!(!owner_voice_filtered(&json!({"state": "analyzed"})));
     }
