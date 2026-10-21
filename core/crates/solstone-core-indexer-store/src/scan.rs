@@ -36,6 +36,9 @@ use crate::activity_provenance::{
     hidden_flag, missing_activity_memberships, record_activity_membership,
     record_activity_provenance,
 };
+use crate::calendar::{
+    Identity, Relisted, forget_calendar_path, index_calendar_file, listing_zone, relist,
+};
 use crate::chunk_sources::{
     CHUNK_SOURCES_LOOKUP_ROWIDS, chunk_path_lookup_ready, delete_chunk_source_rowids,
     record_chunk_source, require_chunk_path_lookup,
@@ -301,11 +304,22 @@ impl PendingChunkRows {
     }
 }
 
+/// Delete every index row filed under one source file. For a calendar file
+/// this returns the identities it held notes for; the caller relists them in
+/// the same transaction.
 fn delete_file_chunks(
     conn: &Connection,
     path: &str,
     known_rows: Option<&[i64]>,
-) -> Result<(), StoreError> {
+) -> Result<BTreeSet<Identity>, StoreError> {
+    // Listing rows can be filed under a calendar file by another file's
+    // relist in this same pass, after `known_rows` was read; the calendar
+    // rows are found through their own table instead.
+    let identities = if is_calendar_note(path) {
+        forget_calendar_path(conn, path)?
+    } else {
+        BTreeSet::new()
+    };
     if let Some(rows) = known_rows {
         let mut statement = conn.prepare_cached("DELETE FROM chunks WHERE rowid=? AND path=?")?;
         for id in rows {
@@ -330,7 +344,7 @@ fn delete_file_chunks(
     conn.execute("DELETE FROM memory_originals WHERE path=?", [path])?;
     conn.execute("DELETE FROM chunk_group_offset WHERE path=?", [path])?;
     conn.execute("DELETE FROM screen_text_source WHERE path=?", [path])?;
-    Ok(())
+    Ok(identities)
 }
 
 #[derive(Clone, Debug)]
@@ -591,6 +605,9 @@ fn scan_journal_pass(
             .chain(removed.iter().cloned()),
     );
     let mut invalid_memory_removed = 0;
+    // Read once per pass. An unreadable settings file leaves calendar rows as
+    // they are; the edge pass below reports that file once for the whole scan.
+    let mut calendar_zone_readable: Option<bool> = None;
     for (rel, path, mtime) in &to_index {
         let family = match resolve_content_shape(path, rel) {
             ContentResolution::Indexed(family) => family,
@@ -673,6 +690,12 @@ fn scan_journal_pass(
         {
             continue;
         }
+        if family == Family::Calendar
+            && !*calendar_zone_readable.get_or_insert_with(|| listing_zone(journal).is_ok())
+        {
+            report.skipped += 1;
+            continue;
+        }
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let chunk_rows = pending_chunks.take(&tx, rel)?;
         let warnings = match ensure_file_current(
@@ -712,8 +735,11 @@ fn scan_journal_pass(
     for rel in &removed {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let chunk_rows = pending_chunks.take(&tx, rel)?;
-        delete_file_chunks(&tx, rel, Some(&chunk_rows))?;
+        let forgotten = delete_file_chunks(&tx, rel, Some(&chunk_rows))?;
         tx.execute("DELETE FROM files WHERE path=?", [rel])?;
+        let relisted = relist(&tx, journal, &forgotten)?;
+        relisted.mark_for_reindex(&tx)?;
+        report.warnings.extend(relisted.warnings);
         commit_scanned(tx, checkpoint)?;
         removed_count += 1;
     }
@@ -1121,6 +1147,10 @@ pub(crate) fn rescan_file_admitted(
     let mut edge_resolver = EdgeResolver::new(journal);
     if edge_source.is_some() {
         edge_resolver.preflight_owner_timezone()?;
+    }
+    if family == Some(Family::Calendar) {
+        // Existing rows stay as they are until the settings file can be read.
+        listing_zone(journal)?;
     }
     let mtime = if family == Some(Family::AgentMemory) {
         memory_file_mtime_secs(&path)?
@@ -2006,18 +2036,27 @@ fn ensure_file_current(
         FileUpdate::Scan(rows) => Some(rows),
         FileUpdate::Force | FileUpdate::IfChanged => None,
     };
-    delete_file_chunks(conn, rel, known_chunk_rows)?;
-    let warnings =
-        index_file(conn, journal, rel, path, family, memory_original).map_err(|warning| {
-            StoreError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                warning,
-            ))
-        })?;
+    let forgotten = delete_file_chunks(conn, rel, known_chunk_rows)?;
+    let indexed = if family == Family::Calendar {
+        index_calendar_source(conn, journal, rel, path, forgotten)
+    } else {
+        index_file(conn, journal, rel, path, family, memory_original)
+            .map(|warnings| (warnings, None))
+    };
+    let (warnings, relisted) = indexed.map_err(|warning| {
+        StoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            warning,
+        ))
+    })?;
     conn.execute(
         "REPLACE INTO files(path, mtime) VALUES (?, ?)",
         params![rel, mtime],
     )?;
+    // After this file's own row, so a file left to index again stays marked.
+    if let Some(relisted) = relisted {
+        relisted.mark_for_reindex(conn)?;
+    }
     Ok(warnings)
 }
 
@@ -2135,6 +2174,43 @@ fn index_file(
     Ok(warnings)
 }
 
+/// Index one calendar file's notes on the day they were stored, then relist
+/// every identity it holds now or held before, in the caller's transaction.
+fn index_calendar_source(
+    conn: &Connection,
+    journal: &Path,
+    rel: &str,
+    path: &Path,
+    mut identities: BTreeSet<Identity>,
+) -> Result<(Vec<String>, Option<Relisted>), String> {
+    let text = fs::read_to_string(path)
+        .map_err(|error| format!("content read failed for {rel}: {error}"))?;
+    let metadata = extract_path_metadata(rel);
+    let stream_lookup = extract_stream(journal, rel);
+    let declarations = FacetDeclarationSet::from_journal(journal)
+        .map_err(|error| format!("facet declaration scan failed for {rel}: {error}"))?;
+    let classification =
+        classify_source(journal, rel, stream_lookup.stream.as_deref(), &declarations);
+    let (indexed, mut warnings) = index_calendar_file(
+        conn,
+        journal,
+        rel,
+        &text,
+        &metadata.day,
+        stream_lookup.stream.as_deref(),
+        &time_bucket(rel),
+    )
+    .map_err(|error| format!("calendar note insert failed for {rel}: {error}"))?;
+    warnings.extend(stream_lookup.warning);
+    identities.extend(indexed);
+    replace_chunk_classification(conn, &classification)
+        .map_err(|error| format!("classification insert failed for {rel}: {error}"))?;
+    let mut relisted = relist(conn, journal, &identities)
+        .map_err(|error| format!("calendar listing failed for {rel}: {error}"))?;
+    warnings.append(&mut relisted.warnings);
+    Ok((warnings, Some(relisted)))
+}
+
 fn resolve_rescan_target(journal: &Path, input: &Path) -> Result<(String, PathBuf), StoreError> {
     if input.is_absolute() {
         let journal_abs = fs::canonicalize(journal)?;
@@ -2162,6 +2238,11 @@ pub(crate) fn file_mtime_secs(path: &Path) -> Result<i64, StoreError> {
 
 fn written_activity(path: &Path, rel: &str) -> bool {
     resolve_content_shape(path, rel) == ContentResolution::Indexed(Family::Activity)
+}
+
+fn is_calendar_note(rel: &str) -> bool {
+    solstone_core_format::content::resolve_spec(rel)
+        .is_some_and(|spec| spec.family == Family::Calendar)
 }
 
 pub(crate) fn is_memory_note(rel: &str) -> bool {

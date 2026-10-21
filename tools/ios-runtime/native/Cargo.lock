@@ -5085,6 +5085,7 @@ name = "solstone-core-indexer-store"
 version = "2.0.52"
 dependencies = [
  "chrono",
+ "chrono-tz",
  "log",
  "rusqlite",
  "serde",
@@ -5097,6 +5098,7 @@ dependencies = [
  "solstone-core-journal-io",
  "solstone-core-memory-original",
  "solstone-core-retention",
+ "solstone-core-segment",
 ]
 
 [[package]]

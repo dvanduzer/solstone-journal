@@ -620,7 +620,7 @@ fn read_json_object(path: &Path, source: &'static str) -> Result<JsonObject, Edg
 /// The journal's owner zone. A config that exists but does not parse fails
 /// the scan rather than guessing; a missing or unknown zone falls back to this
 /// computer's zone.
-pub(crate) fn owner_timezone_for_journal(journal: &Path) -> Result<Tz, EdgeError> {
+pub fn owner_timezone_for_journal(journal: &Path) -> Result<Tz, EdgeError> {
     read_journal_config(journal).map_err(|error| EdgeError::JournalConfigCorrupt {
         path: get_journal_config_path(journal),
         message: error.to_string(),

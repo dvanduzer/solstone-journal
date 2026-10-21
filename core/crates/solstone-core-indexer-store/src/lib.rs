@@ -2,6 +2,7 @@
 // Copyright (c) 2026 sol pbc
 
 mod activity_provenance;
+pub mod calendar;
 pub mod chunk_sources;
 pub mod classification;
 pub mod classification_batch;

@@ -5473,6 +5473,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "solstone-core-format",
  "solstone-core-indexer",
  "solstone-core-indexer-store",
@@ -5485,6 +5486,7 @@ name = "solstone-core-indexer-store"
 version = "2.0.52"
 dependencies = [
  "chrono",
+ "chrono-tz",
  "log",
  "rusqlite",
  "serde",
@@ -5494,9 +5496,11 @@ dependencies = [
  "solstone-core-format",
  "solstone-core-indexer",
  "solstone-core-indexer-todo",
+ "solstone-core-journal-config",
  "solstone-core-journal-io",
  "solstone-core-memory-original",
  "solstone-core-retention",
+ "solstone-core-segment",
 ]
 
 [[package]]
