@@ -19,14 +19,15 @@
 //! indexed. If the owner changes the zone, timed events keep their old days
 //! until the search index is rebuilt.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use chrono::Utc;
+use chrono::{NaiveDate, NaiveDateTime, Utc};
 use chrono_tz::Tz;
 use rusqlite::{Connection, OptionalExtension, params};
 use solstone_core_format::calendar::{
-    CalendarNote, When, listed_days, parse_calendar_note, read_calendar_notes, render_calendar_note,
+    CalendarNote, When, import_stamp, listed_days, parse_calendar_note, read_calendar_notes,
+    render_calendar_note, validate_import_calendar_file,
 };
 use solstone_core_format::segment::hour_bucket;
 
@@ -46,8 +47,35 @@ changed_at_ms INTEGER NOT NULL,
 change_rank INTEGER NOT NULL,
 changed_at TEXT NOT NULL,
 record TEXT NOT NULL,
+import TEXT,
+imported_at_ms INTEGER,
 PRIMARY KEY(path, line)
 )";
+
+/// Add the import columns to a table an earlier version created.
+pub(crate) fn ensure_calendar_note_columns(conn: &Connection) -> Result<(), StoreError> {
+    let columns = {
+        let mut statement = conn.prepare("SELECT name FROM pragma_table_info('calendar_notes')")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<BTreeSet<_>, _>>()?
+    };
+    for (column, kind) in [("import", "TEXT"), ("imported_at_ms", "INTEGER")] {
+        if !columns.contains(column) {
+            conn.execute(
+                &format!("ALTER TABLE calendar_notes ADD COLUMN {column} {kind}"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The stream every calendar import writes to.
+pub const CALENDAR_IMPORT_STREAM: &str = "import.ics";
+
+/// How far past an import its expansion of a repeating series reaches.
+const IMPORT_EXPANSION_DAYS: i64 = 365;
 pub(crate) const CREATE_CALENDAR_NOTES_IDENTITY: &str =
     "CREATE INDEX IF NOT EXISTS calendar_notes_identity ON calendar_notes(event, occurrence)";
 pub(crate) const CREATE_CALENDAR_NOTES_STREAM: &str =
@@ -96,13 +124,16 @@ pub(crate) fn index_calendar_file(
     bucket: &str,
 ) -> Result<(BTreeSet<Identity>, Vec<String>), StoreError> {
     let mut identities = BTreeSet::new();
+    if stream == Some(CALENDAR_IMPORT_STREAM) {
+        return index_imported_calendar_file(conn, rel, text);
+    }
     let Some(stream) =
         stream.filter(|stream| solstone_core_segment::is_calendar_stream(journal, stream))
     else {
         return Ok((
             identities,
             vec![format!(
-                "calendar notes are read only from calendar streams: {rel}"
+                "calendar notes are read only from calendar streams and calendar imports: {rel}"
             )],
         ));
     };
@@ -138,6 +169,185 @@ pub(crate) fn index_calendar_file(
         identities.insert((note.event.clone(), note.occurrence.clone()));
     }
     Ok((identities, warnings))
+}
+
+/// The import that defines a series: the most recent by upload time, with
+/// its id breaking ties, among the imports whose surviving lines hold the
+/// event, and the occurrences it covers.
+struct NewestImport {
+    import: String,
+    /// It holds a line for the event as a single, non-repeating event.
+    single: bool,
+    /// The earliest and latest instants it covers, for a series: its earliest
+    /// and latest written occurrences. When it expanded the series' rule, it
+    /// covers up to a year past the import, as far as an import expands one,
+    /// even when its last written occurrence is earlier.
+    span: Option<(NaiveDateTime, NaiveDateTime)>,
+}
+
+impl NewestImport {
+    /// Whether a line from `import` for `occurrence` still counts. Lines that
+    /// did not come from an import always count; the newest import's always
+    /// count; an older import's count only outside what the newest covers.
+    fn admits(&self, import: Option<&str>, occurrence: &str) -> bool {
+        let Some(import) = import else {
+            return true;
+        };
+        if import == self.import {
+            return true;
+        }
+        if occurrence.is_empty() {
+            return !self.single;
+        }
+        match (self.span, occurrence_instant(occurrence)) {
+            (Some((first, last)), Some(at)) => at < first || at > last,
+            _ => true,
+        }
+    }
+}
+
+fn newest_import(conn: &Connection, event: &str) -> Result<Option<NewestImport>, StoreError> {
+    let newest: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT import, imported_at_ms FROM calendar_notes WHERE event=? AND import IS NOT NULL \
+             ORDER BY imported_at_ms DESC, import DESC LIMIT 1",
+            [event],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((import, imported_at_ms)) = newest else {
+        return Ok(None);
+    };
+    let rows = {
+        let mut statement = conn.prepare_cached(
+            "SELECT occurrence, json_extract(record, '$.expanded') IS 1 FROM calendar_notes \
+             WHERE event=? AND import=?",
+        )?;
+        statement
+            .query_map(params![event, import], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let expanded = rows.iter().any(|(_, expanded)| *expanded);
+    let occurrences = rows
+        .into_iter()
+        .map(|(occurrence, _)| occurrence)
+        .collect::<Vec<_>>();
+    let single = occurrences.iter().any(String::is_empty);
+    let instants = occurrences
+        .iter()
+        .filter_map(|occurrence| occurrence_instant(occurrence))
+        .collect::<Vec<_>>();
+    let span = match (instants.iter().min(), instants.iter().max()) {
+        (Some(&first), Some(&last)) => {
+            let expanded_to = chrono::DateTime::from_timestamp_millis(imported_at_ms)
+                .map(|at| (at + chrono::Duration::days(IMPORT_EXPANSION_DAYS)).naive_utc());
+            let end = expanded_to
+                .filter(|_| expanded)
+                .map_or(last, |end| end.max(last));
+            Some((first, end))
+        }
+        _ => None,
+    };
+    Ok(Some(NewestImport {
+        import,
+        single,
+        span,
+    }))
+}
+
+/// A normalized occurrence as a point in time: the UTC instant of a zoned
+/// start, the wall clock of a floating one, and the start of an all-day date.
+fn occurrence_instant(occurrence: &str) -> Option<NaiveDateTime> {
+    if let Some(utc) = occurrence.strip_suffix('Z') {
+        return NaiveDateTime::parse_from_str(utc, "%Y-%m-%dT%H:%M:%S%.f").ok();
+    }
+    NaiveDateTime::parse_from_str(occurrence, "%Y-%m-%dT%H:%M:%S%.f")
+        .ok()
+        .or_else(|| {
+            NaiveDate::parse_from_str(occurrence, "%Y-%m-%d")
+                .ok()
+                .and_then(|date| date.and_hms_opt(0, 0, 0))
+        })
+}
+
+/// Index a calendar file an import wrote beside a window's transcript. Its
+/// notes join the listing only: the transcript stays the record of the day
+/// the event was placed on. A file that fails the contract, checked against
+/// its segment's own span, is skipped and reported.
+fn index_imported_calendar_file(
+    conn: &Connection,
+    rel: &str,
+    text: &str,
+) -> Result<(BTreeSet<Identity>, Vec<String>), StoreError> {
+    let parts = rel
+        .strip_prefix("chronicle/")
+        .unwrap_or(rel)
+        .split('/')
+        .collect::<Vec<_>>();
+    let [day, _, segment, file_name] = parts.as_slice() else {
+        return Ok((
+            BTreeSet::new(),
+            vec![format!("calendar notes skipped: {rel} is not in a segment")],
+        ));
+    };
+    let notes = match validate_import_calendar_file(file_name, text.as_bytes(), day, segment) {
+        Ok(notes) => notes,
+        Err(error) => {
+            return Ok((
+                BTreeSet::new(),
+                vec![format!("calendar notes in {rel} skipped: {error}")],
+            ));
+        }
+    };
+    let mut events = BTreeSet::new();
+    for (line, note) in notes.iter().enumerate() {
+        let (import, imported_at) =
+            import_stamp(&note.record).expect("validated import lines carry their import");
+        conn.execute(
+            "INSERT INTO calendar_notes(path, line, file_name, stream, event, occurrence, changed_at_ms, change_rank, changed_at, record, import, imported_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                rel,
+                line as i64,
+                file_name,
+                CALENDAR_IMPORT_STREAM,
+                note.event,
+                note.occurrence,
+                note.changed_at_ms(),
+                note.change.rank(),
+                note.changed_at_text(),
+                serde_json::Value::Object(note.record.clone()).to_string(),
+                import,
+                imported_at.timestamp_millis(),
+            ],
+        )?;
+        events.insert(note.event.clone());
+    }
+    Ok((identities_of_events(conn, &events)?, Vec::new()))
+}
+
+/// Every identity of these events the index holds a note or a listing for.
+/// Which import's lines count for one date of a series depends on the
+/// series' other dates, so an import's change relists them all.
+fn identities_of_events(
+    conn: &Connection,
+    events: &BTreeSet<String>,
+) -> Result<BTreeSet<Identity>, StoreError> {
+    let mut identities = BTreeSet::new();
+    let mut statement = conn.prepare_cached(
+        "SELECT event, occurrence FROM calendar_notes WHERE event=? \
+         UNION SELECT event, occurrence FROM calendar_hits WHERE event=? AND version='latest'",
+    )?;
+    for event in events {
+        let rows = statement.query_map(params![event, event], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            identities.insert(row?);
+        }
+    }
+    Ok(identities)
 }
 
 fn insert_chunk(
@@ -221,8 +431,18 @@ pub(crate) fn forget_calendar_path(
             .query_map([rel], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<Result<Vec<(i64, String)>, _>>()?
     };
+    let imported_events = {
+        let mut statement = conn.prepare_cached(
+            "SELECT DISTINCT event FROM calendar_notes WHERE path=? AND import IS NOT NULL",
+        )?;
+        statement
+            .query_map([rel], |row| row.get(0))?
+            .collect::<Result<BTreeSet<String>, _>>()?
+    };
     delete_chunk_rows(conn, &rows)?;
     conn.execute("DELETE FROM calendar_notes WHERE path=?", [rel])?;
+    let mut identities = identities;
+    identities.extend(identities_of_events(conn, &imported_events)?);
     Ok(identities)
 }
 
@@ -286,15 +506,29 @@ pub(crate) fn relist(
 ) -> Result<Relisted, StoreError> {
     let mut relisted = Relisted::default();
     let mut zone: Option<Result<Tz, String>> = None;
+    let mut newest_imports: BTreeMap<String, Option<NewestImport>> = BTreeMap::new();
     for (event, occurrence) in identities {
-        let winner: Option<(String, i64, String, Option<String>)> = conn
-            .query_row(
-                "SELECT path, line, record, stream FROM calendar_notes WHERE event=? AND occurrence=? \
-                 ORDER BY changed_at_ms DESC, change_rank DESC, file_name DESC, path DESC, line DESC LIMIT 1",
-                params![event, occurrence],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()?;
+        if !newest_imports.contains_key(event) {
+            newest_imports.insert(event.clone(), newest_import(conn, event)?);
+        }
+        let newest = newest_imports[event].as_ref();
+        let winner: Option<(String, i64, String, Option<String>)> = {
+            let mut statement = conn.prepare_cached(
+                "SELECT path, line, record, stream, import FROM calendar_notes WHERE event=? AND occurrence=? \
+                 ORDER BY changed_at_ms DESC, change_rank DESC, file_name DESC, path DESC, line DESC",
+            )?;
+            let mut rows = statement.query(params![event, occurrence])?;
+            let mut winner = None;
+            while let Some(row) = rows.next()? {
+                let import: Option<String> = row.get(4)?;
+                if newest.is_some_and(|newest| !newest.admits(import.as_deref(), occurrence)) {
+                    continue;
+                }
+                winner = Some((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?));
+                break;
+            }
+            winner
+        };
         // The rows the winner should have, worked out before any change.
         let mut wanted: Option<(String, String, CalendarNote, Vec<WantedRow>, bool)> = None;
         if let Some((path, line, record, stream)) = winner {

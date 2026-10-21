@@ -15,7 +15,7 @@ use crate::activity_provenance::{
 use crate::calendar::{
     CREATE_CALENDAR_HITS, CREATE_CALENDAR_HITS_IDENTITY, CREATE_CALENDAR_HITS_PATH,
     CREATE_CALENDAR_NOTES, CREATE_CALENDAR_NOTES_IDENTITY, CREATE_CALENDAR_NOTES_STREAM,
-    calendar_paths_in_stream, forget_calendar_path, relist,
+    calendar_paths_in_stream, ensure_calendar_note_columns, forget_calendar_path, relist,
 };
 use crate::chunk_sources::{
     CHUNK_SOURCES_LOOKUP_PATHS, CREATE_CHUNK_SOURCE_READINESS, CREATE_CHUNK_SOURCES,
@@ -737,6 +737,7 @@ fn create_schema(conn: &Connection) -> Result<(), StoreError> {
     conn.execute(CREATE_CHUNK_GROUP_OFFSET, [])?;
     conn.execute(CREATE_SCREEN_TEXT_SOURCE, [])?;
     conn.execute(CREATE_CALENDAR_NOTES, [])?;
+    ensure_calendar_note_columns(conn)?;
     conn.execute(CREATE_CALENDAR_NOTES_IDENTITY, [])?;
     conn.execute(CREATE_CALENDAR_NOTES_STREAM, [])?;
     conn.execute(CREATE_CALENDAR_HITS, [])?;

@@ -900,3 +900,420 @@ fn a_late_older_note_leaves_the_listing_hit_and_its_row_id_unchanged() {
     assert_eq!(journal.listed(MEETING), ["20261028"]);
     assert_ne!(row_id(&journal), before);
 }
+
+const IMPORTS: &str = "import.ics";
+const WEEKLY: &str = "weekly-sync";
+
+/// One date of a weekly series as an import wrote it: placed at `changed_at`,
+/// happening at 09:00 or another hour on `date` in Denver.
+struct Imported<'a> {
+    import: &'a str,
+    imported_at: &'a str,
+    changed_at: &'a str,
+}
+
+impl Imported<'_> {
+    /// One date on its own, as an override writes it.
+    fn date(&self, date: &str, hour: u32) -> String {
+        self.line(date, hour, false)
+    }
+
+    fn line(&self, date: &str, hour: u32, expanded: bool) -> String {
+        let start = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .unwrap()
+            .and_hms_opt(hour, 0, 0)
+            .unwrap();
+        let zone: chrono_tz::Tz = "America/Denver".parse().unwrap();
+        let local = start.and_local_timezone(zone).unwrap();
+        // The original start: 09:00 on the series' date, whatever hour the
+        // date is moved to.
+        let original = start
+            .date()
+            .and_hms_opt(9, 0, 0)
+            .unwrap()
+            .and_local_timezone(zone)
+            .unwrap();
+        let end = local + chrono::Duration::minutes(30);
+        let mut line = note(
+            1,
+            json!({
+                "event": WEEKLY, "change": "added", "changed_at": self.changed_at,
+                "occurrence": original.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                "start": local.to_rfc3339(), "end": end.to_rfc3339(),
+                "repeats": "Weekly", "title": format!("sync {}", self.import),
+                "import": self.import, "imported_at": self.imported_at,
+            }),
+        );
+        if expanded {
+            let mut record: serde_json::Map<String, Value> = serde_json::from_str(&line).unwrap();
+            record.insert("expanded".into(), json!(true));
+            line = Value::Object(record).to_string();
+        }
+        line
+    }
+
+    /// The dates of a series as an import expanded them from its rule.
+    fn dates(&self, dates: &[&str]) -> Vec<String> {
+        dates.iter().map(|date| self.line(date, 9, true)).collect()
+    }
+}
+
+impl Journal {
+    /// Store a calendar file an import wrote beside its transcript.
+    fn save_import(&self, day: &str, segment: &str, lines: &[String]) -> String {
+        let refs = lines.iter().map(String::as_str).collect::<Vec<_>>();
+        self.save_in(IMPORTS, day, segment, &refs)
+    }
+
+    /// The days and files an event is listed under.
+    fn listed_from(&self, event: &str) -> Vec<(String, String)> {
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT c.day, c.path FROM chunks c JOIN calendar_hits h ON h.rowid=c.rowid \
+                 WHERE h.version='latest' AND h.event=? ORDER BY c.day",
+            )
+            .unwrap();
+        statement
+            .query_map([event], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+}
+
+fn days(listed: &[(String, String)]) -> Vec<&str> {
+    listed.iter().map(|(day, _)| day.as_str()).collect()
+}
+
+#[test]
+fn the_import_uploaded_last_defines_a_series_whatever_its_id() {
+    for (tuesdays_uploaded, wednesdays_uploaded) in [
+        ("2026-10-20T12:00:00-06:00", "2026-10-22T12:00:00-06:00"),
+        ("2026-10-22T12:00:00-06:00", "2026-10-20T12:00:00-06:00"),
+    ] {
+        for reverse in [false, true] {
+            let journal = Journal::new(Some("America/Denver"));
+            let tuesdays = Imported {
+                import: "20261020_120000",
+                imported_at: tuesdays_uploaded,
+                changed_at: "2026-10-19T09:42:00-06:00",
+            };
+            // Its id sorts first, though it may be the later upload.
+            let wednesdays = Imported {
+                import: "20250101_000000",
+                imported_at: wednesdays_uploaded,
+                changed_at: "2026-10-21T10:00:00-06:00",
+            };
+            let mut files = [
+                journal.save_import(
+                    "20261019",
+                    "094200_600",
+                    &tuesdays.dates(&["2026-10-27", "2026-11-03", "2026-11-10"]),
+                ),
+                journal.save_import(
+                    "20261021",
+                    "100000_301",
+                    &wednesdays.dates(&["2026-10-21", "2026-10-28", "2026-11-04", "2026-11-11"]),
+                ),
+            ];
+            if reverse {
+                files.reverse();
+            }
+            for file in &files {
+                journal.index(file);
+            }
+            let expected = if wednesdays_uploaded > tuesdays_uploaded {
+                vec!["20261021", "20261028", "20261104", "20261111"]
+            } else {
+                // The Tuesdays' import covers 10-27 onward; the Wednesday
+                // before it is outside that span and still counts.
+                vec!["20261021", "20261027", "20261103", "20261110"]
+            };
+            assert_eq!(
+                days(&journal.listed_from(WEEKLY)),
+                expected,
+                "{tuesdays_uploaded} {reverse}"
+            );
+        }
+    }
+}
+
+#[test]
+fn deleting_the_newest_import_s_segments_lets_the_older_one_count_again() {
+    for reverse in [false, true] {
+        let journal = Journal::new(Some("America/Denver"));
+        let older = Imported {
+            import: "20261020_120000",
+            imported_at: "2026-10-20T12:00:00-06:00",
+            changed_at: "2026-10-19T09:42:00-06:00",
+        };
+        let newer = Imported {
+            import: "20261022_120000",
+            imported_at: "2026-10-22T12:00:00-06:00",
+            changed_at: "2026-10-21T10:00:00-06:00",
+        };
+        // The newer export moved one date to the afternoon, an override it
+        // placed in its own window.
+        let moved = Imported {
+            changed_at: "2026-10-21T15:00:00-06:00",
+            ..newer
+        };
+        let older_file = journal.save_import(
+            "20261019",
+            "094200_600",
+            &older.dates(&["2026-10-21", "2026-10-28", "2026-11-04", "2026-11-11"]),
+        );
+        let series = journal.save_import(
+            "20261021",
+            "100000_600",
+            &newer.dates(&["2026-10-21", "2026-10-28", "2026-11-11"]),
+        );
+        let override_file =
+            journal.save_import("20261021", "150000_600", &[moved.date("2026-11-04", 14)]);
+        let mut files = [&older_file, &series, &override_file];
+        if reverse {
+            files.reverse();
+        }
+        for file in files {
+            journal.index(file);
+        }
+        let listed = journal.listed_from(WEEKLY);
+        assert_eq!(
+            days(&listed),
+            ["20261021", "20261028", "20261104", "20261111"]
+        );
+        assert_eq!(listed[2].1, override_file);
+        assert!(listed.iter().all(|(_, path)| path != &older_file));
+        // The owner deleted the one date's segment: the older import does
+        // not bring that date back.
+        journal.delete_segment_of(&override_file);
+        assert_eq!(
+            days(&journal.listed_from(WEEKLY)),
+            ["20261021", "20261028", "20261111"],
+            "reverse {reverse}"
+        );
+        // With every segment of the newer import gone, the older counts again.
+        journal.delete_segment_of(&series);
+        let listed = journal.listed_from(WEEKLY);
+        assert_eq!(
+            days(&listed),
+            ["20261021", "20261028", "20261104", "20261111"]
+        );
+        assert!(listed.iter().all(|(_, path)| path == &older_file));
+    }
+}
+
+#[test]
+fn a_newer_import_holding_only_one_changed_date_leaves_the_rest_listed() {
+    for reverse in [false, true] {
+        let journal = Journal::new(Some("America/Denver"));
+        let series = Imported {
+            import: "20261020_120000",
+            imported_at: "2026-10-20T12:00:00-06:00",
+            changed_at: "2026-10-19T09:42:00-06:00",
+        };
+        let changed = Imported {
+            import: "20261022_120000",
+            imported_at: "2026-10-22T12:00:00-06:00",
+            changed_at: "2026-10-21T10:00:00-06:00",
+        };
+        let series_file = journal.save_import(
+            "20261019",
+            "094200_600",
+            &series.dates(&["2026-10-21", "2026-10-28", "2026-11-04", "2026-11-11"]),
+        );
+        let changed_file =
+            journal.save_import("20261021", "100000_600", &[changed.date("2026-10-28", 14)]);
+        let mut files = [&series_file, &changed_file];
+        if reverse {
+            files.reverse();
+        }
+        for file in files {
+            journal.index(file);
+        }
+        assert_eq!(
+            journal.listed_from(WEEKLY),
+            [
+                ("20261021".to_owned(), series_file.clone()),
+                ("20261028".to_owned(), changed_file.clone()),
+                ("20261104".to_owned(), series_file.clone()),
+                ("20261111".to_owned(), series_file.clone()),
+            ],
+            "reverse {reverse}"
+        );
+    }
+}
+
+#[test]
+fn a_narrower_newer_export_leaves_older_dates_outside_it_listed() {
+    let journal = Journal::new(Some("America/Denver"));
+    let older = Imported {
+        import: "20261020_120000",
+        imported_at: "2026-10-20T12:00:00-06:00",
+        changed_at: "2026-10-19T09:42:00-06:00",
+    };
+    let newer = Imported {
+        import: "20261101_120000",
+        imported_at: "2026-11-01T12:00:00-06:00",
+        changed_at: "2026-10-30T10:00:00-06:00",
+    };
+    let older_file = journal.save_import(
+        "20261019",
+        "094200_600",
+        &older.dates(&["2026-10-21", "2026-10-28", "2026-11-04", "2026-11-11"]),
+    );
+    let newer_file = journal.save_import(
+        "20261030",
+        "100000_600",
+        &[newer.date("2026-11-04", 11), newer.date("2026-11-11", 11)],
+    );
+    journal.index(&newer_file);
+    journal.index(&older_file);
+    let listed = journal.listed_from(WEEKLY);
+    assert_eq!(
+        listed,
+        [
+            ("20261021".to_owned(), older_file.clone()),
+            ("20261028".to_owned(), older_file.clone()),
+            ("20261104".to_owned(), newer_file.clone()),
+            ("20261111".to_owned(), newer_file.clone()),
+        ]
+    );
+}
+
+#[test]
+fn a_phone_note_for_a_date_the_newest_import_dropped_stays_listed() {
+    let journal = Journal::new(Some("America/Denver"));
+    let tuesdays = Imported {
+        import: "20261020_120000",
+        imported_at: "2026-10-20T12:00:00-06:00",
+        changed_at: "2026-10-19T09:42:00-06:00",
+    };
+    let wednesdays = Imported {
+        import: "20261022_120000",
+        imported_at: "2026-10-22T12:00:00-06:00",
+        changed_at: "2026-10-21T10:00:00-06:00",
+    };
+    let phone = tuesdays.date("2026-10-27", 9);
+    let mut phone: serde_json::Map<String, Value> = serde_json::from_str(&phone).unwrap();
+    phone.remove("import");
+    phone.remove("imported_at");
+    phone.insert("changed_at".into(), json!("2026-10-20T16:30:00-06:00"));
+    phone.insert("title".into(), json!("sync from the phone"));
+    let phone = journal.save(
+        "20261020",
+        "163000_300",
+        &[&Value::Object(phone).to_string()],
+    );
+    let files = [
+        journal.save_import(
+            "20261019",
+            "094200_600",
+            &tuesdays.dates(&["2026-10-27", "2026-11-03"]),
+        ),
+        journal.save_import(
+            "20261021",
+            "100000_600",
+            &wednesdays.dates(&["2026-10-21", "2026-10-28", "2026-11-04"]),
+        ),
+        phone.clone(),
+    ];
+    for file in &files {
+        journal.index(file);
+    }
+    let listed = journal.listed_from(WEEKLY);
+    assert_eq!(
+        days(&listed),
+        ["20261021", "20261027", "20261028", "20261104"]
+    );
+    assert_eq!(listed[1].1, phone);
+}
+
+#[test]
+fn imported_events_are_listed_only_with_no_stored_day_hit() {
+    let journal = Journal::new(Some("America/Denver"));
+    let import = Imported {
+        import: "20261020_120000",
+        imported_at: "2026-10-20T12:00:00-06:00",
+        changed_at: "2026-10-19T09:42:00-06:00",
+    };
+    let file = journal.save_import(
+        "20261019",
+        "094200_600",
+        &import.dates(&["2026-10-21", "2026-10-28"]),
+    );
+    scan_journal(journal.path(), true).unwrap();
+    assert_eq!(days(&journal.listed_from(WEEKLY)), ["20261021", "20261028"]);
+    assert!(journal.stored().is_empty());
+    assert_eq!(
+        journal.count("SELECT count(*) FROM chunks WHERE day='20261019'"),
+        0
+    );
+    let (basis, facets): (String, i64) = journal
+        .conn()
+        .query_row(
+            "SELECT basis, (SELECT count(*) FROM chunks WHERE path=? AND facet<>'') FROM chunk_classification WHERE path=?",
+            params![file, file],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((basis.as_str(), facets), ("journal_wide", 0));
+}
+
+#[test]
+fn an_import_file_outside_its_segment_span_is_skipped_and_reported_once() {
+    let journal = Journal::new(Some("America/Denver"));
+    let good = Imported {
+        import: "20261020_120000",
+        imported_at: "2026-10-20T12:00:00-06:00",
+        changed_at: "2026-10-19T09:42:00-06:00",
+    };
+    let utc = Imported {
+        changed_at: "2026-10-19T15:42:00Z",
+        ..good
+    };
+    let bad = journal.save_import("20261019", "094200_600", &utc.dates(&["2026-10-21"]));
+    let ok = journal.save_import("20261019", "154000_600", &utc.dates(&["2026-10-28"]));
+    let report = scan_journal(journal.path(), true).unwrap();
+    let about = report
+        .warnings
+        .iter()
+        .filter(|warning| warning.contains(&bad))
+        .count();
+    assert_eq!(about, 1, "{:?}", report.warnings);
+    assert!(report.warnings.iter().all(|warning| !warning.contains(&ok)));
+    assert_eq!(days(&journal.listed_from(WEEKLY)), ["20261028"]);
+    let again = scan_journal(journal.path(), false).unwrap();
+    assert!(
+        again.warnings.iter().all(|warning| !warning.contains(&bad)),
+        "{:?}",
+        again.warnings
+    );
+}
+
+#[test]
+fn an_index_made_before_imports_were_listed_gains_their_columns() {
+    let journal = Journal::new(Some("America/Denver"));
+    fs::create_dir_all(db_path(journal.path()).parent().unwrap()).unwrap();
+    {
+        let conn = journal.conn();
+        conn.execute(
+            "CREATE TABLE calendar_notes (path TEXT NOT NULL, line INTEGER NOT NULL, file_name TEXT NOT NULL, stream TEXT NOT NULL, event TEXT NOT NULL, occurrence TEXT NOT NULL, changed_at_ms INTEGER NOT NULL, change_rank INTEGER NOT NULL, changed_at TEXT NOT NULL, record TEXT NOT NULL, PRIMARY KEY(path, line))",
+            [],
+        )
+        .unwrap();
+    }
+    let import = Imported {
+        import: "20261020_120000",
+        imported_at: "2026-10-20T12:00:00-06:00",
+        changed_at: "2026-10-19T09:42:00-06:00",
+    };
+    let file = journal.save_import("20261019", "094200_600", &import.dates(&["2026-10-21"]));
+    journal.index(&file);
+    assert_eq!(days(&journal.listed_from(WEEKLY)), ["20261021"]);
+    assert_eq!(
+        journal.count("SELECT count(*) FROM calendar_notes WHERE import='20261020_120000'"),
+        1
+    );
+}
