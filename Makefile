@@ -7,7 +7,7 @@
 # about identical files.
 export TMPDIR := $(shell cd /var/tmp && /bin/pwd -P)
 
-.PHONY: install preflight uninstall test test-cov test-integration test-performance test-app test-only format format-check ci ci-full ci-full-windows clean clean-install coverage watch versions update pre-commit skills check-journal-device-sim check-distribution-route-protocol check-install-fast check-rust-fmt check-rust-msrv check-rust-clippy check-rust-clippy-full check-rust-unit check-rust-test check-rust-journal-mcp-endpoint check-rust-classified-full-clippy-onnx check-rust-describe-cli-stubs check-rust-race check-rust-ios check-rust-macos check-rust-windows check-rust-deny check-rust-shipped-binaries build build-shipped-features build-sandbox-processing dev-package screen-ocr-rust-notices check-rust-sandbox-processing-build check-spl-dependency-pin audit contract check-contract build-native-sol-inventory check-native-sol-inventory check-native-sol-architecture dev all sandbox sandbox-stop install-models parakeet-helper parakeet-helper-clean check-rust-vad-analyze-test check-rust-onnx-stage check-rust-onnx-test check-rust-pdf-stage check-rust-pdf-test verify service-logs check-call-http-only check-tools-http-only require-win-remote-host sync-win-host win-host-ci brand-sync FORCE
+.PHONY: install preflight uninstall test test-cov test-integration test-performance test-app test-only format format-check ci ci-full ci-full-windows clean clean-install coverage watch versions update pre-commit skills check-journal-device-sim check-distribution-route-protocol check-install-fast check-rust-fmt check-rust-msrv check-rust-clippy check-rust-clippy-full check-rust-unit check-rust-test check-rust-journal-mcp-endpoint check-rust-classified-full-clippy-onnx check-rust-describe-cli-stubs check-rust-race check-rust-ios check-rust-macos check-rust-windows check-rust-deny check-rust-shipped-binaries build build-shipped-features build-sandbox-processing dev-package screen-ocr-rust-notices check-screen-ocr-rust-notices check-rust-sandbox-processing-build check-spl-dependency-pin audit contract check-contract build-native-sol-inventory check-native-sol-inventory check-native-sol-architecture dev all sandbox sandbox-stop install-models parakeet-helper parakeet-helper-clean check-rust-vad-analyze-test check-rust-onnx-stage check-rust-onnx-test check-rust-pdf-stage check-rust-pdf-test verify service-logs check-call-http-only check-tools-http-only require-win-remote-host sync-win-host win-host-ci brand-sync FORCE
 
 # Default target: build the native workspace.
 all: build
@@ -721,6 +721,11 @@ SOLSTONE_DISTRIBUTION_ACQUIRE := cargo run --manifest-path $(RUST_MANIFEST) -p s
 screen-ocr-rust-notices:
 	$(PYTHON) scripts/distribution_rust_notices.py --write --screen-ocr
 
+# The release producer runs from a fresh clone with no venv, and never
+# rewrites tracked notices: it refuses stale ones instead.
+check-screen-ocr-rust-notices:
+	python3 scripts/distribution_rust_notices.py --check --screen-ocr
+
 # Export selector values directly instead of interpolating them into a shell
 # command. This preserves comma- or space-separated values literally and keeps
 # metacharacters from becoming shell syntax.
@@ -741,7 +746,7 @@ check-rust-ci-topology:
 	$(SOLSTONE_CI_RUNNER) validate
 
 .PHONY: check-rust-distribution check-rust-distribution-under-poison check-rust-distribution-cleanroom check-systemd-test
-check-rust-distribution: screen-ocr-rust-notices
+check-rust-distribution: check-screen-ocr-rust-notices
 	$(call run-rust-gate-under-poison,check-rust-distribution-under-poison,$(DISTRIBUTION_FORBIDDEN_TOOLS))
 
 # Live Docker/Podman oracle over already-produced x86_64 artifacts. Set
