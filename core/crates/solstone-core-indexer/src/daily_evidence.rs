@@ -295,6 +295,10 @@ fn project_sources(files: BTreeMap<String, PathBuf>) -> Result<SourceProjection,
         }
         let normalized = normalized_rel(&rel);
         let mut resolution = content::classify(&normalized);
+        // Calendar notes are not something the owner did; no daily unit reads them.
+        if resolution == ContentResolution::Indexed(Family::Calendar) {
+            continue;
+        }
         let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
         if resolution == ContentResolution::Unrecognized
             && (filename.ends_with("_transcript.md") || filename == "imported.md")
@@ -815,9 +819,12 @@ pub fn compute_daily_evidence_cached(
             let d = (anchor - Duration::days(offset))
                 .format("%Y%m%d")
                 .to_string();
+            // The schedule reads segment times as when the owner was active,
+            // which a calendar note is not.
             let keys = iter_segments(journal, PathOrDay::Day(&d))
                 .map_err(|e| e.to_string())?
                 .into_iter()
+                .filter(|s| !solstone_core_segment::is_calendar_segment(journal, s))
                 .map(|s| s.key().to_owned())
                 .collect::<Vec<_>>();
             windows.insert(d, keys);
@@ -1094,6 +1101,55 @@ mod tests {
         );
         for (name, before) in names.iter().zip(before) {
             assert_ne!(revision(&root, name, Some("work")), before, "{name}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn calendar_notes_never_move_a_daily_units_evidence() {
+        let root = root("calendar-not-daily-evidence");
+        let today = journal_today(&root).format("%Y%m%d").to_string();
+        write(
+            &root,
+            "streams/phone_calendar.json",
+            r#"{"name":"phone_calendar","kind":"observer","host":null,"platform":null,"created_at":0,"last_day":null,"last_segment":null,"seq":1,"cid":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source":"calendar"}"#,
+        );
+        write(
+            &root,
+            &format!("chronicle/{today}/talents/flow.md"),
+            "# Flow\nMeeting.",
+        );
+        let names = [
+            "morning_briefing",
+            "entities:entity_observer",
+            "daily_schedule",
+        ];
+        let before = names.map(|name| evidence_of(&root, &today, name, Some("work")).revision);
+        write(
+            &root,
+            &format!(
+                "chronicle/{today}/phone_calendar/094000_300/calendar_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.jsonl"
+            ),
+            include_str!("../../../fixtures/calendar_notes/golden.jsonl"),
+        );
+        let with_notes = names.map(|name| evidence_of(&root, &today, name, Some("work")).revision);
+        assert_eq!(with_notes, before);
+        assert!(
+            capture_day_sources(&root, &today)
+                .unwrap()
+                .iter()
+                .all(|chunk| !chunk.path.contains("calendar_"))
+        );
+        // The twin: an ordinary capture segment moves every revision.
+        write(
+            &root,
+            &format!("chronicle/{today}/mic/100000_300/audio.jsonl"),
+            r#"{"start":"00:00:01","text":"hello there"}"#,
+        );
+        let with_capture =
+            names.map(|name| evidence_of(&root, &today, name, Some("work")).revision);
+        for (index, name) in names.iter().enumerate() {
+            assert_ne!(with_capture[index], before[index], "{name}");
         }
         fs::remove_dir_all(root).unwrap();
     }

@@ -5061,6 +5061,7 @@ dependencies = [
  "solstone-core-journal",
  "solstone-core-journal-config",
  "solstone-core-journal-io",
+ "solstone-core-segment",
  "solstone-core-speaker-id",
 ]
 
@@ -5973,6 +5974,7 @@ dependencies = [
  "solstone-core-journal-config",
  "solstone-core-journal-io",
  "solstone-core-processing-record",
+ "solstone-core-segment",
  "solstone-core-system",
  "thiserror 2.0.21",
  "unicode-xid",

@@ -1489,6 +1489,57 @@ mod tests {
     }
 
     #[test]
+    fn calendar_notes_never_enter_day_or_segment_material() {
+        let root = TempDir::new().unwrap();
+        let notes = root
+            .path()
+            .join("chronicle")
+            .join(DAY)
+            .join("phone_calendar")
+            .join("094000_300");
+        fs::create_dir_all(&notes).unwrap();
+        fs::write(
+            notes.join(format!("calendar_{}.jsonl", "a".repeat(64))),
+            include_str!("../../../fixtures/calendar_notes/golden.jsonl"),
+        )
+        .unwrap();
+        // The twin: an ordinary capture segment the same day.
+        let capture = root
+            .path()
+            .join("chronicle")
+            .join(DAY)
+            .join("mic")
+            .join("100000_60");
+        fs::create_dir_all(&capture).unwrap();
+        fs::write(
+            capture.join("meeting_transcript.md"),
+            "We planned the garden beds.\n",
+        )
+        .unwrap();
+        let everything = sources(true, true, TalentSource::All);
+        let (day, counts) = cluster(root.path(), DAY, &everything);
+        assert!(day.contains("planned the garden"), "{day}");
+        assert!(
+            !day.contains("design review") && !day.contains("Halloween"),
+            "{day}"
+        );
+        assert_eq!(counts.total(), 1);
+        let (segment, counts) = cluster_period(
+            root.path(),
+            DAY,
+            "094000_300",
+            &everything,
+            Some("phone_calendar"),
+        );
+        assert!(!segment.contains("design review"), "{segment}");
+        assert_eq!(counts.total(), 0);
+        let (segment, counts) =
+            cluster_period(root.path(), DAY, "100000_60", &everything, Some("mic"));
+        assert!(segment.contains("planned the garden"), "{segment}");
+        assert_eq!(counts.total(), 1);
+    }
+
+    #[test]
     fn a_strava_workout_reaches_the_transcript_once_on_its_first_piece() {
         let root = TempDir::new().unwrap();
         for (key, index) in [("070200_300", 0), ("070700_300", 1)] {

@@ -1842,9 +1842,12 @@ fn reconcile_pass_with_roots(
         }
     };
     let policy = WorkPolicy::read(journal)?;
+    // A day holding only calendar notes holds nothing the owner did, so it
+    // owes no work.
     let mut days = solstone_core_journal_io::day_dirs(journal)
         .map_err(|error| error.to_string())?
         .into_iter()
+        .filter(|(day, _)| !solstone_core_segment::day_holds_only_calendar(journal, day))
         .collect::<BTreeMap<_, _>>();
     let imports = solstone_core_import::thinking::read(journal)?;
     let pending_archives =
@@ -3214,6 +3217,37 @@ mod tests {
         assert!(queue.contains_reference("supervisor-work-20040101-notes-120000_60"));
         assert!(!queue.contains_reference("supervisor-work-19990101-notes-120000_60"));
         assert!(!queue.contains_reference("supervisor-work-20040101-daily"));
+    }
+
+    #[test]
+    fn a_day_holding_only_calendar_notes_owes_no_work() {
+        let root = fixture("local");
+        std::fs::create_dir_all(root.path().join("streams")).unwrap();
+        std::fs::write(
+            root.path().join("streams/phone_calendar.json"),
+            r#"{"name":"phone_calendar","kind":"observer","host":null,"platform":null,"created_at":0,"last_day":null,"last_segment":null,"seq":1,"cid":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source":"calendar"}"#,
+        )
+        .unwrap();
+        let notes = root
+            .path()
+            .join("chronicle/19990101/phone_calendar/094000_300");
+        std::fs::create_dir_all(&notes).unwrap();
+        std::fs::write(
+            notes.join(format!("calendar_{}.jsonl", "a".repeat(64))),
+            "{}\n",
+        )
+        .unwrap();
+        // The twin: an ordinary capture day still owes its work.
+        segment(root.path(), "20000101", "120000_60");
+        let queue = queue(root.path());
+        reconcile(root.path(), &queue, &AtomicBool::new(false)).unwrap();
+        let report = solstone_core_system::work_inventory::read(root.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.days_total, 1);
+        assert_eq!(report.oldest_day.as_deref(), Some("20000101"));
+        assert!(queue.contains_reference("supervisor-work-20000101-notes-120000_60"));
+        assert!(!queue.contains_reference("supervisor-work-19990101-daily"));
     }
 
     #[test]
