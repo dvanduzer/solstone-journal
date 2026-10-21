@@ -1448,6 +1448,8 @@ mod tests {
                             speaker_evidence_multi_fraction: 0.0,
                             overlap_fraction: 0.0,
                             statement_labels: None,
+                            turn_ranges: None,
+                            overlap_ranges: None,
                         };
                         let mut processing = crate::processing::analyzed_record(facts.input_size);
                         raw::stamp_attempt(&mut processing).unwrap();
@@ -1622,6 +1624,8 @@ mod tests {
                                 speaker_evidence_multi_fraction: 0.0,
                                 overlap_fraction: 0.0,
                                 statement_labels: None,
+                                turn_ranges: None,
+                                overlap_ranges: None,
                             };
                             let processing = crate::processing::analyzed_record(facts.input_size);
                             super::write_full_transcript(super::FullTranscriptWrite {
@@ -1736,6 +1740,8 @@ mod tests {
                             speaker_evidence_multi_fraction: 0.0,
                             overlap_fraction: 0.0,
                             statement_labels: None,
+                            turn_ranges: None,
+                            overlap_ranges: None,
                         };
                         let processing = crate::processing::analyzed_record(facts.input_size);
                         super::write_full_transcript(super::FullTranscriptWrite {
@@ -2229,6 +2235,8 @@ mod tests {
                     speaker_evidence_multi_fraction: 0.0,
                     overlap_fraction: 0.0,
                     statement_labels: None,
+                    turn_ranges: None,
+                    overlap_ranges: None,
                 };
                 super::write_full_transcript(super::FullTranscriptWrite {
                     raw_path: &facts.path,
@@ -2868,6 +2876,8 @@ mod tests {
             speaker_evidence_multi_fraction: 0.0,
             overlap_fraction: 0.0,
             statement_labels: None,
+            turn_ranges: None,
+            overlap_ranges: None,
         };
         let mut processing = crate::processing::analyzed_record(facts.input_size);
         raw::stamp_attempt_from(&mut processing, &context.attempt).unwrap();

@@ -1,0 +1,635 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 sol pbc
+
+//! Deleting the original audio of a recording transcribed in voice-only mode.
+//!
+//! When transcription keeps only the owner's speech, its record names the original file
+//! it processed (`owner_voice.original`). Once those words are saved, the original is
+//! deleted through the door's ordinary raw release with the owner-voice class, under the
+//! transcript's output claim and segment commit, after re-verifying the original's size and
+//! digest against the record. A changed original is recorded as a permanent refusal and is
+//! never deleted. A deletion that cannot finish yet stays owed, and the daily cleanup
+//! routine finishes it for recordings dated within [`owner_voice_owed_days`].
+
+use std::fs;
+use std::io;
+use std::path::{Component, Path};
+
+use chrono::{DateTime, Days, NaiveDate, Utc};
+use serde_json::{Map, Value};
+use solstone_core_callosum::{CallosumEnvelope, DurableEvent, append_durable_event};
+use solstone_core_journal_io::paths::{DEFAULT_STREAM, contained_path, path_lexists};
+use solstone_core_processing_record::{
+    OwnerVoiceFilter, owner_voice, read_jsonl_header, vocab,
+};
+use solstone_core_segment::output_attempt::{InputObservation, OutputClaims, SegmentCommit};
+
+use crate::content::{ClosedHandlerSet, ContentName};
+use crate::eligibility::{FileVerdict, ProvenRaw, resolve_file};
+use crate::original_deletion::RawReleaseClass;
+use crate::scan::read_sidecar;
+
+const EVENTS_FILE: &str = "events.jsonl";
+const RETENTION_TRACT: &str = "retention";
+const ORIGINAL_DELETED_EVENT: &str = "original_deleted";
+const RELEASE_REFUSED_EVENT: &str = "original_release_refused";
+/// Days, counting today, that owed owner-voice deletions are retried.
+pub const OWNER_VOICE_OWED_DAYS: u64 = 30;
+
+/// Why an owner-voice original is kept for good.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OwnerVoiceRefusal {
+    /// The original's size differs from the one the transcript processed.
+    SizeChanged,
+    /// The original's bytes differ from the ones the transcript processed.
+    BytesChanged,
+}
+
+impl OwnerVoiceRefusal {
+    #[must_use]
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::SizeChanged => "size_changed",
+            Self::BytesChanged => "bytes_changed",
+        }
+    }
+}
+
+/// What a segment's retention events record about one file name.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RetentionEventsForName {
+    /// Some `original_deleted` row names this file, whatever its class.
+    pub deleted: bool,
+    /// Some `original_release_refused` row names this file, whatever its reason.
+    pub refused: bool,
+}
+
+/// Scan a segment's `events.jsonl` for retention rows naming `name`.
+///
+/// An absent events file is an empty log. A symlink or other non-file at that name, or a
+/// read error, is an error. A torn or unparseable line is skipped.
+pub fn retention_events_for_name(
+    segment_dir: &Path,
+    name: &str,
+) -> io::Result<RetentionEventsForName> {
+    let path = segment_dir.join(EVENTS_FILE);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(RetentionEventsForName::default());
+        }
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "segment events are not a regular file",
+        ));
+    }
+    let bytes = fs::read(&path)?;
+    let mut found = RetentionEventsForName::default();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        let Ok(text) = std::str::from_utf8(line) else {
+            continue;
+        };
+        let Ok(Value::Object(row)) = serde_json::from_str::<Value>(text.trim()) else {
+            continue;
+        };
+        if row.get("tract").and_then(Value::as_str) != Some(RETENTION_TRACT)
+            || row.get("name").and_then(Value::as_str) != Some(name)
+        {
+            continue;
+        }
+        match row.get("event").and_then(Value::as_str) {
+            Some(ORIGINAL_DELETED_EVENT) => found.deleted = true,
+            Some(RELEASE_REFUSED_EVENT) => found.refused = true,
+            _ => {}
+        }
+    }
+    Ok(found)
+}
+
+/// Record that an owner-voice original is kept for good.
+pub fn record_owner_voice_release_refused(
+    journal: &Path,
+    segment_rel: &str,
+    name: &str,
+    reason: OwnerVoiceRefusal,
+    at: DateTime<Utc>,
+) -> Result<(), String> {
+    let resolved_dir = contained_path(journal, segment_rel).map_err(|error| error.to_string())?;
+    let mut extra = Map::new();
+    extra.insert("name".to_owned(), Value::String(name.to_owned()));
+    extra.insert(
+        "class".to_owned(),
+        Value::String(RawReleaseClass::OwnerVoice.tag().to_owned()),
+    );
+    extra.insert("reason".to_owned(), Value::String(reason.tag().to_owned()));
+    let envelope = CallosumEnvelope {
+        tract: RETENTION_TRACT.to_owned(),
+        event: RELEASE_REFUSED_EVENT.to_owned(),
+        ts: Some(at.timestamp_millis()),
+        extra,
+    };
+    append_durable_event(&resolved_dir, &DurableEvent::Callosum(envelope))
+        .map_err(|error| error.to_string())
+}
+
+/// Whether a transcript's original still has to be deleted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OwedState {
+    Owed,
+    NotOwed,
+    /// The segment's events could not be read; treated as not owed, so the original is kept.
+    Unknown,
+}
+
+/// Whether the original named by a voice-only transcript still has to be deleted.
+///
+/// Reads the transcript's record and the segment's events, never the original's size or
+/// bytes (re-verifying those is the caller's job). Owed only when the record is a terminal
+/// transcription (an analyzed one still carrying its analysis rows), its `owner_voice`
+/// member is valid and names the header's `raw` file, that file exists, and no
+/// `original_deleted` or `original_release_refused` event names it.
+#[must_use]
+pub fn owner_voice_deletion_state(segment_dir: &Path, jsonl: &Path) -> OwedState {
+    let Some(filter) = owed_filter(jsonl) else {
+        return OwedState::NotOwed;
+    };
+    let name = filter.original.name.as_str();
+    match path_lexists(&segment_dir.join(name)) {
+        Ok(true) => {}
+        Ok(false) => return OwedState::NotOwed,
+        Err(_) => return OwedState::Unknown,
+    }
+    match retention_events_for_name(segment_dir, name) {
+        Ok(events) if events.deleted || events.refused => OwedState::NotOwed,
+        Ok(_) => OwedState::Owed,
+        Err(_) => OwedState::Unknown,
+    }
+}
+
+/// Whether the original named by a voice-only transcript still has to be deleted.
+#[must_use]
+pub fn owner_voice_deletion_owed(segment_dir: &Path, jsonl: &Path) -> bool {
+    owner_voice_deletion_state(segment_dir, jsonl) == OwedState::Owed
+}
+
+fn owed_filter(jsonl: &Path) -> Option<OwnerVoiceFilter> {
+    let header = read_jsonl_header(jsonl)?;
+    let record = header.get("_solstone_processing")?;
+    if record.get("schema").and_then(Value::as_str) != Some(vocab::SCHEMA)
+        || record.get("handler").and_then(Value::as_str) != Some(vocab::HANDLER_TRANSCRIBE)
+    {
+        return None;
+    }
+    let state = record.get("state").and_then(Value::as_str)?;
+    if state != vocab::STATE_ANALYZED && state != vocab::STATE_EMPTY {
+        return None;
+    }
+    let filter = owner_voice(record)?.ok()?;
+    if header.get("raw").and_then(Value::as_str) != Some(filter.original.name.as_str()) {
+        return None;
+    }
+    if state == vocab::STATE_ANALYZED
+        && !read_sidecar(jsonl, Some(vocab::AUDIO_TRANSCRIPT_ROW_KEY)).has_analysis_row
+    {
+        return None;
+    }
+    Some(filter)
+}
+
+/// The days, in the owner's zone, whose recordings have owed deletions retried: `today`
+/// and the days before it, [`OWNER_VOICE_OWED_DAYS`] in all.
+pub fn owner_voice_owed_days(today: NaiveDate) -> impl Iterator<Item = NaiveDate> {
+    (0..OWNER_VOICE_OWED_DAYS).filter_map(move |back| today.checked_sub_days(Days::new(back)))
+}
+
+/// What finishing an owner-voice deletion did.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OwnerVoiceDeletion {
+    /// The original was deleted and its deletion recorded.
+    Deleted,
+    /// The original was deleted, but its event could not be written.
+    DeletedUnrecorded,
+    /// The original was already gone; nothing was written.
+    Gone,
+    /// Nothing is owed for this transcript.
+    NotOwed,
+    /// The segment's events could not be read; the original is kept.
+    Unknown,
+    /// The original changed since it was transcribed; it is kept for good.
+    Refused(OwnerVoiceRefusal),
+    /// The deletion could not be proven for this exact file; nothing was deleted or recorded.
+    NotProvable(String),
+    /// The deletion could not finish now and is still owed.
+    Owed(String),
+}
+
+/// Finish the deletion of a voice-only transcript's original.
+///
+/// The caller holds `claims` on exactly `jsonl` and `commit` from those claims on the
+/// transcript's segment, and holds no open handle to the original. Both stay held through
+/// the call, so no cooperating writer can replace the original between the check and the
+/// removal.
+pub fn finish_owner_voice_deletion(
+    journal: &Path,
+    jsonl: &Path,
+    claims: &OutputClaims,
+    commit: &SegmentCommit<'_>,
+    at: DateTime<Utc>,
+) -> OwnerVoiceDeletion {
+    let Some(segment) = jsonl.parent() else {
+        return OwnerVoiceDeletion::NotProvable("transcript has no segment".to_owned());
+    };
+    if let Err(error) = commit.require_outputs(claims, segment, [jsonl.to_path_buf()]) {
+        return OwnerVoiceDeletion::NotProvable(error.to_string());
+    }
+    match owner_voice_deletion_state(segment, jsonl) {
+        OwedState::Owed => {}
+        OwedState::NotOwed => return OwnerVoiceDeletion::NotOwed,
+        OwedState::Unknown => return OwnerVoiceDeletion::Unknown,
+    }
+    let Some(filter) = owed_filter(jsonl) else {
+        return OwnerVoiceDeletion::NotOwed;
+    };
+    let name = filter.original.name.clone();
+    let original = segment.join(&name);
+    let Some((day, stream, dir)) = segment_coordinates(journal, segment) else {
+        return OwnerVoiceDeletion::NotProvable("segment is not inside the journal".to_owned());
+    };
+    let segment_rel = crate::layout::segment_rel(&day, &stream, &dir);
+
+    let observation = match InputObservation::capture(claims, &original) {
+        Ok(observation) => observation,
+        Err(_) if matches!(path_lexists(&original), Ok(false)) => {
+            return OwnerVoiceDeletion::Gone;
+        }
+        Err(error) => return OwnerVoiceDeletion::Owed(error.to_string()),
+    };
+    let refusal = if observation.input_size() != filter.original.size {
+        Some(OwnerVoiceRefusal::SizeChanged)
+    } else if hex(&observation.input_sha256()) != filter.original.sha256 {
+        Some(OwnerVoiceRefusal::BytesChanged)
+    } else {
+        None
+    };
+    if let Some(reason) = refusal {
+        drop(observation);
+        return match record_owner_voice_release_refused(journal, &segment_rel, &name, reason, at) {
+            Ok(()) => OwnerVoiceDeletion::Refused(reason),
+            Err(error) => OwnerVoiceDeletion::Owed(error),
+        };
+    }
+
+    let Some(content) = ContentName::new(&name) else {
+        return OwnerVoiceDeletion::NotProvable("original has no media name".to_owned());
+    };
+    let facts = read_sidecar(jsonl, Some(vocab::AUDIO_TRANSCRIPT_ROW_KEY));
+    let proven = match resolve_file(
+        &ClosedHandlerSet,
+        &day,
+        &stream,
+        &dir,
+        &content,
+        observation.input_size(),
+        &facts,
+    ) {
+        FileVerdict::Releasable(proven) => proven,
+        FileVerdict::Held(_) => {
+            return OwnerVoiceDeletion::NotProvable("the transcript does not prove this original".to_owned());
+        }
+    };
+    if journal.join(proven.rel()) != original {
+        return OwnerVoiceDeletion::NotProvable("proof names a different path".to_owned());
+    }
+    // An open handle would leave the name delete-pending on Windows.
+    drop(observation);
+    release_proven(journal, segment, &proven, &name, at)
+}
+
+fn release_proven(
+    journal: &Path,
+    segment: &Path,
+    proven: &ProvenRaw,
+    name: &str,
+    at: DateTime<Utc>,
+) -> OwnerVoiceDeletion {
+    let (outcome, _tally) = crate::door::release_raw(
+        journal,
+        std::slice::from_ref(proven),
+        RawReleaseClass::OwnerVoice,
+        at,
+    );
+    // Decide by what is now true on disk, not by the receipt's prose.
+    // An unknown answer counts as still present: the deletion stays owed.
+    if !matches!(path_lexists(&segment.join(name)), Ok(false)) {
+        let detail = outcome
+            .targets
+            .iter()
+            .flat_map(|target| target.not_removed.iter())
+            .map(|row| row.reason.clone())
+            .next()
+            .unwrap_or_else(|| "the original is still present".to_owned());
+        return OwnerVoiceDeletion::Owed(detail);
+    }
+    match retention_events_for_name(segment, name) {
+        Ok(events) if events.deleted => OwnerVoiceDeletion::Deleted,
+        _ => OwnerVoiceDeletion::DeletedUnrecorded,
+    }
+}
+
+/// `(day, stream, dir)` of a segment directory inside the journal's chronicle, for either
+/// layout: `chronicle/<day>/<dir>` (the default stream) or `chronicle/<day>/<stream>/<dir>`.
+fn segment_coordinates(journal: &Path, segment: &Path) -> Option<(String, String, String)> {
+    let relative = segment.strip_prefix(journal).ok()?;
+    let parts = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(part) => part.to_str().map(str::to_owned),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    match parts.as_slice() {
+        [chronicle, day, dir] if chronicle == "chronicle" => {
+            Some((day.clone(), DEFAULT_STREAM.to_owned(), dir.clone()))
+        }
+        [chronicle, day, stream, dir] if chronicle == "chronicle" => {
+            Some((day.clone(), stream.clone(), dir.clone()))
+        }
+        _ => None,
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
+        let _ = write!(out, "{byte:02x}");
+        out
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use serde_json::json;
+    use sha2::{Digest, Sha256};
+    use solstone_core_journal_io::activity::ActivityLease;
+    use solstone_core_journal_io::{JournalRoot, LockOptions};
+
+    use super::*;
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    const AUDIO: &[u8] = b"synthetic audio bytes";
+
+    fn at() -> DateTime<Utc> {
+        DateTime::from_timestamp_millis(1_772_614_800_000).unwrap()
+    }
+
+    fn journal() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "retention-owner-voice-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root.canonicalize().unwrap()
+    }
+
+    fn sha(bytes: &[u8]) -> String {
+        hex(&Sha256::digest(bytes))
+    }
+
+    struct Fixture {
+        journal: std::path::PathBuf,
+        segment: std::path::PathBuf,
+        jsonl: std::path::PathBuf,
+        original: std::path::PathBuf,
+    }
+
+    fn record(state: &str, size: u64, digest: &str) -> Value {
+        json!({
+            "schema": vocab::SCHEMA,
+            "state": state,
+            "reason_code": if state == "analyzed" { "ok" } else { "no_speech" },
+            "handler": vocab::HANDLER_TRANSCRIBE,
+            "attempted_at": "2026-10-20T10:00:00Z",
+            "input_size": size,
+            "owner_voice_filter": true,
+            "owner_voice": {
+                "version": 1,
+                "speech_s": 10.0,
+                "kept_s": 6.0,
+                "left_out_s": 4.0,
+                "windows_scored": 5,
+                "windows_kept": 3,
+                "original": {"name": "120000_300.m4a", "size": size, "sha256": digest},
+                "print": {"sha256": "0".repeat(64)},
+            },
+        })
+    }
+
+    fn fixture_in(segment_rel: &str, state: &str) -> Fixture {
+        let journal = journal();
+        let segment = journal.join(segment_rel);
+        fs::create_dir_all(&segment).unwrap();
+        let original = segment.join("120000_300.m4a");
+        fs::write(&original, AUDIO).unwrap();
+        let jsonl = segment.join("120000_300.jsonl");
+        let header = json!({"raw": "120000_300.m4a", "_solstone_processing": record(state, AUDIO.len() as u64, &sha(AUDIO))});
+        let mut body = format!("{header}\n");
+        if state == "analyzed" {
+            body.push_str(&format!("{}\n", json!({"start": "12:00:01", "text": "kept words"})));
+        }
+        fs::write(&jsonl, body).unwrap();
+        Fixture { journal, segment, jsonl, original }
+    }
+
+    fn fixture(state: &str) -> Fixture {
+        fixture_in("chronicle/20261020/watch/120000_300", state)
+    }
+
+    fn finish(fixture: &Fixture) -> OwnerVoiceDeletion {
+        let claims = OutputClaims::acquire(
+            [fixture.jsonl.clone()],
+            LockOptions { timeout: Duration::ZERO, ..LockOptions::default() },
+        )
+        .unwrap();
+        let commit = claims.commit(&fixture.segment).unwrap();
+        finish_owner_voice_deletion(&fixture.journal, &fixture.jsonl, &claims, &commit, at())
+    }
+
+    #[test]
+    fn events_scan_reads_presence_with_its_failure_polarity() {
+        let fixture = fixture("analyzed");
+        assert_eq!(
+            retention_events_for_name(&fixture.segment, "120000_300.m4a").unwrap(),
+            RetentionEventsForName::default()
+        );
+        fs::write(
+            fixture.segment.join(EVENTS_FILE),
+            "{\"tract\":\"retention\",\"event\":\"original_deleted\",\"name\":\"120000_300.m4a\",\"class\":\"some_future_class\"}\n{torn\n{\"tract\":\"retention\",\"event\":\"original_release_refused\",\"name\":\"other.m4a\",\"reason\":\"unknown\"}\n",
+        )
+        .unwrap();
+        let mine = retention_events_for_name(&fixture.segment, "120000_300.m4a").unwrap();
+        assert!(mine.deleted && !mine.refused);
+        let other = retention_events_for_name(&fixture.segment, "other.m4a").unwrap();
+        assert!(!other.deleted && other.refused);
+
+        fs::remove_file(fixture.segment.join(EVENTS_FILE)).unwrap();
+        fs::create_dir(fixture.segment.join(EVENTS_FILE)).unwrap();
+        assert!(retention_events_for_name(&fixture.segment, "120000_300.m4a").is_err());
+    }
+
+    #[test]
+    fn refusal_record_round_trips() {
+        let fixture = fixture("analyzed");
+        record_owner_voice_release_refused(
+            &fixture.journal,
+            "chronicle/20261020/watch/120000_300",
+            "120000_300.m4a",
+            OwnerVoiceRefusal::BytesChanged,
+            at(),
+        )
+        .unwrap();
+        let line = fs::read_to_string(fixture.segment.join(EVENTS_FILE)).unwrap();
+        let row: Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
+        assert_eq!(row["event"], "original_release_refused");
+        assert_eq!(row["reason"], "bytes_changed");
+        assert_eq!(row["class"], "owner_voice_raw_release");
+        assert_eq!(row["ts"], at().timestamp_millis());
+        assert!(retention_events_for_name(&fixture.segment, "120000_300.m4a").unwrap().refused);
+    }
+
+    #[test]
+    fn deletion_state_truth_table() {
+        let owed = fixture("analyzed");
+        assert_eq!(owner_voice_deletion_state(&owed.segment, &owed.jsonl), OwedState::Owed);
+        let empty = fixture("empty");
+        assert_eq!(owner_voice_deletion_state(&empty.segment, &empty.jsonl), OwedState::Owed);
+
+        // The predicate never reads the original's bytes.
+        fs::write(&owed.original, b"different").unwrap();
+        assert_eq!(owner_voice_deletion_state(&owed.segment, &owed.jsonl), OwedState::Owed);
+
+        let gone = fixture("analyzed");
+        fs::remove_file(&gone.original).unwrap();
+        assert_eq!(owner_voice_deletion_state(&gone.segment, &gone.jsonl), OwedState::NotOwed);
+
+        let failed = fixture("failed");
+        assert_eq!(owner_voice_deletion_state(&failed.segment, &failed.jsonl), OwedState::NotOwed);
+
+        let rows_gone = fixture("analyzed");
+        let header = fs::read_to_string(&rows_gone.jsonl).unwrap();
+        fs::write(&rows_gone.jsonl, format!("{}\n", header.lines().next().unwrap())).unwrap();
+        assert_eq!(owner_voice_deletion_state(&rows_gone.segment, &rows_gone.jsonl), OwedState::NotOwed);
+
+        let other_raw = fixture("empty");
+        let text = fs::read_to_string(&other_raw.jsonl).unwrap();
+        fs::write(&other_raw.jsonl, text.replacen("\"raw\":\"120000_300.m4a\"", "\"raw\":\"other.m4a\"", 1)).unwrap();
+        assert_eq!(owner_voice_deletion_state(&other_raw.segment, &other_raw.jsonl), OwedState::NotOwed);
+
+        let unfiltered = fixture("empty");
+        let text = fs::read_to_string(&unfiltered.jsonl).unwrap();
+        let mut header: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        header["_solstone_processing"].as_object_mut().unwrap().remove("owner_voice");
+        fs::write(&unfiltered.jsonl, format!("{header}\n")).unwrap();
+        assert_eq!(owner_voice_deletion_state(&unfiltered.segment, &unfiltered.jsonl), OwedState::NotOwed);
+
+        let invalid = fixture("empty");
+        let text = fs::read_to_string(&invalid.jsonl).unwrap();
+        fs::write(&invalid.jsonl, text.replacen("\"version\":1", "\"version\":2", 1)).unwrap();
+        assert_eq!(owner_voice_deletion_state(&invalid.segment, &invalid.jsonl), OwedState::NotOwed);
+
+        for (event, reason) in [("original_deleted", "x"), ("original_release_refused", "never_heard_of")] {
+            let recorded = fixture("analyzed");
+            fs::write(
+                recorded.segment.join(EVENTS_FILE),
+                format!("{}\n", json!({"tract": "retention", "event": event, "name": "120000_300.m4a", "class": "owner_segment_removal", "reason": reason})),
+            )
+            .unwrap();
+            assert_eq!(owner_voice_deletion_state(&recorded.segment, &recorded.jsonl), OwedState::NotOwed);
+        }
+
+        let unreadable = fixture("analyzed");
+        fs::create_dir(unreadable.segment.join(EVENTS_FILE)).unwrap();
+        assert_eq!(owner_voice_deletion_state(&unreadable.segment, &unreadable.jsonl), OwedState::Unknown);
+        assert!(!owner_voice_deletion_owed(&unreadable.segment, &unreadable.jsonl));
+    }
+
+    #[test]
+    fn owed_days_cover_today_and_the_29_before() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        let days: Vec<_> = owner_voice_owed_days(today).collect();
+        assert_eq!(days.len(), 30);
+        assert_eq!(days.first(), Some(&today));
+        assert!(days.contains(&NaiveDate::from_ymd_opt(2026, 9, 21).unwrap()));
+        assert!(!days.contains(&NaiveDate::from_ymd_opt(2026, 9, 20).unwrap()));
+    }
+
+    #[test]
+    fn finishing_deletes_and_records_in_both_segment_layouts() {
+        for segment_rel in ["chronicle/20261020/watch/120000_300", "chronicle/20261020/120000_300"] {
+            let fixture = fixture_in(segment_rel, "analyzed");
+            assert_eq!(finish(&fixture), OwnerVoiceDeletion::Deleted, "{segment_rel}");
+            assert!(!fixture.original.exists());
+            let events = fs::read_to_string(fixture.segment.join(EVENTS_FILE)).unwrap();
+            assert_eq!(events.matches("owner_voice_raw_release").count(), 1);
+            assert_eq!(finish(&fixture), OwnerVoiceDeletion::NotOwed);
+        }
+    }
+
+    #[test]
+    fn a_changed_original_is_refused_once_and_kept() {
+        for (bytes, reason) in [
+            (&b"synthetic audio bytez"[..], OwnerVoiceRefusal::BytesChanged),
+            (&b"shorter"[..], OwnerVoiceRefusal::SizeChanged),
+        ] {
+            let fixture = fixture("analyzed");
+            fs::write(&fixture.original, bytes).unwrap();
+            assert_eq!(finish(&fixture), OwnerVoiceDeletion::Refused(reason));
+            assert_eq!(fs::read(&fixture.original).unwrap(), bytes);
+            assert_eq!(finish(&fixture), OwnerVoiceDeletion::NotOwed);
+            let events = fs::read_to_string(fixture.segment.join(EVENTS_FILE)).unwrap();
+            assert_eq!(events.matches("original_release_refused").count(), 1);
+            assert!(!events.contains("original_deleted"));
+        }
+    }
+
+    #[test]
+    fn a_commit_from_other_claims_proves_nothing() {
+        let fixture = fixture("analyzed");
+        let other = fixture_in("chronicle/20261020/watch/130000_300", "analyzed");
+        let options = LockOptions { timeout: Duration::ZERO, ..LockOptions::default() };
+        let claims = OutputClaims::acquire([fixture.jsonl.clone()], options).unwrap();
+        let other_claims = OutputClaims::acquire([other.jsonl.clone()], options).unwrap();
+        let other_commit = other_claims.commit(&other.segment).unwrap();
+        let outcome = finish_owner_voice_deletion(&fixture.journal, &fixture.jsonl, &claims, &other_commit, at());
+        assert!(matches!(outcome, OwnerVoiceDeletion::NotProvable(_)));
+        assert_eq!(fs::read(&fixture.original).unwrap(), AUDIO);
+        assert!(!fixture.segment.join(EVENTS_FILE).exists());
+    }
+
+    #[test]
+    fn a_busy_journal_leaves_the_deletion_owed() {
+        let fixture = fixture("analyzed");
+        let root = JournalRoot::open(&fixture.journal).unwrap();
+        let lease = ActivityLease::try_acquire(Arc::new(root)).unwrap();
+        assert!(matches!(finish(&fixture), OwnerVoiceDeletion::Owed(_)));
+        assert_eq!(fs::read(&fixture.original).unwrap(), AUDIO);
+        assert!(owner_voice_deletion_owed(&fixture.segment, &fixture.jsonl));
+        drop(lease);
+        assert_eq!(finish(&fixture), OwnerVoiceDeletion::Deleted);
+    }
+
+    #[test]
+    fn an_absent_original_is_not_owed() {
+        let fixture = fixture("analyzed");
+        fs::remove_file(&fixture.original).unwrap();
+        assert_eq!(finish(&fixture), OwnerVoiceDeletion::NotOwed);
+    }
+}

@@ -394,6 +394,8 @@ mod tests {
             speaker_evidence_multi_fraction: 0.0,
             overlap_fraction: 0.0,
             statement_labels: None,
+            turn_ranges: None,
+            overlap_ranges: None,
         }
     }
 
