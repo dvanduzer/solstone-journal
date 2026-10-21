@@ -3,6 +3,7 @@
 
 mod action_logs;
 mod activities;
+pub use activities::is_retired_plan;
 mod ai_chat;
 mod audio;
 mod browser;
@@ -618,7 +619,10 @@ pub fn produce_chunks_by_shape(
         },
     };
     if produced.error.is_none() && produced.chunks.is_empty() {
-        for record in records.iter().filter(|record| has_partial_input(record)) {
+        for record in records
+            .iter()
+            .filter(|record| has_partial_input(record) && !is_retired_plan(record))
+        {
             produced
                 .chunks
                 .push(recorded_chunk(String::new(), 0, record));

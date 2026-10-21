@@ -334,13 +334,13 @@ mod tests {
         fs::create_dir_all(root.join("chronicle").join(day)).unwrap();
 
         // Enable schedule talent and write a capped daily unit record
-        configure_daily_work(root, Some("schedule"));
+        configure_daily_work(root, Some("morning_briefing"));
         let coverage =
             solstone_core_system::daily_coverage::read_daily_coverage(root, day).unwrap();
         let unit = coverage
             .units
             .iter()
-            .find(|unit| unit.identity.name == "schedule")
+            .find(|unit| unit.identity.name == "morning_briefing")
             .unwrap();
         let mut record = solstone_core_journal_io::DailyUnitRecord::new(
             unit.identity.clone(),

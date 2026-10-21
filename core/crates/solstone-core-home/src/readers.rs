@@ -177,31 +177,6 @@ pub fn enabled_facet_names(context: &HomeContext) -> Vec<String> {
         .collect()
 }
 
-/// Collect anticipated activity records across every declared facet.
-pub fn collect_anticipated_activities(context: &HomeContext, day: &str) -> Vec<Value> {
-    all_facet_names(context).into_iter().flat_map(|facet| {
-        load_activity_records(context.journal_root(), &facet, day, false).unwrap_or_default().into_iter().filter_map(move |record| {
-            (record.get("source").and_then(Value::as_str) == Some("anticipated")).then(|| {
-                let participants = record.get("participation").and_then(Value::as_array).into_iter().flatten().filter_map(|entry| {
-                    (entry.get("role").and_then(Value::as_str) == Some("attendee")).then(|| entry.get("name").and_then(Value::as_str).unwrap_or("").trim().to_owned()).filter(|name| !name.is_empty())
-                }).collect::<Vec<_>>();
-                let mut row = json!({
-                    "title": record.get("title").cloned().unwrap_or(Value::String(String::new())),
-                    "start": record.get("start").cloned().unwrap_or(Value::String(String::new())),
-                    "end": record.get("end").cloned().unwrap_or(Value::String(String::new())),
-                    "facet": facet.clone(),
-                    "occurred": false,
-                    "participants": participants
-                });
-                if let Some(id) = record.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()) {
-                    row["id"] = Value::String(id.to_owned());
-                }
-                row
-            })
-        })
-    }).collect()
-}
-
 /// The local clock time a segment directory name stands for. `HHMMSS_<length>`
 /// is the reference spelling; anything else has no time of its own.
 fn segment_clock(segment: &str) -> Option<NaiveTime> {
@@ -283,7 +258,7 @@ fn merge_faceted_activity(kept: &mut Map<String, Value>, other: &Map<String, Val
     }
 }
 
-/// Collect non-anticipated activity records created within four hours of the injected instant.
+/// Collect activity records created within four hours of the injected instant.
 ///
 /// Each row carries `display_time`: when the activity happened, not when its
 /// record was written, and the list is ordered by the same value.
@@ -300,9 +275,6 @@ pub fn collect_activities(context: &HomeContext, day: &str) -> Vec<Value> {
             load_activity_records(context.journal_root(), &facet, day, false)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|record| {
-                    record.get("source").and_then(Value::as_str) != Some("anticipated")
-                })
                 .map(move |record| (facet.clone(), record))
         })
         .collect::<Vec<_>>();
@@ -1565,11 +1537,6 @@ mod tests {
         );
         assert_eq!(all_facet_names(&context), vec!["muted", "visible"]);
         assert_eq!(enabled_facet_names(&context), vec!["visible"]);
-        let titles = collect_anticipated_activities(&context, "20260602")
-            .into_iter()
-            .map(|row| row["title"].as_str().unwrap().to_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(titles, vec!["muted", "visible"]);
         assert!(collect_top_activities_yesterday(&context).is_empty());
     }
 
@@ -1587,7 +1554,6 @@ mod tests {
         );
         assert_eq!(all_facet_names(&context), vec!["declared"]);
         assert!(enabled_facet_names(&context).contains(&"declared".to_owned()));
-        assert!(collect_anticipated_activities(&context, "20260602").is_empty());
         assert!(collect_activities(&context, "20260602").is_empty());
     }
 
@@ -2963,46 +2929,6 @@ mod tests {
             root.path(),
             "facets/work/activities/20260601.jsonl",
             yesterday_work,
-        );
-
-        // Assert absent from collect_anticipated_activities
-        let anticipated_today = collect_anticipated_activities(&context, "20260602");
-        assert!(
-            anticipated_today
-                .iter()
-                .any(|r| r["title"] == "Visible plan today")
-        );
-        assert!(
-            !anticipated_today
-                .iter()
-                .any(|r| r["title"] == "Cancelled plan")
-        );
-        assert!(
-            !anticipated_today
-                .iter()
-                .any(|r| r["title"] == "Replaced plan")
-        );
-        assert!(
-            !anticipated_today
-                .iter()
-                .any(|r| r["title"] == "Owner hidden detected")
-        );
-
-        let anticipated_yesterday = collect_anticipated_activities(&context, "20260601");
-        assert!(
-            anticipated_yesterday
-                .iter()
-                .any(|r| r["title"] == "Visible plan yesterday")
-        );
-        assert!(
-            !anticipated_yesterday
-                .iter()
-                .any(|r| r["title"] == "Cancelled plan y")
-        );
-        assert!(
-            !anticipated_yesterday
-                .iter()
-                .any(|r| r["title"] == "Replaced plan y")
         );
 
         // Assert absent from collect_activities (recent list)

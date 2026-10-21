@@ -13,6 +13,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- your journal no longer guesses your upcoming plans from what you share. plans it already wrote stay in your journal's folder, but nothing shows them anymore: not activities, home, your morning briefing or connected agents. your morning briefing no longer lists what's ahead today or in the coming week.
 - when input is too long to fit, saved results now say so. health treats those useful partial results separately from failed runs.
 
 - saving or importing something no longer waits for search to finish updating. search catches up in the background, and health shows pending updates and removals that need another try.

@@ -33,15 +33,10 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "segments",
-            "anticipated_activities"
+            "segments"
           ],
           "properties": {
             "segments": {
-              "type": "integer",
-              "minimum": 0
-            },
-            "anticipated_activities": {
               "type": "integer",
               "minimum": 0
             }
@@ -63,7 +58,7 @@
     },
     "your_day": {
       "type": "array",
-      "maxItems": 16,
+      "maxItems": 0,
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -123,7 +118,7 @@
     },
     "forward_look": {
       "type": "array",
-      "maxItems": 16,
+      "maxItems": 0,
       "items": {
         "type": "string",
         "maxLength": 700

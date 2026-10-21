@@ -3906,12 +3906,20 @@ mod tests {
         let today =
             chrono::NaiveDate::parse_from_str(&daily_coverage::local_day(journal, now), "%Y%m%d")
                 .unwrap();
+        // The location input's recipients that a closed day can still owe are
+        // the facet-scoped entity talents, so each day has an active facet.
+        solstone_core_facets::create_facet(journal, "work", "Work", "", "", "", None).unwrap();
         let mut days = Vec::new();
         for age in 1..=12 {
             let day = (today - chrono::Duration::days(age))
                 .format("%Y%m%d")
                 .to_string();
-            std::fs::create_dir_all(journal.join("chronicle").join(&day)).unwrap();
+            let talents = journal
+                .join("chronicle")
+                .join(&day)
+                .join("notes/120000_60/talents");
+            std::fs::create_dir_all(&talents).unwrap();
+            std::fs::write(talents.join("facets.json"), r#"[{"facet":"work"}]"#).unwrap();
             let coverage = daily_coverage::read_daily_coverage(journal, &day).unwrap();
             for unit in &coverage.units {
                 if unit.evidence_revision.is_empty() || unit.contract_digest.is_empty() {

@@ -31,7 +31,6 @@ pub mod participation;
 pub mod prepare;
 mod prompt_context;
 pub mod pulse;
-pub mod schedule;
 mod screen_batch;
 pub mod source_passages;
 pub mod speaker_attribution;
@@ -2426,9 +2425,9 @@ mod tests {
         );
 
         let (source_root, source_paths, source_context) = fixture(
-            "schedule-source-fixture",
+            "source-fixture",
             r#"{
-"type":"generate","max_output_tokens":1024, "hook":{"post":"schedule"}, "load":{"transcripts":true,"percepts":false,"talents":{"screen":true}}
+"type":"generate","max_output_tokens":1024, "load":{"transcripts":true,"percepts":false,"talents":{"screen":true}}
 }"#,
         );
         let source_client =
@@ -2441,7 +2440,7 @@ mod tests {
         )
         .unwrap();
         let source_request = json!({
-            "name":"schedule-source-fixture", "day":source_day, "segment":source_segment, "prompt":"hello"
+            "name":"source-fixture", "day":source_day, "segment":source_segment, "prompt":"hello"
         })
         .as_object()
         .unwrap()
@@ -2452,7 +2451,7 @@ mod tests {
             &source_context,
             prepare::PrepareMode::Execute,
         )
-        .expect("schedule source prepares");
+        .expect("source fixture prepares");
         assert!(
             source_prepared.config["transcript"]
                 .as_str()

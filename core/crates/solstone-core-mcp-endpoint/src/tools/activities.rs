@@ -546,7 +546,7 @@ pub(crate) fn execute_list(
                     .get("hidden")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                if hidden {
+                if hidden || solstone_core_facets::is_retired_plan(&record) {
                     continue;
                 }
                 let entities = activity_entities(&record);

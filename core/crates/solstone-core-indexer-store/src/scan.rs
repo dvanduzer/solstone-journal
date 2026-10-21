@@ -1291,6 +1291,24 @@ fn reconcile_edges(
         }
     }
 
+    // Edges follow file mtimes, and retired plan records stay in files that no
+    // longer change. Re-extract those files once so their edges are dropped.
+    let plans_rechecked = retired_plan_edges_rechecked(conn)?;
+    if !plans_rechecked {
+        for (rel, path) in &files {
+            let activity_file = rel.starts_with("facets/")
+                && rel.contains("/activities/")
+                && rel.ends_with(".jsonl");
+            if activity_file
+                && !to_index.iter().any(|(queued, _, _)| queued == rel)
+                && fs::read_to_string(path).is_ok_and(|text| text.contains("\"anticipated\""))
+                && let Ok(mtime) = file_mtime_secs(path)
+            {
+                to_index.push((rel.clone(), path.clone(), mtime));
+            }
+        }
+    }
+
     let mut resolver = EdgeResolver::new(journal);
     let mut report = EdgeScanReport {
         failures: unreadable,
@@ -1347,7 +1365,27 @@ fn reconcile_edges(
         tx.commit()?;
     }
     report.removed = removed.len();
+    if !plans_rechecked && report.failures.is_empty() {
+        conn.execute(
+            "REPLACE INTO edge_files(path, mtime) VALUES (?, 1)",
+            [RETIRED_PLAN_EDGES_PATH],
+        )?;
+    }
     Ok(report)
+}
+
+/// Marks that files holding retired plan records had their edges re-extracted.
+const RETIRED_PLAN_EDGES_PATH: &str = "edges:retired-plans";
+
+fn retired_plan_edges_rechecked(conn: &Connection) -> Result<bool, StoreError> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM edge_files WHERE path = ?",
+            [RETIRED_PLAN_EDGES_PATH],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 fn replace_edge_file_edges(
@@ -1414,8 +1452,8 @@ fn process_edge_file(
 
 fn edge_file_mtimes(conn: &Connection) -> Result<BTreeMap<String, i64>, StoreError> {
     let mut statement =
-        conn.prepare("SELECT path, mtime FROM edge_files WHERE path != ? ORDER BY path")?;
-    let rows = statement.query_map([EDGES_SCHEMA_PATH], |row| {
+        conn.prepare("SELECT path, mtime FROM edge_files WHERE path NOT IN (?, ?) ORDER BY path")?;
+    let rows = statement.query_map([EDGES_SCHEMA_PATH, RETIRED_PLAN_EDGES_PATH], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
     })?;
     let mut mtimes = BTreeMap::new();
@@ -5348,6 +5386,7 @@ mod tests {
             edge_file_paths(&conn),
             vec![
                 "edges:__schema__".to_string(),
+                "edges:retired-plans".to_string(),
                 "facets/work/entities/123.jsonl".to_string(),
                 "facets/work/entities/20260304.jsonl".to_string(),
                 "facets/work/entities/99999999.jsonl".to_string(),
