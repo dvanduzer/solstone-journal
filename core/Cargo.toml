@@ -292,7 +292,9 @@ solstone-core-nvattest-authority = { path = "crates/solstone-core-nvattest-autho
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 chrono-tz = "0.10.4"
 glob = "0.3.3"
-h3o = "0.8.0"
+# Without `std`, h3o skips ahash and its compile-time RNG chain (const-random,
+# tiny-keccak under CC0-1.0); the map app needs only cells and their outlines.
+h3o = { version = "0.8.0", default-features = false }
 hdbscan = { version = "0.12.0", default-features = false, features = ["serial"] }
 image = { version = "0.25.9", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 log = "0.4.29"
