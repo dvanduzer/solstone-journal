@@ -133,6 +133,29 @@ their scheduled loop. Health reports queued work, failed removals, and the age a
 repair counts of the last finished light check. A segment publication receipt
 means its saved outputs were queued successfully; search visibility follows later.
 
+### Calendar listing
+
+Ingest queues each kept calendar note file on the search work list, and the
+single index writer indexes it like any other path. Each note becomes a hit on
+the day it was stored. The writer also keeps a listing: for every event identity,
+rows under each day the event happens, built from the latest note received for
+it (latest `changed_at` as an instant, then `removed` over `changed` over
+`added`, then by file name). A removal lists nothing. A timed event belongs to
+each local day it overlaps in the journal's zone, end exclusive; an all-day event
+to its own dates; an event lists at most 366 days. The rows are filed under the
+latest note's file, and replacing them happens in the same index transaction
+that indexes the newer note.
+
+The listing is derived from stored notes alone, so a rebuild yields the same
+listing, and nothing outside the index writer writes it. Removing a segment
+drops its notes and falls each affected event back to its latest surviving note.
+Timed events are listed in the journal's zone as it is when they are indexed: if
+the owner changes the journal's time zone, timed events keep their old days until
+the search index is rebuilt. The journal's usual fallback zone applies when none
+is configured. While the settings file cannot be read, existing listing rows stay
+as they are, the scan reports the failure once, and a note that arrives meanwhile
+is listed once the file reads again.
+
 ### Interrupted activity work
 
 `think-cli::activity_work` persists unfinished talent names and accepted Cortex use
