@@ -8,6 +8,7 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- a new setting in transcription settings, "leave out other voices", keeps your words in your journal and leaves out stretches where only other people speak. it's off until you turn it on. while it's on, your journal deletes the original audio of each recording it processes once its words are saved, and tries again each day for recent recordings it couldn't delete right away. other voices may remain, and some of your words may be missed. audio processed before you turned it on, imported audio and existing backups are unchanged. it needs your saved voice.
 - your journal recognizes text from recorded screens on apple silicon macs and linux computers with intel or amd processors. find it in search, including commands, errors and reference numbers. connected agents can read it when you enable screen text in their permissions; existing connections keep their current permissions. masking passwords and other secrets is best effort; your written redaction rules do not apply to screen text.
 - `solstone journal doctor` now shows recorded backup problems and the last successful copy, with dates and qualifications for incomplete or older setups.
 
