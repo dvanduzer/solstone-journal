@@ -307,9 +307,7 @@ fn build_screen_ocr_helper(
     log_directory: &Path,
     epoch: &str,
 ) -> Result<BuiltScreenOcrHelper, String> {
-    let manifest_path = checkout.join(crate::screen_ocr::HELPER_MANIFEST);
-    let lock_path = checkout.join(crate::screen_ocr::HELPER_LOCK);
-    let recipe_path = checkout.join(crate::screen_ocr::RECIPE);
+    let [manifest_path, lock_path, recipe_path] = screen_ocr_input_paths(checkout);
     let manifest = read_bounded(&manifest_path, 4 * 1024 * 1024)?;
     let lock = read_bounded(&lock_path, 64 * 1024 * 1024)?;
     let recipe_bytes = read_bounded(&recipe_path, 1024 * 1024)?;
@@ -405,6 +403,18 @@ fn build_screen_ocr_helper(
             artifact_bytes: artifact.len() as u64,
         },
     })
+}
+
+/// The helper's manifest, lock and recipe under `checkout`, joined one
+/// component at a time: a bounded read opens the parent as a root, and Windows
+/// refuses a root spelled with a forward slash.
+fn screen_ocr_input_paths(checkout: &Path) -> [PathBuf; 3] {
+    [
+        crate::screen_ocr::HELPER_MANIFEST,
+        crate::screen_ocr::HELPER_LOCK,
+        crate::screen_ocr::RECIPE,
+    ]
+    .map(|relative| super::windows_stage::join_components(checkout, relative))
 }
 
 struct BuiltScreenOcrHelper {
@@ -763,6 +773,30 @@ mod tests {
         );
         assert_eq!(read_bounded(&command, 14).unwrap(), b"current output");
         retained.revalidate_canonical_binding().unwrap();
+    }
+
+    #[test]
+    fn screen_ocr_helper_inputs_are_read_through_component_paths() {
+        let temporary = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let root = temporary.path().to_path_buf();
+        #[cfg(not(windows))]
+        let root = temporary.path().canonicalize().unwrap();
+        for (path, relative) in screen_ocr_input_paths(&root).iter().zip([
+            crate::screen_ocr::HELPER_MANIFEST,
+            crate::screen_ocr::HELPER_LOCK,
+            crate::screen_ocr::RECIPE,
+        ]) {
+            assert_eq!(
+                path,
+                &super::super::windows_stage::join_components(&root, relative)
+            );
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, relative.as_bytes()).unwrap();
+            assert_eq!(read_bounded(path, 64).unwrap(), relative.as_bytes());
+            #[cfg(windows)]
+            assert!(read_bounded(&root.join(relative), 64).is_err());
+        }
     }
 
     #[test]
