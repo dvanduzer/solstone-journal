@@ -150,6 +150,30 @@ fn usage(usage: &'static str, error: &str) -> ShareCommand {
 
 /// Run one `share` invocation. Nothing here writes to the journal.
 pub fn run_cli(args: &[OsString], journal: &Path, talents: &dyn TalentCaller) -> CliRun {
+    let partial = std::cell::Cell::new(false);
+    let tracked = |talent: &str, transcript: &str| {
+        let result = talents.call(talent, transcript);
+        if result
+            .as_ref()
+            .ok()
+            .and_then(|v| v.get("partial_input"))
+            .is_some_and(serde_json::Value::is_object)
+        {
+            partial.set(true);
+        }
+        result
+    };
+    let mut result = run_cli_inner(args, journal, &tracked);
+    if partial.get() {
+        result
+            .stderr
+            .push_str(solstone_core_format::content::PARTIAL_INPUT_NOTICE);
+        result.stderr.push('\n');
+    }
+    result
+}
+
+fn run_cli_inner(args: &[OsString], journal: &Path, talents: &dyn TalentCaller) -> CliRun {
     match parse(args) {
         ShareCommand::Help(text) => finished(text.to_owned(), String::new(), 0),
         ShareCommand::Usage { usage, error } => finished(
@@ -219,7 +243,7 @@ fn run_match(
                 continue;
             };
             let activity = ActivityRef::from_record(&record);
-            let line = json!({
+            let mut line = json!({
                 "day": day,
                 "facet": facet,
                 "activity_id": activity.id,
@@ -229,6 +253,9 @@ fn run_match(
                 "segments": matched.segments,
                 "threads": matched.threads,
             });
+            if let Some(partial) = matched.partial_input {
+                line["partial_input"] = partial;
+            }
             stdout.push_str(&line.to_string());
             stdout.push('\n');
         }

@@ -2933,10 +2933,14 @@ pub(crate) fn write_sense_and_change<W: std::io::Write>(
         replace_text_checked(
             context,
             &activity_path,
-            sense
-                .get("activity_summary")
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
+            &solstone_core_format::content::with_partial_input_notice(
+                sense
+                    .get("activity_summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                sense,
+            ),
         )?;
         published.insert(activity_path.clone());
 
@@ -2971,11 +2975,11 @@ pub(crate) fn write_sense_and_change<W: std::io::Write>(
         published.insert(sense_json_path.clone());
 
         let density_json_path = talents.join("density.json");
-        replace_json_checked(
-            context,
-            &density_json_path,
-            &serde_json::json!({"classification":sense["density"],"timestamp":Utc::now().to_rfc3339()}),
-        )?;
+        let mut density = serde_json::json!({"classification":sense["density"],"timestamp":Utc::now().to_rfc3339()});
+        if let Some(partial) = sense.get("partial_input").filter(|v| v.is_object()) {
+            density["partial_input"] = partial.clone();
+        }
+        replace_json_checked(context, &density_json_path, &density)?;
         published.insert(density_json_path.clone());
 
         if sense
@@ -3020,7 +3024,10 @@ pub(crate) fn write_sense_and_change<W: std::io::Write>(
                 replace_text_checked(
                     context,
                     &sense_md_path,
-                    &format!("# Sense Entities\n\n{}", lines.join("\n")),
+                    &solstone_core_format::content::with_partial_input_notice(
+                        format!("# Sense Entities\n\n{}", lines.join("\n")),
+                        sense,
+                    ),
                 )?;
                 published.insert(sense_md_path.clone());
             }
@@ -3232,9 +3239,13 @@ fn publish_segment_topics<W: std::io::Write>(
     let markdown = eval.markdown.as_deref();
     let file_exists = topics_path.exists();
 
-    if markdown.is_some() || file_exists {
-        let bytes = markdown.unwrap_or("");
-        match replace_text_checked(context, &topics_path, bytes) {
+    if markdown.is_some() || file_exists || sense.get("partial_input").is_some_and(Value::is_object)
+    {
+        let bytes = solstone_core_format::content::with_partial_input_notice(
+            markdown.unwrap_or("").to_owned(),
+            sense,
+        );
+        match replace_text_checked(context, &topics_path, &bytes) {
             Ok(()) => {
                 published.insert(topics_path);
             }

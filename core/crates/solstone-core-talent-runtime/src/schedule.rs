@@ -112,6 +112,10 @@ pub(crate) fn apply_result_cancellable(
     let Ok(mut events) = serde_json::from_str::<Value>(output.trim()) else {
         return Ok(());
     };
+    let partial = events
+        .get("partial_input")
+        .filter(|v| v.is_object())
+        .cloned();
     if events.is_object() {
         events = events
             .as_object_mut()
@@ -132,9 +136,11 @@ pub(crate) fn apply_result_cancellable(
     for raw in events {
         crate::writers::check_cancellation(cancellation)?;
         let Some(raw) = raw.as_object() else { continue };
+        let mut raw = raw.clone();
+        crate::partial_input::stamp(&mut raw, partial.as_ref());
         let _ = apply_event(
             journal,
-            raw,
+            &raw,
             day,
             current_day,
             &known_facets,
@@ -158,7 +164,7 @@ fn apply_event(
     >,
     cancellation: &solstone_core_generate::Cancellation,
 ) -> Result<(), String> {
-    let (facet, target_day_key, record) = prepare_event(
+    let (facet, target_day_key, mut record) = prepare_event(
         journal,
         raw,
         day,
@@ -171,6 +177,7 @@ fn apply_event(
         PrepareEventError::Skip { detail, .. } => detail,
         PrepareEventError::Abort(detail) => detail,
     })?;
+    crate::partial_input::stamp(&mut record, raw.get("partial_input"));
     let new_id = require_text(&record, "id")?;
     let cancelled = record
         .get("cancelled")
@@ -258,7 +265,7 @@ pub fn prepare_publication(
             warn_skipped_event(day, SkipReason::NonObject);
             continue;
         };
-        let (facet, target, record) =
+        let (facet, target, mut record) =
             match prepare_event(journal, raw, day, current_day, &known, &mut cache, true) {
                 Ok(prepared) => prepared,
                 Err(PrepareEventError::Skip { reason, .. }) => {
@@ -269,6 +276,18 @@ pub fn prepare_publication(
             };
         let existing = solstone_core_facets::load_activity_records(journal, &facet, &target, true)
             .map_err(|e| e.to_string())?;
+        crate::partial_input::stamp(
+            &mut record,
+            value.get("partial_input").filter(|v| v.is_object()),
+        );
+        if !record.contains_key("partial_input")
+            && existing.iter().any(|old| {
+                old.get("id") == record.get("id")
+                    && old.get("partial_input").is_some_and(Value::is_object)
+            })
+        {
+            record.insert("partial_input".into(), Value::Null);
+        }
         let exact_match = existing.iter().any(|old| old.get("id") == record.get("id"));
         let superseded = existing
             .iter()
@@ -609,6 +628,7 @@ fn dedup_anticipation(
 
             let mut patch = Map::new();
             for key in [
+                "partial_input",
                 "activity",
                 "target_date",
                 "start",
@@ -753,6 +773,49 @@ fn longest_match(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn partial_schedule_survives_creation_and_clears_on_both_update_paths() {
+        for frozen in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            solstone_core_facets::create_facet(root.path(), "work", "Work", "", "", "", None)
+                .unwrap();
+            for clipped in [true, false, true] {
+                let mut output = serde_json::json!({"events":[{"activity":"meeting","target_date":"2026-03-14","start":"09:30:00","title":"Project sync","description":"Discuss roadmap","facet":"work","participation":[]}]});
+                if clipped {
+                    output["partial_input"] = serde_json::json!({"dropped_entries":2});
+                }
+                if frozen {
+                    for batch in
+                        prepare_publication(root.path(), &output.to_string(), "20260310").unwrap()
+                    {
+                        solstone_core_facets::publish_anticipation_batch(
+                            root.path(),
+                            &batch,
+                            true,
+                            || Ok(()),
+                        )
+                        .unwrap();
+                    }
+                } else {
+                    apply_result(root.path(), &output.to_string(), "20260310").unwrap();
+                }
+                let rows = solstone_core_facets::load_activity_records(
+                    root.path(),
+                    "work",
+                    "20260314",
+                    true,
+                )
+                .unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(
+                    rows[0].get("partial_input").is_some_and(Value::is_object),
+                    clipped,
+                    "frozen={frozen}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn anticipated_titles_and_descriptions_drop_a_leading_subject() {
         // the schedule talent's output reaches Home's today card verbatim, so it takes the

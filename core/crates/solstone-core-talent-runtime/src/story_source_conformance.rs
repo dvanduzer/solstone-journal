@@ -257,6 +257,18 @@ fn every_story_source_case_stores_and_returns_one_story() {
                 "{name}: returned confidence"
             );
             assert_eq!(returned["relations"], model["relations"], "{name}");
+        } else if expect["partial"] == true {
+            let mut returned: Value = serde_json::from_str(&output).unwrap();
+            let partial = returned
+                .as_object_mut()
+                .unwrap()
+                .remove("partial_input")
+                .unwrap();
+            assert_eq!(partial, story["partial_input"]);
+            assert_eq!(
+                &returned, model,
+                "{name}: only runtime-owned limitation metadata changes"
+            );
         } else {
             assert_eq!(
                 output, run.response,

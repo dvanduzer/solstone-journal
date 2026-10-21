@@ -538,10 +538,25 @@ fn publish(
     {
         return finished(record).map_err(|e| failure(name, e));
     }
+    let mut prepared = prepared.clone();
+    let retained_budget = record
+        .generated_result
+        .as_ref()
+        .and_then(|v| v.get("input_budget"))
+        .cloned();
+    if record.generated_result.is_some() {
+        prepared.config.remove(crate::INPUT_BUDGET_KEY);
+        if let Some(budget) = retained_budget {
+            prepared
+                .config
+                .insert(crate::INPUT_BUDGET_KEY.into(), budget);
+        }
+    }
+    let prepared = &prepared;
     let (response, usage, degraded) = if let Some(value) = record.generated_result.as_ref() {
         retained_response(value).map_err(|e| failure(name, e))?
     } else {
-        let value = json!({"response":generated.0,"usage":generated.1,"degraded":generated.2});
+        let value = json!({"response":generated.0,"usage":generated.1,"degraded":generated.2,"input_budget":prepared.config.get(crate::INPUT_BUDGET_KEY)});
         authority
             .record_mut()
             .as_mut()
@@ -629,7 +644,9 @@ fn publish(
     };
     let mut receipts = record.receipts.clone();
     receipts.extend(crate::writers::required_artifact_receipts(&publication));
-    let retained = json!({"response":response,"usage":usage,"degraded":degraded,"output":output});
+    let output = crate::partial_input::output(&output, prepared);
+    let degraded = crate::partial_input::degraded(prepared, degraded);
+    let retained = json!({"response":response,"usage":usage,"degraded":degraded,"output":output,"input_budget":prepared.config.get(crate::INPUT_BUDGET_KEY)});
     record.generated_result = Some(retained.clone());
     record.status = status;
     record.reason_code = None;
@@ -3072,6 +3089,88 @@ mod tests {
         record.packet_digest = Some(crate::daily_prepare::packet_digest(packet));
         record.failure_count = failure_count;
         save_daily_unit_record(journal, &record).unwrap();
+    }
+
+    #[test]
+    fn clipped_empty_schedule_retains_metadata_without_inventing_an_activity() {
+        let root = tempfile::tempdir().unwrap();
+        let (context, old_identity, _) = fixture(root.path(), true);
+        let mut record = load_daily_unit_record(&context.journal, &old_identity)
+            .unwrap()
+            .unwrap();
+        record.identity = DailyUnitIdentity::new("20260101", "schedule", None);
+        record.generated_result = Some(
+            json!({"response":"{\"events\":[]}","input_budget":{"clipped":true,"dropped_entries":1}}),
+        );
+        let packet = record.frozen_packet.as_mut().unwrap();
+        packet["prepared"]["name"] = json!("schedule");
+        packet["prepared"]["config"]["output"] = json!("json");
+        packet["prepared"]["config"]["hook"] = json!({"post":"schedule"});
+        packet["prepared"]["config"]["_daily_calendar_before"] = json!({});
+        packet["hook"] = json!("schedule");
+        packet["state"] = json!("None");
+        record.packet_digest = Some(crate::daily_prepare::packet_digest(packet));
+        save_daily_unit_record(&context.journal, &record).unwrap();
+        let request = json!({"name":"schedule","day":"20260101","lock_token":"attempt-1","evidence_revision":"E","contract_digest":"contract"}).as_object().unwrap().clone();
+        let never = |_: &solstone_core_generate::GenerateRequest| -> Result<
+            solstone_core_generate::GenerateResponse,
+            solstone_core_generate::ClientError,
+        > {
+            panic!("must reuse");
+        };
+        let outcome = execute(request, &context, &never, &mut Vec::new());
+        let RuntimeOutcome::Finished {
+            output, degraded, ..
+        } = outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        let result: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(result["events"], json!([]));
+        assert_eq!(result["partial_input"]["dropped_entries"], 1);
+        assert_eq!(degraded.unwrap()["reason"], "partial_input");
+        assert!(!context.journal.join("facets").exists());
+    }
+
+    #[test]
+    fn retained_clipped_generation_resumes_and_reuses_partial_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let (context, identity, request) = fixture(root.path(), true);
+        let mut record = load_daily_unit_record(&context.journal, &identity)
+            .unwrap()
+            .unwrap();
+        record.generated_result.as_mut().unwrap()["input_budget"] =
+            json!({"clipped":true,"dropped_entries":2,"dropped_chars":700});
+        save_daily_unit_record(&context.journal, &record).unwrap();
+        let no_generate = |_: &solstone_core_generate::GenerateRequest| -> Result<
+            solstone_core_generate::GenerateResponse,
+            solstone_core_generate::ClientError,
+        > { panic!("retained output must not regenerate") };
+        for _ in 0..2 {
+            let outcome = execute(request.clone(), &context, &no_generate, &mut Vec::new());
+            let RuntimeOutcome::Finished {
+                output, degraded, ..
+            } = outcome
+            else {
+                panic!("{outcome:?}");
+            };
+            assert!(output.contains("Left out:"));
+            assert_eq!(degraded.unwrap()["reason"], "partial_input");
+        }
+        let saved = fs::read_to_string(
+            context
+                .journal
+                .join("chronicle/20260101/talents/morning_briefing.md"),
+        )
+        .unwrap();
+        assert!(saved.contains("Left out:"));
+        let record = load_daily_unit_record(&context.journal, &identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.generated_result.as_ref().unwrap()["input_budget"]["dropped_entries"],
+            2
+        );
     }
 
     #[test]

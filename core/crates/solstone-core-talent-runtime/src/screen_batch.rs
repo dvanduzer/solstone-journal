@@ -22,12 +22,18 @@ const SCREEN_NARRATIVE_MAX_CHARS: usize = 24_000;
 const SCREEN_ENTITY_MAX_ITEMS: usize = 96;
 const CONTINUATION_GUIDE: &str = "## Tmux batch continuation\n\nThe JSON below is reconstructed visible pane state from earlier observations. It is interpretive context, not a new activity to narrate. Apply the following Tmux changes to this prior state.\n\n";
 
+#[derive(Debug)]
+pub(crate) struct BatchResponse {
+    pub text: String,
+    pub input_budget: Option<Value>,
+}
+
 pub(crate) fn generate_if_needed(
     prepared: &PreparedTalent,
     context: &ExecutionContext,
     client: &dyn solstone_core_generate::GenerateExecutor,
     writer: Option<&mut dyn std::io::Write>,
-) -> Option<Result<String, RuntimeOutcome>> {
+) -> Option<Result<BatchResponse, RuntimeOutcome>> {
     generate_if_needed_with(prepared, context, client, writer, |input| {
         inspect_exact_text_admission(input).map_err(|error| error.detail)
     })
@@ -39,7 +45,7 @@ pub(crate) fn generate_if_needed_with<I>(
     client: &dyn solstone_core_generate::GenerateExecutor,
     mut writer: Option<&mut dyn std::io::Write>,
     mut inspect: I,
-) -> Option<Result<String, RuntimeOutcome>>
+) -> Option<Result<BatchResponse, RuntimeOutcome>>
 where
     I: FnMut(&GenerateInput) -> Result<ExactTextCount, String>,
 {
@@ -96,6 +102,7 @@ where
     };
 
     let mut outputs = Vec::with_capacity(batches.len());
+    let mut clipped_budgets = Vec::new();
     for (batch_idx, batch) in batches.into_iter().enumerate() {
         let request = match generate_request(&batch) {
             Ok(request) => request,
@@ -135,6 +142,13 @@ where
                         validation: response.schema_validation.clone().unwrap_or(Value::Null),
                     }));
                 }
+                if let Some(budget) = response
+                    .input_budget
+                    .as_ref()
+                    .and_then(crate::partial_input::from_budget)
+                {
+                    clipped_budgets.push(budget);
+                }
                 outputs.push(response.text.clone());
             }
             GenerateResponse::Refused(response) => {
@@ -153,9 +167,29 @@ where
             }
         }
     }
-    Some(merge_outputs(&outputs).map_err(|detail| {
-        RuntimeOutcome::StageFailed(stage_error("generate", "screen_batch", prepared, detail))
-    }))
+    let input_budget = (!clipped_budgets.is_empty()).then(|| {
+        let mut budget = serde_json::Map::new();
+        budget.insert("clipped".into(), Value::Bool(true));
+        for key in ["dropped_entries", "dropped_chars"] {
+            let sum = clipped_budgets
+                .iter()
+                .try_fold(0u64, |sum, b| b.get(key)?.as_u64()?.checked_add(sum));
+            budget.insert(key.into(), sum.map(Value::from).unwrap_or(Value::Null));
+        }
+        Value::Object(budget)
+    });
+    Some(
+        merge_outputs(&outputs)
+            .map(|text| BatchResponse { text, input_budget })
+            .map_err(|detail| {
+                RuntimeOutcome::StageFailed(stage_error(
+                    "generate",
+                    "screen_batch",
+                    prepared,
+                    detail,
+                ))
+            }),
+    )
 }
 
 fn journal_uses_bundled_local(journal: &std::path::Path) -> bool {
@@ -1110,34 +1144,32 @@ mod tests {
             .insert("json_schema".into(), json!({"type": "object"}));
 
         // 4 responses: Batch 1 success, Batch 2 fail (schema validation failed), Batch 2 success (retry), Batch 3 success
-        let stub = test_support::sequenced_one_shot_stub(
-            root.path(),
-            &[
-                test_support::generated_response_value(
-                    r#"{"narrative":"Narrative 1","entities":[]}"#,
-                    json!({"valid": true, "errors": []}),
-                ),
-                if cause == "schema_validation_failed" {
-                    test_support::generated_response_value("invalid", json!({"valid": false}))
-                } else {
-                    test_support::refused_response_value(
-                        Some(cause),
-                        true,
-                        false,
-                        "test",
-                        "incomplete",
-                    )
-                },
-                test_support::generated_response_value(
-                    r#"{"narrative":"Narrative 2","entities":[]}"#,
-                    json!({"valid": true, "errors": []}),
-                ),
-                test_support::generated_response_value(
-                    r#"{"narrative":"Narrative 3","entities":[]}"#,
-                    json!({"valid": true, "errors": []}),
-                ),
-            ],
-        );
+        let mut responses = [
+            test_support::generated_response_value(
+                r#"{"narrative":"Narrative 1","entities":[]}"#,
+                json!({"valid": true, "errors": []}),
+            ),
+            if cause == "schema_validation_failed" {
+                test_support::generated_response_value("invalid", json!({"valid": false}))
+            } else {
+                test_support::refused_response_value(Some(cause), true, false, "test", "incomplete")
+            },
+            test_support::generated_response_value(
+                r#"{"narrative":"Narrative 2","entities":[]}"#,
+                json!({"valid": true, "errors": []}),
+            ),
+            test_support::generated_response_value(
+                r#"{"narrative":"Narrative 3","entities":[]}"#,
+                json!({"valid": true, "errors": []}),
+            ),
+        ];
+        responses[0]["input_budget"] =
+            json!({"clipped":true,"dropped_entries":2,"dropped_chars":10});
+        responses[1]["input_budget"] =
+            json!({"clipped":true,"dropped_entries":100,"dropped_chars":1000});
+        responses[2]["input_budget"] = json!({"clipped":false});
+        responses[3]["input_budget"] = json!({"clipped":true,"dropped_entries":3});
+        let stub = test_support::sequenced_one_shot_stub(root.path(), &responses);
         let client = OneShotClient::at_path(&stub);
 
         let inspect = |input: &GenerateInput| {
@@ -1155,7 +1187,11 @@ mod tests {
         let Some(Ok(merged)) = outcome else {
             panic!("expected Some(Ok(..)), got {outcome:?}");
         };
-        let parsed: Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(
+            merged.input_budget,
+            Some(json!({"clipped":true,"dropped_entries":5,"dropped_chars":null}))
+        );
+        let parsed: Value = serde_json::from_str(&merged.text).unwrap();
         assert_eq!(
             parsed["narrative"],
             "Narrative 1\n\nNarrative 2\n\nNarrative 3"

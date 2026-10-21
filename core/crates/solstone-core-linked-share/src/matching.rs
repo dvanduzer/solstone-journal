@@ -59,6 +59,8 @@ pub struct ActivityMatch {
     pub shape: Shape,
     pub segments: Vec<String>,
     pub threads: Vec<ThreadKey>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partial_input: Option<Value>,
 }
 
 /// The parts of an activity record the matcher reads. The journal's title,
@@ -181,6 +183,7 @@ fn message_thread(
         .flat_map(|thread| thread.segments.iter())
         .collect::<BTreeSet<_>>();
     Some(ActivityMatch {
+        partial_input: None,
         basis: Basis::MessageThread,
         shape,
         segments: sources
@@ -263,6 +266,7 @@ fn sustained_voice(sources: &[SegmentSource], person: &PersonRef) -> Option<Acti
         }
     }
     (lines >= VOICE_LINES && lines * 100 >= total * VOICE_SHARE_PERCENT).then(|| ActivityMatch {
+        partial_input: None,
         basis: Basis::Voice,
         shape: Shape::Conversation,
         segments: with_neighbours(sources, &evidenced),
@@ -309,9 +313,11 @@ fn spoken_with(
                 format!("{marker}{label}: {}", lines[line].1.text)
             })
             .collect::<Vec<_>>();
-        if ask_presence(talents, person, owner, &window) == Presence::With {
+        let (presence, partial_input) = ask_presence(talents, person, owner, &window);
+        if presence == Presence::With {
             let evidenced = BTreeSet::from([lines[position].0]);
             return Some(ActivityMatch {
+                partial_input,
                 basis: Basis::SpokenWith,
                 shape: Shape::Conversation,
                 segments: with_neighbours(sources, &evidenced),
@@ -327,7 +333,7 @@ fn ask_presence(
     person: &PersonRef,
     owner: &Owner,
     window: &[String],
-) -> Presence {
+) -> (Presence, Option<Value>) {
     let mut text = format!("Owner: {}\nName in question: {}", owner.name, person.name);
     if !person.aliases.is_empty() {
         text.push_str(&format!(" (also: {})", person.aliases.join(", ")));
@@ -335,14 +341,21 @@ fn ask_presence(
     text.push_str("\n\nLines (the marked line contains the name):\n");
     text.push_str(&window.join("\n"));
     match talents.call(PRESENCE_TALENT, &text) {
-        Ok(value) => match value.get("role").and_then(Value::as_str) {
-            Some("with") => Presence::With,
-            Some("about") => Presence::About,
-            _ => Presence::Unclear,
-        },
+        Ok(value) => {
+            let partial = value
+                .get("partial_input")
+                .filter(|v| v.is_object())
+                .cloned();
+            let presence = match value.get("role").and_then(Value::as_str) {
+                Some("with") => Presence::With,
+                Some("about") => Presence::About,
+                _ => Presence::Unclear,
+            };
+            (presence, partial)
+        }
         Err(error) => {
             log::warn!("presence check unavailable: {error}");
-            Presence::Unclear
+            (Presence::Unclear, None)
         }
     }
 }

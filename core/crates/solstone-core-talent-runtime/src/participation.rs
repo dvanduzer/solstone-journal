@@ -230,6 +230,13 @@ pub(crate) fn apply_result_cancellable(
     if let Some(confidence) = data.get("participation_confidence") {
         patch.insert("participation_confidence".to_owned(), confidence.clone());
     }
+    patch.insert(
+        "participation_partial_input".into(),
+        data.get("partial_input")
+            .filter(|v| v.is_object())
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
     let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true);
     solstone_core_facets::update_activity_record_checked(
         journal,
@@ -502,6 +509,45 @@ mod tests {
         )
         .expect("activity parses");
         activity["participation"][0].clone()
+    }
+
+    #[test]
+    fn partial_participation_replacement_preserves_independent_story_marker() {
+        let root = tempfile::tempdir().unwrap();
+        write_participation_fixture(root.path(), json!({}), json!({}));
+        let path = root
+            .path()
+            .join(format!("facets/{FACET}/activities/{DAY}.jsonl"));
+        let mut row = activity();
+        row.insert(
+            "story".into(),
+            json!({"body":"Saved story","partial_input":{"dropped_entries":8}}),
+        );
+        fs::write(&path, format!("{}\n", Value::Object(row.clone()))).unwrap();
+        let original = row.clone();
+        for clipped in [true, false, true] {
+            let mut output = json!({"participation":[]});
+            if clipped {
+                output["partial_input"] = json!({"dropped_entries":2});
+            }
+            apply_result(
+                root.path(),
+                &output.to_string(),
+                FACET,
+                &solstone_core_facets::observe_facet_write_identity(root.path(), FACET).unwrap(),
+                DAY,
+                &original,
+            )
+            .unwrap();
+            row = serde_json::from_str(fs::read_to_string(&path).unwrap().lines().next().unwrap())
+                .unwrap();
+            assert_eq!(row["story"]["partial_input"]["dropped_entries"], 8);
+            assert_eq!(
+                row.get("participation_partial_input")
+                    .is_some_and(Value::is_object),
+                clipped
+            );
+        }
     }
 
     #[test]

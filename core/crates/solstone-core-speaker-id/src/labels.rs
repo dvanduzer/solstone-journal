@@ -244,6 +244,11 @@ pub fn write_full_labels_checked(
             .cloned()
             .unwrap_or_else(|| Value::Array(Vec::new())),
     );
+    if let Some(partial) = metadata.get("partial_input").filter(|v| v.is_object()) {
+        result.insert("partial_input".into(), partial.clone());
+    } else {
+        result.remove("partial_input");
+    }
     if let Some(gaps) = metadata
         .get("candidate_evidence_gaps")
         .filter(|value| py_truthy(value))
@@ -540,6 +545,11 @@ pub fn build_repaired_label_payload(
             .cloned()
             .unwrap_or_else(|| Value::Array(Vec::new())),
     );
+    if let Some(partial) = metadata.get("partial_input").filter(|v| v.is_object()) {
+        result.insert("partial_input".into(), partial.clone());
+    } else {
+        result.remove("partial_input");
+    }
     if let Some(gaps) = metadata
         .get("candidate_evidence_gaps")
         .filter(|value| py_truthy(value))
@@ -830,6 +840,21 @@ fn write_labels_bound(
 #[cfg(test)]
 mod tests {
     #[cfg(all(unix, feature = "full-tests"))]
+    #[test]
+    fn full_labels_replace_their_own_partial_input_marker() {
+        let root = tempfile::tempdir().unwrap();
+        for partial in [Some(serde_json::json!({"dropped_entries":2})), None] {
+            let mut metadata = Map::new();
+            if let Some(partial) = partial.clone() {
+                metadata.insert("partial_input".into(), partial);
+            }
+            write_full_labels(root.path(), Vec::new(), &metadata).unwrap();
+            let saved: Value =
+                serde_json::from_slice(&fs::read(labels_path(root.path())).unwrap()).unwrap();
+            assert_eq!(saved.get("partial_input"), partial.as_ref());
+        }
+    }
+
     #[test]
     fn public_label_writers_refuse_child_replacement_after_lock() {
         for full in [false, true] {

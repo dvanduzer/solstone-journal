@@ -48,6 +48,7 @@ fn write_outcome(
     counts: &Counts,
     served_ids: &BTreeSet<String>,
     error: Option<&str>,
+    output: &str,
 ) -> Result<(), String> {
     let path = journal
         .join("facets")
@@ -71,6 +72,7 @@ fn write_outcome(
         "ts".to_owned(),
         Value::from(chrono::Utc::now().timestamp_millis()),
     );
+    crate::partial_input::copy_marker(output, &mut payload);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|write_error| write_error.to_string())?;
     }
@@ -881,6 +883,7 @@ pub fn prepare_publication(
         Value::from(chrono::Utc::now().timestamp_millis()),
     );
 
+    crate::partial_input::copy_marker(output, &mut outcome);
     Ok((batches, Value::Object(outcome)))
 }
 
@@ -1048,7 +1051,15 @@ pub(crate) fn apply_result_cancellable(
         error = Some(detail);
     }
     crate::writers::check_cancellation(cancellation)?;
-    write_outcome(journal, facet, day, &counts, served_ids, error.as_deref())
+    write_outcome(
+        journal,
+        facet,
+        day,
+        &counts,
+        served_ids,
+        error.as_deref(),
+        output,
+    )
 }
 
 #[cfg(test)]

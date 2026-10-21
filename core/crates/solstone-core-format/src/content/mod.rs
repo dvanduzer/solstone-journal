@@ -568,7 +568,7 @@ pub fn produce_chunks_by_shape(
     records: &[JsonObject],
 ) -> ProducedChunks {
     let rel_text = rel.unwrap_or("");
-    match family {
+    let mut produced = match family {
         // Markdown renders from text, not records, so there is nothing to
         // produce here. `produce_chunks` guards it before delegating — but this
         // is a public entry point, and an outside caller that resolved a
@@ -616,7 +616,15 @@ pub fn produce_chunks_by_shape(
             error: Some("screen-text renders from text, not records; call produce_chunks with the file text".to_string()),
             warnings: Vec::new(),
         },
+    };
+    if produced.error.is_none() && produced.chunks.is_empty() {
+        for record in records.iter().filter(|record| has_partial_input(record)) {
+            produced
+                .chunks
+                .push(recorded_chunk(String::new(), 0, record));
+        }
     }
+    produced
 }
 
 pub fn produce_chunks(family: Family, rel: &str, text: &str) -> ProducedChunks {
@@ -719,13 +727,75 @@ pub fn produce_screen_talent_raw_screen_chunks(rel: &str, text: &str) -> ScreenT
 
 pub type JsonObject = Map<String, Value>;
 
+pub const PARTIAL_INPUT_NOTICE: &str =
+    "Left out: Some input did not fit. This result was written from part of the input.";
+
+fn partial_markers(record: &JsonObject) -> impl Iterator<Item = &Value> {
+    [
+        record.get("partial_input"),
+        record.get("participation_partial_input"),
+        record.get("story").and_then(|s| s.get("partial_input")),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|v| v.is_object())
+}
+
+fn has_partial_input(record: &JsonObject) -> bool {
+    partial_markers(record).next().is_some()
+}
+
+/// Keep a limitation visible under the same read limit as its saved body.
+/// Only partial results reserve space by shortening the rendered projection;
+/// their full saved source remains available.
+pub fn with_partial_input_notice(mut text: String, record: &JsonObject) -> String {
+    if !has_partial_input(record) {
+        return text;
+    }
+    let limit = [16 * 1024, 64 * 1024]
+        .into_iter()
+        .find(|limit| text.len() <= *limit)
+        .unwrap_or(64 * 1024);
+    let note = if record
+        .get("story")
+        .and_then(|s| s.get("partial_input"))
+        .is_some_and(Value::is_object)
+    {
+        "\n\nThis story, and anything saved with it, was written from part of the activity, not all of it."
+    } else {
+        "\n\nLeft out: Some input did not fit. This result was written from part of the input."
+    };
+    let body_limit = limit - note.len();
+    if text.len() > body_limit {
+        let mut boundary = body_limit;
+        while !text.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        text.truncate(boundary);
+    }
+    text.push_str(note);
+    let mut counts = Vec::new();
+    for marker in partial_markers(record) {
+        for key in ["dropped_entries", "dropped_chars"] {
+            if let Some(count) = marker.get(key).and_then(Value::as_u64) {
+                counts.push(format!("{key}: {count}"));
+            }
+        }
+    }
+    let detail = format!("\nLeft out: {}", counts.join(", "));
+    if !counts.is_empty() && text.len() + detail.len() <= limit {
+        text.push_str(&detail);
+    }
+    text
+}
+
 pub(super) fn recorded_chunk(
     content: String,
     occurrence_time_ms: i64,
     source: &JsonObject,
 ) -> IndexChunk {
     IndexChunk {
-        content,
+        content: with_partial_input_notice(content, source),
         occurrence_time_ms: Some(OccurrenceTimeMs(occurrence_time_ms)),
         source: Some(source.clone()),
         group_offset_ms: None,
@@ -1133,6 +1203,43 @@ mod tests {
                     actual.source
                 ));
             }
+        }
+    }
+
+    #[test]
+    fn partial_inputs_stay_visible_at_read_limits_and_in_empty_projections() {
+        for size in [
+            16 * 1024 - 1,
+            16 * 1024,
+            64 * 1024 - 1,
+            64 * 1024,
+            70 * 1024,
+        ] {
+            let record =
+                serde_json::json!({"partial_input":{"dropped_entries":2,"dropped_chars":500}})
+                    .as_object()
+                    .unwrap()
+                    .clone();
+            let body = "界".repeat(size / 3);
+            let text = super::with_partial_input_notice(body, &record);
+            assert!(text.contains(super::PARTIAL_INPUT_NOTICE));
+            assert!(
+                text.len()
+                    <= if size <= 16 * 1024 {
+                        16 * 1024
+                    } else {
+                        64 * 1024
+                    }
+            );
+        }
+        for family in [Family::Sense, Family::Screen, Family::MorningBriefing] {
+            let record = serde_json::json!({"partial_input":{}})
+                .as_object()
+                .unwrap()
+                .clone();
+            let produced = super::produce_chunks_by_shape(family, None, &[record]);
+            assert_eq!(produced.chunks.len(), 1);
+            assert!(produced.chunks[0].content.contains("Left out:"));
         }
     }
 

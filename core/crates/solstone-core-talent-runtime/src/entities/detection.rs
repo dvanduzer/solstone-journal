@@ -386,7 +386,7 @@ pub(crate) fn apply_result_cancellable(
     };
     let outcome = path.join("talents/detection_outcome.json");
     let (counts, error) = apply_detections(journal, output, day, &path, cancellation);
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "wrote": counts.wrote,
         "skipped": counts.skipped,
         "dropped": counts.dropped,
@@ -395,7 +395,9 @@ pub(crate) fn apply_result_cancellable(
         "ts": chrono::Utc::now().timestamp_millis(),
     });
     crate::writers::check_cancellation(cancellation)?;
-    let _ = fs::write(outcome, format!("{payload}\n"));
+    crate::partial_input::copy_marker(output, payload.as_object_mut().expect("outcome object"));
+    fs::create_dir_all(outcome.parent().expect("outcome parent")).map_err(|e| e.to_string())?;
+    fs::write(outcome, format!("{payload}\n")).map_err(|e| e.to_string())?;
     Ok(())
 }
 
