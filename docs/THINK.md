@@ -156,6 +156,47 @@ is configured. While the settings file cannot be read, existing listing rows sta
 as they are, the scan reports the failure once, and a note that arrives meanwhile
 is listed once the file reads again.
 
+A calendar file imported from an `.ics` export or a zip of them also joins the
+listing. The importer writes calendar note files in the same format beside each
+import window's transcript in the `import.ics` stream, one line per event or
+expanded occurrence, and queues them for search alone: they ask for no
+processing and mark no day as changed. The importer reads each event's `UID` as
+its `event` (or derives a stable one from its content when there is none) and
+its `RECURRENCE-ID` as its `occurrence`. It expands a repeating event's rule
+up to a year past the import, keeping a series' most recent 5,000 dates, and
+keeps each start's local wall time across daylight-saving changes, whatever the
+machine's own zone; lines expanded from a rule carry `"expanded": true`. An
+override stands for its date only when it writes a line of its own. Each line's
+`changed_at` is the instant that placed its event's transcript, `LAST-MODIFIED`
+or else `CREATED`, in the journal zone's offset, and it must fall inside that
+segment's own span rather than the 300-second grid; an import window closes
+where the zone's offset changes, so a daylight-saving change never splits one
+file's times between two offsets. Each line also names its `import` and when
+that import happened (`imported_at`, the upload time from the import's record,
+or for a record with none the time its first save recorded there). An event
+whose change time is missing or unreadable, or whose `TZID` matches no zone,
+directly or through the Windows zone names Outlook exports, writes no line, and
+the import's summary counts it. One import writes at most 200,000 lines; the
+summary counts the events past that limit.
+
+Imported lines are listed only: the import's transcript stays the record of the
+day each event was stored, so they add no stored-day hit, and like phone notes
+they carry no facet. An imported calendar file that fails the note contract or
+its segment's span is skipped and reported once.
+Among imported lines, the most recent import of an event by `imported_at`, with
+the import id breaking ties, defines it across the dates it covers: from its
+earliest written occurrence to its latest, or, when it expanded the event's
+rule, to a year past that import. Older imports' lines for the event inside that span are
+ignored, so dates a newer export dropped leave the listing; outside it they
+still count. Phone notes are never set aside by this rule, and between them and
+the chosen imported lines the latest `changed_at` still wins. Re-saving an import
+replaces only that import's calendar files in its segments. Removing every
+segment of the newest import that holds an event lets the next most recent count
+again. A repeating event that a later export holds as a single event keeps the
+older imports' dates outside that one date, since the newer import covers only
+the date it holds. Calendars imported before this change wrote no calendar note
+files, and nothing backfills them.
+
 ### Interrupted activity work
 
 `think-cli::activity_work` persists unfinished talent names and accepted Cortex use

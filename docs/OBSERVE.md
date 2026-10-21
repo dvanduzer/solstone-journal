@@ -52,6 +52,8 @@ A linked device may send the owner's calendar as calendar notes, with `source="c
 
 A kept file is stored exactly as sent and queued for search at once. It sends no processing event and does not mark its day as changed: a calendar note is not something the owner did, so sense, the daily and weekly units, the maintenance schedule, health and the agent transcript listing leave it out. Search finds each note on the day it was stored and lists every event under the days it happens, as described in [THINK.md](THINK.md#calendar-listing).
 
+Importing a calendar exported as an `.ics` file writes notes in the same format beside each import window's transcript; [THINK.md](THINK.md#calendar-listing) describes how they differ.
+
 ## Commands
 
 | Command | Purpose |

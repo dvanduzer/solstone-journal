@@ -6,6 +6,10 @@ Format adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- calendar files you import from now on can also be found by the day each event happens, not only the day it was added or last changed. repeating events are listed up to a year after you import them. calendars you imported before aren't added.
+
 ## [2.0.53] - 2026-10-21
 
 on windows, this is your journal's first update since 2.0.51, so it also brings the changes from 2.0.52. they're listed under the last heading below.
