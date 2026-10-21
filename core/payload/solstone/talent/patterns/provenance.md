@@ -11,12 +11,12 @@ Canonical implementation: `core/payload/solstone/talent/morning_briefing.md` emi
 A structured preamble summarizing what data sources were consulted and what gaps exist. Appears at the top of the output so the reader knows the briefing's evidence base before reading any claims.
 
 **What it includes:**
-- A coverage preamble, `Not in this briefing: <gaps>.`, when real gaps exist, and empty otherwise
+- A coverage preamble, `Not in this briefing: <what was left out>.`, when real gaps exist, and empty otherwise. It counts omitted activities, stories and location entries rather than naming records
 - Gaps — sources that returned zero results or errored
 - Structured metadata with machine-readable `sources` (`segments`, which is always 0)
 
 **Example:**
-> Not in this briefing: location entries omitted: 3.
+> Not in this briefing: 3 location entries; the story of one activity.
 
 ### 2. Source Attribution
 
