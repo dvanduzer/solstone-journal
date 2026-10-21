@@ -340,6 +340,74 @@ fn read_digest_const(path: &Path, const_name: &str) -> Result<String, EvidenceEr
     })
 }
 
+/// The screen OCR bundle's identity on every target: its recipe pins the
+/// models, the dictionary source and the per-target runtime archive, so the
+/// recipe digest names the bundle and the four pinned inputs are its inputs.
+fn screen_ocr_identity(target: &str) -> Result<(String, String, Vec<InputRef>), EvidenceError> {
+    let recipe_bytes: &[u8] = include_bytes!("../../../screen-ocr-helper/recipe.toml");
+    let recipe = crate::screen_ocr::Recipe::load(recipe_bytes).map_err(EvidenceError::new)?;
+    let runtime = recipe
+        .runtime_archive(target)
+        .ok_or_else(|| EvidenceError::new(format!("unnamed-input: {target} screen-ocr")))?;
+    let ver = format!(
+        "onnxruntime-{}-recipe-{}",
+        recipe.runtime.version,
+        &crate::digest::sha256_hex(recipe_bytes)[..12]
+    );
+    let src = crate::screen_ocr::RECIPE.to_string();
+    // The runtime archive comes first: `screen_ocr_member_input` names it for
+    // every member under `runtime/`.
+    let inputs = vec![
+        InputRef {
+            name: runtime.filename.clone(),
+            sha256: runtime.sha256.clone(),
+        },
+        InputRef {
+            name: recipe.models.detector.filename.clone(),
+            sha256: recipe.models.detector.sha256.clone(),
+        },
+        InputRef {
+            name: recipe.models.recognizer.filename.clone(),
+            sha256: recipe.models.recognizer.sha256.clone(),
+        },
+        InputRef {
+            name: "inference.yml".into(),
+            sha256: recipe.models.dictionary.source_sha256.clone(),
+        },
+    ];
+    Ok((ver, src, inputs))
+}
+
+/// Names the input one screen OCR bundle member came from: the runtime archive
+/// for everything under `runtime/`, each model by its file name, the
+/// materialized dictionary from its YAML source, and the repo-derived recipe,
+/// licences and provenance as themselves, never as another member's input.
+fn screen_ocr_member_input(path: &str, final_sha256: &str, inputs: &[InputRef]) -> InputRef {
+    let path = path.replace('\\', "/");
+    let rel = path
+        .split_once(&format!("{}/", crate::screen_ocr::BUNDLE_DEST))
+        .map(|(_, rel)| rel)
+        .unwrap_or(path.as_str());
+    let named = |name: &str| inputs.iter().find(|input| input.name == name).cloned();
+    let found = if rel.starts_with("runtime/") {
+        inputs.first().cloned()
+    } else if rel == "models/dictionary.txt" {
+        named("inference.yml")
+    } else if let Some(model) = rel.strip_prefix("models/") {
+        named(model)
+    } else {
+        None
+    };
+    found.unwrap_or_else(|| InputRef {
+        name: Path::new(rel)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(rel)
+            .to_string(),
+        sha256: final_sha256.to_string(),
+    })
+}
+
 fn bundled_identity(
     checkout: &Path,
     target: &str,
@@ -354,6 +422,9 @@ fn bundled_identity(
         }) {
             return Ok(res);
         }
+    }
+    if id == "screen-ocr" {
+        return screen_ocr_identity(target);
     }
     if target == "windows-x86_64" {
         match id {
@@ -886,31 +957,11 @@ pub fn name_receipt_inputs(
                 }]
             }
             crate::inventory::Entry::ScreenOcr { .. } => {
-                let recipe = crate::screen_ocr::Recipe::load(include_bytes!(
-                    "../../../screen-ocr-helper/recipe.toml"
-                ))
-                .map_err(EvidenceError::new)?;
-                let runtime = recipe.runtime_archive(target).ok_or_else(|| {
-                    EvidenceError::new(format!("unnamed-input: {target} {id} {dest}"))
-                })?;
-                vec![
-                    InputRef {
-                        name: recipe.models.detector.filename.clone(),
-                        sha256: recipe.models.detector.sha256.clone(),
-                    },
-                    InputRef {
-                        name: recipe.models.recognizer.filename.clone(),
-                        sha256: recipe.models.recognizer.sha256.clone(),
-                    },
-                    InputRef {
-                        name: "inference.yml".into(),
-                        sha256: recipe.models.dictionary.source_sha256.clone(),
-                    },
-                    InputRef {
-                        name: runtime.filename.clone(),
-                        sha256: runtime.sha256.clone(),
-                    },
-                ]
+                screen_ocr_identity(target)
+                    .map_err(|_| {
+                        EvidenceError::new(format!("unnamed-input: {target} {id} {dest}"))
+                    })?
+                    .2
             }
             crate::inventory::Entry::PinnedMembers { input, .. } => {
                 vec![pinned_input_ref(input).ok_or_else(|| {
@@ -1564,21 +1615,25 @@ pub fn render_posix_evidence(
             .file_name()
             .and_then(|f| f.to_str())
             .unwrap_or(path);
-        let input = row_inputs
-            .iter()
-            .find(|inp| {
-                inp.name == file_name
-                    || extracted_info
-                        .as_ref()
-                        .map(|(arch_name, _, _, _)| inp.name == *arch_name)
-                        .unwrap_or(false)
-            })
-            .cloned()
-            .or_else(|| row_inputs.first().cloned())
-            .unwrap_or(InputRef {
-                name: file_name.to_string(),
-                sha256: final_sha256.to_string(),
-            });
+        let input = if id == "screen-ocr" {
+            screen_ocr_member_input(path, final_sha256, &row_inputs)
+        } else {
+            row_inputs
+                .iter()
+                .find(|inp| {
+                    inp.name == file_name
+                        || extracted_info
+                            .as_ref()
+                            .map(|(arch_name, _, _, _)| inp.name == *arch_name)
+                            .unwrap_or(false)
+                })
+                .cloned()
+                .or_else(|| row_inputs.first().cloned())
+                .unwrap_or(InputRef {
+                    name: file_name.to_string(),
+                    sha256: final_sha256.to_string(),
+                })
+        };
 
         records.push(ProvenanceRecord {
             id: id.to_string(),
@@ -1840,10 +1895,14 @@ pub fn render_windows_component_evidence(
             extracted_sha256 = Some(pin_sha256.to_string());
         }
 
-        let input = row_inputs
-            .first()
-            .cloned()
-            .ok_or_else(|| EvidenceError::new(format!("unnamed-input: {target} {id} {dest}")))?;
+        let input = if id == "screen-ocr" {
+            screen_ocr_member_input(dest, &file.sha256, &row_inputs)
+        } else {
+            row_inputs
+                .first()
+                .cloned()
+                .ok_or_else(|| EvidenceError::new(format!("unnamed-input: {target} {id} {dest}")))?
+        };
 
         records.push(ProvenanceRecord {
             id: id.to_string(),
@@ -2250,6 +2309,106 @@ mod tests {
         let win_res = name_receipt_inputs(&inv, "windows-x86_64");
         let err = win_res.unwrap_err();
         assert!(err.message.starts_with("unnamed-input: windows-x86_64"));
+    }
+
+    #[test]
+    fn every_posix_bundled_component_has_an_identity() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let inv =
+            crate::inventory::load_inventory(&repo_root.join("core/distribution/inventory.toml"))
+                .unwrap();
+        for target in ["linux-x86_64", "linux-aarch64", "macos-arm64"] {
+            for entry in &inv.entry {
+                if !entry_targets(entry).iter().any(|t| t == target)
+                    || entry.class() != Some(crate::inventory::DeliveryClass::Component)
+                    || matches!(
+                        entry,
+                        crate::inventory::Entry::PinnedMembers { .. }
+                            | crate::inventory::Entry::PinnedNative { .. }
+                    )
+                {
+                    continue;
+                }
+                let Some(id) = crate::inventory::entry_component_id(entry) else {
+                    continue;
+                };
+                if let Err(err) = bundled_identity(&repo_root, target, id) {
+                    panic!("no identity for {id} on {target}: {}", err.message);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn screen_ocr_identity_names_the_recipe_and_its_pinned_inputs() {
+        let recipe_bytes: &[u8] = include_bytes!("../../../screen-ocr-helper/recipe.toml");
+        let recipe = crate::screen_ocr::Recipe::load(recipe_bytes).unwrap();
+        for target in [
+            "linux-x86_64",
+            "linux-aarch64",
+            "macos-arm64",
+            "windows-x86_64",
+        ] {
+            let (ver, src, inputs) =
+                bundled_identity(Path::new("."), target, "screen-ocr").unwrap();
+            assert_eq!(src, crate::screen_ocr::RECIPE);
+            assert_eq!(
+                ver,
+                format!(
+                    "onnxruntime-{}-recipe-{}",
+                    recipe.runtime.version,
+                    &crate::digest::sha256_hex(recipe_bytes)[..12]
+                )
+            );
+            let runtime = recipe.runtime_archive(target).unwrap();
+            let names: Vec<_> = inputs
+                .iter()
+                .map(|i| (i.name.as_str(), i.sha256.as_str()))
+                .collect();
+            assert_eq!(
+                names,
+                vec![
+                    (runtime.filename.as_str(), runtime.sha256.as_str()),
+                    ("detector.onnx", recipe.models.detector.sha256.as_str()),
+                    ("recognizer.onnx", recipe.models.recognizer.sha256.as_str()),
+                    (
+                        "inference.yml",
+                        recipe.models.dictionary.source_sha256.as_str()
+                    ),
+                ]
+            );
+            for (member, expected) in [
+                (
+                    "runtime/libonnxruntime.1.31.0.dylib",
+                    runtime.filename.as_str(),
+                ),
+                ("runtime\\onnxruntime.dll", runtime.filename.as_str()),
+                ("runtime/LICENSE", runtime.filename.as_str()),
+                ("runtime/ThirdPartyNotices.txt", runtime.filename.as_str()),
+                ("models/detector.onnx", "detector.onnx"),
+                ("models/recognizer.onnx", "recognizer.onnx"),
+                ("models/dictionary.txt", "inference.yml"),
+            ] {
+                let path = format!("{}/{member}", crate::screen_ocr::BUNDLE_DEST);
+                let input = screen_ocr_member_input(&path, &"0".repeat(64), &inputs);
+                assert_eq!(input.name, expected, "{target} {member}");
+                assert_ne!(input.sha256, "0".repeat(64), "{target} {member}");
+            }
+            for member in ["recipe.toml", "licenses/NOTICE", "provenance/bundle.json"] {
+                let path = format!("{}/{member}", crate::screen_ocr::BUNDLE_DEST);
+                let input = screen_ocr_member_input(&path, &"a".repeat(64), &inputs);
+                assert_eq!(input.sha256, "a".repeat(64), "{target} {member}");
+                assert_eq!(
+                    input.name,
+                    Path::new(member).file_name().unwrap().to_str().unwrap()
+                );
+            }
+        }
+        let err = bundled_identity(Path::new("."), "plan9-mips", "screen-ocr").unwrap_err();
+        assert!(
+            err.message
+                .starts_with("unnamed-input: plan9-mips screen-ocr")
+        );
     }
 
     #[test]
