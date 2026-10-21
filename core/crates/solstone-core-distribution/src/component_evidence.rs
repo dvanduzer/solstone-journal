@@ -1469,11 +1469,15 @@ pub fn render_posix_evidence(
 
         // Case 2: Archive member extraction. A pinned entry reads only its own
         // input: a single-file input (a bz2 or a model) answers to the empty
-        // member name, so any other archive would also match it.
+        // member name, so any other archive would also match it. The screen
+        // OCR bundle also reads only its own inputs: its `runtime/LICENSE`,
+        // `licenses/NOTICE` and the like share a file name with top-level
+        // members of unrelated archives.
         let own_input_only = matches!(
             entry,
             crate::inventory::Entry::PinnedMembers { .. }
                 | crate::inventory::Entry::PinnedNative { .. }
+                | crate::inventory::Entry::ScreenOcr { .. }
         );
         let mut extracted_info = None;
         for (archive_name, archive_bytes) in request
@@ -3834,6 +3838,84 @@ mod tests {
         let _ = fs::remove_dir_all(&dest);
         let _ = fs::remove_dir_all(&work);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn screen_ocr_member_ignores_a_same_named_member_of_another_archive() {
+        use crate::promote::{PromoteRequest, promote};
+        use crate::provenance::Provenance;
+
+        let other_name = "unrelated-tool.tar.gz";
+        let other_bytes = make_tar_gz(&[(
+            "LICENSE",
+            b"another project's licence",
+            tar::EntryType::Regular,
+            None,
+        )]);
+        let version = env!("CARGO_PKG_VERSION");
+        let target = "linux-x86_64";
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = PathBuf::from(format!(
+            "/var/tmp/solstone-dist-test-screen-ocr-licence-{}-{nanos}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let member_dest = "lib/solstone-screen-ocr/runtime/LICENSE";
+
+        let mut inv = test_inventory();
+        inv.entry.push(crate::inventory::Entry::ScreenOcr {
+            class: Some(crate::inventory::DeliveryClass::Component),
+            dest_dir: "lib/solstone-screen-ocr".to_string(),
+            targets: vec![target.to_string()],
+        });
+        set_bundled_identity_override(
+            target,
+            "screen-ocr",
+            "1.31.0",
+            crate::screen_ocr::RECIPE,
+            vec![InputRef {
+                name: "onnxruntime.whl".to_string(),
+                sha256: "0".repeat(64),
+            }],
+        );
+
+        let req = PromoteRequest {
+            dest: root.join("dest"),
+            work: root.join("work"),
+            tree: vec![
+                ("bin/solstone-core".into(), b"core".to_vec(), 0o755),
+                (member_dest.into(), b"onnx runtime licence".to_vec(), 0o644),
+            ],
+            version: version.to_owned(),
+            basename: format!("solstone-journal-{version}-{target}"),
+            os: "linux".into(),
+            arch: target.into(),
+            deb_arch: "amd64".into(),
+            rpm_arch: "x86_64".into(),
+            dirty: false,
+            observed: Provenance {
+                commit: "aaa".into(),
+                lock_sha256: "bbb".into(),
+            },
+            expected: Provenance {
+                commit: "aaa".into(),
+                lock_sha256: "bbb".into(),
+            },
+            fail_after: None,
+            apple: None,
+            inventory: inv,
+            archives: vec![(other_name.to_string(), other_bytes)],
+            fail_evidence_install: false,
+            stage_mutator: None,
+        };
+
+        let res = promote(&req);
+        clear_bundled_identity_override();
+        let _ = fs::remove_dir_all(&root);
+        res.unwrap_or_else(|error| panic!("{}", error.message));
     }
 
     /// The published macOS rfdetr archive carries a top-level directory entry,
