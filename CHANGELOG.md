@@ -29,6 +29,7 @@ on windows, this is your journal's first update since 2.0.51, so it also brings 
 
 ### Fixed
 
+- security fix: your journal no longer accepts certificates issued through emSign certificate authorities whose private keys are now public. this includes its connections to the relay, to solstone.me and to your thinking provider, and its update checks and downloads. before, someone between your computer and one of these services could have used one of the exposed keys to pose as that service. posing as your thinking provider, they could have read what your journal sent it, and the key or sign-in your journal uses there.
 - when your morning briefing leaves something out to keep within its size limit, its note now says how many activities, stories or location entries it left out, instead of listing internal names.
 - health shows processing progress sooner when you open it.
 - on windows, home in the journal window shows download progress in sizes like 1.2 GB of 4.8 GB, instead of two bare numbers.

@@ -1,5 +1,5 @@
 {
-  "cargo_lock_sha256": "26319d93057744105320608246e5ad920fb507816184b3b4fcd6179a757e12f8",
+  "cargo_lock_sha256": "66aeb0a2d3d23833fa220fb3edf29a442414f295c80b619d1d56c67b70f6e53a",
   "filter_platform": "x86_64-unknown-linux-gnu",
   "notice_texts": [
     {
@@ -15498,17 +15498,17 @@
       ]
     },
     {
-      "identity": "rustls-webpki@0.103.14 (registry+https://github.com/rust-lang/crates.io-index)",
+      "identity": "rustls-webpki@0.103.16 (registry+https://github.com/rust-lang/crates.io-index)",
       "license_expression": "ISC",
       "notice_references": [
         {
           "bytes": 916,
           "sha256": "5b698ca13897be3afdb7174256fa1574f8c6892b8bea1a66dd6469d3fe27885a",
           "source": {
-            "archive_sha256": "0527518605e68109d875e248ea259b6758801cf165e4b2c2733ae3b51f12535a",
+            "archive_sha256": "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281",
             "kind": "cargo-registry-archive",
             "member": "LICENSE",
-            "source_url": "https://static.crates.io/crates/rustls-webpki/rustls-webpki-0.103.14.crate"
+            "source_url": "https://static.crates.io/crates/rustls-webpki/rustls-webpki-0.103.16.crate"
           }
         }
       ]
@@ -18194,17 +18194,17 @@
       ]
     },
     {
-      "identity": "webpki-roots@1.0.9 (registry+https://github.com/rust-lang/crates.io-index)",
+      "identity": "webpki-roots@1.0.10 (registry+https://github.com/rust-lang/crates.io-index)",
       "license_expression": "CDLA-Permissive-2.0",
       "notice_references": [
         {
           "bytes": 2371,
           "sha256": "e271993808fec50ab29350b39539cdec611a9103f827e0aa26d61da70e2d33f8",
           "source": {
-            "archive_sha256": "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a",
+            "archive_sha256": "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9",
             "kind": "cargo-registry-archive",
             "member": "LICENSE",
-            "source_url": "https://static.crates.io/crates/webpki-roots/webpki-roots-1.0.9.crate"
+            "source_url": "https://static.crates.io/crates/webpki-roots/webpki-roots-1.0.10.crate"
           }
         }
       ]

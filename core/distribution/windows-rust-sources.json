@@ -1,9 +1,9 @@
 {
-  "cargo_lock_sha256": "ea8d7a04b76efbe7827167e452e05e383bb6f94f525be66174de321f41cf9942",
+  "cargo_lock_sha256": "66aeb0a2d3d23833fa220fb3edf29a442414f295c80b619d1d56c67b70f6e53a",
   "dependency_source_companion": {
-    "bytes": 105208023,
-    "filename": "windows-rust-dependencies-ea8d7a04b76efbe7.tar.gz",
-    "sha256": "18845f1d526568bcba1a5c715d65b9f912a8018037449fada35b11128e8cdcaa"
+    "bytes": 102987116,
+    "filename": "windows-rust-dependencies-66aeb0a2d3d23833.tar.gz",
+    "sha256": "2c05414cdb7bb4a6556c0c1c45117a1ee158c493b8b9a2a27d0ffaafdb0f852d"
   },
   "notice_texts": [
     {
@@ -21978,8 +21978,8 @@
       "windows_notice_population": false
     },
     {
-      "archive_sha256": "0527518605e68109d875e248ea259b6758801cf165e4b2c2733ae3b51f12535a",
-      "identity": "rustls-webpki@0.103.14 (registry+https://github.com/rust-lang/crates.io-index)",
+      "archive_sha256": "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281",
+      "identity": "rustls-webpki@0.103.16 (registry+https://github.com/rust-lang/crates.io-index)",
       "license_expression": "ISC",
       "name": "rustls-webpki",
       "notice_references": [
@@ -21987,10 +21987,10 @@
           "bytes": 916,
           "sha256": "5b698ca13897be3afdb7174256fa1574f8c6892b8bea1a66dd6469d3fe27885a",
           "source": {
-            "archive_sha256": "0527518605e68109d875e248ea259b6758801cf165e4b2c2733ae3b51f12535a",
+            "archive_sha256": "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281",
             "kind": "cargo-registry-archive",
             "member": "LICENSE",
-            "source_url": "https://static.crates.io/crates/rustls-webpki/rustls-webpki-0.103.14.crate"
+            "source_url": "https://static.crates.io/crates/rustls-webpki/rustls-webpki-0.103.16.crate"
           }
         }
       ],
@@ -21999,11 +21999,11 @@
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "vcs": {
         "git": {
-          "sha1": "14cbaa18eaacb2ad4110206b7d02c1ad08aabb42"
+          "sha1": "8ecdcc76f56b68fda67a6adf7976f5eed5006a4c"
         },
         "path_in_vcs": ""
       },
-      "version": "0.103.14",
+      "version": "0.103.16",
       "windows_notice_population": true
     },
     {
@@ -27089,8 +27089,8 @@
       "windows_notice_population": true
     },
     {
-      "archive_sha256": "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a",
-      "identity": "webpki-roots@1.0.9 (registry+https://github.com/rust-lang/crates.io-index)",
+      "archive_sha256": "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9",
+      "identity": "webpki-roots@1.0.10 (registry+https://github.com/rust-lang/crates.io-index)",
       "license_expression": "CDLA-Permissive-2.0",
       "name": "webpki-roots",
       "notice_references": [
@@ -27098,10 +27098,10 @@
           "bytes": 2371,
           "sha256": "e271993808fec50ab29350b39539cdec611a9103f827e0aa26d61da70e2d33f8",
           "source": {
-            "archive_sha256": "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a",
+            "archive_sha256": "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9",
             "kind": "cargo-registry-archive",
             "member": "LICENSE",
-            "source_url": "https://static.crates.io/crates/webpki-roots/webpki-roots-1.0.9.crate"
+            "source_url": "https://static.crates.io/crates/webpki-roots/webpki-roots-1.0.10.crate"
           }
         }
       ],
@@ -27110,11 +27110,11 @@
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "vcs": {
         "git": {
-          "sha1": "0a553dbc8b3f18ea05c4f881cffa3f2d005d0d30"
+          "sha1": "70760478b9d3ea729b22faa0b5324da38a297c1c"
         },
         "path_in_vcs": "webpki-roots"
       },
-      "version": "1.0.9",
+      "version": "1.0.10",
       "windows_notice_population": true
     },
     {
@@ -29668,14 +29668,14 @@
     "metadata_feature_scope": "workspace unified; conservative inclusion, not exact PE link graph",
     "notices": "non-dev dependency closure from Windows inventory binary roots in Windows-filtered Cargo metadata",
     "query": "cargo metadata --manifest-path core/Cargo.toml --locked --offline --format-version 1 --filter-platform x86_64-pc-windows-msvc --features solstone-core/journal-mcp-endpoint; inventory roots; follow non-dev dependency edges",
-    "query_utc": "2026-10-20T04:02:34.423983+00:00",
+    "query_utc": "2026-10-21T06:13:47.409001+00:00",
     "shipped_feature_arguments": [
       "--features",
       "solstone-core/journal-mcp-endpoint"
     ],
     "source": "complete Cargo.lock external-source set",
     "source_package_count": 577,
-    "source_sha256": "6f2804d8728b366f2839518d89b35c02a035b64d3e1e42cb9084260226e9978e",
+    "source_sha256": "16fcb33f34dfcb235e95ba0c48081f82d1e67c3be3fc87087ffaee94279a5036",
     "windows_notice_package_count": 511,
     "windows_notice_path_package_count": 1
   },
