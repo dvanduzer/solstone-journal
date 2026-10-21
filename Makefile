@@ -542,8 +542,10 @@ build-sandbox-processing:
 # run the binaries from dev-package/bin instead (a sandbox does). Fetches the
 # host target's pinned inputs into the catalog cache first, and carries the
 # ONNX Runtime build-sandbox-processing staged, the pinned PDFium, and the
-# independent screen OCR helper/model/private-runtime closure.
-dev-package: screen-ocr-rust-notices build-shipped-features build-sandbox-processing $(PDF_RUNTIME_HOST_LINK_DIR)
+# independent screen OCR helper/model/private-runtime closure. Like the release
+# producer, it checks the tracked screen OCR notices rather than rewriting them,
+# so a fresh clone without a venv can build it.
+dev-package: check-screen-ocr-rust-notices build-shipped-features build-sandbox-processing $(PDF_RUNTIME_HOST_LINK_DIR)
 	@$(REQUIRE_SUPPORTED_ONNX_HOST)
 	@set -eu; $(REQUIRE_PDF_HOST_RUNTIME)
 	$(SOLSTONE_DISTRIBUTION_ACQUIRE) acquire catalog-inputs --target $(ONNX_RUNTIME_HOST_TARGET)
@@ -716,13 +718,13 @@ SOLSTONE_DISTRIBUTION := cargo run --manifest-path $(RUST_MANIFEST) -p solstone-
 # itself stays offline and consumes the files this writes.
 SOLSTONE_DISTRIBUTION_ACQUIRE := cargo run --manifest-path $(RUST_MANIFEST) -p solstone-core-distribution --bin solstone-distribution --locked --
 
-# The helper has an independent lock and notice closure. Generate its source
-# index before either release or development staging consumes the bundle.
+# The helper has an independent lock and notice closure. Regenerate its notices
+# and source index here when its lock or inventory changes.
 screen-ocr-rust-notices:
 	$(PYTHON) scripts/distribution_rust_notices.py --write --screen-ocr
 
-# The release producer runs from a fresh clone with no venv, and never
-# rewrites tracked notices: it refuses stale ones instead.
+# The release producer and dev-package can run from a fresh clone with no venv,
+# and never rewrite tracked notices: they refuse stale ones instead.
 check-screen-ocr-rust-notices:
 	python3 scripts/distribution_rust_notices.py --check --screen-ocr
 
