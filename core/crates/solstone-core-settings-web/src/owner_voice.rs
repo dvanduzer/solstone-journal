@@ -28,7 +28,7 @@ pub(crate) fn status_at(journal: &Path, now: DateTime<Utc>) -> Value {
     let (left_out_s, recordings) = today_counts(journal, today);
     let pending = owner_voice_owed_days(today)
         .map(|day| {
-            transcripts_with_original(journal, day)
+            transcripts(journal, day, true)
                 .filter(|(segment, jsonl)| owner_voice_deletion_owed(segment, jsonl))
                 .count()
         })
@@ -43,7 +43,8 @@ pub(crate) fn status_at(journal: &Path, now: DateTime<Utc>) -> Value {
 fn today_counts(journal: &Path, today: NaiveDate) -> (f64, u64) {
     let mut left_out_s = 0.0;
     let mut recordings = 0;
-    for (_segment, jsonl) in transcripts_with_original(journal, today) {
+    // By record, not by original: a successful deletion removes the original.
+    for (_segment, jsonl) in transcripts(journal, today, false) {
         let Some(record) = read_processing_record_header(&jsonl) else {
             continue;
         };
@@ -60,15 +61,16 @@ fn today_counts(journal: &Path, today: NaiveDate) -> (f64, u64) {
     (left_out_s, recordings)
 }
 
-/// `(segment, transcript)` pairs for a day whose transcript has a media sibling of the same
-/// stem; unreadable directories are skipped.
-fn transcripts_with_original(
+/// `(segment, transcript)` pairs for a day, optionally only those whose transcript has a media
+/// sibling of the same stem; unreadable directories are skipped.
+fn transcripts(
     journal: &Path,
     day: NaiveDate,
+    with_original: bool,
 ) -> impl Iterator<Item = (PathBuf, PathBuf)> {
     let key = day.format("%Y%m%d").to_string();
     let segments = solstone_core_segment::list_segments(journal, &key).unwrap_or_default();
-    segments.into_iter().flat_map(|segment| {
+    segments.into_iter().flat_map(move |segment| {
         let segment = segment.path().to_path_buf();
         let names = std::fs::read_dir(&segment)
             .map(|entries| {
@@ -82,17 +84,18 @@ fn transcripts_with_original(
             .iter()
             .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
             .filter(|jsonl| {
-                names.iter().any(|other| {
-                    other.file_stem() == jsonl.file_stem()
-                        && other
-                            .extension()
-                            .and_then(|ext| ext.to_str())
-                            .is_some_and(|ext| {
-                                solstone_core_processing_record::is_media_extension(
-                                    &ext.to_ascii_lowercase(),
-                                )
-                            })
-                })
+                !with_original
+                    || names.iter().any(|other| {
+                        other.file_stem() == jsonl.file_stem()
+                            && other
+                                .extension()
+                                .and_then(|ext| ext.to_str())
+                                .is_some_and(|ext| {
+                                    solstone_core_processing_record::is_media_extension(
+                                        &ext.to_ascii_lowercase(),
+                                    )
+                                })
+                    })
             })
             .map(|jsonl| (segment.clone(), jsonl.clone()))
             .collect::<Vec<_>>()
@@ -168,8 +171,9 @@ mod tests {
 
         let status = status_at(journal, now);
         assert_eq!(status["available"], json!(false));
-        assert_eq!(status["today"]["recordings"], json!(2));
-        assert_eq!(status["today"]["left_out_s"], json!(6.0));
+        // Today's records count whether or not their original is still there.
+        assert_eq!(status["today"]["recordings"], json!(3));
+        assert_eq!(status["today"]["left_out_s"], json!(9.0));
         // Owed: today's three with originals, yesterday's, and the one 29 days back; not the
         // one 30 days back, and not the one whose original is gone.
         assert_eq!(status["pending_deletions"], json!(5));

@@ -226,6 +226,7 @@ fn run_batch_with_environment_and_timeout_with_marker_policy(
         let DeletedOutputs {
             deleted,
             kept_voice_only,
+            kept_while_voice_only_on,
         } = delete_outputs_counted(
             journal,
             &day_dir,
@@ -238,6 +239,11 @@ fn run_batch_with_environment_and_timeout_with_marker_policy(
         if kept_voice_only > 0 {
             println!(
                 "Kept {kept_voice_only} voice-only output file(s): a voice-only result is not reprocessed"
+            );
+        }
+        if kept_while_voice_only_on > 0 {
+            println!(
+                "Kept {kept_while_voice_only_on} transcript(s) made before \"leave out other voices\" was on: turn it off to reprocess them"
             );
         }
         if request.dry_run {
@@ -419,6 +425,37 @@ pub struct DeletedOutputs {
     pub deleted: Vec<PathBuf>,
     /// Voice-only outputs left in place: a voice-only result is final and is never reprocessed.
     pub kept_voice_only: usize,
+    /// Transcripts made without voice-only filtering, left in place while it is on: reprocessing
+    /// them now would filter them and delete their originals.
+    pub kept_while_voice_only_on: usize,
+}
+
+/// A finished transcript made without voice-only filtering.
+fn is_unfiltered_transcript(path: &Path) -> bool {
+    use solstone_core_processing_record::vocab;
+    match solstone_core_processing_record::read_processing_record_header(path) {
+        Some(record) => {
+            record.get("handler").and_then(Value::as_str) == Some(vocab::HANDLER_TRANSCRIBE)
+                && matches!(
+                    record.get("state").and_then(Value::as_str),
+                    Some(vocab::STATE_ANALYZED | vocab::STATE_EMPTY)
+                )
+                && !solstone_core_processing_record::owner_voice_filtered(&record)
+        }
+        None => solstone_core_processing_record::jsonl_has_row_with_key(
+            path,
+            vocab::AUDIO_TRANSCRIPT_ROW_KEY,
+        ),
+    }
+}
+
+fn owner_voice_only_on(journal: &Path) -> bool {
+    solstone_core_journal_config::read_journal_config(journal)
+        .ok()
+        .and_then(|config| config.config)
+        .and_then(|config| config.get("transcribe").cloned())
+        .and_then(|transcribe| transcribe.get("owner_voice_only").cloned())
+        == Some(Value::Bool(true))
 }
 
 /// A voice-only output (success or failure) is never deleted for reprocessing.
@@ -441,6 +478,7 @@ pub fn delete_outputs_counted(
     if !day_dir.exists() {
         return Ok(outcome);
     }
+    let voice_only_on = owner_voice_only_on(journal);
     let listed = iter_segments(journal, PathOrDay::Directory(day_dir))?;
     check_record_identities(selected_segments(&listed, segment_filter, stream_filter))?;
     for segment in listed {
@@ -491,6 +529,10 @@ pub fn delete_outputs_counted(
             }
             if is_voice_only_output(&path) {
                 outcome.kept_voice_only += 1;
+                continue;
+            }
+            if voice_only_on && is_unfiltered_transcript(&path) {
+                outcome.kept_while_voice_only_on += 1;
                 continue;
             }
             if dry_run {
@@ -1214,6 +1256,24 @@ mod tests {
                 assert!(path.join("mic_audio.jsonl").exists());
             }
         }
+        // While voice-only is on, an ordinary finished transcript is kept, not reprocessed.
+        fs::create_dir_all(temp.path().join("config")).expect("config dir");
+        fs::write(
+            temp.path().join("config/journal.json"),
+            r#"{"transcribe": {"owner_voice_only": true}}"#,
+        )
+        .expect("config");
+        fs::write(
+            path.join("mic_audio.jsonl"),
+            header(serde_json::json!({"state": "analyzed", "handler": "transcribe"})),
+        )
+        .expect("sidecar");
+        let outcome =
+            delete_outputs_counted(temp.path(), &day, ReprocessKind::Audio, None, None, false)
+                .expect("reprocess");
+        assert!(outcome.deleted.is_empty());
+        assert_eq!(outcome.kept_while_voice_only_on, 1);
+        fs::remove_file(temp.path().join("config/journal.json")).expect("config");
         // An ordinary output in the same segment is still deleted.
         fs::write(
             path.join("mic_audio.jsonl"),
