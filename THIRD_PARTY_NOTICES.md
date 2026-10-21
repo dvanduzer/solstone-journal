@@ -170,6 +170,25 @@ project https://leafletjs.com
 License notice: BSD 2-Clause License (BSD-2-Clause). The licence text ships
 beside the library as `vendor/leaflet/LICENSE`.
 
+## Windows time zone names (Unicode CLDR)
+
+Calendar files exported from Outlook name time zones the Windows way, such as
+"Pacific Standard Time". The journal reads them through the world mappings of
+the Unicode CLDR `windowsZones` table, kept as data in
+`core/crates/solstone-core-import-sources/src/windows_zones.tsv` and compiled
+into the journal.
+
+Source: `common/supplemental/windowsZones.xml` from
+https://github.com/unicode-org/cldr at revision
+`a70bfe93a2c74473baaedf01eea43b027e782979`.
+
+Changes: only the world ("001") mappings are kept, one Windows name and its
+IANA zone per line, each zone written as its current IANA name from CLDR's
+`common/bcp47/timezone.xml` at the same revision.
+
+License notice: Unicode License v3 (Unicode-3.0), Copyright © Unicode, Inc.
+The full copyright and permission notice is in `licenses/Unicode-3.0.txt`.
+
 ## bundled test fixtures
 
 ### Paradigm Shift AI delayed-video regression fixture

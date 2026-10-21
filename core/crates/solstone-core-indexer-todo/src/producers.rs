@@ -34,7 +34,10 @@ pub const PRODUCERS: &[(Family, &str)] = &[
     ),
     (Family::ProtectedVideo, "ingest retained text publication"),
     (Family::DesktopActivity, "ingest retained text publication"),
-    (Family::Calendar, "ingest calendar note publication"),
+    (
+        Family::Calendar,
+        "ingest calendar note publication and calendar import publication",
+    ),
 ];
 
 pub const CATCH_ALL_ONLY: &[(Family, &str)] = &[(

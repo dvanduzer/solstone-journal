@@ -1540,6 +1540,43 @@ mod tests {
     }
 
     #[test]
+    fn an_imported_calendar_s_notes_never_enter_material_beside_its_transcript() {
+        let root = TempDir::new().unwrap();
+        let window = root
+            .path()
+            .join("chronicle")
+            .join(DAY)
+            .join("import.ics")
+            .join("094130_301");
+        fs::create_dir_all(&window).unwrap();
+        fs::write(
+            window.join("event_transcript.md"),
+            "## planning\nThe garden beds.\n",
+        )
+        .unwrap();
+        fs::write(
+            window.join(format!("calendar_{}.jsonl", "b".repeat(64))),
+            include_str!("../../../fixtures/calendar_notes/golden.jsonl"),
+        )
+        .unwrap();
+        let everything = sources(true, true, TalentSource::All);
+        let (day, counts) = cluster(root.path(), DAY, &everything);
+        assert!(day.contains("garden beds"), "{day}");
+        assert!(!day.contains("design review") && !day.contains("Halloween"));
+        assert_eq!(counts.total(), 1);
+        let (segment, counts) = cluster_period(
+            root.path(),
+            DAY,
+            "094130_301",
+            &everything,
+            Some("import.ics"),
+        );
+        assert!(segment.contains("garden beds"), "{segment}");
+        assert!(!segment.contains("design review"), "{segment}");
+        assert_eq!(counts.total(), 1);
+    }
+
+    #[test]
     fn a_strava_workout_reaches_the_transcript_once_on_its_first_piece() {
         let root = TempDir::new().unwrap();
         for (key, index) in [("070200_300", 0), ("070700_300", 1)] {

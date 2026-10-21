@@ -1155,6 +1155,44 @@ mod tests {
     }
 
     #[test]
+    fn an_imported_calendar_s_notes_never_move_a_daily_units_evidence() {
+        let root = root("calendar-import-not-daily-evidence");
+        let today = journal_today(&root).format("%Y%m%d").to_string();
+        let window = format!("chronicle/{today}/import.ics/094130_301");
+        write(
+            &root,
+            &format!("{window}/event_transcript.md"),
+            "## planning\nThe garden beds.\n",
+        );
+        let names = [
+            "morning_briefing",
+            "entities:entity_observer",
+            "daily_schedule",
+        ];
+        let before = names.map(|name| evidence_of(&root, &today, name, Some("work")).revision);
+        write(
+            &root,
+            &format!("{window}/calendar_{}.jsonl", "b".repeat(64)),
+            include_str!("../../../fixtures/calendar_notes/golden.jsonl"),
+        );
+        let with_notes = names.map(|name| evidence_of(&root, &today, name, Some("work")).revision);
+        assert_eq!(with_notes, before);
+        // The twin: a changed transcript in the same window moves every unit
+        // that reads it; the schedule reads only segment times.
+        write(
+            &root,
+            &format!("{window}/event_transcript.md"),
+            "## planning\nThe garden beds, moved.\n",
+        );
+        let with_transcript =
+            names.map(|name| evidence_of(&root, &today, name, Some("work")).revision);
+        for (index, name) in names[..2].iter().enumerate() {
+            assert_ne!(with_transcript[index], before[index], "{name}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn daily_evidence_tracks_named_direct_imported_sources_and_removal() {
         let root = root("daily-sources-shapes");
         let files = [
