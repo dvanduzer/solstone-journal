@@ -927,6 +927,23 @@ fn ensure_span_parity(
     Ok(())
 }
 
+/// Whether the adapter's own admission test admits this one statement.
+pub(crate) fn admits_statement(
+    raw_path: &Path,
+    audio: &[f32],
+    statement: &Map<String, Value>,
+    sample_rate: u32,
+) -> bool {
+    admitted_statement_ids(
+        raw_path,
+        audio,
+        std::slice::from_ref(statement),
+        sample_rate,
+        MIN_STATEMENT_DURATION_S,
+    )
+    .is_ok_and(|admitted| !admitted.is_empty())
+}
+
 fn admitted_statement_ids(
     raw_path: &Path,
     audio: &[f32],

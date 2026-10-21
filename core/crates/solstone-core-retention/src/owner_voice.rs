@@ -339,6 +339,104 @@ fn release_proven(
     }
 }
 
+/// Counts from one cleanup run, for its report.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OwedRunCounts {
+    pub deleted: u64,
+    pub deleted_unrecorded: u64,
+    pub gone: u64,
+    pub owed: u64,
+    pub refused: u64,
+    pub not_provable: u64,
+    pub not_owed: u64,
+    pub skipped: u64,
+    pub unknown: u64,
+}
+
+/// Finish owed owner-voice deletions for recordings dated in [`owner_voice_owed_days`].
+///
+/// Reads only transcript headers, and only where the named original still exists. Each
+/// deletion acquires the transcript's claim and the segment commit with zero wait and is
+/// skipped on contention (the next run retries). Deletions still owed after the pass are
+/// retried up to `retries` times, `pause` apart, holding no claim while waiting. Runs whatever
+/// the voice-only setting is now: deletion follows each record's saved intent.
+pub fn finish_owed_owner_voice_deletions(
+    journal: &Path,
+    today: NaiveDate,
+    retries: usize,
+    pause: std::time::Duration,
+    now: &dyn Fn() -> DateTime<Utc>,
+) -> OwedRunCounts {
+    let mut counts = OwedRunCounts::default();
+    let mut owed = Vec::new();
+    for day in owner_voice_owed_days(today) {
+        let key = day.format("%Y%m%d").to_string();
+        let Ok(segments) = solstone_core_segment::list_segments(journal, &key) else {
+            continue;
+        };
+        for segment in segments {
+            let Ok(entries) = fs::read_dir(segment.path()) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let jsonl = entry.path();
+                if jsonl.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                match owner_voice_deletion_state(segment.path(), &jsonl) {
+                    OwedState::Owed => owed.push(jsonl),
+                    OwedState::Unknown => counts.unknown += 1,
+                    OwedState::NotOwed => {}
+                }
+            }
+        }
+    }
+    for attempt in 0..=retries {
+        if owed.is_empty() {
+            break;
+        }
+        if attempt > 0 {
+            std::thread::sleep(pause);
+        }
+        let last = attempt == retries;
+        let mut still_owed = Vec::new();
+        for jsonl in owed {
+            match finish_one(journal, &jsonl, now()) {
+                Some(OwnerVoiceDeletion::Owed(_)) if !last => still_owed.push(jsonl),
+                Some(outcome) => tally(&mut counts, &outcome),
+                None => counts.skipped += 1,
+            }
+        }
+        owed = still_owed;
+    }
+    counts
+}
+
+fn finish_one(journal: &Path, jsonl: &Path, at: DateTime<Utc>) -> Option<OwnerVoiceDeletion> {
+    let segment = jsonl.parent()?;
+    let options = solstone_core_journal_io::LockOptions {
+        timeout: std::time::Duration::ZERO,
+        ..solstone_core_journal_io::LockOptions::default()
+    };
+    let claims = OutputClaims::acquire([jsonl.to_path_buf()], options).ok()?;
+    let commit = claims.commit(segment).ok()?;
+    Some(finish_owner_voice_deletion(journal, jsonl, &claims, &commit, at))
+}
+
+fn tally(counts: &mut OwedRunCounts, outcome: &OwnerVoiceDeletion) {
+    let slot = match outcome {
+        OwnerVoiceDeletion::Deleted => &mut counts.deleted,
+        OwnerVoiceDeletion::DeletedUnrecorded => &mut counts.deleted_unrecorded,
+        OwnerVoiceDeletion::Gone => &mut counts.gone,
+        OwnerVoiceDeletion::NotOwed => &mut counts.not_owed,
+        OwnerVoiceDeletion::Unknown => &mut counts.unknown,
+        OwnerVoiceDeletion::Refused(_) => &mut counts.refused,
+        OwnerVoiceDeletion::NotProvable(_) => &mut counts.not_provable,
+        OwnerVoiceDeletion::Owed(_) => &mut counts.owed,
+    };
+    *slot += 1;
+}
+
 /// `(day, stream, dir)` of a segment directory inside the journal's chronicle, for either
 /// layout: `chronicle/<day>/<dir>` (the default stream) or `chronicle/<day>/<stream>/<dir>`.
 fn segment_coordinates(journal: &Path, segment: &Path) -> Option<(String, String, String)> {
@@ -624,6 +722,38 @@ mod tests {
         assert!(owner_voice_deletion_owed(&fixture.segment, &fixture.jsonl));
         drop(lease);
         assert_eq!(finish(&fixture), OwnerVoiceDeletion::Deleted);
+    }
+
+    #[test]
+    fn the_daily_walk_finishes_owed_deletions_in_its_window_only() {
+        let fixture = fixture_in("chronicle/20261020/watch/120000_300", "analyzed");
+        let journal = &fixture.journal;
+        let old = journal.join("chronicle/20260920/watch/120000_300");
+        fs::create_dir_all(&old).unwrap();
+        fs::copy(&fixture.original, old.join("120000_300.m4a")).unwrap();
+        fs::copy(&fixture.jsonl, old.join("120000_300.jsonl")).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+
+        // Busy at first: the deletion stays owed and is retried within the run.
+        let root = JournalRoot::open(journal).unwrap();
+        let lease = std::cell::RefCell::new(Some(ActivityLease::try_acquire(Arc::new(root)).unwrap()));
+        let calls = std::cell::Cell::new(0);
+        let counts = finish_owed_owner_voice_deletions(journal, today, 2, Duration::ZERO, &|| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                lease.borrow_mut().take();
+            }
+            at()
+        });
+        assert_eq!(calls.get(), 2, "the first attempt was busy and the retry deleted it");
+        assert_eq!(counts.deleted, 1);
+        assert_eq!(counts.owed, 0);
+        assert!(!fixture.original.exists());
+        // 2026-09-20 is 30 days back: outside the window, left alone.
+        assert!(old.join("120000_300.m4a").exists());
+
+        let again = finish_owed_owner_voice_deletions(journal, today, 0, Duration::ZERO, &at);
+        assert_eq!(again, OwedRunCounts::default());
     }
 
     #[test]

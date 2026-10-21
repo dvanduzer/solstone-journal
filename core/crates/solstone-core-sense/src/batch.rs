@@ -223,7 +223,10 @@ fn run_batch_with_environment_and_timeout_with_marker_policy(
     check_deadline(deadline)?;
 
     if let Some(reprocess) = request.reprocess {
-        let deleted = delete_outputs(
+        let DeletedOutputs {
+            deleted,
+            kept_voice_only,
+        } = delete_outputs_counted(
             journal,
             &day_dir,
             reprocess,
@@ -232,6 +235,11 @@ fn run_batch_with_environment_and_timeout_with_marker_policy(
             request.dry_run,
         )?;
         check_deadline(deadline)?;
+        if kept_voice_only > 0 {
+            println!(
+                "Kept {kept_voice_only} voice-only output file(s): a voice-only result is not reprocessed"
+            );
+        }
         if request.dry_run {
             if deleted.is_empty() {
                 println!("No files to delete");
@@ -394,12 +402,47 @@ pub fn delete_outputs(
     stream_filter: Option<&str>,
     dry_run: bool,
 ) -> Result<Vec<PathBuf>, BatchError> {
+    delete_outputs_counted(
+        journal,
+        day_dir,
+        reprocess,
+        segment_filter,
+        stream_filter,
+        dry_run,
+    )
+    .map(|outcome| outcome.deleted)
+}
+
+/// What a reprocess deletion did.
+#[derive(Debug, Default)]
+pub struct DeletedOutputs {
+    pub deleted: Vec<PathBuf>,
+    /// Voice-only outputs left in place: a voice-only result is final and is never reprocessed.
+    pub kept_voice_only: usize,
+}
+
+/// A voice-only output (success or failure) is never deleted for reprocessing.
+fn is_voice_only_output(path: &Path) -> bool {
+    solstone_core_processing_record::read_processing_record_header(path)
+        .as_ref()
+        .is_some_and(solstone_core_processing_record::owner_voice_filtered)
+}
+
+/// [`delete_outputs`], also counting the voice-only outputs it left in place.
+pub fn delete_outputs_counted(
+    journal: &Path,
+    day_dir: &Path,
+    reprocess: ReprocessKind,
+    segment_filter: Option<&str>,
+    stream_filter: Option<&str>,
+    dry_run: bool,
+) -> Result<DeletedOutputs, BatchError> {
+    let mut outcome = DeletedOutputs::default();
     if !day_dir.exists() {
-        return Ok(Vec::new());
+        return Ok(outcome);
     }
     let listed = iter_segments(journal, PathOrDay::Directory(day_dir))?;
     check_record_identities(selected_segments(&listed, segment_filter, stream_filter))?;
-    let mut deleted = Vec::new();
     for segment in listed {
         if stream_filter.is_some_and(|value| !segment.stream().matches(value)) {
             continue;
@@ -446,8 +489,13 @@ pub fn delete_outputs(
             if !selected {
                 continue;
             }
-            deleted.push(path.clone());
-            if !dry_run {
+            if is_voice_only_output(&path) {
+                outcome.kept_voice_only += 1;
+                continue;
+            }
+            if dry_run {
+                outcome.deleted.push(path.clone());
+            } else {
                 let failure = |source| BatchError::Delete {
                     path: path.clone(),
                     source,
@@ -471,6 +519,12 @@ pub fn delete_outputs(
                     return Err(failure(std::io::Error::other(
                         "reprocess selection changed before deletion",
                     )));
+                }
+                // Re-read under the claim: a voice-only result published after selection
+                // is final too.
+                if is_voice_only_output(&path) {
+                    outcome.kept_voice_only += 1;
+                    continue;
                 }
                 // A journal rel is `/`-separated on every platform; the native
                 // spelling carries backslashes on Windows, which `sync_dir` refuses.
@@ -505,6 +559,7 @@ pub fn delete_outputs(
                     path: path.clone(),
                     source,
                 })?;
+                outcome.deleted.push(path.clone());
                 // The unlink and its dirty transition precede every later
                 // fallible scan/deadline/dispatcher step. A failed marker is
                 // terminal, but cannot pretend the already-removed output was
@@ -529,8 +584,8 @@ pub fn delete_outputs(
             }
         }
     }
-    deleted.sort();
-    Ok(deleted)
+    outcome.deleted.sort();
+    Ok(outcome)
 }
 
 /// Dispatch a scanned day through the native handler worker/process path.
@@ -1127,6 +1182,41 @@ mod tests {
             .join("120000_1");
         fs::create_dir_all(&path).expect("segment");
         path
+    }
+
+    #[test]
+    fn reprocess_keeps_voice_only_outputs_in_every_mode() {
+        let temp = tempfile::tempdir().expect("journal");
+        let path = segment(temp.path());
+        let day = temp.path().join("chronicle").join("20260812");
+        let header = |record: serde_json::Value| {
+            format!("{}\n", serde_json::json!({"raw": "mic_audio.flac", "_solstone_processing": record}))
+        };
+        for record in [
+            serde_json::json!({"state": "analyzed", "owner_voice_filter": true}),
+            serde_json::json!({"state": "failed", "owner_voice_filter": true}),
+        ] {
+            fs::write(path.join("mic_audio.jsonl"), header(record)).expect("sidecar");
+            fs::write(path.join("mic_audio.flac"), "audio").expect("source");
+            for (kind, dry_run) in [
+                (ReprocessKind::All, true),
+                (ReprocessKind::Audio, true),
+                (ReprocessKind::All, false),
+                (ReprocessKind::Audio, false),
+            ] {
+                let outcome =
+                    delete_outputs_counted(temp.path(), &day, kind, None, None, dry_run).expect("reprocess");
+                assert!(outcome.deleted.is_empty());
+                assert_eq!(outcome.kept_voice_only, 1);
+                assert!(path.join("mic_audio.jsonl").exists());
+            }
+        }
+        // An ordinary output in the same segment is still deleted.
+        fs::write(path.join("mic_audio.jsonl"), header(serde_json::json!({"state": "analyzed"}))).expect("sidecar");
+        let outcome =
+            delete_outputs_counted(temp.path(), &day, ReprocessKind::Audio, None, None, false).expect("reprocess");
+        assert_eq!(outcome.deleted, vec![path.join("mic_audio.jsonl")]);
+        assert_eq!(outcome.kept_voice_only, 0);
     }
 
     #[test]
