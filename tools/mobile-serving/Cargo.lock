@@ -6175,6 +6175,7 @@ dependencies = [
  "solstone-core-npy",
  "solstone-core-processing-record",
  "solstone-core-retention",
+ "solstone-core-segment",
  "solstone-core-serving",
  "solstone-core-speaker-resolve",
  "solstone-core-system",
