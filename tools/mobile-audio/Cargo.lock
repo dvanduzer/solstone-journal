@@ -2163,6 +2163,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "solstone-core-speaker-resolve"
+version = "2.0.52"
+dependencies = [
+ "chrono",
+ "chrono-tz",
+ "getrandom 0.3.4",
+ "log",
+ "ndarray",
+ "nix 0.30.1",
+ "percent-encoding",
+ "rapidfuzz",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "solstone-core-entity",
+ "solstone-core-entity-matching",
+ "solstone-core-facets",
+ "solstone-core-journal-config",
+ "solstone-core-journal-io",
+ "solstone-core-local",
+ "solstone-core-npy",
+ "solstone-core-segment",
+ "solstone-core-speaker-id",
+ "solstone-core-system",
+ "thiserror 2.0.21",
+ "zip",
+]
+
+[[package]]
 name = "solstone-core-speakers"
 version = "2.0.52"
 dependencies = [
@@ -2309,9 +2339,11 @@ dependencies = [
  "solstone-core-local",
  "solstone-core-observe-audio",
  "solstone-core-processing-record",
+ "solstone-core-retention",
  "solstone-core-segment",
  "solstone-core-sound-tags",
  "solstone-core-speaker-id",
+ "solstone-core-speaker-resolve",
  "solstone-core-speakers",
  "solstone-core-speakers-analyze",
  "solstone-core-spp-ratls",
